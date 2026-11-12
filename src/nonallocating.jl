@@ -1237,6 +1237,54 @@ function _nonalloc_exact_signature(ast::Expr, have_types::Tuple)
     Expr(:function, Expr(:tuple, signature.args[1:4]..., typed...), ast.args[2])
 end
 
+# The names a program body assigns exactly once, with their right-hand sides:
+# the definitions a table root's static type is read through.
+function _nonalloc_table_definitions(body)
+    definitions = Dict{Symbol,Any}()
+    repeated = Set{Symbol}()
+    _index_run_visit(body) do ex
+        ex.head === :(=) && length(ex.args) == 2 && ex.args[1] isa Symbol || return
+        haskey(definitions, ex.args[1]) && push!(repeated, ex.args[1])
+        definitions[ex.args[1]] = ex.args[2]
+    end
+    foreach(name -> delete!(definitions, name), repeated)
+    definitions
+end
+
+# The static type of `x` in a program body (`_nonallocating_program`): a
+# value's inferred type, a constant's own type, or what Julia infers for a call
+# of a constant function or operation on arguments of such types. `nothing`
+# when no concrete type follows.
+function _nonalloc_static_type(x, types, definitions, constants, ops,
+                               seen = Set{Symbol}())
+    x isa Union{Number,Nothing} && return typeof(x)
+    x isa QuoteNode && return typeof(x.value)
+    if x isa Symbol
+        T = get(types, x, nothing)
+        T isa Type && isconcretetype(T) && return T
+        (x in seen || !haskey(definitions, x)) && return nothing
+        return _nonalloc_static_type(definitions[x], types, definitions, constants, ops,
+                                     push!(seen, x))
+    end
+    slot = _constant_slot(x)
+    slot === nothing || return typeof(constants[slot])
+    x isa Expr && x.head === :call || return nothing
+    head = first(x.args)
+    slot = _callable_slot(head)
+    f = slot !== nothing ? ops[slot] :
+        head isa GlobalRef && isdefined(head.mod, head.name) &&
+            isconst(head.mod, head.name) ? getglobal(head.mod, head.name) : nothing
+    f === nothing && return nothing
+    argtypes = Any[]
+    for argument in x.args[2:end]
+        T = _nonalloc_static_type(argument, types, definitions, constants, ops, copy(seen))
+        T === nothing && return nothing
+        push!(argtypes, T)
+    end
+    T = Base.promote_op(f, argtypes...)
+    isconcretetype(T) ? T : nothing
+end
+
 """
     _nonallocating_program(p::Plan; have_types, cache_apply, passes) -> (ast, constants, callables, caches)
 
@@ -1273,14 +1321,18 @@ function _nonallocating_program(p::Plan; have_types = nothing,
     # value types of `lowered`, so its cells outline nothing (`outline`), and
     # the step program keys its caches on the operation calls
     # (`_nonalloc_statement!`), so this emitter keeps every recipe's call in
-    # the table rather than its inlined source.
+    # the table rather than its inlined source. Tables of work reused across
+    # an enclosing plate's cells (`_lower_indexed_invariants`) keep lane slots
+    # too (`table_lanes`).
+    table_lanes = Pair{Symbol,Symbol}[]
     ast, constants, callables, recipes = _lower_with_ops(lowered;
                                         exemplar_types = have_types,
                                         declare = false, recycle,
                                         pushdowns = true, outline = false,
                                         plate_element_types = true,
                                         plate_programs = true,
-                                        inline_sources = false)
+                                        inline_sources = false,
+                                        indexed_lanes = table_lanes)
     isempty(passes) || (ast = transform(ast, passes...))
     names = _varnames(lowered)
     types = Dict{Symbol,Any}(names[cid] => T for (cid, T) in values
@@ -1311,6 +1363,19 @@ function _nonallocating_program(p::Plan; have_types = nothing,
         # Typed by the value's inferred array type, so the program reads it
         # concretely (`_lane_reuse`); an uninferred value keeps a `Ref{Any}`.
         A = get(values, cid, Any)
+        slot = A isa Type && A <: Array && isconcretetype(A) ?
+            Base.RefValue{Union{Nothing,A}}(nothing) : Ref{Any}(nothing)
+        j = _step!(prog, _NonallocLane(), slot)
+        push!(lanes, Expr(:(=), lane, Expr(:ref, _CACHES_ARG, j)))
+    end
+    # A table's slot is typed by the array its allocation returns for the
+    # root's static type, as a lane is by its value's type; a root whose type
+    # is not inferred keeps a `Ref{Any}`.
+    definitions = _nonalloc_table_definitions(body)
+    for (lane, root) in table_lanes
+        lane in mentioned || continue
+        R = _nonalloc_static_type(root, types, definitions, constants, prog.ops)
+        A = R === nothing ? Any : Base.promote_op(_indexed_table, R)
         slot = A isa Type && A <: Array && isconcretetype(A) ?
             Base.RefValue{Union{Nothing,A}}(nothing) : Ref{Any}(nothing)
         j = _step!(prog, _NonallocLane(), slot)

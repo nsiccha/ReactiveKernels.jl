@@ -6067,6 +6067,7 @@ end
 # barrier each lowering is inferred on its own, and an image keeps its code.
 function _lower_with_ops(p::Plan; cell_slots::Union{Nothing,Vector{Symbol}} = nothing,
                          cell_tables::Union{Nothing,Vector{Symbol}} = nothing,
+                         indexed_lanes::Union{Nothing,Vector{Pair{Symbol,Symbol}}} = nothing,
                          kwargs...)
     depth = get(task_local_storage(), _INDEXED_INVARIANT_DEPTH, 0)
     result = task_local_storage(_INDEXED_INVARIANT_DEPTH, depth + 1) do
@@ -6079,11 +6080,12 @@ function _lower_with_ops(p::Plan; cell_slots::Union{Nothing,Vector{Symbol}} = no
     ast, constants, callables, recipes = result
     # Analyze spliced nested cells together, so reusable indexed work moves to
     # the widest enclosing plate. Footprints and position scratch retain their
-    # own read and storage protocols.
+    # own read and storage protocols. `indexed_lanes` collects the names a
+    # non-allocating program binds to the tables' lane slots.
     if depth == 0 && get(kwargs, :inline_embedded, true) &&
             !get(kwargs, :footprint, false) && !get(kwargs, :partition_plan, false) &&
             cell_slots === nothing && cell_tables === nothing
-        ast = _lower_indexed_invariants(ast, recipes)
+        ast = _lower_indexed_invariants(ast, recipes; lanes = indexed_lanes)
     end
     ast, constants, callables, recipes
 end
