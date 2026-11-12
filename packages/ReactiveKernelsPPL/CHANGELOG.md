@@ -29,7 +29,7 @@ are recorded in the git history only.
   image's workload on one binding compiles the programs another binding calls.
   A compact factor query also keeps its selection's row plan behind one
   reference instead of boxing it on every call. Values and gradients are
-  unchanged. Requires ReactiveKernels 0.1.181, whose partitions read such a
+  unchanged. Requires ReactiveKernels 0.1.186, whose partitions read such a
   plate's lane without a per-call allocation, so a plate a selection does not
   read costs nothing per call.
 
