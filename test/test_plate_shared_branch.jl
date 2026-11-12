@@ -138,6 +138,53 @@ end
     end
     total::Float64 = sum(cells)
 end
+# An unannotated scalar read from a preceding plate is shared too. The
+# abstract declaration alone cannot prove getindex's result; the native
+# plate's body and allocation prove the concrete array it actually produces.
+@kernel _guarded_plate_alias(x::Vector{Float64}, u::Vector{Float64}) = begin
+    scales::AbstractVector{Float64} = plate(u) do ui
+        exp(ui)
+    end
+    scale = scales[1]
+    cells = plate(x, scale) do xi, si
+        si > 0 ? xi * _counted_log(si) : -xi
+    end
+    total::Float64 = sum(cells)
+end
+@kernel _plate_alias_math(x::Vector{Float64}, u::Vector{Float64}) = begin
+    scales::AbstractVector{Float64} = plate(u) do ui
+        exp(ui)
+    end
+    scale = scales[1]
+    cells = plate(x, scale) do xi, si
+        si > 0 ? xi * log(si) : -xi
+    end
+    total::Float64 = sum(cells)
+end
+
+@kernel _guarded_abstract_plate_alias(x::AbstractVector{Float64}, u::AbstractVector{Float64}) = begin
+    scales::AbstractVector{Float64} = plate(u) do ui
+        exp(ui)
+    end
+    scale = scales[1]
+    cells = plate(x, scale) do xi, si
+        si > 0 ? xi * _counted_log(si) : -xi
+    end
+    total::Float64 = sum(cells)
+end
+
+_after_conversion(::Int) = 2.0
+_after_conversion(::Float64) = [2.0, 3.0, 4.0]
+@kernel _plate_alias_conversion(x::Vector{Float64}, u::Vector{Int}) = begin
+    values::AbstractVector{Float64} = plate(u) do ui
+        ui
+    end
+    scales = _after_conversion(values[1])
+    cells = plate(x, scales) do xi, si
+        si > 0 ? xi * log(si) : -xi
+    end
+    total::Float64 = sum(cells)
+end
 @kernel _endpoint_law_math(scale::Float64) = begin
     logpdf(x::Float64)::Float64 = x > 0 ? x * log(scale) : -x
 end
@@ -194,6 +241,59 @@ end
     k = prepare(_guarded_untyped; exemplars = (x, 2.0))
     @test k(x, 2.0) ≈ sum(x) * log(2.0)
     @test k(x, -2.0) == -sum(x)
+end
+
+@testset "scalar aliases of preceding plates keep shared branch work" begin
+    k = prepare(_guarded_plate_alias)
+    for n in (0, 3, 101), u in ([log(2.0)], [-Inf], [NaN])
+        x = collect(1.0:n)
+        scale = exp(only(u))
+        _ARM_CALLS[] = 0
+        @test k(x, u) ≈ (scale > 0 ? sum(x) * log(scale) : -sum(x))
+        @test _ARM_CALLS[] == (n > 0 && scale > 0 ? 1 : 0)
+    end
+    # The sampler's coordinate port is abstractly declared; its exact HAVE
+    # type comes from exemplar preparation. That evidence must reach aliases
+    # too, while the emitted arm and its callable table remain aligned.
+    typed = prepare(_guarded_abstract_plate_alias; exemplars=([1.0], [0.0]))
+    for n in (0, 3, 101), u in ([log(2.0)], [-Inf], [NaN])
+        x = collect(1.0:n)
+        scale = exp(only(u))
+        _ARM_CALLS[] = 0
+        @test typed(x, u) ≈ (scale > 0 ? sum(x) * log(scale) : -sum(x))
+        @test _ARM_CALLS[] == (n > 0 && scale > 0 ? 1 : 0)
+    end
+    sizes = Int[]
+    for n in (0, 3, 101)
+        x = collect(1.0:n)
+        bound = prepare(_guarded_plate_alias; bound = (; x))
+        _ARM_CALLS[] = 0
+        @test bound([log(2.0)]) ≈ sum(x) * log(2.0)
+        @test _ARM_CALLS[] == (n > 0 ? 1 : 0)
+        # Count expression nodes, not printed gensym widths. Increasing bound
+        # data lengths must not replicate any emitted cell or branch body.
+        nodes(ex) = ex isa Expr ? 1 + sum(nodes, ex.args; init = 0) : 0
+        push!(sizes, nodes(code_expr(bound)))
+    end
+    @test all(==(first(sizes)), sizes)
+    # A typed assignment may change the element type and thereby dispatch.
+    # The producer's pre-conversion Int elements must not make the actual
+    # vector returned after conversion look like a shared scalar.
+    converted = prepare(_plate_alias_conversion)
+    @test converted([1.0, 2.0, 3.0], [2]) ≈ sum([1.0, 2.0, 3.0] .* log.([2.0, 3.0, 4.0]))
+
+    math = prepare(_plate_alias_math)
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    for x in (Float64[], [1.0, 2.0, 3.0])
+        u = [log(2.0)]
+        ad = prepare_ad(math, backend, x, u; active = :u)
+        value, gradient = ad_value_and_gradient(ad, x, u)
+        @test value ≈ sum(x) * only(u)
+        @test gradient ≈ [sum(x)]
+        value, gradient = ad_value_and_gradient(ad, x, [-Inf])
+        @test value == -sum(x)
+        @test gradient == [0.0]
+    end
 end
 
 @testset "a shared plate branch is decided once per call" begin

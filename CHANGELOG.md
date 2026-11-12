@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.188
+## 0.1.201
 
 - `jax_source(...; data, definitions, definitions_module = Main)`: the
   definitions' globals, such as a call head `plate`, resolve in
@@ -27,6 +27,195 @@ are recorded in the git history only.
   (`UNTRANSLATED`: "`f` is not defined in module `Main`"), and one `Main`
   defined differently was translated as that function. The default keeps the
   previous behaviour for direct callers.
+
+## 0.1.200
+
+- Summed-plate factoring also recognizes the direct array reads introduced
+  in 0.1.194. In 0.1.196 only the broadcast-read loop was factored, so a
+  shared-scale Normal plate with matching array axes retained its per-cell
+  scale arithmetic, and a plate over one array was never factored. Both
+  direct and broadcast-read loops now take their shared factors and terms
+  out of the sum, with the same guarded fallback and ordinary reverse.
+
+## 0.1.199
+
+- `jax_source` combines a plate's runtime validity checks across its active
+  lanes, including nested plates, before calling the host. Previously JAX
+  scheduled one callback per cell, which dominated the hidden-Markov model's
+  emission calculation. Inactive and padded lanes are masked, and an
+  active invalid value still raises the check's error.
+- A history scan whose reads have a provable bounded lag carries a rolling
+  buffer and lets `lax.scan` stack its outputs separately. This includes
+  previous-row recurrences with a data-sized row width, such as the HMM
+  forward pass. This bounds the primal history carry; gradients of shared
+  arrays can still carry full-sized buffers. Unknown history accesses keep
+  the full buffer; seeds and reads of unwritten entries keep their values.
+  Empty history scans skip their body, including its indexed reads.
+  Prepared integer bounds survive history-index tracking, so scanned ranges
+  can also bound nested loops.
+
+## 0.1.198
+
+- `jax_source` host preparation keeps helper function and type arguments in
+  the translator instead of emitting them as invalid Python literals. This
+  fixes data-only expressions such as `1 / sqrt(exp(x))`, including when `x`
+  comes from a scan. Nested helpers retain their callable identities; closure
+  captures and aggregate fields that hold numerical values remain runtime
+  arguments. Native arithmetic and data-dependent iteration are unchanged.
+
+## 0.1.197
+
+- Strict plate-cell queries recognize ordinary array addition and subtraction
+  through transparent helper functions on Julia 1.13. The row analysis follows
+  a constant function binding loaded into a separate lowered-code statement,
+  restoring helpers such as `add_arrays(a, b) = a + b`. Full-array shape checks,
+  custom dispatch checks, and rejection of mutable bindings or extra helper
+  work remain in effect.
+
+## 0.1.196
+
+- A summed plate takes shared work out of its sum (with the stable rewrites,
+  `simplify = true`, the default). When a cell's value is `a + c * t`, with
+  `a` and `c` reading only values its cells share, the cells sum `t` alone and
+  the plate adds `n * a + c * sum(t)` once. A Normal observation plate with
+  one scale (`y .~ Normal.(mu, sigma)`) now sums `(y - mu)^2` per cell and
+  takes `-0.5 / sigma^2`, `log(sigma)` and `0.5 * log(2pi)` once per call;
+  before, each cell divided by `sigma`, tested `sigma == 0` twice and
+  subtracted the hoisted `log(sigma)`, and the ordinary reverse accumulated
+  `sigma`'s derivative cell by cell, a serial chain that kept the reverse
+  loop scalar (snag normal-plate-kee-8322185b). Laplace, Cauchy, logistic and
+  Student-t plates with a shared scale take their additive terms out the same
+  way; the Laplace scale leaves the sum too. Values and derivatives change in
+  their last bits. The plate's own loop still runs, and gives its own values,
+  when a law's guard on a shared value holds (`sigma == 0`), when a shared
+  factor is zero, subnormal or not finite (a scale below about 1e-154 or above
+  about 1e154), or when the factored sum is not finite (a residual above
+  about 1e154). Where the density itself is not finite, the derivatives can
+  differ: at a scale so small that a Cauchy cell's `z^2` overflows, the
+  scale's derivative is NaN instead of the plate's own `-n / sigma`.
+  `simplify = false` keeps the plate's own loop.
+
+## 0.1.195
+
+- Native plate lowering retains concrete result types through preceding
+  plates and scalar aliases, including exemplar-prepared abstract inputs.
+  Lazy branch arms reuse that evidence to move shared work outside the cell
+  loop. In a Normal mixture with shared component scales, the outer support
+  guard and scale logarithms now run once per nonempty call; the original divisions and
+  ordinary reverse derivatives are preserved. Empty and inactive branches
+  still skip their guarded work, and bound data retain runtime loops.
+
+## 0.1.194
+
+- A summed plate's cells read each batched array directly when every array
+  they read has exactly the plate's axes; the plate checks this once per call
+  and otherwise runs its loop as before. A plate over one batched array reads
+  it directly always, since that array has the plate's axes. Base's broadcast
+  read tests, at every read, whether each axis has length one, and native
+  Enzyme's reverse loop kept that test in the address of every shadow load
+  and store, so a summed plate's gradient did not vectorize: an `@rkppl`
+  regression `mu = X * beta; y .~ Normal.(mu, sigma)` (N = 1192, K = 2) took
+  1843–1932 ns per value and gradient against 770–797 ns for the hand loop,
+  and now takes 778 ns (gordito, Julia 1.13.1, Enzyme 0.13.219). Values and
+  gradients are unchanged, and nothing about shapes is fixed at preparation.
+  The direct-read copy compiles the summed loop a second time. A cell loop
+  with a nested plate or a scan, one carrying lane slots, cell tables, shared
+  call tables or scheduled groups (a multi-dimensional plate), and the opt-in
+  generated plate reverse keep their one loop as before (snag
+  plate-reverse-lo-31fd6869).
+
+## 0.1.193
+
+- A partition reads a batched lane that views a vector at a range
+  (`view(u, lo:hi)`, such as a packed parameter block) at the positions of that
+  vector its rows hold, computed apart from the read, so a partition's plan
+  computes them once per label. A compact overlay serves them from its active
+  vector when its slot map is constant per label. Before, the lane was sliced
+  on every call, which allocated a fresh index vector each time, also for a
+  partition with no cells in that plate. Values and gradients are unchanged.
+
+## 0.1.192
+
+- Provide shared recurrence-window reduction planning for ReactiveKernelsPPL:
+  a sum over literal backward offsets can read scalar lags without allocating
+  a slice. Data-derived window widths and trajectory lengths remain runtime
+  iteration.
+- `jax_source` converts a numeric tuple to an array for `sum`, including
+  fixed scan windows, so standalone JAX preserves their values and gradients.
+
+## 0.1.191
+
+- A non-allocating kernel keeps the type of a value it reads back from a step's
+  buffer. A value checked by a branch whose other arm throws
+  (`x = ok ? y : throw(...)`) took the type `Any` while the program was
+  decomposed into buffer-filling steps, and the steps computed from it, such
+  as the arms of a recorded helper's `n == 0 ? float.(s) : log.(s)`, kept
+  untyped buffers, so their results reached the program as `Any`. Every plate
+  cell reading them then dispatched at run time and allocated. Since 0.1.131,
+  when DistributionKernels' hidden-Markov helpers record their sources,
+  that included every emission cell of an exponential or normal HMM law whose
+  scales are sampled: `prepare_sampler`'s default density of a two-stream
+  exponential HMM over 416 steps took 60 µs and 6,673 allocations per call,
+  against 15 µs and 27 for `nonallocating = false`; it now takes 14 µs and 16.
+  A throwing arm no
+  longer widens a branch's type, a decomposed value keeps the type the
+  program's planning inferred for it when that is narrower, and a step whose
+  buffer preparation still could not type (a kernel prepared without
+  argument types, say) returns its result as the type its own call infers,
+  while still reusing that buffer. Values are unchanged (snag
+  default-non-allo-a0c23dd8).
+
+## 0.1.190
+
+- `prepare_nonallocating` reuses destinations for matrix products nested in
+  broadcasts consumed by a reduction or plate, including materialized
+  broadcast operands such as `A * (x .* s)`. These products now take the same
+  cache steps as products assigned to their own statements. The outer
+  broadcast keeps its existing lazy or materialized behavior, and destination
+  guards still accommodate changing runtime shapes.
+
+## 0.1.189
+
+- `jax_source` translates `findfirst(predicate, vector)` in host data
+  preparation, including captured predicates such as `isequal(label)`,
+  `Base.Fix1` and `Base.Fix2`. Searches return the first one-based index or
+  `nothing` and stop evaluating at the first match. Positional kernels that
+  map group labels to their levels now prepare those indices in the emitted
+  module. Previously unary `isequal` was incorrectly typed as `Bool`, so
+  these searches emitted an unconditional `findfirst threw` error.
+
+## 0.1.188
+
+- The stable rewrites (0.1.117, on unless `simplify = false`) reach the
+  preparations that compile their own programs. There,
+  `log1pexp(-log(exp(u)))` was `Inf` at `u = -800` and its gradient `NaN` at
+  `u = 710` and `800`; each now gives `prepare`'s finite value and
+  derivative.
+  - `plate(spec; have, want, batched)`. A recipe's source now runs in the
+    generated loop, as in `lower`, and recipes that depend on the same batched
+    ports recompute under one condition. A value hoisted above the loop stays
+    computed once: a per-element statement reads it as it is, so `log(s)` per
+    element of a shared `s = exp(u)` is computed as written there, where
+    `prepare` reads `u` (computing `exp` per element instead measured 3.5×
+    slower on a 10,000-element z-score loop). A composition among the hoisted
+    statements, or among loop statements that depend on the same batched
+    ports, is rewritten.
+  - `vectorize` and `prepare_batched` (position batching). Each part of the
+    position driver is rewritten; a per-position statement reads a value of
+    the shared prefix as it is, as above.
+  - `prepare_reactive` and `prepare_reactive_nonallocating`, for compositions
+    inside one recipe's source. A composition across two state values is
+    computed as written: each value is a slot that `freeze!` can set, so
+    `w = log(v)` reads `v`, never what computed it. A recipe reused in place
+    by `prepare_reactive_nonallocating` runs its own operation.
+- New: `plate(spec; …)`, `vectorize`, `prepare_batched`, `prepare_reactive`
+  and `prepare_reactive_nonallocating` take `simplify`, as `prepare` does;
+  `nothing` (the default) reads an enclosing setting or the project
+  preference. A `PreparedKernel` given to `vectorize` contributes its plan,
+  not its setting. A rebound kernel's kept position drivers are kept per
+  setting.
+- The `prepare_reactive(graph; have, want)` docstring is attached to that
+  method again (it documented an internal helper).
 
 ## 0.1.187
 

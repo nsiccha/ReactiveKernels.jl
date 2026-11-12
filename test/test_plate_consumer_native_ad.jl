@@ -68,8 +68,17 @@ end
     # Both response lengths may change without duplicating either loop body.
     # Each plate's shared `s > 0` guard is decided once per call, so each plate
     # has one cell loop per arm.
+    # A summed plate's loop has a direct-read copy taken when its arrays span
+    # the plate (`ReactiveKernels._plate_direct_read_loop`): the same loop, so
+    # only the loop it copies is counted.
+    spans(c) = c isa Expr && (c.head === :&& ? spans(c.args[1]) :
+        c.head === :call && c.args[1] == GlobalRef(ReactiveKernels, :_plate_spans_axis))
+    copied(x) = x isa ReactiveKernels._PlateProgram ?
+        ReactiveKernels._PlateProgram(copied(x.ast), x.axes) :
+        x isa Expr ? (x.head === :if && length(x.args) == 3 && spans(x.args[1]) ?
+        copied(x.args[3]) : Expr(x.head, map(copied, x.args)...)) : x
     function generated_code_tree(kernel)
-        parts = String[string(code_expr(kernel))]
+        parts = String[string(copied(code_expr(kernel)))]
         for recipe in kernel.lowered_recipes
             op = recipe.op
             op isa ReactiveKernels._AuthoredPlateOp || continue

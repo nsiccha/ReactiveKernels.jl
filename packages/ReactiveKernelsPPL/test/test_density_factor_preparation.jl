@@ -216,3 +216,69 @@ end
     @test value ≈ -sites * 0.5log(2pi) - sum(abs2, u) / 2
     @test gradient ≈ -u
 end
+
+@testset "bindings with rows in other plates share their query programs" begin
+    # Todo 1nndmwq: a selection's structure listed only the plate sites it had
+    # entries in, and an elementwise site with no events in a binding was no
+    # plate site at all. A package image whose workload binding had no `b` rows
+    # then never compiled the programs another binding's `b` units call.
+    model = @rkppl begin
+        sd_a ~ Exponential(1.0)
+        a[1:Ja] .~ Normal.(0.0, sd_a)
+        sd_b ~ Exponential(1.0)
+        b[1:Jb] .~ Normal.(0.0, sd_b)
+        sigma ~ Exponential(1.0)
+        @plate for i in eachindex(y)
+            y[i] ~ Normal(a[ga[i]], sigma)
+        end
+        @plate for i in eachindex(z)
+            z[i] ~ Normal(b[gb[i]], sigma)
+        end
+    end
+    function unit_queries(Ja, Jb)
+        ga, gb = repeat(1:Ja; inner = 2), repeat(1:Jb; inner = 2)
+        plan = model(; Ja, Jb, ga, gb) |
+            (; y = 0.3 .* cos.(eachindex(ga)), z = 0.2 .* sin.(eachindex(gb)))
+        built = build_kernel(plan)
+        c = density_factors(built, plan)
+        u = 0.1 .* sin.(1:built.layout.total)
+        selections = [select_factors(c, [DensityFactor(:prior, :a, k);
+            k <= Jb ? [DensityFactor(:prior, :b, k)] : DensityFactor[]]) for k in 1:Ja]
+        queries = prepare_query_ad(prepare_ad, built, plan, selections,
+            _FACTOR_PREPARATION_REVERSE, u; coordinates = :support)
+        (; built, c, u, queries)
+    end
+    none, some = unit_queries(4, 0), unit_queries(5, 2)
+    shape(c) = [(s.kind, s.site, s.plate !== nothing) for s in getfield(c, :sites)]
+    @test shape(none.c) == shape(some.c)
+    @test length(getfield(none.c, :structures)) == length(getfield(some.c, :structures)) == 1
+    @test length(unique(typeof.(some.queries))) == 1
+    @test unique(typeof.(none.queries)) == unique(typeof.(some.queries))
+    names = coordinate_names(some.built.layout)
+    at(name) = only(findall(==(name), names))
+    prior(s, x) = -0.5log(2pi) - log(s) - x^2 / (2s^2)
+    for (k, q) in enumerate(some.queries), shift in (0.0, 0.17)
+        point = some.u .+ shift
+        sites = k <= 2 ? ((:sd_a, Symbol("a.", k)), (:sd_b, Symbol("b.", k))) :
+            ((:sd_a, Symbol("a.", k)),)
+        @test q.coordinates == sort([at(n) for site in sites for n in site])
+        value, gradient = ad_value_and_gradient(q, point, point[q.coordinates])
+        @test value ≈ sum(prior(exp(point[at(sd)]), point[at(x)]) for (sd, x) in sites)
+        oracle = zeros(length(point))
+        for (sd, x) in sites
+            s, r = exp(point[at(sd)]), point[at(x)]
+            oracle[at(sd)] = -1 + r^2 / s^2
+            oracle[at(x)] = -r / s^2
+        end
+        @test gradient ≈ oracle[q.coordinates]
+    end
+    # A unit without `b` cells runs that plate's partition empty, at no cost in
+    # bytes per call beyond a unit's with them (RK `_cell_lane_range_rows`).
+    function bytes(q, u)
+        active = u[q.coordinates]
+        g = similar(active)
+        ad_value_and_gradient!(q, g, u, active)
+        minimum(@allocated(ad_value_and_gradient!(q, g, u, active)) for _ in 1:3)
+    end
+    @test bytes(some.queries[5], some.u) == bytes(some.queries[1], some.u)
+end
