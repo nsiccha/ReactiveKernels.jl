@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.8
+
+- The Student-t log kernel declares its form at `log|z|` to ReactiveKernels'
+  stable rewrites, so a half-Student or half-Cauchy prior at `exp(u)` reads
+  `u` directly. Requires ReactiveKernels 0.1.204.
+
 ## 0.1.7
 
 - Incomplete-beta and Student-t tails use ReactiveKernels' shared fraction
