@@ -16,6 +16,15 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.165
+
+- `jax_source(built, plan; float_type = Float32)` emits the model's module in
+  float32: `unconstrained`, the prepared data and every value are `float32`,
+  and the module does not turn on JAX's 64-bit mode. The default `Float64`
+  module is its reference. The module's simplex and multivariate normal
+  helpers allocate in their inputs' dtype (the same values in a `Float64`
+  module). Requires ReactiveKernels 0.1.203 (snag jax-source-float-5e6b7604).
+
 ## 0.1.164
 
 - Require ReactiveKernels 0.1.202 and ReactiveKernelsDistributionKernels 0.1.7
