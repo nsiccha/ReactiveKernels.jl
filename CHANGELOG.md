@@ -16,6 +16,23 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.199
+
+- `jax_source` combines a plate's runtime validity checks across its active
+  lanes, including nested plates, before calling the host. Previously JAX
+  scheduled one callback per cell, which dominated the hidden-Markov model's
+  emission calculation. Inactive and padded lanes are masked, and an
+  active invalid value still raises the check's error.
+- A history scan whose reads have a provable bounded lag carries a rolling
+  buffer and lets `lax.scan` stack its outputs separately. This includes
+  previous-row recurrences with a data-sized row width, such as the HMM
+  forward pass. This bounds the primal history carry; gradients of shared
+  arrays can still carry full-sized buffers. Unknown history accesses keep
+  the full buffer; seeds and reads of unwritten entries keep their values.
+  Empty history scans skip their body, including its indexed reads.
+  Prepared integer bounds survive history-index tracking, so scanned ranges
+  can also bound nested loops.
+
 ## 0.1.198
 
 - `jax_source` host preparation keeps helper function and type arguments in
