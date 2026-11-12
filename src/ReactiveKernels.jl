@@ -84,6 +84,7 @@ include("native_ode.jl")
 include("streaming.jl")
 include("streaming_helpers.jl")
 include("jax.jl")
+include("jax_history.jl")
 include("jax_host.jl")
 
 export Value, Recipe, Graph, Plan, PreparedKernel, PreparedADKernel, PreparedADPullback, ReplicatedKernel, NonAllocatingKernel, PlanningError
