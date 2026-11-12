@@ -725,7 +725,11 @@ function _jax_destructure!(ctx::_JaxContext, lhs, v::_PyVal)
         indexed = _jax_index(ctx, target, lhs.args[2:end]; target = true)
         position = indexed.code[ncodeunits(target.code)+1:end]
         name = _jax_fresh(ctx, lhs.args[1])
-        _jax_emit!(ctx, name * " = " * _py_atom(target.code) * ".at" * position * ".set(" * v.code * ")")
+        # In a loop's steps past its bound the entry keeps its value.
+        mask = _jax_write_mask(ctx, lhs.args[1], target, lhs.args[2:end])
+        value = mask === nothing ? v.code :
+            "jnp.where(" * mask * ", " * v.code * ", " * _py_atom(target.code) * position * ")"
+        _jax_emit!(ctx, name * " = " * _py_atom(target.code) * ".at" * position * ".set(" * value * ")")
         ctx.locals[lhs.args[1]] = _PyVal(name, target.T, false, target.extent, target.limit,
                                          target.padded)
         return
@@ -1433,10 +1437,13 @@ end
 # assigns its array). The range's bounds are static, so the loop lowers to a
 # scan that `jax.grad` differentiates; a data-dependent upper bound with a
 # static limit (a padded group vector's length) runs to the limit and keeps
-# the carry unchanged past the bound. Ends that are data with a static number
-# of steps (`_jax_loop_range`) run those steps from the first element; past
-# the last element a step repeats the last (as padding does) and keeps the
-# whole carry, arrays included, unchanged.
+# the carry unchanged past the bound (`_JaxLoopMask`): an array the body
+# rebinds is selected whole, and an indexed write keeps the entry it would
+# change, except a write at the loop index into an array padded by the same
+# length, whose entries past the bound are padding. Ends that are data with a
+# static number of steps (`_jax_loop_range`) run those steps from the first
+# element; past the last element a step repeats the last (as padding does)
+# and keeps the whole carry, arrays included, unchanged.
 function _jax_expr(ctx::_JaxContext, ::Val{:for}, ex)
     ctx.host === nothing || return _host_for(ctx, ex)
     binding, body = ex.args
@@ -1467,13 +1474,22 @@ function _jax_expr(ctx::_JaxContext, ::Val{:for}, ex)
         end
         ctx.locals[var] = _jax_range_index(index, lo, hi)
         statements = body isa Expr && body.head === :block ? body.args : Any[body]
+        kept = index * " <= " * bound
+        # Arrays the body rebinds (not only writes by index) are selected
+        # whole past the bound; the others keep their entries at each write.
+        rebound = isempty(bound) ? Set{Symbol}() : _jax_rebound_names!(Set{Symbol}(), body)
+        written = Set{Symbol}(n for (n, v) in zip(carried, initial)
+                              if _jax_is_array(v.T) && !(n in rebound))
         isempty(bound) ? _jax_statements(ctx, statements; value = false) :
-            _jax_with_guard(() -> _jax_statements(ctx, statements; value = false),
-                            inner, index * " <= " * bound)
+            _jax_with_guard(inner, kept) do
+                _jax_with_loop_mask(() -> _jax_statements(ctx, statements; value = false),
+                                    _JaxLoopMask(inner, kept, index, bound, written))
+            end
         map(zip(carried, initial)) do (n, v)
             new = ctx.locals[n]
-            bound == "" ? new.code : _jax_carry_select(ctx, index * " <= " * bound, new.code,
-                                                       _jax_carry_old(names, carried, n), v.T)
+            bound == "" ? new.code : _jax_carry_select(ctx, kept, new.code,
+                                                       _jax_carry_old(names, carried, n), v.T;
+                                                       arrays = n in rebound)
         end
     finally
         ctx.scope = outer
@@ -1591,17 +1607,77 @@ end
 
 # Past a loop's data-dependent bound (`kept` is false there) the carry keeps
 # its value `old`, of type `T`: a scalar is selected, a tuple element by
-# element; an array written by index there writes only padded entries, so it
-# passes as it is.
+# element. An array passes as it is: past a padded length's bound each write
+# by index keeps its entry or writes padding (`_JaxLoopMask`). With
+# `arrays` (an array the body rebinds) it is selected too.
 function _jax_carry_select(ctx::_JaxContext, kept::AbstractString, new::AbstractString,
-                           old::AbstractString, @nospecialize(T))
-    _jax_is_array(T) && return new
+                           old::AbstractString, @nospecialize(T); arrays::Bool = false)
+    _jax_is_array(T) && !arrays && return new
     _jax_is_tuple(T) || return "jnp.where(" * kept * ", " * new * ", " * old * ")"
     t = _jax_bind!(ctx, :carried, _PyVal(new, T)).code
     _jax_tuple_code([_PyVal(_jax_carry_select(ctx, kept, _py_atom(t) * "[" * string(k - 1) * "]",
                                               _py_atom(old) * "[" * string(k - 1) * "]",
-                                              fieldtype(T, k)), Any)
+                                              fieldtype(T, k); arrays), Any)
                      for k in 1:fieldcount(T)])
+end
+
+# The locals a loop body binds to a new value, `x = ...` or `(x, y) = ...`
+# (not an indexed write `x[i] = ...`).
+function _jax_rebound_names!(names::Set{Symbol}, ex)
+    ex isa Expr || return names
+    ex.head in (:quote, :inert, :->, :function) && return names
+    if (ex.head === :(=) || haskey(_JAX_UPDATING, ex.head)) && length(ex.args) == 2
+        target = ex.args[1]
+        target isa Expr && target.head === :(::) && (target = target.args[1])
+        target isa Symbol && push!(names, target)
+        target isa Expr && target.head === :tuple &&
+            foreach(t -> t isa Symbol && push!(names, t), target.args)
+    end
+    foreach(a -> _jax_rebound_names!(names, a), ex.args)
+    names
+end
+
+# A loop running past its data-dependent bound, a padded length: in its
+# `scope`, steps past `bound` (where `kept` is false) leave the outer arrays
+# it only writes by index (`written`) as they are, except entries along an
+# axis that `bound` pads at the loop `index`, which are padding.
+struct _JaxLoopMask
+    scope::_JaxScope
+    kept::String
+    index::String
+    bound::String
+    written::Set{Symbol}
+end
+const _JAX_LOOP_MASKS = _JaxLoopMask[]
+function _jax_with_loop_mask(f, mask::_JaxLoopMask)
+    push!(_JAX_LOOP_MASKS, mask)
+    try
+        return f()
+    finally
+        pop!(_JAX_LOOP_MASKS)
+    end
+end
+# The condition under which the write `name[indices...] = ...` to `target`
+# runs as Julia's would (`nothing`: always): the conjunction of the masks of
+# the loops it runs in whose steps past their bound would change an entry.
+function _jax_write_mask(ctx::_JaxContext, name::Symbol, target::_PyVal, indices)
+    masks = String[]
+    for m in _JAX_LOOP_MASKS
+        name in m.written && _jax_scope_within(ctx.scope, m.scope) || continue
+        _jax_writes_padding(ctx, target, indices, m) && continue
+        push!(masks, m.kept)
+    end
+    isempty(masks) ? nothing : foldl((a, b) -> "jnp.logical_and(" * a * ", " * b * ")", masks)
+end
+# Whether `target[indices...]` is, at every step past the loop's bound, a
+# padded entry: an index is the loop's own, along an axis padded by its bound.
+function _jax_writes_padding(ctx::_JaxContext, target::_PyVal, indices, m::_JaxLoopMask)
+    target.extent == m.bound || return false
+    axes = _jax_padded_axes(target)
+    any(enumerate(indices)) do (k, i)
+        i isa Symbol && haskey(ctx.locals, i) && ctx.locals[i].code == m.index &&
+            axes & (1 << (k - 1)) != 0
+    end
 end
 
 # The locals a loop body assigns, including arrays it writes by index.
