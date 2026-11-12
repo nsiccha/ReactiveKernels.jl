@@ -16,6 +16,15 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.167
+
+- `prepare_sampler(...; nonallocating = :auto)` keeps buffer reuse when
+  `with_plate_reverse` is enabled. Eligible summed plates receive generated
+  reverse programs after cache activity and ownership are determined;
+  unsupported regions use ordinary backend differentiation. Explicit
+  `nonallocating = true` also installs the eligible rules. Requires
+  ReactiveKernels 0.1.207.
+
 ## 0.1.166
 
 - `adaptive_centering_problem(built, plan, problem, backend; cells)` connects

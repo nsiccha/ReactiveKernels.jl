@@ -396,6 +396,22 @@ function _jax_param_name(used::Set{String}, name; stable::Bool = true)
     _jax_identifier(used, name)
 end
 
+# A data value's key at the module's data interface: `prepare_data`'s keyword
+# and the dict it returns, `**prepared`, and the metadata (`DATA`, `INPUTS`,
+# `PREPARED`, `UNTRANSLATED`). It is the value's own name when that is an
+# identifier, also one Python reserves (`class`, `lambda`, `id`): only the
+# Python local that holds it is respelled (`_jax_param_name`), so a caller
+# binds the data by the names the model reads (snag jax-source-renam-c36033de).
+# A name that is no identifier (a submodel's `r.g`) takes a fresh one (`r_g`).
+function _jax_key_name(used::Set{String}, name; stable::Bool = true)
+    text = stable ? _jax_stable_name(name) : String(Symbol(name))
+    if occursin(r"^[A-Za-z_][A-Za-z0-9_]*$", text) && !(text in used)
+        push!(used, text)
+        return text
+    end
+    _jax_identifier(used, name)
+end
+
 function _jax_fresh(ctx::_JaxContext, hint)
     name = _jax_identifier(union(ctx.scope.used, ctx.mod.used), hint)
     push!(ctx.scope.used, name)
@@ -5884,7 +5900,7 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
     remaining_names = [_jax_param_name(used, v.name) for v in split.remaining]
     prepared_names = String[]
     for v in split.constants
-        name = _jax_param_name(used, v.name)
+        name = _jax_key_name(used, v.name)
         push!(used, name * "_lengths", name * "_flat")
         push!(prepared_names, name)
         mod.helper_names[(:prepared_name, v.name)] = name
@@ -6007,10 +6023,16 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
     host && (ctx.host = _HostState())
     params = String[]
     inputs = Pair{String,Any}[]
+    # Each input's Python local, beside its key in `inputs`. A prepared input
+    # (after the first `keyword_from`) is read from `**prepared` by its key
+    # (`_jax_key_name`) into a local, respelled when Python reserves the key.
+    input_locals = String[]
     for (k, (v, T)) in enumerate(zip(p.have, argtypes))
-        param = names === nothing ? _jax_identifier(scope.used, v.name) :
-            (push!(scope.used, names[k]); names[k])
-        push!(params, param); push!(inputs, param => T)
+        keyed = names !== nothing && keyword_from !== nothing && k > keyword_from
+        key = names === nothing ? _jax_identifier(scope.used, v.name) :
+            keyed ? names[k] : (push!(scope.used, names[k]); names[k])
+        param = keyed ? _jax_param_name(scope.used, key; stable = false) : key
+        push!(params, param); push!(inputs, key => T); push!(input_locals, param)
         if host
             # Host inputs are NumPy arrays; a ragged input is a list of them.
             scope.values[canon_id(p.graph, v.id)] = _PyVal(param, T, true)
@@ -6019,17 +6041,21 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
                 _jax_emit!(ctx, param * " = np.asarray(" * param * ")")
             continue
         end
-        extent = ""
+        extent = flat = ""
         if _jax_ragged(T)
+            extent_key = names === nothing ? "" : key * "_lengths"
             extent = names === nothing ? _jax_identifier(scope.used, Symbol(v.name, :_lengths)) :
-                (push!(scope.used, names[k] * "_lengths"); names[k] * "_lengths")
-            push!(params, extent); push!(inputs, extent => Vector{Int})
+                keyed ? _jax_param_name(scope.used, extent_key; stable = false) :
+                (push!(scope.used, extent_key); extent_key)
+            push!(params, extent); push!(inputs, (names === nothing ? extent : extent_key) => Vector{Int})
+            push!(input_locals, extent)
             if names !== nothing
                 # A prepared ragged input's flat positions; their count, the
                 # total length, is the static length of its flattening.
-                flat = names[k] * "_flat"
-                push!(scope.used, flat)
-                push!(params, flat); push!(inputs, flat => Vector{Int})
+                flat_key = key * "_flat"
+                flat = keyed ? _jax_param_name(scope.used, flat_key; stable = false) :
+                    (push!(scope.used, flat_key); flat_key)
+                push!(params, flat); push!(inputs, flat_key => Vector{Int}); push!(input_locals, flat)
                 mod.helper_names[(:flat, extent)] = flat
             end
         end
@@ -6041,15 +6067,17 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
         # bounds that `prepare_data` computes (`_jax_trip_bound`).
         prepared = keyword_from !== nothing && k > keyword_from &&
             T isa Type && T <: AbstractArray && _jax_integer_data(T)
+        # Its origin names the array by its key in the prepared data, which
+        # `prepare_data` reads to compute the bound.
         scope.values[canon_id(p.graph, v.id)] = _PyVal(param, T, static, extent, "", 0,
-            prepared ? _JaxOrigin(param, nothing, "0") : nothing)
+            prepared ? _JaxOrigin(key, nothing, "0") : nothing)
         # Callers may pass NumPy arrays; JAX indexes only its own arrays by a
         # traced index.
         if _jax_is_array(T) && (eltype(T) <: Number || _jax_ragged(T))
             _jax_emit!(ctx, param * " = jnp.asarray(" * param * _jax_input_dtype(T) * ")")
             isempty(extent) || _jax_emit!(ctx, extent * " = jnp.asarray(" * extent * ")")
             haskey(mod.helper_names, (:flat, extent)) && names !== nothing &&
-                _jax_emit!(ctx, names[k] * "_flat = jnp.asarray(" * names[k] * "_flat)")
+                _jax_emit!(ctx, flat * " = jnp.asarray(" * flat * ")")
         elseif T isa Type && T <: AbstractFloat && !isempty(_jax_input_dtype(T))
             _jax_emit!(ctx, param * " = jnp.asarray(" * param * _jax_input_dtype(T) * ")")
         end
@@ -6079,10 +6107,10 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
             body = join(scope.lines, "\n")
             for (bn, _, _) in _jax_prepared_bounds(mod)
                 occursin(Regex("\\b" * bn * "\\b"), body) || continue
-                push!(inputs, bn => Int)
+                push!(inputs, bn => Int); push!(input_locals, bn)
             end
-            for (pn, _) in inputs[keyword_from+1:end]
-                push!(lines, "    " * pn * " = prepared[\"" * pn * "\"]")
+            for ((pn, _), local_name) in zip(inputs[keyword_from+1:end], input_locals[keyword_from+1:end])
+                push!(lines, "    " * local_name * " = prepared[\"" * pn * "\"]")
             end
         end
     else

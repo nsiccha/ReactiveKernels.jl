@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.207
+## 0.1.211
 
 - `jax_source` again translates a padded plate over a scan's tuple step
   outputs, such as an `@rkppl` `@plate` cell holding a stochastic `@scan`
@@ -26,6 +26,72 @@ are recorded in the git history only.
   `AttributeError: 'tuple' object has no attribute 'shape'`. The mask now
   spans the plate's mapped axes of the first column, as the empty-plate test
   already did.
+
+## 0.1.210
+
+- A summed plate whose rows are per-cell arrays runs once per distinct row
+  too. 0.1.184 grouped rows whose bound operands are primitive numbers; a
+  bound operand that holds one dense array of them per cell, such as one
+  capture history per individual, now compares its rows by value as well. A
+  capture-recapture likelihood over 237 histories of 3 occasions, 8 of them
+  distinct, runs 8 cells (PosteriorDB Mt: ordinary Reverse gradient 6.8 to
+  1.1 µs). Rows also compare only by the bound vectors the cell reads: a lane
+  index whose bound gather preparation already cached still sets the domain
+  but no longer makes every row distinct (PosteriorDB Mb, 31 distinct of 318
+  histories: 16 to 1.9 µs). A gather still tells rows apart whether or not
+  the cell uses its value, so every index is read as before. Values agree with
+  the row-by-row sum to rounding, as before.
+
+## 0.1.209
+
+- `jax_source` keeps a data name that Python reserves, or that the module's
+  code uses (`class`, `lambda`, `in`, `id`, `type`, `sum`, ...), at the
+  module's data interface. `prepare_data`'s keywords and the dict it returns,
+  the functions' `**prepared`, `DATA`, `INPUTS`, `PREPARED`, `UNTRANSLATED`
+  and `JAXSource.prepared` all name it as the data does, as they already did
+  every other identifier; only the Python local holding it is respelled
+  (`class_`). No parameter can be named `class`, so `prepare_data` takes such
+  inputs through `**data` (its signature ends `**data: ArrayLike`) and raises
+  `TypeError` for a missing or unexpected one. Before, the interface used the
+  respelled name (`DATA`, `INPUTS`, `PREPARED` and the parameter said `class_`
+  while `UNTRANSLATED` said `class`), so `prepare_data(**raw)` with the
+  binding's own names failed. A name that is no Python identifier (a
+  submodel's `r.g`) is still `r_g`.
+  **Breaking:** a caller that passed such an input as `class_=`, or
+  positionally, passes it by its own name: `prepare_data(**raw)`.
+
+## 0.1.208
+
+- A bound preparation (`prepare(...; bound)`, `prepare!(cache, ...; bound)`,
+  `prepare_ad(...; bound)`) evaluates a summed Gaussian observation plate over
+  a bound response from least-squares statistics frozen at binding, when its
+  location is linear in live values with bound coefficients: a bound matrix
+  times a live vector (`X * beta`), live numbers, or live vectors gathered
+  through one bound index (`alpha[g] .+ f .* beta[g]`), each times bound
+  coefficients, plus bound offsets. The density and its ordinary reverse then
+  cost time in the parameter count (K² for a dense design of K columns, a few
+  operations per index value for gathered ones) instead of the row count.
+  Values and gradients agree with the per-row plate to rounding, and are more
+  accurate when the response is far from zero. A binding whose data do not fit
+  (too few rows per parameter, non-finite entries) compiles today's program.
+  Pointwise and per-cell queries keep the per-row plate. New keyword
+  `bound_statistics` (default `true`) on every preparation entry that takes
+  `simplify`, project preference `[ReactiveKernels] bound_statistics`, and
+  `with_bound_statistics(f, enabled)` for the preparations `f` makes (a PPL
+  sampler's, say): `bound_statistics = false` keeps the per-row plate.
+
+## 0.1.207
+
+- `with_plate_reverse` applies generated summed-plate reverse programs to
+  non-allocating kernels after their cache activity and ownership rewrite.
+  Reused primal buffers and AD-owned caches retain their existing ownership.
+  `plate_reverse_report` accepts non-allocating kernels and reports static
+  eligibility; backend operand annotations can still require ordinary AD.
+- An authored plate's axis marker no longer prevents the generated reverse
+  when the marker is used only by derivative-inert queries. Numerical alias
+  reads and writes retain the conservative fallback; marker checks remain.
+- The generated reverse adapter keeps single-lane calls statically dispatched
+  by using separate local names in its batched-lane closure.
 
 ## 0.1.206
 

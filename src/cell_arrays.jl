@@ -33,6 +33,42 @@ end
     Base.Broadcast.Broadcasted(bc.style, bc.f,
         _native_broadcast_map(_cell_array_materialize, bc.args), bc.axes)
 
+# A nonescaping fill snapshots one primitive scalar, with the same runtime
+# dimensions as its dense array. Scalar readers expose that shared value to
+# native optimization instead of loading it from a freshly filled buffer.
+struct _CellFill{T,N} <: _CellArray{T,N}
+    value::T
+    dimensions::NTuple{N,Int}
+end
+Base.size(a::_CellFill) = a.dimensions
+@inline _cell_array_materialize(a::_CellFill) = fill(a.value, a.dimensions)
+@inline function Base.getindex(a::_CellFill, i::Int, I::Int...)
+    @boundscheck checkbounds(a, i, I...)
+    a.value
+end
+@inline function Base.getindex(a::_CellFill)
+    @boundscheck checkbounds(a)
+    a.value
+end
+@inline _cell_array_fill(value, dims...) = fill(value, dims...)
+@inline function _cell_array_fill(value::T, dims::Vararg{Int,N}) where {T<:Union{Float32,Float64},N}
+    # Invalid or overflowing dimensions keep Base's allocation path and its
+    # original exception. The conservative byte limit also leaves huge empty
+    # layouts to Base, without depending on version-specific Array internals.
+    limit = div(typemax(Int), sizeof(T))
+    count = 1
+    for dim in dims
+        0 <= dim <= limit || return fill(value, dims...)
+        if dim == 0
+            count = 0
+        else
+            count <= div(limit, dim) || return fill(value, dims...)
+            count *= dim
+        end
+    end
+    _CellFill(value, dims)
+end
+
 struct _CellHcat{T,A} <: _CellArray{T,2}
     arguments::A
     rows::Int
@@ -375,6 +411,7 @@ end
 function _cell_array_producer(x)
     x isa Expr && x.head === :call || return nothing
     fn = _cell_array_function(first(x.args))
+    fn === fill && return Expr(:call, _cell_array_ref(:_cell_array_fill), x.args[2:end]...)
     fn === _native_hcat && return Expr(:call, _cell_array_ref(:_cell_array_hcat),
         map(_cell_array_child, x.args[2:end])...)
     fn === _native_broadcast_materialize && return Expr(:call,

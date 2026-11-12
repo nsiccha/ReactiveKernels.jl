@@ -2,7 +2,7 @@
 # by its row count (`src/duplicate_cells.jl`, snag `summed-plates-ov-67f319ae`).
 module DuplicateCellAcceptance
 using ReactiveKernels, Enzyme, DifferentiationInterface, Test
-using LogExpFunctions: log1pexp, logistic
+using LogExpFunctions: log1pexp, logistic, logsumexp, logaddexp
 include("type_stability_audit.jl")
 using .TypeStabilityAudit: findings, ad_call_findings
 const RK = ReactiveKernels
@@ -50,6 +50,64 @@ end
     end
     total::Float64 = sum(terms)
     return total
+end
+
+# A whole-event mixture: one component governs a whole (ragged) history, and
+# each position's lazy branch reads the history. The capture-recapture shape:
+# the varying operand is one bound `Vector{Bool}` per cell.
+@kernel event_law(observed::Vector{Bool}, P::Matrix{Float64}, w::Vector{Float64}) = begin
+    components = plate(1:length(w)) do k
+        cells = plate(1:length(observed)) do i
+            cell::Float64 = observed[i] ? log(P[i, k]) : log1p(-P[i, k])
+            cell
+        end
+        sum(cells)
+    end
+    log_weights = log.(w)
+    weighted = plate(components, log_weights) do s, lw
+        s + lw
+    end
+    return logsumexp(weighted)
+end
+@kernel histories_model(p::Vector{Float64}, histories::Vector{Vector{Bool}},
+                        absent::Vector{Float64}, omega::Float64) = begin
+    terms = plate(histories) do h
+        P = hcat(p, absent)
+        w = [omega, 1 - omega]
+        event_law(h, P, w)
+    end
+    total::Float64 = sum(terms)
+    return total
+end
+# A lane index whose bound gather preparation caches: the cell no longer
+# reads the index, only the gathered value.
+@kernel indexed_logs(s::Vector{Float64}, values::Vector{Float64},
+                     idx::Vector{Int}) = begin
+    terms = plate(idx) do i
+        cell::Float64 = log(values[i] * s[1])
+        cell
+    end
+    total::Float64 = sum(terms)
+    return total
+end
+
+# A gathered operand the cell ignores: the gather still reads every row.
+@kernel unread_gather(q::Vector{Float64}, idx::Vector{Int}, x::Vector{Float64}) = begin
+    gathered = ReactiveKernels._readonly_gather(q, idx)
+    terms = plate(gathered, x) do a, z
+        cell::Float64 = log(z * q[1])
+        cell
+    end
+    total::Float64 = sum(terms)
+    return total
+end
+
+function histories_oracle(p, histories, absent, omega)
+    sum(histories; init = 0.0) do h
+        a = sum(i -> h[i] ? log(p[i]) : log1p(-p[i]), eachindex(h); init = 0.0)
+        b = sum(i -> h[i] ? log(absent[i]) : log1p(-absent[i]), eachindex(h); init = 0.0)
+        logaddexp(log(omega) + a, log(1 - omega) + b)
+    end
 end
 
 function rows_oracle(coef, x, y)
@@ -148,6 +206,68 @@ end
                                              y = fill(true, 32)))
     @test grouped(invalid)
     @test_throws BoundsError invalid(q)
+end
+
+@testset "duplicate cells: rows of per-cell arrays and unread lane indices" begin
+    # 40 ragged histories, 4 distinct.
+    base = [Bool[0, 0, 0, 0], Bool[0, 1, 1, 0], Bool[1, 0], Bool[0, 0, 1]]
+    histories = base[repeat([1, 2, 1, 3, 1, 4, 2, 1, 3, 1], 4)]
+    absent = zeros(4); omega = 0.7
+    k = prepare(histories_model; bound = (; histories, absent, omega))
+    @test grouped(k)
+    @test sort(only(multiplicities(k))) ==
+          sort([count(==(h), histories) for h in unique(histories)])
+    p = [0.3, 0.45, 0.6, 0.2]
+    value = histories_oracle(p, histories, absent, omega)
+    @test k(p) ≈ value rtol = 1e-12
+    ad = prepare_ad(k, AutoEnzyme(; mode = Enzyme.Reverse), p; active = :p,
+                    native_forward_batch = false)
+    g = zero(p); v, _ = ad_value_and_gradient!(ad, g, p)
+    @test v ≈ value rtol = 1e-12
+    step = 1e-6
+    fd = map(eachindex(p)) do i
+        e = zeros(length(p)); e[i] = step
+        (histories_oracle(p .+ e, histories, absent, omega) -
+         histories_oracle(p .- e, histories, absent, omega)) / (2step)
+    end
+    @test g ≈ fd rtol = 1e-6
+    @test isempty(findings(k, (Vector{Float64},)))
+    # A position no history takes keeps its arm untaken: at p[1] = 1 every
+    # history must capture at position 1, and the gradient stays finite.
+    captured = [Bool[1, 0], Bool[1, 1], Bool[1, 0], Bool[1, 0]]
+    k = prepare(histories_model; bound = (histories = captured, absent = [0.5, 0.5],
+                                          omega = 0.6))
+    @test grouped(k)
+    ad = prepare_ad(k, AutoEnzyme(; mode = Enzyme.Reverse), [1.0, 0.4]; active = :p,
+                    native_forward_batch = false)
+    g = zeros(2); ad_value_and_gradient!(ad, g, [1.0, 0.4])
+    @test all(isfinite, g)
+
+    # The cell reads `values[i]`, which preparation caches per row, and not
+    # `i`: rows group by the cached value.
+    values = [2.0, 3.0, 2.0]
+    idx = repeat([1, 2, 3, 1], 6)
+    k = prepare(indexed_logs; bound = (; values, idx))
+    @test grouped(k)
+    @test sort(only(multiplicities(k))) == [6, 18]
+    @test k([0.5]) ≈ sum(log(values[i] * 0.5) for i in idx) rtol = 1e-13
+    ad = prepare_ad(k, AutoEnzyme(; mode = Enzyme.Reverse), [0.5]; active = :s,
+                    native_forward_batch = false)
+    g = zeros(1); ad_value_and_gradient!(ad, g, [0.5])
+    @test only(g) ≈ length(idx) / 0.5 rtol = 1e-12
+    # Its first throwing row still throws.
+    bad = prepare(indexed_logs; bound = (values = [2.0, -1.0], idx = repeat([1, 2], 8)))
+    @test grouped(bad)
+    @test_throws DomainError bad([0.5])
+
+    # A gather the cell ignores still tells rows apart: every index is read,
+    # and an out-of-range one still throws.
+    x = repeat([2.0, 3.0], 12)
+    k = prepare(unread_gather; bound = (idx = repeat([1, 2, 3], 8), x))
+    @test length(only(multiplicities(k))) == length(unique(zip(repeat([1, 2, 3], 8), x)))
+    @test k([0.5, 1.0, 2.0]) ≈ sum(log.(x .* 0.5)) rtol = 1e-13
+    invalid = prepare(unread_gather; bound = (idx = vcat(fill(1, 23), 9), x))
+    @test_throws BoundsError invalid([0.5, 1.0, 2.0])
 end
 
 @testset "duplicate cells: which plates are grouped" begin
