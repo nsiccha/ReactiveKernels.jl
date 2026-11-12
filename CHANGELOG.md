@@ -30,12 +30,12 @@ are recorded in the git history only.
     random-intercept regression, now 224 B, and 22–39 allocations on small
     PosteriorDB models.
   - A random-intercept Normal regression's gradient (2,000 and 100,000 rows)
-    now takes 1.7–1.85× its hand-written closed form, against 2.65–3.15×
-    before. That is 2.5–3.4× faster than Enzyme over the same program (Julia
+    now takes 1.7–2.0× its hand-written closed form, against 2.65–3.15×
+    before. That is 2.1–2.4× faster than the default preparation (Julia
     1.10.12 and 1.13.1, Enzyme dogfood).
-  - Among PosteriorDB ports whose likelihood the rule covers, Rats now
-    differentiates 1.76× faster than the default preparation, and the two
-    `BLR` ports 1.3–1.36× faster.
+  - Among PosteriorDB ports whose likelihood the rule covers, Rats and the two
+    `BLR` ports now differentiate 1.4–1.5× faster than the default
+    preparation, and ARMA11 1.1× faster (Julia 1.13.1).
 
 ## 0.1.199
 
