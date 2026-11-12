@@ -91,6 +91,8 @@ function _host_lines!(ctx::_JaxContext, first::Int)
     end
 end
 
+# Host integers stay int64 in every module: NumPy computes the data with
+# them, and JAX converts them when a float32 module's functions read them.
 _host_dtype(@nospecialize(E)) = E isa Type && E <: Bool ? "np.bool_" :
     E isa Type && E <: Integer ? "np.int64" :
     E isa Type && E <: AbstractFloat ? "np." * _jax_dtype_name(E) :

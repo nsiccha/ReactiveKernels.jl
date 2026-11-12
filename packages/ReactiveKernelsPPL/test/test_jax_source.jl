@@ -644,6 +644,34 @@ end
     @test split(strip(out), "\n") == expected
 end
 
+# The float32 module of each case (`float_type = Float32`, snag
+# jax-source-float-5e6b7604): with 64-bit mode on (its float64 module imported
+# first), its value and gradient hold no strongly typed float64, and they are
+# the float64 module's to float32 rounding. Alone, it runs without 64-bit mode.
+@testset "jax_source(built, plan; float_type = Float32) ($name)" for name in
+        keys(merge(_JAX_CASES, _JAX_ICAR_CASES))
+    if !rk_jax_available()
+        @info "RK_JAX_PYTHON is not set: float32 JAX parity for $name skipped"
+        @test_skip false
+    else
+        plan = merge(_JAX_CASES, _JAX_ICAR_CASES)[name]()
+        built = build_kernel(plan)
+        src64 = jax_source(built, plan)
+        src32 = jax_source(built, plan; float_type = Float32)
+        @test !occursin("jax_enable_x64", string(src32))
+        u = 0.2 .* randn(Xoshiro(7), built.layout.total)
+        args = (u, jax_raw_data(plan, src64)...)
+        r = rk_jax_float32(src32, src64, :log_density, args; prepare = true)
+        @test r.x64 && !r.f64
+        @test r.dtype == "float32" && r.grad_dtype == "float32"
+        @test abs(r.value - r.reference) <= 64 * eps(Float32) * max(1, abs(r.reference))
+        @test norm(r.grad .- r.reference_grad) <= 1e-4 * max(1, norm(r.reference_grad))
+        alone = rk_jax_float32(src32, nothing, :log_density, args; prepare = true)
+        @test !alone.x64 && alone.dtype == "float32"
+        @test abs(alone.value - r.reference) <= 64 * eps(Float32) * max(1, abs(r.reference))
+    end
+end
+
 # A dotted cell latent's helper values are data-only: `prepare_data` computes
 # them, so the module takes only the bound data, the same module whether or
 # not a native query filled the binding's values first (snag

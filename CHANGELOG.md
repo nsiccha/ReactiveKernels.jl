@@ -16,6 +16,25 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.204
+
+- `jax_source` takes `float_type`, `Float64` (the default) or `Float32`: the
+  dtype of every float value the program does not type `Float32` itself, for
+  an accelerator whose float64 is slow. A `Float32` module casts its float
+  inputs to `float32`, its `prepare_data` returns `float32` data, its dtype
+  metadata says so, and it does not turn on JAX's 64-bit mode; its device
+  integers are JAX's default integer (`int32` without that mode). An `fma`,
+  which rounds once through a float64 product, still turns it on. It stays
+  float32 where another module turned 64-bit mode on: integers a float is
+  computed from alone (`log(k)`, `i / j`), NumPy-computed constants, `I(n)`,
+  scan carries and the literal arms of traced branches take its float type.
+  The `Float64` module of the same program is its reference, and is unchanged
+  (snag jax-source-float-5e6b7604).
+- A traced branch whose arm returns a static value (a literal, a NumPy
+  constant) returns it in the branch's float dtype where that dtype is
+  `float32`: `jax.lax.cond` refused a float64 literal arm beside a `float32`
+  one, also in a `Float32` program's `Float64` module.
+
 ## 0.1.203
 
 - Nested native plates reuse elementary scalar work on an invariant array

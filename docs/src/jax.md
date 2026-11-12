@@ -20,9 +20,9 @@ print(source)
 
 Input annotations tell the emitter each port's rank. For untyped ports, supply the corresponding `types` keyword. The emitted input order follows the selected input boundary.
 
-Typed `Float32` allocations and conversions keep `float32`, including arrays
-computed by host `prepare_data`; `Float64` keeps `float64`. Prepared input
-metadata reports the same dtype.
+Typed `Float32` values keep `float32`, also in `prepare_data`; other floats
+take `jax_source`'s `float_type` (`Float64`, or `Float32` without JAX's 64-bit
+mode), as metadata reports.
 
 `fma` of `Float64` or `Float32` values, also broadcast, rounds once, as in
 Julia; `jax.grad` gives `(y, x, 1)`. Integer `fma` and `muladd` are
