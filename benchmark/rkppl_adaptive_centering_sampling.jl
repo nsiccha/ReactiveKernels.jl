@@ -26,7 +26,7 @@ function check_reporter_targets(data, built, plan)
     original = prepare_sampler(built, plan, u0; backend = AutoEnzyme())
     centered = adaptive_centering_problem(built, plan, original, AutoEnzyme();
         cells = (theta = (location = :theta_location, log_scale = :theta_log_scale,
-            source = 1.0),), u0, locality = :error)
+            source = 1.0),), u0)
     for (label, model, candidate) in ((:noncentered, NONCENTRED, original),
             (:centered, CENTRED, centered))
         reference_plan = model(; inputs...) | (; y = data.y)
@@ -75,8 +75,7 @@ function sample_comparison()
                     (phi = (location = :phi_location, log_scale = :phi_log_scale),) :
                     (theta = (location = :theta_location, log_scale = :theta_log_scale,
                         source = arm === :fixed_theta_centered ? 1.0 : 0.0),)
-                rp = adaptive_centering_problem(built, plan, problem, AutoEnzyme(); cells, u0,
-                    locality = :error)
+                rp = adaptive_centering_problem(built, plan, problem, AutoEnzyme(); cells, u0)
             end
             result = adaptive_warmup_mcmc(Xoshiro(100 + chain), rp;
                 n_draws = 1000, monitor_ess = true,

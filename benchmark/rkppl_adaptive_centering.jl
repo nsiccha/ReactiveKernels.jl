@@ -44,3 +44,26 @@ function scaling()
 end
 
 scaling()
+
+function shared_scaling()
+    cells = (z = (location = :array_location, log_scale = :log_scale, source = 0.7),)
+    built = nothing
+    for n in (16, 64, 256, 1024)
+        s = ACT.shared_setup(n; built)
+        built = s.built
+        rp = adaptive_centering_problem(s.built, s.plan, s.problem, AutoEnzyme(); cells, u0 = s.u)
+        base = measurements(x -> LDP.logdensity_and_gradient(s.problem, x), s.u)
+        affine = measurements(x -> LDP.logdensity_and_gradient(rp, x), s.u)
+        ir, p = ACT.map_for(s.built, s.plan, cells; u0 = s.u)
+        counted = map(k -> ACT.CountedKernel(k, Ref(0)), p.kernels)
+        observed = ACT.EXT._centering_reparametrization(counted, p.records)
+        WarmupHMC.with_logabsdet_jacobian!(copy(s.u), observed, s.u)
+        calls = map(k -> k.calls[], counted)
+        @test all(==(1), calls)
+        println((; phase = :shared_scaling, n, calls, base, affine,
+            ratio = affine.seconds / base.seconds))
+        flush(stdout)
+    end
+end
+
+shared_scaling()

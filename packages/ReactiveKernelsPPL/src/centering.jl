@@ -1,6 +1,6 @@
 """
     adaptive_centering_problem(built, plan, problem, backend; cells, u0 = nothing,
-                               on_error = nothing, locality = nothing)
+                               on_error = nothing)
 
 Wrap a packed-coordinate LogDensityProblems target for WarmupHMC's adaptive
 partial centering. Load `WarmupHMC` and `LogDensityProblems` to enable this
@@ -16,8 +16,9 @@ rp = adaptive_centering_problem(built, plan, problem, AutoEnzyme();
 The location and log-scale are named values in the model graph. Each is a
 scalar (shared by the selected coordinates) or an array with the latent's
 shape, indexed in Julia's linear order. Their numerical work and derivatives
-stay in the graph. Array queries use the graph's scalar cell lowering;
-`locality` has the same meaning as in [`prepare_cell_query`](@ref).
+stay in the graph. WarmupHMC 0.2.19 or later evaluates each named quantity once
+per contiguous latent block and shares its result across the coordinates,
+including when the quantity contains a reduction over unselected latents.
 
 Each cell optionally supplies `target` and `source` in `[0, 1]`: zero is
 non-centered, one is centered. Both default to `0.0`. `target` describes the
@@ -32,51 +33,45 @@ the map. This condition concerns coordinates, not prior families (a real
 ICAR block, for example, can be selected).
 
 Construction evaluates each named value once to check its shape, using `u0`
-(default zeros) as a model-coordinate exemplar. It prepares one scalar kernel
-per named value, independent of the number of latent coordinates. Keep shared
-scalar calculations small: WarmupHMC calls the accessors per coordinate.
+(default zeros) as a model-coordinate exemplar. It prepares one graph kernel
+per named value, independent of the number of latent coordinates.
 """
 function adaptive_centering_problem end
 
 # One concrete accessor type for every pair, even across different authored
 # cell families. Tuple recursion dispatches statically on the prepared kernels;
-# the family and element indices are runtime data, never type parameters.
+# the family index is runtime data, never a type parameter.
 # Share the tuple through one typed holder: storing every prepared kernel
 # inline in every accessor makes each indexed map large and costly to copy.
 struct _CenteringAccessor{K}
     kernels::Base.RefValue{K}
     family::Int
-    element::Int
 end
-@inline (a::_CenteringAccessor)(x) = _centering_value(a.kernels[], a.family, x, a.element)
-@inline _centering_value(kernels::Tuple, family::Int, x, element::Int) =
-    family == 1 ? first(kernels)(x, element) :
-        _centering_value(Base.tail(kernels), family - 1, x, element)
-_centering_value(::Tuple{}, family::Int, x, element::Int) =
+@inline (a::_CenteringAccessor)(x) = _centering_value(a.kernels[], a.family, x)
+@inline _centering_value(kernels::Tuple, family::Int, x) =
+    family == 1 ? first(kernels)(x) :
+        _centering_value(Base.tail(kernels), family - 1, x)
+_centering_value(::Tuple{}, family::Int, x) =
     throw(BoundsError((), family))
 
-const _CENTERING_INDEX = :_ppl_centering_index
 const _CENTERING_VALUE = :_ppl_centering_value
 
-function _centering_kernel(built, plan, name::Symbol, value, exemplar;
-        on_error, locality)
+# Every family returns one concrete container type. Scalars occupy one slot;
+# arrays retain Julia's linear coordinate order. This conversion is a graph
+# recipe, so the ordinary backend differentiates through it with the model.
+_centering_values(value::Real) = Float64[value]
+_centering_values(value::AbstractArray{<:Real}) = collect(Float64, vec(value))
+
+function _centering_kernel(built, plan, name::Symbol; on_error)
     RK = ReactiveKernels
     spec = RK._copy_cell_factor_spec(built.spec)
-    for port in (_CENTERING_INDEX, _CENTERING_VALUE)
-        haskey(spec.ports, port) && throw(ContractValidationError(
-            "[centering] graph port `$port` collides with an adapter port"))
-    end
-    index = value!(spec.graph, _CENTERING_INDEX, Int)
-    spec.ports[_CENTERING_INDEX] = index
-    push!(spec.port_order, _CENTERING_INDEX)
-    push!(spec.have_names, _CENTERING_INDEX)
-    term = value isa Real ? spec[name] :
-        RK._cell_factor_term!(spec, spec[name], index, locality)
-    output = value!(spec.graph, _CENTERING_VALUE, Float64)
+    haskey(spec.ports, _CENTERING_VALUE) && throw(ContractValidationError(
+        "[centering] graph port `$_CENTERING_VALUE` collides with an adapter port"))
+    output = value!(spec.graph, _CENTERING_VALUE, Vector{Float64})
     spec.ports[_CENTERING_VALUE] = output
     push!(spec.port_order, _CENTERING_VALUE)
-    add!(spec.graph, (term,) => output, Float64)
-    have = (_query_have(plan)..., _CENTERING_INDEX)
+    add!(spec.graph, (spec[name],) => output, _centering_values)
+    have = _query_have(plan)
     _absent_refusal(plan, spec, have, output) do
         # Samplers also evaluate column views of their position matrices.
         # Keep the graph's AbstractVector input contract instead of narrowing
@@ -87,11 +82,9 @@ function _centering_kernel(built, plan, name::Symbol, value, exemplar;
 end
 
 function _centering_cells(built, plan::StructuralPlan, cells::NamedTuple;
-        u0, on_error, locality)
+        u0, on_error)
     isbound(plan) || throw(ContractValidationError(
         "[centering] adaptive_centering_problem requires a bound plan"))
-    locality in (nothing, :error, :warn, :ignore) || throw(ContractValidationError(
-        "[centering] locality must be :error, :warn, :ignore or nothing"))
     built = _binding_build(built, plan)
     _check_built_program(built, plan)
     layout = built.layout
@@ -129,6 +122,7 @@ function _centering_cells(built, plan::StructuralPlan, cells::NamedTuple;
             throw(ContractValidationError("[centering] `$name` needs a scalar or " *
                 "rectangular array of identity-transformed coordinates"))
         families = Int[]
+        scalars = Bool[]
         for field in (:location, :log_scale)
             node = cell[field]
             node isa Symbol && haskey(built.spec.ports, node) ||
@@ -147,15 +141,16 @@ function _centering_cells(built, plan::StructuralPlan, cells::NamedTuple;
                     "scalar or an array of shape $shape for `$name`; got $(typeof(value))"))
             family = findfirst(==(node), kernel_names)
             if family === nothing
-                push!(kernels, _centering_kernel(built, plan, node, value, exemplar;
-                    on_error, locality))
+                push!(kernels, _centering_kernel(built, plan, node; on_error))
                 push!(kernel_names, node)
                 family = length(kernels)
             end
             push!(families, family)
+            push!(scalars, value isa Real)
         end
         push!(records, (; offset = entry.offset, size = entry.size,
-            location = families[1], log_scale = families[2], target, source))
+            location = families[1], log_scale = families[2],
+            scalar_location = scalars[1], scalar_log_scale = scalars[2], target, source))
     end
     (; kernels = Tuple(kernels), records, dimension = layout.total)
 end

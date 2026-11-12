@@ -101,9 +101,10 @@ keeps its ICAR density and any soft sum constraint.
 Every selected affine quantity must remain invariant under the selected maps.
 A location that reads another selected latent needs a coupled transform;
 WarmupHMC's independent indexed maps do not supply that transport. The adapter
-checks this graph dependency before sampling. It evaluates one scalar graph
-query per accessor call. Use `locality = :error` to reject array operations
-whose cell query would compute a whole array, and avoid a large shared scalar
-reduction in a per-coordinate accessor.
+checks this graph dependency before sampling. With WarmupHMC 0.2.19 or later,
+each named graph quantity is evaluated once per latent block and its result
+is shared across coordinates. Scalar reductions and array-valued locations
+therefore avoid repeating graph work for each coordinate. Ordinary AD
+differentiates these graph queries.
 
 The [Eight-schools example](eight-schools.md) checks the complete density decomposition and its coordinate transformation.

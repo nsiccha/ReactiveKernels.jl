@@ -34,7 +34,7 @@ end
 
 function map_for(built, plan, cells; u0 = nothing)
     p = ReactiveKernelsPPL._centering_cells(built, plan, cells;
-        u0, on_error = nothing, locality = :error)
+        u0, on_error = nothing)
     EXT._centering_reparametrization(p.kernels, p.records), p
 end
 
@@ -209,6 +209,91 @@ end
     # not implement the triangular transport needed to transform both.
     @test_throws ContractValidationError adaptive_centering_problem(
         built, plan, problem, BACKEND; cells = (; theta, phi), u0 = u)
+end
+
+const SHARED = @rkppl begin
+    phi[1:N] .~ Normal.(0, 1)
+    z[1:N] .~ Normal.(0, 1)
+    location = sum(phi) / N
+    array_location = location .+ offsets
+    log_scale = sum(phi .* phi) / (2N)
+    total = array_location .+ exp(log_scale) .* z
+    y .~ Normal.(total, se)
+end
+
+function shared_setup(n = 4; built = nothing)
+    offsets = collect(range(-0.3, 0.4; length = n))
+    plan = SHARED(; N = n, offsets, se = 0.7) | (; y = fill(0.2, n))
+    built = built === nothing ? build_kernel(plan) : built
+    layout = assign_layout(plan)
+    u = 0.1 .* sin.(1:layout.total)
+    problem = prepare_sampler(built, plan, u; backend = BACKEND)
+    (; built, plan, layout, u, problem, offsets)
+end
+
+# Primal-only observation of the actual prepared cuts. AD tests below use
+# the unmodified kernels and the backend's ordinary reverse path.
+struct CountedKernel{K}
+    kernel::K
+    calls::Base.RefValue{Int}
+end
+(c::CountedKernel)(x) = (c.calls[] += 1; c.kernel(x))
+
+@testset "shared graph reductions run once per block" begin
+    shapes = []
+    types = []
+    built = nothing
+    for n in (4, 128)
+        s = shared_setup(n; built)
+        built = s.built
+        entries = Dict(e.name => e for e in s.layout.entries)
+        pi = entries[:phi].offset .+ (0:n-1)
+        zi = entries[:z].offset .+ (0:n-1)
+        for node in (:location, :array_location)
+            cells = (z = (location = node, log_scale = :log_scale, source = 0.7),)
+            ir, p = map_for(s.built, s.plan, cells; u0 = s.u)
+            push!(types, typeof(ir))
+            push!(shapes, map(emission_shape, p.kernels))
+            @test @inferred(last(first(ir.pairs)).args[1](s.u)) isa Float64
+            counted = map(k -> CountedKernel(k, Ref(0)), p.kernels)
+            observed = EXT._centering_reparametrization(counted, p.records)
+            jac, mapped = WarmupHMC.with_logabsdet_jacobian!(copy(s.u), observed, s.u)
+            @test all(k -> k.calls[] == 1, counted)
+            foreach(k -> (k.calls[] = 0), counted)
+            ijac, back = WarmupHMC.with_logabsdet_jacobian!(copy(mapped),
+                WarmupHMC.InverseFunctions.inverse(observed), mapped)
+            @test all(k -> k.calls[] == 1, counted)
+            @test back ≈ s.u
+            @test ijac ≈ -jac
+            function reference(x)
+                loc = sum(x[pi]) / n .+ (node === :location ? zeros(n) : s.offsets)
+                ls = sum(abs2, x[pi]) / (2n)
+                expected = copy(x)
+                expected[zi] .= (x[zi] .- 0.7 .* loc) .* exp(-0.7 * ls)
+                expected, -0.7 * n * ls
+            end
+            expected, expected_jac = reference(s.u)
+            @test mapped ≈ expected
+            @test jac ≈ expected_jac
+            rp = adaptive_centering_problem(s.built, s.plan, s.problem, BACKEND;
+                cells, u0 = s.u)
+            value, gradient = LDP.logdensity_and_gradient(rp, s.u)
+            @test value ≈ LDP.logdensity(s.problem, expected) + expected_jac
+            if n == 4
+                function reference_density(x)
+                    y, j = reference(x)
+                    LDP.logdensity(s.problem, y) + j
+                end
+                @test gradient ≈ finite_gradient(reference_density, s.u) rtol = 2e-7 atol = 2e-7
+            end
+            column = view(hcat(s.u, 2s.u), :, 1)
+            @test LDP.logdensity_and_gradient(rp, column) == (value, gradient)
+        end
+    end
+    @test types[1] == types[3]
+    @test types[2] == types[4]
+    @test shapes[1] == shapes[3]
+    @test shapes[2] == shapes[4]
 end
 
 end
