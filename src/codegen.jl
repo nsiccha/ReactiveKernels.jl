@@ -6519,6 +6519,9 @@ function _lower_with_ops_collecting(p::Plan;
     # Shared factors and terms leave a summed plate's sum (summed_plate_factors.jl)
     # before index runs group the cells that remain.
     inline_embedded && (body = _lower_summed_plate_factors_native(body, runtime_ops))
+    # A factored sum of squared residuals over bound data reads its frozen
+    # least-squares statistics (bound_statistics.jl).
+    inline_embedded && (body = _lower_bound_statistics_native(body, runtime_ops))
     inline_embedded && (body = _lower_index_runs_native(body, runtime_ops))
     # A partition with a plan port reads its integer bookkeeping from the
     # port's value, computed once per label; in plan mode the body computes
@@ -9311,9 +9314,9 @@ nested ones included, and cached preparations are kept per setting.
 function prepare(p::Plan; passes = (), bound = (), on_error = nothing,
                  exemplars = nothing, type_stability = nothing,
                  type_stability_level = nothing, branch_arms = nothing,
-                 simplify = nothing, _data_cache = nothing)
+                 simplify = nothing, bound_statistics = nothing, _data_cache = nothing)
     _with_branch_arms(branch_arms) do
-    _with_simplify(simplify) do
+    _with_settings(simplify, bound_statistics) do
         _with_type_stability(type_stability, type_stability_level) do
             kernel = _prepare_plan(p; passes = passes, bound = bound, on_error = on_error,
                                    exemplars, _data_cache)
@@ -9394,11 +9397,11 @@ end
 function prepare(g::Graph; have = (), want = (), passes = (), bound = (),
                  on_error = nothing, exemplars = nothing, type_stability = nothing,
                  type_stability_level = nothing, branch_arms = nothing,
-                 simplify = nothing, _data_cache = nothing)
+                 simplify = nothing, bound_statistics = nothing, _data_cache = nothing)
     # One type for every selection's width before the closure captures them.
     haves, wants, binding = _value_list(have), _value_list(want), _bound_list(bound)
     _with_branch_arms(branch_arms) do
-    _with_simplify(simplify) do
+    _with_settings(simplify, bound_statistics) do
         _with_type_stability(type_stability, type_stability_level) do
             exemplars === nothing && _reuses_bound_preparation(binding, passes) &&
                 return _graph_bound_preparation(g, haves, wants, passes, binding, on_error;

@@ -16,6 +16,25 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.206
+
+- A bound preparation (`prepare(...; bound)`, `prepare!(cache, ...; bound)`,
+  `prepare_ad(...; bound)`) evaluates a summed Gaussian observation plate over
+  a bound response from least-squares statistics frozen at binding, when its
+  location is linear in live values with bound coefficients: a bound matrix
+  times a live vector (`X * beta`), live numbers, or live vectors gathered
+  through one bound index (`alpha[g] .+ f .* beta[g]`), each times bound
+  coefficients, plus bound offsets. The density and its ordinary reverse then
+  cost time in the parameter count (K² for a dense design of K columns, a few
+  operations per index value for gathered ones) instead of the row count.
+  Values and gradients agree with the per-row plate to rounding, and are more
+  accurate when the response is far from zero. A binding whose data do not fit
+  (too few rows per parameter, non-finite entries) compiles today's program.
+  Pointwise and per-cell queries keep the per-row plate. New keyword
+  `bound_statistics` (default `true`) on every preparation entry that takes
+  `simplify`, and project preference `[ReactiveKernels] bound_statistics`:
+  `bound_statistics = false` keeps the per-row plate.
+
 ## 0.1.205
 
 - `@traceable` takes a trailing Vararg argument: `args...`, `args::T...`,

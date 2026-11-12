@@ -89,8 +89,9 @@ function __init__()
     push!(Base.package_callbacks, _register_image_programs)
     # This process reads its own project's type-stability preferences.
     foreach(preference -> preference[] = nothing, _TYPE_STABILITY_PREFERENCES)
-    # and its own `simplify` preference (`stable_rewrites.jl`).
-    _SIMPLIFY_PREFERENCE[] = nothing
+    # and its own `simplify` and `bound_statistics` preferences
+    # (`simplify_setting.jl`).
+    foreach(setting -> setting.preference[] = nothing, _PREPARATION_SETTINGS)
     nothing
 end
 
