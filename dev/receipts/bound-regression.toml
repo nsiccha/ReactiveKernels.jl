@@ -1,4 +1,4 @@
-reactivekernels_version = "0.1.175"
+reactivekernels_version = "0.1.176"
 julia_version = "1.10.13"
 page = "bound-regression"
 source_sha256 = "5eb2dcab36f0deb0b3bba72ab5307af8d0d674a28fbecc0da9b5b53d85290fd6"
