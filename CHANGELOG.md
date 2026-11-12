@@ -16,6 +16,21 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.178
+
+- `jax_source` translates `reduce(hcat, columns)` for a vector of numeric
+  vectors or matrices, such as a plate's per-cell vectors: the matrix keeps
+  Julia's orientation (column `k` is `columns[k]`; a matrix contributes its
+  columns in turn), on the device and in host `prepare_data`, and
+  differentiates as a transpose. Columns of different lengths raise when the
+  module runs, as Julia's `DimensionMismatch` does; no columns raise while
+  JAX traces, as Julia's empty `reduce` does. `stack` shares the same check,
+  which now also rejects ragged rows of one length shorter than their padded
+  width instead of returning the padding.
+- `reduce(vcat, cells)` and `reduce(hcat, columns)` translate when a plain
+  helper calls them, as they do in a kernel's own recipe; before, a helper's
+  call fell through to Base's generic `reduce` and failed on `IndexStyle`.
+
 ## 0.1.177
 
 - `jax_source` translates `fma` of `Float64` and `Float32` values, scalar and
