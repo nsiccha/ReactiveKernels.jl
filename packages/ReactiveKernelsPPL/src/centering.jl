@@ -41,12 +41,14 @@ function adaptive_centering_problem end
 # One concrete accessor type for every pair, even across different authored
 # cell families. Tuple recursion dispatches statically on the prepared kernels;
 # the family and element indices are runtime data, never type parameters.
+# Share the tuple through one typed holder: storing every prepared kernel
+# inline in every accessor makes each indexed map large and costly to copy.
 struct _CenteringAccessor{K}
-    kernels::K
+    kernels::Base.RefValue{K}
     family::Int
     element::Int
 end
-(a::_CenteringAccessor)(x) = _centering_value(a.kernels, a.family, x, a.element)
+@inline (a::_CenteringAccessor)(x) = _centering_value(a.kernels[], a.family, x, a.element)
 @inline _centering_value(kernels::Tuple, family::Int, x, element::Int) =
     family == 1 ? first(kernels)(x, element) :
         _centering_value(Base.tail(kernels), family - 1, x, element)

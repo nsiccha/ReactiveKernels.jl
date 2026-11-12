@@ -14,13 +14,14 @@ function PPL.adaptive_centering_problem(built, plan::PPL.StructuralPlan, problem
 end
 
 function _centering_reparametrization(kernels::K, records) where {K}
-    accessor = PPL._CenteringAccessor(kernels, 1, 1)
+    shared = Ref(kernels)
+    accessor = PPL._CenteringAccessor(shared, 1, 1)
     identity = WH.Reparametrization(WH.PartiallyCentered(0.0),
         WH.PartiallyCentered(0.0), accessor, accessor)
     pairs = Pair{Int,typeof(identity)}[]
     for cell in records, element in 1:cell.size
-        location = PPL._CenteringAccessor(kernels, cell.location, element)
-        log_scale = PPL._CenteringAccessor(kernels, cell.log_scale, element)
+        location = PPL._CenteringAccessor(shared, cell.location, element)
+        log_scale = PPL._CenteringAccessor(shared, cell.log_scale, element)
         push!(pairs, (cell.offset + element - 1) => WH.Reparametrization(
             WH.PartiallyCentered(cell.target), WH.PartiallyCentered(cell.source),
             location, log_scale))

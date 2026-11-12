@@ -2,7 +2,7 @@
 # argument. The reference fixture used for the initial acceptance has SHA-256
 # 1076770bb986328a9a7614d24e6016cded45b1d27d3b6a42fbffe32b6b8460b1.
 # This script prints its actual digest before checking target agreement and
-# comparing four chains per arm. Timing includes compilation on the first arm.
+# comparing four chains per arm. Timing includes each arm's first-use compilation.
 using ReactiveKernelsPPL, WarmupHMC, Enzyme, Random, Statistics, SHA, Test
 using DifferentiationInterface: AutoEnzyme
 import LogDensityProblems as LDP
@@ -63,8 +63,10 @@ function sample_comparison()
     for arm in (:original, :adaptive_theta, :adaptive_phi, :fixed_theta_centered)
         results = []
         controls = []
+        chain_elapsed = Float64[]
         t0 = time()
         for chain in 1:4
+            chain_started = time()
             problem = prepare_sampler(built, plan, u0; backend = AutoEnzyme())
             if arm === :original
                 rp = problem
@@ -79,10 +81,12 @@ function sample_comparison()
             result = adaptive_warmup_mcmc(Xoshiro(100 + chain), rp;
                 n_draws = 1000, monitor_ess = true,
                 nonlinear_adapt = arm !== :fixed_theta_centered)
+            push!(chain_elapsed, time() - chain_started)
             push!(results, result)
             arm === :original || push!(controls,
                 [last(pair).c for pair in WarmupHMC.reparam_sources(rp)])
-            println((; phase = :chain_finished, arm, chain, draws = size(result.posterior_position, 2)))
+            println((; phase = :chain_finished, arm, chain,
+                draws = size(result.posterior_position, 2), elapsed = last(chain_elapsed)))
             flush(stdout)
         end
         elapsed = time() - t0
@@ -96,7 +100,7 @@ function sample_comparison()
             min_tail_ess = minimum(MCD.ess(cube; kind = :tail)), divergent,
             divergent_percent = 100 * divergent / draws,
             evaluations_per_draw = [r.sampling_evaluation_counter / size(r.posterior_position, 2)
-                for r in results], elapsed, controls))
+                for r in results], elapsed, chain_elapsed, controls))
         flush(stdout)
     end
 end
