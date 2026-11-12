@@ -7,6 +7,7 @@ const MUTATING_FUNCTIONS_REV = rk_source_pins()["MutatingFunctions"]["rev"]
 
 root = normpath(joinpath(@__DIR__, ".."))
 testfiles = [joinpath(@__DIR__, "test_nonallocating.jl"),
+             joinpath(@__DIR__, "test_nonallocating_nested_products.jl"),
              joinpath(@__DIR__, "test_nonallocating_mnist.jl"),
              joinpath(@__DIR__, "test_nonallocating_ad.jl"),
              joinpath(@__DIR__, "test_nonallocating_repeated.jl"),

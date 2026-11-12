@@ -23,7 +23,7 @@ are recorded in the git history only.
   single-state and multi-state scans. It retains `sum`'s accumulator
   promotion and the runtime scan length. Other history slices in centered
   single-state densities now use views, as multi-state scans already did.
-  Requires ReactiveKernels 0.1.186.
+  Requires ReactiveKernels 0.1.192.
 
 ## 0.1.160
 
