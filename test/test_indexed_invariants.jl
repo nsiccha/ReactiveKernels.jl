@@ -274,6 +274,13 @@ end
     @test custom.count[] == 0
     @test !ReactiveKernels._indexed_data_safe(Any[short])
     @test !ReactiveKernels._indexed_passive_type(Tuple)
+    # Reused native output buffers have an ordinary-array-or-nothing field.
+    # The proof must cover every possible value without reading that field.
+    lane = Ref{Union{Nothing,Matrix{Float64}}}(nothing)
+    @test ReactiveKernels._indexed_data_safe(lane)
+    lane[] = p
+    @test ReactiveKernels._indexed_data_safe(lane)
+    @test !ReactiveKernels._indexed_data_safe(Ref{Union{Nothing,ObservedReads}}(nothing))
 end
 
 @kernel indexed_changing_columns(columns, p::Matrix{Float64}) = begin

@@ -7,7 +7,8 @@
 # recursively containing ordinary data can use values cached across those
 # reads. Unknown objects keep their authored execution. Type proofs avoid
 # traversing a dense vector of ordinary dense rows on every call.
-_indexed_passive_type(::Type) = false
+_indexed_passive_type(T::Type) =
+    T isa Union && all(_indexed_passive_type, Base.uniontypes(T))
 _indexed_passive_type(::Type{T}) where {T<:Union{Nothing,Bool,Int8,Int16,Int32,Int64,
     Int128,UInt8,UInt16,UInt32,UInt64,UInt128,Float16,Float32,Float64,Char}} = true
 _indexed_passive_type(::Type{Array{T,N}}) where {T,N} = _indexed_passive_type(T)

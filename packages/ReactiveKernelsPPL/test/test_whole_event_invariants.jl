@@ -117,7 +117,9 @@ end
             @test isempty(call_depths!(Int[],ast,ReactiveKernels._indexed_map))
         else
             @test call_depths!(Int[],ast,ReactiveKernels._indexed_map) == [0,0]
-            @test ReactiveKernels._indexed_data_safe((sampler.kernel.constants,raw))
+            lanes = filter(cache -> cache isa Base.RefValue,sampler.kernel.caches)
+            @test !isempty(lanes)
+            @test ReactiveKernels._indexed_data_safe((lanes,sampler.kernel.constants,raw))
         end
         for values in (raw,raw .+ 0.15)
             expected_gradient = zero(values)
@@ -125,6 +127,7 @@ end
                 Enzyme.Duplicated(values,expected_gradient),Enzyme.Const(events),
                 Enzyme.Const(offsets),Enzyme.Const(kind))[2]
             actual, gradient = sampler_value_and_gradient!(sampler,similar(values),values)
+            @test sampler(values) ≈ expected rtol=1e-12
             @test actual ≈ expected rtol=1e-12
             @test gradient ≈ expected_gradient rtol=1e-11 atol=1e-12
         end
@@ -134,6 +137,7 @@ end
         expected = Enzyme.autodiff(Enzyme.ReverseWithPrimal,reference,Enzyme.Active,
             Enzyme.Duplicated(raw,expected_gradient),Enzyme.Const(Vector{Bool}[]),
             Enzyme.Const(Float64[]),Enzyme.Const(kind))[2]
+        @test empty_sampler(raw) ≈ expected
         @test actual ≈ expected
         @test gradient ≈ expected_gradient
     end
