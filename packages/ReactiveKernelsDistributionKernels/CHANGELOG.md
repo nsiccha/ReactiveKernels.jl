@@ -6,7 +6,7 @@
   value/partials graph. Reflection selects the fraction's arguments before
   its call, so batched JAX gradients avoid two reflected fraction evaluations
   and a reverse tape over the iterations. Endpoint guards remain lazy.
-  Requires ReactiveKernels 0.1.194.
+  Requires ReactiveKernels 0.1.202.
 
 ## 0.1.6
 

@@ -272,14 +272,17 @@ function _cell_forwarded_arithmetic(f, args, stack = Set{Any}())
     ci === nothing && return nothing
     # A transparent wrapper does exactly one call and returns that call. In
     # particular, do not discard unused calls, checks, conversions or effects.
+    # Julia 1.13 can load the constant callee in a separate SSA statement.
     statements = [(i, st) for (i, st) in enumerate(ci.code) if
         !(st === nothing || st isa LineNumberNode || st isa Core.NewvarNode ||
-          st isa Expr && st.head in (:meta, :code_coverage_effect, :inbounds))]
+          st isa Expr && st.head in (:meta, :code_coverage_effect, :inbounds) ||
+          st isa GlobalRef && isdefined(st.mod, st.name) && isconst(st.mod, st.name))]
     length(statements) == 2 || return nothing
     (index, ex), (_, ret) = statements
     Meta.isexpr(ex, :call) && ret isa Core.ReturnNode && isdefined(ret, :val) &&
         ret.val === Core.SSAValue(index) || return nothing
     callee = ex.args[1]
+    callee isa Core.SSAValue && (callee = ci.code[callee.id])
     callee isa GlobalRef && isdefined(callee.mod, callee.name) &&
         isconst(callee.mod, callee.name) || return nothing
     all(a -> a isa Core.SlotNumber && 2 <= a.id <= length(args) + 1,
