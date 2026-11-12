@@ -16,6 +16,23 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.161
+
+- A density catalogue (`density_factors`) keeps an elementwise site as a plate
+  site in a binding where it has no events. Every selection's query structure
+  reads each plate site of the catalogue by cells, with no cells where it
+  selects no entries, and adds the folded data-only constant whenever the
+  catalogue folds a site. Compact derivative queries
+  (`prepare_query_ad(...; coordinates = :support)`) whose selections read the
+  same sites whole therefore share one program across their entries, and
+  across bindings whose plates have rows in different places: a package
+  image's workload on one binding compiles the programs another binding calls.
+  A compact factor query also keeps its selection's row plan behind one
+  reference instead of boxing it on every call. Values and gradients are
+  unchanged. Requires ReactiveKernels 0.1.181, whose partitions read such a
+  plate's lane without a per-call allocation, so a plate a selection does not
+  read costs nothing per call.
+
 ## 0.1.160
 
 - A cell latent whose plate iterates a sampled vector with a data-known
