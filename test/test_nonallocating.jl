@@ -63,6 +63,20 @@ const SPEC = @kernel untyped_logs(x, w) = begin
 end
 end
 
+# A traced helper whose trailing Vararg formal is the tuple of its arguments.
+module TracedVarargFixture
+using ReactiveKernels
+@traceable function centered_parts(w, parts::Vararg{Any,N}) where {N}
+    c = first(parts) .- last(parts)
+    c .* c .* w
+end
+const SPEC = @kernel traced_vararg(x::Vector{Float64}, y::Vector{Float64},
+                                   w::Float64) = begin
+    d::Vector{Float64} = centered_parts(w, x, y)
+    out::Float64 = sum(d)
+end
+end
+
 module TracedDispatchFixture
 using ReactiveKernels
 @traceable scaled(x, s) = x .* s
@@ -408,6 +422,16 @@ end
         @test k(x, 0.7) == ordinary(x, 0.7)
         @test k(2 .* x, 1.3) == ordinary(2 .* x, 1.3)
         @test kernel_allocations(k, x, 0.7) == 0
+    end
+
+    @testset "a traced helper's Vararg formal is the tuple of its arguments" begin
+        spec = TracedVarargFixture.SPEC
+        ordinary = prepare(spec; have = (:x, :y, :w), want = :out)
+        k = prepare_nonallocating(spec; have = (:x, :y, :w), want = :out)
+        x, y = [sin(3i) for i in 1:40], [cos(2i) for i in 1:40]
+        @test k(x, y, 0.7) == ordinary(x, y, 0.7)
+        @test k(y, 2 .* x, 1.3) == ordinary(y, 2 .* x, 1.3)
+        @test kernel_allocations(k, x, y, 0.7) == 0
     end
 
     @testset "a branch's arms fill buffers of their own" begin

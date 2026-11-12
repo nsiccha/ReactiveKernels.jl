@@ -1881,18 +1881,29 @@ function _jax_if(ctx::_JaxContext, ex, value::Bool)
         v = translate(body)
         # An arm that throws carries nothing out: the branch is the other arm.
         v.T === Union{} && return v
-        parts = [v.T === Nothing ? "None" : v.code]
+        # A carried number is an array (`_jax_carry_value`) of the type the
+        # arm gives it, which the branch promotes with the other arm's
+        # (`_jax_branch_type`). So is an integer value known while tracing:
+        # it may be a prepared `StaticInt`, which is not a JAX value.
+        parts = [v.T === Nothing ? "None" :
+                 v.static && v.T isa Type && v.T <: Integer && !(v.T <: Bool) ?
+                 _jax_carry_value(ctx, v).code : v.code]
+        types = Any[_jax_typeof(v)]
         for n in carried
-            push!(parts, _jax_carry_value(ctx, ctx.locals[n]).code)
+            c = ctx.locals[n]
+            push!(parts, _jax_carry_value(ctx, c).code)
+            push!(types, _jax_is_scalar(c.T) && isconcretetype(c.T) ? c.T : before[n].T)
         end
-        _PyVal("(" * join(parts, ", ") * ")", Tuple{_jax_typeof(v), (before[n].T for n in carried)...})
+        _PyVal("(" * join(parts, ", ") * ")", Tuple{types...})
     end
     branch = _jax_conditional(ctx, condition, arm(ex.args[2]), arm(otherwise))
     branch.T === Union{} && return branch
     result = _jax_bind!(ctx, :branch, branch)
     for (k, n) in enumerate(carried)
         b = before[n]
-        ctx.locals[n] = _PyVal(_py_atom(result.code) * "[" * string(k) * "]", b.T, false, b.extent,
+        T = _jax_is_tuple(result.T) && result.T <: Tuple && _jax_is_scalar(fieldtype(result.T, k + 1)) ?
+            fieldtype(result.T, k + 1) : b.T
+        ctx.locals[n] = _PyVal(_py_atom(result.code) * "[" * string(k) * "]", T, false, b.extent,
                                b.limit, b.padded)
     end
     _PyVal(_py_atom(result.code) * "[0]", result.T isa Type && result.T <: Tuple ? fieldtype(result.T, 1) : Any)
@@ -1920,7 +1931,7 @@ function _jax_conditional(ctx::_JaxContext, condition::_PyVal, then_build, else_
     traced = ctx.traced_branches
     ctx.traced_branches = condition.static ? 0 : traced + 1
     effects = _JAX_EFFECTS[]
-    then_arm, else_arm = try
+    then_built, else_built = try
         condition.static ? (_jax_arm_function(ctx, :then_arm, then_build),
                             _jax_arm_function(ctx, :else_arm, else_build)) :
             (_jax_with_guard(() -> _jax_arm_function(ctx, :then_arm, then_build),
@@ -1930,8 +1941,14 @@ function _jax_conditional(ctx::_JaxContext, condition::_PyVal, then_build, else_
     finally
         ctx.traced_branches = traced
     end
-    T = then_arm.T === Union{} ? else_arm.T : else_arm.T === Union{} ? then_arm.T :
-        promote_type(_jax_typeof(then_arm), _jax_typeof(else_arm))
+    A, B = then_built.value.T, else_built.value.T
+    T = A === Union{} ? B : B === Union{} ? A :
+        _jax_branch_type(_jax_typeof(then_built.value), _jax_typeof(else_built.value))
+    # A `jax.lax.cond`'s arms return the branch's type (`_jax_branch_value`);
+    # a Python conditional returns the taken arm's value as Julia does.
+    lax = !condition.static && A !== Union{} && B !== Union{}
+    then_arm = _jax_emit_arm!(ctx, then_built, lax ? T : nothing)
+    else_arm = _jax_emit_arm!(ctx, else_built, lax ? T : nothing)
     # Bound at once, so an arm that raises does so in program order even when
     # the value is unused (a guard `n == k || throw(...)`).
     condition.static &&
@@ -2134,14 +2151,20 @@ _jax_expr(ctx::_JaxContext, ::Val{:elseif}, ex) = _jax_expr(ctx, Val(:if),
 
 _jax_typeof(v::_PyVal) = v.T isa Type ? v.T : Any
 
-# A zero-argument nested function whose body `build` translates; its value's
-# type travels in the returned `_PyVal`.
+# An arm of a conditional, translated but not yet emitted: the name of its
+# zero-argument nested function, the scope holding its body, and its value.
+struct _JaxArm
+    name::String
+    scope::_JaxScope
+    value::_PyVal
+end
+
+# Translate an arm's body `build` in a scope of its own.
 function _jax_arm_function(ctx::_JaxContext, hint, build)
     name = _jax_fresh(ctx, hint)
     outer = ctx.scope
     inner = _JaxScope(outer)
     inner.indent = outer.indent + 1
-    push!(outer.lines, "    "^outer.indent * "def " * name * "():")
     saved_locals = copy(ctx.locals)
     ctx.scope = inner
     result = try
@@ -2150,11 +2173,77 @@ function _jax_arm_function(ctx::_JaxContext, hint, build)
         ctx.scope = outer
         empty!(ctx.locals); merge!(ctx.locals, saved_locals)
     end
-    append!(outer.lines, inner.lines)
-    push!(outer.lines, "    "^inner.indent * "return " * result.code)
     union!(outer.used, inner.used)
-    _PyVal(name, result.T, result.static)
+    _JaxArm(name, inner, result)
 end
+
+# Emit an arm as its nested function, returning its value as type `T` when
+# `T` is given (`_jax_branch_value`). The function's name stands for the arm,
+# with the type and staticness of what it returns.
+function _jax_emit_arm!(ctx::_JaxContext, arm::_JaxArm, @nospecialize(T) = nothing)
+    outer = ctx.scope
+    result = arm.value
+    if T !== nothing
+        ctx.scope = arm.scope
+        try
+            result = _jax_branch_value(ctx, result, T)
+        finally
+            ctx.scope = outer
+        end
+        union!(outer.used, arm.scope.used)
+    end
+    push!(outer.lines, "    "^outer.indent * "def " * arm.name * "():")
+    append!(outer.lines, arm.scope.lines)
+    push!(outer.lines, "    "^arm.scope.indent * "return " * result.code)
+    _PyVal(arm.name, result.T, result.static)
+end
+
+# The type of a branch whose arms have types `A` and `B`: Julia's promotion,
+# element by element for tuples of one length (an `if` returning its value
+# with the locals it assigns), where `promote_type` would give `Real`.
+function _jax_branch_type(@nospecialize(A), @nospecialize(B))
+    A isa Type && B isa Type || return Any
+    A <: Tuple && B <: Tuple && isconcretetype(A) && isconcretetype(B) &&
+        fieldcount(A) == fieldcount(B) &&
+        return Tuple{(_jax_branch_type(fieldtype(A, k), fieldtype(B, k)) for k in 1:fieldcount(A))...}
+    promote_type(A, B)
+end
+
+# An arm's value `v` as the branch's type `T`. JAX requires both arms of a
+# `jax.lax.cond` to return one structure of one dtype, where Julia's arms may
+# differ in type (`s == 0 ? 1.0 : s` with an integer `s`). A number whose type
+# is not `T` becomes an array of `T`'s dtype, and so does an integer known
+# while tracing: it may be a prepared `StaticInt`, a pytree node without
+# leaves where the other arm returns an array. An array converts its element
+# type, and a tuple converts element by element.
+function _jax_branch_value(ctx::_JaxContext, v::_PyVal, @nospecialize(T))
+    _jax_branch_converts(_jax_typeof(v), v.static, T) || return v
+    S = _jax_typeof(v)
+    if S <: Tuple
+        t = _jax_bind!(ctx, :arm_value, v)
+        parts = [_jax_branch_value(ctx, _PyVal(_py_atom(t.code) * "[" * string(k - 1) * "]",
+                                               fieldtype(S, k), false), fieldtype(T, k))
+                 for k in 1:fieldcount(T)]
+        return _PyVal(_jax_tuple_code(parts), T)
+    end
+    E = T <: AbstractArray ? eltype(T) : T
+    _PyVal("jnp.asarray(" * v.code * ", dtype=" * _jax_dtype(E) * ")", T)
+end
+function _jax_branch_converts(@nospecialize(S), static::Bool, @nospecialize(T))
+    isconcretetype(T) && isconcretetype(S) || return false
+    if T <: Tuple
+        return S <: Tuple && fieldcount(S) == fieldcount(T) &&
+            any(_jax_branch_converts(fieldtype(S, k), false, fieldtype(T, k)) for k in 1:fieldcount(T))
+    elseif T <: _JaxBranchReal
+        return S <: _JaxBranchReal && (S !== T || static && T <: Integer && !(T <: Bool))
+    elseif T <: AbstractArray
+        return S <: AbstractArray && ndims(S) == ndims(T) && eltype(S) <: _JaxBranchReal &&
+            isconcretetype(eltype(T)) && eltype(T) <: _JaxBranchReal && eltype(S) !== eltype(T)
+    end
+    false
+end
+# The numbers whose dtype `_jax_dtype` names.
+const _JaxBranchReal = Union{Integer,AbstractFloat}
 
 function _jax_expr(ctx::_JaxContext, ::Val{:call}, ex)
     head = ex.args[1]
@@ -2242,6 +2331,8 @@ function _jax_call(ctx::_JaxContext,
     f in (sum, prod) && names == [:init] ||
         _jax_error("keyword arguments ", join(names, ", "), " to `", f,
                    "` have no JAX translation", _jax_where(ctx))
+    f === sum && length(args) == 2 && _jax_fixed_tuple_type(args[2]) !== nothing &&
+        return _jax_tuple_sum(ctx, _jax_function_of(args[1]), args[2], last(only(kw)))
     reduced = _jax_call_positional(ctx, f, args)
     _jax_call(ctx, f === sum ? (+) : (*), [last(only(kw)), reduced])
 end
@@ -2958,6 +3049,8 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(sum), args::Vector{_PyVal
         return _PyVal("jnp.sum(" * _jax_padded_reduced(ctx, sum, args[1], "0.0") * ")",
                       eltype(args[1].T))
     length(args) == 1 && return _jax_result(sum, args, "jnp.sum(" * args[1].code * ")")
+    length(args) == 2 && _jax_fixed_tuple_type(args[2]) !== nothing &&
+        return _jax_tuple_sum(ctx, _jax_function_of(args[1]), args[2], nothing)
     length(args) == 2 && _jax_is_array(args[2].T) || _jax_error("this `sum` call", _jax_where(ctx))
     mapped = _jax_broadcast(ctx, _jax_function_of(args[1]), [args[2]])
     # `f` of a padded array's padding is not part of the sum.
@@ -2965,6 +3058,25 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(sum), args::Vector{_PyVal
                                             eltype(mapped.T))
     masked = _PyVal(mapped.code, mapped.T, false, args[2].extent, "", _jax_padded_axes(args[2]))
     _PyVal("jnp.sum(" * _jax_padded_reduced(ctx, sum, masked, "0") * ")", eltype(mapped.T))
+end
+# The type of a tuple value whose length its type fixes (a Vararg formal's
+# trailing arguments, a tuple literal), also one holding a function, or
+# `nothing`.
+function _jax_fixed_tuple_type(v::_PyVal)
+    T = v.T isa _JaxAggregate ? v.T.T : v.T
+    _jax_is_tuple(T) && T <: Tuple ? T : nothing
+end
+# `sum(g, t[; init])` of such a tuple: `g` of each element, added in order
+# from `init`, as Julia folds a tuple. The fold follows the tuple's fixed
+# length, as `afoldl` folds a fixed argument list, never a data length.
+function _jax_tuple_sum(ctx::_JaxContext, g, t::_PyVal, init)
+    total = init
+    for k in 1:fieldcount(_jax_fixed_tuple_type(t))
+        v = _jax_call(ctx, g, [_jax_tuple_element(ctx, t, _PyVal(string(k), Int, true))])
+        total = total === nothing ? v : _jax_call(ctx, +, [total, v])
+    end
+    total === nothing && _jax_error("`sum` of an empty tuple without `init`", _jax_where(ctx))
+    total
 end
 for (f, name, neutral) in ((prod, "jnp.prod", "1.0"), (maximum, "jnp.max", "-jnp.inf"),
                            (minimum, "jnp.min", "jnp.inf"))
@@ -4153,9 +4265,12 @@ function _jax_traceable_call(ctx::_JaxContext, f, args::Vector{_PyVal})
     source === nothing && return nothing
     names, body, mod = source
     length(source) >= 5 && (body = _jax_static_parameters(body, source[5]))
-    length(names) == length(args) || return nothing
-    ctx.host === nothing || return _host_function_call(ctx, f, collect(Symbol, names), body, mod, args)
-    v = _jax_source_expr(ctx, body, collect(Symbol, names), args, mod, nothing)
+    # A Vararg source's last formal is the tuple of the trailing arguments.
+    inputs = _traceable_arguments(source, args, rest -> _jax_call_positional(ctx, tuple, rest))
+    inputs === nothing && return nothing
+    ctx.host === nothing ||
+        return _host_function_call(ctx, f, collect(Symbol, names), body, mod, args, inputs)
+    v = _jax_source_expr(ctx, body, collect(Symbol, names), inputs, mod, nothing)
     _jax_bind!(ctx, :value, v)
 end
 
