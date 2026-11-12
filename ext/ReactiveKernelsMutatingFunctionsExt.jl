@@ -76,8 +76,24 @@ end
     end
 end
 
-@inline function cache_apply!(slot::Base.RefValue, op, args...)
+@inline function cache_apply!(slot::Base.RefValue{S}, op, args...) where {S}
+    R = ReactiveKernels._nonalloc_step_type(S, op, args...)
+    R isa Type && isconcretetype(R) && return _cache_apply_as!(slot, R, op, args...)
     slot[] = MutatingFunctions.apply!!(slot[], op, args...)
+end
+
+# A slot whose value type preparation could not infer (`Ref{Any}`) is read as
+# the type the step's own call infers here, `R`: its buffer is offered to
+# `apply!!` once it is an `R`, and the result keeps that type. Read back as
+# `Any`, the result reached every later use, each plate cell's included, as an
+# untyped value that dispatched at run time and boxed its numbers.
+@inline function _cache_apply_as!(slot::Base.RefValue, ::Type{R}, op,
+                                  args...) where {R}
+    cache = slot[]
+    result = cache isa R ? MutatingFunctions.apply!!(cache, op, args...) :
+        MutatingFunctions.apply!!(nothing, op, args...)
+    slot[] = result
+    result
 end
 
 # A step whose result is a tuple of a buffer and numbers, such as RKPPL's

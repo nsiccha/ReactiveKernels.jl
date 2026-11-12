@@ -155,6 +155,19 @@ function _static_type(f, argtypes...)
     T === Union{} ? Any : T
 end
 
+# The type later steps assume for a decomposed recipe's value. The plan's type
+# (inference over the whole recipe) and the decomposition's (assembled from its
+# parts) both bound the value's type from above, so their intersection does.
+# The decomposition's can be the wider one, `Any` for a part inference cannot
+# type alone, and it replaced the plan's: a `log.(x)` step over an `x` typed
+# `Any` that way kept a `Ref{Any}` slot (`_nonalloc_step_type`). Should the
+# two ever disagree, the decomposition is the code that runs: its type.
+function _nonalloc_tighter_type(planned, decomposed)
+    planned isa Type && decomposed isa Type || return decomposed
+    T = typeintersect(planned, decomposed)
+    T === Union{} ? decomposed : T
+end
+
 # A square dense matrix plus a `UniformScaling` (`K + sigma * I`), as
 # LinearAlgebra computes it: a copy of the matrix with `λ` added along its
 # diagonal, into a matching cache. Copied element by element, the loop native
@@ -178,6 +191,21 @@ end
 
 _nonalloc_slot(::Type{T}) where {T} = Ref{Union{Nothing,T}}(nothing)
 _nonalloc_slot(op, ::Type{T}) where {T} = _nonalloc_slot(T)
+
+# The type of the value a slot of `Ref{S}` holds once seeded: `Any` for the
+# `Ref{Any}` of a step whose type preparation could not infer.
+_nonalloc_slot_value(::Type{Union{Nothing,T}}) where {T} = T
+_nonalloc_slot_value(::Type{T}) where {T} = T
+
+# The type `op(args...)` infers to, folded at compile time (as `_promote_op`):
+# the type the native program's plain call of a step has. A cache driver
+# reading a slot whose value type is not concrete returns its result as this
+# type (`_nonalloc_step_type`), so the slot keeps its buffer without hiding
+# the result's type from the rest of the program.
+@generated _nonalloc_call_type(op, args::Vararg{Any,N}) where {N} =
+    :(Base._return_type(op, $(Tuple{args...})))
+@inline _nonalloc_step_type(::Type{S}, op, args...) where {S} =
+    isconcretetype(_nonalloc_slot_value(S)) ? nothing : _nonalloc_call_type(op, args...)
 
 # Identity-preserving wrappers that are cheaper to rebuild inline than to
 # cache: caching them buys no buffer reuse and may force conversion copies.
@@ -328,10 +356,24 @@ function _decompose_branch(ctx::_FusedDecomposition, node::Expr)
             return nothing
         end
         push!(parts, d[1])
-        i == 1 || push!(types, d[2])
+        # An arm that throws (an argument check's `else throw(...)`) returns
+        # no value, so the branch has the other arms' type.
+        i == 1 || _nonalloc_throws(ctx, part) || push!(types, d[2])
     end
     length(node.args) == 2 && push!(types, Nothing)
-    (Expr(node.head, parts...), Union{types...})
+    (Expr(node.head, parts...), isempty(types) ? Any : Union{types...})
+end
+
+# Whether an arm's value is a call of `throw`, which never returns.
+function _nonalloc_throws(ctx::_FusedDecomposition, ex)
+    lines = _nonalloc_straight_line(ex)
+    lines === nothing && return false
+    final = lines[2]
+    final isa Expr && final.head === :call && !isempty(final.args) || return false
+    callee = final.args[1]
+    callee isa Symbol && haskey(ctx.argmap, callee) && return false
+    resolved = _nonalloc_resolve_function(ctx.mod, callee)
+    resolved !== nothing && first(resolved) === Core.throw
 end
 
 # One arm (or condition) of a branch as a block of its own statements and its
@@ -1081,7 +1123,7 @@ function _nonalloc_step!(prog::_StepProgram, r::Recipe, i::Int,
         if r.op isa _KernelSourceOp && !(r.source isa _NoKernelSource)
             dec = _decompose_fused_recipe!(prog, r, callargs, argtypes, lhs)
             if dec !== nothing
-                types[lhs] = dec[2]
+                types[lhs] = _nonalloc_tighter_type(get(types, lhs, Any), dec[2])
                 return dec[1]
             end
         end
@@ -1091,7 +1133,7 @@ function _nonalloc_step!(prog::_StepProgram, r::Recipe, i::Int,
             if !(r.op isa _KernelSourceOp)
                 dec = _decompose_traceable_recipe!(prog, op, callargs, argtypes, lhs)
                 if dec !== nothing
-                    types[lhs] = dec[2]
+                    types[lhs] = _nonalloc_tighter_type(get(types, lhs, Any), dec[2])
                     return dec[1]
                 end
             end
@@ -1109,7 +1151,7 @@ function _nonalloc_step!(prog::_StepProgram, r::Recipe, i::Int,
     if !r.effectful && !(r.op isa _KernelSourceOp)
         dec = _decompose_traceable_recipe!(prog, op, callargs, argtypes, lhs)
         if dec !== nothing
-            types[lhs] = dec[2]
+            types[lhs] = _nonalloc_tighter_type(get(types, lhs, Any), dec[2])
             return dec[1]
         end
     end

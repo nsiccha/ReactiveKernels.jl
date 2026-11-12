@@ -16,6 +16,28 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.191
+
+- A non-allocating kernel keeps the type of a value it reads back from a step's
+  buffer. A value checked by a branch whose other arm throws
+  (`x = ok ? y : throw(...)`) took the type `Any` while the program was
+  decomposed into buffer-filling steps, and the steps computed from it, such
+  as the arms of a recorded helper's `n == 0 ? float.(s) : log.(s)`, kept
+  untyped buffers, so their results reached the program as `Any`. Every plate
+  cell reading them then dispatched at run time and allocated. Since 0.1.131,
+  when DistributionKernels' hidden-Markov helpers record their sources,
+  that included every emission cell of an exponential or normal HMM law whose
+  scales are sampled: `prepare_sampler`'s default density of a two-stream
+  exponential HMM over 416 steps took 60 µs and 6,673 allocations per call,
+  against 15 µs and 27 for `nonallocating = false`; it now takes 14 µs and 16.
+  A throwing arm no
+  longer widens a branch's type, a decomposed value keeps the type the
+  program's planning inferred for it when that is narrower, and a step whose
+  buffer preparation still could not type (a kernel prepared without
+  argument types, say) returns its result as the type its own call infers,
+  while still reusing that buffer. Values are unchanged (snag
+  default-non-allo-a0c23dd8).
+
 ## 0.1.190
 
 - `prepare_nonallocating` reuses destinations for matrix products nested in
