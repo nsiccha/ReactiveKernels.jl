@@ -1071,9 +1071,39 @@ function _host_rewrite!(ctx::_JaxContext, f, ex)
     v
 end
 function _jax_call_positional(ctx::_JaxContext, ::typeof(isequal), args::Vector{_PyVal})
-    ctx.host === nothing && return _jax_function_call(ctx, isequal, args)
+    (ctx.host === nothing || length(args) != 2) &&
+        return _jax_function_call(ctx, isequal, args)
     name = _jax_helper!(ctx, "_rk_isequal", _HOST_ISEQUAL)
     _PyVal(name * "(" * _jax_args(args) * ")", Bool, true)
+end
+
+# Search concrete host data in order, stopping before evaluating any later
+# predicate. The result is Julia's one-based index, or nothing when absent.
+function _jax_function_call(ctx::_JaxContext, ::typeof(findfirst), args::Vector{_PyVal})
+    if ctx.host === nothing || length(args) != 2 ||
+       !(args[2].T isa Type && args[2].T <: AbstractVector)
+        return _jax_traceable_or_lowered(ctx, findfirst, args)
+    end
+    predicate = _jax_function_of(args[1])
+    values = args[2]
+    result = _jax_fresh(ctx, :found)
+    index = _jax_fresh(ctx, :position)
+    element = _jax_fresh(ctx, :element)
+    _jax_emit!(ctx, result * " = None")
+    _jax_emit!(ctx, "for " * index * ", " * element * " in enumerate(" * values.code * ", 1):")
+    ctx.scope.indent += 1
+    try
+        test = _jax_bind!(ctx, :matched,
+                         _jax_call(ctx, predicate, [_PyVal(element, eltype(values.T), true)]))
+        _jax_emit!(ctx, "if not isinstance(" * test.code * ", (bool, np.bool_)):")
+        _jax_emit!(ctx, "    raise TypeError(\"findfirst predicate must return Bool\")")
+        _jax_emit!(ctx, "if " * test.code * ":")
+        _jax_emit!(ctx, "    " * result * " = " * index)
+        _jax_emit!(ctx, "    break")
+    finally
+        ctx.scope.indent -= 1
+    end
+    _PyVal(result, Union{Nothing,Int}, true)
 end
 function _jax_call_positional(ctx::_JaxContext, ::typeof(ismissing), args::Vector{_PyVal})
     ctx.host === nothing && return _jax_function_call(ctx, ismissing, args)
@@ -1191,21 +1221,49 @@ end
 
 # --- helpers called from host code ----------------------------------------------------
 
+# Function identities and types belong to translation, not a Python argument
+# list. A closure or aggregate can also carry runtime values: pass those leaves
+# and rebuild its translation metadata using names in the helper's own scope.
+function _host_function_input!(scope, params, passed, hint, v::_PyVal)
+    _host_function_input!(scope, params, passed, hint, v, v.T)
+end
+function _host_function_input!(scope, params, passed, hint, v::_PyVal, T)
+    if T isa Type && T <: Function && Base.issingletontype(T)
+        return _PyVal(v.code, _JaxCallable(T.instance), true)
+    end
+    type = _jax_type_of_value(v)
+    type === nothing || return _PyVal(v.code, _JaxCallable(type), true)
+    name = _jax_identifier(scope.used, hint)
+    push!(params, name)
+    push!(passed, v)
+    _PyVal(name, T, true)
+end
+function _host_function_input!(scope, params, passed, hint, v::_PyVal, T::_JaxCallable)
+    T.f isa _JaxClosure || return v
+    captures = [_host_function_input!(scope, params, passed, Symbol(hint, :_, i), a)
+                for (i, a) in enumerate(T.f.captures)]
+    _PyVal(v.code, _JaxCallable(_JaxClosure(T.f.F, captures)), true)
+end
+function _host_function_input!(scope, params, passed, hint, v::_PyVal, T::_JaxAggregate)
+    fields = [_host_function_input!(scope, params, passed, Symbol(hint, :_, i), a)
+              for (i, a) in enumerate(T.fields)]
+    _PyVal(v.code, _JaxAggregate(T.T, fields), true)
+end
+
 # A `@traceable` helper on the host: a module-level function of its body.
 function _host_function_call(ctx::_JaxContext, f, names::Vector{Symbol}, body, mod::Module,
                              args::Vector{_PyVal})
-    types = Any[a.T for a in args]
-    key = (:host_traceable, objectid(f), Tuple(types))
+    types = Any[_jax_argument_type(a) for a in args]
+    key = (:host_traceable, objectid(f), Tuple(a.T for a in args))
+    scope = _JaxScope()
+    params, passed = String[], _PyVal[]
+    locals = Dict{Symbol,_PyVal}(n => _host_function_input!(scope, params, passed, n, a)
+                                for (n, a) in zip(names, args))
     name = get(ctx.mod.helper_names, key, nothing)
     if name === nothing
         name = _jax_private_identifier(ctx.mod.used, Symbol("_rk_", nameof_or(f), "_np"))
         ctx.mod.helper_names[key] = name
-        scope = _JaxScope()
-        params = [_jax_identifier(scope.used, n) for n in names]
-        inner = _JaxContext(ctx.mod, scope, ctx.recipe, mod,
-                            Dict{Symbol,_PyVal}(n => _PyVal(p, T, true)
-                                                for (n, p, T) in zip(names, params, types)),
-                            nothing)
+        inner = _JaxContext(ctx.mod, scope, ctx.recipe, mod, locals, nothing)
         inner.host = _HostState(Set{String}(params); in_function = true)
         # A list it ends with (`unique!(sort!(v))`) leaves as an array.
         v = _host_read(inner, _jax_expr(inner, body))
@@ -1219,7 +1277,7 @@ function _host_function_call(ctx::_JaxContext, f, names::Vector{Symbol}, body, m
         ctx.mod.helper_names[(:host_traceable_type, name)] = T
     end
     T = ctx.mod.helper_names[(:host_traceable_type, name)]
-    _jax_bind!(ctx, :value, _PyVal(name * "(" * _jax_args(args) * ")", T, true))
+    _jax_bind!(ctx, :value, _PyVal(name * "(" * _jax_args(passed) * ")", T, true))
 end
 
 # --- prepare_data ---------------------------------------------------------------------
@@ -1761,7 +1819,10 @@ function _jax_prepare_function!(mod::_JaxModule, split, raw_types, names, types;
     end
     # The data definitions, in order, over the parameters and the definitions
     # before them. A data value takes the type the binding's own value has; a
-    # local of the definitions (`T0 === nothing`), the translation's.
+    # local of the definitions (`T0 === nothing`), the translation's. Their
+    # globals resolve in the module the caller names (`definitions_module`),
+    # never in whichever module called `jax_source`.
+    ctx.source_module = mod.definitions_module
     for (name, ex, T0) in definitions
         # One reading a definition without a host translation that is no input
         # either (the caller gave no value of it) has none: it says why.
@@ -1791,6 +1852,7 @@ function _jax_prepare_function!(mod::_JaxModule, split, raw_types, names, types;
         end
         known[name] = _PyVal(local_name, T, true)
     end
+    ctx.source_module = Main
     for v in p.have
         scope.values[canon_id(p.graph, v.id)] = known[v.name]
     end

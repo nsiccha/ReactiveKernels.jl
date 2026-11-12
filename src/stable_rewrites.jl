@@ -50,32 +50,9 @@
 
 # --- the setting -------------------------------------------------------------
 
-# The project's preference (`[ReactiveKernels] simplify = false` in its
-# `LocalPreferences.toml`), read at the first preparation of a process, as the
-# type-stability preferences are (`type_stability.jl`); `__init__` forgets a
-# value read while an image was generated.
-const _SIMPLIFY_PREFERENCE = Ref{Union{Nothing,Bool}}(nothing)
-const _SIMPLIFY_SCOPE = :ReactiveKernels_simplify
-
-function _simplify_preference()
-    cached = _SIMPLIFY_PREFERENCE[]
-    cached === nothing || return cached
-    value = Preferences.load_preference(@__MODULE__, "simplify", true)
-    value isa Bool || throw(ArgumentError(
-        "the ReactiveKernels preference `simplify` must be true or false; got $(repr(value))"))
-    _SIMPLIFY_PREFERENCE[] = value
-end
-
-# Whether the preparation in progress applies the stable rewrites: the
-# innermost enclosing `simplify` keyword, else the preference.
-_simplify() = get(_simplify_preference, task_local_storage(), _SIMPLIFY_SCOPE)::Bool
-
-# `f()` with every preparation inside it, nested ones included, applying (true)
-# or not applying (false) the rewrites; `nothing` keeps the enclosing setting.
-_with_simplify(f, ::Nothing) = f()
-_with_simplify(f, value::Bool) = task_local_storage(f, _SIMPLIFY_SCOPE, value)
-_with_simplify(f, value) = throw(ArgumentError(
-    "`simplify` must be `true`, `false` or `nothing`; got $(repr(value))"))
+# `simplify` (`_simplify`, `_with_simplify` and the project preference) is
+# defined in `simplify_setting.jl`: the summed-plate pass reads it too, inside
+# lowerings that run while this module loads.
 
 # --- the stable forms --------------------------------------------------------
 #
@@ -313,7 +290,7 @@ function _rw_pure_read(x, ctx::_RwContext, env)
     parts = _rw_read_parts(x)
     parts === nothing && return false
     call = parts[2]
-    _rw_resolve(call.args[1], @__MODULE__) === Base.Broadcast._broadcast_getindex &&
+    _rw_resolve(call.args[1], @__MODULE__) in (Base.Broadcast._broadcast_getindex, _plate_read) &&
         all(a -> a isa Number || (a isa Symbol && (haskey(env, a) || a in ctx.params)),
             call.args[2:end])
 end
