@@ -16,6 +16,18 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.201
+
+- `jax_source(...; data, definitions, definitions_module = Main)`: the
+  definitions' globals, such as a call head `plate`, resolve in
+  `definitions_module`. A binder passes the module it evaluates its
+  definitions in, so the module it emits no longer depends on what the caller
+  imported. Before, they always resolved in `Main`, so a definition calling a
+  function the caller's `Main` did not see stayed a `prepare_data` input
+  (`UNTRANSLATED`: "`f` is not defined in module `Main`"), and one `Main`
+  defined differently was translated as that function. The default keeps the
+  previous behaviour for direct callers.
+
 ## 0.1.200
 
 - Summed-plate factoring also recognizes the direct array reads introduced
