@@ -795,5 +795,443 @@
         ]
       ]
     }
-  ]
+  ],
+  "integration_recovery": {
+    "date": "2026-11-12",
+    "host": "strato2",
+    "fleet_job": "7cf30ddb3a414a4d",
+    "exit_code": 0,
+    "canonical_base": "4d08ffd8497fdb795f962018867611d65c2d5dcf",
+    "tested_commit": "63f2f89a4d59c1300388552777f66fccca69e434",
+    "snapshot_overlay": "4f33ed4588aa",
+    "provenance": "The snapshot preceded the commit. Remote byte read-back matched committed lowering, added tests and HMM benchmark programs.",
+    "cpu_limit": 1,
+    "package_versions": {
+      "ReactiveKernelsPPL": "0.1.160",
+      "Enzyme": "0.13.219",
+      "DifferentiationInterface": "0.7.22"
+    },
+    "selected_jax_tests": {
+      "test_jax_history.jl": {
+        "result": "PASS",
+        "log": "Test Summary:                                   | Pass  Total   Time\nJAX history indices retain prepared loop bounds |   16     16  23.8s\nTest Summary:                                                 | Pass  Total   Time\nJAX history scans retain only proven bounded lag in the carry |   56     56  29.2s\n[hmm-recovery] result=PASS\n"
+      },
+      "test_jax_scan_bounds.jl": {
+        "result": "PASS",
+        "log": "RETAINED_SCAN_BODIES [(118, 5), (118, 5), (118, 5)]\n\nTest Summary:                                              | Pass  Total   Time\njax_source: prepared bounds through scans and ragged cells |  114    114  52.9s\n[hmm-recovery] result=PASS\n"
+      },
+      "test_jax_data_ranges.jl": {
+        "result": "PASS",
+        "log": "Test Summary:                                   | Pass  Total     Time\njax_source: ranges whose ends are prepared data |  127    127  1m01.2s\nTest Summary:                                     | Pass  Total  Time\njax_source: loops and generators over no elements |   10     10  5.4s\n[hmm-recovery] result=PASS\n"
+      },
+      "test_jax_source.jl": {
+        "result": "PASS",
+        "log": "Test Summary:         | Pass  Broken  Total   Time\njax_source: structure |   48       1     49  11.5s\nTest Summary:                  | Pass  Total  Time\njax_source: refused constructs |    7      7  1.7s\nTest Summary:                                   | Pass  Total  Time\njax_source: plain-helper shapes and cumsum dims |    4      4  3.0s\nTest Summary:                    | Pass  Total   Time\njax_source: values and gradients |   59     59  38.7s\nTest Summary:                   | Pass  Total  Time\njax_source: all inputs prepared |    9      9  3.2s\nTest Summary:            | Pass  Total   Time\njax_source: prepare_data |   37     37  25.4s\nTest Summary:                                                     | Pass  Total  Time\njax_source: a data-only definition calling a program-level kernel |    9      9  4.8s\nTest Summary:                                             | Pass  Total  Time\njax_source: sort, unique and searchsorted in prepare_data |   11     11  4.2s\nTest Summary:                                               | Pass  Total  Time\njax_source: axes tuples and broadcast_shape in prepare_data |    6      6  2.2s\nTest Summary:                                                | Pass  Total   Time\njax_source: a plate cell's data-only recipes in prepare_data |   24     24  20.3s\nTest Summary:                                                      | Pass  Total  Time\njax_source: a plate cell reads a shared prepared integer as static |    8      8  3.8s\nTest Summary:                                                   | Pass  Total  Time\njax_source: stable cell rewrites preserve shared static lengths |    9      9  4.5s\nTest Summary:                                                                       | Pass  Total   Time\njax_source: rule primals, captured endpoints, positional views and statement writes |   15     15  13.3s\nTest Summary:                                                 | Pass  Total   Time\njax_source: tuple scan outputs, history scans, merge and dims |   49     49  26.9s\nTest Summary:                                     | Pass  Total   Time\njax_source: log-sum-exp whose inputs are all -Inf |   91     91  31.5s\nTest Summary:                                         | Pass  Total   Time\njax_source: reductions of gathers through ragged rows |   22     22  12.3s\nTest Summary:                                                     | Pass  Total  Time\njax_source: reductions of padded matrices along their padded axes |   10     10  8.6s\nTest Summary:                                      | Pass  Total   Time\njax_source: modified Bessel functions of any order |   18     18  27.0s\nTest Summary:                               | Pass  Total  Time\njax_source: keyword calls in a plain helper |    4      4  2.0s\nTest Summary:                                       | Pass  Total  Time\njax_source: same-level operands keep their grouping |    4      4  1.6s\nTest Summary:                                                      | Pass  Total  Time\njax_source: a throw that depends on data is a masked runtime check |   22     22  8.1s\nTest Summary:                                                      | Pass  Total  Time\njax_source: a generated method's source from a registered provider |   27     27  3.4s\nTest Summary:                                    | Pass  Total  Time\njax_source: string-built shape-guard diagnostics |   29     29  8.1s\n[hmm-recovery] result=PASS\n"
+      },
+      "test_jax_checks.jl": {
+        "result": "PASS",
+        "log": "jax.debug.callback failed\nTraceback (most recent call last):\n  File \"/home/n/.local/opt/jax-python-0.12.0.1/lib/python3.14/site-packages/jax/_src/debugging.py\", line 101, in debug_callback_impl\n    callback(*args)\n    ~~~~~~~~^^^^^^^\n  File \"/home/n/.local/opt/jax-python-0.12.0.1/lib/python3.14/site-packages/jax/_src/debugging.py\", line 507, in _flat_callback\n    callback(*args_, **kwargs_)\n    ~~~~~~~~^^^^^^^^^^^^^^^^^^^\n  File \"<string>\", line 11, in recorded\n    callback(*values)\n    ~~~~~~~~^^^^^^^^^\n  File \"/home/n/scratch/kb-agent-tmp/ReactiveKerne-c9f9c204e1/jl_lNNDC6/checks.py\", line 39, in check\n    raise ValueError(message)\nValueError: checked input must be positive\nTest Summary:                                            | Pass  Total  Time\nJAX runtime checks batch across nested and ragged plates |    4      4  4.8s\n[hmm-recovery] result=PASS\n"
+      },
+      "test_jax_padded_loops.jl": {
+        "result": "PASS",
+        "log": "Test Summary:                                                             | Pass  Total   Time\njax_source: loops to a padded row's length keep outer locals past its end |   37     37  14.2s\n[hmm-recovery] result=PASS\n"
+      }
+    },
+    "ppl_hmm_tests": {
+      "hmm_law": {
+        "passed": 4
+      },
+      "hmm_unreached": {
+        "passed": 4
+      },
+      "one_module_across_steps_and_states": {
+        "passed": 5
+      }
+    },
+    "emissions": [
+      {
+        "N": 4,
+        "bytes": 47582,
+        "sha256": "cd45ce43f582147986feaa4b0f4a8db90c27ddc2e9d08569fdc5943d015d0d20"
+      },
+      {
+        "N": 100,
+        "bytes": 47582,
+        "sha256": "cd45ce43f582147986feaa4b0f4a8db90c27ddc2e9d08569fdc5943d015d0d20"
+      },
+      {
+        "N": 400,
+        "bytes": 47582,
+        "sha256": "cd45ce43f582147986feaa4b0f4a8db90c27ddc2e9d08569fdc5943d015d0d20"
+      },
+      {
+        "N": 1600,
+        "bytes": 47582,
+        "sha256": "cd45ce43f582147986feaa4b0f4a8db90c27ddc2e9d08569fdc5943d015d0d20"
+      }
+    ],
+    "native": [
+      {
+        "N": 4,
+        "value": -11.029068768809312,
+        "gradient": [
+          0.6731574770705007,
+          -0.6432338321047101,
+          -2.3563464581960334,
+          1.2692002401988567
+        ]
+      },
+      {
+        "N": 100,
+        "value": -135.11980047459508,
+        "gradient": [
+          6.781541927969874,
+          -14.555255668871832,
+          -55.01379683952464,
+          0.24044503272987885
+        ]
+      },
+      {
+        "N": 400,
+        "value": -522.5189989493831,
+        "gradient": [
+          28.20759334891317,
+          -57.99987325144494,
+          -219.3138709200882,
+          -3.258984536995457
+        ]
+      },
+      {
+        "N": 1600,
+        "value": -2072.297382996827,
+        "gradient": [
+          111.91315177750248,
+          -231.72329176745373,
+          -877.038766513759,
+          -16.912474248831437
+        ]
+      }
+    ],
+    "observations": [
+      {
+        "module": "candidate",
+        "path": "/home/n/scratch/kb-fleet-exec/7cf30ddb3a414a4d/work/checkout/.hmm-recovery-final/hmm_4.py",
+        "sha256": "cd45ce43f582147986feaa4b0f4a8db90c27ddc2e9d08569fdc5943d015d0d20"
+      },
+      {
+        "jax": "0.12.0.1",
+        "platform": "cpu",
+        "x64": true
+      },
+      {
+        "N": 4,
+        "name": "row_reference",
+        "value_time": {
+          "median_ms": 0.006359,
+          "min_ms": 0.005959,
+          "temporary_bytes": 544
+        },
+        "grad_time": {
+          "median_ms": 0.008031,
+          "min_ms": 0.00729,
+          "temporary_bytes": 1464
+        },
+        "value": -11.02906876880931,
+        "gradient": [
+          0.6731574770705004,
+          -0.6432338321047099,
+          -2.3563464581960334,
+          1.2692002401988576
+        ],
+        "callback_regions": 0,
+        "scan_carry_sizes": [
+          2
+        ],
+        "gradient_scan_carry_sizes": [
+          2,
+          4,
+          2
+        ]
+      },
+      {
+        "N": 4,
+        "name": "candidate",
+        "value_time": {
+          "median_ms": 0.114768,
+          "min_ms": 0.087511,
+          "temporary_bytes": 1476
+        },
+        "grad_time": {
+          "median_ms": 0.142928,
+          "min_ms": 0.095522,
+          "temporary_bytes": 5448
+        },
+        "value": -11.02906876880931,
+        "gradient": [
+          0.6731574770705008,
+          -0.64323383210471,
+          -2.356346458196033,
+          1.2692002401988567
+        ],
+        "callback_regions": 1,
+        "scan_carry_sizes": [
+          1,
+          3,
+          1,
+          1,
+          1,
+          1
+        ],
+        "gradient_scan_carry_sizes": [
+          1,
+          3,
+          1,
+          1,
+          1,
+          1,
+          8,
+          1,
+          12,
+          8,
+          1,
+          3,
+          12,
+          3,
+          1
+        ]
+      },
+      {
+        "N": 100,
+        "name": "row_reference",
+        "value_time": {
+          "median_ms": 0.031824,
+          "min_ms": 0.02222,
+          "temporary_bytes": 3488
+        },
+        "grad_time": {
+          "median_ms": 0.034839,
+          "min_ms": 0.02928,
+          "temporary_bytes": 10872
+        },
+        "value": -135.11980047459508,
+        "gradient": [
+          6.781541927969873,
+          -14.555255668871826,
+          -55.0137968395246,
+          0.2404450327298905
+        ],
+        "callback_regions": 0,
+        "scan_carry_sizes": [
+          2
+        ],
+        "gradient_scan_carry_sizes": [
+          2,
+          4,
+          2
+        ]
+      },
+      {
+        "N": 100,
+        "name": "candidate",
+        "value_time": {
+          "median_ms": 0.237178,
+          "min_ms": 0.196861,
+          "temporary_bytes": 13344
+        },
+        "grad_time": {
+          "median_ms": 0.427531,
+          "min_ms": 0.222087,
+          "temporary_bytes": 51272
+        },
+        "value": -135.11980047459508,
+        "gradient": [
+          6.781541927969877,
+          -14.555255668871832,
+          -55.0137968395246,
+          0.2404450327298865
+        ],
+        "callback_regions": 1,
+        "scan_carry_sizes": [
+          1,
+          3,
+          1,
+          1,
+          1,
+          1
+        ],
+        "gradient_scan_carry_sizes": [
+          1,
+          3,
+          1,
+          1,
+          1,
+          1,
+          200,
+          1,
+          396,
+          200,
+          1,
+          3,
+          396,
+          3,
+          1
+        ]
+      },
+      {
+        "N": 400,
+        "name": "row_reference",
+        "value_time": {
+          "median_ms": 0.039495,
+          "min_ms": 0.038363,
+          "temporary_bytes": 13088
+        },
+        "grad_time": {
+          "median_ms": 0.046915,
+          "min_ms": 0.044892,
+          "temporary_bytes": 40248
+        },
+        "value": -522.5189989493831,
+        "gradient": [
+          28.207593348913175,
+          -57.99987325144499,
+          -219.31387092008822,
+          -3.2589845369954493
+        ],
+        "callback_regions": 0,
+        "scan_carry_sizes": [
+          2
+        ],
+        "gradient_scan_carry_sizes": [
+          2,
+          4,
+          2
+        ]
+      },
+      {
+        "N": 400,
+        "name": "candidate",
+        "value_time": {
+          "median_ms": 0.244196,
+          "min_ms": 0.15959,
+          "temporary_bytes": 51744
+        },
+        "grad_time": {
+          "median_ms": 0.534047,
+          "min_ms": 0.378914,
+          "temporary_bytes": 197192
+        },
+        "value": -522.5189989493831,
+        "gradient": [
+          28.207593348913168,
+          -57.99987325144495,
+          -219.3138709200882,
+          -3.2589845369954347
+        ],
+        "callback_regions": 1,
+        "scan_carry_sizes": [
+          1,
+          3,
+          1,
+          1,
+          1,
+          1
+        ],
+        "gradient_scan_carry_sizes": [
+          1,
+          3,
+          1,
+          1,
+          1,
+          1,
+          800,
+          1,
+          1596,
+          800,
+          1,
+          3,
+          1596,
+          3,
+          1
+        ]
+      },
+      {
+        "N": 1600,
+        "name": "row_reference",
+        "value_time": {
+          "median_ms": 0.136018,
+          "min_ms": 0.103573,
+          "temporary_bytes": 51488
+        },
+        "grad_time": {
+          "median_ms": 0.199404,
+          "min_ms": 0.146733,
+          "temporary_bytes": 157816
+        },
+        "value": -2072.2973829968273,
+        "gradient": [
+          111.91315177750262,
+          -231.7232917674538,
+          -877.0387665137611,
+          -16.912474248832662
+        ],
+        "callback_regions": 0,
+        "scan_carry_sizes": [
+          2
+        ],
+        "gradient_scan_carry_sizes": [
+          2,
+          4,
+          2
+        ]
+      },
+      {
+        "N": 1600,
+        "name": "candidate",
+        "value_time": {
+          "median_ms": 0.401014,
+          "min_ms": 0.380165,
+          "temporary_bytes": 205344
+        },
+        "grad_time": {
+          "median_ms": 4.551291,
+          "min_ms": 4.320062,
+          "temporary_bytes": 782664
+        },
+        "value": -2072.297382996827,
+        "gradient": [
+          111.91315177750265,
+          -231.72329176745342,
+          -877.0387665137602,
+          -16.912474248832652
+        ],
+        "callback_regions": 1,
+        "scan_carry_sizes": [
+          1,
+          3,
+          1,
+          1,
+          1,
+          1
+        ],
+        "gradient_scan_carry_sizes": [
+          1,
+          3,
+          1,
+          1,
+          1,
+          1,
+          3200,
+          1,
+          6396,
+          3200,
+          1,
+          3,
+          6396,
+          3,
+          1
+        ]
+      }
+    ],
+    "timing_scope": "Independent validation observations; no cross-host comparison with the original gordito speedup."
+  }
 }

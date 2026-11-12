@@ -161,6 +161,28 @@ bound and rejected that program; the combined representation preserves both.
 The regression covers empty and changed ranges, unchanged emitted source,
 values and ordinary native/JAX gradients.
 
+The final production change is
+`63f2f89a4d59c1300388552777f66fccca69e434`. Fleet job
+`7cf30ddb3a414a4d` validated those source and test bytes on strato2 and
+exited zero on 2026-11-12. Its snapshot preceded the commit; a byte-for-byte
+read-back matched the committed lowering, both added test files, and both
+HMM benchmark programs. The six selected JAX files (`history`, `scan_bounds`,
+`data_ranges`, `source`, `checks`, `padded_loops`) passed. This includes the
+16 new combined-provenance assertions, all 56 existing history assertions,
+and 114 scan-bound assertions; the source suite retains one pre-existing
+broken case. The PPL HMM subsets passed again (4 + 4 + 5 assertions), as did
+native Enzyme/JAX value and gradient parity at N = 4, 100, 400 and 1600.
+
+All four emitted modules remain identical to the original candidate:
+47,582 bytes and SHA256
+`cd45ce43f582147986feaa4b0f4a8db90c27ddc2e9d08569fdc5943d015d0d20`.
+The recovery used JAX 0.12.0.1 CPU x64 with a one-CPU limit. Its measurements
+are retained separately under `integration_recovery` in the results JSON;
+they are validation observations, not a cross-host speedup comparison.
+The report/registration follow-up changes only retained evidence and moves
+the two test registrations after the scan-bound suite to avoid overlapping
+the newly landed search-test registration.
+
 ## Reproduction
 
 Use an environment with this checkout, RKPPL, DistributionKernels,
