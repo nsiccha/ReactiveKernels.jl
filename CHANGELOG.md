@@ -25,6 +25,8 @@ are recorded in the git history only.
   in `prepare_data`. Counts remain runtime data and loop bodies stay compact;
   the emitted primal supports ordinary `jax.grad`. Empty scans with numeric
   or numeric-tuple outputs skip the step, including its indexed reads.
+  Scanning `eachindex(row)` or `axes(row, d)` keeps the row's valid length,
+  so padded steps do not contribute to its results.
 
 ## 0.1.185
 

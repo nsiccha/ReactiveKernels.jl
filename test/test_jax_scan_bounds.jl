@@ -98,9 +98,9 @@ end
 end
 @kernel jax_scan_bound_crossrows(a::Float64, starts::Vector{Vector{Int}},
                                 stops::Vector{Vector{Int}}) = begin
-    left = starts[1]
-    right = stops[2]
-    path = scan(left, right; init = 0.0) do acc, lo, hi
+    path = scan(eachindex(starts[1]), Ref(starts), Ref(stops); init = 0.0) do acc, j, starts, stops
+        lo = starts[1][j]
+        hi = stops[2][j]
         next = begin
             out = acc
             for j in lo:hi
@@ -133,7 +133,7 @@ end
     if !rk_jax_available()
         @test_skip false
     else
-        for k in kernels
+        @testset "ragged kernel $kind" for (kind, k) in enumerate(kernels)
             f = prepare(k; have, want = :total)
             src = jax_source(k; have, want = :total, data = (; counts = rows))
             for counts in (rows, [[1, 0], Int[]], [Int[], Int[]], Vector{Int}[],

@@ -3459,7 +3459,7 @@ _jax_plus_one(b::_PyVal) = match(r"^-?[0-9]+$", b.code) === nothing ?
     _py_infix("+", [b.code, "1"]) : string(parse(Int, b.code) + 1)
 _jax_function_call(ctx::_JaxContext, ::typeof(eachindex), args::Vector{_PyVal}) =
     length(args) == 1 && _jax_is_array(args[1].T) && ndims(args[1].T) == 1 ?
-    _PyVal("jnp.arange(1, " * _jax_dim_code(ctx, args[1], 1) * " + 1)", Base.OneTo{Int}) :
+    _jax_axis(ctx, args[1], 1) :
     _jax_error("`eachindex` of `", args[1].T, "`", _jax_where(ctx))
 function _jax_function_call(ctx::_JaxContext, ::typeof(axes), args::Vector{_PyVal})
     # On the host, `axes(x)` is the tuple of its ranges (`_host_axes`).
@@ -3467,8 +3467,18 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(axes), args::Vector{_PyVa
     length(args) == 2 || _jax_error("`axes` without a dimension", _jax_where(ctx))
     d = match(r"^[0-9]+$", args[2].code)
     d === nothing && _jax_error("`axes` with a computed dimension", _jax_where(ctx))
-    _PyVal("jnp.arange(1, " * _jax_dim_code(ctx, args[1], parse(Int, args[2].code)) * " + 1)",
-           Base.OneTo{Int})
+    _jax_axis(ctx, args[1], parse(Int, args[2].code))
+end
+# An axis of a padded row has the row's valid length, even though its
+# storage spans the padded width. Scans and reductions must mask that tail.
+function _jax_axis(ctx::_JaxContext, x::_PyVal, dim::Int)
+    extent = ""
+    if ctx.host === nothing && !isempty(x.extent) && !_jax_ragged(x.T)
+        size = _jax_padded_size(ctx, x, [_PyVal(string(dim), Int, true)])
+        isempty(size.limit) || (extent = size.code)
+    end
+    _PyVal("jnp.arange(1, " * _jax_dim_code(ctx, x, dim) * " + 1)",
+           Base.OneTo{Int}, false, extent)
 end
 function _jax_function_call(ctx::_JaxContext, ::typeof(collect), args::Vector{_PyVal})
     x = only(args)
@@ -4901,7 +4911,7 @@ end
 # a static bound, so a loop or generator up to it runs to that bound, masked.
 function _jax_scan_element(name::AbstractString, seq::_PyVal, position::String)
     E = eltype(seq.T)
-    seq.T isa Type && seq.T <: Base.OneTo && isempty(seq.extent) ||
+    seq.T isa Type && seq.T <: Base.OneTo ||
         return _jax_with_origin(_PyVal(name, E), _jax_selected_origin(seq, E, position))
     _PyVal(name, E, false, "", _py_atom(seq.code) * ".shape[0]")
 end
