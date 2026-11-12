@@ -122,3 +122,52 @@ end
         @test only(r.grad) ≈ expected
     end
 end
+
+# A trailing Vararg formal (snag traceable-on-a-v-e940f11c): the recorded
+# source reads it as the tuple of the trailing arguments, in `prepare_data`
+# (a data-only design merging several time vectors) and in the functions.
+# `sum(f, args[; init])` folds the tuple's fixed length.
+@traceable function jax_host_union(args::Vararg{Any,N}) where {N}
+    out = Float64[]
+    for a in args
+        for v in a
+            push!(out, v)
+        end
+    end
+    unique!(sort!(out))
+end
+@traceable jax_host_count(args...) = sum(length, args; init = 0)
+@traceable jax_host_rest_scale(w, rest...) = w * (sum(sum, rest) + length(rest))
+@kernel jax_host_vararg(a::Float64, t1::Vector{Float64}, t2::Vector{Float64},
+                        t3::Vector{Float64}) = begin
+    times = jax_host_union(t1, t2, t3)
+    n_points = jax_host_count(t1, t2, t3)
+    spread = jax_host_rest_scale(a, times, t1)
+    total = spread + length(times) / n_points
+    return total
+end
+
+@testset "jax_source: a @traceable helper with a Vararg argument" begin
+    data = ([0.0, 0.5, 2.0], [0.5, 1.0], [3.0, 0.0, 1.0, 0.25])
+    native = prepare(jax_host_vararg; have = (:a, :t1, :t2, :t3), want = :total)
+    expected = native(1.3, data...)
+    times = sort!(unique!(vcat(data...)))
+    @test expected ≈ 1.3 * (sum(times) + sum(data[1]) + 2) + length(times) / 9
+    prepared = jax_source(jax_host_vararg; have = (:a, :t1, :t2, :t3), want = :total,
+                          data = (:t1, :t2, :t3))
+    # The merge runs once per dataset on the host; the scale, which reads the
+    # parameter, in the functions.
+    @test occursin("def prepare_data", string(prepared))
+    # The loop over each argument's data stays a loop.
+    @test occursin(r"\bfor\b", string(prepared))
+    if !rk_jax_available()
+        @test_skip false
+    else
+        r = rk_jax_evaluate(prepared, :kernel, (1.3, data...); grad = true,
+                            prepare = :arguments)
+        @test r.value ≈ expected
+        derivative = Enzyme.autodiff(Enzyme.Reverse, native, Enzyme.Active,
+            Enzyme.Active(1.3), map(Enzyme.Const, data)...)[1][1]
+        @test only(r.grad) ≈ derivative
+    end
+end

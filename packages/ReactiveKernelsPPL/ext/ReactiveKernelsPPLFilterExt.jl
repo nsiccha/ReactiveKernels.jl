@@ -224,7 +224,9 @@ function _value(c, ex; time=nothing, seed=false, group=nothing, scalarize=false)
         if scalarize && provider isa Function && any(a -> _bare_series(c,a;group),ex.args[2:end])
             types = [_source_type(c,a;group) for a in ex.args[2:end]]
             source = Base.invokelatest(RK._traceable_source,typeof(provider),types...)
-            if source !== nothing
+            # A Vararg helper's source has no streaming translation; the call
+            # takes the paths below, as one without recorded source does.
+            if source !== nothing && !(length(source) >= 6 && source[6])
                 flags = [_bare_series(c,a;group) for a in ex.args[2:end]]
                 all(!flag || T <: AbstractVector{Float64} for (flag,T) in zip(flags,types)) ||
                     _fail("recorded helper temporal arguments currently require Float64 vector elements")
