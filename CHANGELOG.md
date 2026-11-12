@@ -16,6 +16,20 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.216
+
+- The stable rewrites compute a symmetric law's standardized log kernel at a
+  positive value's exponential from the value's logarithm. A half-Student or
+  half-Cauchy prior on `exp(u)` (`student_t(nu, 0, s).logpdf(exp(u))`, an
+  RKPPL `restricted.(StudentT.(nu, 0, s), 0, Inf)` prior on a positive
+  parameter) is `-((nu + 1) / 2) * log1pexp(2(u - log(s)) - log(nu))`: no
+  exponential, branch or logarithm of the scale, finite where `exp(u)`
+  overflows, and in a plate its `log(nu)` and `log(s)` run once before the
+  cells. A cell reads such a value through a lazy cell array of `exp.(u)`; a
+  materialized one keeps its reads. A kernel opts in by declaring
+  `_rk_log_abs_form` and its parameter part. A location that is not zero, a
+  negative `nu` and non-real operands run the literal kernel.
+
 ## 0.1.215
 
 - `jax_source` translates broadcasts of padded (ragged) rows padded by
