@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.181
+## 0.1.182
 
 - The opt-in generated summed-plate reverse (`with_plate_reverse`, or the
   preference `plate_reverse = "on"`) returns the backend's gradient on Julia
@@ -39,6 +39,21 @@ are recorded in the git history only.
   Julia 1.10.12). A plain cell loop over an active array already took the
   backend's reverse when called; it now does so from preparation, and the
   report says so.
+
+## 0.1.181
+
+- `jax_source`: a loop or generator over no elements, such as
+  `for r in 1:length(a)` or `sum(f(a[i]) for i in idx)` with empty data, runs
+  no JAX loop or `vmap`: Python decides the static element count while JAX
+  traces, and the loop's carry keeps its initial values. Before, JAX traced
+  the body anyway and its gathers from the empty array raised `IndexError`.
+  A nonempty range over an empty array still raises, as Julia's `BoundsError`.
+- A step past the stop of a range whose ends are prepared-data entries (RK
+  0.1.179) is a lazy branch (`jax.lax.cond`) that keeps the carry and reads
+  nothing; a generator's is a zero the reduction masks. Before, such a step
+  ran the body at the clamped stop and selected the old carry, so on an
+  empty interval a non-finite derivative there (`log(x[t])` at an
+  `x[t] = 0` Julia never reads) made `jax.grad` NaN.
 
 ## 0.1.180
 

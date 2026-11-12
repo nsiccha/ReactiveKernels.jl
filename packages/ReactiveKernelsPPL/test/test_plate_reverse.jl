@@ -94,7 +94,7 @@ end
             ((64, 4), (200, 5))
         # Rows sorted by group, runs of at least 8: the likelihood plate sums
         # each run's cells into a partial (src/index_runs.jl), an outer loop
-        # the generated reverse does not differentiate. Before RK 0.1.181 the
+        # the generated reverse does not differentiate. Before RK 0.1.182 the
         # plate still took the rule, ran that loop forward only and returned a
         # gradient without the likelihood (relative error about 1 on every
         # Julia; RadonCounty in snag plate-reverse-wr-8f83d36c). It keeps the
