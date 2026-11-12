@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.7
+## 0.1.8
 
 - Bernoulli, Binomial and zero-inflated Binomial product-mixture laws accept
   a singleton position row in each parameter matrix independently. A `1 × K`
@@ -10,6 +10,14 @@
 - Binomial probability and logit routes expose their bound log coefficient
   under a data-only support guard, allowing nested preparation to cache it
   even when some components cannot produce the observed counts.
+
+## 0.1.7
+
+- Incomplete-beta and Student-t tails use ReactiveKernels' shared fraction
+  value/partials graph. Reflection selects the fraction's arguments before
+  its call, so batched JAX gradients avoid two reflected fraction evaluations
+  and a reverse tape over the iterations. Endpoint guards remain lazy.
+  Requires ReactiveKernels 0.1.202.
 
 ## 0.1.6
 

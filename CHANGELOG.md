@@ -16,6 +16,83 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.204
+
+- `jax_source` takes `float_type`, `Float64` (the default) or `Float32`: the
+  dtype of every float value the program does not type `Float32` itself, for
+  an accelerator whose float64 is slow. A `Float32` module casts its float
+  inputs to `float32`, its `prepare_data` returns `float32` data, its dtype
+  metadata says so, and it does not turn on JAX's 64-bit mode; its device
+  integers are JAX's default integer (`int32` without that mode). An `fma`,
+  which rounds once through a float64 product, still turns it on. It stays
+  float32 where another module turned 64-bit mode on: integers a float is
+  computed from alone (`log(k)`, `i / j`), NumPy-computed constants, `I(n)`,
+  scan carries and the literal arms of traced branches take its float type.
+  The `Float64` module of the same program is its reference, and is unchanged
+  (snag jax-source-float-5e6b7604).
+- A traced branch whose arm returns a static value (a literal, a NumPy
+  constant) returns it in the branch's float dtype where that dtype is
+  `float32`: `jax.lax.cond` refused a float64 literal arm beside a `float32`
+  one, also in a `Float32` program's `Float64` module.
+
+## 0.1.203
+
+- Nested native plates reuse elementary scalar work on an invariant array
+  across enclosing cells. For example, a whole-event Bernoulli mixture can
+  compute `log(p[j,k])` and `log1p(-p[j,k])` once per matrix entry instead of
+  once per observation. The same lowering handles logit expressions and
+  invariant subexpressions inside event-dependent arithmetic. Tables and loops
+  keep runtime sizes. Domain and storage checks retain the authored path for
+  singular live inputs, unsupported arrays and effectful regions; empty and
+  ragged domains retain their values, ordinary derivatives and access checks.
+
+## 0.1.202
+
+- `jax_source` generates scalar derivative-rule adapters from the same
+  activity-selected mathematical graph as native AD. Joint cuts and repeated
+  calls share their emitted helpers; inactive partials are not contracted.
+- Add the shared incomplete-beta fraction value/partials graph used by
+  distribution tails. First-order native and JAX gradients retain its partials
+  instead of a reverse tape of 300 fraction iterations.
+
+## 0.1.201
+
+- `jax_source(...; data, definitions, definitions_module = Main)`: the
+  definitions' globals, such as a call head `plate`, resolve in
+  `definitions_module`. A binder passes the module it evaluates its
+  definitions in, so the module it emits no longer depends on what the caller
+  imported. Before, they always resolved in `Main`, so a definition calling a
+  function the caller's `Main` did not see stayed a `prepare_data` input
+  (`UNTRANSLATED`: "`f` is not defined in module `Main`"), and one `Main`
+  defined differently was translated as that function. The default keeps the
+  previous behaviour for direct callers.
+
+## 0.1.200
+
+- Summed-plate factoring also recognizes the direct array reads introduced
+  in 0.1.194. In 0.1.196 only the broadcast-read loop was factored, so a
+  shared-scale Normal plate with matching array axes retained its per-cell
+  scale arithmetic, and a plate over one array was never factored. Both
+  direct and broadcast-read loops now take their shared factors and terms
+  out of the sum, with the same guarded fallback and ordinary reverse.
+
+## 0.1.199
+
+- `jax_source` combines a plate's runtime validity checks across its active
+  lanes, including nested plates, before calling the host. Previously JAX
+  scheduled one callback per cell, which dominated the hidden-Markov model's
+  emission calculation. Inactive and padded lanes are masked, and an
+  active invalid value still raises the check's error.
+- A history scan whose reads have a provable bounded lag carries a rolling
+  buffer and lets `lax.scan` stack its outputs separately. This includes
+  previous-row recurrences with a data-sized row width, such as the HMM
+  forward pass. This bounds the primal history carry; gradients of shared
+  arrays can still carry full-sized buffers. Unknown history accesses keep
+  the full buffer; seeds and reads of unwritten entries keep their values.
+  Empty history scans skip their body, including its indexed reads.
+  Prepared integer bounds survive history-index tracking, so scanned ranges
+  can also bound nested loops.
+
 ## 0.1.198
 
 - `jax_source` host preparation keeps helper function and type arguments in

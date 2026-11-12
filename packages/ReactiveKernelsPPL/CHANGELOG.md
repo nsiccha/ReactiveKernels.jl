@@ -16,6 +16,33 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.165
+
+- `jax_source(built, plan; float_type = Float32)` emits the model's module in
+  float32: `unconstrained`, the prepared data and every value are `float32`,
+  and the module does not turn on JAX's 64-bit mode. The default `Float64`
+  module is its reference. The module's simplex and multivariate normal
+  helpers allocate in their inputs' dtype (the same values in a `Float64`
+  module). Requires ReactiveKernels 0.1.204 (snag jax-source-float-5e6b7604).
+
+## 0.1.164
+
+- Require ReactiveKernels 0.1.202 and ReactiveKernelsDistributionKernels 0.1.7
+  for the shared incomplete-beta value/partials graph. Censored Student-t JAX
+  gradients use the generated scalar rule instead of reversing 300 fraction
+  iterations.
+
+## 0.1.163
+
+- `jax_source(built, plan)` emits the same module whatever the caller
+  imported: the data-only definitions `prepare_data` computes resolve their
+  callees as `bind_data` does, in the generated scope. Before, they resolved
+  in the caller's `Main`. A stochastic `@scan` in a `@plate` cell then left
+  its step counts in `UNTRANSLATED` ("`plate` is not defined in module
+  `Main`") unless that `Main` had `using ReactiveKernels`, and `prepare_data`
+  took the internal column `_rkppl_scan_<state>_count_values` as an input.
+  Requires ReactiveKernels 0.1.201.
+
 ## 0.1.162
 
 - A density catalogue (`density_factors`) keeps an elementwise site as a plate

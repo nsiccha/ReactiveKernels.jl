@@ -40,57 +40,10 @@ include("gamma_logtails.jl")
 # Preserve qualified consumer names as imports of the same owned graphs.
 using ReactiveKernels: rk_symmetric_eigvals_rule, rk_symmetric_eigvecs_rule
 
-# Owned regularized incomplete beta, I_x(a, b). The probability helper is
-# used over the Student-t slice; beta_logtails.jl also uses its continued
-# fraction for the two free shape parameters of BetaPrime and FDist.
-# This spelling is plain transparent math — endpoint guards, reflection to
-# x <= (a+1)/(a+b+2), a logbeta front factor, and Lentz's continued fraction
-# over a FIXED count in one retained `while` loop — so it differentiates under
-# Enzyme without any rule (no backend-specific derivative code, no method on
-# a function this repository does not own). Endpoint guards and reflection use lazy branches, including their
-# derivative work. Tail selection only selects between already valid values.
-#
-# `@_record_source` keeps the source of these helpers for `jax_source`, whose
-# `jax.grad` differentiates the continued fraction (`jax.scipy.special.betainc`
-# has no derivative in its shape parameters).
-#
-# `test_rk_beta_inc.jl` validates the Student-t slice, and
-# `test_positive_families.jl` validates the general log-tail route separately.
-const RK_BETA_INC_ITERS = 300
-const RK_BETA_INC_FPMIN = 1e-300
-
-ReactiveKernels.@_record_source function _rk_beta_inc_cf(a, b, x)
-    qab = a + b
-    qap = a + 1
-    qam = a - 1
-    c = one(qab)
-    d = 1 - qab * x / qap
-    d = ifelse(abs(d) < RK_BETA_INC_FPMIN, RK_BETA_INC_FPMIN, d)
-    d = one(d) / d
-    h = d * one(d)
-    # A retained loop over the fixed count, never unrolled.
-    i = 0
-    while i < RK_BETA_INC_ITERS
-        m = i + 1
-        m2 = 2 * m
-        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
-        d = 1 + aa * d
-        d = ifelse(abs(d) < RK_BETA_INC_FPMIN, RK_BETA_INC_FPMIN, d)
-        c = 1 + aa / c
-        c = ifelse(abs(c) < RK_BETA_INC_FPMIN, RK_BETA_INC_FPMIN, c)
-        d = one(d) / d
-        h = h * d * c
-        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
-        d = 1 + aa * d
-        d = ifelse(abs(d) < RK_BETA_INC_FPMIN, RK_BETA_INC_FPMIN, d)
-        c = 1 + aa / c
-        c = ifelse(abs(c) < RK_BETA_INC_FPMIN, RK_BETA_INC_FPMIN, c)
-        d = one(d) / d
-        h = h * d * c
-        i = i + 1
-    end
-    return h
-end
+# Normalization and tail selection stay in the distribution graph. The
+# general continued fraction and its named partials live in RK proper;
+# native and JAX adapters are generated from that same mathematical graph.
+using ReactiveKernels: _rk_beta_inc_cf
 
 ReactiveKernels.@_record_source function _rk_beta_inc_core(a, b, x)
     front = exp(a * log(x) + b * log1p(-x) - logbeta(a, b))
@@ -98,15 +51,12 @@ ReactiveKernels.@_record_source function _rk_beta_inc_core(a, b, x)
 end
 
 ReactiveKernels.@_record_source function _rk_beta_inc_interior(a, b, x, upper::Bool)
-    result = zero(a + b)
-    if x < (a + 1) / (a + b + 2)
-        small = _rk_beta_inc_core(a, b, x)
-        result = ifelse(upper, 1 - small, small)
-    else
-        small = _rk_beta_inc_core(b, a, 1 - x)
-        result = ifelse(upper, small, 1 - small)
-    end
-    return result
+    lower = x < (a + 1) / (a + b + 2)
+    shape_a = ifelse(lower, a, b)
+    shape_b = ifelse(lower, b, a)
+    t = ifelse(lower, x, 1 - x)
+    small = _rk_beta_inc_core(shape_a, shape_b, t)
+    return ifelse(upper == lower, 1 - small, small)
 end
 ReactiveKernels.@_record_source function _rk_beta_inc_upper_guard(a, b, x, upper::Bool)
     result = zero(a + b)

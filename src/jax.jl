@@ -9,8 +9,8 @@
 # arms. Nothing is unrolled per element (`CONTRIBUTING.md`, "Preserve
 # data-dependent iteration"), and sizes are read from the inputs, so one
 # emitted module serves every data size of the same program. Gradients are
-# `jax.grad` of the emitted primal; derivative rules contribute only their
-# primal cut. Construct the emitter cannot translate raises a
+# `jax.grad` of the emitted callable; scalar derivative rules contribute
+# activity-selected cuts of their mathematical graph. A construct the emitter cannot translate raises a
 # `JAXEmissionError` naming the recipe and the construct.
 #
 # Conventions. Arrays keep Julia's dimension order (a Julia `n × p` matrix is
@@ -117,8 +117,12 @@ struct _JaxBetween
 end
 # The value whose static bounds bound `v` from below (above): the first
 # (last) end of the range `v` is an element of, or `v` itself.
-_jax_lower_end(v::_PyVal) = v.origin isa _JaxBetween ? _jax_lower_end(v.origin.lo) : v
-_jax_upper_end(v::_PyVal) = v.origin isa _JaxBetween ? _jax_upper_end(v.origin.hi) : v
+_jax_lower_end(v::_PyVal) = _jax_lower_end(v, v.origin)
+_jax_upper_end(v::_PyVal) = _jax_upper_end(v, v.origin)
+_jax_lower_end(v::_PyVal, origin) = v
+_jax_upper_end(v::_PyVal, origin) = v
+_jax_lower_end(v::_PyVal, origin::_JaxBetween) = _jax_lower_end(origin.lo)
+_jax_upper_end(v::_PyVal, origin::_JaxBetween) = _jax_upper_end(origin.hi)
 # A range element's index value `index`, between `lo` and `hi`.
 _jax_range_index(index::AbstractString, lo::_PyVal, hi::_PyVal) =
     _PyVal(index, Int, false, "", "", 0, _JaxBetween(lo, hi))
@@ -288,6 +292,9 @@ mutable struct _JaxModule
     # recipe of one of them that neither side translates takes its value from
     # the definition instead (`_JaxPromote`).
     host_definitions::Set{Symbol}
+    # The module those definitions' globals resolve in (`jax_source`'s
+    # `definitions_module`).
+    definitions_module::Module
     # Why `prepare_data` leaves a plate cell's data-only recipe to the
     # functions, by (plate recipe id, cell recipe id) (`_jax_cell_split`,
     # jax_host.jl).
@@ -299,8 +306,9 @@ mutable struct _JaxModule
     failure_paths::IdDict{Any,Vector{Tuple{Plan,Recipe}}}
 end
 _JaxModule() = _JaxModule(String[], Dict{Any,Any}(), Set{String}(), 0,
-                          Dict{Int,JAXEmissionError}(), nothing, Set{Symbol}(),
-                          Dict{Tuple{Int,Int},JAXEmissionError}(), Set{Tuple{Int,Int}}(), Tuple{Plan,Recipe}[],
+                          Dict{Int,JAXEmissionError}(), nothing, Set{Symbol}(), Main,
+                          Dict{Tuple{Int,Int},JAXEmissionError}(), Set{Tuple{Int,Int}}(),
+                          Tuple{Plan,Recipe}[],
                           IdDict{Any,Vector{Tuple{Plan,Recipe}}}())
 
 # Translation state: the module, the current function scope, the current
@@ -652,8 +660,26 @@ _jax_is_singleton_value(v::_PyVal) = v.T isa Type && v.T !== Nothing && !(v.T <:
 # parameter, `promote_type(...)`), as `clamp`'s `convert(T, x)` passes it.
 _jax_type_of_value(v::_PyVal) = v.T isa _JaxCallable ? (v.T.f isa Type ? v.T.f : nothing) :
     v.T isa Type && v.T <: Type && !(v.T isa UnionAll) ? v.T.parameters[1] : nothing
-_jax_dtype(@nospecialize(E)) = E <: Bool ? "jnp.bool_" : E <: Integer ? "jnp.int64" :
-    E <: AbstractFloat ? "jnp." * _jax_dtype_name(E) : "jnp.float64"
+_jax_dtype(@nospecialize(E)) = E <: Bool ? "jnp.bool_" : E <: Integer ? _jax_int_dtype() :
+    E <: AbstractFloat ? "jnp." * _jax_dtype_name(E) : "jnp." * _jax_float_name()
+
+# The module's float type, `jax_source`'s `float_type`: the dtype of every
+# float value the program does not type `Float32` explicitly (Julia's default
+# `Float64`, a sampler boundary's values, data). It is set for the task that
+# emits one module, so modules emitted concurrently do not share it.
+const _JAX_FLOAT_TYPE_KEY = :reactivekernels_jax_float_type
+_jax_float_type() = get(task_local_storage(), _JAX_FLOAT_TYPE_KEY, Float64)::DataType
+_jax_float_name() = _jax_float_type() === Float32 ? "float32" : "float64"
+# A float32 module does not turn on JAX's 64-bit mode (`_jax_needs_x64`), so
+# its integers are JAX's default integer, Python's `int` as a dtype: int32,
+# or int64 where another module turned 64-bit mode on, as `jnp.arange` and
+# the integer data are there.
+_jax_int_dtype() = _jax_float_type() === Float32 ? "int" : "jnp.int64"
+function _jax_with_float_type(f, float_type)
+    float_type in (Float64, Float32) || throw(ArgumentError(
+        "jax_source: `float_type` is `Float64` or `Float32`; got `$float_type`"))
+    task_local_storage(f, _JAX_FLOAT_TYPE_KEY, float_type)
+end
 
 _jax_expr(ctx::_JaxContext, ::Val{H}, ex) where {H} =
     _jax_error("the construct `", H, "` (`", ex, "`) has no JAX translation yet",
@@ -888,6 +914,10 @@ end
 # Index `x` with Julia indices `indices` (source expressions). An assignment
 # `target` reads the position only, so its gather carries no extent.
 function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
+    if !target && x.origin isa _JaxHistoryLayout
+        read = _jax_history_read!(ctx, x, indices)
+        read === nothing || return read
+    end
     if ctx.host !== nothing
         v = _host_index(ctx, x, indices)
         v === nothing || return v
@@ -1019,6 +1049,9 @@ end
 # An index expression in which `end` and `begin` name the bounds of `x`'s
 # dimension `dim`.
 function _jax_bound_expr(ctx::_JaxContext, x::_PyVal, dim::Int, index)
+    # A history access may already have resolved its index while checking
+    # the storage layout. Reuse it without repeating any emitted effects.
+    index isa _PyVal && return index
     index === :end && return _PyVal(_jax_dim_code(ctx, x, dim), Int, true)
     index === :begin && return _PyVal("1", Int)
     if index isa Expr && (_jax_mentions(index, :end) || _jax_mentions(index, :begin))
@@ -1616,6 +1649,11 @@ end
 # A loop carry enters with a fixed dtype, as `fori_loop` requires. A tuple
 # (or `NamedTuple`) stays a Python tuple, its elements coerced one by one, so
 # it has the structure the loop body and a branch's arms return.
+# A scan's initial carry. A float32 module types it as a loop's carry is: a
+# literal (`level[1] = 0.0`) is float64 under 64-bit mode, and the carry would
+# stay float64 through the step's float32 arithmetic.
+_jax_scan_init(ctx::_JaxContext, v::_PyVal) =
+    _jax_float_type() === Float64 ? v : _jax_carry_value(ctx, v)
 function _jax_carry_value(ctx::_JaxContext, v::_PyVal)
     _jax_is_array(v.T) && return v
     if _jax_is_tuple(v.T)
@@ -1911,10 +1949,22 @@ function _jax_conditional(ctx::_JaxContext, condition::_PyVal, then_build, else_
         _jax_emit!(ctx, valued.code * "()")
         return _PyVal("None", Union{}, true)
     end
-    branch = _PyVal("jax.lax.cond(" * condition.code * ", " * then_arm.code * ", " *
-                    else_arm.code * ")", T)
+    branch = _PyVal("jax.lax.cond(" * condition.code * ", " * _jax_typed_arm(then_arm, T) * ", " *
+                    _jax_typed_arm(else_arm, T) * ")", T)
     # An arm with a runtime check runs even when the branch value is unused.
     _JAX_EFFECTS[] == effects ? branch : _jax_bind!(ctx, :branch, branch)
+end
+# A static arm's value, a Python literal (`return 1.0`) or a NumPy scalar, is
+# float64 under 64-bit mode, and `jax.lax.cond` refuses arms of different
+# dtypes: where the branch's float dtype is another (a float32 module, a
+# `Float32` program), the arm returns its value as that dtype.
+function _jax_typed_arm(arm::_PyVal, @nospecialize(T))
+    arm.static || return arm.code
+    E = _jax_eltype(T)
+    E isa Type && E <: AbstractFloat && (T === E || T <: AbstractArray) || return arm.code
+    dtype = _jax_dtype(E)
+    dtype == "jnp.float64" && return arm.code
+    "(lambda: jnp.asarray(" * arm.code * "(), dtype=" * dtype * "))"
 end
 # `throw` in a branch decided while tracing raises then. Under conditions that
 # depend on data it is `_runtime_check(false, e)` there: a check masked by
@@ -1945,7 +1995,18 @@ def _rk_check(valid, message):
         import numpy as np
         if not np.all(v):
             raise ValueError(message)
-    jax.debug.callback(check, valid)
+    # A plate checks all active lanes with one callback. Re-entering checked
+    # batches outer vmap axes too; an empty axis executes no checks.
+    @jax.custom_batching.custom_vmap
+    def checked(v):
+        jax.debug.callback(check, v)
+        return ()
+    @checked.def_vmap
+    def checked_batch(axis_size, in_batched, v):
+        if axis_size:
+            checked(jnp.all(v))
+        return (), ()
+    checked(valid)
 """
 function _jax_call_positional(ctx::_JaxContext, ::typeof(_runtime_check), args::Vector{_PyVal})
     valid, e = args
@@ -2313,9 +2374,19 @@ function _jax_result(f, args::Vector{_PyVal}, code::AbstractString)
     static = !isempty(args) && all(a -> a.static, args)
     if static && _jax_stages(code, args)
         host = _host_static_text(code)
-        host === nothing ? (static = false) : (code = host)
+        host === nothing ? (static = false) : (code = _host_float_value(host, T))
     end
     _PyVal(code, T, static, _jax_is_array(T) ? _jax_extent(args) : "")
+end
+# NumPy computes a static float as float64, a strongly typed value that turns
+# the JAX arithmetic it meets float64: in a float32 module it is rounded to
+# the module's float type (`np.float32(np.log(2 * np.pi))`).
+function _host_float_value(code::AbstractString, @nospecialize(T))
+    E = _jax_eltype(T)
+    E isa Type && E <: AbstractFloat || return code
+    dtype = _host_dtype(E)
+    dtype == "np.float64" && return code
+    T === E ? dtype * "(" * code * ")" : "np.asarray(" * code * ", dtype=" * dtype * ")"
 end
 function _jax_stages(code::AbstractString, args::Vector{_PyVal})
     operation = foldl((c, a) -> isempty(a.code) ? c : replace(c, a.code => ""), args; init = code)
@@ -2621,6 +2692,10 @@ function _jax_elementwise_call(ctx::_JaxContext, ::typeof(fma), args::Vector{_Py
     _jax_real_operands(args) || return nothing
     T = promote_type((a.T for a in args)...)
     T <: Integer && return _jax_mul_add(ctx, args)
+    # A float32 module's default float is float32, so its `fma` rounds once
+    # to float32 (`_rk_fma32`, which turns on 64-bit mode for its float64
+    # product: `_jax_needs_x64`).
+    T <: AbstractFloat && T !== Float32 && _jax_float_type() === Float32 && (T = Float32)
     haskey(_JAX_FMA, T) ||
         _jax_error("`fma` of `", T, "` values has no JAX translation (`Float64`, `Float32` ",
                    "and integer `fma` do)", _jax_where(ctx))
@@ -2652,6 +2727,8 @@ _jax_int_literal(v::_PyVal) = occursin(r"^-?[0-9]+$", v.code)
 function _jax_scalar_or_elementwise(ctx::_JaxContext, f, args::Vector{_PyVal})
     any(c -> c === f, _JAX_COMPARISONS) && length(args) == 2 && all(_jax_int_literal, args) &&
         return _jax_literal(f(parse(Int, args[1].code), parse(Int, args[2].code)))
+    args = _jax_float_operands(ctx, f, args)
+    any(a -> !a.static, args) && (args = map(a -> _jax_float_static(ctx, a), args))
     if haskey(_JAX_INFIX, f)
         op = _JAX_INFIX[f]
         length(args) == 1 && f === (-) &&
@@ -2677,6 +2754,43 @@ function _jax_scalar_or_elementwise(ctx::_JaxContext, f, args::Vector{_PyVal})
     _jax_result(f, args, name * "(" * _jax_args(args) * ")")
 end
 
+# A float that a float32 module computes from traced integers alone (`log(k)`,
+# `i / j`, `0.5 * k`) would be JAX's default float, float64 under 64-bit
+# mode: the integers are cast to the module's float first, as Julia's
+# promotion makes them `Float64`, the module's float type. A float operand
+# beside them (`x ^ n`) keeps them integers.
+function _jax_float_operands(ctx::_JaxContext, f, args::Vector{_PyVal})
+    ctx.host === nothing && _jax_float_type() !== Float64 || return args
+    integer(a) = (E = _jax_eltype(a.T); E isa Type && E <: Integer && !(E <: Bool))
+    any(a -> !a.static && integer(a), args) || return args
+    all(a -> a.static || integer(a), args) || return args
+    T = _jax_return_type(f, [a.T isa Type ? a.T : Any for a in args])
+    E = _jax_eltype(T)
+    E isa Type && E <: AbstractFloat || return args
+    map(args) do a
+        (a.static || !integer(a)) && return a
+        F = a.T <: AbstractArray ? Array{Float64,ndims(a.T)} : Float64
+        _PyVal("jnp.asarray(" * a.code * ", dtype=" * _jax_dtype(Float64) * ")", F, false,
+               a.extent, a.limit, a.padded, nothing)
+    end
+end
+
+# A static float that NumPy computed (a host helper's value, `np.log(...)`) is
+# float64, a strongly typed value that turns the float32 arithmetic it meets
+# float64 under 64-bit mode: where it meets a traced value in a float32
+# module, it is rounded to the module's float. A Python literal is weakly
+# typed and follows the traced value as it is.
+# A Python literal (weakly typed), or a value already rounded to float32.
+const _JAX_WEAK_OR_SINGLE = Regex("^(?:" * join((raw"-?[0-9.]+(?:[eE][-+]?[0-9]+)?",
+    raw"-?jnp\.(?:inf|nan|pi|e)", raw"float\('-?(?:inf|nan)'\)", raw"np\.float32\(.*",
+    raw"np\.asarray\(.*dtype=np\.float32\)"), "|") * ")\$")
+function _jax_float_static(ctx::_JaxContext, a::_PyVal)
+    a.static && ctx.host === nothing && _jax_float_type() !== Float64 || return a
+    occursin(_JAX_WEAK_OR_SINGLE, a.code) && return a
+    code = _host_float_value(a.code, a.T)
+    code == a.code ? a : _PyVal(code, a.T, true, a.extent, a.limit, a.padded, a.origin)
+end
+
 # A call on scalars is its elementwise form. A call with an array argument
 # has Julia's array semantics (`exp(A)` is the matrix exponential), except the
 # operators that act elementwise on arrays too: `+` and `-`, and `/` by a scalar.
@@ -2692,13 +2806,19 @@ function _jax_call_positional(ctx::_JaxContext, f::Function, args::Vector{_PyVal
         v = _jax_scalar_or_elementwise(ctx, f, args)
         v === nothing || return _jax_shifted_limit(f, args, v)
     end
-    _jax_function_call(ctx, f, args)
+    _jax_history_index_result(f, args, _jax_function_call(ctx, f, args))
 end
 
 # `j ± c` of an integer `j` with a static bound and a static integer `c`
 # keeps a bound (`j - 1` of a step index is at most its bound, `j + c` at most
 # the bound plus `c`), so a loop up to it still runs to a static limit.
 function _jax_shifted_limit(f, args::Vector{_PyVal}, v::_PyVal)
+    # A history index can also be a prepared integer used as a loop bound.
+    # Propagate the ordinary integer origin before adding its lag proof.
+    values = map(_jax_history_value, args)
+    _jax_history_index_result(f, args, _jax_shifted_integer_limit(f, values, v))
+end
+function _jax_shifted_integer_limit(f, args::Vector{_PyVal}, v::_PyVal)
     (f === (+) || f === (-)) && length(args) == 2 && isempty(v.limit) && !v.static || return v
     a, b = args
     a.T isa Type && a.T <: Integer && b.T isa Type && b.T <: Integer || return v
@@ -2719,7 +2839,7 @@ function _jax_shifted_limit(f, args::Vector{_PyVal}, v::_PyVal)
     else
         return v
     end
-    _PyVal(v.code, v.T, v.static, v.extent, limit, v.padded)
+    _PyVal(v.code, v.T, v.static, v.extent, limit, v.padded, v.origin)
 end
 
 """
@@ -2869,8 +2989,8 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(div), args::Vector{_PyVal
         return _PyVal(code, Int, true)
     end
     ctx.host === nothing || _jax_error("`div` of host values that are not known", _jax_where(ctx))
-    _PyVal("jax.lax.div(jnp.asarray(" * a.code * ", dtype=jnp.int64), jnp.asarray(" * b.code *
-           ", dtype=jnp.int64))", Int)
+    _PyVal("jax.lax.div(jnp.asarray(" * a.code * ", dtype=" * _jax_dtype(Int) * "), jnp.asarray(" *
+           b.code * ", dtype=" * _jax_dtype(Int) * "))", Int)
 end
 
 # `x in t` for a scalar `x` and a tuple of scalars `t`: Python's `in` when
@@ -3458,7 +3578,8 @@ function _jax_call_positional(ctx::_JaxContext, ::Colon, args::Vector{_PyVal})
         return _PyVal("jnp.arange(" * a.code * ", " * _jax_plus_one(_PyVal(b.limit, Int)) * ")",
                       UnitRange{Int}, false, count)
     end
-    _PyVal("jnp.arange(" * a.code * ", " * _jax_plus_one(b) * ")", UnitRange{Int})
+    _jax_with_origin(_PyVal("jnp.arange(" * a.code * ", " * _jax_plus_one(b) * ")", UnitRange{Int}),
+                     _JaxScanRange(a.code))
 end
 _jax_plus_one(b::_PyVal) = match(r"^-?[0-9]+$", b.code) === nothing ?
     _py_infix("+", [b.code, "1"]) : string(parse(Int, b.code) + 1)
@@ -3537,7 +3658,10 @@ function _jax_call_positional(ctx::_JaxContext, J::LinearAlgebra.UniformScaling,
         _jax_error("`I` called with `", join((a.T for a in args), ", "), "`", _jax_where(ctx))
     size, extent = _jax_allocation_size(ctx, only(args))
     np = ctx.host === nothing ? "jnp." : "np."
-    code = np * "eye(" * size * ")"
+    # Its entries are the default float, the module's float type in a float32 one.
+    dtype = _jax_float_type() === Float64 ? "" :
+        ", dtype=" * (ctx.host === nothing ? _jax_dtype(Float64) : _host_dtype(Float64))
+    code = np * "eye(" * size * dtype * ")"
     J.λ == true || (code = _py_infix("*", [_jax_literal(J.λ).code, code]))
     _PyVal(code, typeof(J(1)), false, extent, "", isempty(extent) ? 0 : 3)
 end
@@ -3610,7 +3734,7 @@ function _jax_call_positional(ctx::_JaxContext, T::Type, args::Vector{_PyVal})
         return _PyVal("jnp.asarray(" * args[1].code * ", dtype=" * _jax_dtype(T) * ")", T)
     end
     if T <: Integer && length(args) == 1
-        return _PyVal("jnp.asarray(" * args[1].code * ", dtype=jnp.int64)", T)
+        return _PyVal("jnp.asarray(" * args[1].code * ", dtype=" * _jax_dtype(Int) * ")", T)
     end
     _jax_error("constructing a `", T, "` has no JAX translation", _jax_where(ctx))
 end
@@ -3659,6 +3783,7 @@ function _jax_broadcast(ctx::_JaxContext, f, args::Vector{_PyVal})
                                    _jax_broadcast_padded(args, R))
     if haskey(_JAX_INFIX, f) || f === (*) || f === (^) ||
        _jax_elementwise_name(ctx, f, scalars) !== nothing
+        any(a -> !a.static, padded) && (padded = map(a -> _jax_float_static(ctx, a), padded))
         v = f === (*) ? _PyVal(_py_infix("*", [p.code for p in padded]), E) :
             f === (^) ? _PyVal(_py_infix("**", [padded[1].code, padded[2].code]), E) :
             _jax_scalar_or_elementwise(ctx, f, scalars)
@@ -3853,20 +3978,29 @@ function _jax_unpack_captures(body, environment::Symbol, captures)
 end
 _jax_op_body(f) = _jax_error("an embedded operation `", typeof(f), "` without its source")
 
-# A derivative rule called as a function: its primal cut, which `jax.grad`
-# differentiates; the rule's partials are not needed.
+# Scalar rules retain their mathematical derivative authority in JAX. The
+# adapter contains only activity selection and the scalar chain rule.
 _jax_call_positional(ctx::_JaxContext,
         rule::ScalarDerivativeRule{Name,N,Inputs,Primal}, args::Vector{_PyVal}) where {Name,N,Inputs,Primal} =
-    _jax_rule_primal(ctx, rule, Primal, args)
+    _jax_scalar_rule(ctx, rule, args)
 _jax_call_positional(ctx::_JaxContext,
         rule::DerivativeRule{Name,N,Inputs,Primal}, args::Vector{_PyVal}) where {Name,N,Inputs,Primal} =
     _jax_rule_primal(ctx, rule, Primal, args)
 
 function _jax_rule_primal(ctx::_JaxContext, rule, Primal, args::Vector{_PyVal})
-    signature, steps, ret = Primal
+    value = _jax_rule_body(ctx, Primal, rule.primal_ops, args)
+    T = _jax_return_type(rule, Any[a.T for a in args])
+    # A primal of static arguments is NumPy's float64 value: rounded in a
+    # float32 module (`_jax_float_static`), as the rule's result is not static.
+    value.static && (value = _jax_float_static(ctx, _PyVal(value.code, T, true, "", "", 0)))
+    _PyVal(value.code, T)
+end
+
+function _jax_rule_body(ctx::_JaxContext, spec, ops, args::Vector{_PyVal})
+    signature, steps, ret = spec
     env = Dict{Symbol,_PyVal}(zip(signature, args))
     for (output, index, arguments) in steps
-        op = rule.primal_ops[index]
+        op = ops[index]
         inputs = _PyVal[a isa Symbol ? env[a] : _jax_literal(a) for a in arguments]
         v = _jax_call(ctx, op, inputs)
         if output isa Symbol
@@ -3879,9 +4013,83 @@ function _jax_rule_primal(ctx::_JaxContext, rule, Primal, args::Vector{_PyVal})
             end
         end
     end
-    T = _jax_return_type(rule, Any[a.T for a in args])
-    ret isa Symbol ? _PyVal(env[ret].code, T) :
-        _PyVal(_jax_tuple_code([env[r] for r in ret]), T)
+    ret isa Symbol && return env[ret]
+    values = _PyVal[env[r] for r in ret]
+    _PyVal(_jax_tuple_code(values), Tuple{(v.T for v in values)...})
+end
+
+function _jax_rule_function!(ctx, name, spec, ops, types)
+    scope = _JaxScope()
+    params = [_jax_identifier(scope.used, Symbol(:x, i)) for i in eachindex(types)]
+    inner = _JaxContext(ctx.mod, scope, ctx.recipe, ctx.source_module,
+                        Dict{Symbol,_PyVal}(), nothing)
+    result = _jax_rule_body(inner, spec, ops,
+                           [_PyVal(p, T) for (p, T) in zip(params, types)])
+    lines = ["def " * name * "(" * join(params, ", ") * "):"]
+    append!(lines, scope.lines)
+    push!(lines, "    return " * result.code)
+    join(lines, "\n")
+end
+
+function _jax_scalar_rule(ctx::_JaxContext,
+        rule::ScalarDerivativeRule{Name,N,Inputs,Primal,Cuts},
+        args::Vector{_PyVal}) where {Name,N,Inputs,Primal,Cuts}
+    # Data preparation and literal/shape expressions need ordinary host values.
+    (ctx.host !== nothing || all(a -> a.static, args)) &&
+        return _jax_rule_primal(ctx, rule, Primal, args)
+    types = Tuple(a.T for a in args)
+    key = (:scalar_rule, objectid(rule), types)
+    name = get(ctx.mod.helper_names, key, nothing)
+    if name === nothing
+        name = _jax_private_identifier(ctx.mod.used, Symbol("_rk_", Name))
+        ctx.mod.helper_names[key] = name
+        primal = _jax_rule_function!(ctx, name, Primal, rule.primal_ops, types)
+        push!(ctx.mod.helpers, "@jax.custom_jvp\n" * primal)
+
+        # Joint recipes often serve several activity masks. Emit their body
+        # once, with the union of its requested outputs; each mask selects
+        # only its own partials. No numerical algorithm lives in this adapter.
+        groups = Dict{Any,Vector{Int}}()
+        for mask in eachindex(Cuts)
+            signature, steps, _ = Cuts[mask]
+            push!(get!(() -> Int[], groups,
+                       (signature, steps, rule.cut_ops[mask])), mask)
+        end
+        calls = Dict{Int,Tuple{String,Vector{Symbol}}}()
+        for masks in sort!(collect(values(groups)); by = first)
+            mask = first(masks)
+            outputs = unique(Symbol[r for m in masks for r in Cuts[m][3]])
+            signature, steps, _ = Cuts[mask]
+            cutname = _jax_private_identifier(ctx.mod.used, Symbol(name, "_partials_", mask))
+            push!(ctx.mod.helpers, _jax_rule_function!(ctx, cutname,
+                (signature, steps, Tuple(outputs)), rule.cut_ops[mask], types))
+            for m in masks
+                calls[m] = (cutname, outputs)
+            end
+        end
+        jvp = _jax_private_identifier(ctx.mod.used, Symbol(name, "_jvp"))
+        lines = ["def " * jvp * "(primals, tangents):",
+                 "    active = tuple(not isinstance(t, jax.custom_derivatives.SymbolicZero) for t in tangents)",
+                 "    mask = sum((1 << i) for i, a in enumerate(active) if a)",
+                 "    if mask == 0:",
+                 "        value = " * name * "(*primals)",
+                 "        return value, jnp.zeros_like(value)"]
+        for mask in eachindex(Cuts)
+            cutname, outputs = calls[mask]
+            ret = Cuts[mask][3]
+            indices = [i for i in 1:N if (mask >> (i - 1)) & 1 == 1]
+            terms = ["values[" * string(findfirst(==(ret[k + 1]), outputs) - 1) *
+                     "] * tangents[" * string(i - 1) * "]" for (k, i) in enumerate(indices)]
+            append!(lines, ["    if mask == " * string(mask) * ":",
+                "        values = " * cutname * "(*primals)",
+                "        return values[" * string(findfirst(==(ret[1]), outputs) - 1) *
+                "], " * join(terms, " + ")])
+        end
+        push!(lines, name * ".defjvp(" * jvp * ", symbolic_zeros=True)")
+        push!(ctx.mod.helpers, join(lines, "\n"))
+    end
+    _jax_bind!(ctx, :value,
+        _PyVal(name * "(" * _jax_args(args) * ")", _jax_return_type(rule, collect(types))))
 end
 
 # A prepared kernel called as a function (a distribution endpoint a helper
@@ -4578,7 +4786,8 @@ function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
                              statics = fill(false, length(p.have)),
                              links = fill(nothing, length(p.have)),
                              origins = fill(nothing, length(p.have)),
-                             fields = fill(0, length(p.have)))
+                             fields = fill(0, length(p.have)),
+                             active_cells::Bool = false)
     name = _jax_fresh(ctx, hint)
     outer = ctx.scope
     inner = _JaxScope(outer)
@@ -4596,10 +4805,16 @@ function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
                                                        fields[i], origins[i])
         links[i] === nothing || (inner.links[canon_id(p.graph, v.id)] = links[i])
     end
+    active = active_cells ? _jax_identifier(inner.used, :active_cell) : ""
+    active_cells && push!(names, active)
     recipe = ctx.recipe
     ctx.scope = inner
     wants = try
-        _jax_plan!(ctx, p)
+        if active_cells
+            _jax_with_guard(() -> _jax_plan!(ctx, p), inner, active)
+        else
+            _jax_plan!(ctx, p)
+        end
         [_jax_lookup(ctx, p.graph, v) for v in p.want]
     finally
         ctx.scope = outer
@@ -4680,12 +4895,21 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     position = string("cell ", _JAX_CELL_POSITIONS[] += 1)
     cell_origins = Any[mapped[i] ? _jax_selected_origin(v, cell_types[i], position) : v.origin
                        for (i, v) in enumerate(inputs)]
+    masks = [_jax_padded_mask(v) for v in inputs[padded]]
+    masked = any(padded) && all(m -> m !== nothing, masks)
+    effects_before = _JAX_EFFECTS[]
     cell, wants, with_length, cell_params = _jax_plan_function!(ctx, :cell, body, cell_types;
                                                                 extents = cell_extents,
                                                                 statics = cell_statics,
                                                                 links = cell_links,
                                                                 origins = cell_origins,
-                                                                fields = cell_fields)
+                                                                fields = cell_fields,
+                                                                active_cells = masked)
+    # A check cannot be run on padding unless its valid cells are known.
+    # Pure cells without checks retain their existing translation.
+    any(padded) && !masked && _JAX_EFFECTS[] != effects_before &&
+        _jax_error("runtime checks in a padded plate whose valid axes are unknown",
+                   _jax_where(ctx))
     want = only(wants)
     E = _jax_typeof(want)
     axes = String[]
@@ -4695,6 +4919,14 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
         if ragged[i]
             push!(axes, mapped[i] ? "0" : "None"); push!(args, v.extent)
         end
+    end
+    if masked
+        # Padding is storage, not a native cell. Include its activity in
+        # runtime-check guards before batching those checks across lanes.
+        masks = ["jnp.broadcast_to(" * mask * ", " * _py_atom(v.code) * ".shape)"
+                 for (v, mask) in zip(inputs[padded], masks)]
+        push!(axes, "0")
+        push!(args, foldl((a, b) -> "jnp.logical_and(" * a * ", " * b * ")", masks))
     end
     axes_text = "(" * join(axes, ", ") * (length(axes) == 1 ? ",)" : ")")
     call = cell
@@ -4736,7 +4968,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
             empty_value = "jnp.zeros((" * join(fill("0", ndims(E) + 1), ", ") *
                           "), dtype=" * _jax_dtype(eltype(E)) * ")"
             only(with_length) && (empty_value = "(" * empty_value *
-                ", jnp.zeros((0,), dtype=jnp.int64))")
+                ", jnp.zeros((0,), dtype=" * _jax_dtype(Int) * "))")
             call = "(" * empty_value * " if " * empty * " else " * call * ")"
         end
         result = _jax_fresh(ctx, :plate_value)
@@ -4896,7 +5128,8 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     sequences = "(" * join(seqs, ", ") * (length(seqs) == 1 ? ",)" : ")")
     result = _jax_fresh(ctx, :scan_result)
     E = _jax_typeof(wants[2])
-    call = "jax.lax.scan(" * step * ", " * inputs[1].code * ", " * sequences * ")[1]"
+    call = "jax.lax.scan(" * step * ", " * _jax_scan_init(ctx, inputs[1]).code * ", " *
+           sequences * ")[1]"
     # JAX otherwise traces the step even for zero steps, including indexed
     # reads of an empty shared row. Numeric outputs have a known empty shape.
     empty = E <: Number ? _jax_no_values(E, false) :
@@ -4940,7 +5173,8 @@ end
 # carry and the result vector. That vector starts as `h₀` filled to the
 # sequences' length, or as the leading entries followed by zeros; step `j`
 # writes entry `offset + j` (`.at[].set`, stored as the vector's element
-# type) and reads the whole vector, as natively. Linear in the steps.
+# type). Bounded-lag reads use a rolling carry; all other uses retain the
+# full vector. Outputs are stacked by scan separately from that carry.
 function _jax_history_scan(ctx::_JaxContext, recipe::Recipe,
                            op::_AuthoredScanOp{K,A,I,H}, inputs) where {K,A,I,H}
     body = op.kernel.plan
@@ -4958,16 +5192,7 @@ function _jax_history_scan(ctx::_JaxContext, recipe::Recipe,
                    _jax_where(ctx))
     dtype = _jax_dtype(E)
     steps = _py_atom(args[iterated[1]].code) * ".shape[0]"
-    buffer = _jax_fresh(ctx, :history)
-    offset = if HT <: Number
-        _jax_emit!(ctx, buffer * " = jnp.full((" * steps * ",), " * history.code * ", dtype=" *
-                        dtype * ")")
-        "0"
-    else
-        _jax_emit!(ctx, buffer * " = jnp.concatenate([jnp.asarray(" * history.code * ", dtype=" *
-                        dtype * "), jnp.zeros((" * steps * ",), dtype=" * dtype * ")])")
-        _py_atom(history.code) * ".shape[0]"
-    end
+    offset = HT <: Number ? "0" : _py_atom(history.code) * ".shape[0]"
     step = _jax_fresh(ctx, :step)
     state = _jax_fresh(ctx, :state)
     xs = _jax_fresh(ctx, :xs)
@@ -4977,6 +5202,10 @@ function _jax_history_scan(ctx::_JaxContext, recipe::Recipe,
     push!(inner.used, state, xs)
     carry = _jax_identifier(inner.used, :carry)
     earlier = _jax_identifier(inner.used, :earlier)
+    position = _jax_identifier(inner.used, :position)
+    history_token = _jax_identifier(inner.used, :history_value)
+    layout = _JaxHistoryLayout(history_token, earlier, position, offset,
+                               HT <: Number ? history.code : "0", Tuple{String,String,_JaxHistoryIndex}[])
     have = body.have
     inner.values[canon_id(body.graph, have[1].id)] = _PyVal(carry, args[1].T)
     unpack = String[]
@@ -4985,14 +5214,14 @@ function _jax_history_scan(ctx::_JaxContext, recipe::Recipe,
         name = _jax_identifier(inner.used, have[1 + k].name)
         push!(unpack, name)
         inner.values[canon_id(body.graph, have[1 + k].id)] =
-            _jax_scan_element(name, args[i], entry_position)
+            _jax_history_element(ctx, name, args[i], layout, entry_position)
     end
-    position = _jax_identifier(inner.used, :position)
     push!(unpack, position)
     for (k, i) in enumerate(shared)
         inner.values[canon_id(body.graph, have[1 + length(iterated) + k].id)] = args[i]
     end
-    inner.values[canon_id(body.graph, have[end].id)] = _PyVal(earlier, Vector{E})
+    inner.values[canon_id(body.graph, have[end].id)] =
+        _jax_with_origin(_PyVal(history_token, Vector{E}), layout)
     recipe_saved = ctx.recipe
     ctx.scope = inner
     wants = try
@@ -5006,15 +5235,27 @@ function _jax_history_scan(ctx::_JaxContext, recipe::Recipe,
     end
     _jax_typeof(wants[2]) <: Number || _jax_error("a history scan whose step outputs `",
         _jax_typeof(wants[2]), "` has no JAX translation yet", _jax_where(ctx))
+    storage = _jax_history_layout!(ctx, layout, inner, wants, steps, history, dtype)
+    wants = storage.wants
     push!(outer.lines, "    "^outer.indent * "def " * step * "(" * state * ", " * xs * "):")
     append!(outer.lines, inner.lines)
+    output = _jax_identifier(inner.used, :output)
+    push!(outer.lines, "    "^inner.indent * output * " = jnp.asarray(" * wants[2].code * ", dtype=" * dtype * ")")
+    at = _py_infix("+", [offset, position])
+    at = "((" * at * ") % " * storage.width * " if " * storage.use_compact * " else " * at * ")"
     push!(outer.lines, "    "^inner.indent * "return (" * wants[1].code * ", " * earlier *
-          ".at[" * _py_infix("+", [offset, position]) * "].set(" * wants[2].code * ")), None")
+          ".at[" * at * "].set(" * output * ")), " * output)
     seqs = String[[args[i].code for i in iterated]; "jnp.arange(" * steps * ")"]
     result = _jax_fresh(ctx, :scan_result)
-    _jax_emit_unless_empty!(ctx, result,
-        "jax.lax.scan(" * step * ", (" * args[1].code * ", " * buffer * "), (" *
-        join(seqs, ", ") * "))[0][1]", buffer, _jax_nonempty("1", steps))
+    full = _jax_fresh(ctx, :history_result)
+    init = _jax_scan_init(ctx, args[1]).code
+    outputs = _jax_fresh(ctx, :scan_outputs)
+    _jax_emit!(ctx, "(_, " * full * "), " * outputs * " = jax.lax.scan(" * step * ", (" * init *
+                    ", " * storage.buffer * "), (" * join(seqs, ", ") * ")) if " * steps *
+                    " else ((" * init * ", " * storage.buffer * "), jnp.zeros((0,), dtype=" * dtype * "))")
+    compact_result = HT <: Number ? outputs :
+        "jnp.concatenate([jnp.asarray(" * history.code * ", dtype=" * dtype * "), " * outputs * "])"
+    _jax_emit!(ctx, result * " = " * compact_result * " if " * storage.use_compact * " else " * full)
     [_PyVal(result, Vector{E})]
 end
 
@@ -5086,12 +5327,20 @@ from jax.typing import ArrayLike
 
 jax.config.update("jax_enable_x64", True)
 """
+const _JAX_X64_LINE = "\njax.config.update(\"jax_enable_x64\", True)\n"
+# Whether the module turns on JAX's 64-bit mode: for float64 values, and in a
+# float32 module only for the float64 product of `fma`'s once-rounding helper.
+# Without it the module's floats are float32 and its integers int32 even
+# where a dtype is left to JAX.
+_jax_needs_x64(mod::_JaxModule) =
+    _jax_float_type() === Float64 || haskey(mod.helper_names, (:helper, "_rk_fma32"))
 
 """
-    jax_source(spec::KernelSpec; have, want, types = nothing, name = :kernel) -> JAXSource
+    jax_source(spec::KernelSpec; have, want, types = nothing, name = :kernel,
+               float_type = Float64) -> JAXSource
     jax_source(spec::KernelSpec; have, functions, types = nothing, constants = (;),
-               doc = nothing) -> JAXSource
-    jax_source(p::Plan; types = nothing, name = :kernel) -> JAXSource
+               doc = nothing, float_type = Float64) -> JAXSource
+    jax_source(p::Plan; types = nothing, name = :kernel, float_type = Float64) -> JAXSource
 
 Translate the program that computes `want` from `have` into a Python module
 whose function `name` takes the HAVE values, in order, and returns the WANT
@@ -5110,6 +5359,18 @@ annotate their parameters (`ArrayLike`) and results.
 a tuple in HAVE order; by default the ports' declared types are used, and
 they must be concrete. Value ranks follow from these types, so the module is
 generic in array sizes: one module serves every size of the same program.
+
+`float_type` (`Float64`, the default, or `Float32`) is the dtype of every
+float value the program does not type `Float32` itself: Julia's default
+`Float64` values, the inputs and data among them, are `float32` in a module
+emitted with `float_type = Float32`, for an accelerator whose float64 is slow.
+Such a module casts its float inputs to `float32`, `prepare_data` returns
+`float32` data, and the dtype metadata says so. It does not turn on JAX's
+64-bit mode (`jax_enable_x64`), so its device integers are JAX's default
+(`int32`), unless it rounds an `fma` once, which takes a float64 product; it
+stays float32 where another module turned that mode on. Its results carry
+float32 rounding: compare it with the `Float64` module of the same program at
+a tolerance relative to `eps(Float32)` and the size of the value.
 
 The translation keeps the program's structure. A plate is `jax.vmap` of its
 cell, a scan is `jax.lax.scan` of its step, a lazy branch is `jax.lax.cond`
@@ -5138,7 +5399,8 @@ its body's reads from empty arrays are never traced.
 function jax_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
                     want = nothing, functions = nothing, types = nothing,
                     name = :kernel, constants = NamedTuple(), doc = nothing, data = nothing,
-                    definitions = nothing, keep = (), function_docs = NamedTuple())
+                    definitions = nothing, definitions_module::Module = Main, keep = (),
+                    function_docs = NamedTuple(), float_type = Float64)
     functions === nothing && want === nothing && (want = _KERNEL_DEFAULT_BOUNDARY)
     if functions === nothing
         functions = NamedTuple{(Symbol(name),)}((want,))
@@ -5149,14 +5411,21 @@ function jax_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
         "jax_source: `functions` must be a nonempty NamedTuple of function name => WANT"))
     plans = [fname => (plan(spec; have, want = _jax_want_names(w)), w)
              for (fname, w) in pairs(functions)]
-    _jax_module_source(plans, types, constants, doc; data, definitions, keep, function_docs)
+    _jax_with_float_type(float_type) do
+        _jax_module_source(plans, types, constants, doc; data, definitions, definitions_module,
+                           keep, function_docs)
+    end
 end
 
 jax_source(p::Plan; types = nothing, name = :kernel, constants = NamedTuple(),
-           doc = nothing, data = nothing, definitions = nothing, keep = (),
-           function_docs = NamedTuple()) =
-    _jax_module_source([Symbol(name) => (p, Tuple(v.name for v in p.want))],
-                       types, constants, doc; data, definitions, keep, function_docs)
+           doc = nothing, data = nothing, definitions = nothing,
+           definitions_module::Module = Main, keep = (), function_docs = NamedTuple(),
+           float_type = Float64) =
+    _jax_with_float_type(float_type) do
+        _jax_module_source([Symbol(name) => (p, Tuple(v.name for v in p.want))],
+                           types, constants, doc; data, definitions, definitions_module, keep,
+                           function_docs)
+    end
 
 _jax_want_names(w::Symbol) = (w,)
 _jax_want_names(w::Tuple) = w
@@ -5178,10 +5447,15 @@ _jax_want_names(w) = throw(ArgumentError(
 # definitions before it read. A definition without a host
 # translation, or one given as a `JAXEmissionError` (the reason it has none),
 # stays a `prepare_data` input, named with that reason in the module constant
-# `UNTRANSLATED`. `keep` names data-only values `prepare_data` also returns
-# (the functions take them too), for a caller that reads them.
+# `UNTRANSLATED`. The definitions' globals (a call head such as `plate`, a
+# bare name no definition or data value binds) resolve in
+# `definitions_module`: a binder passes the module it evaluates them in, so
+# the module it emits does not depend on what its caller imported. `keep`
+# names data-only values `prepare_data` also returns (the functions take them
+# too), for a caller that reads them.
 function _jax_module_source(plans, types, constants, doc; data = nothing,
-                            definitions = nothing, keep = (), function_docs = NamedTuple())
+                            definitions = nothing, definitions_module::Module = Main,
+                            keep = (), function_docs = NamedTuple())
     if data === nothing
         definitions === nothing || isempty(definitions) || throw(ArgumentError(
             "jax_source: `definitions` compute data values, so they need `data`"))
@@ -5239,7 +5513,7 @@ function _jax_module_source(plans, types, constants, doc; data = nothing,
         try
             return _jax_module_text(plans, types, constants, doc,
                                     (data, excluded, defs, untranslated, keep, reasons,
-                                     promoted, cells, cell_reasons);
+                                     promoted, cells, cell_reasons, definitions_module);
                                     function_docs)
         catch e
             if e isa _HostUnsupportedDefinition && !haskey(untranslated, e.name)
@@ -5344,7 +5618,8 @@ function _jax_module_text(plans, types, constants, doc, prepare; function_docs =
             push!(functions, f)
         end
     else
-        data, excluded, defs, untranslated, keep, reasons, promoted, cells, cell_reasons = prepare
+        data, excluded, defs, untranslated, keep, reasons, promoted, cells, cell_reasons,
+            mod.definitions_module = prepare
         merge!(mod.host_reasons, reasons)
         merge!(mod.cell_reasons, cell_reasons)
         mod.host_graph = first(plans).second[1].graph
@@ -5359,12 +5634,12 @@ function _jax_module_text(plans, types, constants, doc, prepare; function_docs =
         push!(constant_lines, cname * " = " * _jax_py_literal(value))
     end
     prepare === nothing && any(f -> any(io -> _jax_ragged(last(io)), f.inputs), functions) &&
-        pushfirst!(mod.helpers, rstrip(_JAX_PAD_RAGGED))
+        pushfirst!(mod.helpers, rstrip(replace(_JAX_PAD_RAGGED, "np.float64" => "np." * _jax_float_name())))
     lines = String[]
     docstring = doc === nothing ?
         "Generated by ReactiveKernels.jax_source; do not edit." : String(doc)
     push!(lines, "\"\"\"" * replace(docstring, "\"\"\"" => "\\\"\\\"\\\"") * "\"\"\"")
-    header = rstrip(_JAX_HEADER)
+    header = rstrip(_jax_needs_x64(mod) ? _JAX_HEADER : replace(_JAX_HEADER, _JAX_X64_LINE => ""))
     # The host code: `prepare_data`, and static values the functions compute
     # with NumPy.
     host = prepare !== nothing || any(b -> occursin(r"(?<![.\w])(?:np|ssp|scipy)\.",
@@ -5577,13 +5852,25 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
                          any(v -> v.name === n, params))))
 end
 
+# A float32 module casts its float inputs, so a caller's float64 NumPy arrays
+# and scalars, strongly typed in JAX, do not turn its arithmetic float64.
+function _jax_input_dtype(@nospecialize(T))
+    _jax_float_type() === Float64 && return ""
+    E = T
+    while E isa Type && E <: AbstractArray
+        E = eltype(E)
+    end
+    E isa Type && E <: AbstractFloat ? ", dtype=" * _jax_dtype(E) : ""
+end
+
 # A value's dtype and rank, as module metadata describes an input.
 _jax_dtype_name(::Type{<:AbstractArray{T}}) where {T} = _jax_dtype_name(T)
 _jax_dtype_name(::Type{<:AbstractArray{<:AbstractArray{T}}}) where {T} = _jax_dtype_name(T)
 _jax_dtype_name(::Type{Bool}) = "bool"
 _jax_dtype_name(::Type{<:Integer}) = "int64"
 _jax_dtype_name(::Type{Float32}) = "float32"
-_jax_dtype_name(::Type{<:AbstractFloat}) = "float64"
+# Every other float is the module's float type (`jax_source`'s `float_type`).
+_jax_dtype_name(::Type{<:AbstractFloat}) = _jax_float_name()
 # Non-numeric values (level labels) cross as Python objects.
 _jax_dtype_name(@nospecialize(T)) = "object"
 _jax_meta_rank(@nospecialize(T)) = T isa Type && T <: AbstractArray ? ndims(T) : 0
@@ -5638,10 +5925,12 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
         # Callers may pass NumPy arrays; JAX indexes only its own arrays by a
         # traced index.
         if _jax_is_array(T) && (eltype(T) <: Number || _jax_ragged(T))
-            _jax_emit!(ctx, param * " = jnp.asarray(" * param * ")")
+            _jax_emit!(ctx, param * " = jnp.asarray(" * param * _jax_input_dtype(T) * ")")
             isempty(extent) || _jax_emit!(ctx, extent * " = jnp.asarray(" * extent * ")")
             haskey(mod.helper_names, (:flat, extent)) && names !== nothing &&
                 _jax_emit!(ctx, names[k] * "_flat = jnp.asarray(" * names[k] * "_flat)")
+        elseif T isa Type && T <: AbstractFloat && !isempty(_jax_input_dtype(T))
+            _jax_emit!(ctx, param * " = jnp.asarray(" * param * _jax_input_dtype(T) * ")")
         end
     end
     _jax_plan!(ctx, p)

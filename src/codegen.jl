@@ -5892,14 +5892,28 @@ end
 function _lower_with_ops(p::Plan; cell_slots::Union{Nothing,Vector{Symbol}} = nothing,
                          cell_tables::Union{Nothing,Vector{Symbol}} = nothing,
                          kwargs...)
-    task_local_storage(_CELL_TABLES, cell_tables) do
-        task_local_storage(_CELL_SLOTS, cell_slots) do
-            Base.inferencebarrier(_lower_with_ops_collecting)(p; kwargs...)::Tuple{Expr,Tuple,Tuple,Tuple}
+    depth = get(task_local_storage(), _INDEXED_INVARIANT_DEPTH, 0)
+    result = task_local_storage(_INDEXED_INVARIANT_DEPTH, depth + 1) do
+        task_local_storage(_CELL_TABLES, cell_tables) do
+            task_local_storage(_CELL_SLOTS, cell_slots) do
+                Base.inferencebarrier(_lower_with_ops_collecting)(p; kwargs...)::Tuple{Expr,Tuple,Tuple,Tuple}
+            end
         end
     end
+    ast, constants, callables, recipes = result
+    # Analyze spliced nested cells together, so reusable indexed work moves to
+    # the widest enclosing plate. Footprints and position scratch retain their
+    # own read and storage protocols.
+    if depth == 0 && get(kwargs, :inline_embedded, true) &&
+            !get(kwargs, :footprint, false) && !get(kwargs, :partition_plan, false) &&
+            cell_slots === nothing && cell_tables === nothing
+        ast = _lower_indexed_invariants(ast, recipes)
+    end
+    ast, constants, callables, recipes
 end
 const _CELL_SLOTS = :ReactiveKernels_cell_slots
 const _CELL_TABLES = :ReactiveKernels_cell_tables
+const _INDEXED_INVARIANT_DEPTH = :ReactiveKernels_indexed_invariant_depth
 
 # Whether a plate keeps per-cell tables (`_lane_cell_take!`): a plate of a
 # lowering that collects them (`_CELL_TABLES`: the position residual's top
