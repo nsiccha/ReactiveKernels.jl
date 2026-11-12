@@ -24,6 +24,10 @@ Typed `Float32` allocations and conversions keep `float32`, including arrays
 computed by host `prepare_data`; `Float64` keeps `float64`. Prepared input
 metadata reports the same dtype.
 
+`fma` of `Float64` or `Float32` values, also broadcast, rounds once, as in
+Julia; `jax.grad` gives `(y, x, 1)`. Integer `fma` and `muladd` are
+`x * y + z`. Subnormals follow the backend.
+
 ## Julia evaluation
 
 The Julia callable evaluates the same authored mathematical expression. Its output establishes the reference value for a consumer testing the emitted module.

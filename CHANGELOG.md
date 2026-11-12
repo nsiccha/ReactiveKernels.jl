@@ -16,6 +16,20 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.177
+
+- `jax_source` translates `fma` of `Float64` and `Float32` values, scalar and
+  broadcast, in JAX and host `prepare_data`: it rounds `x * y + z` once,
+  through a module helper (`_rk_fma`, `_rk_fma32`), and ordinary `jax.grad`
+  gives its derivatives (`y`, `x`, `1`). JAX has no fused multiply-add, and
+  XLA fuses `x * y + z` on CPU under `jax.jit` but not eagerly, so the helper
+  forms the product exactly instead. Subnormal values follow the backend:
+  XLA's CPU backend flushes them to zero, host NumPy keeps them. Integer `fma`
+  and `muladd` are `x * y + z`, as written in source; XLA may fuse `muladd`,
+  as Julia may. Before, emission failed with
+  ``the function `have_fma` has no JAX translation`` (``muladd_float`` for
+  `muladd`).
+
 ## 0.1.176
 
 - `jax_source` translates immutable closures created inside plain helpers,
