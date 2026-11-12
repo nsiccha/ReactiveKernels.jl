@@ -6,12 +6,8 @@ Wrap a packed-coordinate LogDensityProblems target for WarmupHMC's adaptive
 partial centering. Load `WarmupHMC` and `LogDensityProblems` to enable this
 extension. `built` and the bound `plan` describe the same model as `problem`.
 
-Select whole real-valued latent parameters by their graph names:
-
-```julia
-rp = adaptive_centering_problem(built, plan, problem, AutoEnzyme();
-    cells = (z = (location = :z_location, log_scale = :z_log_scale),))
-```
+Select whole real-valued latent parameters by their graph names, for example
+`cells = (z = (location = :z_location, log_scale = :z_log_scale),)`.
 
 The location and log-scale are named values in the model graph. Each is a
 scalar (shared by the selected coordinates) or an array with the latent's
