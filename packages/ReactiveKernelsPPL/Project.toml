@@ -1,7 +1,7 @@
 name = "ReactiveKernelsPPL"
 uuid = "e266ea2a-6817-46cd-8bec-6238f0035f44"
 authors = ["Nikolas Siccha <nikolassiccha@gmail.com>"]
-version = "0.1.165"
+version = "0.1.167"
 
 [deps]
 DataAPI = "9a962f9c-6df0-11e9-0e5d-c546b8b5ee8a"
@@ -29,6 +29,7 @@ ReactiveKernelsPPLDistributionsExt = "Distributions"
 ReactiveKernelsPPLSMCExt = ["LogDensityProblems", "Random", "SequentialMonteCarlo", "WarmupHMC", "Treebars"]
 ReactiveKernelsPPLFilterExt = ["Distributions", "Random", "SequentialMonteCarlo"]
 ReactiveKernelsPPLLogDensityProblemsExt = "LogDensityProblems"
+ReactiveKernelsPPLWarmupHMCExt = ["WarmupHMC", "LogDensityProblems"]
 
 [sources]
 MutatingFunctions = {url = "https://github.com/nsiccha/MutatingFunctions.jl.git", rev = "02eb981b9770e767f47a7fda287fcbfb9531d587"}
@@ -48,9 +49,9 @@ SequentialMonteCarlo = "0.7"
 Serialization = "1"
 SparseArrays = "1"
 Treebars = "0.1.5"
-WarmupHMC = "0.2.18"
+WarmupHMC = "0.2.19"
 PrecompileTools = "1.2"
-ReactiveKernels = "0.1.204"
+ReactiveKernels = "0.1.207"
 ReactiveKernelsDistributionKernels = "0.1.7"
 SpecialFunctions = "2"
 StatsFuns = "1, 2"

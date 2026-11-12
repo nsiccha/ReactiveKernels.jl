@@ -523,22 +523,37 @@ function _pr_call_function(head, mod::Module, values::Dict{Symbol,Any})
 end
 
 # Symbols an expression reads, outside inert calls.
-function _pr_reads!(found::Set{Symbol}, ex, mod, values)
+function _pr_reads!(found::Set{Symbol}, ex, mod, values; ignore_bindings = false)
     if ex isa Symbol
         push!(found, ex)
     elseif ex isa Expr
         ex.head in (:quote, :meta, :inbounds, :loopinfo, :line) && return found
+        if ignore_bindings && Meta.isexpr(ex, :(=), 2)
+            lhs = ex.args[1]
+            if lhs isa Symbol || Meta.isexpr(lhs, :(::), 2) && lhs.args[1] isa Symbol
+                return _pr_reads!(found, ex.args[2], mod, values; ignore_bindings)
+            end
+        elseif ignore_bindings && ex.head === :local
+            for a in ex.args
+                # Declarations do not read a value. Initializers and writes
+                # through an indexed destination still do.
+                a isa Symbol && continue
+                Meta.isexpr(a, :(::), 2) && a.args[1] isa Symbol && continue
+                _pr_reads!(found, a, mod, values; ignore_bindings)
+            end
+            return found
+        end
         if ex.head === :call
             f = _pr_call_function(ex.args[1], mod, values)
             f !== nothing && f in _PR_PROGRAM_INERT && return found
             for a in ex.args[2:end]
-                _pr_reads!(found, a, mod, values)
+                _pr_reads!(found, a, mod, values; ignore_bindings)
             end
-            ex.args[1] isa Expr && _pr_reads!(found, ex.args[1], mod, values)
+            ex.args[1] isa Expr && _pr_reads!(found, ex.args[1], mod, values; ignore_bindings)
             return found
         end
         for a in ex.args
-            _pr_reads!(found, a, mod, values)
+            _pr_reads!(found, a, mod, values; ignore_bindings)
         end
     end
     found
@@ -1383,15 +1398,27 @@ function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict
     active = _pr_program_activity(body, active_params, mod, values)
     batched = Symbol[p for p in params if p in active_params && p in Base.values(prepared)]
     scalar = Symbol[p for p in params if p in active_params && !(p in batched)]
+    assignments = _pr_assignments!(Pair{Symbol,Any}[], body)
+    # A marker returns an operand alias, not detached metadata. Permit it
+    # only when its result is read exclusively by derivative-inert queries.
+    # Keep the call and its checks in the program; a numerical read, another
+    # alias or a write through the marker retains the conservative fallback.
+    value_reads = _pr_reads!(Set{Symbol}(), body, mod, values; ignore_bindings = true)
+    inert_markers = Set(lhs for (lhs, rhs) in assignments if
+        Meta.isexpr(rhs, :call) &&
+        _pr_is_ref(rhs.args[1], @__MODULE__, :_authored_plate_marker) &&
+        !(lhs in value_reads))
     for p in batched
         # A batched parameter reaches the cells only through its prepared
         # operand (aliases such as the plate's axis marker are inert).
-        for (lhs, rhs) in _pr_assignments!(Pair{Symbol,Any}[], body)
+        for (lhs, rhs) in assignments
             rhs === p && continue
             p in _pr_reads!(Set{Symbol}(), rhs, mod, values) || continue
             haskey(broadcastables, lhs) && continue
             # `preprocess(nothing, p)`: the body passed p in already broadcastable.
             get(prepared, lhs, nothing) === p && continue
+            lhs in inert_markers && Meta.isexpr(rhs, :call) &&
+                _pr_is_ref(rhs.args[1], @__MODULE__, :_authored_plate_marker) && continue
             _pr_fail("batched operand `$p` is also read directly by `$lhs`")
         end
     end
@@ -1491,8 +1518,15 @@ Run `f()` with the generated summed-plate reverse `enabled` (or disabled) for
 every AD preparation `f` makes, whatever the `plate_reverse` preference says.
 A prepared gradient differentiates each eligible summed plate program with a
 reverse generated from its own code; every other plate is differentiated by
-the backend as before. [`plate_reverse_report`](@ref) names which plates took
-the generated reverse and why the others did not.
+the backend as before. This also applies to non-allocating kernels after
+their cache activity and ownership rewrite. [`plate_reverse_report`](@ref)
+reports static eligibility; backend operand annotations can still require
+the ordinary reverse at execution.
+
+Include kernel preparation in this scope as well as AD preparation. Native
+optimizations chosen while the rule is disabled can produce forms outside
+the generated reverse's current coverage; enabling it only for AD can then
+retain the backend's ordinary reverse for those regions.
 """
 with_plate_reverse(f, enabled::Bool = true) =
     task_local_storage(f, _PLATE_REVERSE_SCOPE, enabled)
@@ -1647,6 +1681,11 @@ _pr_active_ports(kernel::PreparedKernel, I) = begin
     I isa Integer ? Symbol[ports[I]] : Symbol[ports[i] for i in I]
 end
 
+_pr_active_ports(kernel::NonAllocatingKernel, I) = begin
+    ports = Symbol[_pr_param_name(p) for p in kernel.ast.args[1].args[5:end]]
+    I isa Integer ? Symbol[ports[I]] : Symbol[ports[i] for i in I]
+end
+
 # The AD kernel (`_ad_inline_plate_programs`) for active selector `I`: with the
 # generated plate reverse enabled, each eligible plate program a rule.
 Base.@nospecializeinfer function _ad_inline_plate_programs(
@@ -1662,15 +1701,18 @@ Base.@nospecializeinfer function _ad_inline_plate_programs(
 end
 
 """
-    plate_reverse_report(kernel::PreparedKernel, active = 1) -> Vector{Pair{Symbol,String}}
+    plate_reverse_report(kernel, active = 1) -> Vector{Pair{Symbol,String}}
 
 For a gradient of `kernel` with HAVE port `active` (its position, or a tuple of
 positions) active: each plate program's result name and either `"rule"`, when
-its gradient is the generated summed-plate reverse, or the reason the
-backend's own reverse differentiates it instead. Plates the lowering keeps
-inline (a body with one plate) are not programs and are not listed.
+the source is eligible for generated reverse, or its fallback reason.
+Accepts a `PreparedKernel` or `NonAllocatingKernel`. This is a static report,
+independent of whether the preference is enabled; cache rewrites and backend
+operand annotations can affect the rule used by a prepared gradient.
+Plates the lowering keeps inline (a body with one plate) are not programs
+and are not listed.
 """
-function plate_reverse_report(kernel::PreparedKernel, active = 1)
+function plate_reverse_report(kernel::Union{PreparedKernel,NonAllocatingKernel}, active = 1)
     _has_plate_programs(kernel.ast) || return Pair{Symbol,String}[]
     _, report = _pr_inline_plate_programs(kernel.ast, kernel, _pr_active_ports(kernel, active))
     Pair{Symbol,String}[Symbol(first(r)) => last(r) for r in report]

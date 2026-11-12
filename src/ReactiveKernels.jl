@@ -43,6 +43,7 @@ include("position_cells.jl")
 include("index_runs.jl")
 include("duplicate_cells.jl")
 include("summed_plate_factors.jl")
+include("bound_statistics.jl")
 include("nonallocating.jl")
 include("type_stability_audit.jl")
 include("type_stability.jl")
@@ -102,7 +103,7 @@ export PreparedADAccumulator, prepare_ad_accumulator, ad_accumulator_storage, ad
 export ad_value_gradient_and_retained, ad_value_gradient_and_retained!,
     ad_retains_primal_sweep
 export prepare_ad_pullback, ad_pullback
-export with_plate_reverse, plate_reverse_report
+export with_plate_reverse, plate_reverse_report, with_bound_statistics
 export ScalarDerivativeRule, scalar_derivative_rule, derivative_cut
 export DerivativeRule, derivative_rule, forward_cut, reverse_cut, reverse_residuals
 export rk_expm, rk_symmetric_eigvals, rk_symmetric_eigvecs
