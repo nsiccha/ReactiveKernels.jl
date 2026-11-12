@@ -1104,6 +1104,43 @@ end
 # nothing, even when the coefficient is not finite (an arm no cell took).
 @inline _pr_scaled(k, acc) = iszero(acc) ? zero(k * acc) : k * acc
 
+# ------------------------------------------------------- direct operand reads
+#
+# A cell reads its operands through broadcast extrusion
+# (`_broadcast_getindex(preprocess(nothing, x), CartesianIndex(i))`), which
+# selects, per access and dimension, the cell's index or the operand's single
+# element. When every operand the cell loop reads spans the plate in every
+# dimension, which the plate's shape check then makes the plate's own axes, the
+# fused loop reads `x[i]` instead: a check above the loop picks that copy of
+# the loop or the extruded one, so the reverse pass carries no per-read select.
+@inline _pr_spans(A::Base.Broadcast.Extruded, cells) = ndims(A.x) == ndims(cells) && all(A.keeps)
+@inline _pr_spans(::Union{Number,Base.RefValue}, cells) = true
+@inline _pr_spans(_, cells) = false
+@inline _pr_spans_all(cells, operands...) = all(A -> _pr_spans(A, cells), operands)
+@inline _pr_direct_read(A::Base.Broadcast.Extruded, i) = @inbounds A.x[i]
+@inline _pr_direct_read(x::Number, i) = x
+@inline _pr_direct_read(r::Base.RefValue, i) = r[]
+
+# The prepared operands the statements read, and the statements with each read
+# of them direct.
+function _pr_direct_reads(stmts, st::_PRProgramState, linear::Symbol, found::Vector{Symbol} = Symbol[])
+    out = Any[]
+    for s in stmts
+        if _pr_is_read(s, st)
+            s.args[1] in found || push!(found, s.args[1])
+            push!(out, _PRCall(s.lhs, _pr_direct_read, GlobalRef(@__MODULE__, :_pr_direct_read),
+                               Any[s.args[1], linear]))
+        elseif s isa _PRBranch
+            push!(out, _PRBranch(s.lhs, s.cond, _pr_direct_reads(s.then_stmts, st, linear, found)[1],
+                                 s.then_result, _pr_direct_reads(s.else_stmts, st, linear, found)[1],
+                                 s.else_result))
+        else
+            push!(out, s)
+        end
+    end
+    out, found
+end
+
 function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState)
     body = Any[a for a in cell.args if !(a isa LineNumberNode)]
     isempty(body) && _pr_fail("empty cell")
@@ -1205,16 +1242,30 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState)
             coefficients, flush = fc.pre, fc.post
             _pr_reverse_exprs!(after, hoisted, active, copy(defined); touched = st.touched)
         end
+        direct_in, read_operands = _pr_direct_reads(inloop, st, linear)
+        loop = isempty(read_operands) ?
+            :(@inbounds for $linear in $cells
+                  $(forward_in...)
+                  $(reverse...)
+              end) :
+            :(if $(GlobalRef(@__MODULE__, :_pr_spans_all))($cells, $(read_operands...))
+                  @inbounds for $linear in $cells
+                      $(_pr_forward_exprs(direct_in)...)
+                      $(reverse...)
+                  end
+              else
+                  @inbounds for $linear in $cells
+                      $(forward_in...)
+                      $(reverse...)
+                  end
+              end)
         quote
             $(forward_pre...)
             $(init...)
             $cells = $range
             $ncells = Float64(length($cells))
             $(coefficients...)
-            @inbounds for $linear in $cells
-                $(forward_in...)
-                $(reverse...)
-            end
+            $loop
             $(flush...)
             $(after...)
         end
