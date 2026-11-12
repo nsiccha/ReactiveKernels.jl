@@ -16,6 +16,16 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.189
+
+- `jax_source` translates `findfirst(predicate, vector)` in host data
+  preparation, including captured predicates such as `isequal(label)`,
+  `Base.Fix1` and `Base.Fix2`. Searches return the first one-based index or
+  `nothing` and stop evaluating at the first match. Positional kernels that
+  map group labels to their levels now prepare those indices in the emitted
+  module. Previously unary `isequal` was incorrectly typed as `Bool`, so
+  these searches emitted an unconditional `findfirst threw` error.
+
 ## 0.1.188
 
 - The stable rewrites (0.1.117, on unless `simplify = false`) reach the
