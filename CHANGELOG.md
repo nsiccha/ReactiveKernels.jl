@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.181
+## 0.1.191
 
 - A non-allocating kernel keeps the type of a value it reads back from a step's
   buffer. A value checked by a branch whose other arm throws
@@ -37,6 +37,171 @@ are recorded in the git history only.
   argument types, say) returns its result as the type its own call infers,
   while still reusing that buffer. Values are unchanged (snag
   default-non-allo-a0c23dd8).
+
+## 0.1.190
+
+- `prepare_nonallocating` reuses destinations for matrix products nested in
+  broadcasts consumed by a reduction or plate, including materialized
+  broadcast operands such as `A * (x .* s)`. These products now take the same
+  cache steps as products assigned to their own statements. The outer
+  broadcast keeps its existing lazy or materialized behavior, and destination
+  guards still accommodate changing runtime shapes.
+
+## 0.1.189
+
+- `jax_source` translates `findfirst(predicate, vector)` in host data
+  preparation, including captured predicates such as `isequal(label)`,
+  `Base.Fix1` and `Base.Fix2`. Searches return the first one-based index or
+  `nothing` and stop evaluating at the first match. Positional kernels that
+  map group labels to their levels now prepare those indices in the emitted
+  module. Previously unary `isequal` was incorrectly typed as `Bool`, so
+  these searches emitted an unconditional `findfirst threw` error.
+
+## 0.1.188
+
+- The stable rewrites (0.1.117, on unless `simplify = false`) reach the
+  preparations that compile their own programs. There,
+  `log1pexp(-log(exp(u)))` was `Inf` at `u = -800` and its gradient `NaN` at
+  `u = 710` and `800`; each now gives `prepare`'s finite value and
+  derivative.
+  - `plate(spec; have, want, batched)`. A recipe's source now runs in the
+    generated loop, as in `lower`, and recipes that depend on the same batched
+    ports recompute under one condition. A value hoisted above the loop stays
+    computed once: a per-element statement reads it as it is, so `log(s)` per
+    element of a shared `s = exp(u)` is computed as written there, where
+    `prepare` reads `u` (computing `exp` per element instead measured 3.5×
+    slower on a 10,000-element z-score loop). A composition among the hoisted
+    statements, or among loop statements that depend on the same batched
+    ports, is rewritten.
+  - `vectorize` and `prepare_batched` (position batching). Each part of the
+    position driver is rewritten; a per-position statement reads a value of
+    the shared prefix as it is, as above.
+  - `prepare_reactive` and `prepare_reactive_nonallocating`, for compositions
+    inside one recipe's source. A composition across two state values is
+    computed as written: each value is a slot that `freeze!` can set, so
+    `w = log(v)` reads `v`, never what computed it. A recipe reused in place
+    by `prepare_reactive_nonallocating` runs its own operation.
+- New: `plate(spec; …)`, `vectorize`, `prepare_batched`, `prepare_reactive`
+  and `prepare_reactive_nonallocating` take `simplify`, as `prepare` does;
+  `nothing` (the default) reads an enclosing setting or the project
+  preference. A `PreparedKernel` given to `vectorize` contributes its plan,
+  not its setting. A rebound kernel's kept position drivers are kept per
+  setting.
+- The `prepare_reactive(graph; have, want)` docstring is attached to that
+  method again (it documented an internal helper).
+
+## 0.1.187
+
+- The opt-in generated plate reverse (`with_plate_reverse`) keeps the
+  backend's reverse for a plate program whose batched operand is a lazy cell
+  array, such as `mu = z .+ w .* x` read by `y .~ Normal.(mu, sigma)`.
+  Enzyme passes a lazy broadcast of arrays only as `Duplicated`, with a
+  shadow of the same lazy structure, and the generated reverse could not add a
+  cell's cotangent into it: preparing such a sampler with the rule on failed
+  with `CanonicalIndexError: setindex! not defined for
+  ReactiveKernels._CellBroadcast` (PosteriorDB UKDrivers). The program now
+  falls back when the sampler is prepared, and `plate_reverse_report` names
+  the reason, "batched operand `mu` is a lazy cell array, whose shadow the
+  generated reverse does not write". The Enzyme adapter also never treats a
+  lazy cell array as a covered batched operand. Gradients are unchanged
+  wherever preparation succeeded before; the default preparation is
+  unchanged.
+
+## 0.1.186
+
+- `jax_source` retains prepared integer bounds through ragged rows and scan
+  elements. Loops inside a scan nested in a plate can use a scanned count,
+  an indexed row entry, or a data-only cell computation as their end.
+  When a computed integer needs a bound, its existing data-only recipe runs
+  in `prepare_data`. Counts remain runtime data and loop bodies stay compact;
+  the emitted primal supports ordinary `jax.grad`. Empty scans with numeric
+  or numeric-tuple outputs skip the step, including its indexed reads.
+  Scanning `eachindex(row)` or `axes(row, d)` keeps the row's valid length,
+  so padded steps do not contribute to its results.
+
+## 0.1.185
+
+- `jax_source`: a `for` loop to a padded row's length, such as
+  `for t in 1:length(r)` in a ragged plate's cell, leaves its outer arrays as
+  Julia's loop does. The loop runs to the longest row's length. Before, its
+  steps past the row's end changed an outer array whenever the body wrote it
+  anywhere other than the row's own padding, so the value was silently
+  wrong. Affected writes were at a fixed position (`y[1] += r[t]`), at the
+  loop index into an array not of the row's length, inside a nested loop, or
+  by rebinding the array or a tuple that holds one (`y = y .+ r[t]`). Those
+  steps now keep each written entry and select a rebound array whole. A write
+  at the loop index into an array of the row's length (`out[t] = f(r[t])`)
+  still writes its padding, so padded values, and gradients through masked
+  reductions over them, are unchanged.
+
+## 0.1.184
+
+- A summed plate whose rows repeat runs once per distinct row. When a plate's
+  total is its only use and every operand that varies across its cells is
+  bound data or a gather through a bound index (`a[group]`), binding groups
+  the equal rows, and the plate evaluates one cell per group, times the
+  group's row count, in the forward and the reverse pass. A Bernoulli-logit
+  regression over 1179 rows of 10 distinct `(income, vote)` pairs then runs
+  10 cells instead of 1179. The total agrees with the row-by-row sum to
+  rounding. A plate whose rows repeat less than twice on average, a plate
+  over no rows, a plate whose cells are read one by one, and every plate
+  under `simplify = false` keep their own loop. A live operand whose
+  declaration does not say it is a number counts as shared only when the
+  preparation's `exemplars` prove it one, as the lowering infers it.
+
+## 0.1.183
+
+- An input check (`input_check!`) no longer slows a gradient. Enzyme treats
+  the check as constant and never inlines it, so a gradient calls it as a
+  compiled method. That method was not specialized on the check's arguments,
+  because Julia does not specialize a vararg that is only passed on, so every
+  gradient made a generic call through the boxed calling convention.
+  ReactiveKernelsPPL registers a check on every program. On small
+  PosteriorDB ports this made the default sampler gradient 10 to 14 ns
+  (1.06x to 1.36x) slower than before the check. The check now specializes:
+  on a toy hierarchical model, a checked gradient takes 58.7 ns against
+  58.0 ns unchecked, where it took 65.0 against 57.6. Values, gradients and
+  refusals are unchanged, and primal calls, which inlined the check already,
+  are unaffected (snag `packed-point-inp-ce5df38b`).
+
+## 0.1.182
+
+- The opt-in generated summed-plate reverse (`with_plate_reverse`, or the
+  preference `plate_reverse = "on"`) returns the backend's gradient on Julia
+  1.13. Julia 1.13's `@simd` is hygienic and binds its range inside a block
+  (`let; r = range; …`) where 1.10–1.12 bind it directly (`let r = range`),
+  and the generated reverse recognized only the direct form. On 1.13 it found
+  no cell loop in any plate program and kept each loop forward-only, so every
+  plate that `plate_reverse_report` listed as `"rule"` returned a gradient
+  without its cells' contributions, with no error: whole components were zero
+  (snag plate-reverse-wr-8f83d36c, todo 1aput86). Julia 1.10–1.12 were not
+  affected.
+- A plate program holding any other loop that reads an active value now
+  keeps the backend's reverse, and `plate_reverse_report` names the reason
+  ("a loop over active values that is not a summed cell loop"). Before, the
+  generated reverse ran such a loop forward only. On every Julia version
+  this dropped the gradient of a plate whose rows come in runs of one group
+  (rows sorted by a grouping index, runs of at least 8, summed run by run):
+  the plate was listed as `"rule"` and its gradient had a relative error of
+  about 1 (PosteriorDB RadonCounty and RadonVariableInterceptSlopeNCMN on
+  Julia 1.10.12). A plain cell loop over an active array already took the
+  backend's reverse when called; it now does so from preparation, and the
+  report says so.
+
+## 0.1.181
+
+- `jax_source`: a loop or generator over no elements, such as
+  `for r in 1:length(a)` or `sum(f(a[i]) for i in idx)` with empty data, runs
+  no JAX loop or `vmap`: Python decides the static element count while JAX
+  traces, and the loop's carry keeps its initial values. Before, JAX traced
+  the body anyway and its gathers from the empty array raised `IndexError`.
+  A nonempty range over an empty array still raises, as Julia's `BoundsError`.
+- A step past the stop of a range whose ends are prepared-data entries (RK
+  0.1.179) is a lazy branch (`jax.lax.cond`) that keeps the carry and reads
+  nothing; a generator's is a zero the reduction masks. Before, such a step
+  ran the body at the clamped stop and selected the old carry, so on an
+  empty interval a non-finite derivative there (`log(x[t])` at an
+  `x[t] = 0` Julia never reads) made `jax.grad` NaN.
 
 ## 0.1.180
 

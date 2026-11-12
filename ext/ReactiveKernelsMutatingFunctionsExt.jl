@@ -581,10 +581,12 @@ ReactiveKernels._reactive_inplace_destination(::typeof(reactive_cache_apply),
 
 function ReactiveKernels.prepare_reactive_nonallocating(graph::ReactiveKernels.Graph;
         have = (), want = (),
-        is_mutating = ReactiveKernels._default_is_mutating)
+        is_mutating = ReactiveKernels._default_is_mutating,
+        simplify = nothing)
     ReactiveKernels._prepare_reactive(graph;
         have = have, want = want,
-        cache_apply = reactive_cache_apply, is_mutating = is_mutating)
+        cache_apply = reactive_cache_apply, is_mutating = is_mutating,
+        simplify = simplify)
 end
 
 function ReactiveKernels.prepare_reactive_nonallocating(spec::ReactiveKernels.KernelSpec;

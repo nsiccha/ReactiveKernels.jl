@@ -630,8 +630,8 @@ end
 # Returns (range, linear, cell) or nothing.
 function _pr_simd_loop(ex)
     Meta.isexpr(ex, :let, 2) || return nothing
-    binding = ex.args[1]
-    Meta.isexpr(binding, :(=), 2) || return nothing
+    binding = _pr_let_binding(ex.args[1])
+    binding === nothing && return nothing
     r, range = binding.args
     found = Ref{Any}(nothing)
     function visit(node)
@@ -663,6 +663,17 @@ function _pr_is_ref(x, mod, name)
     isdefined(mod, name) && x === getglobal(mod, name)
 end
 
+# The one binding of a `let`: `let r = x` (`@simd` on Julia 1.10–1.12), or the
+# same binding inside a block (1.13's hygienic `@simd`, `let; r = x; end`).
+function _pr_let_binding(binding)
+    if Meta.isexpr(binding, :block)
+        bindings = Any[b for b in binding.args if !(b isa LineNumberNode)]
+        length(bindings) == 1 || return nothing
+        binding = only(bindings)
+    end
+    Meta.isexpr(binding, :(=), 2) ? binding : nothing
+end
+
 # A loop `begin <simd let> nothing end` wraps the expansion in a block.
 function _pr_cell_loop(ex)
     Meta.isexpr(ex, :block) || return _pr_simd_loop(ex)
@@ -671,6 +682,13 @@ function _pr_cell_loop(ex)
     length(lets) == 1 && isempty(rest) || return nothing
     _pr_simd_loop(only(lets))
 end
+
+# Whether `ex` holds a loop. The generated reverse differentiates only the
+# cell loops it recognizes (`_pr_cell_loop`): any other loop a program keeps
+# runs forward only, so one that reads an active value would contribute
+# nothing to the gradient.
+_pr_has_loop(ex) = ex isa Expr && ex.head !== :quote &&
+    (ex.head === :for || ex.head === :while || any(_pr_has_loop, ex.args))
 
 # ----------------------------------------------------------- the transform
 
@@ -969,6 +987,8 @@ function _pr_program_block(stmts, st::_PRProgramState)
         elseif Meta.isexpr(s, :block)
             append!(fwd, _pr_program_block(s.args, st))
         else
+            _pr_has_loop(s) && !isdisjoint(_pr_reads!(Set{Symbol}(), s, st.mod, st.values), st.active) &&
+                _pr_fail("a loop over active values that is not a summed cell loop")
             push!(fwd, s)
             for (lhs, rhs) in _pr_assignments!(Pair{Symbol,Any}[], s)
                 lhs in st.active || continue
@@ -1185,7 +1205,54 @@ end
 
 # A generated rule for the program call `call` (`program(args...)`), or the
 # reason it falls back.
-function _pr_rule_for(call::Expr, outer_active::Set{Symbol}, kernel)
+# The expression a binding's value comes from: the last expression of a `let`
+# or a block, else the expression itself.
+function _pr_result_expr(ex)
+    while ex isa Expr && ex.head in (:let, :block)
+        body = ex.head === :let ? ex.args[2] : ex
+        statements = Meta.isexpr(body, :block) ? body.args : Any[body]
+        i = findlast(s -> !(s isa LineNumberNode), statements)
+        i === nothing && return nothing
+        ex = statements[i]
+    end
+    ex
+end
+
+# Whether `ex` can be a lazy cell array (`_CellArray`): a `_cell_array_broadcast`
+# or `_cell_array_hcat` result, an alias of a name in `lazy`, or a declaration
+# that keeps it (`_cell_array_as`).
+_pr_lazy_value(ex::Symbol, lazy) = ex in lazy
+function _pr_lazy_value(ex::Expr, lazy)
+    ex.head === :call || return false
+    f = _cell_array_function(first(ex.args))
+    (f === _cell_array_broadcast || f === _cell_array_hcat) && return true
+    f === _cell_array_as && length(ex.args) == 3 && return _pr_lazy_value(ex.args[3], lazy)
+    f === identity && length(ex.args) == 2 && return _pr_lazy_value(ex.args[2], lazy)
+    false
+end
+_pr_lazy_value(ex, lazy) = false
+
+# The names `body` binds to a value that can be a lazy cell array. Its entries
+# are computed on read, and its shadow is the same lazy structure over its
+# operands' shadows, which has no entries to add a cell's cotangent into.
+function _pr_lazy_cell_arrays(body)
+    lazy = Set{Symbol}()
+    bindings = _pr_assignments!(Pair{Symbol,Any}[], body)
+    changed = true
+    while changed
+        changed = false
+        for (lhs, rhs) in bindings
+            lhs in lazy && continue
+            _pr_lazy_value(_pr_result_expr(rhs), lazy) || continue
+            push!(lazy, lhs)
+            changed = true
+        end
+    end
+    lazy
+end
+
+function _pr_rule_for(call::Expr, outer_active::Set{Symbol}, kernel,
+                      lazy::Set{Symbol} = Set{Symbol}())
     program = first(call.args)::_PlateProgram
     params = Symbol[p for p in program.ast.args[1].args]
     args = call.args[2:end]
@@ -1202,6 +1269,14 @@ function _pr_rule_for(call::Expr, outer_active::Set{Symbol}, kernel)
     isempty(active_params) && return nothing, "no active operand"
     try
         rexpr, scalar, batched = _pr_program_reverse(program.ast, active_params, @__MODULE__, values)
+        # A batched operand's cotangent is added into its shadow cell by cell,
+        # which a lazy cell array's shadow cannot take: the program keeps the
+        # backend's reverse (snag generated-plate-56eaf6e3).
+        for p in batched
+            a = args[findfirst(==(p), params)]
+            a isa Symbol && a in lazy && _pr_fail(
+                "batched operand `$a` is a lazy cell array, whose shadow the generated reverse does not write")
+        end
         S = Tuple(findfirst(==(p), params) for p in scalar)
         B = Tuple(findfirst(==(p), params) for p in batched)
         # Called through `_PlateCall`'s typed methods: a runtime-generated
@@ -1222,11 +1297,12 @@ end
 # report of each program: `(result, "rule" or the reason it falls back)`.
 function _pr_inline_plate_programs(ast::Expr, kernel, active_ports)
     outer_active = _pr_body_activity(ast.args[2], Set{Symbol}(active_ports))
+    lazy = _pr_lazy_cell_arrays(ast.args[2])
     report = Any[]
     function replace(node)
         if node isa Expr && node.head === :(=) && node.args[2] isa Expr &&
                 node.args[2].head === :call && first(node.args[2].args) isa _PlateProgram
-            rule, info = _pr_rule_for(node.args[2], outer_active, kernel)
+            rule, info = _pr_rule_for(node.args[2], outer_active, kernel, lazy)
             push!(report, (node.args[1], rule === nothing ? info : "rule"))
             rule === nothing && return node
             return Expr(:(=), node.args[1], Expr(:call, rule, node.args[2].args[2:end]...))
