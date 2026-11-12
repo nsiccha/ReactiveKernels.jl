@@ -125,6 +125,54 @@ end
     return total
 end
 
+# A step past an interval's stop reads nothing (a lazy branch): an empty
+# interval whose stop is an entry where `log` has no finite derivative adds
+# nothing to the value or the gradient, also in a plate cell.
+@kernel jax_ranges_log(x::Vector{Float64}, starts::Vector{Int}, stops::Vector{Int}) = begin
+    result = begin
+        acc = 0.0
+        for r in 1:length(starts)
+            for t in starts[r]:stops[r]
+                acc = acc + log(x[t])
+            end
+            acc = acc + sum(log(x[t]) for t in starts[r]:stops[r]; init = 0.0)
+        end
+        acc
+    end
+    return result
+end
+@kernel jax_ranges_log_cells(x::Vector{Float64}, starts::Vector{Int}, stops::Vector{Int}) = begin
+    cells = plate(starts, stops) do a, b
+        s = begin
+            acc = 0.0
+            for t in a:b
+                acc = acc + log(x[t])
+            end
+            acc + sum(log(x[t]) for t in a:b; init = 0.0)
+        end
+        s
+    end
+    total = sum(cells)
+    return total
+end
+# Loops and generators over no elements (todo 0v40v2g): JAX traces a loop's
+# body even for no steps, so the module runs none, and a body's gathers from
+# an empty array are never traced.
+@kernel jax_ranges_none(x::Vector{Float64}, idx::Vector{Int}) = begin
+    result = begin
+        acc = 1.0
+        y = zeros(2)
+        for r in 1:length(idx)
+            acc = acc + x[idx[r]]^2
+            y[1] = y[1] + x[idx[r]]
+        end
+        acc + sum(abs2, y) + sum(x[idx[r]] for r in 1:length(idx); init = 0.0) +
+            sum(x[i]^3 for i in idx; init = 0.0) + sum(x[i] for i in idx if i > 1; init = 0.0) +
+            sum([x[idx[r]] for r in 1:length(idx)]; init = 0.0)
+    end
+    return result
+end
+
 const JAX_RANGES_KERNELS = (jax_ranges_loop, jax_ranges_forms, jax_ranges_plate, jax_ranges_open,
                             jax_ranges_writes, jax_ranges_nested)
 _jax_ranges_want(k) = k === jax_ranges_plate ? :total : :result
@@ -165,9 +213,6 @@ _jax_ranges_want(k) = k === jax_ranges_plate ? :total : :result
         datasets = [(starts, stops), ([3, 5, 2], [2, 4, 1]), ([1, 5, 3], [1, 5, 3]),
                     (Int[], Int[])]
         for k in JAX_RANGES_KERNELS, (s, e) in datasets
-            # A loop over no records traces its body's gathers from empty
-            # arrays, which JAX refuses (as before this change).
-            isempty(s) && k !== jax_ranges_plate && continue
             want = _jax_ranges_want(k)
             f = prepare(k; have, want)
             src = jax_source(k; have, want, data = (; starts = s, stops = e))
@@ -211,5 +256,43 @@ print("EAGER_SCAN_OK")
             output = read(Cmd(`$RK_JAX_PYTHON $(joinpath(dir, "check.py"))`; dir), String)
             @test occursin("EAGER_SCAN_OK", output)
         end
+        # `log` at `x[2] = 0`, the stop of the empty interval `3:2`, which
+        # Julia never reads: the derivative there is 0, not NaN.
+        lx, ls, le = [2.0, 0.0, 3.0], [1, 3], [1, 2]
+        for (k, want) in ((jax_ranges_log, :result), (jax_ranges_log_cells, :total))
+            f = prepare(k; have, want)
+            src = jax_source(k; have, want, data = (; starts = ls, stops = le))
+            for prepare_mode in (true, :arguments)
+                r = rk_jax_evaluate(src, "kernel", (lx, ls, le); prepare = prepare_mode, grad = true)
+                @test r.value ≈ f(lx, ls, le)
+                @test r.grad == [1.0, 0.0, 0.0]
+            end
+        end
+    end
+end
+
+@testset "jax_source: loops and generators over no elements" begin
+    f = prepare(jax_ranges_none; have = (:x, :idx), want = :result)
+    x = [1.0, 2.0, 3.0]
+    plain = jax_source(jax_ranges_none; have = (:x, :idx), want = :result)
+    # The loop runs only for elements; a literal empty range emits none.
+    @test occursin(r"jax\.lax\.fori_loop\(1, idx\.\w+ \+ 1, \w+, carry_init\) if 1 <= idx\.\w+ else carry_init",
+                   string(plain))
+    @test occursin(r"jax\.vmap\(\w+\)\(\w+\) if 0 < \w+\.shape\[0\] else jnp\.zeros\(\(0,\)", string(plain))
+    prepared = jax_source(jax_ranges_none; have = (:x, :idx), want = :result, data = (; idx = Int[]))
+    if !rk_jax_available()
+        @test_skip false
+    else
+        for idx in (Int[], [3, 1, 3])
+            r = rk_jax_evaluate(plain, "kernel", (x, idx); grad = true)
+            @test r.value ≈ f(x, idx)
+            @test r.grad ≈ rk_fd_gradient(u -> f(u, idx), x) atol = 1e-6
+            r = rk_jax_evaluate(prepared, "kernel", (x, idx); prepare = :arguments, grad = true)
+            @test r.value ≈ f(x, idx)
+        end
+        # An empty `x` with a nonempty range still reads `x` (Julia's
+        # BoundsError), as an empty plate's does (test_jax_empty_plate.jl).
+        @test_throws BoundsError f(Float64[], [1])
+        @test_throws ErrorException rk_jax_evaluate(plain, "kernel", (Float64[], [1]))
     end
 end
