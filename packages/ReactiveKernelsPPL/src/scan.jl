@@ -502,14 +502,27 @@ end
 # Bound integer lags choose a field of the authored seed-depth window. The
 # window's shape stays fixed; the data never expand a recurrence body.
 function _resolve_scan(plan::StructuralPlan, s::ScanSpec)
+    names = union(_all_name_set(plan), Set{Symbol}(keys(plan.columns)),
+        Set(st.target for st in s.step), Set([s.loopvar]))
+    # Bare call heads in scan expressions resolve in the generated PPL scope.
+    # Do not optimize a local callable or a caller-qualified function named sum.
+    base_sum(h, bound) = h === :sum ? !(:sum in bound || :sum in names) :
+        h == GlobalRef(Base, :sum) ||
+        (h == :(Base.sum) && !(:Base in bound || :Base in names))
     # Generator binders are never data lags: `a[t - s]` under `for s in …`
     # is a history read.
     function resolve(ex, bound)
         ex isa Expr || return ex
+        ex.head === :quote && return ex
         if ex.head === :generator
             inner = union(bound, Set{Symbol}(v for (v, _) in
                 first(_scan_generator_clauses(ex)) if v isa Symbol))
             return Expr(ex.head, map(a -> resolve(a, inner), ex.args)...)
+        end
+        if Meta.isexpr(ex, :call, 2) && base_sum(ex.args[1], bound)
+            expanded = ReactiveKernels._history_window_sum(ex, s.states,
+                s.loopvar, s.lo - 1)
+            expanded === nothing || return expanded
         end
         if ex.head === :ref && length(ex.args) == 2 && ex.args[1] in s.states
             env = Dict{Symbol,Any}(b => nothing for b in bound)

@@ -5426,14 +5426,20 @@ end
 
 # --- Sequential-recurrence (scan) density (slice 1: CENTERED) ---
 
-# Replace each `state[loopvar-j]` lag read with its aligned-slice do-var.
+# Replace each lag read with its aligned-slice do-var, and history slices
+# with views, as in the multi-state translator below.
 function _subst_scan_lags(ex, state::Symbol, loopvar::Symbol, dovar::Dict{Int,Symbol})
     ex isa Expr || return ex
+    ex.head === :quote && return ex
     if ex.head === :ref && length(ex.args) == 2 && ex.args[1] === state
         idx = ex.args[2]
         if idx isa Expr && idx.head === :call && length(idx.args) == 3 &&
            idx.args[1] === :- && idx.args[2] === loopvar && idx.args[3] isa Int
             return dovar[idx.args[3]]
+        end
+        if _history_is_slice(idx)
+            return Expr(:call, GlobalRef(Base, :view), state,
+                _subst_scan_lags(idx, state, loopvar, dovar))
         end
     end
     return Expr(ex.head,
