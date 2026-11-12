@@ -6520,6 +6520,9 @@ function _lower_with_ops_collecting(p::Plan;
     # Shared factors and terms leave a summed plate's sum (summed_plate_factors.jl)
     # before index runs group the cells that remain.
     inline_embedded && (body = _lower_summed_plate_factors_native(body, runtime_ops))
+    # A factored sum of squared residuals over bound data reads its frozen
+    # least-squares statistics (bound_statistics.jl).
+    inline_embedded && (body = _lower_bound_statistics_native(body, runtime_ops))
     inline_embedded && (body = _lower_index_runs_native(body, runtime_ops))
     # A partition with a plan port reads its integer bookkeeping from the
     # port's value, computed once per label; in plan mode the body computes
@@ -9267,6 +9270,20 @@ whenever such a guard holds, a shared factor is not a normal number, or the
 factored sum is not finite, so every finite value and its derivatives agree
 with the plate's own to rounding.
 
+With `bound` data and `bound_statistics = true` (the default, with `simplify`)
+a summed plate that sums `(y - mu)^2` this way, `y` bound and `mu` linear in
+live values with bound coefficients, is evaluated from least-squares
+statistics of the bound rows computed at binding. `mu` may be a bound matrix
+times a live vector, live numbers, or live vectors gathered through one bound
+index, each times bound coefficients, plus bound offsets. A call then costs
+time in the number of parameters, not of rows, and `mu` is not computed; the
+plate's own loop, where it runs, reads it row by row. A binding whose data do
+not fit (fewer than two rows per parameter of a block, a non-finite entry, a
+response that is not a vector) compiles the plate as before.
+`bound_statistics = false` keeps the rows; `nothing` takes the enclosing
+setting ([`with_bound_statistics`](@ref)), else the project's ReactiveKernels
+preference `bound_statistics`, else `true`.
+
 Selected authored plates with a single plate consumer are composed during
 lowering, eliminating the intermediate array. Named ports remain in `p`: asking
 for an intermediate, supplying it as HAVE, or selecting another consumer keeps
@@ -9312,9 +9329,9 @@ nested ones included, and cached preparations are kept per setting.
 function prepare(p::Plan; passes = (), bound = (), on_error = nothing,
                  exemplars = nothing, type_stability = nothing,
                  type_stability_level = nothing, branch_arms = nothing,
-                 simplify = nothing, _data_cache = nothing)
+                 simplify = nothing, bound_statistics = nothing, _data_cache = nothing)
     _with_branch_arms(branch_arms) do
-    _with_simplify(simplify) do
+    _with_settings(simplify, bound_statistics) do
         _with_type_stability(type_stability, type_stability_level) do
             kernel = _prepare_plan(p; passes = passes, bound = bound, on_error = on_error,
                                    exemplars, _data_cache)
@@ -9395,11 +9412,11 @@ end
 function prepare(g::Graph; have = (), want = (), passes = (), bound = (),
                  on_error = nothing, exemplars = nothing, type_stability = nothing,
                  type_stability_level = nothing, branch_arms = nothing,
-                 simplify = nothing, _data_cache = nothing)
+                 simplify = nothing, bound_statistics = nothing, _data_cache = nothing)
     # One type for every selection's width before the closure captures them.
     haves, wants, binding = _value_list(have), _value_list(want), _bound_list(bound)
     _with_branch_arms(branch_arms) do
-    _with_simplify(simplify) do
+    _with_settings(simplify, bound_statistics) do
         _with_type_stability(type_stability, type_stability_level) do
             exemplars === nothing && _reuses_bound_preparation(binding, passes) &&
                 return _graph_bound_preparation(g, haves, wants, passes, binding, on_error;

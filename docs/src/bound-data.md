@@ -59,5 +59,50 @@ Expose preprocessing as graph values when it is part of the model. That makes
 its dependencies inspectable and lets the planner select it without copying
 the preprocessing code into another function.
 
+## Gaussian observation plates
+
+A summed plate of Gaussian observations over a bound response adds
+`a + c * (y[i] - mu[i])^2` per row, with the scale's terms `a` and `c` shared
+by every row. When `mu` is linear in live values with bound coefficients (a
+bound matrix times a live vector, live numbers, or live vectors gathered
+through one bound index, each times bound coefficients, plus bound offsets),
+the sum of squared residuals is a quadratic polynomial whose coefficients are
+sums over the bound rows. A bound preparation computes least-squares
+statistics of the rows once (a triangular factor of the design and the
+least-squares solution carried at extended precision). Each call then costs
+time in the number of parameters instead of the number of rows, in the value
+and in its ordinary reverse derivative.
+
+```@example binding
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal
+
+@kernel regression_density(X, y, beta, sigma) = begin
+    mu = X * beta
+    lp = plate(y, mu) do yi, mi
+        normal(mi, sigma).logpdf(yi)
+    end
+    total = sum(lp)
+    return total
+end
+X = [ones(200) range(-1, 1; length=200)]
+y = X * [0.5, 2.0] .+ 0.1 .* sin.(1:200)
+collapsed = prepare(regression_density; bound=(; X, y))
+per_row = prepare(regression_density; bound=(; X, y), bound_statistics=false)
+beta = [0.4, 2.1]
+(; collapsed=collapsed(beta, 0.3), per_row=per_row(beta, 0.3),
+   same_result=collapsed(beta, 0.3) ≈ per_row(beta, 0.3),
+   reads_statistics=occursin("_ls_rss", string(code_expr(collapsed))))
+```
+
+Values and derivatives agree with the per-row plate to rounding. They are
+more accurate where the response is far from zero, where the per-row sum
+itself loses digits. A binding whose data do not fit compiles the per-row
+plate as before: fewer rows than twice the parameters per block, a non-finite
+entry, or data of another shape. The plate's own loop also still runs where
+the factored sum is not used, for example at a scale of zero. Per-row and
+per-cell queries keep the per-row plate. `bound_statistics = false` on a
+preparation, or `bound_statistics = false` under `[ReactiveKernels]` in the
+project's `LocalPreferences.toml`, keeps the per-row plate everywhere.
+
 [Bound regression](bound-regression.md) applies this pattern to a design
 matrix and separates prediction from residual evaluation.

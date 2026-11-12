@@ -2136,6 +2136,7 @@ function partial_evaluation(p::Plan, bound, values; _data_cache = nothing)
         "partial evaluation received $(length(bound_values)) bound ports " *
         "but $(length(value_tuple)) bound values"))
     p = _partial_split_bound(p, bound_values)
+    p = _partial_bound_statistics(p, bound_values)
     p = _partial_index_runs(p, bound_values)
     boundary = _partial_boundary(p, bound_values)
     hoisted = _data_cache === nothing ? _partial_hoisted(p, boundary, value_tuple) :
@@ -2263,11 +2264,17 @@ function _bound_plate_class(@nospecialize(x::AbstractArray))
     rank == 0 ? nothing : AbstractArray{<:Any,rank}
 end
 
-# One binding's class per plate slot: the key of its compiled residual.
+# One binding's class per plate slot, then whether each location's bound
+# least-squares statistics are usable (`_ls_classes`): the key of its compiled
+# residual.
 function _partial_plate_classes(b::_PartialBoundary, @nospecialize(hoisted))
-    classes = Vector{Any}(undef, length(b.plate_slots))
+    statistics = _ls_classes(b, hoisted)
+    classes = Vector{Any}(undef, length(b.plate_slots) + length(statistics))
     for (index, slot) in enumerate(b.plate_slots)
         classes[index] = _bound_plate_class(hoisted[slot])
+    end
+    for (index, usable) in enumerate(statistics)
+        classes[length(b.plate_slots) + index] = usable
     end
     Tuple(classes)
 end
@@ -2285,6 +2292,12 @@ end
 # `merge` refuses (snag selective-fresh-96f7fe96).
 function _partial_narrow_plate_inputs(g::Graph, b::_PartialBoundary,
                                       @nospecialize(classes::Tuple))
+    # The classes after the plate slots' decide each bound least-squares
+    # location (`_ls_class_residual`, bound_statistics.jl).
+    _ls_class_residual(g, b, classes, _partial_narrow_plate_classes(g, b, classes))
+end
+function _partial_narrow_plate_classes(g::Graph, b::_PartialBoundary,
+                                       @nospecialize(classes::Tuple))
     narrowed = Dict{ValueId,Any}()
     for (slot, class) in zip(b.plate_slots, classes)
         class === nothing || (narrowed[canon_id(g, b.constants[slot].id)] = class)
@@ -2317,7 +2330,9 @@ function _partial_residual_plan(p::Plan, b::_PartialBoundary, @nospecialize(hois
                                 residual::Vector{Recipe})
     recipes = isempty(b.constants) ? residual :
         vcat(_partial_constant_recipes(b.constants, hoisted, residual), residual)
-    _partial_subplan(p, b.remaining, p.want, recipes)
+    # Least-squares statistics this binding's residual does not read
+    # (`_ls_class_residual`) leave it as if never computed.
+    _partial_subplan(p, b.remaining, p.want, _ls_unread_statistics(p.graph, recipes))
 end
 
 function _partial_residual_plan(p::Plan, b::_PartialBoundary, @nospecialize(hoisted))
@@ -2560,6 +2575,7 @@ function _bound_entry(p::Plan, @nospecialize(ports))
     p = _fuse_authored_plate_chains(p; cells_only = true)
     bound_values = _value_vector(ports)
     p = _partial_split_bound(p, bound_values)
+    p = _partial_bound_statistics(p, bound_values)
     p = _partial_index_runs(p, bound_values)
     boundary = _partial_boundary(p, bound_values)
     prefix = isempty(boundary.constants) ? nothing :
