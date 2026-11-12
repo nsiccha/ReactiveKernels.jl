@@ -45,6 +45,21 @@ _rk_py_input(x::NamedTuple) =
 _rk_py_input(x::Tuple) = "(" * join(map(_rk_py_input, x), ", ") * (length(x) == 1 ? ",)" : ")")
 _rk_py_input(x) = _rk_py(x)
 
+# The args file of a call through `prepare_data`: `ARGS`, and `NAMES`, the
+# names `prepare_data` takes its inputs by, which `raw_data` pairs with the
+# raw values (in that order) for the documented call `prepare_data(**raw)`.
+function _rk_jax_args(inputs, src::Union{Nothing,JAXSource} = nothing)
+    text = "ARGS = [" * join(map(_rk_py_input, inputs), ", ") * "]\n"
+    src === nothing && return text
+    names = first.(only(f for f in src.functions if f.name == "prepare_data").inputs)
+    text * "NAMES = [" * join(repr.(String.(names)), ", ") * "]\n" * raw"""
+def raw_data(values):
+    if len(values) != len(NAMES):
+        raise ValueError("%d raw values for prepare_data's %d inputs %s" % (len(values), len(NAMES), NAMES))
+    return dict(zip(NAMES, values))
+"""
+end
+
 const _RK_JAX_DRIVER = raw"""
 import importlib.util, math, sys
 import numpy as np
@@ -56,7 +71,7 @@ exec(open(sys.argv[2]).read())
 f = getattr(module, sys.argv[3])
 first, rest = ARGS[0], ARGS[1:]
 if sys.argv[5] in ("prepare", "arguments"):
-    prepared = module.prepare_data(*rest)
+    prepared = module.prepare_data(**raw_data(rest))
     call = lambda u: f(u, **prepared)
 else:
     call = lambda u: f(u, *rest)
@@ -103,7 +118,7 @@ function rk_jax_evaluate(src::JAXSource, name, args; grad::Bool = false, prepare
     write(module_path, src)
     args_path = joinpath(dir, "args.py")
     inputs = prepare === false ? rk_jax_inputs(args) : Any[args...]
-    write(args_path, "ARGS = [" * join(map(_rk_py_input, inputs), ", ") * "]\n")
+    write(args_path, _rk_jax_args(inputs, prepare === false ? nothing : src))
     driver = joinpath(dir, "driver.py")
     write(driver, _RK_JAX_DRIVER)
     errors = joinpath(dir, "stderr.txt")
@@ -143,7 +158,7 @@ def caller(m, cast):
     f = getattr(m, name)
     first, rest = ARGS[0], ARGS[1:]
     if prepare:
-        p = m.prepare_data(*rest)
+        p = m.prepare_data(**raw_data(rest))
         return (single(first) if cast else first), (lambda u: f(u, **p))
     rest = [single(a) for a in rest] if cast else rest
     return (single(first) if cast else first), (lambda u: f(u, *rest))
@@ -207,7 +222,7 @@ function rk_jax_float32(src32::JAXSource, reference, name, args; prepare::Bool =
     end
     args_path = joinpath(dir, "args.py")
     inputs = prepare ? Any[args...] : rk_jax_inputs(args)
-    write(args_path, "ARGS = [" * join(map(_rk_py_input, inputs), ", ") * "]\n")
+    write(args_path, _rk_jax_args(inputs, prepare ? src32 : nothing))
     driver = joinpath(dir, "float32.py")
     write(driver, _RK_JAX_FLOAT32_DRIVER)
     errors = joinpath(dir, "stderr.txt")
@@ -229,7 +244,7 @@ spec = importlib.util.spec_from_file_location("rk_module", sys.argv[1])
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 exec(open(sys.argv[2]).read())
-prepared = module.prepare_data(*ARGS)
+prepared = module.prepare_data(**raw_data(ARGS))
 params = module.parameters(prepared)
 print("(dimension = %d, parameters = Dict(%s))" % (module.dimension(prepared), ", ".join(
     '"%s" => (start = %d, stop = %d, dims = (%s))' % (k, v["start"], v["stop"],
@@ -248,7 +263,7 @@ function rk_jax_layout(src::JAXSource, data)
     module_path = joinpath(dir, "rk_module.py")
     write(module_path, src)
     args_path = joinpath(dir, "args.py")
-    write(args_path, "ARGS = [" * join(map(_rk_py_input, Any[data...]), ", ") * "]\n")
+    write(args_path, _rk_jax_args(Any[data...], src))
     driver = joinpath(dir, "layout.py")
     write(driver, _RK_JAX_LAYOUT_DRIVER)
     Base.eval(Module(), Meta.parse(read(`$RK_JAX_PYTHON $driver $module_path $args_path`, String)))
