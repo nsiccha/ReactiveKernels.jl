@@ -4880,10 +4880,21 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     # a bare `object.endpoint(args...)` call, so no KernelObjectSpec survives to
     # runtime.
     rewritten_entries = Any[]
+    # Scalar kernels can later be composed into a plate. Keep their lazy
+    # arms' graphs before endpoint expansion turns a nested call into source;
+    # otherwise the plate's binding pass sees an opaque call inside that arm.
+    # Key by the recipe expression, not its output name: alternative producers
+    # of one value can have different branches and dependency boundaries.
+    ordinary_branch_arms = IdDict{Any,Any}()
     boundary_types = Dict{Symbol,Vector{Any}}()
     for entry in entries
         if entry[1] === :recipe && entry[5] === nothing
             _, outputs, authored_rhs, metadata, plate_expr, destructured = entry
+            arms = length(outputs) == 1 && !get(metadata, :effectful, false) &&
+                (branch_arm_specs === nothing ||
+                 !haskey(branch_arm_specs, outputs[1][1])) ?
+                _kernel_plate_arm_entries(authored_rhs, known, Set{Symbol}(),
+                    mod, known; endpoint_cache) : nothing
             local_types = Dict{Symbol,Any}()
             materialized = Tuple{Symbol,Any,Any}[]
             rewritten, inferred = _kernel_constructed_endpoint(
@@ -4913,6 +4924,7 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
             end
             push!(rewritten_entries,
                   (:recipe, outputs, rewritten, metadata, plate_expr, destructured))
+            arms === nothing || (ordinary_branch_arms[rewritten] = arms)
         else
             push!(rewritten_entries, entry)
         end
@@ -5025,6 +5037,8 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
         effectful = get(metadata, :effectful, false)
         branch_arms = branch_arm_specs === nothing || length(outputs) != 1 ?
             nothing : get(branch_arm_specs, outputs[1][1], nothing)
+        branch_arms === nothing &&
+            (branch_arms = get(ordinary_branch_arms, authored_rhs, nothing))
         op = plate_expr === nothing ? _kernel_operation(
             rhs, deps, known; pure = !effectful, mod = mod,
             nested_specs = nested_specs, branch_arms = branch_arms) :

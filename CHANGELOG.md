@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.206
+## 0.1.208
 
 - A bound preparation (`prepare(...; bound)`, `prepare!(cache, ...; bound)`,
   `prepare_ad(...; bound)`) evaluates a summed Gaussian observation plate over
@@ -35,6 +35,31 @@ are recorded in the git history only.
   `simplify`, project preference `[ReactiveKernels] bound_statistics`, and
   `with_bound_statistics(f, enabled)` for the preparations `f` makes (a PPL
   sampler's, say): `bound_statistics = false` keeps the per-row plate.
+
+## 0.1.207
+
+- `with_plate_reverse` applies generated summed-plate reverse programs to
+  non-allocating kernels after their cache activity and ownership rewrite.
+  Reused primal buffers and AD-owned caches retain their existing ownership.
+  `plate_reverse_report` accepts non-allocating kernels and reports static
+  eligibility; backend operand annotations can still require ordinary AD.
+- An authored plate's axis marker no longer prevents the generated reverse
+  when the marker is used only by derivative-inert queries. Numerical alias
+  reads and writes retain the conservative fallback; marker checks remain.
+- The generated reverse adapter keeps single-lane calls statically dispatched
+  by using separate local names in its batched-lane closure.
+
+## 0.1.206
+
+- `jax_source`: a branch whose condition is traced (`jax.lax.cond`) returns
+  one JAX type from both arms. Julia's arm types are promoted (element by
+  element for an `if` that also assigns locals), and an arm returning an
+  integer known while tracing, such as a prepared integer (`StaticInt`),
+  returns it as an array. Before, `s == 0 && y == m ? 1.0 : s` over a
+  prepared integer `s` (a Gaussian's guarded scale in a plate cell) raised
+  `cond branch outputs must have the same pytree structure`, and an
+  integer arm beside a float arm raised `cond branches must have equal
+  output types`.
 
 ## 0.1.205
 
