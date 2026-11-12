@@ -16,6 +16,21 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.182
+
+- `jax_source`: a `for` loop to a padded row's length, such as
+  `for t in 1:length(r)` in a ragged plate's cell, leaves its outer arrays as
+  Julia's loop does. The loop runs to the longest row's length. Before, its
+  steps past the row's end changed an outer array whenever the body wrote it
+  anywhere other than the row's own padding, so the value was silently
+  wrong. Affected writes were at a fixed position (`y[1] += r[t]`), at the
+  loop index into an array not of the row's length, inside a nested loop, or
+  by rebinding the array or a tuple that holds one (`y = y .+ r[t]`). Those
+  steps now keep each written entry and select a rebound array whole. A write
+  at the loop index into an array of the row's length (`out[t] = f(r[t])`)
+  still writes its padding, so padded values, and gradients through masked
+  reductions over them, are unchanged.
+
 ## 0.1.181
 
 - `jax_source`: a loop or generator over no elements, such as
