@@ -45,6 +45,11 @@ head_count(ex, head) = ex isa ReactiveKernels._PlateProgram ? head_count(ex.ast,
     (ex.head === head) + sum(arg -> head_count(arg, head), ex.args; init=0) : 0
 scalar_caches(kernel) = [r.op.value for r in kernel.plan.recipes
     if r.op isa ReactiveKernels._BoundConstant && r.op.value isa Vector{Float64}]
+# Factor hoisting retains a fixed fallback loop beside the optimized loop.
+# Depth checks that binding removes the inner axis from every alternative;
+# the size comparison below independently checks bounded emitted-body growth.
+loop_depth(ex) = ex isa ReactiveKernels._PlateProgram ? loop_depth(ex.ast) :
+    ex isa Expr ? (ex.head === :for) + maximum(loop_depth, ex.args; init=0) : 0
 
 @testset "nested shared bound scalars preserve lazy cells" begin
     for (groups, cuts) in (
@@ -363,7 +368,7 @@ end
             Enzyme.Active, Enzyme.Active(a)))) ≈ slope
     end
     @test !occursin(".log(", string(code_expr(kernel)))
-    @test head_count(code_expr(kernel), :for) == 1
+    @test loop_depth(code_expr(kernel)) == 1
     @test events == saved
 end
 
@@ -382,11 +387,13 @@ end
         @test kernel(-1.2) ≈ -1.2slope
         @test bound_calls[] == sum(length, events)
         @test !occursin("counted_term", string(code_expr(kernel)))
-        @test head_count(code_expr(kernel), :for) == 1
+        @test loop_depth(code_expr(kernel)) == 1
         if first_kernel === nothing
             first_kernel = kernel
         else
             @test typeof(kernel.f) === typeof(first_kernel.f)
+            @test head_count(code_expr(kernel), :for) ==
+                  head_count(code_expr(first_kernel), :for)
             @test head_count(code_expr(kernel), :(=)) ==
                   head_count(code_expr(first_kernel), :(=))
         end
@@ -429,7 +436,7 @@ end
         kernel = prepare(spec; bound=(; events), type_stability=:error)
         @test kernel(0.5) ≈ 0.5slope
         @test !occursin(".log(", string(code_expr(kernel)))
-        @test head_count(code_expr(kernel), :for) == 1
+        @test loop_depth(code_expr(kernel)) == 1
         @test only(only(Enzyme.autodiff(Enzyme.Reverse, kernel,
             Enzyme.Active, Enzyme.Active(0.5)))) ≈ slope
     end
@@ -438,7 +445,7 @@ end
     kernel = prepare(deep_score; bound=(; events), type_stability=:error)
     @test kernel(0.5) ≈ 0.5slope
     @test !occursin(".log(", string(code_expr(kernel)))
-    @test head_count(code_expr(kernel), :for) == 1
+    @test loop_depth(code_expr(kernel)) == 1
     @test only(only(Enzyme.autodiff(Enzyme.Reverse, kernel,
         Enzyme.Active, Enzyme.Active(0.5)))) ≈ slope
 end
