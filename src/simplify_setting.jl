@@ -59,6 +59,17 @@ _with_simplify(f, value) = _with_setting(f, _SIMPLIFY, value)
 # Whether the preparation in progress uses bound least-squares statistics.
 _bound_statistics() = _setting(_BOUND_STATISTICS)
 _with_bound_statistics(f, value) = _with_setting(f, _BOUND_STATISTICS, value)
+
+"""
+    with_bound_statistics(f, enabled::Bool = true)
+
+Run `f()` with every preparation it makes, nested ones included, using
+(`true`) or not using (`false`) bound least-squares statistics for summed
+Gaussian plates, whatever the `bound_statistics` preference says. It is the
+`bound_statistics` keyword of [`prepare`](@ref) for preparations made through
+an API that does not pass it on, such as a PPL's sampler preparation.
+"""
+with_bound_statistics(f, enabled::Bool = true) = _with_bound_statistics(f, enabled)
 # Both preparation keywords.
 _with_settings(f, simplify, bound_statistics) =
     _with_simplify(() -> _with_bound_statistics(f, bound_statistics), simplify)

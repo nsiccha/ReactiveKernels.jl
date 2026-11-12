@@ -9269,6 +9269,20 @@ whenever such a guard holds, a shared factor is not a normal number, or the
 factored sum is not finite, so every finite value and its derivatives agree
 with the plate's own to rounding.
 
+With `bound` data and `bound_statistics = true` (the default, with `simplify`)
+a summed plate that sums `(y - mu)^2` this way, `y` bound and `mu` linear in
+live values with bound coefficients, is evaluated from least-squares
+statistics of the bound rows computed at binding. `mu` may be a bound matrix
+times a live vector, live numbers, or live vectors gathered through one bound
+index, each times bound coefficients, plus bound offsets. A call then costs
+time in the number of parameters, not of rows, and `mu` is not computed; the
+plate's own loop, where it runs, reads it row by row. A binding whose data do
+not fit (fewer than two rows per parameter of a block, a non-finite entry, a
+response that is not a vector) compiles the plate as before.
+`bound_statistics = false` keeps the rows; `nothing` takes the enclosing
+setting ([`with_bound_statistics`](@ref)), else the project's ReactiveKernels
+preference `bound_statistics`, else `true`.
+
 Selected authored plates with a single plate consumer are composed during
 lowering, eliminating the intermediate array. Named ports remain in `p`: asking
 for an intermediate, supplying it as HAVE, or selecting another consumer keeps

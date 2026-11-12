@@ -283,6 +283,16 @@ end
     @test_throws BoundsError k(alpha[1:J-1], beta, 0.5)
 end
 
+@testset "with_bound_statistics scopes the setting" begin
+    (; X, y) = dense_data(60, 2)
+    @test !_collapsed(with_bound_statistics(() -> prepare(ls_dense; bound = (; X, y)), false))
+    @test _collapsed(with_bound_statistics(() -> prepare(ls_dense; bound = (; X, y))))
+    # A keyword inside the scope decides for its own preparation.
+    @test _collapsed(with_bound_statistics(false) do
+        prepare(ls_dense; bound = (; X, y), bound_statistics = true)
+    end)
+end
+
 @testset "rebinding recomputes the statistics" begin
     cache = PreparationCache()
     for shift in (0.0, 10.0)

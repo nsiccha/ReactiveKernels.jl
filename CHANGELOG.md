@@ -32,8 +32,9 @@ are recorded in the git history only.
   (too few rows per parameter, non-finite entries) compiles today's program.
   Pointwise and per-cell queries keep the per-row plate. New keyword
   `bound_statistics` (default `true`) on every preparation entry that takes
-  `simplify`, and project preference `[ReactiveKernels] bound_statistics`:
-  `bound_statistics = false` keeps the per-row plate.
+  `simplify`, project preference `[ReactiveKernels] bound_statistics`, and
+  `with_bound_statistics(f, enabled)` for the preparations `f` makes (a PPL
+  sampler's, say): `bound_statistics = false` keeps the per-row plate.
 
 ## 0.1.205
 
