@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.161
+## 0.1.162
 
 - A density catalogue (`density_factors`) keeps an elementwise site as a plate
   site in a binding where it has no events. Every selection's query structure
@@ -29,9 +29,18 @@ are recorded in the git history only.
   image's workload on one binding compiles the programs another binding calls.
   A compact factor query also keeps its selection's row plan behind one
   reference instead of boxing it on every call. Values and gradients are
-  unchanged. Requires ReactiveKernels 0.1.186, whose partitions read such a
+  unchanged. Requires ReactiveKernels 0.1.193, whose partitions read such a
   plate's lane without a per-call allocation, so a plate a selection does not
   read costs nothing per call.
+
+## 0.1.161
+
+- `@scan` lowers a literal backward window sum such as
+  `sum(h[(t - 11):(t - 1)])` to the corresponding scalar lag reads in both
+  single-state and multi-state scans. It retains `sum`'s accumulator
+  promotion and the runtime scan length. Other history slices in centered
+  single-state densities now use views, as multi-state scans already did.
+  Requires ReactiveKernels 0.1.192.
 
 ## 0.1.160
 

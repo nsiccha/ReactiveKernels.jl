@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.186
+## 0.1.193
 
 - A partition reads a batched lane that views a vector at a range
   (`view(u, lo:hi)`, such as a packed parameter block) at the positions of that
@@ -25,6 +25,118 @@ are recorded in the git history only.
   vector when its slot map is constant per label. Before, the lane was sliced
   on every call, which allocated a fresh index vector each time, also for a
   partition with no cells in that plate. Values and gradients are unchanged.
+
+## 0.1.192
+
+- Provide shared recurrence-window reduction planning for ReactiveKernelsPPL:
+  a sum over literal backward offsets can read scalar lags without allocating
+  a slice. Data-derived window widths and trajectory lengths remain runtime
+  iteration.
+- `jax_source` converts a numeric tuple to an array for `sum`, including
+  fixed scan windows, so standalone JAX preserves their values and gradients.
+
+## 0.1.191
+
+- A non-allocating kernel keeps the type of a value it reads back from a step's
+  buffer. A value checked by a branch whose other arm throws
+  (`x = ok ? y : throw(...)`) took the type `Any` while the program was
+  decomposed into buffer-filling steps, and the steps computed from it, such
+  as the arms of a recorded helper's `n == 0 ? float.(s) : log.(s)`, kept
+  untyped buffers, so their results reached the program as `Any`. Every plate
+  cell reading them then dispatched at run time and allocated. Since 0.1.131,
+  when DistributionKernels' hidden-Markov helpers record their sources,
+  that included every emission cell of an exponential or normal HMM law whose
+  scales are sampled: `prepare_sampler`'s default density of a two-stream
+  exponential HMM over 416 steps took 60 µs and 6,673 allocations per call,
+  against 15 µs and 27 for `nonallocating = false`; it now takes 14 µs and 16.
+  A throwing arm no
+  longer widens a branch's type, a decomposed value keeps the type the
+  program's planning inferred for it when that is narrower, and a step whose
+  buffer preparation still could not type (a kernel prepared without
+  argument types, say) returns its result as the type its own call infers,
+  while still reusing that buffer. Values are unchanged (snag
+  default-non-allo-a0c23dd8).
+
+## 0.1.190
+
+- `prepare_nonallocating` reuses destinations for matrix products nested in
+  broadcasts consumed by a reduction or plate, including materialized
+  broadcast operands such as `A * (x .* s)`. These products now take the same
+  cache steps as products assigned to their own statements. The outer
+  broadcast keeps its existing lazy or materialized behavior, and destination
+  guards still accommodate changing runtime shapes.
+
+## 0.1.189
+
+- `jax_source` translates `findfirst(predicate, vector)` in host data
+  preparation, including captured predicates such as `isequal(label)`,
+  `Base.Fix1` and `Base.Fix2`. Searches return the first one-based index or
+  `nothing` and stop evaluating at the first match. Positional kernels that
+  map group labels to their levels now prepare those indices in the emitted
+  module. Previously unary `isequal` was incorrectly typed as `Bool`, so
+  these searches emitted an unconditional `findfirst threw` error.
+
+## 0.1.188
+
+- The stable rewrites (0.1.117, on unless `simplify = false`) reach the
+  preparations that compile their own programs. There,
+  `log1pexp(-log(exp(u)))` was `Inf` at `u = -800` and its gradient `NaN` at
+  `u = 710` and `800`; each now gives `prepare`'s finite value and
+  derivative.
+  - `plate(spec; have, want, batched)`. A recipe's source now runs in the
+    generated loop, as in `lower`, and recipes that depend on the same batched
+    ports recompute under one condition. A value hoisted above the loop stays
+    computed once: a per-element statement reads it as it is, so `log(s)` per
+    element of a shared `s = exp(u)` is computed as written there, where
+    `prepare` reads `u` (computing `exp` per element instead measured 3.5×
+    slower on a 10,000-element z-score loop). A composition among the hoisted
+    statements, or among loop statements that depend on the same batched
+    ports, is rewritten.
+  - `vectorize` and `prepare_batched` (position batching). Each part of the
+    position driver is rewritten; a per-position statement reads a value of
+    the shared prefix as it is, as above.
+  - `prepare_reactive` and `prepare_reactive_nonallocating`, for compositions
+    inside one recipe's source. A composition across two state values is
+    computed as written: each value is a slot that `freeze!` can set, so
+    `w = log(v)` reads `v`, never what computed it. A recipe reused in place
+    by `prepare_reactive_nonallocating` runs its own operation.
+- New: `plate(spec; …)`, `vectorize`, `prepare_batched`, `prepare_reactive`
+  and `prepare_reactive_nonallocating` take `simplify`, as `prepare` does;
+  `nothing` (the default) reads an enclosing setting or the project
+  preference. A `PreparedKernel` given to `vectorize` contributes its plan,
+  not its setting. A rebound kernel's kept position drivers are kept per
+  setting.
+- The `prepare_reactive(graph; have, want)` docstring is attached to that
+  method again (it documented an internal helper).
+
+## 0.1.187
+
+- The opt-in generated plate reverse (`with_plate_reverse`) keeps the
+  backend's reverse for a plate program whose batched operand is a lazy cell
+  array, such as `mu = z .+ w .* x` read by `y .~ Normal.(mu, sigma)`.
+  Enzyme passes a lazy broadcast of arrays only as `Duplicated`, with a
+  shadow of the same lazy structure, and the generated reverse could not add a
+  cell's cotangent into it: preparing such a sampler with the rule on failed
+  with `CanonicalIndexError: setindex! not defined for
+  ReactiveKernels._CellBroadcast` (PosteriorDB UKDrivers). The program now
+  falls back when the sampler is prepared, and `plate_reverse_report` names
+  the reason, "batched operand `mu` is a lazy cell array, whose shadow the
+  generated reverse does not write". The Enzyme adapter also never treats a
+  lazy cell array as a covered batched operand. Gradients are unchanged
+  wherever preparation succeeded before; the default preparation is
+  unchanged.
+
+## 0.1.186
+
+- `jax_source` retains prepared integer bounds through ragged rows and scan
+  elements. Loops inside a scan nested in a plate can use a scanned count,
+  an indexed row entry, or a data-only cell computation as their end.
+  When a computed integer needs a bound, its existing data-only recipe runs
+  in `prepare_data`. Counts remain runtime data and loop bodies stay compact;
+  the emitted primal supports ordinary `jax.grad`. Empty scans with numeric
+  or numeric-tuple outputs skip the step, including its indexed reads.
+  Scanning `eachindex(row)` or `axes(row, d)` keeps the row's valid length,
+  so padded steps do not contribute to its results.
 
 ## 0.1.185
 
