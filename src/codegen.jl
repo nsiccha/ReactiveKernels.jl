@@ -4985,10 +4985,11 @@ function _lower_authored_plate_cell_state!(body, runtime_ops, runtime_recipes, s
             s.plate, s.slices, s.plate_values, nothing, s.lhs; batch)
         return
     end
-    pointwise = gensym(:cell_pointwise)
+    # The checked slices contain exactly one cell. Use the existing scalar
+    # result mode, as producer windows at one row do, instead of allocating a
+    # one-element pointwise buffer and reading it back with `only`.
     _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
-        s.plate, s.slices, s.plate_values, pointwise, nothing)
-    push!(body.args, Expr(:(=), s.lhs, Expr(:call, GlobalRef(Base, :only), pointwise)))
+        s.plate, s.slices, s.plate_values, nothing, nothing; cell = s.lhs)
     nothing
 end
 

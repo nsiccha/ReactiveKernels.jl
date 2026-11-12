@@ -98,7 +98,8 @@ end
     allocated(x, y, s) = (k(x, y, s, 3); @allocated k(x, y, s, 3))
     small, large = allocated(data(10)...), allocated(data(100_000)...)
     @test large == small
-    @test large < 8 * 1000
+    # A scalar cell needs no intermediate one-element result arrays.
+    @test large == 0
 end
 
 @testset "plate_cell: captured whole values read at the cell's position" begin
