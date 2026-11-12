@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.197
+
+- Strict plate-cell queries recognize ordinary array addition and subtraction
+  through transparent helper functions on Julia 1.13. The row analysis follows
+  a constant function binding loaded into a separate lowered-code statement,
+  restoring helpers such as `add_arrays(a, b) = a + b`. Full-array shape checks,
+  custom dispatch checks, and rejection of mutable bindings or extra helper
+  work remain in effect.
+
 ## 0.1.196
 
 - A summed plate takes shared work out of its sum (with the stable rewrites,
