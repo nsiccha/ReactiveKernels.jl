@@ -249,33 +249,61 @@ end
 
 function _prepare_getter(plan::Plan, index, recipe_index, id::ValueId;
                          cache_apply = nothing,
-                         mutating_slots::Set{Int} = Set{Int}())
+                         mutating_slots::Set{Int} = Set{Int}(),
+                         ops::Tuple = Tuple(recipe.op for recipe in plan.recipes))
     in_place = cache_apply !== nothing
     ast = _getter_ast(plan, index, recipe_index, id;
                       in_place = in_place, mutating_slots = mutating_slots)
-    ops = Tuple(recipe.op for recipe in plan.recipes)
     in_place ?
         _ReactiveGetterInPlace(compile(ast), ops, cache_apply, ast) :
         _ReactiveGetter(compile(ast), ops, ast)
 end
 
-"""
-    prepare_reactive(graph; have, want) -> ReactiveProgram
+# The stable rewrites (`stable_rewrites.jl`) in a compiled reactive state. Each
+# state value has its own slot, which `freeze!` and `assign!` can set, so a
+# getter reads every recipe input from its slot and a rewrite never reads past
+# one recipe: `w = log(v)` keeps reading `v`'s slot even where `v = exp(u)`.
+# A composition inside one recipe's source is rewritten as `prepare` rewrites
+# it: the source inlined over its parameters (`inline_sources.jl`), the pass
+# run over it, and the result compiled once for every getter that calls the
+# recipe. The getters keep calling the recipe through the callables table, so
+# their code is the same with and without the rewrites.
 
-Prepare a closed-world stateful program. `have` declares the mutable,
-authoritative state boundary; `want` declares all downstream values the state
-may demand. Planning happens once. Each reachable value receives a compiled
-lazy getter that reuses valid slots and recomputes only invalid dependencies.
+# A recipe's source rewritten and compiled with the tables it reads.
+struct _StableRecipeOp{F,K,O}
+    f::F
+    constants::K
+    callables::O
+end
+@inline (op::_StableRecipeOp)(args...) = op.f(op.constants, op.callables, args...)
 
-Instantiate with `state = program(have_values...)`, then obtain typed handles
-once with `x = statevalue(program, graph_value)`. Mutate a source with `set!`,
-or mutate its stored object in a [`mutate!`](@ref) transaction. Both invalidate
-downstream state; `get!` performs the generated minimal recomputation.
+# What the getters call for recipe `r`: `r.op`, or the rewritten source when
+# the rewrites change it.
+function _reactive_stable_op(r::Recipe)
+    params = Any[Symbol("#reactive_input#", i) for i in eachindex(r.inputs)]
+    inlined = _inline_source_form(r, params, 1)
+    inlined === nothing && return r.op
+    ast = Expr(:function, Expr(:tuple, _CONSTANTS_ARG, _CALLABLES_ARG, params...),
+               Expr(:block, inlined[1]))
+    rewritten = _stable_rewrites(ast, (r,))
+    rewritten === ast && return r.op
+    constants, callables = _lowering_tables(Any[r.op])
+    _StableRecipeOp(compile(rewritten), constants, _native_table(rewritten, callables))
+end
 
-The selected graph and runtime slot types are fixed. This is the efficient
-state-machine counterpart to the open-ended, dictionary-backed
-[`ReactiveState`](@ref).
-"""
+# The callables table of the getters: one operation per recipe, rewritten
+# unless `simplify = false` or the recipe's slot is reused in place (its
+# operation selects the in-place method, `_mutating_slots`).
+function _reactive_ops(plan::Plan, index, mutating_slots::Set{Int})
+    graph = plan.graph
+    _simplify() || return Tuple(recipe.op for recipe in plan.recipes)
+    Tuple(begin
+        in_place = length(recipe.outputs) == 1 &&
+            get(index, canon_id(graph, only(recipe.outputs).id), 0) in mutating_slots
+        in_place ? recipe.op : _reactive_stable_op(recipe)
+    end for recipe in plan.recipes)
+end
+
 # A type is a candidate for in-place reuse when it is a mutable, non-isbits
 # object (arrays, `MutableDiffResult`-style containers, any mutable struct):
 # those own heap storage a mutating op can fill in place. Scalars/isbits and
@@ -319,12 +347,37 @@ function _mutating_slots(plan::Plan, graph::Graph, index, cache_apply, is_mutati
     slots
 end
 
-function prepare_reactive(graph::Graph; have = (), want = ())
-    _prepare_reactive(graph; have = have, want = want)
+"""
+    prepare_reactive(graph; have, want, simplify = nothing) -> ReactiveProgram
+
+Prepare a closed-world stateful program. `have` declares the mutable,
+authoritative state boundary; `want` declares all downstream values the state
+may demand. Planning happens once. Each reachable value receives a compiled
+lazy getter that reuses valid slots and recomputes only invalid dependencies.
+
+Instantiate with `state = program(have_values...)`, then obtain typed handles
+once with `x = statevalue(program, graph_value)`. Mutate a source with `set!`,
+or mutate its stored object in a [`mutate!`](@ref) transaction. Both invalidate
+downstream state; `get!` performs the generated minimal recomputation.
+
+The selected graph and runtime slot types are fixed. This is the efficient
+state-machine counterpart to the open-ended, dictionary-backed
+[`ReactiveState`](@ref).
+
+Unless `simplify = false` (or the project preference `[ReactiveKernels]
+simplify = false`), each recipe computes the numerically fragile compositions
+in its own source in the stable form [`prepare`](@ref) computes
+(`log(exp(u))` as `u`). A composition across two state values is computed as
+written: `w = log(v)` reads `v`'s slot, which [`freeze!`](@ref) can set, even
+where `v = exp(u)`.
+"""
+function prepare_reactive(graph::Graph; have = (), want = (), simplify = nothing)
+    _prepare_reactive(graph; have = have, want = want, simplify = simplify)
 end
 
 """
-    prepare_reactive_nonallocating(graph; have, want, is_mutating=_default_is_mutating)
+    prepare_reactive_nonallocating(graph; have, want, is_mutating=_default_is_mutating,
+                                   simplify=nothing)
     prepare_reactive_nonallocating(spec::KernelSpec; ...)
 
 Optional MutatingFunctions-backed reactive preparation. Install and load
@@ -333,6 +386,8 @@ extension that supplies these methods. It prepares the same closed-world state
 program as [`prepare_reactive`](@ref), but selected single-output recipes reuse
 their per-instance slot buffer in place through `MutatingFunctions.apply!!`
 instead of allocating a fresh recipe return on every recomputation.
+`simplify` is as for [`prepare_reactive`](@ref); a recipe reused in place
+runs its own operation, which selects its in-place method.
 
 Selection is per recipe via `is_mutating(recipe)::Bool` (default: mutable/
 array-like outputs). With the MutatingFunctions hook a selected recipe is
@@ -359,7 +414,14 @@ end
 
 function _prepare_reactive(graph::Graph; have = (), want = (),
                            cache_apply = nothing,
-                           is_mutating = _default_is_mutating)
+                           is_mutating = _default_is_mutating,
+                           simplify = nothing)
+    _with_simplify(simplify) do
+        _prepare_reactive_program(graph, have, want, cache_apply, is_mutating)
+    end
+end
+
+function _prepare_reactive_program(graph::Graph, have, want, cache_apply, is_mutating)
     selected = plan(graph; have = have, want = want)
     values = _state_values(selected)
     index = Dict(canon_id(graph, value.id) => i for (i, value) in enumerate(values))
@@ -367,9 +429,11 @@ function _prepare_reactive(graph::Graph; have = (), want = (),
     handles = _state_handles(token, graph, values)
     recipe_index = Dict(recipe.id => i for (i, recipe) in enumerate(selected.recipes))
     mutating_slots = _mutating_slots(selected, graph, index, cache_apply, is_mutating)
+    ops = _reactive_ops(selected, index, mutating_slots)
     getters = Tuple(
         _prepare_getter(selected, index, recipe_index, canon_id(graph, value.id);
-                        cache_apply = cache_apply, mutating_slots = mutating_slots)
+                        cache_apply = cache_apply, mutating_slots = mutating_slots,
+                        ops = ops)
         for value in values
     )
 

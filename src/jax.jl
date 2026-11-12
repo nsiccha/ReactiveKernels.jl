@@ -82,6 +82,30 @@ struct _JaxOrigin
     key::String
     position::Union{Nothing,String}
     offset::String
+    path::String
+end
+_JaxOrigin(key::String, position::Union{Nothing,String}, offset::String) =
+    _JaxOrigin(key, position, offset, "")
+# A data-only cell recipe that can be moved to prepare_data if a later loop
+# needs a bound on its integer result. The existing host split does the work.
+struct _JaxCellData
+    plate::Int
+    recipe::Int
+end
+# An integer array, including a ragged array of integer arrays. Bounds are
+# computed over its prepared representation, not over a Julia exemplar.
+_jax_integer_data(@nospecialize(T)) = T isa Type &&
+    (T <: Integer || T <: AbstractArray && _jax_integer_data(eltype(T)))
+# Selecting a row keeps its original prepared array and records the row's
+# position. A later scalar selection completes that position. This lets two
+# ends in the same row/scan step share a span bound without confusing entries
+# read from different rows.
+function _jax_selected_origin(source::_PyVal, @nospecialize(T), position::String)
+    o = source.origin
+    o isa _JaxCellData && _jax_integer_data(T) && return o
+    o isa _JaxOrigin && o.position === nothing && _jax_integer_data(T) || return nothing
+    path = isempty(o.path) ? position : repr((o.path, position))
+    T <: Integer ? _JaxOrigin(o.key, path, "0") : _JaxOrigin(o.key, nothing, "0", path)
 end
 # An element of a loop's or generator's range: at least `lo` and at most
 # `hi`, its ends, so a range from or to it is bounded by theirs (`for s in
@@ -93,8 +117,12 @@ struct _JaxBetween
 end
 # The value whose static bounds bound `v` from below (above): the first
 # (last) end of the range `v` is an element of, or `v` itself.
-_jax_lower_end(v::_PyVal) = v.origin isa _JaxBetween ? _jax_lower_end(v.origin.lo) : v
-_jax_upper_end(v::_PyVal) = v.origin isa _JaxBetween ? _jax_upper_end(v.origin.hi) : v
+_jax_lower_end(v::_PyVal) = _jax_lower_end(v, v.origin)
+_jax_upper_end(v::_PyVal) = _jax_upper_end(v, v.origin)
+_jax_lower_end(v::_PyVal, origin) = v
+_jax_upper_end(v::_PyVal, origin) = v
+_jax_lower_end(v::_PyVal, origin::_JaxBetween) = _jax_lower_end(origin.lo)
+_jax_upper_end(v::_PyVal, origin::_JaxBetween) = _jax_upper_end(origin.hi)
 # A range element's index value `index`, between `lo` and `hi`.
 _jax_range_index(index::AbstractString, lo::_PyVal, hi::_PyVal) =
     _PyVal(index, Int, false, "", "", 0, _JaxBetween(lo, hi))
@@ -268,6 +296,7 @@ mutable struct _JaxModule
     # functions, by (plate recipe id, cell recipe id) (`_jax_cell_split`,
     # jax_host.jl).
     cell_reasons::Dict{Tuple{Int,Int},JAXEmissionError}
+    cell_data::Set{Tuple{Int,Int}}
     # The recipes being emitted, outermost first, each with its plan; and for
     # an emission error, that chain where it was raised (`_jax_plan_recipe!`).
     path::Vector{Tuple{Plan,Recipe}}
@@ -275,7 +304,7 @@ mutable struct _JaxModule
 end
 _JaxModule() = _JaxModule(String[], Dict{Any,Any}(), Set{String}(), 0,
                           Dict{Int,JAXEmissionError}(), nothing, Set{Symbol}(),
-                          Dict{Tuple{Int,Int},JAXEmissionError}(), Tuple{Plan,Recipe}[],
+                          Dict{Tuple{Int,Int},JAXEmissionError}(), Set{Tuple{Int,Int}}(), Tuple{Plan,Recipe}[],
                           IdDict{Any,Vector{Tuple{Plan,Recipe}}}())
 
 # Translation state: the module, the current function scope, the current
@@ -863,6 +892,10 @@ end
 # Index `x` with Julia indices `indices` (source expressions). An assignment
 # `target` reads the position only, so its gather carries no extent.
 function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
+    if !target && x.origin isa _JaxHistoryLayout
+        read = _jax_history_read!(ctx, x, indices)
+        read === nothing || return read
+    end
     if ctx.host !== nothing
         v = _host_index(ctx, x, indices)
         v === nothing || return v
@@ -925,7 +958,8 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
         isempty(x.extent) && _jax_error("a ragged array without its lengths", _jax_where(ctx))
         # One group's row and length, or several groups' rows and lengths.
         return _PyVal(_py_atom(x.code) * "[" * join(parts, ", ") * "]", T, false,
-                      x.extent * "[" * join(parts, ", ") * "]")
+                      x.extent * "[" * join(parts, ", ") * "]", "", 0,
+                      kept == 0 && !target ? _jax_selected_origin(x, T, join(parts, ", ")) : nothing)
     end
     if !isempty(x.extent) && kept > 0
         # A gather from a padded group vector by an index vector: the indices
@@ -939,9 +973,7 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
                target ? "" : _jax_gather_extent(ctx, values, kept))
     # An entry of a prepared integer array keeps where it comes from, so a
     # loop over a range it ends has a static number of steps.
-    o = x.origin
-    kept == 0 && !target && o isa _JaxOrigin && o.position === nothing ?
-        _jax_with_origin(v, _JaxOrigin(o.key, join(parts, ", "), "0")) : v
+    kept == 0 && !target ? _jax_with_origin(v, _jax_selected_origin(x, T, join(parts, ", "))) : v
 end
 # The extent of a gather: the lengths of its index vector, when that is padded
 # (a ragged row, or a range to a data length), since the gathered entries are
@@ -995,6 +1027,9 @@ end
 # An index expression in which `end` and `begin` name the bounds of `x`'s
 # dimension `dim`.
 function _jax_bound_expr(ctx::_JaxContext, x::_PyVal, dim::Int, index)
+    # A history access may already have resolved its index while checking
+    # the storage layout. Reuse it without repeating any emitted effects.
+    index isa _PyVal && return index
     index === :end && return _PyVal(_jax_dim_code(ctx, x, dim), Int, true)
     index === :begin && return _PyVal("1", Int)
     if index isa Expr && (_jax_mentions(index, :end) || _jax_mentions(index, :begin))
@@ -1744,6 +1779,11 @@ end
 function _jax_trip_bound(ctx::_JaxContext, lo::_PyVal, hi::_PyVal)
     lo, hi = _jax_lower_end(lo), _jax_upper_end(hi)
     a, b = lo.origin, hi.origin
+    for o in (a, b)
+        o isa _JaxCellData || continue
+        throw(_CellHostNeeded(o.plate, o.recipe, JAXEmissionError(
+            "a data-only integer used as a loop end needs a bound from `prepare_data`" * _jax_where(ctx))))
+    end
     count = if a isa _JaxOrigin && b isa _JaxOrigin && a.position !== nothing &&
                a.position == b.position
         span = _jax_prepared_bound!(ctx, :span, a.key, b.key)
@@ -1916,7 +1956,18 @@ def _rk_check(valid, message):
         import numpy as np
         if not np.all(v):
             raise ValueError(message)
-    jax.debug.callback(check, valid)
+    # A plate checks all active lanes with one callback. Re-entering checked
+    # batches outer vmap axes too; an empty axis executes no checks.
+    @jax.custom_batching.custom_vmap
+    def checked(v):
+        jax.debug.callback(check, v)
+        return ()
+    @checked.def_vmap
+    def checked_batch(axis_size, in_batched, v):
+        if axis_size:
+            checked(jnp.all(v))
+        return (), ()
+    checked(valid)
 """
 function _jax_call_positional(ctx::_JaxContext, ::typeof(_runtime_check), args::Vector{_PyVal})
     valid, e = args
@@ -2663,13 +2714,19 @@ function _jax_call_positional(ctx::_JaxContext, f::Function, args::Vector{_PyVal
         v = _jax_scalar_or_elementwise(ctx, f, args)
         v === nothing || return _jax_shifted_limit(f, args, v)
     end
-    _jax_function_call(ctx, f, args)
+    _jax_history_index_result(f, args, _jax_function_call(ctx, f, args))
 end
 
 # `j ± c` of an integer `j` with a static bound and a static integer `c`
 # keeps a bound (`j - 1` of a step index is at most its bound, `j + c` at most
 # the bound plus `c`), so a loop up to it still runs to a static limit.
 function _jax_shifted_limit(f, args::Vector{_PyVal}, v::_PyVal)
+    # A history index can also be a prepared integer used as a loop bound.
+    # Propagate the ordinary integer origin before adding its lag proof.
+    values = map(_jax_history_value, args)
+    _jax_history_index_result(f, args, _jax_shifted_integer_limit(f, values, v))
+end
+function _jax_shifted_integer_limit(f, args::Vector{_PyVal}, v::_PyVal)
     (f === (+) || f === (-)) && length(args) == 2 && isempty(v.limit) && !v.static || return v
     a, b = args
     a.T isa Type && a.T <: Integer && b.T isa Type && b.T <: Integer || return v
@@ -2690,7 +2747,7 @@ function _jax_shifted_limit(f, args::Vector{_PyVal}, v::_PyVal)
     else
         return v
     end
-    _PyVal(v.code, v.T, v.static, v.extent, limit, v.padded)
+    _PyVal(v.code, v.T, v.static, v.extent, limit, v.padded, v.origin)
 end
 
 """
@@ -2793,6 +2850,11 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(/), args::Vector{_PyVal})
 end
 
 function _jax_function_call(ctx::_JaxContext, ::typeof(sum), args::Vector{_PyVal})
+    # Fixed structural lag windows reduce a numeric tuple. JAX reductions
+    # require an array; tuples of arrays have different Julia sum semantics.
+    if length(args) == 1 && _jax_numeric_tuple(args[1].T)
+        return _jax_result(sum, args, "jnp.sum(jnp.asarray(" * args[1].code * "))")
+    end
     if length(args) == 1 && !isempty(args[1].extent) && _jax_rank(args[1].T) == 1
         x = args[1]
         return _PyVal("jnp.sum(jnp.where(" * _jax_mask(x) * ", " * x.code * ", 0.0))", eltype(x.T))
@@ -3424,13 +3486,14 @@ function _jax_call_positional(ctx::_JaxContext, ::Colon, args::Vector{_PyVal})
         return _PyVal("jnp.arange(" * a.code * ", " * _jax_plus_one(_PyVal(b.limit, Int)) * ")",
                       UnitRange{Int}, false, count)
     end
-    _PyVal("jnp.arange(" * a.code * ", " * _jax_plus_one(b) * ")", UnitRange{Int})
+    _jax_with_origin(_PyVal("jnp.arange(" * a.code * ", " * _jax_plus_one(b) * ")", UnitRange{Int}),
+                     _JaxScanRange(a.code))
 end
 _jax_plus_one(b::_PyVal) = match(r"^-?[0-9]+$", b.code) === nothing ?
     _py_infix("+", [b.code, "1"]) : string(parse(Int, b.code) + 1)
 _jax_function_call(ctx::_JaxContext, ::typeof(eachindex), args::Vector{_PyVal}) =
     length(args) == 1 && _jax_is_array(args[1].T) && ndims(args[1].T) == 1 ?
-    _PyVal("jnp.arange(1, " * _jax_dim_code(ctx, args[1], 1) * " + 1)", Base.OneTo{Int}) :
+    _jax_axis(ctx, args[1], 1) :
     _jax_error("`eachindex` of `", args[1].T, "`", _jax_where(ctx))
 function _jax_function_call(ctx::_JaxContext, ::typeof(axes), args::Vector{_PyVal})
     # On the host, `axes(x)` is the tuple of its ranges (`_host_axes`).
@@ -3438,8 +3501,18 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(axes), args::Vector{_PyVa
     length(args) == 2 || _jax_error("`axes` without a dimension", _jax_where(ctx))
     d = match(r"^[0-9]+$", args[2].code)
     d === nothing && _jax_error("`axes` with a computed dimension", _jax_where(ctx))
-    _PyVal("jnp.arange(1, " * _jax_dim_code(ctx, args[1], parse(Int, args[2].code)) * " + 1)",
-           Base.OneTo{Int})
+    _jax_axis(ctx, args[1], parse(Int, args[2].code))
+end
+# An axis of a padded row has the row's valid length, even though its
+# storage spans the padded width. Scans and reductions must mask that tail.
+function _jax_axis(ctx::_JaxContext, x::_PyVal, dim::Int)
+    extent = ""
+    if ctx.host === nothing && !isempty(x.extent) && !_jax_ragged(x.T)
+        size = _jax_padded_size(ctx, x, [_PyVal(string(dim), Int, true)])
+        isempty(size.limit) || (extent = size.code)
+    end
+    _PyVal("jnp.arange(1, " * _jax_dim_code(ctx, x, dim) * " + 1)",
+           Base.OneTo{Int}, false, extent)
 end
 function _jax_function_call(ctx::_JaxContext, ::typeof(collect), args::Vector{_PyVal})
     x = only(args)
@@ -3496,6 +3569,18 @@ function _jax_call_positional(ctx::_JaxContext, J::LinearAlgebra.UniformScaling,
     code = np * "eye(" * size * ")"
     J.λ == true || (code = _py_infix("*", [_jax_literal(J.λ).code, code]))
     _PyVal(code, typeof(J(1)), false, extent, "", isempty(extent) ? 0 : 3)
+end
+
+# Fixed arguments are captured runtime values, just as in anonymous closures.
+function _jax_call_positional(ctx::_JaxContext, T::Union{Type{Base.Fix1},Type{Base.Fix2}},
+                              args::Vector{_PyVal})
+    length(args) == 2 || return _jax_error("constructing `", T, "` requires two arguments",
+                                         _jax_where(ctx))
+    # Source passes singleton functions by their type; lowered calls carry a
+    # callable. Normalize that field before Base's Fix1/Fix2 body reads it.
+    captures = [_PyVal("<callable>", _JaxCallable(_jax_function_of(args[1]))), args[2]]
+    F = T{_jax_argument_type(args[1]),_jax_argument_type(args[2])}
+    _PyVal("<closure>", _JaxCallable(_JaxClosure(F, captures)), false)
 end
 
 # A Julia type called as a function: a conversion.
@@ -4185,6 +4270,8 @@ function _jax_module_global(ctx::_JaxContext, m::Module, name::Symbol, read)
 end
 function _jax_call_positional(ctx::_JaxContext, ::typeof(getproperty), args::Vector{_PyVal})
     x, field = args
+    x.T isa _JaxCallable && x.T.f isa _JaxClosure &&
+        return _jax_function_call(ctx, getproperty, args)
     name = _jax_static_symbol(ctx, field)
     # `StanBlocks.jcall` in lowered code is `getproperty(StanBlocks, :jcall)`.
     x.T isa _JaxCallable{Module} && return _jax_module_global(ctx, x.T.f, name, getproperty)
@@ -4306,10 +4393,15 @@ end
 
 function _jax_define!(ctx::_JaxContext, g::Graph, v::Value, val::_PyVal; bind::Bool = true)
     id = canon_id(g, v.id)
+    if ctx.host === nothing && !val.static && val.origin === nothing &&
+       _jax_integer_data(val.T) && length(ctx.mod.path) == 2
+        key = (last(ctx.mod.path[1]).id, last(ctx.mod.path[2]).id)
+        key in ctx.mod.cell_data && (val = _jax_with_origin(val, _JaxCellData(key...)))
+    end
     if bind
         name = _jax_fresh(ctx, v.name)
         _jax_emit!(ctx, name * " = " * val.code)
-        val = _PyVal(name, val.T, val.static, val.extent, val.limit, val.padded)
+        val = _PyVal(name, val.T, val.static, val.extent, val.limit, val.padded, val.origin)
     end
     ctx.scope.values[id] = val
     val
@@ -4515,7 +4607,8 @@ function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
                              statics = fill(false, length(p.have)),
                              links = fill(nothing, length(p.have)),
                              origins = fill(nothing, length(p.have)),
-                             fields = fill(0, length(p.have)))
+                             fields = fill(0, length(p.have)),
+                             active_cells::Bool = false)
     name = _jax_fresh(ctx, hint)
     outer = ctx.scope
     inner = _JaxScope(outer)
@@ -4533,10 +4626,16 @@ function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
                                                        fields[i], origins[i])
         links[i] === nothing || (inner.links[canon_id(p.graph, v.id)] = links[i])
     end
+    active = active_cells ? _jax_identifier(inner.used, :active_cell) : ""
+    active_cells && push!(names, active)
     recipe = ctx.recipe
     ctx.scope = inner
     wants = try
-        _jax_plan!(ctx, p)
+        if active_cells
+            _jax_with_guard(() -> _jax_plan!(ctx, p), inner, active)
+        else
+            _jax_plan!(ctx, p)
+        end
         [_jax_lookup(ctx, p.graph, v) for v in p.want]
     finally
         ctx.scope = outer
@@ -4615,16 +4714,23 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     # every argument the plate maps (`starts[i]:stops[i]` as `a:b` of a cell
     # over `starts` and `stops`).
     position = string("cell ", _JAX_CELL_POSITIONS[] += 1)
-    cell_origins = Any[v.origin isa _JaxOrigin && v.origin.position === nothing &&
-                       !ragged[i] && !padded[i] ?
-                       (mapped[i] ? _JaxOrigin(v.origin.key, position, "0") : v.origin) : nothing
+    cell_origins = Any[mapped[i] ? _jax_selected_origin(v, cell_types[i], position) : v.origin
                        for (i, v) in enumerate(inputs)]
+    masks = [_jax_padded_mask(v) for v in inputs[padded]]
+    masked = any(padded) && all(m -> m !== nothing, masks)
+    effects_before = _JAX_EFFECTS[]
     cell, wants, with_length, cell_params = _jax_plan_function!(ctx, :cell, body, cell_types;
                                                                 extents = cell_extents,
                                                                 statics = cell_statics,
                                                                 links = cell_links,
                                                                 origins = cell_origins,
-                                                                fields = cell_fields)
+                                                                fields = cell_fields,
+                                                                active_cells = masked)
+    # A check cannot be run on padding unless its valid cells are known.
+    # Pure cells without checks retain their existing translation.
+    any(padded) && !masked && _JAX_EFFECTS[] != effects_before &&
+        _jax_error("runtime checks in a padded plate whose valid axes are unknown",
+                   _jax_where(ctx))
     want = only(wants)
     E = _jax_typeof(want)
     axes = String[]
@@ -4634,6 +4740,14 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
         if ragged[i]
             push!(axes, mapped[i] ? "0" : "None"); push!(args, v.extent)
         end
+    end
+    if masked
+        # Padding is storage, not a native cell. Include its activity in
+        # runtime-check guards before batching those checks across lanes.
+        masks = ["jnp.broadcast_to(" * mask * ", " * _py_atom(v.code) * ".shape)"
+                 for (v, mask) in zip(inputs[padded], masks)]
+        push!(axes, "0")
+        push!(args, foldl((a, b) -> "jnp.logical_and(" * a * ", " * b * ")", masks))
     end
     axes_text = "(" * join(axes, ", ") * (length(axes) == 1 ? ",)" : ")")
     call = cell
@@ -4787,10 +4901,12 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     have = body.have
     inner.values[canon_id(body.graph, have[1].id)] = _PyVal(carry, types[1])
     unpack = String[]
+    entry_position = string("scan ", _JAX_CELL_POSITIONS[] += 1)
     for (k, i) in enumerate(iterated)
         name = _jax_identifier(inner.used, have[1 + k].name)
         push!(unpack, name)
-        inner.values[canon_id(body.graph, have[1 + k].id)] = _jax_scan_element(name, inputs[i])
+        inner.values[canon_id(body.graph, have[1 + k].id)] =
+            _jax_scan_element(name, inputs[i], entry_position)
     end
     for (k, i) in enumerate(shared)
         inner.values[canon_id(body.graph, have[1 + length(iterated) + k].id)] = inputs[i]
@@ -4832,9 +4948,19 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     isempty(position) || push!(seqs, "jnp.arange(" * _py_atom(inputs[iterated[1]].code) * ".shape[0])")
     sequences = "(" * join(seqs, ", ") * (length(seqs) == 1 ? ",)" : ")")
     result = _jax_fresh(ctx, :scan_result)
-    _jax_emit!(ctx, "_, " * result * " = jax.lax.scan(" * step * ", " * inputs[1].code *
-                    ", " * sequences * ")")
     E = _jax_typeof(wants[2])
+    call = "jax.lax.scan(" * step * ", " * inputs[1].code * ", " * sequences * ")[1]"
+    # JAX otherwise traces the step even for zero steps, including indexed
+    # reads of an empty shared row. Numeric outputs have a known empty shape.
+    empty = E <: Number ? _jax_no_values(E, false) :
+        _jax_numeric_namedtuple(E) || _jax_numeric_tuple(E) ?
+        "(" * join((_jax_no_values(F, false) for F in fieldtypes(E)), ", ") * ",)" : nothing
+    if empty === nothing
+        _jax_emit!(ctx, result * " = " * call)
+    else
+        steps = _jax_mapped_array(inputs[first(iterated)]) * ".shape[0]"
+        _jax_emit_unless_empty!(ctx, result, call, empty, _jax_nonempty("1", steps))
+    end
     if I
         _jax_emit!(ctx, result * " = jnp.concatenate([jnp.atleast_1d(" * inputs[1].code *
                         "), " * result * "])")
@@ -4855,9 +4981,10 @@ end
 # One element of a scan's sequence, as its step reads it. An index of
 # `eachindex(x)`/`axes(x, d)` (`Base.OneTo`) is at most the sequence's length,
 # a static bound, so a loop or generator up to it runs to that bound, masked.
-function _jax_scan_element(name::AbstractString, seq::_PyVal)
+function _jax_scan_element(name::AbstractString, seq::_PyVal, position::String)
     E = eltype(seq.T)
-    seq.T isa Type && seq.T <: Base.OneTo && isempty(seq.extent) || return _PyVal(name, E)
+    seq.T isa Type && seq.T <: Base.OneTo ||
+        return _jax_with_origin(_PyVal(name, E), _jax_selected_origin(seq, E, position))
     _PyVal(name, E, false, "", _py_atom(seq.code) * ".shape[0]")
 end
 
@@ -4866,7 +4993,8 @@ end
 # carry and the result vector. That vector starts as `h₀` filled to the
 # sequences' length, or as the leading entries followed by zeros; step `j`
 # writes entry `offset + j` (`.at[].set`, stored as the vector's element
-# type) and reads the whole vector, as natively. Linear in the steps.
+# type). Bounded-lag reads use a rolling carry; all other uses retain the
+# full vector. Outputs are stacked by scan separately from that carry.
 function _jax_history_scan(ctx::_JaxContext, recipe::Recipe,
                            op::_AuthoredScanOp{K,A,I,H}, inputs) where {K,A,I,H}
     body = op.kernel.plan
@@ -4884,16 +5012,7 @@ function _jax_history_scan(ctx::_JaxContext, recipe::Recipe,
                    _jax_where(ctx))
     dtype = _jax_dtype(E)
     steps = _py_atom(args[iterated[1]].code) * ".shape[0]"
-    buffer = _jax_fresh(ctx, :history)
-    offset = if HT <: Number
-        _jax_emit!(ctx, buffer * " = jnp.full((" * steps * ",), " * history.code * ", dtype=" *
-                        dtype * ")")
-        "0"
-    else
-        _jax_emit!(ctx, buffer * " = jnp.concatenate([jnp.asarray(" * history.code * ", dtype=" *
-                        dtype * "), jnp.zeros((" * steps * ",), dtype=" * dtype * ")])")
-        _py_atom(history.code) * ".shape[0]"
-    end
+    offset = HT <: Number ? "0" : _py_atom(history.code) * ".shape[0]"
     step = _jax_fresh(ctx, :step)
     state = _jax_fresh(ctx, :state)
     xs = _jax_fresh(ctx, :xs)
@@ -4903,20 +5022,26 @@ function _jax_history_scan(ctx::_JaxContext, recipe::Recipe,
     push!(inner.used, state, xs)
     carry = _jax_identifier(inner.used, :carry)
     earlier = _jax_identifier(inner.used, :earlier)
+    position = _jax_identifier(inner.used, :position)
+    history_token = _jax_identifier(inner.used, :history_value)
+    layout = _JaxHistoryLayout(history_token, earlier, position, offset,
+                               HT <: Number ? history.code : "0", Tuple{String,String,_JaxHistoryIndex}[])
     have = body.have
     inner.values[canon_id(body.graph, have[1].id)] = _PyVal(carry, args[1].T)
     unpack = String[]
+    entry_position = string("scan ", _JAX_CELL_POSITIONS[] += 1)
     for (k, i) in enumerate(iterated)
         name = _jax_identifier(inner.used, have[1 + k].name)
         push!(unpack, name)
-        inner.values[canon_id(body.graph, have[1 + k].id)] = _jax_scan_element(name, args[i])
+        inner.values[canon_id(body.graph, have[1 + k].id)] =
+            _jax_history_element(ctx, name, args[i], layout, entry_position)
     end
-    position = _jax_identifier(inner.used, :position)
     push!(unpack, position)
     for (k, i) in enumerate(shared)
         inner.values[canon_id(body.graph, have[1 + length(iterated) + k].id)] = args[i]
     end
-    inner.values[canon_id(body.graph, have[end].id)] = _PyVal(earlier, Vector{E})
+    inner.values[canon_id(body.graph, have[end].id)] =
+        _jax_with_origin(_PyVal(history_token, Vector{E}), layout)
     recipe_saved = ctx.recipe
     ctx.scope = inner
     wants = try
@@ -4930,14 +5055,26 @@ function _jax_history_scan(ctx::_JaxContext, recipe::Recipe,
     end
     _jax_typeof(wants[2]) <: Number || _jax_error("a history scan whose step outputs `",
         _jax_typeof(wants[2]), "` has no JAX translation yet", _jax_where(ctx))
+    storage = _jax_history_layout!(ctx, layout, inner, wants, steps, history, dtype)
+    wants = storage.wants
     push!(outer.lines, "    "^outer.indent * "def " * step * "(" * state * ", " * xs * "):")
     append!(outer.lines, inner.lines)
+    output = _jax_identifier(inner.used, :output)
+    push!(outer.lines, "    "^inner.indent * output * " = jnp.asarray(" * wants[2].code * ", dtype=" * dtype * ")")
+    at = _py_infix("+", [offset, position])
+    at = "((" * at * ") % " * storage.width * " if " * storage.use_compact * " else " * at * ")"
     push!(outer.lines, "    "^inner.indent * "return (" * wants[1].code * ", " * earlier *
-          ".at[" * _py_infix("+", [offset, position]) * "].set(" * wants[2].code * ")), None")
+          ".at[" * at * "].set(" * output * ")), " * output)
     seqs = String[[args[i].code for i in iterated]; "jnp.arange(" * steps * ")"]
     result = _jax_fresh(ctx, :scan_result)
-    _jax_emit!(ctx, "(_, " * result * "), _ = jax.lax.scan(" * step * ", (" * args[1].code *
-                    ", " * buffer * "), (" * join(seqs, ", ") * "))")
+    full = _jax_fresh(ctx, :history_result)
+    outputs = _jax_fresh(ctx, :scan_outputs)
+    _jax_emit!(ctx, "(_, " * full * "), " * outputs * " = jax.lax.scan(" * step * ", (" * args[1].code *
+                    ", " * storage.buffer * "), (" * join(seqs, ", ") * ")) if " * steps *
+                    " else ((" * args[1].code * ", " * storage.buffer * "), jnp.zeros((0,), dtype=" * dtype * "))")
+    compact_result = HT <: Number ? outputs :
+        "jnp.concatenate([jnp.asarray(" * history.code * ", dtype=" * dtype * "), " * outputs * "])"
+    _jax_emit!(ctx, result * " = " * compact_result * " if " * storage.use_compact * " else " * full)
     [_PyVal(result, Vector{E})]
 end
 
@@ -5458,6 +5595,7 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
     all_types = Any[[have_types[v.name] for v in split.remaining]; prepared_types]
     all_names = [remaining_names; prepared_names]
     for (fname, (rp, w)) in split.residuals
+        _jax_cell_data!(mod, split, rp)
         lines, f = try
             _jax_function!(mod, fname, rp, Tuple(all_types), w; names = all_names,
                            doc = get(function_docs, fname, nothing),
@@ -5553,8 +5691,8 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
         static = names !== nothing && T isa Type && T <: Integer
         # A prepared integer array: ranges over its entries have static
         # bounds that `prepare_data` computes (`_jax_trip_bound`).
-        prepared = keyword_from !== nothing && k > keyword_from && isempty(extent) &&
-            T isa Type && T <: AbstractArray && eltype(T) <: Integer
+        prepared = keyword_from !== nothing && k > keyword_from &&
+            T isa Type && T <: AbstractArray && _jax_integer_data(T)
         scope.values[canon_id(p.graph, v.id)] = _PyVal(param, T, static, extent, "", 0,
             prepared ? _JaxOrigin(param, nothing, "0") : nothing)
         # Callers may pass NumPy arrays; JAX indexes only its own arrays by a
