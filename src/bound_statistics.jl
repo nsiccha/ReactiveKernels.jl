@@ -859,14 +859,16 @@ function _ls_plate_rewrite(p::Plan, r::Recipe, total::Recipe, dataonly::Set{Valu
     unique!(data)
     live = ValueId[l for (_, l, _, _) in x.terms]
     S = _ls_structure(x, data, live)
-    drop = _ls_exclusive(p, canon_id(g, location.id), r, wanted, dataonly)
+    # The location operation reads the live values and the data itself.
+    kept = union(wanted, Set(live), Set(data))
+    drop = _ls_exclusive(p, canon_id(g, location.id), r, kept, dataonly)
     (; S, response, location, position, data, live, drop)
 end
 
 # The recipes that compute only the authored location for this plate: none
-# of their outputs is wanted or read by anything else. A usable binding drops
-# them (`_ls_class_residual`).
-function _ls_exclusive(p::Plan, location::ValueId, plate::Recipe, wanted, dataonly)
+# of their outputs is `kept` (wanted, or read by the location operation) or
+# read by anything else. A usable binding drops them (`_ls_class_residual`).
+function _ls_exclusive(p::Plan, location::ValueId, plate::Recipe, kept, dataonly)
     g = p.graph
     readers = Dict{ValueId,Vector{Int}}()
     for q in p.recipes, v in q.inputs
@@ -876,12 +878,12 @@ function _ls_exclusive(p::Plan, location::ValueId, plate::Recipe, wanted, dataon
     pending = [location]
     while !isempty(pending)
         id = pop!(pending)
-        (id in wanted || id in dataonly) && continue
+        (id in kept || id in dataonly) && continue
         r = get(p.producer, id, nothing)
         r === nothing && continue
         r.effectful && continue
         r.id in drop && continue
-        all(o -> !(canon_id(g, o.id) in wanted) &&
+        all(o -> !(canon_id(g, o.id) in kept) &&
             all(q -> q == plate.id || q in drop, get(readers, canon_id(g, o.id), Int[])),
             r.outputs) || continue
         push!(drop, r.id)
