@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.203
+## 0.1.204
 
 - `jax_source` takes `float_type`, `Float64` (the default) or `Float32`: the
   dtype of every float value the program does not type `Float32` itself, for
@@ -34,6 +34,17 @@ are recorded in the git history only.
   constant) returns it in the branch's float dtype where that dtype is
   `float32`: `jax.lax.cond` refused a float64 literal arm beside a `float32`
   one, also in a `Float32` program's `Float64` module.
+
+## 0.1.203
+
+- Nested native plates reuse elementary scalar work on an invariant array
+  across enclosing cells. For example, a whole-event Bernoulli mixture can
+  compute `log(p[j,k])` and `log1p(-p[j,k])` once per matrix entry instead of
+  once per observation. The same lowering handles logit expressions and
+  invariant subexpressions inside event-dependent arithmetic. Tables and loops
+  keep runtime sizes. Domain and storage checks retain the authored path for
+  singular live inputs, unsupported arrays and effectful regions; empty and
+  ragged domains retain their values, ordinary derivatives and access checks.
 
 ## 0.1.202
 

@@ -23,7 +23,7 @@ are recorded in the git history only.
   and the module does not turn on JAX's 64-bit mode. The default `Float64`
   module is its reference. The module's simplex and multivariate normal
   helpers allocate in their inputs' dtype (the same values in a `Float64`
-  module). Requires ReactiveKernels 0.1.203 (snag jax-source-float-5e6b7604).
+  module). Requires ReactiveKernels 0.1.204 (snag jax-source-float-5e6b7604).
 
 ## 0.1.164
 

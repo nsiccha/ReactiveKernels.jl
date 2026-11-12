@@ -338,14 +338,20 @@ const _EDGES = (-800.0, 710.0, 800.0)
 _edge_value(u) = log1p(exp(-big(u)))
 _edge_derivative(u) = -1 / (1 + exp(big(u)))
 
-# The reactive getter of `want` at `u`, and its derivative in `u`.
+# The reactive getter of `want` at `u`.
 function _reactive_value(program, want, u)
     state = program(u)
     get!(state, statevalue(program, want))
 end
-_reactive_derivative(program, want, u) = Enzyme.autodiff(Enzyme.Reverse,
-    Enzyme.Const(x -> _reactive_value(program, want, x)), Enzyme.Active,
-    Enzyme.Active(u))[1][1]
+# The derivative in `u` of the one recipe the getter of `want` calls: the
+# operation in its callables table, differentiated alone. Differentiating
+# through constructing the state stores the program's constant graph into
+# differentiable memory, which registered Enzyme on Julia 1.13 refuses
+# (`EnzymeRuntimeActivityError`); that is not what this checks.
+function _reactive_derivative(program, want, u)
+    getter = program.getters[RK._slot_index(statevalue(program, want))]
+    _scalar_reverse(only(getter.callables), u)
+end
 
 @testset "a compiled reactive state rewrites each recipe's own source" begin
     program = prepare_reactive(stable_one_statement)

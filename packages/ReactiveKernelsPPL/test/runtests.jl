@@ -132,6 +132,7 @@ const _PPL_TEST_FILES = (
     "test_graph_geometry_constructors.jl",
     "test_geometry_properties.jl",
     "test_whole_event_mixture.jl",
+    "test_whole_event_invariants.jl",
     "test_whole_event_occupancy.jl",
     "test_hidden_markov.jl",
     "test_icar.jl",
