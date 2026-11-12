@@ -1,5 +1,6 @@
 module NestedPlatePartialEvaluationTests
 using ReactiveKernels, Enzyme, Test
+using DifferentiationInterface: AutoEnzyme
 
 @kernel nested_terms(groups::Vector{Vector{Int}}, cuts::Vector{Vector{Float64}},
                      x::Float64) = begin
@@ -195,6 +196,153 @@ end
         deep_terms(y) * a
     end
     return sum(terms)
+end
+
+@kernel indexed_terms(events::Vector{Vector{Int}}, a::Float64) = begin
+    terms = plate(events) do event
+        cells = plate(event) do y
+            sin(a * counted_term(y))
+        end
+        sum(cells)
+    end
+    return sum(terms)
+end
+
+@kernel deep_indexed_terms(events::Vector{Vector{Vector{Int}}}, a::Float64) = begin
+    terms = plate(events) do event
+        indexed_terms(event, a)
+    end
+    return sum(terms)
+end
+
+@kernel indexed_positions(events::Vector{Vector{Int}}, a::Float64) = begin
+    terms = plate(events) do event
+        cells = plate(1:length(event)) do i
+            sin(a * counted_term(event[i]))
+        end
+        sum(cells)
+    end
+    return sum(terms)
+end
+
+@testset "indexed bound work inside live nested cells" begin
+    for spec in (indexed_terms, indexed_positions, deep_indexed_terms)
+        first_kernel = nothing
+        for n in (2, 29, 0)
+            rows = [collect(0:(i % 7)) for i in 1:n]
+            events = spec === deep_indexed_terms ? [rows, [Int[]]] : rows
+            saved = deepcopy(events)
+            bound_calls[] = 0
+            kernel = prepare(spec; bound=(; events), type_stability=:error)
+            @test bound_calls[] == sum(length, rows; init=0)
+            logarithms = [log(Float64(y) + 1) for row in rows for y in row]
+            for a in (0.3, -1.2)
+                @test kernel(a) ≈ sum(l -> sin(a*l), logarithms; init=0.0)
+                @test only(only(Enzyme.autodiff(Enzyme.Reverse, kernel,
+                    Enzyme.Active, Enzyme.Active(a)))) ≈
+                    sum(l -> l*cos(a*l), logarithms; init=0.0)
+            end
+            @test bound_calls[] == sum(length, rows; init=0)
+            @test !occursin("counted_term", string(code_expr(kernel)))
+            @test head_count(code_expr(kernel), :for) ==
+                (spec === deep_indexed_terms ? 3 : 2)
+            if first_kernel === nothing
+                first_kernel = kernel
+            else
+                @test typeof(kernel.f) === typeof(first_kernel.f)
+                @test head_count(code_expr(kernel), :(=)) ==
+                    head_count(code_expr(first_kernel), :(=))
+            end
+            @test events == saved
+        end
+    end
+end
+
+@kernel composed_term(y::Int, a::Float64) = begin
+    result::Float64 = a * counted_term(y)
+    return result
+end
+
+@kernel composed_branch(y::Int, a::Float64) = begin
+    result::Float64 = a > 0 ? composed_term(y, a) + a : a * y
+    return result
+end
+
+@kernel nested_composed_branches(events::Vector{Vector{Int}}, a::Float64) = begin
+    terms = plate(events) do event
+        cells = plate(event) do y
+            composed_branch(y, a)
+        end
+        sum(cells)
+    end
+    return sum(terms)
+end
+
+@testset "scalar kernel branch graphs survive nested composition" begin
+    first_kernel = nothing
+    for n in (2, 29, 0)
+        events = [collect(0:(i % 7)) for i in 1:n]
+        flat = reduce(vcat, events; init=Int[])
+        bound_calls[] = 0
+        kernel = prepare(nested_composed_branches; bound=(;events),
+            type_stability=:error)
+        @test bound_calls[] == length(flat)
+        op = prepare_ad(kernel, AutoEnzyme(;mode=Enzyme.Reverse), 0.3; active=:a)
+        for a in (0.3, -1.2)
+            slope = a > 0 ? sum(y -> log(Float64(y) + 1) + 1, flat; init=0.0) :
+                sum(flat; init=0)
+            value, gradient = ad_value_and_gradient(op, a)
+            @test value ≈ a * slope
+            @test gradient ≈ slope
+        end
+        @test bound_calls[] == length(flat)
+        @test head_count(code_expr(kernel), :for) == 2
+        if first_kernel === nothing
+            first_kernel = kernel
+        else
+            @test typeof(kernel.f) === typeof(first_kernel.f)
+            @test head_count(code_expr(kernel), :(=)) ==
+                head_count(code_expr(first_kernel), :(=))
+        end
+    end
+end
+
+@kernel indexed_guarded_terms(events::Vector{Vector{Float64}}, a::Float64) = begin
+    terms = plate(events) do event
+        cells = plate(event) do y
+            a > 0 ? a * log(y) : a * y
+        end
+        sum(cells)
+    end
+    return sum(terms)
+end
+
+@kernel indexed_owned_results(events::Vector{Vector{Int}}, a::Float64) = begin
+    rows = plate(events) do event
+        plate(event) do y
+            a > 0 ? fill(y, 2) : fill(y + 1, 2)
+        end
+    end
+    return rows
+end
+
+@testset "indexed speculation retains guards and result ownership" begin
+    for events in ([[2.0, 3.0], Float64[]], [[-1.0]], [[0.0]], [Float64[]])
+        kernel = prepare(indexed_guarded_terms; bound=(; events), type_stability=:error)
+        slope = sum(row -> sum(row; init=0.0), events; init=0.0)
+        @test kernel(-0.7) ≈ -0.7slope
+        @test only(only(Enzyme.autodiff(Enzyme.Reverse, kernel,
+            Enzyme.Active, Enzyme.Active(-0.7)))) ≈ slope
+    end
+    throwing = prepare(indexed_guarded_terms; bound=(events=[[-1.0]],))
+    @test_throws DomainError throwing(0.7)
+    kernel = prepare(indexed_owned_results; bound=(events=[[1, 2], Int[]],),
+        type_stability=:error)
+    first_result = kernel(0.7)
+    @test first_result == [[[1, 1], [2, 2]], Vector{Int}[]]
+    first_result[1][1][1] = 100
+    @test kernel(0.7) == [[[1, 1], [2, 2]], Vector{Int}[]]
+    @test kernel(-0.7) == [[[2, 2], [3, 3]], Vector{Int}[]]
 end
 
 @testset "whole bound nested plate runs at preparation" begin

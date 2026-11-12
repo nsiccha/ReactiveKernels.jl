@@ -3242,15 +3242,14 @@ function _plate_branch_source_inputs(inner::Plan, r::Recipe, atomic, callvalues,
     names, shared
 end
 
-# A constructed endpoint's branch is spliced into the cell as recipes, so its
-# authored branch operation does not carry the arm graphs made for a cell's own
-# source. Recover those graphs only when a plate lowers it, with the actual
-# shared inputs of that plate. The operation's source module owns its globals;
-# the graphs remain cold metadata and the original lazy closures execute.
+# A constructed endpoint can carry arm graphs before its enclosing plate's
+# shared inputs are known. Split their strict subexpressions at this boundary,
+# or recover missing graphs from the source, using the actual shared inputs.
+# The graphs remain cold metadata and the original lazy closures execute.
 Base.@nospecializeinfer function _plate_branch_source_graphs(
         r::Recipe, names, shared::Set{Symbol})
     branch = getfield(r.op, :f)
-    (_plate_branch_has_graph(branch) || isempty(shared) ||
+    (isempty(shared) ||
      _kernel_branch_parts(r.source) === nothing) && return branch
     mod = _kernel_endpoint_source_module(r.op)
     key = (Tuple(names), Tuple(sort!(collect(shared))), mod)
@@ -3275,6 +3274,8 @@ Base.@nospecializeinfer function _plate_branch_source_graphs(
             Dict{Any,Any}()
         end
         get!(by_inputs, key) do
+            _plate_branch_has_graph(branch) &&
+                return _plate_branch_split_shared_graphs(branch, shared)
             inputs = Set(names)
             entries = _kernel_plate_arm_entries(r.source, inputs, shared, mod,
                 inputs; endpoint_cache = IdDict{Any,Dict{Any,KernelSpec}}())
@@ -3282,6 +3283,27 @@ Base.@nospecializeinfer function _plate_branch_source_graphs(
                 _plate_branch_with_source_graphs(branch, entries, mod)
         end
     end
+end
+
+# The same strict expression split used by binding can expose a live shared
+# subexpression without evaluating it. Cache this graph with the source above:
+# repeated lowerings must append the same operation objects to their tables.
+Base.@nospecializeinfer function _plate_branch_split_shared_graphs(
+        @nospecialize(branch), shared::Set{Symbol})
+    CI, TI, EI = (typeof(branch)::DataType).parameters
+    child(arm) = arm isa _KernelBranch ?
+        _plate_branch_split_shared_graphs(arm, shared) : arm
+    function split(spec)
+        spec === nothing && return nothing
+        arm = _plate_arm_plan(spec)
+        invariant = Set{ValueId}(canon_id(arm.graph, v.id) for v in arm.have
+                                if v.name in shared)
+        isempty(invariant) && return spec
+        _partial_split_recipes(arm, invariant, Set{Int}(), Dict{Int,Any}())
+    end
+    _KernelBranch(Val(CI), Val(TI), Val(EI), branch.call, branch.condition,
+        child(branch.then_arm), child(branch.else_arm),
+        split(branch.then_spec), split(branch.else_spec))
 end
 
 # A stable hash plus weak identity keeps this cold cache from retaining a

@@ -1369,15 +1369,15 @@ end
 @kernel binomial_product_mixture_logdensity(observed::Vector{Int},
         trials::Matrix{Int}, probabilities::Matrix{Float64},
         weights::Vector{Float64}) = begin
-    checked_trials = size(trials) == size(probabilities) ?
-        trials : throw(DimensionMismatch("trial counts and probabilities must match"))
-    rows_checked = size(probabilities, 1) == length(observed) ?
-        probabilities : throw(DimensionMismatch("probability rows must match observations"))
+    matched_probabilities = size(trials) == size(probabilities) ?
+        probabilities : throw(DimensionMismatch("trial counts and probabilities must match"))
+    rows_checked = size(matched_probabilities, 1) == length(observed) ?
+        matched_probabilities : throw(DimensionMismatch("probability rows must match observations"))
     checked_probabilities = size(rows_checked, 2) == length(weights) ?
         rows_checked : throw(DimensionMismatch("mixture weights must match components"))
-    components = plate(1:length(weights)) do k
+    components = plate(1:size(trials, 2)) do k
         cells = plate(1:length(observed)) do i
-            binomial(checked_trials[i, k], checked_probabilities[i, k]).logpdf(observed[i])
+            binomial(trials[i, k], checked_probabilities[i, k]).logpdf(observed[i])
         end
         sum(cells)
     end
@@ -1409,15 +1409,15 @@ end
 @kernel binomial_logit_product_mixture_logdensity(observed::Vector{Int},
         trials::Matrix{Int}, logits::Matrix{Float64},
         weights::Vector{Float64}) = begin
-    checked_trials = size(trials) == size(logits) ?
-        trials : throw(DimensionMismatch("trial counts and logits must match"))
-    rows_checked = size(logits, 1) == length(observed) ?
-        logits : throw(DimensionMismatch("logit rows must match observations"))
+    matched_logits = size(trials) == size(logits) ?
+        logits : throw(DimensionMismatch("trial counts and logits must match"))
+    rows_checked = size(matched_logits, 1) == length(observed) ?
+        matched_logits : throw(DimensionMismatch("logit rows must match observations"))
     checked_logits = size(rows_checked, 2) == length(weights) ?
         rows_checked : throw(DimensionMismatch("mixture weights must match components"))
-    components = plate(1:length(weights)) do k
+    components = plate(1:size(trials, 2)) do k
         cells = plate(1:length(observed)) do i
-            binomial(; n = checked_trials[i, k],
+            binomial(; n = trials[i, k],
                 logit = checked_logits[i, k]).logpdf(observed[i])
         end
         sum(cells)
@@ -1434,17 +1434,17 @@ end
 @kernel zero_inflated_binomial_logit_product_mixture_logdensity(
         observed::Vector{Int}, trials::Matrix{Int}, logits::Matrix{Float64},
         zi_logits::Matrix{Float64}, weights::Vector{Float64}) = begin
-    checked_trials = size(trials) == size(logits) ?
-        trials : throw(DimensionMismatch("trial counts and logits must match"))
+    matched_logits = size(trials) == size(logits) ?
+        logits : throw(DimensionMismatch("trial counts and logits must match"))
     checked_zi_logits = size(zi_logits) == size(logits) ?
         zi_logits : throw(DimensionMismatch("zero-inflation logits and logits must match"))
-    rows_checked = size(logits, 1) == length(observed) ?
-        logits : throw(DimensionMismatch("logit rows must match observations"))
+    rows_checked = size(matched_logits, 1) == length(observed) ?
+        matched_logits : throw(DimensionMismatch("logit rows must match observations"))
     checked_logits = size(rows_checked, 2) == length(weights) ?
         rows_checked : throw(DimensionMismatch("mixture weights must match components"))
-    components = plate(1:length(weights)) do k
+    components = plate(1:size(trials, 2)) do k
         cells = plate(1:length(observed)) do i
-            zero_inflated_binomial_logit_zi(; n = checked_trials[i, k],
+            zero_inflated_binomial_logit_zi(; n = trials[i, k],
                 logit = checked_logits[i, k],
                 zi_logit = checked_zi_logits[i, k]).logpdf(observed[i])
         end
