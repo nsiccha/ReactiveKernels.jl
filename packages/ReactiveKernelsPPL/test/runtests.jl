@@ -176,6 +176,7 @@ const _PPL_TEST_FILES = (
     "test_capability_pointwise_boundaries.jl",
     "test_capability_cells.jl",
     "test_capability_ordinal_levels.jl",
+    "test_capability_categorical_levels.jl",
     "test_capability_stream_latents.jl",
     "test_capability_ranges.jl",
     "test_missing_observations.jl",
