@@ -1272,6 +1272,30 @@ end
 # call `reader_call` run.
 function _lower_authored_scan_slice_native!(body, op::_AuthoredScanOp, callargs,
         offset, demand, reader_args, lhs, reader_call; type_offset = nothing)
+    # Binding and source splitting can lift `lo:hi` into a reader argument.
+    # Its concrete type selects slice demand here; integer and other index
+    # arguments retain the existing element/fallback path. Inspect the range
+    # only inside its selected arm, and evaluate the argument just once.
+    if demand.index_position !== nothing
+        at = demand.index_position
+        argument = gensym(:scan_reader_index)
+        push!(body.args, :($argument = $(reader_args[at])))
+        arguments = Any[reader_args...]
+        arguments[at] = argument
+        element = merge(demand, (; index_position = nothing))
+        parameter = demand.params[at]
+        window = merge(element, (; scalar = false,
+            lo = Expr(:call, GlobalRef(Base, :first), parameter),
+            hi = Expr(:call, GlobalRef(Base, :last), parameter)))
+        range_body, element_body = Expr(:block), Expr(:block)
+        _lower_authored_scan_slice_native!(range_body, op, callargs, offset,
+            window, arguments, lhs, reader_call; type_offset)
+        _lower_authored_scan_slice_native!(element_body, op, callargs, offset,
+            element, arguments, lhs, reader_call; type_offset)
+        push!(body.args, Expr(:if, :($argument isa $(UnitRange{Int})),
+                             range_body, element_body))
+        return body
+    end
     indices, index, carry, output = gensym.((:scan_indices, :scan_index,
         :scan_carry, :scan_output))
     (; seqs, xs, step_body, inferred_output_type, inferred_carry_type) =
@@ -1694,7 +1718,9 @@ end
 # A scan read only through one slice `trajectory[lo:hi]`, or one element
 # `trajectory[k]`, `last(trajectory)` or `first(trajectory)`, whose other steps
 # compute nothing that is read (`_lower_authored_scan_slice_native!`). Returns
-# `(; reader, position, lo, hi, params, mod, carry_free, scalar)` or `nothing`.
+# `(; reader, position, lo, hi, params, mod, carry_free, scalar, index_position)`
+# or `nothing`. An index supplied as a reader argument can be either an
+# integer or a unit range; its runtime type chooses the matching demand.
 #
 # The scan has no `history` and a pure step; its result is no WANT and is read
 # by exactly one recipe, as exactly one of that recipe's inputs (`position`).
@@ -1740,6 +1766,7 @@ function _authored_scan_slice_demand(p::Plan, scan_recipe::Recipe)
     end
     native isa Expr || return nothing
     trajectory = params[position]
+    index_position = nothing
     if native.head === :ref && length(native.args) == 2 && native.args[1] === trajectory
         index = native.args[2]
         if index isa Expr && index.head === :call && !isempty(index.args) &&
@@ -1751,6 +1778,7 @@ function _authored_scan_slice_demand(p::Plan, scan_recipe::Recipe)
             index === :(:) && return nothing
             lo = hi = index
             scalar = true
+            index isa Symbol && (index_position = findfirst(==(index), params))
         end
     elseif native.head === :call && length(native.args) == 2 && native.args[2] === trajectory
         accessor = _kernel_resolve_binding(mod, native.args[1])
@@ -1762,7 +1790,8 @@ function _authored_scan_slice_demand(p::Plan, scan_recipe::Recipe)
     end
     trajectory in _source_symbols!(Set{Symbol}(), Expr(:tuple, lo, hi)) &&
         return nothing
-    demand = (; reader, position, lo, hi, params, mod, carry_free = false, scalar)
+    demand = (; reader, position, lo, hi, params, mod, carry_free = false,
+              scalar, index_position)
     # The bounds must be expressible over the reader's arguments.
     placeholders = Any[gensym(:argument) for _ in reader.inputs]
     any(isnothing, _scan_slice_bound_exprs(demand, placeholders, :length)) &&

@@ -94,6 +94,7 @@ const _MATRIX_CORE_TESTS = (
     "test_authored_scan.jl",
     "test_scan_terminal_minima.jl",
     "test_scan_slice_demand.jl",
+    "test_scan_range_argument.jl",
     "test_plate_fold_lift.jl",
     "test_plate_closures.jl",
     "test_plate_cell_destructuring.jl",
