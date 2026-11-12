@@ -298,6 +298,17 @@ const _JAX_CASES = (
             y[i] .~ Normal.(m[i], s)
         end
     end))(; G = 4) | (; y = _JAX_YR),
+    # A ragged plate whose Gaussian scale is an integer definition (a BRM
+    # `y[i] ~ normal(m, 1)` emits one): the cell reads it as a prepared
+    # `StaticInt`, beside the float arm of the scale's guard, a `jax.lax.cond`
+    # (snag jax-ragged-integ-35502154).
+    ragged_integer_scale = () -> (@rkppl(begin
+        a ~ Normal(0, 1)
+        s = 1
+        @plate for i in eachindex(y)
+            y[i] .~ Normal.(a .* x[i], s)
+        end
+    end))(; x = _JAX_R) | (; y = _JAX_YR),
     # Per-group recurrences over series of different lengths: an observed
     # AR(1), a deterministic recurrence of a ragged input, and a random walk
     # with one innovation per step (a one-entry group included).

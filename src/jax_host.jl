@@ -1252,15 +1252,17 @@ function _host_function_input!(scope, params, passed, hint, v::_PyVal, T::_JaxAg
     _PyVal(v.code, _JaxAggregate(T.T, fields), true)
 end
 
-# A `@traceable` helper on the host: a module-level function of its body.
+# A `@traceable` helper on the host: a module-level function of its body. The
+# call's `args` select it; `inputs` are the values its formals `names` take
+# (a Vararg formal's is the tuple of the trailing arguments).
 function _host_function_call(ctx::_JaxContext, f, names::Vector{Symbol}, body, mod::Module,
-                             args::Vector{_PyVal})
+                             args::Vector{_PyVal}, inputs::Vector{_PyVal} = args)
     types = Any[_jax_argument_type(a) for a in args]
     key = (:host_traceable, objectid(f), Tuple(a.T for a in args))
     scope = _JaxScope()
     params, passed = String[], _PyVal[]
     locals = Dict{Symbol,_PyVal}(n => _host_function_input!(scope, params, passed, n, a)
-                                for (n, a) in zip(names, args))
+                                for (n, a) in zip(names, inputs))
     name = get(ctx.mod.helper_names, key, nothing)
     if name === nothing
         name = _jax_private_identifier(ctx.mod.used, Symbol("_rk_", nameof_or(f), "_np"))

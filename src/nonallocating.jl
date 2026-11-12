@@ -554,7 +554,8 @@ function _decompose_traceable(ctx::_FusedDecomposition, f, args, types)
         return nothing
     end
     called.sig == traced || return nothing
-    length(names) == length(args) || return nothing
+    formal_types = _traceable_arguments(source, types, rest -> Tuple{rest...})
+    formal_types === nothing && return nothing
     lines = _nonalloc_straight_line(body)
     lines === nothing && return nothing
     statements, body = lines
@@ -569,8 +570,14 @@ function _decompose_traceable(ctx::_FusedDecomposition, f, args, types)
             push!(bound, tmp)
         end
     end
+    # A Vararg formal is the tuple of the trailing arguments, as in the call.
+    bound = _traceable_arguments(source, bound, rest -> begin
+        tmp = gensym(:traced_varargs)
+        push!(ctx.stmts, Expr(:(=), tmp, Expr(:tuple, rest...)))
+        tmp
+    end)
     inner = _FusedDecomposition(mod, Dict{Symbol,Any}(zip(names, bound)),
-                                Dict{Symbol,Any}(zip(names, types)),
+                                Dict{Symbol,Any}(zip(names, formal_types)),
                                 ctx.stmts, ctx.ops, ctx.caches, ctx.offset,
                                 ctx.cache_apply)
     d = all(st -> _decompose_traced_statement!(inner, st), statements) ?

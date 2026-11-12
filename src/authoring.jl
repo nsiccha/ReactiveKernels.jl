@@ -3394,8 +3394,10 @@ nested Base fold (the compiler page, "Lowering and emitted ABI"). The method's
 source is recorded for source-reading compilers ([`jax_source`](@ref)), and an
 `on_error = :ignore` preparation calls its throw-stripped twin.
 
-Supported: positional arguments with optional defaults, `where` clauses, and
-a return-type annotation.  A docstring before `@traceable` documents the
+Supported: positional arguments with optional defaults, a trailing Vararg
+argument (`args...`, `args::T...`, `args::Vararg{T,N}`, whose name the
+recorded source reads as the tuple of the trailing arguments, as the method
+does), `where` clauses, and a return-type annotation.  A docstring before `@traceable` documents the
 method, as it does a plain definition.  A `@traceable` method of a function
 from Base, Core or ReactiveKernels is rejected, and so are keyword arguments
 and a `return` before the end of the body (write that branch as an
@@ -3492,31 +3494,95 @@ function _record_source_method(def)
 end
 
 """
-    _traceable_source(::Type{typeof(f)}, argument_types...) -> (names, body, module, signature, statics) or nothing
+    _traceable_source(::Type{typeof(f)}, argument_types...) -> (names, body, module, signature, statics, vararg) or nothing
 
 The authored source of the `@traceable` method of `f` that arguments of
 `argument_types` call: its formal names, its body, the module the body's
-globals resolve in, the method's signature type, and its `where` parameters as
+globals resolve in, the method's signature type, its `where` parameters as
 those types bind them (a named tuple; `nothing` for one they leave unbound),
-for a body that reads one (`exp(k * x)` of a `::Val{k}`). Source-reading compilers
-(`jax_source`) translate the helper from it. A more specific plain method of
-`f` is the one native execution calls; comparing its `which(...).sig` with the
-signature tells the two apart. `nothing` for a function without a
-`@traceable` method.
+for a body that reads one (`exp(k * x)` of a `::Val{k}`), and whether its last
+formal is a Vararg one (`args...`, `args::Vararg{T,N}`), whose name the body
+reads as the tuple of the trailing arguments ([`_traceable_arguments`](@ref)).
+Source-reading compilers (`jax_source`) translate the helper from it. A more
+specific plain method of `f` is the one native execution calls; comparing its
+`which(...).sig` with the signature tells the two apart. `nothing` for a
+function without a `@traceable` method.
 """
 _traceable_source(@nospecialize(args...)) = nothing
 
+"""
+    _traceable_arguments(source, args, group) -> Vector or nothing
+
+The values the formals of a recorded `source` (what [`_traceable_source`](@ref)
+returns, or its first three entries) take in a call with `args`, one per name
+in `source[1]`: each fixed formal its argument and, for a Vararg source, the
+last formal `group(trailing arguments)`, the value a source reader makes of
+them (a tuple, as the method receives them). `nothing` when the number of
+arguments does not fit the formals.
+"""
+function _traceable_arguments(source, args, group)
+    names = first(source)
+    vararg = length(source) >= 6 && source[6]::Bool
+    fixed = length(names) - vararg
+    values = collect(args)
+    (vararg ? length(values) >= fixed : length(values) == fixed) || return nothing
+    vararg || return values
+    vcat(values[1:fixed], [group(values[fixed+1:end])])
+end
+
+_traceable_is_vararg(x) = x === :Vararg || x == GlobalRef(Core, :Vararg) ||
+    (x isa Expr && x.head === :. && x.args[1] in (:Core, :Base) && x.args[2] == QuoteNode(:Vararg))
+
+# A Vararg formal (`args...`, `args::T...`, `args::Vararg{T}`,
+# `args::Vararg{T,N}`, or one of them unnamed) as `(name, element type, count)`,
+# the count `nothing` when the formal leaves it free; `nothing` for any other
+# formal.
+function _traceable_vararg(formal, k)
+    unnamed = Symbol("_unnamed_", k)
+    if formal isa Expr && formal.head === :... && length(formal.args) == 1
+        inner = only(formal.args)
+        inner isa Symbol && return (inner, GlobalRef(Core, :Any), nothing)
+        inner isa Expr && inner.head === :(::) && length(inner.args) in (1, 2) || return nothing
+        name = length(inner.args) == 2 ? inner.args[1] : unnamed
+        return name isa Symbol ? (name, inner.args[end], nothing) : nothing
+    end
+    formal isa Expr && formal.head === :(::) && length(formal.args) in (1, 2) || return nothing
+    name = length(formal.args) == 2 ? formal.args[1] : unnamed
+    name isa Symbol || return nothing
+    V = formal.args[end]
+    _traceable_is_vararg(V) && return (name, GlobalRef(Core, :Any), nothing)
+    V isa Expr && V.head === :curly && length(V.args) in (2, 3) &&
+        _traceable_is_vararg(V.args[1]) || return nothing
+    (name, V.args[2], length(V.args) == 3 ? V.args[3] : nothing)
+end
+
 # A method of `_traceable_source` over the argument TYPES, with the method's own
 # formals as type bounds, so dispatch selects the source of the method that
-# values of those types call. Defaulted, splatted and destructured formals
-# record no source.
+# values of those types call. A trailing Vararg formal bounds each trailing
+# argument type by its element type, and its count by the formal's. Defaulted
+# and destructured formals record no source.
 function _traceable_source_method(callee, formals, wheres, body, mod)
     params = Any[]
     names = Symbol[]
     bounds = Any[]
+    vararg = false
     for (k, formal) in enumerate(formals)
         formal isa Symbol && (push!(params, :(::Type)); push!(names, formal);
                               push!(bounds, GlobalRef(Core, :Any)); continue)
+        va = _traceable_vararg(formal, k)
+        if va !== nothing
+            # Julia rejects a Vararg formal before the last one when it
+            # defines the method itself.
+            k == length(formals) || return Any[]
+            name, T, count = va
+            counts = count === nothing ? () : (count,)
+            push!(params, Expr(:(::), Expr(:curly, GlobalRef(Core, :Vararg),
+                                           Expr(:curly, :Type, Expr(:<:, T)), counts...)))
+            push!(names, name)
+            push!(bounds, Expr(:curly, GlobalRef(Core, :Vararg), T, counts...))
+            vararg = true
+            continue
+        end
         # An unnamed formal (`::typeof(exp)`, a method selected by an argument
         # it never reads) takes a placeholder name.
         formal isa Expr && formal.head === :(::) && length(formal.args) == 1 &&
@@ -3548,7 +3614,7 @@ function _traceable_source_method(callee, formals, wheres, body, mod)
     end
     Any[Expr(:const, Expr(:(=), held, method_type)),
         Expr(:(=), signature, Expr(:tuple, QuoteNode(Tuple(names)), QuoteNode(body), mod, held,
-                                   Expr(:tuple, statics...)))]
+                                   Expr(:tuple, statics...), vararg))]
 end
 
 # The body with its tail-position `return`s replaced by their values, as a
@@ -4814,10 +4880,21 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     # a bare `object.endpoint(args...)` call, so no KernelObjectSpec survives to
     # runtime.
     rewritten_entries = Any[]
+    # Scalar kernels can later be composed into a plate. Keep their lazy
+    # arms' graphs before endpoint expansion turns a nested call into source;
+    # otherwise the plate's binding pass sees an opaque call inside that arm.
+    # Key by the recipe expression, not its output name: alternative producers
+    # of one value can have different branches and dependency boundaries.
+    ordinary_branch_arms = IdDict{Any,Any}()
     boundary_types = Dict{Symbol,Vector{Any}}()
     for entry in entries
         if entry[1] === :recipe && entry[5] === nothing
             _, outputs, authored_rhs, metadata, plate_expr, destructured = entry
+            arms = length(outputs) == 1 && !get(metadata, :effectful, false) &&
+                (branch_arm_specs === nothing ||
+                 !haskey(branch_arm_specs, outputs[1][1])) ?
+                _kernel_plate_arm_entries(authored_rhs, known, Set{Symbol}(),
+                    mod, known; endpoint_cache) : nothing
             local_types = Dict{Symbol,Any}()
             materialized = Tuple{Symbol,Any,Any}[]
             rewritten, inferred = _kernel_constructed_endpoint(
@@ -4847,6 +4924,7 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
             end
             push!(rewritten_entries,
                   (:recipe, outputs, rewritten, metadata, plate_expr, destructured))
+            arms === nothing || (ordinary_branch_arms[rewritten] = arms)
         else
             push!(rewritten_entries, entry)
         end
@@ -4959,6 +5037,8 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
         effectful = get(metadata, :effectful, false)
         branch_arms = branch_arm_specs === nothing || length(outputs) != 1 ?
             nothing : get(branch_arm_specs, outputs[1][1], nothing)
+        branch_arms === nothing &&
+            (branch_arms = get(ordinary_branch_arms, authored_rhs, nothing))
         op = plate_expr === nothing ? _kernel_operation(
             rhs, deps, known; pure = !effectful, mod = mod,
             nested_specs = nested_specs, branch_arms = branch_arms) :
