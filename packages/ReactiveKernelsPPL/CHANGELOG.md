@@ -16,6 +16,16 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.161
+
+- `adaptive_centering_problem(built, plan, problem, backend; cells)` connects
+  named latent parameters and graph-derived affine locations/log-scales to
+  WarmupHMC's adaptive partial centering. Scalar and rectangular real-valued
+  latent blocks share compiled scalar graph queries across their coordinates;
+  supported prior families are not restricted to Normal. Selected affine
+  quantities must be independent of every selected latent, as required by
+  the indexed source-vector transform and its inverse.
+
 ## 0.1.160
 
 - A cell latent whose plate iterates a sampled vector with a data-known

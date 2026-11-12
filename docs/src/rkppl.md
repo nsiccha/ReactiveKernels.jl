@@ -58,4 +58,52 @@ Tutorials.html(model_view(built; bound))
 
 `prepare_query` returns a raw prepared callable. Calls made from an already compiled Julia function may require a world-age barrier; `prepare_sampler` supplies the managed sampler boundary. See the [PPL reference](ppl-api.md) for derivative, predictive and conditional-latent queries.
 
+## Adaptive partial centering
+
+Select affine cells when setting up WarmupHMC. Declare their location and
+log-scale as ordinary named values in the model, then pass those names to
+`adaptive_centering_problem`:
+
+```julia
+using WarmupHMC, LogDensityProblems, Enzyme
+using DifferentiationInterface: AutoEnzyme
+
+model = @rkppl begin
+    mu ~ Normal(0, mu_sd)
+    sigma ~ Exponential(sigma_scale)
+    z[1:N] .~ Normal.(0, 1)
+    z_location = mu .+ offsets
+    z_log_scale = log(sigma)
+    total = z_location .+ exp(z_log_scale) .* z
+    y .~ Normal.(total, se)
+end
+plan = model(; N = 4, offsets = [-0.2, 0.1, 0.3, -0.1],
+    mu_sd = 2.0, sigma_scale = 1.0, se = 0.3) | (; y = [0.1, 0.2, 0.7, -0.2])
+built = build_kernel(plan)
+u0 = zeros(built.layout.total)
+problem = prepare_sampler(built, plan, u0; backend = AutoEnzyme())
+adaptive = adaptive_centering_problem(built, plan, problem, AutoEnzyme();
+    cells = (z = (location = :z_location, log_scale = :z_log_scale),), u0)
+```
+
+Pass `adaptive` to WarmupHMC with nonlinear adaptation enabled. The selected
+latent starts in its authored non-centered coordinates; the sampler can adapt
+its centering and returns draws in the original model frame. A cell can set
+`target = 1.0` for an authored centered coordinate and `source` for a different
+initial sampler frame. Zero means non-centered; one means centered.
+
+The location and log-scale may be scalars or arrays matching the latent shape.
+Their values and derivatives come from the graph, including dependencies on
+unselected latent parameters. The adapter selects identity-transformed real
+coordinates, without changing their priors. For example, a real ICAR block
+keeps its ICAR density and any soft sum constraint.
+
+Every selected affine quantity must remain invariant under the selected maps.
+A location that reads another selected latent needs a coupled transform;
+WarmupHMC's independent indexed maps do not supply that transport. The adapter
+checks this graph dependency before sampling. It evaluates one scalar graph
+query per accessor call. Use `locality = :error` to reject array operations
+whose cell query would compute a whole array, and avoid a large shared scalar
+reduction in a per-coordinate accessor.
+
 The [Eight-schools example](eight-schools.md) checks the complete density decomposition and its coordinate transformation.
