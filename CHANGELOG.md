@@ -16,6 +16,16 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.186
+
+- Native plate lowering retains concrete result types through preceding
+  plates and scalar aliases, including exemplar-prepared abstract inputs.
+  Lazy branch arms reuse that evidence to move shared work outside the cell
+  loop. In a Normal mixture with shared component scales, the outer support
+  guard and scale logarithms now run once per nonempty call; the original divisions and
+  ordinary reverse derivatives are preserved. Empty and inactive branches
+  still skip their guarded work, and bound data retain runtime loops.
+
 ## 0.1.185
 
 - `jax_source`: a `for` loop to a padded row's length, such as
