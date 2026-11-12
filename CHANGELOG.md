@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.186
+
+- `prepare_nonallocating` reuses destinations for matrix products nested in
+  broadcasts consumed by a reduction or plate, including materialized
+  broadcast operands such as `A * (x .* s)`. These products now take the same
+  cache steps as products assigned to their own statements. The outer
+  broadcast keeps its existing lazy or materialized behavior, and destination
+  guards still accommodate changing runtime shapes.
+
 ## 0.1.185
 
 - `jax_source`: a `for` loop to a padded row's length, such as

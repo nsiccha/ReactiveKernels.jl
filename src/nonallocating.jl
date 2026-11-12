@@ -467,12 +467,16 @@ function _decompose_call_resolved(ctx::_FusedDecomposition, callee, f, fref,
        all(t -> t isa Type && t <: Integer, types)
         return (_emit_step!(ctx, _FillConstructorStep(f), T, args...), T)
     end
-    if f === Base.:*
+    if f === Base.:* || f === _native_mul
         length(types) == 2 &&
             all(t -> t isa Type && isconcretetype(t) &&
                      t <: AbstractVecOrMat, types) ||
             return nothing
         return (_emit_step!(ctx, _MatMulStep(), T, args...), T)
+    end
+    if f === _native_broadcast_materialize && length(args) == 1 &&
+       T isa DataType && isconcretetype(T) && T <: Array
+        return (_emit_step!(ctx, _MaterializeStep(), T, args...), T)
     end
     # The in-place layer's `\` and `/` coverage shares `mul!`'s pre-sized
     # destination convention; without a guarded step, keep the whole-recipe
@@ -999,7 +1003,7 @@ function _nonalloc_statement!(prog::_StepProgram, recipes::Tuple,
     call = stmt.args[2]
     call.args[1] == GlobalRef(@__MODULE__, :_cell_array_broadcast) &&
         length(call.args) == 2 &&
-        return _nonalloc_cell_broadcast!(prog, types, stmt.args[1], call.args[2], stmt)
+        return _nonalloc_cell_broadcast!(prog, types, stmt.args[1], call.args[2])
     i = _callable_slot(call.args[1])
     i !== nothing && 1 <= i <= length(recipes) &&
         length(recipes[i].outputs) == 1 || return Any[stmt]
@@ -1013,14 +1017,34 @@ end
 # make it materialize, it becomes a materialization step with a buffer of its
 # own, which `copyto!`s the same elements.
 function _nonalloc_cell_broadcast!(prog::_StepProgram, types::Dict{Symbol,Any},
-                                   lhs::Symbol, bc, stmt)
-    BT = _nonalloc_expr_type(types, bc)
+                                   lhs::Symbol, bc)
+    # This path receives native source rather than a recipe call. Decompose
+    # its eager operands too: an inline product (and a materialized operand
+    # of that product) needs the same destination as a named statement, even
+    # when the outer broadcast stays lazy for its elementwise readers.
+    ctx = _FusedDecomposition(@__MODULE__, Dict{Symbol,Any}(s => s for s in keys(types)),
+                              types, Any[], Any[], Any[], length(prog.ops),
+                              prog.cache_apply)
+    d = _decompose(ctx, bc, false)
+    if d !== nothing
+        bc, BT = d
+        append!(prog.ops, ctx.ops)
+        append!(prog.caches, ctx.caches)
+    else
+        BT = _nonalloc_expr_type(types, bc)
+    end
     T = BT isa Type ? _static_type(_cell_array_broadcast, BT) : Any
-    T isa DataType && isconcretetype(T) && T <: Array || return Any[stmt]
-    j = _step!(prog, _MaterializeStep(), _nonalloc_slot(T))
+    stmts = d === nothing ? Any[] : ctx.stmts
     types[lhs] = T
-    Any[Expr(:(=), lhs, _step_call(j,
-        Expr(:call, GlobalRef(@__MODULE__, :_cell_array_materialize), bc)))]
+    if !(T isa DataType && isconcretetype(T) && T <: Array)
+        push!(stmts, Expr(:(=), lhs, Expr(:call,
+            GlobalRef(@__MODULE__, :_cell_array_broadcast), bc)))
+        return stmts
+    end
+    j = _step!(prog, _MaterializeStep(), _nonalloc_slot(T))
+    push!(stmts, Expr(:(=), lhs, _step_call(j,
+        Expr(:call, GlobalRef(@__MODULE__, :_cell_array_materialize), bc))))
+    stmts
 end
 
 # The static type of a program expression over names of known value types:
