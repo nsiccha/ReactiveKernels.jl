@@ -11,10 +11,14 @@ using ReactiveKernels, Test
 # plans a guarded body at top level and inside one compiling call (where the
 # compiled planner is warm-wrapped) while its image is generated; a fresh
 # process compares those plans with plans computed at run time.
-_cc_has_generator(x) = x isa Expr && x.head !== :quote &&
-    (x.head === :generator || any(_cc_has_generator, x.args))
-_cc_lifted(f) = !_cc_has_generator(ReactiveKernels._program_expression(
-    ReactiveKernels._native_generated_function(f)))
+# A compiled program's expression is the `(args...) -> body` that
+# `RuntimeGeneratedFunctions` keeps, where a generator it compiles is already
+# `Base.Generator(@opaque (…) -> …, …)`: a closure left in the body shows as a
+# lambda, not as a generator.
+_cc_has_closure(x) = x isa Expr && x.head !== :quote &&
+    (x.head in (:generator, :->) || any(_cc_has_closure, x.args))
+_cc_lifted(f) = !_cc_has_closure(ReactiveKernels._program_expression(
+    ReactiveKernels._native_generated_function(f)).args[2])
 
 @testset "compiled comprehensions run as programs of their own" begin
     compile = ReactiveKernels.compile
@@ -173,8 +177,12 @@ end
                 # the compiled planner holds none.
                 has_generator(x) = x isa Expr && x.head !== :quote &&
                     (x.head === :generator || any(has_generator, x.args))
+                # A compiled closure is a lambda in the kept program's body.
+                has_closure(x) = x isa Expr && x.head !== :quote &&
+                    (x.head in (:generator, :->) || any(has_closure, x.args))
+                body(f) = RK._program_expression(RK._native_generated_function(f)).args[2]
                 @test has_generator(Expr(:block, C.SPLIT[1]...))
-                @test !has_generator(RK._program_expression(RK._native_generated_function(C.PLANNER)))
+                @test !has_closure(body(C.PLANNER))
                 runtime = RK.compile(C.PLANNER_AST)
                 T = typeof(C.PLANS[2])
                 @test isconcretetype(T)
@@ -202,8 +210,8 @@ end
                 # The wide bookkeeping: its element reads more locals than a
                 # program call takes operands and travels them as one tuple.
                 @test has_generator(Expr(:block, C.WIDE_SPLIT[1]...))
-                wide = RK._program_expression(RK._native_generated_function(C.WIDE_PLANNER))
-                @test !has_generator(wide)
+                wide = body(C.WIDE_PLANNER)
+                @test !has_closure(wide)
                 packed(x) = x === GlobalRef(RK, :_PackedComprehensionElement) ||
                     x isa Expr && any(packed, x.args)
                 @test packed(wide)
