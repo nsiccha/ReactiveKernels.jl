@@ -16,6 +16,18 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.205
+
+- `jax_source`: a branch whose condition is traced (`jax.lax.cond`) returns
+  one JAX type from both arms. Julia's arm types are promoted (element by
+  element for an `if` that also assigns locals), and an arm returning an
+  integer known while tracing, such as a prepared integer (`StaticInt`),
+  returns it as an array. Before, `s == 0 && y == m ? 1.0 : s` over a
+  prepared integer `s` (a Gaussian's guarded scale in a plate cell) raised
+  `cond branch outputs must have the same pytree structure`, and an
+  integer arm beside a float arm raised `cond branches must have equal
+  output types`.
+
 ## 0.1.204
 
 - `jax_source` takes `float_type`, `Float64` (the default) or `Float32`: the
