@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.192
+
+- Provide shared recurrence-window reduction planning for ReactiveKernelsPPL:
+  a sum over literal backward offsets can read scalar lags without allocating
+  a slice. Data-derived window widths and trajectory lengths remain runtime
+  iteration.
+- `jax_source` converts a numeric tuple to an array for `sum`, including
+  fixed scan windows, so standalone JAX preserves their values and gradients.
+
 ## 0.1.191
 
 - A non-allocating kernel keeps the type of a value it reads back from a step's
