@@ -68,6 +68,10 @@ end
     @test isconcretetype(eltype(ir.pairs))
     @test length(p.kernels) == 3
     @test @inferred(last(first(ir.pairs)).args[1](u)) isa Float64
+    column = view(hcat(u, 2u), :, 1)
+    @test @inferred(last(first(ir.pairs)).args[1](column)) ==
+        last(first(ir.pairs)).args[1](u)
+    @test LDP.logdensity(rp, column) == LDP.logdensity(rp, u)
 
     entries = Dict(e.name => e for e in s.layout.entries)
     zi = entries[:z].offset .+ (0:entries[:z].size-1)

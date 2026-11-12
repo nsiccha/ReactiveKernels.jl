@@ -78,8 +78,11 @@ function _centering_kernel(built, plan, name::Symbol, value, exemplar;
     add!(spec.graph, (term,) => output, Float64)
     have = (_query_have(plan)..., _CENTERING_INDEX)
     _absent_refusal(plan, spec, have, output) do
+        # Samplers also evaluate column views of their position matrices.
+        # Keep the graph's AbstractVector input contract instead of narrowing
+        # this callable to the construction exemplar's concrete storage type.
         Base.invokelatest(_prepare_cached, plan, spec; have, want = output,
-            bound = _query_bound(plan), on_error, exemplars = (exemplar, 1))
+            bound = _query_bound(plan), on_error)
     end
 end
 
