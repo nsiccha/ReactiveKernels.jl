@@ -13,7 +13,8 @@ parameters, then the prepared data. Its functions:
 
 - `prepare_data(data...)`: the functions' data inputs, computed in host NumPy
   from the data the model is bound with, by the names the model reads them
-  (sorted, or by name), including the data-only definitions `bind_data`
+  (sorted, or by name; a name Python reserves, such as `class`, only by name,
+  through `**data`), including the data-only definitions `bind_data`
   evaluates; frozen definitions are inputs too;
 
 - `log_density(unconstrained, data...)`: the `:sampler` value (prior,
