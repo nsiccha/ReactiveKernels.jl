@@ -264,6 +264,11 @@ _partial_plate_cacheable(::Type) = false
 _partial_plate_cacheable(::Type{<:_PartialPlateScalar}) = true
 _partial_plate_cacheable(::Type{<:Array{<:_PartialPlateScalar}}) = true
 
+# Deeper arrays are private storage introduced by nested bound maps, not a
+# new cache representation for authored array values or record fields.
+_partial_nested_cacheable(T) = _partial_plate_cacheable(T)
+_partial_nested_cacheable(::Type{Array{T,N}}) where {T,N} = _partial_nested_cacheable(T)
+
 # A tuple, named tuple or immutable record (a per-subject design of index and
 # time vectors, say) whose fields the cache holds, directly or as such records
 # in turn, is cached field by field: one cache value per leaf, in the
@@ -917,8 +922,9 @@ Base.isequal(a::_PlateAnalysisKey, b::_PlateAnalysisKey) =
     a.recipe == b.recipe && a.inputs == b.inputs && isequal(a.types, b.types) &&
     isequal(a.refused, b.refused)
 
-# Expose a nested cell's shared, data-only scalar work to the enclosing
-# plate's binding pass. The nested loop itself stays in the residual. Every
+# Expose a nested cell's data-only work to the enclosing plate's binding pass.
+# Shared work remains scalar; indexed work becomes a map over the bound axes.
+# The nested loop itself stays in the residual. Every
 # lifted recipe is speculative: even a strict inner recipe may belong to an
 # empty inner domain, and a branch-arm recipe may never be reached. A failed
 # bind-time evaluation therefore restores it beneath its original guards.
@@ -936,8 +942,8 @@ function _partial_nested_shared_recipes(inner::Plan, bound, bound_types,
         if !(r.id in excluded) && all(v -> canon_id(g, v.id) in dataonly, r.inputs)
             cid = canon_id(g, only(r.outputs).id)
             push!(dataonly, cid)
-            types[cid] = Base.promote_op(r.op,
-                (get(types, canon_id(g, v.id), Any) for v in r.inputs)...)
+            types[cid] = _partial_prefix_type(r.op,
+                Any[get(types, canon_id(g, v.id), Any) for v in r.inputs])
         end
         nested = r.op isa _AuthoredPlateOp ?
             _partial_nested_shared_recipe(g, r, dataonly, types, refused) : nothing
@@ -948,20 +954,37 @@ function _partial_nested_shared_recipes(inner::Plan, bound, bound_types,
         copied === nothing && (copied = Graph(copy(g.values), copy(g.recipes),
             copy(g.producers), copy(g.aliases), g.version, nothing, copy(g.checks)))
         ng = nested.inner.graph
-        available = Dict(canon_id(ng, v.id) => input
+        available = Dict{ValueId,Value}(canon_id(ng, v.id) => input
             for (v, input) in zip(nested.inner.have, r.inputs))
         for q in nested.selected
             output = only(q.outputs)
+            shared = canon_id(ng, output.id) in nested.shared
+            part_op = q.op
+            part_inputs = Value[q.inputs...]
+            if !shared
+                # Each bound lane keeps the same scalar recipe. Lift it as a
+                # runtime map, rather than expanding the inner domain into
+                # source or treating its indexed input as a shared scalar.
+                part_inputs = unique(part_inputs)
+                scalar = _partial_subplan(nested.inner, part_inputs, Value[output], [q])
+                kernel = _prepare(scalar, _lower_with_ops(scalar; inline_embedded=false)...)
+                atomic = Tuple(i for (i, v) in enumerate(part_inputs)
+                    if canon_id(ng, v.id) in nested.shared)
+                part_op = _AuthoredPlateOp{typeof(kernel),atomic}(kernel, ())
+            end
+            inputs = Tuple(available[canon_id(ng, v.id)] for v in part_inputs)
+            T = _partial_prefix_type(part_op,
+                Any[types[canon_id(copied, v.id)] for v in inputs])
             value = value!(copied, Symbol(only(r.outputs).name, :_shared_, output.name),
-                           valtype(output))
-            part = Recipe(fresh(), Tuple(available[canon_id(ng, v.id)] for v in q.inputs),
-                (value,), q.op, q.cost, nothing, false, q.source)
+                           T)
+            part = Recipe(fresh(), inputs,
+                (value,), part_op, q.cost, nothing, false, q.source)
             push!(recipes, part)
             readable[part.id] = part
             speculative[part.id] = nested.keys[q.id]
             available[canon_id(ng, output.id)] = value
             push!(dataonly, value.id)
-            types[value.id] = nested.types[canon_id(ng, output.id)]
+            types[value.id] = T
         end
         scalar = _partial_subplan(nested.inner,
             vcat(nested.inner.have, nested.frontier), nested.inner.want, nested.residual)
@@ -970,7 +993,8 @@ function _partial_nested_shared_recipes(inner::Plan, bound, bound_types,
             kernel.inputs, kernel.outputs, kernel.plan, kernel.ast,
             Tuple(get(nested.readable, q.id, q) for q in nested.residual))
         atomic = Tuple([typeof(r.op).parameters[2]...;
-            (length(r.inputs) + 1):(length(r.inputs) + length(nested.frontier))])
+            [length(r.inputs) + i for (i, v) in enumerate(nested.frontier)
+                if canon_id(ng, v.id) in nested.shared]])
         op = _AuthoredPlateOp{typeof(kernel),atomic}(kernel, r.op.axis_checks)
         inputs = (r.inputs..., (available[canon_id(ng, v.id)] for v in nested.frontier)...)
         push!(recipes, Recipe(r.id, inputs, r.outputs, op, r.cost, nothing,
@@ -990,15 +1014,18 @@ function _partial_nested_shared_recipe(g, r, dataonly, outer_types, refused)
     excluded === nothing && return nothing
     atomic = typeof(op).parameters[2]
     bound = Set{ValueId}()
+    shared = Set{ValueId}()
     types = Dict{ValueId,Any}()
     for (i, (input, v)) in enumerate(zip(r.inputs, original.have))
         cid = canon_id(g, input.id)
         cid in dataonly || continue
         T = get(outer_types, cid, valtype(input))
-        (i in atomic || T <: Number) || continue
+        isshared = i in atomic || T <: Number
+        (isshared || T <: AbstractArray) || continue
         nid = canon_id(original.graph, v.id)
         push!(bound, nid)
-        types[nid] = T
+        isshared && push!(shared, nid)
+        types[nid] = isshared ? T : eltype(T)
     end
     isempty(bound) && return nothing
     prefix_key = (:nested_recipe, r.id)
@@ -1010,8 +1037,11 @@ function _partial_nested_shared_recipe(g, r, dataonly, outer_types, refused)
     union!(excluded, (q.id for q in inner.recipes if (prefix_key..., q.id) in refused))
     nested_refused = Set(key[3] for key in refused
         if length(key) == 3 && key[1:2] == node_key)
+    inner, nested_speculative = _partial_nested_shared_recipes(inner, bound,
+        types, excluded, readable, nested_refused)
     inner, speculative = _partial_speculate_recipes(inner, bound, excluded, readable,
         nested_refused; bound_guards=true)
+    merge!(speculative, nested_speculative)
     prefix, residual, owned = _partial_split(inner, bound, excluded)
     canon_id(inner.graph, only(inner.want).id) in owned && return nothing
     frontier = filter(v -> !(canon_id(inner.graph, v.id) in bound),
@@ -1019,18 +1049,41 @@ function _partial_nested_shared_recipe(g, r, dataonly, outer_types, refused)
     isempty(frontier) && return nothing
     selected = _partial_frontier_prefix(inner, prefix, frontier)
     for q in selected
-        types[canon_id(inner.graph, only(q.outputs).id)] = Base.promote_op(q.op,
-            (get(types, canon_id(inner.graph, v.id), Any) for v in q.inputs)...)
+        cid = canon_id(inner.graph, only(q.outputs).id)
+        types[cid] = _partial_prefix_type(q.op,
+            Any[get(types, canon_id(inner.graph, v.id), Any) for v in q.inputs])
+        all(v -> canon_id(inner.graph, v.id) in shared, q.inputs) && push!(shared, cid)
     end
-    # This pass moves scalar arm invariants. Keeping arrays in their existing
-    # cell avoids introducing shared owned storage into a nested result.
-    all(frontier) do v
-        T = types[canon_id(inner.graph, v.id)]
-        T <: Number && isbitstype(T)
-    end || return nothing
+    # Only the arrays introduced by the recursive lift cross this boundary.
+    # An authored array can escape through a live branch and must retain its
+    # per-evaluation ownership. A lifted map's array is instead private cache
+    # storage: the residual reads its elements as the original scalar values.
+    mapped = Set(canon_id(inner.graph, only(q.outputs).id) for q in selected
+        if haskey(nested_speculative, q.id))
+    residual_ids = Set(q.id for q in residual)
+    while true
+        uncached = Set(canon_id(inner.graph, v.id) for v in frontier if begin
+            cid = canon_id(inner.graph, v.id)
+            T = types[cid]
+            !(T <: _PartialPlateScalar || cid in mapped && _partial_nested_cacheable(T))
+        end)
+        isempty(uncached) && break
+        repeated = filter(q -> canon_id(inner.graph, only(q.outputs).id) in uncached,
+                          selected)
+        # A speculative arm's value cannot be reconstructed eagerly in its
+        # residual cell. Leave this lift under the authored guards instead.
+        any(q -> haskey(speculative, q.id), repeated) && return nothing
+        union!(residual_ids, (q.id for q in repeated))
+        setdiff!(owned, uncached)
+        residual = filter(q -> q.id in residual_ids, inner.recipes)
+        frontier = filter(v -> !(canon_id(inner.graph, v.id) in bound),
+            _partial_constants(inner, owned, residual))
+        isempty(frontier) && return nothing
+        selected = _partial_frontier_prefix(inner, prefix, frontier)
+    end
     keys = Dict(q.id => haskey(speculative, q.id) ?
         (node_key..., speculative[q.id]) : (prefix_key..., q.id) for q in selected)
-    (; inner, selected, residual, frontier, types, readable, keys)
+    (; inner, selected, residual, frontier, types, readable, keys, shared)
 end
 
 # Everything `_partial_plate_recipe` decides before it evaluates a cell
@@ -1061,10 +1114,17 @@ Base.@nospecializeinfer function _partial_plate_analysis(
     merge!(speculative, nested_speculative)
     have_ids = Set(canon_id(inner.graph, v.id) for v in inner.have)
     retry_speculation = false
+    recomputed = Set{Int}()
     local residual, frontier, selected, cell_types, want_id
     while true
         prefix, residual, owned = _partial_split(inner, bound, excluded)
         isempty(prefix) && return nothing
+        if !isempty(recomputed)
+            residual_ids = union(recomputed, Set(r.id for r in residual))
+            residual = filter(r -> r.id in residual_ids, inner.recipes)
+            setdiff!(owned, (canon_id(inner.graph, only(r.outputs).id)
+                            for r in residual))
+        end
         frontier = filter(_partial_constants(inner, owned, residual)) do v
             !(canon_id(inner.graph, v.id) in have_ids)
         end
@@ -1105,6 +1165,7 @@ Base.@nospecializeinfer function _partial_plate_analysis(
             cid = canon_id(inner.graph, only(r.outputs).id)
             T = cell_types[cid]
             cid in frontier_ids && !_partial_plate_cacheable(T) &&
+                !(haskey(nested_speculative, r.id) && _partial_nested_cacheable(T)) &&
                 !(cid != want_id && cid in derived && _partial_plate_record(T)) &&
                 push!(uncached, r.id)
         end
@@ -1117,7 +1178,12 @@ Base.@nospecializeinfer function _partial_plate_analysis(
             retry_speculation = true
         end
         retry_speculation && break
-        union!(excluded, uncached)
+        # A range or view that must stay in the cell can also be an input to
+        # worthwhile bind-time work farther down the prefix. Reconstruct it
+        # in the residual while retaining its bind-time use; excluding its
+        # producer would make every dependent cache live again. The recipes
+        # here are strict, pure cell recipes; speculative ones retried above.
+        union!(recomputed, uncached)
     end
     retry_speculation && continue
 
@@ -1185,6 +1251,10 @@ function _partial_cell_values!(result, batch)
     end
     result
 end
+
+_partial_nested_finite(value) = true
+_partial_nested_finite(value::Number) = isfinite(value)
+_partial_nested_finite(value::AbstractArray) = all(_partial_nested_finite, value)
 
 # A plate's cell kernel, and the length of its callables table from its
 # type. Each read of a field of an unspecialized plate operation boxes a copy
@@ -1325,10 +1395,9 @@ Base.@nospecializeinfer function _partial_plate_recipe(
             # a speculative evaluation that throws, this only declines the
             # new lift; it does not reject or change the authored arithmetic.
             key = empty_domain ? nothing : get(analysis.speculative, current, nothing)
-            if key !== nothing && first(key) in (:nested_recipe, :nested_node) &&
-                    analysis.cell_types[cid] <: Union{AbstractFloat,Complex{<:AbstractFloat}}
+            if key !== nothing && first(key) in (:nested_recipe, :nested_node)
                 data = arguments[cid]
-                if !(data isa Ref ? isfinite(data[]) : all(isfinite, data))
+                if !_partial_nested_finite(data isa Ref ? data[] : data)
                     push!(refused, key)
                     retry_nonfinite = true
                     break
@@ -1378,7 +1447,7 @@ Base.@nospecializeinfer function _partial_plate_recipe(
             push!(cache_names, v.name)
             push!(cache_data, data[])
             push!(atomic, length(keep) + length(cache_data))
-        elseif _partial_plate_cacheable(eltype(data))
+        elseif _partial_nested_cacheable(eltype(data))
             push!(cache_names, v.name)
             push!(cache_data, data)
         else
