@@ -52,4 +52,10 @@ reverse = reverse_cut(scaled, Val(1), 2.0, geometry, 1.0)
 
 The reverse mask uses original input positions. A bit for a data-only input is invalid. Data remains available to the primal and any derivative that reads it, but has no authored derivative port.
 
+`jax_source` generates `custom_jvp` adapters for scalar rules from these same
+activity-selected graph cuts. Joint value/partials recipes are shared across
+calls and activity patterns. Host data preparation uses the primal cut;
+general `derivative_rule` calls still emit their primal cut. See
+[JAX source](jax.md).
+
 For adapter and stage APIs, see the [core reference](api.md). The [bound-regression example](bound-regression.md) illustrates the same graph-selection principle for primal outputs.

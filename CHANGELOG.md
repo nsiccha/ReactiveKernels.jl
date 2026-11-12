@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.202
+
+- `jax_source` generates scalar derivative-rule adapters from the same
+  activity-selected mathematical graph as native AD. Joint cuts and repeated
+  calls share their emitted helpers; inactive partials are not contracted.
+- Add the shared incomplete-beta fraction value/partials graph used by
+  distribution tails. First-order native and JAX gradients retain its partials
+  instead of a reverse tape of 300 fraction iterations.
+
 ## 0.1.201
 
 - `jax_source(...; data, definitions, definitions_module = Main)`: the

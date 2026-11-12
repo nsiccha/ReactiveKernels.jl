@@ -16,6 +16,13 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.164
+
+- Require ReactiveKernels 0.1.202 and ReactiveKernelsDistributionKernels 0.1.7
+  for the shared incomplete-beta value/partials graph. Censored Student-t JAX
+  gradients use the generated scalar rule instead of reversing 300 fraction
+  iterations.
+
 ## 0.1.163
 
 - `jax_source(built, plan)` emits the same module whatever the caller

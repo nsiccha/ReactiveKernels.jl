@@ -1,7 +1,6 @@
 # Owned `rk_beta_inc` (regularized incomplete beta over the Student-t cdf
-# slice) vs the `SpecialFunctions.beta_inc` oracle, plus transparent-math
-# Enzyme gradients (no rule: the continued-fraction body differentiates
-# ordinarily) and the student-t cdf rewire pin.
+# slice) vs the `SpecialFunctions.beta_inc` oracle, plus Enzyme gradients
+# through the shared fraction's generated scalar rule and Student-t tails.
 using DifferentiationInterface: AutoEnzyme, gradient
 using Distributions: TDist, cdf, pdf
 import Enzyme
@@ -28,7 +27,7 @@ using Test
     end
 end
 
-@testset "rk_beta_inc differentiates as transparent math (no rule)" begin
+@testset "rk_beta_inc gradients through the shared fraction graph" begin
     backend = AutoEnzyme(; mode = Enzyme.Reverse)
     # x-partial is the beta density in closed form.
     for (a, b, x) in ((1.5, 0.5, 0.3), (1.5, 0.5, 0.8), (5.0, 0.5, 0.6))
