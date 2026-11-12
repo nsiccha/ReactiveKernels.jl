@@ -16,6 +16,22 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.214
+
+- `jax_source` bounds a range whose end is a prepared-data entry times a
+  static integer, plus a static integer: `pk[1:2 * n[i]]` of two interleaved
+  values per counted read, `1:(n[r] * 2 + 1)`, `(length(x) - 2 * n[r] + 1):length(x)`
+  and `1:K * n[r]` of a prepared integer `K`. Its static number of steps is
+  the same function of the array's largest entry (its least for a negative
+  multiple, either where the multiple's sign is known only while tracing),
+  and ends of one record with one positive multiple (`(2a - 1):(2b)`) take
+  that multiple of the longest record's range. Before, a multiple lost the
+  bound that `n[i] + c` keeps: an `@rkppl` cell's `v[1:2 * n[i]]` raised `a
+  range whose length depends on data has no JAX translation`, and a
+  `@kernel`'s `x[1:2 * n[r]]` emitted a slice JAX rejects when it traces.
+  A padded row's length times a nonnegative integer literal
+  (`1:2 * length(r)`) likewise keeps its static limit, scaled.
+
 ## 0.1.213
 
 - Calling a `KernelSpec` on positional values, `spec(args...)`, prepares its
