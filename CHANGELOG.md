@@ -16,6 +16,21 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.184
+
+- A summed plate whose rows repeat runs once per distinct row. When a plate's
+  total is its only use and every operand that varies across its cells is
+  bound data or a gather through a bound index (`a[group]`), binding groups
+  the equal rows, and the plate evaluates one cell per group, times the
+  group's row count, in the forward and the reverse pass. A Bernoulli-logit
+  regression over 1179 rows of 10 distinct `(income, vote)` pairs then runs
+  10 cells instead of 1179. The total agrees with the row-by-row sum to
+  rounding. A plate whose rows repeat less than twice on average, a plate
+  over no rows, a plate whose cells are read one by one, and every plate
+  under `simplify = false` keep their own loop. A live operand whose
+  declaration does not say it is a number counts as shared only when the
+  preparation's `exemplars` prove it one, as the lowering infers it.
+
 ## 0.1.183
 
 - An input check (`input_check!`) no longer slows a gradient. Enzyme treats

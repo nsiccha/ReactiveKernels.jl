@@ -1940,7 +1940,17 @@ function _partial_inner_plates(p::Plan, known, rewrites, one_object::Set{ValueId
         partitioned = _partition_plate_recipe(copied, r, known, r.op, pending,
                                               p.want, fresh, lane_lengths)
         if partitioned === nothing
-            push!(recipes, r)
+            # A summed plate whose rows repeat runs once per distinct row,
+            # weighted by its row count (`duplicate_cells.jl`).
+            grouped = _cell_group_recipe(copied, p.have, r, known, r.op, recipes,
+                pending, p.want, fresh, keyed ? rewrites : nothing)
+            if grouped === nothing
+                push!(recipes, r)
+            else
+                changed = true
+                push!(signature, grouped.key)
+                append!(recipes, grouped.expansion)
+            end
             continue
         end
         changed = true
