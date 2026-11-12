@@ -217,6 +217,40 @@ end
         @test !isempty(report)
     end
 
+    @testset "a lazy cell broadcast of arrays only (Duplicated)" begin
+        # `mu = X * (beta .* s) .+ z` stays a lazy cell broadcast of the
+        # computed product and the latent vector. With no active scalar inside
+        # it, Enzyme passes it as `Duplicated`, with a shadow of the same lazy
+        # structure, which has no entries to add a cell's cotangent into:
+        # preparation failed with "setindex! not defined for _CellBroadcast"
+        # (PosteriorDB UKDrivers, snag generated-plate-56eaf6e3), or, under a
+        # registered Enzyme, with its readonly-proof exception. The program
+        # keeps the backend's reverse, and the report names why.
+        rng = MersenneTwister(23)
+        N, K = 40, 3
+        X = randn(rng, N, K)
+        y = randn(rng, N)
+        built, bound = _prv_build(quote
+            beta[1:K] .~ Normal.(0, 1)
+            z[1:N] .~ Normal.(0, 1)
+            sigma ~ Exponential(1)
+            mu = X * (beta .* s) .+ z
+            y .~ Normal.(mu, sigma)
+        end, Dict(:y => y, :X => X, :N => N, :K => K, :s => [0.5, 1.0, 2.0]), (:y, :X, :N, :K, :s))
+        report = _prv_compare(built, bound)
+        @info "plate reverse: lazy cell broadcast of arrays" report
+        @test any(r -> first(r) === :_ppl_lik_y_resp && occursin("lazy cell array", last(r)), report)
+        # The adapter's backstop: a lazy cell array is never covered as a
+        # batched operand, whatever the preparation decided.
+        RK = ReactiveKernels
+        ext = Base.get_extension(RK, :ReactiveKernelsEnzymeExt)
+        lazy = RK._cell_array_broadcast(Base.Broadcast.broadcasted(+, [1.0, 2.0], [3.0, 4.0]))
+        shadow = RK._cell_array_broadcast(Base.Broadcast.broadcasted(+, [0.0, 0.0], [0.0, 0.0]))
+        @test lazy isa RK._CellArray
+        @test !ext._pr_covers(Val(()), Val((1,)), (Duplicated(lazy, shadow),))
+        @test ext._pr_covers(Val(()), Val((1,)), (Duplicated([1.0, 2.0], [0.0, 0.0]),))
+    end
+
     @testset "a plate program with more operands than map unrolls" begin
         # 24 covariates, each with its own coefficient: the likelihood's plate
         # program takes about 50 operands. Past 32, `map` over the operand

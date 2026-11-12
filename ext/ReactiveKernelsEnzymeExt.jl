@@ -543,7 +543,7 @@ end
 # the generated reverse does not take differentiates the program with
 # Enzyme's ordinary reverse instead.
 
-using ReactiveKernels: _PlateSumRule, _pr_scalar_positions, _pr_batched_positions
+using ReactiveKernels: _PlateSumRule, _pr_scalar_positions, _pr_batched_positions, _CellArray
 
 function EnzymeRules.augmented_primal(
         config::RevConfig, rule::Const{<:_PlateSumRule}, ::Type{RT},
@@ -628,14 +628,16 @@ _pr_tuple_operand(::Type) = false
 # with Enzyme's ordinary reverse instead.
 # A batched operand is covered only as a plain array shadow: a `MixedDuplicated`
 # operand (a struct of active scalars and arrays, such as a cell broadcast
-# `a .+ v`) has a shadow the generated reverse does not write.
+# `a .+ v`) has a shadow the generated reverse does not write, and neither does
+# a lazy cell array of arrays only (`_CellArray`, such as `u .+ v`), which
+# Enzyme passes as `Duplicated` with a shadow of the same lazy structure.
 @generated function _pr_covers(::Val{S}, ::Val{B}, args::Tuple) where {S,B}
     for (i, T) in enumerate(args.parameters)
         T <: Const && continue
         if T <: Active
             i in S || (i in B && _pr_tuple_operand(T)) || return :(false)
         elseif T <: Union{Duplicated,DuplicatedNoNeed,BatchDuplicated,BatchDuplicatedNoNeed}
-            i in B || return :(false)
+            i in B && !(T.parameters[1] <: _CellArray) || return :(false)
         else
             return :(false)
         end

@@ -2485,6 +2485,15 @@ struct Exact end
 end
 "The value scaled by the factor."
 @traceable scaled(x::T, s) where {T<:Real} = s * x
+# Trailing Vararg formals (snag traceable-on-a-v-e940f11c): the body reads the
+# formal as the tuple of the trailing arguments.
+"The arguments' total length."
+@traceable function total_length(args::Vararg{Any,N}) where {N}
+    sum(length, args; init = 0)
+end
+@traceable rest_count(x, rest...) = x + length(rest)
+@traceable typed_rest(x, rest::Float64...) = x * prod(rest; init = 1.0)
+@traceable bounded_rest(rest::Vararg{T,2}) where {T<:Real} = rest[1] - rest[2]
 # An opaque in-place helper.
 function superpose(plan::Lattice, units, weights, nobs)
     out = zeros(nobs)
@@ -2515,6 +2524,31 @@ end
     @test operation(:(superpose(plan, u, w, n))) === :superpose
     @test operation(:(row_index(t, p, i))) === :row_index
     @test operation(:(plain_helper(plan, u, w, n))) === :plain_helper
+    # A trailing Vararg formal defines the method and records its source, with
+    # the formal standing for the tuple of the trailing arguments.
+    @test H.total_length([1, 2], [3], Int[]) == 3 && H.total_length() == 0
+    @test H.rest_count(1.0) == 1.0 && H.rest_count(1.0, :a, "b") == 3.0
+    @test H.typed_rest(2.0, 3.0, 4.0) == 24.0
+    @test H.bounded_rest(5, 2) == 3
+    @test occursin("total length", string(@doc H.total_length))
+    source(f, types...) = ReactiveKernels._traceable_source(typeof(f), types...)
+    s = source(H.total_length, Vector{Int}, Vector{Int}, Vector{Int})
+    @test s[1] == (:args,) && s[6] === true
+    @test s[4] == which(H.total_length, Tuple{Vector{Int},Vector{Int},Vector{Int}}).sig
+    @test s[5] == (; N = 3)
+    @test source(H.total_length)[5] == (; N = 0)
+    @test source(H.rest_count, Float64)[1] == (:x, :rest)
+    @test source(H.typed_rest, Float64, Float64, Float64)[6] === true
+    @test source(H.typed_rest, Float64, Int) === nothing
+    @test source(H.bounded_rest, Int, Int)[5] == (; T = Int)
+    @test source(H.bounded_rest, Int, Int, Int) === nothing
+    @test source(H.scaled, Int, Float64)[6] === false
+    group(rest) = Expr(:tuple, rest...)
+    @test ReactiveKernels._traceable_arguments(s, [:a, :b, :c], group) == [:((a, b, c))]
+    @test ReactiveKernels._traceable_arguments(source(H.rest_count, Float64), [:x], group) ==
+        [:x, :(())]
+    @test ReactiveKernels._traceable_arguments(source(H.scaled, Int, Float64), [:x], group) ===
+        nothing
     # Loud refusals.
     define(ex) = ReactiveKernels._traceable_definition(ex, H)
     @test_throws ArgumentError define(:(sum(x::Lattice) = 0))

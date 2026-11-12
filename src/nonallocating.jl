@@ -155,6 +155,19 @@ function _static_type(f, argtypes...)
     T === Union{} ? Any : T
 end
 
+# The type later steps assume for a decomposed recipe's value. The plan's type
+# (inference over the whole recipe) and the decomposition's (assembled from its
+# parts) both bound the value's type from above, so their intersection does.
+# The decomposition's can be the wider one, `Any` for a part inference cannot
+# type alone, and it replaced the plan's: a `log.(x)` step over an `x` typed
+# `Any` that way kept a `Ref{Any}` slot (`_nonalloc_step_type`). Should the
+# two ever disagree, the decomposition is the code that runs: its type.
+function _nonalloc_tighter_type(planned, decomposed)
+    planned isa Type && decomposed isa Type || return decomposed
+    T = typeintersect(planned, decomposed)
+    T === Union{} ? decomposed : T
+end
+
 # A square dense matrix plus a `UniformScaling` (`K + sigma * I`), as
 # LinearAlgebra computes it: a copy of the matrix with `λ` added along its
 # diagonal, into a matching cache. Copied element by element, the loop native
@@ -178,6 +191,21 @@ end
 
 _nonalloc_slot(::Type{T}) where {T} = Ref{Union{Nothing,T}}(nothing)
 _nonalloc_slot(op, ::Type{T}) where {T} = _nonalloc_slot(T)
+
+# The type of the value a slot of `Ref{S}` holds once seeded: `Any` for the
+# `Ref{Any}` of a step whose type preparation could not infer.
+_nonalloc_slot_value(::Type{Union{Nothing,T}}) where {T} = T
+_nonalloc_slot_value(::Type{T}) where {T} = T
+
+# The type `op(args...)` infers to, folded at compile time (as `_promote_op`):
+# the type the native program's plain call of a step has. A cache driver
+# reading a slot whose value type is not concrete returns its result as this
+# type (`_nonalloc_step_type`), so the slot keeps its buffer without hiding
+# the result's type from the rest of the program.
+@generated _nonalloc_call_type(op, args::Vararg{Any,N}) where {N} =
+    :(Base._return_type(op, $(Tuple{args...})))
+@inline _nonalloc_step_type(::Type{S}, op, args...) where {S} =
+    isconcretetype(_nonalloc_slot_value(S)) ? nothing : _nonalloc_call_type(op, args...)
 
 # Identity-preserving wrappers that are cheaper to rebuild inline than to
 # cache: caching them buys no buffer reuse and may force conversion copies.
@@ -328,10 +356,24 @@ function _decompose_branch(ctx::_FusedDecomposition, node::Expr)
             return nothing
         end
         push!(parts, d[1])
-        i == 1 || push!(types, d[2])
+        # An arm that throws (an argument check's `else throw(...)`) returns
+        # no value, so the branch has the other arms' type.
+        i == 1 || _nonalloc_throws(ctx, part) || push!(types, d[2])
     end
     length(node.args) == 2 && push!(types, Nothing)
-    (Expr(node.head, parts...), Union{types...})
+    (Expr(node.head, parts...), isempty(types) ? Any : Union{types...})
+end
+
+# Whether an arm's value is a call of `throw`, which never returns.
+function _nonalloc_throws(ctx::_FusedDecomposition, ex)
+    lines = _nonalloc_straight_line(ex)
+    lines === nothing && return false
+    final = lines[2]
+    final isa Expr && final.head === :call && !isempty(final.args) || return false
+    callee = final.args[1]
+    callee isa Symbol && haskey(ctx.argmap, callee) && return false
+    resolved = _nonalloc_resolve_function(ctx.mod, callee)
+    resolved !== nothing && first(resolved) === Core.throw
 end
 
 # One arm (or condition) of a branch as a block of its own statements and its
@@ -467,12 +509,16 @@ function _decompose_call_resolved(ctx::_FusedDecomposition, callee, f, fref,
        all(t -> t isa Type && t <: Integer, types)
         return (_emit_step!(ctx, _FillConstructorStep(f), T, args...), T)
     end
-    if f === Base.:*
+    if f === Base.:* || f === _native_mul
         length(types) == 2 &&
             all(t -> t isa Type && isconcretetype(t) &&
                      t <: AbstractVecOrMat, types) ||
             return nothing
         return (_emit_step!(ctx, _MatMulStep(), T, args...), T)
+    end
+    if f === _native_broadcast_materialize && length(args) == 1 &&
+       T isa DataType && isconcretetype(T) && T <: Array
+        return (_emit_step!(ctx, _MaterializeStep(), T, args...), T)
     end
     # The in-place layer's `\` and `/` coverage shares `mul!`'s pre-sized
     # destination convention; without a guarded step, keep the whole-recipe
@@ -508,7 +554,8 @@ function _decompose_traceable(ctx::_FusedDecomposition, f, args, types)
         return nothing
     end
     called.sig == traced || return nothing
-    length(names) == length(args) || return nothing
+    formal_types = _traceable_arguments(source, types, rest -> Tuple{rest...})
+    formal_types === nothing && return nothing
     lines = _nonalloc_straight_line(body)
     lines === nothing && return nothing
     statements, body = lines
@@ -523,8 +570,14 @@ function _decompose_traceable(ctx::_FusedDecomposition, f, args, types)
             push!(bound, tmp)
         end
     end
+    # A Vararg formal is the tuple of the trailing arguments, as in the call.
+    bound = _traceable_arguments(source, bound, rest -> begin
+        tmp = gensym(:traced_varargs)
+        push!(ctx.stmts, Expr(:(=), tmp, Expr(:tuple, rest...)))
+        tmp
+    end)
     inner = _FusedDecomposition(mod, Dict{Symbol,Any}(zip(names, bound)),
-                                Dict{Symbol,Any}(zip(names, types)),
+                                Dict{Symbol,Any}(zip(names, formal_types)),
                                 ctx.stmts, ctx.ops, ctx.caches, ctx.offset,
                                 ctx.cache_apply)
     d = all(st -> _decompose_traced_statement!(inner, st), statements) ?
@@ -999,7 +1052,7 @@ function _nonalloc_statement!(prog::_StepProgram, recipes::Tuple,
     call = stmt.args[2]
     call.args[1] == GlobalRef(@__MODULE__, :_cell_array_broadcast) &&
         length(call.args) == 2 &&
-        return _nonalloc_cell_broadcast!(prog, types, stmt.args[1], call.args[2], stmt)
+        return _nonalloc_cell_broadcast!(prog, types, stmt.args[1], call.args[2])
     i = _callable_slot(call.args[1])
     i !== nothing && 1 <= i <= length(recipes) &&
         length(recipes[i].outputs) == 1 || return Any[stmt]
@@ -1013,14 +1066,34 @@ end
 # make it materialize, it becomes a materialization step with a buffer of its
 # own, which `copyto!`s the same elements.
 function _nonalloc_cell_broadcast!(prog::_StepProgram, types::Dict{Symbol,Any},
-                                   lhs::Symbol, bc, stmt)
-    BT = _nonalloc_expr_type(types, bc)
+                                   lhs::Symbol, bc)
+    # This path receives native source rather than a recipe call. Decompose
+    # its eager operands too: an inline product (and a materialized operand
+    # of that product) needs the same destination as a named statement, even
+    # when the outer broadcast stays lazy for its elementwise readers.
+    ctx = _FusedDecomposition(@__MODULE__, Dict{Symbol,Any}(s => s for s in keys(types)),
+                              types, Any[], Any[], Any[], length(prog.ops),
+                              prog.cache_apply)
+    d = _decompose(ctx, bc, false)
+    if d !== nothing
+        bc, BT = d
+        append!(prog.ops, ctx.ops)
+        append!(prog.caches, ctx.caches)
+    else
+        BT = _nonalloc_expr_type(types, bc)
+    end
     T = BT isa Type ? _static_type(_cell_array_broadcast, BT) : Any
-    T isa DataType && isconcretetype(T) && T <: Array || return Any[stmt]
-    j = _step!(prog, _MaterializeStep(), _nonalloc_slot(T))
+    stmts = d === nothing ? Any[] : ctx.stmts
     types[lhs] = T
-    Any[Expr(:(=), lhs, _step_call(j,
-        Expr(:call, GlobalRef(@__MODULE__, :_cell_array_materialize), bc)))]
+    if !(T isa DataType && isconcretetype(T) && T <: Array)
+        push!(stmts, Expr(:(=), lhs, Expr(:call,
+            GlobalRef(@__MODULE__, :_cell_array_broadcast), bc)))
+        return stmts
+    end
+    j = _step!(prog, _MaterializeStep(), _nonalloc_slot(T))
+    push!(stmts, Expr(:(=), lhs, _step_call(j,
+        Expr(:call, GlobalRef(@__MODULE__, :_cell_array_materialize), bc))))
+    stmts
 end
 
 # The static type of a program expression over names of known value types:
@@ -1057,7 +1130,7 @@ function _nonalloc_step!(prog::_StepProgram, r::Recipe, i::Int,
         if r.op isa _KernelSourceOp && !(r.source isa _NoKernelSource)
             dec = _decompose_fused_recipe!(prog, r, callargs, argtypes, lhs)
             if dec !== nothing
-                types[lhs] = dec[2]
+                types[lhs] = _nonalloc_tighter_type(get(types, lhs, Any), dec[2])
                 return dec[1]
             end
         end
@@ -1067,7 +1140,7 @@ function _nonalloc_step!(prog::_StepProgram, r::Recipe, i::Int,
             if !(r.op isa _KernelSourceOp)
                 dec = _decompose_traceable_recipe!(prog, op, callargs, argtypes, lhs)
                 if dec !== nothing
-                    types[lhs] = dec[2]
+                    types[lhs] = _nonalloc_tighter_type(get(types, lhs, Any), dec[2])
                     return dec[1]
                 end
             end
@@ -1085,7 +1158,7 @@ function _nonalloc_step!(prog::_StepProgram, r::Recipe, i::Int,
     if !r.effectful && !(r.op isa _KernelSourceOp)
         dec = _decompose_traceable_recipe!(prog, op, callargs, argtypes, lhs)
         if dec !== nothing
-            types[lhs] = dec[2]
+            types[lhs] = _nonalloc_tighter_type(get(types, lhs, Any), dec[2])
             return dec[1]
         end
     end

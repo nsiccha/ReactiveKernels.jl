@@ -92,3 +92,25 @@ using Test
         @test get!(s2, statevalue(s2, b)) == [9.0, 8.0, 7.0]     # reverse([7,8,9])
     end
 end
+
+# The stable rewrites (`stable_rewrites.jl`) reach the nonallocating reactive
+# state as they reach `prepare_reactive`: a recipe's own `log(exp(u))` is `u`
+# beyond exp's range. An array recipe reused in place runs its own operation.
+@kernel reactive_na_stable(u::Float64, x::Vector{Float64}) = begin
+    out::Float64 = log1p(exp(-log(exp(u))))
+    y::Vector{Float64} = copy(x)
+end
+
+@testset "nonallocating reactive state: the stable rewrites" begin
+    stable = prepare_reactive_nonallocating(reactive_na_stable)
+    literal = prepare_reactive_nonallocating(reactive_na_stable; simplify = false)
+    for (u, expected) in ((-800.0, 800.0), (800.0, 0.0))
+        s = stable(u, [1.0, 2.0])
+        @test get!(s, statevalue(s, reactive_na_stable.out)) == expected
+        @test get!(s, statevalue(s, reactive_na_stable.y)) == [1.0, 2.0]
+    end
+    s = literal(-800.0, [1.0, 2.0])
+    @test get!(s, statevalue(s, reactive_na_stable.out)) == Inf
+    # `y = copy(x)` keeps its registered in-place operation.
+    @test occursin("__cache_apply__", string(code_expr(stable, reactive_na_stable.y)))
+end

@@ -3394,8 +3394,10 @@ nested Base fold (the compiler page, "Lowering and emitted ABI"). The method's
 source is recorded for source-reading compilers ([`jax_source`](@ref)), and an
 `on_error = :ignore` preparation calls its throw-stripped twin.
 
-Supported: positional arguments with optional defaults, `where` clauses, and
-a return-type annotation.  A docstring before `@traceable` documents the
+Supported: positional arguments with optional defaults, a trailing Vararg
+argument (`args...`, `args::T...`, `args::Vararg{T,N}`, whose name the
+recorded source reads as the tuple of the trailing arguments, as the method
+does), `where` clauses, and a return-type annotation.  A docstring before `@traceable` documents the
 method, as it does a plain definition.  A `@traceable` method of a function
 from Base, Core or ReactiveKernels is rejected, and so are keyword arguments
 and a `return` before the end of the body (write that branch as an
@@ -3492,31 +3494,95 @@ function _record_source_method(def)
 end
 
 """
-    _traceable_source(::Type{typeof(f)}, argument_types...) -> (names, body, module, signature, statics) or nothing
+    _traceable_source(::Type{typeof(f)}, argument_types...) -> (names, body, module, signature, statics, vararg) or nothing
 
 The authored source of the `@traceable` method of `f` that arguments of
 `argument_types` call: its formal names, its body, the module the body's
-globals resolve in, the method's signature type, and its `where` parameters as
+globals resolve in, the method's signature type, its `where` parameters as
 those types bind them (a named tuple; `nothing` for one they leave unbound),
-for a body that reads one (`exp(k * x)` of a `::Val{k}`). Source-reading compilers
-(`jax_source`) translate the helper from it. A more specific plain method of
-`f` is the one native execution calls; comparing its `which(...).sig` with the
-signature tells the two apart. `nothing` for a function without a
-`@traceable` method.
+for a body that reads one (`exp(k * x)` of a `::Val{k}`), and whether its last
+formal is a Vararg one (`args...`, `args::Vararg{T,N}`), whose name the body
+reads as the tuple of the trailing arguments ([`_traceable_arguments`](@ref)).
+Source-reading compilers (`jax_source`) translate the helper from it. A more
+specific plain method of `f` is the one native execution calls; comparing its
+`which(...).sig` with the signature tells the two apart. `nothing` for a
+function without a `@traceable` method.
 """
 _traceable_source(@nospecialize(args...)) = nothing
 
+"""
+    _traceable_arguments(source, args, group) -> Vector or nothing
+
+The values the formals of a recorded `source` (what [`_traceable_source`](@ref)
+returns, or its first three entries) take in a call with `args`, one per name
+in `source[1]`: each fixed formal its argument and, for a Vararg source, the
+last formal `group(trailing arguments)`, the value a source reader makes of
+them (a tuple, as the method receives them). `nothing` when the number of
+arguments does not fit the formals.
+"""
+function _traceable_arguments(source, args, group)
+    names = first(source)
+    vararg = length(source) >= 6 && source[6]::Bool
+    fixed = length(names) - vararg
+    values = collect(args)
+    (vararg ? length(values) >= fixed : length(values) == fixed) || return nothing
+    vararg || return values
+    vcat(values[1:fixed], [group(values[fixed+1:end])])
+end
+
+_traceable_is_vararg(x) = x === :Vararg || x == GlobalRef(Core, :Vararg) ||
+    (x isa Expr && x.head === :. && x.args[1] in (:Core, :Base) && x.args[2] == QuoteNode(:Vararg))
+
+# A Vararg formal (`args...`, `args::T...`, `args::Vararg{T}`,
+# `args::Vararg{T,N}`, or one of them unnamed) as `(name, element type, count)`,
+# the count `nothing` when the formal leaves it free; `nothing` for any other
+# formal.
+function _traceable_vararg(formal, k)
+    unnamed = Symbol("_unnamed_", k)
+    if formal isa Expr && formal.head === :... && length(formal.args) == 1
+        inner = only(formal.args)
+        inner isa Symbol && return (inner, GlobalRef(Core, :Any), nothing)
+        inner isa Expr && inner.head === :(::) && length(inner.args) in (1, 2) || return nothing
+        name = length(inner.args) == 2 ? inner.args[1] : unnamed
+        return name isa Symbol ? (name, inner.args[end], nothing) : nothing
+    end
+    formal isa Expr && formal.head === :(::) && length(formal.args) in (1, 2) || return nothing
+    name = length(formal.args) == 2 ? formal.args[1] : unnamed
+    name isa Symbol || return nothing
+    V = formal.args[end]
+    _traceable_is_vararg(V) && return (name, GlobalRef(Core, :Any), nothing)
+    V isa Expr && V.head === :curly && length(V.args) in (2, 3) &&
+        _traceable_is_vararg(V.args[1]) || return nothing
+    (name, V.args[2], length(V.args) == 3 ? V.args[3] : nothing)
+end
+
 # A method of `_traceable_source` over the argument TYPES, with the method's own
 # formals as type bounds, so dispatch selects the source of the method that
-# values of those types call. Defaulted, splatted and destructured formals
-# record no source.
+# values of those types call. A trailing Vararg formal bounds each trailing
+# argument type by its element type, and its count by the formal's. Defaulted
+# and destructured formals record no source.
 function _traceable_source_method(callee, formals, wheres, body, mod)
     params = Any[]
     names = Symbol[]
     bounds = Any[]
+    vararg = false
     for (k, formal) in enumerate(formals)
         formal isa Symbol && (push!(params, :(::Type)); push!(names, formal);
                               push!(bounds, GlobalRef(Core, :Any)); continue)
+        va = _traceable_vararg(formal, k)
+        if va !== nothing
+            # Julia rejects a Vararg formal before the last one when it
+            # defines the method itself.
+            k == length(formals) || return Any[]
+            name, T, count = va
+            counts = count === nothing ? () : (count,)
+            push!(params, Expr(:(::), Expr(:curly, GlobalRef(Core, :Vararg),
+                                           Expr(:curly, :Type, Expr(:<:, T)), counts...)))
+            push!(names, name)
+            push!(bounds, Expr(:curly, GlobalRef(Core, :Vararg), T, counts...))
+            vararg = true
+            continue
+        end
         # An unnamed formal (`::typeof(exp)`, a method selected by an argument
         # it never reads) takes a placeholder name.
         formal isa Expr && formal.head === :(::) && length(formal.args) == 1 &&
@@ -3548,7 +3614,7 @@ function _traceable_source_method(callee, formals, wheres, body, mod)
     end
     Any[Expr(:const, Expr(:(=), held, method_type)),
         Expr(:(=), signature, Expr(:tuple, QuoteNode(Tuple(names)), QuoteNode(body), mod, held,
-                                   Expr(:tuple, statics...)))]
+                                   Expr(:tuple, statics...), vararg))]
 end
 
 # The body with its tail-position `return`s replaced by their values, as a
@@ -5705,7 +5771,7 @@ end
 """
     prepare_batched(spec::KernelSpec; batched, have=inputs(spec),
                     want=outputs(spec), passes=(), reuse=false,
-                    schedule=nothing) -> callable
+                    schedule=nothing, simplify=nothing) -> callable
 
 First-class position batching for a scalar `@kernel`. The named HAVE ports
 carry one shared trailing batch axis; all other HAVE ports are shared by every
@@ -5728,7 +5794,11 @@ The lifted kernel requires pure recipes and retains their internal loops and
 lazy branches. Native execution hoists shared-only recipes, including plates,
 scans and embedded kernels, and lowers both the hoisted prefix and the
 per-position residual as `prepare` lowers a scalar kernel, so an inline plate
-runs as its fused loop at every position. The default allocates fresh stacked outputs;
+runs as its fused loop at every position. Unless `simplify = false`, each part
+computes numerically fragile compositions in their stable form, as `prepare`
+does; a composition of a per-position value over a hoisted one (`log(s)` of a
+shared `s = exp(a)`) is computed as written, so the hoisted value is computed
+once. The default allocates fresh stacked outputs;
 retaining a result across calls is safe. It is not the allocation-free reducing
 `plate` contract.
 
@@ -5772,34 +5842,47 @@ function prepare_batched(spec::KernelSpec;
                          want = _KERNEL_DEFAULT_BOUNDARY,
                          passes = (),
                          reuse = false,
-                         schedule = nothing)
+                         schedule = nothing,
+                         simplify = nothing)
     selected_have = have === _KERNEL_DEFAULT_BOUNDARY ? inputs(spec) : have
     selected_want = want === _KERNEL_DEFAULT_BOUNDARY ? outputs(spec) : want
-    prepared = prepare(plan(spec; have = selected_have, want = selected_want);
-                       passes = passes)
-    replicated = vectorize(prepared; batched, reuse, schedule)
+    replicated = _with_simplify(simplify) do
+        prepared = prepare(plan(spec; have = selected_have, want = selected_want);
+                           passes = passes)
+        vectorize(prepared; batched, reuse, schedule)
+    end
     have === _KERNEL_DEFAULT_BOUNDARY || return replicated
     _kernel_signature_callable(replicated, spec.call_signature)
 end
 
 """
-    vectorize(kernel::PreparedKernel; batched, reuse=false, schedule=nothing) -> callable
+    vectorize(kernel::PreparedKernel; batched, reuse=false, schedule=nothing,
+              simplify=nothing) -> callable
     vectorize(spec::KernelSpec; batched, have=inputs(spec),
-              want=outputs(spec), passes=(), reuse=false, schedule=nothing) -> callable
+              want=outputs(spec), passes=(), reuse=false, schedule=nothing,
+              simplify=nothing) -> callable
 
 Lift a scalar kernel over position batching. This is the concise public spelling
 for [`prepare_batched`](@ref); `replica` remains the equivalent lower-level
 name. See that docstring for the batch-axis, output-shape, purity, and
 allocation contract.
 
+`simplify` is as for [`prepare`](@ref): unless it is `false`, the position
+driver computes numerically fragile compositions in their stable form. A
+`PreparedKernel` argument contributes its plan, not its setting, as for
+[`prepare_nonallocating`](@ref).
+
 For a native `reuse=true` result, `copy(kernel)` creates an independent execution
 instance with empty output buffers and the same prepared computation. See
 [`prepare_batched`](@ref) for its lifetime and concurrency contract.
 """
-function vectorize(kernel::PreparedKernel; batched, reuse = false, schedule = nothing)
+function vectorize(kernel::PreparedKernel; batched, reuse = false, schedule = nothing,
+                   simplify = nothing)
     # A kernel `prepare(…; bound)` rebound from a cached template reuses the
     # position drivers lowered for an earlier binding (bound_vectorize.jl).
-    _vectorize(kernel.rebinding, kernel, batched, reuse, schedule)
+    _with_simplify(simplify) do
+        _vectorize(kernel.rebinding, kernel, batched, reuse, schedule)
+    end
 end
 
 function vectorize(spec::KernelSpec;
@@ -5808,12 +5891,14 @@ function vectorize(spec::KernelSpec;
                    want = _KERNEL_DEFAULT_BOUNDARY,
                    passes = (),
                    reuse = false,
-                   schedule = nothing)
-    prepare_batched(spec; batched, have, want, passes, reuse, schedule)
+                   schedule = nothing,
+                   simplify = nothing)
+    prepare_batched(spec; batched, have, want, passes, reuse, schedule, simplify)
 end
 
-function vectorize(callable::_KernelSignatureCallable; batched, reuse = false, schedule = nothing)
-    replicated = vectorize(callable.target; batched, reuse, schedule)
+function vectorize(callable::_KernelSignatureCallable; batched, reuse = false,
+                   schedule = nothing, simplify = nothing)
+    replicated = vectorize(callable.target; batched, reuse, schedule, simplify)
     _kernel_signature_callable(replicated, callable.signature)
 end
 
@@ -5832,7 +5917,7 @@ scalar_kernel(kernel::BorrowedBatchedKernel) = scalar_kernel(kernel.target)
 scalar_kernel(kernel::_KernelSignatureCallable) = scalar_kernel(kernel.target)
 
 """
-    plate(spec::KernelSpec; have, want, batched, reduce = :+) -> PreparedKernel
+    plate(spec::KernelSpec; have, want, batched, reduce = :+, simplify = nothing) -> PreparedKernel
 
 Prepare a batched, loop-invariant-hoisting kernel from a scalar `@kernel` spec.
 The `batched` HAVE ports (a name or a collection of names) are passed as arrays;
@@ -5841,11 +5926,13 @@ single scalar `want` is mapped over the batched values and reduced (a sum by
 default). Pass `reduce = nothing` to collect the per-element wants instead.
 
 The generated map/reduction form is allocation-free for native reducing
-execution. See [`lower_batched`](@ref).
+execution. See [`lower_batched`](@ref). `simplify` is as for
+[`prepare`](@ref): unless it is `false`, numerically fragile compositions are
+computed in their stable form (`log(exp(u))` as `u`).
 """
-function plate(spec::KernelSpec; have, want, batched, reduce = :+)
+function plate(spec::KernelSpec; have, want, batched, reduce = :+, simplify = nothing)
     p = plan(spec; have = have, want = want)
-    _prepare_batched(p; batched = batched, reduce = reduce)
+    _prepare_batched(p; batched = batched, reduce = reduce, simplify = simplify)
 end
 
 """

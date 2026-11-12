@@ -34,6 +34,49 @@ const SPEC = @kernel traced_steps(x::Vector{Float64}, w::Float64) = begin
 end
 end
 
+# An argument check (`... ? s : throw(...)`) feeding a traced helper whose
+# arms build arrays, read by every cell of a plate.
+module ThrowGuardFixture
+using ReactiveKernels
+@traceable scaled_logs(s, n) = n == 0 ? float.(s) : log.(s)
+const SPEC = @kernel throw_guard(x::Vector{Float64}, s::Vector{Float64}) = begin
+    checked = length(s) == 2 ? s : throw(DimensionMismatch("two scales"))
+    logs = scaled_logs(checked, length(x))
+    cells = plate(1:length(x)) do i
+        -logs[1 + i % 2] - x[i] / checked[1 + i % 2]
+    end
+    total::Float64 = sum(cells)
+end
+end
+
+# The same shape over untyped HAVE ports: preparation cannot type the traced
+# helper's step, so its slot is a `Ref{Any}`.
+module UntypedTracedFixture
+using ReactiveKernels
+@traceable logs_of(x) = log.(x)
+const SPEC = @kernel untyped_logs(x, w) = begin
+    y = logs_of(x)
+    cells = plate(1:length(y)) do i
+        y[i] * w - x[i]
+    end
+    total::Float64 = sum(cells)
+end
+end
+
+# A traced helper whose trailing Vararg formal is the tuple of its arguments.
+module TracedVarargFixture
+using ReactiveKernels
+@traceable function centered_parts(w, parts::Vararg{Any,N}) where {N}
+    c = first(parts) .- last(parts)
+    c .* c .* w
+end
+const SPEC = @kernel traced_vararg(x::Vector{Float64}, y::Vector{Float64},
+                                   w::Float64) = begin
+    d::Vector{Float64} = centered_parts(w, x, y)
+    out::Float64 = sum(d)
+end
+end
+
 module TracedDispatchFixture
 using ReactiveKernels
 @traceable scaled(x, s) = x .* s
@@ -381,6 +424,16 @@ end
         @test kernel_allocations(k, x, 0.7) == 0
     end
 
+    @testset "a traced helper's Vararg formal is the tuple of its arguments" begin
+        spec = TracedVarargFixture.SPEC
+        ordinary = prepare(spec; have = (:x, :y, :w), want = :out)
+        k = prepare_nonallocating(spec; have = (:x, :y, :w), want = :out)
+        x, y = [sin(3i) for i in 1:40], [cos(2i) for i in 1:40]
+        @test k(x, y, 0.7) == ordinary(x, y, 0.7)
+        @test k(y, 2 .* x, 1.3) == ordinary(y, 2 .* x, 1.3)
+        @test kernel_allocations(k, x, y, 0.7) == 0
+    end
+
     @testset "a branch's arms fill buffers of their own" begin
         # An authored `if` whose taken arm builds an array: each arm decomposes
         # into its own steps, which run only when the arm is taken.
@@ -398,6 +451,37 @@ end
         @test k(x, w, true) == ordinary(x, w, true)
         @test k(x, w, false) == ordinary(x, w, false) == -Inf
         @test kernel_allocations(k, x, w, true) == 0
+    end
+
+    @testset "a checked value keeps its type through a traced helper's arms" begin
+        # The check's `throw` arm returns nothing, so `checked` keeps the
+        # type of `s`, and the helper's broadcasts fill typed buffers. Typed
+        # `Any`, their slots handed the plate an untyped `logs`, and every
+        # cell dispatched at run time: allocations grew with the cell count.
+        spec = ThrowGuardFixture.SPEC
+        ordinary = prepare(spec; have = (:x, :s), want = :total)
+        k = prepare_nonallocating(spec; have = (:x, :s), want = :total)
+        x, s = [0.5 + 0.01i for i in 1:400], [0.7, 2.0]
+        @test k(x, s) == ordinary(x, s)
+        @test kernel_allocations(k, x, s) == 0
+        @test !any(c -> c isa Base.RefValue{Any}, k.caches)
+        @test_throws DimensionMismatch k(x, [0.7, 2.0, 1.0])
+    end
+
+    @testset "an untyped step keeps its buffer and its call's type" begin
+        # The `Ref{Any}` slot's result is read as the type `log.(x)` infers
+        # where it is called, so the plate cells reading it stay typed, and
+        # the slot still keeps its buffer from call to call.
+        spec = UntypedTracedFixture.SPEC
+        ordinary = prepare(spec; have = (:x, :w), want = :total)
+        k = prepare_nonallocating(spec; have = (:x, :w), want = :total)
+        x = [0.5 + 0.01i for i in 1:400]
+        @test k(x, 0.3) == ordinary(x, 0.3)
+        untyped = [c for c in k.caches if c isa Base.RefValue{Any}]
+        @test !isempty(untyped)
+        buffers = map(c -> c[], untyped)
+        @test kernel_allocations(k, x, 0.3) == 0
+        @test all(map((c, b) -> c[] === b, untyped, buffers))
     end
 
     @testset "a traced helper's source stands only for its own method" begin

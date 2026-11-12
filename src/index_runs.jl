@@ -134,6 +134,11 @@ end
 
 _index_run_call(x,f,n=nothing)=x isa Expr && x.head===:call &&
     x.args[1]==f && (n===nothing || length(x.args)==n+1)
+# A plate cell's read of a batched argument at its coordinate: through Base's
+# broadcast projection, or directly where the argument spans the plate
+# (`_plate_read`, `_plate_direct_read_loop`).
+_index_run_read(x)=_index_run_call(x,GlobalRef(Base.Broadcast,:_broadcast_getindex),2) ||
+    _index_run_call(x,GlobalRef(@__MODULE__,:_plate_read),2)
 function _index_run_visit(f,x)
     x isa Expr || return
     x.head in (:quote,:inert) && return
@@ -220,7 +225,9 @@ function _lower_index_runs_native(body::Expr,ops)
             op===_readonly_gather_runs && length(rhs.args)==4 &&
                 rhs.args[4] isa Symbol && (gathers[lhs]=rhs.args[4])
         elseif _index_run_call(rhs,GlobalRef(Base,:broadcastable),1)
-            m=get(gathers,rhs.args[2],nothing);m===nothing || (raw[lhs]=m)
+            # A cell loop reading the gather in place reads this value itself
+            # (`_plate_direct_read_loop`), so it is a projection too.
+            m=get(gathers,rhs.args[2],nothing);m===nothing || (raw[lhs]=m; projections[lhs]=m)
         elseif _index_run_call(rhs,GlobalRef(Base.Broadcast,:preprocess),2)
             m=get(raw,rhs.args[3],nothing);m===nothing || (projections[lhs]=m)
         end
@@ -240,8 +247,7 @@ function _lower_index_runs_native(body::Expr,ops)
         axes,index,cellbody=plate
         selected=Symbol[];additions=Expr[]
         _index_run_visit(cellbody) do cell
-            if _index_run_call(cell,GlobalRef(Base.Broadcast,:_broadcast_getindex),2) &&
-                    cell.args[3]==index && haskey(projections,cell.args[2])
+            if _index_run_read(cell) && cell.args[3]==index && haskey(projections,cell.args[2])
                 cell.args[2] in selected || push!(selected,cell.args[2])
             end
             cell.head===:(=) && length(cell.args)==2 &&
@@ -267,8 +273,7 @@ function _lower_index_runs_native(body::Expr,ops)
         shared=Dict(s=>Symbol(s,:_index_run_value_,k) for s in selected)
         part,run,lo,hi,linear=(Symbol(metadata,:_,s,:_,k) for s in (:run_partial,:run,:run_lo,:run_hi,:run_linear))
         grouped_body=_index_run_replace(cellbody) do cell
-            if _index_run_call(cell,GlobalRef(Base.Broadcast,:_broadcast_getindex),2) &&
-                    cell.args[3]==index && haskey(shared,cell.args[2])
+            if _index_run_read(cell) && cell.args[3]==index && haskey(shared,cell.args[2])
                 return shared[cell.args[2]]
             end
             cell

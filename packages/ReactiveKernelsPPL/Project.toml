@@ -1,7 +1,7 @@
 name = "ReactiveKernelsPPL"
 uuid = "e266ea2a-6817-46cd-8bec-6238f0035f44"
 authors = ["Nikolas Siccha <nikolassiccha@gmail.com>"]
-version = "0.1.161"
+version = "0.1.166"
 
 [deps]
 DataAPI = "9a962f9c-6df0-11e9-0e5d-c546b8b5ee8a"
@@ -51,8 +51,8 @@ SparseArrays = "1"
 Treebars = "0.1.5"
 WarmupHMC = "0.2.19"
 PrecompileTools = "1.2"
-ReactiveKernels = "0.1.174"
-ReactiveKernelsDistributionKernels = "0.1.6"
+ReactiveKernels = "0.1.204"
+ReactiveKernelsDistributionKernels = "0.1.7"
 SpecialFunctions = "2"
 StatsFuns = "1, 2"
 Statistics = "1"

@@ -93,6 +93,26 @@ function _history_lag_form(idx, loopvar, env)
     return nothing
 end
 
+# A literal-width sum can read the same scalar lags as an authored tuple.
+# Its width comes from syntax, never from a bound value or trajectory length.
+# Keep Base.sum (rather than replacing it by +) for its accumulator promotion.
+# The caller establishes that the call names Base.sum in its lexical scope.
+function _history_window_sum(ex, states, loopvar, depth)
+    Meta.isexpr(ex, :call, 2) || return nothing
+    slice = ex.args[2]
+    (Meta.isexpr(slice, :ref, 2) && slice.args[1] in states) || return nothing
+    range = slice.args[2]
+    _history_is_slice(range) || return nothing
+    env = Dict{Symbol,Any}()
+    firstlag = _history_lag_form(range.args[2], loopvar, env)
+    lastlag = _history_lag_form(range.args[3], loopvar, env)
+    (firstlag isa Int && lastlag isa Int && 1 <= lastlag <= firstlag <= depth) ||
+        return nothing
+    values = Expr(:tuple, (Expr(:ref, slice.args[1],
+        Expr(:call, :-, loopvar, k)) for k in firstlag:-1:lastlag)...)
+    return Expr(:call, ex.args[1], values)
+end
+
 # The environment inside generator `gen`: each iteration name maps to the
 # interval its range proves, read in the enclosing environment.
 function _history_generator_env(gen::Expr, loopvar, env)

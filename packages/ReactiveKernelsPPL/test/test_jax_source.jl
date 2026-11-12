@@ -298,6 +298,17 @@ const _JAX_CASES = (
             y[i] .~ Normal.(m[i], s)
         end
     end))(; G = 4) | (; y = _JAX_YR),
+    # A ragged plate whose Gaussian scale is an integer definition (a BRM
+    # `y[i] ~ normal(m, 1)` emits one): the cell reads it as a prepared
+    # `StaticInt`, beside the float arm of the scale's guard, a `jax.lax.cond`
+    # (snag jax-ragged-integ-35502154).
+    ragged_integer_scale = () -> (@rkppl(begin
+        a ~ Normal(0, 1)
+        s = 1
+        @plate for i in eachindex(y)
+            y[i] .~ Normal.(a .* x[i], s)
+        end
+    end))(; x = _JAX_R) | (; y = _JAX_YR),
     # Per-group recurrences over series of different lengths: an observed
     # AR(1), a deterministic recurrence of a ragged input, and a random walk
     # with one innovation per step (a one-entry group included).
@@ -585,6 +596,90 @@ end
                               prepare = :arguments).value ≈ query(u) rtol = 1e-10
         reference = rk_fd_gradient(query, u)
         @test maximum(abs.(r.grad .- reference) ./ max.(1, abs.(reference))) < 1e-5
+    end
+end
+
+# The module does not depend on what the caller imported (snag
+# jax-source-stand-a5129478). A stochastic cell scan's step counts are a data
+# definition `plate(...) do g ... end`, which `jax_source` resolved in `Main`:
+# from a Main without `using ReactiveKernels` they were UNTRANSLATED and
+# `prepare_data` took `_rkppl_scan_h_count_values`. This file's own `using
+# ReactiveKernels` hid it, so the cases also run in a process whose Main
+# imports only ReactiveKernelsPPL.
+const _JAX_CALLER_IMPORTS = raw"""
+const CALLER_CASES = (
+    cell_scan_data_length = () -> (@rkppl(begin
+        s ~ Exponential(1)
+        @plate for g in eachindex(y)
+            @scan begin
+                h[1] = 0.0
+                for t in 2:length(y[g])
+                    e ~ Normal(0, 1)
+                    h[t] = h[t - 1] + s * e
+                end
+            end
+            y[g] .~ Normal.(h, 1)
+        end
+    end))() | (; y = [[0.1, 0.2, 0.0], [0.3], [0.0, 0.1]]),
+    cell_scan_shared_length = () -> (@rkppl(begin
+        s ~ Exponential(1)
+        @plate for g in eachindex(y)
+            @scan begin
+                h[1] = 0.0
+                for t in 2:K
+                    e ~ Normal(0, 1)
+                    h[t] = h[t - 1] + s * e
+                end
+            end
+            y[g] .~ Normal.(h[idx[g]], 1)
+        end
+    end))(; K = 3, idx = [[1, 2, 3], [2], [1, 3]]) | (; y = [[0.1, 0.2, 0.0], [0.3], [0.0, 0.1]]),
+)
+# Per case: its name, `prepare_data`'s inputs and `UNTRANSLATED`.
+caller_summary() = map(collect(pairs(CALLER_CASES))) do (name, make)
+    plan = make()
+    src = jax_source(build_kernel(plan), plan)
+    inputs = first.(only(f for f in src.functions if f.name == "prepare_data").inputs)
+    string(name, " ", join(inputs, ","), " ", match(r"^UNTRANSLATED = (.*)$"m, string(src))[1])
+end
+"""
+@testset "jax_source(built, plan): the module does not depend on the caller's imports" begin
+    expected = ["cell_scan_data_length y {}", "cell_scan_shared_length K,idx,y {}"]
+    here = Module(:JaxCallerImports)
+    Core.eval(here, :(using ReactiveKernelsPPL))
+    include_string(here, _JAX_CALLER_IMPORTS)
+    @test Base.invokelatest(here.caller_summary) == expected
+    script = "using ReactiveKernelsPPL\n" * _JAX_CALLER_IMPORTS * "\nforeach(println, caller_summary())\n"
+    project = dirname(Base.active_project())
+    out = read(`$(Base.julia_cmd()) --startup-file=no --project=$project -e $script`, String)
+    @test split(strip(out), "\n") == expected
+end
+
+# The float32 module of each case (`float_type = Float32`, snag
+# jax-source-float-5e6b7604): with 64-bit mode on (its float64 module imported
+# first), its value and gradient hold no strongly typed float64, and they are
+# the float64 module's to float32 rounding. Alone, it runs without 64-bit mode.
+@testset "jax_source(built, plan; float_type = Float32) ($name)" for name in
+        keys(merge(_JAX_CASES, _JAX_ICAR_CASES))
+    if !rk_jax_available()
+        @info "RK_JAX_PYTHON is not set: float32 JAX parity for $name skipped"
+        @test_skip false
+    else
+        plan = merge(_JAX_CASES, _JAX_ICAR_CASES)[name]()
+        built = build_kernel(plan)
+        src64 = jax_source(built, plan)
+        src32 = jax_source(built, plan; float_type = Float32)
+        @test !occursin("jax_enable_x64", string(src32))
+        u = 0.2 .* randn(Xoshiro(7), built.layout.total)
+        args = (u, jax_raw_data(plan, src64)...)
+        r = rk_jax_float32(src32, src64, :log_density, args; prepare = true)
+        @test r.x64 && !r.f64
+        @test r.dtype == "float32" && r.grad_dtype == "float32"
+        @test abs(r.value - r.reference) <= 64 * eps(Float32) * max(1, abs(r.reference))
+        @test norm(r.grad .- r.reference_grad) <= 1e-4 * max(1, norm(r.reference_grad))
+        alone = rk_jax_float32(src32, nothing, :log_density, args; prepare = true)
+        @test !alone.x64 && alone.dtype == "float32"
+        @test abs(alone.value - r.reference) <= 64 * eps(Float32) * max(1, abs(r.reference))
     end
 end
 

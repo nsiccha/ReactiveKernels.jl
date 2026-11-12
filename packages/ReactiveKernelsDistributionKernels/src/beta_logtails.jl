@@ -9,14 +9,18 @@ ReactiveKernels.@_record_source function _beta_log_tail(a, b, log_x, log_one_min
         result = upper ? 0.0 : -Inf
     elseif log_one_minus_x == -Inf
         result = upper ? -Inf : 0.0
-    elseif log_x < log((a + 1) / (a + b + 2))
-        small = a * log_x + b * log_one_minus_x - log_beta - log(a) +
-            log(_rk_beta_inc_cf(a, b, exp(log_x)))
-        result = upper ? LogExpFunctions.log1mexp(small) : small
     else
-        small = b * log_one_minus_x + a * log_x - log_beta - log(b) +
-            log(_rk_beta_inc_cf(b, a, exp(log_one_minus_x)))
-        result = upper ? small : LogExpFunctions.log1mexp(small)
+        # Reflect the arguments before the one continued fraction. Both
+        # sets of operands are valid interior values; endpoint guards remain
+        # lazy above. Batched execution need not run a fraction in each arm.
+        lower = log_x < log((a + 1) / (a + b + 2))
+        shape_a = ifelse(lower, a, b)
+        shape_b = ifelse(lower, b, a)
+        log_t = ifelse(lower, log_x, log_one_minus_x)
+        log_one_minus_t = ifelse(lower, log_one_minus_x, log_x)
+        small = shape_a * log_t + shape_b * log_one_minus_t - log_beta - log(shape_a) +
+            log(_rk_beta_inc_cf(shape_a, shape_b, exp(log_t)))
+        result = (upper == lower) ? LogExpFunctions.log1mexp(small) : small
     end
     return result
 end

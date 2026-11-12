@@ -20,9 +20,9 @@ print(source)
 
 Input annotations tell the emitter each port's rank. For untyped ports, supply the corresponding `types` keyword. The emitted input order follows the selected input boundary.
 
-Typed `Float32` allocations and conversions keep `float32`, including arrays
-computed by host `prepare_data`; `Float64` keeps `float64`. Prepared input
-metadata reports the same dtype.
+Typed `Float32` values keep `float32`, also in `prepare_data`; other floats
+take `jax_source`'s `float_type` (`Float64`, or `Float32` without JAX's 64-bit
+mode), as metadata reports.
 
 `fma` of `Float64` or `Float32` values, also broadcast, rounds once, as in
 Julia; `jax.grad` gives `(y, x, 1)`. Integer `fma` and `muladd` are
@@ -41,7 +41,23 @@ A PPL model can emit its sampler boundary through `jax_source(built, bound)`. Th
 
 A dotted cell latent, `v[i] .~ D.(args…)` with a length per index that data decide, has its dimensions, packed offsets, block table and argument entries computed in `prepare_data` when its arguments read data, scalar parameters or a shared array; an argument that reads a sampled array at the index, or an array of rank 2 or more at each index, raises `JAXEmissionError` for now.
 
+Host preparation translates `findfirst(predicate, vector)`, including captured predicates such as `isequal(label)`, `Base.Fix1` and `Base.Fix2`. It searches in order, stops at the first match, and returns a one-based index or `nothing`. A positional kernel can therefore compute group indices with `plate(values) do value; Int(findfirst(isequal(value), levels)); end` inside the emitted module. Label values and the lengths of both vectors remain runtime inputs.
+
 Translation errors identify an unsupported operation instead of substituting a different computation. JAX compilation, device placement and differentiation belong to the Python consumer.
+
+For `scalar_derivative_rule`, the module generates a `jax.custom_jvp` adapter
+from the rule's mathematical graph. It selects the primal and named partials
+for the active arguments, then applies the scalar chain rule. An inactive
+argument's partial is not contracted with a numeric zero. Calls share their
+generated helpers, including a joint recipe that serves several activity
+patterns. Host data preparation uses the primal cut. General `derivative_rule`
+calls currently emit their primal cut for ordinary JAX differentiation.
+
+The incomplete-beta continued fraction used by distribution tails supplies
+its value and shape/argument partials through such a shared graph. A first
+JAX gradient retains those partials rather than a reverse tape of all 300
+fraction iterations. The primal and partials use fixed loops, so their
+higher derivatives remain available through ordinary JAX differentiation.
 
 Unless `simplify = false`, each emitted recipe computes numerically fragile compositions in the stable form native preparation computes, together with the statements that compute its inputs, also from a lazy arm or a plate's cell: `log(exp(u))` is emitted as `u`, and `log1p(-p)` of `p = logistic(u)` reads `u`, so the value and `jax.grad` stay finite where `exp(u)` overflows. A law's term on a value computed outside the law (`Normal(0, s)`'s `log(s)` of `s = exp(a)`) is still translated as written: the law's endpoint is translated from its compiled lowered code, which the rewrites do not read yet.
 
@@ -49,7 +65,7 @@ The [Eight-schools example](eight-schools.md) explains the model and coordinate 
 
 ## Helpers with loops and branches
 
-A helper translates from recorded source when available: `@traceable` records it; `for` becomes `jax.lax.fori_loop`, `if` becomes `jax.lax.cond`, and `A[i] = v` becomes `A.at[i].set(v)`. Plain lowered helpers support straight-line code and terminal forward branches, including size guards. They can create immutable closures and fold fixed argument lists with `Base.afoldl`. Broadcasting `Ref(x)` passes `x` whole to each call. Captures remain runtime inputs; host `prepare_data` uses the same translation.
+A helper translates from recorded source when available: `@traceable` records it, and a trailing Vararg argument (`args...`, `args::Vararg{T,N}`) reads as the tuple of the trailing arguments, as the method receives them, and `sum(f, t; init)` folds such a tuple over its fixed length; `for` becomes `jax.lax.fori_loop`, `if` becomes `jax.lax.cond`, and `A[i] = v` becomes `A.at[i].set(v)`. Plain lowered helpers support straight-line code and terminal forward branches, including size guards. They can create immutable closures and fold fixed argument lists with `Base.afoldl`. Broadcasting `Ref(x)` passes `x` whole to each call. Captures remain runtime inputs; host `prepare_data` uses the same translation.
 
 A method that a package generates, such as one its macro writes into the caller's module, cannot carry `@traceable`. The generating package keeps the method's source as a `TraceableSource` (argument names, body, and the module whose globals the body reads) and hands it over through a provider. It registers the provider with `register_source_provider!`, once, from the `__init__` of the package extension that loads with ReactiveKernels. The emitter asks the provider for a call that has no other translation and no `@traceable` source, with the function and the `Tuple` type of the argument types. The provider answers `nothing` or the source of the method those arguments call natively.
 

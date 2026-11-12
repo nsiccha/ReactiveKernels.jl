@@ -13,7 +13,11 @@ end
 _record_density!(::Nothing, args...; kwargs...) = nothing
 function _record_density!(sites::Vector{_DensitySite}, stmts, kind, site, total;
         pointwise = nothing, count = 1, owner = site)
-    plate = if pointwise === nothing || count == 0
+    # A site of elementwise events is a plate site whatever its event count: a
+    # binding with no events there (a plate over no rows) keeps the plate, so
+    # the catalogue, and the query structures of its selections, are the same
+    # for every binding of the program.
+    plate = if pointwise === nothing
         nothing
     else
         name = Symbol(:_ppl_density_cells_, length(sites) + 1)
@@ -475,9 +479,9 @@ function _density_bound_cells(c::DensityFactors, s::_DensitySite)
 end
 
 # Selections of one structure share one query graph: the sites they read
-# whole (`totals`), the sites they read as partitioned cells (`plates`),
-# whether folded data-only cells add a constant, the row plan's type and the
-# compact overlay. A graph copied per selection kept a whole catalogue graph
+# whole (`totals`), the sites they read as partitioned cells (`plates`, every
+# plate site of the catalogue, `_density_selection_spec`), whether folded
+# data-only cells add a constant, the row plan's type and the compact overlay. A graph copied per selection kept a whole catalogue graph
 # alive in every query and in the binding's data store.
 #
 # A value query (`prepare_query`) binds its selection's entries, row plan,
@@ -574,12 +578,16 @@ function _density_selection_spec(built, plan, selection; locality, on_error, u0,
     bindings = Pair{Symbol,Any}[pairs(_query_bound(plan))...]
     context = Any[]
     select!(pair) = runtime ? push!(context, last(pair)) : push!(bindings, pair)
+    # A selection's structure is its catalogue's, not its entries': it reads
+    # every plate site by cells, with no cells where it selects none, and adds
+    # the folded constant whenever the catalogue folds a site. Which plates a
+    # binding has rows in then does not change the program a query calls
+    # (todo 1nndmwq). Sites read whole are read only when selected.
     for (j, s) in enumerate(c.sites)
         entries = [f.entry - s.offset for f in selection if f.kind === s.kind &&
             f.site === s.site && s.offset < f.entry <= s.offset + s.count]
-        isempty(entries) && continue
         if s.plate === nothing
-            push!(totals, j)
+            isempty(entries) || push!(totals, j)
         elseif (cells = _density_bound_cells(c, s)) !== nothing
             constant += sum(i -> cells[i], entries; init = 0.0)
             folded = true
@@ -735,9 +743,12 @@ must come from one catalogue. The batch checks its bound program once, then
 shares one packed exemplar across preparation. With `coordinates = :support`,
 each returned `FactorQueryAD` owns a compact derivative workspace; fixed row
 and coordinate metadata use storage proportional to the selected supports.
-Selections with one structure (the same kinds and sites, each read whole or
-by cells) share one prepared program, so a query keeps only its own entries,
-row plan, slots and workspace, never a copy of the model graph.
+Selections that read the same sites whole share one prepared program, so a
+query keeps only its own entries, row plan, slots and workspace, never a copy
+of the model graph. Every selection reads each elementwise (plate) site of the
+catalogue by cells, with no cells where it selects none, so neither its
+entries nor which plates the binding has rows in change that program: another
+binding of the model calls the programs this one compiled.
 Empty selections return zero-valued queries; an empty batch returns no queries.
 Single-selection calls retain their bound-program validation.
 """
@@ -799,6 +810,15 @@ function _prepare_factor_query_ad(prepare_operator, built, plan, selection, back
         prepared = Base.invokelatest(prepare_operator, shared.kernel, backend,
             Base.front(exemplars)..., Base.front(point)..., context...;
             active = :_ppl_cell_active)
+        # The selection keeps its plan behind one reference, which an operator
+        # that boxes its plan takes unchanged (`ReactiveKernels._ad_plan_argument`,
+        # as `_LabelPlans` does): boxing it on every call allocated the reference
+        # each time, 64 B for one plate and 368 B for three. Its position is one
+        # past the selection's own, after the slot map `context` starts with.
+        q.plan_index === nothing || (context = Base.setindex(context,
+            ReactiveKernels._ad_plan_argument(prepared,
+                ReactiveKernels._PartitionPlanRef(context[q.plan_index + 1])),
+            q.plan_index + 1))
         return FactorQueryAD(prepared, built.layout, selected, context)
     end
     kernel = Base.invokelatest(_prepare_cached, plan, q.spec; have = q.have, want = q.want,

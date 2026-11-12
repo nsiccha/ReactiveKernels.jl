@@ -1614,6 +1614,80 @@ end
     end
 end
 
+# A branch whose condition is traced is a `jax.lax.cond`, whose arms must
+# return one structure of one dtype; Julia's arms may differ in type (snag
+# jax-ragged-integ-35502154). A Gaussian's guarded scale over a prepared
+# integer `s` (`StaticInt` in the module) is `1.0` in one arm and `s` in the
+# other; an arm's integer and the other's float; an `if` that assigns a local
+# an integer in one arm and a float in the other.
+@kernel jax_int_scale_arms(y::Vector{Float64}, s::Int, a::Float64) = begin
+    lp = plate(y) do yi
+        z = (yi - a) / (s == 0 && yi == a ? 1.0 : s)
+        -0.5 * z^2 - log(s)
+    end
+    total = sum(lp)
+    return total
+end
+@traceable function jax_mixed_scale(x::Real)
+    s = x > 0 ? 2 : 0.5
+    return s * x
+end
+@kernel jax_mixed_arms(x::Float64) = begin
+    t = jax_mixed_scale(x)
+    return t
+end
+@traceable function jax_mixed_carried(x::Real, n::Integer)
+    k = 0
+    v = if x > 0
+        k = n
+        1.5
+    else
+        k = 0.5
+        n
+    end
+    return v * x + k * x^2
+end
+@kernel jax_mixed_carried_kernel(n::Int, x::Float64) = begin
+    t = jax_mixed_carried(x, n)
+    return t
+end
+
+@testset "jax_source: a traced branch's arms return one JAX type" begin
+    y = [0.1, -0.3, 0.4]
+    scaled = jax_source(jax_int_scale_arms; have = (:a, :y, :s), want = :total, data = (; y, s = 1))
+    @test occursin("jax.lax.cond(", string(scaled))
+    @test occursin(r"return jnp\.asarray\(s\w*, dtype=jnp\.float64\)", string(scaled))
+    mixed = jax_source(jax_mixed_arms; have = (:x,), want = :t)
+    @test occursin("return jnp.asarray(2, dtype=jnp.float64)", string(mixed))
+    carried = jax_source(jax_mixed_carried_kernel; have = (:x, :n), want = :t, data = (; n = 3))
+    @test occursin("jax.lax.cond(", string(carried))
+    if !rk_jax_available()
+        @test_skip false
+    else
+        native = prepare(jax_int_scale_arms; have = (:a, :y, :s), want = :total)
+        for a in (-0.4, 0.7), s in (1, 3)
+            src = jax_source(jax_int_scale_arms; have = (:a, :y, :s), want = :total, data = (; y, s))
+            r = rk_jax_evaluate(src, "kernel", (a, y, s); grad = true, prepare = true)
+            @test r.value ≈ native(a, y, s) rtol = 1e-12
+            @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), y, s), [a])) rtol = 1e-6
+            @test rk_jax_evaluate(src, "kernel", (a, y, s); prepare = :arguments).value ≈
+                  native(a, y, s) rtol = 1e-12
+        end
+        native = prepare(jax_mixed_arms; have = (:x,), want = :t)
+        for x in (-0.6, 0.8)
+            r = rk_jax_evaluate(mixed, "kernel", (x,); grad = true)
+            @test r.value ≈ native(x) rtol = 1e-12
+            @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u)), [x])) rtol = 1e-6
+        end
+        native = prepare(jax_mixed_carried_kernel; have = (:x, :n), want = :t)
+        for x in (-0.6, 0.8)
+            r = rk_jax_evaluate(carried, "kernel", (x, 3); grad = true, prepare = true)
+            @test r.value ≈ native(x, 3) rtol = 1e-12
+            @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), 3), [x])) rtol = 1e-6
+        end
+    end
+end
+
 # A data-only definition calling a program-level kernel (a binder's
 # `x_mean = covariate_mean(x)`): `prepare_data` computes it from the kernel's
 # plan, a host function, so the module takes only the raw data (snag
@@ -1650,6 +1724,41 @@ end
             @test r.value ≈ reference(theta) rtol = 1e-12
             @test r.grad ≈ rk_fd_gradient(reference, theta) rtol = 1e-6
         end
+    end
+end
+
+# A definition's globals resolve in `definitions_module`, by default `Main`: a
+# binder passes the module it evaluates its definitions in, so what it emits
+# does not depend on the caller's imports (snag jax-source-stand-a5129478:
+# RKPPL's `plate(...) do ... end` step counts were untranslated unless the
+# caller's Main had `using ReactiveKernels`).
+module JaxDefinitionScope
+jax_scope_mean(v) = sum(v) / length(v)
+end
+@testset "jax_source: definitions resolve their globals in definitions_module" begin
+    x = [0.3, 1.1, 2.4, 0.8, 4.1]
+    g = [3.0, 1.0, 2.0, 3.0, 1.0]
+    levels = [1.0, 2.0, 3.0]
+    have = (:theta, :x, :xm, :pos)
+    data = (; x, xm = jax_kspec_mean(x), pos = jax_kspec_positions(g, levels), g, levels)
+    definitions = [:xm => :(jax_scope_mean(x)), :pos => :($jax_kspec_positions(g, levels))]
+    @test !isdefined(Main, :jax_scope_mean)
+    unscoped = jax_source(jax_kspec_model; have, want = :total, data, definitions)
+    @test occursin("UNTRANSLATED = {\"xm\": \"`jax_scope_mean` is not defined in module `Main`",
+                   string(unscoped))
+    src = jax_source(jax_kspec_model; have, want = :total, data, definitions,
+                     definitions_module = JaxDefinitionScope)
+    @test occursin("UNTRANSLATED = {}", string(src))
+    @test Set(first.(src.functions[1].inputs)) == Set(["x", "g", "levels"])
+    if !rk_jax_available()
+        @test_skip false
+    else
+        native = prepare(jax_kspec_model; have, want = :total)
+        theta = [0.6, 0.2, -0.4, 0.7]
+        reference = native(theta, x, JaxDefinitionScope.jax_scope_mean(x),
+                           jax_kspec_positions(g, levels))
+        @test rk_jax_evaluate(src, "kernel", (theta, x, g, levels); prepare = true).value ≈
+              reference rtol = 1e-12
     end
 end
 
