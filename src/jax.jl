@@ -1125,6 +1125,35 @@ const _JAX_GENERATOR_REDUCTIONS = Dict{Any,Tuple{String,String}}(
     maximum => ("jnp.max", "-jnp.inf"), minimum => ("jnp.min", "jnp.inf"),
     any => ("jnp.any", "False"), all => ("jnp.all", "True"))
 
+# Whether a range from `lo` to `hi`, Python integers known while JAX traces,
+# has elements: `true` or `false` when both are literals, else the Python
+# condition. JAX traces a loop's body, and a `vmap`ped element, even for no
+# steps, and one that gathers from an empty array then fails (`a[r]` in
+# `for r in 1:length(a)` with `a` empty), so an empty range runs neither.
+function _jax_nonempty(lo::AbstractString, hi::AbstractString)
+    a, b = tryparse(Int, lo), tryparse(Int, hi)
+    a !== nothing && b !== nothing && return a <= b
+    _py_infix("<=", [lo, hi])
+end
+# `target = call` where `nonempty` (`_jax_nonempty`) holds, else `target =
+# empty`, as Python decides while JAX traces.
+function _jax_emit_unless_empty!(ctx::_JaxContext, target::AbstractString, call::AbstractString,
+                                 empty::AbstractString, nonempty)
+    nonempty === true && return _jax_emit!(ctx, target * " = " * call)
+    nonempty === false && return _jax_emit!(ctx, target * " = " * empty)
+    _jax_emit!(ctx, target * " = " * call * " if " * nonempty * " else " * empty)
+end
+# A loop's initial carry, bound to a name when the loop may not run (both
+# branches of `_jax_emit_unless_empty!` read it).
+function _jax_initial_carry(ctx::_JaxContext, initial, nonempty)
+    code = "(" * join((v.code for v in initial), ", ") * (length(initial) == 1 ? ",)" : ")")
+    nonempty === true ? code : _jax_bind!(ctx, :carry_init, _PyVal(code, Any)).code
+end
+# The values of a `vmap` over no elements: `E`s, and the filter's mask.
+_jax_no_values(@nospecialize(E), filtered::Bool) =
+    filtered ? "(jnp.zeros((0,), dtype=" * _jax_dtype(E) * "), jnp.zeros((0,), dtype=jnp.bool_))" :
+    "jnp.zeros((0,), dtype=" * _jax_dtype(E) * ")"
+
 # A loop or generator range `_jax_loop_range` reads: `a:b`, `eachindex(x)`,
 # `axes(x, 1)`.
 _jax_is_range_form(ctx::_JaxContext, iter) =
@@ -1160,14 +1189,18 @@ function _jax_collection_values(ctx::_JaxContext, body, var::Symbol, iter, condi
           (keep === nothing ? value.code : "(" * value.code * ", " * keep.code * ")"))
     E = _jax_typeof(value)
     E <: Number || _jax_error("a generator whose elements are `", E, "`", _jax_where(ctx))
+    # An empty collection maps no element (`_jax_nonempty`).
+    xs = _jax_bind!(ctx, :collection, xs)
+    first_column = _jax_columns(xs.T) ? _jax_column(xs, 1) : xs
+    nonempty = _py_infix("<", ["0", _py_atom(first_column.code) * ".shape[0]"])
     values = _jax_fresh(ctx, :values)
     masks = String[]
     mapped = "jax.vmap(" * fname * ")(" * xs.code * ")"
     if keep === nothing
-        _jax_emit!(ctx, values * " = " * mapped)
+        _jax_emit_unless_empty!(ctx, values, mapped, _jax_no_values(E, false), nonempty)
     else
         kept = _jax_fresh(ctx, :kept)
-        _jax_emit!(ctx, values * ", " * kept * " = " * mapped)
+        _jax_emit_unless_empty!(ctx, values * ", " * kept, mapped, _jax_no_values(E, true), nonempty)
         push!(masks, kept)
     end
     if !isempty(xs.extent)
@@ -1190,7 +1223,10 @@ function _jax_generator_values(ctx::_JaxContext, gen::Expr)
         return (_jax_collection_values(ctx, body, var, spec.args[2], condition)..., nothing)
     lo, hi, bound, steps = _jax_loop_range(ctx, spec.args[2])
     # Ends that are data (`steps`): the element at step `k` is the range's
-    # `min(lo + k, hi)`, Julia's while `k <= hi - lo`.
+    # `lo + k` (clamped to `hi`), Julia's while `k <= hi - lo`. It is a lazy
+    # branch, `jax.lax.cond`, whose other arm is a zero the reduction masks,
+    # so a later step's reads reach neither value nor derivative (as a
+    # stepped `for`, `_jax_stepped_for`).
     stepped = !isempty(steps)
     reach = stepped ? _jax_bind!(ctx, :reach, _PyVal(_py_infix("-", [hi.code, lo.code]), Int)) :
         nothing
@@ -1202,8 +1238,14 @@ function _jax_generator_values(ctx::_JaxContext, gen::Expr)
     push!(inner.used, index)
     saved = copy(ctx.locals)
     ctx.scope = inner
-    value, keep = try
+    run = stepped ? _JaxScope(inner) : inner
+    returned = try
         if stepped
+            kept = _jax_fresh(ctx, :kept)
+            _jax_emit!(ctx, kept * " = " * _py_infix("<=", [index, reach.code]))
+            run_name = _jax_fresh(ctx, :element_body)
+            run.indent = inner.indent + 1
+            ctx.scope = run
             element_index = _jax_fresh(ctx, var)
             _jax_emit!(ctx, element_index * " = jnp.minimum(" * _py_infix("+", [lo.code, index]) *
                             ", " * hi.code * ")")
@@ -1213,30 +1255,49 @@ function _jax_generator_values(ctx::_JaxContext, gen::Expr)
         end
         element = () -> (_jax_expr(ctx, body),
                          condition === nothing ? nothing : _jax_expr(ctx, condition))
-        guard = stepped ? _py_infix("<=", [index, reach.code]) :
-            isempty(bound) ? "" : index * " <= " * bound
-        isempty(guard) ? element() : _jax_with_guard(element, inner, guard)
+        guard = stepped ? kept : isempty(bound) ? "" : index * " <= " * bound
+        value, keep = isempty(guard) ? element() : _jax_with_guard(element, run, guard)
+        if stepped
+            E = _jax_typeof(value)
+            E <: Number || _jax_error("a generator whose elements are `", E, "`", _jax_where(ctx))
+            # Both arms return the element's type, and a filter's `Bool`.
+            arm = "jnp.asarray(" * value.code * ", dtype=" * _jax_dtype(E) * ")"
+            zero = "jnp.zeros((), dtype=" * _jax_dtype(E) * ")"
+            if keep !== nothing
+                arm = "(" * arm * ", jnp.asarray(" * keep.code * ", dtype=jnp.bool_))"
+                zero = "(" * zero * ", jnp.zeros((), dtype=jnp.bool_))"
+            end
+            ctx.scope = inner
+            push!(inner.lines, "    "^inner.indent * "def " * run_name * "():")
+            append!(inner.lines, run.lines)
+            push!(inner.lines, "    "^run.indent * "return " * arm)
+            (value, keep, "jax.lax.cond(" * kept * ", " * run_name * ", lambda: " * zero * ")")
+        else
+            (value, keep, keep === nothing ? value.code : "(" * value.code * ", " * keep.code * ")")
+        end
     finally
         ctx.scope = outer
         empty!(ctx.locals); merge!(ctx.locals, saved)
     end
+    value, keep, element_code = returned
     push!(outer.lines, "    "^outer.indent * "def " * fname * "(" * index * "):")
     append!(outer.lines, inner.lines)
-    push!(outer.lines, "    "^inner.indent * "return " *
-          (keep === nothing ? value.code : "(" * value.code * ", " * keep.code * ")"))
+    push!(outer.lines, "    "^inner.indent * "return " * element_code)
     indices = _jax_fresh(ctx, stepped ? :steps : :indices)
     _jax_emit!(ctx, indices * " = jnp.arange(" *
                     (stepped ? steps : lo.code * ", " * _jax_plus_one(hi)) * ")")
     mapped = "jax.vmap(" * fname * ")(" * indices * ")"
     E = _jax_typeof(value)
     E <: Number || _jax_error("a generator whose elements are `", E, "`", _jax_where(ctx))
+    # An empty range maps no element (`_jax_nonempty`).
+    nonempty = stepped ? _jax_nonempty("1", steps) : _jax_nonempty(lo.code, hi.code)
     values = _jax_fresh(ctx, :values)
     masks = String[]
     if keep === nothing
-        _jax_emit!(ctx, values * " = " * mapped)
+        _jax_emit_unless_empty!(ctx, values, mapped, _jax_no_values(E, false), nonempty)
     else
         kept = _jax_fresh(ctx, :kept)
-        _jax_emit!(ctx, values * ", " * kept * " = " * mapped)
+        _jax_emit_unless_empty!(ctx, values * ", " * kept, mapped, _jax_no_values(E, true), nonempty)
         push!(masks, kept)
     end
     # The number of Julia's elements, a comprehension's length.
@@ -1422,10 +1483,13 @@ function _jax_expr(ctx::_JaxContext, ::Val{:for}, ex)
     append!(outer.lines, inner.lines)
     push!(outer.lines, "    "^inner.indent * "return (" * join(updated, ", ") *
                        (length(updated) == 1 ? ",)" : ")"))
+    # An empty range runs no loop: the carry keeps its initial values
+    # (`_jax_nonempty`).
+    nonempty = _jax_nonempty(lo.code, hi.code)
+    init = _jax_initial_carry(ctx, initial, nonempty)
     result = _jax_fresh(ctx, :loop_carry)
-    _jax_emit!(ctx, result * " = jax.lax.fori_loop(" * lo.code * ", " * _jax_plus_one(hi) * ", " *
-                    fname * ", (" * join((v.code for v in initial), ", ") *
-                    (length(initial) == 1 ? ",))" : "))"))
+    _jax_emit_unless_empty!(ctx, result, "jax.lax.fori_loop(" * lo.code * ", " * _jax_plus_one(hi) *
+                            ", " * fname * ", " * init * ")", init, nonempty)
     for (k, (n, v)) in enumerate(zip(carried, initial))
         ctx.locals[n] = _PyVal(result * "[" * string(k - 1) * "]", v.T, false, v.extent, v.limit,
                                v.padded)
@@ -1435,11 +1499,13 @@ end
 _jax_carry_old(names, carried, n) = names[findfirst(==(n), carried)]
 
 # A `for` over a range whose ends are data, `lo:hi`, taking a static number
-# of `steps` (`_jax_loop_range`): step `k` runs the body at `min(lo + k, hi)`
-# when `k <= hi - lo`, Julia's elements; a later step repeats the last
-# element, whose values every read has, and keeps the carry it was given.
-# Arrays are kept whole there: a write past the stop may be at an entry the
-# range does not reach.
+# of `steps` (`_jax_loop_range`): step `k` is a lazy branch, `jax.lax.cond`,
+# that runs the body at `lo + k` (clamped to `hi`) when `k <= hi - lo`,
+# Julia's elements, and otherwise keeps the carry. A later step does not run
+# the body (CONTRIBUTING.md, "Lazy branches"): its reads at an element Julia
+# never reaches cannot reach the value or the derivative. Under `jax.vmap`
+# (a plate cell) JAX runs both arms and selects, reading the untaken one's
+# inputs through `stop_gradient`, so a non-finite value there reaches neither.
 function _jax_stepped_for(ctx::_JaxContext, var::Symbol, body, lo::_PyVal, hi::_PyVal,
                           steps::AbstractString)
     assigned = Set{Symbol}()
@@ -1457,36 +1523,49 @@ function _jax_stepped_for(ctx::_JaxContext, var::Symbol, body, lo::_PyVal, hi::_
     push!(inner.used, step, carry)
     saved = copy(ctx.locals)
     ctx.scope = inner
-    updated = try
-        names = [_jax_identifier(inner.used, n) for n in carried]
+    try
+        kept = _jax_fresh(ctx, :kept)
+        _jax_emit!(ctx, kept * " = " * _py_infix("<=", [step, reach.code]))
+        # The step's body, a function of the carry, which the branch runs.
+        run_name = _jax_fresh(ctx, :step_body)
+        run_carry = _jax_fresh(ctx, :carry)
+        run = _JaxScope(inner)
+        run.indent = inner.indent + 1
+        push!(run.used, run_carry)
+        ctx.scope = run
+        names = [_jax_identifier(run.used, n) for n in carried]
         isempty(names) || _jax_emit!(ctx, "(" * join(names, ", ") * (length(names) == 1 ? ",)" : ")") *
-                                         " = " * carry)
+                                         " = " * run_carry)
         for (n, name, v) in zip(carried, names, initial)
             ctx.locals[n] = _PyVal(name, v.T, false, v.extent, v.limit, v.padded)
         end
-        kept = _jax_fresh(ctx, :kept)
-        _jax_emit!(ctx, kept * " = " * _py_infix("<=", [step, reach.code]))
         index = _jax_fresh(ctx, var)
         _jax_emit!(ctx, index * " = jnp.minimum(" * _py_infix("+", [lo.code, step]) * ", " *
                         hi.code * ")")
         ctx.locals[var] = _jax_range_index(index, lo, hi)
         statements = body isa Expr && body.head === :block ? body.args : Any[body]
-        _jax_with_guard(() -> _jax_statements(ctx, statements; value = false), inner, kept)
-        map(zip(carried, initial)) do (n, v)
-            _jax_carry_select(ctx, kept, ctx.locals[n].code, _jax_carry_old(names, carried, n), v.T;
-                              arrays = true)
-        end
+        _jax_with_guard(() -> _jax_statements(ctx, statements; value = false), run, kept)
+        # The arms return the carry's types (each value coerced as it entered).
+        updated = [_jax_carry_value(ctx, _PyVal(ctx.locals[n].code, v.T)).code
+                   for (n, v) in zip(carried, initial)]
+        ctx.scope = inner
+        push!(inner.lines, "    "^inner.indent * "def " * run_name * "(" * run_carry * "):")
+        append!(inner.lines, run.lines)
+        push!(inner.lines, "    "^run.indent * "return (" * join(updated, ", ") *
+                           (length(updated) == 1 ? ",)" : ")"))
+        _jax_emit!(ctx, "return jax.lax.cond(" * kept * ", " * run_name * ", lambda c: c, " *
+                        carry * ")")
     finally
         ctx.scope = outer
         empty!(ctx.locals); merge!(ctx.locals, saved)
     end
     push!(outer.lines, "    "^outer.indent * "def " * fname * "(" * step * ", " * carry * "):")
     append!(outer.lines, inner.lines)
-    push!(outer.lines, "    "^inner.indent * "return (" * join(updated, ", ") *
-                       (length(updated) == 1 ? ",)" : ")"))
+    nonempty = _jax_nonempty("1", steps)
+    init = _jax_initial_carry(ctx, initial, nonempty)
     result = _jax_fresh(ctx, :loop_carry)
-    _jax_emit!(ctx, result * " = jax.lax.fori_loop(0, " * steps * ", " * fname * ", (" *
-                    join((v.code for v in initial), ", ") * (length(initial) == 1 ? ",))" : "))"))
+    _jax_emit_unless_empty!(ctx, result, "jax.lax.fori_loop(0, " * steps * ", " * fname * ", " *
+                            init * ")", init, nonempty)
     for (k, (n, v)) in enumerate(zip(carried, initial))
         ctx.locals[n] = _PyVal(result * "[" * string(k - 1) * "]", v.T, false, v.extent, v.limit,
                                v.padded)
@@ -1512,17 +1591,16 @@ end
 
 # Past a loop's data-dependent bound (`kept` is false there) the carry keeps
 # its value `old`, of type `T`: a scalar is selected, a tuple element by
-# element. Past a padded length's bound an array written by index there
-# writes only padded entries, so it passes as it is; with `arrays` (a loop
-# whose steps are not padded positions) it is selected too.
+# element; an array written by index there writes only padded entries, so it
+# passes as it is.
 function _jax_carry_select(ctx::_JaxContext, kept::AbstractString, new::AbstractString,
-                           old::AbstractString, @nospecialize(T); arrays::Bool = false)
-    _jax_is_array(T) && !arrays && return new
+                           old::AbstractString, @nospecialize(T))
+    _jax_is_array(T) && return new
     _jax_is_tuple(T) || return "jnp.where(" * kept * ", " * new * ", " * old * ")"
     t = _jax_bind!(ctx, :carried, _PyVal(new, T)).code
     _jax_tuple_code([_PyVal(_jax_carry_select(ctx, kept, _py_atom(t) * "[" * string(k - 1) * "]",
                                               _py_atom(old) * "[" * string(k - 1) * "]",
-                                              fieldtype(T, k); arrays), Any)
+                                              fieldtype(T, k)), Any)
                      for k in 1:fieldcount(T)])
 end
 
@@ -4896,11 +4974,13 @@ longest such range; for one end that is data, the largest stop less the least
 start. `prepare_data` computes these bounds and returns them with the data,
 under keys starting with `_rk_`. A range from or to an element of another
 such range, or of a static range (`for j in i:n`), is bounded by that range's
-ends. The steps past a range's stop repeat its last element and leave the
-loop's values unchanged, so Julia's values, empty ranges included, are kept;
-the work is the bound for every range, so a long range among short ones
-costs each of them its length. A start that is a traced input, such as a
-positional `Int`, has no static bound and raises.
+ends. A step past a range's stop is a lazy branch (`jax.lax.cond`) that
+leaves the loop's values unchanged and reads nothing, so Julia's values and
+derivatives, empty ranges included, are kept; the work is the bound for
+every range, so a long range among short ones costs each of them its length.
+A start that is a traced input, such as a positional `Int`, has no static
+bound and raises. A loop or generator over no elements runs no JAX loop, so
+its body's reads from empty arrays are never traced.
 """
 function jax_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
                     want = nothing, functions = nothing, types = nothing,

@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.181
+## 0.1.184
 
 - A summed plate whose rows repeat runs once per distinct row. When a plate's
   total is its only use and every operand that varies across its cells is
@@ -30,6 +30,60 @@ are recorded in the git history only.
   under `simplify = false` keep their own loop. A live operand whose
   declaration does not say it is a number counts as shared only when the
   preparation's `exemplars` prove it one, as the lowering infers it.
+
+## 0.1.183
+
+- An input check (`input_check!`) no longer slows a gradient. Enzyme treats
+  the check as constant and never inlines it, so a gradient calls it as a
+  compiled method. That method was not specialized on the check's arguments,
+  because Julia does not specialize a vararg that is only passed on, so every
+  gradient made a generic call through the boxed calling convention.
+  ReactiveKernelsPPL registers a check on every program. On small
+  PosteriorDB ports this made the default sampler gradient 10 to 14 ns
+  (1.06x to 1.36x) slower than before the check. The check now specializes:
+  on a toy hierarchical model, a checked gradient takes 58.7 ns against
+  58.0 ns unchecked, where it took 65.0 against 57.6. Values, gradients and
+  refusals are unchanged, and primal calls, which inlined the check already,
+  are unaffected (snag `packed-point-inp-ce5df38b`).
+
+## 0.1.182
+
+- The opt-in generated summed-plate reverse (`with_plate_reverse`, or the
+  preference `plate_reverse = "on"`) returns the backend's gradient on Julia
+  1.13. Julia 1.13's `@simd` is hygienic and binds its range inside a block
+  (`let; r = range; …`) where 1.10–1.12 bind it directly (`let r = range`),
+  and the generated reverse recognized only the direct form. On 1.13 it found
+  no cell loop in any plate program and kept each loop forward-only, so every
+  plate that `plate_reverse_report` listed as `"rule"` returned a gradient
+  without its cells' contributions, with no error: whole components were zero
+  (snag plate-reverse-wr-8f83d36c, todo 1aput86). Julia 1.10–1.12 were not
+  affected.
+- A plate program holding any other loop that reads an active value now
+  keeps the backend's reverse, and `plate_reverse_report` names the reason
+  ("a loop over active values that is not a summed cell loop"). Before, the
+  generated reverse ran such a loop forward only. On every Julia version
+  this dropped the gradient of a plate whose rows come in runs of one group
+  (rows sorted by a grouping index, runs of at least 8, summed run by run):
+  the plate was listed as `"rule"` and its gradient had a relative error of
+  about 1 (PosteriorDB RadonCounty and RadonVariableInterceptSlopeNCMN on
+  Julia 1.10.12). A plain cell loop over an active array already took the
+  backend's reverse when called; it now does so from preparation, and the
+  report says so.
+
+## 0.1.181
+
+- `jax_source`: a loop or generator over no elements, such as
+  `for r in 1:length(a)` or `sum(f(a[i]) for i in idx)` with empty data, runs
+  no JAX loop or `vmap`: Python decides the static element count while JAX
+  traces, and the loop's carry keeps its initial values. Before, JAX traced
+  the body anyway and its gathers from the empty array raised `IndexError`.
+  A nonempty range over an empty array still raises, as Julia's `BoundsError`.
+- A step past the stop of a range whose ends are prepared-data entries (RK
+  0.1.179) is a lazy branch (`jax.lax.cond`) that keeps the carry and reads
+  nothing; a generator's is a zero the reduction masks. Before, such a step
+  ran the body at the clamped stop and selected the old carry, so on an
+  empty interval a non-finite derivative there (`log(x[t])` at an
+  `x[t] = 0` Julia never reads) made `jax.grad` NaN.
 
 ## 0.1.180
 

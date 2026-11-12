@@ -2163,7 +2163,13 @@ end
 # Differentiated, its error path entered the gradient: ReactiveKernelsPPL's
 # message rewrite (a regex `replace`) segfaulted Julia's GC lowering or failed
 # Enzyme's codegen type check.
-function _input_check(f::F, args...) where {F}
+# `Vararg{Any,N}` makes Julia specialize on the arguments, which it otherwise
+# does not do for a vararg that is only passed on. Primal code inlines the
+# check either way. Enzyme never inlines a function marked inactive, so an
+# unspecialized check was a generic call through the boxed calling convention
+# on every gradient: 10 to 14 ns on small models (snag
+# `packed-point-inp-ce5df38b`).
+function _input_check(f::F, args::Vararg{Any,N}) where {F,N}
     f(args...)
     nothing
 end

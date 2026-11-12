@@ -630,8 +630,8 @@ end
 # Returns (range, linear, cell) or nothing.
 function _pr_simd_loop(ex)
     Meta.isexpr(ex, :let, 2) || return nothing
-    binding = ex.args[1]
-    Meta.isexpr(binding, :(=), 2) || return nothing
+    binding = _pr_let_binding(ex.args[1])
+    binding === nothing && return nothing
     r, range = binding.args
     found = Ref{Any}(nothing)
     function visit(node)
@@ -663,6 +663,17 @@ function _pr_is_ref(x, mod, name)
     isdefined(mod, name) && x === getglobal(mod, name)
 end
 
+# The one binding of a `let`: `let r = x` (`@simd` on Julia 1.10–1.12), or the
+# same binding inside a block (1.13's hygienic `@simd`, `let; r = x; end`).
+function _pr_let_binding(binding)
+    if Meta.isexpr(binding, :block)
+        bindings = Any[b for b in binding.args if !(b isa LineNumberNode)]
+        length(bindings) == 1 || return nothing
+        binding = only(bindings)
+    end
+    Meta.isexpr(binding, :(=), 2) ? binding : nothing
+end
+
 # A loop `begin <simd let> nothing end` wraps the expansion in a block.
 function _pr_cell_loop(ex)
     Meta.isexpr(ex, :block) || return _pr_simd_loop(ex)
@@ -671,6 +682,13 @@ function _pr_cell_loop(ex)
     length(lets) == 1 && isempty(rest) || return nothing
     _pr_simd_loop(only(lets))
 end
+
+# Whether `ex` holds a loop. The generated reverse differentiates only the
+# cell loops it recognizes (`_pr_cell_loop`): any other loop a program keeps
+# runs forward only, so one that reads an active value would contribute
+# nothing to the gradient.
+_pr_has_loop(ex) = ex isa Expr && ex.head !== :quote &&
+    (ex.head === :for || ex.head === :while || any(_pr_has_loop, ex.args))
 
 # ----------------------------------------------------------- the transform
 
@@ -969,6 +987,8 @@ function _pr_program_block(stmts, st::_PRProgramState)
         elseif Meta.isexpr(s, :block)
             append!(fwd, _pr_program_block(s.args, st))
         else
+            _pr_has_loop(s) && !isdisjoint(_pr_reads!(Set{Symbol}(), s, st.mod, st.values), st.active) &&
+                _pr_fail("a loop over active values that is not a summed cell loop")
             push!(fwd, s)
             for (lhs, rhs) in _pr_assignments!(Pair{Symbol,Any}[], s)
                 lhs in st.active || continue
