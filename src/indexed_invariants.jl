@@ -16,14 +16,14 @@ _indexed_passive_type(::Type{CartesianIndex{N}}) where N = true
 _indexed_passive_type(::Type{UnitRange{T}}) where T = _indexed_passive_type(T)
 _indexed_passive_type(::Type{Base.OneTo{T}}) where T = _indexed_passive_type(T)
 _indexed_passive_type(::Type{Base.RefValue{T}}) where T = _indexed_passive_type(T)
-_indexed_data_safe(x) = _indexed_passive_type(typeof(x))
-@generated function _indexed_data_safe(x::Tuple)
-    # Constants and input tuples describe structural arguments, not data
-    # extents. Keep their checks concrete even beyond Base's splat limit.
-    foldr((i,rest) -> :(_indexed_data_safe(getfield(x,$i)) && $rest),
-          1:fieldcount(x); init=true)
+function _indexed_passive_type(::Type{T}) where {T<:Union{Tuple,NamedTuple}}
+    isconcretetype(T) && all(_indexed_passive_type, fieldtypes(T))
 end
-_indexed_data_safe(x::NamedTuple) = _indexed_data_safe(values(x))
+@generated function _indexed_data_safe(x::T) where T
+    # A tuple may itself hold observations. Prove storage from its type and
+    # emit one Boolean, never a chain of reads sized by a tuple's data extent.
+    _indexed_passive_type(T)
+end
 
 function _indexed_formula_expr(formula, x)
     formula === :input && return x

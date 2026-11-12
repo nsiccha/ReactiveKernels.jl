@@ -241,6 +241,41 @@ end
     @test actual_reads[] == sum(length,events)
 end
 
+@testset "tuple-held observations keep storage proofs bounded" begin
+    p = [0.2 0.3; 0.6 0.7; 0.8 0.4]
+    short = Tuple(Bool[isodd(i >> j) for j in 0:2] for i in 1:13)
+    long = (short...,short...,short...,short...)
+    readers = map((short,long)) do events
+        reader = prepare(indexed_log_choices;bound=(; events))
+        @test table_depths!(Int[],code_expr(reader)) == [0,0]
+        for bound in (false,true)
+            kernel = bound ? reader : prepare(indexed_log_choices)
+            args = bound ? (p,) : (events,p)
+            ad = prepare_ad(kernel,backend,args...;active=:p)
+            actual, gradient = ad_value_and_gradient(ad,args...)
+            expected, expected_gradient = reference_gradient(p,events,false)
+            @test actual ≈ expected
+            @test gradient ≈ expected_gradient
+        end
+        reader
+    end
+    @test nodes(code_expr(readers[1])) == nodes(code_expr(readers[2]))
+    # Inspect the reachable generated helper too: a bounded caller alone
+    # would miss one emitted storage check per tuple-held observation.
+    proof_sizes = map((short,long)) do events
+        data = (readers[1].constants,(; events),[events],p)
+        @test ReactiveKernels._indexed_data_safe(data)
+        lowered = only(code_lowered(ReactiveKernels._indexed_data_safe,(typeof(data),)))
+        length(lowered.code) + sum(nodes,lowered.code;init=0)
+    end
+    @test proof_sizes[1] == proof_sizes[2]
+    custom = ObservedReads(p,Ref(0))
+    @test !ReactiveKernels._indexed_data_safe((; events=short,custom))
+    @test custom.count[] == 0
+    @test !ReactiveKernels._indexed_data_safe(Any[short])
+    @test !ReactiveKernels._indexed_passive_type(Tuple)
+end
+
 @kernel indexed_changing_columns(columns, p::Matrix{Float64}) = begin
     rows = plate(columns) do k
         cells = plate(axes(p,1)) do j
