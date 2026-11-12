@@ -100,7 +100,7 @@ function _vectorize(vectorizations::_BoundVectorizations,
     # The types of every constant, including those the scalar kernel's
     # constants table no longer holds.
     key = (_replica_batch_indices(inputs(kernel), batched), reuse,
-           schedule === nothing, fieldtype(typeof(kernel), :constants),
+           schedule === nothing, _simplify(), fieldtype(typeof(kernel), :constants),
            fieldtype(typeof(kernel), :callables), Tuple(map(typeof, constants.values)))
     kept = lock(() -> get(vectorizations.products, key, nothing), vectorizations.lock)
     kept === nothing || return _rebound(kept, kernel, constants, schedule)

@@ -4205,20 +4205,72 @@ end
 # may serve them from its parts (`_cell_lazy_rows`; a compact overlay reads
 # its active vector at the slots of the rows, bookkeeping a partition's plan
 # computes once per label), else the source itself is read at the rows.
-function _cell_source_rows_expr(e::_CellEmitter, icid::ValueId, rows)
+_cell_source_rows_expr(e::_CellEmitter, icid::ValueId, rows) = something(
+    _cell_lazy_rows_expr(e, icid, rows),
+    Expr(:call, _cell_ref(:_cell_source_rows), e.names[icid], rows))
+# The rows of an unpushed lazy view's value served from its parts, or `nothing`
+# (not a lazy view, or one whose parts cannot serve them). `bind` emits a
+# statement and returns its name (`_cell_lazy_rows`).
+function _cell_lazy_rows_expr(e::_CellEmitter, icid::ValueId, rows;
+                              bind = (prefix, value) -> _cell_bind!(e, prefix, value))
     d = e.pushdowns
     # An unpushed value's producer is found in the graph (`d.producer` holds
     # the pushed values' only).
     ids = producers_of(d.graph, icid)
     r = length(ids) == 1 ? d.graph.recipes[only(ids)] : nothing
-    if r !== nothing && _cell_lazy_view(r.op)
-        inputs = _input_list(v -> e.names[canon_id(d.graph, v.id)], r.inputs)
-        served = _cell_lazy_rows(r.op, inputs, rows,
-                                 (prefix, value) -> _cell_bind!(e, prefix, value),
-                                 name -> name in e.constant)
-        served === nothing || return served
+    r !== nothing && _cell_lazy_view(r.op) || return nothing
+    inputs = _input_list(v -> e.names[canon_id(d.graph, v.id)], r.inputs)
+    _cell_lazy_rows(r.op, inputs, rows, bind, name -> name in e.constant)
+end
+_cell_lazy_source(d::_CellPushdowns, icid::ValueId) = (ids = producers_of(d.graph, icid);
+    length(ids) == 1 && _cell_lazy_view(d.graph.recipes[only(ids)].op))
+
+# A partition's batched lane that views a vector at a range (`view(u, lo:hi)`,
+# RKPPL's packed parameter block; bounds literal or read whole) is read at the
+# positions of that vector its rows hold, computed apart from the read as a
+# range view's source rows are (`_cell_range_rows`, the lane's one row repeated
+# where broadcasting extrudes it): a partition's plan computes them once per
+# label, and a lazy vector serves them from its parts (`_cell_lazy_rows`: a
+# compact overlay's active vector at their slots). Slicing the lane itself
+# (`_cell_row_slice`) reindexed the view's range at the rows, a fresh vector on
+# every call, also for a partition without cells in that plate. `nothing` keeps
+# that slice: no windows, a footprint, a lane of another form, or a lazy vector
+# whose parts cannot serve the rows (reading the lazy array itself at rows is a
+# `view` native Enzyme can need a dogfood repair for, `_reads_lazy_view_rows`).
+function _cell_lane_range_rows(e, value::Value, rows::Symbol)
+    (e === nothing || _footprint_recording()) && return nothing
+    d = e.pushdowns
+    cid = canon_id(d.graph, value.id)
+    ids = producers_of(d.graph, cid)
+    length(ids) == 1 || return nothing
+    r = d.graph.recipes[only(ids)]
+    r.effectful && return nothing
+    f = _cell_form(r)
+    f !== nothing && f.kind === :range_view || return nothing
+    source = canon_id(d.graph, r.inputs[only(f.leaves)].id)
+    (source in d.pushed || !haskey(e.names, source)) && return nothing
+    get(d.types, source, valtype(r.inputs[only(f.leaves)])) <: AbstractVector || return nothing
+    all(f.literal) do part
+        part isa Int && return true
+        input = canon_id(d.graph, r.inputs[part.input].id)
+        !(input in d.pushed) && haskey(e.names, input) &&
+            get(d.types, input, valtype(r.inputs[part.input])) <: Integer
+    end || return nothing
+    statements = Any[]
+    bind(prefix, value) = (name = gensym(prefix);
+                           push!(statements, Expr(:(=), name, value)); name)
+    parts = _cell_literal!(e, r, f)
+    shape = bind(:cell_shape, Expr(:call, _cell_ref(:_cell_range_shape), parts))
+    leaf = bind(:cell_row, Expr(:call, _cell_ref(:_cell_leaf_row), shape, rows))
+    push!(statements, Expr(:call, _cell_ref(:_cell_check_row), shape, leaf, e.sorted))
+    positions = bind(:cell_row, Expr(:call, _cell_ref(:_cell_range_rows), parts, leaf))
+    read = _cell_lazy_rows_expr(e, source, positions; bind)
+    if read === nothing
+        _cell_lazy_source(d, source) && return nothing
+        read = Expr(:call, _cell_ref(:_cell_source_rows), e.names[source], positions)
     end
-    Expr(:call, _cell_ref(:_cell_source_rows), e.names[icid], rows)
+    append!(e.body.args, statements)
+    read
 end
 # The expression reading rows `rows` of a lazy view's value from its inputs'
 # names, or `nothing` to read the value itself; a lazy view op's own method.
