@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.211
+## 0.1.213
 
 - Calling a `KernelSpec` on positional values, `spec(args...)`, prepares its
   default boundary once per graph version and keeps that kernel in the graph,
@@ -27,6 +27,36 @@ are recorded in the git history only.
   as `input_check!`) or another preparation setting (such as `simplify`)
   prepares afresh. A hot loop that holds `prepare(spec)` still skips the
   lookup.
+
+## 0.1.212
+
+- A partition plan whose row bookkeeping sits behind a condition on the
+  label (cached by the plan since 0.1.170) is typed and computed while a
+  package image is generated, as in a PrecompileTools workload. The plan
+  body cached that bookkeeping in a comprehension, which
+  `RuntimeGeneratedFunctions` compiles to an opaque closure, and Julia
+  refuses to expand one while it generates an image: `prepare` of such a
+  partition with an untyped plan port (ReactiveKernelsPPL's
+  `prepare_partition`, BayesianRegressionModels' `brm_nlme_model` with a
+  grouping) failed with `partition plan: the plan port … is untyped and
+  evaluating its plan on the exemplars failed: Impossible to correctly
+  handle OpaqueClosure inside @generated returned during precompile
+  process.`, and a plan kernel called there failed the same way. `compile`
+  now runs a comprehension or generator of a compiled body as a function of
+  its own over the body's locals that its element reads, where the element
+  assigns none of them; plans, their types (also for a label without rows)
+  and values are unchanged.
+
+## 0.1.211
+
+- `jax_source` again translates a padded plate over a scan's tuple step
+  outputs, such as an `@rkppl` `@plate` cell holding a stochastic `@scan`
+  whose step count varies by cell. Since 0.1.199 (batched runtime checks) the
+  plate's valid-cell mask read the step count and shape of the Python tuple of
+  columns instead of its first column, so tracing the module raised
+  `AttributeError: 'tuple' object has no attribute 'shape'`. The mask now
+  spans the plate's mapped axes of the first column, as the empty-plate test
+  already did.
 
 ## 0.1.210
 
