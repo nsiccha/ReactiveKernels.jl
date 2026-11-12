@@ -126,6 +126,7 @@ const _MATRIX_CORE_TESTS = (
     "test_jax_fma.jl",
     "test_jax_columns.jl",
     "test_jax_data_ranges.jl",
+    "test_jax_scan_bounds.jl",
     "test_jax_padded_fields.jl",
     "test_jax_padded_loops.jl",
     "test_scan_columns.jl",

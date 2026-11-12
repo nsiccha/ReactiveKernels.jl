@@ -16,6 +16,18 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.186
+
+- `jax_source` retains prepared integer bounds through ragged rows and scan
+  elements. Loops inside a scan nested in a plate can use a scanned count,
+  an indexed row entry, or a data-only cell computation as their end.
+  When a computed integer needs a bound, its existing data-only recipe runs
+  in `prepare_data`. Counts remain runtime data and loop bodies stay compact;
+  the emitted primal supports ordinary `jax.grad`. Empty scans with numeric
+  or numeric-tuple outputs skip the step, including its indexed reads.
+  Scanning `eachindex(row)` or `axes(row, d)` keeps the row's valid length,
+  so padded steps do not contribute to its results.
+
 ## 0.1.185
 
 - `jax_source`: a `for` loop to a padded row's length, such as
