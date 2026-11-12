@@ -288,6 +288,9 @@ mutable struct _JaxModule
     # recipe of one of them that neither side translates takes its value from
     # the definition instead (`_JaxPromote`).
     host_definitions::Set{Symbol}
+    # The module those definitions' globals resolve in (`jax_source`'s
+    # `definitions_module`).
+    definitions_module::Module
     # Why `prepare_data` leaves a plate cell's data-only recipe to the
     # functions, by (plate recipe id, cell recipe id) (`_jax_cell_split`,
     # jax_host.jl).
@@ -299,8 +302,9 @@ mutable struct _JaxModule
     failure_paths::IdDict{Any,Vector{Tuple{Plan,Recipe}}}
 end
 _JaxModule() = _JaxModule(String[], Dict{Any,Any}(), Set{String}(), 0,
-                          Dict{Int,JAXEmissionError}(), nothing, Set{Symbol}(),
-                          Dict{Tuple{Int,Int},JAXEmissionError}(), Set{Tuple{Int,Int}}(), Tuple{Plan,Recipe}[],
+                          Dict{Int,JAXEmissionError}(), nothing, Set{Symbol}(), Main,
+                          Dict{Tuple{Int,Int},JAXEmissionError}(), Set{Tuple{Int,Int}}(),
+                          Tuple{Plan,Recipe}[],
                           IdDict{Any,Vector{Tuple{Plan,Recipe}}}())
 
 # Translation state: the module, the current function scope, the current
@@ -5119,7 +5123,8 @@ its body's reads from empty arrays are never traced.
 function jax_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
                     want = nothing, functions = nothing, types = nothing,
                     name = :kernel, constants = NamedTuple(), doc = nothing, data = nothing,
-                    definitions = nothing, keep = (), function_docs = NamedTuple())
+                    definitions = nothing, definitions_module::Module = Main, keep = (),
+                    function_docs = NamedTuple())
     functions === nothing && want === nothing && (want = _KERNEL_DEFAULT_BOUNDARY)
     if functions === nothing
         functions = NamedTuple{(Symbol(name),)}((want,))
@@ -5130,14 +5135,16 @@ function jax_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
         "jax_source: `functions` must be a nonempty NamedTuple of function name => WANT"))
     plans = [fname => (plan(spec; have, want = _jax_want_names(w)), w)
              for (fname, w) in pairs(functions)]
-    _jax_module_source(plans, types, constants, doc; data, definitions, keep, function_docs)
+    _jax_module_source(plans, types, constants, doc; data, definitions, definitions_module,
+                       keep, function_docs)
 end
 
 jax_source(p::Plan; types = nothing, name = :kernel, constants = NamedTuple(),
-           doc = nothing, data = nothing, definitions = nothing, keep = (),
-           function_docs = NamedTuple()) =
+           doc = nothing, data = nothing, definitions = nothing,
+           definitions_module::Module = Main, keep = (), function_docs = NamedTuple()) =
     _jax_module_source([Symbol(name) => (p, Tuple(v.name for v in p.want))],
-                       types, constants, doc; data, definitions, keep, function_docs)
+                       types, constants, doc; data, definitions, definitions_module, keep,
+                       function_docs)
 
 _jax_want_names(w::Symbol) = (w,)
 _jax_want_names(w::Tuple) = w
@@ -5159,10 +5166,15 @@ _jax_want_names(w) = throw(ArgumentError(
 # definitions before it read. A definition without a host
 # translation, or one given as a `JAXEmissionError` (the reason it has none),
 # stays a `prepare_data` input, named with that reason in the module constant
-# `UNTRANSLATED`. `keep` names data-only values `prepare_data` also returns
-# (the functions take them too), for a caller that reads them.
+# `UNTRANSLATED`. The definitions' globals (a call head such as `plate`, a
+# bare name no definition or data value binds) resolve in
+# `definitions_module`: a binder passes the module it evaluates them in, so
+# the module it emits does not depend on what its caller imported. `keep`
+# names data-only values `prepare_data` also returns (the functions take them
+# too), for a caller that reads them.
 function _jax_module_source(plans, types, constants, doc; data = nothing,
-                            definitions = nothing, keep = (), function_docs = NamedTuple())
+                            definitions = nothing, definitions_module::Module = Main,
+                            keep = (), function_docs = NamedTuple())
     if data === nothing
         definitions === nothing || isempty(definitions) || throw(ArgumentError(
             "jax_source: `definitions` compute data values, so they need `data`"))
@@ -5220,7 +5232,7 @@ function _jax_module_source(plans, types, constants, doc; data = nothing,
         try
             return _jax_module_text(plans, types, constants, doc,
                                     (data, excluded, defs, untranslated, keep, reasons,
-                                     promoted, cells, cell_reasons);
+                                     promoted, cells, cell_reasons, definitions_module);
                                     function_docs)
         catch e
             if e isa _HostUnsupportedDefinition && !haskey(untranslated, e.name)
@@ -5325,7 +5337,8 @@ function _jax_module_text(plans, types, constants, doc, prepare; function_docs =
             push!(functions, f)
         end
     else
-        data, excluded, defs, untranslated, keep, reasons, promoted, cells, cell_reasons = prepare
+        data, excluded, defs, untranslated, keep, reasons, promoted, cells, cell_reasons,
+            mod.definitions_module = prepare
         merge!(mod.host_reasons, reasons)
         merge!(mod.cell_reasons, cell_reasons)
         mod.host_graph = first(plans).second[1].graph

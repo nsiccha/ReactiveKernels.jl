@@ -1761,7 +1761,10 @@ function _jax_prepare_function!(mod::_JaxModule, split, raw_types, names, types;
     end
     # The data definitions, in order, over the parameters and the definitions
     # before them. A data value takes the type the binding's own value has; a
-    # local of the definitions (`T0 === nothing`), the translation's.
+    # local of the definitions (`T0 === nothing`), the translation's. Their
+    # globals resolve in the module the caller names (`definitions_module`),
+    # never in whichever module called `jax_source`.
+    ctx.source_module = mod.definitions_module
     for (name, ex, T0) in definitions
         # One reading a definition without a host translation that is no input
         # either (the caller gave no value of it) has none: it says why.
@@ -1791,6 +1794,7 @@ function _jax_prepare_function!(mod::_JaxModule, split, raw_types, names, types;
         end
         known[name] = _PyVal(local_name, T, true)
     end
+    ctx.source_module = Main
     for v in p.have
         scope.values[canon_id(p.graph, v.id)] = known[v.name]
     end
