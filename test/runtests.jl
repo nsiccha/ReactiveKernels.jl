@@ -34,6 +34,7 @@ const _MATRIX_CORE_TESTS = (
     "test_shared_preparation.jl",
     "test_wide_prepared_call.jl",
     "test_index_runs.jl",
+    "test_duplicate_cells.jl",
     "test_inner_plate_partial_evaluation.jl",
     "test_nested_plate_partial_evaluation.jl",
     "test_branch_partition.jl",

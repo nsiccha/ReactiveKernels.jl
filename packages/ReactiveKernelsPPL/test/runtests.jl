@@ -256,6 +256,7 @@ const _PPL_TEST_FILES = (
     "test_absent_observations.jl",
     "test_frozen_definitions.jl",
     "test_bound_data_reuse.jl",
+    "test_duplicate_cells.jl",
     "test_predictive_draws.jl",
     "test_discrete_latents.jl",
     "test_glm_object_values.jl",

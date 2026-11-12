@@ -90,6 +90,33 @@ end
         @test any(r -> first(r) === :_ppl_lik_y_resp && last(r) == "rule", report)
     end
 
+    @testset "gauss_ri with sorted groups: contiguous index runs (N = $N)" for (N, J) in
+            ((64, 4), (200, 5))
+        # Rows sorted by group, runs of at least 8: the likelihood plate sums
+        # each run's cells into a partial (src/index_runs.jl), an outer loop
+        # the generated reverse does not differentiate. Before RK 0.1.182 the
+        # plate still took the rule, ran that loop forward only and returned a
+        # gradient without the likelihood (relative error about 1 on every
+        # Julia; RadonCounty in snag plate-reverse-wr-8f83d36c). It keeps the
+        # backend's reverse until the generator covers index runs.
+        rng = MersenneTwister(13)
+        x = _prv_stdz(randn(rng, N))
+        g = [cld(i * J, N) for i in 1:N]
+        y = 1 .+ 0.5 .* x .+ (0.7 .* randn(rng, J))[g] .+ randn(rng, N)
+        built, bound = _prv_build(quote
+            a ~ Normal(0, 5)
+            b ~ Normal(0, 1)
+            sd ~ Exponential(1)
+            sigma ~ Exponential(1)
+            z[1:J] .~ Normal.(0, 1)
+            mu = a .+ b .* x .+ sd .* z[g]
+            y .~ Normal.(mu, sigma)
+        end, Dict(:y => y, :x => x, :g => g, :J => J), (:y, :x, :g, :J))
+        report = _prv_compare(built, bound)
+        @test any(r -> first(r) === :_ppl_lik_y_resp &&
+            last(r) == "a loop over active values that is not a summed cell loop", report)
+    end
+
     @testset "stable rewrites: sigma = exp(u) at the edges of exp" begin
         # The stable rewrites (on by default) compute the Normal law's
         # log(scale) of sigma = exp(u) as a `_rk_*_of` helper call. The
@@ -331,6 +358,46 @@ end
         gr1, (hg1,) = ad_gradient_and_hvp(h1, (v,), u)
         @test isapprox(gr1, gr0; rtol = 1e-9, atol = 1e-12)
         @test isapprox(hg1, hg0; rtol = 1e-9, atol = 1e-12)
+    end
+
+    @testset "cell loops in either @simd expansion; other loops fall back" begin
+        RK = ReactiveKernels
+        # Julia 1.10–1.12's `@simd` binds `let r = R`; 1.13's hygienic `@simd`
+        # binds the same inside a block. The generated reverse found no cell
+        # loop in the 1.13 form and kept each loop forward-only, so every
+        # opted-in gradient lost its plates' contributions without an error
+        # (snag plate-reverse-wr-8f83d36c). Both forms are cell loops.
+        simd = macroexpand(RK, Expr(:macrocall, GlobalRef(Base, Symbol("@simd")),
+            LineNumberNode(0), Expr(:for, :(lin = R),
+                Expr(:block, :(idx = CartesianIndex(lin)), :(t = t + v)))))
+        loop = only(a for a in simd.args if Meta.isexpr(a, :let))
+        binding = loop.args[1]
+        bare = Meta.isexpr(binding, :block) ?
+            only(b for b in binding.args if !(b isa LineNumberNode)) : binding
+        for b in (bare, Expr(:block, bare))
+            found = RK._pr_cell_loop(Expr(:block, Expr(:let, b, loop.args[2]), nothing))
+            @test found !== nothing
+            @test found[1] === :R && found[2] === :lin
+        end
+        # A loop the generated reverse does not differentiate, over an active
+        # operand, makes the program fall back: kept forward-only, it would
+        # contribute nothing to the gradient.
+        ast = :(function (x, n)
+            t = $(GlobalRef(RK, :_plate_total_seed))(Float64, 0.0)
+            for i in 1:n
+                t = $(GlobalRef(RK, :_plate_total_add))(t, x * i)
+            end
+            out = $(GlobalRef(RK, :_plate_total_value))(t)
+            out
+        end)
+        err = try
+            RK._pr_program_reverse(ast, [:x], RK, Dict{Symbol,Any}())
+            nothing
+        catch e
+            e
+        end
+        @test err isa RK._PRIneligible
+        @test err isa RK._PRIneligible && occursin("not a summed cell loop", err.reason)
     end
 
     @testset "off by default" begin
