@@ -16,6 +16,17 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.207
+
+- `jax_source` again translates a padded plate over a scan's tuple step
+  outputs, such as an `@rkppl` `@plate` cell holding a stochastic `@scan`
+  whose step count varies by cell. Since 0.1.199 (batched runtime checks) the
+  plate's valid-cell mask read the step count and shape of the Python tuple of
+  columns instead of its first column, so tracing the module raised
+  `AttributeError: 'tuple' object has no attribute 'shape'`. The mask now
+  spans the plate's mapped axes of the first column, as the empty-plate test
+  already did.
+
 ## 0.1.206
 
 - `jax_source`: a branch whose condition is traced (`jax.lax.cond`) returns

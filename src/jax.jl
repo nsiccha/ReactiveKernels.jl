@@ -162,8 +162,11 @@ function _jax_extent(args)
     end
     ""
 end
-# A padded vector's valid-entry mask.
-_jax_mask(v::_PyVal) = "(jnp.arange(" * _py_atom(v.code) * ".shape[0]) < " * v.extent * ")"
+# A padded vector's valid-entry mask, over the leading axis of its stored
+# array: a vector of tuples is held as a Python tuple of columns, whose first
+# column carries that axis (`_jax_mapped_array`).
+_jax_mask(v::_PyVal) = "(jnp.arange(" * _py_atom(_jax_mapped_array(v)) * ".shape[0]) < " *
+                       v.extent * ")"
 # A vector or an adjoint (transposed) vector: stored as one 1-D array.
 _jax_vector_like(@nospecialize(T)) = T isa Type && (T <: AbstractVector ||
     T <: Union{LinearAlgebra.Adjoint{<:Any,<:AbstractVector},
@@ -5038,8 +5041,11 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     if masked
         # Padding is storage, not a native cell. Include its activity in
         # runtime-check guards before batching those checks across lanes.
-        masks = ["jnp.broadcast_to(" * mask * ", " * _py_atom(v.code) * ".shape)"
-                 for (v, mask) in zip(inputs[padded], masks)]
+        # The mask spans the `R` mapped axes of the argument's stored array
+        # (a scan's tuple step outputs: their first column), so each cell
+        # receives one flag.
+        masks = ["jnp.broadcast_to(" * mask * ", " * _py_atom(_jax_mapped_array(v)) *
+                 ".shape[:" * string(R) * "])" for (v, mask) in zip(inputs[padded], masks)]
         push!(axes, "0")
         push!(args, foldl((a, b) -> "jnp.logical_and(" * a * ", " * b * ")", masks))
     end
