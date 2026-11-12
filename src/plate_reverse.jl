@@ -835,6 +835,275 @@ end
 
 const _PR_MAX_UNSWITCH = 2
 
+# ------------------------------------------------- factored cell reverse
+#
+# The reverse of a cell multiplies every cell's adjoints by the same invariant
+# factors: the total's adjoint (the seed), literal partials (`-1`, `0.5 · 2`)
+# and partials that read only shared values (`1/σ`, `sd`). The sweep keeps each
+# cell adjoint as a sum of terms `num · ∏ inv · var`, with `inv` invariant
+# factors and `var` the one cell-varying factor (`nothing` for 1), so literal
+# chains fold at generation time (`-1 · 0.5 · 2z` is `-z`). A contribution to a
+# shared value's adjoint adds only `var` into a partial sum per (value,
+# coefficient), which is scaled by `num · ∏ inv` once after the loop; a
+# contribution of 1 at the cell's top level is the cell count times the
+# coefficient. A batched operand's shadow takes `coefficient · var` per cell,
+# the coefficient computed once above the loop. Reassociating the sums changes
+# adjoints only at rounding level; the primal is the program's own.
+#
+# Coefficients are evaluated above the loop. A compound invariant partial
+# (`inv(σ)`) is a coefficient only at the cell's top level, which runs at every
+# cell as the hoisted invariants do; inside a branch arm it stays a cell
+# factor, so an arm's partials are never evaluated where the arm is not taken.
+
+# One term of a cell adjoint: `num · ∏ inv · var`.
+struct _PRTerm
+    num::Float64
+    inv::Vector{Any}
+    var::Any                     # a symbol, or `nothing` for 1
+end
+
+mutable struct _PRFactored
+    st::_PRProgramState
+    cellvars::Set{Symbol}
+    invariant::Set{Symbol}       # cell statements hoisted above the loop
+    shared::Set{Symbol}          # values whose adjoints accumulate across cells
+    active::Set{Symbol}
+    linear::Symbol
+    ncells::Symbol
+    pre::Vector{Any}             # above the loop: coefficients and partial sums
+    post::Vector{Any}            # after it: each partial sum into its adjoint
+    coefs::Dict{Any,Any}         # coefficient key => atom
+    sums::Dict{Any,Symbol}       # (value, coefficient key) => partial sum
+    counts::Dict{Any,Any}        # (value, coefficient key) => (value, term, unit contributions per cell)
+end
+
+_pr_fresh!(fc::_PRFactored, base) = (fc.st.counter += 1; Symbol("_pr_", base, fc.st.counter))
+
+function _pr_is_invariant(fc::_PRFactored, x, toplevel::Bool)
+    x isa Symbol && return !(x in fc.cellvars) || x in fc.invariant
+    x isa Expr || return true
+    toplevel || return false
+    found = Set{Symbol}()
+    function visit(node)
+        if node isa Symbol
+            push!(found, node)
+        elseif node isa Expr && node.head !== :quote
+            # A call head names a function, not a value.
+            foreach(visit, node.head === :call ? node.args[2:end] : node.args)
+        end
+    end
+    visit(x)
+    all(s -> _pr_is_invariant(fc, s, true), found)
+end
+
+_pr_is_mul(h) = h === :* || h == GlobalRef(Base, :*)
+_pr_is_neg(ex) = Meta.isexpr(ex, :call, 2) && (ex.args[1] === :- || ex.args[1] == GlobalRef(Base, :-))
+
+# A partial as `num · ∏ inv · ∏ vars`.
+function _pr_split_partial(fc::_PRFactored, p, toplevel::Bool)
+    num = Ref(1.0); inv = Any[]; vars = Any[]
+    function split!(x)
+        if x isa Real && !(x isa Bool)
+            num[] *= Float64(x)
+        elseif Meta.isexpr(x, :call) && _pr_is_mul(x.args[1])
+            foreach(split!, x.args[2:end])
+        elseif _pr_is_neg(x)
+            num[] = -num[]; split!(x.args[2])
+        elseif Meta.isexpr(x, :let, 2) && Meta.isexpr(x.args[1], :block) && isempty(x.args[1].args)
+            split!(x.args[2])
+        elseif Meta.isexpr(x, :block) && count(a -> !(a isa LineNumberNode), x.args) == 1
+            split!(only(a for a in x.args if !(a isa LineNumberNode)))
+        elseif _pr_is_invariant(fc, x, toplevel)
+            push!(inv, x)
+        else
+            push!(vars, x)
+        end
+    end
+    split!(p)
+    num[], inv, vars
+end
+
+_pr_coef_key(num, inv) = (num, sort!(map(string, inv)))
+
+# The coefficient `num · ∏ inv` as an atom, computed once above the loop.
+function _pr_coef!(fc::_PRFactored, num::Float64, inv::Vector{Any})
+    isempty(inv) && return num
+    get!(fc.coefs, _pr_coef_key(num, inv)) do
+        num == 1.0 && length(inv) == 1 && inv[1] isa Symbol && return inv[1]
+        k = _pr_fresh!(fc, :coef)
+        prod = length(inv) == 1 ? inv[1] : Expr(:call, GlobalRef(Base, :*), inv...)
+        push!(fc.pre, :($k = $(num == 1.0 ? prod : num == -1.0 ? :(-$prod) : :($num * $prod))))
+        k
+    end
+end
+
+_pr_scale_atom(c, v) = v === nothing ? c : c == 1.0 ? v : c == -1.0 ? :(-$v) : :($c * $v)
+
+# `x` as an atom: `x` itself, or a cell temporary bound to it.
+function _pr_bind!(out, fc::_PRFactored, x)
+    (x isa Symbol || x isa Number) && return x
+    t = _pr_fresh!(fc, :f)
+    push!(out, :($t = $x))
+    t
+end
+
+# The value of a sum of terms, bound in the cell.
+function _pr_materialize!(out, fc::_PRFactored, terms::Vector{_PRTerm})
+    pieces = Any[_pr_scale_atom(_pr_coef!(fc, t.num, t.inv), t.var) for t in terms]
+    all(p -> p isa Number, pieces) && return sum(Float64, pieces; init = 0.0)
+    _pr_bind!(out, fc, length(pieces) == 1 ? only(pieces) : Expr(:call, GlobalRef(Base, :+), pieces...))
+end
+
+# Terms sharing a coefficient merge into one term; more than two coefficients
+# collapse into one bound value.
+function _pr_normalize!(out, fc::_PRFactored, terms::Vector{_PRTerm})
+    length(terms) <= 1 && return terms
+    groups = Dict{Any,Vector{_PRTerm}}()
+    order = Any[]
+    for t in terms
+        k = sort!(map(string, t.inv))
+        haskey(groups, k) || push!(order, k)
+        push!(get!(groups, k, _PRTerm[]), t)
+    end
+    if length(order) > 2
+        v = _pr_materialize!(out, fc, terms)
+        return [v isa Number ? _PRTerm(v, Any[], nothing) : _PRTerm(1.0, Any[], v)]
+    end
+    merged = _PRTerm[]
+    for k in order
+        g = groups[k]
+        if length(g) == 1
+            push!(merged, only(g))
+        else
+            v = _pr_materialize!(out, fc, [_PRTerm(t.num, Any[], t.var) for t in g])
+            push!(merged, v isa Number ? _PRTerm(v, first(g).inv, nothing) :
+                          _PRTerm(1.0, first(g).inv, v))
+        end
+    end
+    merged
+end
+
+# Send `terms` to the adjoint of `a`: a shared value's partial sums, a cell
+# value's adjoint bound across a branch (`mutable`), or a cell value's terms.
+function _pr_contribute!(out, fc::_PRFactored, adj, mutable, a::Symbol, terms, toplevel::Bool)
+    if a in fc.shared
+        push!(fc.st.touched, a)
+        for t in terms
+            key = (a, _pr_coef_key(t.num, t.inv))
+            if t.var === nothing && toplevel
+                _, _, n = get(fc.counts, key, (a, t, 0))
+                fc.counts[key] = (a, t, n + 1)
+                continue
+            end
+            s = get!(fc.sums, key) do
+                s = _pr_fresh!(fc, :sum)
+                push!(fc.pre, :($s = 0.0))
+                push!(fc.post, :($(_pr_bar(a)) = $(_pr_bar(a)) + $(GlobalRef(@__MODULE__, :_pr_scaled))(
+                    $(_pr_coef!(fc, t.num, t.inv)), $s)))
+                s
+            end
+            push!(out, :($s = $s + $(t.var === nothing ? 1.0 : t.var)))
+        end
+    elseif haskey(mutable, a)
+        m = mutable[a]
+        push!(out, :($m = $m + $(_pr_materialize!(out, fc, terms))))
+    else
+        append!(get!(adj, a, _PRTerm[]), terms)
+    end
+end
+
+function _pr_adjoint_terms!(out, fc::_PRFactored, adj, mutable, s::Symbol)
+    haskey(mutable, s) && return [_PRTerm(1.0, Any[], mutable[s])]
+    haskey(adj, s) || return nothing
+    adj[s] = _pr_normalize!(out, fc, adj[s])
+end
+
+# Symbols bound inside `stmts`, at any depth.
+function _pr_bound!(found::Set{Symbol}, stmts)
+    for s in stmts
+        s isa Union{_PRAlias,_PRCall} && push!(found, s.lhs)
+        if s isa _PRBranch
+            push!(found, s.lhs); _pr_bound!(found, s.then_stmts); _pr_bound!(found, s.else_stmts)
+        end
+    end
+    found
+end
+
+# The factored reverse sweep of `stmts`.
+function _pr_factored_sweep!(out, fc::_PRFactored, stmts, adj, mutable, toplevel::Bool)
+    st = fc.st; active = fc.active
+    for s in Iterators.reverse(stmts)
+        if s isa _PRAlias
+            s.rhs isa Symbol && s.rhs in active || continue
+            terms = _pr_adjoint_terms!(out, fc, adj, mutable, s.lhs)
+            terms === nothing && continue
+            _pr_contribute!(out, fc, adj, mutable, s.rhs, terms, toplevel)
+        elseif s isa _PRCall
+            s.lhs in active || continue
+            terms = _pr_adjoint_terms!(out, fc, adj, mutable, s.lhs)
+            terms === nothing && continue
+            if _pr_is_read(s, st)
+                v = _pr_materialize!(out, fc, terms)
+                push!(out, :($(GlobalRef(@__MODULE__, :_pr_shadow_add!))(
+                    $(st.shadow[st.prepared[s.args[1]]]), $(fc.linear), $v)))
+                continue
+            end
+            partials = _pr_partials(s.f, s.lhs, s.args)
+            partials === nothing && _pr_fail("no derivative for `$(s.fref)`")
+            for (a, p) in zip(s.args, partials)
+                a isa Symbol && a in active || continue
+                p === nothing && _pr_fail("`$(s.fref)` has no derivative in an active argument")
+                num, inv, vars = _pr_split_partial(fc, p, toplevel)
+                pv = isempty(vars) ? nothing : _pr_bind!(out, fc,
+                    length(vars) == 1 ? only(vars) : Expr(:call, GlobalRef(Base, :*), vars...))
+                new = _PRTerm[_PRTerm(t.num * num, vcat(t.inv, inv),
+                    t.var === nothing ? pv : pv === nothing ? t.var : _pr_bind!(out, fc, :($(t.var) * $pv)))
+                    for t in terms]
+                _pr_contribute!(out, fc, adj, mutable, a, new, toplevel)
+            end
+        elseif s isa _PRBranch
+            s.lhs in active || continue
+            terms = _pr_adjoint_terms!(out, fc, adj, mutable, s.lhs)
+            terms === nothing && continue
+            # Cell values bound outside the branch that an arm contributes to
+            # get one bound adjoint, which both arms and later statements add to.
+            inside = _pr_bound!(Set{Symbol}(), Any[s])
+            for t in sort!(collect(_pr_touched!(Set{Symbol}(), Any[s], active)))
+                (t in inside || t in fc.shared || haskey(mutable, t)) && continue
+                m = _pr_fresh!(fc, :adj)
+                prior = _pr_adjoint_terms!(out, fc, adj, mutable, t)
+                push!(out, :($m = $(prior === nothing ? 0.0 : _pr_materialize!(out, fc, prior))))
+                mutable[t] = m
+                delete!(adj, t)
+            end
+            arm(stmts_, result) = begin
+                o = Any[]
+                a2 = Dict{Symbol,Vector{_PRTerm}}(k => copy(v) for (k, v) in adj)
+                result isa Symbol && result in active &&
+                    _pr_contribute!(o, fc, a2, mutable, result, terms, false)
+                _pr_factored_sweep!(o, fc, stmts_, a2, mutable, false)
+                Expr(:block, o...)
+            end
+            push!(out, Expr(:if, s.cond, arm(s.then_stmts, s.then_result),
+                            arm(s.else_stmts, s.else_result)))
+        end
+    end
+    out
+end
+
+# A value that every cell contributes the same invariant to (`log σ` takes `-1`
+# from each cell) takes `n · cells · coefficient` once, after the loop.
+function _pr_flush_counts!(fc::_PRFactored)
+    for (key, (a, t, n)) in sort!(collect(fc.counts); by = string ∘ first)
+        push!(fc.post, :($(_pr_bar(a)) = $(_pr_bar(a)) + $(GlobalRef(@__MODULE__, :_pr_scaled))(
+            $(_pr_coef!(fc, t.num, t.inv)), $(n == 1 ? fc.ncells : :($n * $(fc.ncells))))))
+    end
+end
+
+# A partial sum scaled by its coefficient; a sum that received nothing adds
+# nothing, even when the coefficient is not finite (an arm no cell took).
+@inline _pr_scaled(k, acc) = iszero(acc) ? zero(k * acc) : k * acc
+
 function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState)
     body = Any[a for a in cell.args if !(a isa LineNumberNode)]
     isempty(body) && _pr_fail("empty cell")
@@ -856,16 +1125,7 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState)
     result = density isa Symbol ? density : _pr_flatten!(stmts, density, ctx)
     st.counter = ctx.counter
     # Symbols the cell binds (at any depth), and its top-level aliases.
-    cellvars = Set{Symbol}()
-    function bound!(ss)
-        for s in ss
-            s isa Union{_PRAlias,_PRCall} && push!(cellvars, s.lhs)
-            if s isa _PRBranch
-                push!(cellvars, s.lhs); bound!(s.then_stmts); bound!(s.else_stmts)
-            end
-        end
-    end
-    bound!(stmts)
+    cellvars = _pr_bound!(Set{Symbol}(), stmts)
     # The loop index varies by cell, and so does everything computed from it.
     push!(cellvars, linear)
     aliases = Dict{Symbol,Any}(s.lhs => s.rhs for s in stmts if s isa _PRAlias)
@@ -924,23 +1184,38 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState)
         init = Any[:($(_pr_bar(h)) = 0.0) for h in hoisted_active]
         defined = Set{Symbol}(_pr_bar(s) for s in st.outer if !(s in st.totals))
         union!(defined, (_pr_bar(h) for h in hoisted_active))
+        st.counter += 1
+        cells = Symbol(:_pr_cells, st.counter)
+        ncells = Symbol(:_pr_ncells, st.counter)
+        coefficients = Any[]
+        flush = Any[]
         if result isa Symbol && result in active
-            rbar = _pr_bar(result)
-            push!(reverse, :($rbar = $(_pr_bar(total))))
-            push!(defined, rbar)
-            leaf = s -> _pr_is_read(s, st) && s.lhs in active ?
-                :($(GlobalRef(@__MODULE__, :_pr_shadow_add!))(
-                    $(st.shadow[st.prepared[s.args[1]]]), $linear, $(_pr_bar(s.lhs)))) : nothing
-            _pr_reverse_exprs!(reverse, inloop, active, copy(defined); leaf, touched = st.touched)
+            shared = Set{Symbol}(s for s in st.outer if !(s in st.totals))
+            union!(shared, hoisted_active)
+            fc = _PRFactored(st, cellvars, inv2, shared, active, linear, ncells,
+                             Any[], Any[], Dict{Any,Any}(), Dict{Any,Symbol}(), Dict{Any,Any}())
+            # The cell density's adjoint is the total's (the seed), the same
+            # at every cell.
+            adj = Dict{Symbol,Vector{_PRTerm}}()
+            mutable = Dict{Symbol,Symbol}()
+            _pr_contribute!(reverse, fc, adj, mutable, result,
+                            [_PRTerm(1.0, Any[_pr_bar(total)], nothing)], true)
+            _pr_factored_sweep!(reverse, fc, inloop, adj, mutable, true)
+            _pr_flush_counts!(fc)
+            coefficients, flush = fc.pre, fc.post
             _pr_reverse_exprs!(after, hoisted, active, copy(defined); touched = st.touched)
         end
         quote
             $(forward_pre...)
             $(init...)
-            @inbounds for $linear in $range
+            $cells = $range
+            $ncells = Float64(length($cells))
+            $(coefficients...)
+            @inbounds for $linear in $cells
                 $(forward_in...)
                 $(reverse...)
             end
+            $(flush...)
             $(after...)
         end
     end
