@@ -16,6 +16,24 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.206
+
+- `jax_source` keeps a data name that Python reserves, or that the module's
+  code uses (`class`, `lambda`, `in`, `id`, `type`, `sum`, ...), at the
+  module's data interface. `prepare_data`'s keywords and the dict it returns,
+  the functions' `**prepared`, `DATA`, `INPUTS`, `PREPARED`, `UNTRANSLATED`
+  and `JAXSource.prepared` all name it as the data does, as they already did
+  every other identifier; only the Python local holding it is respelled
+  (`class_`). No parameter can be named `class`, so `prepare_data` takes such
+  inputs through `**data` (its signature ends `**data: ArrayLike`) and raises
+  `TypeError` for a missing or unexpected one. Before, the interface used the
+  respelled name (`DATA`, `INPUTS`, `PREPARED` and the parameter said `class_`
+  while `UNTRANSLATED` said `class`), so `prepare_data(**raw)` with the
+  binding's own names failed. A name that is no Python identifier (a
+  submodel's `r.g`) is still `r_g`.
+  **Breaking:** a caller that passed such an input as `class_=`, or
+  positionally, passes it by its own name: `prepare_data(**raw)`.
+
 ## 0.1.205
 
 - `@traceable` takes a trailing Vararg argument: `args...`, `args::T...`,
