@@ -5,7 +5,7 @@
 # one module serves every binding of the same program.
 
 """
-    jax_source(built, plan; values = (), doc = nothing) -> JAXSource
+    jax_source(built, plan; values = (), doc = nothing, float_type = Float64) -> JAXSource
 
 A Python module for the `build_kernel` output `built`, evaluating the program
 with `jax.numpy` over the sampler boundary: the packed unconstrained
@@ -31,13 +31,22 @@ in order), `DATA` (each `prepare_data` parameter's dtype and rank) and
 `UNTRANSLATED` (each data-only definition `prepare_data` takes as an input
 instead of computing it, with the reason; `{}` when none).
 
+`float_type = Float32` emits the module in float32 (`ReactiveKernels.jax_source`'s
+`float_type`): `unconstrained`, the data and every value are `float32`, and
+the module does not turn on JAX's 64-bit mode. The default `Float64` module
+is its reference.
+
 `plan` is any binding that generates the same program as `built`, as for
 [`prepare_query`](@ref); its values only type the inputs. Data arrays keep
 Julia's dimension order and integer index data stay 1-based. See
 `ReactiveKernels.jax_source` for the translation.
 """
-function ReactiveKernels.jax_source(built::NamedTuple, plan::StructuralPlan;
-                                    values = (), doc = nothing)
+ReactiveKernels.jax_source(built::NamedTuple, plan::StructuralPlan; values = (), doc = nothing,
+                           float_type = Float64) =
+    ReactiveKernels._jax_with_float_type(float_type) do
+        _jax_module_of(built, plan; values, doc, float_type)
+    end
+function _jax_module_of(built, plan; values, doc, float_type)
     built = _binding_build(built, plan)
     isbound(plan) || throw(ContractValidationError(
         "[jax] jax_source requires a bound plan (bind_data first)"))
@@ -123,7 +132,7 @@ function ReactiveKernels.jax_source(built::NamedTuple, plan::StructuralPlan;
         # (`_eval_callee`): in the generated scope, whatever the caller imported.
         jax_source(built.spec; have, functions, types, constants, doc = module_doc, data,
                    definitions, definitions_module = PPLGeneratedModels,
-                   keep = Tuple(sizes), function_docs)
+                   keep = Tuple(sizes), function_docs, float_type)
     end
     _jax_with_layout(src, built.layout)
 end
@@ -356,6 +365,9 @@ function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
     ReactiveKernels._jax_call(ctx, d.f, ReactiveKernels._PyVal[args[2]; d.args])
 end
 
+# These helpers allocate in their inputs' dtype, so a float32 module
+# (`float_type = Float32`) stays float32 where 64-bit mode is on.
+#
 # A multivariate normal log density through the lower Cholesky factor, with
 # a validity flag the caller checks at run time, as native execution checks
 # the covariance. `n` is the count of entries a padded (ragged) vector holds,
@@ -368,13 +380,13 @@ def _rkppl_mvnormal_logpdf(x, mu, S, n, factor):
     if n is not None:
         m = jnp.arange(k) < n
         d = jnp.where(m, d, 0.0)
-        S = jnp.where(m[:, None] & m[None, :], S, jnp.eye(k))
+        S = jnp.where(m[:, None] & m[None, :], S, jnp.eye(k, dtype=S.dtype))
     else:
         n = k
     L = jnp.tril(S) if factor else jnp.linalg.cholesky(S)
     diag = jnp.diagonal(L)
     ok = jnp.all(jnp.isfinite(L)) & jnp.all(diag > 0)
-    safe = jnp.where(ok, L, jnp.eye(k))
+    safe = jnp.where(ok, L, jnp.eye(k, dtype=L.dtype))
     z = jax.scipy.linalg.solve_triangular(safe, d, lower=True)
     value = (-0.5 * jnp.dot(z, z) - jnp.sum(jnp.log(jnp.diagonal(safe)))
              - 0.5 * n * jnp.log(2 * jnp.pi))
@@ -430,10 +442,10 @@ def _rk_simplex_constrain_logjac(u, lo, hi):
     # RKPPL stick-breaking simplex of u[lo:hi] and its log-Jacobian.
     v = u[lo - 1:hi]
     K = hi - lo + 2
-    z = 1.0 / (1.0 + jnp.exp(-(v + jnp.log(K - jnp.arange(1, K)))))
+    z = 1.0 / (1.0 + jnp.exp(-(v + jnp.log((K - jnp.arange(1, K)).astype(v.dtype)))))
     l = jnp.log1p(-z)
-    lr = jnp.cumsum(jnp.concatenate([jnp.zeros(1), l]))
-    return (jnp.exp(lr) * jnp.concatenate([z, jnp.ones(1)]),
+    lr = jnp.cumsum(jnp.concatenate([jnp.zeros(1, dtype=v.dtype), l]))
+    return (jnp.exp(lr) * jnp.concatenate([z, jnp.ones(1, dtype=v.dtype)]),
             jnp.sum(lr[:K - 1] + jnp.log(z) + l))
 """
 function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
@@ -492,9 +504,13 @@ function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
         ::typeof(_ppl_rows), args::Vector{ReactiveKernels._PyVal})
     x, n = args
     np = ctx.host === nothing ? "jnp" : "np"
+    # The module's float type (`float_type`): float64 unless it is float32.
+    dtype = ctx.host === nothing ? ReactiveKernels._jax_dtype(Float64) :
+        ReactiveKernels._host_dtype(Float64)
+    ones = ReactiveKernels._jax_float_type() === Float64 ? "" : ", dtype=" * dtype
     code = ReactiveKernels._jax_is_array(x.T) ?
-        np * ".ones(" * n.code * ") * " * ReactiveKernels._py_atom(x.code) :
-        np * ".full((" * n.code * ",), " * x.code * ", dtype=" * np * ".float64)"
+        np * ".ones(" * n.code * ones * ") * " * ReactiveKernels._py_atom(x.code) :
+        np * ".full((" * n.code * ",), " * x.code * ", dtype=" * dtype * ")"
     ReactiveKernels._PyVal(code, Vector{Float64}, false, x.extent)
 end
 

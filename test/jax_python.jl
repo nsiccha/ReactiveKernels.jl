@@ -118,6 +118,110 @@ function rk_jax_evaluate(src::JAXSource, name, args; grad::Bool = false, prepare
     end
     _rk_jax_unarray(Base.eval(Module(), Meta.parse(output)))
 end
+const _RK_JAX_FLOAT32_DRIVER = raw"""
+import importlib.util, math, sys
+import numpy as np
+def load(path, tag):
+    spec = importlib.util.spec_from_file_location(tag, path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+# The reference (float64) module first: it turns on 64-bit mode, so a float64
+# value the float32 module leaks would be float64 in its trace.
+reference = load(sys.argv[2], "rk_reference") if sys.argv[2] != "-" else None
+module = load(sys.argv[1], "rk_module")
+import jax
+exec(open(sys.argv[3]).read())
+name, prepare = sys.argv[4], sys.argv[5] == "prepare"
+def single(x):
+    if isinstance(x, np.ndarray) and x.dtype.kind == "f":
+        return x.astype(np.float32)
+    if isinstance(x, float):
+        return np.float32(x)
+    return x
+def caller(m, cast):
+    f = getattr(m, name)
+    first, rest = ARGS[0], ARGS[1:]
+    if prepare:
+        p = m.prepare_data(*rest)
+        return (single(first) if cast else first), (lambda u: f(u, **p))
+    rest = [single(a) for a in rest] if cast else rest
+    return (single(first) if cast else first), (lambda u: f(u, *rest))
+# A strongly typed float64 value anywhere in a trace, nested jaxprs included.
+# A Python literal (`jnp.where(m, x, 0.0)`) is weakly typed: it takes the
+# float32 of what it meets, so it is no float64 arithmetic.
+def strong_f64(j):
+    bad = lambda a: getattr(a, "dtype", None) == np.float64 and not getattr(a, "weak_type", False)
+    if any(bad(v.aval) for v in list(j.invars) + list(j.constvars)):
+        return True
+    for e in j.eqns:
+        if any(bad(v.aval) for v in list(e.invars) + list(e.outvars)):
+            return True
+        for value in e.params.values():
+            for x in (value if isinstance(value, (list, tuple)) else [value]):
+                sub = getattr(x, "jaxpr", x)
+                if hasattr(sub, "eqns") and strong_f64(sub):
+                    return True
+    return False
+u, call = caller(module, True)
+f64 = strong_f64(jax.make_jaxpr(call)(u).jaxpr) or strong_f64(jax.make_jaxpr(jax.grad(call))(u).jaxpr)
+value, grad = jax.jit(call)(u), jax.jit(jax.grad(call))(u)
+def jl(x):
+    x = np.asarray(x, dtype=np.float64)
+    if x.ndim > 0:
+        return "Float64[" + ", ".join(jl(v) for v in x.reshape(-1)) + "]"
+    v = float(x)
+    return "NaN" if math.isnan(v) else ("Inf" if v == math.inf else ("-Inf" if v == -math.inf else repr(v)))
+out = "(x64 = %s, f64 = %s, dtype = %r, grad_dtype = %r, value = %s, grad = %s" % (
+    "true" if jax.config.read("jax_enable_x64") else "false", "true" if f64 else "false",
+    str(value.dtype), str(grad.dtype), jl(value), jl(grad))
+if reference is not None:
+    u64, call64 = caller(reference, False)
+    out += ", reference = %s, reference_grad = %s" % (jl(jax.jit(call64)(u64)), jl(jax.jit(jax.grad(call64))(u64)))
+print(out.replace("'", '"') + ")")
+"""
+
+"""
+    rk_jax_float32(src32, reference, name, args; prepare = false) -> NamedTuple
+
+Call function `name` of the module `src32`, whose floats are float32 (a
+`float_type = Float32` module, or one of a `Float32` program), on `args`,
+with the float values a caller passes cast to `float32`, and return its value
+and `jax.grad` with respect to the first argument, their dtypes, whether
+JAX's 64-bit mode was on (`x64`) and whether the traced value or gradient
+holds any strongly typed float64 (`f64`; a weakly typed Python literal takes
+the float32 of what it meets). With a `reference` module (the `Float64` module of
+the same program), it is imported first, which turns 64-bit mode on, and its
+value and gradient on the original arguments are returned as `reference` and
+`reference_grad`; with `reference = nothing` the float32 module runs alone.
+`prepare = true` passes the arguments after the first through `prepare_data`.
+"""
+function rk_jax_float32(src32::JAXSource, reference, name, args; prepare::Bool = false)
+    dir = mktempdir()
+    module_path = joinpath(dir, "rk_module.py")
+    write(module_path, src32)
+    reference_path = "-"
+    if reference !== nothing
+        reference_path = joinpath(dir, "rk_reference.py")
+        write(reference_path, reference)
+    end
+    args_path = joinpath(dir, "args.py")
+    inputs = prepare ? Any[args...] : rk_jax_inputs(args)
+    write(args_path, "ARGS = [" * join(map(_rk_py_input, inputs), ", ") * "]\n")
+    driver = joinpath(dir, "float32.py")
+    write(driver, _RK_JAX_FLOAT32_DRIVER)
+    errors = joinpath(dir, "stderr.txt")
+    cmd = `$RK_JAX_PYTHON $driver $module_path $reference_path $args_path $(String(name)) $(prepare ? "prepare" : "plain")`
+    output = try
+        read(pipeline(cmd; stderr = errors), String)
+    catch e
+        e isa ProcessFailedException || rethrow()
+        error("the emitted float32 module failed in Python (module at ", module_path, "):\n",
+              join(last(readlines(errors), 12), "\n"))
+    end
+    Base.eval(Module(), Meta.parse(output))
+end
+
 const _RK_JAX_LAYOUT_DRIVER = raw"""
 import importlib.util, sys
 import numpy as np
