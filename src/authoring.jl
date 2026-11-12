@@ -1877,7 +1877,8 @@ end
 
 # A child kernel prepared once when its caller is defined and applied where
 # the splicer cannot reach (a lazy arm or a closure), in place of the runtime
-# `(spec::KernelSpec)(args...)` that prepares it on every call. `name` is the
+# `(spec::KernelSpec)(args...)` that looks its kernel up in its graph's cache on
+# every call. `name` is the
 # authored callee, present in `code_expr`. `lane` is the child lowered for a
 # position residual (`_lane_kernel`), or `nothing`; only that residual's
 # destination forms call it (lane_sources.jl).
@@ -2304,8 +2305,9 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                 rewritten_ex, spec, nested_specs)) !== nothing
         # The splicer cannot reach a lazy arm or a deferred lexical scope, so
         # the call would stay a runtime `(spec::KernelSpec)(args...)`, which
-        # plans and prepares the child on every evaluation; inside a
-        # differentiated kernel that planning reaches Enzyme. Render the
+        # looks the child's kernel up in its graph's cache (and prepares it at
+        # the first call) on every evaluation; inside a differentiated kernel
+        # that lookup reaches Enzyme. Render the
         # child's planned recipes as source at the call position instead, as
         # for an object endpoint under an arm: the arm still evaluates the
         # child only when taken, and the backend differentiates its math.
@@ -5294,6 +5296,13 @@ call site receives fresh internal value identities, so repeated calls remain
 independent while the outer planner can prune or CSE their recipes. No nested
 runtime call remains in a prepared kernel.
 
+Calling a spec itself with positional values, `spec(args...)`, runs its default
+boundary, as `prepare(spec)(args...)` does. The graph keeps that prepared
+kernel, so only the first call per graph version prepares it (and the first
+under another preparation setting, such as `simplify`); later calls cost a
+cache lookup on top of the kernel's own call. A hot loop that holds
+`prepare(spec)` skips the lookup as well.
+
 A short expression body is a compact single-result kernel. Its value is exposed
 as a port named after the kernel, and that port is the default `want` boundary:
 `@kernel square(x) = x * x` creates ports `:x` and `:square`. A bare identity
@@ -5631,10 +5640,47 @@ end
                    want = _KERNEL_DEFAULT_BOUNDARY) =
     extract(spec; have = have, want = want)
 
-# Positional application requests the distinguished default output.  This is a
-# convenience/compiler-entry surface; performance-sensitive callers should
-# still retain `prepare(spec)` so compilation is paid once.
-(spec::KernelSpec)(arg, args...) = prepare(spec)(arg, args...)
+# Positional application runs the default boundary, as `prepare(spec)(args...)`
+# does. The graph keeps that kernel (`_graph_preparations`, graphops.jl), so
+# the first call per graph version and preparation setting prepares it and
+# every later call looks it up: about 1 ms of planning and lowering per call
+# for a five-input kernel before (snag `direct-call-of-a-30927f43`). A caller
+# holding `prepare(spec)` skips the lookup too.
+(spec::KernelSpec)(arg, args...) = _kernel_direct_callable(spec)(arg, args...)
+
+Base.@nospecializeinfer function _kernel_direct_callable(@nospecialize(spec::KernelSpec))
+    g = getfield(spec, :graph)
+    cache = _graph_preparations(g)
+    # The key `_prepare_unbound!` computes, read from the port table without
+    # building the boundary's values: those were most of a hit's cost.
+    have_sig = _kernel_port_sig(spec, getfield(spec, :have_names))
+    want_sig = _kernel_port_sig(spec, getfield(spec, :want_names))
+    kernel = if have_sig === nothing || want_sig === nothing
+        nothing
+    else
+        key = _unbound_key(g, nothing, have_sig, want_sig, (), nothing)
+        @lock cache.lock get(cache.kernels, key, nothing)
+    end
+    kernel === nothing && (kernel = _prepare_unbound!(cache, g,
+        _kernel_selected_values(spec, _KERNEL_DEFAULT_BOUNDARY, spec.have_names, :have),
+        _kernel_selected_values(spec, _KERNEL_DEFAULT_BOUNDARY, spec.want_names, :want),
+        (), nothing))
+    _kernel_signature_callable(kernel, getfield(spec, :call_signature))
+end
+
+# `_sig` of the named ports, or `nothing` when one is missing (the full path
+# then raises the error naming it).
+Base.@nospecializeinfer function _kernel_port_sig(@nospecialize(spec::KernelSpec),
+                                                  names::Vector{Symbol})
+    g, ports = getfield(spec, :graph), getfield(spec, :ports)
+    ids = ValueId[]
+    for name in names
+        port = get(ports, name, nothing)
+        port === nothing && return nothing
+        push!(ids, canon_id(g, (port::Value).id))
+    end
+    ids
+end
 
 function plan(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
               want = _KERNEL_DEFAULT_BOUNDARY)
