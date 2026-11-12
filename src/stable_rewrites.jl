@@ -50,32 +50,9 @@
 
 # --- the setting -------------------------------------------------------------
 
-# The project's preference (`[ReactiveKernels] simplify = false` in its
-# `LocalPreferences.toml`), read at the first preparation of a process, as the
-# type-stability preferences are (`type_stability.jl`); `__init__` forgets a
-# value read while an image was generated.
-const _SIMPLIFY_PREFERENCE = Ref{Union{Nothing,Bool}}(nothing)
-const _SIMPLIFY_SCOPE = :ReactiveKernels_simplify
-
-function _simplify_preference()
-    cached = _SIMPLIFY_PREFERENCE[]
-    cached === nothing || return cached
-    value = Preferences.load_preference(@__MODULE__, "simplify", true)
-    value isa Bool || throw(ArgumentError(
-        "the ReactiveKernels preference `simplify` must be true or false; got $(repr(value))"))
-    _SIMPLIFY_PREFERENCE[] = value
-end
-
-# Whether the preparation in progress applies the stable rewrites: the
-# innermost enclosing `simplify` keyword, else the preference.
-_simplify() = get(_simplify_preference, task_local_storage(), _SIMPLIFY_SCOPE)::Bool
-
-# `f()` with every preparation inside it, nested ones included, applying (true)
-# or not applying (false) the rewrites; `nothing` keeps the enclosing setting.
-_with_simplify(f, ::Nothing) = f()
-_with_simplify(f, value::Bool) = task_local_storage(f, _SIMPLIFY_SCOPE, value)
-_with_simplify(f, value) = throw(ArgumentError(
-    "`simplify` must be `true`, `false` or `nothing`; got $(repr(value))"))
+# `simplify` (`_simplify`, `_with_simplify` and the project preference) is
+# defined in `simplify_setting.jl`: the summed-plate pass reads it too, inside
+# lowerings that run while this module loads.
 
 # --- the stable forms --------------------------------------------------------
 #
@@ -187,6 +164,19 @@ end
 @_record_source @inline _rk_div_by_of(y, f::F, x) where {F} = y / f(x)
 @_record_source @inline _rk_div_by_of(y::Real, ::_RwExp, x::Real) = y * exp(-float(x))
 
+# The parameter-only part of a rewritten division can run before a loop.
+# Only built-in floats have a pure, total reciprocal exponential: the generic
+# method does no work, so a matrix or a user number keeps the original helper
+# at its original call site (including its exceptions and dispatch).
+# The lowering keeps this work inside the nonempty-plate guard. Lazy cell
+# arms retain their original helper, so reverse mode never multiplies an
+# unused overflowing exponential by a zero adjoint.
+@_record_source @inline _rk_div_by_scale(f, x) = nothing
+@_record_source @inline _rk_div_by_scale(f::_RwExp, x::Base.IEEEFloat) = _rk_inv_of(f, x)
+@_record_source @inline _rk_div_by_of(y, f, x, scale) = _rk_div_by_of(y, f, x)
+@_record_source @inline _rk_div_by_of(y::Real, ::_RwExp, x::Base.IEEEFloat,
+                                    scale::Base.IEEEFloat) = y * scale
+
 # `f(x)^k`: a literal integer power as Julia lowers it (`literal_pow`), any
 # other power as a call of `^`.
 @_record_source @inline _rk_pow_of(f::F, x, ::Val{k}) where {F,k} = Base.literal_pow(^, f(x), Val(k))
@@ -216,7 +206,7 @@ end
 # translates the same stable forms native execution runs.
 const _RK_STABLE_HELPERS = (_rk_log_of, _rk_log1p_of, _rk_log1p_neg_of, _rk_log_one_minus_of,
     _rk_log_one_plus, _rk_log_one_plus_of, _rk_log_add_of, _rk_log_sum_of, _rk_logit_of,
-    _rk_log_odds_of, _rk_exp_log_of, _rk_minus_one_of, _rk_inv_of, _rk_div_by_of, _rk_pow_of,
+    _rk_log_odds_of, _rk_exp_log_of, _rk_minus_one_of, _rk_inv_of, _rk_div_by_of, _rk_div_by_scale, _rk_pow_of,
     _rk_sqrt_of, _rk_log_sigmoid, _rk_log1m_sigmoid)
 
 # --- recognising calls --------------------------------------------------------
@@ -229,12 +219,19 @@ struct _RwView
     broadcast::Bool
 end
 
+struct _RwLoop
+    available::Set{Symbol}
+    scales::Dict{Any,Symbol}
+    prelude::Vector{Any}
+end
+
 struct _RwContext
     recipes::Tuple
     counts::Dict{Symbol,Int}    # assignments of each name in the program
     params::Set{Symbol}         # parameters the body never assigns
-    reads::Base.RefValue{Int}   # moved cell reads so far (`_rw_fresh`)
+    reads::Base.RefValue{Int}   # fresh stable read/scale temporaries emitted
     hoisted::Bool               # a loop never reads a definition from outside it
+    loops::Vector{_RwLoop}
 end
 
 # A name defined outside the loop being rewritten, under `hoisted`: readable
@@ -313,7 +310,7 @@ function _rw_pure_read(x, ctx::_RwContext, env)
     parts = _rw_read_parts(x)
     parts === nothing && return false
     call = parts[2]
-    _rw_resolve(call.args[1], @__MODULE__) === Base.Broadcast._broadcast_getindex &&
+    _rw_resolve(call.args[1], @__MODULE__) in (Base.Broadcast._broadcast_getindex, _plate_read) &&
         all(a -> a isa Number || (a isa Symbol && (haskey(env, a) || a in ctx.params)),
             call.args[2:end])
 end
@@ -670,8 +667,82 @@ end
 function _rw_rule_div(outer::_RwView, ctx, env)
     length(outer.args) == 2 || return nothing
     hit = _rw_unary(outer.args[2], ctx, env, outer, _rw_is_exp)
-    hit === nothing ? nothing :
-        _rw_emit(ctx, outer, :_rk_div_by_of, outer.args[1], _rw_ref(hit[1].f), hit[2])
+    hit === nothing && return nothing
+    f, x = _rw_ref(hit[1].f), hit[2]
+    scale = outer.broadcast ? nothing : _rw_loop_scale(ctx, env, f, x)
+    scale === nothing ? _rw_emit(ctx, outer, :_rk_div_by_of, outer.args[1], f, x) :
+        _rw_emit(ctx, outer, :_rk_div_by_of, outer.args[1], f, x, scale)
+end
+
+# Use the nearest plate whose entry can read the coordinate. No cell
+# reads, calls or array values are moved: a name must dominate the loop and
+# remain unassigned/unmutated throughout it. Inlined source aliases may name
+# the same outer coordinate. One scale serves every use in that loop.
+function _rw_loop_scale(ctx::_RwContext, env, f, x)
+    for _ in 1:64
+        x isa Symbol && get(env, x, nothing) isa Symbol || break
+        x = env[x]
+    end
+    for loop in Iterators.take(Iterators.reverse(ctx.loops), 1)
+        (x isa Number || (x isa Symbol && x in loop.available)) || continue
+        key = (f, x)
+        return get!(loop.scales, key) do
+            name = Symbol("#stable_scale#", ctx.reads[] += 1)
+            push!(loop.prelude, Expr(:(=), name,
+                Expr(:call, _rw_helper(:_rk_div_by_scale), f, x)))
+            name
+        end
+    end
+    nothing
+end
+
+# Recognize only RK's own cell loops. Their domain is CartesianIndices over
+# prepared axes, so checking emptiness adds no user iterator calls. SIMD's
+# generated control flow is scaffolding, whereas branches in the cell body
+# remain semantic boundaries for lifting.
+function _rw_plate_loop(ex::Expr)
+    simd = _index_run_simd_plate(ex)
+    if simd !== nothing
+        axes, index, body = simd
+        replace = rewritten -> _index_run_replace(ex) do node
+            node.head === :block || return node
+            statements = Any[a for a in node.args if !(a isa LineNumberNode)]
+            isempty(statements) && return node
+            first_statement = first(statements)
+            _rw_assignment(first_statement) !== nothing &&
+                first_statement.args[1] === index || return node
+            Expr(:block, first_statement, rewritten.args...)
+        end
+        return (; axes, index, body, replace)
+    end
+    ex.head === :for && length(ex.args) == 2 || return nothing
+    binding = ex.args[1]
+    _rw_assignment(binding) === nothing && return nothing
+    domain = binding.args[2]
+    _index_run_call(domain, GlobalRef(@__MODULE__, :_plate_cells), 1) || return nothing
+    indices = domain.args[2]
+    _index_run_call(indices, GlobalRef(Base, :CartesianIndices), 1) || return nothing
+    (; axes = indices.args[2], index = binding.args[1], body = ex.args[2],
+       replace = rewritten -> Expr(:for, binding, rewritten))
+end
+
+function _rw_plate_expr(ex, plate, ctx, env)
+    assigned = keys(_rw_count!(Dict{Symbol,Int}(), ex))
+    loop = _RwLoop(setdiff(union(ctx.params, keys(env)), assigned),
+                   Dict{Any,Symbol}(), Any[])
+    push!(ctx.loops, loop)
+    inner = ctx.hoisted ? Dict{Symbol,Any}(name => _RwOuter() for name in keys(env)) :
+            copy(env)
+    # The extracted cell body starts after SIMD's index assignment. Keep the
+    # index readable by existing cell-read rewrites, but never loop-invariant.
+    inner[plate.index] = nothing
+    rewritten = _rw_expr(plate.body, ctx, inner)
+    pop!(ctx.loops)
+    result = plate.replace(rewritten)
+    isempty(loop.prelude) && return result
+    has_cells = Expr(:call, GlobalRef(Base, :!), Expr(:call, GlobalRef(Base, :isempty),
+        Expr(:call, GlobalRef(Base, :CartesianIndices), plate.axes)))
+    Expr(:if, has_cells, Expr(:block, loop.prelude..., result))
 end
 function _rw_rule_pow(outer::_RwView, ctx, env)
     length(outer.args) == 2 || return nothing
@@ -820,6 +891,8 @@ function _rw_expr(ex, ctx::_RwContext, env::Dict{Symbol,Any})
     head = ex.head
     head in _RW_OPAQUE && return ex
     head in _RW_CLOSURES && return ex
+    plate = _rw_plate_loop(ex)
+    plate === nothing || return _rw_plate_expr(ex, plate, ctx, env)
     if head === :block
         return _rw_block(ex, ctx, copy(env))
     elseif head === :let
@@ -831,16 +904,25 @@ function _rw_expr(ex, ctx::_RwContext, env::Dict{Symbol,Any})
             a === nothing || (inner[a[1]] = a[2])
         end
         return Expr(:let, bindings, _rw_expr(ex.args[2], ctx, inner))
-    elseif head in (:if, :elseif, :while)
+    elseif head in (:if, :elseif, :&&, :||)
         args = Any[_rw_expr(ex.args[1], ctx, env)]
+        loops = copy(ctx.loops)
+        empty!(ctx.loops)
         for a in ex.args[2:end]
             push!(args, _rw_expr(a, ctx, copy(env)))
         end
+        append!(ctx.loops, loops)
         return Expr(head, args...)
-    elseif head === :for
-        inner = ctx.hoisted ? Dict{Symbol,Any}(name => _RwOuter() for name in keys(env)) :
-                copy(env)
-        return Expr(:for, ex.args[1], Any[_rw_expr(a, ctx, copy(inner)) for a in ex.args[2:end]]...)
+    elseif head in (:for, :while, :try)
+        loops = copy(ctx.loops)
+        empty!(ctx.loops)
+        inner = head === :for && ctx.hoisted ?
+                Dict{Symbol,Any}(name => _RwOuter() for name in keys(env)) : env
+        condition = head === :for ? ex.args[1] : _rw_expr(ex.args[1], ctx, env)
+        result = Expr(head, condition,
+            Any[_rw_expr(a, ctx, copy(inner)) for a in ex.args[2:end]]...)
+        append!(ctx.loops, loops)
+        return result
     elseif head === :(=) && length(ex.args) == 2
         return Expr(:(=), ex.args[1], _rw_expr(ex.args[2], ctx, env))
     elseif head === :local
@@ -1004,7 +1086,7 @@ function _stable_rewrites(ast::Expr, recipes::Tuple,
                arg isa Expr && arg.head === :(::) && arg.args[1] isa Symbol ? arg.args[1] : nothing
         name === nothing || get(counts, name, 0) == 0 && push!(params, name)
     end
-    ctx = _RwContext(recipes, counts, params, Ref(0), hoisted)
+    ctx = _RwContext(recipes, counts, params, Ref(0), hoisted, _RwLoop[])
     body = _rw_expr(ast.args[2], ctx, copy(definitions))
     body isa Expr && body.head === :block || return ast
     body == ast.args[2] && return ast
