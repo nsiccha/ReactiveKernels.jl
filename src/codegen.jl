@@ -5063,7 +5063,11 @@ Base.@nospecializeinfer function _cell_lowering_setup!(body, @nospecialize(recip
             continue
         end
         slice = gensym(:cell_argument)
-        push!(body.args, Expr(:(=), slice, partition ?
+        # A lane viewing a vector at a range reads that vector at the positions
+        # of its rows, which a partition's plan computes (`_cell_lane_range_rows`).
+        served = partition && !single ?
+            _cell_lane_range_rows(windows, plate_values[position], cell) : nothing
+        push!(body.args, Expr(:(=), slice, served !== nothing ? served : partition ?
             Expr(:call, GlobalRef(@__MODULE__, :_cell_row_slice), raw[position], cell) :
             Expr(:call, GlobalRef(@__MODULE__, :_plate_cell_slice), raw[position], cell)))
         push!(slices, slice)

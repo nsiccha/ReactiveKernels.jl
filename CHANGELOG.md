@@ -16,6 +16,16 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.186
+
+- A partition reads a batched lane that views a vector at a range
+  (`view(u, lo:hi)`, such as a packed parameter block) at the positions of that
+  vector its rows hold, computed apart from the read, so a partition's plan
+  computes them once per label. A compact overlay serves them from its active
+  vector when its slot map is constant per label. Before, the lane was sliced
+  on every call, which allocated a fresh index vector each time, also for a
+  partition with no cells in that plate. Values and gradients are unchanged.
+
 ## 0.1.185
 
 - `jax_source`: a `for` loop to a padded row's length, such as
