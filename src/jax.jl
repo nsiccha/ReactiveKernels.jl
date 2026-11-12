@@ -52,6 +52,10 @@ _jax_error(message...) = throw(JAXEmissionError(string(message...)))
 # broadcast against a matrix pads the result's first axis, `I(n)` at a padded
 # size both. Zero where no translation recorded them; a vector pads its one
 # axis and an adjoint vector its second, by type (`_jax_padded_axes`).
+# For a tuple, or a vector of tuples (a tuple-valued plate's values), whose
+# `extent` is a tuple of its fields' lengths, `padded` records instead which
+# fields have one (bit `k - 1` for field `k`, `_jax_padded_fields`): the
+# others are `None` there, and no length at all.
 #
 # `origin` records where a data integer comes from (`_JaxOrigin`), so a loop
 # over a range whose ends are entries of the prepared data has a static
@@ -142,7 +146,7 @@ _jax_vector_like(@nospecialize(T)) = T isa Type && (T <: AbstractVector ||
 # or an array whose padded axes no translation recorded.
 function _jax_padded_axes(v::_PyVal)
     isempty(v.extent) && return 0
-    v.padded == 0 || return v.padded
+    v.padded == 0 || _jax_tuple_valued(v.T) || return v.padded
     T = v.T
     T isa Type && !_jax_ragged(T) || return 0
     T <: AbstractVector && return 1
@@ -778,10 +782,27 @@ function _jax_expr(ctx::_JaxContext, ::Val{:tuple}, ex)
     _jax_call_positional(ctx, tuple, values)
 end
 # The extents of a tuple's padded elements, as a Python tuple (`None` for an
-# element that is not padded), or "" when none is.
+# element that is not padded), or "" when none is; and which elements are
+# padded, as `padded` records them for a tuple.
 _jax_tuple_extent(values) = all(v -> isempty(v.extent), values) ? "" :
     "(" * join((isempty(v.extent) ? "None" : v.extent for v in values), ", ") *
     (length(values) == 1 ? ",)" : ")")
+_jax_tuple_fields(values) =
+    foldl((m, (k, v)) -> isempty(v.extent) ? m : m | 1 << (k - 1), enumerate(values); init = 0)
+_jax_tuple_valued(@nospecialize(T)) = T isa Type && (T <: Tuple ||
+    T <: AbstractArray && eltype(T) isa Type && eltype(T) <: Tuple)
+# The fields of a tuple (or of a vector of tuples' entries) that have a
+# length in its extent, as a bitmask; zero when none was recorded, in which
+# case every field with an array type is taken to have one.
+_jax_padded_fields(v::_PyVal) = isempty(v.extent) || !_jax_tuple_valued(v.T) ? 0 : v.padded
+# The extent of a tuple's field `k` of type `T`: its entry of the tuple's
+# extent when it has a length, else none ("").
+function _jax_field_extent(x::_PyVal, k::Int, @nospecialize(T))
+    (isempty(x.extent) || !_jax_is_array(T)) && return ""
+    fields = _jax_padded_fields(x)
+    fields == 0 || fields & (1 << (k - 1)) != 0 || return ""
+    _py_atom(x.extent) * "[" * string(k - 1) * "]"
+end
 _jax_tuple_code(values) = "(" * join((v.code for v in values), ", ") *
                           (length(values) == 1 ? ",)" : ")")
 
@@ -847,9 +868,8 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
             _jax_error("a tuple is indexed with a literal integer only", _jax_where(ctx))
         k = indices[1]
         T = fieldtype(x.T, k)
-        extent = isempty(x.extent) ? "" : x.extent * "[" * string(k - 1) * "]"
         return _PyVal(_py_atom(x.code) * "[" * string(k - 1) * "]", T, x.static,
-                      _jax_is_array(T) ? extent : "")
+                      _jax_field_extent(x, k, T))
     end
     # A number indexed by ones is itself (`s[1, 1, 1]`, as Julia's).
     if x.T isa Type && x.T <: Number
@@ -2923,6 +2943,9 @@ end
 # (an integer a helper returns, `size(U, _slice_dims(o))`); a dimension that
 # is data has no static shape entry.
 function _jax_function_call(ctx::_JaxContext, ::typeof(size), args::Vector{_PyVal})
+    x = args[1]
+    ctx.host === nothing && !isempty(x.extent) && _jax_is_array(x.T) && !_jax_ragged(x.T) &&
+        return _jax_padded_size(ctx, x, args[2:end])
     shape = ctx.host === nothing ? _py_atom(args[1].code) * ".shape" : "np.shape(" * args[1].code * ")"
     length(args) == 2 || return _PyVal(shape, NTuple{_jax_rank(args[1].T),Int}, true)
     d = args[2]
@@ -2942,6 +2965,34 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(size), args::Vector{_PyVa
     T isa Type && T <: AbstractArray || return _PyVal(entry, Int, true)
     _PyVal("(" * entry * " if " * _py_atom(d.code) * " <= " * string(_jax_rank(T)) *
            " else 1)", Int, true)
+end
+# `size` of a padded value (a ragged row in its cell, an allocation at a data
+# length): along an axis its extent pads, its length, the extent, bounded by
+# the stored size, as `length` gives it; along another axis, the stored size.
+# The padded width is not a size Julia has, so a value whose padded axes are
+# not known is refused.
+function _jax_padded_size(ctx::_JaxContext, x::_PyVal, dims::Vector{_PyVal})
+    axes = _jax_padded_axes(x)
+    axes == 0 && _jax_error("`size` of a padded `", x.T, "` whose padded axes are not known",
+                            _jax_where(ctx))
+    R = _jax_rank(x.T)
+    function entry(k)
+        k > R && return _PyVal("1", Int, true)
+        # An adjoint vector is stored as its one (second) axis.
+        adjoint = _jax_adjoint_vector(x.T)
+        adjoint && k == 1 && return _PyVal("1", Int, true)
+        stored = _py_atom(x.code) * ".shape[" * string(adjoint ? 0 : k - 1) * "]"
+        axes & (1 << (k - 1)) == 0 && return _PyVal(stored, Int, true)
+        _PyVal(x.extent, Int, false, "", stored)
+    end
+    if isempty(dims)
+        parts = _PyVal[entry(k) for k in 1:R]
+        return _PyVal(_jax_tuple_code(parts), NTuple{R,Int}, false, "", _jax_tuple_limit(parts))
+    end
+    d = only(dims)
+    occursin(r"^[0-9]+$", d.code) ||
+        _jax_error("`size` of a padded value along a computed dimension", _jax_where(ctx))
+    entry(parse(Int, d.code))
 end
 # `lastindex` (the lowered `end` of `x[a:end]` in a plain helper): the length
 # or the dimension's size, static as `end` in source is. A padded (ragged)
@@ -3950,7 +4001,7 @@ function _jax_call_positional(ctx::_JaxContext, ::typeof(tuple), args::Vector{_P
     any(_jax_translation_only, args) &&
         return _PyVal("<tuple>", _JaxAggregate(T, args), all(a -> a.static, args))
     _PyVal(_jax_tuple_code(args), T, all(a -> a.static, args),
-           _jax_tuple_extent(args), _jax_tuple_limit(args))
+           _jax_tuple_extent(args), _jax_tuple_limit(args), _jax_tuple_fields(args))
 end
 # A shape tuple may carry a padded vector's length through a local or helper.
 # Its bound refers to the padded input shape, not an observed length literal.
@@ -4302,13 +4353,15 @@ end
 # with `extents[i]` true is padded and takes its length (or lengths) as an
 # extra parameter after it. A WANT with an extent returns its length too.
 # A parameter with `statics[i]` true is known while JAX traces (its caller
-# passes it a value that is).
+# passes it a value that is). A padded tuple parameter's `fields[i]` records
+# which of its fields its lengths give (`_jax_padded_fields`).
 # Returns the function name, the WANT values and which of them return a length.
 function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
                              extents = fill(false, length(p.have)),
                              statics = fill(false, length(p.have)),
                              links = fill(nothing, length(p.have)),
-                             origins = fill(nothing, length(p.have)))
+                             origins = fill(nothing, length(p.have)),
+                             fields = fill(0, length(p.have)))
     name = _jax_fresh(ctx, hint)
     outer = ctx.scope
     inner = _JaxScope(outer)
@@ -4322,8 +4375,8 @@ function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
             extent = _jax_identifier(inner.used, Symbol(v.name, :_n))
             push!(names, extent)
         end
-        inner.values[canon_id(p.graph, v.id)] = _PyVal(param, types[i], statics[i], extent, "", 0,
-                                                       origins[i])
+        inner.values[canon_id(p.graph, v.id)] = _PyVal(param, types[i], statics[i], extent, "",
+                                                       fields[i], origins[i])
         links[i] === nothing || (inner.links[canon_id(p.graph, v.id)] = links[i])
     end
     recipe = ctx.recipe
@@ -4380,6 +4433,9 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     padded = [mapped[i] && !ragged[i] && !isempty(v.extent) for (i, v) in enumerate(inputs)]
     cell_types = Any[mapped[i] ? eltype(v.T) : _jax_unref(v.T) for (i, v) in enumerate(inputs)]
     cell_extents = Bool[ragged[i] for i in eachindex(inputs)]
+    # A tuple-valued plate's entries keep which fields have a length: a field
+    # without one is `None` in the cell's lengths, and has no extent there.
+    cell_fields = Int[ragged[i] ? _jax_padded_fields(v) : 0 for (i, v) in enumerate(inputs)]
     # `jax.vmap` hands an argument it does not map (`in_axes` `None`) to the
     # cell unchanged, also under `jax.jit`: a Python or NumPy value stays
     # one, and a `StaticInt` of the prepared data stays static (measured with
@@ -4413,7 +4469,8 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
                                                                 extents = cell_extents,
                                                                 statics = cell_statics,
                                                                 links = cell_links,
-                                                                origins = cell_origins)
+                                                                origins = cell_origins,
+                                                                fields = cell_fields)
     want = only(wants)
     E = _jax_typeof(want)
     axes = String[]
@@ -4435,10 +4492,10 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     # no cells. Shape tests are known to the backend while tracing; branch
     # before calling vmap, without reading or evaluating a cell. Only equal
     # mapped shapes take this path, preserving existing mismatch checks.
-    # Scan outputs with tuple-valued cells are stored column by column;
-    # their first column carries the mapped shape.
-    shapes = [_py_atom((_jax_columns(v.T) ? _jax_column(v, 1) : v).code) *
-              ".shape[:" * string(R) * "]"
+    # Scan outputs with tuple-valued cells are stored column by column, and
+    # a tuple-valued plate's values field by field; their first column (or
+    # field) carries the mapped shape.
+    shapes = [_py_atom(_jax_mapped_array(v)) * ".shape[:" * string(R) * "]"
               for (i, v) in enumerate(inputs) if mapped[i]]
     empty = "0 in " * first(shapes)
     for shape in shapes[2:end]
@@ -4450,7 +4507,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
         if only(with_length)
             lengths = _jax_fresh(ctx, :plate_lengths)
             _jax_emit!(ctx, result * ", " * lengths * " = " * call)
-            return [_PyVal(result, Vector{E}, false, lengths)]
+            return [_PyVal(result, Vector{E}, false, lengths, "", _jax_padded_fields(want))]
         end
         _jax_emit!(ctx, result * " = " * call)
         return [_PyVal(result, Vector{E})]
@@ -4489,6 +4546,17 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
            empty * " else " * call * ")"
     extent = _jax_extent(inputs[padded])
     [_PyVal(call, Array{E,R}, false, extent)]
+end
+# The stored array whose leading axes are a mapped plate argument's: the
+# argument itself, or, for a vector of tuples (a Python tuple of stacked
+# arrays, one per field), its first field's.
+function _jax_mapped_array(v::_PyVal)
+    _jax_columns(v.T) && return _jax_column(v, 1).code
+    code, E = v.code, _jax_is_array(v.T) ? eltype(v.T) : Any
+    while E isa Type && E <: Tuple && isconcretetype(E) && fieldcount(E) > 0
+        code, E = _py_atom(code) * "[0]", fieldtype(E, 1)
+    end
+    code
 end
 # A cell's extent expression `extent`, over its parameters `params`, as the
 # plate's: each parameter replaced by its argument (`args`, mapped where `axes`

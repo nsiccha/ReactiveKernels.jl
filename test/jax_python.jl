@@ -31,7 +31,10 @@ _rk_py(x) = repr(string(x))
 _rk_py(x::AbstractArray) = ndims(x) == 1 ? "[" * join(map(_rk_py, x), ", ") * "]" :
     "[" * join((_rk_py(selectdim(x, 1, i)) for i in axes(x, 1)), ", ") * "]"
 _rk_py_input(x::AbstractArray{<:Number}) = "np.asarray(" * _rk_py(x) * ", dtype=" *
-    (eltype(x) <: Bool ? "bool" : eltype(x) <: Integer ? "np.int64" : "np.float64") * ")"
+    (eltype(x) <: Bool ? "bool" : eltype(x) <: Integer ? "np.int64" : "np.float64") * ")" *
+    # An empty array of rank two or more (no ragged rows, padded to width 1)
+    # prints as `[]`; it keeps its shape.
+    (isempty(x) && ndims(x) > 1 ? ".reshape(" * _rk_py(collect(size(x))) * ")" : "")
 # A raw ragged input (for `prepare_data`) is a list of arrays.
 _rk_py_input(x::AbstractVector{<:AbstractVector{<:Number}}) =
     "[" * join(map(_rk_py_input, x), ", ") * "]"
