@@ -9089,7 +9089,11 @@ function _prepare_plan_body(p::Plan; passes = (), bound = (), on_error = nothing
     # eligible chains compose after that split but before guarded cells are
     # partitioned, so data-only producers can still be cached.
     bound === () || (p = _fuse_authored_plate_chains(p; cells_only = true))
-    p = _partial_apply(p, bound; _data_cache)
+    # The exemplars type the remaining HAVE ports for the bound pre-pass too
+    # (`_cell_group_numbers`).
+    unbound = p
+    p = _with_partial_exemplars(() -> _partial_apply(unbound, bound; _data_cache),
+                                exemplars)
     exemplar_types = if exemplars === nothing
         nothing
     else

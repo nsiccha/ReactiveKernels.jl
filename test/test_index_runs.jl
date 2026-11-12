@@ -106,8 +106,9 @@ end
     end
     @test length(sources)==2
     @test sources[false]!==sources[true]
-    # The active array length is a runtime property too.
-    q4=[q;0.7];idx4=fill(4,32);x4=fill(.1,32)
+    # The active array length is a runtime property too. Distinct x per row:
+    # identical rows would run once per distinct row instead (duplicate_cells.jl).
+    q4=[q;0.7];idx4=fill(4,32);x4=[sin(i/3)/2 for i in 1:32]
     k4=prepare!(cache,subject;bound=(idx=idx4,x=x4))
     @test k4.f===sources[true]
     verify(k4,q4,oracle(q4,idx4,x4))
