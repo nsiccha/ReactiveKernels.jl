@@ -2331,6 +2331,8 @@ function _jax_call(ctx::_JaxContext,
     f in (sum, prod) && names == [:init] ||
         _jax_error("keyword arguments ", join(names, ", "), " to `", f,
                    "` have no JAX translation", _jax_where(ctx))
+    f === sum && length(args) == 2 && _jax_fixed_tuple_type(args[2]) !== nothing &&
+        return _jax_tuple_sum(ctx, _jax_function_of(args[1]), args[2], last(only(kw)))
     reduced = _jax_call_positional(ctx, f, args)
     _jax_call(ctx, f === sum ? (+) : (*), [last(only(kw)), reduced])
 end
@@ -3047,6 +3049,8 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(sum), args::Vector{_PyVal
         return _PyVal("jnp.sum(" * _jax_padded_reduced(ctx, sum, args[1], "0.0") * ")",
                       eltype(args[1].T))
     length(args) == 1 && return _jax_result(sum, args, "jnp.sum(" * args[1].code * ")")
+    length(args) == 2 && _jax_fixed_tuple_type(args[2]) !== nothing &&
+        return _jax_tuple_sum(ctx, _jax_function_of(args[1]), args[2], nothing)
     length(args) == 2 && _jax_is_array(args[2].T) || _jax_error("this `sum` call", _jax_where(ctx))
     mapped = _jax_broadcast(ctx, _jax_function_of(args[1]), [args[2]])
     # `f` of a padded array's padding is not part of the sum.
@@ -3054,6 +3058,25 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(sum), args::Vector{_PyVal
                                             eltype(mapped.T))
     masked = _PyVal(mapped.code, mapped.T, false, args[2].extent, "", _jax_padded_axes(args[2]))
     _PyVal("jnp.sum(" * _jax_padded_reduced(ctx, sum, masked, "0") * ")", eltype(mapped.T))
+end
+# The type of a tuple value whose length its type fixes (a Vararg formal's
+# trailing arguments, a tuple literal), also one holding a function, or
+# `nothing`.
+function _jax_fixed_tuple_type(v::_PyVal)
+    T = v.T isa _JaxAggregate ? v.T.T : v.T
+    _jax_is_tuple(T) && T <: Tuple ? T : nothing
+end
+# `sum(g, t[; init])` of such a tuple: `g` of each element, added in order
+# from `init`, as Julia folds a tuple. The fold follows the tuple's fixed
+# length, as `afoldl` folds a fixed argument list, never a data length.
+function _jax_tuple_sum(ctx::_JaxContext, g, t::_PyVal, init)
+    total = init
+    for k in 1:fieldcount(_jax_fixed_tuple_type(t))
+        v = _jax_call(ctx, g, [_jax_tuple_element(ctx, t, _PyVal(string(k), Int, true))])
+        total = total === nothing ? v : _jax_call(ctx, +, [total, v])
+    end
+    total === nothing && _jax_error("`sum` of an empty tuple without `init`", _jax_where(ctx))
+    total
 end
 for (f, name, neutral) in ((prod, "jnp.prod", "1.0"), (maximum, "jnp.max", "-jnp.inf"),
                            (minimum, "jnp.min", "jnp.inf"))
@@ -4242,9 +4265,12 @@ function _jax_traceable_call(ctx::_JaxContext, f, args::Vector{_PyVal})
     source === nothing && return nothing
     names, body, mod = source
     length(source) >= 5 && (body = _jax_static_parameters(body, source[5]))
-    length(names) == length(args) || return nothing
-    ctx.host === nothing || return _host_function_call(ctx, f, collect(Symbol, names), body, mod, args)
-    v = _jax_source_expr(ctx, body, collect(Symbol, names), args, mod, nothing)
+    # A Vararg source's last formal is the tuple of the trailing arguments.
+    inputs = _traceable_arguments(source, args, rest -> _jax_call_positional(ctx, tuple, rest))
+    inputs === nothing && return nothing
+    ctx.host === nothing ||
+        return _host_function_call(ctx, f, collect(Symbol, names), body, mod, args, inputs)
+    v = _jax_source_expr(ctx, body, collect(Symbol, names), inputs, mod, nothing)
     _jax_bind!(ctx, :value, v)
 end
 

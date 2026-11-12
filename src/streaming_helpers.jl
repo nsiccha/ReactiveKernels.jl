@@ -83,6 +83,8 @@ copied from the method source. No helper is executed during preparation.
 """
 function _stream_helper_expression(source, arguments, series_arguments, carry!, time)
     names, rawbody, mod = source
+    length(source) >= 6 && source[6] &&
+        _stream_error("helper with a Vararg argument has no streaming translation")
     length(names) == length(arguments) || _stream_error("helper argument count differs from its recorded source")
     series = Set(n for (n,flag) in zip(names,series_arguments) if flag)
     body = _traceable_tail_body(rawbody, :stream_helper)
