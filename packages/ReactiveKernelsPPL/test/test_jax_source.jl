@@ -117,6 +117,19 @@ ReactiveKernels.@kernel jax_ppl_feature_mixture(x1, x_rest, centres, scales) = b
     peak = maximum(score)
     return peak + log(sum(exp.(score .- peak)))
 end
+# The same law with each feature's measurement standard error, a second
+# padded row of the same length, and log weights after the reduction (snag
+# jax-source-sum-o-d4f6aa97).
+ReactiveKernels.@kernel jax_ppl_feature_mixture_errors(x1, x_rest, s1, s_rest, centres, scales,
+                                                       log_weights) = begin
+    x = vcat(x1, x_rest)
+    s = vcat(s1, s_rest)
+    sd = sqrt.(scales .^ 2 .+ s .^ 2)
+    cell = -0.5 .* ((x .- centres) ./ sd) .^ 2 .- log.(sd)
+    score = vec(sum(cell; dims = 1)) .+ log_weights
+    peak = maximum(score)
+    return peak + log(sum(exp.(score .- peak)))
+end
 
 const _JAX_RNG = Xoshiro(20261024)
 const _JAX_N = 30
@@ -489,6 +502,19 @@ const _JAX_CASES = (
         end
     end))(; x_rest = [[0.2, -0.1], [0.1, 0.4], [-0.4, 0.0], [0.3, 0.2]], D = 3, K = 2,
            zeros_dk = zeros(3, 2), scales = [1.0 0.5; 2.0 1.0; 0.7 1.3]) |
+        (; x1 = [0.1, -0.3, 0.5, 0.2]),
+    # Two padded rows of the same length per index, broadcast into one
+    # feature matrix: each has its own lengths in the translation.
+    feature_mixture_errors = () -> (@rkppl(begin
+        centres[1:D, 1:K] .~ Normal.(zeros_dk, 1.0)
+        @plate for i in eachindex(x1)
+            x1[i] ~ LogDensity(jax_ppl_feature_mixture_errors, x_rest[i], s1[i], s_rest[i],
+                               centres, scales, log_weights)
+        end
+    end))(; x_rest = [[0.2, -0.1], [0.1, 0.4], [-0.4, 0.0], [0.3, 0.2]],
+           s1 = [0.3, 0.2, 0.1, 0.4], s_rest = [[0.1, 0.5], [0.2, 0.3], [0.3, 0.1], [0.6, 0.2]],
+           D = 3, K = 2, zeros_dk = zeros(3, 2), scales = [1.0 0.5; 2.0 1.0; 0.7 1.3],
+           log_weights = log.([0.4, 0.6])) |
         (; x1 = [0.1, -0.3, 0.5, 0.2]),
     # Dotted cell latents whose length per index comes from data: BRM's
     # non-centred per-unit steps (one vector per index, a scalar scale, an

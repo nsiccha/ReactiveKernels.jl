@@ -203,6 +203,47 @@ function _jax_padded_union(args)
     end
     axes
 end
+# Operands padded along the same axes by different extents: two per-row
+# arguments broadcast together (`(x .- m) ./ s` with `x` and `s` ragged rows
+# of one cell), each with its own lengths. Julia's broadcast gives each such
+# axis one length, the operands' length other than one (one when all are
+# one). The operands are returned with that length as their common extent,
+# `_rk_broadcast_length(...)` of their extents (sorted, so every combination
+# of the same rows reads alike and combines again by string equality), an
+# expression of their extents, valid wherever they are. Lengths Julia
+# refuses to broadcast (two lengths other than one differ) are not checked:
+# a check is a host callback in every evaluation (several times the cost of
+# a small model's gradient), and a padded row broadcast against an unpadded
+# array is not checked either. Operands padding different axes by different
+# extents (`x .* s'`) would need an extent per axis: they are returned as
+# they are, so a broadcast of them records no padded axes and a reduction of
+# it raises.
+const _JAX_BROADCAST_LENGTH = """
+def _rk_broadcast_length(*lengths):
+    # Julia's broadcast length along an axis its operands pad: the length
+    # other than one, or one when every operand has length one.
+    n = lengths[0]
+    for m in lengths[1:]:
+        n = jnp.where(n == 1, m, n)
+    return n
+"""
+function _jax_common_extent(ctx, args::Vector{_PyVal})
+    ctx.host === nothing || return args
+    padded = [a for a in args if !isempty(a.extent)]
+    length(unique(a.extent for a in padded)) > 1 || return args
+    masks = unique(_jax_padded_axes(a) for a in padded)
+    length(masks) == 1 && only(masks) != 0 || return args
+    parts = String[]
+    for a in padded
+        append!(parts, get(ctx.mod.helper_names, (:broadcast_length, a.extent), [a.extent]))
+    end
+    sort!(unique!(parts))
+    name = _jax_helper!(ctx, "_rk_broadcast_length", _JAX_BROADCAST_LENGTH)
+    extent = name * "(" * join(parts, ", ") * ")"
+    ctx.mod.helper_names[(:broadcast_length, extent)] = parts
+    [isempty(a.extent) ? a : _PyVal(a.code, a.T, a.static, extent, "", a.padded, a.origin)
+     for a in args]
+end
 # The padded axes an elementwise function of `x` keeps: `x`'s, unless `x` is
 # an adjoint vector, whose result (typed a matrix) is stored with one axis.
 _jax_adjoint_vector(@nospecialize(T)) = _jax_vector_like(T) && !(T <: AbstractVector)
@@ -2878,6 +2919,8 @@ function _jax_scalar_or_elementwise(ctx::_JaxContext, f, args::Vector{_PyVal})
             return _jax_elementwise_result(f, args, _py_negate(args[1].code))
         length(args) == 1 && f === (+) && return args[1]
         length(args) >= 2 || return nothing
+        f in ((+), (-)) && all(a -> _jax_is_array(a.T), args) &&
+            (args = _jax_common_extent(ctx, args))
         return _jax_elementwise_result(f, args, _py_infix(op, [a.code for a in args]))
     end
     if f === (*) && any(a -> a.T isa Type && a.T <: AbstractString, args)
@@ -3946,6 +3989,9 @@ function _jax_broadcast(ctx::_JaxContext, f, args::Vector{_PyVal})
         return _PyVal("jnp.asarray(" * x.code * ", dtype=" * _jax_dtype(f) * ")",
                       R == 0 ? f : Array{f,R}, false, x.extent, "", _jax_padded_like(x))
     end
+    # The result's extent and padded axes: rows padded by different lengths
+    # along the same axes take Julia's broadcast length (`_jax_common_extent`).
+    meta = _jax_common_extent(ctx, args)
     padded = map(values, referenced) do a, ref
         r = _jax_rank(a.T)
         !ref && 0 < r < R ? _PyVal(_py_atom(a.code) * "[" * join(fill("...", 1), "") *
@@ -3964,12 +4010,12 @@ function _jax_broadcast(ctx::_JaxContext, f, args::Vector{_PyVal})
     if any(referenced) || f isa _JaxClosure || any(_jax_translation_only, scalars)
         R == 0 && return _jax_call(ctx, f, scalars)
         code, E = _jax_captured_broadcast(ctx, f, scalars, padded, referenced)
-        return _PyVal(code, Array{E,R}, false, _jax_extent(args), "",
-                      _jax_broadcast_padded(args, R))
+        return _PyVal(code, Array{E,R}, false, _jax_extent(meta), "",
+                      _jax_broadcast_padded(meta, R))
     end
     v = _jax_elementwise_call(ctx, f, scalars)
-    v === nothing || return _PyVal(v.code, T, false, R == 0 ? "" : _jax_extent(args), "",
-                                   _jax_broadcast_padded(args, R))
+    v === nothing || return _PyVal(v.code, T, false, R == 0 ? "" : _jax_extent(meta), "",
+                                   _jax_broadcast_padded(meta, R))
     if haskey(_JAX_INFIX, f) || f === (*) || f === (^) ||
        _jax_elementwise_name(ctx, f, scalars) !== nothing
         any(a -> !a.static, padded) && (padded = map(a -> _jax_float_static(ctx, a), padded))
@@ -3977,8 +4023,8 @@ function _jax_broadcast(ctx::_JaxContext, f, args::Vector{_PyVal})
             f === (^) ? _PyVal(_py_infix("**", [padded[1].code, padded[2].code]), E) :
             _jax_scalar_or_elementwise(ctx, f, scalars)
         v === nothing && _jax_error("broadcasting `", f, "`", _jax_where(ctx))
-        return _PyVal(v.code, T, false, R == 0 ? "" : _jax_extent(args), "",
-                      _jax_broadcast_padded(args, R))
+        return _PyVal(v.code, T, false, R == 0 ? "" : _jax_extent(meta), "",
+                      _jax_broadcast_padded(meta, R))
     end
     # A function of each vector of a padded vector of vectors (`Diagonal.(rows)`
     # of a ragged plate's per-cell arguments) maps over the rows, each a padded
@@ -4015,7 +4061,7 @@ function _jax_broadcast(ctx::_JaxContext, f, args::Vector{_PyVal})
     ctx.host === nothing || return _PyVal("np.vectorize(" * name * ", otypes=[" *
         _host_dtype(E) * "])(" * _jax_args(padded) * ")", T)
     _PyVal("jnp.vectorize(" * name * ")(" * _jax_args(padded) * ")", T, false,
-           R == 0 ? "" : _jax_extent(args), "", _jax_broadcast_padded(args, R))
+           R == 0 ? "" : _jax_extent(meta), "", _jax_broadcast_padded(meta, R))
 end
 
 function _jax_captured_broadcast(ctx::_JaxContext, f, scalars, padded, referenced)
