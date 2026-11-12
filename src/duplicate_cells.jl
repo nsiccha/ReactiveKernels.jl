@@ -27,12 +27,18 @@
 # - a number: a bound number, or a live value whose declared type, or whose
 #   type inferred from the preparation's exemplars (`_cell_group_numbers`), is
 #   a `Number`;
-# - a bound vector of primitive numbers, of one length `n` for every such
-#   operand (a bound singleton broadcasts and is shared); or
+# - a bound vector of primitive numbers, or of dense arrays of them (one
+#   observation vector per cell, such as a capture history), of one length
+#   `n` for every such operand (a bound singleton broadcasts and is shared);
+#   or
 # - a gather (`_readonly_gather`, with or without index runs) of any array
 #   through a bound index vector of that length,
 #
-# is grouped by its bound vectors and gather indices (`_cell_group_lanes`).
+# is grouped by the bound vectors and gather indices its cell reads
+# (`_cell_group_lanes`). An operand the cell no longer reads, such as a
+# lane index whose bound gather preparation already cached, still sets the
+# plate's domain: it is compacted like the others but does not tell rows
+# apart.
 # When the rows repeat often enough (`_CELL_GROUP_MINIMUM_MULTIPLICITY`), the
 # plate is replaced by the same cell over the first row of each group, times
 # the group's row count:
@@ -79,9 +85,13 @@ _partial_exemplar_types() = get(task_local_storage(), _PARTIAL_EXEMPLARS, nothin
 _with_partial_exemplars(f, exemplars) = task_local_storage(f, _PARTIAL_EXEMPLARS,
     exemplars isa Tuple ? map(typeof, exemplars) : nothing)
 
-# A bound per-cell vector of primitive numbers.
+# A bound per-cell vector of primitive numbers, or of dense arrays of them,
+# which rows compare by value (`isequal`, elementwise).
 _cell_group_column(@nospecialize(data)) = data isa AbstractVector &&
-    !Base.has_offset_axes(data) && eltype(data) <: _PartialPlateScalar
+    !Base.has_offset_axes(data) && _cell_group_element(eltype(data))
+_cell_group_element(@nospecialize(T)) = T <: _PartialPlateScalar ||
+    (T isa DataType && isconcretetype(T) && T <: DenseArray &&
+     eltype(T) <: _PartialPlateScalar)
 
 # The first row of each distinct row of `columns` (in row order) and the
 # number of rows equal to it. Rows compare with `isequal`.
@@ -249,9 +259,16 @@ Base.@nospecializeinfer function _cell_group_recipe(
     isempty(shared) || _cell_group_numbers(g, have, recipes, recipe, shared) ||
         return nothing
 
-    keys = Any[last(c) for c in columns]
-    foreach(q -> push!(keys, index_data(last(q))), gathers)
-    lanes, counts = _cell_group_lanes(Tuple(keys))
+    # Rows differ only in the operands the cell reads.
+    read = Set{ValueId}(canon_id(inner.graph, v.id) for v in inner.want)
+    for r in Iterators.reverse(inner.recipes)
+        any(v -> canon_id(inner.graph, v.id) in read, r.outputs) &&
+            union!(read, (canon_id(inner.graph, v.id) for v in r.inputs))
+    end
+    reads(index) = canon_id(inner.graph, inner.have[index].id) in read
+    keys = Any[last(c) for c in columns if reads(first(c))]
+    foreach(q -> reads(first(q)) && push!(keys, index_data(last(q))), gathers)
+    lanes, counts = isempty(keys) ? ([1], [n]) : _cell_group_lanes(Tuple(keys))
     length(lanes) * _CELL_GROUP_MINIMUM_MULTIPLICITY <= n || return nothing
 
     # The rewrite follows from the plate's operation and which operands are

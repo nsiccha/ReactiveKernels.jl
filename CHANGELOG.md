@@ -16,6 +16,20 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.206
+
+- A summed plate whose rows are per-cell arrays runs once per distinct row
+  too. 0.1.184 grouped rows whose bound operands are primitive numbers; a
+  bound operand that holds one dense array of them per cell, such as one
+  capture history per individual, now compares its rows by value as well. A
+  capture-recapture likelihood over 237 histories of 3 occasions, 8 of them
+  distinct, runs 8 cells (PosteriorDB Mt: ordinary Reverse gradient 10.3 to
+  0.7 µs). Rows also compare only by the operands the cell reads: a lane index
+  whose bound gather preparation already cached still sets the domain but no
+  longer makes every row distinct (PosteriorDB Mb, 31 distinct of 318
+  histories: 16 to 1.7 µs). Values agree with the row-by-row sum to rounding,
+  as before.
+
 ## 0.1.205
 
 - `@traceable` takes a trailing Vararg argument: `args...`, `args::T...`,
