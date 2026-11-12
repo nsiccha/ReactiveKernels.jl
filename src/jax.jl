@@ -2850,6 +2850,11 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(/), args::Vector{_PyVal})
 end
 
 function _jax_function_call(ctx::_JaxContext, ::typeof(sum), args::Vector{_PyVal})
+    # Fixed structural lag windows reduce a numeric tuple. JAX reductions
+    # require an array; tuples of arrays have different Julia sum semantics.
+    if length(args) == 1 && _jax_numeric_tuple(args[1].T)
+        return _jax_result(sum, args, "jnp.sum(jnp.asarray(" * args[1].code * "))")
+    end
     if length(args) == 1 && !isempty(args[1].extent) && _jax_rank(args[1].T) == 1
         x = args[1]
         return _PyVal("jnp.sum(jnp.where(" * _jax_mask(x) * ", " * x.code * ", 0.0))", eltype(x.T))
@@ -3566,6 +3571,18 @@ function _jax_call_positional(ctx::_JaxContext, J::LinearAlgebra.UniformScaling,
     _PyVal(code, typeof(J(1)), false, extent, "", isempty(extent) ? 0 : 3)
 end
 
+# Fixed arguments are captured runtime values, just as in anonymous closures.
+function _jax_call_positional(ctx::_JaxContext, T::Union{Type{Base.Fix1},Type{Base.Fix2}},
+                              args::Vector{_PyVal})
+    length(args) == 2 || return _jax_error("constructing `", T, "` requires two arguments",
+                                         _jax_where(ctx))
+    # Source passes singleton functions by their type; lowered calls carry a
+    # callable. Normalize that field before Base's Fix1/Fix2 body reads it.
+    captures = [_PyVal("<callable>", _JaxCallable(_jax_function_of(args[1]))), args[2]]
+    F = T{_jax_argument_type(args[1]),_jax_argument_type(args[2])}
+    _PyVal("<closure>", _JaxCallable(_JaxClosure(F, captures)), false)
+end
+
 # A Julia type called as a function: a conversion.
 function _jax_call_positional(ctx::_JaxContext, T::Type, args::Vector{_PyVal})
     isempty(args) && Base.issingletontype(T) && return _PyVal("None", T)
@@ -4253,6 +4270,8 @@ function _jax_module_global(ctx::_JaxContext, m::Module, name::Symbol, read)
 end
 function _jax_call_positional(ctx::_JaxContext, ::typeof(getproperty), args::Vector{_PyVal})
     x, field = args
+    x.T isa _JaxCallable && x.T.f isa _JaxClosure &&
+        return _jax_function_call(ctx, getproperty, args)
     name = _jax_static_symbol(ctx, field)
     # `StanBlocks.jcall` in lowered code is `getproperty(StanBlocks, :jcall)`.
     x.T isa _JaxCallable{Module} && return _jax_module_global(ctx, x.T.f, name, getproperty)
