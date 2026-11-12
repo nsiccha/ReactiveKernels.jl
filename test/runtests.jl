@@ -150,6 +150,7 @@ const _MATRIX_CORE_TESTS = (
     "test_precompiled_prepared.jl",
     "test_precompiled_source_companions.jl",
     "test_precompiled_construction.jl",
+    "test_precompiled_guarded_plan.jl",
     "test_position_batching.jl",
     "test_position_record_reverse.jl",
     "test_position_batching_reuse.jl",

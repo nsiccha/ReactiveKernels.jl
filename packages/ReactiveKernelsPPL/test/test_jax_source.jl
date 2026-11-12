@@ -142,6 +142,10 @@ const _JAX_LENGTHS = [9, 4, 13, 6]
 const _JAX_R = [abs.(randn(_JAX_RNG, n)) for n in _JAX_LENGTHS]
 const _JAX_YR = [0.1 .+ 0.05 .* jax_ppl_recurrence(R, 0.7, 0.3) .+ 0.01 .* randn(_JAX_RNG, length(R))
                  for R in _JAX_R]
+# Per-row counts of reads with two interleaved values each (`2n` entries of
+# the row), and the observed values; no random draws, so the data below stay.
+const _JAX_COUNTS = [4, 2, 0, 3]
+const _JAX_YC = [0.5 .* R[1:2n] .+ 0.05 for (R, n) in zip(_JAX_R, _JAX_COUNTS)]
 const _JAX_TRIALS = rand(_JAX_RNG, 10:20, _JAX_N)
 const _JAX_SUCCESSES = [rand(_JAX_RNG, 0:n) for n in _JAX_TRIALS]
 const _JAX_HURDLE = [rand(_JAX_RNG) < 0.3 ? 0 : rand(_JAX_RNG, 1:5) for _ in 1:_JAX_N]
@@ -322,6 +326,17 @@ const _JAX_CASES = (
             y[i] .~ Normal.(a .* x[i], s)
         end
     end))(; x = _JAX_R) | (; y = _JAX_YR),
+    # A cell's slice to a multiple of a prepared count (`1:2 * n[i]`, two
+    # interleaved values per counted read): bounded by that multiple of the
+    # largest count (snag jax-source-range-9f5848e9).
+    scaled_count_slice = () -> (@rkppl(begin
+        a ~ Normal(0, 1); s ~ Exponential(1.0)
+        @plate for i in eachindex(y)
+            v = a .* z[i]
+            conc = v[1:2 * n[i]]
+            y[i] .~ Normal.(conc, s)
+        end
+    end))(; z = _JAX_R, n = _JAX_COUNTS) | (; y = _JAX_YC),
     # Per-group recurrences over series of different lengths: an observed
     # AR(1), a deterministic recurrence of a ragged input, and a random walk
     # with one innovation per step (a one-entry group included).

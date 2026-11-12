@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.211
+## 0.1.215
 
 - `jax_source` translates broadcasts of padded (ragged) rows padded by
   different lengths along the same axes, such as two per-row arguments of one
@@ -32,6 +32,64 @@ are recorded in the git history only.
   against an unpadded array: a check would be a host callback in every
   evaluation. Rows padding different axes by different lengths (`x .* s'`)
   are still refused.
+
+## 0.1.214
+
+- `jax_source` bounds a range whose end is a prepared-data entry times a
+  static integer, plus a static integer: `pk[1:2 * n[i]]` of two interleaved
+  values per counted read, `1:(n[r] * 2 + 1)`, `(length(x) - 2 * n[r] + 1):length(x)`
+  and `1:K * n[r]` of a prepared integer `K`. Its static number of steps is
+  the same function of the array's largest entry (its least for a negative
+  multiple, either where the multiple's sign is known only while tracing),
+  and ends of one record with one positive multiple (`(2a - 1):(2b)`) take
+  that multiple of the longest record's range. Before, a multiple lost the
+  bound that `n[i] + c` keeps: an `@rkppl` cell's `v[1:2 * n[i]]` raised `a
+  range whose length depends on data has no JAX translation`, and a
+  `@kernel`'s `x[1:2 * n[r]]` emitted a slice JAX rejects when it traces.
+  A padded row's length times a nonnegative integer literal
+  (`1:2 * length(r)`) likewise keeps its static limit, scaled.
+
+## 0.1.213
+
+- Calling a `KernelSpec` on positional values, `spec(args...)`, prepares its
+  default boundary once per graph version and keeps that kernel in the graph,
+  as plain `prepare(spec; bound)` keeps its bound preparations. Later calls
+  look it up, about 2 µs on top of the kernel's own call. Before, every call
+  planned and lowered the kernel again: 1.0 ms per call of a five-input
+  kernel whose held `prepare(spec)` took 0.36 µs. A change to the graph (such
+  as `input_check!`) or another preparation setting (such as `simplify`)
+  prepares afresh. A hot loop that holds `prepare(spec)` still skips the
+  lookup.
+
+## 0.1.212
+
+- A partition plan whose row bookkeeping sits behind a condition on the
+  label (cached by the plan since 0.1.170) is typed and computed while a
+  package image is generated, as in a PrecompileTools workload. The plan
+  body cached that bookkeeping in a comprehension, which
+  `RuntimeGeneratedFunctions` compiles to an opaque closure, and Julia
+  refuses to expand one while it generates an image: `prepare` of such a
+  partition with an untyped plan port (ReactiveKernelsPPL's
+  `prepare_partition`, BayesianRegressionModels' `brm_nlme_model` with a
+  grouping) failed with `partition plan: the plan port … is untyped and
+  evaluating its plan on the exemplars failed: Impossible to correctly
+  handle OpaqueClosure inside @generated returned during precompile
+  process.`, and a plan kernel called there failed the same way. `compile`
+  now runs a comprehension or generator of a compiled body as a function of
+  its own over the body's locals that its element reads, where the element
+  assigns none of them; plans, their types (also for a label without rows)
+  and values are unchanged.
+
+## 0.1.211
+
+- `jax_source` again translates a padded plate over a scan's tuple step
+  outputs, such as an `@rkppl` `@plate` cell holding a stochastic `@scan`
+  whose step count varies by cell. Since 0.1.199 (batched runtime checks) the
+  plate's valid-cell mask read the step count and shape of the Python tuple of
+  columns instead of its first column, so tracing the module raised
+  `AttributeError: 'tuple' object has no attribute 'shape'`. The mask now
+  spans the plate's mapped axes of the first column, as the empty-plate test
+  already did.
 
 ## 0.1.210
 

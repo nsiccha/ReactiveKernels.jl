@@ -16,6 +16,19 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.168
+
+- A categorical response binds outcomes that hold only some of its classes
+  when the model states the class count K. `CategoricalLogit.(eta2, eta3)`
+  states it with its locations plus the reference, and `Categorical(s)` with
+  `s ~ Dirichlet(3, 1.0)` with the concentration's length. Replaying a fit on
+  a design whose rows all name one class, which reads that class's pointwise
+  probabilities, therefore binds instead of raising "leveled response must
+  cover every level 1..K exactly". A `Categorical` simplex now takes K from its
+  concentration rather than from the largest observed code. Codes outside
+  `1..K` and non-integer codes are still refused. A level count read from the
+  observations, with no stated support, still requires every code `1..K`.
+
 ## 0.1.167
 
 - `prepare_sampler(...; nonallocating = :auto)` keeps buffer reuse when
