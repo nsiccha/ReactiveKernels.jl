@@ -33,6 +33,10 @@ are recorded in the git history only.
   length, so `reduce(hcat, ·)` of the field raised "the columns differ in
   length" although every column filled the width (snag
   jax-tuple-valued-1ead4c4c).
+- A plate over a tuple-valued plate's values reads whether it has no cells
+  from their first field. It read the values' `shape`, which their Python
+  tuple does not have, so such a plate raised `AttributeError` whenever it
+  mapped them first.
 
 ## 0.1.179
 
