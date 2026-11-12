@@ -16,6 +16,23 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.187
+
+- The opt-in generated plate reverse (`with_plate_reverse`) keeps the
+  backend's reverse for a plate program whose batched operand is a lazy cell
+  array, such as `mu = z .+ w .* x` read by `y .~ Normal.(mu, sigma)`.
+  Enzyme passes a lazy broadcast of arrays only as `Duplicated`, with a
+  shadow of the same lazy structure, and the generated reverse could not add a
+  cell's cotangent into it: preparing such a sampler with the rule on failed
+  with `CanonicalIndexError: setindex! not defined for
+  ReactiveKernels._CellBroadcast` (PosteriorDB UKDrivers). The program now
+  falls back when the sampler is prepared, and `plate_reverse_report` names
+  the reason, "batched operand `mu` is a lazy cell array, whose shadow the
+  generated reverse does not write". The Enzyme adapter also never treats a
+  lazy cell array as a covered batched operand. Gradients are unchanged
+  wherever preparation succeeded before; the default preparation is
+  unchanged.
+
 ## 0.1.186
 
 - `jax_source` retains prepared integer bounds through ragged rows and scan
