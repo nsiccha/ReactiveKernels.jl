@@ -16,6 +16,20 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.216
+
+- `jax_source`: a `Bool` array index (`BitVector`, `Vector{Bool}`) selects
+  the entries where it is true, as Julia's logical indexing does. Before, it
+  was shifted as one-based positions (`x[mask - 1]`), so every element read
+  the first or the last entry: `table[table[:, 2] .!= 1, 4]` in
+  `prepare_data` returned the wrong amounts and length, silently whenever the
+  shapes still agreed. The host uses NumPy boolean masks (lists keep their
+  selected entries); device code gathers at the selected positions, padded to
+  the mask's length with the count as its extent, and a masked write writes
+  only the selected entries. A same-shape mask (`A[A .> 0]`) selects in
+  column-major order. A single `Bool` index into an array raises
+  `JAXEmissionError`, as Julia refuses it.
+
 ## 0.1.215
 
 - `jax_source` translates broadcasts of padded (ragged) rows padded by
