@@ -1279,6 +1279,7 @@ function _nonallocating_program(p::Plan; have_types = nothing,
                                         declare = false, recycle,
                                         pushdowns = true, outline = false,
                                         plate_element_types = true,
+                                        plate_programs = true,
                                         inline_sources = false)
     isempty(passes) || (ast = transform(ast, passes...))
     names = _varnames(lowered)
@@ -1317,7 +1318,8 @@ function _nonallocating_program(p::Plan; have_types = nothing,
     end
     prepend!(body.args, lanes)
     ports = ast.args[1].args[3:2 + length(lowered.have)]
-    (Expr(:function, Expr(:tuple, _CONSTANTS_ARG, _CALLABLES_ARG, _CACHES_ARG,
-                          _CACHE_APPLY_ARG, ports...), body),
+    (_extract_plate_programs(Expr(:function,
+        Expr(:tuple, _CONSTANTS_ARG, _CALLABLES_ARG, _CACHES_ARG,
+             _CACHE_APPLY_ARG, ports...), body)),
      constants, Tuple(prog.ops), Tuple(prog.caches))
 end
