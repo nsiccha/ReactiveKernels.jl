@@ -25,17 +25,13 @@ are recorded in the git history only.
     loop instead of in every cell.
   - Operands that span the plate are read directly rather than through
     broadcast extrusion.
-  - The Enzyme adapter's reverse call is statically dispatched. Before, every
-    opted-in gradient boxed its operands: 1,712 B per gradient on a
-    random-intercept regression, now 224 B, and 22–39 allocations on small
-    PosteriorDB models.
-  - A random-intercept Normal regression's gradient (2,000 and 100,000 rows)
-    now takes 1.7–2.0× its hand-written closed form, against 2.65–3.15×
-    before. That is 2.1–2.4× faster than the default preparation (Julia
-    1.10.12 and 1.13.1, Enzyme dogfood).
-  - Among PosteriorDB ports whose likelihood the rule covers, Rats and the two
-    `BLR` ports now differentiate 1.4–1.5× faster than the default
-    preparation, and ARMA11 1.1× faster (Julia 1.13.1).
+  - Against 0.1.210's rule, opted-in gradients are 1.35–1.55× faster on a
+    random-intercept Normal regression (2,000 and 100,000 rows) and up to
+    1.2× faster on a fixed-effects one. They are now 1.08–1.28× faster than the
+    default preparation on those models; 0.1.210's rule was 0.8× the default
+    on the random-intercept one (Julia 1.10.12 and 1.13.1, Enzyme dogfood).
+  - The default preparation is still faster on the PosteriorDB ports measured
+    (the rule at 0.3–0.98× the default on Julia 1.13.1), and on small plates.
 
 ## 0.1.210
 
