@@ -4,7 +4,7 @@ Use `jax_source` to emit a Python module for a supported graph boundary. Julia p
 
 ## Emitted function
 
-This build executes the emitter and prints its complete result. The documentation environment does not include Python JAX, so this page does not claim to execute the emitted Python.
+This build executes the emitter and prints its complete result. The documentation environment has no Python JAX, so the emitted Python is not executed here.
 
 ```@example jax
 using ReactiveKernels
@@ -37,13 +37,11 @@ prepared = prepare(quadratic)
 prepared(3.0, 2.0)
 ```
 
-A PPL model can emit its sampler boundary through `jax_source(built, bound)`. The generated module includes data preparation and coordinate metadata. A top-level plate's cell recipe that reads only the plate's data and that the JAX functions cannot compute runs in `prepare_data` as a loop over the cells, and the plate reads its values as inputs of its own, one per cell. A data-only definition that calls a program-level `@kernel` with positional arguments, as Julia runs it (`prepare(spec)(args...)`), is computed in `prepare_data` by a host function of that kernel's plan. Inspect its untranslated-data declarations before treating it as a standalone raw-data pipeline; a definition without a host translation remains a required prepared input. A cell's vector argument arrives padded to the longest row, and an array it is broadcast into is padded along the same axes: reductions, also over `dims`, and `vec` read only the row's entries. A response whose element type admits `missing` is passed to `prepare_data` as the caller has it, with `None` for a missing entry; the module computes its presence mask, so one module serves every absence pattern.
-
-`reduce(hcat, columns)` of a vector of numeric vectors, such as a plate's cells, is Julia's matrix with column `k` equal to `columns[k]`; a vector of matrices gives each matrix's columns in turn. The emitted module transposes the stored cells, so its work and memory are linear in the matrix, and `jax.grad` differentiates through it. Its columns must have one length: a ragged value whose rows do not all fill its padded width, the longest length, raises when the module runs, as Julia raises `DimensionMismatch` for columns of different lengths. `stack` applies the same check. Host `prepare_data` uses NumPy's `column_stack`. `reduce(hcat, ·)` and `reduce(vcat, ·)` translate the same way whether a kernel's recipe or a plain helper calls them.
+A PPL model can emit its sampler boundary through `jax_source(built, bound)`. The generated module includes data preparation and coordinate metadata. A top-level plate's cell recipe that reads only the plate's data and that the JAX functions cannot compute runs in `prepare_data` as a loop over the cells, and the plate reads its values as inputs of its own, one per cell. A data-only definition that calls a program-level `@kernel` with positional arguments, as Julia runs it (`prepare(spec)(args...)`), is computed in `prepare_data` by a host function of that kernel's plan. Inspect its untranslated-data declarations before treating it as a standalone raw-data pipeline; a definition without a host translation remains a required prepared input. A cell's vector argument arrives padded to the longest row, and an array it is broadcast into is padded along the same axes: reductions, also over `dims`, and `vec` read only the row's entries. `reduce(hcat, cells)` of vectors or matrices keeps Julia's columns; like `stack`, it raises at run time unless every column fills the padded width (Julia's `DimensionMismatch`). A response whose element type admits `missing` is passed to `prepare_data` as the caller has it, with `None` for a missing entry; the module computes its presence mask, so one module serves every absence pattern.
 
 A dotted cell latent, `v[i] .~ D.(args…)` with a length per index that data decide, has its dimensions, packed offsets, block table and argument entries computed in `prepare_data` when its arguments read data, scalar parameters or a shared array; an argument that reads a sampled array at the index, or an array of rank 2 or more at each index, raises `JAXEmissionError` for now.
 
-Only supported operations can be emitted. Translation errors identify an unsupported operation instead of substituting a different computation. JAX compilation, device placement and differentiation belong to the Python consumer.
+Translation errors identify an unsupported operation instead of substituting a different computation. JAX compilation, device placement and differentiation belong to the Python consumer.
 
 Unless `simplify = false`, each emitted recipe computes numerically fragile compositions in the stable form native preparation computes, together with the statements that compute its inputs, also from a lazy arm or a plate's cell: `log(exp(u))` is emitted as `u`, and `log1p(-p)` of `p = logistic(u)` reads `u`, so the value and `jax.grad` stay finite where `exp(u)` overflows. A law's term on a value computed outside the law (`Normal(0, s)`'s `log(s)` of `s = exp(a)`) is still translated as written: the law's endpoint is translated from its compiled lowered code, which the rewrites do not read yet.
 
@@ -95,7 +93,7 @@ The body follows the rules of an `@traceable` body: a `return` only at its end, 
 
 A package extension can map its own callable during source emission. Julia execution is unchanged; ordinary `jax.grad` differentiates the emitted primal without a registered derivative rule.
 
-Use `ReactiveKernels._jax_elementwise(::typeof(f))` for scalar calls and `f.(xs)`. Return a Python callable name, `name => source` defining a module-level helper, or `nothing` for fallback translation. This does **not** register ordinary array calls: Julia's `exp(A)` is a matrix exponential; `exp.(A)` applies scalar exponentials. Treating them alike changes the computation.
+Use `ReactiveKernels._jax_elementwise(::typeof(f))` for scalar calls and `f.(xs)`. Return a Python callable name, `name => source` defining a module-level helper, or `nothing` for fallback translation. This does **not** register ordinary array calls: Julia's `exp(A)` is a matrix exponential; `exp.(A)` applies scalar exponentials.
 
 For a positional whole-function call, including an array-valued helper, define
 `_jax_function_call(ctx::_JaxContext, ::typeof(my_function), args::Vector{_PyVal})`.
@@ -103,7 +101,7 @@ Qualify RK names with `ReactiveKernels`, as in the executable example below.
 
 These underscored names form the package extension interface. The context and vector annotations make the method more specific than RK's generic method. Selection precedes recorded/provider source and lowered-code translation, but follows applicable scalar/elementwise mappings. This hook registers positional calls, not keyword handling.
 
-Each `args[i]` describes an argument: `code` is its Python expression, `T` its Julia type. It contains no actual Julia or Python value. Parenthesize expressions when composing operators. Return a `_PyVal`, not a string or `nothing`; call `_jax_traceable_or_lowered(ctx, f, args)` for the generic hook's source fallback.
+Each `args[i]` describes an argument: `code` is its Python expression, `T` its Julia type. Parenthesize expressions when composing operators. Return a `_PyVal`, not a string or `nothing`; call `_jax_traceable_or_lowered(ctx, f, args)` for the generic hook's source fallback.
 
 `_jax_result(f, args, expression)` infers the native result type from `f` and the argument types, preserving matrix rank for subsequent multiplication. The expression must implement that native result and shape. Shapes and numerical inputs remain runtime expressions, not sampled data. For elementwise whole-array calls preserving the arrays' axes, `_jax_elementwise_result(f, args, expression)` additionally carries padded-axis metadata.
 
@@ -145,7 +143,7 @@ host_source = jax_source(ex.exponential; have=(:scale, :A), want=:total, data=(:
 print(host_source)
 ```
 
-After `write("matrix_model.py", host_source)`, run `python examples/jax_translations.py matrix_model.py` with a Python that has JAX and SciPy. This consumer checks the result and gradient against SciPy and checks that preparation returns NumPy arrays:
+After `write("matrix_model.py", host_source)`, run `python examples/jax_translations.py matrix_model.py` with a Python that has JAX and SciPy. This consumer checks the result and gradient against SciPy and that preparation returns NumPy arrays:
 
 ```@example jax
 python_file = joinpath(pkgdir(ReactiveKernels), "examples", "jax_translations.py") # hide
