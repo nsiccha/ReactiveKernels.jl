@@ -1839,12 +1839,49 @@ function _jax_call(ctx::_JaxContext, ::typeof(stack), args::Vector{_PyVal}, kw)
     ctx.host === nothing ||
         return _PyVal("np.stack(" * x.code * ", axis=" * (dims == "1" ? "0" : "1") * ")",
                       Matrix{eltype(eltype(T))}, x.static)
-    if !isempty(x.extent)
-        lengths = x.extent
-        _jax_call(ctx, _runtime_check, [_PyVal("jnp.all(" * lengths * " == " * lengths * "[0])", Bool),
-                                       _PyVal(repr("stack: the vectors differ in length"), ArgumentError)])
-    end
+    x = _jax_uniform_rows(ctx, x, "stack: the vectors differ in length")
     _PyVal(dims == "1" ? x.code : "jnp.transpose(" * x.code * ")", Matrix{eltype(eltype(T))})
+end
+# A vector of arrays of one size, stored one array per row along the leading
+# axis, as `stack` and `reduce(hcat, ·)` read it. A ragged one is checked when
+# JAX runs it: every row must fill the padded width, which is the longest
+# row's length. Rows of different lengths are Julia's `DimensionMismatch`;
+# rows of one length shorter than that width would leave padding in the
+# result, whose shape JAX fixes while tracing.
+function _jax_uniform_rows(ctx::_JaxContext, x::_PyVal, message::AbstractString)
+    isempty(x.extent) && return x
+    rows = _jax_bind!(ctx, :rows, x)
+    _jax_call(ctx, _runtime_check,
+              [_PyVal("jnp.all(" * _py_atom(rows.extent) * " == " * rows.code * ".shape[1])", Bool),
+               _PyVal(repr(message * " (each must fill the padded width, the longest length)"),
+                      DimensionMismatch)])
+    rows
+end
+# `reduce(hcat, columns)`: the columns side by side, as Julia's
+# `reduce(hcat, ::AbstractVector{<:AbstractVecOrMat})` builds them; a vector of
+# matrices gives each matrix's columns in turn. Under JAX a vector of vectors
+# is stored one vector per row, so the matrix is its transpose, and a vector
+# of `r×c` matrices, stored `(n, r, c)`, is `(r, n*c)`. On the host, NumPy's
+# `column_stack` does the same for a list of arrays or a stored array.
+function _jax_reduce_hcat(ctx::_JaxContext, x::_PyVal)
+    T = x.T
+    C = T isa Type && T <: AbstractVector ? eltype(T) : nothing
+    C isa Type && (C <: AbstractVector || C <: AbstractMatrix) && eltype(C) <: Number ||
+        _jax_error("`reduce(hcat, x)` of a `", T, "` (a vector of numeric vectors or ",
+                   "matrices translates; of numbers, `permutedims(x)` is the row)", _jax_where(ctx))
+    E = eltype(C)
+    ctx.host === nothing ||
+        return _PyVal("np.column_stack([np.asarray(c) for c in " * x.code * "])", Matrix{E}, true)
+    v = _jax_bind!(ctx, :columns,
+                   _jax_uniform_rows(ctx, x, "reduce(hcat, columns): the columns differ in length"))
+    # No columns is Julia's error too (`reduce` over an empty collection); the
+    # count is a shape, so the check raises while JAX traces.
+    _jax_call(ctx, _runtime_check, [_PyVal(_py_atom(v.code) * ".shape[0] > 0", Bool, true),
+        _PyVal(repr("reduce(hcat, columns): reducing over an empty collection is not allowed"),
+               ArgumentError)])
+    C <: AbstractVector && return _PyVal("jnp.transpose(" * v.code * ")", Matrix{E})
+    _PyVal("jnp.reshape(jnp.transpose(" * v.code * ", (1, 0, 2)), (" * v.code * ".shape[1], " *
+           v.code * ".shape[0] * " * v.code * ".shape[2]))", Matrix{E})
 end
 
 _jax_call_positional(ctx::_JaxContext, f, args::Vector{_PyVal}) =
@@ -2780,8 +2817,11 @@ end
 # whose lengths its own are (a static shape). A runtime check confirms they
 # add up.
 function _jax_call_positional(ctx::_JaxContext, ::typeof(reduce), args::Vector{_PyVal})
-    length(args) == 2 && args[1].T isa Type && args[1].T === typeof(vcat) ||
-        return _jax_function_call(ctx, reduce, args)
+    # The reducer is a value: its type at the program level, a callable
+    # (`_JaxCallable`) inside a helper's lowered body.
+    op = length(args) == 2 ? _jax_argument_type(args[1]) : nothing
+    op === typeof(hcat) && return _jax_reduce_hcat(ctx, args[2])
+    op === typeof(vcat) || return _jax_function_call(ctx, reduce, args)
     x = args[2]
     T = x.T
     T isa Type && T <: AbstractVector && eltype(T) isa Type && eltype(T) <: AbstractVector ||
