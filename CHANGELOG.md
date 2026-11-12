@@ -16,6 +16,18 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.213
+
+- Calling a `KernelSpec` on positional values, `spec(args...)`, prepares its
+  default boundary once per graph version and keeps that kernel in the graph,
+  as plain `prepare(spec; bound)` keeps its bound preparations. Later calls
+  look it up, about 2 µs on top of the kernel's own call. Before, every call
+  planned and lowered the kernel again: 1.0 ms per call of a five-input
+  kernel whose held `prepare(spec)` took 0.36 µs. A change to the graph (such
+  as `input_check!`) or another preparation setting (such as `simplify`)
+  prepares afresh. A hot loop that holds `prepare(spec)` still skips the
+  lookup.
+
 ## 0.1.212
 
 - A partition plan whose row bookkeeping sits behind a condition on the
