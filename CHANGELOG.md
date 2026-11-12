@@ -23,12 +23,13 @@ are recorded in the git history only.
   bound operand that holds one dense array of them per cell, such as one
   capture history per individual, now compares its rows by value as well. A
   capture-recapture likelihood over 237 histories of 3 occasions, 8 of them
-  distinct, runs 8 cells (PosteriorDB Mt: ordinary Reverse gradient 10.3 to
-  0.7 µs). Rows also compare only by the operands the cell reads: a lane index
-  whose bound gather preparation already cached still sets the domain but no
-  longer makes every row distinct (PosteriorDB Mb, 31 distinct of 318
-  histories: 16 to 1.7 µs). Values agree with the row-by-row sum to rounding,
-  as before.
+  distinct, runs 8 cells (PosteriorDB Mt: ordinary Reverse gradient 6.8 to
+  1.1 µs). Rows also compare only by the bound vectors the cell reads: a lane
+  index whose bound gather preparation already cached still sets the domain
+  but no longer makes every row distinct (PosteriorDB Mb, 31 distinct of 318
+  histories: 16 to 1.9 µs). A gather still tells rows apart whether or not
+  the cell uses its value, so every index is read as before. Values agree with
+  the row-by-row sum to rounding, as before.
 
 ## 0.1.205
 
