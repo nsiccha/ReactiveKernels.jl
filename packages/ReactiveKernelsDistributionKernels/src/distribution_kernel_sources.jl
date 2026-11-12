@@ -1327,6 +1327,8 @@ include("positive_families.jl")
 # parameter matrices are component laws; rows are positions within the one
 # event. Each matrix may independently have one row, shared by every position,
 # or one row per observation. Component columns never broadcast.
+# Row selection chooses between valid integer values before indexing; it needs
+# no lazy branch or branch cache in a position cell.
 # The two nested plates retain both data-derived loops, while the
 # shared mixture fold keeps any family-specific cell density in one place.
 # Each law checks its parameter matrix's component count against the weights
@@ -1367,7 +1369,7 @@ end
     nrows = size(checked_probabilities, 1)
     components = plate(1:length(weights)) do k
         cells = plate(1:length(observed)) do i
-            row = nrows == 1 ? 1 : i
+            row = ifelse(nrows == 1, 1, i)
             bernoulli(checked_probabilities[row, k]).logpdf(observed[i])
         end
         sum(cells)
@@ -1389,8 +1391,8 @@ end
     prows = size(checked_probabilities, 1)
     components = plate(1:size(trials, 2)) do k
         cells = plate(1:length(observed)) do i
-            ni = nrows == 1 ? 1 : i
-            pi = prows == 1 ? 1 : i
+            ni = ifelse(nrows == 1, 1, i)
+            pi = ifelse(prows == 1, 1, i)
             binomial(trials[ni, k], checked_probabilities[pi, k]).logpdf(observed[i])
         end
         sum(cells)
@@ -1414,7 +1416,7 @@ end
     nrows = size(checked_logits, 1)
     components = plate(1:length(weights)) do k
         cells = plate(1:length(observed)) do i
-            row = nrows == 1 ? 1 : i
+            row = ifelse(nrows == 1, 1, i)
             bernoulli(; logit = checked_logits[row, k]).logpdf(observed[i])
         end
         sum(cells)
@@ -1436,8 +1438,8 @@ end
     lrows = size(checked_logits, 1)
     components = plate(1:size(trials, 2)) do k
         cells = plate(1:length(observed)) do i
-            ni = nrows == 1 ? 1 : i
-            li = lrows == 1 ? 1 : i
+            ni = ifelse(nrows == 1, 1, i)
+            li = ifelse(lrows == 1, 1, i)
             binomial(; n = trials[ni, k],
                 logit = checked_logits[li, k]).logpdf(observed[i])
         end
@@ -1470,9 +1472,9 @@ end
     zrows = size(checked_zi_logits, 1)
     components = plate(1:size(trials, 2)) do k
         cells = plate(1:length(observed)) do i
-            ni = nrows == 1 ? 1 : i
-            li = lrows == 1 ? 1 : i
-            zi = zrows == 1 ? 1 : i
+            ni = ifelse(nrows == 1, 1, i)
+            li = ifelse(lrows == 1, 1, i)
+            zi = ifelse(zrows == 1, 1, i)
             zero_inflated_binomial_logit_zi(; n = trials[ni, k],
                 logit = checked_logits[li, k],
                 zi_logit = checked_zi_logits[zi, k]).logpdf(observed[i])
