@@ -747,6 +747,11 @@ end
 _ls_enabled() = _bound_statistics() && _simplify() && !_plate_reverse_enabled() &&
     !_footprint_recording()
 
+function _ls_vector_value(v::Value)
+    T = typeintersect(valtype(v), AbstractVector)
+    T === Union{} ? v : Value{T}(v.id, v.name)
+end
+
 # The positions `(a, b)` of a plate's arguments whose squared difference its
 # factored loop sums, `(read(a) - read(b))^2`, or `nothing`. The plate and its
 # total are lowered alone, over their arguments, and read as the lowering pass
@@ -755,8 +760,15 @@ _ls_enabled() = _bound_statistics() && _simplify() && !_plate_reverse_enabled() 
 # composed source with a guard the plate lowering takes outside its loop).
 function _ls_squared_ports(p::Plan, r::Recipe, total::Recipe)
     g = p.graph
-    have = unique(v -> canon_id(g, v.id), collect(Value, r.inputs))
-    alone = _partial_subplan(p, have, Value[only(total.outputs)], Recipe[r, total])
+    # The batched arguments as the vectors a usable binding has (a bound
+    # response narrowed to its class, `_partial_narrow_plate_inputs`; the
+    # location an `_LSLocation`): an argument of unknown type would take the
+    # plate's generic loop, which the summed plate factors do not read.
+    atomic = typeof(r.op).parameters[2]
+    inputs = Value[k in atomic ? v : _ls_vector_value(v) for (k, v) in enumerate(r.inputs)]
+    plate = Recipe(r.id, Tuple(inputs), r.outputs, r.op, r.cost, r.cse_key, r.effectful, r.source)
+    have = unique(v -> canon_id(g, v.id), inputs)
+    alone = _partial_subplan(p, have, Value[only(total.outputs)], Recipe[plate, total])
     ast = first(_lower_with_ops(alone))
     signature = ast.args[1]
     params = Any[a isa Expr && a.head === :(::) ? a.args[1] : a for a in signature.args[3:end]]
@@ -765,7 +777,7 @@ function _ls_squared_ports(p::Plan, r::Recipe, total::Recipe)
     for (k, name) in enumerate(params)
         name isa Symbol || return nothing
         h = canon_id(g, have[k].id)
-        position[name] = findfirst(v -> canon_id(g, v.id) == h, r.inputs)
+        position[name] = findfirst(v -> canon_id(g, v.id) == h, inputs)
     end
     roots = _ls_roots(ast)
     root(x) = get(roots, x, x)

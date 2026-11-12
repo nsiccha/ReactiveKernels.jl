@@ -166,6 +166,15 @@ end
     total::Float64 = sum(lp)
     return total
 end
+# Ports without declared types.
+@kernel ls_untyped(X, y, beta, sigma) = begin
+    mu = X * beta
+    lp = plate(y, mu) do yi, mi
+        normal(mi, sigma).logpdf(yi)
+    end
+    total = sum(lp)
+    return total
+end
 # Not a squared residual: the plate keeps its location.
 @kernel ls_student(X::Matrix{Float64}, y::Vector{Float64}, beta::Vector{Float64},
                    sigma::Float64) = begin
@@ -229,6 +238,14 @@ dense_data(n, k; shift = 0.0) = (X = [ones(n) randn(RNG, n, k - 1) .+ 2],
             @test isequal(v, vl) || isapprox(v, vl; rtol = 1e-12)
         end
     end
+end
+
+@testset "ports without declared types" begin
+    (; X, y) = dense_data(60, 2)
+    k = prepare(ls_untyped; bound = (; X, y))
+    literal = prepare(ls_untyped; bound = (; X, y), bound_statistics = false)
+    @test _collapsed(k)
+    @test k([0.1, 0.2], 0.8) ≈ literal([0.1, 0.2], 0.8) rtol = 1e-12
 end
 
 @testset "a live vector computed for the location alone" begin
