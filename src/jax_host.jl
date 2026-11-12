@@ -1558,6 +1558,21 @@ function _jax_cell_refused(mod::_JaxModule, op::_JaxCellPrefix, e::JAXEmissionEr
     isempty(targets) ? copy(op.targets) : targets
 end
 
+# Remember data-only cell recipes even when their device translation works:
+# a later loop may need their integer result as a prepared static bound.
+function _jax_cell_data!(mod::_JaxModule, split, rp::Plan)
+    prepared = Set{ValueId}(canon_id(rp.graph, v.id) for v in split.constants)
+    for plate in rp.recipes
+        plate.op isa _AuthoredPlateOp || continue
+        cell = plate.op.kernel.plan
+        length(cell.have) == length(plate.inputs) || continue
+        bound = Set{ValueId}(canon_id(cell.graph, cell.have[i].id) for i in eachindex(plate.inputs)
+                             if canon_id(rp.graph, plate.inputs[i].id) in prepared)
+        pre, _, _ = _partial_split(cell, bound)
+        union!(mod.cell_data, ((plate.id, r.id) for r in pre))
+    end
+end
+
 # The error `e` of a module function `rp` (the residual plan of `split`)
 # raised by a data-only recipe of a top-level plate's cell: a
 # `_CellHostNeeded` for it, or, when `prepare_data` has no host translation

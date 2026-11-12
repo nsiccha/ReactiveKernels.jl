@@ -6790,12 +6790,18 @@ function _replicated_parts(p::Plan, analysis)
        residual = _partial_subplan(p, vcat(mapped_have, constants), p.want, residual))
 end
 
-# Lower one part as `prepare` lowers a scalar kernel. Every output is declared,
-# as the position driver always did.
-_replicated_part_ast(part::Plan; recycle = Pair{ValueId,Symbol}[],
-                     cell_slots = nothing, cell_tables = nothing) =
-    _lower_with_ops(_lowering_plan(part); declare = true, recycle, cell_slots,
-                    cell_tables)
+# Lower one part as `prepare` lowers a scalar kernel, stable rewrites included
+# (`stable_rewrites.jl`). Every output is declared, as the position driver
+# always did. The pass reads one part at a time: a residual statement reads a
+# prefix value as the input it is, so a composition across the two parts
+# (`log(s)` per position of a shared `s = exp(a)`) is computed as written.
+function _replicated_part_ast(part::Plan; recycle = Pair{ValueId,Symbol}[],
+                              cell_slots = nothing, cell_tables = nothing)
+    ast, constants, callables, recipes = _lower_with_ops(_lowering_plan(part);
+        declare = true, recycle, cell_slots, cell_tables)
+    _simplify() && (ast = _stable_rewrites(ast, recipes))
+    ast, constants, callables, recipes
+end
 
 # A bound constant keeps its exact value type (a bound view stays a view).
 function _replicated_declares(p::Plan, value::Value)
@@ -7084,15 +7090,15 @@ function lower_batched(p::Plan; batched, reduce = :+)
         prepared_arguments[cid] = gensym(Symbol(:plate_prepared_, value.name))
     end
 
-    # `_broadcast_getindex` implements Julia's scalar, Ref, and singleton
-    # projection at the current Cartesian coordinate.
-    function argref(input)
-        cid = canon_id(g, input.id)
-        haskey(prepared_arguments, cid) || return nm(input)
-        Expr(:call, GlobalRef(Base.Broadcast, :_broadcast_getindex),
-             prepared_arguments[cid], index)
+    # Recipe `k`'s statement over `args`: its authored source, as `lower` emits
+    # it (`inline_sources.jl`), else its call or constant through the tables.
+    function callexpr(k, r, args = Any[nm(input) for input in r.inputs])
+        if _inline_sources_enabled()
+            inlined = _inline_source_form(r, args, k)
+            inlined === nothing || return inlined[1]
+        end
+        _slot_call_expr(r, k, args)
     end
-    callexpr(k, r) = _slot_call_expr(r, k, (argref(inp) for inp in r.inputs))
 
     argexprs = Any[_CONSTANTS_ARG, _CALLABLES_ARG]
     for v in p.have
@@ -7131,8 +7137,16 @@ function lower_batched(p::Plan; batched, reduce = :+)
         push!(body.args, Expr(:(=), nm(out), callexpr(k, r)))
     end
 
+    # The batch-dependent recipes, grouped by the batched ports they depend on:
+    # one group recomputes under one condition, its recipes in plan order, its
+    # batched ports read once at the current coordinate. A recipe depends on
+    # the ports of each recipe it reads, so ordering the groups by their number
+    # of ports keeps every producer ahead of its consumers. Within a group a
+    # recipe's statement follows its producers' in one block, where the stable
+    # rewrites can read them (`stable_rewrites.jl`).
     loopbody = Expr(:block)
     loop_assigned = copy(assigned)
+    groups = Dict{Set{ValueId},Vector{Int}}()
     for (k, r) in enumerate(p.recipes)
         roots = analysis.recipe_dependencies[k]
         isempty(roots) && continue
@@ -7141,13 +7155,38 @@ function lower_batched(p::Plan; batched, reduce = :+)
         cid in loop_assigned && continue
         push!(loop_assigned, cid)
         push!(body.args, Expr(:local, Expr(:(::), nm(out), valtype(out))))
+        push!(get!(() -> Int[], groups, roots), k)
+    end
+    for (roots, members) in sort!(collect(groups);
+                                  by = group -> (length(first(group)), first(last(group))))
+        block = Expr(:block)
+        reads = Dict{ValueId,Symbol}()
+        for k in members
+            r = p.recipes[k]
+            args = Any[]
+            for input in r.inputs
+                cid = canon_id(g, input.id)
+                if haskey(prepared_arguments, cid)
+                    # `_broadcast_getindex` implements Julia's scalar, Ref, and
+                    # singleton projection at the current Cartesian coordinate.
+                    push!(args, get!(reads, cid) do
+                        element = gensym(Symbol(:plate_element_, input.name))
+                        push!(block.args, Expr(:(=), element,
+                            Expr(:call, GlobalRef(Base.Broadcast, :_broadcast_getindex),
+                                 prepared_arguments[cid], index)))
+                        element
+                    end)
+                else
+                    push!(args, nm(input))
+                end
+            end
+            push!(block.args, Expr(:(=), nm(only(r.outputs)), callexpr(k, r, args)))
+        end
         changed = foldl((left, right) -> Expr(:||, left, right),
             (Expr(:call, GlobalRef(@__MODULE__, :_plate_dependency_changed),
                   index, previous, prepared_arguments[root])
              for root in sort!(collect(roots); by = root -> have_rank[root])))
-        condition = Expr(:||, first_coordinate, changed)
-        push!(loopbody.args,
-              Expr(:if, condition, Expr(:(=), nm(out), callexpr(k, r))))
+        push!(loopbody.args, Expr(:if, Expr(:||, first_coordinate, changed), block))
     end
 
     want = analysis.want
@@ -8818,23 +8857,28 @@ Base.@nospecializeinfer function _prepare(p::Plan, ast::Expr,
 end
 
 """
-    _prepare_batched(p::Plan; batched, reduce = :+) -> PreparedKernel
+    _prepare_batched(p::Plan; batched, reduce = :+, simplify = nothing) -> PreparedKernel
 
 Internal constructor for public plate authoring. It compiles the
-allocation-free native loop.
+allocation-free native loop, with the stable rewrites (`stable_rewrites.jl`)
+unless `simplify = false` or the project preference turns them off.
 """
-function _prepare_batched(p::Plan; batched, reduce = :+)
+function _prepare_batched(p::Plan; batched, reduce = :+, simplify = nothing)
     batched_names = Set{Symbol}(batched isa Symbol ? (batched,) : batched)
     input_index = findfirst(v -> v.name in batched_names, p.have)
     input_index === nothing && throw(ArgumentError(
         "lower_batched: none of the have ports are batched (batched = $(sort(collect(batched_names))))"))
 
     native_ast = lower_batched(p; batched = batched, reduce = reduce)
+    recipes = Tuple(p.recipes)
+    _with_simplify(simplify) do
+        _simplify() && (native_ast = _stable_rewrites(native_ast, recipes; hoisted = true))
+    end
     native = compile(native_ast)
     constants, callables = _lowering_tables(Any[r.op for r in p.recipes])
     callables = _native_table(native_ast, callables)
     _prepared_kernel(_ArrayFunction(native), constants, callables, Tuple(p.have),
-                     Tuple(p.want), p, native_ast, Tuple(p.recipes))
+                     Tuple(p.want), p, native_ast, recipes)
 end
 
 # The optional MutatingFunctions extension uses one typed cache cell per
@@ -9000,8 +9044,8 @@ the program. A graph prepared with exemplars is compiled afresh.
 Preparation computes numerically fragile compositions in their stable form
 (`simplify = true`, the default): `log(exp(u))` as `u`, `log(logistic(x))` as
 `loglogistic(x)`, `log(1 + x)` as `log1p(x)`, `y / exp(u)` as `y * exp(-u)`,
-`log(exp(a) + exp(b))` as a log-sum-exp, and the rest of the table on the
-compiler page ("Stable rewrites"). The literal composition is finite only where
+`log(exp(a) + exp(b))` as a log-sum-exp, and the rest of the rule table in
+`src/stable_rewrites.jl`. The literal composition is finite only where
 its intermediate is representable, and its ordinary reverse forms `0 * Inf` at
 the edges; the stable form agrees with it to within rounding wherever it is
 finite and stays finite, with a finite derivative, beyond. Errors, lazy branches
@@ -9012,6 +9056,10 @@ function. `simplify = false` compiles the literal arithmetic; `nothing` takes
 the setting of an enclosing preparation, else the project's ReactiveKernels
 preference `simplify` (`Preferences.set_preferences!(ReactiveKernels,
 "simplify" => false)`), else `true`. Cached preparations are kept per setting.
+The same setting governs [`prepare_nonallocating`](@ref), [`plate`](@ref) over
+a scalar spec, [`vectorize`](@ref) and [`prepare_reactive`](@ref), which take
+`simplify` too, and [`jax_source`](@ref), which reads the enclosing setting or
+the preference.
 
 Selected authored plates with a single plate consumer are composed during
 lowering, eliminating the intermediate array. Named ports remain in `p`: asking
