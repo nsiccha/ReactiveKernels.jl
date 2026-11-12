@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.204
+## 0.1.216
 
 - The stable rewrites compute a symmetric law's standardized log kernel at a
   positive value's exponential from the value's logarithm. A half-Student or
@@ -29,6 +29,195 @@ are recorded in the git history only.
   materialized one keeps its reads. A kernel opts in by declaring
   `_rk_log_abs_form` and its parameter part. A location that is not zero, a
   negative `nu` and non-real operands run the literal kernel.
+
+## 0.1.215
+
+- `jax_source` translates broadcasts of padded (ragged) rows padded by
+  different lengths along the same axes, such as two per-row arguments of one
+  plate cell broadcast into one matrix (`(vcat(x1, x_rest) .- centres) ./
+  sqrt.(scales .^ 2 .+ vcat(s1, s_rest) .^ 2)`). The result is padded along
+  those axes by Julia's broadcast length, the rows' common length or the
+  other row's where one has length one, so `sum(cell; dims = 1)`, whole
+  reductions and `vec` of it mask its padding; before, its padded axes were
+  not recorded and those reductions raised; a vector broadcast of two such
+  rows read the first row's length, wrong where the other row is the longer
+  and the first has length one. Lengths Julia refuses to broadcast
+  (`DimensionMismatch`) are not checked, as for a padded row broadcast
+  against an unpadded array: a check would be a host callback in every
+  evaluation. Rows padding different axes by different lengths (`x .* s'`)
+  are still refused.
+
+## 0.1.214
+
+- `jax_source` bounds a range whose end is a prepared-data entry times a
+  static integer, plus a static integer: `pk[1:2 * n[i]]` of two interleaved
+  values per counted read, `1:(n[r] * 2 + 1)`, `(length(x) - 2 * n[r] + 1):length(x)`
+  and `1:K * n[r]` of a prepared integer `K`. Its static number of steps is
+  the same function of the array's largest entry (its least for a negative
+  multiple, either where the multiple's sign is known only while tracing),
+  and ends of one record with one positive multiple (`(2a - 1):(2b)`) take
+  that multiple of the longest record's range. Before, a multiple lost the
+  bound that `n[i] + c` keeps: an `@rkppl` cell's `v[1:2 * n[i]]` raised `a
+  range whose length depends on data has no JAX translation`, and a
+  `@kernel`'s `x[1:2 * n[r]]` emitted a slice JAX rejects when it traces.
+  A padded row's length times a nonnegative integer literal
+  (`1:2 * length(r)`) likewise keeps its static limit, scaled.
+
+## 0.1.213
+
+- Calling a `KernelSpec` on positional values, `spec(args...)`, prepares its
+  default boundary once per graph version and keeps that kernel in the graph,
+  as plain `prepare(spec; bound)` keeps its bound preparations. Later calls
+  look it up, about 2 µs on top of the kernel's own call. Before, every call
+  planned and lowered the kernel again: 1.0 ms per call of a five-input
+  kernel whose held `prepare(spec)` took 0.36 µs. A change to the graph (such
+  as `input_check!`) or another preparation setting (such as `simplify`)
+  prepares afresh. A hot loop that holds `prepare(spec)` still skips the
+  lookup.
+
+## 0.1.212
+
+- A partition plan whose row bookkeeping sits behind a condition on the
+  label (cached by the plan since 0.1.170) is typed and computed while a
+  package image is generated, as in a PrecompileTools workload. The plan
+  body cached that bookkeeping in a comprehension, which
+  `RuntimeGeneratedFunctions` compiles to an opaque closure, and Julia
+  refuses to expand one while it generates an image: `prepare` of such a
+  partition with an untyped plan port (ReactiveKernelsPPL's
+  `prepare_partition`, BayesianRegressionModels' `brm_nlme_model` with a
+  grouping) failed with `partition plan: the plan port … is untyped and
+  evaluating its plan on the exemplars failed: Impossible to correctly
+  handle OpaqueClosure inside @generated returned during precompile
+  process.`, and a plan kernel called there failed the same way. `compile`
+  now runs a comprehension or generator of a compiled body as a function of
+  its own over the body's locals that its element reads, where the element
+  assigns none of them; plans, their types (also for a label without rows)
+  and values are unchanged.
+
+## 0.1.211
+
+- `jax_source` again translates a padded plate over a scan's tuple step
+  outputs, such as an `@rkppl` `@plate` cell holding a stochastic `@scan`
+  whose step count varies by cell. Since 0.1.199 (batched runtime checks) the
+  plate's valid-cell mask read the step count and shape of the Python tuple of
+  columns instead of its first column, so tracing the module raised
+  `AttributeError: 'tuple' object has no attribute 'shape'`. The mask now
+  spans the plate's mapped axes of the first column, as the empty-plate test
+  already did.
+
+## 0.1.210
+
+- A summed plate whose rows are per-cell arrays runs once per distinct row
+  too. 0.1.184 grouped rows whose bound operands are primitive numbers; a
+  bound operand that holds one dense array of them per cell, such as one
+  capture history per individual, now compares its rows by value as well. A
+  capture-recapture likelihood over 237 histories of 3 occasions, 8 of them
+  distinct, runs 8 cells (PosteriorDB Mt: ordinary Reverse gradient 6.8 to
+  1.1 µs). Rows also compare only by the bound vectors the cell reads: a lane
+  index whose bound gather preparation already cached still sets the domain
+  but no longer makes every row distinct (PosteriorDB Mb, 31 distinct of 318
+  histories: 16 to 1.9 µs). A gather still tells rows apart whether or not
+  the cell uses its value, so every index is read as before. Values agree with
+  the row-by-row sum to rounding, as before.
+
+## 0.1.209
+
+- `jax_source` keeps a data name that Python reserves, or that the module's
+  code uses (`class`, `lambda`, `in`, `id`, `type`, `sum`, ...), at the
+  module's data interface. `prepare_data`'s keywords and the dict it returns,
+  the functions' `**prepared`, `DATA`, `INPUTS`, `PREPARED`, `UNTRANSLATED`
+  and `JAXSource.prepared` all name it as the data does, as they already did
+  every other identifier; only the Python local holding it is respelled
+  (`class_`). No parameter can be named `class`, so `prepare_data` takes such
+  inputs through `**data` (its signature ends `**data: ArrayLike`) and raises
+  `TypeError` for a missing or unexpected one. Before, the interface used the
+  respelled name (`DATA`, `INPUTS`, `PREPARED` and the parameter said `class_`
+  while `UNTRANSLATED` said `class`), so `prepare_data(**raw)` with the
+  binding's own names failed. A name that is no Python identifier (a
+  submodel's `r.g`) is still `r_g`.
+  **Breaking:** a caller that passed such an input as `class_=`, or
+  positionally, passes it by its own name: `prepare_data(**raw)`.
+
+## 0.1.208
+
+- A bound preparation (`prepare(...; bound)`, `prepare!(cache, ...; bound)`,
+  `prepare_ad(...; bound)`) evaluates a summed Gaussian observation plate over
+  a bound response from least-squares statistics frozen at binding, when its
+  location is linear in live values with bound coefficients: a bound matrix
+  times a live vector (`X * beta`), live numbers, or live vectors gathered
+  through one bound index (`alpha[g] .+ f .* beta[g]`), each times bound
+  coefficients, plus bound offsets. The density and its ordinary reverse then
+  cost time in the parameter count (K² for a dense design of K columns, a few
+  operations per index value for gathered ones) instead of the row count.
+  Values and gradients agree with the per-row plate to rounding, and are more
+  accurate when the response is far from zero. A binding whose data do not fit
+  (too few rows per parameter, non-finite entries) compiles today's program.
+  Pointwise and per-cell queries keep the per-row plate. New keyword
+  `bound_statistics` (default `true`) on every preparation entry that takes
+  `simplify`, project preference `[ReactiveKernels] bound_statistics`, and
+  `with_bound_statistics(f, enabled)` for the preparations `f` makes (a PPL
+  sampler's, say): `bound_statistics = false` keeps the per-row plate.
+
+## 0.1.207
+
+- `with_plate_reverse` applies generated summed-plate reverse programs to
+  non-allocating kernels after their cache activity and ownership rewrite.
+  Reused primal buffers and AD-owned caches retain their existing ownership.
+  `plate_reverse_report` accepts non-allocating kernels and reports static
+  eligibility; backend operand annotations can still require ordinary AD.
+- An authored plate's axis marker no longer prevents the generated reverse
+  when the marker is used only by derivative-inert queries. Numerical alias
+  reads and writes retain the conservative fallback; marker checks remain.
+- The generated reverse adapter keeps single-lane calls statically dispatched
+  by using separate local names in its batched-lane closure.
+
+## 0.1.206
+
+- `jax_source`: a branch whose condition is traced (`jax.lax.cond`) returns
+  one JAX type from both arms. Julia's arm types are promoted (element by
+  element for an `if` that also assigns locals), and an arm returning an
+  integer known while tracing, such as a prepared integer (`StaticInt`),
+  returns it as an array. Before, `s == 0 && y == m ? 1.0 : s` over a
+  prepared integer `s` (a Gaussian's guarded scale in a plate cell) raised
+  `cond branch outputs must have the same pytree structure`, and an
+  integer arm beside a float arm raised `cond branches must have equal
+  output types`.
+
+## 0.1.205
+
+- `@traceable` takes a trailing Vararg argument: `args...`, `args::T...`,
+  `args::Vararg{T}` and `args::Vararg{T,N} where {N}`. Before, the
+  `Vararg{...}` forms failed to define the method (`TypeError: in TypeVar, in
+  upper bound, expected Type, got Vararg{Any, N}`), and `args...` recorded no
+  source, so `jax_source` refused a body with loops. The recorded source reads
+  the formal as the tuple of the trailing arguments, as the method does, in
+  `jax_source`'s functions and `prepare_data` and in non-allocating
+  preparation. In `jax_source`, a `where` count such as `N` reads as its
+  value.
+- `jax_source` translates `sum(f, t)` and `sum(f, t; init)` of a tuple `t`
+  (such as those arguments, or a literal `(a, b, c)`), in the functions and
+  in `prepare_data`: `f` of each element, added in order from `init`. The
+  fold follows the tuple's fixed length. Before, it raised a
+  `JAXEmissionError` ("this `sum` call").
+
+## 0.1.204
+
+- `jax_source` takes `float_type`, `Float64` (the default) or `Float32`: the
+  dtype of every float value the program does not type `Float32` itself, for
+  an accelerator whose float64 is slow. A `Float32` module casts its float
+  inputs to `float32`, its `prepare_data` returns `float32` data, its dtype
+  metadata says so, and it does not turn on JAX's 64-bit mode; its device
+  integers are JAX's default integer (`int32` without that mode). An `fma`,
+  which rounds once through a float64 product, still turns it on. It stays
+  float32 where another module turned 64-bit mode on: integers a float is
+  computed from alone (`log(k)`, `i / j`), NumPy-computed constants, `I(n)`,
+  scan carries and the literal arms of traced branches take its float type.
+  The `Float64` module of the same program is its reference, and is unchanged
+  (snag jax-source-float-5e6b7604).
+- A traced branch whose arm returns a static value (a literal, a NumPy
+  constant) returns it in the branch's float dtype where that dtype is
+  `float32`: `jax.lax.cond` refused a float64 literal arm beside a `float32`
+  one, also in a `Float32` program's `Float64` module.
 
 ## 0.1.203
 

@@ -16,6 +16,48 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.168
+
+- A categorical response binds outcomes that hold only some of its classes
+  when the model states the class count K. `CategoricalLogit.(eta2, eta3)`
+  states it with its locations plus the reference, and `Categorical(s)` with
+  `s ~ Dirichlet(3, 1.0)` with the concentration's length. Replaying a fit on
+  a design whose rows all name one class, which reads that class's pointwise
+  probabilities, therefore binds instead of raising "leveled response must
+  cover every level 1..K exactly". A `Categorical` simplex now takes K from its
+  concentration rather than from the largest observed code. Codes outside
+  `1..K` and non-integer codes are still refused. A level count read from the
+  observations, with no stated support, still requires every code `1..K`.
+
+## 0.1.167
+
+- `prepare_sampler(...; nonallocating = :auto)` keeps buffer reuse when
+  `with_plate_reverse` is enabled. Eligible summed plates receive generated
+  reverse programs after cache activity and ownership are determined;
+  unsupported regions use ordinary backend differentiation. Explicit
+  `nonallocating = true` also installs the eligible rules. Requires
+  ReactiveKernels 0.1.207.
+
+## 0.1.166
+
+- `adaptive_centering_problem(built, plan, problem, backend; cells)` connects
+  named latent parameters and graph-derived affine locations/log-scales to
+  WarmupHMC's adaptive partial centering. Scalar and rectangular real-valued
+  latent blocks share whole graph queries across their coordinates (WarmupHMC
+  0.2.19+), including shared reductions over unselected parameters;
+  supported prior families are not restricted to Normal. Selected affine
+  quantities must be independent of every selected latent, as required by
+  the indexed source-vector transform and its inverse.
+
+## 0.1.165
+
+- `jax_source(built, plan; float_type = Float32)` emits the model's module in
+  float32: `unconstrained`, the prepared data and every value are `float32`,
+  and the module does not turn on JAX's 64-bit mode. The default `Float64`
+  module is its reference. The module's simplex and multivariate normal
+  helpers allocate in their inputs' dtype (the same values in a `Float64`
+  module). Requires ReactiveKernels 0.1.204 (snag jax-source-float-5e6b7604).
+
 ## 0.1.164
 
 - Require ReactiveKernels 0.1.202 and ReactiveKernelsDistributionKernels 0.1.7

@@ -173,6 +173,53 @@ end
     return result
 end
 
+# Ends that are an entry times a static integer, plus one (snag
+# jax-source-range-9f5848e9): records of `n[r]` reads of two interleaved
+# values each take the first `2 * n[r]` entries. The bound is the same
+# function of the array's largest entry, or its least for a negative
+# multiple (`length(x) - 2 * n[r] + 1`), or both where the multiple is a
+# prepared integer whose sign is known only while tracing (`K * n[r]`).
+@kernel jax_ranges_scaled(x::Vector{Float64}, n::Vector{Int}, K::Int) = begin
+    result = begin
+        acc = 0.0
+        for r in 1:length(n)
+            acc = acc + r * sum(abs2, x[1:2 * n[r]])
+            for t in 1:(n[r] * 2 + 1)
+                acc = acc + x[t]
+            end
+            acc = acc + sum(x[t]^2 for t in (length(x) - 2 * n[r] + 1):length(x); init = 0.0)
+            acc = acc + r * sum(x[t] for t in 1:K * n[r]; init = 0.0)
+        end
+        acc
+    end
+    return result
+end
+# A plate cell's entry, and ends at one position with different multiples
+# (`(2k + 1):(3k)`, bounded by the largest and least entries).
+@kernel jax_ranges_scaled_plate(x::Vector{Float64}, n::Vector{Int}) = begin
+    cells = plate(n) do k
+        sum(abs2, x[1:2 * k]) + sum(x[t] for t in (2 * k + 1):(3 * k); init = 0.0)
+    end
+    total = sum(cells)
+    return total
+end
+# Ends of one record with one multiple: twice the longest record's range.
+@kernel jax_ranges_scaled_records(x::Vector{Float64}, starts::Vector{Int}, stops::Vector{Int}) = begin
+    cells = plate(starts, stops) do a, b
+        sum(x[t] for t in (2 * a - 1):(2 * b); init = 0.0)
+    end
+    total = sum(abs2, cells)
+    return total
+end
+# A multiple of a padded row's length: twice its static limit.
+@kernel jax_ranges_scaled_rows(x::Vector{Float64}, R::Vector{Vector{Float64}}) = begin
+    cells = plate(R) do r
+        sum(r) * sum(x[t] for t in 1:2 * length(r); init = 0.0)
+    end
+    total = sum(cells)
+    return total
+end
+
 const JAX_RANGES_KERNELS = (jax_ranges_loop, jax_ranges_forms, jax_ranges_plate, jax_ranges_open,
                             jax_ranges_writes, jax_ranges_nested)
 _jax_ranges_want(k) = k === jax_ranges_plate ? :total : :result
@@ -268,6 +315,61 @@ print("EAGER_SCAN_OK")
                 @test r.grad == [1.0, 0.0, 0.0]
             end
         end
+    end
+end
+
+@testset "jax_source: ranges to a multiple of a prepared entry" begin
+    x = collect(1.0:12.0)
+    n, K = [1, 4, 0, 2], 3
+    scaled = string(jax_source(jax_ranges_scaled; have = (:x, :n, :K), want = :result,
+                               data = (; n, K)))
+    # The static bounds are the same functions of the prepared extremes.
+    @test occursin("max(2 * _rk_max_n - 1 + 1, 0)", scaled)
+    @test occursin("max(2 * _rk_max_n + 1 - 1 + 1, 0)", scaled)
+    @test occursin("-2 * _rk_max_n", scaled)
+    @test occursin("max(K * _rk_max_n, K * _rk_min_n)", scaled)
+    @test !occursin("while_loop", scaled)
+    records = string(jax_source(jax_ranges_scaled_records; have = (:x, :starts, :stops),
+                                want = :total, data = (; starts = [2, 4], stops = [3, 4])))
+    @test occursin("jnp.arange(max(2 * _rk_span_starts_stops - (0 - 1) + 1, 0))", records)
+    # A multiple of a padded row's length runs to that multiple of its limit.
+    rows = string(jax_source(jax_ranges_scaled_rows; have = (:x, :R), want = :total))
+    @test occursin("jnp.arange(1, 2 * r.shape[0] + 1)", rows)
+
+    if !rk_jax_available()
+        @test_skip false
+    else
+        have = (:x, :n, :K)
+        f = prepare(jax_ranges_scaled; have, want = :result)
+        g = prepare(jax_ranges_scaled_plate; have = (:x, :n), want = :total)
+        for (n, K) in (([1, 4, 0, 2], 3), ([0, 0], -1), (Int[], 2), ([3], 0))
+            src = jax_source(jax_ranges_scaled; have, want = :result, data = (; n, K))
+            plate_src = jax_source(jax_ranges_scaled_plate; have = (:x, :n), want = :total,
+                                   data = (; n))
+            for prepare_mode in (true, :arguments)
+                r = rk_jax_evaluate(src, "kernel", (x, n, K); prepare = prepare_mode, grad = true)
+                @test r.value ≈ f(x, n, K) rtol = 1e-12
+                @test r.grad ≈ rk_fd_gradient(u -> f(u, n, K), x) rtol = 1e-6 atol = 1e-6
+                r = rk_jax_evaluate(plate_src, "kernel", (x, n); prepare = prepare_mode, grad = true)
+                @test r.value ≈ g(x, n) rtol = 1e-12
+                @test r.grad ≈ rk_fd_gradient(u -> g(u, n), x) rtol = 1e-6 atol = 1e-6
+            end
+        end
+        h = prepare(jax_ranges_scaled_records; have = (:x, :starts, :stops), want = :total)
+        xr = collect(1.0:10.0)
+        for (s, e) in (([2, 4, 4, 1, 5], [3, 4, 3, 5, 4]), (Int[], Int[]))
+            src = jax_source(jax_ranges_scaled_records; have = (:x, :starts, :stops),
+                             want = :total, data = (; starts = s, stops = e))
+            r = rk_jax_evaluate(src, "kernel", (xr, s, e); prepare = true, grad = true)
+            @test r.value ≈ h(xr, s, e) rtol = 1e-12
+            @test r.grad ≈ rk_fd_gradient(u -> h(u, s, e), xr) rtol = 1e-6 atol = 1e-6
+        end
+        R = [[1.0, 2.0, 3.0], [4.0], [5.0, 6.0]]
+        q = prepare(jax_ranges_scaled_rows; have = (:x, :R), want = :total)
+        src = jax_source(jax_ranges_scaled_rows; have = (:x, :R), want = :total)
+        r = rk_jax_evaluate(src, "kernel", (xr, R); grad = true)
+        @test r.value ≈ q(xr, R) rtol = 1e-12
+        @test r.grad ≈ rk_fd_gradient(u -> q(u, R), xr) rtol = 1e-6 atol = 1e-6
     end
 end
 

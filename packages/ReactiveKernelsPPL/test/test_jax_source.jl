@@ -117,6 +117,19 @@ ReactiveKernels.@kernel jax_ppl_feature_mixture(x1, x_rest, centres, scales) = b
     peak = maximum(score)
     return peak + log(sum(exp.(score .- peak)))
 end
+# The same law with each feature's measurement standard error, a second
+# padded row of the same length, and log weights after the reduction (snag
+# jax-source-sum-o-d4f6aa97).
+ReactiveKernels.@kernel jax_ppl_feature_mixture_errors(x1, x_rest, s1, s_rest, centres, scales,
+                                                       log_weights) = begin
+    x = vcat(x1, x_rest)
+    s = vcat(s1, s_rest)
+    sd = sqrt.(scales .^ 2 .+ s .^ 2)
+    cell = -0.5 .* ((x .- centres) ./ sd) .^ 2 .- log.(sd)
+    score = vec(sum(cell; dims = 1)) .+ log_weights
+    peak = maximum(score)
+    return peak + log(sum(exp.(score .- peak)))
+end
 
 const _JAX_RNG = Xoshiro(20261024)
 const _JAX_N = 30
@@ -129,6 +142,10 @@ const _JAX_LENGTHS = [9, 4, 13, 6]
 const _JAX_R = [abs.(randn(_JAX_RNG, n)) for n in _JAX_LENGTHS]
 const _JAX_YR = [0.1 .+ 0.05 .* jax_ppl_recurrence(R, 0.7, 0.3) .+ 0.01 .* randn(_JAX_RNG, length(R))
                  for R in _JAX_R]
+# Per-row counts of reads with two interleaved values each (`2n` entries of
+# the row), and the observed values; no random draws, so the data below stay.
+const _JAX_COUNTS = [4, 2, 0, 3]
+const _JAX_YC = [0.5 .* R[1:2n] .+ 0.05 for (R, n) in zip(_JAX_R, _JAX_COUNTS)]
 const _JAX_TRIALS = rand(_JAX_RNG, 10:20, _JAX_N)
 const _JAX_SUCCESSES = [rand(_JAX_RNG, 0:n) for n in _JAX_TRIALS]
 const _JAX_HURDLE = [rand(_JAX_RNG) < 0.3 ? 0 : rand(_JAX_RNG, 1:5) for _ in 1:_JAX_N]
@@ -298,6 +315,28 @@ const _JAX_CASES = (
             y[i] .~ Normal.(m[i], s)
         end
     end))(; G = 4) | (; y = _JAX_YR),
+    # A ragged plate whose Gaussian scale is an integer definition (a BRM
+    # `y[i] ~ normal(m, 1)` emits one): the cell reads it as a prepared
+    # `StaticInt`, beside the float arm of the scale's guard, a `jax.lax.cond`
+    # (snag jax-ragged-integ-35502154).
+    ragged_integer_scale = () -> (@rkppl(begin
+        a ~ Normal(0, 1)
+        s = 1
+        @plate for i in eachindex(y)
+            y[i] .~ Normal.(a .* x[i], s)
+        end
+    end))(; x = _JAX_R) | (; y = _JAX_YR),
+    # A cell's slice to a multiple of a prepared count (`1:2 * n[i]`, two
+    # interleaved values per counted read): bounded by that multiple of the
+    # largest count (snag jax-source-range-9f5848e9).
+    scaled_count_slice = () -> (@rkppl(begin
+        a ~ Normal(0, 1); s ~ Exponential(1.0)
+        @plate for i in eachindex(y)
+            v = a .* z[i]
+            conc = v[1:2 * n[i]]
+            y[i] .~ Normal.(conc, s)
+        end
+    end))(; z = _JAX_R, n = _JAX_COUNTS) | (; y = _JAX_YC),
     # Per-group recurrences over series of different lengths: an observed
     # AR(1), a deterministic recurrence of a ragged input, and a random walk
     # with one innovation per step (a one-entry group included).
@@ -463,6 +502,19 @@ const _JAX_CASES = (
         end
     end))(; x_rest = [[0.2, -0.1], [0.1, 0.4], [-0.4, 0.0], [0.3, 0.2]], D = 3, K = 2,
            zeros_dk = zeros(3, 2), scales = [1.0 0.5; 2.0 1.0; 0.7 1.3]) |
+        (; x1 = [0.1, -0.3, 0.5, 0.2]),
+    # Two padded rows of the same length per index, broadcast into one
+    # feature matrix: each has its own lengths in the translation.
+    feature_mixture_errors = () -> (@rkppl(begin
+        centres[1:D, 1:K] .~ Normal.(zeros_dk, 1.0)
+        @plate for i in eachindex(x1)
+            x1[i] ~ LogDensity(jax_ppl_feature_mixture_errors, x_rest[i], s1[i], s_rest[i],
+                               centres, scales, log_weights)
+        end
+    end))(; x_rest = [[0.2, -0.1], [0.1, 0.4], [-0.4, 0.0], [0.3, 0.2]],
+           s1 = [0.3, 0.2, 0.1, 0.4], s_rest = [[0.1, 0.5], [0.2, 0.3], [0.3, 0.1], [0.6, 0.2]],
+           D = 3, K = 2, zeros_dk = zeros(3, 2), scales = [1.0 0.5; 2.0 1.0; 0.7 1.3],
+           log_weights = log.([0.4, 0.6])) |
         (; x1 = [0.1, -0.3, 0.5, 0.2]),
     # Dotted cell latents whose length per index comes from data: BRM's
     # non-centred per-unit steps (one vector per index, a scalar scale, an
@@ -642,6 +694,34 @@ end
     project = dirname(Base.active_project())
     out = read(`$(Base.julia_cmd()) --startup-file=no --project=$project -e $script`, String)
     @test split(strip(out), "\n") == expected
+end
+
+# The float32 module of each case (`float_type = Float32`, snag
+# jax-source-float-5e6b7604): with 64-bit mode on (its float64 module imported
+# first), its value and gradient hold no strongly typed float64, and they are
+# the float64 module's to float32 rounding. Alone, it runs without 64-bit mode.
+@testset "jax_source(built, plan; float_type = Float32) ($name)" for name in
+        keys(merge(_JAX_CASES, _JAX_ICAR_CASES))
+    if !rk_jax_available()
+        @info "RK_JAX_PYTHON is not set: float32 JAX parity for $name skipped"
+        @test_skip false
+    else
+        plan = merge(_JAX_CASES, _JAX_ICAR_CASES)[name]()
+        built = build_kernel(plan)
+        src64 = jax_source(built, plan)
+        src32 = jax_source(built, plan; float_type = Float32)
+        @test !occursin("jax_enable_x64", string(src32))
+        u = 0.2 .* randn(Xoshiro(7), built.layout.total)
+        args = (u, jax_raw_data(plan, src64)...)
+        r = rk_jax_float32(src32, src64, :log_density, args; prepare = true)
+        @test r.x64 && !r.f64
+        @test r.dtype == "float32" && r.grad_dtype == "float32"
+        @test abs(r.value - r.reference) <= 64 * eps(Float32) * max(1, abs(r.reference))
+        @test norm(r.grad .- r.reference_grad) <= 1e-4 * max(1, norm(r.reference_grad))
+        alone = rk_jax_float32(src32, nothing, :log_density, args; prepare = true)
+        @test !alone.x64 && alone.dtype == "float32"
+        @test abs(alone.value - r.reference) <= 64 * eps(Float32) * max(1, abs(r.reference))
+    end
 end
 
 # A dotted cell latent's helper values are data-only: `prepare_data` computes

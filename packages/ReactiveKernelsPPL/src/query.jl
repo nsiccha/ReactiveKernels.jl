@@ -489,13 +489,16 @@ unless the request needs the ordinary sampler:
   run the non-allocating gradient;
 - a program with a multi-output recipe (a destructuring assignment), which a
   non-allocating kernel does not take;
-- the opt-in plate reverse (`ReactiveKernels.with_plate_reverse`), which
-  differentiates the ordinary program;
 - a program whose plates run as matrix products (ReactiveKernels' batched
   plates), which a non-allocating program runs cell by cell.
 
 `nonallocating = true` requires it, and those requests then fail;
 `nonallocating = false` prepares the ordinary sampler.
+
+The opt-in generated plate reverse (`ReactiveKernels.with_plate_reverse`)
+also applies to non-allocating gradients. Eligible summed plates use their
+generated reverse after cache activity and ownership have been determined;
+other regions keep the backend's ordinary reverse.
 
 A non-allocating sampler writes every operation with a destination-passing form
 into a buffer the query owns: an evaluation reuses the same memory instead of
@@ -540,12 +543,10 @@ function prepare_sampler(built, plan::StructuralPlan, u0::AbstractVector{<:Real}
             exemplars = exemplar)), wants
     end
     # `:auto` also keeps the ordinary sampler for a program a non-allocating
-    # kernel cannot take, while the opt-in plate reverse is on, which
-    # differentiates ordinary programs, and for a program whose plates run as
+    # kernel cannot take, and for a program whose plates run as
     # matrix products, which a non-allocating program runs cell by cell.
     choice === :auto && nonallocating && (nonallocating =
         ReactiveKernels._nonallocating_plan_supported(kern.plan) &&
-        !ReactiveKernels._plate_reverse_enabled() &&
         !ReactiveKernels._runs_batched_plates(kern))
     # A factored sampled covariance differentiates the ordinary program.
     ordinary_gradient = nonallocating && isempty(wants) && _factors_covariance(kern)

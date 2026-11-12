@@ -1877,7 +1877,8 @@ end
 
 # A child kernel prepared once when its caller is defined and applied where
 # the splicer cannot reach (a lazy arm or a closure), in place of the runtime
-# `(spec::KernelSpec)(args...)` that prepares it on every call. `name` is the
+# `(spec::KernelSpec)(args...)` that looks its kernel up in its graph's cache on
+# every call. `name` is the
 # authored callee, present in `code_expr`. `lane` is the child lowered for a
 # position residual (`_lane_kernel`), or `nothing`; only that residual's
 # destination forms call it (lane_sources.jl).
@@ -2304,8 +2305,9 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                 rewritten_ex, spec, nested_specs)) !== nothing
         # The splicer cannot reach a lazy arm or a deferred lexical scope, so
         # the call would stay a runtime `(spec::KernelSpec)(args...)`, which
-        # plans and prepares the child on every evaluation; inside a
-        # differentiated kernel that planning reaches Enzyme. Render the
+        # looks the child's kernel up in its graph's cache (and prepares it at
+        # the first call) on every evaluation; inside a differentiated kernel
+        # that lookup reaches Enzyme. Render the
         # child's planned recipes as source at the call position instead, as
         # for an object endpoint under an arm: the arm still evaluates the
         # child only when taken, and the backend differentiates its math.
@@ -3394,8 +3396,10 @@ nested Base fold (the compiler page, "Lowering and emitted ABI"). The method's
 source is recorded for source-reading compilers ([`jax_source`](@ref)), and an
 `on_error = :ignore` preparation calls its throw-stripped twin.
 
-Supported: positional arguments with optional defaults, `where` clauses, and
-a return-type annotation.  A docstring before `@traceable` documents the
+Supported: positional arguments with optional defaults, a trailing Vararg
+argument (`args...`, `args::T...`, `args::Vararg{T,N}`, whose name the
+recorded source reads as the tuple of the trailing arguments, as the method
+does), `where` clauses, and a return-type annotation.  A docstring before `@traceable` documents the
 method, as it does a plain definition.  A `@traceable` method of a function
 from Base, Core or ReactiveKernels is rejected, and so are keyword arguments
 and a `return` before the end of the body (write that branch as an
@@ -3492,31 +3496,95 @@ function _record_source_method(def)
 end
 
 """
-    _traceable_source(::Type{typeof(f)}, argument_types...) -> (names, body, module, signature, statics) or nothing
+    _traceable_source(::Type{typeof(f)}, argument_types...) -> (names, body, module, signature, statics, vararg) or nothing
 
 The authored source of the `@traceable` method of `f` that arguments of
 `argument_types` call: its formal names, its body, the module the body's
-globals resolve in, the method's signature type, and its `where` parameters as
+globals resolve in, the method's signature type, its `where` parameters as
 those types bind them (a named tuple; `nothing` for one they leave unbound),
-for a body that reads one (`exp(k * x)` of a `::Val{k}`). Source-reading compilers
-(`jax_source`) translate the helper from it. A more specific plain method of
-`f` is the one native execution calls; comparing its `which(...).sig` with the
-signature tells the two apart. `nothing` for a function without a
-`@traceable` method.
+for a body that reads one (`exp(k * x)` of a `::Val{k}`), and whether its last
+formal is a Vararg one (`args...`, `args::Vararg{T,N}`), whose name the body
+reads as the tuple of the trailing arguments ([`_traceable_arguments`](@ref)).
+Source-reading compilers (`jax_source`) translate the helper from it. A more
+specific plain method of `f` is the one native execution calls; comparing its
+`which(...).sig` with the signature tells the two apart. `nothing` for a
+function without a `@traceable` method.
 """
 _traceable_source(@nospecialize(args...)) = nothing
 
+"""
+    _traceable_arguments(source, args, group) -> Vector or nothing
+
+The values the formals of a recorded `source` (what [`_traceable_source`](@ref)
+returns, or its first three entries) take in a call with `args`, one per name
+in `source[1]`: each fixed formal its argument and, for a Vararg source, the
+last formal `group(trailing arguments)`, the value a source reader makes of
+them (a tuple, as the method receives them). `nothing` when the number of
+arguments does not fit the formals.
+"""
+function _traceable_arguments(source, args, group)
+    names = first(source)
+    vararg = length(source) >= 6 && source[6]::Bool
+    fixed = length(names) - vararg
+    values = collect(args)
+    (vararg ? length(values) >= fixed : length(values) == fixed) || return nothing
+    vararg || return values
+    vcat(values[1:fixed], [group(values[fixed+1:end])])
+end
+
+_traceable_is_vararg(x) = x === :Vararg || x == GlobalRef(Core, :Vararg) ||
+    (x isa Expr && x.head === :. && x.args[1] in (:Core, :Base) && x.args[2] == QuoteNode(:Vararg))
+
+# A Vararg formal (`args...`, `args::T...`, `args::Vararg{T}`,
+# `args::Vararg{T,N}`, or one of them unnamed) as `(name, element type, count)`,
+# the count `nothing` when the formal leaves it free; `nothing` for any other
+# formal.
+function _traceable_vararg(formal, k)
+    unnamed = Symbol("_unnamed_", k)
+    if formal isa Expr && formal.head === :... && length(formal.args) == 1
+        inner = only(formal.args)
+        inner isa Symbol && return (inner, GlobalRef(Core, :Any), nothing)
+        inner isa Expr && inner.head === :(::) && length(inner.args) in (1, 2) || return nothing
+        name = length(inner.args) == 2 ? inner.args[1] : unnamed
+        return name isa Symbol ? (name, inner.args[end], nothing) : nothing
+    end
+    formal isa Expr && formal.head === :(::) && length(formal.args) in (1, 2) || return nothing
+    name = length(formal.args) == 2 ? formal.args[1] : unnamed
+    name isa Symbol || return nothing
+    V = formal.args[end]
+    _traceable_is_vararg(V) && return (name, GlobalRef(Core, :Any), nothing)
+    V isa Expr && V.head === :curly && length(V.args) in (2, 3) &&
+        _traceable_is_vararg(V.args[1]) || return nothing
+    (name, V.args[2], length(V.args) == 3 ? V.args[3] : nothing)
+end
+
 # A method of `_traceable_source` over the argument TYPES, with the method's own
 # formals as type bounds, so dispatch selects the source of the method that
-# values of those types call. Defaulted, splatted and destructured formals
-# record no source.
+# values of those types call. A trailing Vararg formal bounds each trailing
+# argument type by its element type, and its count by the formal's. Defaulted
+# and destructured formals record no source.
 function _traceable_source_method(callee, formals, wheres, body, mod)
     params = Any[]
     names = Symbol[]
     bounds = Any[]
+    vararg = false
     for (k, formal) in enumerate(formals)
         formal isa Symbol && (push!(params, :(::Type)); push!(names, formal);
                               push!(bounds, GlobalRef(Core, :Any)); continue)
+        va = _traceable_vararg(formal, k)
+        if va !== nothing
+            # Julia rejects a Vararg formal before the last one when it
+            # defines the method itself.
+            k == length(formals) || return Any[]
+            name, T, count = va
+            counts = count === nothing ? () : (count,)
+            push!(params, Expr(:(::), Expr(:curly, GlobalRef(Core, :Vararg),
+                                           Expr(:curly, :Type, Expr(:<:, T)), counts...)))
+            push!(names, name)
+            push!(bounds, Expr(:curly, GlobalRef(Core, :Vararg), T, counts...))
+            vararg = true
+            continue
+        end
         # An unnamed formal (`::typeof(exp)`, a method selected by an argument
         # it never reads) takes a placeholder name.
         formal isa Expr && formal.head === :(::) && length(formal.args) == 1 &&
@@ -3548,7 +3616,7 @@ function _traceable_source_method(callee, formals, wheres, body, mod)
     end
     Any[Expr(:const, Expr(:(=), held, method_type)),
         Expr(:(=), signature, Expr(:tuple, QuoteNode(Tuple(names)), QuoteNode(body), mod, held,
-                                   Expr(:tuple, statics...)))]
+                                   Expr(:tuple, statics...), vararg))]
 end
 
 # The body with its tail-position `return`s replaced by their values, as a
@@ -4814,10 +4882,21 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     # a bare `object.endpoint(args...)` call, so no KernelObjectSpec survives to
     # runtime.
     rewritten_entries = Any[]
+    # Scalar kernels can later be composed into a plate. Keep their lazy
+    # arms' graphs before endpoint expansion turns a nested call into source;
+    # otherwise the plate's binding pass sees an opaque call inside that arm.
+    # Key by the recipe expression, not its output name: alternative producers
+    # of one value can have different branches and dependency boundaries.
+    ordinary_branch_arms = IdDict{Any,Any}()
     boundary_types = Dict{Symbol,Vector{Any}}()
     for entry in entries
         if entry[1] === :recipe && entry[5] === nothing
             _, outputs, authored_rhs, metadata, plate_expr, destructured = entry
+            arms = length(outputs) == 1 && !get(metadata, :effectful, false) &&
+                (branch_arm_specs === nothing ||
+                 !haskey(branch_arm_specs, outputs[1][1])) ?
+                _kernel_plate_arm_entries(authored_rhs, known, Set{Symbol}(),
+                    mod, known; endpoint_cache) : nothing
             local_types = Dict{Symbol,Any}()
             materialized = Tuple{Symbol,Any,Any}[]
             rewritten, inferred = _kernel_constructed_endpoint(
@@ -4847,6 +4926,7 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
             end
             push!(rewritten_entries,
                   (:recipe, outputs, rewritten, metadata, plate_expr, destructured))
+            arms === nothing || (ordinary_branch_arms[rewritten] = arms)
         else
             push!(rewritten_entries, entry)
         end
@@ -4959,6 +5039,8 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
         effectful = get(metadata, :effectful, false)
         branch_arms = branch_arm_specs === nothing || length(outputs) != 1 ?
             nothing : get(branch_arm_specs, outputs[1][1], nothing)
+        branch_arms === nothing &&
+            (branch_arms = get(ordinary_branch_arms, authored_rhs, nothing))
         op = plate_expr === nothing ? _kernel_operation(
             rhs, deps, known; pure = !effectful, mod = mod,
             nested_specs = nested_specs, branch_arms = branch_arms) :
@@ -5213,6 +5295,13 @@ positionally and destructure the nested default output boundary exactly. Every
 call site receives fresh internal value identities, so repeated calls remain
 independent while the outer planner can prune or CSE their recipes. No nested
 runtime call remains in a prepared kernel.
+
+Calling a spec itself with positional values, `spec(args...)`, runs its default
+boundary, as `prepare(spec)(args...)` does. The graph keeps that prepared
+kernel, so only the first call per graph version prepares it (and the first
+under another preparation setting, such as `simplify`); later calls cost a
+cache lookup on top of the kernel's own call. A hot loop that holds
+`prepare(spec)` skips the lookup as well.
 
 A short expression body is a compact single-result kernel. Its value is exposed
 as a port named after the kernel, and that port is the default `want` boundary:
@@ -5551,10 +5640,47 @@ end
                    want = _KERNEL_DEFAULT_BOUNDARY) =
     extract(spec; have = have, want = want)
 
-# Positional application requests the distinguished default output.  This is a
-# convenience/compiler-entry surface; performance-sensitive callers should
-# still retain `prepare(spec)` so compilation is paid once.
-(spec::KernelSpec)(arg, args...) = prepare(spec)(arg, args...)
+# Positional application runs the default boundary, as `prepare(spec)(args...)`
+# does. The graph keeps that kernel (`_graph_preparations`, graphops.jl), so
+# the first call per graph version and preparation setting prepares it and
+# every later call looks it up: about 1 ms of planning and lowering per call
+# for a five-input kernel before (snag `direct-call-of-a-30927f43`). A caller
+# holding `prepare(spec)` skips the lookup too.
+(spec::KernelSpec)(arg, args...) = _kernel_direct_callable(spec)(arg, args...)
+
+Base.@nospecializeinfer function _kernel_direct_callable(@nospecialize(spec::KernelSpec))
+    g = getfield(spec, :graph)
+    cache = _graph_preparations(g)
+    # The key `_prepare_unbound!` computes, read from the port table without
+    # building the boundary's values: those were most of a hit's cost.
+    have_sig = _kernel_port_sig(spec, getfield(spec, :have_names))
+    want_sig = _kernel_port_sig(spec, getfield(spec, :want_names))
+    kernel = if have_sig === nothing || want_sig === nothing
+        nothing
+    else
+        key = _unbound_key(g, nothing, have_sig, want_sig, (), nothing)
+        @lock cache.lock get(cache.kernels, key, nothing)
+    end
+    kernel === nothing && (kernel = _prepare_unbound!(cache, g,
+        _kernel_selected_values(spec, _KERNEL_DEFAULT_BOUNDARY, spec.have_names, :have),
+        _kernel_selected_values(spec, _KERNEL_DEFAULT_BOUNDARY, spec.want_names, :want),
+        (), nothing))
+    _kernel_signature_callable(kernel, getfield(spec, :call_signature))
+end
+
+# `_sig` of the named ports, or `nothing` when one is missing (the full path
+# then raises the error naming it).
+Base.@nospecializeinfer function _kernel_port_sig(@nospecialize(spec::KernelSpec),
+                                                  names::Vector{Symbol})
+    g, ports = getfield(spec, :graph), getfield(spec, :ports)
+    ids = ValueId[]
+    for name in names
+        port = get(ports, name, nothing)
+        port === nothing && return nothing
+        push!(ids, canon_id(g, (port::Value).id))
+    end
+    ids
+end
 
 function plan(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
               want = _KERNEL_DEFAULT_BOUNDARY)
@@ -5615,9 +5741,9 @@ function prepare(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
                  bound = NamedTuple(), on_error = nothing,
                  exemplars = nothing, type_stability = nothing,
                  type_stability_level = nothing, branch_arms = nothing,
-                 simplify = nothing, _data_cache = nothing)
+                 simplify = nothing, bound_statistics = nothing, _data_cache = nothing)
     _with_branch_arms(branch_arms) do
-    _with_simplify(simplify) do
+    _with_settings(simplify, bound_statistics) do
         _with_type_stability(type_stability, type_stability_level) do
             isempty(bound) || return prepare(spec.graph;
                 have = _kernel_selected_values(spec, have, spec.have_names, :have),
@@ -5649,12 +5775,13 @@ function prepare!(cache::PreparationCache, spec::KernelSpec;
                   have = _KERNEL_DEFAULT_BOUNDARY,
                   want = _KERNEL_DEFAULT_BOUNDARY, passes = (),
                   bound = NamedTuple(), on_error = nothing, type_stability = nothing,
-                  type_stability_level = nothing, simplify = nothing)
+                  type_stability_level = nothing, simplify = nothing,
+                  bound_statistics = nothing)
     isempty(bound) || return prepare!(cache, spec.graph;
         have = _kernel_selected_values(spec, have, spec.have_names, :have),
         want = _kernel_selected_values(spec, want, spec.want_names, :want),
         passes = passes, bound = _kernel_bound_pairs(spec, bound), on_error = on_error,
-        type_stability, type_stability_level, simplify)
+        type_stability, type_stability_level, simplify, bound_statistics)
     prepared = prepare!(cache, spec.graph;
                         have = _kernel_selection(spec, have, spec.have_names, :have),
                         want = _kernel_selection(spec, want, spec.want_names, :want),
@@ -5667,11 +5794,13 @@ end
 function prepare_nonallocating(spec::KernelSpec, exemplars...;
                                have = _KERNEL_DEFAULT_BOUNDARY,
                                want = _KERNEL_DEFAULT_BOUNDARY, passes = (),
-                               bound = NamedTuple(), simplify = nothing)
+                               bound = NamedTuple(), simplify = nothing,
+                               bound_statistics = nothing)
     isempty(bound) || return prepare_nonallocating(spec.graph, exemplars...;
         have = _kernel_selection(spec, have, spec.have_names, :have),
         want = _kernel_selection(spec, want, spec.want_names, :want),
-        passes = passes, bound = _kernel_bound_pairs(spec, bound), simplify)
+        passes = passes, bound = _kernel_bound_pairs(spec, bound), simplify,
+        bound_statistics)
     prepared = prepare_nonallocating(spec.graph, exemplars...;
         have = _kernel_selection(spec, have, spec.have_names, :have),
         want = _kernel_selection(spec, want, spec.want_names, :want),

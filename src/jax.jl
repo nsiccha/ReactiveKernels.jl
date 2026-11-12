@@ -73,19 +73,21 @@ _PyVal(code::AbstractString, @nospecialize(T), static::Bool, extent::AbstractStr
        limit::AbstractString, padded::Int) =
     _PyVal(String(code), T, static, String(extent), String(limit), padded, nothing)
 # An integer array of the prepared data, `prepared[key]` (`position ===
-# nothing`), or an entry of one, `prepared[key][position] + offset`:
+# nothing`), or an entry of one, `scale * prepared[key][position] + offset`:
 # `position` is the gather's index code, or a token naming a plate cell's
-# entry, and `offset` a static integer. Entries of two arrays at one position
-# are entries of one record (`starts[r]:stops[r]`), so their difference is
+# entry, and `scale` and `offset` static integers (`2 * n[i] + 1` of two
+# interleaved reads per entry). Entries of two arrays at one position are
+# entries of one record (`starts[r]:stops[r]`), so their difference is
 # bounded by the arrays' largest difference, which `prepare_data` computes.
 struct _JaxOrigin
     key::String
     position::Union{Nothing,String}
     offset::String
     path::String
+    scale::String
 end
-_JaxOrigin(key::String, position::Union{Nothing,String}, offset::String) =
-    _JaxOrigin(key, position, offset, "")
+_JaxOrigin(key::String, position::Union{Nothing,String}, offset::String, path::String = "") =
+    _JaxOrigin(key, position, offset, path, "1")
 # A data-only cell recipe that can be moved to prepare_data if a later loop
 # needs a bound on its integer result. The existing host split does the work.
 struct _JaxCellData
@@ -162,8 +164,11 @@ function _jax_extent(args)
     end
     ""
 end
-# A padded vector's valid-entry mask.
-_jax_mask(v::_PyVal) = "(jnp.arange(" * _py_atom(v.code) * ".shape[0]) < " * v.extent * ")"
+# A padded vector's valid-entry mask, over the leading axis of its stored
+# array: a vector of tuples is held as a Python tuple of columns, whose first
+# column carries that axis (`_jax_mapped_array`).
+_jax_mask(v::_PyVal) = "(jnp.arange(" * _py_atom(_jax_mapped_array(v)) * ".shape[0]) < " *
+                       v.extent * ")"
 # A vector or an adjoint (transposed) vector: stored as one 1-D array.
 _jax_vector_like(@nospecialize(T)) = T isa Type && (T <: AbstractVector ||
     T <: Union{LinearAlgebra.Adjoint{<:Any,<:AbstractVector},
@@ -197,6 +202,47 @@ function _jax_padded_union(args)
         axes |= m
     end
     axes
+end
+# Operands padded along the same axes by different extents: two per-row
+# arguments broadcast together (`(x .- m) ./ s` with `x` and `s` ragged rows
+# of one cell), each with its own lengths. Julia's broadcast gives each such
+# axis one length, the operands' length other than one (one when all are
+# one). The operands are returned with that length as their common extent,
+# `_rk_broadcast_length(...)` of their extents (sorted, so every combination
+# of the same rows reads alike and combines again by string equality), an
+# expression of their extents, valid wherever they are. Lengths Julia
+# refuses to broadcast (two lengths other than one differ) are not checked:
+# a check is a host callback in every evaluation (several times the cost of
+# a small model's gradient), and a padded row broadcast against an unpadded
+# array is not checked either. Operands padding different axes by different
+# extents (`x .* s'`) would need an extent per axis: they are returned as
+# they are, so a broadcast of them records no padded axes and a reduction of
+# it raises.
+const _JAX_BROADCAST_LENGTH = """
+def _rk_broadcast_length(*lengths):
+    # Julia's broadcast length along an axis its operands pad: the length
+    # other than one, or one when every operand has length one.
+    n = lengths[0]
+    for m in lengths[1:]:
+        n = jnp.where(n == 1, m, n)
+    return n
+"""
+function _jax_common_extent(ctx, args::Vector{_PyVal})
+    ctx.host === nothing || return args
+    padded = [a for a in args if !isempty(a.extent)]
+    length(unique(a.extent for a in padded)) > 1 || return args
+    masks = unique(_jax_padded_axes(a) for a in padded)
+    length(masks) == 1 && only(masks) != 0 || return args
+    parts = String[]
+    for a in padded
+        append!(parts, get(ctx.mod.helper_names, (:broadcast_length, a.extent), [a.extent]))
+    end
+    sort!(unique!(parts))
+    name = _jax_helper!(ctx, "_rk_broadcast_length", _JAX_BROADCAST_LENGTH)
+    extent = name * "(" * join(parts, ", ") * ")"
+    ctx.mod.helper_names[(:broadcast_length, extent)] = parts
+    [isempty(a.extent) ? a : _PyVal(a.code, a.T, a.static, extent, "", a.padded, a.origin)
+     for a in args]
 end
 # The padded axes an elementwise function of `x` keeps: `x`'s, unless `x` is
 # an adjoint vector, whose result (typed a matrix) is stored with one axis.
@@ -387,6 +433,22 @@ end
 function _jax_param_name(used::Set{String}, name; stable::Bool = true)
     text = stable ? _jax_stable_name(name) : String(Symbol(name))
     if occursin(r"^[A-Za-z_][A-Za-z0-9_]*$", text) && !(text in _JAX_RESERVED) && !(text in used)
+        push!(used, text)
+        return text
+    end
+    _jax_identifier(used, name)
+end
+
+# A data value's key at the module's data interface: `prepare_data`'s keyword
+# and the dict it returns, `**prepared`, and the metadata (`DATA`, `INPUTS`,
+# `PREPARED`, `UNTRANSLATED`). It is the value's own name when that is an
+# identifier, also one Python reserves (`class`, `lambda`, `id`): only the
+# Python local that holds it is respelled (`_jax_param_name`), so a caller
+# binds the data by the names the model reads (snag jax-source-renam-c36033de).
+# A name that is no identifier (a submodel's `r.g`) takes a fresh one (`r_g`).
+function _jax_key_name(used::Set{String}, name; stable::Bool = true)
+    text = stable ? _jax_stable_name(name) : String(Symbol(name))
+    if occursin(r"^[A-Za-z_][A-Za-z0-9_]*$", text) && !(text in used)
         push!(used, text)
         return text
     end
@@ -660,8 +722,26 @@ _jax_is_singleton_value(v::_PyVal) = v.T isa Type && v.T !== Nothing && !(v.T <:
 # parameter, `promote_type(...)`), as `clamp`'s `convert(T, x)` passes it.
 _jax_type_of_value(v::_PyVal) = v.T isa _JaxCallable ? (v.T.f isa Type ? v.T.f : nothing) :
     v.T isa Type && v.T <: Type && !(v.T isa UnionAll) ? v.T.parameters[1] : nothing
-_jax_dtype(@nospecialize(E)) = E <: Bool ? "jnp.bool_" : E <: Integer ? "jnp.int64" :
-    E <: AbstractFloat ? "jnp." * _jax_dtype_name(E) : "jnp.float64"
+_jax_dtype(@nospecialize(E)) = E <: Bool ? "jnp.bool_" : E <: Integer ? _jax_int_dtype() :
+    E <: AbstractFloat ? "jnp." * _jax_dtype_name(E) : "jnp." * _jax_float_name()
+
+# The module's float type, `jax_source`'s `float_type`: the dtype of every
+# float value the program does not type `Float32` explicitly (Julia's default
+# `Float64`, a sampler boundary's values, data). It is set for the task that
+# emits one module, so modules emitted concurrently do not share it.
+const _JAX_FLOAT_TYPE_KEY = :reactivekernels_jax_float_type
+_jax_float_type() = get(task_local_storage(), _JAX_FLOAT_TYPE_KEY, Float64)::DataType
+_jax_float_name() = _jax_float_type() === Float32 ? "float32" : "float64"
+# A float32 module does not turn on JAX's 64-bit mode (`_jax_needs_x64`), so
+# its integers are JAX's default integer, Python's `int` as a dtype: int32,
+# or int64 where another module turned 64-bit mode on, as `jnp.arange` and
+# the integer data are there.
+_jax_int_dtype() = _jax_float_type() === Float32 ? "int" : "jnp.int64"
+function _jax_with_float_type(f, float_type)
+    float_type in (Float64, Float32) || throw(ArgumentError(
+        "jax_source: `float_type` is `Float64` or `Float32`; got `$float_type`"))
+    task_local_storage(f, _JAX_FLOAT_TYPE_KEY, float_type)
+end
 
 _jax_expr(ctx::_JaxContext, ::Val{H}, ex) where {H} =
     _jax_error("the construct `", H, "` (`", ex, "`) has no JAX translation yet",
@@ -1631,6 +1711,11 @@ end
 # A loop carry enters with a fixed dtype, as `fori_loop` requires. A tuple
 # (or `NamedTuple`) stays a Python tuple, its elements coerced one by one, so
 # it has the structure the loop body and a branch's arms return.
+# A scan's initial carry. A float32 module types it as a loop's carry is: a
+# literal (`level[1] = 0.0`) is float64 under 64-bit mode, and the carry would
+# stay float64 through the step's float32 arithmetic.
+_jax_scan_init(ctx::_JaxContext, v::_PyVal) =
+    _jax_float_type() === Float64 ? v : _jax_carry_value(ctx, v)
 function _jax_carry_value(ctx::_JaxContext, v::_PyVal)
     _jax_is_array(v.T) && return v
     if _jax_is_tuple(v.T)
@@ -1788,23 +1873,54 @@ function _jax_trip_bound(ctx::_JaxContext, lo::_PyVal, hi::_PyVal)
         throw(_CellHostNeeded(o.plate, o.recipe, JAXEmissionError(
             "a data-only integer used as a loop end needs a bound from `prepare_data`" * _jax_where(ctx))))
     end
+    # Ends at one position with one positive scale differ by that scale times
+    # the arrays' difference there, at most that times their largest one.
     count = if a isa _JaxOrigin && b isa _JaxOrigin && a.position !== nothing &&
-               a.position == b.position
-        span = _jax_prepared_bound!(ctx, :span, a.key, b.key)
+               a.position == b.position && a.scale == b.scale && _jax_static_sign(a.scale) > 0
+        span = _jax_scaled(a.scale, _jax_prepared_bound!(ctx, :span, a.key, b.key))
         _jax_offset(_jax_offset(span, "+", b.offset), "-", a.offset)
     else
         upper = hi.static ? hi.code : !isempty(hi.limit) ? hi.limit :
-            b isa _JaxOrigin && b.position !== nothing ?
-            _jax_offset(_jax_prepared_bound!(ctx, :max, b.key), "+", b.offset) : nothing
+            b isa _JaxOrigin && b.position !== nothing ? _jax_entry_bound(ctx, b, true) : nothing
         lower = lo.static ? lo.code : a isa _JaxOrigin && a.position !== nothing ?
-            _jax_offset(_jax_prepared_bound!(ctx, :min, a.key), "+", a.offset) : nothing
+            _jax_entry_bound(ctx, a, false) : nothing
         upper === nothing || lower === nothing ? nothing : _py_infix("-", [upper, lower])
     end
     count === nothing ? nothing : "max(" * _py_infix("+", [count, "1"]) * ", 0)"
 end
+# A static upper (`upper`) or lower bound of a prepared entry `o`,
+# `scale * prepared[key][i] + offset`: the scale times the array's largest
+# entry, or its least where the scale is negative (either where its sign is
+# known only while tracing), plus the offset.
+function _jax_entry_bound(ctx::_JaxContext, o::_JaxOrigin, upper::Bool)
+    sign = _jax_static_sign(o.scale)
+    extreme(kind) = _jax_scaled(o.scale, _jax_prepared_bound!(ctx, kind, o.key))
+    bound = sign > 0 ? extreme(upper ? :max : :min) :
+        sign < 0 ? extreme(upper ? :min : :max) :
+        (upper ? "max(" : "min(") * extreme(:max) * ", " * extreme(:min) * ")"
+    _jax_offset(bound, "+", o.offset)
+end
 # `code op offset`, a static integer offset; nothing added for a zero one.
 _jax_offset(code::AbstractString, op::AbstractString, offset::AbstractString) =
     offset == "0" ? code : _py_infix(op, [code, offset])
+# `scale * code`, a static integer scale; nothing multiplied for a unit one.
+_jax_scaled(scale::AbstractString, code::AbstractString) =
+    scale == "1" ? code : _py_infix("*", [scale, code])
+# The sign of a static integer's code when it is a literal, else 0 (known
+# only while tracing).
+function _jax_static_sign(code::AbstractString)
+    m = match(r"^-?[0-9]+$", code)
+    m === nothing ? 0 : sign(parse(Int, code))
+end
+# `x op y` of static integers' codes, folded when both are literals.
+function _jax_static_integer_op(op::AbstractString, x::AbstractString, y::AbstractString)
+    literal = r"^-?[0-9]+$"
+    if occursin(literal, x) && occursin(literal, y)
+        a, b = parse(Int, x), parse(Int, y)
+        return string(op == "+" ? a + b : op == "-" ? a - b : a * b)
+    end
+    _py_infix(op, [x, y])
+end
 
 # The name of a static bound of prepared integer arrays `keys` (`:min` and
 # `:max` of one array's entries, `:span` the largest difference of the second
@@ -1858,18 +1974,29 @@ function _jax_if(ctx::_JaxContext, ex, value::Bool)
         v = translate(body)
         # An arm that throws carries nothing out: the branch is the other arm.
         v.T === Union{} && return v
-        parts = [v.T === Nothing ? "None" : v.code]
+        # A carried number is an array (`_jax_carry_value`) of the type the
+        # arm gives it, which the branch promotes with the other arm's
+        # (`_jax_branch_type`). So is an integer value known while tracing:
+        # it may be a prepared `StaticInt`, which is not a JAX value.
+        parts = [v.T === Nothing ? "None" :
+                 v.static && v.T isa Type && v.T <: Integer && !(v.T <: Bool) ?
+                 _jax_carry_value(ctx, v).code : v.code]
+        types = Any[_jax_typeof(v)]
         for n in carried
-            push!(parts, _jax_carry_value(ctx, ctx.locals[n]).code)
+            c = ctx.locals[n]
+            push!(parts, _jax_carry_value(ctx, c).code)
+            push!(types, _jax_is_scalar(c.T) && isconcretetype(c.T) ? c.T : before[n].T)
         end
-        _PyVal("(" * join(parts, ", ") * ")", Tuple{_jax_typeof(v), (before[n].T for n in carried)...})
+        _PyVal("(" * join(parts, ", ") * ")", Tuple{types...})
     end
     branch = _jax_conditional(ctx, condition, arm(ex.args[2]), arm(otherwise))
     branch.T === Union{} && return branch
     result = _jax_bind!(ctx, :branch, branch)
     for (k, n) in enumerate(carried)
         b = before[n]
-        ctx.locals[n] = _PyVal(_py_atom(result.code) * "[" * string(k) * "]", b.T, false, b.extent,
+        T = _jax_is_tuple(result.T) && result.T <: Tuple && _jax_is_scalar(fieldtype(result.T, k + 1)) ?
+            fieldtype(result.T, k + 1) : b.T
+        ctx.locals[n] = _PyVal(_py_atom(result.code) * "[" * string(k) * "]", T, false, b.extent,
                                b.limit, b.padded)
     end
     _PyVal(_py_atom(result.code) * "[0]", result.T isa Type && result.T <: Tuple ? fieldtype(result.T, 1) : Any)
@@ -1897,7 +2024,7 @@ function _jax_conditional(ctx::_JaxContext, condition::_PyVal, then_build, else_
     traced = ctx.traced_branches
     ctx.traced_branches = condition.static ? 0 : traced + 1
     effects = _JAX_EFFECTS[]
-    then_arm, else_arm = try
+    then_built, else_built = try
         condition.static ? (_jax_arm_function(ctx, :then_arm, then_build),
                             _jax_arm_function(ctx, :else_arm, else_build)) :
             (_jax_with_guard(() -> _jax_arm_function(ctx, :then_arm, then_build),
@@ -1907,8 +2034,14 @@ function _jax_conditional(ctx::_JaxContext, condition::_PyVal, then_build, else_
     finally
         ctx.traced_branches = traced
     end
-    T = then_arm.T === Union{} ? else_arm.T : else_arm.T === Union{} ? then_arm.T :
-        promote_type(_jax_typeof(then_arm), _jax_typeof(else_arm))
+    A, B = then_built.value.T, else_built.value.T
+    T = A === Union{} ? B : B === Union{} ? A :
+        _jax_branch_type(_jax_typeof(then_built.value), _jax_typeof(else_built.value))
+    # A `jax.lax.cond`'s arms return the branch's type (`_jax_branch_value`);
+    # a Python conditional returns the taken arm's value as Julia does.
+    lax = !condition.static && A !== Union{} && B !== Union{}
+    then_arm = _jax_emit_arm!(ctx, then_built, lax ? T : nothing)
+    else_arm = _jax_emit_arm!(ctx, else_built, lax ? T : nothing)
     # Bound at once, so an arm that raises does so in program order even when
     # the value is unused (a guard `n == k || throw(...)`).
     condition.static &&
@@ -1926,10 +2059,22 @@ function _jax_conditional(ctx::_JaxContext, condition::_PyVal, then_build, else_
         _jax_emit!(ctx, valued.code * "()")
         return _PyVal("None", Union{}, true)
     end
-    branch = _PyVal("jax.lax.cond(" * condition.code * ", " * then_arm.code * ", " *
-                    else_arm.code * ")", T)
+    branch = _PyVal("jax.lax.cond(" * condition.code * ", " * _jax_typed_arm(then_arm, T) * ", " *
+                    _jax_typed_arm(else_arm, T) * ")", T)
     # An arm with a runtime check runs even when the branch value is unused.
     _JAX_EFFECTS[] == effects ? branch : _jax_bind!(ctx, :branch, branch)
+end
+# A static arm's value, a Python literal (`return 1.0`) or a NumPy scalar, is
+# float64 under 64-bit mode, and `jax.lax.cond` refuses arms of different
+# dtypes: where the branch's float dtype is another (a float32 module, a
+# `Float32` program), the arm returns its value as that dtype.
+function _jax_typed_arm(arm::_PyVal, @nospecialize(T))
+    arm.static || return arm.code
+    E = _jax_eltype(T)
+    E isa Type && E <: AbstractFloat && (T === E || T <: AbstractArray) || return arm.code
+    dtype = _jax_dtype(E)
+    dtype == "jnp.float64" && return arm.code
+    "(lambda: jnp.asarray(" * arm.code * "(), dtype=" * dtype * "))"
 end
 # `throw` in a branch decided while tracing raises then. Under conditions that
 # depend on data it is `_runtime_check(false, e)` there: a check masked by
@@ -2099,14 +2244,20 @@ _jax_expr(ctx::_JaxContext, ::Val{:elseif}, ex) = _jax_expr(ctx, Val(:if),
 
 _jax_typeof(v::_PyVal) = v.T isa Type ? v.T : Any
 
-# A zero-argument nested function whose body `build` translates; its value's
-# type travels in the returned `_PyVal`.
+# An arm of a conditional, translated but not yet emitted: the name of its
+# zero-argument nested function, the scope holding its body, and its value.
+struct _JaxArm
+    name::String
+    scope::_JaxScope
+    value::_PyVal
+end
+
+# Translate an arm's body `build` in a scope of its own.
 function _jax_arm_function(ctx::_JaxContext, hint, build)
     name = _jax_fresh(ctx, hint)
     outer = ctx.scope
     inner = _JaxScope(outer)
     inner.indent = outer.indent + 1
-    push!(outer.lines, "    "^outer.indent * "def " * name * "():")
     saved_locals = copy(ctx.locals)
     ctx.scope = inner
     result = try
@@ -2115,11 +2266,77 @@ function _jax_arm_function(ctx::_JaxContext, hint, build)
         ctx.scope = outer
         empty!(ctx.locals); merge!(ctx.locals, saved_locals)
     end
-    append!(outer.lines, inner.lines)
-    push!(outer.lines, "    "^inner.indent * "return " * result.code)
     union!(outer.used, inner.used)
-    _PyVal(name, result.T, result.static)
+    _JaxArm(name, inner, result)
 end
+
+# Emit an arm as its nested function, returning its value as type `T` when
+# `T` is given (`_jax_branch_value`). The function's name stands for the arm,
+# with the type and staticness of what it returns.
+function _jax_emit_arm!(ctx::_JaxContext, arm::_JaxArm, @nospecialize(T) = nothing)
+    outer = ctx.scope
+    result = arm.value
+    if T !== nothing
+        ctx.scope = arm.scope
+        try
+            result = _jax_branch_value(ctx, result, T)
+        finally
+            ctx.scope = outer
+        end
+        union!(outer.used, arm.scope.used)
+    end
+    push!(outer.lines, "    "^outer.indent * "def " * arm.name * "():")
+    append!(outer.lines, arm.scope.lines)
+    push!(outer.lines, "    "^arm.scope.indent * "return " * result.code)
+    _PyVal(arm.name, result.T, result.static)
+end
+
+# The type of a branch whose arms have types `A` and `B`: Julia's promotion,
+# element by element for tuples of one length (an `if` returning its value
+# with the locals it assigns), where `promote_type` would give `Real`.
+function _jax_branch_type(@nospecialize(A), @nospecialize(B))
+    A isa Type && B isa Type || return Any
+    A <: Tuple && B <: Tuple && isconcretetype(A) && isconcretetype(B) &&
+        fieldcount(A) == fieldcount(B) &&
+        return Tuple{(_jax_branch_type(fieldtype(A, k), fieldtype(B, k)) for k in 1:fieldcount(A))...}
+    promote_type(A, B)
+end
+
+# An arm's value `v` as the branch's type `T`. JAX requires both arms of a
+# `jax.lax.cond` to return one structure of one dtype, where Julia's arms may
+# differ in type (`s == 0 ? 1.0 : s` with an integer `s`). A number whose type
+# is not `T` becomes an array of `T`'s dtype, and so does an integer known
+# while tracing: it may be a prepared `StaticInt`, a pytree node without
+# leaves where the other arm returns an array. An array converts its element
+# type, and a tuple converts element by element.
+function _jax_branch_value(ctx::_JaxContext, v::_PyVal, @nospecialize(T))
+    _jax_branch_converts(_jax_typeof(v), v.static, T) || return v
+    S = _jax_typeof(v)
+    if S <: Tuple
+        t = _jax_bind!(ctx, :arm_value, v)
+        parts = [_jax_branch_value(ctx, _PyVal(_py_atom(t.code) * "[" * string(k - 1) * "]",
+                                               fieldtype(S, k), false), fieldtype(T, k))
+                 for k in 1:fieldcount(T)]
+        return _PyVal(_jax_tuple_code(parts), T)
+    end
+    E = T <: AbstractArray ? eltype(T) : T
+    _PyVal("jnp.asarray(" * v.code * ", dtype=" * _jax_dtype(E) * ")", T)
+end
+function _jax_branch_converts(@nospecialize(S), static::Bool, @nospecialize(T))
+    isconcretetype(T) && isconcretetype(S) || return false
+    if T <: Tuple
+        return S <: Tuple && fieldcount(S) == fieldcount(T) &&
+            any(_jax_branch_converts(fieldtype(S, k), false, fieldtype(T, k)) for k in 1:fieldcount(T))
+    elseif T <: _JaxBranchReal
+        return S <: _JaxBranchReal && (S !== T || static && T <: Integer && !(T <: Bool))
+    elseif T <: AbstractArray
+        return S <: AbstractArray && ndims(S) == ndims(T) && eltype(S) <: _JaxBranchReal &&
+            isconcretetype(eltype(T)) && eltype(T) <: _JaxBranchReal && eltype(S) !== eltype(T)
+    end
+    false
+end
+# The numbers whose dtype `_jax_dtype` names.
+const _JaxBranchReal = Union{Integer,AbstractFloat}
 
 function _jax_expr(ctx::_JaxContext, ::Val{:call}, ex)
     head = ex.args[1]
@@ -2207,6 +2424,8 @@ function _jax_call(ctx::_JaxContext,
     f in (sum, prod) && names == [:init] ||
         _jax_error("keyword arguments ", join(names, ", "), " to `", f,
                    "` have no JAX translation", _jax_where(ctx))
+    f === sum && length(args) == 2 && _jax_fixed_tuple_type(args[2]) !== nothing &&
+        return _jax_tuple_sum(ctx, _jax_function_of(args[1]), args[2], last(only(kw)))
     reduced = _jax_call_positional(ctx, f, args)
     _jax_call(ctx, f === sum ? (+) : (*), [last(only(kw)), reduced])
 end
@@ -2339,9 +2558,19 @@ function _jax_result(f, args::Vector{_PyVal}, code::AbstractString)
     static = !isempty(args) && all(a -> a.static, args)
     if static && _jax_stages(code, args)
         host = _host_static_text(code)
-        host === nothing ? (static = false) : (code = host)
+        host === nothing ? (static = false) : (code = _host_float_value(host, T))
     end
     _PyVal(code, T, static, _jax_is_array(T) ? _jax_extent(args) : "")
+end
+# NumPy computes a static float as float64, a strongly typed value that turns
+# the JAX arithmetic it meets float64: in a float32 module it is rounded to
+# the module's float type (`np.float32(np.log(2 * np.pi))`).
+function _host_float_value(code::AbstractString, @nospecialize(T))
+    E = _jax_eltype(T)
+    E isa Type && E <: AbstractFloat || return code
+    dtype = _host_dtype(E)
+    dtype == "np.float64" && return code
+    T === E ? dtype * "(" * code * ")" : "np.asarray(" * code * ", dtype=" * dtype * ")"
 end
 function _jax_stages(code::AbstractString, args::Vector{_PyVal})
     operation = foldl((c, a) -> isempty(a.code) ? c : replace(c, a.code => ""), args; init = code)
@@ -2647,6 +2876,10 @@ function _jax_elementwise_call(ctx::_JaxContext, ::typeof(fma), args::Vector{_Py
     _jax_real_operands(args) || return nothing
     T = promote_type((a.T for a in args)...)
     T <: Integer && return _jax_mul_add(ctx, args)
+    # A float32 module's default float is float32, so its `fma` rounds once
+    # to float32 (`_rk_fma32`, which turns on 64-bit mode for its float64
+    # product: `_jax_needs_x64`).
+    T <: AbstractFloat && T !== Float32 && _jax_float_type() === Float32 && (T = Float32)
     haskey(_JAX_FMA, T) ||
         _jax_error("`fma` of `", T, "` values has no JAX translation (`Float64`, `Float32` ",
                    "and integer `fma` do)", _jax_where(ctx))
@@ -2678,12 +2911,16 @@ _jax_int_literal(v::_PyVal) = occursin(r"^-?[0-9]+$", v.code)
 function _jax_scalar_or_elementwise(ctx::_JaxContext, f, args::Vector{_PyVal})
     any(c -> c === f, _JAX_COMPARISONS) && length(args) == 2 && all(_jax_int_literal, args) &&
         return _jax_literal(f(parse(Int, args[1].code), parse(Int, args[2].code)))
+    args = _jax_float_operands(ctx, f, args)
+    any(a -> !a.static, args) && (args = map(a -> _jax_float_static(ctx, a), args))
     if haskey(_JAX_INFIX, f)
         op = _JAX_INFIX[f]
         length(args) == 1 && f === (-) &&
             return _jax_elementwise_result(f, args, _py_negate(args[1].code))
         length(args) == 1 && f === (+) && return args[1]
         length(args) >= 2 || return nothing
+        f in ((+), (-)) && all(a -> _jax_is_array(a.T), args) &&
+            (args = _jax_common_extent(ctx, args))
         return _jax_elementwise_result(f, args, _py_infix(op, [a.code for a in args]))
     end
     if f === (*) && any(a -> a.T isa Type && a.T <: AbstractString, args)
@@ -2701,6 +2938,43 @@ function _jax_scalar_or_elementwise(ctx::_JaxContext, f, args::Vector{_PyVal})
     name = _jax_elementwise_name(ctx, f, args)
     name === nothing && return nothing
     _jax_result(f, args, name * "(" * _jax_args(args) * ")")
+end
+
+# A float that a float32 module computes from traced integers alone (`log(k)`,
+# `i / j`, `0.5 * k`) would be JAX's default float, float64 under 64-bit
+# mode: the integers are cast to the module's float first, as Julia's
+# promotion makes them `Float64`, the module's float type. A float operand
+# beside them (`x ^ n`) keeps them integers.
+function _jax_float_operands(ctx::_JaxContext, f, args::Vector{_PyVal})
+    ctx.host === nothing && _jax_float_type() !== Float64 || return args
+    integer(a) = (E = _jax_eltype(a.T); E isa Type && E <: Integer && !(E <: Bool))
+    any(a -> !a.static && integer(a), args) || return args
+    all(a -> a.static || integer(a), args) || return args
+    T = _jax_return_type(f, [a.T isa Type ? a.T : Any for a in args])
+    E = _jax_eltype(T)
+    E isa Type && E <: AbstractFloat || return args
+    map(args) do a
+        (a.static || !integer(a)) && return a
+        F = a.T <: AbstractArray ? Array{Float64,ndims(a.T)} : Float64
+        _PyVal("jnp.asarray(" * a.code * ", dtype=" * _jax_dtype(Float64) * ")", F, false,
+               a.extent, a.limit, a.padded, nothing)
+    end
+end
+
+# A static float that NumPy computed (a host helper's value, `np.log(...)`) is
+# float64, a strongly typed value that turns the float32 arithmetic it meets
+# float64 under 64-bit mode: where it meets a traced value in a float32
+# module, it is rounded to the module's float. A Python literal is weakly
+# typed and follows the traced value as it is.
+# A Python literal (weakly typed), or a value already rounded to float32.
+const _JAX_WEAK_OR_SINGLE = Regex("^(?:" * join((raw"-?[0-9.]+(?:[eE][-+]?[0-9]+)?",
+    raw"-?jnp\.(?:inf|nan|pi|e)", raw"float\('-?(?:inf|nan)'\)", raw"np\.float32\(.*",
+    raw"np\.asarray\(.*dtype=np\.float32\)"), "|") * ")\$")
+function _jax_float_static(ctx::_JaxContext, a::_PyVal)
+    a.static && ctx.host === nothing && _jax_float_type() !== Float64 || return a
+    occursin(_JAX_WEAK_OR_SINGLE, a.code) && return a
+    code = _host_float_value(a.code, a.T)
+    code == a.code ? a : _PyVal(code, a.T, true, a.extent, a.limit, a.padded, a.origin)
 end
 
 # A call on scalars is its elementwise form. A call with an array argument
@@ -2731,18 +3005,26 @@ function _jax_shifted_limit(f, args::Vector{_PyVal}, v::_PyVal)
     _jax_history_index_result(f, args, _jax_shifted_integer_limit(f, values, v))
 end
 function _jax_shifted_integer_limit(f, args::Vector{_PyVal}, v::_PyVal)
-    (f === (+) || f === (-)) && length(args) == 2 && isempty(v.limit) && !v.static || return v
+    isempty(v.limit) && !v.static || return v
+    all(a -> a.T isa Type && a.T <: Integer, args) || return v
+    f === (*) && return _jax_scaled_integer_limit(args, v)
+    # `-j` is `-1 * j`.
+    f === (-) && length(args) == 1 && return _jax_scaled_integer_limit([_jax_literal(-1), args[1]], v)
+    (f === (+) || f === (-)) && length(args) == 2 || return v
     a, b = args
-    a.T isa Type && a.T <: Integer && b.T isa Type && b.T <: Integer || return v
+    entry(x) = x.origin isa _JaxOrigin && x.origin.position !== nothing
     # An entry of the prepared data shifted by a static integer keeps its
     # origin, shifted: `stops[r] - 1` is at most the largest stop less one.
-    if a.origin isa _JaxOrigin && a.origin.position !== nothing && b.static
-        offset = a.origin.offset == "0" && f === (+) ? b.code :
-            _py_infix(f === (+) ? "+" : "-", [a.origin.offset, b.code])
-        return _jax_with_origin(v, _JaxOrigin(a.origin.key, a.origin.position, offset))
-    elseif f === (+) && b.origin isa _JaxOrigin && b.origin.position !== nothing && a.static
-        return _jax_with_origin(v, _JaxOrigin(b.origin.key, b.origin.position,
-                                              _jax_offset(a.code, "+", b.origin.offset)))
+    if entry(a) && b.static
+        o = a.origin
+        offset = o.offset == "0" && f === (+) ? b.code :
+            _py_infix(f === (+) ? "+" : "-", [o.offset, b.code])
+        return _jax_with_origin(v, _JaxOrigin(o.key, o.position, offset, o.path, o.scale))
+    elseif entry(b) && a.static
+        # `c - j` is `-1 * j + c`.
+        o = f === (-) ? _jax_scaled_origin(b.origin, "-1") : b.origin
+        return _jax_with_origin(v, _JaxOrigin(o.key, o.position, _jax_offset(a.code, "+", o.offset),
+                                              o.path, o.scale))
     end
     if !isempty(a.limit) && b.static && (f === (+) || occursin(r"^[0-9]+$", b.code))
         limit = f === (-) ? a.limit : _py_infix("+", [a.limit, b.code])
@@ -2753,6 +3035,23 @@ function _jax_shifted_integer_limit(f, args::Vector{_PyVal}, v::_PyVal)
     end
     _PyVal(v.code, v.T, v.static, v.extent, limit, v.padded, v.origin)
 end
+# `k * j` of static integers `k` and one integer `j` with a static bound
+# keeps a bound: an entry of the prepared data keeps its origin, scaled
+# (`2 * n[i]` is at most twice the largest entry), and a nonnegative literal
+# scales a static limit (`2 * length(r)` of a padded row).
+function _jax_scaled_integer_limit(args::Vector{_PyVal}, v::_PyVal)
+    count(a -> !a.static, args) == 1 && length(args) >= 2 || return v
+    j = only(a for a in args if !a.static)
+    k = foldl((x, y) -> _jax_static_integer_op("*", x, y), (a.code for a in args if a.static))
+    j.origin isa _JaxOrigin && j.origin.position !== nothing &&
+        return _jax_with_origin(v, _jax_scaled_origin(j.origin, k))
+    !isempty(j.limit) && occursin(r"^[0-9]+$", k) || return v
+    _PyVal(v.code, v.T, v.static, v.extent, _jax_scaled(k, j.limit), v.padded, v.origin)
+end
+# `k` times an entry's origin: its scale and offset times `k`.
+_jax_scaled_origin(o::_JaxOrigin, k::AbstractString) =
+    _JaxOrigin(o.key, o.position, o.offset == "0" ? "0" : _jax_static_integer_op("*", k, o.offset),
+               o.path, o.scale == "1" ? k : _jax_static_integer_op("*", k, o.scale))
 
 """
     _jax_function_call(ctx::_JaxContext, f, args::Vector{_PyVal}) -> _PyVal
@@ -2870,6 +3169,8 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(sum), args::Vector{_PyVal
         return _PyVal("jnp.sum(" * _jax_padded_reduced(ctx, sum, args[1], "0.0") * ")",
                       eltype(args[1].T))
     length(args) == 1 && return _jax_result(sum, args, "jnp.sum(" * args[1].code * ")")
+    length(args) == 2 && _jax_fixed_tuple_type(args[2]) !== nothing &&
+        return _jax_tuple_sum(ctx, _jax_function_of(args[1]), args[2], nothing)
     length(args) == 2 && _jax_is_array(args[2].T) || _jax_error("this `sum` call", _jax_where(ctx))
     mapped = _jax_broadcast(ctx, _jax_function_of(args[1]), [args[2]])
     # `f` of a padded array's padding is not part of the sum.
@@ -2877,6 +3178,25 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(sum), args::Vector{_PyVal
                                             eltype(mapped.T))
     masked = _PyVal(mapped.code, mapped.T, false, args[2].extent, "", _jax_padded_axes(args[2]))
     _PyVal("jnp.sum(" * _jax_padded_reduced(ctx, sum, masked, "0") * ")", eltype(mapped.T))
+end
+# The type of a tuple value whose length its type fixes (a Vararg formal's
+# trailing arguments, a tuple literal), also one holding a function, or
+# `nothing`.
+function _jax_fixed_tuple_type(v::_PyVal)
+    T = v.T isa _JaxAggregate ? v.T.T : v.T
+    _jax_is_tuple(T) && T <: Tuple ? T : nothing
+end
+# `sum(g, t[; init])` of such a tuple: `g` of each element, added in order
+# from `init`, as Julia folds a tuple. The fold follows the tuple's fixed
+# length, as `afoldl` folds a fixed argument list, never a data length.
+function _jax_tuple_sum(ctx::_JaxContext, g, t::_PyVal, init)
+    total = init
+    for k in 1:fieldcount(_jax_fixed_tuple_type(t))
+        v = _jax_call(ctx, g, [_jax_tuple_element(ctx, t, _PyVal(string(k), Int, true))])
+        total = total === nothing ? v : _jax_call(ctx, +, [total, v])
+    end
+    total === nothing && _jax_error("`sum` of an empty tuple without `init`", _jax_where(ctx))
+    total
 end
 for (f, name, neutral) in ((prod, "jnp.prod", "1.0"), (maximum, "jnp.max", "-jnp.inf"),
                            (minimum, "jnp.min", "jnp.inf"))
@@ -2901,8 +3221,8 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(div), args::Vector{_PyVal
         return _PyVal(code, Int, true)
     end
     ctx.host === nothing || _jax_error("`div` of host values that are not known", _jax_where(ctx))
-    _PyVal("jax.lax.div(jnp.asarray(" * a.code * ", dtype=jnp.int64), jnp.asarray(" * b.code *
-           ", dtype=jnp.int64))", Int)
+    _PyVal("jax.lax.div(jnp.asarray(" * a.code * ", dtype=" * _jax_dtype(Int) * "), jnp.asarray(" *
+           b.code * ", dtype=" * _jax_dtype(Int) * "))", Int)
 end
 
 # `x in t` for a scalar `x` and a tuple of scalars `t`: Python's `in` when
@@ -3570,7 +3890,10 @@ function _jax_call_positional(ctx::_JaxContext, J::LinearAlgebra.UniformScaling,
         _jax_error("`I` called with `", join((a.T for a in args), ", "), "`", _jax_where(ctx))
     size, extent = _jax_allocation_size(ctx, only(args))
     np = ctx.host === nothing ? "jnp." : "np."
-    code = np * "eye(" * size * ")"
+    # Its entries are the default float, the module's float type in a float32 one.
+    dtype = _jax_float_type() === Float64 ? "" :
+        ", dtype=" * (ctx.host === nothing ? _jax_dtype(Float64) : _host_dtype(Float64))
+    code = np * "eye(" * size * dtype * ")"
     J.λ == true || (code = _py_infix("*", [_jax_literal(J.λ).code, code]))
     _PyVal(code, typeof(J(1)), false, extent, "", isempty(extent) ? 0 : 3)
 end
@@ -3643,7 +3966,7 @@ function _jax_call_positional(ctx::_JaxContext, T::Type, args::Vector{_PyVal})
         return _PyVal("jnp.asarray(" * args[1].code * ", dtype=" * _jax_dtype(T) * ")", T)
     end
     if T <: Integer && length(args) == 1
-        return _PyVal("jnp.asarray(" * args[1].code * ", dtype=jnp.int64)", T)
+        return _PyVal("jnp.asarray(" * args[1].code * ", dtype=" * _jax_dtype(Int) * ")", T)
     end
     _jax_error("constructing a `", T, "` has no JAX translation", _jax_where(ctx))
 end
@@ -3666,6 +3989,9 @@ function _jax_broadcast(ctx::_JaxContext, f, args::Vector{_PyVal})
         return _PyVal("jnp.asarray(" * x.code * ", dtype=" * _jax_dtype(f) * ")",
                       R == 0 ? f : Array{f,R}, false, x.extent, "", _jax_padded_like(x))
     end
+    # The result's extent and padded axes: rows padded by different lengths
+    # along the same axes take Julia's broadcast length (`_jax_common_extent`).
+    meta = _jax_common_extent(ctx, args)
     padded = map(values, referenced) do a, ref
         r = _jax_rank(a.T)
         !ref && 0 < r < R ? _PyVal(_py_atom(a.code) * "[" * join(fill("...", 1), "") *
@@ -3684,20 +4010,21 @@ function _jax_broadcast(ctx::_JaxContext, f, args::Vector{_PyVal})
     if any(referenced) || f isa _JaxClosure || any(_jax_translation_only, scalars)
         R == 0 && return _jax_call(ctx, f, scalars)
         code, E = _jax_captured_broadcast(ctx, f, scalars, padded, referenced)
-        return _PyVal(code, Array{E,R}, false, _jax_extent(args), "",
-                      _jax_broadcast_padded(args, R))
+        return _PyVal(code, Array{E,R}, false, _jax_extent(meta), "",
+                      _jax_broadcast_padded(meta, R))
     end
     v = _jax_elementwise_call(ctx, f, scalars)
-    v === nothing || return _PyVal(v.code, T, false, R == 0 ? "" : _jax_extent(args), "",
-                                   _jax_broadcast_padded(args, R))
+    v === nothing || return _PyVal(v.code, T, false, R == 0 ? "" : _jax_extent(meta), "",
+                                   _jax_broadcast_padded(meta, R))
     if haskey(_JAX_INFIX, f) || f === (*) || f === (^) ||
        _jax_elementwise_name(ctx, f, scalars) !== nothing
+        any(a -> !a.static, padded) && (padded = map(a -> _jax_float_static(ctx, a), padded))
         v = f === (*) ? _PyVal(_py_infix("*", [p.code for p in padded]), E) :
             f === (^) ? _PyVal(_py_infix("**", [padded[1].code, padded[2].code]), E) :
             _jax_scalar_or_elementwise(ctx, f, scalars)
         v === nothing && _jax_error("broadcasting `", f, "`", _jax_where(ctx))
-        return _PyVal(v.code, T, false, R == 0 ? "" : _jax_extent(args), "",
-                      _jax_broadcast_padded(args, R))
+        return _PyVal(v.code, T, false, R == 0 ? "" : _jax_extent(meta), "",
+                      _jax_broadcast_padded(meta, R))
     end
     # A function of each vector of a padded vector of vectors (`Diagonal.(rows)`
     # of a ragged plate's per-cell arguments) maps over the rows, each a padded
@@ -3734,7 +4061,7 @@ function _jax_broadcast(ctx::_JaxContext, f, args::Vector{_PyVal})
     ctx.host === nothing || return _PyVal("np.vectorize(" * name * ", otypes=[" *
         _host_dtype(E) * "])(" * _jax_args(padded) * ")", T)
     _PyVal("jnp.vectorize(" * name * ")(" * _jax_args(padded) * ")", T, false,
-           R == 0 ? "" : _jax_extent(args), "", _jax_broadcast_padded(args, R))
+           R == 0 ? "" : _jax_extent(meta), "", _jax_broadcast_padded(meta, R))
 end
 
 function _jax_captured_broadcast(ctx::_JaxContext, f, scalars, padded, referenced)
@@ -3897,7 +4224,11 @@ _jax_call_positional(ctx::_JaxContext,
 
 function _jax_rule_primal(ctx::_JaxContext, rule, Primal, args::Vector{_PyVal})
     value = _jax_rule_body(ctx, Primal, rule.primal_ops, args)
-    _PyVal(value.code, _jax_return_type(rule, Any[a.T for a in args]))
+    T = _jax_return_type(rule, Any[a.T for a in args])
+    # A primal of static arguments is NumPy's float64 value: rounded in a
+    # float32 module (`_jax_float_static`), as the rule's result is not static.
+    value.static && (value = _jax_float_static(ctx, _PyVal(value.code, T, true, "", "", 0)))
+    _PyVal(value.code, T)
 end
 
 function _jax_rule_body(ctx::_JaxContext, spec, ops, args::Vector{_PyVal})
@@ -4057,9 +4388,12 @@ function _jax_traceable_call(ctx::_JaxContext, f, args::Vector{_PyVal})
     source === nothing && return nothing
     names, body, mod = source
     length(source) >= 5 && (body = _jax_static_parameters(body, source[5]))
-    length(names) == length(args) || return nothing
-    ctx.host === nothing || return _host_function_call(ctx, f, collect(Symbol, names), body, mod, args)
-    v = _jax_source_expr(ctx, body, collect(Symbol, names), args, mod, nothing)
+    # A Vararg source's last formal is the tuple of the trailing arguments.
+    inputs = _traceable_arguments(source, args, rest -> _jax_call_positional(ctx, tuple, rest))
+    inputs === nothing && return nothing
+    ctx.host === nothing ||
+        return _host_function_call(ctx, f, collect(Symbol, names), body, mod, args, inputs)
+    v = _jax_source_expr(ctx, body, collect(Symbol, names), inputs, mod, nothing)
     _jax_bind!(ctx, :value, v)
 end
 
@@ -4827,8 +5161,11 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     if masked
         # Padding is storage, not a native cell. Include its activity in
         # runtime-check guards before batching those checks across lanes.
-        masks = ["jnp.broadcast_to(" * mask * ", " * _py_atom(v.code) * ".shape)"
-                 for (v, mask) in zip(inputs[padded], masks)]
+        # The mask spans the `R` mapped axes of the argument's stored array
+        # (a scan's tuple step outputs: their first column), so each cell
+        # receives one flag.
+        masks = ["jnp.broadcast_to(" * mask * ", " * _py_atom(_jax_mapped_array(v)) *
+                 ".shape[:" * string(R) * "])" for (v, mask) in zip(inputs[padded], masks)]
         push!(axes, "0")
         push!(args, foldl((a, b) -> "jnp.logical_and(" * a * ", " * b * ")", masks))
     end
@@ -4872,7 +5209,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
             empty_value = "jnp.zeros((" * join(fill("0", ndims(E) + 1), ", ") *
                           "), dtype=" * _jax_dtype(eltype(E)) * ")"
             only(with_length) && (empty_value = "(" * empty_value *
-                ", jnp.zeros((0,), dtype=jnp.int64))")
+                ", jnp.zeros((0,), dtype=" * _jax_dtype(Int) * "))")
             call = "(" * empty_value * " if " * empty * " else " * call * ")"
         end
         result = _jax_fresh(ctx, :plate_value)
@@ -5032,7 +5369,8 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     sequences = "(" * join(seqs, ", ") * (length(seqs) == 1 ? ",)" : ")")
     result = _jax_fresh(ctx, :scan_result)
     E = _jax_typeof(wants[2])
-    call = "jax.lax.scan(" * step * ", " * inputs[1].code * ", " * sequences * ")[1]"
+    call = "jax.lax.scan(" * step * ", " * _jax_scan_init(ctx, inputs[1]).code * ", " *
+           sequences * ")[1]"
     # JAX otherwise traces the step even for zero steps, including indexed
     # reads of an empty shared row. Numeric outputs have a known empty shape.
     empty = E <: Number ? _jax_no_values(E, false) :
@@ -5151,10 +5489,11 @@ function _jax_history_scan(ctx::_JaxContext, recipe::Recipe,
     seqs = String[[args[i].code for i in iterated]; "jnp.arange(" * steps * ")"]
     result = _jax_fresh(ctx, :scan_result)
     full = _jax_fresh(ctx, :history_result)
+    init = _jax_scan_init(ctx, args[1]).code
     outputs = _jax_fresh(ctx, :scan_outputs)
-    _jax_emit!(ctx, "(_, " * full * "), " * outputs * " = jax.lax.scan(" * step * ", (" * args[1].code *
+    _jax_emit!(ctx, "(_, " * full * "), " * outputs * " = jax.lax.scan(" * step * ", (" * init *
                     ", " * storage.buffer * "), (" * join(seqs, ", ") * ")) if " * steps *
-                    " else ((" * args[1].code * ", " * storage.buffer * "), jnp.zeros((0,), dtype=" * dtype * "))")
+                    " else ((" * init * ", " * storage.buffer * "), jnp.zeros((0,), dtype=" * dtype * "))")
     compact_result = HT <: Number ? outputs :
         "jnp.concatenate([jnp.asarray(" * history.code * ", dtype=" * dtype * "), " * outputs * "])"
     _jax_emit!(ctx, result * " = " * compact_result * " if " * storage.use_compact * " else " * full)
@@ -5229,12 +5568,20 @@ from jax.typing import ArrayLike
 
 jax.config.update("jax_enable_x64", True)
 """
+const _JAX_X64_LINE = "\njax.config.update(\"jax_enable_x64\", True)\n"
+# Whether the module turns on JAX's 64-bit mode: for float64 values, and in a
+# float32 module only for the float64 product of `fma`'s once-rounding helper.
+# Without it the module's floats are float32 and its integers int32 even
+# where a dtype is left to JAX.
+_jax_needs_x64(mod::_JaxModule) =
+    _jax_float_type() === Float64 || haskey(mod.helper_names, (:helper, "_rk_fma32"))
 
 """
-    jax_source(spec::KernelSpec; have, want, types = nothing, name = :kernel) -> JAXSource
+    jax_source(spec::KernelSpec; have, want, types = nothing, name = :kernel,
+               float_type = Float64) -> JAXSource
     jax_source(spec::KernelSpec; have, functions, types = nothing, constants = (;),
-               doc = nothing) -> JAXSource
-    jax_source(p::Plan; types = nothing, name = :kernel) -> JAXSource
+               doc = nothing, float_type = Float64) -> JAXSource
+    jax_source(p::Plan; types = nothing, name = :kernel, float_type = Float64) -> JAXSource
 
 Translate the program that computes `want` from `have` into a Python module
 whose function `name` takes the HAVE values, in order, and returns the WANT
@@ -5253,6 +5600,18 @@ annotate their parameters (`ArrayLike`) and results.
 a tuple in HAVE order; by default the ports' declared types are used, and
 they must be concrete. Value ranks follow from these types, so the module is
 generic in array sizes: one module serves every size of the same program.
+
+`float_type` (`Float64`, the default, or `Float32`) is the dtype of every
+float value the program does not type `Float32` itself: Julia's default
+`Float64` values, the inputs and data among them, are `float32` in a module
+emitted with `float_type = Float32`, for an accelerator whose float64 is slow.
+Such a module casts its float inputs to `float32`, `prepare_data` returns
+`float32` data, and the dtype metadata says so. It does not turn on JAX's
+64-bit mode (`jax_enable_x64`), so its device integers are JAX's default
+(`int32`), unless it rounds an `fma` once, which takes a float64 product; it
+stays float32 where another module turned that mode on. Its results carry
+float32 rounding: compare it with the `Float64` module of the same program at
+a tolerance relative to `eps(Float32)` and the size of the value.
 
 The translation keeps the program's structure. A plate is `jax.vmap` of its
 cell, a scan is `jax.lax.scan` of its step, a lazy branch is `jax.lax.cond`
@@ -5282,7 +5641,7 @@ function jax_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
                     want = nothing, functions = nothing, types = nothing,
                     name = :kernel, constants = NamedTuple(), doc = nothing, data = nothing,
                     definitions = nothing, definitions_module::Module = Main, keep = (),
-                    function_docs = NamedTuple())
+                    function_docs = NamedTuple(), float_type = Float64)
     functions === nothing && want === nothing && (want = _KERNEL_DEFAULT_BOUNDARY)
     if functions === nothing
         functions = NamedTuple{(Symbol(name),)}((want,))
@@ -5293,16 +5652,21 @@ function jax_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
         "jax_source: `functions` must be a nonempty NamedTuple of function name => WANT"))
     plans = [fname => (plan(spec; have, want = _jax_want_names(w)), w)
              for (fname, w) in pairs(functions)]
-    _jax_module_source(plans, types, constants, doc; data, definitions, definitions_module,
-                       keep, function_docs)
+    _jax_with_float_type(float_type) do
+        _jax_module_source(plans, types, constants, doc; data, definitions, definitions_module,
+                           keep, function_docs)
+    end
 end
 
 jax_source(p::Plan; types = nothing, name = :kernel, constants = NamedTuple(),
            doc = nothing, data = nothing, definitions = nothing,
-           definitions_module::Module = Main, keep = (), function_docs = NamedTuple()) =
-    _jax_module_source([Symbol(name) => (p, Tuple(v.name for v in p.want))],
-                       types, constants, doc; data, definitions, definitions_module, keep,
-                       function_docs)
+           definitions_module::Module = Main, keep = (), function_docs = NamedTuple(),
+           float_type = Float64) =
+    _jax_with_float_type(float_type) do
+        _jax_module_source([Symbol(name) => (p, Tuple(v.name for v in p.want))],
+                           types, constants, doc; data, definitions, definitions_module, keep,
+                           function_docs)
+    end
 
 _jax_want_names(w::Symbol) = (w,)
 _jax_want_names(w::Tuple) = w
@@ -5511,12 +5875,12 @@ function _jax_module_text(plans, types, constants, doc, prepare; function_docs =
         push!(constant_lines, cname * " = " * _jax_py_literal(value))
     end
     prepare === nothing && any(f -> any(io -> _jax_ragged(last(io)), f.inputs), functions) &&
-        pushfirst!(mod.helpers, rstrip(_JAX_PAD_RAGGED))
+        pushfirst!(mod.helpers, rstrip(replace(_JAX_PAD_RAGGED, "np.float64" => "np." * _jax_float_name())))
     lines = String[]
     docstring = doc === nothing ?
         "Generated by ReactiveKernels.jax_source; do not edit." : String(doc)
     push!(lines, "\"\"\"" * replace(docstring, "\"\"\"" => "\\\"\\\"\\\"") * "\"\"\"")
-    header = rstrip(_JAX_HEADER)
+    header = rstrip(_jax_needs_x64(mod) ? _JAX_HEADER : replace(_JAX_HEADER, _JAX_X64_LINE => ""))
     # The host code: `prepare_data`, and static values the functions compute
     # with NumPy.
     host = prepare !== nothing || any(b -> occursin(r"(?<![.\w])(?:np|ssp|scipy)\.",
@@ -5640,7 +6004,7 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
     remaining_names = [_jax_param_name(used, v.name) for v in split.remaining]
     prepared_names = String[]
     for v in split.constants
-        name = _jax_param_name(used, v.name)
+        name = _jax_key_name(used, v.name)
         push!(used, name * "_lengths", name * "_flat")
         push!(prepared_names, name)
         mod.helper_names[(:prepared_name, v.name)] = name
@@ -5729,13 +6093,25 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
                          any(v -> v.name === n, params))))
 end
 
+# A float32 module casts its float inputs, so a caller's float64 NumPy arrays
+# and scalars, strongly typed in JAX, do not turn its arithmetic float64.
+function _jax_input_dtype(@nospecialize(T))
+    _jax_float_type() === Float64 && return ""
+    E = T
+    while E isa Type && E <: AbstractArray
+        E = eltype(E)
+    end
+    E isa Type && E <: AbstractFloat ? ", dtype=" * _jax_dtype(E) : ""
+end
+
 # A value's dtype and rank, as module metadata describes an input.
 _jax_dtype_name(::Type{<:AbstractArray{T}}) where {T} = _jax_dtype_name(T)
 _jax_dtype_name(::Type{<:AbstractArray{<:AbstractArray{T}}}) where {T} = _jax_dtype_name(T)
 _jax_dtype_name(::Type{Bool}) = "bool"
 _jax_dtype_name(::Type{<:Integer}) = "int64"
 _jax_dtype_name(::Type{Float32}) = "float32"
-_jax_dtype_name(::Type{<:AbstractFloat}) = "float64"
+# Every other float is the module's float type (`jax_source`'s `float_type`).
+_jax_dtype_name(::Type{<:AbstractFloat}) = _jax_float_name()
 # Non-numeric values (level labels) cross as Python objects.
 _jax_dtype_name(@nospecialize(T)) = "object"
 _jax_meta_rank(@nospecialize(T)) = T isa Type && T <: AbstractArray ? ndims(T) : 0
@@ -5751,10 +6127,16 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
     host && (ctx.host = _HostState())
     params = String[]
     inputs = Pair{String,Any}[]
+    # Each input's Python local, beside its key in `inputs`. A prepared input
+    # (after the first `keyword_from`) is read from `**prepared` by its key
+    # (`_jax_key_name`) into a local, respelled when Python reserves the key.
+    input_locals = String[]
     for (k, (v, T)) in enumerate(zip(p.have, argtypes))
-        param = names === nothing ? _jax_identifier(scope.used, v.name) :
-            (push!(scope.used, names[k]); names[k])
-        push!(params, param); push!(inputs, param => T)
+        keyed = names !== nothing && keyword_from !== nothing && k > keyword_from
+        key = names === nothing ? _jax_identifier(scope.used, v.name) :
+            keyed ? names[k] : (push!(scope.used, names[k]); names[k])
+        param = keyed ? _jax_param_name(scope.used, key; stable = false) : key
+        push!(params, param); push!(inputs, key => T); push!(input_locals, param)
         if host
             # Host inputs are NumPy arrays; a ragged input is a list of them.
             scope.values[canon_id(p.graph, v.id)] = _PyVal(param, T, true)
@@ -5763,17 +6145,21 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
                 _jax_emit!(ctx, param * " = np.asarray(" * param * ")")
             continue
         end
-        extent = ""
+        extent = flat = ""
         if _jax_ragged(T)
+            extent_key = names === nothing ? "" : key * "_lengths"
             extent = names === nothing ? _jax_identifier(scope.used, Symbol(v.name, :_lengths)) :
-                (push!(scope.used, names[k] * "_lengths"); names[k] * "_lengths")
-            push!(params, extent); push!(inputs, extent => Vector{Int})
+                keyed ? _jax_param_name(scope.used, extent_key; stable = false) :
+                (push!(scope.used, extent_key); extent_key)
+            push!(params, extent); push!(inputs, (names === nothing ? extent : extent_key) => Vector{Int})
+            push!(input_locals, extent)
             if names !== nothing
                 # A prepared ragged input's flat positions; their count, the
                 # total length, is the static length of its flattening.
-                flat = names[k] * "_flat"
-                push!(scope.used, flat)
-                push!(params, flat); push!(inputs, flat => Vector{Int})
+                flat_key = key * "_flat"
+                flat = keyed ? _jax_param_name(scope.used, flat_key; stable = false) :
+                    (push!(scope.used, flat_key); flat_key)
+                push!(params, flat); push!(inputs, flat_key => Vector{Int}); push!(input_locals, flat)
                 mod.helper_names[(:flat, extent)] = flat
             end
         end
@@ -5785,15 +6171,19 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
         # bounds that `prepare_data` computes (`_jax_trip_bound`).
         prepared = keyword_from !== nothing && k > keyword_from &&
             T isa Type && T <: AbstractArray && _jax_integer_data(T)
+        # Its origin names the array by its key in the prepared data, which
+        # `prepare_data` reads to compute the bound.
         scope.values[canon_id(p.graph, v.id)] = _PyVal(param, T, static, extent, "", 0,
-            prepared ? _JaxOrigin(param, nothing, "0") : nothing)
+            prepared ? _JaxOrigin(key, nothing, "0") : nothing)
         # Callers may pass NumPy arrays; JAX indexes only its own arrays by a
         # traced index.
         if _jax_is_array(T) && (eltype(T) <: Number || _jax_ragged(T))
-            _jax_emit!(ctx, param * " = jnp.asarray(" * param * ")")
+            _jax_emit!(ctx, param * " = jnp.asarray(" * param * _jax_input_dtype(T) * ")")
             isempty(extent) || _jax_emit!(ctx, extent * " = jnp.asarray(" * extent * ")")
             haskey(mod.helper_names, (:flat, extent)) && names !== nothing &&
-                _jax_emit!(ctx, names[k] * "_flat = jnp.asarray(" * names[k] * "_flat)")
+                _jax_emit!(ctx, flat * " = jnp.asarray(" * flat * ")")
+        elseif T isa Type && T <: AbstractFloat && !isempty(_jax_input_dtype(T))
+            _jax_emit!(ctx, param * " = jnp.asarray(" * param * _jax_input_dtype(T) * ")")
         end
     end
     _jax_plan!(ctx, p)
@@ -5821,10 +6211,10 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
             body = join(scope.lines, "\n")
             for (bn, _, _) in _jax_prepared_bounds(mod)
                 occursin(Regex("\\b" * bn * "\\b"), body) || continue
-                push!(inputs, bn => Int)
+                push!(inputs, bn => Int); push!(input_locals, bn)
             end
-            for (pn, _) in inputs[keyword_from+1:end]
-                push!(lines, "    " * pn * " = prepared[\"" * pn * "\"]")
+            for ((pn, _), local_name) in zip(inputs[keyword_from+1:end], input_locals[keyword_from+1:end])
+                push!(lines, "    " * local_name * " = prepared[\"" * pn * "\"]")
             end
         end
     else

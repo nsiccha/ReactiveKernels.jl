@@ -2169,17 +2169,25 @@ end
         good.columns, good.n_obs)
     # Predictor metadata does not restrict a response use.
     @test validate_structure(bad) === nothing
-    # Response must be recoded 1..K integers: floats, gaps, and level
-    # overflow all fail.
+    # The two predictors state K = 3, so observations may omit a class
+    # (density and gradient: test_capability_categorical_levels.jl).
+    gapcols = Dict{Symbol,AbstractVector}(good.columns)
+    gapcols[:y] = [1, 3, 3, 1, 3, 3, 1, 3, 3]
+    gap = StructuralPlan(good.responses, good.predictors,
+        good.population_priors, good.parameters, good.assignments,
+        gapcols, good.n_obs)
+    @test validate_data(gap) === nothing
+    @test _categorical_plan(; cols = gapcols).responses[1].n_levels == 3
+    # Response must hold integer codes in 1..K: floats and level overflow
+    # fail.
     for (tag, newy) in (("floats", Float64.([1, 2, 3, 2, 1, 3, 1, 2, 3])),
-            ("gap", [1, 3, 3, 1, 3, 3, 1, 3, 3]),
             ("overflow", [1, 2, 4, 2, 1, 3, 1, 2, 3]))
         badcols = Dict{Symbol,AbstractVector}(good.columns)
         badcols[:y] = newy
         bad = StructuralPlan(good.responses, good.predictors,
             good.population_priors, good.parameters, good.assignments,
             badcols, good.n_obs)
-        # refused: float-typed leveled response (wrong eltype)
+        # refused: a float code or one above K names no category of the law
         @test_throws ContractValidationError validate_data(bad)
     end
 end
@@ -2219,8 +2227,15 @@ end
     # refused: simplex cutpoints do not have a real-support element prior.
     @test_throws ContractValidationError _ordered_plan(;
         vecfam = :simplex_dirichlet)
+    # Without a stated cutpoint count, K is read from the observations, so a
+    # skipped code would silently drop a category.
+    colsg = _leveled_columns(9)
+    colsg[:y] = [1, 3, 3, 1, 3, 3, 1, 3, 3]
+    # refused: an inferred level count needs every code 1..K observed
+    @test_throws ContractValidationError _ordered_plan(; cols = colsg)
     # Declared cutpoint sizes determine support, including absent categories.
     @test (validate_plan(_ordered_plan(; vecsize = 2)); true)
+    @test _ordered_plan(; vecsize = 2, cols = colsg).responses[1].n_levels == 3
     # Declared cutpoints may include an unobserved category (0zzviq9).
     larger_support = _ordered_plan(; vecsize = 3)
     @test larger_support.responses[1].n_levels == 4
@@ -2486,6 +2501,19 @@ end
     one = _categorical_plain_plan(6; cols = cols1, alpha = [2.0])
     @test (validate_plan(one); true)
     @test one.vector_parameters[1].size == 1
+    # The concentration states K = 3, including classes absent from y.
+    for newy in ([1, 3, 1, 3, 1, 3], fill(2, 6), [1, 2, 1, 2, 1, 2])
+        colsk = _leveled_columns(6)
+        colsk[:y] = newy
+        part = _categorical_plain_plan(6; cols = colsk)
+        @test (validate_plan(part); true)
+        @test part.responses[1].n_levels == 3
+        @test part.vector_parameters[1].size == 3
+    end
+    colsk = _leveled_columns(6)
+    colsk[:y] = [1, 2, 4, 1, 2, 3]
+    # refused: code 4 lies outside the three-entry simplex's support
+    @test_throws ContractValidationError _categorical_plain_plan(6; cols = colsk)
     # Categorical takes no trials / count columns / thresholds.
     r = LikelihoodSpec(CategoricalFam, IdentityLink, :y, :s, nothing,
         nothing, _none_evidence(), :y_resp, :N, nothing)

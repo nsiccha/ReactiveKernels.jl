@@ -4985,10 +4985,11 @@ function _lower_authored_plate_cell_state!(body, runtime_ops, runtime_recipes, s
             s.plate, s.slices, s.plate_values, nothing, s.lhs; batch)
         return
     end
-    pointwise = gensym(:cell_pointwise)
+    # The checked slices contain exactly one cell. Use the existing scalar
+    # result mode, as producer windows at one row do, instead of allocating a
+    # one-element pointwise buffer and reading it back with `only`.
     _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
-        s.plate, s.slices, s.plate_values, pointwise, nothing)
-    push!(body.args, Expr(:(=), s.lhs, Expr(:call, GlobalRef(Base, :only), pointwise)))
+        s.plate, s.slices, s.plate_values, nothing, nothing; cell = s.lhs)
     nothing
 end
 
@@ -5642,19 +5643,19 @@ end
 # statements over the call's arguments: the body `_extract_plate_programs` was
 # given, the guard of a program's call kept. Ordinary AD differentiates this
 # body (`_ad_inline_plate_programs`).
-function _inline_plate_programs(ast)
+function _inline_plate_programs(ast; expand = _plate_program_or_inline)
     declared = Set{Symbol}()
     _program_local_declarations!(declared, ast)
-    _inline_plate_programs(ast, declared)
+    _inline_plate_programs(ast, declared, expand)
 end
-function _inline_plate_programs(node, declared::Set{Symbol})
+function _inline_plate_programs(node, declared::Set{Symbol}, expand)
     if node isa Expr && node.head === :(=) && node.args[2] isa Expr &&
             node.args[2].head === :call && first(node.args[2].args) isa _PlateProgram
-        return _plate_program_or_inline(node, node.args[2], declared)
+        return expand(node, node.args[2], declared)
     elseif node isa Expr && node.head === :call && first(node.args) isa _PlateProgram
-        return _plate_program_or_inline(node, node, declared)
+        return expand(node, node, declared)
     elseif node isa Expr && node.head !== :quote
-        return Expr(node.head, Any[_inline_plate_programs(arg, declared) for arg in node.args]...)
+        return Expr(node.head, Any[_inline_plate_programs(arg, declared, expand) for arg in node.args]...)
     end
     node
 end
@@ -5726,6 +5727,181 @@ function _compile_plate_programs(ast, context::Module, native_context::GlobalRef
     ast isa Expr && ast.head !== :quote || return ast
     Expr(ast.head, Any[_compile_plate_programs(arg, context, native_context)
                        for arg in ast.args]...)
+end
+
+# A comprehension or generator in a compiled body is a closure, which
+# `RuntimeGeneratedFunctions` turns into an opaque closure; Julia refuses to
+# expand a generated function whose code holds one while a package image is
+# generated ("Impossible to correctly handle OpaqueClosure inside @generated
+# returned during precompile process."). A partition plan whose bookkeeping
+# sits behind a label-only guard caches it in a comprehension
+# (`_partition_guarded_plan`), so such a plan could be neither typed nor
+# computed in a downstream workload (snag `partition-plan-o-1d9db0fc`).
+# `_compile` therefore lifts each comprehension and generator at the body's
+# function scope whose element reads the body's locals and writes none of
+# them: the element becomes a program of its own over those locals and the
+# iteration variable (`_PlateProgram`, compiled with the body), and the body
+# iterates `_ComprehensionElement`, which calls it with the locals' current
+# values. A comprehension is `collect` of that generator, as Julia lowers it,
+# so its element type, also when it has no elements, is the program's
+# inferred return type. Every other closure is left as written.
+struct _ComprehensionElement{F,C<:Tuple}
+    program::F
+    captures::C
+end
+@inline (element::_ComprehensionElement)(x) =
+    getfield(element, :program)(getfield(element, :captures)..., x)
+
+_has_generator(node) = node isa Expr && node.head !== :quote &&
+    (node.head === :generator || any(_has_generator, node.args))
+
+# Heads whose arguments the lift leaves as written at function scope: a new
+# scope (whose locals the lift does not track), quoted or macro syntax, and
+# the forms whose generator is syntax (a nested `for` and a typed
+# comprehension).
+const _LIFT_OPAQUE_HEADS = (:let, :for, :while, :try, :->, :function, :do, :macrocall,
+    :module, :struct, :macro, :toplevel, :quote, :inert, :meta, :flatten,
+    :typed_comprehension)
+# An assignment that defines a function (`f(x) = …`), whose body is a scope.
+_lift_function_definition(target) = Meta.isexpr(target, (:call, :where))
+
+# `ast`, a function expression, with each comprehension and generator lifted
+# where `_lift_generator` can.
+function _lift_comprehensions(ast::Expr)
+    ast.head in (:function, :->) && length(ast.args) == 2 &&
+        ast.args[1] isa Expr && ast.args[1].head === :tuple || return ast
+    _has_generator(ast.args[2]) || return ast
+    visible = Set{Symbol}()
+    for arg in ast.args[1].args
+        name = _program_parameter(arg)
+        name === nothing || push!(visible, name)
+    end
+    Expr(ast.head, ast.args[1], _lift_comprehensions!(ast.args[2], visible))
+end
+# `node` at the body's function scope, its statements in evaluation order;
+# `visible` holds the parameters and the locals bound before `node`.
+function _lift_comprehensions!(node, visible::Set{Symbol})
+    node isa Expr || return node
+    head = node.head
+    head in _LIFT_OPAQUE_HEADS && return node
+    if head === :comprehension && length(node.args) == 1 &&
+            Meta.isexpr(node.args[1], :generator)
+        lifted = _lift_generator(node.args[1], visible)
+        return lifted === nothing ? node : Expr(:call, GlobalRef(Base, :collect), lifted)
+    elseif head === :generator
+        lifted = _lift_generator(node, visible)
+        return lifted === nothing ? node : lifted
+    elseif head === :(=)
+        _lift_function_definition(node.args[1]) && return node
+        value = _lift_comprehensions!(node.args[2], visible)
+        _program_bound_target!(visible, node.args[1])
+        return Expr(:(=), node.args[1], value)
+    elseif head === :local
+        foreach(target -> _program_bound_target!(visible, target), node.args)
+        return node
+    elseif head === :kw
+        return Expr(:kw, node.args[1], _lift_comprehensions!(node.args[2], visible))
+    elseif head === :tuple
+        # A named tuple's field names are labels, not locals.
+        return Expr(:tuple, Any[Meta.isexpr(arg, :(=), 2) ?
+            Expr(:(=), arg.args[1], _lift_comprehensions!(arg.args[2], visible)) :
+            _lift_comprehensions!(arg, visible) for arg in node.args]...)
+    end
+    Expr(head, Any[_lift_comprehensions!(arg, visible) for arg in node.args]...)
+end
+
+# `Base.Generator` over `gen`'s element as a program of its own, or `nothing`
+# where the element cannot leave the body: more than one iteration
+# specification or a filter, an element that assigns or declares a local of
+# the body (a closure writes the body's variable, a lifted program its own
+# copy), a construct whose scope the walk does not follow, or more operands
+# than a program call takes.
+function _lift_generator(gen::Expr, visible::Set{Symbol})
+    length(gen.args) == 2 || return nothing
+    element, spec = gen.args
+    Meta.isexpr(spec, :(=), 2) && spec.args[1] isa Symbol || return nothing
+    variable = spec.args[1]
+    captures = Symbol[]
+    _comprehension_captures!(captures, element, visible, Set{Symbol}((variable,))) ||
+        return nothing
+    length(captures) + 1 <= _PLATE_CALL_MAX_ARGUMENTS || return nothing
+    domain = _lift_comprehensions!(spec.args[2], visible)
+    program = _PlateProgram(Expr(:function, Expr(:tuple, captures..., variable), element))
+    Expr(:call, GlobalRef(Base, :Generator),
+         Expr(:call, GlobalRef(@__MODULE__, :_ComprehensionElement), program,
+              Expr(:tuple, captures...)),
+         domain)
+end
+
+# Push onto `found`, in first-occurrence order, the body's locals (`visible`)
+# that `node` reads where no binding inside it (`shadowed`) hides them; `false`
+# where `node` cannot leave the body (`_lift_generator`).
+function _comprehension_captures!(found::Vector{Symbol}, node, visible::Set{Symbol},
+                                  shadowed::Set{Symbol})
+    if node isa Symbol
+        node in visible && !(node in shadowed) && !(node in found) && push!(found, node)
+        return true
+    end
+    node isa Expr || return true
+    head = node.head
+    head in _INLINE_OPAQUE_HEADS && return true
+    walk(arg, hidden = shadowed) = _comprehension_captures!(found, arg, visible, hidden)
+    if head === :(=)
+        target = node.args[1]
+        _lift_function_definition(target) && return false
+        for name in _program_bound_target!(Set{Symbol}(), target)
+            # A local the body binds: the closure would assign the body's
+            # variable. A new name is the element's own and is never captured.
+            name in visible && !(name in shadowed) && return false
+        end
+        Meta.isexpr(target, (:ref, :.)) && (walk(target) || return false)
+        Meta.isexpr(target, :(::), 2) && (walk(target.args[2]) || return false)
+        return walk(node.args[2])
+    elseif head === :local
+        # The element's own local, as above; a body's local declared again in
+        # the element would be a new variable there and a parameter here.
+        for target in node.args
+            declared = Meta.isexpr(target, :(=), 2) ? target.args[1] : target
+            for name in _program_bound_target!(Set{Symbol}(), declared)
+                name in visible && !(name in shadowed) && return false
+            end
+            Meta.isexpr(declared, :(::), 2) && (walk(declared.args[2]) || return false)
+            Meta.isexpr(target, :(=), 2) && (walk(target.args[2]) || return false)
+        end
+        return true
+    elseif head === :let
+        inner = copy(shadowed)
+        bindings = Meta.isexpr(node.args[1], :block) ? node.args[1].args : Any[node.args[1]]
+        for binding in bindings
+            binding isa LineNumberNode && continue
+            if Meta.isexpr(binding, :(=), 2)
+                walk(binding.args[2], inner) || return false
+                _program_bound_target!(inner, binding.args[1])
+            else
+                name = _program_parameter(binding)
+                name === nothing && return false
+                push!(inner, name)
+            end
+        end
+        return walk(node.args[2], inner)
+    elseif head === :generator
+        length(node.args) == 2 && Meta.isexpr(node.args[2], :(=), 2) &&
+            node.args[2].args[1] isa Symbol || return false
+        walk(node.args[2].args[2]) || return false
+        return walk(node.args[1], push!(copy(shadowed), node.args[2].args[1]))
+    elseif head === :kw
+        return walk(node.args[2])
+    elseif head === :tuple
+        return all(arg -> Meta.isexpr(arg, :(=), 2) ? walk(arg.args[2]) : walk(arg),
+                   node.args)
+    elseif head === :. && length(node.args) == 2 && node.args[2] isa QuoteNode
+        return walk(node.args[1])
+    elseif head in (:global, :const, :for, :while, :try, :->, :function, :do,
+                    :macrocall, :module, :struct, :macro, :toplevel, :flatten,
+                    :typed_comprehension)
+        return false
+    end
+    all(walk, node.args)
 end
 
 # A recipe output authored with a type (`weights::Vector{Float64} = ...`) is
@@ -6519,6 +6695,9 @@ function _lower_with_ops_collecting(p::Plan;
     # Shared factors and terms leave a summed plate's sum (summed_plate_factors.jl)
     # before index runs group the cells that remain.
     inline_embedded && (body = _lower_summed_plate_factors_native(body, runtime_ops))
+    # A factored sum of squared residuals over bound data reads its frozen
+    # least-squares statistics (bound_statistics.jl).
+    inline_embedded && (body = _lower_bound_statistics_native(body, runtime_ops))
     inline_embedded && (body = _lower_index_runs_native(body, runtime_ops))
     # A partition with a plan port reads its integer bookkeeping from the
     # port's value, computed once per label; in plan mode the body computes
@@ -7572,7 +7751,7 @@ end
 # unchanged, as `@_native_context` below does: its hygiene qualifies the globals.
 # A package whose lowered bodies name its own functions compiles them this way.
 function _compile(ast::Expr, context::Module, native_context::GlobalRef)
-    ast = _compile_plate_programs(ast, context, native_context)
+    ast = _compile_plate_programs(_lift_comprehensions(ast), context, native_context)
     ast = _distinguish_module_generations(
         _canonical_embedded(_canonical_locals(_canonical_globals(ast))))
     f = RuntimeGeneratedFunction(context, context, ast)
@@ -9266,6 +9445,20 @@ whenever such a guard holds, a shared factor is not a normal number, or the
 factored sum is not finite, so every finite value and its derivatives agree
 with the plate's own to rounding.
 
+With `bound` data and `bound_statistics = true` (the default, with `simplify`)
+a summed plate that sums `(y - mu)^2` this way, `y` bound and `mu` linear in
+live values with bound coefficients, is evaluated from least-squares
+statistics of the bound rows computed at binding. `mu` may be a bound matrix
+times a live vector, live numbers, or live vectors gathered through one bound
+index, each times bound coefficients, plus bound offsets. A call then costs
+time in the number of parameters, not of rows, and `mu` is not computed; the
+plate's own loop, where it runs, reads it row by row. A binding whose data do
+not fit (fewer than two rows per parameter of a block, a non-finite entry, a
+response that is not a vector) compiles the plate as before.
+`bound_statistics = false` keeps the rows; `nothing` takes the enclosing
+setting ([`with_bound_statistics`](@ref)), else the project's ReactiveKernels
+preference `bound_statistics`, else `true`.
+
 Selected authored plates with a single plate consumer are composed during
 lowering, eliminating the intermediate array. Named ports remain in `p`: asking
 for an intermediate, supplying it as HAVE, or selecting another consumer keeps
@@ -9311,9 +9504,9 @@ nested ones included, and cached preparations are kept per setting.
 function prepare(p::Plan; passes = (), bound = (), on_error = nothing,
                  exemplars = nothing, type_stability = nothing,
                  type_stability_level = nothing, branch_arms = nothing,
-                 simplify = nothing, _data_cache = nothing)
+                 simplify = nothing, bound_statistics = nothing, _data_cache = nothing)
     _with_branch_arms(branch_arms) do
-    _with_simplify(simplify) do
+    _with_settings(simplify, bound_statistics) do
         _with_type_stability(type_stability, type_stability_level) do
             kernel = _prepare_plan(p; passes = passes, bound = bound, on_error = on_error,
                                    exemplars, _data_cache)
@@ -9394,11 +9587,11 @@ end
 function prepare(g::Graph; have = (), want = (), passes = (), bound = (),
                  on_error = nothing, exemplars = nothing, type_stability = nothing,
                  type_stability_level = nothing, branch_arms = nothing,
-                 simplify = nothing, _data_cache = nothing)
+                 simplify = nothing, bound_statistics = nothing, _data_cache = nothing)
     # One type for every selection's width before the closure captures them.
     haves, wants, binding = _value_list(have), _value_list(want), _bound_list(bound)
     _with_branch_arms(branch_arms) do
-    _with_simplify(simplify) do
+    _with_settings(simplify, bound_statistics) do
         _with_type_stability(type_stability, type_stability_level) do
             exemplars === nothing && _reuses_bound_preparation(binding, passes) &&
                 return _graph_bound_preparation(g, haves, wants, passes, binding, on_error;

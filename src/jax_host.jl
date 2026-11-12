@@ -91,6 +91,8 @@ function _host_lines!(ctx::_JaxContext, first::Int)
     end
 end
 
+# Host integers stay int64 in every module: NumPy computes the data with
+# them, and JAX converts them when a float32 module's functions read them.
 _host_dtype(@nospecialize(E)) = E isa Type && E <: Bool ? "np.bool_" :
     E isa Type && E <: Integer ? "np.int64" :
     E isa Type && E <: AbstractFloat ? "np." * _jax_dtype_name(E) :
@@ -1250,15 +1252,17 @@ function _host_function_input!(scope, params, passed, hint, v::_PyVal, T::_JaxAg
     _PyVal(v.code, _JaxAggregate(T.T, fields), true)
 end
 
-# A `@traceable` helper on the host: a module-level function of its body.
+# A `@traceable` helper on the host: a module-level function of its body. The
+# call's `args` select it; `inputs` are the values its formals `names` take
+# (a Vararg formal's is the tuple of the trailing arguments).
 function _host_function_call(ctx::_JaxContext, f, names::Vector{Symbol}, body, mod::Module,
-                             args::Vector{_PyVal})
+                             args::Vector{_PyVal}, inputs::Vector{_PyVal} = args)
     types = Any[_jax_argument_type(a) for a in args]
     key = (:host_traceable, objectid(f), Tuple(a.T for a in args))
     scope = _JaxScope()
     params, passed = String[], _PyVal[]
     locals = Dict{Symbol,_PyVal}(n => _host_function_input!(scope, params, passed, n, a)
-                                for (n, a) in zip(names, args))
+                                for (n, a) in zip(names, inputs))
     name = get(ctx.mod.helper_names, key, nothing)
     if name === nothing
         name = _jax_private_identifier(ctx.mod.used, Symbol("_rk_", nameof_or(f), "_np"))
@@ -1769,6 +1773,20 @@ def _rk_fields(x, names):
     return x
 """
 
+const _JAX_KEYWORD_INPUTS = """
+def _rk_keyword_inputs(data, names):
+    # The `prepare_data` inputs no parameter can be named for (`class`), which
+    # it takes by their own names through `**data`: their values, in `names`
+    # order. Another key, or a missing one, raises as a parameter would.
+    unexpected = [k for k in data if k not in names]
+    if unexpected:
+        raise TypeError("prepare_data() got unexpected keyword arguments: " + ", ".join(map(repr, unexpected)))
+    missing = [n for n in names if n not in data]
+    if missing:
+        raise TypeError("prepare_data() missing required arguments: " + ", ".join(map(repr, missing)))
+    return tuple(data[n] for n in names)
+"""
+
 # A raw `prepare_data` input as the host code reads it: a numeric array as a
 # NumPy array of its element type, a ragged one as a list of them, and a named
 # tuple (the value of a definition without a host translation, `g =
@@ -1807,12 +1825,32 @@ function _jax_prepare_function!(mod::_JaxModule, split, raw_types, names, types;
     scope = _JaxScope()
     ctx = _JaxContext(mod, scope, nothing, Main, Dict{Symbol,_PyVal}(), nothing)
     ctx.host = _HostState()
+    # The caller passes the data by these names: each input's key is its own
+    # name (`_jax_key_name`), held in a Python local of the same name. A name
+    # Python reserves (`class`) is held in a respelled local (`class_`), and
+    # `prepare_data` takes that input by its own name through `**data`.
     param_names = String[]
+    input_locals = String[]
+    keys_used = Set{String}()
+    for v in params
+        key = _jax_key_name(keys_used, v.name; stable = false)
+        push!(param_names, key)
+        push!(input_locals, _jax_param_name(scope.used, key; stable = false))
+    end
+    keyword = [k for k in eachindex(param_names) if param_names[k] != input_locals[k]]
+    keyword_data = isempty(keyword) ? "" : _jax_identifier(scope.used, :data)
+    if !isempty(keyword)
+        if !haskey(mod.helper_names, (:helper, "_rk_keyword_inputs"))
+            mod.helper_names[(:helper, "_rk_keyword_inputs")] = "_rk_keyword_inputs"
+            push!(mod.used, "_rk_keyword_inputs")
+            push!(mod.helpers, rstrip(_JAX_KEYWORD_INPUTS))
+        end
+        py_tuple(xs) = join(xs, ", ") * (length(xs) == 1 ? "," : "")
+        _jax_emit!(ctx, py_tuple(input_locals[keyword]) * " = _rk_keyword_inputs(" * keyword_data *
+                        ", (" * py_tuple(repr.(param_names[keyword])) * "))")
+    end
     known = Dict{Symbol,_PyVal}()
-    for (v, T) in zip(params, raw_types)
-        # The caller passes the data by these names: keep them exactly.
-        param = _jax_param_name(scope.used, v.name; stable = false)
-        push!(param_names, param)
+    for (v, T, param) in zip(params, raw_types, input_locals)
         known[v.name] = _PyVal(param, T, true)
         code = _host_input!(ctx, param, T)
         code == param || _jax_emit!(ctx, param * " = " * code)
@@ -1899,13 +1937,21 @@ function _jax_prepare_function!(mod::_JaxModule, split, raw_types, names, types;
             push!(entries, "\"" * name * "\": " * v.code)
         end
     end
-    signature = join((n * ": " * (_jax_ragged(T) ? "list" :
-                                  T isa Type && T <: NamedTuple ? "dict" : _jax_annotation(T))
-                      for (n, T) in zip(param_names, raw_types)), ", ")
-    lines = String["def prepare_data(" * signature * ") -> dict:"]
+    annotation(T) = _jax_ragged(T) ? "list" : T isa Type && T <: NamedTuple ? "dict" : _jax_annotation(T)
+    signature = String[n * ": " * annotation(T) for (k, (n, T)) in enumerate(zip(param_names, raw_types))
+                       if !(k in keyword)]
+    if !isempty(keyword)
+        kinds = unique(annotation(T) for T in raw_types[keyword])
+        push!(signature, "**" * keyword_data * ": " * (length(kinds) == 1 ? only(kinds) : "Any"))
+    end
+    lines = String["def prepare_data(" * join(signature, ", ") * ") -> dict:"]
+    keyword_doc = isempty(keyword) ? "" :
+        "\n    `**" * keyword_data * "` takes " * join(("`" * n * "`" for n in param_names[keyword]), ", ") *
+        " by name, which no parameter can have:\n    pass the data by name, `prepare_data(**raw)`.\n"
     push!(lines, "    \"\"\"The functions' data inputs, computed from the raw data once per dataset.\n\n" *
                  "    Pass the data by the names the model reads them; a list of arrays is a ragged\n" *
-                 "    column. Call the other functions with the result: `f(u, **prepared)`.\n    \"\"\"")
+                 "    column. Call the other functions with the result: `f(u, **prepared)`.\n" *
+                 keyword_doc * "    \"\"\"")
     for r in split.excluded
         push!(lines, "    # Computed by the functions (no host translation): " * _recipe_line(r))
         reason = get(mod.host_reasons, r.id, nothing)

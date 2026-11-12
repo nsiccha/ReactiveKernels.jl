@@ -104,6 +104,9 @@ function make_sampler(kind, events, offsets, raw)
         backend=DI.AutoEnzyme(;mode=Enzyme.Reverse),native_forward_batch=false)
 end
 
+# Registered Enzyme (0.13.219) refuses the `hcat(location, absent)` tables here
+# with EnzymeRuntimeActivityError; Enzyme dogfood differentiates them. The
+# boundary is Enzyme's: benchmark/repro_enzyme_lazy_hcat_table_const_column.jl.
 @testset "natural whole-event invariant expressions" begin
     events = [Bool[true,false,true],Bool[false,false,false],Bool[false,true,false],
               Bool[true,true,false],Bool[false,false,false]]

@@ -79,6 +79,7 @@ export preprocessing_recipes
 export PPL_NODES, WORKFLOW_WANTS, workflow_wants
 export prepare_query, prepare_sampler, SamplerQuery, sampler_value_and_gradient!,
     sampler_value_gradient_and_retained!
+export adaptive_centering_problem
 export QueryAD, prepare_query_ad
 export DensityFactor, DensityFactors, FactorSelection, density_factors, select_factors,
     factor_coordinates, factor_support, FactorQueryAD
@@ -137,6 +138,7 @@ include("preprocessing.jl")
 include("generator.jl")
 include("arrays.jl")
 include("query.jl")
+include("centering.jl")
 include("cell_factors.jl")
 include("cell_shared.jl")
 include("cell_batch.jl")
