@@ -1247,6 +1247,64 @@ class StaticInt(int):
 jax.tree_util.register_pytree_node(StaticInt, lambda s: ((), int(s)), lambda v, _: StaticInt(v))
 """
 
+# Static bounds of prepared integer arrays, for ranges whose ends are their
+# entries (`_jax_trip_bound`): `prepare_data` returns them with the data. An
+# array without entries gives 0 (no range over its entries runs) and a span
+# of -1 (no steps).
+const _JAX_PREPARED_BOUNDS = Dict{Symbol,Tuple{String,String}}(
+    :min => ("_rk_bound_min", """
+def _rk_bound_min(a):
+    \"\"\"The least entry of a prepared integer array, static (0 without entries).\"\"\"
+    a = np.asarray(a)
+    return StaticInt(int(a.min()) if a.size else 0)
+"""),
+    :max => ("_rk_bound_max", """
+def _rk_bound_max(a):
+    \"\"\"The largest entry of a prepared integer array, static (0 without entries).\"\"\"
+    a = np.asarray(a)
+    return StaticInt(int(a.max()) if a.size else 0)
+"""),
+    :span => ("_rk_bound_span", """
+def _rk_bound_span(first, last):
+    \"\"\"The largest `last - first` of two prepared integer arrays' entries at one
+    position (over the positions both have), static: the steps of the longest
+    range `first[i]:last[i]`, less one (-1 without entries).
+    \"\"\"
+    first, last = np.asarray(first), np.asarray(last)
+    if first.ndim != last.ndim:
+        return StaticInt((int(last.max()) if last.size else 0) -
+                         (int(first.min()) if first.size else 0))
+    block = tuple(slice(0, min(m, n)) for m, n in zip(first.shape, last.shape))
+    d = last[block] - first[block]
+    return StaticInt(int(d.max()) if d.size else -1)
+"""))
+
+# `prepare_data`'s `lines` with the static bounds `bounds` (`(name, kind,
+# keys)`, `_jax_prepared_bounds`) added to the dict it returns, computed from
+# the prepared arrays they bound.
+function _jax_prepare_bounds_lines(mod::_JaxModule, lines::Vector{String}, bounds)
+    isempty(bounds) && return lines
+    last_line = lines[end]
+    prefix = "    return {"
+    startswith(last_line, prefix) || error("prepare_data does not end in its dict")
+    for helper in ("StaticInt" => _JAX_STATIC_INT, (_JAX_PREPARED_BOUNDS[k] for (_, k, _) in bounds)...)
+        name, text = helper
+        haskey(mod.helper_names, (:helper, name)) && continue
+        mod.helper_names[(:helper, name)] = name
+        push!(mod.used, name)
+        push!(mod.helpers, rstrip(text))
+    end
+    result = "_rk_prepared"
+    out = lines[1:end-1]
+    push!(out, "    " * result * " = " * last_line[length("    return ")+1:end])
+    for (name, kind, keys) in bounds
+        push!(out, "    " * result * "[\"" * name * "\"] = " * first(_JAX_PREPARED_BOUNDS[kind]) * "(" *
+                   join((result * "[\"" * k * "\"]" for k in keys), ", ") * ")")
+    end
+    push!(out, "    return " * result)
+    out
+end
+
 const _JAX_PAD_ROWS = """
 def _rk_pad_rows(rows, dtype):
     # A ragged value as the functions take it: the padded array (each row

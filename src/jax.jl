@@ -52,6 +52,10 @@ _jax_error(message...) = throw(JAXEmissionError(string(message...)))
 # broadcast against a matrix pads the result's first axis, `I(n)` at a padded
 # size both. Zero where no translation recorded them; a vector pads its one
 # axis and an adjoint vector its second, by type (`_jax_padded_axes`).
+#
+# `origin` records where a data integer comes from (`_JaxOrigin`), so a loop
+# over a range whose ends are entries of the prepared data has a static
+# number of steps (`_jax_trip_bound`).
 struct _PyVal
     code::String
     T::Any
@@ -59,7 +63,39 @@ struct _PyVal
     extent::String
     limit::String
     padded::Int
+    origin::Any
 end
+_PyVal(code::AbstractString, @nospecialize(T), static::Bool, extent::AbstractString,
+       limit::AbstractString, padded::Int) =
+    _PyVal(String(code), T, static, String(extent), String(limit), padded, nothing)
+# An integer array of the prepared data, `prepared[key]` (`position ===
+# nothing`), or an entry of one, `prepared[key][position] + offset`:
+# `position` is the gather's index code, or a token naming a plate cell's
+# entry, and `offset` a static integer. Entries of two arrays at one position
+# are entries of one record (`starts[r]:stops[r]`), so their difference is
+# bounded by the arrays' largest difference, which `prepare_data` computes.
+struct _JaxOrigin
+    key::String
+    position::Union{Nothing,String}
+    offset::String
+end
+# An element of a loop's or generator's range: at least `lo` and at most
+# `hi`, its ends, so a range from or to it is bounded by theirs (`for s in
+# starts[r]:t` with `t` of `starts[r]:stops[r]`, `for j in i:n` with `i` of
+# `1:n`).
+struct _JaxBetween
+    lo::_PyVal
+    hi::_PyVal
+end
+# The value whose static bounds bound `v` from below (above): the first
+# (last) end of the range `v` is an element of, or `v` itself.
+_jax_lower_end(v::_PyVal) = v.origin isa _JaxBetween ? _jax_lower_end(v.origin.lo) : v
+_jax_upper_end(v::_PyVal) = v.origin isa _JaxBetween ? _jax_upper_end(v.origin.hi) : v
+# A range element's index value `index`, between `lo` and `hi`.
+_jax_range_index(index::AbstractString, lo::_PyVal, hi::_PyVal) =
+    _PyVal(index, Int, false, "", "", 0, _JaxBetween(lo, hi))
+_jax_with_origin(v::_PyVal, origin) =
+    _PyVal(v.code, v.T, v.static, v.extent, v.limit, v.padded, origin)
 struct _JaxCallable{F}
     f::F
 end
@@ -333,7 +369,7 @@ function _jax_bind!(ctx::_JaxContext, hint, v::_PyVal)
     (_jax_translation_only(v) || occursin(r"^[A-Za-z_][A-Za-z0-9_]*$", v.code)) && return v
     name = _jax_fresh(ctx, hint)
     _jax_emit!(ctx, name * " = " * v.code)
-    _PyVal(name, v.T, v.static, v.extent, v.limit, v.padded)
+    _PyVal(name, v.T, v.static, v.extent, v.limit, v.padded, v.origin)
 end
 
 # --- types and ranks ----------------------------------------------------------------
@@ -676,7 +712,7 @@ function _jax_destructure!(ctx::_JaxContext, lhs, v::_PyVal)
         _jax_translation_only(v) && (ctx.locals[lhs] = v; return)
         name = _jax_fresh(ctx, lhs)
         _jax_emit!(ctx, name * " = " * v.code)
-        ctx.locals[lhs] = _PyVal(name, v.T, v.static, v.extent, v.limit, v.padded)
+        ctx.locals[lhs] = _PyVal(name, v.T, v.static, v.extent, v.limit, v.padded, v.origin)
         return
     end
     if lhs isa Expr && lhs.head === :ref && lhs.args[1] isa Symbol && haskey(ctx.locals, lhs.args[1])
@@ -875,8 +911,13 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
             _jax_error("slicing a padded group vector has no JAX translation", _jax_where(ctx))
         return _PyVal(_py_atom(x.code) * "[" * join(parts, ", ") * "]", T, false, gather.extent)
     end
-    _PyVal(_py_atom(x.code) * "[" * join(parts, ", ") * "]", T, false,
-           target ? "" : _jax_gather_extent(ctx, values, kept))
+    v = _PyVal(_py_atom(x.code) * "[" * join(parts, ", ") * "]", T, false,
+               target ? "" : _jax_gather_extent(ctx, values, kept))
+    # An entry of a prepared integer array keeps where it comes from, so a
+    # loop over a range it ends has a static number of steps.
+    o = x.origin
+    kept == 0 && !target && o isa _JaxOrigin && o.position === nothing ?
+        _jax_with_origin(v, _JaxOrigin(o.key, join(parts, ", "), "0")) : v
 end
 # The extent of a gather: the lengths of its index vector, when that is padded
 # (a ragged row, or a range to a data length), since the gathered entries are
@@ -899,6 +940,14 @@ function _jax_index_part(ctx::_JaxContext, x::_PyVal, dim::Int, index)
        length(index.args) == 3
         lo = _jax_bound_expr(ctx, x, dim, index.args[2])
         hi = _jax_bound_expr(ctx, x, dim, index.args[3])
+        # Ends that are data with a static number of elements (a stop with a
+        # static limit, or ends `_jax_trip_bound` bounds): a gather by the
+        # range's elements, padded (`_jax_call_positional(::Colon)`).
+        if !(_jax_known(ctx, lo) && _jax_known(ctx, hi)) &&
+           (_jax_known(ctx, lo) && !isempty(hi.limit) || _jax_trip_bound(ctx, lo, hi) !== nothing)
+            i = _jax_call_positional(ctx, Colon(), [lo, hi])
+            return (_py_infix("-", [i.code, "1"]), 1, i)
+        end
         return (_jax_minus_one(lo) * ":" * hi.code, 1, nothing)
     end
     i = _jax_bound_expr(ctx, x, dim, index)
@@ -1118,9 +1167,14 @@ function _jax_generator_values(ctx::_JaxContext, gen::Expr)
         _jax_error("the generator `", gen, "` has no JAX translation", _jax_where(ctx))
     var = spec.args[1]
     _jax_is_range_form(ctx, spec.args[2]) ||
-        return _jax_collection_values(ctx, body, var, spec.args[2], condition)
-    lo, hi, bound = _jax_loop_range(ctx, spec.args[2])
-    index = _jax_fresh(ctx, var)
+        return (_jax_collection_values(ctx, body, var, spec.args[2], condition)..., nothing)
+    lo, hi, bound, steps = _jax_loop_range(ctx, spec.args[2])
+    # Ends that are data (`steps`): the element at step `k` is the range's
+    # `min(lo + k, hi)`, Julia's while `k <= hi - lo`.
+    stepped = !isempty(steps)
+    reach = stepped ? _jax_bind!(ctx, :reach, _PyVal(_py_infix("-", [hi.code, lo.code]), Int)) :
+        nothing
+    index = _jax_fresh(ctx, stepped ? :step : var)
     fname = _jax_fresh(ctx, :element)
     outer = ctx.scope
     inner = _JaxScope(outer)
@@ -1129,10 +1183,19 @@ function _jax_generator_values(ctx::_JaxContext, gen::Expr)
     saved = copy(ctx.locals)
     ctx.scope = inner
     value, keep = try
-        ctx.locals[var] = _PyVal(index, Int)
+        if stepped
+            element_index = _jax_fresh(ctx, var)
+            _jax_emit!(ctx, element_index * " = jnp.minimum(" * _py_infix("+", [lo.code, index]) *
+                            ", " * hi.code * ")")
+            ctx.locals[var] = _jax_range_index(element_index, lo, hi)
+        else
+            ctx.locals[var] = _jax_range_index(index, lo, hi)
+        end
         element = () -> (_jax_expr(ctx, body),
                          condition === nothing ? nothing : _jax_expr(ctx, condition))
-        isempty(bound) ? element() : _jax_with_guard(element, inner, index * " <= " * bound)
+        guard = stepped ? _py_infix("<=", [index, reach.code]) :
+            isempty(bound) ? "" : index * " <= " * bound
+        isempty(guard) ? element() : _jax_with_guard(element, inner, guard)
     finally
         ctx.scope = outer
         empty!(ctx.locals); merge!(ctx.locals, saved)
@@ -1141,8 +1204,9 @@ function _jax_generator_values(ctx::_JaxContext, gen::Expr)
     append!(outer.lines, inner.lines)
     push!(outer.lines, "    "^inner.indent * "return " *
           (keep === nothing ? value.code : "(" * value.code * ", " * keep.code * ")"))
-    indices = _jax_fresh(ctx, :indices)
-    _jax_emit!(ctx, indices * " = jnp.arange(" * lo.code * ", " * _jax_plus_one(hi) * ")")
+    indices = _jax_fresh(ctx, stepped ? :steps : :indices)
+    _jax_emit!(ctx, indices * " = jnp.arange(" *
+                    (stepped ? steps : lo.code * ", " * _jax_plus_one(hi)) * ")")
     mapped = "jax.vmap(" * fname * ")(" * indices * ")"
     E = _jax_typeof(value)
     E <: Number || _jax_error("a generator whose elements are `", E, "`", _jax_where(ctx))
@@ -1155,13 +1219,22 @@ function _jax_generator_values(ctx::_JaxContext, gen::Expr)
         _jax_emit!(ctx, values * ", " * kept * " = " * mapped)
         push!(masks, kept)
     end
-    isempty(bound) || push!(masks, _py_infix("<=", [indices, bound]))
-    _PyVal(values, Vector{E}), masks
+    # The number of Julia's elements, a comprehension's length.
+    count = if stepped
+        push!(masks, _py_infix("<=", [indices, reach.code]))
+        "jnp.maximum(" * _py_infix("+", [reach.code, "1"]) * ", 0)"
+    elseif !isempty(bound)
+        push!(masks, _py_infix("<=", [indices, bound]))
+        _jax_range_count(lo, _PyVal(bound, Int))
+    else
+        ""
+    end
+    _PyVal(values, Vector{E}), masks, count
 end
 
 function _jax_generator_reduce(ctx::_JaxContext, f, gen::Expr, kwargs)
     ctx.host === nothing || return _host_generator_reduce(ctx, f, gen, kwargs)
-    values, masks = _jax_generator_values(ctx, gen)
+    values, masks, _ = _jax_generator_values(ctx, gen)
     reduce, neutral = _JAX_GENERATOR_REDUCTIONS[f]
     operand = isempty(masks) ? values.code :
         "jnp.where(" * join(masks, " & ") * ", " * values.code * ", " * neutral * ")"
@@ -1184,11 +1257,16 @@ function _jax_expr(ctx::_JaxContext, ::Val{:comprehension}, ex)
     ctx.host === nothing || return _host_comprehension(ctx, gen)
     gen.args[2] isa Expr && gen.args[2].head === :filter &&
         _jax_error("a filtered comprehension has a data-dependent length", _jax_where(ctx))
-    values, masks = _jax_generator_values(ctx, gen)
+    values, masks, count = _jax_generator_values(ctx, gen)
     isempty(masks) && return values
-    # The range's data-dependent bound is the vector's length.
-    _, hi, bound = _jax_loop_range(ctx, gen.args[2].args[2])
-    _PyVal(values.code, values.T, false, bound)
+    if count === nothing
+        # The range's data-dependent bound is the vector's length.
+        _, hi, bound, _ = _jax_loop_range(ctx, gen.args[2].args[2])
+        count = bound
+    end
+    # A range with a data-dependent end: the vector is padded to its static
+    # length, and its length is the number of the range's elements.
+    _PyVal(values.code, values.T, false, count)
 end
 
 # A `while` loop: `jax.lax.while_loop` over the outer locals the body assigns.
@@ -1274,14 +1352,18 @@ end
 # assigns its array). The range's bounds are static, so the loop lowers to a
 # scan that `jax.grad` differentiates; a data-dependent upper bound with a
 # static limit (a padded group vector's length) runs to the limit and keeps
-# the carry unchanged past the bound.
+# the carry unchanged past the bound. Ends that are data with a static number
+# of steps (`_jax_loop_range`) run those steps from the first element; past
+# the last element a step repeats the last (as padding does) and keeps the
+# whole carry, arrays included, unchanged.
 function _jax_expr(ctx::_JaxContext, ::Val{:for}, ex)
     ctx.host === nothing || return _host_for(ctx, ex)
     binding, body = ex.args
     binding isa Expr && binding.head === :(=) && binding.args[1] isa Symbol ||
         _jax_error("the loop binding `", binding, "` has no JAX translation", _jax_where(ctx))
     var = binding.args[1]
-    lo, hi, bound = _jax_loop_range(ctx, binding.args[2])
+    lo, hi, bound, steps = _jax_loop_range(ctx, binding.args[2])
+    isempty(steps) || return _jax_stepped_for(ctx, var, body, lo, hi, steps)
     assigned = Set{Symbol}()
     _jax_assigned_names!(assigned, body)
     carried = sort!([n for n in assigned if haskey(ctx.locals, n) && n !== var])
@@ -1302,7 +1384,7 @@ function _jax_expr(ctx::_JaxContext, ::Val{:for}, ex)
         for (n, name, v) in zip(carried, names, initial)
             ctx.locals[n] = _PyVal(name, v.T, false, v.extent, v.limit, v.padded)
         end
-        ctx.locals[var] = _PyVal(index, Int)
+        ctx.locals[var] = _jax_range_index(index, lo, hi)
         statements = body isa Expr && body.head === :block ? body.args : Any[body]
         isempty(bound) ? _jax_statements(ctx, statements; value = false) :
             _jax_with_guard(() -> _jax_statements(ctx, statements; value = false),
@@ -1332,6 +1414,66 @@ function _jax_expr(ctx::_JaxContext, ::Val{:for}, ex)
 end
 _jax_carry_old(names, carried, n) = names[findfirst(==(n), carried)]
 
+# A `for` over a range whose ends are data, `lo:hi`, taking a static number
+# of `steps` (`_jax_loop_range`): step `k` runs the body at `min(lo + k, hi)`
+# when `k <= hi - lo`, Julia's elements; a later step repeats the last
+# element, whose values every read has, and keeps the carry it was given.
+# Arrays are kept whole there: a write past the stop may be at an entry the
+# range does not reach.
+function _jax_stepped_for(ctx::_JaxContext, var::Symbol, body, lo::_PyVal, hi::_PyVal,
+                          steps::AbstractString)
+    assigned = Set{Symbol}()
+    _jax_assigned_names!(assigned, body)
+    carried = sort!([n for n in assigned if haskey(ctx.locals, n) && n !== var])
+    initial = [_jax_carry_value(ctx, ctx.locals[n]) for n in carried]
+    # The steps that are Julia's: `k <= last - first`.
+    reach = _jax_bind!(ctx, :reach, _PyVal(_py_infix("-", [hi.code, lo.code]), Int))
+    fname = _jax_fresh(ctx, :loop_body)
+    step = _jax_fresh(ctx, :step)
+    carry = _jax_fresh(ctx, :carry)
+    outer = ctx.scope
+    inner = _JaxScope(outer)
+    inner.indent = outer.indent + 1
+    push!(inner.used, step, carry)
+    saved = copy(ctx.locals)
+    ctx.scope = inner
+    updated = try
+        names = [_jax_identifier(inner.used, n) for n in carried]
+        isempty(names) || _jax_emit!(ctx, "(" * join(names, ", ") * (length(names) == 1 ? ",)" : ")") *
+                                         " = " * carry)
+        for (n, name, v) in zip(carried, names, initial)
+            ctx.locals[n] = _PyVal(name, v.T, false, v.extent, v.limit, v.padded)
+        end
+        kept = _jax_fresh(ctx, :kept)
+        _jax_emit!(ctx, kept * " = " * _py_infix("<=", [step, reach.code]))
+        index = _jax_fresh(ctx, var)
+        _jax_emit!(ctx, index * " = jnp.minimum(" * _py_infix("+", [lo.code, step]) * ", " *
+                        hi.code * ")")
+        ctx.locals[var] = _jax_range_index(index, lo, hi)
+        statements = body isa Expr && body.head === :block ? body.args : Any[body]
+        _jax_with_guard(() -> _jax_statements(ctx, statements; value = false), inner, kept)
+        map(zip(carried, initial)) do (n, v)
+            _jax_carry_select(ctx, kept, ctx.locals[n].code, _jax_carry_old(names, carried, n), v.T;
+                              arrays = true)
+        end
+    finally
+        ctx.scope = outer
+        empty!(ctx.locals); merge!(ctx.locals, saved)
+    end
+    push!(outer.lines, "    "^outer.indent * "def " * fname * "(" * step * ", " * carry * "):")
+    append!(outer.lines, inner.lines)
+    push!(outer.lines, "    "^inner.indent * "return (" * join(updated, ", ") *
+                       (length(updated) == 1 ? ",)" : ")"))
+    result = _jax_fresh(ctx, :loop_carry)
+    _jax_emit!(ctx, result * " = jax.lax.fori_loop(0, " * steps * ", " * fname * ", (" *
+                    join((v.code for v in initial), ", ") * (length(initial) == 1 ? ",))" : "))"))
+    for (k, (n, v)) in enumerate(zip(carried, initial))
+        ctx.locals[n] = _PyVal(result * "[" * string(k - 1) * "]", v.T, false, v.extent, v.limit,
+                               v.padded)
+    end
+    _PyVal("None", Nothing, true)
+end
+
 # A loop carry enters with a fixed dtype, as `fori_loop` requires. A tuple
 # (or `NamedTuple`) stays a Python tuple, its elements coerced one by one, so
 # it has the structure the loop body and a branch's arms return.
@@ -1350,16 +1492,17 @@ end
 
 # Past a loop's data-dependent bound (`kept` is false there) the carry keeps
 # its value `old`, of type `T`: a scalar is selected, a tuple element by
-# element; an array written by index there writes only padded entries, so it
-# passes as it is.
+# element. Past a padded length's bound an array written by index there
+# writes only padded entries, so it passes as it is; with `arrays` (a loop
+# whose steps are not padded positions) it is selected too.
 function _jax_carry_select(ctx::_JaxContext, kept::AbstractString, new::AbstractString,
-                           old::AbstractString, @nospecialize(T))
-    _jax_is_array(T) && return new
+                           old::AbstractString, @nospecialize(T); arrays::Bool = false)
+    _jax_is_array(T) && !arrays && return new
     _jax_is_tuple(T) || return "jnp.where(" * kept * ", " * new * ", " * old * ")"
     t = _jax_bind!(ctx, :carried, _PyVal(new, T)).code
     _jax_tuple_code([_PyVal(_jax_carry_select(ctx, kept, _py_atom(t) * "[" * string(k - 1) * "]",
                                               _py_atom(old) * "[" * string(k - 1) * "]",
-                                              fieldtype(T, k)), Any)
+                                              fieldtype(T, k); arrays), Any)
                      for k in 1:fieldcount(T)])
 end
 
@@ -1381,8 +1524,18 @@ function _jax_assigned_names!(names::Set{Symbol}, ex)
     names
 end
 
-# A loop range's (first, last, data-dependent bound or ""): `a:b`,
-# `eachindex(x)`, `axes(x, 1)`.
+# A loop range: `a:b`, `eachindex(x)`, `axes(x, 1)`, as
+# `(first, last, bound, steps)`.
+#
+# - Static ends: the loop runs from `first` to `last`; `bound` and `steps`
+#   are empty.
+# - A stop that is data with a static limit (a padded group's length): the
+#   loop runs from `first` to `last`, the limit, and Julia's elements are
+#   those up to `bound`, the stop.
+# - Ends that are data with a static number of steps (`_jax_trip_bound`:
+#   entries of the prepared data, `starts[r]:stops[r]`): the loop takes
+#   `steps` steps, element `first + k` at step `k`, and Julia's elements are
+#   those up to `last`; `first` and `last` are bound to names.
 function _jax_loop_range(ctx::_JaxContext, iter)
     if iter isa Expr && iter.head === :call && iter.args[1] === :(:) && length(iter.args) == 3
         lo, hi = _jax_expr(ctx, iter.args[2]), _jax_expr(ctx, iter.args[3])
@@ -1397,12 +1550,70 @@ function _jax_loop_range(ctx::_JaxContext, iter)
     else
         _jax_error("the loop range `", iter, "` has no JAX translation", _jax_where(ctx))
     end
-    lo.static || _jax_error("a loop whose first index depends on data", _jax_where(ctx))
-    hi.static && return (lo, hi, "")
-    isempty(hi.limit) && _jax_error("a loop whose trip count depends on data has no JAX ",
-                                    "translation", _jax_where(ctx))
-    (lo, _PyVal(hi.limit, Int, true), hi.code)
+    lo.static && hi.static && return (lo, hi, "", "")
+    lo.static && !isempty(hi.limit) && return (lo, _PyVal(hi.limit, Int, true), hi.code, "")
+    steps = _jax_trip_bound(ctx, lo, hi)
+    steps === nothing && _jax_error("a loop whose ", lo.static ? "trip count" : "first index",
+        " depends on data has no JAX translation: its number of steps needs a static ",
+        "bound. Ends that are entries of integer arrays of the prepared data ",
+        "(`jax_source(...; data)`) have one", _jax_where(ctx))
+    (_jax_bind!(ctx, :first, lo), _jax_bind!(ctx, :last, hi), "", steps)
 end
+
+# A static number of steps for a range from `lo` to `hi`, at least each
+# range's length, as Python code (`nothing` when none is known). Entries of
+# two prepared arrays at one position (`starts[r]:stops[r]`) take the arrays'
+# largest difference, so the loop runs to the longest record's length;
+# otherwise the bound is a static upper bound of `hi` (a static value, a
+# padded length's limit, or the largest entry of its prepared array) less a
+# static lower bound of `lo` (a static value, or the least entry of its array).
+function _jax_trip_bound(ctx::_JaxContext, lo::_PyVal, hi::_PyVal)
+    lo, hi = _jax_lower_end(lo), _jax_upper_end(hi)
+    a, b = lo.origin, hi.origin
+    count = if a isa _JaxOrigin && b isa _JaxOrigin && a.position !== nothing &&
+               a.position == b.position
+        span = _jax_prepared_bound!(ctx, :span, a.key, b.key)
+        _jax_offset(_jax_offset(span, "+", b.offset), "-", a.offset)
+    else
+        upper = hi.static ? hi.code : !isempty(hi.limit) ? hi.limit :
+            b isa _JaxOrigin && b.position !== nothing ?
+            _jax_offset(_jax_prepared_bound!(ctx, :max, b.key), "+", b.offset) : nothing
+        lower = lo.static ? lo.code : a isa _JaxOrigin && a.position !== nothing ?
+            _jax_offset(_jax_prepared_bound!(ctx, :min, a.key), "+", a.offset) : nothing
+        upper === nothing || lower === nothing ? nothing : _py_infix("-", [upper, lower])
+    end
+    count === nothing ? nothing : "max(" * _py_infix("+", [count, "1"]) * ", 0)"
+end
+# `code op offset`, a static integer offset; nothing added for a zero one.
+_jax_offset(code::AbstractString, op::AbstractString, offset::AbstractString) =
+    offset == "0" ? code : _py_infix(op, [code, offset])
+
+# The name of a static bound of prepared integer arrays `keys` (`:min` and
+# `:max` of one array's entries, `:span` the largest difference of the second
+# array's entries less the first's at one position), which `prepare_data`
+# computes and returns with the data (`_jax_prepared_bounds`).
+function _jax_prepared_bound!(ctx::_JaxContext, kind::Symbol, keys::String...)
+    key = (:prepared_bound, kind, keys)
+    haskey(ctx.mod.helper_names, key) && return ctx.mod.helper_names[key]
+    base = "_rk_" * string(kind) * "_" * join(keys, "_")
+    taken = Set{String}(v for (k, v) in ctx.mod.helper_names
+                        if k isa Tuple && first(k) === :prepared_bound)
+    name, n = base, 1
+    while name in taken || name in ctx.mod.used
+        n += 1
+        name = base * "_" * string(n)
+    end
+    push!(ctx.mod.used, name)
+    ctx.mod.helper_names[key] = name
+end
+# The prepared bounds requested so far, in name order: `(name, kind, keys)`.
+_jax_prepared_bounds(mod::_JaxModule) =
+    sort!([(v, k[2], k[3]) for (k, v) in mod.helper_names
+           if k isa Tuple && first(k) === :prepared_bound]; by = first)
+
+# The number of elements of a range from `lo` to `hi`, `hi - lo + 1`, as code.
+_jax_range_count(lo::_PyVal, hi::_PyVal) =
+    lo.code == "1" ? hi.code : _py_infix("-", [_jax_plus_one(hi), lo.code])
 
 # A lazy branch: `jax.lax.cond` of one function per arm, so only the taken
 # arm runs (under `jax.vmap` JAX itself decides how to batch the region).
@@ -2288,6 +2499,16 @@ function _jax_shifted_limit(f, args::Vector{_PyVal}, v::_PyVal)
     (f === (+) || f === (-)) && length(args) == 2 && isempty(v.limit) && !v.static || return v
     a, b = args
     a.T isa Type && a.T <: Integer && b.T isa Type && b.T <: Integer || return v
+    # An entry of the prepared data shifted by a static integer keeps its
+    # origin, shifted: `stops[r] - 1` is at most the largest stop less one.
+    if a.origin isa _JaxOrigin && a.origin.position !== nothing && b.static
+        offset = a.origin.offset == "0" && f === (+) ? b.code :
+            _py_infix(f === (+) ? "+" : "-", [a.origin.offset, b.code])
+        return _jax_with_origin(v, _JaxOrigin(a.origin.key, a.origin.position, offset))
+    elseif f === (+) && b.origin isa _JaxOrigin && b.origin.position !== nothing && a.static
+        return _jax_with_origin(v, _JaxOrigin(b.origin.key, b.origin.position,
+                                              _jax_offset(a.code, "+", b.origin.offset)))
+    end
     if !isempty(a.limit) && b.static && (f === (+) || occursin(r"^[0-9]+$", b.code))
         limit = f === (-) ? a.limit : _py_infix("+", [a.limit, b.code])
     elseif f === (+) && !isempty(b.limit) && a.static
@@ -2960,10 +3181,25 @@ end
 function _jax_call_positional(ctx::_JaxContext, ::Colon, args::Vector{_PyVal})
     a, b = args[1], args[end]
     limited = !isempty(b.limit) && (length(args) == 2 || args[2].code == "1")
+    unit = length(args) == 2 || args[2].code == "1"
+    # Ends that are data with a static number of steps (`_jax_trip_bound`,
+    # entries of the prepared data): that many elements from `a`, the ones
+    # past `b` repeating `b` as padding does, and the range's length as the
+    # extent that reductions and gathers mask by.
+    if !(_jax_known(ctx, a) && (_jax_known(ctx, b) || limited)) && unit
+        steps = _jax_trip_bound(ctx, a, b)
+        if steps !== nothing
+            a, b = _jax_bind!(ctx, :first, a), _jax_bind!(ctx, :last, b)
+            count = "jnp.maximum(" * _py_infix("+", [_py_infix("-", [b.code, a.code]), "1"]) * ", 0)"
+            return _jax_bind!(ctx, :range, _PyVal("jnp.minimum(" *
+                _py_infix("+", [a.code, "jnp.arange(" * steps * ")"]) * ", " * b.code * ")",
+                UnitRange{Int}, false, count))
+        end
+    end
     _jax_known(ctx, a) && (_jax_known(ctx, b) || limited) ||
         _jax_error("a range whose length depends on data has no JAX translation (its ",
-                   "stop needs a static limit, its start and step must be static)",
-                   _jax_where(ctx))
+                   "stop needs a static limit, its start and step must be static, or its ",
+                   "ends entries of integer arrays of the prepared data)", _jax_where(ctx))
     if length(args) == 3
         a, step, b = args
         step.code == "1" && return _jax_call_positional(ctx, Colon(), [a, b])
@@ -4071,7 +4307,8 @@ end
 function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
                              extents = fill(false, length(p.have)),
                              statics = fill(false, length(p.have)),
-                             links = fill(nothing, length(p.have)))
+                             links = fill(nothing, length(p.have)),
+                             origins = fill(nothing, length(p.have)))
     name = _jax_fresh(ctx, hint)
     outer = ctx.scope
     inner = _JaxScope(outer)
@@ -4085,7 +4322,8 @@ function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
             extent = _jax_identifier(inner.used, Symbol(v.name, :_n))
             push!(names, extent)
         end
-        inner.values[canon_id(p.graph, v.id)] = _PyVal(param, types[i], statics[i], extent)
+        inner.values[canon_id(p.graph, v.id)] = _PyVal(param, types[i], statics[i], extent, "", 0,
+                                                       origins[i])
         links[i] === nothing || (inner.links[canon_id(p.graph, v.id)] = links[i])
     end
     recipe = ctx.recipe
@@ -4108,6 +4346,9 @@ function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
         returned[1] : "(" * join(returned, ", ") * ")"))
     name, wants, Bool[!isempty(w.extent) for w in wants], names
 end
+
+# Positions of plate cells' entries (`_JaxOrigin`): one per plate translated.
+const _JAX_CELL_POSITIONS = Ref(0)
 
 # A plate: the cell as a function, mapped over the batched arguments with
 # `jax.vmap` (one mapped axis per broadcast dimension). Shared arguments
@@ -4159,10 +4400,20 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     # outside the plate).
     cell_links = Any[!mapped[i] && !ragged[i] && cell_types[i] === v.T ? (p, recipe.inputs[i]) :
                      nothing for (i, v) in enumerate(inputs)]
+    # A prepared integer array keeps its origin in the cell: shared, as the
+    # array; mapped, as its entry at the cell's position, one position for
+    # every argument the plate maps (`starts[i]:stops[i]` as `a:b` of a cell
+    # over `starts` and `stops`).
+    position = string("cell ", _JAX_CELL_POSITIONS[] += 1)
+    cell_origins = Any[v.origin isa _JaxOrigin && v.origin.position === nothing &&
+                       !ragged[i] && !padded[i] ?
+                       (mapped[i] ? _JaxOrigin(v.origin.key, position, "0") : v.origin) : nothing
+                       for (i, v) in enumerate(inputs)]
     cell, wants, with_length, cell_params = _jax_plan_function!(ctx, :cell, body, cell_types;
                                                                 extents = cell_extents,
                                                                 statics = cell_statics,
-                                                                links = cell_links)
+                                                                links = cell_links,
+                                                                origins = cell_origins)
     want = only(wants)
     E = _jax_typeof(want)
     axes = String[]
@@ -4567,6 +4818,21 @@ of its arms, and nothing is unrolled per element. Arrays keep Julia's
 dimension order, Julia's broadcasting rules are kept, and integer index data
 stay 1-based. Gradients are `jax.grad` of a function. A construct without a
 translation raises a [`JAXEmissionError`](@ref) naming its recipe.
+
+A `for` loop, generator, comprehension or slice over a range takes a static
+number of steps, so `jax.grad` reverses it. Static ends and a stop that is a
+padded row's length have one. So do ends that are entries of integer arrays
+of the prepared data (`data`): for `starts[r]:stops[r]`, entries of two
+arrays at one position (also a plate cell's entries of both), it is the
+longest such range; for one end that is data, the largest stop less the least
+start. `prepare_data` computes these bounds and returns them with the data,
+under keys starting with `_rk_`. A range from or to an element of another
+such range, or of a static range (`for j in i:n`), is bounded by that range's
+ends. The steps past a range's stop repeat its last element and leave the
+loop's values unchanged, so Julia's values, empty ranges included, are kept;
+the work is the bound for every range, so a long range among short ones
+costs each of them its length. A start that is a traced input, such as a
+positional `Int`, has no static bound and raises.
 """
 function jax_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
                     want = nothing, functions = nothing, types = nothing,
@@ -4958,11 +5224,13 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
         params, definitions = [(n, ex, get(have_types, n, nothing)) for (n, ex) in computed],
         untranslated)
     push!(bodies, join(lines, "\n"))
+    prepare_lines, prepare_body = lines, length(bodies)
     # The inputs by the names `prepare_data` takes them (a name that is no
     # Python identifier, such as a submodel's `v.mask`, is spelled `v_mask`).
     push!(functions, JAXFunction("prepare_data",
         [n => T for (n, T) in zip(param_names, raw_types)],
         [n => T for (n, T) in zip(prepared_names, prepared_types)]))
+    prepare_function = length(functions)
     all_types = Any[[have_types[v.name] for v in split.remaining]; prepared_types]
     all_names = [remaining_names; prepared_names]
     for (fname, (rp, w)) in split.residuals
@@ -4979,6 +5247,17 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
         end
         push!(bodies, join(lines, "\n"))
         push!(functions, f)
+    end
+    # Static bounds of prepared integer arrays that ranges over their entries
+    # read (`_jax_trip_bound`): `prepare_data` computes and returns them too.
+    bounds = _jax_prepared_bounds(mod)
+    if !isempty(bounds)
+        bodies[prepare_body] = join(_jax_prepare_bounds_lines(mod, prepare_lines, bounds), "\n")
+        f = functions[prepare_function]
+        functions[prepare_function] = JAXFunction(f.name, f.inputs,
+            [f.outputs; [name => Int for (name, _, _) in bounds]])
+        append!(prepared_names, (name for (name, _, _) in bounds))
+        prepared_types = Any[prepared_types; fill(Int, length(bounds))]
     end
     meta = (INPUTS = Tuple(first(io) for io in functions[2].inputs),
             PREPARED = [n => (dtype = _jax_dtype_name(T), ndim = _jax_meta_rank(T),
@@ -5048,7 +5327,12 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
         # `jax.jit` too, so it is known while tracing (a shape test on it
         # decides then).
         static = names !== nothing && T isa Type && T <: Integer
-        scope.values[canon_id(p.graph, v.id)] = _PyVal(param, T, static, extent)
+        # A prepared integer array: ranges over its entries have static
+        # bounds that `prepare_data` computes (`_jax_trip_bound`).
+        prepared = keyword_from !== nothing && k > keyword_from && isempty(extent) &&
+            T isa Type && T <: AbstractArray && eltype(T) <: Integer
+        scope.values[canon_id(p.graph, v.id)] = _PyVal(param, T, static, extent, "", 0,
+            prepared ? _JaxOrigin(param, nothing, "0") : nothing)
         # Callers may pass NumPy arrays; JAX indexes only its own arrays by a
         # traced index.
         if _jax_is_array(T) && (eltype(T) <: Number || _jax_ragged(T))
@@ -5078,6 +5362,13 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
         lines = String["def " * name * "(" * join(signature, ", ") * ") -> " * _jax_return_annotation(w, wants) * ":"]
         push!(lines, _jax_docstring(something(doc, _jax_default_doc(w)), "    "))
         if keyword_from !== nothing
+            # The static bounds of prepared arrays the body reads (ranges over
+            # their entries), which `prepare_data` returns with the data.
+            body = join(scope.lines, "\n")
+            for (bn, _, _) in _jax_prepared_bounds(mod)
+                occursin(Regex("\\b" * bn * "\\b"), body) || continue
+                push!(inputs, bn => Int)
+            end
             for (pn, _) in inputs[keyword_from+1:end]
                 push!(lines, "    " * pn * " = prepared[\"" * pn * "\"]")
             end

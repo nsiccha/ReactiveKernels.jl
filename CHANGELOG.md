@@ -16,6 +16,31 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.179
+
+- `jax_source` translates loops, generators, comprehensions and slices over
+  ranges whose ends are entries of integer arrays of the prepared data
+  (`data`), such as a record's interval `starts[r]:stops[r]`, also as a
+  plate cell's `a:b` over `starts` and `stops`, with shifted ends
+  (`starts[r] + 1`) and with one static end. Before, the module refused them
+  (`a loop whose first index depends on data`, or `whose trip count depends
+  on data`). Such a range takes a static number of steps that `prepare_data`
+  computes and returns with the data under `_rk_`-prefixed keys: the longest
+  record's range when both ends are entries at one position, else the
+  largest stop less the least start. Steps past a range's stop repeat its
+  last element and leave the loop's values, arrays included, unchanged, so
+  values (empty ranges included) are Julia's and `jax.grad` reverses the loop
+  as a scan. The work is that bound for every range. A range from or to an
+  element of such a range, or of a static range (`for j in i:n`), is bounded
+  by that range's ends. A start that is a traced input still raises, now
+  naming the prepared-data route.
+- A comprehension over a range from a static start past 1 to a padded row's
+  length (`[r[t] for t in 2:length(r)]` in a cell) has as many entries as
+  its range; it counted from 1, so its sum and length read padding.
+- A slice of a padded row up to its length (`r[1:length(r)]` in a cell) is a
+  padded gather; it was refused (`slicing a padded group vector has no JAX
+  translation`).
+
 ## 0.1.178
 
 - `jax_source` translates `reduce(hcat, columns)` for a vector of numeric
