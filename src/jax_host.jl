@@ -1191,21 +1191,49 @@ end
 
 # --- helpers called from host code ----------------------------------------------------
 
+# Function identities and types belong to translation, not a Python argument
+# list. A closure or aggregate can also carry runtime values: pass those leaves
+# and rebuild its translation metadata using names in the helper's own scope.
+function _host_function_input!(scope, params, passed, hint, v::_PyVal)
+    _host_function_input!(scope, params, passed, hint, v, v.T)
+end
+function _host_function_input!(scope, params, passed, hint, v::_PyVal, T)
+    if T isa Type && T <: Function && Base.issingletontype(T)
+        return _PyVal(v.code, _JaxCallable(T.instance), true)
+    end
+    type = _jax_type_of_value(v)
+    type === nothing || return _PyVal(v.code, _JaxCallable(type), true)
+    name = _jax_identifier(scope.used, hint)
+    push!(params, name)
+    push!(passed, v)
+    _PyVal(name, T, true)
+end
+function _host_function_input!(scope, params, passed, hint, v::_PyVal, T::_JaxCallable)
+    T.f isa _JaxClosure || return v
+    captures = [_host_function_input!(scope, params, passed, Symbol(hint, :_, i), a)
+                for (i, a) in enumerate(T.f.captures)]
+    _PyVal(v.code, _JaxCallable(_JaxClosure(T.f.F, captures)), true)
+end
+function _host_function_input!(scope, params, passed, hint, v::_PyVal, T::_JaxAggregate)
+    fields = [_host_function_input!(scope, params, passed, Symbol(hint, :_, i), a)
+              for (i, a) in enumerate(T.fields)]
+    _PyVal(v.code, _JaxAggregate(T.T, fields), true)
+end
+
 # A `@traceable` helper on the host: a module-level function of its body.
 function _host_function_call(ctx::_JaxContext, f, names::Vector{Symbol}, body, mod::Module,
                              args::Vector{_PyVal})
-    types = Any[a.T for a in args]
-    key = (:host_traceable, objectid(f), Tuple(types))
+    types = Any[_jax_argument_type(a) for a in args]
+    key = (:host_traceable, objectid(f), Tuple(a.T for a in args))
+    scope = _JaxScope()
+    params, passed = String[], _PyVal[]
+    locals = Dict{Symbol,_PyVal}(n => _host_function_input!(scope, params, passed, n, a)
+                                for (n, a) in zip(names, args))
     name = get(ctx.mod.helper_names, key, nothing)
     if name === nothing
         name = _jax_private_identifier(ctx.mod.used, Symbol("_rk_", nameof_or(f), "_np"))
         ctx.mod.helper_names[key] = name
-        scope = _JaxScope()
-        params = [_jax_identifier(scope.used, n) for n in names]
-        inner = _JaxContext(ctx.mod, scope, ctx.recipe, mod,
-                            Dict{Symbol,_PyVal}(n => _PyVal(p, T, true)
-                                                for (n, p, T) in zip(names, params, types)),
-                            nothing)
+        inner = _JaxContext(ctx.mod, scope, ctx.recipe, mod, locals, nothing)
         inner.host = _HostState(Set{String}(params); in_function = true)
         # A list it ends with (`unique!(sort!(v))`) leaves as an array.
         v = _host_read(inner, _jax_expr(inner, body))
@@ -1219,7 +1247,7 @@ function _host_function_call(ctx::_JaxContext, f, names::Vector{Symbol}, body, m
         ctx.mod.helper_names[(:host_traceable_type, name)] = T
     end
     T = ctx.mod.helper_names[(:host_traceable_type, name)]
-    _jax_bind!(ctx, :value, _PyVal(name * "(" * _jax_args(args) * ")", T, true))
+    _jax_bind!(ctx, :value, _PyVal(name * "(" * _jax_args(passed) * ")", T, true))
 end
 
 # --- prepare_data ---------------------------------------------------------------------

@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.186
+
+- `jax_source` host preparation keeps helper function and type arguments in
+  the translator instead of emitting them as invalid Python literals. This
+  fixes data-only expressions such as `1 / sqrt(exp(x))`, including when `x`
+  comes from a scan. Nested helpers retain their callable identities; closure
+  captures and aggregate fields that hold numerical values remain runtime
+  arguments. Native arithmetic and data-dependent iteration are unchanged.
+
 ## 0.1.185
 
 - `jax_source`: a `for` loop to a padded row's length, such as
