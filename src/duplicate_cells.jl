@@ -34,11 +34,13 @@
 # - a gather (`_readonly_gather`, with or without index runs) of any array
 #   through a bound index vector of that length,
 #
-# is grouped by the bound vectors and gather indices its cell reads
-# (`_cell_group_lanes`). An operand the cell no longer reads, such as a
+# is grouped by its gather indices and the bound vectors its cell reads
+# (`_cell_group_lanes`). A bound vector the cell no longer reads, such as a
 # lane index whose bound gather preparation already cached, still sets the
 # plate's domain: it is compacted like the others but does not tell rows
-# apart.
+# apart. A gather always does: it reads its array before any cell runs,
+# whether or not the cell uses the value, so rows with different indices
+# keep their own reads (and an out-of-range index still throws).
 # When the rows repeat often enough (`_CELL_GROUP_MINIMUM_MULTIPLICITY`), the
 # plate is replaced by the same cell over the first row of each group, times
 # the group's row count:
@@ -259,7 +261,8 @@ Base.@nospecializeinfer function _cell_group_recipe(
     isempty(shared) || _cell_group_numbers(g, have, recipes, recipe, shared) ||
         return nothing
 
-    # Rows differ only in the operands the cell reads.
+    # Rows differ in their gather indices and in the bound vectors the cell
+    # reads; a bound vector it does not read only sets the domain.
     read = Set{ValueId}(canon_id(inner.graph, v.id) for v in inner.want)
     for r in Iterators.reverse(inner.recipes)
         any(v -> canon_id(inner.graph, v.id) in read, r.outputs) &&
@@ -267,7 +270,7 @@ Base.@nospecializeinfer function _cell_group_recipe(
     end
     reads(index) = canon_id(inner.graph, inner.have[index].id) in read
     keys = Any[last(c) for c in columns if reads(first(c))]
-    foreach(q -> reads(first(q)) && push!(keys, index_data(last(q))), gathers)
+    foreach(q -> push!(keys, index_data(last(q))), gathers)
     lanes, counts = isempty(keys) ? ([1], [n]) : _cell_group_lanes(Tuple(keys))
     length(lanes) * _CELL_GROUP_MINIMUM_MULTIPLICITY <= n || return nothing
 

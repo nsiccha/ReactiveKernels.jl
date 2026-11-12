@@ -91,6 +91,17 @@ end
     return total
 end
 
+# A gathered operand the cell ignores: the gather still reads every row.
+@kernel unread_gather(q::Vector{Float64}, idx::Vector{Int}, x::Vector{Float64}) = begin
+    gathered = ReactiveKernels._readonly_gather(q, idx)
+    terms = plate(gathered, x) do a, z
+        cell::Float64 = log(z * q[1])
+        cell
+    end
+    total::Float64 = sum(terms)
+    return total
+end
+
 function histories_oracle(p, histories, absent, omega)
     sum(histories; init = 0.0) do h
         a = sum(i -> h[i] ? log(p[i]) : log1p(-p[i]), eachindex(h); init = 0.0)
@@ -248,6 +259,15 @@ end
     bad = prepare(indexed_logs; bound = (values = [2.0, -1.0], idx = repeat([1, 2], 8)))
     @test grouped(bad)
     @test_throws DomainError bad([0.5])
+
+    # A gather the cell ignores still tells rows apart: every index is read,
+    # and an out-of-range one still throws.
+    x = repeat([2.0, 3.0], 12)
+    k = prepare(unread_gather; bound = (idx = repeat([1, 2, 3], 8), x))
+    @test length(only(multiplicities(k))) == length(unique(zip(repeat([1, 2, 3], 8), x)))
+    @test k([0.5, 1.0, 2.0]) ≈ sum(log.(x .* 0.5)) rtol = 1e-13
+    invalid = prepare(unread_gather; bound = (idx = vcat(fill(1, 23), 9), x))
+    @test_throws BoundsError invalid([0.5, 1.0, 2.0])
 end
 
 @testset "duplicate cells: which plates are grouped" begin
