@@ -16,6 +16,22 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.217
+
+- A guarded partition plan of a wide model is typed and computed while a
+  package image is generated. 0.1.212 lifted a comprehension of a compiled
+  body into a program of its own only when the locals its element reads, and
+  the iteration variable, fit the 64 operands a program call takes; a model
+  whose guarded bookkeeping reads more (109 and 175 in one real plan)
+  kept the comprehension as a closure, and `prepare` of its partition
+  (ReactiveKernelsPPL's `prepare_partition`, BayesianRegressionModels'
+  `brm_nlme_model` with a grouping) still failed in a workload with
+  `partition plan: the plan port … is untyped and evaluating its plan on the
+  exemplars failed: Impossible to correctly handle OpaqueClosure inside
+  @generated returned during precompile process.` Such an element now
+  receives those locals as one tuple, which its program unpacks; plans, their
+  types (also for a label without rows) and values are unchanged.
+
 ## 0.1.216
 
 - The stable rewrites compute a symmetric law's standardized log kernel at a
