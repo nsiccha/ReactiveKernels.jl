@@ -49,6 +49,22 @@ RK.input_check!(_input_check_blocks, :x, input_check_length, :x, :stop)
     @test_throws refused ad_value_and_gradient(ad, x4)
 end
 
+# Enzyme never inlines `_input_check`, which it treats as constant, so a
+# gradient calls it as a compiled method. Each compiled method is specialized
+# on the check's arguments. An unspecialized `Vararg` method was a generic call
+# through the boxed calling convention, 10 to 14 ns on every gradient of a
+# small model (snag `packed-point-inp-ce5df38b`).
+@testset "a gradient calls the input check specialized" begin
+    x3 = [1.0, 2.0, 3.0]
+    cut = prepare(_input_check_blocks; have = (:x, :n), want = :total, bound = (; n = 2))
+    ad = prepare_ad(cut, AutoEnzyme(; mode = Enzyme.Reverse), x3; active = :x)
+    @test ad_value_and_gradient(ad, x3) == (33.0, [1.0, 1.0, 10.0])
+    compiled = [Base.unwrap_unionall(mi.specTypes)
+        for m in methods(RK._input_check) for mi in Base.specializations(m) if mi !== nothing]
+    @test !isempty(compiled)
+    @test !any(T -> Base.isvarargtype(last(T.parameters)), compiled)
+end
+
 # Kernels derived from a checked one keep its check on the same value.
 @kernel _input_check_summary(total) = begin
     doubled = 2 * total

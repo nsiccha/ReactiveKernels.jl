@@ -16,6 +16,21 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.183
+
+- An input check (`input_check!`) no longer slows a gradient. Enzyme treats
+  the check as constant and never inlines it, so a gradient calls it as a
+  compiled method. That method was not specialized on the check's arguments,
+  because Julia does not specialize a vararg that is only passed on, so every
+  gradient made a generic call through the boxed calling convention.
+  ReactiveKernelsPPL registers a check on every program. On small
+  PosteriorDB ports this made the default sampler gradient 10 to 14 ns
+  (1.06x to 1.36x) slower than before the check. The check now specializes:
+  on a toy hierarchical model, a checked gradient takes 58.7 ns against
+  58.0 ns unchecked, where it took 65.0 against 57.6. Values, gradients and
+  refusals are unchanged, and primal calls, which inlined the check already,
+  are unaffected (snag `packed-point-inp-ce5df38b`).
+
 ## 0.1.182
 
 - The opt-in generated summed-plate reverse (`with_plate_reverse`, or the
