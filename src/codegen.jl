@@ -5643,19 +5643,19 @@ end
 # statements over the call's arguments: the body `_extract_plate_programs` was
 # given, the guard of a program's call kept. Ordinary AD differentiates this
 # body (`_ad_inline_plate_programs`).
-function _inline_plate_programs(ast)
+function _inline_plate_programs(ast; expand = _plate_program_or_inline)
     declared = Set{Symbol}()
     _program_local_declarations!(declared, ast)
-    _inline_plate_programs(ast, declared)
+    _inline_plate_programs(ast, declared, expand)
 end
-function _inline_plate_programs(node, declared::Set{Symbol})
+function _inline_plate_programs(node, declared::Set{Symbol}, expand)
     if node isa Expr && node.head === :(=) && node.args[2] isa Expr &&
             node.args[2].head === :call && first(node.args[2].args) isa _PlateProgram
-        return _plate_program_or_inline(node, node.args[2], declared)
+        return expand(node, node.args[2], declared)
     elseif node isa Expr && node.head === :call && first(node.args) isa _PlateProgram
-        return _plate_program_or_inline(node, node, declared)
+        return expand(node, node, declared)
     elseif node isa Expr && node.head !== :quote
-        return Expr(node.head, Any[_inline_plate_programs(arg, declared) for arg in node.args]...)
+        return Expr(node.head, Any[_inline_plate_programs(arg, declared, expand) for arg in node.args]...)
     end
     node
 end

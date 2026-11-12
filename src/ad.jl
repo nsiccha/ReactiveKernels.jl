@@ -839,7 +839,12 @@ end
 # Returns the rewritten statements too, which name the hidden operands.
 function _ad_na_program(kernel::NonAllocatingKernel, active_selector,
                         exemplars::Tuple)
-    ast = kernel.ast
+    # Cache activity and ownership are analyzed with the whole program in
+    # scope. Retain each plate's region so its generated reverse can be
+    # installed after the cache rewrite, using the rewritten operands.
+    plate_reverse = _plate_reverse_enabled()
+    ast = _inline_plate_programs(kernel.ast;
+        expand = plate_reverse ? _ad_na_plate_region : _ad_na_inline_plate)
     ast.head === :function && ast.args[1] isa Expr &&
         ast.args[1].head === :tuple &&
         length(ast.args[1].args) >= 4 &&
@@ -880,10 +885,25 @@ function _ad_na_program(kernel::NonAllocatingKernel, active_selector,
         index in elided ? nothing :
             _ad_na_concretize_cache(caches[index], index, ops[index])
     end
-    f = compile(Expr(:function, deepcopy(ast.args[1]),
-                     Expr(:block, new_stmts...)))
     ad_constants = isempty(fold_values) ? constants : (constants..., fold_values...)
+    rewritten = Expr(:function, deepcopy(ast.args[1]), Expr(:block, new_stmts...))
+    # With the rule disabled, keep the original inline AD program without
+    # another extraction pass. Only the rule needs plate boundaries after
+    # the ownership rewrite.
+    if plate_reverse
+        rewritten = first(_pr_inline_plate_programs(_extract_plate_programs(rewritten),
+            (; constants = ad_constants, callables = ops),
+            have_syms[collect(_ad_selector_indices(active_selector))]))
+    end
+    f = compile(rewritten)
     f, ad_caches, ad_constants, ops, new_stmts
+end
+
+_ad_na_inline_plate(node, call, declared) = _inline_plate_program(call, declared)
+
+function _ad_na_plate_region(node, call, declared)
+    program = first(call.args)::_PlateProgram
+    _plate_block(_inline_plate_program(call, declared), nothing, program.axes)
 end
 
 function _ad_kernel_call(kernel::NonAllocatingKernel, args::Tuple,
