@@ -482,9 +482,9 @@ end
 # --- the plan rewrite ----------------------------------------------------------
 #
 # Per bound port set (`_partial_bound_statistics`, before the index runs): a
-# total-only summed plate whose cell adds `a + c * (y - mu)^2`, `a` and `c`
-# shared and `y` a bound argument, and whose location argument `mu` is linear
-# in live values with bound coefficients, gets
+# total-only summed plate whose factored loop (summed_plate_factors.jl) sums
+# `(y - mu)^2`, `y` a bound argument, and whose location argument `mu` is
+# linear in live values with bound coefficients, gets
 #
 #     stats = _LSStatisticsOp{S}()(y, data...)                 # data-only: frozen at binding
 #     loc = _LSLocationCall{S}()(stats, y, data..., live..., mu)
@@ -495,67 +495,6 @@ end
 # the plate reads `loc` row by row only where its own loop runs, and the
 # lowering sums the squared residuals from `stats` (`_lower_bound_statistics_native`);
 # an unusable one gives the plate `mu` back and drops `loc`: today's program.
-
-# The cell's value as a term `a + c * t` (summed_plate_factors.jl) over the
-# names of the cell plan's ports: `cell[k]` names a batched port, read per cell,
-# and the others are shared. `nothing` when a recipe is not a source the terms
-# read (an opaque operation, a recipe of several outputs).
-function _ls_cell_term(inner::Plan, names::Vector{Symbol}, batched::Vector{Bool})
-    g = inner.graph
-    env = Dict{ValueId,_SPFTerm}()
-    for (k, v) in enumerate(inner.have)
-        env[canon_id(g, v.id)] = batched[k] ? _spf_cell(names[k]) : _spf_shared(names[k])
-    end
-    ctx = _SPFCtx(Symbol("#ls_no_index"), Set{Symbol}(), Pair{Any,Bool}[],
-                  Pair{Any,Symbol}[], Symbol("#ls"), ())
-    _ls_plan_terms!(env, inner, ctx) || return nothing
-    term = get(env, canon_id(g, only(inner.want).id), nothing)
-    term === nothing && return nothing
-    (; term, atoms = ctx.atoms)
-end
-
-function _ls_plan_terms!(env::Dict{ValueId,_SPFTerm}, p::Plan, ctx::_SPFCtx)
-    g = p.graph
-    for r in p.recipes
-        length(r.outputs) == 1 || return false
-        r.effectful && return false
-        inputs = _SPFTerm[]
-        for v in r.inputs
-            t = get(env, canon_id(g, v.id), nothing)
-            t === nothing && return false
-            push!(inputs, t)
-        end
-        term = _ls_recipe_term(r, inputs, ctx)
-        term === nothing && return false
-        env[canon_id(g, only(r.outputs).id)] = term
-    end
-    true
-end
-
-# One recipe's term from its inputs' terms: an embedded kernel through its own
-# plan, a source through its authored expression.
-function _ls_recipe_term(r::Recipe, inputs::Vector{_SPFTerm}, ctx::_SPFCtx)
-    kernel = _embedded_kernel(r.op)
-    if kernel !== nothing
-        inner = getfield(kernel, :plan)
-        length(inner.have) == length(inputs) && length(inner.want) == 1 || return nothing
-        env = Dict{ValueId,_SPFTerm}(canon_id(inner.graph, v.id) => inputs[k]
-                                     for (k, v) in enumerate(inner.have))
-        _ls_plan_terms!(env, inner, ctx) || return nothing
-        return get(env, canon_id(inner.graph, only(inner.want).id), nothing)
-    end
-    source = _ls_recipe_source(r)
-    source === nothing && return nothing
-    names, source = source
-    length(names) == length(inputs) || return nothing
-    local_env = Dict{Symbol,_SPFTerm}(zip(names, inputs))
-    try
-        _spf_term(source, local_env, ctx)
-    catch err
-        err isa _SPFAbort || rethrow()
-        nothing
-    end
-end
 
 # A recipe's parameter names and authored source, its called names resolved:
 # a source operation's in its module, and a bare call's (`log(scale)`, whose
@@ -590,16 +529,6 @@ end
 _ls_is_call(x, f, n) = x isa Expr && x.head === :call && length(x.args) == n + 1 &&
     _rw_resolve(x.args[1], @__MODULE__) === f
 
-# `(response, location)` port names when a cell term adds `c * (y - mu)^2` to
-# shared values (either order of the difference), else `nothing`.
-function _ls_squared_residual(term::_SPFTerm)
-    t = term.t
-    _ls_is_call(t, Base.:^, 2) && t.args[3] == 2 || return nothing
-    d = t.args[2]
-    _ls_is_call(d, Base.:-, 2) && d.args[2] isa Symbol && d.args[3] isa Symbol || return nothing
-    (d.args[2], d.args[3])
-end
-
 # --- the location ----------------------------------------------------------------
 
 # A coefficient: `literal` times the product of data values.
@@ -627,7 +556,8 @@ end
 # data-only values; `seen` the recipes the form reads through.
 function _ls_location(p::Plan, v::Value, dataonly::Set{ValueId}, seen::Vector{Recipe})
     x = _ls_operand(p, v, dataonly, seen, 0)
-    x isa _LSAffine || return nothing
+    x = x isa _LSAffine ? x : nothing
+    x === nothing && return nothing
     isempty(x.terms) ? nothing : x
 end
 
@@ -650,12 +580,48 @@ function _ls_operand(p::Plan, v::Value, dataonly, seen, depth)
                          _LSCoef[])
     end
     length(r.outputs) == 1 && !r.effectful || return _LSLive(id, v)
+    r.op isa _AuthoredPlateOp && return _ls_plate_operand(p, r, id, v, dataonly, seen, depth)
     source = _ls_recipe_source(r)
     source === nothing && return _LSLive(id, v)
     names, source = source
     length(names) == length(r.inputs) || return _LSLive(id, v)
-    env = Dict{Symbol,Value}(zip(names, r.inputs))
-    x = _ls_expr(p, source, env, dataonly, seen, depth + 1)
+    env = Dict{Symbol,Any}(zip(names, r.inputs))
+    x = _ls_expr(p, source, env, dataonly, seen, depth + 1, false)
+    x === nothing && return _LSLive(id, v)
+    push!(seen, r)
+    x
+end
+
+# An array-valued plate read as the elementwise expression its cell computes
+# (`plate(x, b) do x, v; x * v end` is `x .* b`): RKPPL builds a location from
+# such plates. Each cell recipe is read from its source, over the operands of
+# the plate's arguments.
+function _ls_plate_operand(p::Plan, r::Recipe, id::ValueId, v::Value, dataonly, seen, depth)
+    inner = getfield(r.op.kernel, :plan)
+    length(inner.have) == length(r.inputs) && length(inner.want) == 1 || return _LSLive(id, v)
+    ig = inner.graph
+    env = Dict{ValueId,Any}()
+    for (k, h) in enumerate(inner.have)
+        x = _ls_operand(p, r.inputs[k], dataonly, seen, depth + 1)
+        x === nothing && return _LSLive(id, v)
+        env[canon_id(ig, h.id)] = x
+    end
+    for q in inner.recipes
+        length(q.outputs) == 1 && !q.effectful || return _LSLive(id, v)
+        source = _ls_recipe_source(q)
+        source === nothing && return _LSLive(id, v)
+        names, source = source
+        length(names) == length(q.inputs) || return _LSLive(id, v)
+        local_env = Dict{Symbol,Any}()
+        for (name, input) in zip(names, q.inputs)
+            haskey(env, canon_id(ig, input.id)) || return _LSLive(id, v)
+            local_env[name] = env[canon_id(ig, input.id)]
+        end
+        x = _ls_expr(p, source, local_env, dataonly, seen, depth + 1, true)
+        x === nothing && return _LSLive(id, v)
+        env[canon_id(ig, only(q.outputs).id)] = x
+    end
+    x = get(env, canon_id(ig, only(inner.want).id), nothing)
     x === nothing && return _LSLive(id, v)
     push!(seen, r)
     x
@@ -668,15 +634,20 @@ _ls_affine_of(x::_LSLive, p) = valtype(x.value) <: Number ?
     _LSAffine([((1.0, ValueId[]), x.id, nothing, nothing)], _LSCoef[]) : nothing
 _ls_affine_of(::Nothing, p) = nothing
 
-function _ls_expr(p::Plan, ex, env::Dict{Symbol,Value}, dataonly, seen, depth)
-    ex isa Symbol && return haskey(env, ex) ?
-        _ls_operand(p, env[ex], dataonly, seen, depth) : nothing
+# `elementwise`: the expression is a plate cell's, whose arithmetic is per
+# element of its batched arguments.
+function _ls_expr(p::Plan, ex, env::Dict{Symbol,Any}, dataonly, seen, depth, elementwise::Bool)
+    if ex isa Symbol
+        haskey(env, ex) || return nothing
+        x = env[ex]
+        return x isa Value ? _ls_operand(p, x, dataonly, seen, depth) : x
+    end
     ex isa Real && !(ex isa Bool) && return (Float64(ex), ValueId[])::_LSCoef
     ex isa Expr || return nothing
     if ex.head === :block
         statements = Any[a for a in ex.args if !(a isa LineNumberNode)]
         length(statements) == 1 || return nothing
-        return _ls_expr(p, only(statements), env, dataonly, seen, depth)
+        return _ls_expr(p, only(statements), env, dataonly, seen, depth, elementwise)
     end
     # Dotted calls `a .+ b` and calls `+(a, b)` read alike here: the plate
     # reads the result row by row in either case.
@@ -688,12 +659,16 @@ function _ls_expr(p::Plan, ex, env::Dict{Symbol,Value}, dataonly, seen, depth)
         else
             (_rw_resolve(ex.args[1], @__MODULE__), ex.args[2:end])
         end
+    elseif ex.head === :call && ex.args[1] isa Function
+        # A bare call's operation (`_ls_recipe_source`).
+        (ex.args[1], ex.args[2:end])
     elseif ex.head === :. && length(ex.args) == 2 && Meta.isexpr(ex.args[2], :tuple)
         (_rw_resolve(ex.args[1], @__MODULE__), ex.args[2].args)
     elseif ex.head === :ref && length(ex.args) == 2
         # `src[index]`: a gather of a live source by a data index.
         src, index = ex.args
-        src isa Symbol && index isa Symbol && haskey(env, src) && haskey(env, index) || return nothing
+        src isa Symbol && index isa Symbol && haskey(env, src) && haskey(env, index) &&
+            env[src] isa Value && env[index] isa Value || return nothing
         g = p.graph
         sid, iid = canon_id(g, env[src].id), canon_id(g, env[index].id)
         iid in dataonly && !(sid in dataonly) || return nothing
@@ -701,9 +676,9 @@ function _ls_expr(p::Plan, ex, env::Dict{Symbol,Value}, dataonly, seen, depth)
     else
         return nothing
     end
-    dotted = ex.head === :. || (ex.head === :call && startswith(String(ex.args[1] isa GlobalRef ?
-        ex.args[1].name : ex.args[1]), "."))
-    operands = Any[_ls_expr(p, a, env, dataonly, seen, depth) for a in args]
+    dotted = elementwise || ex.head === :. || (ex.head === :call && ex.args[1] isa Union{Symbol,GlobalRef} &&
+        startswith(String(ex.args[1] isa GlobalRef ? ex.args[1].name : ex.args[1]), "."))
+    operands = Any[_ls_expr(p, a, env, dataonly, seen, depth, elementwise) for a in args]
     any(o -> o === nothing, operands) && return nothing
     if f === Base.:+
         forms = Any[_ls_affine_of(o, p) for o in operands]
@@ -772,6 +747,40 @@ end
 _ls_enabled() = _bound_statistics() && _simplify() && !_plate_reverse_enabled() &&
     !_footprint_recording()
 
+# The positions `(a, b)` of a plate's arguments whose squared difference its
+# factored loop sums, `(read(a) - read(b))^2`, or `nothing`. The plate and its
+# total are lowered alone, over their arguments, and read as the lowering pass
+# below reads them: the summed plate factors (summed_plate_factors.jl) decide
+# what a cell adds, whatever the spelling of its law (a source per term, or a
+# composed source with a guard the plate lowering takes outside its loop).
+function _ls_squared_ports(p::Plan, r::Recipe, total::Recipe)
+    g = p.graph
+    have = unique(v -> canon_id(g, v.id), collect(Value, r.inputs))
+    alone = _partial_subplan(p, have, Value[only(total.outputs)], Recipe[r, total])
+    ast = first(_lower_with_ops(alone))
+    signature = ast.args[1]
+    params = Any[a isa Expr && a.head === :(::) ? a.args[1] : a for a in signature.args[3:end]]
+    length(params) == length(have) || return nothing
+    position = Dict{Symbol,Int}()
+    for (k, name) in enumerate(params)
+        name isa Symbol || return nothing
+        h = canon_id(g, have[k].id)
+        position[name] = findfirst(v -> canon_id(g, v.id) == h, r.inputs)
+    end
+    roots = _ls_roots(ast)
+    root(x) = get(roots, x, x)
+    found = nothing
+    _ls_factored_blocks(ast) do partial, index, cellbody
+        found === nothing || return
+        pair = _ls_factored_pair(cellbody, index, partial, root)
+        pair === nothing && return
+        a, b = pair
+        haskey(position, a) && haskey(position, b) && position[a] != position[b] &&
+            (found = (position[a], position[b]))
+    end
+    found
+end
+
 function _partial_bound_statistics(p::Plan, bound_values::Vector{Value})
     isempty(bound_values) && return p
     _ls_enabled() || return p
@@ -792,7 +801,7 @@ function _partial_bound_statistics(p::Plan, bound_values::Vector{Value})
     _, _, dataonly = _partial_split(p, bound)
     rewrites = Dict{Int,Any}()
     for r in candidates
-        rewrite = _ls_plate_rewrite(p, r, dataonly, wanted)
+        rewrite = _ls_plate_rewrite(p, r, _authored_plate_sum_recipe(p, r), dataonly, wanted)
         rewrite === nothing || (rewrites[r.id] = rewrite)
     end
     isempty(rewrites) && return p
@@ -829,25 +838,12 @@ function _partial_bound_statistics(p::Plan, bound_values::Vector{Value})
 end
 
 # The rewrite of one total-only plate, or `nothing`.
-function _ls_plate_rewrite(p::Plan, r::Recipe, dataonly::Set{ValueId}, wanted::Set{ValueId})
+function _ls_plate_rewrite(p::Plan, r::Recipe, total::Recipe, dataonly::Set{ValueId},
+                           wanted::Set{ValueId})
     g = p.graph
-    inner = getfield(r.op.kernel, :plan)
-    length(inner.have) == length(r.inputs) && length(inner.want) == 1 || return nothing
-    atomic = typeof(r.op).parameters[2]
-    names = Symbol[Symbol("#ls_port_", k) for k in eachindex(r.inputs)]
-    batched = Bool[!(k in atomic) for k in eachindex(r.inputs)]
-    cell = _ls_cell_term(inner, names, batched)
-    cell === nothing && return nothing
-    term = cell.term
-    _spf_isshared(term) && return nothing
-    # The summed plate factors take this sum out only when something does
-    # (`_spf_factor`): a shared condition, or a shared part that reads a value.
-    isempty(cell.atoms) && !_spf_reads_value(term.a) && !_spf_reads_value(term.c) && return nothing
-    pair = _ls_squared_residual(term)
+    pair = _ls_squared_ports(p, r, total)
     pair === nothing && return nothing
-    a, b = (findfirst(==(n), names) for n in pair)
-    (a === nothing || b === nothing || a == b) && return nothing
-    batched[a] && batched[b] || return nothing
+    a, b = pair
     ida, idb = canon_id(g, r.inputs[a].id), canon_id(g, r.inputs[b].id)
     # The response is bound data, the location is not.
     position, response, location = ida in dataonly && !(idb in dataonly) ? (b, r.inputs[a], r.inputs[b]) :
@@ -971,60 +967,89 @@ function _ls_read_arg(rhs, index::Symbol)
     call.args[2]
 end
 
-function _lower_bound_statistics_native(body::Expr, ops)
-    any(op -> op isa _LSLocationCall, ops) || return body
-    # Each location's response, and every name that reads an array as another
-    # does (`Base.broadcastable`, `Broadcast.preprocess`), to its root.
-    responses = Dict{Symbol,Any}()
+# Every name that reads an array as another does (`Base.broadcastable`,
+# `Broadcast.preprocess`), to the name it reads.
+function _ls_roots(body::Expr)
     roots = Dict{Symbol,Symbol}()
     _index_run_visit(body) do ex
         ex.head === :(=) && length(ex.args) == 2 && ex.args[1] isa Symbol || return
         lhs, rhs = ex.args
-        rhs isa Expr && rhs.head === :call || return
-        if _ls_location_callee(rhs.args[1], ops) && length(rhs.args) >= 3
-            responses[lhs] = rhs.args[3]
-        elseif _index_run_call(rhs, GlobalRef(Base, :broadcastable), 1) && rhs.args[2] isa Symbol
+        if _index_run_call(rhs, GlobalRef(Base, :broadcastable), 1) && rhs.args[2] isa Symbol
             roots[lhs] = get(roots, rhs.args[2], rhs.args[2])
         elseif _index_run_call(rhs, GlobalRef(Base.Broadcast, :preprocess), 2) &&
                 rhs.args[3] isa Symbol
             roots[lhs] = get(roots, rhs.args[3], rhs.args[3])
         end
     end
+    roots
+end
+
+# `(partial, index, cellbody, block, at)` of each factored block of `ex`: the
+# summed plate factors' `if fast; partial = seed; <loop>; ... end`, whose loop
+# is statement `at` of `block`; `nothing` for anything else.
+function _ls_factored_block(ex)
+    ex isa Expr && ex.head === :if && length(ex.args) == 2 && ex.args[1] isa Symbol &&
+        endswith(String(ex.args[1]), _spf_mark()) && Meta.isexpr(ex.args[2], :block) ||
+        return nothing
+    block = ex.args[2]
+    positions = [k for (k, a) in enumerate(block.args) if !(a isa LineNumberNode)]
+    length(positions) >= 2 || return nothing
+    seed, loop = block.args[positions[1]], block.args[positions[2]]
+    Meta.isexpr(seed, :(=), 2) && seed.args[1] isa Symbol &&
+        _index_run_call(seed.args[2], GlobalRef(@__MODULE__, :_plate_run_seed), 1) || return nothing
+    plate = _index_run_simd_plate(loop)
+    plate === nothing && return nothing
+    _, index, cellbody = plate
+    (seed.args[1], index, cellbody, block, positions[2])
+end
+_ls_factored_blocks(f, body::Expr) = _index_run_visit(body) do ex
+    found = _ls_factored_block(ex)
+    found === nothing || f(found[1], found[2], found[3])
+end
+
+function _lower_bound_statistics_native(body::Expr, ops)
+    any(op -> op isa _LSLocationCall, ops) || return body
+    # Each location's response.
+    responses = Dict{Symbol,Any}()
+    _index_run_visit(body) do ex
+        ex.head === :(=) && length(ex.args) == 2 && ex.args[1] isa Symbol || return
+        lhs, rhs = ex.args
+        rhs isa Expr && rhs.head === :call && _ls_location_callee(rhs.args[1], ops) &&
+            length(rhs.args) >= 3 && (responses[lhs] = rhs.args[3])
+    end
     isempty(responses) && return body
+    roots = _ls_roots(body)
     root(x) = get(roots, x, x)
     _index_run_replace(body) do ex
-        ex.head === :if && length(ex.args) == 2 && ex.args[1] isa Symbol &&
-            endswith(String(ex.args[1]), _spf_mark()) && Meta.isexpr(ex.args[2], :block) || return ex
-        block = ex.args[2]
-        positions = [k for (k, a) in enumerate(block.args) if !(a isa LineNumberNode)]
-        length(positions) >= 2 || return ex
-        seed, loop = block.args[positions[1]], block.args[positions[2]]
-        Meta.isexpr(seed, :(=), 2) && seed.args[1] isa Symbol &&
-            _index_run_call(seed.args[2], GlobalRef(@__MODULE__, :_plate_run_seed), 1) || return ex
-        partial = seed.args[1]
-        plate = _index_run_simd_plate(loop)
-        plate === nothing && return ex
-        _, index, cellbody = plate
-        location = _ls_factored_location(cellbody, index, partial, root, responses)
+        found = _ls_factored_block(ex)
+        found === nothing && return ex
+        partial, index, cellbody, block, at = found
+        pair = _ls_factored_pair(cellbody, index, partial, root)
+        pair === nothing && return ex
+        location = nothing
+        for (loc, y) in (pair, reverse(pair))
+            haskey(responses, loc) || continue
+            response = responses[loc]
+            response isa Symbol && root(response) === y && (location = loc; break)
+        end
         location === nothing && return ex
-        call = Expr(:(=), partial, Expr(:call, GlobalRef(@__MODULE__, :_plate_total_add), partial,
-            Expr(:call, GlobalRef(@__MODULE__, :_ls_rss), location)))
         args = copy(block.args)
-        args[positions[2]] = call
+        args[at] = Expr(:(=), partial, Expr(:call, GlobalRef(@__MODULE__, :_plate_total_add), partial,
+            Expr(:call, GlobalRef(@__MODULE__, :_ls_rss), location)))
         Expr(:if, ex.args[1], Expr(:block, args...))
     end
 end
 
-# The location a factored cell body sums `(y - loc)^2` of, `y` its response,
-# or `nothing`.
-function _ls_factored_location(cellbody::Expr, index::Symbol, partial::Symbol, root, responses)
+# The roots of the arrays a factored cell body sums the squared difference of,
+# `(read(a) - read(b))^2`, or `nothing`.
+function _ls_factored_pair(cellbody::Expr, index::Symbol, partial::Symbol, root)
     statements = Any[s for s in cellbody.args if !(s isa LineNumberNode)]
     length(statements) >= 2 || return nothing
     add, term = statements[end], statements[end-1]
     Meta.isexpr(add, :(=), 2) && add.args[1] === partial &&
         _index_run_call(add.args[2], GlobalRef(@__MODULE__, :_plate_total_add), 2) &&
         Meta.isexpr(term, :(=), 2) && add.args[2].args[3] === term.args[1] || return nothing
-    reads = Dict{Symbol,Symbol}()     # a cell name => the array it reads
+    reads = Dict{Symbol,Symbol}()     # a cell name => the root of the array it reads
     defs = Dict{Symbol,Any}()         # any other cell name => its value
     for s in statements[1:end-2]
         Meta.isexpr(s, :(=), 2) && s.args[1] isa Symbol || return nothing
@@ -1038,20 +1063,19 @@ function _ls_factored_location(cellbody::Expr, index::Symbol, partial::Symbol, r
         end
     end
     # A name the factored cell binds stands for its value.
-    value(x) = (seen = 0; while x isa Symbol && haskey(defs, x) && (seen += 1) < 64
-        x = defs[x] end; x)
+    function value(x)
+        for _ in 1:64
+            x isa Symbol && haskey(defs, x) || return x
+            x = defs[x]
+        end
+        x
+    end
     t = value(term.args[2])
     _ls_is_call(t, Base.:^, 2) && t.args[3] == 2 || return nothing
     d = value(t.args[2])
     _ls_is_call(d, Base.:-, 2) || return nothing
     a, b = (x isa Symbol ? get(reads, x, nothing) : nothing for x in d.args[2:3])
-    (a === nothing || b === nothing) && return nothing
-    for (loc, y) in ((a, b), (b, a))
-        haskey(responses, loc) || continue
-        response = responses[loc]
-        response isa Symbol && root(response) === y && return loc
-    end
-    nothing
+    a === nothing || b === nothing || a === b ? nothing : (a, b)
 end
 
 # The residual recipes without the constants that only a rewritten location
