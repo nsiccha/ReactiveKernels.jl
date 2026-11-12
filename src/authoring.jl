@@ -5695,9 +5695,9 @@ function prepare(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
                  bound = NamedTuple(), on_error = nothing,
                  exemplars = nothing, type_stability = nothing,
                  type_stability_level = nothing, branch_arms = nothing,
-                 simplify = nothing, _data_cache = nothing)
+                 simplify = nothing, bound_statistics = nothing, _data_cache = nothing)
     _with_branch_arms(branch_arms) do
-    _with_simplify(simplify) do
+    _with_settings(simplify, bound_statistics) do
         _with_type_stability(type_stability, type_stability_level) do
             isempty(bound) || return prepare(spec.graph;
                 have = _kernel_selected_values(spec, have, spec.have_names, :have),
@@ -5729,12 +5729,13 @@ function prepare!(cache::PreparationCache, spec::KernelSpec;
                   have = _KERNEL_DEFAULT_BOUNDARY,
                   want = _KERNEL_DEFAULT_BOUNDARY, passes = (),
                   bound = NamedTuple(), on_error = nothing, type_stability = nothing,
-                  type_stability_level = nothing, simplify = nothing)
+                  type_stability_level = nothing, simplify = nothing,
+                  bound_statistics = nothing)
     isempty(bound) || return prepare!(cache, spec.graph;
         have = _kernel_selected_values(spec, have, spec.have_names, :have),
         want = _kernel_selected_values(spec, want, spec.want_names, :want),
         passes = passes, bound = _kernel_bound_pairs(spec, bound), on_error = on_error,
-        type_stability, type_stability_level, simplify)
+        type_stability, type_stability_level, simplify, bound_statistics)
     prepared = prepare!(cache, spec.graph;
                         have = _kernel_selection(spec, have, spec.have_names, :have),
                         want = _kernel_selection(spec, want, spec.want_names, :want),
@@ -5747,11 +5748,13 @@ end
 function prepare_nonallocating(spec::KernelSpec, exemplars...;
                                have = _KERNEL_DEFAULT_BOUNDARY,
                                want = _KERNEL_DEFAULT_BOUNDARY, passes = (),
-                               bound = NamedTuple(), simplify = nothing)
+                               bound = NamedTuple(), simplify = nothing,
+                               bound_statistics = nothing)
     isempty(bound) || return prepare_nonallocating(spec.graph, exemplars...;
         have = _kernel_selection(spec, have, spec.have_names, :have),
         want = _kernel_selection(spec, want, spec.want_names, :want),
-        passes = passes, bound = _kernel_bound_pairs(spec, bound), simplify)
+        passes = passes, bound = _kernel_bound_pairs(spec, bound), simplify,
+        bound_statistics)
     prepared = prepare_nonallocating(spec.graph, exemplars...;
         have = _kernel_selection(spec, have, spec.have_names, :have),
         want = _kernel_selection(spec, want, spec.want_names, :want),

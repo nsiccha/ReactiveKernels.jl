@@ -598,8 +598,9 @@ end
 function ReactiveKernels.prepare_nonallocating(p::ReactiveKernels.Plan,
                                                exemplars...;
                                                passes = (), bound = (),
-                                               simplify = nothing)
-    ReactiveKernels._with_simplify(simplify) do
+                                               simplify = nothing,
+                                               bound_statistics = nothing)
+    ReactiveKernels._with_settings(simplify, bound_statistics) do
         # As ordinary `prepare`: cell-only producers compose before the bound split.
         fused = bound === () ? p :
             ReactiveKernels._fuse_authored_plate_chains(p; cells_only = true)
@@ -613,10 +614,12 @@ end
 function ReactiveKernels.prepare_nonallocating(g::ReactiveKernels.Graph,
                                                 exemplars...;
                                                 have = (), want = (), passes = (),
-                                                bound = (), simplify = nothing)
+                                                bound = (), simplify = nothing,
+                                                bound_statistics = nothing)
     p = ReactiveKernels.plan(g; have = have, want = want)
     ReactiveKernels.prepare_nonallocating(p, exemplars...; passes = passes,
-                                          bound = bound, simplify = simplify)
+                                          bound = bound, simplify = simplify,
+                                          bound_statistics = bound_statistics)
 end
 
 # The natural consumer call after benchmarking an ordinary prepared kernel:

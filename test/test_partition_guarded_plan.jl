@@ -1,6 +1,8 @@
 using ReactiveKernels, Enzyme, Test
 const _PGP = ReactiveKernels
 
+_pgp_has_generator(x) = x isa Expr && x.head !== :quote &&
+    (x.head === :generator || any(_pgp_has_generator, x.args))
 _pgp_concrete_storage(x) = isconcretetype(typeof(x))
 _pgp_concrete_storage(x::Tuple) = all(_pgp_concrete_storage, x)
 _pgp_concrete_storage(x::AbstractArray) =
@@ -15,6 +17,11 @@ function _pgp_check(body, cases; active_values = (2.0, 3.0, 4.0), require_plan =
         (Any[], body.args, Symbol[], Symbol[]) : split
     planner = _PGP.compile(Expr(:function, Expr(:tuple, :u, :label),
         Expr(:block, plan..., Expr(:return, Expr(:tuple, needed...)))))
+    # `_compile` lifts the cache's comprehension out of the compiled body: an
+    # opaque closure there cannot run while a package image is generated
+    # (`test_precompiled_guarded_plan.jl`).
+    @test !_pgp_has_generator(
+        _PGP._program_expression(_PGP._native_generated_function(planner)))
     reads = [Expr(:(=), name, :(p[$i])) for (i, name) in enumerate(needed)]
     planned = _PGP.compile(Expr(:function, Expr(:tuple, :u, :label, :p),
         Expr(:block, reads..., main...)))

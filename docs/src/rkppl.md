@@ -64,8 +64,8 @@ Select affine cells when setting up WarmupHMC. Declare their location and
 log-scale as ordinary named values in the model, then pass those names to
 `adaptive_centering_problem`:
 
-```julia
-using WarmupHMC, LogDensityProblems, Enzyme
+```@example adaptive_centering
+using ReactiveKernelsPPL, WarmupHMC, LogDensityProblems, Enzyme
 using DifferentiationInterface: AutoEnzyme
 
 model = @rkppl begin
@@ -84,6 +84,10 @@ u0 = zeros(built.layout.total)
 problem = prepare_sampler(built, plan, u0; backend = AutoEnzyme())
 adaptive = adaptive_centering_problem(built, plan, problem, AutoEnzyme();
     cells = (z = (location = :z_location, log_scale = :z_log_scale),), u0)
+@assert LogDensityProblems.logdensity(adaptive, u0) ==
+    LogDensityProblems.logdensity(problem, u0)
+(; dimension = LogDensityProblems.dimension(adaptive),
+    logdensity = LogDensityProblems.logdensity(adaptive, u0))
 ```
 
 Pass `adaptive` to WarmupHMC with nonlinear adaptation enabled. The selected

@@ -11,9 +11,8 @@ const ACT = AdaptiveCenteringTests
 # Execute the displayed guide example without maintaining a second copy.
 guide = read(joinpath(pkgdir(ReactiveKernels), "docs", "src", "rkppl.md"), String)
 section = split(guide, "## Adaptive partial centering"; limit = 2)[2]
-example = match(r"```julia\n(.*?)\n```"s, section).captures[1]
+example = match(r"```@example adaptive_centering\n(.*?)\n```"s, section).captures[1]
 module CenteringGuide
-using ReactiveKernelsPPL
 end
 include_string(CenteringGuide, example, "rkppl.md:adaptive-centering")
 @test LDP.logdensity(CenteringGuide.adaptive, CenteringGuide.u0) ==

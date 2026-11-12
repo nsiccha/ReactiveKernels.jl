@@ -2363,8 +2363,9 @@ function prepare_ad(spec::KernelSpec,
                     args...; active, want, bound = NamedTuple(),
                     retain::Tuple = (), warm::Bool = false,
                     native_forward_batch::Bool = false, type_stability = nothing,
-                    type_stability_level = nothing, simplify = nothing, kwargs...)
-    _with_simplify(simplify) do
+                    type_stability_level = nothing, simplify = nothing,
+                    bound_statistics = nothing, kwargs...)
+    _with_settings(simplify, bound_statistics) do
         _with_type_stability(type_stability, type_stability_level) do
             kernel, resolver, keywords =
                 _ad_spec_boundary(spec, want, bound, kwargs; retain)
