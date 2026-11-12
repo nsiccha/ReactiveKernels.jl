@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.7
+
+- Bernoulli, Binomial and zero-inflated Binomial product-mixture laws accept
+  a singleton position row in each parameter matrix independently. A `1 × K`
+  matrix shares its row across all observations; an `N × K` matrix keeps one
+  row per observation. All matrices still need one column per mixture weight.
+  Empty events accept zero or one row and contribute `log(sum(weights))`.
+- Binomial probability and logit routes expose their bound log coefficient
+  under a data-only support guard, allowing nested preparation to cache it
+  even when some components cannot produce the observed counts.
+
 ## 0.1.6
 
 - Add `icar_rows_logdensity(phi, node1, node2)` and

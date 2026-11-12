@@ -800,14 +800,20 @@ using SpecialFunctions: beta_inc
     # released Enzyme fail reverse compilation ("Illegal cached pointer").
     # The DK test pins the identity.
     logpdf(observed::Int)::Float64 = begin
+        # Keep both routes' coefficient under its own data-only
+        # support guard. A mixture may contain invalid trial counts beside
+        # valid ones; binding can then cache this whole guarded expression
+        # without speculating loggamma at an invalid count.
+        coefficient::Float64 = (observed >= 0) & (observed <= n) ?
+            loggamma(n + 1.0) - loggamma(observed + 1.0) -
+                loggamma(n - observed + 1.0) : 0.0
         # Read the supplied logit directly so HAVE planning preserves tails.
         lp::Float64 =
             (observed >= 0) & (observed <= n) ?
                 (n == 0 ? 0.0 :
                  observed == 0 ? -n * log1pexp(logit) :
                  observed == n ? -n * log1pexp(-logit) :
-                 loggamma(n + 1.0) - loggamma(observed + 1.0) -
-                 loggamma(n - observed + 1.0) +
+                 coefficient +
                  (logit >= 0 ?
                      (l1pe = log1pexp(-logit);
                       -observed * l1pe - (n - observed) * (l1pe + logit)) :
@@ -816,8 +822,7 @@ using SpecialFunctions: beta_inc
                 -Inf
         lp::Float64 =
             (observed >= 0) & (observed <= n) ?
-                (loggamma(n + 1.0) - loggamma(observed + 1.0) -
-                 loggamma(n - observed + 1.0) +
+                (coefficient +
                  (observed == 0 ? 0.0 : observed * log(p)) +
                  (observed == n ? 0.0 : (n - observed) * log1p(-p))) :
                 -Inf
@@ -1320,7 +1325,9 @@ include("positive_families.jl")
 
 # One component is chosen for the entire observed vector. Columns of the
 # parameter matrices are component laws; rows are positions within the one
-# event. The two nested plates retain both data-derived loops, while the
+# event. Each matrix may independently have one row, shared by every position,
+# or one row per observation. Component columns never broadcast.
+# The two nested plates retain both data-derived loops, while the
 # shared mixture fold keeps any family-specific cell density in one place.
 # Each law checks its parameter matrix's component count against the weights
 # and passes the weights on as given. The fold's only reader of the component
@@ -1353,13 +1360,15 @@ end
 
 @kernel bernoulli_product_mixture_logdensity(observed::Vector{Bool},
         probabilities::Matrix{Float64}, weights::Vector{Float64}) = begin
-    rows_checked = size(probabilities, 1) == length(observed) ?
-        probabilities : throw(DimensionMismatch("probability rows must match observations"))
+    rows_checked = (size(probabilities, 1) == 1 || size(probabilities, 1) == length(observed)) ?
+        probabilities : throw(DimensionMismatch("probabilities need one row or one per observation"))
     checked_probabilities = size(rows_checked, 2) == length(weights) ?
         rows_checked : throw(DimensionMismatch("mixture weights must match components"))
+    nrows = size(checked_probabilities, 1)
     components = plate(1:length(weights)) do k
         cells = plate(1:length(observed)) do i
-            bernoulli(checked_probabilities[i, k]).logpdf(observed[i])
+            row = nrows == 1 ? 1 : i
+            bernoulli(checked_probabilities[row, k]).logpdf(observed[i])
         end
         sum(cells)
     end
@@ -1369,15 +1378,20 @@ end
 @kernel binomial_product_mixture_logdensity(observed::Vector{Int},
         trials::Matrix{Int}, probabilities::Matrix{Float64},
         weights::Vector{Float64}) = begin
-    matched_probabilities = size(trials) == size(probabilities) ?
-        probabilities : throw(DimensionMismatch("trial counts and probabilities must match"))
-    rows_checked = size(matched_probabilities, 1) == length(observed) ?
-        matched_probabilities : throw(DimensionMismatch("probability rows must match observations"))
+    matched_probabilities = ((size(trials, 1) == 1 || size(trials, 1) == length(observed)) &&
+        size(trials, 2) == size(probabilities, 2)) ?
+        probabilities : throw(DimensionMismatch("trials need one row or one per observation and matching components"))
+    rows_checked = (size(matched_probabilities, 1) == 1 || size(matched_probabilities, 1) == length(observed)) ?
+        matched_probabilities : throw(DimensionMismatch("probabilities need one row or one per observation"))
     checked_probabilities = size(rows_checked, 2) == length(weights) ?
         rows_checked : throw(DimensionMismatch("mixture weights must match components"))
+    nrows = size(trials, 1)
+    prows = size(checked_probabilities, 1)
     components = plate(1:size(trials, 2)) do k
         cells = plate(1:length(observed)) do i
-            binomial(trials[i, k], checked_probabilities[i, k]).logpdf(observed[i])
+            ni = nrows == 1 ? 1 : i
+            pi = prows == 1 ? 1 : i
+            binomial(trials[ni, k], checked_probabilities[pi, k]).logpdf(observed[i])
         end
         sum(cells)
     end
@@ -1393,13 +1407,15 @@ end
 # probability 1.
 @kernel bernoulli_logit_product_mixture_logdensity(observed::Vector{Bool},
         logits::Matrix{Float64}, weights::Vector{Float64}) = begin
-    rows_checked = size(logits, 1) == length(observed) ?
-        logits : throw(DimensionMismatch("logit rows must match observations"))
+    rows_checked = (size(logits, 1) == 1 || size(logits, 1) == length(observed)) ?
+        logits : throw(DimensionMismatch("logits need one row or one per observation"))
     checked_logits = size(rows_checked, 2) == length(weights) ?
         rows_checked : throw(DimensionMismatch("mixture weights must match components"))
+    nrows = size(checked_logits, 1)
     components = plate(1:length(weights)) do k
         cells = plate(1:length(observed)) do i
-            bernoulli(; logit = checked_logits[i, k]).logpdf(observed[i])
+            row = nrows == 1 ? 1 : i
+            bernoulli(; logit = checked_logits[row, k]).logpdf(observed[i])
         end
         sum(cells)
     end
@@ -1409,16 +1425,21 @@ end
 @kernel binomial_logit_product_mixture_logdensity(observed::Vector{Int},
         trials::Matrix{Int}, logits::Matrix{Float64},
         weights::Vector{Float64}) = begin
-    matched_logits = size(trials) == size(logits) ?
-        logits : throw(DimensionMismatch("trial counts and logits must match"))
-    rows_checked = size(matched_logits, 1) == length(observed) ?
-        matched_logits : throw(DimensionMismatch("logit rows must match observations"))
+    matched_logits = ((size(trials, 1) == 1 || size(trials, 1) == length(observed)) &&
+        size(trials, 2) == size(logits, 2)) ?
+        logits : throw(DimensionMismatch("trials need one row or one per observation and matching components"))
+    rows_checked = (size(matched_logits, 1) == 1 || size(matched_logits, 1) == length(observed)) ?
+        matched_logits : throw(DimensionMismatch("logits need one row or one per observation"))
     checked_logits = size(rows_checked, 2) == length(weights) ?
         rows_checked : throw(DimensionMismatch("mixture weights must match components"))
+    nrows = size(trials, 1)
+    lrows = size(checked_logits, 1)
     components = plate(1:size(trials, 2)) do k
         cells = plate(1:length(observed)) do i
-            binomial(; n = trials[i, k],
-                logit = checked_logits[i, k]).logpdf(observed[i])
+            ni = nrows == 1 ? 1 : i
+            li = lrows == 1 ? 1 : i
+            binomial(; n = trials[ni, k],
+                logit = checked_logits[li, k]).logpdf(observed[i])
         end
         sum(cells)
     end
@@ -1434,19 +1455,27 @@ end
 @kernel zero_inflated_binomial_logit_product_mixture_logdensity(
         observed::Vector{Int}, trials::Matrix{Int}, logits::Matrix{Float64},
         zi_logits::Matrix{Float64}, weights::Vector{Float64}) = begin
-    matched_logits = size(trials) == size(logits) ?
-        logits : throw(DimensionMismatch("trial counts and logits must match"))
-    checked_zi_logits = size(zi_logits) == size(logits) ?
-        zi_logits : throw(DimensionMismatch("zero-inflation logits and logits must match"))
-    rows_checked = size(matched_logits, 1) == length(observed) ?
-        matched_logits : throw(DimensionMismatch("logit rows must match observations"))
+    matched_logits = ((size(trials, 1) == 1 || size(trials, 1) == length(observed)) &&
+        size(trials, 2) == size(logits, 2)) ?
+        logits : throw(DimensionMismatch("trials need one row or one per observation and matching components"))
+    checked_zi_logits = ((size(zi_logits, 1) == 1 || size(zi_logits, 1) == length(observed)) &&
+        size(zi_logits, 2) == size(logits, 2)) ?
+        zi_logits : throw(DimensionMismatch("zero-inflation logits need one row or one per observation and matching components"))
+    rows_checked = (size(matched_logits, 1) == 1 || size(matched_logits, 1) == length(observed)) ?
+        matched_logits : throw(DimensionMismatch("logits need one row or one per observation"))
     checked_logits = size(rows_checked, 2) == length(weights) ?
         rows_checked : throw(DimensionMismatch("mixture weights must match components"))
+    nrows = size(trials, 1)
+    lrows = size(checked_logits, 1)
+    zrows = size(checked_zi_logits, 1)
     components = plate(1:size(trials, 2)) do k
         cells = plate(1:length(observed)) do i
-            zero_inflated_binomial_logit_zi(; n = trials[i, k],
-                logit = checked_logits[i, k],
-                zi_logit = checked_zi_logits[i, k]).logpdf(observed[i])
+            ni = nrows == 1 ? 1 : i
+            li = lrows == 1 ? 1 : i
+            zi = zrows == 1 ? 1 : i
+            zero_inflated_binomial_logit_zi(; n = trials[ni, k],
+                logit = checked_logits[li, k],
+                zi_logit = checked_zi_logits[zi, k]).logpdf(observed[i])
         end
         sum(cells)
     end
