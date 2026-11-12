@@ -2006,6 +2006,111 @@ def _rk_log2mexp(x):
 """,
 )
 
+# `fma(x, y, z)` rounds `x * y + z` once. JAX has no fused multiply-add, and
+# XLA contracts `x * y + z` only sometimes (on CPU under `jax.jit`, never
+# eagerly), so a floating-point `fma` calls a module helper that rounds once
+# however it runs (snag jax-scalar-fma-h-ad6e34c6). Each text is the helper's
+# JAX form with `BARRIER(` for `jax.lax.optimization_barrier(`, which keeps
+# XLA from fusing a rounded product into a later sum, and `STOP(` for
+# `jax.lax.stop_gradient(`; the host twin in plain NumPy needs neither.
+# The rounded value carries no derivative. The helper subtracts a term that is
+# exactly +0 and has the derivatives of `x * y + z`, so ordinary `jax.grad`
+# differentiates `fma` as Julia does, (y, x, 1), with no derivative rule.
+# Non-finite operands give IEEE `fma`'s value: `z` for finite `x` and `y`,
+# otherwise `x * y + z`.
+const _JAX_FMA_TAIL = """
+    value = jnp.where(ok, value, jnp.where(finite, z, x * y + z))
+    xs = jnp.where(ok, x, 0.0)
+    ys = jnp.where(ok, y, 0.0)
+    zs = jnp.where(ok, z, 0.0)
+    return value - (((STOP(xs) - xs) * ys + STOP(xs) * (STOP(ys) - ys)) + (STOP(zs) - zs))
+"""
+const _JAX_FMA = Dict{DataType,Tuple{String,String}}(
+    Float64 => ("_rk_fma", """
+def _rk_fma(x, y, z):
+    # x * y + z rounded once (Base.fma of Float64). The product of the
+    # mantissas, scaled to [0.5, 1) so no partial term under- or overflows, is
+    # exact (Dekker), z is added exactly, and the remaining tail is rounded to
+    # odd before the one rounding to nearest (Boldo and Melquiond, IEEE Trans.
+    # Comput. 57(4), 2008).
+    x = jnp.asarray(x, dtype=jnp.float64)
+    y = jnp.asarray(y, dtype=jnp.float64)
+    z = jnp.asarray(z, dtype=jnp.float64)
+    finite = jnp.isfinite(x) & jnp.isfinite(y)
+    ok = finite & jnp.isfinite(z)
+    a = jnp.where(ok, STOP(x), 1.0)
+    b = jnp.where(ok, STOP(y), 1.0)
+    c = jnp.where(ok, STOP(z), 1.0)
+    ma, ea = jnp.frexp(a)
+    mb, eb = jnp.frexp(b)
+    mc, ec = jnp.frexp(c)
+    k = ea + eb
+    d = ec - k
+    near = jnp.abs(d) <= 110
+    # Far below the product, z only decides a tie: any small value of its sign does.
+    cs = jnp.where(near, jnp.ldexp(c, jnp.where(near, -k, 0)), jnp.copysign(2.0 ** -200, c))
+    split = 1.5 * 2.0 ** 26
+    ah = BARRIER(ma + split) - split
+    al = ma - ah
+    bh = BARRIER(mb + split) - split
+    bl = mb - bh
+    ph = BARRIER(ma * mb)
+    pl = ((ah * bh - ph) + ah * bl + al * bh) + al * bl
+    th = cs + ph
+    tb = th - cs
+    tl = (cs - (th - tb)) + (ph - tb)
+    s = tl + pl
+    sb = s - tl
+    se = (tl - (s - sb)) + (pl - sb)
+    even = jnp.fmod(jnp.ldexp(jnp.frexp(s)[0], 53), 2.0) == 0
+    v = jnp.where((se != 0) & even, jnp.nextafter(s, jnp.copysign(jnp.inf, se)), s)
+    r = th + v
+    # A subnormal result rounds again when scaled back. Where r lies on a
+    # midpoint of that coarser grid, the exact residual's sign decides.
+    rb = r - th
+    re = (th - (r - rb)) + (v - rb)
+    rest = jnp.where(re != 0, jnp.sign(re), jnp.where(v == s, jnp.sign(se), -jnp.sign(se)))
+    tiny = jnp.frexp(r)[1] + k <= -1022
+    t = jnp.ldexp(r, jnp.where(tiny, k + 1075, 0))
+    tie = tiny & (rest != 0) & (t == jnp.floor(t)) & (jnp.fmod(t, 2.0) != 0)
+    r = jnp.where(tie, jnp.nextafter(r, jnp.copysign(jnp.inf, rest)), r)
+    value = jnp.where(d > 110, c, jnp.ldexp(r, k))
+    value = jnp.where(mc == 0, a * b, value)
+    value = jnp.where((ma == 0) | (mb == 0), a * b + c, value)
+""" * _JAX_FMA_TAIL),
+    Float32 => ("_rk_fma32", """
+def _rk_fma32(x, y, z):
+    # x * y + z rounded once (Base.fma of Float32): the float64 product is
+    # exact, and the float64 sum rounded to odd rounds to float32 correctly.
+    x = jnp.asarray(x, dtype=jnp.float32)
+    y = jnp.asarray(y, dtype=jnp.float32)
+    z = jnp.asarray(z, dtype=jnp.float32)
+    finite = jnp.isfinite(x) & jnp.isfinite(y)
+    ok = finite & jnp.isfinite(z)
+    a = jnp.asarray(STOP(x), dtype=jnp.float64)
+    b = jnp.asarray(STOP(y), dtype=jnp.float64)
+    c = jnp.asarray(STOP(z), dtype=jnp.float64)
+    p = a * b
+    s = p + c
+    sb = s - p
+    se = (p - (s - sb)) + (c - sb)
+    even = jnp.fmod(jnp.ldexp(jnp.frexp(s)[0], 53), 2.0) == 0
+    odd = jnp.isfinite(s) & (se != 0) & even
+    value = jnp.asarray(jnp.where(odd, jnp.nextafter(s, jnp.copysign(jnp.inf, se)), s),
+                        dtype=jnp.float32)
+""" * _JAX_FMA_TAIL),
+)
+
+# The `fma` helper for `T` values: its NumPy twin on static operands or in
+# host preparation, so a static value stays static, otherwise its JAX form.
+function _jax_fma_helper!(ctx::_JaxContext, ::Type{T}, static::Bool) where {T}
+    name, text = _JAX_FMA[T]
+    (static || ctx.host !== nothing) &&
+        return _host_helper!(ctx, name, replace(text, "BARRIER(" => "(", "STOP(" => "("))
+    _jax_helper!(ctx, name, replace(text, "BARRIER(" => "jax.lax.optimization_barrier(",
+                                    "STOP(" => "jax.lax.stop_gradient("))
+end
+
 function _jax_use_prelude!(ctx::_JaxContext, name::AbstractString)
     haskey(_JAX_PRELUDE, name) || return
     _jax_helper!(ctx, name, _JAX_PRELUDE[name])
@@ -2049,6 +2154,28 @@ a broadcast, elementwise to arrays, so its code must act elementwise. A
 package adds one for its own function with a method of this function.
 """
 _jax_elementwise_call(ctx::_JaxContext, f, args::Vector{_PyVal}) = nothing
+
+# `x * y + z` as the source spelling translates. Julia's `muladd` may or may
+# not fuse, so this is its translation, and XLA may fuse it in turn; integer
+# `fma` is this too.
+_jax_mul_add(ctx::_JaxContext, args::Vector{_PyVal}) =
+    _jax_call(ctx, +, [_jax_call(ctx, *, args[1:2]), args[3]])
+_jax_real_operands(args::Vector{_PyVal}) =
+    length(args) == 3 && all(a -> a.T isa Type && a.T <: Real, args)
+_jax_elementwise_call(ctx::_JaxContext, ::typeof(muladd), args::Vector{_PyVal}) =
+    _jax_real_operands(args) ? _jax_mul_add(ctx, args) : nothing
+
+# Julia's `fma` of real numbers promotes them; integer `fma` is `x * y + z`.
+function _jax_elementwise_call(ctx::_JaxContext, ::typeof(fma), args::Vector{_PyVal})
+    _jax_real_operands(args) || return nothing
+    T = promote_type((a.T for a in args)...)
+    T <: Integer && return _jax_mul_add(ctx, args)
+    haskey(_JAX_FMA, T) ||
+        _jax_error("`fma` of `", T, "` values has no JAX translation (`Float64`, `Float32` ",
+                   "and integer `fma` do)", _jax_where(ctx))
+    name = _jax_fma_helper!(ctx, T, all(a -> a.static, args))
+    _jax_result(fma, args, name * "(" * _jax_args(args) * ")")
+end
 
 function _jax_elementwise_name(ctx::_JaxContext, f, args::Vector{_PyVal})
     length(args) == 2 && haskey(_JAX_BINARY_NAMES, f) && return _JAX_BINARY_NAMES[f]
