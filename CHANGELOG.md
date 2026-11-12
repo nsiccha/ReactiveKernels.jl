@@ -16,6 +16,17 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.199
+
+- Nested native plates reuse elementary scalar work on an invariant array
+  across enclosing cells. For example, a whole-event Bernoulli mixture can
+  compute `log(p[j,k])` and `log1p(-p[j,k])` once per matrix entry instead of
+  once per observation. The same lowering handles logit expressions and
+  invariant subexpressions inside event-dependent arithmetic. Tables and loops
+  keep runtime sizes. Domain and storage checks retain the authored path for
+  singular live inputs, unsupported arrays and effectful regions; empty and
+  ragged domains retain their values, ordinary derivatives and access checks.
+
 ## 0.1.198
 
 - `jax_source` host preparation keeps helper function and type arguments in
