@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.200
+
+- Summed-plate factoring also recognizes the direct array reads introduced
+  in 0.1.194. In 0.1.196 only the broadcast-read loop was factored, so a
+  shared-scale Normal plate with matching array axes retained its per-cell
+  scale arithmetic, and a plate over one array was never factored. Both
+  direct and broadcast-read loops now take their shared factors and terms
+  out of the sum, with the same guarded fallback and ordinary reverse.
+
 ## 0.1.199
 
 - `jax_source` combines a plate's runtime validity checks across its active
