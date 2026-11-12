@@ -1071,9 +1071,39 @@ function _host_rewrite!(ctx::_JaxContext, f, ex)
     v
 end
 function _jax_call_positional(ctx::_JaxContext, ::typeof(isequal), args::Vector{_PyVal})
-    ctx.host === nothing && return _jax_function_call(ctx, isequal, args)
+    (ctx.host === nothing || length(args) != 2) &&
+        return _jax_function_call(ctx, isequal, args)
     name = _jax_helper!(ctx, "_rk_isequal", _HOST_ISEQUAL)
     _PyVal(name * "(" * _jax_args(args) * ")", Bool, true)
+end
+
+# Search concrete host data in order, stopping before evaluating any later
+# predicate. The result is Julia's one-based index, or nothing when absent.
+function _jax_function_call(ctx::_JaxContext, ::typeof(findfirst), args::Vector{_PyVal})
+    if ctx.host === nothing || length(args) != 2 ||
+       !(args[2].T isa Type && args[2].T <: AbstractVector)
+        return _jax_traceable_or_lowered(ctx, findfirst, args)
+    end
+    predicate = _jax_function_of(args[1])
+    values = args[2]
+    result = _jax_fresh(ctx, :found)
+    index = _jax_fresh(ctx, :position)
+    element = _jax_fresh(ctx, :element)
+    _jax_emit!(ctx, result * " = None")
+    _jax_emit!(ctx, "for " * index * ", " * element * " in enumerate(" * values.code * ", 1):")
+    ctx.scope.indent += 1
+    try
+        test = _jax_bind!(ctx, :matched,
+                         _jax_call(ctx, predicate, [_PyVal(element, eltype(values.T), true)]))
+        _jax_emit!(ctx, "if not isinstance(" * test.code * ", (bool, np.bool_)):")
+        _jax_emit!(ctx, "    raise TypeError(\"findfirst predicate must return Bool\")")
+        _jax_emit!(ctx, "if " * test.code * ":")
+        _jax_emit!(ctx, "    " * result * " = " * index)
+        _jax_emit!(ctx, "    break")
+    finally
+        ctx.scope.indent -= 1
+    end
+    _PyVal(result, Union{Nothing,Int}, true)
 end
 function _jax_call_positional(ctx::_JaxContext, ::typeof(ismissing), args::Vector{_PyVal})
     ctx.host === nothing && return _jax_function_call(ctx, ismissing, args)
