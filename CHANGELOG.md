@@ -16,6 +16,19 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.205
+
+- `with_plate_reverse` applies generated summed-plate reverse programs to
+  non-allocating kernels after their cache activity and ownership rewrite.
+  Reused primal buffers and AD-owned caches retain their existing ownership.
+  `plate_reverse_report` accepts non-allocating kernels and reports static
+  eligibility; backend operand annotations can still require ordinary AD.
+- An authored plate's axis marker no longer prevents the generated reverse
+  when the marker is used only by derivative-inert queries. Numerical alias
+  reads and writes retain the conservative fallback; marker checks remain.
+- The generated reverse adapter keeps single-lane calls statically dispatched
+  by using separate local names in its batched-lane closure.
+
 ## 0.1.204
 
 - `jax_source` takes `float_type`, `Float64` (the default) or `Float32`: the

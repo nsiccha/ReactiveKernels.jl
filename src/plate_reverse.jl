@@ -1196,6 +1196,11 @@ the backend as before. This also applies to non-allocating kernels after
 their cache activity and ownership rewrite. [`plate_reverse_report`](@ref)
 reports static eligibility; backend operand annotations can still require
 the ordinary reverse at execution.
+
+Include kernel preparation in this scope as well as AD preparation. Native
+optimizations chosen while the rule is disabled can produce forms outside
+the generated reverse's current coverage; enabling it only for AD can then
+retain the backend's ordinary reverse for those regions.
 """
 with_plate_reverse(f, enabled::Bool = true) =
     task_local_storage(f, _PLATE_REVERSE_SCOPE, enabled)

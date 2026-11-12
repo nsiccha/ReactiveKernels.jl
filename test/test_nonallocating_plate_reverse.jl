@@ -83,9 +83,19 @@ end
                 @test (q.kernel isa NonAllocatingKernel) == (nonallocating !== false)
                 installed = _napr_installed(q.kernel, u, enabled)
                 @test enabled ? installed > 0 : installed == 0
-                @test any(r -> last(r) == "rule", plate_reverse_report(q.kernel))
-                if model === :regression
-                    @test (:_ppl_lik_y_resp => "rule") in plate_reverse_report(q.kernel)
+                report = plate_reverse_report(q.kernel)
+                opposite_report = with_plate_reverse(!enabled) do
+                    plate_reverse_report(q.kernel)
+                end
+                @test report == opposite_report
+                # The report describes the prepared representation. Native
+                # optimizations selected with the rule disabled can produce
+                # forms outside the generated reverse's current coverage.
+                if enabled
+                    @test any(r -> last(r) == "rule", report)
+                    if model === :regression
+                        @test (:_ppl_lik_y_resp => "rule") in report
+                    end
                 end
                 if n != 0
                     ast = with_plate_reverse(enabled) do
@@ -186,13 +196,20 @@ end
     backend = AutoEnzyme(; mode = Enzyme.Reverse)
     exemplar = [0.1 * sin(i) for i in 1:7]
     kernel = prepare(napr_changing_shape; have = (:x,), want = :total)
-    nonallocating = prepare_nonallocating(kernel, exemplar)
     prepared = map((false, true)) do enabled
         with_plate_reverse(enabled) do
-            prepare_ad(nonallocating, backend, exemplar; active = :x)
+            nonallocating = prepare_nonallocating(kernel, exemplar)
+            nonallocating, prepare_ad(nonallocating, backend, exemplar; active = :x)
         end
     end
-    @test _napr_installed(nonallocating, exemplar, true) > 0
+    @test _napr_installed(first(prepared[2]), exemplar, true) > 0
+    # Retain the late-enable case too: earlier native transformations may
+    # require backend fallback, whose values and changed-shape gradients must
+    # still agree. This is not evidence of generated-rule engagement.
+    late_kernel = first(prepared[1])
+    late_ad = with_plate_reverse(true) do
+        prepare_ad(late_kernel, backend, exemplar; active = :x)
+    end
     for n in (7, 73, 0, 11, 7)
         x = [0.1 * cos(i) for i in 1:n]
         original = copy(x)
@@ -201,7 +218,7 @@ end
         expected = scale * factor
         derivative = 4 .* x.^3 .* factor .+
             scale .* cos.(x.^2 .+ x) .* (2 .* x .+ 1)
-        for ad in prepared
+        for (nonallocating, ad) in (prepared..., (late_kernel, late_ad))
             gradient = similar(x)
             value, _ = ad_value_and_gradient!(ad, gradient, x)
             @test value ≈ expected rtol = 1e-12
