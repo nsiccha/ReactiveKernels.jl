@@ -45,6 +45,20 @@ Host preparation translates `findfirst(predicate, vector)`, including captured p
 
 Translation errors identify an unsupported operation instead of substituting a different computation. JAX compilation, device placement and differentiation belong to the Python consumer.
 
+For `scalar_derivative_rule`, the module generates a `jax.custom_jvp` adapter
+from the rule's mathematical graph. It selects the primal and named partials
+for the active arguments, then applies the scalar chain rule. An inactive
+argument's partial is not contracted with a numeric zero. Calls share their
+generated helpers, including a joint recipe that serves several activity
+patterns. Host data preparation uses the primal cut. General `derivative_rule`
+calls currently emit their primal cut for ordinary JAX differentiation.
+
+The incomplete-beta continued fraction used by distribution tails supplies
+its value and shape/argument partials through such a shared graph. A first
+JAX gradient retains those partials rather than a reverse tape of all 300
+fraction iterations. The primal and partials use fixed loops, so their
+higher derivatives remain available through ordinary JAX differentiation.
+
 Unless `simplify = false`, each emitted recipe computes numerically fragile compositions in the stable form native preparation computes, together with the statements that compute its inputs, also from a lazy arm or a plate's cell: `log(exp(u))` is emitted as `u`, and `log1p(-p)` of `p = logistic(u)` reads `u`, so the value and `jax.grad` stay finite where `exp(u)` overflows. A law's term on a value computed outside the law (`Normal(0, s)`'s `log(s)` of `s = exp(a)`) is still translated as written: the law's endpoint is translated from its compiled lowered code, which the rewrites do not read yet.
 
 The [Eight-schools example](eight-schools.md) explains the model and coordinate boundary that a PPL export must preserve.

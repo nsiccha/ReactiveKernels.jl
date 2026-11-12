@@ -119,8 +119,11 @@ function ReactiveKernels.jax_source(built::NamedTuple, plan::StructuralPlan;
             over * " Returns a dict, a submodel's values nested under its name:\n\n" *
             join(map(entry, paths), "\n"))
     src = _absent_refusal(plan, built.spec, have, :posterior) do
+        # The definitions' callees resolve as `bind_data` resolves them
+        # (`_eval_callee`): in the generated scope, whatever the caller imported.
         jax_source(built.spec; have, functions, types, constants, doc = module_doc, data,
-                   definitions, keep = Tuple(sizes), function_docs)
+                   definitions, definitions_module = PPLGeneratedModels,
+                   keep = Tuple(sizes), function_docs)
     end
     _jax_with_layout(src, built.layout)
 end
@@ -301,7 +304,10 @@ function _jax_data_definitions(plan::StructuralPlan, names)
         push!(order, nm)
     end
     foreach(visit, sort!(collect(keys(found))))
-    Pair{Symbol,Any}[missing_responses; [nm => found[nm] for nm in order]]
+    # `jax_source` resolves their callees in the generated scope, as binding
+    # does, where the value vocabulary's `logistic` is `_ppl_logistic`.
+    Pair{Symbol,Any}[missing_responses;
+                     [nm => _argument_value_calls(found[nm]) for nm in order]]
 end
 _jax_data_name(nm::Symbol) = nm
 
