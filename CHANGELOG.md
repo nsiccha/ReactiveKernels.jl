@@ -16,6 +16,27 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.186
+
+- The opt-in generated summed-plate reverse (`with_plate_reverse`) is faster.
+  Values and gradients are unchanged, apart from rounding.
+  - A cell loop's invariant factors (the total's adjoint, literal partials,
+    partials that read only shared values such as `1/σ`) apply once after the
+    loop instead of in every cell.
+  - Operands that span the plate are read directly rather than through
+    broadcast extrusion.
+  - The Enzyme adapter's reverse call is statically dispatched. Before, every
+    opted-in gradient boxed its operands: 1,712 B per gradient on a
+    random-intercept regression, now 224 B, and 22–39 allocations on small
+    PosteriorDB models.
+  - A random-intercept Normal regression's gradient (2,000 and 100,000 rows)
+    now takes 1.7–1.85× its hand-written closed form, against 2.65–3.15×
+    before. That is 2.5–3.4× faster than Enzyme over the same program (Julia
+    1.10.12 and 1.13.1, Enzyme dogfood).
+  - Among PosteriorDB ports whose likelihood the rule covers, Rats now
+    differentiates 1.76× faster than the default preparation, and the two
+    `BLR` ports 1.3–1.36× faster.
+
 ## 0.1.185
 
 - `jax_source`: a `for` loop to a padded row's length, such as
