@@ -698,10 +698,13 @@ function EnzymeRules.reverse(
         cot = r.reverse(operands..., ȳ, shadows...)
         return _pr_reverse_return(Val(S), args, cot, Val(B), shadows)
     end
+    # The lanes' own names: a closure assigning the `ȳ` and `shadows` of the
+    # width-1 branches above would share them, boxed, and the width-1 call
+    # would dispatch dynamically and allocate every argument.
     lanes = ntuple(Val(W)) do w
-        ȳ = dret.val[w]
-        shadows = _pr_shadows(Val(B), args, Val(W), w)
-        r.reverse(operands..., ȳ, shadows...)
+        lane_ȳ = dret.val[w]
+        lane_shadows = _pr_shadows(Val(B), args, Val(W), w)
+        r.reverse(operands..., lane_ȳ, lane_shadows...)
     end
     # Active scalars of a batched call take one cotangent per lane.
     ntuple(Val(N)) do i
