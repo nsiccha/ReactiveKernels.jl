@@ -586,10 +586,10 @@ end
 #   reverse pass makes no second pass over the cells; it scales by the seed.
 # - Two passes otherwise: the augmented primal runs the program; the reverse
 #   pass runs the sweep with the seed straight into the shadows. A buffer as
-#   long as the cells (an operand that spans the plate, such as a range view
-#   `view(u, 5:J+4)`, or a gather from a long parent) costs about as much as that
-#   second pass, and on a small plate one pass's allocation costs more than the
-#   pass it saves.
+#   long as the cells (a gather from a parent at least as long as the plate)
+#   costs about as much as that second pass, and on a small plate one pass's
+#   allocation costs more than the pass it saves. A range view never takes one
+#   pass, decided on types (`_pr_gather_view`).
 #
 # A call whose activity the generated reverse does not take runs the program
 # and differentiates it with Enzyme's ordinary reverse instead.
@@ -641,8 +641,17 @@ end
 # `_pr_gather_view` precedes the generator that calls it: a generator runs in
 # the world of its own definition, so a helper defined after it is too new
 # (Julia 1.10) or undefined (1.12 and later).
+#
+# A unit-range view (`view(u, 3:10)`, as RKPPL holds a parameter block of its
+# flat vector) repeats no entry, so it has no groups to factor and its buffer,
+# the view's parent, is at least as long as the view: such a call would always
+# take two passes at run time. Deciding that on types keeps the two-pass tape
+# rather than a vector one, which costs a call that never uses it (eight
+# schools: 0.087–0.089 µs with the vector tape, 0.074 µs without; 0.077 µs
+# before one pass).
 _pr_gather_view(::Type) = false
 _pr_gather_view(::Type{<:SubArray{Float64,1,<:AbstractVector,<:Tuple{AbstractVector{<:Integer}}}}) = true
+_pr_gather_view(::Type{<:SubArray{Float64,1,<:AbstractVector,<:Tuple{AbstractUnitRange{<:Integer}}}}) = false
 @generated function _pr_one_pass(::Val{S}, ::Val{B}, ::Val{O}, args::Tuple) where {S,B,O}
     gathered = false
     for b in B

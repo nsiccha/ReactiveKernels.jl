@@ -112,6 +112,18 @@ end
     end
 end
 
+# Which views can take one pass, on types: an index vector may repeat groups; a
+# unit range repeats none (its buffer is never shorter than its cells), so it
+# keeps the two-pass tape without a run-time check.
+@testset "one-pass eligibility by index type" begin
+    ext = Base.get_extension(RK, :ReactiveKernelsEnzymeExt)
+    z = zeros(5)
+    @test ext._pr_gather_view(typeof(view(z, [1, 2, 2])))
+    @test !ext._pr_gather_view(typeof(view(z, 2:4)))
+    @test !ext._pr_gather_view(typeof(view(z, Base.OneTo(3))))
+    @test !ext._pr_gather_view(typeof(z))
+end
+
 # End to end: a grouped model whose plate reads `sd .* z[group]` (a gathered
 # view) takes one pass from `_PR_ONE_PASS_MIN_CELLS` cells when its buffer (as
 # long as `z`) is shorter than the plate, and two passes otherwise.
