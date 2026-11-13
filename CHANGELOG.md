@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.228
+## 0.1.230
 
 - The opt-in generated summed-plate reverse (`with_plate_reverse`) runs one
   pass over the cells for a plate with a gathered operand (`view(z, g)` with an
@@ -27,14 +27,31 @@ are recorded in the git history only.
   reverse pass only scales them by the seed. Invariant terms of the cell
   density are summed once per plate rather than per cell, and a shared value's
   partial through the gathered read is one product per group. Other plates
-  (fewer cells, no gathered operand, a unit-range view such as a sampler's
-  parameter block, or a gather from a parent at least as long as the plate)
-  keep two passes and their previous cost. A shadow read at more than one site
-  on an execution path keeps per-cell accumulation. Gradients are unchanged up
-  to rounding. The one-pass tape is one allocation per gradient (the buffer
-  plus the scalar partials). On a grouped Gaussian model the rule's gradient
-  goes from about 1.9 to about 1.45 times a hand-written closed form at 2,000
-  cells, and to about 1.3 times at 100,000 cells. The rule remains opt-in.
+  keep two passes: one with no gathered operand, or only unit-range views (a
+  sampler's parameter block), at its previous cost; one whose gathered operand
+  falls back at run time (fewer cells, or a parent at least as long as the
+  plate) with one 16-byte allocation per gradient. A shadow read at more than
+  one site on an execution path keeps per-cell accumulation. Gradients are
+  unchanged up to rounding. The one-pass tape is one allocation per gradient
+  (the buffer plus the scalar partials). On a grouped Gaussian model the rule's
+  gradient goes from about 1.9 to about 1.45 times a hand-written closed form
+  at 2,000 cells, and to about 1.3 times at 100,000 cells. The rule remains
+  opt-in.
+
+## 0.1.229
+
+- Partition plans retain constant row calculations used to size fresh scan
+  outputs, including buffers selected by a conditional. Mutating an output no
+  longer pulls its marker's row calculations into each gradient call. Aliases
+  of existing storage and mutations in conditions stay in ordinary execution.
+
+## 0.1.228
+
+- JAX emission resolves `isa` checks when Julia argument types prove the answer,
+  including the checks in lowered `oftype` calls. Plain callees can now use
+  `oftype(float(x), NaN)` or `oftype(float(x), Inf)` in guarded branches.
+  Partially overlapping abstract types still require an unsupported runtime
+  type check; they are not folded to a false result.
 
 ## 0.1.227
 
