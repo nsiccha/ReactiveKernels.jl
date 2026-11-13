@@ -2264,17 +2264,12 @@ function _bound_plate_class(@nospecialize(x::AbstractArray))
     rank == 0 ? nothing : AbstractArray{<:Any,rank}
 end
 
-# One binding's class per plate slot, then whether each location's bound
-# least-squares statistics are usable (`_ls_classes`): the key of its compiled
-# residual.
+# One binding's class per plate slot: the compiled residual's key. Numerical
+# statistics eligibility remains a runtime value in that residual.
 function _partial_plate_classes(b::_PartialBoundary, @nospecialize(hoisted))
-    statistics = _ls_classes(b, hoisted)
-    classes = Vector{Any}(undef, length(b.plate_slots) + length(statistics))
+    classes = Vector{Any}(undef, length(b.plate_slots))
     for (index, slot) in enumerate(b.plate_slots)
         classes[index] = _bound_plate_class(hoisted[slot])
-    end
-    for (index, usable) in enumerate(statistics)
-        classes[length(b.plate_slots) + index] = usable
     end
     Tuple(classes)
 end
@@ -2290,11 +2285,11 @@ end
 # the label alone gave `t::Number` beside `s::Float64`: a second declaration in
 # one alias class, which a graph rebuilt from these recipes keeps and
 # `merge` refuses (snag selective-fresh-96f7fe96).
-function _partial_narrow_plate_inputs(g::Graph, b::_PartialBoundary,
+function _partial_narrow_plate_inputs(p::Plan, b::_PartialBoundary,
                                       @nospecialize(classes::Tuple))
-    # The classes after the plate slots' decide each bound least-squares
-    # location (`_ls_class_residual`, bound_statistics.jl).
-    _ls_class_residual(g, b, classes, _partial_narrow_plate_classes(g, b, classes))
+    # Statistics regions retain both eligible and authored plans under a
+    # runtime guard (`_ls_class_residual`, bound_statistics.jl).
+    _ls_class_residual(p, _partial_narrow_plate_classes(p.graph, b, classes))
 end
 function _partial_narrow_plate_classes(g::Graph, b::_PartialBoundary,
                                        @nospecialize(classes::Tuple))
@@ -2336,7 +2331,7 @@ function _partial_residual_plan(p::Plan, b::_PartialBoundary, @nospecialize(hois
 end
 
 function _partial_residual_plan(p::Plan, b::_PartialBoundary, @nospecialize(hoisted))
-    residual = _partial_narrow_plate_inputs(p.graph, b,
+    residual = _partial_narrow_plate_inputs(p, b,
                                             _partial_plate_classes(b, hoisted))
     _partial_residual_plan(p, b, hoisted, residual)
 end
@@ -2597,7 +2592,7 @@ function _bound_fused_residual(entry::_BoundEntry, cache,
     lock(cache.lock) do
         get!(entry.fused, classes) do
             b = entry.boundary
-            narrowed = _partial_narrow_plate_inputs(entry.plan.graph, b, classes)
+            narrowed = _partial_narrow_plate_inputs(entry.plan, b, classes)
             skeleton = _partial_subplan(entry.plan, vcat(b.remaining, b.constants),
                                         entry.plan.want, narrowed)
             _fuse_authored_plate_chains(skeleton).recipes

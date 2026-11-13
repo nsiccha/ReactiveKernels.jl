@@ -190,6 +190,15 @@ _code(k) = string(code_expr(k))
 # The program up to its gensym numbering.
 _shape(k) = replace(_code(k), r"#\d+" => "#")
 _collapsed(k) = occursin("_ls_rss", _code(k))
+_reads_usable(x) = false
+_reads_usable(x::QuoteNode) = x.value === :usable
+_reads_usable(x::Expr) = any(_reads_usable, x.args)
+function _statistics_arms(ex)
+    ex isa Expr || return Tuple{Any,Any}[]
+    Meta.isexpr(ex, :if, 3) && _reads_usable(ex.args[1]) &&
+        return [(ex.args[2], ex.args[3])]
+    reduce(vcat, (_statistics_arms(a) for a in ex.args); init = Tuple{Any,Any}[])
+end
 function _loops(ex)
     ex isa Expr || return 0
     (ex.head === :while) + sum(_loops, ex.args; init = 0)
@@ -221,8 +230,12 @@ dense_data(n, k; shift = 0.0) = (X = [ones(n) randn(RNG, n, k - 1) .+ 2],
         literal = prepare(kernel; bound, bound_statistics = false)
         @test _collapsed(k)
         @test !_collapsed(literal)
-        # The design product is no longer computed.
-        @test !occursin("X * beta", _code(k))
+        # Eligibility is a runtime choice. Only its selected statistics arm
+        # computes the collapsed sum; the other retains authored row work.
+        arms = _statistics_arms(code_expr(k))
+        @test length(arms) == 1
+        @test occursin("_ls_rss", string(only(arms)[1]))
+        @test !occursin("_ls_rss", string(only(arms)[2]))
         for sigma in (0.7, 3.0, 1e-3)
             v, g = _value_gradient(k, live..., sigma)
             vl, gl = _value_gradient(literal, live..., sigma)
@@ -269,8 +282,12 @@ end
     k = prepare(ls_gathered; bound = (; idx, f, y))
     literal = prepare(ls_gathered; bound = (; idx, f, y), bound_statistics = false)
     @test _collapsed(k)
-    # Neither the gathers nor their index runs remain.
-    @test !occursin("_readonly_gather", _code(k)) && !occursin("index_runs", _code(k))
+    # The optimized arm does not gather or group authored rows. Their source
+    # remains in the lazy fallback for bindings where statistics cannot apply.
+    arms = _statistics_arms(code_expr(k))
+    @test length(arms) == 1
+    fast = string(only(arms)[1])
+    @test !occursin("_readonly_gather", fast) && !occursin("index_runs", fast)
     for sigma in (0.5, 2.0)
         v, g = _value_gradient(k, alpha, beta, sigma)
         vl, gl = _value_gradient(literal, alpha, beta, sigma)
@@ -305,14 +322,16 @@ end
     end
 end
 
-@testset "an unusable binding keeps today's program" begin
+@testset "an unusable binding selects authored arithmetic at runtime" begin
+    template = prepare(ls_dense; bound = dense_data(20, 3))
     # Fewer rows than the statistics would cost, and data that are not finite.
     for (X, y) in ((randn(RNG, 4, 3), randn(RNG, 4)),
                    ([ones(20) [NaN; randn(RNG, 19)]], randn(RNG, 20)))
         k = prepare(ls_dense; bound = (; X, y))
         literal = prepare(ls_dense; bound = (; X, y), bound_statistics = false)
-        @test !_collapsed(k)
-        @test _shape(k) == _shape(literal)
+        @test _collapsed(k)
+        @test typeof(k) === typeof(template)
+        @test _shape(k) == _shape(template)
         beta = zeros(size(X, 2))
         @test isequal(k(beta, 0.8), literal(beta, 0.8))
     end

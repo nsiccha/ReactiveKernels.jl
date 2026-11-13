@@ -669,6 +669,17 @@ end
     Base.axes(cache) == Base.axes(args[1])
 @inline _ad_na_arith_matches(cache, args) = false
 
+# An untaken branch can still have a concrete array destination. Its AD slot
+# starts with zero capacity, without evaluating that branch. Shape checks in
+# the ordinary cache driver allocate if the branch later needs other axes.
+# Rank-zero arrays have no empty shape and retain the unseeded fallback.
+function _ad_na_cache_array_type(::Base.RefValue{S}) where {S}
+    A = _nonalloc_slot_value(S)
+    A isa DataType && isconcretetype(A) && A <: Array && ndims(A) > 0 ? A : nothing
+end
+_ad_na_cache_array_type(slot) = nothing
+_ad_na_empty_array(::Type{A}) where {A<:Array} = A(undef, ntuple(_ -> 0, ndims(A)))
+
 # Taint-walk one program node, rewriting cache steps whose arguments are all
 # free of the active input into plain operation calls. Steps free of every
 # HAVE input (bound-data-only) are folded instead: their seeded value is
@@ -698,10 +709,11 @@ function _ad_na_walk(node, tainted::Set{Symbol}, have_free::Set{Symbol},
             step_tainted = step_tainted || arg_tainted
             step_free = step_free && arg_free
         end
-        if caches[step] isa Base.RefValue && caches[step][] === nothing
-            # A step the exemplar call never ran (an untaken branch arm) has no
-            # buffer to offer: it allocates there, as the ordinary program does,
-            # and keeps no slot (as an unfilled lane, `_ad_na_concretize_cache`).
+        if caches[step] isa Base.RefValue && caches[step][] === nothing &&
+                !(step_tainted && _ad_na_cache_array_type(caches[step]) !== nothing)
+            # An unseeded step without a concrete active array destination
+            # keeps its ordinary call. In particular, never fold an untaken
+            # bound-only step to a value it has not computed.
             push!(elided, step)
             return Expr(:call, Expr(:ref, _CALLABLES_ARG, step), rewritten...),
                 step_tainted, !step_tainted && step_free
@@ -723,7 +735,8 @@ function _ad_na_walk(node, tainted::Set{Symbol}, have_free::Set{Symbol},
         # (the MutatingFunctions extension's nested plate cache), not one
         # array: its own driver fills it, below.
         if step_tainted && ops[step] isa _AuthoredPlateOp &&
-           caches[step] isa Base.RefValue && caches[step][] isa AbstractArray
+           caches[step] isa Base.RefValue &&
+           (caches[step][] isa AbstractArray || _ad_na_cache_array_type(caches[step]) !== nothing)
             # Hoist the nested cell kernel out of the constant operation table
             # into a direct literal: calling a closure-held nested RGF under
             # reverse-mode Enzyme trips activity analysis, while the identical
@@ -826,6 +839,10 @@ end
 
 # Re-wrap one seeded primal slot as a concretely-typed AD-owned slot.
 function _ad_na_concretize_cache(slot::Base.RefValue, step::Int, op)
+    if slot[] === nothing
+        A = _ad_na_cache_array_type(slot)
+        A === nothing || return Base.RefValue{A}(_ad_na_empty_array(A))
+    end
     value = _ad_na_seed_value(slot, step, op)
     Base.RefValue{typeof(value)}(value)
 end
