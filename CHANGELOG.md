@@ -16,6 +16,143 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.219
+
+- A non-allocating program (`prepare_nonallocating`, and so ReactiveKernelsPPL's
+  default sampler) keeps the tables of indexed work that nested plates reuse
+  across an enclosing plate's cells (0.1.203) in buffers it owns, typed from
+  the program's static types, and refills them on each call. Before, each
+  density call allocated every table, and each gradient call every table and
+  its derivative: the PosteriorDB capture model Mt's sampler took 6
+  allocations (320 B) per density and 10 (608 B) per gradient, where it took
+  2 (64 B) and 2 (96 B) without the tables; it takes 2 and 2 again (snag
+  posteriordb-mt-c-01c1a87b). An ordinary prepared kernel still allocates its
+  tables on each call.
+
+## 0.1.218
+
+- The opt-in generated summed-plate reverse (`with_plate_reverse`) is faster.
+  Values and gradients are unchanged, apart from rounding.
+  - A cell loop's invariant factors (the total's adjoint, literal partials,
+    partials that read only shared values such as `1/σ`) apply once after the
+    loop instead of in every cell.
+  - Operands that span the plate are read directly rather than through
+    broadcast extrusion.
+  - Against 0.1.210's rule, opted-in gradients are 1.35–1.55× faster on a
+    random-intercept Normal regression (2,000 and 100,000 rows) and up to
+    1.2× faster on a fixed-effects one. They are now 1.08–1.28× faster than the
+    default preparation on those models; 0.1.210's rule was 0.8× the default
+    on the random-intercept one (Julia 1.10.12 and 1.13.1, Enzyme dogfood).
+  - The default preparation is still faster on the PosteriorDB ports measured
+    (the rule at 0.3–0.98× the default on Julia 1.13.1), and on small plates.
+  - With registered Enzyme 0.13.219, the rule's allocating program
+    (`nonallocating = false`) can raise `EnzymeMutabilityException` at an
+    `.innerparm` store (reactivekernels-use §7aq); Enzyme dogfood
+    differentiates it.
+
+## 0.1.217
+
+- `jax_source`: a `Bool` array index (`BitVector`, `Vector{Bool}`) selects
+  the entries where it is true, as Julia's logical indexing does. Before, it
+  was shifted as one-based positions (`x[mask - 1]`), so every element read
+  the first or the last entry: `table[table[:, 2] .!= 1, 4]` in
+  `prepare_data` returned the wrong amounts and length, silently whenever the
+  shapes still agreed. The host uses NumPy boolean masks (lists keep their
+  selected entries); device code gathers at the selected positions, padded to
+  the mask's length with the count as its extent, and a masked write writes
+  only the selected entries. A same-shape mask (`A[A .> 0]`) selects in
+  column-major order. A single `Bool` index into an array raises
+  `JAXEmissionError`, as Julia refuses it.
+
+## 0.1.216
+
+- The stable rewrites compute a symmetric law's standardized log kernel at a
+  positive value's exponential from the value's logarithm. A half-Student or
+  half-Cauchy prior on `exp(u)` (`student_t(nu, 0, s).logpdf(exp(u))`, an
+  RKPPL `restricted.(StudentT.(nu, 0, s), 0, Inf)` prior on a positive
+  parameter) is `-((nu + 1) / 2) * log1pexp(2(u - log(s)) - log(nu))`: no
+  exponential, branch or logarithm of the scale, finite where `exp(u)`
+  overflows, and in a plate its `log(nu)` and `log(s)` run once before the
+  cells. A cell reads such a value through a lazy cell array of `exp.(u)`; a
+  materialized one keeps its reads. A kernel opts in by declaring
+  `_rk_log_abs_form` and its parameter part. A location that is not zero, a
+  negative `nu` and non-real operands run the literal kernel.
+
+## 0.1.215
+
+- `jax_source` translates broadcasts of padded (ragged) rows padded by
+  different lengths along the same axes, such as two per-row arguments of one
+  plate cell broadcast into one matrix (`(vcat(x1, x_rest) .- centres) ./
+  sqrt.(scales .^ 2 .+ vcat(s1, s_rest) .^ 2)`). The result is padded along
+  those axes by Julia's broadcast length, the rows' common length or the
+  other row's where one has length one, so `sum(cell; dims = 1)`, whole
+  reductions and `vec` of it mask its padding; before, its padded axes were
+  not recorded and those reductions raised; a vector broadcast of two such
+  rows read the first row's length, wrong where the other row is the longer
+  and the first has length one. Lengths Julia refuses to broadcast
+  (`DimensionMismatch`) are not checked, as for a padded row broadcast
+  against an unpadded array: a check would be a host callback in every
+  evaluation. Rows padding different axes by different lengths (`x .* s'`)
+  are still refused.
+
+## 0.1.214
+
+- `jax_source` bounds a range whose end is a prepared-data entry times a
+  static integer, plus a static integer: `pk[1:2 * n[i]]` of two interleaved
+  values per counted read, `1:(n[r] * 2 + 1)`, `(length(x) - 2 * n[r] + 1):length(x)`
+  and `1:K * n[r]` of a prepared integer `K`. Its static number of steps is
+  the same function of the array's largest entry (its least for a negative
+  multiple, either where the multiple's sign is known only while tracing),
+  and ends of one record with one positive multiple (`(2a - 1):(2b)`) take
+  that multiple of the longest record's range. Before, a multiple lost the
+  bound that `n[i] + c` keeps: an `@rkppl` cell's `v[1:2 * n[i]]` raised `a
+  range whose length depends on data has no JAX translation`, and a
+  `@kernel`'s `x[1:2 * n[r]]` emitted a slice JAX rejects when it traces.
+  A padded row's length times a nonnegative integer literal
+  (`1:2 * length(r)`) likewise keeps its static limit, scaled.
+
+## 0.1.213
+
+- Calling a `KernelSpec` on positional values, `spec(args...)`, prepares its
+  default boundary once per graph version and keeps that kernel in the graph,
+  as plain `prepare(spec; bound)` keeps its bound preparations. Later calls
+  look it up, about 2 µs on top of the kernel's own call. Before, every call
+  planned and lowered the kernel again: 1.0 ms per call of a five-input
+  kernel whose held `prepare(spec)` took 0.36 µs. A change to the graph (such
+  as `input_check!`) or another preparation setting (such as `simplify`)
+  prepares afresh. A hot loop that holds `prepare(spec)` still skips the
+  lookup.
+
+## 0.1.212
+
+- A partition plan whose row bookkeeping sits behind a condition on the
+  label (cached by the plan since 0.1.170) is typed and computed while a
+  package image is generated, as in a PrecompileTools workload. The plan
+  body cached that bookkeeping in a comprehension, which
+  `RuntimeGeneratedFunctions` compiles to an opaque closure, and Julia
+  refuses to expand one while it generates an image: `prepare` of such a
+  partition with an untyped plan port (ReactiveKernelsPPL's
+  `prepare_partition`, BayesianRegressionModels' `brm_nlme_model` with a
+  grouping) failed with `partition plan: the plan port … is untyped and
+  evaluating its plan on the exemplars failed: Impossible to correctly
+  handle OpaqueClosure inside @generated returned during precompile
+  process.`, and a plan kernel called there failed the same way. `compile`
+  now runs a comprehension or generator of a compiled body as a function of
+  its own over the body's locals that its element reads, where the element
+  assigns none of them; plans, their types (also for a label without rows)
+  and values are unchanged.
+
+## 0.1.211
+
+- `jax_source` again translates a padded plate over a scan's tuple step
+  outputs, such as an `@rkppl` `@plate` cell holding a stochastic `@scan`
+  whose step count varies by cell. Since 0.1.199 (batched runtime checks) the
+  plate's valid-cell mask read the step count and shape of the Python tuple of
+  columns instead of its first column, so tracing the module raised
+  `AttributeError: 'tuple' object has no attribute 'shape'`. The mask now
+  spans the plate's mapped axes of the first column, as the empty-plate test
+  already did.
+
 ## 0.1.210
 
 - A summed plate whose rows are per-cell arrays runs once per distinct row

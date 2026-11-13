@@ -862,10 +862,20 @@ function _host_index(ctx::_JaxContext, x::_PyVal, indices)
     E = _jax_eltype(T)
     indices[1] === :(:) && return _PyVal("list(" * x.code * ")", T, true)
     i = _jax_bound_expr(ctx, x, 1, indices[1])
+    i.T === Bool && _jax_bool_index_error(ctx, indices[1])
     i.T isa Type && i.T <: Integer &&
         return _PyVal(_py_atom(x.code) * "[" * _jax_minus_one(i) * "]", E, true)
     _jax_is_array(i.T) || i.T isa Type && i.T <: AbstractRange ||
         _jax_error("the index of type `", i.T, "` into a list", _jax_where(ctx))
+    if _jax_logical(i.T)
+        # A mask keeps the entries where it is true; one of another length
+        # fails, as Julia's `BoundsError` does.
+        ndims(i.T) == 1 || _jax_error("a rank-", ndims(i.T), " `Bool` mask of a list",
+                                      _jax_where(ctx))
+        v, keep = _jax_fresh(ctx, :v), _jax_fresh(ctx, :keep)
+        return _host_collected("[" * v * " for " * v * ", " * keep * " in zip(" * x.code * ", " *
+                               i.code * ", strict=True) if " * keep * "]", E)
+    end
     k = _jax_fresh(ctx, :k)
     _host_collected("[" * _py_atom(x.code) * "[" * k * " - 1] for " * k * " in " * i.code * "]", E)
 end

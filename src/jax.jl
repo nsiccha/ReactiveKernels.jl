@@ -73,19 +73,21 @@ _PyVal(code::AbstractString, @nospecialize(T), static::Bool, extent::AbstractStr
        limit::AbstractString, padded::Int) =
     _PyVal(String(code), T, static, String(extent), String(limit), padded, nothing)
 # An integer array of the prepared data, `prepared[key]` (`position ===
-# nothing`), or an entry of one, `prepared[key][position] + offset`:
+# nothing`), or an entry of one, `scale * prepared[key][position] + offset`:
 # `position` is the gather's index code, or a token naming a plate cell's
-# entry, and `offset` a static integer. Entries of two arrays at one position
-# are entries of one record (`starts[r]:stops[r]`), so their difference is
+# entry, and `scale` and `offset` static integers (`2 * n[i] + 1` of two
+# interleaved reads per entry). Entries of two arrays at one position are
+# entries of one record (`starts[r]:stops[r]`), so their difference is
 # bounded by the arrays' largest difference, which `prepare_data` computes.
 struct _JaxOrigin
     key::String
     position::Union{Nothing,String}
     offset::String
     path::String
+    scale::String
 end
-_JaxOrigin(key::String, position::Union{Nothing,String}, offset::String) =
-    _JaxOrigin(key, position, offset, "")
+_JaxOrigin(key::String, position::Union{Nothing,String}, offset::String, path::String = "") =
+    _JaxOrigin(key, position, offset, path, "1")
 # A data-only cell recipe that can be moved to prepare_data if a later loop
 # needs a bound on its integer result. The existing host split does the work.
 struct _JaxCellData
@@ -162,8 +164,11 @@ function _jax_extent(args)
     end
     ""
 end
-# A padded vector's valid-entry mask.
-_jax_mask(v::_PyVal) = "(jnp.arange(" * _py_atom(v.code) * ".shape[0]) < " * v.extent * ")"
+# A padded vector's valid-entry mask, over the leading axis of its stored
+# array: a vector of tuples is held as a Python tuple of columns, whose first
+# column carries that axis (`_jax_mapped_array`).
+_jax_mask(v::_PyVal) = "(jnp.arange(" * _py_atom(_jax_mapped_array(v)) * ".shape[0]) < " *
+                       v.extent * ")"
 # A vector or an adjoint (transposed) vector: stored as one 1-D array.
 _jax_vector_like(@nospecialize(T)) = T isa Type && (T <: AbstractVector ||
     T <: Union{LinearAlgebra.Adjoint{<:Any,<:AbstractVector},
@@ -197,6 +202,47 @@ function _jax_padded_union(args)
         axes |= m
     end
     axes
+end
+# Operands padded along the same axes by different extents: two per-row
+# arguments broadcast together (`(x .- m) ./ s` with `x` and `s` ragged rows
+# of one cell), each with its own lengths. Julia's broadcast gives each such
+# axis one length, the operands' length other than one (one when all are
+# one). The operands are returned with that length as their common extent,
+# `_rk_broadcast_length(...)` of their extents (sorted, so every combination
+# of the same rows reads alike and combines again by string equality), an
+# expression of their extents, valid wherever they are. Lengths Julia
+# refuses to broadcast (two lengths other than one differ) are not checked:
+# a check is a host callback in every evaluation (several times the cost of
+# a small model's gradient), and a padded row broadcast against an unpadded
+# array is not checked either. Operands padding different axes by different
+# extents (`x .* s'`) would need an extent per axis: they are returned as
+# they are, so a broadcast of them records no padded axes and a reduction of
+# it raises.
+const _JAX_BROADCAST_LENGTH = """
+def _rk_broadcast_length(*lengths):
+    # Julia's broadcast length along an axis its operands pad: the length
+    # other than one, or one when every operand has length one.
+    n = lengths[0]
+    for m in lengths[1:]:
+        n = jnp.where(n == 1, m, n)
+    return n
+"""
+function _jax_common_extent(ctx, args::Vector{_PyVal})
+    ctx.host === nothing || return args
+    padded = [a for a in args if !isempty(a.extent)]
+    length(unique(a.extent for a in padded)) > 1 || return args
+    masks = unique(_jax_padded_axes(a) for a in padded)
+    length(masks) == 1 && only(masks) != 0 || return args
+    parts = String[]
+    for a in padded
+        append!(parts, get(ctx.mod.helper_names, (:broadcast_length, a.extent), [a.extent]))
+    end
+    sort!(unique!(parts))
+    name = _jax_helper!(ctx, "_rk_broadcast_length", _JAX_BROADCAST_LENGTH)
+    extent = name * "(" * join(parts, ", ") * ")"
+    ctx.mod.helper_names[(:broadcast_length, extent)] = parts
+    [isempty(a.extent) ? a : _PyVal(a.code, a.T, a.static, extent, "", a.padded, a.origin)
+     for a in args]
 end
 # The padded axes an elementwise function of `x` keeps: `x`'s, unless `x` is
 # an adjoint vector, whose result (typed a matrix) is stored with one axis.
@@ -429,6 +475,8 @@ end
 
 _jax_rank(@nospecialize(T)) = T isa Type && T <: AbstractArray ? ndims(T) : 0
 _jax_is_array(@nospecialize(T)) = T isa Type && T <: AbstractArray
+# A logical index: an array of `Bool`s (`BitVector`, `Vector{Bool}`).
+_jax_logical(@nospecialize(T)) = _jax_is_array(T) && eltype(T) === Bool
 _jax_is_scalar(@nospecialize(T)) = T isa Type && T <: Number
 _jax_eltype(@nospecialize(T)) = T isa Type && T <: AbstractArray ? eltype(T) : T
 
@@ -966,10 +1014,23 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
                       element || number === nothing ? "" : parts[number].extent)
     end
     N = ndims(x.T)
-    # Linear indexing reads the array in Julia's column-major order.
+    # Linear indexing reads the array in Julia's column-major order. A `Bool`
+    # mask of the array's shape (`A[A .> 0]`) selects in that order too.
     if length(indices) == 1 && N > 1 && !_jax_ragged(x.T) && isempty(x.extent)
         flat = _PyVal("jnp.ravel(" * x.code * ", order=\"F\")", Vector{eltype(x.T)}, x.static)
-        return _jax_index(ctx, flat, indices)
+        _jax_written_slice(indices[1]) && return _jax_index(ctx, flat, indices; target)
+        i = _jax_bound_expr(ctx, flat, 1, indices[1])
+        if _jax_logical(i.T) && ndims(i.T) > 1
+            ndims(i.T) == N && isempty(i.extent) ||
+                _jax_error("a rank-", ndims(i.T), " `Bool` mask of a rank-", N, " array",
+                           _jax_where(ctx))
+            _jax_call(ctx, _runtime_check,
+                      [_PyVal("(jnp.shape(" * x.code * ") == jnp.shape(" * i.code * "))", Bool, true),
+                       _PyVal(repr("BoundsError: a `Bool` mask must have the shape of the array it indexes"),
+                              BoundsError)])
+            i = _PyVal("jnp.ravel(" * i.code * ", order=\"F\")", Vector{Bool}, i.static)
+        end
+        return _jax_index(ctx, flat, [i]; target)
     end
     # Julia accepts indices past the rank that are 1 (`v[i, 1, 1]`): one
     # known while tracing is checked then, and dropped.
@@ -985,7 +1046,7 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
     values = Union{Nothing,_PyVal}[]
     kept = 0
     for (dim, index) in enumerate(indices)
-        part, keeps, value = _jax_index_part(ctx, x, dim, index)
+        part, keeps, value = _jax_index_part(ctx, x, dim, index; target)
         push!(parts, part)
         push!(values, value)
         kept += keeps
@@ -1020,14 +1081,20 @@ end
 function _jax_gather_extent(ctx::_JaxContext, values, kept::Int)
     padded = [v for v in values if v !== nothing && _jax_is_array(v.T) && !isempty(v.extent)]
     isempty(padded) && return ""
-    kept == 1 || _jax_error("a gather by a padded (ragged) index vector beside another ",
-                            "kept dimension has no JAX translation", _jax_where(ctx))
+    kept == 1 || _jax_error("a gather by a padded (ragged) index vector or a `Bool` mask ",
+                            "beside another kept dimension has no JAX translation",
+                            _jax_where(ctx))
     only(padded).extent
 end
 
+# A literal colon or a written range `a:b`, which `_jax_index_part` slices
+# from the source expression (never a value it evaluates first).
+_jax_written_slice(index) = index === :(:) || index == :(Colon()) ||
+    index isa Expr && index.head === :call && index.args[1] === :(:) && length(index.args) == 3
+
 # One index position: the Python index text, whether it keeps a dimension,
 # and the index's value (`nothing` for a literal colon or a written range).
-function _jax_index_part(ctx::_JaxContext, x::_PyVal, dim::Int, index)
+function _jax_index_part(ctx::_JaxContext, x::_PyVal, dim::Int, index; target::Bool = false)
     index === :(:) && return (":", 1, nothing)
     index == :(Colon()) && return (":", 1, nothing)
     if index isa Expr && index.head === :call && index.args[1] === :(:) &&
@@ -1046,6 +1113,10 @@ function _jax_index_part(ctx::_JaxContext, x::_PyVal, dim::Int, index)
     end
     i = _jax_bound_expr(ctx, x, dim, index)
     i.T === Colon && return (":", 1, i)
+    # `Bool <: Integer`, but a `Bool` index is no position: an array selects
+    # with a mask of them, and refuses a single one, as Julia does.
+    i.T === Bool && _jax_bool_index_error(ctx, index)
+    _jax_logical(i.T) && return _jax_mask_part(ctx, x, i; target)
     _jax_is_scalar(i.T) && i.T <: Integer && return (_jax_minus_one(i), 0, i)
     if _jax_is_array(i.T) && eltype(i.T) <: Integer
         ndims(i.T) == 1 || _jax_error("a gather by a rank-", ndims(i.T), " index array",
@@ -1060,6 +1131,35 @@ function _jax_index_part(ctx::_JaxContext, x::_PyVal, dim::Int, index)
     end
     _jax_error("the index `", index, "` (of type `", i.T, "`) has no JAX translation",
                _jax_where(ctx))
+end
+
+_jax_bool_index_error(ctx::_JaxContext, index) =
+    _jax_error("indexing an array by the `Bool` `", index, "` (Julia refuses it: invalid index)",
+               _jax_where(ctx))
+
+# A logical index (a `Bool` vector, `A[mask, j]`): the entries where it is
+# true, in order. The host takes NumPy's boolean mask, which also refuses a
+# mask of another length, as Julia does. JAX shapes are static, so the device
+# gathers at a padded position vector instead: the true positions, then the
+# last of them repeated (padding repeats the last valid entry), with their
+# count as the extent that reductions mask by. A write's padding is past the
+# end, where JAX drops the update, so an all-false mask writes nothing. A
+# padded mask counts only its valid entries.
+function _jax_mask_part(ctx::_JaxContext, x::_PyVal, i::_PyVal; target::Bool = false)
+    ndims(i.T) == 1 || _jax_error("a rank-", ndims(i.T), " `Bool` mask beside other indices",
+                                  _jax_where(ctx))
+    ctx.host === nothing || return ("np.asarray(" * i.code * ", dtype=bool)", 1, i)
+    _jax_ragged(x.T) && _jax_error("a `Bool` mask of the groups of a ragged value has no ",
+                                   "JAX translation", _jax_where(ctx))
+    valid = isempty(i.extent) ? i.code : "jnp.logical_and(" * i.code * ", " * _jax_mask(i) * ")"
+    mask = _jax_bind!(ctx, :mask, _PyVal(valid, Vector{Bool}))
+    n = _py_atom(mask.code) * ".shape[0]"
+    count = _jax_bind!(ctx, :count, _PyVal("jnp.sum(" * mask.code * ")", Int))
+    fill = target ? n : "jnp.max(jnp.where(" * mask.code * ", jnp.arange(" * n * "), 0), initial=0)"
+    positions = _jax_bind!(ctx, :positions,
+        _PyVal("jnp.nonzero(" * mask.code * ", size=" * n * ", fill_value=" * fill * ")[0]",
+               Vector{Int}, false, count.code))
+    (positions.code, 1, positions)
 end
 
 # An index expression in which `end` and `begin` name the bounds of `x`'s
@@ -1827,23 +1927,54 @@ function _jax_trip_bound(ctx::_JaxContext, lo::_PyVal, hi::_PyVal)
         throw(_CellHostNeeded(o.plate, o.recipe, JAXEmissionError(
             "a data-only integer used as a loop end needs a bound from `prepare_data`" * _jax_where(ctx))))
     end
+    # Ends at one position with one positive scale differ by that scale times
+    # the arrays' difference there, at most that times their largest one.
     count = if a isa _JaxOrigin && b isa _JaxOrigin && a.position !== nothing &&
-               a.position == b.position
-        span = _jax_prepared_bound!(ctx, :span, a.key, b.key)
+               a.position == b.position && a.scale == b.scale && _jax_static_sign(a.scale) > 0
+        span = _jax_scaled(a.scale, _jax_prepared_bound!(ctx, :span, a.key, b.key))
         _jax_offset(_jax_offset(span, "+", b.offset), "-", a.offset)
     else
         upper = hi.static ? hi.code : !isempty(hi.limit) ? hi.limit :
-            b isa _JaxOrigin && b.position !== nothing ?
-            _jax_offset(_jax_prepared_bound!(ctx, :max, b.key), "+", b.offset) : nothing
+            b isa _JaxOrigin && b.position !== nothing ? _jax_entry_bound(ctx, b, true) : nothing
         lower = lo.static ? lo.code : a isa _JaxOrigin && a.position !== nothing ?
-            _jax_offset(_jax_prepared_bound!(ctx, :min, a.key), "+", a.offset) : nothing
+            _jax_entry_bound(ctx, a, false) : nothing
         upper === nothing || lower === nothing ? nothing : _py_infix("-", [upper, lower])
     end
     count === nothing ? nothing : "max(" * _py_infix("+", [count, "1"]) * ", 0)"
 end
+# A static upper (`upper`) or lower bound of a prepared entry `o`,
+# `scale * prepared[key][i] + offset`: the scale times the array's largest
+# entry, or its least where the scale is negative (either where its sign is
+# known only while tracing), plus the offset.
+function _jax_entry_bound(ctx::_JaxContext, o::_JaxOrigin, upper::Bool)
+    sign = _jax_static_sign(o.scale)
+    extreme(kind) = _jax_scaled(o.scale, _jax_prepared_bound!(ctx, kind, o.key))
+    bound = sign > 0 ? extreme(upper ? :max : :min) :
+        sign < 0 ? extreme(upper ? :min : :max) :
+        (upper ? "max(" : "min(") * extreme(:max) * ", " * extreme(:min) * ")"
+    _jax_offset(bound, "+", o.offset)
+end
 # `code op offset`, a static integer offset; nothing added for a zero one.
 _jax_offset(code::AbstractString, op::AbstractString, offset::AbstractString) =
     offset == "0" ? code : _py_infix(op, [code, offset])
+# `scale * code`, a static integer scale; nothing multiplied for a unit one.
+_jax_scaled(scale::AbstractString, code::AbstractString) =
+    scale == "1" ? code : _py_infix("*", [scale, code])
+# The sign of a static integer's code when it is a literal, else 0 (known
+# only while tracing).
+function _jax_static_sign(code::AbstractString)
+    m = match(r"^-?[0-9]+$", code)
+    m === nothing ? 0 : sign(parse(Int, code))
+end
+# `x op y` of static integers' codes, folded when both are literals.
+function _jax_static_integer_op(op::AbstractString, x::AbstractString, y::AbstractString)
+    literal = r"^-?[0-9]+$"
+    if occursin(literal, x) && occursin(literal, y)
+        a, b = parse(Int, x), parse(Int, y)
+        return string(op == "+" ? a + b : op == "-" ? a - b : a * b)
+    end
+    _py_infix(op, [x, y])
+end
 
 # The name of a static bound of prepared integer arrays `keys` (`:min` and
 # `:max` of one array's entries, `:span` the largest difference of the second
@@ -2842,6 +2973,8 @@ function _jax_scalar_or_elementwise(ctx::_JaxContext, f, args::Vector{_PyVal})
             return _jax_elementwise_result(f, args, _py_negate(args[1].code))
         length(args) == 1 && f === (+) && return args[1]
         length(args) >= 2 || return nothing
+        f in ((+), (-)) && all(a -> _jax_is_array(a.T), args) &&
+            (args = _jax_common_extent(ctx, args))
         return _jax_elementwise_result(f, args, _py_infix(op, [a.code for a in args]))
     end
     if f === (*) && any(a -> a.T isa Type && a.T <: AbstractString, args)
@@ -2926,18 +3059,26 @@ function _jax_shifted_limit(f, args::Vector{_PyVal}, v::_PyVal)
     _jax_history_index_result(f, args, _jax_shifted_integer_limit(f, values, v))
 end
 function _jax_shifted_integer_limit(f, args::Vector{_PyVal}, v::_PyVal)
-    (f === (+) || f === (-)) && length(args) == 2 && isempty(v.limit) && !v.static || return v
+    isempty(v.limit) && !v.static || return v
+    all(a -> a.T isa Type && a.T <: Integer, args) || return v
+    f === (*) && return _jax_scaled_integer_limit(args, v)
+    # `-j` is `-1 * j`.
+    f === (-) && length(args) == 1 && return _jax_scaled_integer_limit([_jax_literal(-1), args[1]], v)
+    (f === (+) || f === (-)) && length(args) == 2 || return v
     a, b = args
-    a.T isa Type && a.T <: Integer && b.T isa Type && b.T <: Integer || return v
+    entry(x) = x.origin isa _JaxOrigin && x.origin.position !== nothing
     # An entry of the prepared data shifted by a static integer keeps its
     # origin, shifted: `stops[r] - 1` is at most the largest stop less one.
-    if a.origin isa _JaxOrigin && a.origin.position !== nothing && b.static
-        offset = a.origin.offset == "0" && f === (+) ? b.code :
-            _py_infix(f === (+) ? "+" : "-", [a.origin.offset, b.code])
-        return _jax_with_origin(v, _JaxOrigin(a.origin.key, a.origin.position, offset))
-    elseif f === (+) && b.origin isa _JaxOrigin && b.origin.position !== nothing && a.static
-        return _jax_with_origin(v, _JaxOrigin(b.origin.key, b.origin.position,
-                                              _jax_offset(a.code, "+", b.origin.offset)))
+    if entry(a) && b.static
+        o = a.origin
+        offset = o.offset == "0" && f === (+) ? b.code :
+            _py_infix(f === (+) ? "+" : "-", [o.offset, b.code])
+        return _jax_with_origin(v, _JaxOrigin(o.key, o.position, offset, o.path, o.scale))
+    elseif entry(b) && a.static
+        # `c - j` is `-1 * j + c`.
+        o = f === (-) ? _jax_scaled_origin(b.origin, "-1") : b.origin
+        return _jax_with_origin(v, _JaxOrigin(o.key, o.position, _jax_offset(a.code, "+", o.offset),
+                                              o.path, o.scale))
     end
     if !isempty(a.limit) && b.static && (f === (+) || occursin(r"^[0-9]+$", b.code))
         limit = f === (-) ? a.limit : _py_infix("+", [a.limit, b.code])
@@ -2948,6 +3089,23 @@ function _jax_shifted_integer_limit(f, args::Vector{_PyVal}, v::_PyVal)
     end
     _PyVal(v.code, v.T, v.static, v.extent, limit, v.padded, v.origin)
 end
+# `k * j` of static integers `k` and one integer `j` with a static bound
+# keeps a bound: an entry of the prepared data keeps its origin, scaled
+# (`2 * n[i]` is at most twice the largest entry), and a nonnegative literal
+# scales a static limit (`2 * length(r)` of a padded row).
+function _jax_scaled_integer_limit(args::Vector{_PyVal}, v::_PyVal)
+    count(a -> !a.static, args) == 1 && length(args) >= 2 || return v
+    j = only(a for a in args if !a.static)
+    k = foldl((x, y) -> _jax_static_integer_op("*", x, y), (a.code for a in args if a.static))
+    j.origin isa _JaxOrigin && j.origin.position !== nothing &&
+        return _jax_with_origin(v, _jax_scaled_origin(j.origin, k))
+    !isempty(j.limit) && occursin(r"^[0-9]+$", k) || return v
+    _PyVal(v.code, v.T, v.static, v.extent, _jax_scaled(k, j.limit), v.padded, v.origin)
+end
+# `k` times an entry's origin: its scale and offset times `k`.
+_jax_scaled_origin(o::_JaxOrigin, k::AbstractString) =
+    _JaxOrigin(o.key, o.position, o.offset == "0" ? "0" : _jax_static_integer_op("*", k, o.offset),
+               o.path, o.scale == "1" ? k : _jax_static_integer_op("*", k, o.scale))
 
 """
     _jax_function_call(ctx::_JaxContext, f, args::Vector{_PyVal}) -> _PyVal
@@ -3193,7 +3351,7 @@ function _jax_stable_rewrite(ctx::_JaxContext, p::Plan, view, operands, inputs; 
     end
     alone || !isempty(definitions) || return nothing
     ast = Expr(:->, Expr(:tuple, params...), Expr(:block, view.expr))
-    rewritten = _stable_rewrites(ast, (), definitions)
+    rewritten = _stable_rewrites(ast, (), definitions; parts = false)
     rewritten === ast && return nothing
     body = rewritten.args[2]
     body = length(body.args) == 1 ? only(body.args) : body
@@ -3630,18 +3788,26 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(hcat), args::Vector{_PyVa
     _PyVal("jnp.concatenate([" * join(columns, ", ") * "], axis=1)", Matrix{E})
 end
 
-# Index with already translated index values (an integer or an integer array).
+# Index with already translated index values (an integer, an integer array
+# or a `Bool` mask).
 function _jax_index_values(ctx::_JaxContext, x::_PyVal, indices::Vector{_PyVal})
     _jax_is_array(x.T) && length(indices) == ndims(x.T) ||
         _jax_error("a gather from `", x.T, "`", _jax_where(ctx))
     parts = String[]
+    # A mask gathers at its positions, which carry the gather's extent.
+    gathered = copy(indices)
     kept = 0
-    for i in indices
+    for (k, i) in enumerate(indices)
         if _jax_is_colon(i)
             # A whole axis; a ragged value's padding would show through it.
             isempty(x.extent) ||
                 _jax_error("a whole-axis slice of a ragged value", _jax_where(ctx))
             push!(parts, ":"); kept += 1
+        elseif i.T === Bool
+            _jax_bool_index_error(ctx, i.code)
+        elseif _jax_logical(i.T)
+            part, _, gathered[k] = _jax_mask_part(ctx, x, i)
+            push!(parts, part); kept += 1
         elseif i.T isa Type && i.T <: Integer
             push!(parts, _jax_minus_one(i))
         elseif _jax_is_array(i.T) && eltype(i.T) <: Integer && ndims(i.T) == 1
@@ -3658,7 +3824,7 @@ function _jax_index_values(ctx::_JaxContext, x::_PyVal, indices::Vector{_PyVal})
         isempty(x.extent) && _jax_error("a ragged array without its lengths", _jax_where(ctx))
         return _PyVal(code, T, false, x.extent * "[" * join(parts, ", ") * "]")
     end
-    _PyVal(code, T, false, _jax_gather_extent(ctx, indices, kept))
+    _PyVal(code, T, false, _jax_gather_extent(ctx, gathered, kept))
 end
 
 # A range value, `a:b`: the array of its elements. JAX arrays have static
@@ -3885,6 +4051,9 @@ function _jax_broadcast(ctx::_JaxContext, f, args::Vector{_PyVal})
         return _PyVal("jnp.asarray(" * x.code * ", dtype=" * _jax_dtype(f) * ")",
                       R == 0 ? f : Array{f,R}, false, x.extent, "", _jax_padded_like(x))
     end
+    # The result's extent and padded axes: rows padded by different lengths
+    # along the same axes take Julia's broadcast length (`_jax_common_extent`).
+    meta = _jax_common_extent(ctx, args)
     padded = map(values, referenced) do a, ref
         r = _jax_rank(a.T)
         !ref && 0 < r < R ? _PyVal(_py_atom(a.code) * "[" * join(fill("...", 1), "") *
@@ -3903,12 +4072,12 @@ function _jax_broadcast(ctx::_JaxContext, f, args::Vector{_PyVal})
     if any(referenced) || f isa _JaxClosure || any(_jax_translation_only, scalars)
         R == 0 && return _jax_call(ctx, f, scalars)
         code, E = _jax_captured_broadcast(ctx, f, scalars, padded, referenced)
-        return _PyVal(code, Array{E,R}, false, _jax_extent(args), "",
-                      _jax_broadcast_padded(args, R))
+        return _PyVal(code, Array{E,R}, false, _jax_extent(meta), "",
+                      _jax_broadcast_padded(meta, R))
     end
     v = _jax_elementwise_call(ctx, f, scalars)
-    v === nothing || return _PyVal(v.code, T, false, R == 0 ? "" : _jax_extent(args), "",
-                                   _jax_broadcast_padded(args, R))
+    v === nothing || return _PyVal(v.code, T, false, R == 0 ? "" : _jax_extent(meta), "",
+                                   _jax_broadcast_padded(meta, R))
     if haskey(_JAX_INFIX, f) || f === (*) || f === (^) ||
        _jax_elementwise_name(ctx, f, scalars) !== nothing
         any(a -> !a.static, padded) && (padded = map(a -> _jax_float_static(ctx, a), padded))
@@ -3916,8 +4085,8 @@ function _jax_broadcast(ctx::_JaxContext, f, args::Vector{_PyVal})
             f === (^) ? _PyVal(_py_infix("**", [padded[1].code, padded[2].code]), E) :
             _jax_scalar_or_elementwise(ctx, f, scalars)
         v === nothing && _jax_error("broadcasting `", f, "`", _jax_where(ctx))
-        return _PyVal(v.code, T, false, R == 0 ? "" : _jax_extent(args), "",
-                      _jax_broadcast_padded(args, R))
+        return _PyVal(v.code, T, false, R == 0 ? "" : _jax_extent(meta), "",
+                      _jax_broadcast_padded(meta, R))
     end
     # A function of each vector of a padded vector of vectors (`Diagonal.(rows)`
     # of a ragged plate's per-cell arguments) maps over the rows, each a padded
@@ -3954,7 +4123,7 @@ function _jax_broadcast(ctx::_JaxContext, f, args::Vector{_PyVal})
     ctx.host === nothing || return _PyVal("np.vectorize(" * name * ", otypes=[" *
         _host_dtype(E) * "])(" * _jax_args(padded) * ")", T)
     _PyVal("jnp.vectorize(" * name * ")(" * _jax_args(padded) * ")", T, false,
-           R == 0 ? "" : _jax_extent(args), "", _jax_broadcast_padded(args, R))
+           R == 0 ? "" : _jax_extent(meta), "", _jax_broadcast_padded(meta, R))
 end
 
 function _jax_captured_broadcast(ctx::_JaxContext, f, scalars, padded, referenced)
@@ -5054,8 +5223,11 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     if masked
         # Padding is storage, not a native cell. Include its activity in
         # runtime-check guards before batching those checks across lanes.
-        masks = ["jnp.broadcast_to(" * mask * ", " * _py_atom(v.code) * ".shape)"
-                 for (v, mask) in zip(inputs[padded], masks)]
+        # The mask spans the `R` mapped axes of the argument's stored array
+        # (a scan's tuple step outputs: their first column), so each cell
+        # receives one flag.
+        masks = ["jnp.broadcast_to(" * mask * ", " * _py_atom(_jax_mapped_array(v)) *
+                 ".shape[:" * string(R) * "])" for (v, mask) in zip(inputs[padded], masks)]
         push!(axes, "0")
         push!(args, foldl((a, b) -> "jnp.logical_and(" * a * ", " * b * ")", masks))
     end
