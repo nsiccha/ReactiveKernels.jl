@@ -627,6 +627,12 @@ end
 @inline _pr_shadow(arg::Active{<:Tuple}, ::Val{1}, w) = zeros(eltype(arg.val), length(arg.val))
 @inline _pr_shadow(arg, ::Val, w) = nothing
 
+# A batched Active tuple of floats accumulates its cotangent in a vector and
+# returns it as a tuple. Define this predicate before the generators that call
+# it so it is available in their world when loading the extension from source.
+_pr_tuple_operand(::Type{<:Active{T}}) where {T} = T <: Tuple{Vararg{AbstractFloat}}
+_pr_tuple_operand(::Type) = false
+
 # The reverse's return: the cotangent of each Active operand (zero for one the
 # rule does not differentiate), `nothing` for every other annotation.
 @generated function _pr_reverse_return(::Val{S}, args::Tuple, cot::Tuple,
@@ -652,13 +658,6 @@ end
     Expr(:tuple, exprs...)
 end
 
-# A batched operand Enzyme passes as `Active` (an immutable collection such as
-# a tuple) has no shadow to add into. Such a call differentiates the program
-# with Enzyme's ordinary reverse instead, seeded with the covector.
-# A batched operand passed as `Active` is supported when it is a tuple of
-# floats: its cotangent accumulates in a vector and returns as a tuple.
-_pr_tuple_operand(::Type{<:Active{T}}) where {T} = T <: Tuple{Vararg{AbstractFloat}}
-_pr_tuple_operand(::Type) = false
 # Whether the generated reverse returns or accumulates the cotangent of every
 # operand Enzyme treats as active. The rule was generated for the operands its
 # own activity analysis marked active (scalar positions `S`, batched `B`); an
