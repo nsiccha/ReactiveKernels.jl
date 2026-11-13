@@ -118,5 +118,8 @@ vector on a map or inverse, and shares results across scoring candidates.
 Cells are ordered by packed coordinate, regardless of keyword order. Identity
 maps skip endpoint evaluation. Ordinary AD differentiates the joint graph;
 arrays remain read-only, without concatenation into a new endpoint buffer.
+For Enzyme differentiation through cached matrix endpoints, use the
+`const_array_reshape` repair (dogfood `9c4df614` or later); the acceptance
+suite checks ordinary reverse differentiation and unchanged cached inputs.
 
 The [Eight-schools example](eight-schools.md) checks the complete density decomposition and its coordinate transformation.
