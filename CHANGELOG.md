@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.228
+## 0.1.229
 
 - Partition plans retain constant row calculations used to size fresh scan
   outputs, including buffers selected by a conditional. Mutating an output no
