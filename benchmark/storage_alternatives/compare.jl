@@ -73,10 +73,12 @@ function one_workload(kind, n)
                 recurse=RK._code_recursion(Val(:all)))
             ast=RK._inline_plate_programs(k.ast)
             nodes,loops=structure(ast)
-            write(joinpath(OUT,"$kind-$n-$mode.jl"),sprint(show,ast))
+            write(joinpath(OUT,"$kind-$n-$mode.jl"),sprint(show,code_expr(k)))
+            write(joinpath(OUT,"$kind-$n-$mode-structure.jl"),sprint(show,ast))
             row=Dict{String,Any}("workload"=>string(kind),"n"=>n,"mode"=>string(mode),
                 "prepare_s"=>prep.time,"prepare_bytes"=>prep.bytes,
-                "ad_prepare_s"=>adprep.time,"first_gradient_s"=>firstcall.time,
+                "ad_prepare_s"=>adprep.time,"ad_prepare_bytes"=>adprep.bytes,
+                "first_gradient_s"=>firstcall.time,"first_gradient_bytes"=>firstcall.bytes,
                 "nodes"=>nodes,"loops"=>loops,"audit_findings"=>length(audit),
                 "audit"=>string.(audit),"semantic_pass"=>true,"rounds"=>Any[])
             push!(RESULTS["measurements"],row)
