@@ -579,16 +579,17 @@ end
 # returns the value and the scalar operands' cotangents, adding each batched
 # operand's cotangent into a shadow. Two schedules use it:
 #
-# - One pass (`_pr_one_pass`, a plate with a gathered operand and at least
-#   `_PR_ONE_PASS_MIN_CELLS` cells): the augmented primal runs the sweep with a
-#   unit seed, each gathered operand's cotangent going into a buffer of its
-#   parent's length (`z` for `z[g]`). The reverse pass makes no second pass over
-#   the cells; it scales by the seed.
+# - One pass (`_pr_one_pass`, a plate with a gathered operand, at least
+#   `_PR_ONE_PASS_MIN_CELLS` cells, and buffers shorter than the cells): the
+#   augmented primal runs the sweep with a unit seed, each gathered operand's
+#   cotangent going into a buffer of its parent's length (`z` for `z[g]`). The
+#   reverse pass makes no second pass over the cells; it scales by the seed.
 # - Two passes otherwise: the augmented primal runs the program; the reverse
 #   pass runs the sweep with the seed straight into the shadows. A buffer as
-#   long as the cells (an operand that spans the plate) costs about as much as
-#   that second pass, and on a small plate one pass's allocation costs more than
-#   the pass it saves.
+#   long as the cells (an operand that spans the plate, such as a range view
+#   `view(u, 5:J+4)`, or a gather from a long parent) costs about as much as that
+#   second pass, and on a small plate one pass's allocation costs more than the
+#   pass it saves.
 #
 # A call whose activity the generated reverse does not take runs the program
 # and differentiates it with Enzyme's ordinary reverse instead.
@@ -599,7 +600,8 @@ using ReactiveKernels: _PlateSumRule, _pr_scalar_positions, _pr_batched_position
 # operand's buffer, then the scalar operands' unit-seed cotangents. It is a heap
 # array already, so Enzyme keeps it without boxing a tape struct (a struct
 # holding the buffers cost each eight-schools plate a 64 B box). This constant
-# empty vector marks a plate below the cell threshold: two passes, no allocation.
+# empty vector marks a call that takes two passes after all (too few cells, or
+# buffers at least as long as the cells): no allocation.
 const _PR_TWO_PASS = Float64[]
 # Below this many cells one pass's tape allocation outweighs the pass it saves
 # (eight schools, 8 cells: 0.070 µs in two passes, 0.102–0.118 µs in one).
@@ -616,10 +618,11 @@ function EnzymeRules.augmented_primal(
     S, B = _pr_scalar_positions(r), _pr_batched_positions(r)
     if _pr_covers(Val(S), Val(B), args) &&
             _pr_one_pass(Val(S), Val(B), Val(overwritten(config)), args)
-        if _pr_cells(Val(B), args) < _PR_ONE_PASS_MIN_CELLS
+        cells, buffers = _pr_cells(Val(B), args), _pr_buffer_length(Val(B), args)
+        if cells < _PR_ONE_PASS_MIN_CELLS || buffers >= cells
             return AugmentedReturn(needs_primal(config) ? r(values...) : nothing, nothing, _PR_TWO_PASS)
         end
-        tape = zeros(Float64, _pr_buffer_length(Val(B), args) + length(S))
+        tape = zeros(Float64, buffers + length(S))
         swept = r.reverse(values..., 1.0, Val(true), _pr_tape_buffers(Val(B), args, tape)...)
         _pr_store_cotangents!(tape, Base.tail(swept))
         return AugmentedReturn(needs_primal(config) ? first(swept) : nothing, nothing, tape)

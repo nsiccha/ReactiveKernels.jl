@@ -113,7 +113,8 @@ end
 end
 
 # End to end: a grouped model whose plate reads `sd .* z[group]` (a gathered
-# view) takes one pass from `_PR_ONE_PASS_MIN_CELLS` cells, two below.
+# view) takes one pass from `_PR_ONE_PASS_MIN_CELLS` cells when its buffer (as
+# long as `z`) is shorter than the plate, and two passes otherwise.
 module OnePassModels
 using ReactiveKernelsPPL
 const grouped = @rkppl begin
@@ -126,9 +127,9 @@ const grouped = @rkppl begin
 end
 end
 
-@testset "one-pass grouped gradients, $n observations" for n in (40, 600)
+@testset "one-pass grouped gradients, $n observations in $J groups" for (n, J) in
+        ((40, 10), (600, 150), (600, 700))
     backend = AutoEnzyme(; mode = Enzyme.Reverse)
-    J = n ÷ 4
     # The last group has no observation.
     group = [mod1(7i, J - 1) for i in 1:n]
     x = [0.3 * cos(i) for i in 1:n]
@@ -156,12 +157,13 @@ end
         # Witness of the schedule: one pass keeps a J-length buffer on its tape,
         # an allocation per gradient that the non-allocating kernel otherwise
         # does not make (todo `08gmx4k` may move it to owned storage, which then
-        # needs another witness). The rule off is the control.
+        # needs another witness). The rule off is the control. More groups
+        # than observations: two passes, no buffer.
         if nonallocating && n >= 128
             g = similar(u)
             sampler_value_and_gradient!(on, g, u)
             sampler_value_and_gradient!(off, g, u)
-            @test (@allocated sampler_value_and_gradient!(on, g, u)) >= 8J
+            @test ((@allocated sampler_value_and_gradient!(on, g, u)) >= 8J) == (J < n)
             @test (@allocated sampler_value_and_gradient!(off, g, u)) < 8J
         end
     end
