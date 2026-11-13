@@ -1,11 +1,9 @@
 # A joint numerical graph keeps the expensive exponential available to both
 # the stable value and its partial. Backend adapters select cuts of this graph.
 @kernel rk_log1pexp_graph(x::Float64) = begin
-    positive = x >= 0
-    magnitude::Float64 = ifelse(positive, -x, x)
-    q::Float64 = exp(magnitude)
-    value::Float64 = ifelse(positive, x, 0.0) + log1p(q)
-    partial::Float64 = ifelse(positive, 1.0, q) / (1 + q)
+    q::Float64 = exp(-abs(x))
+    value::Float64 = max(x, 0.0) + log1p(q)
+    partial::Float64 = ifelse(x >= 0, 1.0, q) / (1 + q)
     return value, partial
 end
 
