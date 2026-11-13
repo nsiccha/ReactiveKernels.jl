@@ -1001,7 +1001,10 @@ _kernel_object_skeleton(obj::KernelObjectSpec) = getfield(obj, :skeleton)
 _kernel_object_bindings(::_KernelObjectSkeleton) = NamedTuple()
 _kernel_object_bindings(obj::KernelObjectSpec) = getfield(obj, :bindings)
 
-function _kernel_object_owner_spec(object)
+# These functions reconstruct planning metadata. Inferring them through each
+# object's template and signature types recompiles the same graph traversal
+# for every distribution used while building a model.
+Base.@nospecializeinfer function _kernel_object_owner_spec(@nospecialize(object))
     skel = _kernel_object_skeleton(object)
     spec = kernel_spec(skel)
     bindings = _kernel_object_bindings(object)
@@ -1028,7 +1031,7 @@ end
 
 kernel_spec(obj::KernelObjectSpec) = _kernel_object_owner_spec(obj)
 
-function _kernel_object_full_spec(object)
+Base.@nospecializeinfer function _kernel_object_full_spec(@nospecialize(object))
     skel = _kernel_object_skeleton(object)
     bindings = _kernel_object_bindings(object)
     templates = _kernel_endpoint_templates(skel)
@@ -1046,7 +1049,7 @@ function _kernel_object_full_spec(object)
     combined
 end
 
-function _kernel_object_default_have(object, wanted)
+Base.@nospecializeinfer function _kernel_object_default_have(@nospecialize(object), wanted)
     skel = _kernel_object_skeleton(object)
     templates = _kernel_endpoint_templates(skel)
     names = copy(_kernel_object_owner_spec(object).have_names)
@@ -1068,7 +1071,7 @@ Splice every pure endpoint template and bound child kernel into one ordinary
 named graph, then return the requested boundary view.  Supplying an endpoint
 as `want` automatically adds its parameter ports to the default HAVE boundary.
 """
-function extract(object::Union{_KernelObjectSkeleton,KernelObjectSpec};
+Base.@nospecializeinfer function extract(@nospecialize(object::Union{_KernelObjectSkeleton,KernelObjectSpec});
                  have = _KERNEL_DEFAULT_BOUNDARY,
                  want = _KERNEL_DEFAULT_BOUNDARY)
     full = _kernel_object_full_spec(object)

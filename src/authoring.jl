@@ -1964,23 +1964,24 @@ end
 # The nested splicer clones recipes into each caller graph; it never mutates the
 # cached source view, and a new cache preserves `extract`'s public fresh-view
 # contract across separate authoring calls.
-function _kernel_cached_object_extract!(cache, object;
+Base.@nospecializeinfer function _kernel_cached_object_extract!(cache, @nospecialize(object);
         have = _KERNEL_DEFAULT_BOUNDARY, want = _KERNEL_DEFAULT_BOUNDARY)
     views = get!(cache, object) do
         Dict{Any,KernelSpec}()
     end
-    get!(views, (:extract, have, want)) do
-        extract(object; have, want)
-    end
+    # Do not capture the object's complete template type in a cache closure.
+    key = (:extract, have, want)
+    haskey(views, key) && return views[key]
+    views[key] = extract(object; have, want)
 end
 
-function _kernel_cached_object_full!(cache, object)
+Base.@nospecializeinfer function _kernel_cached_object_full!(cache, @nospecialize(object))
     views = get!(cache, object) do
         Dict{Any,KernelSpec}()
     end
-    get!(views, (:full,)) do
-        _kernel_object_full_spec(object)
-    end
+    key = (:full,)
+    haskey(views, key) && return views[key]
+    views[key] = _kernel_object_full_spec(object)
 end
 
 function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
