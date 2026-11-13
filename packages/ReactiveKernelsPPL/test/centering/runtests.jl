@@ -4,6 +4,7 @@
 module AdaptiveCenteringTests
 
 using Test, ReactiveKernels, ReactiveKernelsPPL, Enzyme, WarmupHMC
+using ReactiveKernelsPPL: adaptive_centering_problem
 using DifferentiationInterface: AutoEnzyme
 import LogDensityProblems as LDP
 
@@ -53,6 +54,34 @@ function emission_shape(kernel)
     end
     visit(code_expr(kernel))
     (; heads, callables = length(kernel.callables))
+end
+
+# Stand-in for BayesianRegressionModels, which exports a different
+# `adaptive_centering_problem(model, problem, ad_backend; ...)`. A consumer
+# loading both packages must still call BRM's name unqualified
+# (snag rkppl-export-ada-38f23f30).
+module SameNameExporter
+export adaptive_centering_problem
+adaptive_centering_problem(model, problem, ad_backend) = :same_name_exporter
+end
+
+module SameNameConsumer
+using ReactiveKernelsPPL
+using ..SameNameExporter
+call_unqualified() = adaptive_centering_problem(nothing, nothing, nothing)
+end
+
+@testset "a package exporting the same name loads beside RKPPL" begin
+    @test !Base.isexported(ReactiveKernelsPPL, :adaptive_centering_problem)
+    @static if isdefined(Base, :ispublic)
+        @test Base.ispublic(ReactiveKernelsPPL, :adaptive_centering_problem)
+    end
+    @test SameNameConsumer.call_unqualified() === :same_name_exporter
+    s = setup()
+    cells = (z = (location = :z_location, log_scale = :log_scale),)
+    rp = ReactiveKernelsPPL.adaptive_centering_problem(s.built, s.plan, s.problem,
+        BACKEND; cells)
+    @test LDP.logdensity(rp, s.u) == LDP.logdensity(s.problem, s.u)
 end
 
 @testset "graph-backed affine cells" begin
@@ -141,6 +170,70 @@ end
     @test isempty(ir0.pairs)
 end
 
+@testset "constant affine quantities" begin
+    s = setup()
+    (; built, plan, u, problem) = s
+    entries = Dict(e.name => e for e in s.layout.entries)
+    zi = entries[:z].offset .+ (0:entries[:z].size-1)
+    ti = entries[:t].offset
+    mu = u[entries[:mu].offset]
+    ls = u[entries[:sigma].offset]
+    # Exercise both constant fields, nonzero constants, and mixtures with
+    # graph queries in the same indexed map (one concrete pair type).
+    for (location, log_scale, loc, scale) in
+            ((0.0, :log_scale, 0.0, ls),
+             (:z_location, log(1.4), mu .+ collect(range(-0.3, 0.4; length = length(zi))), log(1.4)),
+             (0.3f0, 0, Float64(0.3f0), 0.0),
+             (1//4, -0.2, 0.25, -0.2))
+        for (target, source) in ((0.0, 0.0), (0.0, 1.0), (1.0, 0.0), (0.7, 0.2))
+            cells = (z = (; location, log_scale, target, source),
+                t = (; location = :t_location, log_scale = :log_scale, target, source))
+            ir, p = map_for(built, plan, cells; u0 = u)
+            @test isconcretetype(eltype(ir.pairs))
+            @test @inferred(last(first(ir.pairs)).args[1](u)) isa Float64
+            expected = copy(u)
+            expected[zi] .= target .* loc .+ (u[zi] .- source .* loc) .* exp(scale * (target - source))
+            expected[ti] = target * mu + (u[ti] - source * mu) * exp(ls * (target - source))
+            jac, mapped = WarmupHMC.with_logabsdet_jacobian!(copy(u), ir, u)
+            @test mapped ≈ expected
+            @test jac ≈ (length(zi) * scale + ls) * (target - source)
+            ijac, back = WarmupHMC.with_logabsdet_jacobian!(copy(mapped),
+                WarmupHMC.InverseFunctions.inverse(ir), mapped)
+            @test back ≈ u
+            @test ijac ≈ -jac
+            rp = ReactiveKernelsPPL.adaptive_centering_problem(built, plan, problem,
+                BACKEND; cells, u0 = u)
+            value, gradient = LDP.logdensity_and_gradient(rp, u)
+            @test value ≈ LDP.logdensity(problem, expected) + jac
+            @test gradient ≈ finite_gradient(x -> LDP.logdensity(rp, x), u) rtol = 2e-7 atol = 2e-7
+            @test LDP.logdensity_and_gradient(deepcopy(rp), u) == (value, gradient)
+            column = view(hcat(u, 2u), :, 1)
+            @test LDP.logdensity_and_gradient(rp, column) == (value, gradient)
+        end
+    end
+    # Configuration numbers stay runtime values; changing them or a latent's
+    # bound length does not create a new accessor program.
+    cells = (z = (location = 0.0, log_scale = 0.2, source = 0.5),)
+    ir1, p1 = map_for(built, plan, cells; u0 = u)
+    other = (z = (location = 1.3, log_scale = -0.7, source = 0.5),)
+    ir2, p2 = map_for(built, plan, other; u0 = u)
+    @test typeof(ir1) == typeof(ir2)
+    @test typeof(p1.kernels) == typeof(p2.kernels)
+    @test last(first(ir1.pairs)).args[1](u) == 0.0
+    @test last(first(ir2.pairs)).args[1](u) == 1.3
+    equal_constants = (z = (location = 0.0, log_scale = 0.0, source = 0.5),)
+    ir_equal, p_equal = map_for(built, plan, equal_constants; u0 = u)
+    @test typeof(ir_equal) == typeof(ir1)
+    @test typeof(p_equal.kernels) == typeof(p1.kernels)
+    for n in (0, 23)
+        resized = setup(n; built)
+        ir, p = map_for(resized.built, resized.plan, cells; u0 = resized.u)
+        @test typeof(ir) == typeof(ir1)
+        @test length(ir.pairs) == n
+        @test typeof(p.kernels) == typeof(p1.kernels)
+    end
+end
+
 const SPATIAL = @rkppl begin
     mu ~ Normal(0, mu_sd)
     sigma ~ Exponential(sigma_scale)
@@ -174,7 +267,7 @@ end
     built = build_kernel(plan)
     u = 0.1 .* cos.(1:built.layout.total)
     cells = (z = (location = :location, log_scale = :log_scale, source = 1.0),)
-    ir, _ = map_for(built, plan, cells; u0 = u)
+    ir, prepared = map_for(built, plan, cells; u0 = u)
     entries = Dict(e.name => e for e in built.layout.entries)
     zi = entries[:z].offset .+ (0:5)
     expected = copy(u)
@@ -182,6 +275,30 @@ end
     jac, mapped = WarmupHMC.with_logabsdet_jacobian!(copy(u), ir, u)
     @test mapped ≈ expected
     @test jac ≈ -sum(log, scales)
+
+    # Array endpoints may borrow graph storage, including bound cached values.
+    # Maps and reverse AD must only read it, and a later evaluation must not
+    # change an earlier result or the caller's input/data.
+    inputs = (copy(u), copy(offsets), copy(scales))
+    endpoints = map(k -> k(u), prepared.kernels)
+    snapshots = map(copy, endpoints)
+    problem = prepare_sampler(built, plan, u; backend = BACKEND)
+    rp = adaptive_centering_problem(built, plan, problem, BACKEND; cells, u0 = u)
+    first_result = LDP.logdensity_and_gradient(rp, u)
+    first_gradient = copy(last(first_result))
+    for point in (u, u .+ 0.07, view(hcat(u, u .+ 0.07), :, 2))
+        value, gradient = LDP.logdensity_and_gradient(rp, point)
+        @test value ≈ LDP.logdensity(rp, point)
+        @test gradient ≈ finite_gradient(x -> LDP.logdensity(rp, x), point) rtol = 2e-7 atol = 2e-7
+        _, forward = WarmupHMC.with_logabsdet_jacobian!(copy(point), ir, point)
+        _, inverse = WarmupHMC.with_logabsdet_jacobian!(copy(forward),
+            WarmupHMC.InverseFunctions.inverse(ir), forward)
+        @test inverse ≈ point
+        @test endpoints == snapshots
+        @test (u, offsets, scales) == inputs
+        @test last(first_result) == first_gradient
+    end
+    @test LDP.logdensity_and_gradient(rp, u) == first_result
 end
 
 @testset "a graph-derived spatial cell preserves the original density" begin
