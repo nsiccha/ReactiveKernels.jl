@@ -91,11 +91,7 @@ end
 # where it is computed (`_ppl_categorical_probabilities`), so one check
 # serves every observation that shares it.
 function _ppl_categorical_probabilities(probabilities::AbstractVector)
-    all(p -> p >= zero(p), probabilities) &&
-        isapprox(sum(probabilities), one(eltype(probabilities))) ||
-        throw(DomainError(probabilities,
-            "categorical probabilities must be nonnegative and sum to one"))
-    return probabilities
+    return DistributionKernelSources._checked_categorical_probabilities(probabilities)
 end
 function _ppl_categorical_logdensity(value::Integer, probabilities::AbstractVector)
     # An unsupported category has zero probability; log(0) keeps the

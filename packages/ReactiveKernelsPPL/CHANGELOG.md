@@ -16,6 +16,45 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.175
+
+- Adaptive affine cells prepare one joint endpoint kernel, sharing common
+  graph work across cells and location/log-scale roles. The indexed map orders
+  cells by packed coordinate so WarmupHMC evaluates that kernel once per map
+  or inverse, and shares its results across scoring candidates. Constants stay
+  runtime bound inputs; array endpoints remain read-only. Requires WarmupHMC
+  0.2.21, whose identity maps skip endpoint evaluation entirely.
+
+## 0.1.174
+
+- `sampling_distribution_graph` maps `Categorical`, `Poisson`, `Binomial`
+  and `Bernoulli` constructors to owned density objects. Constructor defaults
+  and checks remain in the graph; real observations outside integer support
+  return `-Inf`. The mappings compose in native programs and JAX emission,
+  sharing the existing count arithmetic and binding data-only normalizers.
+  Requires ReactiveKernelsDistributionKernels 0.1.10.
+
+## 0.1.173
+
+- Adaptive affine cells accept `Real` constants for `location` and `log_scale`,
+  shared across the selected block. Constants can mix with named graph queries
+  without adding sampler-only declarations to the model; their values remain
+  runtime configuration and use the same concrete accessor type across blocks.
+
+## 0.1.172
+
+- **Breaking:** `adaptive_centering_problem` is no longer exported. It is
+  declared `public` instead (on Julia 1.11 and later, through Compat, now a
+  direct dependency). BayesianRegressionModels has long exported a different
+  `adaptive_centering_problem`, and two packages exporting one name leave it
+  undefined in every module that loads both. With this change, BRM's
+  unqualified `adaptive_centering_problem(model, problem, ad_backend; ...)`
+  works again beside `using ReactiveKernelsPPL`. Callers of RKPPL's
+  graph-backed adapter add
+  `using ReactiveKernelsPPL: adaptive_centering_problem` or call
+  `ReactiveKernelsPPL.adaptive_centering_problem(built, plan, problem, backend; cells)`;
+  its arguments and behaviour are unchanged.
+
 ## 0.1.171
 
 - A compact cell or partition query gathers its constant base rows with a

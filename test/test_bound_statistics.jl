@@ -40,23 +40,21 @@ rowwise(A, y, t) = sum(abs2, y .- A * t)
         end
     end
 
-    @testset "a rank-deficient design" begin
+    @testset "a rank-deficient design keeps its rows" begin
         N = 60
         Z = randn(rng, N, 2)
         A = [Z Z[:, 1]]
         y = randn(rng, N) .+ 3
         s = RK._ls_statistics_dense(A, y)
-        t = randn(rng, 3)
-        @test relerr(RK._ls_rss_dense(s, (t,)), rss_ref(A, y, t)) < 1e-14
+        @test !s.usable
+        @test isnan(RK._ls_rss_dense(s, (randn(rng, 3),)))
     end
 
     @testset "one block per index value: $(label)" for (label, shift) in (
             ("unshifted", 0.0), ("shifted response", 1e4))
         J, N = 30, 600
         g = rand(rng, 1:J, N)          # unsorted, not contiguous
-        g[1] = J + 2                   # a value with one row
-        f = Float64.(rand(rng, 0:1, N))
-        f[g .== 3] .= 0.0              # a constant coefficient within one group
+        f = Float64.(rand(rng, 0:1, N)) .+ 0.1 .* randn(rng, N)
         y = randn(rng, N) .+ 1.3 .+ 0.5 .* f .+ shift
         alpha = randn(rng, J + 2) .+ 1.3 .+ shift
         beta = randn(rng, J + 2)
@@ -72,7 +70,7 @@ rowwise(A, y, t) = sum(abs2, y .- A * t)
         v = RK._ls_rss_grouped(s, (alpha, beta))
         @test relerr(v, ref) <= max(4 * relerr(rowwise(A, y, t), ref), 1e-15)
         # A gathered source too short for an index value raises, as the gather does.
-        @test_throws BoundsError RK._ls_rss_grouped(s, (alpha[1:J], beta))
+        @test_throws BoundsError RK._ls_rss_grouped(s, (alpha[1:J-1], beta))
     end
 
     @testset "unusable bindings return NaN" begin
@@ -190,6 +188,15 @@ _code(k) = string(code_expr(k))
 # The program up to its gensym numbering.
 _shape(k) = replace(_code(k), r"#\d+" => "#")
 _collapsed(k) = occursin("_ls_rss", _code(k))
+_reads_usable(x) = false
+_reads_usable(x::QuoteNode) = x.value === :usable
+_reads_usable(x::Expr) = any(_reads_usable, x.args)
+function _statistics_arms(ex)
+    ex isa Expr || return Tuple{Any,Any}[]
+    Meta.isexpr(ex, :if, 3) && _reads_usable(ex.args[1]) &&
+        return [(ex.args[2], ex.args[3])]
+    reduce(vcat, (_statistics_arms(a) for a in ex.args); init = Tuple{Any,Any}[])
+end
 function _loops(ex)
     ex isa Expr || return 0
     (ex.head === :while) + sum(_loops, ex.args; init = 0)
@@ -221,8 +228,12 @@ dense_data(n, k; shift = 0.0) = (X = [ones(n) randn(RNG, n, k - 1) .+ 2],
         literal = prepare(kernel; bound, bound_statistics = false)
         @test _collapsed(k)
         @test !_collapsed(literal)
-        # The design product is no longer computed.
-        @test !occursin("X * beta", _code(k))
+        # Eligibility is a runtime choice. Only its selected statistics arm
+        # computes the collapsed sum; the other retains authored row work.
+        arms = _statistics_arms(code_expr(k))
+        @test length(arms) == 1
+        @test occursin("_ls_rss", string(only(arms)[1]))
+        @test !occursin("_ls_rss", string(only(arms)[2]))
         for sigma in (0.7, 3.0, 1e-3)
             v, g = _value_gradient(k, live..., sigma)
             vl, gl = _value_gradient(literal, live..., sigma)
@@ -269,8 +280,12 @@ end
     k = prepare(ls_gathered; bound = (; idx, f, y))
     literal = prepare(ls_gathered; bound = (; idx, f, y), bound_statistics = false)
     @test _collapsed(k)
-    # Neither the gathers nor their index runs remain.
-    @test !occursin("_readonly_gather", _code(k)) && !occursin("index_runs", _code(k))
+    # The optimized arm does not gather or group authored rows. Their source
+    # remains in the lazy fallback for bindings where statistics cannot apply.
+    arms = _statistics_arms(code_expr(k))
+    @test length(arms) == 1
+    fast = string(only(arms)[1])
+    @test !occursin("_readonly_gather", fast) && !occursin("index_runs", fast)
     for sigma in (0.5, 2.0)
         v, g = _value_gradient(k, alpha, beta, sigma)
         vl, gl = _value_gradient(literal, alpha, beta, sigma)
@@ -281,6 +296,36 @@ end
     end
     # A source too short for an index value raises, as the gather does.
     @test_throws BoundsError k(alpha[1:J-1], beta, 0.5)
+end
+
+@testset "rank-deficient gathered blocks use the authored fallback" begin
+    cache = PreparationCache()
+    kernels = []
+    # Include a full-rank control, a constant column, and a singleton group.
+    for kind in (:independent, :constant, :singleton)
+        idx = repeat(collect(1:3), 40)
+        f = collect(range(-1.0, 1.0; length = length(idx)))
+        kind === :constant && (f[idx .== 3] .= 0.0)
+        kind === :singleton && (idx[1] = 4)
+        y = 1.3 .+ 0.5 .* f
+        alpha, beta = fill(1.1, 4), fill(0.4, 4)
+        original = deepcopy((idx, f, y))
+        k = prepare!(cache, ls_gathered; bound = (; idx, f, y))
+        push!(kernels, k)
+        s = only(filter(x -> x isa RK._LSStatistics, k.constants))
+        @test s.usable == (kind === :independent)
+        literal = prepare(ls_gathered; bound = (; idx, f, y), bound_statistics = false)
+        v, g = _value_gradient(k, alpha, beta, 0.7)
+        vl, gl = _value_gradient(literal, alpha, beta, 0.7)
+        @test v ≈ vl rtol = 1e-12
+        for (a, b) in zip(g, gl)
+            @test a ≈ b rtol = 1e-12 atol = 1e-12
+        end
+        @test (idx, f, y) == original
+        @test_throws BoundsError k(alpha[1:2], beta, 0.7)
+    end
+    @test allequal(typeof.(kernels))
+    @test allequal(_shape.(kernels))
 end
 
 @testset "with_bound_statistics scopes the setting" begin
@@ -305,14 +350,16 @@ end
     end
 end
 
-@testset "an unusable binding keeps today's program" begin
+@testset "an unusable binding selects authored arithmetic at runtime" begin
+    template = prepare(ls_dense; bound = dense_data(20, 3))
     # Fewer rows than the statistics would cost, and data that are not finite.
     for (X, y) in ((randn(RNG, 4, 3), randn(RNG, 4)),
                    ([ones(20) [NaN; randn(RNG, 19)]], randn(RNG, 20)))
         k = prepare(ls_dense; bound = (; X, y))
         literal = prepare(ls_dense; bound = (; X, y), bound_statistics = false)
-        @test !_collapsed(k)
-        @test _shape(k) == _shape(literal)
+        @test _collapsed(k)
+        @test typeof(k) === typeof(template)
+        @test _shape(k) == _shape(template)
         beta = zeros(size(X, 2))
         @test isequal(k(beta, 0.8), literal(beta, 0.8))
     end
