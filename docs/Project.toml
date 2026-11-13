@@ -29,7 +29,8 @@ AlgebraOfVega = "0.2.29"
 Documenter = "1"
 DocumenterVitepress = "0.3.9"
 LogDensityProblems = "2"
-WarmupHMC = "0.2.19"
+ReactiveKernelsPPL = "0.1.175"
+WarmupHMC = "0.2.21"
 
 [sources.ReactiveKernels]
 path = ".."

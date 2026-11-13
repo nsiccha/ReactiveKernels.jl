@@ -167,20 +167,59 @@ end
 @inline _zero_like(x::AbstractArray) = zero(x)
 @inline _zero_like(x::Number) = zero(x)
 
-# Retain the staged residuals across the reverse pass. An input array Enzyme
-# says may be overwritten before then is copied, and so is a residual that IS
-# the returned primal array (the caller owns it and may overwrite it); fresh
-# intermediates of the primal stage are owned here and kept as they are.
-@inline function _retain_residuals(sources::NTuple{R,Int}, residuals::NTuple{R,Any},
-        primal, overwritten_flags) where {R}
-    ntuple(Val(R)) do k
-        value = residuals[k]
-        value isa AbstractArray || return value
-        source = sources[k]
-        # `overwritten` includes the function object at position 1.
-        source > 0 ? (overwritten_flags[source + 1] ? copy(value) : value) :
-            value === primal ? copy(value) : value
+# Graph provenance does not prove storage ownership. Preserve derivative
+# snapshots across caller mutation, borrowing only backend-proven stable input
+# arrays in flat environments with no mutable primal escape.
+# Use Julia's documented deepcopy specialization hook on an owned wrapper. The
+# memo is shared across the flat environment, preserving repeated array
+# references. Nested containers retain the existing whole-tuple snapshot path.
+struct _DerivativeResidualEnvironment{R,S,F}
+    residuals::R
+    sources::S
+    overwritten::F
+    borrow_inputs::Bool
+end
+
+_flat_residual_value(value) = isbitstype(typeof(value)) ||
+    (value isa Array && isbitstype(eltype(value)))
+_flat_residual_environment(residuals::Tuple) = all(_flat_residual_value, residuals)
+
+_seed_borrowed_residuals!(memo, ::Tuple{}, ::Tuple{}, flags) = nothing
+function _seed_borrowed_residuals!(memo, residuals::Tuple, sources::Tuple, flags)
+    value = first(residuals)
+    source = first(sources)
+    # A direct dense bits array has no reference-valued element. The backend
+    # flag must establish that its memory is unchanged through the reverse.
+    if value isa Array && isbitstype(eltype(value)) && source > 0 &&
+            !flags[source + 1]
+        memo[value] = value
     end
+    _seed_borrowed_residuals!(memo, Base.tail(residuals), Base.tail(sources), flags)
+end
+
+function Base.deepcopy_internal(env::_DerivativeResidualEnvironment{R}, memo::IdDict) where {R}
+    env.borrow_inputs && _seed_borrowed_residuals!(memo, env.residuals, env.sources,
+        env.overwritten)
+    # Preserve each structural tuple position's type. Base's tuple copier uses
+    # integer indexing and infers a tuple of unions for heterogeneous residuals.
+    retained = map(env.residuals) do value
+        isbitstype(typeof(value)) && return value
+        (Base.@noinline Base.deepcopy_internal(value, memo))::typeof(value)
+    end
+    _DerivativeResidualEnvironment(retained, env.sources, env.overwritten, env.borrow_inputs)
+end
+
+@inline function _retain_residuals(sources::NTuple{R,Int}, residuals::NTuple{R,Any},
+        primal, flags) where {R}
+    isbitstype(typeof(residuals)) && return residuals
+    # A mutable returned value can expose input storage independently of the
+    # original argument's write flag. Keep the complete snapshot in that case.
+    if !isbitstype(typeof(primal)) || !_flat_residual_environment(residuals)
+        return Base.@noinline deepcopy(residuals)
+    end
+    env = _DerivativeResidualEnvironment(residuals, sources, flags, true)
+    saved = Base.@noinline deepcopy(env)
+    saved.residuals
 end
 
 function EnzymeRules.augmented_primal(

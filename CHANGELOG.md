@@ -16,6 +16,19 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.225
+
+- General derivative rules select their primal and active cotangents together
+  before splitting forward and reverse stages. The split preserves the selected
+  producers and shares their retained work; a primal requiring the unavailable
+  reverse seed retains the existing independent staging. Declared recipe costs
+  determine selection and do not guarantee the fastest runtime strategy.
+- Enzyme's retained derivative values preserve snapshots across caller mutation,
+  including views and nested containers that alias an input or returned value.
+  Shared references remain shared within the snapshot. Flat scalar/array
+  environments can retain direct array inputs without copying when the backend
+  establishes that they remain unchanged and no mutable primal escapes.
+
 ## 0.1.224
 
 - Bound Gaussian statistics choose between the collapsed sum and authored rows
