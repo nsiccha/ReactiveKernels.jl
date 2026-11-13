@@ -26,17 +26,16 @@ are recorded in the git history only.
   operand's partials per group into a buffer as long as its parent, and the
   reverse pass only scales them by the seed. Invariant terms of the cell
   density are summed once per plate rather than per cell, and a shared value's
-  partial through the gathered read is one product per group. Other plates
-  keep two passes: one with no gathered operand, or only unit-range views (a
-  sampler's parameter block), at its previous cost; one whose gathered operand
-  falls back at run time (fewer cells, or a parent at least as long as the
-  plate) with one 16-byte allocation per gradient. A shadow read at more than
-  one site on an execution path keeps per-cell accumulation. Gradients are
-  unchanged up to rounding. The one-pass tape is one allocation per gradient
-  (the buffer plus the scalar partials). On a grouped Gaussian model the rule's
-  gradient goes from about 1.9 to about 1.45 times a hand-written closed form
-  at 2,000 cells, and to about 1.3 times at 100,000 cells. The rule remains
-  opt-in.
+  partial through the gathered read is one product per group. The schedule is
+  chosen per call from the operands' sizes; every other plate (fewer cells, no
+  gathered operand, only unit-range views such as a sampler's parameter block,
+  or a parent at least as long as the plate) keeps two passes at its previous
+  cost. A shadow read at more than one site on an execution path keeps per-cell
+  accumulation. Gradients are unchanged up to rounding. The one-pass tape is
+  one allocation per gradient (the buffer plus the scalar partials). On a
+  grouped Gaussian model the rule's gradient goes from about 1.9 to about 1.45
+  times a hand-written closed form at 2,000 cells, and to about 1.3 times at
+  100,000 cells. The rule remains opt-in.
 
 ## 0.1.230
 

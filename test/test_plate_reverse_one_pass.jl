@@ -113,15 +113,39 @@ end
 end
 
 # Which views can take one pass, on types: an index vector may repeat groups; a
-# unit range repeats none (its buffer is never shorter than its cells), so it
-# keeps the two-pass tape without a run-time check.
+# unit range repeats none (its buffer is never shorter than its cells).
 @testset "one-pass eligibility by index type" begin
-    ext = Base.get_extension(RK, :ReactiveKernelsEnzymeExt)
     z = zeros(5)
-    @test ext._pr_gather_view(typeof(view(z, [1, 2, 2])))
-    @test !ext._pr_gather_view(typeof(view(z, 2:4)))
-    @test !ext._pr_gather_view(typeof(view(z, Base.OneTo(3))))
-    @test !ext._pr_gather_view(typeof(z))
+    @test RK._pr_gather_value(typeof(view(z, [1, 2, 2])))
+    @test !RK._pr_gather_value(typeof(view(z, 2:4)))
+    @test !RK._pr_gather_value(typeof(view(z, Base.OneTo(3))))
+    @test !RK._pr_gather_value(typeof(z))
+end
+
+# The primal picks the rule per call: one pass for a gathered operand with at
+# least `_PR_ONE_PASS_MIN_CELLS` cells and a shorter parent, the two-pass body
+# otherwise (an identity gather on a small plate, as RKPPL's `b[axes(n, 1)]`,
+# or a parent as long as the plate). Gradients through Enzyme agree either way.
+seeded(rule, x, s, ȳ) = ȳ * rule(x, s)
+@testset "one pass is chosen per call: $n cells, parent of $J" for (n, J, onepass) in
+        ((40, 8, false), (200, 30, true), (200, 250, false), (21, 21, false))
+    ast = program([:($MUL(s, v1))])
+    rexpr, scalar, batched = RK._pr_program_reverse(ast, [:x, :s], RK, Dict{Symbol,Any}())
+    primal, reverse = RK.compile(ast), RK.compile(rexpr)
+    rule = RK._PlateSumRule{(2,),(1,),typeof(primal),typeof(reverse)}(primal, reverse)
+    z = [0.3 * cos(j) for j in 1:J]
+    g = n == J ? collect(1:n) : [mod1(3i, J) for i in 1:n]
+    x = view(z, g)
+    @test RK._pr_rule_target(rule, (x, 0.6)) isa
+          (onepass ? RK._PlateSumRuleOnePass : RK._PlateSumRuleBody)
+    @test RK._pr_rule_target(rule, (collect(x), 0.6)) isa RK._PlateSumRuleBody
+    @test RK._pr_rule_target(rule, (view(zeros(n + 3), 2:n+1), 0.6)) isa RK._PlateSumRuleBody
+    @test rule(x, 0.6) ≈ 0.6 * sum(x)
+    dz = zeros(J)
+    cot = first(Enzyme.autodiff(Enzyme.Reverse, seeded, Enzyme.Active, Enzyme.Const(rule),
+        Enzyme.Duplicated(x, view(dz, g)), Enzyme.Active(0.6), Enzyme.Const(1.7)))
+    @test dz ≈ scatter(g, fill(1.7 * 0.6, n), J)
+    @test cot[3] ≈ 1.7 * sum(x)
 end
 
 # End to end: a grouped model whose plate reads `sd .* z[group]` (a gathered

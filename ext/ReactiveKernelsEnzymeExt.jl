@@ -617,92 +617,76 @@ end
 
 
 # ------------------------------------------------ generated plate reverse ----
-# `_PlateSumRuleBody` (src/plate_reverse.jl): the storage-compatible call of a
-# summed plate program (`_PlateSumRule`, its `rule`) with a reverse generated
-# from its own code. The generated sweep runs the cells once and
-# returns the value and the scalar operands' cotangents, adding each batched
-# operand's cotangent into a shadow. Two schedules use it:
+# `_PlateSumRuleBody` and `_PlateSumRuleOnePass` (src/plate_reverse.jl): the
+# storage-compatible calls of a summed plate program (`_PlateSumRule`, their
+# `rule`) with a reverse generated from its own code. The generated sweep runs
+# the cells once and returns the value and the scalar operands' cotangents,
+# adding each batched operand's cotangent into a shadow. Two schedules use it:
 #
-# - One pass (`_pr_one_pass`, a plate with a gathered operand, at least
-#   `_PR_ONE_PASS_MIN_CELLS` cells, and buffers shorter than the cells): the
-#   augmented primal runs the sweep with a unit seed, each gathered operand's
-#   cotangent going into a buffer of its parent's length (`z` for `z[g]`). The
-#   reverse pass makes no second pass over the cells; it scales by the seed.
-# - Two passes otherwise: the augmented primal runs the program; the reverse
-#   pass runs the sweep with the seed straight into the shadows. A buffer as
-#   long as the cells (a gather from a parent at least as long as the plate)
-#   costs about as much as that second pass, and on a small plate one pass's
-#   allocation costs more than the pass it saves. A range view never takes one
-#   pass, decided on types (`_pr_gather_view`).
+# - Two passes (`_PlateSumRuleBody`): the augmented primal runs the program;
+#   the reverse pass runs the sweep with the seed straight into the shadows.
+# - One pass (`_PlateSumRuleOnePass`, which the primal picks for a gathered
+#   operand of enough cells and a shorter parent, when `_pr_one_pass` admits
+#   the annotations): the augmented primal runs the sweep with a unit seed, each
+#   gathered operand's cotangent going into a buffer of its parent's length (`z`
+#   for `z[g]`). The reverse pass makes no second pass over the cells; it
+#   scales by the seed. A one-pass call whose annotations `_pr_one_pass` does
+#   not admit takes two passes, as the body does.
 #
 # A call whose activity the generated reverse does not take runs the program
 # and differentiates it with Enzyme's ordinary reverse instead.
 
-using ReactiveKernels: _PlateSumRuleBody, _pr_scalar_positions, _pr_batched_positions, _CellArray
-
-# A one-pass-eligible call's tape is one `Vector{Float64}`: each gathered
-# operand's buffer, then the scalar operands' unit-seed cotangents. It is a heap
-# array already, so Enzyme keeps it without boxing a tape struct (a struct
-# holding the buffers cost each eight-schools plate a 64 B box). This constant
-# empty vector marks a call that takes two passes after all (too few cells, or
-# buffers at least as long as the cells): no allocation.
-const _PR_TWO_PASS = Float64[]
-# Below this many cells one pass's tape allocation outweighs the pass it saves
-# (eight schools, 8 cells: 0.070 µs in two passes, 0.102–0.118 µs in one).
-const _PR_ONE_PASS_MIN_CELLS = 128
+using ReactiveKernels: _PlateSumRuleBody, _PlateSumRuleOnePass, _pr_gather_value,
+    _pr_scalar_positions, _pr_batched_positions, _CellArray
 
 function EnzymeRules.augmented_primal(
         config::RevConfig, rule::Const{<:_PlateSumRuleBody}, ::Type{RT},
         args::Vararg{Annotation,N}) where {RT,N}
     values = _pr_values(args)
-    body = rule.val
+    primal = rule.val(values...)
     if RT <: Const || all(a -> a isa Const, args)
-        return AugmentedReturn(needs_primal(config) ? body(values...) : nothing, nothing, nothing)
+        return AugmentedReturn(needs_primal(config) ? primal : nothing, nothing, nothing)
     end
-    r = body.rule
-    S, B = _pr_scalar_positions(r), _pr_batched_positions(r)
-    if _pr_covers(Val(S), Val(B), args) &&
-            _pr_one_pass(Val(S), Val(B), Val(overwritten(config)), args)
-        cells, buffers = _pr_cells(Val(B), args), _pr_buffer_length(Val(B), args)
-        if cells < _PR_ONE_PASS_MIN_CELLS || buffers >= cells
-            return AugmentedReturn(needs_primal(config) ? body(values...) : nothing, nothing, _PR_TWO_PASS)
-        end
-        tape = zeros(Float64, buffers + length(S))
-        swept = r.reverse(values..., 1.0, Val(true), _pr_tape_buffers(Val(B), args, tape)...)
-        _pr_store_cotangents!(tape, Base.tail(swept))
-        return AugmentedReturn(needs_primal(config) ? first(swept) : nothing, nothing, tape)
-    end
-    primal = body(values...)
     tape = _pr_tape(Val(overwritten(config)), values)
     AugmentedReturn(needs_primal(config) ? primal : nothing, nothing, tape)
 end
 
-# Whether a call can take the vector tape, on types alone: at least one batched
-# operand is a gathered `Float64` view (`view(z, g)` with an index vector) and
-# every other is constant, every active scalar is a `Float64`, and no array
-# operand may be overwritten before the reverse pass (which, in two passes,
-# reads the operands themselves).
-#
-# `_pr_gather_view` precedes the generator that calls it: a generator runs in
-# the world of its own definition, so a helper defined after it is too new
-# (Julia 1.10) or undefined (1.12 and later).
-#
-# A unit-range view (`view(u, 3:10)`, as RKPPL holds a parameter block of its
-# flat vector) repeats no entry, so it has no groups to factor and its buffer,
-# the view's parent, is at least as long as the view: such a call would always
-# take two passes at run time. Deciding that on types keeps the two-pass tape
-# rather than a vector one, which costs a call that never uses it (eight
-# schools: 0.087–0.089 µs with the vector tape, 0.074 µs without; 0.077 µs
-# before one pass).
-_pr_gather_view(::Type) = false
-_pr_gather_view(::Type{<:SubArray{Float64,1,<:AbstractVector,<:Tuple{AbstractVector{<:Integer}}}}) = true
-_pr_gather_view(::Type{<:SubArray{Float64,1,<:AbstractVector,<:Tuple{AbstractUnitRange{<:Integer}}}}) = false
+# The one-pass tape is one `Vector{Float64}`: each gathered operand's buffer,
+# then the scalar operands' unit-seed cotangents. It is a heap array already,
+# so Enzyme keeps it without boxing a tape struct (a struct holding the buffers
+# cost each eight-schools plate a 64 B box).
+function EnzymeRules.augmented_primal(
+        config::RevConfig, rule::Const{<:_PlateSumRuleOnePass}, ::Type{RT},
+        args::Vararg{Annotation,N}) where {RT,N}
+    values = _pr_values(args)
+    r = rule.val.rule
+    S, B = _pr_scalar_positions(r), _pr_batched_positions(r)
+    if !(RT <: Const) && _pr_covers(Val(S), Val(B), args) &&
+            _pr_one_pass(Val(S), Val(B), Val(overwritten(config)), args)
+        tape = zeros(Float64, _pr_buffer_length(Val(B), args) + length(S))
+        swept = r.reverse(values..., 1.0, Val(true), _pr_tape_buffers(Val(B), args, tape)...)
+        _pr_store_cotangents!(tape, Base.tail(swept))
+        return AugmentedReturn(needs_primal(config) ? first(swept) : nothing, nothing, tape)
+    end
+    primal = rule.val(values...)
+    if RT <: Const || all(a -> a isa Const, args)
+        return AugmentedReturn(needs_primal(config) ? primal : nothing, nothing, nothing)
+    end
+    tape = _pr_tape(Val(overwritten(config)), values)
+    AugmentedReturn(needs_primal(config) ? primal : nothing, nothing, tape)
+end
+
+# Whether a one-pass call can take the vector tape, on types alone: at least
+# one batched operand is a gathered `Float64` view (`_pr_gather_value`) and every
+# other is constant, every active scalar is a `Float64`, and no array operand
+# may be overwritten before the reverse pass (which, in two passes, reads the
+# operands themselves).
 @generated function _pr_one_pass(::Val{S}, ::Val{B}, ::Val{O}, args::Tuple) where {S,B,O}
     gathered = false
     for b in B
         T = args.parameters[b]
         T <: Const && continue
-        T <: Union{Duplicated,DuplicatedNoNeed} && _pr_gather_view(T.parameters[1]) || return :(false)
+        T <: Union{Duplicated,DuplicatedNoNeed} && _pr_gather_value(T.parameters[1]) || return :(false)
         gathered = true
     end
     gathered || return :(false)
@@ -716,14 +700,6 @@ _pr_gather_view(::Type{<:SubArray{Float64,1,<:AbstractVector,<:Tuple{AbstractUni
     :(true)
 end
 
-# The cells of the plate: a gathered operand's length.
-@generated function _pr_cells(::Val{B}, args::Tuple) where {B}
-    for b in B
-        args.parameters[b] <: Union{Duplicated,DuplicatedNoNeed} &&
-            return :(length(getfield(args, $b).val))
-    end
-    :(0)
-end
 # The buffers' total length: each gathered operand's parent.
 @generated function _pr_buffer_length(::Val{B}, args::Tuple) where {B}
     terms = Any[:(length(parent(getfield(args, $b).dval))) for b in B
@@ -896,8 +872,8 @@ function _pr_ordinary_reverse(program::F, ȳ, tape, args::Tuple) where {F}
 end
 
 function EnzymeRules.reverse(
-        config::RevConfig, rule::Const{<:_PlateSumRuleBody}, dret, tape,
-        args::Vararg{Annotation,N}) where {N}
+        config::RevConfig, rule::Const{<:Union{_PlateSumRuleBody,_PlateSumRuleOnePass}},
+        dret, tape, args::Vararg{Annotation,N}) where {N}
     r = rule.val.rule
     S = _pr_scalar_positions(r)
     B = _pr_batched_positions(r)
@@ -937,18 +913,11 @@ function EnzymeRules.reverse(
 end
 
 # The reverse pass of a call with a vector tape (width 1, by `_pr_one_pass`):
-# under one pass only the seed's scaling of what the augmented primal computed;
-# for a plate below the threshold (the empty tape) the sweep, as two passes do.
-# `r::R`: Julia does not otherwise specialize on a `Function` it only reads
-# fields of, and the sweep's call would dispatch dynamically.
+# only the seed's scaling of what the augmented primal computed. `r::R`: Julia
+# does not otherwise specialize on a `Function` it only reads fields of.
 function _pr_vector_tape_reverse(r::R, ::Val{S}, ::Val{B}, dret, tape::Vector{Float64},
                                  args::Tuple) where {R,S,B}
     ȳ = dret isa Active ? dret.val : dret
-    if isempty(tape)
-        shadows = _pr_shadows(Val(B), args, Val(1), 1)
-        cot = Base.tail(r.reverse(_pr_values(args)..., ȳ, Val(false), shadows...))
-        return _pr_reverse_return(Val(S), args, cot, Val(B), shadows)
-    end
     shadows = _pr_scaled_shadows(Val(B), args, _pr_tape_buffers(Val(B), args, tape), ȳ)
     _pr_reverse_return(Val(S), args, _pr_tape_cotangents(Val(length(S)), tape, ȳ), Val(B), shadows)
 end

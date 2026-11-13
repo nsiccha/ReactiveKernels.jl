@@ -1870,9 +1870,54 @@ end
 struct _PlateSumRuleBody{S,B,R} <: Function
     rule::R
 end
-@generated function _pr_rule_target(rule::_PlateSumRule{S,B}, args::Tuple) where {S,B}
-    any(b -> args.parameters[b] <: _CellArray, B) && return :(getfield(rule, :program))
-    :(_PlateSumRuleBody{$S,$B,typeof(rule)}(rule))
+# The same call where the generated reverse takes one pass over the cells (the
+# Enzyme extension's `_pr_one_pass`): a gathered operand (`_pr_gather_value`),
+# at least `_PR_ONE_PASS_MIN_CELLS` cells, and the gathered operands' parents
+# (the one-pass buffers) shorter than the plate. It is chosen here, per call
+# from the operands' sizes, so that each target's rule has one tape type: a
+# call that takes two passes keeps the two-pass rule's empty tape. Deciding in
+# the rule instead cost every small plate with a gather its unused vector tape
+# (Seeds' identity gather `b[axes(n, 1)]`, 21 cells: 16 B and about 15 ns).
+struct _PlateSumRuleOnePass{S,B,R} <: Function
+    rule::R
+end
+# Below this many cells one pass's tape allocation outweighs the pass it saves
+# (eight schools, 8 cells: 0.070 µs in two passes, 0.102–0.118 µs in one).
+const _PR_ONE_PASS_MIN_CELLS = 128
+# Whether an operand type is a gather one pass can factor through: a `Float64`
+# view with an index vector. A unit range (`view(u, 3:10)`, as RKPPL holds a
+# parameter block of its flat vector) repeats no entry, so it has no groups to
+# factor and its parent is at least as long as the view. Defined before the
+# generators that call it, which run in the world of their own definition.
+_pr_gather_value(::Type) = false
+_pr_gather_value(::Type{<:SubArray{Float64,1,<:AbstractVector,<:Tuple{AbstractVector{<:Integer}}}}) = true
+_pr_gather_value(::Type{<:SubArray{Float64,1,<:AbstractVector,<:Tuple{AbstractUnitRange{<:Integer}}}}) = false
+# The target of a call with operands of types `types`, as an expression in
+# `rule` and `args` that `make` turns into the result (the target itself, or
+# its call): the program for a lazy cell array, else the two-pass body, or the
+# one-pass call when a gathered operand's sizes allow.
+function _pr_target_expr(S, B, types, make)
+    any(b -> types[b] <: _CellArray, B) && return make(:(getfield(rule, :program)))
+    body = make(:(_PlateSumRuleBody{$S,$B,typeof(rule)}(rule)))
+    gathered = [b for b in B if _pr_gather_value(types[b])]
+    isempty(gathered) && return body
+    buffers = Expr(:call, :+, (:(length(parent(getfield(args, $b)))) for b in gathered)...)
+    quote
+        cells = length(getfield(args, $(first(gathered))))
+        if cells >= _PR_ONE_PASS_MIN_CELLS && $buffers < cells
+            $(make(:(_PlateSumRuleOnePass{$S,$B,typeof(rule)}(rule))))
+        else
+            $body
+        end
+    end
+end
+@generated _pr_rule_target(rule::_PlateSumRule{S,B}, args::Tuple) where {S,B} =
+    _pr_target_expr(S, B, args.parameters, identity)
+# The call itself, made in each branch: a target chosen by size and then called
+# would be a union of the two wrappers, boxed in the primal.
+@generated function _pr_rule_call(rule::_PlateSumRule{S,B}, args::Tuple) where {S,B}
+    operands = Any[:(getfield(args, $i)) for i in 1:length(args.parameters)]
+    _pr_target_expr(S, B, args.parameters, target -> Expr(:call, target, operands...))
 end
 # One method per operand count, each operand's type a parameter of its own:
 # Julia does not otherwise specialize on a `Function` operand it only passes on
@@ -1883,8 +1928,10 @@ for count in 0:_PLATE_CALL_MAX_ARGUMENTS
     local types = Any[Symbol("Argument", index) for index in 1:count]
     local typed = Any[:($a::$T) for (a, T) in zip(arguments, types)]
     @eval @inline (rule::_PlateSumRule)($(typed...)) where {$(types...)} =
-        _pr_rule_target(rule, ($(arguments...),))($(arguments...))
+        _pr_rule_call(rule, ($(arguments...),))
     @eval @inline (call::_PlateSumRuleBody)($(typed...)) where {$(types...)} =
+        getfield(getfield(call, :rule), :program)($(arguments...))
+    @eval @inline (call::_PlateSumRuleOnePass)($(typed...)) where {$(types...)} =
         getfield(getfield(call, :rule), :program)($(arguments...))
 end
 _pr_scalar_positions(::_PlateSumRule{S}) where {S} = S
