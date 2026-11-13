@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.10
+
+- Add guarded density adapters and authored constructor checks for discrete
+  Distributions mappings in ReactiveKernelsPPL. The checks translate to JAX
+  from the same source used by native execution.
+- Poisson's shared observation port accepts real values. Its density returns
+  `-Inf` for nonintegers and supports integer-valued observations beyond the
+  machine integer range. CDF endpoints include counts up to `floor(observed)`
+  and handle infinite bounds and NaN explicitly.
+
 ## 0.1.9
 
 - The Student-t log kernel declares its form at `log|z|` to ReactiveKernels'

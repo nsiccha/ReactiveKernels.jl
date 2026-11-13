@@ -16,6 +16,15 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.174
+
+- `sampling_distribution_graph` maps `Categorical`, `Poisson`, `Binomial`
+  and `Bernoulli` constructors to owned density objects. Constructor defaults
+  and checks remain in the graph; real observations outside integer support
+  return `-Inf`. The mappings compose in native programs and JAX emission,
+  sharing the existing count arithmetic and binding data-only normalizers.
+  Requires ReactiveKernelsDistributionKernels 0.1.10.
+
 ## 0.1.173
 
 - Adaptive affine cells accept `Real` constants for `location` and `log_scale`,
