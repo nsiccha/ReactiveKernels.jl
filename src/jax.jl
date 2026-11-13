@@ -3351,7 +3351,7 @@ function _jax_stable_rewrite(ctx::_JaxContext, p::Plan, view, operands, inputs; 
     end
     alone || !isempty(definitions) || return nothing
     ast = Expr(:->, Expr(:tuple, params...), Expr(:block, view.expr))
-    rewritten = _stable_rewrites(ast, (), definitions)
+    rewritten = _stable_rewrites(ast, (), definitions; parts = false)
     rewritten === ast && return nothing
     body = rewritten.args[2]
     body = length(body.args) == 1 ? only(body.args) : body

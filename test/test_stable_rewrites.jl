@@ -510,4 +510,145 @@ end
     @test RK._rk_pow_of(exp, A, Val(2)) == exp(A)^2
 end
 
+# A kernel of a log-magnitude at an exponential (snag
+# `measured-the-rem-97a93f3f`): a half-Student prior on positive values
+# `exp.(eta)` reads `eta` and computes its `log(nu)` and `log(scale)` once.
+const student_t = DistributionKernelSources.student_t
+const standard_student_t = DistributionKernelSources.standard_student_t
+const student_log_kernel = DistributionKernelSources._student_log_kernel
+
+@kernel stable_half_student(eta::Vector{Float64}, nu::Float64, location::Float64,
+                            scale::Float64) = begin
+    lp = plate(eta) do e
+        student_t(nu, location, scale).logpdf(exp(e))
+    end
+    total = sum(lp)
+    return total
+end
+@kernel stable_student_at_exp(u::Float64, nu::Float64) = begin
+    total = standard_student_t(nu).logpdf(exp(u))
+    return total
+end
+# Each cell's own `nu`: no parameter part can run before the cells.
+@kernel stable_half_student_cell_nu(eta::Vector{Float64}, nus::Vector{Float64}) = begin
+    lp = plate(eta, nus) do e, nu
+        student_t(nu, 0.0, 1.0).logpdf(exp(e))
+    end
+    total = sum(lp)
+    return total
+end
+@kernel stable_student_dotted(eta::Vector{Float64}, nu::Float64) = begin
+    lp = student_log_kernel.(nu, exp.(eta))
+    total = sum(lp)
+    return total
+end
+
+# d/de of the kernel at z = exp(e) / s, in BigFloat.
+_half_student_slope(e, nu, s) =
+    (z2 = exp(2big(e)) / big(s)^2; -(big(nu) + 1) * z2 / (big(nu) + z2))
+function _eta_gradient(k, eta, rest...)
+    d = zero(eta)
+    Enzyme.autodiff(Enzyme.Reverse, Enzyme.Const(k), Enzyme.Active,
+                    Enzyme.Duplicated(copy(eta), d), map(Enzyme.Const, rest)...)
+    d
+end
+
+@testset "a Student-t kernel at an exponential reads its logarithm" begin
+    k = prepare(stable_half_student)
+    literal = prepare(stable_half_student; simplify = false)
+    code = _code(k)
+    @test occursin("_rk_at_exp_std(", code) && occursin("#stable_scale#", code)
+    @test !occursin("_student_log_kernel(", code)
+    mid = [-1.0, 0.0, 0.5, 2.0]
+    for nu in (1.0, 4.0, Inf), (location, scale) in ((0.0, 1.0), (0.0, 2.5), (0.7, 1.0))
+        args = (nu, location, scale)
+        @test k(mid, args...) ≈ literal(mid, args...) rtol = 1e-13
+        @test _eta_gradient(k, mid, args...) ≈ _eta_gradient(literal, mid, args...) rtol = 1e-12
+    end
+    # Far tails: every derivative is the stable one, to rounding.
+    eta = [-700.0, -300.0, -20.0, 0.0, 20.0, 300.0, 700.0]
+    for nu in (1.0, 4.0), scale in (1.0, 2.5)
+        g = _eta_gradient(k, eta, nu, 0.0, scale)
+        @test all(i -> _close(g[i], _half_student_slope(eta[i], nu, scale); atol = 1e-290),
+                  eachindex(eta))
+    end
+    # Beyond exp's range the rewritten kernel is finite, the literal is not.
+    k = prepare(stable_student_at_exp)
+    literal = prepare(stable_student_at_exp; simplify = false)
+    @test occursin("_rk_at_exp1(", _code(k))
+    for nu in (1.0, 3.0)
+        @test isfinite(k(800.0, nu)) && literal(800.0, nu) == -Inf
+        @test _close(_reverse(k, 800.0, nu)[1], _half_student_slope(800.0, nu, 1.0))
+        @test isnan(_reverse(literal, 800.0, nu)[1])
+        for u in (-800.0, -20.0, 0.3, 20.0, 400.0)
+            @test k(u, nu) ≈ literal(u, nu) rtol = 1e-14
+        end
+    end
+    @test k(0.3, Inf) ≈ literal(0.3, Inf) rtol = 1e-14
+    # A negative nu raises the kernel's own error.
+    @test_throws DomainError k(0.3, -1.0)
+    @test_throws DomainError prepare(stable_half_student)(mid, -1.0, 0.0, 1.0)
+    # Per-cell parameters: the literal kernel, whose own work costs less there.
+    k = prepare(stable_half_student_cell_nu)
+    @test !occursin("_rk_at_exp", _code(k))
+    @test k(mid, [1.0, 2.0, 3.0, 4.0]) ≈
+          prepare(stable_half_student_cell_nu; simplify = false)(mid, [1.0, 2.0, 3.0, 4.0]) rtol = 1e-13
+    # A dotted call computes its part once.
+    k = prepare(stable_student_dotted)
+    literal = prepare(stable_student_dotted; simplify = false)
+    @test occursin("_rk_at_exp_part", _code(k))
+    for nu in (1.0, 4.0)
+        @test k(mid, nu) ≈ literal(mid, nu) rtol = 1e-13
+        @test _eta_gradient(k, mid, nu) ≈ _eta_gradient(literal, mid, nu) rtol = 1e-12
+    end
+end
+
+@testset "log-magnitude helpers: the literal unless the form applies" begin
+    f = student_log_kernel
+    @test RK._rk_at_exp_std1(f, exp, 0.3, 0.0, 2.0, 3.0) ≈ f(3.0, exp(0.3) / 2) rtol = 1e-15
+    @test RK._rk_at_exp_std1(f, exp, 0.3, 0.5, 2.0, 3.0) === f(3.0, (exp(0.3) - 0.5) / 2)
+    @test RK._rk_at_exp1(f, exp, 0.5f0, 3.0f0) isa Float32
+    @test RK._rk_at_exp_part(f, exp, [1.0, 2.0]) === nothing
+    p = RK._rk_at_exp_std_part(f, exp, 0.0, 1.0, -1.0)
+    @test !p.ok
+    @test_throws DomainError RK._rk_at_exp_std(f, exp, 0.3, 0.0, 1.0, p, -1.0)
+    @test RK._rk_at_exp_std(f, exp, 0.3, 0.0, 1.0, nothing, 2.0) === f(2.0, exp(0.3) / 1.0)
+end
+
+# Per-cell definitions: a name each of two loops assigns once in its cell is
+# that cell's definition; one a cell reads before assigning it is carried
+# from the previous cell and never is.
+@testset "a plate cell's own definitions" begin
+    cells(body) = Expr(:for, Expr(:(=), :i, Expr(:call, GlobalRef(RK, :_plate_cells),
+        Expr(:call, GlobalRef(Base, :CartesianIndices), :ax))), body)
+    own = quote
+        y = x[i]
+        s = exp(y)
+        t = t + log(s)
+    end
+    ast = Expr(:->, Expr(:tuple, :x, :ax),
+               Expr(:block, :(t = 0.0), cells(own), cells(copy(own)), :t))
+    @test count("_rk_log_of", string(RK._stable_rewrites(ast, ()))) == 2
+    carried = quote
+        a = exp(b)
+        b = x[i]
+        t = t + log(a)
+    end
+    ast = Expr(:->, Expr(:tuple, :x, :ax),
+               Expr(:block, :(t = 0.0), :(b = 0.0), cells(carried), :t))
+    @test !occursin("_rk_log_of", string(RK._stable_rewrites(ast, ())))
+    # A loop that is not a plate has no prelude: nothing is hoisted out of it,
+    # literal operands included.
+    ast = :((y, n) -> begin
+        t = 0.0
+        for k in 1:n
+            t = t + y / exp(2.0) + student_log_kernel(3.0, exp(1.5))
+        end
+        t
+    end)
+    rewritten = RK._stable_rewrites(ast, ())
+    @test !occursin("#stable_scale#", string(rewritten))
+    @test eval(rewritten)(1.0, 3) ≈ 3 * (exp(-2.0) + student_log_kernel(3.0, exp(1.5)))
+end
+
 end # module

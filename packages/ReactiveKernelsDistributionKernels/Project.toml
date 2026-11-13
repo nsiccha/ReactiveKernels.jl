@@ -1,7 +1,7 @@
 name = "ReactiveKernelsDistributionKernels"
 uuid = "4b169cd9-fc12-43fd-ba39-43e54ed8db7a"
 authors = ["Nikolas Siccha <nikolassiccha@gmail.com>"]
-version = "0.1.8"
+version = "0.1.9"
 
 [deps]
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
@@ -14,7 +14,7 @@ SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
 DifferentiationInterface = "0.7"
 Enzyme = "0.13"
 LogExpFunctions = "0.3, 1.0.2"
-ReactiveKernels = "0.1.202"
+ReactiveKernels = "0.1.216"
 SpecialFunctions = "2"
 julia = "1.10"
 
