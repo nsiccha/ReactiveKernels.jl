@@ -16,6 +16,20 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.168
+
+- `SMCOptions(cloud_kernels=J)` fits each stage's NUTS kernels to the stage
+  target's weighted cloud before moving it: a diagonal Gaussian mixture with at
+  most `J` components (count by BIC) gives each component its own diagonal
+  scales and a step size tuned on discarded trial transitions. Each move picks a
+  component from the responsibilities at the particle and accepts with
+  probability `min(1, r_j(x')/r_j(x))`, so every move keeps the stage target
+  invariant. Particles in different modes, such as relabelled mixture
+  components, no longer share one pilot chain's metric. Default `0` keeps the
+  frozen kernels and the random stream unchanged. Stage histories record the
+  fit, step sizes, `tuning_evaluations` and `selection_rejections`.
+  `tune_smc` and `initialize_filter_smc` refuse options with `cloud_kernels > 0`.
+
 ## 0.1.167
 
 - `prepare_sampler(...; nonallocating = :auto)` keeps buffer reuse when
