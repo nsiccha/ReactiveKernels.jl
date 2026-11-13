@@ -415,8 +415,9 @@ end
     @testset "logit HAVE stays the stable log-sum-exp form (saturating tails)" begin
         for logit in (-30.0, -20.0, -1.3, 0.0, 0.7, 20.0, 30.0), observed in (true, false)
             reference = observed ? -log1pexp(-logit) : -log1pexp(logit)
-            # Bit-identical: the logit route is unchanged by the direct-p fix.
-            @test logp_at((:observed, :logit), observed, logit) === reference
+            # The owned softplus shares its exponential with its derivative;
+            # its equivalent stable arithmetic can differ by a rounding bit.
+            @test logp_at((:observed, :logit), observed, logit) ≈ reference rtol=2eps(Float64)
         end
     end
 
@@ -747,6 +748,7 @@ include("test_zero_inflated_binomial_logit_zi.jl")
 end
 
 include("test_glm.jl")
+include("test_bernoulli_shared_softplus.jl")
 include("test_enzyme_rules.jl")
 include("test_rk_beta_inc.jl")
 include("test_logtails.jl")

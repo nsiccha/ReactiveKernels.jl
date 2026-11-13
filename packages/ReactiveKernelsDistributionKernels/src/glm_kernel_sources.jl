@@ -45,7 +45,8 @@
 # data-only normalizer must stay a named, foldable temp).
 
 const BERNOULLI_LOGIT_GLM_KERNEL_SOURCE = raw"""
-using LogExpFunctions: logistic as _rk_logistic, log1pexp
+using LogExpFunctions: logistic as _rk_logistic
+using ReactiveKernels: rk_log1pexp
 
 @kernel bernoulli_logit_glm(
         X::Matrix{Float64}, beta::Vector{Float64}) = begin
@@ -67,10 +68,10 @@ using LogExpFunctions: logistic as _rk_logistic, log1pexp
     # Signed-margin Bernoulli, the scalar `bernoulli(; logit)` object's
     # form: -log1pexp(-s*eta) with s = 2y - 1, one log1pexp per cell.
     # Exact in both tails; -Inf only where the probability is 0 (eta
-    # infinite against y), and log1pexp's lazy branches keep the
-    # gradient finite at every eta.
+    # infinite against y). The owned softplus shares its stable exponential
+    # between value and partial without evaluating an overflowing tail.
     pointwise(y::Vector{Int})::Vector{Float64} =
-        0.0 .- log1pexp.((1 .- 2 .* y) .* eta)
+        0.0 .- rk_log1pexp.((1 .- 2 .* y) .* eta)
     # dℓ/dη per cell, Stan's theta_derivative: s*em/(em+1) interior,
     # s*em / s past the em-magnitude cutoffs exp(-+20). Fully nested
     # (even scalar temps drop edges here — see NOTE).
