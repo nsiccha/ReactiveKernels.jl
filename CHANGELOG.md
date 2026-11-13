@@ -16,6 +16,27 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.218
+
+- The opt-in generated summed-plate reverse (`with_plate_reverse`) is faster.
+  Values and gradients are unchanged, apart from rounding.
+  - A cell loop's invariant factors (the total's adjoint, literal partials,
+    partials that read only shared values such as `1/σ`) apply once after the
+    loop instead of in every cell.
+  - Operands that span the plate are read directly rather than through
+    broadcast extrusion.
+  - Against 0.1.210's rule, opted-in gradients are 1.35–1.55× faster on a
+    random-intercept Normal regression (2,000 and 100,000 rows) and up to
+    1.2× faster on a fixed-effects one. They are now 1.08–1.28× faster than the
+    default preparation on those models; 0.1.210's rule was 0.8× the default
+    on the random-intercept one (Julia 1.10.12 and 1.13.1, Enzyme dogfood).
+  - The default preparation is still faster on the PosteriorDB ports measured
+    (the rule at 0.3–0.98× the default on Julia 1.13.1), and on small plates.
+  - With registered Enzyme 0.13.219, the rule's allocating program
+    (`nonallocating = false`) can raise `EnzymeMutabilityException` at an
+    `.innerparm` store (reactivekernels-use §7aq); Enzyme dogfood
+    differentiates it.
+
 ## 0.1.217
 
 - `jax_source`: a `Bool` array index (`BitVector`, `Vector{Bool}`) selects
