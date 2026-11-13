@@ -16,6 +16,19 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.219
+
+- A non-allocating program (`prepare_nonallocating`, and so ReactiveKernelsPPL's
+  default sampler) keeps the tables of indexed work that nested plates reuse
+  across an enclosing plate's cells (0.1.203) in buffers it owns, typed from
+  the program's static types, and refills them on each call. Before, each
+  density call allocated every table, and each gradient call every table and
+  its derivative: the PosteriorDB capture model Mt's sampler took 6
+  allocations (320 B) per density and 10 (608 B) per gradient, where it took
+  2 (64 B) and 2 (96 B) without the tables; it takes 2 and 2 again (snag
+  posteriordb-mt-c-01c1a87b). An ordinary prepared kernel still allocates its
+  tables on each call.
+
 ## 0.1.218
 
 - The opt-in generated summed-plate reverse (`with_plate_reverse`) is faster.

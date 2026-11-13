@@ -86,6 +86,19 @@ function _indexed_map(formula, array)
     result
 end
 
+# A non-allocating program's table (`_nonallocating_program`) refills the
+# buffer its lane slot keeps, as a materialized plate output does
+# (`_lane_acquire`): a buffer of the table's element type and axes is
+# overwritten in full, and any other allocates afresh and is kept.
+function _indexed_map(formula, array, lane)
+    result = _lane_acquire(lane, eltype(array), axes(array), _indexed_table, array)
+    @inbounds for i in eachindex(array)
+        result[i] = _indexed_apply(formula, array[i])
+    end
+    result
+end
+_indexed_table(array) = Array{eltype(array)}(undef, size(array))
+
 function _indexed_formula(source, argument)
     source === argument && return :input
     source isa Expr && source.head === :call && length(source.args) == 2 || return nothing
@@ -282,7 +295,8 @@ function _indexed_coordinate_varies(x, outer, inner, definitions, inside,
                                         copy(seen)), x.args)
 end
 
-function _indexed_loop(loop, available, definitions, statements, recipes, data_guard)
+function _indexed_loop(loop, available, definitions, statements, recipes, data_guard,
+                       lanes)
     loop.head === :for && length(loop.args) == 2 || return nothing
     binding = loop.args[1]
     binding isa Expr && binding.head === :(=) && length(binding.args) == 2 || return nothing
@@ -325,8 +339,15 @@ function _indexed_loop(loop, available, definitions, statements, recipes, data_g
             flags = Expr(:call, GlobalRef(Base, :Val),
                 QuoteNode(_indexed_flags(root, definitions, recipes)))
             push!(tests, Expr(:call, GlobalRef(@__MODULE__, :_indexed_safe), tag, root, flags))
-            push!(prefix.args, Expr(:(=), table,
-                Expr(:call, GlobalRef(@__MODULE__, :_indexed_map), tag, root)))
+            build = Expr(:call, GlobalRef(@__MODULE__, :_indexed_map), tag, root)
+            if lanes !== nothing
+                # The program binds this name to a lane slot it owns, typed
+                # from the root's static type.
+                lane = gensym(:indexed_lane)
+                push!(lanes, lane => root)
+                push!(build.args, lane)
+            end
+            push!(prefix.args, Expr(:(=), table, build))
             table
         end
         # The original scalar gather proves the corresponding table access
@@ -417,7 +438,11 @@ function _indexed_loop(loop, available, definitions, statements, recipes, data_g
     Expr(:if, guard, prefix, loop)
 end
 
-function _lower_indexed_invariants(ast::Expr, recipes)
+# `lanes`, when a vector, collects one free name per table, paired with the
+# table's root; the caller binds each name to a lane slot it keeps across
+# calls (`_nonallocating_program`). With `nothing`, every call allocates its
+# tables.
+function _lower_indexed_invariants(ast::Expr, recipes; lanes = nothing)
     any(r -> r.effectful, recipes) && return ast
     definitions = Dict{Symbol,Any}()
     statements = Dict{Symbol,Expr}()
@@ -437,7 +462,8 @@ function _lower_indexed_invariants(ast::Expr, recipes)
         ex isa Expr || return ex
         ex.head in (:quote, :inert) && return ex
         if ex.head === :for
-            replacement = _indexed_loop(ex, available, definitions, statements, recipes, data_guard)
+            replacement = _indexed_loop(ex, available, definitions, statements, recipes,
+                                        data_guard, lanes)
             replacement === nothing || return replacement
         end
         locals = copy(available)
