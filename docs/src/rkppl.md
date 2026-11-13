@@ -111,10 +111,12 @@ keeps its ICAR density and any soft sum constraint.
 Every selected affine quantity must remain invariant under the selected maps.
 A location that reads another selected latent needs a coupled transform;
 WarmupHMC's independent indexed maps do not supply that transport. The adapter
-checks this graph dependency before sampling. With WarmupHMC 0.2.19 or later,
-each named graph quantity is evaluated once per latent block and its result
-is shared across coordinates. Scalar reductions and array-valued locations
-therefore avoid repeating graph work for each coordinate. Ordinary AD
-differentiates these graph queries.
+checks this graph dependency before sampling. RKPPL 0.1.174 with WarmupHMC
+0.2.21 or later prepares one joint endpoint kernel, sharing common graph work
+across selected cells and their location/log-scale roles. It runs once per
+vector on a map or inverse, and shares results across scoring candidates.
+Cells are ordered by packed coordinate, regardless of keyword order. Identity
+maps skip endpoint evaluation. Ordinary AD differentiates the joint graph;
+arrays remain read-only, without concatenation into a new endpoint buffer.
 
 The [Eight-schools example](eight-schools.md) checks the complete density decomposition and its coordinate transformation.

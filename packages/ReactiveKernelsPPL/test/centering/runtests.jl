@@ -36,7 +36,7 @@ end
 function map_for(built, plan, cells; u0 = nothing)
     p = ReactiveKernelsPPL._centering_cells(built, plan, cells;
         u0, on_error = nothing)
-    EXT._centering_reparametrization(p.kernels, p.records), p
+    EXT._centering_reparametrization(p.kernel, p.records), p
 end
 
 function finite_gradient(f, x)
@@ -95,7 +95,7 @@ end
     @test LDP.logdensity_and_gradient(rp, u) == LDP.logdensity_and_gradient(problem, u)
     ir, p = map_for(built, plan, cells)
     @test isconcretetype(eltype(ir.pairs))
-    @test length(p.kernels) == 3
+    @test length(p.kernel(u).values) == 3
     @test @inferred(last(first(ir.pairs)).args[1](u)) isa Float64
     column = view(hcat(u, 2u), :, 1)
     @test @inferred(last(first(ir.pairs)).args[1](column)) ==
@@ -161,7 +161,7 @@ end
     @test length(ir2.pairs) == 23
     # Generated local names differ across preparations. Check body/control-flow
     # size without rewriting the displayed code, and exercise the new binding.
-    @test map(emission_shape, p1.kernels) == map(emission_shape, p2.kernels)
+    @test emission_shape(p1.kernel) == emission_shape(p2.kernel)
     mu_index = only(e.offset for e in large.layout.entries if e.name === :mu)
     @test last(first(ir2.pairs)).args[1](large.u) ≈ large.u[mu_index] - 0.3
     @test last(last(ir2.pairs)).args[1](large.u) ≈ large.u[mu_index] + 0.4
@@ -218,19 +218,19 @@ end
     other = (z = (location = 1.3, log_scale = -0.7, source = 0.5),)
     ir2, p2 = map_for(built, plan, other; u0 = u)
     @test typeof(ir1) == typeof(ir2)
-    @test typeof(p1.kernels) == typeof(p2.kernels)
+    @test typeof(p1.kernel) == typeof(p2.kernel)
     @test last(first(ir1.pairs)).args[1](u) == 0.0
     @test last(first(ir2.pairs)).args[1](u) == 1.3
     equal_constants = (z = (location = 0.0, log_scale = 0.0, source = 0.5),)
     ir_equal, p_equal = map_for(built, plan, equal_constants; u0 = u)
     @test typeof(ir_equal) == typeof(ir1)
-    @test typeof(p_equal.kernels) == typeof(p1.kernels)
+    @test typeof(p_equal.kernel) == typeof(p1.kernel)
     for n in (0, 23)
         resized = setup(n; built)
         ir, p = map_for(resized.built, resized.plan, cells; u0 = resized.u)
         @test typeof(ir) == typeof(ir1)
         @test length(ir.pairs) == n
-        @test typeof(p.kernels) == typeof(p1.kernels)
+        @test typeof(p.kernel) == typeof(p1.kernel)
     end
 end
 
@@ -280,7 +280,7 @@ end
     # Maps and reverse AD must only read it, and a later evaluation must not
     # change an earlier result or the caller's input/data.
     inputs = (copy(u), copy(offsets), copy(scales))
-    endpoints = map(k -> k(u), prepared.kernels)
+    endpoints = prepared.kernel(u).values
     snapshots = map(copy, endpoints)
     problem = prepare_sampler(built, plan, u; backend = BACKEND)
     rp = adaptive_centering_problem(built, plan, problem, BACKEND; cells, u0 = u)
@@ -356,7 +356,57 @@ struct CountedKernel{K}
 end
 (c::CountedKernel)(x) = (c.calls[] += 1; c.kernel(x))
 
-@testset "shared graph reductions run once per block" begin
+@testset "one joint evaluation across cells and affine roles" begin
+    s = setup()
+    # Reverse keyword order and reuse the same endpoint at both positions.
+    # Both cells depend on unselected mu; the selected coordinates are invariant.
+    cells = (t = (location = :t_location, log_scale = :t_location, source = 0.4),
+        z = (location = :z_location, log_scale = :t_location, source = 0.7))
+    ir, p = map_for(s.built, s.plan, cells; u0 = s.u)
+    @test issorted(first.(ir.pairs))
+    @test length(p.kernel(s.u).values) == 2
+    counted = CountedKernel(p.kernel, Ref(0))
+    observed = EXT._centering_reparametrization(counted, p.records)
+    jac, mapped = WarmupHMC.with_logabsdet_jacobian!(copy(s.u), observed, s.u)
+    @test counted.calls[] == 1
+    counted.calls[] = 0
+    ijac, back = WarmupHMC.with_logabsdet_jacobian!(copy(mapped),
+        WarmupHMC.InverseFunctions.inverse(observed), mapped)
+    @test counted.calls[] == 1
+    @test back ≈ s.u
+    @test ijac ≈ -jac
+
+    rp = WarmupHMC.ReparametrizedProblem(ir, s.problem, BACKEND)
+    for point in (s.u, s.u .+ 0.03, view(hcat(s.u, s.u .+ 0.03), :, 2))
+        value, gradient = LDP.logdensity_and_gradient(rp, point)
+        @test value ≈ LDP.logdensity(rp, point)
+        @test gradient ≈ finite_gradient(x -> LDP.logdensity(rp, x), point) rtol = 2e-7 atol = 2e-7
+    end
+
+    # Observe the public retrospective scorer with primal counters only.
+    # Its supplied gradients came from the unmodified ordinary-AD target.
+    positions = hcat(s.u, s.u .+ 0.01, s.u .- 0.02, s.u .+ 0.03)
+    gradients = hcat((last(LDP.logdensity_and_gradient(rp, x))
+        for x in eachcol(positions))...)
+    counted.calls[] = 0
+    scored = WarmupHMC.candidate_scoring_losses(
+        WarmupHMC.ReparametrizedProblem(observed, s.problem, BACKEND), positions, gradients)
+    @test counted.calls[] == size(positions, 2)
+    reference = WarmupHMC.candidate_scoring_losses(rp, positions, gradients)
+    @test isequal(scored, reference)
+
+    identity_records = map(c -> merge(c, (; target = 0.7, source = 0.7)), p.records)
+    identity = EXT._centering_reparametrization(counted, identity_records)
+    counted.calls[] = 0
+    for mapping in (identity, WarmupHMC.InverseFunctions.inverse(identity))
+        j, point = WarmupHMC.with_logabsdet_jacobian!(copy(s.u), mapping, s.u)
+        @test point == s.u
+        @test j == 0.0
+    end
+    @test counted.calls[] == 0
+end
+
+@testset "shared graph reductions run once per vector" begin
     shapes = []
     types = []
     built = nothing
@@ -370,16 +420,16 @@ end
             cells = (z = (location = node, log_scale = :log_scale, source = 0.7),)
             ir, p = map_for(s.built, s.plan, cells; u0 = s.u)
             push!(types, typeof(ir))
-            push!(shapes, map(emission_shape, p.kernels))
+            push!(shapes, emission_shape(p.kernel))
             @test @inferred(last(first(ir.pairs)).args[1](s.u)) isa Float64
-            counted = map(k -> CountedKernel(k, Ref(0)), p.kernels)
+            counted = CountedKernel(p.kernel, Ref(0))
             observed = EXT._centering_reparametrization(counted, p.records)
             jac, mapped = WarmupHMC.with_logabsdet_jacobian!(copy(s.u), observed, s.u)
-            @test all(k -> k.calls[] == 1, counted)
-            foreach(k -> (k.calls[] = 0), counted)
+            @test counted.calls[] == 1
+            counted.calls[] = 0
             ijac, back = WarmupHMC.with_logabsdet_jacobian!(copy(mapped),
                 WarmupHMC.InverseFunctions.inverse(observed), mapped)
-            @test all(k -> k.calls[] == 1, counted)
+            @test counted.calls[] == 1
             @test back ≈ s.u
             @test ijac ≈ -jac
             function reference(x)
@@ -404,7 +454,10 @@ end
                 @test gradient ≈ finite_gradient(reference_density, s.u) rtol = 2e-7 atol = 2e-7
             end
             column = view(hcat(s.u, 2s.u), :, 1)
-            @test LDP.logdensity_and_gradient(rp, column) == (value, gradient)
+            column_value, column_gradient = LDP.logdensity_and_gradient(rp, column)
+            @test column_value == value
+            # Reverse accumulation can round differently for a column view.
+            @test column_gradient ≈ gradient rtol = 1e-13 atol = 1e-13
         end
     end
     @test types[1] == types[3]

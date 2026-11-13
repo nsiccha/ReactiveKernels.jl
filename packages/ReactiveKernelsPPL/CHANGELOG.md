@@ -16,6 +16,15 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.174
+
+- Adaptive affine cells prepare one joint endpoint kernel, sharing common
+  graph work across cells and location/log-scale roles. The indexed map orders
+  cells by packed coordinate so WarmupHMC evaluates that kernel once per map
+  or inverse, and shares its results across scoring candidates. Constants stay
+  runtime bound inputs; array endpoints remain read-only. Requires WarmupHMC
+  0.2.21, whose identity maps skip endpoint evaluation entirely.
+
 ## 0.1.173
 
 - Adaptive affine cells accept `Real` constants for `location` and `log_scale`,
