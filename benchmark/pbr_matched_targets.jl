@@ -27,6 +27,12 @@ end
 const shared_softplus = scalar_derivative_rule(softplus_graph; primal=:value,
     partials=(x=:partial,), name=:shared_softplus)
 
+@inline function softplus_primal(x)
+    positive = x >= 0
+    q = exp(ifelse(positive, -x, x))
+    ifelse(positive, x, zero(x)) + log1p(q)
+end
+
 @kernel gaussian(theta::Vector{Float64}, X::Matrix{Float64}, y::Vector{Float64}) = begin
     p = size(X, 2)
     beta = view(theta, 1:p)
@@ -54,6 +60,15 @@ end
     eta::Vector{Float64} = X * theta
     terms = plate(eta, y) do ei, yi
         yi * ei - shared_softplus(ei)
+    end
+    total::Float64 = sum(terms) - sum(abs2, theta) / 8
+    return total
+end
+
+@kernel bernoulli_shared_primal(theta::Vector{Float64}, X::Matrix{Float64}, y::Vector{Float64}) = begin
+    eta::Vector{Float64} = X * theta
+    terms = plate(eta, y) do ei, yi
+        yi * ei - softplus_primal(ei)
     end
     total::Float64 = sum(terms) - sum(abs2, theta) / 8
     return total
@@ -219,16 +234,18 @@ function run_family(family)
     println("END family=",family); flush(stdout)
 end
 
-println("PROVENANCE Julia=", VERSION, " RK=", pkgdir(RK), " PBR=", pkgdir(PBR),
-    " Enzyme=", pkgdir(Enzyme), " library=", Enzyme.Compiler.Enzyme_jll.libEnzyme_path)
-@testset "Matched RK and PBR targets" begin
-    for x in (-1000.0, -40.0, -1.0, -0.0, 0.0, 1.0, 40.0, 1000.0)
-        v, d = derivative_cut(MatchedTargets.shared_softplus, (true,), x)
-        @test v ≈ log1pexp(x)
-        @test d ≈ logistic(x)
+if abspath(PROGRAM_FILE) == @__FILE__
+    println("PROVENANCE Julia=", VERSION, " RK=", pkgdir(RK), " PBR=", pkgdir(PBR),
+        " Enzyme=", pkgdir(Enzyme), " library=", Enzyme.Compiler.Enzyme_jll.libEnzyme_path)
+    @testset "Matched RK and PBR targets" begin
+        for x in (-1000.0, -40.0, -1.0, -0.0, 0.0, 1.0, 40.0, 1000.0)
+            v, d = derivative_cut(MatchedTargets.shared_softplus, (true,), x)
+            @test v ≈ log1pexp(x)
+            @test d ≈ logistic(x)
+        end
+        for family in (isempty(ARGS) ? (:gaussian, :bernoulli) : Tuple(Symbol.(ARGS)))
+            run_family(family)
+        end
     end
-    for family in (isempty(ARGS) ? (:gaussian, :bernoulli) : Tuple(Symbol.(ARGS)))
-        run_family(family)
-    end
+    println("COMPLETE")
 end
-println("COMPLETE")
