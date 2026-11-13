@@ -16,6 +16,54 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.219
+
+- A non-allocating program (`prepare_nonallocating`, and so ReactiveKernelsPPL's
+  default sampler) keeps the tables of indexed work that nested plates reuse
+  across an enclosing plate's cells (0.1.203) in buffers it owns, typed from
+  the program's static types, and refills them on each call. Before, each
+  density call allocated every table, and each gradient call every table and
+  its derivative: the PosteriorDB capture model Mt's sampler took 6
+  allocations (320 B) per density and 10 (608 B) per gradient, where it took
+  2 (64 B) and 2 (96 B) without the tables; it takes 2 and 2 again (snag
+  posteriordb-mt-c-01c1a87b). An ordinary prepared kernel still allocates its
+  tables on each call.
+
+## 0.1.218
+
+- The opt-in generated summed-plate reverse (`with_plate_reverse`) is faster.
+  Values and gradients are unchanged, apart from rounding.
+  - A cell loop's invariant factors (the total's adjoint, literal partials,
+    partials that read only shared values such as `1/σ`) apply once after the
+    loop instead of in every cell.
+  - Operands that span the plate are read directly rather than through
+    broadcast extrusion.
+  - Against 0.1.210's rule, opted-in gradients are 1.35–1.55× faster on a
+    random-intercept Normal regression (2,000 and 100,000 rows) and up to
+    1.2× faster on a fixed-effects one. They are now 1.08–1.28× faster than the
+    default preparation on those models; 0.1.210's rule was 0.8× the default
+    on the random-intercept one (Julia 1.10.12 and 1.13.1, Enzyme dogfood).
+  - The default preparation is still faster on the PosteriorDB ports measured
+    (the rule at 0.3–0.98× the default on Julia 1.13.1), and on small plates.
+  - With registered Enzyme 0.13.219, the rule's allocating program
+    (`nonallocating = false`) can raise `EnzymeMutabilityException` at an
+    `.innerparm` store (reactivekernels-use §7aq); Enzyme dogfood
+    differentiates it.
+
+## 0.1.217
+
+- `jax_source`: a `Bool` array index (`BitVector`, `Vector{Bool}`) selects
+  the entries where it is true, as Julia's logical indexing does. Before, it
+  was shifted as one-based positions (`x[mask - 1]`), so every element read
+  the first or the last entry: `table[table[:, 2] .!= 1, 4]` in
+  `prepare_data` returned the wrong amounts and length, silently whenever the
+  shapes still agreed. The host uses NumPy boolean masks (lists keep their
+  selected entries); device code gathers at the selected positions, padded to
+  the mask's length with the count as its extent, and a masked write writes
+  only the selected entries. A same-shape mask (`A[A .> 0]`) selects in
+  column-major order. A single `Bool` index into an array raises
+  `JAXEmissionError`, as Julia refuses it.
+
 ## 0.1.216
 
 - The stable rewrites compute a symmetric law's standardized log kernel at a
