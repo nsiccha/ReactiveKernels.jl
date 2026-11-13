@@ -155,6 +155,45 @@ The completed dogfood array measurements give the same qualitative tradeoff:
 
 Julia allocation counts match the registered snapshot comparison above.
 
+## Readonly design-matrix cost
+
+`derivative_readonly_snapshot_costs.jl` compares the old retention helper and
+the installed whole-tuple snapshot in separate processes on registered Enzyme.
+Both use the same joint-staging source and an owned least-squares rule; only
+the retention helper changes. The design matrix and response are inactive
+inputs, and the gradient is with respect to the coefficient vector. Values
+and gradients agree with independent matrix formulas at lengths 0, 128, 2,048
+and 8,192. Each nonempty size has 12 alternating rule/native rounds.
+
+| Matrix shape | Old helper rule | Whole snapshot rule | Old helper bytes | Whole snapshot bytes |
+| --- | ---: | ---: | ---: | ---: |
+| 128 × 8 | 0.633 µs | 1.750 µs | 2,448 | 12,256 |
+| 2,048 × 32 | 11.406 µs | 37.900 µs | 33,712 | 574,960 |
+| 8,192 × 64 | 112.836 µs | 309.933 µs | 132,336 | 4,392,672 |
+
+These are medians from different processes, not paired version ratios. Within
+each process, the rule/native paired ratios are 0.696/0.811/0.945 for the old
+helper and 1.897/2.718/2.610 for the whole snapshot. Native-control medians are
+0.931/14.120/120.641 µs and 0.909/14.177/119.244 µs respectively.
+
+Whole copying fixes the demonstrated ownership failures but duplicates a
+readonly matrix on every evaluation. It is not ready to recommend as a
+generally efficient retention policy. A separate benchmark-only refinement is
+testing reuse of direct dense bits-array inputs when the backend's write flags
+prove they stay unchanged and the primal cannot expose mutable storage. It
+uses Julia's documented deepcopy specialization hook on an owned wrapper to
+preserve references shared between borrowed inputs and nested residuals. Its
+mutation and type checks must pass before measuring its costs.
+
+The first borrowing run passed all 239 existing snapshot checks and 11 new
+alias checks, then failed its direct audit of the owned copying hook. Base's
+integer-indexed tuple copier produced a tuple of unions for heterogeneous
+residuals. That failed run stopped before the direct/view/global mutation
+controls or timing; it provides no borrowing performance result. The revised
+prototype uses a structural tuple map, retaining each position's concrete
+type, and directly audits the owned hook for seven additional container forms.
+That revision remains under verification.
+
 ## Preparation and evidence limits
 
 The initial preparation observations shared compiler caches between arms and
@@ -202,8 +241,14 @@ controls, not that the alias arm passed correctness.
 - Installed candidate, both 722-check suites, scalar ordinary AD and dogfood
   array timings: fleet `489475552ac94380`, exit 0, 1,992 seconds;
   [matching source digests, manifests, complete logs, summaries and receipt](http://localhost:4200/code/download?path=/home/niko/.local/state/kb-agents/uploads/4699e336a84baf398a46152bd51bb33c23504be20dd17aa7c40ff3cdff1922ab.tgz).
+- Readonly matrix control versus installed snapshots: fleet `ac43ba1722ff4810`,
+  exit 0, 292 seconds;
+  [exact source hashes, both complete measurement logs, manifest, summaries and receipt](http://localhost:4200/code/download?path=/home/niko/.local/state/kb-agents/uploads/800eb06be9857547338354b14a4b6423d1c34a0bf681b22dbc93c8e464a794c6.tgz).
+- First borrowing prototype: fleet `a62b3a9dca8b4baa`, exit 1, 160 seconds,
+  250 pass / 1 owned-hook type-audit failure;
+  [exact failed source, successful checks, audit finding and terminal receipt](http://localhost:4200/code/download?path=/home/niko/.local/state/kb-agents/uploads/fddd0f69bbbe8962a91725e2ed6d8a17334d7e0a10bc336b4a0c7f88c1249313.tgz).
 
-The remaining cost comparison covers a readonly design matrix. Conservative
+The remaining ownership refinement targets readonly inputs. Conservative
 copying can duplicate readonly data and whole parents of small views; it is not
 an ownership analysis. The prototype does not account for these measured
 storage costs when selecting recipes. No general preference follows from the
