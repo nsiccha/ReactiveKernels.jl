@@ -25,7 +25,8 @@ end
 # Preserve the point-in-time values of every dense floating operand of a newly
 # deferred broadcast. Unsupported producer shapes keep their original statement.
 # This is a narrow structural prototype, not a function-effect whitelist.
-function snapshot_new_broadcasts(before, after, type_of)
+function snapshot_new_broadcasts(before, after, type_of;
+        copy_operand=(x,T) -> Expr(:call,GlobalRef(Base,:copy),x))
     original = RK._nonalloc_table_definitions(before)
     function snapshot_operand(x, statements)
         if Meta.isexpr(x,:call) && RK._cell_array_function(x.args[1]) in
@@ -37,7 +38,7 @@ function snapshot_new_broadcasts(before, after, type_of)
         T = type_of(x)
         if T isa Type && T <: Union{Array{Float32},Array{Float64}}
             name = gensym(:snapshot)
-            push!(statements,Expr(:(=),name,Expr(:call,GlobalRef(Base,:copy),x)))
+            push!(statements,Expr(:(=),name,copy_operand(x,T)))
             return name
         elseif T isa Type && isconcretetype(T) && isbitstype(T) && T <: Number
             return x
@@ -85,6 +86,21 @@ function source_statement!(prog, recipes, types, stmt)
         lhs, rhs = stmt.args
         if rhs.args[1] == GlobalRef(RK, :_cell_array_broadcast)
             return RK._nonalloc_statement!(prog, recipes, types, stmt)
+        end
+        # Stable rewriting can introduce callable-value constructors (e.g.
+        # _RwFn(exp), Val(2)) outside the fused-source decomposition grammar.
+        # The emitted expression still identifies this allocation explicitly.
+        # Use the existing materialization step and its planned concrete array
+        # type; do not leave an allocation solely because its scalar callable
+        # could not be decomposed. Its operands remain evaluated here, once.
+        if rhs.args[1] == GlobalRef(RK, :_native_broadcast_materialize) && length(rhs.args)==2
+            inferred = RK._nonalloc_expr_type(types, rhs)
+            T = inferred isa Type && isconcretetype(inferred) ? inferred : get(types,lhs,Any)
+            if T isa DataType && isconcretetype(T) && T <: Array
+                j = RK._step!(prog,RK._MaterializeStep(),RK._nonalloc_slot(T))
+                types[lhs] = T
+                return Any[Expr(:(=),lhs,RK._step_call(j,rhs.args[2]))]
+            end
         end
         ctx = RK._FusedDecomposition(RK, Dict{Symbol,Any}(s => s for s in keys(types)),
             types, Any[], Any[], Any[], length(prog.ops), prog.cache_apply)
@@ -183,6 +199,7 @@ function late(p, args...; snapshot=false)
         ex
     end
     body = RK._lower_cell_arrays_native(exposed.args[2],recipes)
+    prog = RK._StepProgram(Any[k.callables...],Any[k.caches...],k.cache_apply)
     if snapshot
         types = Dict{Symbol,Any}()
         for (port,T) in zip(ast.args[1].args[5:end],map(typeof,args))
@@ -190,13 +207,20 @@ function late(p, args...; snapshot=false)
         end
         definitions = RK._nonalloc_table_definitions(exposed.args[2])
         type_of(x) = RK._nonalloc_static_type(x,types,definitions,k.constants,k.callables)
-        body = snapshot_new_broadcasts(exposed.args[2],body,type_of)
+        # Snapshot at the original production point, with the same generic
+        # destination-passing copy used by normal storage planning. Each arm
+        # owns these slots; repeated calls can reuse their dense buffers.
+        function copy_operand(x,T)
+            j = RK._step!(prog,Base.copy,RK._nonalloc_slot(T))
+            RK._step_call(j,x)
+        end
+        body = snapshot_new_broadcasts(exposed.args[2],body,type_of;copy_operand)
     end
     restored = RK._index_run_replace(ex -> get(restore,ex,ex),Expr(ast.head,ast.args[1],body))
-    rewritten = RK._stable_rewrites(restored,(recipes...,k.callables[length(recipes)+1:end]...))
+    rewritten = RK._stable_rewrites(restored,(recipes...,prog.ops[length(recipes)+1:end]...))
     S = typeof(k).parameters[end]
     RK.NonAllocatingKernel{S}(RK.compile(RK._nonallocating_body(rewritten)),
-        k.constants,k.callables,k.caches,k.cache_apply,k.inputs,k.outputs,k.plan,rewritten)
+        k.constants,Tuple(prog.ops),Tuple(prog.caches),k.cache_apply,k.inputs,k.outputs,k.plan,rewritten)
 end
 
 # Diagnostic compiler-effects gate. An unconditional effect-free result for
