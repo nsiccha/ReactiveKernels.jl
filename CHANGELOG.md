@@ -16,6 +16,13 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.231
+
+- JAX export keeps each retained tuple-plate field's ragged lengths tied to
+  its prepared input. Flattening a projected field now drops padding and
+  supports rebinding the emitted module to different row and cell counts.
+  Empty tuple-valued plates skip indexed cell reads, as empty numeric plates do.
+
 ## 0.1.230
 
 - JAX numerical functions return typed JAX arrays for constant terms and numeric
