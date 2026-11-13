@@ -96,9 +96,10 @@ beta = [0.4, 2.1]
 
 Values and derivatives agree with the per-row plate to rounding. They are
 more accurate where the response is far from zero, where the per-row sum
-itself loses digits. A binding whose data do not fit compiles the per-row
-plate as before: fewer rows than twice the parameters per block, a non-finite
-entry, or data of another shape. The plate's own loop also still runs where
+itself loses digits. A runtime guard selects the per-row plate when the data
+do not fit: fewer rows than twice the parameters per block, a non-finite
+entry, or data of another shape. With unchanged input types, crossing this
+boundary keeps the same compiled program type. The plate's own loop also still runs where
 the factored sum is not used, for example at a scale of zero. Per-row and
 per-cell queries keep the per-row plate. So does a location that mixes a
 gathered term with a second grouping or with an ungathered live term, such

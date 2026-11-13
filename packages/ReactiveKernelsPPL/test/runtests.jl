@@ -55,6 +55,7 @@ const _PPL_TEST_FILES = (
     "test_precompiled_build.jl",
     "test_program_identity.jl",
     "test_preparation_identity.jl",
+    "test_bound_statistics_runtime.jl",
     "test_latest_native_source.jl",
     "test_surface.jl",
     "test_documentation.jl",

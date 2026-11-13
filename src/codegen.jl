@@ -733,7 +733,8 @@ _rewrite_parameter(item, names::Dict{Symbol,Any}, op_offset::Int) =
     item isa Symbol ? Expr(:kw, item, _rewrite_embedded(item, names, op_offset)) :
     _rewrite_labeled(item, names, op_offset)
 
-function _embedded_statements(ast::Expr, callargs, lhs, op_offset::Int)
+function _embedded_statements(ast::Expr, callargs, lhs, op_offset::Int;
+                              source_ids = nothing, value_ids = nothing)
     ast.head === :function || throw(ArgumentError(
         "nested preparation requires an RK-generated function expression"))
     signature, body = ast.args
@@ -768,6 +769,14 @@ function _embedded_statements(ast::Expr, callargs, lhs, op_offset::Int)
         names[local_name] = _inline_local_index(local_name) === nothing ?
             gensym(Symbol(:embedded_, local_name)) :
             _inline_shifted_local(local_name, op_offset)
+    end
+    # Retained regions belong to the caller's graph. Carry their value ids
+    # through the same renaming as their code, for downstream storage planning.
+    if source_ids !== nothing && value_ids !== nothing
+        for (name, id) in source_ids
+            renamed = get(names, name, name)
+            renamed isa Symbol && (value_ids[renamed] = id)
+        end
     end
 
     bodyargs = body.args
@@ -4734,8 +4743,7 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         # loop as it is.
         direct_reads = !parallel_cells && nested === nothing && !one &&
             !has_scheduled_groups && isempty(slotted) && isempty(table_entries) &&
-            isempty(shares) && !any(r -> r.op isa _AuthoredScanOp, inner.recipes) &&
-            !_plate_reverse_enabled()
+            isempty(shares) && !any(r -> r.op isa _AuthoredScanOp, inner.recipes)
         if reduction === nothing && !batched && direct_reads
             shared_names = _mentioned_symbols!(Set{Symbol}(), Expr(:block, declarations...))
             for name in (accumulator, pointwise_lhs, total_lhs)
@@ -5316,9 +5324,8 @@ end
 # type, buffer and total seed) and its result stay in the body, so a plate
 # whose domain is empty, such as a branch arm no row takes, calls no program.
 # A plate lowered another way (a shared branch, say) is marked whole. Once the
-# whole body is lowered, `_extract_plate_programs` turns each marked block of a
-# body with two or more of them into a call of a `_PlateProgram` (a body with
-# one keeps it inline, as before): a function over the names the block reads
+# whole body is lowered, `_extract_plate_programs` records each marked block
+# as a `_PlateProgram` (a lone program is inlined when compiled): a function over the names the block reads
 # that the body binds, with each literal `__callables__[k]` and
 # `__constants__[k]` it reads passed as an argument of its own, returning the
 # names the block binds that the rest of the body reads. A name both bind,
@@ -5334,6 +5341,13 @@ struct _PlateBlock
     axes::Union{Symbol,Nothing}   # the body's name for the plate's axes, if known
 end
 
+# Embedded plans rename their locals before plate programs are extracted.
+# These markers refer to those same locals although they are not Expr nodes.
+function _rewrite_embedded(block::_PlateBlock, names::Dict{Symbol,Any}, op_offset::Int)
+    _PlateBlock(_rewrite_embedded(block.condition, names, op_offset),
+        block.axes === nothing ? nothing : get(names, block.axes, block.axes))
+end
+
 """
     _PlateProgram(ast)
 
@@ -5346,12 +5360,23 @@ struct _PlateProgram
     # The body's name for the plate's axes when the program is the plate's cell
     # work (`_PlateBlock`), else `nothing`; see `_inline_plate_programs`.
     axes::Union{Symbol,Nothing}
+    # Retain a lone plate's boundary for later AD preparation without adding
+    # a call to its ordinary primal or ordinary reverse.
+    always_inline::Bool
 end
 _PlateProgram(ast::Expr) = _PlateProgram(ast, nothing)
+_PlateProgram(ast::Expr, axes) = _PlateProgram(ast, axes, false)
+function _rewrite_embedded(program::_PlateProgram, names::Dict{Symbol,Any}, ::Int)
+    # The function has its own scope; only its caller's axes name moves.
+    _PlateProgram(program.ast,
+        program.axes === nothing ? nothing : get(names, program.axes, program.axes),
+        program.always_inline)
+end
 Base.show(io::IO, program::_PlateProgram) = print(io, '(', program.ast, ')')
-Base.:(==)(a::_PlateProgram, b::_PlateProgram) = a.ast == b.ast && a.axes === b.axes
+Base.:(==)(a::_PlateProgram, b::_PlateProgram) =
+    a.ast == b.ast && a.axes === b.axes && a.always_inline === b.always_inline
 Base.hash(program::_PlateProgram, h::UInt) =
-    hash(program.ast, hash(program.axes, hash(_PlateProgram, h)))
+    hash(program.ast, hash(program.axes, hash(program.always_inline, hash(_PlateProgram, h))))
 # A plate program is a value: nothing changes its expression once it is built.
 # A deep copy of a body keeps the program itself, so the copy compares equal on
 # Julia 1.13, whose `Expr` comparison takes a leaf that is not an expression by
@@ -5576,23 +5601,17 @@ function _extract_plate_programs(ast::Expr)
         (_is_plate_block(node) ? push!(blocks, node) : foreach(collect_blocks, node.args))
     collect_blocks(ast.args[2])
     isempty(blocks) && return ast
+    single_plate = _program_plate_count(ast.args[2]) == 1
     replacements = IdDict{Expr,Any}()
     body = ast.args[2]
-    if length(blocks) > 1
-        # What each block asks of the rest of the body, from one walk of it
-        # (`_program_timeline`). A name occurs outside a block when the body
-        # holds more of its occurrences than the block's occurrences do.
-        timeline = _program_timeline(body)
-        body_bound = _program_bound!(_ProgramNameCounts(), body; declarations = false)
-        body_used = _program_symbol_counts(body; declarations = false)
-    end
+    # What each block asks of the rest of the body, from one walk of it
+    # (`_program_timeline`). A name occurs outside a block when the body
+    # holds more of its occurrences than the block's occurrences do.
+    timeline = _program_timeline(body)
+    body_bound = _program_bound!(_ProgramNameCounts(), body; declarations = false)
+    body_used = _program_symbol_counts(body; declarations = false)
     for block in blocks
         statements = block.args[2:end]
-        # A lone plate loop compiles as a lone loop already.
-        if length(blocks) == 1
-            replacements[block] = Expr(:block, statements...)
-            continue
-        end
         inside = _program_bound!(Set{Symbol}(), block)
         times = timeline.occurrences[block]
         block_bound = _program_bound!(_ProgramNameCounts(), block; declarations = false)
@@ -5639,7 +5658,7 @@ function _extract_plate_programs(ast::Expr)
         program = _PlateProgram(Expr(:function,
             Expr(:tuple, free..., (last(pair) for pair in slots)...),
             Expr(:block, redeclared..., rewritten..., result)),
-            first(block.args).axes)
+            first(block.args).axes, single_plate)
         call = Expr(:call, program, free..., (copy(first(pair)) for pair in slots)...)
         call = isempty(outputs) ? call :
             Expr(:(=), length(outputs) == 1 ? only(outputs) : Expr(:tuple, outputs...), call)
@@ -5652,6 +5671,20 @@ function _extract_plate_programs(ast::Expr)
             Expr(node.head, Any[replace_blocks(arg) for arg in node.args]...)
         end : node
     Expr(ast.head, ast.args[1], replace_blocks(ast.args[2]))
+end
+
+# Mutually exclusive versions of one plate do not add a second plate to a
+# call. Count the largest path through branches, so retaining an optimized
+# and a literal arm preserves the original single-plate inlining choice.
+_program_plate_count(node) = 0
+function _program_plate_count(node::Expr)
+    node.head === :quote && return 0
+    _is_plate_block(node) && return 1
+    if node.head in (:if, :elseif)
+        return _program_plate_count(node.args[1]) +
+            maximum(_program_plate_count, node.args[2:end]; init = 0)
+    end
+    sum(_program_plate_count, node.args; init = 0)
 end
 
 # `node` with each call of a `_PlateProgram` replaced by that program's
@@ -5682,7 +5715,9 @@ end
 # (a whole plate lowered another way) stays inline.
 function _plate_program_or_inline(node::Expr, call::Expr, declared::Set{Symbol})
     inline = _inline_plate_program(call, declared)
-    axes = (first(call.args)::_PlateProgram).axes
+    program = first(call.args)::_PlateProgram
+    program.always_inline && return inline
+    axes = program.axes
     axes === nothing && return inline
     Expr(:if, Expr(:call, GlobalRef(@__MODULE__, :_plate_ad_inline), axes), inline, node)
 end
@@ -5735,6 +5770,13 @@ _mentioned_symbols!(found::Set{Symbol}, node) = found
 
 _has_plate_programs(node) = node isa _PlateProgram ||
     node isa Expr && node.head !== :quote && any(_has_plate_programs, node.args)
+
+_has_inline_plate_programs(node::_PlateProgram) = node.always_inline
+_has_inline_plate_programs(node) = node isa Expr && node.head !== :quote &&
+    any(_has_inline_plate_programs, node.args)
+_inline_native_plate_program(node, call, declared) =
+    (first(call.args)::_PlateProgram).always_inline ?
+        _inline_plate_program(call, declared) : node
 
 # `ast` with each `_PlateProgram` compiled as `_compile` compiles `ast`.
 function _compile_plate_programs(ast, context::Module, native_context::GlobalRef)
@@ -6155,12 +6197,14 @@ _lane_slot_values(p::Plan, excluded) =
 
 function _lower_with_ops_collecting(p::Plan;
                          inline_embedded::Bool = true,
+                         native_passes::Bool = true,
                          declare::Bool = inline_embedded && _owns_array_regions(p),
                          recycle::Vector{Pair{ValueId,Symbol}} = Pair{ValueId,Symbol}[],
                          pushdowns::Bool = isempty(recycle),
                          outline::Bool = pushdowns,
                          plate_element_types::Bool = false,
                          type_hints = nothing, exemplar_types = nothing,
+                         value_ids = nothing,
                          footprint::Bool = false,
                          footprint_selection = nothing,
                          partition_plan::Bool = false,
@@ -6172,7 +6216,7 @@ function _lower_with_ops_collecting(p::Plan;
     # body records every read of a HAVE port and returns them instead of the
     # wanted values.
     footprint && return task_local_storage(_FOOTPRINT, _FootprintRecords(footprint_selection)) do
-        _lower_with_ops_collecting(p; inline_embedded, declare, recycle, pushdowns, outline,
+        _lower_with_ops_collecting(p; inline_embedded, native_passes, declare, recycle, pushdowns, outline,
                                    plate_element_types, type_hints, exemplar_types, inline_sources,
                                    shares, cell_have_types)
     end
@@ -6182,7 +6226,7 @@ function _lower_with_ops_collecting(p::Plan;
     recording = get(task_local_storage(), _FOOTPRINT, nothing)
     if recording !== nothing
         recording.active && return task_local_storage(_FOOTPRINT, nothing) do
-            _lower_with_ops_collecting(p; inline_embedded, declare, recycle, pushdowns, outline,
+            _lower_with_ops_collecting(p; inline_embedded, native_passes, declare, recycle, pushdowns, outline,
                                        plate_element_types, type_hints, exemplar_types, inline_sources,
                                        shares, cell_have_types)
         end
@@ -6214,6 +6258,11 @@ function _lower_with_ops_collecting(p::Plan;
     end
     g = p.graph
     names = _varnames(p)
+    if value_ids !== nothing
+        for (id, name) in names
+            value_ids[name] = id
+        end
+    end
     nm(v) = names[canon_id(g, v.id)]
     argexprs = Any[_CONSTANTS_ARG, _CALLABLES_ARG]
     for v in p.have
@@ -6650,6 +6699,25 @@ function _lower_with_ops_collecting(p::Plan;
             end
             continue
         end
+        if inline_embedded && r.op isa _LSRegion
+            # Statistics eligibility is runtime data. Lower both retained plans
+            # with this target's declarations and reusable lane destinations.
+            # The containing body runs the native passes once after embedding;
+            # factoring a lowered arm again would also factor its fallback.
+            region_ids = value_ids === nothing ? nothing : Dict{Symbol,ValueId}()
+            ast, constants, callables, recipes = _ls_region_program(
+                r.op.fast, r.op.literal, r.op.statistics;
+                native_passes = false,
+                declare, recycle, pushdowns, outline, plate_element_types,
+                inline_sources, plate_programs, value_ids = region_ids)
+            offset = length(runtime_ops)
+            append!(runtime_ops, _table_ops(constants, callables, recipes))
+            append!(runtime_recipes, recipes)
+            append!(body.args, _embedded_statements(ast,
+                Any[callargs; last.(recycle)], lhs, offset;
+                source_ids = region_ids, value_ids))
+            continue
+        end
         embedded = inline_embedded ? _embedded_kernel(r.op) : nothing
         if embedded === nothing
             push!(runtime_ops, r.op)
@@ -6727,14 +6795,14 @@ function _lower_with_ops_collecting(p::Plan;
     push!(body.args, Expr(:return, retval))
     # Compose before index runs duplicate a cell body into grouped/flat arms;
     # otherwise those mutually exclusive definitions appear to escape here.
-    inline_embedded && (body = _lower_cell_arrays_native(body, runtime_recipes))
+    inline_embedded && native_passes && (body = _lower_cell_arrays_native(body, runtime_recipes))
     # Shared factors and terms leave a summed plate's sum (summed_plate_factors.jl)
     # before index runs group the cells that remain.
-    inline_embedded && (body = _lower_summed_plate_factors_native(body, runtime_ops))
+    inline_embedded && native_passes && (body = _lower_summed_plate_factors_native(body, runtime_ops))
     # A factored sum of squared residuals over bound data reads its frozen
     # least-squares statistics (bound_statistics.jl).
-    inline_embedded && (body = _lower_bound_statistics_native(body, runtime_ops))
-    inline_embedded && (body = _lower_index_runs_native(body, runtime_ops))
+    inline_embedded && native_passes && (body = _lower_bound_statistics_native(body, runtime_ops))
+    inline_embedded && native_passes && (body = _lower_index_runs_native(body, runtime_ops))
     # A partition with a plan port reads its integer bookkeeping from the
     # port's value, computed once per label; in plan mode the body computes
     # and returns that bookkeeping instead (`_partition_plan_lowering`,
@@ -7787,6 +7855,8 @@ end
 # unchanged, as `@_native_context` below does: its hygiene qualifies the globals.
 # A package whose lowered bodies name its own functions compiles them this way.
 function _compile(ast::Expr, context::Module, native_context::GlobalRef)
+    _has_inline_plate_programs(ast) &&
+        (ast = _inline_plate_programs(ast; expand = _inline_native_plate_program))
     ast = _compile_plate_programs(_lift_comprehensions(ast), context, native_context)
     ast = _distinguish_module_generations(
         _canonical_embedded(_canonical_locals(_canonical_globals(ast))))
@@ -9373,15 +9443,29 @@ end
         "with $(map(typeof, args)). Prepare another kernel from exemplars of " *
         "the new types"))
 
-# Whether `prepare_nonallocating` can prepare `p`: every recipe has one output
-# (a destructuring assignment's recipe has several). RKPPL's sampler reads it
-# to keep the ordinary sampler for such a program under `nonallocating = :auto`.
-_nonallocating_plan_supported(p::Plan) = all(r -> length(r.outputs) == 1, p.recipes)
+# Storage steps require single-output recipes. A statistics region is inlined
+# before step construction, so inspect its retained recipes instead of the
+# tuple of results it returns to the enclosing plan.
+function _nonallocating_unsupported_recipe(p::Plan)
+    for r in p.recipes
+        if r.op isa _LSRegion
+            for arm in (r.op.fast, r.op.literal)
+                unsupported = _nonallocating_unsupported_recipe(arm)
+                unsupported === nothing || return unsupported
+            end
+        elseif length(r.outputs) != 1
+            return r
+        end
+    end
+    nothing
+end
+# RKPPL's `nonallocating = :auto` uses the same preparation check.
+_nonallocating_plan_supported(p::Plan) = _nonallocating_unsupported_recipe(p) === nothing
 
 function _prepare_nonallocating(p::Plan, cache_apply; have_types=nothing,
                                 exact_signature::Bool=false, passes=())
-    if !_nonallocating_plan_supported(p)
-        r = first(r for r in p.recipes if length(r.outputs) != 1)
+    r = _nonallocating_unsupported_recipe(p)
+    if r !== nothing
         throw(ArgumentError(
             "prepare_nonallocating requires single-output recipes; recipe $(r.id) has $(length(r.outputs)) outputs"))
     end

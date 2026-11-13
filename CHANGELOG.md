@@ -16,6 +16,27 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.223
+
+- Bound Gaussian statistics choose between the collapsed sum and authored rows
+  with a runtime guard. Changing bound values or row counts across the statistics
+  threshold preserves prepared kernel, sampler and AD types when input types
+  stay the same. Both paths retain reusable storage, including overlapping
+  regions with intermediate plates and matrix products. Input checks keep their
+  evaluation order, and declared conversions are preserved. AD preparation can
+  initialize a concrete array cache step from an untaken branch without running
+  that branch; later calls retain its lazy behavior and ordinary derivatives.
+
+- Generated summed-plate reverse can be enabled when preparing AD for an
+  already prepared kernel that uses native direct reads. A single plate now
+  retains its boundary for AD and appears in `plate_reverse_report`, while
+  ordinary native execution still inlines it. Enabling the rule during kernel
+  preparation also preserves native direct reads, including when an unsupported
+  derivative falls back to ordinary AD. Direct-read eligibility proves that each
+  read uses the current cell index. Factored reductions with intermediate totals
+  keep ordinary AD until their adjoints can be propagated; the report names that
+  fallback. The generated rule remains opt-in and is not a general speedup.
+
 ## 0.1.222
 
 - A partition of one cell per label (`plate_partition(…; single = true)`) and
