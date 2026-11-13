@@ -602,8 +602,10 @@ _pr_gather_view(::Type{<:SubArray{<:Any,1,<:AbstractVector,<:Tuple{AbstractVecto
 # like its shadow: a gathered view's buffer is a view of a fresh parent.
 @generated _pr_buffers(::Val{B}, args::Tuple) where {B} =
     Expr(:tuple, (:(_pr_buffer(getfield(args, $b))) for b in B)...)
+# Its index vector is the operand value's own, so a sum over the buffer's
+# parent lines up with the operand's parent (`_pr_gather_dot`).
 @inline _pr_buffer(arg::Union{Duplicated,DuplicatedNoNeed}) =
-    view(zero(parent(arg.dval)), parentindices(arg.dval)...)
+    view(zero(parent(arg.dval)), parentindices(arg.val)...)
 @inline _pr_buffer(arg::Active{<:Tuple}) = zeros(eltype(arg.val), length(arg.val))
 @inline _pr_buffer(arg) = nothing
 

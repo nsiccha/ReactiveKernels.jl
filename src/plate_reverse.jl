@@ -890,6 +890,8 @@ mutable struct _PRFactored
     coefs::Dict{Any,Any}         # coefficient key => atom
     sums::Dict{Any,Symbol}       # (value, coefficient key) => partial sum
     counts::Dict{Any,Any}        # (value, coefficient key) => (value, term, unit contributions per cell)
+    readof::Dict{Symbol,Symbol}  # a gathered read's value (or an alias of it) => the read
+    deferred::Dict{Symbol,Vector{Any}}  # read => (shared value, num, inv, other factor) products
 end
 
 _pr_fresh!(fc::_PRFactored, base) = (fc.st.counter += 1; Symbol("_pr_", base, fc.st.counter))
@@ -1056,19 +1058,31 @@ function _pr_factored_sweep!(out, fc::_PRFactored, stmts, adj, mutable, toplevel
         elseif s isa _PRCall
             s.lhs in active || continue
             terms = _pr_adjoint_terms!(out, fc, adj, mutable, s.lhs)
-            terms === nothing && continue
             if _pr_is_read(s, st)
-                v = _pr_materialize!(out, fc, terms)
-                push!(out, :($(GlobalRef(@__MODULE__, :_pr_shadow_add!))(
-                    $(st.shadow[st.prepared[s.args[1]]]), $(fc.linear), $v)))
+                terms === nothing && !haskey(fc.deferred, s.lhs) && continue
+                _pr_read_reverse!(out, fc, adj, mutable, s, terms, toplevel)
                 continue
             end
+            terms === nothing && continue
             partials = _pr_partials(s.f, s.lhs, s.args)
             partials === nothing && _pr_fail("no derivative for `$(s.fref)`")
             for (a, p) in zip(s.args, partials)
                 a isa Symbol && a in active || continue
                 p === nothing && _pr_fail("`$(s.fref)` has no derivative in an active argument")
                 num, inv, vars = _pr_split_partial(fc, p, toplevel)
+                # A shared value's partial that is a gathered read: its sum over
+                # the cells can run per group, through the read's own scatter
+                # (see the read below), so it waits for the read.
+                if toplevel && a in fc.shared && length(vars) == 1 && vars[1] isa Symbol &&
+                        haskey(fc.readof, vars[1]) &&
+                        all(t -> t.var === nothing || t.var isa Symbol, terms)
+                    r = fc.readof[vars[1]]
+                    for t in terms
+                        push!(get!(fc.deferred, r, Any[]),
+                              (a, t.num * num, vcat(t.inv, inv), t.var, vars[1]))
+                    end
+                    continue
+                end
                 pv = isempty(vars) ? nothing : _pr_bind!(out, fc,
                     length(vars) == 1 ? only(vars) : Expr(:call, GlobalRef(Base, :*), vars...))
                 new = _PRTerm[_PRTerm(t.num * num, vcat(t.inv, inv),
@@ -1104,6 +1118,101 @@ function _pr_factored_sweep!(out, fc::_PRFactored, stmts, adj, mutable, toplevel
         end
     end
     out
+end
+
+# The reads of batched operands that the cell reads once, at its top level, and
+# every alias of their values: `alias => read`.
+function _pr_single_reads(stmts, st::_PRProgramState, active)
+    counts = Dict{Symbol,Int}()
+    function count!(ss)
+        for s in ss
+            _pr_is_read(s, st) && (counts[s.args[1]] = get(counts, s.args[1], 0) + 1)
+            s isa _PRBranch && (count!(s.then_stmts); count!(s.else_stmts))
+        end
+    end
+    count!(stmts)
+    readof = Dict{Symbol,Symbol}()
+    for s in stmts
+        if _pr_is_read(s, st) && counts[s.args[1]] == 1 && st.prepared[s.args[1]] in active &&
+                haskey(st.shadow, st.prepared[s.args[1]])
+            readof[s.lhs] = s.lhs
+        elseif s isa _PRAlias && s.rhs isa Symbol && haskey(readof, s.rhs)
+            readof[s.lhs] = readof[s.rhs]
+        end
+    end
+    readof
+end
+
+# The reverse of a read of a batched operand: its cotangent added into the
+# operand's shadow, cell by cell. Under one pass (`_PR_WANT_VALUE`, where the
+# shadow is the plate's own zeroed buffer, `view(buffer, g)` for a gathered
+# operand) a read whose cotangent is one term `k · v` adds `v` alone and scales
+# the buffer by `k` once, after the loop; a shared value's partial `c · u · read`
+# with `u == v` (`sd` in `sd * z[g]`) is then `c · Σⱼ zⱼ · bufferⱼ`, one product
+# per group instead of one per cell.
+function _pr_read_reverse!(out, fc::_PRFactored, adj, mutable, s, terms, toplevel)
+    st = fc.st
+    shadow = st.shadow[st.prepared[s.args[1]]]
+    prepared = s.args[1]
+    deferred = toplevel ? pop!(fc.deferred, s.lhs, Any[]) : Any[]
+    terms = terms === nothing ? _PRTerm[] : terms
+    u = isempty(terms) ? (isempty(deferred) ? nothing : deferred[1][4]) : only(terms).var
+    factorable = toplevel && haskey(fc.readof, s.lhs) && length(terms) <= 1 &&
+        !(isempty(terms) && isempty(deferred)) && all(d -> d[4] == u, deferred)
+    # The per-cell form: the deferred partials as products, the read's cotangent scaled.
+    plain = Any[]
+    for (a, num, inv, u, value) in deferred
+        pv = u === nothing ? value : _pr_bind!(plain, fc, :($u * $value))
+        _pr_contribute!(plain, fc, adj, mutable, a, [_PRTerm(num, inv, pv)], toplevel)
+    end
+    if !isempty(terms)
+        v = _pr_materialize!(plain, fc, terms)
+        push!(plain, :($(GlobalRef(@__MODULE__, :_pr_shadow_add!))($shadow, $(fc.linear), $v)))
+    end
+    if !factorable
+        append!(out, plain)
+        return
+    end
+    one_pass = :($_PR_WANT_VALUE isa Val{true} && !($shadow isa Nothing))
+    push!(out, Expr(:if, one_pass,
+        :($(GlobalRef(@__MODULE__, :_pr_shadow_add!))($shadow, $(fc.linear), $(u === nothing ? 1.0 : u))),
+        Expr(:block, plain...)))
+    post = Any[]
+    for (a, num, inv, _, _) in deferred
+        push!(fc.st.touched, a)
+        push!(post, :($(_pr_bar(a)) = $(_pr_bar(a)) + $(GlobalRef(@__MODULE__, :_pr_scaled))(
+            $(_pr_coef!(fc, num, inv)),
+            $(GlobalRef(@__MODULE__, :_pr_gather_dot))($prepared, $shadow))))
+    end
+    k = isempty(terms) ? 0.0 : _pr_coef!(fc, only(terms).num, only(terms).inv)
+    push!(post, :($(GlobalRef(@__MODULE__, :_pr_scale_buffer!))($shadow, $k)))
+    push!(fc.post, Expr(:if, one_pass, Expr(:block, post...)))
+end
+
+# Σ over the operand's storage of value × buffer: for a gathered operand
+# (`view(z, g)`, prepared as broadcast extrusion) its parent's length, not the
+# cells'. The buffer is a view of the same index vector (the Enzyme extension
+# builds it from the operand's own indices).
+@inline _pr_gather_dot(A::Base.Broadcast.Extruded, buffer) = _pr_gather_dot(A.x, buffer)
+function _pr_gather_dot(x::SubArray, buffer::SubArray)
+    p = parent(x); q = parent(buffer)
+    acc = zero(eltype(p)) * zero(eltype(q))
+    @inbounds for j in eachindex(p, q)
+        acc += p[j] * q[j]
+    end
+    acc
+end
+_pr_gather_dot(x, buffer) = throw(ArgumentError(
+    "plate reverse: a one-pass product through a read of $(typeof(x)) with a buffer $(typeof(buffer))"))
+# The plate's own buffer scaled in place, once (`_pr_scaled` per entry, so an
+# entry no cell reached stays zero under a coefficient that is not finite).
+_pr_scale_buffer!(::Nothing, k) = nothing
+function _pr_scale_buffer!(buffer::SubArray, k)
+    q = parent(buffer)
+    @inbounds for j in eachindex(q)
+        q[j] = _pr_scaled(k, q[j])
+    end
+    nothing
 end
 
 # A value that every cell contributes the same invariant to (`log σ` takes `-1`
@@ -1323,7 +1432,8 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState)
             shared = Set{Symbol}(s for s in st.outer if !(s in st.totals))
             union!(shared, hoisted_active)
             fc = _PRFactored(st, cellvars, inv2, shared, active, linear, ncells,
-                             Any[], Any[], Dict{Any,Any}(), Dict{Any,Symbol}(), Dict{Any,Any}())
+                             Any[], Any[], Dict{Any,Any}(), Dict{Any,Symbol}(), Dict{Any,Any}(),
+                             _pr_single_reads(inloop, st, active), Dict{Symbol,Vector{Any}}())
             # The cell density's adjoint is the total's (the seed), the same
             # at every cell.
             adj = Dict{Symbol,Vector{_PRTerm}}()
