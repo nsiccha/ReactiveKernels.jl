@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.231
+## 0.1.232
 
 - The opt-in generated summed-plate reverse (`with_plate_reverse`) runs one
   pass over the cells for a plate with a gathered operand (`view(z, g)` with an
@@ -36,6 +36,13 @@ are recorded in the git history only.
   grouped Gaussian model the rule's gradient goes from about 1.9 to about 1.45
   times a hand-written closed form at 2,000 cells, and to about 1.3 times at
   100,000 cells. The rule remains opt-in.
+
+## 0.1.231
+
+- JAX export keeps each retained tuple-plate field's ragged lengths tied to
+  its prepared input. Flattening a projected field now drops padding and
+  supports rebinding the emitted module to different row and cell counts.
+  Empty tuple-valued plates skip indexed cell reads, as empty numeric plates do.
 
 ## 0.1.230
 
