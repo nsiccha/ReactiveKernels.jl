@@ -2167,6 +2167,9 @@ _mi_row_value(x::Number, i) = x
 _ppl_range_values(x::Number, indices) = x
 # Its source lets a non-allocating kernel gather into a buffer of its own.
 @traceable _ppl_range_values(x::AbstractArray, indices) = x[indices]
+# The selected rows (columns) of a matrix holding one slice per observation.
+@traceable _ppl_range_rows(x::AbstractMatrix, indices) = x[indices, :]
+@traceable _ppl_range_cols(x::AbstractMatrix, indices) = x[:, indices]
 
 # `ones(n) .* x` without the ones operand: a number fills the rows, and a
 # vector already holding one Float64 per row is that location value itself,
@@ -2201,7 +2204,14 @@ function _ranged_response_stmts(r, plan, stmts)
         rows = Set{Symbol}()
         # Select ordinary row values before family-specific conversions or
         # ordinal stage expansion. Simplexes and covariance factors stay whole.
-        if r.family ∉ (CategoricalFam, MultinomialFam)
+        # A logit matrix holds one slice per observation: select whole slices.
+        if _categorical_logit_slices(r)
+            alias = Symbol(:_ppl_range_logits_, r.label)
+            getter = GlobalRef(@__MODULE__, r.logit_slices === :rows ?
+                :_ppl_range_rows : :_ppl_range_cols)
+            push!(pre, :($alias = $getter($(r.predictor), $idx)))
+            aliases[r.predictor] = alias
+        elseif r.family ∉ (CategoricalFam, MultinomialFam)
             push!(rows, _location_node(r, plan))
             union!(rows, r.extra_predictors)
         end
@@ -4151,6 +4161,8 @@ end
 # nested logaddexp chain would double nodes per level; the max chain is
 # re-embedded per term, so K² worst case — K is small).
 function _categorical_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
+    _categorical_logit_slices(r) &&
+        return _categorical_slices_plate_stmts(r, plan, node, pw)
     pre = Expr[]
     preds = [r.predictor; r.extra_predictors...]
     inputs = Any[r.response, preds...]
@@ -4187,6 +4199,59 @@ function _categorical_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node:
         cell = _weighted_cell(wv,cell)
     end
     return Expr[pre..., _plate_sum_stmts(pw,node,inputs,cell)...]
+end
+
+# Reference-coded multi-logit categorical over the slices of one logit
+# matrix (`y .~ CategoricalLogit.(eachrow(E))` / `eachcol(E)`). One plate
+# pairs observation `i` with its slice, and the cell is the
+# `categorical_logit_ref` law over that slice
+# (`_ppl_categorical_logit_ref_logpdf`): the observed class's logit minus
+# the log-sum-exp over the slice and the zero reference, in two passes that
+# allocate nothing. The class count is the slice length + 1 when the model
+# runs, so the emitted program is the same for every K. An observation
+# beyond its slice is outside the law's support; the lazy guard keeps the
+# gather in bounds.
+function _categorical_slices_plate_stmts(r::LikelihoodSpec,
+        plan::StructuralPlan, node::Symbol, pw::Symbol)
+    pre = Expr[]
+    slices = r.logit_slices === :rows ? :eachrow : :eachcol
+    inputs = Any[r.response, :($slices($(r.predictor)))]
+    yv, row = _dovar(1), _dovar(2)
+    levels = :(length($row) + 1)
+    law = :(ReactiveKernelsPPL._ppl_categorical_logit_ref_logpdf($row, $yv))
+    tail = (b, upper) -> :(ReactiveKernelsPPL._ppl_categorical_logit_ref_tail(
+        $row, $b, $upper))
+    cell = r.evidence.kind === :none ? :(1 <= $yv && $yv <= $levels ? $law : -Inf) :
+        _wrap_evidence!(r, plan, pre, inputs, law;
+            cdf = b -> tail(b, false), ccdf = b -> tail(b, true), levels)
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = _weighted_cell(wv, cell)
+    end
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
+# The lower (`upper = false`: P(y ≤ b)) or upper (`upper = true`:
+# P(y > b)) tail of the reference-coded categorical over its K−1
+# non-reference logits, the positional emitter's `categorical_tail` with
+# its class loop kept at run time. Each tail sums its own classes, so
+# neither is formed as one minus the other. Its source is recorded so a JAX
+# module translates it; the logits are Float64, as the response's are.
+@traceable function _ppl_categorical_logit_ref_tail(nonreference::AbstractVector,
+        b, upper::Bool)
+    m = 0.0
+    for j in eachindex(nonreference)
+        m = max(m, nonreference[j])
+    end
+    reference = exp(-m)
+    total = reference
+    part = (upper ? b < 1 : b >= 1) ? reference : 0.0
+    for j in eachindex(nonreference)
+        term = exp(nonreference[j] - m)
+        total += term
+        part += (upper ? b < j + 1 : b >= j + 1) ? term : 0.0
+    end
+    return part / total
 end
 
 # Stable log-logistic (Stan `log_inv_logit`): `-log1pexp(-z)`, the RK
