@@ -1,6 +1,6 @@
 # data: y X Km1
 # A categorical-logit response over one row of logits per observation
-# (RKPPL 0.1.169). Row i of E holds observation i's K−1 non-reference
+# (RKPPL 0.1.170). Row i of E holds observation i's K−1 non-reference
 # logits, class 1 the zero reference, exactly as the positional
 # `CategoricalLogit.(eta_2, …, eta_K)` reads its arguments; K is the row
 # length + 1 when the model runs, so one program serves every class count.
@@ -10,7 +10,7 @@
 # observes the same law. Weights, censoring and missing responses work as
 # for the positional form; `mi()` missingness cannot select rows yet; a
 # class beyond its row has log density -Inf. `jax_source` translates every
-# form (ReactiveKernels 0.1.217). Tests:
+# form (ReactiveKernels 0.1.221). Tests:
 # test_categorical_logit_slices.jl, test_leveled_k_invariance.jl.
 begin
     B[axes(X, 2), 1:Km1] .~ Normal.(0, 1)

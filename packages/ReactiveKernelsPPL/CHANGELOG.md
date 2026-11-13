@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.169
+## 0.1.170
 
 - A categorical-logit response reads its logits as one slice per
   observation: `y .~ CategoricalLogit.(eachrow(E))` (or `eachcol(E)`, or
@@ -29,7 +29,21 @@ are recorded in the git history only.
   weights, censoring and missing responses like the positional form; an
   observation beyond its slice has log density `-Inf`. `mi()` missingness
   does not select logit slices yet. `jax_source` translates every form;
-  requires ReactiveKernels 0.1.217.
+  requires ReactiveKernels 0.1.221.
+
+## 0.1.169
+
+- `SMCOptions(cloud_kernels=J)` fits each stage's NUTS kernels to the stage
+  target's weighted cloud before moving it: a diagonal Gaussian mixture with at
+  most `J` components (count by BIC) gives each component its own diagonal
+  scales and a step size tuned on discarded trial transitions. Each move picks a
+  component from the responsibilities at the particle and accepts with
+  probability `min(1, r_j(x')/r_j(x))`, so every move keeps the stage target
+  invariant. Particles in different modes, such as relabelled mixture
+  components, no longer share one pilot chain's metric. Default `0` keeps the
+  frozen kernels and the random stream unchanged. Stage histories record the
+  fit, step sizes, `tuning_evaluations` and `selection_rejections`.
+  `tune_smc` and `initialize_filter_smc` refuse options with `cloud_kernels > 0`.
 
 ## 0.1.168
 
