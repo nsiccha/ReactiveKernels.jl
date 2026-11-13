@@ -536,18 +536,25 @@ end
 
 # ------------------------------------------------ generated plate reverse ----
 # `_PlateSumRule` (src/plate_reverse.jl): a summed plate program with a reverse
-# generated from its own code. The augmented primal runs the generated sweep
-# once: it returns the value and the cotangents for a unit seed, and adds each
-# batched operand's cotangent into a buffer of that operand's own length. The
-# tape holds those results, so the reverse pass reads no operand and makes no
-# second pass over the cells: it scales the cotangents by each lane's seed and
-# adds the scaled buffers into the shadows. A call whose activity the generated
-# reverse does not take runs the program and differentiates it with Enzyme's
-# ordinary reverse instead.
+# generated from its own code. The generated sweep runs the cells once and
+# returns the value and the scalar operands' cotangents, adding each batched
+# operand's cotangent into a shadow. Two schedules use it:
+#
+# - One pass (`_pr_one_pass`): the augmented primal runs the sweep with a unit
+#   seed, each batched operand's cotangent going into a buffer of the operand's
+#   own storage: a gathered view's parent (`z` for `z[g]`) or a tuple's length.
+#   The reverse pass makes no second pass over the cells; it scales by the seed.
+# - Two passes otherwise: the augmented primal runs the program; the reverse
+#   pass runs the sweep with the seed straight into the shadows. A buffer as
+#   long as the cells (an operand that spans the plate) costs about as much as
+#   that second pass, and a fresh one per call costs more.
+#
+# A call whose activity the generated reverse does not take runs the program
+# and differentiates it with Enzyme's ordinary reverse instead.
 
 using ReactiveKernels: _PlateSumRule, _pr_scalar_positions, _pr_batched_positions, _CellArray
 
-# The tape of a covered call: the unit-seed cotangents of the scalar operands
+# The tape of a one-pass call: the unit-seed cotangents of the scalar operands
 # and one buffer per batched operand (`nothing` for a constant one).
 struct _PROnePass{C<:Tuple,U<:Tuple}
     cotangents::C
@@ -562,9 +569,10 @@ function EnzymeRules.augmented_primal(
     if RT <: Const || all(a -> a isa Const, args)
         return AugmentedReturn(needs_primal(config) ? r(values...) : nothing, nothing, nothing)
     end
-    if _pr_covers(Val(_pr_scalar_positions(r)), Val(_pr_batched_positions(r)), args)
-        buffers = _pr_buffers(Val(_pr_batched_positions(r)), args)
-        swept = r.reverse(values..., buffers...)
+    S, B = _pr_scalar_positions(r), _pr_batched_positions(r)
+    if _pr_covers(Val(S), Val(B), args) && _pr_one_pass(Val(B), args)
+        buffers = _pr_buffers(Val(B), args)
+        swept = r.reverse(values..., one(_pr_seed_type(r, values)), buffers...)
         tape = _PROnePass(Base.tail(swept), buffers)
         return AugmentedReturn(needs_primal(config) ? first(swept) : nothing, nothing, tape)
     end
@@ -572,35 +580,48 @@ function EnzymeRules.augmented_primal(
     tape = _pr_tape(Val(overwritten(config)), values)
     AugmentedReturn(needs_primal(config) ? primal : nothing, nothing, tape)
 end
+@inline _pr_seed_type(r, values) = Float64
+
+# One pass when no batched operand needs a buffer as long as the cells: each is
+# constant, a float tuple, or a gathered view (`view(z, g)` with an index
+# vector), whose buffer is its parent's length. Decided on types alone.
+@generated function _pr_one_pass(::Val{B}, args::Tuple) where {B}
+    for b in B
+        T = args.parameters[b]
+        T <: Const && continue
+        T <: Active && continue          # a covered Active batched operand is a float tuple
+        T <: Union{Duplicated,DuplicatedNoNeed} && _pr_gather_view(T.parameters[1]) && continue
+        return :(false)
+    end
+    :(true)
+end
+_pr_gather_view(::Type) = false
+_pr_gather_view(::Type{<:SubArray{<:Any,1,<:AbstractVector,<:Tuple{AbstractVector{<:Integer}}}}) = true
 
 # A fresh, zeroed buffer for each batched operand's unit-seed cotangent, shaped
-# like the shadow the reverse pass adds it into.
+# like its shadow: a gathered view's buffer is a view of a fresh parent.
 @generated _pr_buffers(::Val{B}, args::Tuple) where {B} =
     Expr(:tuple, (:(_pr_buffer(getfield(args, $b))) for b in B)...)
-@inline _pr_buffer(arg::Union{Duplicated,DuplicatedNoNeed}) = zero(arg.dval)
-@inline _pr_buffer(arg::Union{BatchDuplicated,BatchDuplicatedNoNeed}) = zero(arg.dval[1])
+@inline _pr_buffer(arg::Union{Duplicated,DuplicatedNoNeed}) =
+    view(zero(parent(arg.dval)), parentindices(arg.dval)...)
 @inline _pr_buffer(arg::Active{<:Tuple}) = zeros(eltype(arg.val), length(arg.val))
 @inline _pr_buffer(arg) = nothing
 
-# Lane `w`'s share of a covered call: each buffer scaled by the lane's seed
-# `ȳ` and added into the operand's shadow (a tuple operand's cotangent is the
-# scaled buffer itself), and the scaled scalar cotangents.
-@generated function _pr_scaled_shadows(::Val{B}, args::Tuple, buffers::Tuple,
-                                       ::Val{W}, w, ȳ) where {B,W}
-    Expr(:tuple, (:(_pr_scaled_shadow(getfield(args, $b), Val($W), w,
-                                      getfield(buffers, $j), ȳ)) for (j, b) in enumerate(B))...)
+# Each buffer scaled by the seed `ȳ`: added into the operand's shadow (through
+# the gathered view's parent), or, for a tuple operand, the cotangent itself.
+@generated function _pr_scaled_shadows(::Val{B}, args::Tuple, buffers::Tuple, ȳ) where {B}
+    Expr(:tuple, (:(_pr_scaled_shadow(getfield(args, $b), getfield(buffers, $j), ȳ))
+                  for (j, b) in enumerate(B))...)
 end
-@inline _pr_scaled_shadow(arg, ::Val, w, ::Nothing, ȳ) = nothing
-@inline _pr_scaled_shadow(arg::Active{<:Tuple}, ::Val, w, buffer::AbstractVector, ȳ) =
-    ȳ .* buffer
-@inline function _pr_scaled_shadow(
-        arg::Union{Duplicated,DuplicatedNoNeed,BatchDuplicated,BatchDuplicatedNoNeed},
-        ::Val{W}, w, buffer::AbstractArray, ȳ) where {W}
-    shadow = _pr_shadow(arg, Val(W), w)
-    @inbounds for i in eachindex(shadow, buffer)
-        shadow[i] += ȳ * buffer[i]
+@inline _pr_scaled_shadow(arg, ::Nothing, ȳ) = nothing
+@inline _pr_scaled_shadow(arg::Active{<:Tuple}, buffer::AbstractVector, ȳ) = ȳ .* buffer
+@inline function _pr_scaled_shadow(arg::Union{Duplicated,DuplicatedNoNeed}, buffer::SubArray, ȳ)
+    shadow = parent(arg.dval)
+    source = parent(buffer)
+    @inbounds for i in eachindex(shadow, source)
+        shadow[i] += ȳ * source[i]
     end
-    shadow
+    arg.dval
 end
 # Unrolled, like `_pr_values`: `map` stops unrolling past 32 elements.
 @generated _pr_scaled(cotangents::Tuple, ȳ) =
@@ -627,9 +648,15 @@ end
                   :(getfield(tape, $i)) for i in 1:length(args.parameters))...)
 end
 
-# The shadow of a batched array operand, for lane `w`.
+# The shadow of each batched operand, for lane `w` (`nothing` for a constant one).
+@generated function _pr_shadows(::Val{B}, args::Tuple, ::Val{W}, w) where {B,W}
+    Expr(:tuple, (:(_pr_shadow(getfield(args, $b), Val($W), w)) for b in B)...)
+end
+
 @inline _pr_shadow(arg::Union{Duplicated,DuplicatedNoNeed}, ::Val{1}, w) = arg.dval
 @inline _pr_shadow(arg::Union{BatchDuplicated,BatchDuplicatedNoNeed}, ::Val, w) = arg.dval[w]
+@inline _pr_shadow(arg::Active{<:Tuple}, ::Val{1}, w) = zeros(eltype(arg.val), length(arg.val))
+@inline _pr_shadow(arg, ::Val, w) = nothing
 
 # The reverse's return: the cotangent of each Active operand (zero for one the
 # rule does not differentiate), `nothing` for every other annotation.
@@ -724,34 +751,55 @@ function EnzymeRules.reverse(
     B = _pr_batched_positions(r)
     W = width(config)
     tape === nothing && return _pr_reverse_return(Val(()), args, ())
-    tape isa _PROnePass && return _pr_onepass_reverse(Val(S), Val(B), Val(W), dret, tape, args)
-    # Not covered (see `_pr_covers`): the program under Enzyme's ordinary
-    # reverse, which takes one lane.
-    W == 1 || throw(ArgumentError(
+    tape isa _PROnePass && return _pr_one_pass_reverse(Val(S), Val(B), Val(W), dret, tape, args)
+    operands = _pr_operands(tape, args)
+    covered = _pr_covers(Val(S), Val(B), args)
+    if W == 1 && !covered
+        ȳ = dret isa Active ? dret.val : dret
+        return _pr_ordinary_reverse(r.program, ȳ, operands, args)
+    end
+    covered || throw(ArgumentError(
         "plate reverse: a batched (width $W) reverse of a plate program with an active " *
         "operand the generated reverse does not differentiate; prepare without `with_plate_reverse`"))
-    ȳ = dret isa Active ? dret.val : dret
-    _pr_ordinary_reverse(r.program, ȳ, _pr_operands(tape, args), args)
-end
-
-# The reverse pass of a covered call: no sweep over the cells, only the seed's
-# scaling of what the augmented primal computed.
-function _pr_onepass_reverse(::Val{S}, ::Val{B}, ::Val{W}, dret, tape::_PROnePass,
-                             args::Tuple{Vararg{Any,N}}) where {S,B,W,N}
     if W == 1
         ȳ = dret isa Active ? dret.val : dret
-        shadows = _pr_scaled_shadows(Val(B), args, tape.buffers, Val(1), 1, ȳ)
-        return _pr_reverse_return(Val(S), args, _pr_scaled(tape.cotangents, ȳ), Val(B), shadows)
+        shadows = _pr_shadows(Val(B), args, Val(1), 1)
+        cot = Base.tail(r.reverse(operands..., ȳ, shadows...))
+        return _pr_reverse_return(Val(S), args, cot, Val(B), shadows)
     end
     # The lanes' own names: a closure assigning the `ȳ` and `shadows` of the
-    # width-1 branch above would share them, boxed, and the width-1 call would
-    # dispatch dynamically and allocate every argument.
+    # width-1 branches above would share them, boxed, and the width-1 call
+    # would dispatch dynamically and allocate every argument.
     lanes = ntuple(Val(W)) do w
         lane_ȳ = dret.val[w]
-        lane_shadows = _pr_scaled_shadows(Val(B), args, tape.buffers, Val(W), w, lane_ȳ)
+        lane_shadows = _pr_shadows(Val(B), args, Val(W), w)
+        Base.tail(r.reverse(operands..., lane_ȳ, lane_shadows...))
+    end
+    # Active scalars of a batched call take one cotangent per lane.
+    ntuple(Val(N)) do i
+        a = args[i]
+        a isa Active || return nothing
+        k = findfirst(==(i), S)
+        ntuple(w -> k === nothing ? zero(a.val[w]) : lanes[w][k], Val(W))
+    end
+end
+
+# The reverse pass of a one-pass call: no sweep over the cells, only the
+# seed's scaling of what the augmented primal computed.
+function _pr_one_pass_reverse(::Val{S}, ::Val{B}, ::Val{W}, dret, tape::_PROnePass,
+                              args::Tuple{Vararg{Any,N}}) where {S,B,W,N}
+    if W == 1
+        ȳ = dret isa Active ? dret.val : dret
+        shadows = _pr_scaled_shadows(Val(B), args, tape.buffers, ȳ)
+        return _pr_reverse_return(Val(S), args, _pr_scaled(tape.cotangents, ȳ), Val(B), shadows)
+    end
+    # A batched call: `_pr_one_pass` admits only width-1 shadows, so only
+    # scalar and tuple operands reach here; each lane scales the same results.
+    lanes = ntuple(Val(W)) do w
+        lane_ȳ = dret.val[w]
+        lane_shadows = _pr_scaled_shadows(Val(B), args, tape.buffers, lane_ȳ)
         _pr_reverse_return(Val(S), args, _pr_scaled(tape.cotangents, lane_ȳ), Val(B), lane_shadows)
     end
-    # An Active operand of a batched call takes one cotangent per lane.
     ntuple(i -> args[i] isa Active ? ntuple(w -> lanes[w][i], Val(W)) : nothing, Val(N))
 end
 
