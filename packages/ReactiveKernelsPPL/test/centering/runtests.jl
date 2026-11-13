@@ -4,6 +4,7 @@
 module AdaptiveCenteringTests
 
 using Test, ReactiveKernels, ReactiveKernelsPPL, Enzyme, WarmupHMC
+using ReactiveKernelsPPL: adaptive_centering_problem
 using DifferentiationInterface: AutoEnzyme
 import LogDensityProblems as LDP
 
@@ -53,6 +54,34 @@ function emission_shape(kernel)
     end
     visit(code_expr(kernel))
     (; heads, callables = length(kernel.callables))
+end
+
+# Stand-in for BayesianRegressionModels, which exports a different
+# `adaptive_centering_problem(model, problem, ad_backend; ...)`. A consumer
+# loading both packages must still call BRM's name unqualified
+# (snag rkppl-export-ada-38f23f30).
+module SameNameExporter
+export adaptive_centering_problem
+adaptive_centering_problem(model, problem, ad_backend) = :same_name_exporter
+end
+
+module SameNameConsumer
+using ReactiveKernelsPPL
+using ..SameNameExporter
+call_unqualified() = adaptive_centering_problem(nothing, nothing, nothing)
+end
+
+@testset "a package exporting the same name loads beside RKPPL" begin
+    @test !Base.isexported(ReactiveKernelsPPL, :adaptive_centering_problem)
+    @static if isdefined(Base, :ispublic)
+        @test Base.ispublic(ReactiveKernelsPPL, :adaptive_centering_problem)
+    end
+    @test SameNameConsumer.call_unqualified() === :same_name_exporter
+    s = setup()
+    cells = (z = (location = :z_location, log_scale = :log_scale),)
+    rp = ReactiveKernelsPPL.adaptive_centering_problem(s.built, s.plan, s.problem,
+        BACKEND; cells)
+    @test LDP.logdensity(rp, s.u) == LDP.logdensity(s.problem, s.u)
 end
 
 @testset "graph-backed affine cells" begin

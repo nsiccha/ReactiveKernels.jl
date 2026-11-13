@@ -16,6 +16,20 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.172
+
+- **Breaking:** `adaptive_centering_problem` is no longer exported. It is
+  declared `public` instead (on Julia 1.11 and later, through Compat, now a
+  direct dependency). BayesianRegressionModels has long exported a different
+  `adaptive_centering_problem`, and two packages exporting one name leave it
+  undefined in every module that loads both. With this change, BRM's
+  unqualified `adaptive_centering_problem(model, problem, ad_backend; ...)`
+  works again beside `using ReactiveKernelsPPL`. Callers of RKPPL's
+  graph-backed adapter add
+  `using ReactiveKernelsPPL: adaptive_centering_problem` or call
+  `ReactiveKernelsPPL.adaptive_centering_problem(built, plan, problem, backend; cells)`;
+  its arguments and behaviour are unchanged.
+
 ## 0.1.171
 
 - A compact cell or partition query gathers its constant base rows with a
