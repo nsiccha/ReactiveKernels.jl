@@ -61,3 +61,36 @@ ReactiveKernels.@_record_source function _student_log_kernel(nu, z)
     end
     return result
 end
+
+# The kernel at `l = log|z|` (`ReactiveKernels._rk_log_abs_form`): both finite
+# arms are `-((nu + 1) / 2) * log1p(z^2 / nu)`, and `log1p(z^2 / nu)` is
+# `log1pexp(2l - log(nu))`. A positive parameter's half-Student or half-Cauchy
+# prior at `exp(u)` reads `u` with no exponential formed: finite where
+# `exp(u)` overflows, and without the kernel's branch and logarithms of `z`.
+# A negative `nu` raises `DomainError` in `log`, as the kernel's `sqrt` does.
+ReactiveKernels.@_record_source function _student_log_kernel_at_log_abs(l, nu)
+    result = zero(nu + l)
+    if nu == Inf
+        result = -exp(2l) / 2
+    else
+        result = -((nu + 1) / 2) * LogExpFunctions.log1pexp(2l - log(nu))
+    end
+    return result
+end
+ReactiveKernels._rk_log_abs_form(::typeof(_student_log_kernel)) = _student_log_kernel_at_log_abs
+
+# Its parameter-only part at `l = x + shift`, once per plate: `offset` is
+# `2shift - log(nu)`. It never raises: below zero `ok` is false and each cell
+# runs the kernel, which raises its own `DomainError`.
+function ReactiveKernels._rk_log_abs_prepare(::typeof(_student_log_kernel), ok::Bool,
+                                             shift::Real, nu::Real)
+    T = float(promote_type(typeof(shift), typeof(nu)))
+    valid = !(nu < 0)
+    infinite = nu == Inf
+    lognu = valid && !infinite ? log(convert(T, nu)) : zero(T)
+    (ok = ok & valid, infinite = infinite, half = convert(T, -(nu + 1) / 2),
+     offset = convert(T, 2shift - lognu), twice = convert(T, 2shift))
+end
+@inline ReactiveKernels._rk_log_abs_apply(::typeof(_student_log_kernel), p::NamedTuple,
+                                          x::Real) =
+    p.infinite ? -exp(2x + p.twice) / 2 : p.half * LogExpFunctions.log1pexp(2x + p.offset)

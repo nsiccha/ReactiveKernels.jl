@@ -6697,9 +6697,14 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
         return nothing
     elseif r.family === CategoricalLogitFam || _is_ordered_family(r.family) ||
             r.family === CategoricalFam
-        # Ordinal support is stated by its cutpoints; observed categories
-        # need not exhaust that support. Other recoded responses retain
-        # exact contiguity 1..K. K=1 is uniform
+        # The law states its support 1..K: ordinal cutpoints, the
+        # CategoricalLogit locations plus the reference, a Categorical's
+        # probability vector. Each observation's density is defined for any
+        # code in it (Stan's `categorical_logit`, `categorical` and
+        # `ordered_logistic` accept such data), so observed categories need
+        # not exhaust that support, as a replay design holding one class
+        # shows. A K read from the observations instead already required
+        # every code 1..K in `_infer_response_levels`. K=1 is uniform
         # (a zero-information likelihood, SB's one-emission rule) — except
         # CategoricalLogit, whose structural K needs ≥1 non-reference
         # predictor (a single-level categorical is degenerate and stays
@@ -6718,10 +6723,6 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
                 _fail(r.label, "each ordinal observation must lie in its " *
                     "threshold vector's support 1..length(cuts)+1")
         end
-        (_is_ordered_family(r.family) || r.evidence.kind !== :none ||
-            sort(unique(col)) == collect(1:K)) ||
-            return _fail(r.label, "leveled response must cover every level " *
-                "1..$K exactly (recoded levels have no gaps)")
         return nothing
     elseif r.family === MultinomialFam
         # The count matrix crosses as K raw columns (lead + tail), each a
@@ -9187,8 +9188,9 @@ end
 
 # Bind-time level inference (the LevelMap binder-evaluation precedent):
 # `n_levels === nothing` fills structurally (CategoricalLogit: 1 +
-# predictor count; Multinomial: count-column count) or from the response
-# column (max(y) for OrderedLogistic/Ordinal/Categorical); vector-param
+# predictor count; Multinomial: count-column count), from the law's stated
+# support (cutpoint count + 1; a Categorical's probability-vector width), or
+# from the response column (max(y), every code observed); vector-param
 # `size === nothing` fills from the linked response (K−1 thresholds, K
 # simplex), or a declared value shape. Explicit values assert against the
 # inference. Returns new (immutable) vectors; unbound plans keep
@@ -9310,16 +9312,22 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
             kind = _group_thresholds(plan, r) ? ThresholdRows(r.thresholds) : r.thresholds
             declared = _data_threshold_extent(kind, cuts, r.label)
         end
-        K = declared !== nothing ? declared + 1 : if r.evidence.kind !== :none && r.n_levels === nothing &&
-                r.family !== CategoricalLogitFam
-            # Clamp endpoints need not be category integers. Infer the law's
-            # support from its explicit probability/threshold vector first.
+        K = declared !== nothing ? declared + 1 : if r.n_levels === nothing &&
+                (r.family === CategoricalFam ||
+                    (r.evidence.kind !== :none && r.family !== CategoricalLogitFam))
+            # A categorical's probability vector states its support, as
+            # cutpoints do: categories absent from these observations keep
+            # their entries. Clamp endpoints need not be category integers
+            # either. Infer the law's support from its explicit
+            # probability/threshold vector first.
             ref = r.family === CategoricalFam ? r.predictor : r.thresholds
             vi = findfirst(v -> v.name === ref, vectors)
             width = if vi !== nothing
                 v = vectors[vi]
                 v.family === :simplex_dirichlet ? _dirichlet_size(plan, v.args.arg1, v.label) : v.size
-            elseif haskey(columns, ref)
+            elseif haskey(columns, ref) && columns[ref] isa AbstractVector{<:Real}
+                # One shared probability/threshold vector; per-row vectors
+                # carry no single width here.
                 length(columns[ref])
             else
                 nothing
