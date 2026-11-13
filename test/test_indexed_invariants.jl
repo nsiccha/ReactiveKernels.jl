@@ -56,7 +56,10 @@ function reference_gradient(p, events, logit)
     value, gradient
 end
 nodes(x) = x isa Expr ? 1 + sum(nodes, x.args; init=0) : 0
+nodes(x::ReactiveKernels._PlateProgram) = nodes(x.ast)
 function table_depths!(depths, x, depth=0)
+    # Retained plate programs execute their bodies at the call's loop depth.
+    x isa ReactiveKernels._PlateProgram && return table_depths!(depths, x.ast, depth)
     x isa Expr || return depths
     x.head in (:quote,:inert) && return depths
     if x.head === :call && first(x.args) == GlobalRef(ReactiveKernels,:_indexed_map)
