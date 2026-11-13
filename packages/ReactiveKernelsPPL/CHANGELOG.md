@@ -16,12 +16,26 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.172
+## 0.1.173
 
 - Adaptive affine cells accept `Real` constants for `location` and `log_scale`,
   shared across the selected block. Constants can mix with named graph queries
   without adding sampler-only declarations to the model; their values remain
   runtime configuration and use the same concrete accessor type across blocks.
+
+## 0.1.172
+
+- **Breaking:** `adaptive_centering_problem` is no longer exported. It is
+  declared `public` instead (on Julia 1.11 and later, through Compat, now a
+  direct dependency). BayesianRegressionModels has long exported a different
+  `adaptive_centering_problem`, and two packages exporting one name leave it
+  undefined in every module that loads both. With this change, BRM's
+  unqualified `adaptive_centering_problem(model, problem, ad_backend; ...)`
+  works again beside `using ReactiveKernelsPPL`. Callers of RKPPL's
+  graph-backed adapter add
+  `using ReactiveKernelsPPL: adaptive_centering_problem` or call
+  `ReactiveKernelsPPL.adaptive_centering_problem(built, plan, problem, backend; cells)`;
+  its arguments and behaviour are unchanged.
 
 ## 0.1.171
 

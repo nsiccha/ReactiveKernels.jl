@@ -4,6 +4,7 @@
 module AdaptiveCenteringTests
 
 using Test, ReactiveKernels, ReactiveKernelsPPL, Enzyme, WarmupHMC
+using ReactiveKernelsPPL: adaptive_centering_problem
 using DifferentiationInterface: AutoEnzyme
 import LogDensityProblems as LDP
 
@@ -53,6 +54,34 @@ function emission_shape(kernel)
     end
     visit(code_expr(kernel))
     (; heads, callables = length(kernel.callables))
+end
+
+# Stand-in for BayesianRegressionModels, which exports a different
+# `adaptive_centering_problem(model, problem, ad_backend; ...)`. A consumer
+# loading both packages must still call BRM's name unqualified
+# (snag rkppl-export-ada-38f23f30).
+module SameNameExporter
+export adaptive_centering_problem
+adaptive_centering_problem(model, problem, ad_backend) = :same_name_exporter
+end
+
+module SameNameConsumer
+using ReactiveKernelsPPL
+using ..SameNameExporter
+call_unqualified() = adaptive_centering_problem(nothing, nothing, nothing)
+end
+
+@testset "a package exporting the same name loads beside RKPPL" begin
+    @test !Base.isexported(ReactiveKernelsPPL, :adaptive_centering_problem)
+    @static if isdefined(Base, :ispublic)
+        @test Base.ispublic(ReactiveKernelsPPL, :adaptive_centering_problem)
+    end
+    @test SameNameConsumer.call_unqualified() === :same_name_exporter
+    s = setup()
+    cells = (z = (location = :z_location, log_scale = :log_scale),)
+    rp = ReactiveKernelsPPL.adaptive_centering_problem(s.built, s.plan, s.problem,
+        BACKEND; cells)
+    @test LDP.logdensity(rp, s.u) == LDP.logdensity(s.problem, s.u)
 end
 
 @testset "graph-backed affine cells" begin
@@ -238,7 +267,7 @@ end
     built = build_kernel(plan)
     u = 0.1 .* cos.(1:built.layout.total)
     cells = (z = (location = :location, log_scale = :log_scale, source = 1.0),)
-    ir, _ = map_for(built, plan, cells; u0 = u)
+    ir, prepared = map_for(built, plan, cells; u0 = u)
     entries = Dict(e.name => e for e in built.layout.entries)
     zi = entries[:z].offset .+ (0:5)
     expected = copy(u)
@@ -246,6 +275,30 @@ end
     jac, mapped = WarmupHMC.with_logabsdet_jacobian!(copy(u), ir, u)
     @test mapped ≈ expected
     @test jac ≈ -sum(log, scales)
+
+    # Array endpoints may borrow graph storage, including bound cached values.
+    # Maps and reverse AD must only read it, and a later evaluation must not
+    # change an earlier result or the caller's input/data.
+    inputs = (copy(u), copy(offsets), copy(scales))
+    endpoints = map(k -> k(u), prepared.kernels)
+    snapshots = map(copy, endpoints)
+    problem = prepare_sampler(built, plan, u; backend = BACKEND)
+    rp = adaptive_centering_problem(built, plan, problem, BACKEND; cells, u0 = u)
+    first_result = LDP.logdensity_and_gradient(rp, u)
+    first_gradient = copy(last(first_result))
+    for point in (u, u .+ 0.07, view(hcat(u, u .+ 0.07), :, 2))
+        value, gradient = LDP.logdensity_and_gradient(rp, point)
+        @test value ≈ LDP.logdensity(rp, point)
+        @test gradient ≈ finite_gradient(x -> LDP.logdensity(rp, x), point) rtol = 2e-7 atol = 2e-7
+        _, forward = WarmupHMC.with_logabsdet_jacobian!(copy(point), ir, point)
+        _, inverse = WarmupHMC.with_logabsdet_jacobian!(copy(forward),
+            WarmupHMC.InverseFunctions.inverse(ir), forward)
+        @test inverse ≈ point
+        @test endpoints == snapshots
+        @test (u, offsets, scales) == inputs
+        @test last(first_result) == first_gradient
+    end
+    @test LDP.logdensity_and_gradient(rp, u) == first_result
 end
 
 @testset "a graph-derived spatial cell preserves the original density" begin

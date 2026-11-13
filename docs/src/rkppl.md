@@ -62,10 +62,13 @@ Tutorials.html(model_view(built; bound))
 
 Select affine cells when setting up WarmupHMC. Declare their location and
 log-scale as ordinary named values in the model, then pass those names to
-`adaptive_centering_problem`:
+`adaptive_centering_problem`. It is public but not exported, because
+BayesianRegressionModels exports a different function of that name; import it
+explicitly:
 
 ```@example adaptive_centering
 using ReactiveKernelsPPL, WarmupHMC, LogDensityProblems, Enzyme
+using ReactiveKernelsPPL: adaptive_centering_problem
 using DifferentiationInterface: AutoEnzyme
 
 model = @rkppl begin
