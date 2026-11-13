@@ -16,12 +16,19 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.229
+## 0.1.230
 
 - JAX numerical functions return typed JAX arrays for constant terms and numeric
   leaves of tuple/dict results as well as computed values. Eager constant outputs
   follow `jax.default_device`, so device-placement checks also cover a zero log
   Jacobian. Host preparation and static shape/coordinate metadata remain host values.
+
+## 0.1.229
+
+- Partition plans retain constant row calculations used to size fresh scan
+  outputs, including buffers selected by a conditional. Mutating an output no
+  longer pulls its marker's row calculations into each gradient call. Aliases
+  of existing storage and mutations in conditions stay in ordinary execution.
 
 ## 0.1.228
 

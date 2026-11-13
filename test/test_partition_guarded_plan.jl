@@ -229,3 +229,50 @@ end
         return y
     end, (0, 1, 4, 31))
 end
+
+module _PGPScanAllocatorLookalike
+_scan_similar_output(rows, ::Type{T}) where {T} = rows
+end
+
+@testset "fresh scan buffers retain marker planning" begin
+    split = _pgp_check(quote
+        rows = collect(1:label)
+        concrete = isconcretetype(Float64)
+        preallocated = concrete ? $(GlobalRef(ReactiveKernels, :_scan_similar_output))(rows, Float64) : nothing
+        scratch = preallocated === nothing ? $(GlobalRef(ReactiveKernels, :_scan_similar_output))(rows, Float64) : preallocated
+        for i in eachindex(scratch)
+            scratch[i] = u * rows[i]
+        end
+        return sum(scratch)
+    end, (0, 1, 4, 31))
+    @test :rows in split.needed
+    @test !(:scratch in split.needed)
+    @test !(:preallocated in split.needed)
+end
+
+@testset "conditional aliases retain mutable backing arrays" begin
+    _pgp_check(quote
+        a = zeros(label + 1)
+        b = zeros(label + 1)
+        selected = isodd(label) ? a : b
+        selected[1] = u
+        return sum(a) + 2sum(b)
+    end, (0, 1, 4, 31); require_plan=false)
+
+    # The allocator promise belongs to an exact owned callable. An unrelated
+    # function with the same name may return its marker as an alias.
+    _pgp_check(quote
+        rows = zeros(label + 1)
+        scratch = $(GlobalRef(_PGPScanAllocatorLookalike, :_scan_similar_output))(rows, Float64)
+        scratch[1] = u
+        return sum(rows)
+    end, (0, 1, 4, 31); require_plan=false)
+
+    # A condition does not supply the returned storage, but evaluating it may
+    # still mutate an array. Such writes must remain in ordinary execution.
+    _pgp_check(quote
+        rows = zeros(label + 1)
+        scratch = (rows[1] = u; isodd(label)) ? rows : rows
+        return sum(scratch)
+    end, (0, 1, 4, 31); require_plan=false)
+end
