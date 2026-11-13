@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.9
+
+- The Student-t log kernel declares its form at `log|z|` to ReactiveKernels'
+  stable rewrites, so a half-Student or half-Cauchy prior at `exp(u)` reads
+  `u` directly. Requires ReactiveKernels 0.1.216.
+
 ## 0.1.8
 
 - Bernoulli, Binomial and zero-inflated Binomial product-mixture laws accept

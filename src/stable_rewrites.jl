@@ -47,6 +47,20 @@
 # state (`stateful.jl`), whose values are slots a rewrite never reads past;
 # and `jax_source`, which translates the same rule catalogue
 # (`_jax_stable_rewrite`). Opaque native functions are never visible to it.
+#
+# Kernels of a log-magnitude (snag `measured-the-rem-97a93f3f`). A positive
+# parameter's prior evaluates a law's standardized log kernel at `exp(u)`: a
+# half-Student or half-Cauchy prior on a scale computes `exp(u)`, divides,
+# squares and takes logarithms of what `u` already is. A function whose value
+# depends on its last argument only through `log|z|` declares that form
+# (`_rk_log_abs_form`); the pass then computes `f(args..., exp(x))` and
+# `f(args..., (exp(x) - c) / s)` with `c == 0` from `x` directly. In a plate
+# cell the declared parameter-only part (`log(nu)`, the scale's logarithm) runs
+# once before the cells (`_rw_loop_part`), as a shared reciprocal does; a call
+# the program repeats whose part cannot run once keeps the literal, which is
+# cheaper there. A cell reads a value a lazy cell array computes as `f(y[i])`
+# through that array (`_rw_read_view`); a materialized array is computed either
+# way, so its reads stay.
 
 # --- the setting -------------------------------------------------------------
 
@@ -198,6 +212,63 @@ end
 @_record_source @inline _rk_log1m_sigmoid(c1::Real, c2::Real, ::_RwExp, u::Real) =
     convert(_rw_float(c1, c2, u), LogExpFunctions.log1mlogistic(u))
 
+# --- kernels of a log-magnitude --------------------------------------------------
+#
+# A function `f(args..., z)` whose value depends on its last argument only
+# through `l = log|z|` (a symmetric law's standardized log kernel) declares:
+#
+#     ReactiveKernels._rk_log_abs_form(::typeof(f)) = g
+#
+# `g(l, args...)` is `f(args..., z)` as a real function wherever `l = log|z|`
+# is finite, its limit as `l → -Inf` is `f(args..., 0)`, and it raises every
+# error `f(args..., z)` raises; it records its source, so `jax_source`
+# translates it. The same package splits `g` for a loop:
+#
+#     ReactiveKernels._rk_log_abs_prepare(::typeof(f), ok, shift, args...) -> p::NamedTuple
+#     ReactiveKernels._rk_log_abs_apply(::typeof(f), p, x)   # g(x + shift, args...)
+#
+# `prepare` holds the parameter-only work, runs before a plate's cells and
+# never raises: `p.ok` is `ok` where `g` reproduces `f`, and false where `f`
+# raises or the form does not apply, so each cell runs `f` itself there.
+_rk_log_abs_form(f) = nothing
+function _rk_log_abs_prepare end
+function _rk_log_abs_apply end
+
+# `x - log|s|`, in the float type `(exp(x) - c) / s` has.
+@inline _rw_log_abs_ratio(x, c, s) =
+    (T = _rw_float(x, c, s); convert(T, x) - log(abs(convert(T, s))))
+
+# `f(args..., e(x))` and `f(args..., (e(x) - c) / s)`, at one call.
+@_record_source @inline _rk_at_exp1(f::F, e::E, x, args...) where {F,E} = f(args..., e(x))
+@_record_source @inline _rk_at_exp1(f::F, ::_RwExp, x::Real, args::Real...) where {F} =
+    _rk_log_abs_form(f)(float(x), args...)
+@_record_source @inline _rk_at_exp_std1(f::F, e::E, x, c, s, args...) where {F,E} =
+    f(args..., (e(x) - c) / s)
+@_record_source @inline _rk_at_exp_std1(f::F, e::_RwExp, x::Real, c::Real, s::Real,
+                                        args::Real...) where {F} =
+    iszero(c) ? _rk_log_abs_form(f)(_rw_log_abs_ratio(x, c, s), args...) :
+        f(args..., (e(x) - c) / s)
+
+# Their parameter-only parts, computed once: `nothing` (the literal at each
+# call) unless every operand is a real number.
+@inline _rk_at_exp_part(f, e, args...) = nothing
+@inline _rk_at_exp_part(f::F, ::_RwExp, args::Real...) where {F} =
+    _rk_log_abs_prepare(f, true, false, args...)
+@inline _rk_at_exp_std_part(f, e, c, s, args...) = nothing
+@inline _rk_at_exp_std_part(f::F, ::_RwExp, c::Real, s::Real, args::Real...) where {F} =
+    _rk_log_abs_prepare(f, iszero(c), -log(abs(float(s))), args...)
+
+# The same calls given their part `p`.
+@_record_source @inline _rk_at_exp(f::F, e::E, x, p, args...) where {F,E} = f(args..., e(x))
+@_record_source @inline _rk_at_exp(f::F, e::_RwExp, x::Real, p::NamedTuple,
+                                   args::Real...) where {F} =
+    p.ok ? _rk_log_abs_apply(f, p, x) : f(args..., e(x))
+@_record_source @inline _rk_at_exp_std(f::F, e::E, x, c, s, p, args...) where {F,E} =
+    f(args..., (e(x) - c) / s)
+@_record_source @inline _rk_at_exp_std(f::F, e::_RwExp, x::Real, c::Real, s::Real,
+                                       p::NamedTuple, args::Real...) where {F} =
+    p.ok ? _rk_log_abs_apply(f, p, x) : f(args..., (e(x) - c) / s)
+
 # Every helper the pass emits, by identity, for code that reads a rewritten
 # program: the generated plate reverse expands each call into the method its
 # operands select (`_pr_expand_stable_helper`, `src/plate_reverse.jl`).
@@ -207,7 +278,8 @@ end
 const _RK_STABLE_HELPERS = (_rk_log_of, _rk_log1p_of, _rk_log1p_neg_of, _rk_log_one_minus_of,
     _rk_log_one_plus, _rk_log_one_plus_of, _rk_log_add_of, _rk_log_sum_of, _rk_logit_of,
     _rk_log_odds_of, _rk_exp_log_of, _rk_minus_one_of, _rk_inv_of, _rk_div_by_of, _rk_div_by_scale, _rk_pow_of,
-    _rk_sqrt_of, _rk_log_sigmoid, _rk_log1m_sigmoid)
+    _rk_sqrt_of, _rk_log_sigmoid, _rk_log1m_sigmoid, _rk_at_exp1, _rk_at_exp_std1, _rk_at_exp,
+    _rk_at_exp_std)
 
 # --- recognising calls --------------------------------------------------------
 
@@ -223,6 +295,7 @@ struct _RwLoop
     available::Set{Symbol}
     scales::Dict{Any,Symbol}
     prelude::Vector{Any}
+    hoist::Bool                 # a plate loop, whose prelude runs before its cells
 end
 
 struct _RwContext
@@ -231,8 +304,13 @@ struct _RwContext
     params::Set{Symbol}         # parameters the body never assigns
     reads::Base.RefValue{Int}   # fresh stable read/scale temporaries emitted
     hoisted::Bool               # a loop never reads a definition from outside it
-    loops::Vector{_RwLoop}
+    loops::Vector{_RwLoop}      # the plate loops around the site; a barrier for any other
+    parts::Bool                 # a kernel's parameter part may be computed once (native)
 end
+
+# A loop or branch the walk is inside, where nothing can be computed once
+# before the cells: a plate loop's `available` names are readable before it.
+_rw_barrier() = _RwLoop(Set{Symbol}(), Dict{Any,Symbol}(), Any[], false)
 
 # A name defined outside the loop being rewritten, under `hoisted`: readable
 # there, but its definition is not, so no rewrite moves the work that computed
@@ -311,9 +389,15 @@ function _rw_pure_read(x, ctx::_RwContext, env)
     parts === nothing && return false
     call = parts[2]
     _rw_resolve(call.args[1], @__MODULE__) in (Base.Broadcast._broadcast_getindex, _plate_read) &&
-        all(a -> a isa Number || (a isa Symbol && (haskey(env, a) || a in ctx.params)),
-            call.args[2:end])
+        all(a -> _rw_read_operand(a, ctx, env), call.args[2:end])
 end
+# An operand of such a read: a literal, a name the site can read, or the
+# broadcastable form of one (`_rw_read_view`'s read of a lazy array's operand).
+_rw_read_operand(a, ctx::_RwContext, env) = a isa Number ||
+    (a isa Symbol && (haskey(env, a) || a in ctx.params)) ||
+    (a isa Expr && a.head === :call && length(a.args) == 2 && a.args[2] isa Symbol &&
+     _rw_resolve(a.args[1], @__MODULE__) === Base.broadcastable &&
+     _rw_read_operand(a.args[2], ctx, env))
 # An operand as the rewritten call spells it: a read moved out of its statement
 # declares a local of its own, never one its statement still declares. The
 # local is numbered in the walk's order, never minted with `gensym`, so one
@@ -444,9 +528,60 @@ function _rw_materialize_step(ex::Expr, ctx::_RwContext)
     k !== nothing && 1 <= k <= length(ctx.recipes) && ctx.recipes[k] isa _MaterializeStep
 end
 
+# A plate cell's read of an argument that is a lazy cell array of one function
+# of one operand, `w = f.(y)` (`_cell_array_broadcast`): `f` of the operand's
+# read at the same coordinate. Every entry of `w` is `f(y[i])`, and the
+# plate's axes are `w`'s, which are `y`'s. A materialized array keeps its
+# reads: its buffer is computed whether or not a cell reads it, and a cell
+# computing `f(y[i])` again would only add work.
+function _rw_read_view(call::Expr, ctx::_RwContext, env)
+    length(call.args) == 3 && _rw_resolve(call.args[1], @__MODULE__) === _plate_read ||
+        return nothing
+    arg, index = call.args[2], call.args[3]
+    arg isa Symbol && index isa Symbol || return nothing
+    prepared = get(env, arg, nothing)
+    prepared isa Expr && prepared.head === :call && length(prepared.args) == 2 &&
+        _rw_resolve(prepared.args[1], @__MODULE__) === Base.broadcastable || return nothing
+    lazy = _rw_lazy_broadcast(prepared.args[2], env)
+    lazy === nothing && return nothing
+    inner = _rw_view(lazy, ctx, env)
+    inner !== nothing && inner.broadcast && length(inner.args) == 1 || return nothing
+    y = only(inner.args)
+    y isa Symbol && _rw_available(y, ctx, env) || return nothing
+    # A placeholder local: an emitted read declares a fresh one (`_rw_fresh`).
+    name = Symbol("#stable_read#")
+    read = Expr(:block, Expr(:inbounds, true),
+        Expr(:local, Expr(:(=), name, Expr(:call, GlobalRef(@__MODULE__, :_plate_read),
+            Expr(:call, GlobalRef(Base, :broadcastable), y), index))),
+        Expr(:inbounds, :pop), name)
+    _RwView(inner.f, Any[read], false)
+end
+
+# The lazy cell array a name is defined as, under a declaration that keeps its
+# elements, else `nothing`.
+function _rw_lazy_broadcast(x, env)
+    for _ in 1:64
+        x isa Symbol || break
+        x = get(env, x, nothing)
+    end
+    x isa Expr && x.head === :call && !isempty(x.args) || return nothing
+    f = _rw_resolve(x.args[1], @__MODULE__)
+    f === _cell_array_as && length(x.args) == 3 && _rw_keeps_elements(x.args[2]) &&
+        return _rw_lazy_broadcast(x.args[3], env)
+    f === _cell_array_broadcast && length(x.args) == 2 ? x : nothing
+end
+
+# A declared array type (`_cell_array_as`) whose conversion keeps every
+# element as it is: one of `Float64` entries.
+_rw_keeps_elements(T) = T isa Type && T <: AbstractArray && eltype(T) === Float64
+
 # The call `ex` makes, or `nothing`.
 function _rw_view(ex, ctx::_RwContext, env)
     ex isa Expr || return nothing
+    if ex.head === :block
+        parts = _rw_read_parts(ex)
+        return parts === nothing ? nothing : _rw_read_view(parts[2], ctx, env)
+    end
     if ex.head === :let
         peeled = _rw_peel_let(ex, ctx, env)
         return peeled === nothing ? nothing : _rw_view(peeled, ctx, env)
@@ -462,8 +597,11 @@ function _rw_view(ex, ctx::_RwContext, env)
                 inner !== nothing && inner.broadcast ? inner : nothing)
     f = _rw_resolve(callee, @__MODULE__)
     f === nothing && return nothing
-    if f === _native_broadcast_materialize && length(args) == 1
+    if (f === _native_broadcast_materialize || f === _cell_array_broadcast) && length(args) == 1
         inner = _rw_view(args[1], ctx, env)
+        return inner !== nothing && inner.broadcast ? inner : nothing
+    elseif f === _cell_array_as && length(args) == 2 && _rw_keeps_elements(args[1])
+        inner = _rw_view(args[2], ctx, env)
         return inner !== nothing && inner.broadcast ? inner : nothing
     elseif _rw_is_broadcasted(f) && !isempty(args)
         g = _rw_resolve(args[1], @__MODULE__)
@@ -684,6 +822,7 @@ function _rw_loop_scale(ctx::_RwContext, env, f, x)
         x = env[x]
     end
     for loop in Iterators.take(Iterators.reverse(ctx.loops), 1)
+        loop.hoist || continue
         (x isa Number || (x isa Symbol && x in loop.available)) || continue
         key = (f, x)
         return get!(loop.scales, key) do
@@ -726,17 +865,47 @@ function _rw_plate_loop(ex::Expr)
        replace = rewritten -> Expr(:for, binding, rewritten))
 end
 
+# The assignment counts a plate cell's statements see: a name the cell assigns
+# once, and never reads before that assignment, is a definition inside the
+# cell however often the program assigns it elsewhere (a summed plate's
+# factored loop and its own loop spell one cell twice,
+# `summed_plate_factors.jl`). A name a cell carries to the next
+# (`total = add(total, term)`) never is.
+function _rw_cell_counts(body, counts::Dict{Symbol,Int})
+    cell = _rw_count!(Dict{Symbol,Int}(), body)
+    isempty(cell) && return counts
+    carried = Set{Symbol}()
+    seen = Set{Symbol}()
+    statements = body isa Expr && body.head === :block ? body.args : Any[body]
+    for st in statements
+        st isa LineNumberNode && continue
+        for name in keys(_rw_reads!(Dict{Symbol,Int}(), st))
+            haskey(cell, name) && !(name in seen) && push!(carried, name)
+        end
+        union!(seen, keys(_rw_count!(Dict{Symbol,Int}(), st)))
+    end
+    merged = copy(counts)
+    for (name, k) in cell
+        merged[name] = k == 1 && !(name in carried) ? 1 : max(k, 2)
+    end
+    merged
+end
+
 function _rw_plate_expr(ex, plate, ctx, env)
     assigned = keys(_rw_count!(Dict{Symbol,Int}(), ex))
     loop = _RwLoop(setdiff(union(ctx.params, keys(env)), assigned),
-                   Dict{Any,Symbol}(), Any[])
+                   Dict{Any,Symbol}(), Any[], true)
     push!(ctx.loops, loop)
     inner = ctx.hoisted ? Dict{Symbol,Any}(name => _RwOuter() for name in keys(env)) :
             copy(env)
+    # A name the loop assigns has no definition from before it.
+    foreach(name -> delete!(inner, name), assigned)
     # The extracted cell body starts after SIMD's index assignment. Keep the
     # index readable by existing cell-read rewrites, but never loop-invariant.
     inner[plate.index] = nothing
-    rewritten = _rw_expr(plate.body, ctx, inner)
+    cell = _RwContext(ctx.recipes, _rw_cell_counts(plate.body, ctx.counts), ctx.params,
+                      ctx.reads, ctx.hoisted, ctx.loops, ctx.parts)
+    rewritten = _rw_expr(plate.body, cell, inner)
     pop!(ctx.loops)
     result = plate.replace(rewritten)
     isempty(loop.prelude) && return result
@@ -757,6 +926,96 @@ function _rw_rule_sqrt(outer::_RwView, ctx, env)
     length(outer.args) == 1 || return nothing
     hit = _rw_unary(only(outer.args), ctx, env, outer, _rw_is_exp)
     hit === nothing ? nothing : _rw_emit(ctx, outer, :_rk_sqrt_of, _rw_ref(hit[1].f), hit[2])
+end
+
+# A reference the rewritten program calls `f` by: the binding it is the
+# constant value of.
+function _rw_callable_ref(f)
+    r = _rw_ref(f)
+    r === nothing || return r
+    f isa Function || return nothing
+    m, name = parentmodule(f), nameof(f)
+    _rw_binding(m, name) === f ? GlobalRef(m, name) : nothing
+end
+
+# An operand that stays at its site and is read there as written.
+_rw_site_operand(a) = a isa Union{Number,Symbol,QuoteNode,GlobalRef} ||
+    _rw_read_parts(a) !== nothing
+
+# A name for `helper(operands...)`, computed once before the cells of the
+# nearest plate loop when every operand is readable there (a name the loop
+# never assigns, a literal, a constant), else `nothing`. One name serves every
+# use of the same call in that loop.
+function _rw_loop_part(ctx::_RwContext, env, helper::Symbol, operands)
+    isempty(ctx.loops) && return nothing
+    loop = last(ctx.loops)
+    loop.hoist || return nothing
+    resolved = Any[]
+    for a in operands
+        for _ in 1:64
+            a isa Symbol && get(env, a, nothing) isa Symbol || break
+            a = env[a]
+        end
+        a isa Union{Number,GlobalRef} || (a isa Symbol && a in loop.available) ||
+            return nothing
+        push!(resolved, a)
+    end
+    call = Expr(:call, _rw_helper(helper), resolved...)
+    get!(loop.scales, call) do
+        name = Symbol("#stable_scale#", ctx.reads[] += 1)
+        push!(loop.prelude, Expr(:(=), name, call))
+        name
+    end
+end
+
+# `f(params..., e(x))` (`mid` empty) or `f(params..., (e(x) - c) / s)` (`mid`
+# = `(c, s)`) as the call of `helper` given its parameter part: computed once
+# before a plate loop's cells, or once for a dotted call, else at a call that
+# runs once (`helper1`). A call the program repeats whose part cannot run once
+# keeps the literal, which costs less there than computing the part each time.
+function _rw_log_abs_emit(ctx::_RwContext, env, outer::_RwView, helper::Symbol,
+                          part::Symbol, fref, eref, x, mid, params)
+    operands = Any[fref, eref, mid..., params...]
+    if ctx.parts && outer.broadcast
+        all(a -> a isa Union{Number,Symbol,GlobalRef}, Any[mid..., params...]) ||
+            return nothing
+        once = Expr(:call, GlobalRef(@__MODULE__, :_RwFn),
+                    Expr(:call, _rw_helper(part), operands...))
+        return _rw_emit(ctx, outer, helper, fref, eref, x, mid..., once, params...)
+    elseif ctx.parts
+        name = _rw_loop_part(ctx, env, part, operands)
+        name === nothing ||
+            return _rw_emit(ctx, outer, helper, fref, eref, x, mid..., name, params...)
+    end
+    isempty(ctx.loops) || return nothing
+    _rw_emit(ctx, outer, Symbol(helper, 1), fref, eref, x, mid..., params...)
+end
+
+# `f(args..., z)` with `f` a kernel of a log-magnitude (`_rk_log_abs_form`) and
+# `z` an exponential, `exp(x)`, or its standardization, `(exp(x) - c) / s`.
+function _rw_rule_log_abs(outer::_RwView, ctx, env)
+    isempty(outer.args) && return nothing
+    fref = _rw_callable_ref(outer.f)
+    fref === nothing && return nothing
+    params = outer.args[1:end-1]
+    all(_rw_site_operand, params) || return nothing
+    z = outer.args[end]
+    hit = _rw_unary(z, ctx, env, outer, _rw_is_exp)
+    hit === nothing ||
+        return _rw_log_abs_emit(ctx, env, outer, :_rk_at_exp, :_rk_at_exp_part, fref,
+                                _rw_ref(hit[1].f), hit[2], (), params)
+    q, def = _rw_operand(z, ctx, env)
+    q !== nothing && _rw_fits(outer, q) && q.f === (/) && length(q.args) == 2 || return nothing
+    num, s = q.args
+    n, ndef = _rw_operand(num, ctx, env)
+    n !== nothing && _rw_fits(outer, n) && n.f === (-) && length(n.args) == 2 || return nothing
+    hit = _rw_unary(n.args[1], ctx, env, outer, _rw_is_exp)
+    hit === nothing && return nothing
+    c = n.args[2]
+    moved = def || ndef
+    all(a -> _rw_movable(a, moved, ctx, env), (hit[2], c, s)) || return nothing
+    _rw_log_abs_emit(ctx, env, outer, :_rk_at_exp_std, :_rk_at_exp_std_part, fref,
+                     _rw_ref(hit[1].f), hit[2], (c, s), params)
 end
 
 # The rewritten call `ex`, or `nothing` when no rule applies. A dotted call is
@@ -780,6 +1039,7 @@ function _rw_rules(ex::Expr, ctx::_RwContext, env)
     g === (/) && return _rw_rule_div(outer, ctx, env)
     g === (^) && return _rw_rule_pow(outer, ctx, env)
     g === sqrt && return _rw_rule_sqrt(outer, ctx, env)
+    _rk_log_abs_form(g) === nothing || return _rw_rule_log_abs(outer, ctx, env)
     nothing
 end
 
@@ -801,6 +1061,7 @@ function _rw_resolve_view_rule(outer::_RwView, ctx, env)
     g === inv && return _rw_rule_inv(outer, ctx, env)
     g === (/) && return _rw_rule_div(outer, ctx, env)
     g === sqrt && return _rw_rule_sqrt(outer, ctx, env)
+    _rk_log_abs_form(g) === nothing || return _rw_rule_log_abs(outer, ctx, env)
     nothing
 end
 
@@ -908,19 +1169,25 @@ function _rw_expr(ex, ctx::_RwContext, env::Dict{Symbol,Any})
         args = Any[_rw_expr(ex.args[1], ctx, env)]
         loops = copy(ctx.loops)
         empty!(ctx.loops)
+        # A branch inside a loop is still repeated, but nothing in it moves
+        # before the loop.
+        isempty(loops) || push!(ctx.loops, _rw_barrier())
         for a in ex.args[2:end]
             push!(args, _rw_expr(a, ctx, copy(env)))
         end
+        empty!(ctx.loops)
         append!(ctx.loops, loops)
         return Expr(head, args...)
     elseif head in (:for, :while, :try)
         loops = copy(ctx.loops)
         empty!(ctx.loops)
+        (head !== :try || !isempty(loops)) && push!(ctx.loops, _rw_barrier())
         inner = head === :for && ctx.hoisted ?
                 Dict{Symbol,Any}(name => _RwOuter() for name in keys(env)) : env
         condition = head === :for ? ex.args[1] : _rw_expr(ex.args[1], ctx, env)
         result = Expr(head, condition,
             Any[_rw_expr(a, ctx, copy(inner)) for a in ex.args[2:end]]...)
+        empty!(ctx.loops)
         append!(ctx.loops, loops)
         return result
     elseif head === :(=) && length(ex.args) == 2
@@ -1061,7 +1328,7 @@ end
 # --- the pass -------------------------------------------------------------------
 
 """
-    _stable_rewrites(ast::Expr, recipes::Tuple[, definitions]; hoisted = false) -> Expr
+    _stable_rewrites(ast::Expr, recipes::Tuple[, definitions]; hoisted = false, parts = true) -> Expr
 
 The generated function `ast` with its numerically fragile compositions in their
 stable forms (the file header). `recipes` holds what each position of the
@@ -1072,11 +1339,14 @@ source-reading backend's earlier statements, `jax_source`), so a composition
 across them is found as one within the body is. With `hoisted = true` a
 statement inside a loop reads a value defined outside it as it is, never
 through its definition: a value hoisted out of a loop stays computed once
-(`lower_batched`). Returns `ast` itself when nothing applies.
+(`lower_batched`). With `parts = false` a kernel of a log-magnitude is
+rewritten only where its call runs once, through its declared one-call form
+(`jax_source`, which translates that form and not the parameter part's
+`NamedTuple`). Returns `ast` itself when nothing applies.
 """
 function _stable_rewrites(ast::Expr, recipes::Tuple,
                           definitions::Dict{Symbol,Any} = Dict{Symbol,Any}();
-                          hoisted::Bool = false)
+                          hoisted::Bool = false, parts::Bool = true)
     ast.head in (:function, :->) && length(ast.args) == 2 &&
         ast.args[1] isa Expr && ast.args[1].head === :tuple || return ast
     counts = _rw_count!(Dict{Symbol,Int}(), ast.args[2])
@@ -1086,7 +1356,7 @@ function _stable_rewrites(ast::Expr, recipes::Tuple,
                arg isa Expr && arg.head === :(::) && arg.args[1] isa Symbol ? arg.args[1] : nothing
         name === nothing || get(counts, name, 0) == 0 && push!(params, name)
     end
-    ctx = _RwContext(recipes, counts, params, Ref(0), hoisted, _RwLoop[])
+    ctx = _RwContext(recipes, counts, params, Ref(0), hoisted, _RwLoop[], parts)
     body = _rw_expr(ast.args[2], ctx, copy(definitions))
     body isa Expr && body.head === :block || return ast
     body == ast.args[2] && return ast
