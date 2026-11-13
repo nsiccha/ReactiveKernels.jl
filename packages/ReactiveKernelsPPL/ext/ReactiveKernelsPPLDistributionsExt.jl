@@ -99,6 +99,27 @@ function ReactiveKernelsPPL.sampling_distribution_graph(::Type{Distributions.Dir
     _graph_call(:dirichlet_multinomial, args...)
 end
 
+function ReactiveKernelsPPL.sampling_distribution_graph(::Type{Distributions.Categorical}, args::Tuple)
+    length(args) == 1 || return nothing
+    _graph_call(:_categorical_distribution, only(args))
+end
+function ReactiveKernelsPPL.sampling_distribution_graph(::Type{Distributions.Poisson}, args::Tuple)
+    length(args) <= 1 || return nothing
+    _graph_call(:poisson, _checked_argument(isempty(args) ? 1.0 : only(args), true))
+end
+function ReactiveKernelsPPL.sampling_distribution_graph(::Type{Distributions.Bernoulli}, args::Tuple)
+    length(args) <= 1 || return nothing
+    _graph_call(:_bernoulli_distribution,
+        _graph_call(:_checked_probability, isempty(args) ? 0.5 : only(args)))
+end
+function ReactiveKernelsPPL.sampling_distribution_graph(::Type{Distributions.Binomial}, args::Tuple)
+    length(args) <= 2 || return nothing
+    n = isempty(args) ? 1 : args[1]
+    p = length(args) < 2 ? 0.5 : args[2]
+    _graph_call(:_binomial_distribution,
+        _graph_call(:_checked_trials, n), _graph_call(:_checked_probability, p))
+end
+
 # ── Laws for posterior-predictive draws ──────────────────────────────────
 # Each observation's law cell (`ReactiveKernelsPPL._law_fields`) names the
 # RK distribution object its density evaluates and that object's arguments:

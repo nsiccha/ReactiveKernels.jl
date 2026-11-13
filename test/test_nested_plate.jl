@@ -400,7 +400,14 @@ end
     reference(x, y, a, b) = sum(-0.5 .* (x .- a) .^ 2) + sum(-0.5 .* (y .- b) .^ 2 .- log(2.0))
     k = prepare(P.two_plates; have = (:x, :y, :a, :b))
     @test programs(code_expr(k)) == 2
-    @test programs(code_expr(prepare(P.one_plate; have = (:x, :a)))) == 0
+    one = prepare(P.one_plate; have = (:x, :a))
+    @test programs(code_expr(one)) == 1
+    # The retained boundary is preparation metadata; ordinary execution
+    # still compiles the lone plate inline.
+    native = one.f isa RK._ArrayFunction ? one.f.native : one.f
+    calls(ex) = ex isa RK._PlateCall ? 1 :
+        ex isa Expr ? sum(calls, ex.args; init = 0) : 0
+    @test calls(RK._program_expression(native)) == 0
     @test k(x, y, 0.3, 1.1) ≈ reference(x, y, 0.3, 1.1)
     # The printed program is the code that runs, each plate's loop included.
     @test NestedPlates.head_count(code_expr(k), :for) == 2
