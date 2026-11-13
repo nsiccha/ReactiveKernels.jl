@@ -698,6 +698,67 @@ end
     @test gdotna == gdot == ones(size(A0))
 end
 
+# Three or more axes: the AD-only fills run one loop per axis
+# (`ReactiveKernels._ad_na_fill!`), because Enzyme differentiates a
+# `CartesianIndices` iteration over three axes many times slower than its
+# primal (snag `hmm-per-step-tra-0e27954b`: an HMM transition with a step
+# axis). The loops visit the indices of `eachindex` in its order, so an
+# extruded build, a same-shape `log.` and a three-axis `+` give the ordinary
+# gradient.
+@kernel naad_three_axes(theta, keep, w) = begin
+    P = theta .* keep
+    L = log.(P)
+    Q = L + w
+    s = sum(Q .* w)
+    return s
+end
+@testset "tainted NA steps over three axes" begin
+    n = 7
+    theta0 = [0.7 0.3; 0.2 0.8]
+    keep0 = reshape(collect(range(0.5, 1.5; length = n)), 1, 1, n)
+    w0 = reshape(collect(range(-1.0, 1.0; length = 4n)), 2, 2, n)
+    bound = (; keep = keep0, w = w0)
+    kb = prepare(naad_three_axes; have = (:theta, :keep, :w), want = :s, bound)
+    kbna = prepare_nonallocating(naad_three_axes; have = (:theta, :keep, :w),
+                                 want = :s, bound)
+    prep = prepare_ad(kb, NA_AD_BACKEND, theta0; active = :theta)
+    prepna = prepare_ad(kbna, NA_AD_BACKEND, theta0; active = :theta)
+    # Vacuity: the three-axis broadcasts and the `+` stay tainted steps.
+    @test count(op -> op isa ReactiveKernels._MaterializeStep,
+                naad_ad_callables(prepna)) >= 2
+    @test any(op -> op === +, naad_ad_callables(prepna))
+    g, gna = zero(theta0), zero(theta0)
+    v, _ = ad_value_and_gradient!(prep, g, theta0)
+    vna, _ = ad_value_and_gradient!(prepna, gna, theta0)
+    # s = Σ (log(θ_ij keep_t) + w_ijt) w_ijt, so ∂s/∂θ_ij = Σ_t w_ijt / θ_ij.
+    @test vna ≈ v
+    @test gna ≈ g ≈ dropdims(sum(w0; dims = 3); dims = 3) ./ theta0
+end
+
+@testset "AD-only fills visit eachindex's indices in order" begin
+    for dims in ((), (3,), (2, 3), (2, 3, 4), (2, 1, 3, 2))
+        A = reshape(collect(1.0:prod(dims)), dims)
+        bc = Base.Broadcast.instantiate(Base.Broadcast.broadcasted(identity, A))
+        f, args, hoisted = ReactiveKernels._ad_na_broadcast_hoisted(bc)
+        seen = Float64[]
+        record = x -> (push!(seen, x); x)
+        dest = zero(A)
+        @test ReactiveKernels._ad_na_fill!(dest, record, args, hoisted, bc,
+                                           axes(bc)) === dest
+        @test dest == A
+        @test seen == vec(A)
+    end
+    # An extruded leaf and a nested broadcast read the same elements.
+    A = reshape(collect(1.0:24.0), 2, 3, 4)
+    row = reshape([10.0, 20.0, 30.0, 40.0], 1, 1, 4)
+    bc = Base.Broadcast.instantiate(Base.Broadcast.broadcasted(+, A,
+        Base.Broadcast.broadcasted(*, row, 2.0)))
+    f, args, hoisted = ReactiveKernels._ad_na_broadcast_hoisted(bc)
+    dest = zero(A)
+    ReactiveKernels._ad_na_fill!(dest, f, args, hoisted, bc, axes(bc))
+    @test dest == A .+ row .* 2.0
+end
+
 # A non-allocating program takes its operation table, cache tuple and cache
 # driver ahead of the HAVE ports. Called through the RGF vararg wrapper, whose
 # one-tuple splat of every operand stays a dynamic `Core._apply_iterate` past
