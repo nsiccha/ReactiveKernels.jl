@@ -80,8 +80,51 @@ counterexample rules out adopting the current prototype unchanged.
 tests direct aliases, views, tuples, named tuples, records, nested arrays and a
 view of the returned primal. Its snapshot mode deep-copies the entire retained
 tuple together, preserving internal sharing. This is a benchmark-only method
-replacement, not a production ownership policy. Its validation and cost
-measurements are tracked separately from the completed results above.
+replacement, not a production ownership policy.
+
+The first run varied the joint cost to 2, which also makes unchanged staging
+retain the partial. Both old and proposed staging then recorded 14 wrong
+ordinary input-overwrite gradients and two wrong returned-primal-view gradients.
+The unchanged retention helper has identical source bytes at `6358fa81`,
+`aa82c44e1` and `95b1ebba1`. The defect therefore predates joint selection.
+
+Whole-tuple copying passed every numerical, retained-type and shared-alias
+assertion, but the run finished **146 pass / 5 fail**: five recursive audit
+assertions reported inlined Base copying internals. Their frames identify
+`Array`, `IdDict` and `deepcopy`; one mutable-record case also reports
+`deepcopy_internal::Any`. These failures remain in the original log.
+
+`derivative_snapshot_audit.jl` isolates the same finding in a plain caller of
+Base's `deepcopy`. Preserving that Base call boundary produces no audit finding,
+while a nonconcrete user helper behind the same boundary is still reported.
+All nine attribution checks passed. This follows the documented audit scope
+which treats Julia's own callees as leaves; it does not make Base's internals
+concrete. The `snapshot_leaf` mode passed all 151 numerical, ownership and
+scoped audit checks on registered Enzyme, including the eight container forms
+at lengths 0, 3 and 17. No audit implementation or policy was changed.
+
+## Costs with conservative snapshots
+
+The registered-Enzyme follow-up applies whole-tuple copying to both adapter
+arms, including direct input residuals which a more precise ownership analysis
+could avoid copying. The explicit stage-loop arms do not call retention and
+therefore are not the snapshot-inclusive comparison. The following uses the
+ordinary Reverse adapter arms, with the same 12 paired rounds as above.
+
+| Family | Length | Shared / independent | Within-run 95% interval | Shared / native ordinary AD |
+| --- | ---: | ---: | ---: | ---: |
+| Array exponential | 1,000 | 0.632 | 0.605–0.655 | 0.703 |
+| Array exponential | 100,000 | 0.500 | 0.495–0.508 | 0.509 |
+| Array square | 1,000 | 1.330 | 1.166–1.368 | 5.147 |
+| Array square | 100,000 | 1.213 | 1.175–1.239 | 2.466 |
+
+At length 1,000, independent/shared adapters allocate 16,640/24,768 Julia
+bytes in 7/8 allocations. At 100,000 they allocate 1,600,480/2,400,528 bytes
+in 9/11 allocations. The native control still reports zero Julia allocations.
+The snapshot-inclusive exponential sharing gain survives this conservative
+copying strategy; cheap square partials still favor recomputation. These are
+controlled producer-selection comparisons, not a general production speedup.
+The second Enzyme environment is being checked separately.
 
 ## Preparation and evidence limits
 
@@ -89,9 +132,21 @@ The initial preparation observations shared compiler caches between arms and
 cannot establish an independent first-call saving. Two subsequent preparation
 drivers failed before measurement: first on a relative include path, then on
 assigning the exported `value` name at top level. Neither failed run establishes
-a preparation cost. A corrected, separately timed process comparison is in
-progress; its timer covers graph construction, rule construction and first
-forward/reverse stages, excluding package loading and driver setup.
+a preparation cost. The corrected `derivative_joint_preparation.jl` now measures
+graph construction, rule construction and first forward/reverse stages in
+separate fresh processes, excluding package loading and driver setup. It calls
+the timed operations through `invokelatest` so target compilation occurs inside
+the timer. The following are individual shared-host observations, not repeated
+cold-start distributions or measurements of first ordinary-AD compilation.
+
+| Family | Existing staging | Joint staging |
+| --- | ---: | ---: |
+| Scalar exponential | 8.776 s | 9.302 s |
+| Array exponential | 8.957 s | 9.054 s |
+| Array square | 9.760 s | 8.903 s |
+
+Compilation accounts for almost all of these measured intervals. They do not
+show a consistent preparation advantage for either strategy.
 
 The diagnostics below preserve failures as well as successful phases. A
 diagnostic exit 0 means the wrong-gradient result was recorded with passing
@@ -105,7 +160,15 @@ controls, not that the alias arm passed correctness.
 - Matched baseline/joint alias attribution and landed PPL checks: fleet
   `f111b12289c44ea3`, combined exit 1 due to the preparation name collision;
   [logs, manifests, exact failed driver and terminal receipt](http://localhost:4200/code/download?path=/home/niko/.local/state/kb-agents/uploads/662c084cbbcc49411ba998b338b38ec5f38ff192ac17ad5404ac225122272b13.tgz).
+- Existing/joint ownership controls, first snapshot experiment and baseline
+  preparation: fleet `1a1e38dfe0314cda`, exit 1 on the five audit assertions;
+  [exact sources and full retained evidence](http://localhost:4200/code/download?path=/home/niko/.local/state/kb-agents/uploads/a026b3374cd443f8e500ccd86fe0402c3955e03e5ce69b8c9fa47aa84a2646e5.tgz).
+- Independent joint preparation, snapshot acceptance, audit attribution and
+  registered snapshot-inclusive costs: fleet `287b0545ab4c4558`, exit 0,
+  605 seconds;
+  [exact sources, typed IR, manifests, raw rounds, summary and terminal receipt](http://localhost:4200/code/download?path=/home/niko/.local/state/kb-agents/uploads/db20ada0d0f59502be1f4cf098390991cc80c5473105de0bb7c3a145f791529f.tgz).
 
-The remaining comparison is whether ownership-safe retention preserves useful
-sharing gains after its preparation, allocation and memory costs. No general
-preference follows from the additive recipe costs alone.
+The remaining work includes the second-backend snapshot check and a reviewable
+retention repair. The prototype does not account for these measured storage
+costs when selecting recipes. No general preference follows from the additive
+recipe costs alone.
