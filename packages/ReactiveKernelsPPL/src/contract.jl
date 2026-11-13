@@ -297,13 +297,21 @@ at their defaults:
 - `n_levels`: category count K (`nothing` = infer at bind: from the
   response column for OrderedLogistic/Ordinal/Categorical, structurally
   — 1 + predictor count — for CategoricalLogit, structurally — column
-  count — for Multinomial).
+  count — for Multinomial). A CategoricalLogit over `logit_slices` keeps
+  `nothing`: its K is the slice length + 1 at run time.
 - `thresholds`: shared ordered/vector parameter ([`VectorParameter`](@ref)),
   shared data vector, or `ThresholdRows` for vectors broadcast per observation
   for OrderedLogistic/Ordinal; `nothing` otherwise.
 - `extra_predictors`: CategoricalLogit non-reference predictors after
   `predictor` (class order 2..K is `[predictor; extra_predictors...]`,
   K−1 total); empty otherwise.
+- `logit_slices`: `:rows` or `:cols` for a CategoricalLogit response
+  over the slices of one logit matrix (`y .~ CategoricalLogit.(eachrow(E))`
+  or `eachcol(E)`), `nothing` otherwise. `predictor` then names the matrix
+  value `E`, which the response reads whole (the GLM-object precedent): no
+  [`PredictorSpec`](@ref), no `extra_predictors`, and no `n_levels`. Each
+  slice holds observation `i`'s K−1 non-reference logits, with class 1 the
+  zero reference, so K is the slice length + 1 at run time.
 - `count_columns`: Multinomial count columns after `response`
   (category order 1..K is `[response; count_columns...]`); empty
   otherwise.
@@ -465,7 +473,10 @@ struct LikelihoodSpec
     interval::Union{Nothing,Tuple{Union{Real,Symbol},Union{Real,Symbol}}}
     threshold_effects::Union{Nothing,Symbol}
     mixture_components::Vector{NamedTuple}
+    logit_slices::Union{Nothing,Symbol}
 end
+# Preserve the all-fields constructor predating categorical logit slices.
+LikelihoodSpec(args::Vararg{Any,34}) = LikelihoodSpec(args..., nothing)
 # Preserve the all-fields constructor predating graph-backed mixture components.
 LikelihoodSpec(args::Vararg{Any,33}) = LikelihoodSpec(args..., NamedTuple[])
 # Preserve the all-fields constructor predating per-component trials.
@@ -518,7 +529,8 @@ function LikelihoodSpec(family, link, response, predictor, scale, weights,
         mi_jobs::Union{Nothing,ColumnRef} = nothing,
         interval::Union{Nothing,Tuple{Union{Real,Symbol},Union{Real,Symbol}}} = nothing,
         threshold_effects::Union{Nothing,Symbol} = nothing,
-        mixture_components::Vector{NamedTuple} = NamedTuple[])
+        mixture_components::Vector{NamedTuple} = NamedTuple[],
+        logit_slices::Union{Nothing,Symbol} = nothing)
     return LikelihoodSpec(family, link, response, predictor, scale, weights,
         evidence, label, trials, range, n_levels, thresholds,
         extra_predictors, count_columns, ordinal_structure, discrimination,
@@ -526,8 +538,12 @@ function LikelihoodSpec(family, link, response, predictor, scale, weights,
         factor_corr, glm_alpha isa Real ? Float64(glm_alpha) : glm_alpha,
         glm_beta, mixture_family, mixture_locs,
         mixture_scales, mixture_weights, mixture_trials, nu, zi, mi_jobs, interval,
-        threshold_effects, mixture_components)
+        threshold_effects, mixture_components, logit_slices)
 end
+
+# A CategoricalLogit response over the slices of one logit matrix.
+_categorical_logit_slices(r::LikelihoodSpec) =
+    r.family === CategoricalLogitFam && r.logit_slices !== nothing
 
 _mixture_component_count(r::LikelihoodSpec) = isempty(r.mixture_components) ?
     length(r.mixture_locs) : length(r.mixture_components)
@@ -5454,6 +5470,35 @@ function _validate_categorical_fields(r::LikelihoodSpec, plan::StructuralPlan,
     r.n_levels === nothing || r.n_levels == k_struct || _fail(r.label,
         "n_levels $(r.n_levels) disagrees with the $(length(all_preds)) " *
         "categorical predictors (K = predictors + 1 = $k_struct)")
+    return _validate_categorical_unused_fields(r)
+end
+
+# `y .~ CategoricalLogit.(eachrow(E))` / `eachcol(E)`: `predictor` names the
+# logit matrix value, read whole; each slice is one observation's K−1
+# non-reference logits, so K is the slice length + 1 when the model runs.
+function _validate_categorical_slices_response(r::LikelihoodSpec,
+        plan::StructuralPlan)
+    r.link === LogitLink || _fail(r.label,
+        "a CategoricalLogit response uses the logit link (got $(r.link))")
+    r.logit_slices in (:rows, :cols) || _fail(r.label,
+        "logit_slices is :rows or :cols, got $(repr(r.logit_slices))")
+    _find_matrix(plan, r.predictor) !== nothing ||
+        _glm_value_name(plan, r.predictor) || _fail(r.label,
+            "categorical logits $(r.predictor) name no value — bind it as " *
+            "data or define it (`$(r.predictor) = X * B`)")
+    isempty(r.extra_predictors) || _fail(r.label,
+        "categorical logit slices take no extra_predictors: each slice " *
+        "holds every non-reference logit")
+    r.n_levels === nothing || _fail(r.label,
+        "categorical logit slices take no n_levels: K is the slice " *
+        "length + 1 when the model runs")
+    r.mi_jobs === nothing || _fail(r.label,
+        "`mi()` missingness does not select categorical logit slices yet; " *
+        "a missing response (`missing` entries) is omitted automatically")
+    return _validate_categorical_unused_fields(r)
+end
+
+function _validate_categorical_unused_fields(r::LikelihoodSpec)
     r.thresholds === nothing ||
         _fail(r.label, "CategoricalLogit takes no thresholds")
     isempty(r.count_columns) ||
@@ -6226,8 +6271,22 @@ function _validate_responses(plan::StructuralPlan)
     for r in plan.responses
         r.threshold_effects === nothing || r.family === OrdinalFam ||
             _fail(r.label, "only Ordinal takes threshold_effects")
+        r.logit_slices === nothing || r.family === CategoricalLogitFam ||
+            _fail(r.label, "only CategoricalLogit takes logit_slices")
         _validate_mi_structure(r, plan)
         _validate_glm_fields(r)
+        # A CategoricalLogit over the slices of one logit matrix reads the
+        # matrix whole, by name (the GLM-object precedent): it has no
+        # PredictorSpec, and its K is the slice length + 1 at run time.
+        if _categorical_logit_slices(r)
+            _validate_categorical_slices_response(r, plan)
+            _validate_scale(r, plan)
+            _validate_nu(r, plan)
+            _validate_zi(r, plan)
+            _validate_interval(r, plan)
+            _validate_evidence_structure(r, plan)
+            continue
+        end
         # A mixture response validates whole (dedicated component slots;
         # the anchor is polymorphic, so this branch leads the scan-state
         # and plate-param checks below).
@@ -6711,6 +6770,15 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
         # inexpressible).
         (eltype(col) <: Integer && eltype(col) !== Bool) ||
             return _fail(r.label, "a leveled response must hold integers 1..K")
+        # Over logit slices K is the slice length + 1 when the model runs,
+        # and a class without observations still has its logit. An
+        # observation beyond its slice is outside the law's support.
+        if _categorical_logit_slices(r)
+            all(>=(1), col) || return _fail(r.label,
+                "a categorical response must hold integers 1..K (K = the " *
+                "logit slice length + 1)")
+            return nothing
+        end
         K = r.n_levels
         K === nothing && return _fail(r.label,
             "internal: leveled n_levels unresolved at bind")
@@ -9296,6 +9364,8 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
     out_r = LikelihoodSpec[]
     for r in responses
         _is_leveled_family(r.family) || (push!(out_r, r); continue)
+        # Logit slices carry K in their own length; nothing to infer.
+        _categorical_logit_slices(r) && (push!(out_r, r); continue)
         # A stated threshold vector owns its extent, including categories
         # absent from these observations. An inferred extent still comes
         # from contiguous observed level codes.

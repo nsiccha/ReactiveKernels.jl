@@ -61,6 +61,10 @@ _bcf_nodes(ex) = ex isa Expr ? 1 + sum(_bcf_nodes, ex.args; init = 0) : 1
 _bcf_heads(ex, head) = ex isa Expr ?
     Int(ex.head === head) + sum(x -> _bcf_heads(x, head), ex.args; init = 0) : 0
 _bcf_support(fp, u, i) = Base.invokelatest(fp, u, i).unconstrained
+# Calls of `ReactiveKernels.<name>` in an expression.
+_bcf_calls(ex, name) = ex isa Expr ?
+    Int(ex.head === :call && !isempty(ex.args) && ex.args[1] isa GlobalRef &&
+        ex.args[1].name === name) + sum(x -> _bcf_calls(x, name), ex.args; init = 0) : 0
 
 @testset "retained branches union bound capture rows" begin
     for named in (false, true)
@@ -101,10 +105,15 @@ _bcf_support(fp, u, i) = Base.invokelatest(fp, u, i).unconstrained
             push!(costs, (; bytes = minimum(@allocated(q(u, 1)) for _ in 1:3),
                 footprint_bytes = minimum(@allocated(_bcf_support(fp, u, 1)) for _ in 1:3),
                 nodes = _bcf_nodes(q.kernel.ast), loops = _bcf_heads(q.kernel.ast, :for),
-                branches = _bcf_heads(q.kernel.ast, :if)))
+                branches = _bcf_heads(q.kernel.ast, :if),
+                one_cells = _bcf_calls(q.kernel.ast, :_plate_one_cell)))
         end
         @test costs[1] == costs[2]
-        @test costs[1].loops > 0
+        # The query's plate is checked to be one cell, and runs it once
+        # (`_plate_one_cell`), not as a loop over that one cell: its trip
+        # count is one by construction, not data. The same cost at n = 2 and
+        # n = 2000 above is what shows no body follows the data's length.
+        @test costs[1].one_cells > 0
         @test costs[1].branches > 0
         @info "retained branch cell work" named costs
     end

@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.169
+## 0.1.172
 
 - **Breaking:** `adaptive_centering_problem` is no longer exported. It is
   declared `public` instead (on Julia 1.11 and later, through Compat, now a
@@ -29,6 +29,46 @@ are recorded in the git history only.
   `using ReactiveKernelsPPL: adaptive_centering_problem` or call
   `ReactiveKernelsPPL.adaptive_centering_problem(built, plan, problem, backend; cells)`;
   its arguments and behaviour are unchanged.
+
+## 0.1.171
+
+- A compact cell or partition query gathers its constant base rows with a
+  counted loop (ReactiveKernels 0.1.222's `_gather_copy`) instead of Base's
+  vector-index read, whose loops left their Enzyme Reverse caches to libc
+  allocations on every call. With ReactiveKernels 0.1.222's one-cell
+  partitions, a one-subject gradient of BRM's joint NLME toy makes 22 libc
+  allocator calls instead of 79 and costs about its share of the whole-cohort
+  sweep; values and gradients are unchanged bit for bit. Needs
+  ReactiveKernels 0.1.222.
+
+## 0.1.170
+
+- A categorical-logit response reads its logits as one slice per
+  observation: `y .~ CategoricalLogit.(eachrow(E))` (or `eachcol(E)`, or
+  an inline matrix expression), and the `@plate` cell
+  `y[i] ~ CategoricalLogit(E[i, :])`. A slice holds the K−1 non-reference
+  logits with class 1 the zero reference, as the positional
+  `CategoricalLogit.(eta_2, …, eta_K)` reads its arguments, and K is the
+  slice length + 1 when the model runs. One lowered program, query type and
+  sampler type therefore serve every class count. The slice form takes
+  weights, censoring and missing responses like the positional form; an
+  observation beyond its slice has log density `-Inf`. `mi()` missingness
+  does not select logit slices yet. `jax_source` translates every form;
+  requires ReactiveKernels 0.1.221.
+
+## 0.1.169
+
+- `SMCOptions(cloud_kernels=J)` fits each stage's NUTS kernels to the stage
+  target's weighted cloud before moving it: a diagonal Gaussian mixture with at
+  most `J` components (count by BIC) gives each component its own diagonal
+  scales and a step size tuned on discarded trial transitions. Each move picks a
+  component from the responsibilities at the particle and accepts with
+  probability `min(1, r_j(x')/r_j(x))`, so every move keeps the stage target
+  invariant. Particles in different modes, such as relabelled mixture
+  components, no longer share one pilot chain's metric. Default `0` keeps the
+  frozen kernels and the random stream unchanged. Stage histories record the
+  fit, step sizes, `tuning_evaluations` and `selection_rejections`.
+  `tune_smc` and `initialize_filter_smc` refuse options with `cloud_kernels > 0`.
 
 ## 0.1.168
 

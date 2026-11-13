@@ -143,6 +143,7 @@ const _PPL_TEST_FILES = (
     "test_names.jl",
     "test_plates.jl",
     "test_plate_categorical.jl",
+    "test_categorical_logit_slices.jl",
     "test_cell_mvnormal.jl",
     "test_indexed_response_families.jl",
     "test_multi_axes.jl",

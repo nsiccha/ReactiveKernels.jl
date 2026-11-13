@@ -16,6 +16,110 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.223
+
+- `jax_source`: a padded (ragged) row's length less a constant bounds what
+  it sizes. `n = length(x)` of a row padded to width `L` has the static bound
+  `L`, and `n - c` now has `L - c` (it had `L`), so a range or an array of
+  length `n - c` pads to the width Julia's has when the row is longest.
+  Before, `x[2:n] .- x[1:(n - 1)]` padded the two ranges to `L - 1` and `L`
+  entries and failed in Python with `incompatible shapes for broadcasting`.
+  Past its stop, a range to such a length repeats the stop, as padding
+  repeats a row's last entry, so a gather by it pads with its own last entry
+  and the differences' padding is the last valid difference.
+- `jax_source` translates `diff(x)` of a vector and `diff(x; dims = d)` of an
+  unpadded array along a literal axis. A padded row's differences have one
+  valid entry fewer, and their padding repeats the last valid difference.
+  Before, `diff` raised `JAXEmissionError` (keyword arguments to `diff` have
+  no JAX translation), also in a data-only cell recipe.
+
+## 0.1.222
+
+- A partition of one cell per label (`plate_partition(…; single = true)`) and
+  a plate computed at one row of a cell run their one cell once, checked to
+  be one cell, instead of a loop over a one-cell domain; plates nested in the
+  cell keep their loops. A matrix row product's entry (`_CellRowProduct`) sums
+  over a counted range, and `_gather_copy(array, indices)` copies a gather
+  with a counted loop (ReactiveKernelsPPL 0.1.171 gathers its compact
+  overlay's constant base with it). Under Enzyme Reverse each loop entry
+  allocated the caches its reverse pass reads through libc (`malloc`, and
+  `realloc` per entry when the trip count is not known on entry), which a
+  one-subject call paid per call. BRM's joint NLME toy's one-subject gradient
+  made 79 such calls and now makes 22, about its share of the sweep's; the PK
+  toy's made 6 and now none. Values and gradients are unchanged, bit for
+  bit, on both toys.
+
+## 0.1.221
+
+- `jax_source` translates a plate over `eachrow(M)` or `eachcol(M)`: the
+  plate maps the matrix's rows (or its transpose's) with `jax.vmap`, and each
+  cell reads one slice, as natively. A categorical-logit response over one
+  logit row per observation (ReactiveKernelsPPL 0.1.170) emits this plate.
+
+## 0.1.220
+
+- A guarded partition plan of a wide model is typed and computed while a
+  package image is generated. 0.1.212 lifted a comprehension of a compiled
+  body into a program of its own only when the locals its element reads, and
+  the iteration variable, fit the 64 operands a program call takes; a model
+  whose guarded bookkeeping reads more (109 and 175 in one real plan)
+  kept the comprehension as a closure, and `prepare` of its partition
+  (ReactiveKernelsPPL's `prepare_partition`, BayesianRegressionModels'
+  `brm_nlme_model` with a grouping) still failed in a workload with
+  `partition plan: the plan port … is untyped and evaluating its plan on the
+  exemplars failed: Impossible to correctly handle OpaqueClosure inside
+  @generated returned during precompile process.` Such an element now
+  receives those locals as one tuple, which its program unpacks; plans, their
+  types (also for a label without rows) and values are unchanged.
+
+## 0.1.219
+
+- A non-allocating program (`prepare_nonallocating`, and so ReactiveKernelsPPL's
+  default sampler) keeps the tables of indexed work that nested plates reuse
+  across an enclosing plate's cells (0.1.203) in buffers it owns, typed from
+  the program's static types, and refills them on each call. Before, each
+  density call allocated every table, and each gradient call every table and
+  its derivative: the PosteriorDB capture model Mt's sampler took 6
+  allocations (320 B) per density and 10 (608 B) per gradient, where it took
+  2 (64 B) and 2 (96 B) without the tables; it takes 2 and 2 again (snag
+  posteriordb-mt-c-01c1a87b). An ordinary prepared kernel still allocates its
+  tables on each call.
+
+## 0.1.218
+
+- The opt-in generated summed-plate reverse (`with_plate_reverse`) is faster.
+  Values and gradients are unchanged, apart from rounding.
+  - A cell loop's invariant factors (the total's adjoint, literal partials,
+    partials that read only shared values such as `1/σ`) apply once after the
+    loop instead of in every cell.
+  - Operands that span the plate are read directly rather than through
+    broadcast extrusion.
+  - Against 0.1.210's rule, opted-in gradients are 1.35–1.55× faster on a
+    random-intercept Normal regression (2,000 and 100,000 rows) and up to
+    1.2× faster on a fixed-effects one. They are now 1.08–1.28× faster than the
+    default preparation on those models; 0.1.210's rule was 0.8× the default
+    on the random-intercept one (Julia 1.10.12 and 1.13.1, Enzyme dogfood).
+  - The default preparation is still faster on the PosteriorDB ports measured
+    (the rule at 0.3–0.98× the default on Julia 1.13.1), and on small plates.
+  - With registered Enzyme 0.13.219, the rule's allocating program
+    (`nonallocating = false`) can raise `EnzymeMutabilityException` at an
+    `.innerparm` store (reactivekernels-use §7aq); Enzyme dogfood
+    differentiates it.
+
+## 0.1.217
+
+- `jax_source`: a `Bool` array index (`BitVector`, `Vector{Bool}`) selects
+  the entries where it is true, as Julia's logical indexing does. Before, it
+  was shifted as one-based positions (`x[mask - 1]`), so every element read
+  the first or the last entry: `table[table[:, 2] .!= 1, 4]` in
+  `prepare_data` returned the wrong amounts and length, silently whenever the
+  shapes still agreed. The host uses NumPy boolean masks (lists keep their
+  selected entries); device code gathers at the selected positions, padded to
+  the mask's length with the count as its extent, and a masked write writes
+  only the selected entries. A same-shape mask (`A[A .> 0]`) selects in
+  column-major order. A single `Bool` index into an array raises
+  `JAXEmissionError`, as Julia refuses it.
+
 ## 0.1.216
 
 - The stable rewrites compute a symmetric law's standardized log kernel at a
