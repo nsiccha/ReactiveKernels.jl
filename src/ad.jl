@@ -1,8 +1,8 @@
 """
-    PreparedADOperator{I,K,R,F,B,P,E,O}
+    PreparedADOperator{I,K,R,F,B,P,E,O,S}
 
 One prepared DifferentiationInterface operator over a ReactiveKernels
-boundary. The last parameter `O` names the operator: `:gradient`
+boundary. The parameter `O` names the operator: `:gradient`
 ([`PreparedADKernel`](@ref)),
 `:pullback` ([`PreparedADPullback`](@ref)), `:pushforward`
 ([`PreparedADPushforward`](@ref)), `:hvp` ([`PreparedADHVP`](@ref)) or
@@ -16,13 +16,14 @@ stored in the object differs.
 The stored preparation is mutable and not thread-safe. Prepare one object per
 concurrent caller.
 """
-struct PreparedADOperator{I,K,R,F,B,P,E,O}
+struct PreparedADOperator{I,K,R,F,B,P,E,O,S}
     kernel::K
     resolver::R
     call::F
     backend::B
     preparation::P
     external_values::E
+    storage::S
 end
 
 """
@@ -156,6 +157,29 @@ _ad_active_point_component(value::Number) = Ref(value)
 _ad_active_point_component(value::Union{Tuple,NamedTuple}) =
     map(_ad_active_point_component, value)
 _ad_active_point_component(value) = value
+
+# Scalar normalization storage belongs to one prepared gradient, just like its
+# backend preparation. Rebind every scalar before evaluating; arrays remain
+# caller-owned inputs. Unsupported or changed component types keep the ordinary
+# normalization path.
+_ad_scalar_point_storage(x::Base.RefValue{T}) where {T<:Number} = Ref(x[])
+_ad_scalar_point_storage(x::Union{Tuple,NamedTuple}) = map(_ad_scalar_point_storage, x)
+_ad_scalar_point_storage(x) = nothing
+@inline function _ad_stored_point_component(slot::Base.RefValue{T}, x::T) where {T<:Number}
+    slot[] = x
+    slot
+end
+@inline _ad_stored_point_component(slot::Tuple, x::Tuple) =
+    length(slot) == length(x) ? map(_ad_stored_point_component, slot, x) :
+                              _ad_active_point_component(x)
+@inline _ad_stored_point_component(slot::NamedTuple{K}, x::NamedTuple{K}) where {K} =
+    map(_ad_stored_point_component, slot, x)
+@inline _ad_stored_point_component(slot, x) = _ad_active_point_component(x)
+_ad_gradient_buffer_storage(backend, point, contexts) = nothing
+_ad_prepared_storage(op, backend, point, contexts) = nothing
+_ad_prepared_storage(::Val{:gradient}, backend, point::Tuple, contexts) =
+    (; point = _ad_scalar_point_storage(point),
+       buffers = _ad_gradient_buffer_storage(backend, point, contexts))
 _ad_active_value(value::Base.RefValue) = value[]
 _ad_active_value(value::Union{Tuple,NamedTuple}) = map(_ad_active_value, value)
 _ad_active_value(value) = value
@@ -1349,17 +1373,21 @@ function _ad_context_exprs(I, types::Tuple, operand)
             for ordinal in eachindex(inactive) if !(ordinal in packed)]]
 end
 
-@generated function _ad_arguments(::Val{I}, args::A) where {I,A<:Tuple}
+_ad_arguments(selector, args) = _ad_arguments(selector, args, nothing)
+@generated function _ad_arguments(::Val{I}, args::A, storage::S) where {I,A<:Tuple,S}
     N = fieldcount(A)
     indices = _ad_selector_indices(I)
     all(index -> 1 <= index <= N, indices) || return :(throw(ArgumentError(
         "invalid active input selector $I for $N kernel arguments")))
     contexts = _ad_context_exprs(I, Tuple(A.parameters),
                                  index -> :(getfield(args, $index)))
-    point = I isa Int ? :(getfield(args, $I)) :
+    point = I isa Int ? :(getfield(args, $I)) : S === Nothing ?
         Expr(:tuple, (:(
             _ad_active_point_component(getfield(args, $index)))
-            for index in indices)...)
+            for index in indices)...) :
+        Expr(:tuple, (:(
+            _ad_stored_point_component(getfield(storage, $ordinal), getfield(args, $index)))
+            for (ordinal, index) in enumerate(indices))...)
     :($point, ($(contexts...),))
 end
 
@@ -2197,11 +2225,12 @@ function _prepare_ad_operator(op::Val{O}, kernel::_ADKernel, resolver,
     position = _ad_plan_position(kernel)
     position === nothing ||
         (resolver = _ADPlanBoxing{position,typeof(resolver)}(resolver))
+    storage = _ad_prepared_storage(op, backend, point, contexts)
     # Built without compiling the constructor for this program's types.
     prepared = _kernel_new_instance(PreparedADOperator{
         active_selector,typeof(kernel),typeof(resolver),typeof(call),
-        typeof(backend),typeof(preparation),typeof(external_values),O,
-    }, (kernel, resolver, call, backend, preparation, external_values))::PreparedADOperator
+        typeof(backend),typeof(preparation),typeof(external_values),O,typeof(storage),
+    }, (kernel, resolver, call, backend, preparation, external_values, storage))::PreparedADOperator
     warm && _ad_warm!(prepared, point, contexts)
     prepared
 end
@@ -2751,13 +2780,13 @@ _ad_call_argument_types(point, contexts) =
      map(c -> Core.Typeof(DifferentiationInterface.unwrap(c)), contexts)...)
 
 function _ad_prepared_arguments(
-        prepared::PreparedADOperator{I}, args, kwargs::NamedTuple) where {I}
+        prepared::PreparedADOperator{I}, args, kwargs::NamedTuple, storage=nothing) where {I}
     resolved = _ad_resolve(prepared.resolver, args, NamedTuple(kwargs))
     length(resolved) == length(inputs(prepared.kernel)) || throw(ArgumentError(
         "selected HAVE boundary expects $(length(inputs(prepared.kernel))) " *
         "values; got $(length(resolved))"))
     point, contexts =
-        _ad_arguments(Val(I), (resolved..., prepared.external_values...))
+        _ad_arguments(Val(I), (resolved..., prepared.external_values...), storage)
     point, contexts
 end
 
@@ -3405,9 +3434,11 @@ writing the gradient into `gradient`. Runtime arguments follow the original RK
 HAVE boundary; the prepared active port or ordered tuple of ports is reordered
 to DI position one, and every other current argument is rebound as a fresh
 `DifferentiationInterface.Constant` context. For a tuple selector, `gradient`
-is a matching tuple of mutable destinations. The backend's structured
-out-of-place gradient is copied into those destinations after the same single
-reverse pass.
+is a matching tuple of mutable destinations. Reverse Enzyme can fill matching
+tuples of disjoint dense arrays and scalar `Ref`s directly when the prepared
+call has DI contexts. Other destination shapes and backends copy the structured
+gradient after the same single reverse pass. Scalar normalization storage is
+owned by the preparation and reused by mutating calls.
 
 Returns the `(value, gradient)` pair from
 `DifferentiationInterface.value_and_gradient!`. The destination must be valid
@@ -3429,8 +3460,8 @@ thread-safe; use one per concurrent caller.
             :(getfield(prepared.external_values, $(index - N))))
     point = I isa Int ? :(getfield(args, $I)) :
         Expr(:tuple, (:(
-            _ad_active_point_component(getfield(args, $index)))
-            for index in indices)...)
+            _ad_stored_point_component(getfield(prepared.storage.point, $ordinal), getfield(args, $index)))
+            for (ordinal, index) in enumerate(indices))...)
     quote
         length(inputs(prepared.kernel)) == $N || throw(ArgumentError(
             "selected HAVE boundary expects " *
@@ -3443,8 +3474,9 @@ end
 
 function ad_value_and_gradient!(
         prepared::PreparedADKernel, gradient, args...; kwargs...)
+    storage = prepared.storage === nothing ? nothing : prepared.storage.point
     point, contexts = _ad_prepared_arguments(
-        prepared, args, NamedTuple(kwargs))
+        prepared, args, NamedTuple(kwargs), storage)
     _ad_prepared_value_and_gradient!(prepared, gradient, point, contexts)
 end
 
@@ -3485,8 +3517,16 @@ function ad_value_gradient_and_retained(
     value, gradient, _ad_retained_values(prepared)
 end
 
-function _ad_prepared_value_and_gradient!(
+@inline function _ad_prepared_value_and_gradient!(
         prepared, gradient, point::Tuple, contexts)
+    _ad_prepared_tuple_value_and_gradient!(
+        prepared.backend, prepared, gradient, point, contexts)
+end
+
+_ad_prepared_tuple_value_and_gradient!(backend, prepared, gradient, point, contexts) =
+    _ad_copy_value_and_gradient!(prepared, gradient, point, contexts)
+
+function _ad_copy_value_and_gradient!(prepared, gradient, point, contexts)
     value, derivative = _ad_prepared_value_and_gradient(
         prepared, point, contexts)
     _ad_copy_cotangent!(gradient, derivative)
