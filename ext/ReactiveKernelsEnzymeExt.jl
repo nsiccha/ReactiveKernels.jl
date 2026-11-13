@@ -581,19 +581,21 @@ function EnzymeRules.augmented_primal(
     AugmentedReturn(needs_primal(config) ? primal : nothing, nothing, tape)
 end
 
-# One pass when no batched operand needs a buffer as long as the cells: each is
-# constant or a gathered view (`view(z, g)` with an index vector), whose buffer
-# is its parent's length. A float tuple keeps two passes: its few cells cost
-# less than the vectors and heap tape one pass would allocate (eight schools,
-# 0.078 against 0.123 µs). Decided on types alone.
+# One pass when at least one batched operand is a gathered view (`view(z, g)`
+# with an index vector, whose buffer is its parent's length) and every other is
+# constant. Otherwise two passes: a buffer as long as the cells costs about as
+# much as the second pass, and a plate with no gathered operand gains less from
+# one pass than Enzyme's heap-allocated tape costs (eight schools, 0.070 against
+# 0.102–0.118 µs with one pass). Decided on types alone.
 @generated function _pr_one_pass(::Val{B}, args::Tuple) where {B}
+    gathered = false
     for b in B
         T = args.parameters[b]
         T <: Const && continue
-        T <: Union{Duplicated,DuplicatedNoNeed} && _pr_gather_view(T.parameters[1]) && continue
-        return :(false)
+        T <: Union{Duplicated,DuplicatedNoNeed} && _pr_gather_view(T.parameters[1]) || return :(false)
+        gathered = true
     end
-    :(true)
+    gathered ? :(true) : :(false)
 end
 _pr_gather_view(::Type) = false
 _pr_gather_view(::Type{<:SubArray{<:Any,1,<:AbstractVector,<:Tuple{AbstractVector{<:Integer}}}}) = true
