@@ -146,6 +146,9 @@ const _JAX_YR = [0.1 .+ 0.05 .* jax_ppl_recurrence(R, 0.7, 0.3) .+ 0.01 .* randn
 # the row), and the observed values; no random draws, so the data below stay.
 const _JAX_COUNTS = [4, 2, 0, 3]
 const _JAX_YC = [0.5 .* R[1:2n] .+ 0.05 for (R, n) in zip(_JAX_R, _JAX_COUNTS)]
+# Increasing per-group times of lengths 3, 2, 4 and 1, and one response per group.
+const _JAX_TIMES = [[0.0, 1.0, 3.0], [0.0, 2.0], [1.0, 2.0, 4.0, 7.0], [5.0]]
+const _JAX_TIME_Y = [3.1, 1.9, 6.2, 0.2]
 const _JAX_TRIALS = rand(_JAX_RNG, 10:20, _JAX_N)
 const _JAX_SUCCESSES = [rand(_JAX_RNG, 0:n) for n in _JAX_TRIALS]
 const _JAX_HURDLE = [rand(_JAX_RNG) < 0.3 ? 0 : rand(_JAX_RNG, 1:5) for _ in 1:_JAX_N]
@@ -385,6 +388,40 @@ const _JAX_CASES = (
             y[g] .~ Normal.(a .* x[idx[g]], 1)
         end
     end))(; x = [0.1, 0.4, -0.2, 0.3], idx = [[1, 3], Int[], [2]]) | (; y = [[0.2, 0.1], Float64[], [0.9]]),
+    # First differences of a ragged per-cell row, three spellings (snag
+    # jax-source-drops-72f21166): a cell-local length's shifted ranges, `end`,
+    # and `diff`, a one-entry row included; and `diff` of a parameter-scaled row.
+    ragged_difference_length = () -> (@rkppl(begin
+        mu ~ Normal(0.0, 1.0)
+        @plate for i in eachindex(y)
+            x = t[i]
+            n = length(x)
+            d = x[2:n] .- x[1:(n - 1)]
+            y[i] ~ Normal(mu + sum(d), 1.0)
+        end
+    end))(; t = _JAX_TIMES) | (; y = _JAX_TIME_Y),
+    ragged_difference_end = () -> (@rkppl(begin
+        mu ~ Normal(0.0, 1.0)
+        @plate for i in eachindex(y)
+            x = t[i]
+            d = x[2:end] .- x[1:(end - 1)]
+            y[i] ~ Normal(mu + sum(d), 1.0)
+        end
+    end))(; t = _JAX_TIMES) | (; y = _JAX_TIME_Y),
+    ragged_difference_diff = () -> (@rkppl(begin
+        mu ~ Normal(0.0, 1.0)
+        @plate for i in eachindex(y)
+            d = diff(t[i])
+            y[i] ~ Normal(mu + sum(d), 1.0)
+        end
+    end))(; t = _JAX_TIMES) | (; y = _JAX_TIME_Y),
+    ragged_difference_scaled = () -> (@rkppl(begin
+        mu ~ Normal(0.0, 1.0); s ~ Exponential(1.0)
+        @plate for i in eachindex(y)
+            d = diff(s .* t[i])
+            y[i] ~ Normal(mu + sum(log1p.(d)), 1.0)
+        end
+    end))(; t = _JAX_TIMES) | (; y = _JAX_TIME_Y),
     ragged_recurrence = () -> (@rkppl(begin
         rho ~ LogNormal(log(0.7), 0.3); kappa ~ LogNormal(log(0.3), 1.0)
         b0 ~ Normal(0.1, 0.1); tau ~ Exponential(0.05); s ~ Exponential(0.05)
