@@ -16,6 +16,13 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.229
+
+- Partition plans retain constant row calculations used to size fresh scan
+  outputs, including buffers selected by a conditional. Mutating an output no
+  longer pulls its marker's row calculations into each gradient call. Aliases
+  of existing storage and mutations in conditions stay in ordinary execution.
+
 ## 0.1.228
 
 - JAX emission resolves `isa` checks when Julia argument types prove the answer,

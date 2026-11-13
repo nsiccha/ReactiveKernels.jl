@@ -1705,6 +1705,26 @@ function _symbol_refs!(refs::Set{Symbol}, ex)
     refs
 end
 
+# References that may supply the storage returned by an expression. Fresh
+# owned allocations cannot alias their markers or dimensions. A conditional
+# can return either arm, but not its condition; writes made while evaluating
+# that condition are found independently by `_written_plan_symbols`.
+# Unknown calls remain conservative, even ones named like an owned allocator.
+function _plan_storage_alias_refs!(refs::Set{Symbol}, ex)
+    ex isa Symbol && (push!(refs, ex); return refs)
+    ex isa Expr || return refs
+    if ex.head === :call && ex.args[1] in (
+            GlobalRef(@__MODULE__, :_plate_similar_output),
+            GlobalRef(@__MODULE__, :_scan_similar_output))
+        return refs
+    elseif ex.head === :if
+        foreach(a -> _plan_storage_alias_refs!(refs, a), ex.args[2:end])
+    else
+        foreach(a -> _plan_storage_alias_refs!(refs, a), ex.args)
+    end
+    refs
+end
+
 # The emitted body split into the plan's statements (each assigning or
 # checking something that varies with the label only) and the body's rest, with
 # the plan symbols the rest reads and their field names (`plan_k`, positional:
@@ -1739,16 +1759,7 @@ function _partition_plan_split(body::Expr, data_names, ops)
     while !isempty(pending)
         name = pop!(pending)
         for value in get(bindings, name, ())
-            # This allocator returns fresh storage. Writing its result does
-            # not write the axis marker, element-type inputs or shape used
-            # to allocate it. Following those as aliases would pull the
-            # marker's entire row-bookkeeping ancestry back into the body.
-            # Keep unknown calls conservative; match the owned allocator's
-            # identity, never an authored function with the same name.
-            Meta.isexpr(value, :call) &&
-                value.args[1] === GlobalRef(@__MODULE__, :_plate_similar_output) &&
-                continue
-            for ref in intersect(_symbol_refs!(Set{Symbol}(), value), names)
+            for ref in intersect(_plan_storage_alias_refs!(Set{Symbol}(), value), names)
                 ref in followed && continue
                 push!(forced, ref)
                 push!(followed, ref)
