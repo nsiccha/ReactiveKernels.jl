@@ -153,6 +153,65 @@ end
 
 seeded_plate(program, x, seed) = seed * program(x)
 
+function lazy_plate(program, x, scale, seed, overwrite)
+    # The active scalar and array require the ordinary backend fallback.
+    # Both leaves reference x, one through a view; a later write must not
+    # change the values seen by the reverse, or duplicate its shadow storage.
+    alias = view(x, :)
+    cells = RK._cell_array_broadcast(Base.broadcasted(+,
+        Base.broadcasted(*, scale, x), alias))
+    result = seed * program(cells)
+    overwrite && fill!(alias, 2.0)
+    result
+end
+
+function overwritten_plate(program, x, seed)
+    result = seed * program(x)
+    fill!(view(x, :), 2.0)
+    result
+end
+
+@testset "ordinary plate fallback retains values across aliased mutation" begin
+    ast = direct_program()
+    rexpr, _, _ = RK._pr_program_reverse(ast, [:x], RK, Dict{Symbol,Any}())
+    primal, reverse = RK.compile(ast), RK.compile(rexpr)
+    rule = RK._PlateSumRule{(),(1,),typeof(primal),typeof(reverse)}(primal, reverse)
+    cells = RK._cell_array_broadcast(Base.broadcasted(*, 0.7, [0.2, -0.3]))
+    @test RK._pr_rule_target(rule, (cells,)) === primal
+    @test RK._pr_rule_target(rule, ([0.2, -0.3],)) isa RK._PlateSumRuleBody
+    @test RK._pr_rule_target(rule, ((0.2, -0.3),)) isa RK._PlateSumRuleBody
+    for n in (0, 1, 17), seed in (1.7, -0.4), overwrite in (false, true)
+        original = [0.2cos(i) for i in 1:n]
+        scale = 0.7
+        expected = seed .* cos.((scale + 1) .* original)
+        results = map((primal, rule)) do program
+            x, dx = copy(original), fill(0.3, n)
+            cot, value = Enzyme.autodiff(Enzyme.ReverseWithPrimal,
+                lazy_plate, Enzyme.Active, Enzyme.Const(program),
+                Enzyme.Duplicated(x, dx), Enzyme.Active(scale),
+                Enzyme.Const(seed), Enzyme.Const(overwrite))
+            @test value ≈ seed * sum(sin, (scale + 1) .* original; init=0.0)
+            @test dx ≈ (overwrite ? 0.0 : 0.3) .+ (scale + 1) .* expected
+            @test cot[3] ≈ sum(original .* expected; init=0.0)
+            @test x == (overwrite ? fill(2.0, n) : original)
+            (value, dx, cot[3])
+        end
+        @test all(isapprox.(results[1], results[2]))
+    end
+    # The supported array path still takes a snapshot when its input changes
+    # after the primal. Moving the rule boundary must retain that contract.
+    for n in (0, 1, 17), seed in (1.7, -0.4), program in (primal, rule)
+        original = [0.2cos(i) for i in 1:n]
+        x, dx = copy(original), zeros(n)
+        _, value = Enzyme.autodiff(Enzyme.ReverseWithPrimal,
+            overwritten_plate, Enzyme.Active, Enzyme.Const(program),
+            Enzyme.Duplicated(x, dx), Enzyme.Const(seed))
+        @test value ≈ seed * sum(sin, original; init=0.0)
+        @test dx ≈ seed .* cos.(original)
+        @test x == fill(2.0, n)
+    end
+end
+
 @testset "tuple operands return cotangents through ordinary reverse" begin
     # Compile one runtime loop. The same source and rule also accept arrays
     # of changing length; tuple lengths are inherent in their Julia types.

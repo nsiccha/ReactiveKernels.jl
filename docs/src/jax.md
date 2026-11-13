@@ -61,8 +61,12 @@ An explicit platform list makes CUDA initialization mandatory and CUDA the
 default; it does not silently fall back to CPU if CUDA initialization fails.
 For a GPU-required consumer, select `gpu = jax.devices("gpu")[0]`, place
 numerical inputs with `jax.device_put(value, gpu)`, and verify result and
-gradient arrays with `array.devices() == {gpu}`. The host validates the check
-predicates; it does not evaluate the numerical kernel. Call
+gradient arrays with `array.devices() == {gpu}`. Evaluate inside
+`with jax.default_device(gpu):` so newly created constants use that device too.
+Numerical function results, including constant terms and numeric leaves of
+tuple/dict results, are JAX arrays with the emitted dtype. `prepare_data`,
+`dimension`, `parameters` and module metadata remain host values.
+The host validates the check predicates; it does not evaluate the numerical kernel. Call
 `jax.block_until_ready(result)` and `jax.effects_barrier()` when checking
 completion and callback errors. Host callbacks incur transfer and
 synchronization costs; `prepare_data` also runs on the host.

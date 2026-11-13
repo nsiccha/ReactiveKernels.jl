@@ -6531,7 +6531,7 @@ function _jax_functions!(mod, bodies, functions, plans, types;
                     _jax_call(ctx, c.f, _PyVal[a isa Value ? _jax_lookup(ctx, g, a) :
                         _PyVal(repr(a), typeof(a), true) for a in c.args])
                 end
-                wants = [_jax_returned(ctx, _jax_lookup(ctx, g, v)) for v in q.want]
+                wants = [_jax_returned(ctx, _jax_lookup(ctx, g, v); arrays = true) for v in q.want]
                 outputs[fname] = wants
                 _jax_emit!(ctx, "return " * _jax_result_code(w, wants))
                 ctx.scope.indent -= 1
@@ -6668,7 +6668,8 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
     returned, wants = _jax_with_function_guard(scope, guard) do
         if emit === nothing
             _jax_plan!(ctx, p)
-            values = [_jax_returned(ctx, _jax_lookup(ctx, p.graph, v)) for v in p.want]
+            values = [_jax_returned(ctx, _jax_lookup(ctx, p.graph, v); arrays = reserve && !host)
+                      for v in p.want]
             _jax_result_code(w, values), values
         else
             emit(ctx)
@@ -6749,11 +6750,29 @@ function _jax_nested_dict(w::NamedTuple, wants)
     "{" * join(entries, ", ") * "}"
 end
 
+# Public numerical results are arrays, including constants and nested leaves.
+# Helpers and host preparation keep static scalars usable as shapes and bounds.
 # A returned named tuple is a `dict` keyed by its field names.
-function _jax_returned(ctx::_JaxContext, v::_PyVal)
+function _jax_returned(ctx::_JaxContext, v::_PyVal; arrays::Bool = false)
     v.T === Union{} && return v # an unconditional diagnostic has no returned fields
     _jax_translation_only(v) && _jax_error("returning a callable or reference as a module output ",
                                           "has no JAX translation", _jax_where(ctx))
+    if arrays && v.T isa Type &&
+            (v.T <: Number || v.T <: AbstractArray && eltype(v.T) <: Number)
+        dtype = v.T <: Union{Bool,Integer,AbstractFloat} ? ", dtype=" * _jax_dtype(v.T) :
+            _jax_input_dtype(v.T)
+        return _PyVal("jnp.asarray(" * v.code * dtype * ")", v.T, false,
+                      v.extent, v.limit, v.padded, v.origin)
+    elseif arrays && _jax_is_tuple(v.T)
+        bound = _jax_bind!(ctx, :result, v)
+        fields = [_jax_returned(ctx, _jax_tuple_element(ctx, bound, _PyVal(string(i), Int));
+                               arrays = true) for i in 1:fieldcount(v.T)]
+        code = v.T <: NamedTuple ?
+            "{" * join((repr(string(n)) * ": " * x.code
+                        for (n, x) in zip(fieldnames(v.T), fields)), ", ") * "}" :
+            _jax_tuple_code(fields)
+        return _PyVal(code, v.T, false, v.extent, v.limit, v.padded, v.origin)
+    end
     v.T isa Type && v.T <: NamedTuple && fieldcount(v.T) > 0 || return v
     bound = _jax_bind!(ctx, :result, v)
     names = fieldnames(v.T)

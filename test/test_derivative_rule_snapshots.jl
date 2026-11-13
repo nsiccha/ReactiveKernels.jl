@@ -162,6 +162,60 @@ end
     end
 end
 
+# Measure the prepared, typed call and consume its result. A top-level call
+# through a locally loaded extension function boxes its argument/result tuples
+# on Julia 1.10, even when retention itself allocates nothing.
+function retention_allocations(f::F, sources, residuals, primal, flags) where {F}
+    @allocated(f(sources, residuals, primal, flags) === residuals)
+end
+
+@testset "dense primal alias protection" begin
+    ext = Base.get_extension(ReactiveKernels, :ReactiveKernelsEnzymeExt)
+    retain = ext._retain_residuals
+    a, b = [1.0, 2.0, 3.0], [4.0, 5.0, 6.0]
+    readonly = (a, b, 1.5)
+    sources, flags = (1, 2, -1), (false, false, false)
+    primal = similar(a)
+    @test (@inferred retain(sources, readonly, primal, flags)) === readonly
+    retention_allocations(retain, sources, readonly, primal, flags)
+    @test retention_allocations(retain, sources, readonly, primal, flags) == 0
+    protected = @inferred retain(sources, readonly, b, flags)
+    @test protected[1] === a
+    @test protected[2] !== b
+    @test protected[2] == b
+    borrowed = @inferred retain((1, -1), (a, a), b, (false, false))
+    @test borrowed[1] === a
+    @test borrowed[2] === a
+    for (primal, flags) in ((a, (false, false)), (b, (false, true)))
+        saved = @inferred retain((1, -1), (a, a), primal, flags)
+        @test saved[1] !== a
+        @test saved[2] === saved[1]
+        @test saved[1] == a
+    end
+    @test retain((1,), ([a],), b, (false, false))[1][1] !== a
+    @test retain((1,), (a,), view(b, :), (false, false))[1] !== a
+    # Distinct wrappers can overlap without sharing an array header or their
+    # first element's address. Keep the owner alive throughout this check.
+    owner = collect(1.0:8.0)
+    GC.@preserve owner begin
+        firstpart = unsafe_wrap(Array, pointer(owner), 4; own=false)
+        overlap = unsafe_wrap(Array, pointer(owner, 3), 4; own=false)
+        separate = unsafe_wrap(Array, pointer(owner, 5), 4; own=false)
+        @test ext._residual_storage_overlaps(firstpart, overlap)
+        @test ext._residual_storage_overlaps(overlap, firstpart)
+        @test !ext._residual_storage_overlaps(firstpart, separate)
+        @test !ext._residual_storage_overlaps(separate, firstpart)
+        saved = retain((1,), (firstpart,), overlap, (false, false))
+        @test saved[1] !== firstpart
+        @test saved[1] == firstpart
+    end
+    @test !ext._residual_storage_overlaps(Float64[], a)
+    @test !ext._residual_storage_overlaps(a, Float64[])
+    @test isempty(ReactiveKernels._level_code_findings(:all, retain,
+        (Tuple{Int,Int}, Tuple{Vector{Float64},Vector{Float64}},
+         Vector{Float64}, Tuple{Bool,Bool})))
+end
+
 module BorrowedMutationChecks
 using ReactiveKernels, Test, LinearAlgebra
 import Enzyme

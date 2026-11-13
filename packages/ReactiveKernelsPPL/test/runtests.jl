@@ -41,6 +41,7 @@ const _PPL_TEST_FILES = (
     "test_jax_source.jl",
     "test_jax_submodel_functions.jl",
     "test_jax_scoped_functions.jl",
+    "test_jax_outputs.jl",
     "test_jax_student_t.jl",
     "test_derived_affine_fusion.jl",
     "test_scalar_prior_packing.jl",

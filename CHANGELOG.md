@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.230
+## 0.1.231
 
 - JAX source retains named, documented functions for source-backed helpers and
   shares compatible public entries through one computation body. Static entry
@@ -24,6 +24,13 @@ are recorded in the git history only.
   carry runtime extents, ragged positions and integer bounds; helpers using scan
   history remain nested in the scan's lexical scope. Nested plate cells and
   scan steps take names from their authored values.
+
+## 0.1.230
+
+- JAX numerical functions return typed JAX arrays for constant terms and numeric
+  leaves of tuple/dict results as well as computed values. Eager constant outputs
+  follow `jax.default_device`, so device-placement checks also cover a zero log
+  Jacobian. Host preparation and static shape/coordinate metadata remain host values.
 
 ## 0.1.229
 
