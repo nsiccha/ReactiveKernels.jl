@@ -1,0 +1,25 @@
+   Resolving package versions...
+    Updating `~/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/env-old/Project.toml`
+  [78e9f072] ~ ReactiveKernels v0.1.224 `~/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad` ⇒ v0.1.225 `~/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad`
+    Updating `~/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/env-old/Manifest.toml`
+  [78e9f072] ~ ReactiveKernels v0.1.224 `~/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad` ⇒ v0.1.225 `~/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad`
+     Project No packages added to or removed from `~/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/env-old/Project.toml`
+    Manifest No packages added to or removed from `~/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/env-old/Manifest.toml`
+Precompiling packages...
+ 115.6 s  ✓ ReactiveKernels
+   1.9 s  ✓ ReactiveKernels → ReactiveKernelsSpecialFunctionsExt
+   3.6 s  ✓ ReactiveKernels → ReactiveKernelsEnzymeExt
+   1.9 s  ✓ ReactiveKernels → ReactiveKernelsSparseArraysExt
+   1.9 s  ✓ ReactiveKernels → ReactiveKernelsMutatingFunctionsExt
+ 105.5 s  ✓ ReactiveKernelsDistributionKernels
+ 162.7 s  ✓ ReactiveKernelsPPL
+  7 dependencies successfully precompiled in 388 seconds. 98 already precompiled.
+KB-DOGFOOD-LIBENZYME	eea6a012bc319b5a20d68a945f816dfc0312e4ab	llvm20	/home/niko/.local/state/kb-agents/libenzyme-dogfood/eea6a012bc319b5a20d68a945f816dfc0312e4ab/llvm20
+RESOLVE-ACCEPTANCE-PRECOMPILE	complete	passes=1	checked=103	tolerated=0
+KB-DEVELOPED	ReactiveKernels	0987481070ee9b08b738ef5e201bd2bf843a0d47	/home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad
+KB-DEVELOPED	ReactiveKernelsDistributionKernels	0987481070ee9b08b738ef5e201bd2bf843a0d47	/home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsDistributionKernels
+KB-DEVELOPED	Enzyme	1ed42fb9984ff3f49a8adcba7732382e0f22c9bb	/home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/Enzyme-old
+KB-DEVELOPED	OutputSignatures	f971381f760e91986b3a728a719341e7e7761f55	/home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/OutputSignatures
+KB-DEVELOPED	MutatingFunctions	02eb981b9770e767f47a7fda287fcbfb9531d587	/home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/MutatingFunctions
+KB-DEVELOPED	EnzymeCore	1ed42fb9984ff3f49a8adcba7732382e0f22c9bb	/home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/Enzyme-old/lib/EnzymeCore
+KB-DEVELOPED	ReactiveKernelsPPL	0987481070ee9b08b738ef5e201bd2bf843a0d47	/home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsPPL

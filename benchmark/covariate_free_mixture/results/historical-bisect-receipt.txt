@@ -1,0 +1,40 @@
+queue position: 0 waiter(s) ahead of you
+pool: held=4/32 longest=tok1/22m04s mem_avail_kb=77024748 next_grant_floor_kb=16700867 load=14.13/21.02/23.67 cpus=32 cores=16 grants_last_hour=63 last_grant=10s bound=none
+MEM_OK mem_avail_kb=77193608 floor_kb=16700867 holders=10 reserve_kb=1024000
+TOKEN_ACQUIRED tok4 (queue)
+HOST_LOAD at=grant load=14.13/21.02/23.67 cpus=32 cores=16 holders=12 (a token reserves no CPU: compare timings only at similar load)
+CPU_CAP cpus=1 (standard lane; the run gets at most 1 CPU of time however many threads it starts; thread pools: OPENBLAS_NUM_THREADS=1 (lane), OMP_NUM_THREADS=1 (lane))
+BEGIN index=0 rev=d9074a0b at=2026-11-13T11:07:29+01:00
+HEAD is now at d9074a0bc Merge branch 'kb-impl/ReactiveKernels-snag.jax-ragged-integ-35502154'
+==> NOTE: EnzymeCore is a [sources] path dependency of /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/env-bisect/Project.toml; developing /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/Enzyme-old/lib/EnzymeCore
+==> NOTE: /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/env-bisect/Project.toml declares [sources.ReactiveKernels] path /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad, but this resolve develops ReactiveKernels from /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/rk-bisect (an explicit spec or the pkg/pkg_dir arguments outrank the project's own [sources])
+    /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/env-bisect/Project.toml is untracked, so nothing restores it: Julia 1.11+ Pkg.develop records /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/rk-bisect as its [sources.ReactiveKernels] path.
+==> NOTE: /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/env-bisect/Project.toml declares [sources.ReactiveKernelsDistributionKernels] path /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsDistributionKernels, but this resolve develops ReactiveKernelsDistributionKernels from /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/rk-bisect/packages/ReactiveKernelsDistributionKernels (an explicit spec or the pkg/pkg_dir arguments outrank the project's own [sources])
+    /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/env-bisect/Project.toml is untracked, so nothing restores it: Julia 1.11+ Pkg.develop records /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/rk-bisect/packages/ReactiveKernelsDistributionKernels as its [sources.ReactiveKernelsDistributionKernels] path.
+==> NOTE: /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/env-bisect/Project.toml declares [sources.ReactiveKernelsPPL] path /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsPPL, but this resolve develops ReactiveKernelsPPL from /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/rk-bisect/packages/ReactiveKernelsPPL (an explicit spec or the pkg/pkg_dir arguments outrank the project's own [sources])
+    /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/env-bisect/Project.toml is untracked, so nothing restores it: Julia 1.11+ Pkg.develop records /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/rk-bisect/packages/ReactiveKernelsPPL as its [sources.ReactiveKernelsPPL] path.
+(tag = "d9074a0b", julia = v"1.13.1", enzyme = v"0.13.220", library = "/home/niko/.local/state/kb-agents/libenzyme-dogfood/eea6a012bc319b5a20d68a945f816dfc0312e4ab/llvm20/libEnzyme-20.so", rk = v"0.1.206", rk_dir = "/home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/rk-bisect", rkppl = v"0.1.165", count = true)
+PREPARED nocov in 178.5 s; value -480.2676232908929; grad[1:3] [26.46820230941377, -0.011920608730989, -9.596994955614804]; gradsum -13.30570971479065
+NATIVE nocov gradient (malloc = 12, free = 12)
+RESULT index=0 rev=d9074a0b malloc=12
+BEGIN index=2 rev=b78ce392f at=2026-11-13T11:18:11+01:00
+Previous HEAD position was d9074a0bc Merge branch 'kb-impl/ReactiveKernels-snag.jax-ragged-integ-35502154'
+HEAD is now at b78ce392f Merge branch 'kb-impl/ReactiveKernels-snag.whole-row-mixtur-b31e8567'
+==> NOTE: EnzymeCore is a [sources] path dependency of /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/env-bisect/Project.toml; developing /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/Enzyme-old/lib/EnzymeCore
+(tag = "b78ce392f", julia = v"1.13.1", enzyme = v"0.13.220", library = "/home/niko/.local/state/kb-agents/libenzyme-dogfood/eea6a012bc319b5a20d68a945f816dfc0312e4ab/llvm20/libEnzyme-20.so", rk = v"0.1.206", rk_dir = "/home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/rk-bisect", rkppl = v"0.1.166", count = true)
+PREPARED nocov in 180.1 s; value -480.2676232908929; grad[1:3] [26.46820230941377, -0.011920608730989, -9.596994955614804]; gradsum -13.30570971479065
+NATIVE nocov gradient (malloc = 307, free = 307)
+RESULT index=2 rev=b78ce392f malloc=307
+BEGIN index=1 rev=769df47f6 at=2026-11-13T11:29:23+01:00
+Previous HEAD position was b78ce392f Merge branch 'kb-impl/ReactiveKernels-snag.whole-row-mixtur-b31e8567'
+HEAD is now at 769df47f6 Merge branch 'kb-impl/ReactiveKernels-snag.rkppl-adaptive-c-2120d96a'
+==> NOTE: EnzymeCore is a [sources] path dependency of /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/env-bisect/Project.toml; developing /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/Enzyme-old/lib/EnzymeCore
+(tag = "769df47f6", julia = v"1.13.1", enzyme = v"0.13.220", library = "/home/niko/.local/state/kb-agents/libenzyme-dogfood/eea6a012bc319b5a20d68a945f816dfc0312e4ab/llvm20/libEnzyme-20.so", rk = v"0.1.206", rk_dir = "/home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/rk-bisect", rkppl = v"0.1.166", count = true)
+PREPARED nocov in 160.3 s; value -480.2676232908929; grad[1:3] [26.46820230941377, -0.011920608730989, -9.596994955614804]; gradsum -13.30570971479065
+NATIVE nocov gradient (malloc = 12, free = 12)
+RESULT index=1 rev=769df47f6 malloc=12
+FIRST_BAD b78ce392f AFTER_GOOD 769df47f6
+HOST_LOAD at=release load=20.42/22.94/23.74 held=1933s
+MEM_PEAK anon=3.01GiB total=3.43GiB figure=none (anon: the highest anonymous memory read, every 1s, so a last burst can be missed, and what --memory compares; total: the kernel's peak, with file cache it can reclaim)
+
+[bisect-exit] exit=0 at=2026-11-13T11:39:43+01:00

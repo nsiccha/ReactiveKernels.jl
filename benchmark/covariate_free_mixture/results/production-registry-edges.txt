@@ -1,0 +1,4 @@
+Test Summary:                                                     | Pass  Total   Time
+Bernoulli mixture counts preserve empty and saturated derivatives |  110    110  49.2s
+Test Summary:                                        | Pass  Total  Time
+full-row Bernoulli mixtures retain runtime iteration |    5      5  0.2s

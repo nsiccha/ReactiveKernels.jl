@@ -28,6 +28,7 @@ function reference(counts, nmax, p)
     end
 end
 function structure(ex)
+    ex isa ReactiveKernels._PlateProgram && return structure(ex.ast)
     ex isa Expr || return (0, 0)
     result = (1, Int(ex.head in (:for, :while)))
     for child in ex.args

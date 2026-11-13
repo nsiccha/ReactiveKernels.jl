@@ -1,0 +1,8 @@
+Test Summary:                                    | Pass  Total   Time
+one component governs each whole observed vector |    9      9  59.7s
+Test Summary:                                     | Pass  Total   Time
+logit-scale whole-event laws keep saturated tails |   30     30  27.5s
+Test Summary:                                 | Pass  Total  Time
+whole-event laws keep no per-component vector |   12     12  0.7s
+Test Summary:                                               | Pass  Total   Time
+events that share the weights take their logs once per call |   14     14  30.8s

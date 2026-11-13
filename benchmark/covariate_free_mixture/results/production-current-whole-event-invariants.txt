@@ -1,0 +1,2 @@
+Test Summary:                             | Pass  Broken  Total     Time
+natural whole-event invariant expressions |   50       1     51  6m13.7s

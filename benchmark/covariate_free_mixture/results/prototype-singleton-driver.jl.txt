@@ -1,0 +1,54 @@
+using ReactiveKernels, ReactiveKernelsDistributionKernels, Chairmarks
+using DifferentiationInterface: AutoEnzyme
+import Enzyme
+include(joinpath(@__DIR__, "full-counter-method.jl"))
+const DK = ReactiveKernelsDistributionKernels.DistributionKernelSources
+Base.include(DK, joinpath(@__DIR__, "counts-law.jl"))
+function law_case(spec, observed, logits, weights)
+    kernel = prepare(spec; bound=(; observed, weights), type_stability=:error)
+    ad = prepare_ad(kernel, AutoEnzyme(; mode=Enzyme.Reverse), logits; active=:logits)
+    gradient = zero(logits)
+    case = (; kernel, ad, gradient, logits)
+    call_gradient!(case)
+    case
+end
+function call_gradient!(case)
+    ad_value_and_gradient!(case.ad, case.gradient, case.logits)
+    nothing
+end
+function stats(case)
+    f() = call_gradient!(case)
+    (; native=native_counts(f), julia_bytes=@allocated(f()))
+end
+function timed(case)
+    f() = call_gradient!(case)
+    minimum(Chairmarks.benchmark(nothing, f, _->nothing; seconds=0.05)).time*1e6
+end
+median(v) = (s=sort(v); (s[length(s)÷2]+s[length(s)÷2+1])/2)
+function compare(a, b, n)
+    @assert isapprox(a.kernel(a.logits), b.kernel(b.logits); rtol=2e-13, atol=2e-13)
+    @assert isapprox(a.gradient, b.gradient; rtol=2e-13, atol=2e-13)
+    ta, tb = Float64[], Float64[]
+    before = strip(read("/proc/loadavg", String))
+    for round in 1:12
+        if isodd(round)
+            push!(ta, timed(a)); push!(tb, timed(b))
+        else
+            push!(tb, timed(b)); push!(ta, timed(a))
+        end
+    end
+    println((; positions=n, baseline=stats(a), counts=stats(b),
+        baseline_gradient_us=median(ta), counts_gradient_us=median(tb),
+        ratio=median(tb)/median(ta),
+        max_gradient_error=maximum(abs.(a.gradient .- b.gradient); init=0.0),
+        load_before=before, load_after=strip(read("/proc/loadavg", String))))
+    flush(stdout)
+end
+println((; enzyme=pkgversion(Enzyme), library=Enzyme.Compiler.Enzyme_jll.libEnzyme_path))
+for n in (5, 51, 501)
+    observed = Bool[isodd(i) for i in 1:n]
+    logits = [0.7 -1.2]
+    weights = [0.35, 0.65]
+    compare(law_case(DK.bernoulli_logit_product_mixture_logdensity, observed, logits, weights),
+        law_case(DK.counts_product_mixture, observed, copy(logits), weights), n)
+end
