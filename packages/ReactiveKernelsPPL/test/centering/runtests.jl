@@ -174,7 +174,7 @@ end
     built = build_kernel(plan)
     u = 0.1 .* cos.(1:built.layout.total)
     cells = (z = (location = :location, log_scale = :log_scale, source = 1.0),)
-    ir, _ = map_for(built, plan, cells; u0 = u)
+    ir, prepared = map_for(built, plan, cells; u0 = u)
     entries = Dict(e.name => e for e in built.layout.entries)
     zi = entries[:z].offset .+ (0:5)
     expected = copy(u)
@@ -182,6 +182,30 @@ end
     jac, mapped = WarmupHMC.with_logabsdet_jacobian!(copy(u), ir, u)
     @test mapped ≈ expected
     @test jac ≈ -sum(log, scales)
+
+    # Array endpoints may borrow graph storage, including bound cached values.
+    # Maps and reverse AD must only read it, and a later evaluation must not
+    # change an earlier result or the caller's input/data.
+    inputs = (copy(u), copy(offsets), copy(scales))
+    endpoints = map(k -> k(u), prepared.kernels)
+    snapshots = map(copy, endpoints)
+    problem = prepare_sampler(built, plan, u; backend = BACKEND)
+    rp = adaptive_centering_problem(built, plan, problem, BACKEND; cells, u0 = u)
+    first_result = LDP.logdensity_and_gradient(rp, u)
+    first_gradient = copy(last(first_result))
+    for point in (u, u .+ 0.07, view(hcat(u, u .+ 0.07), :, 2))
+        value, gradient = LDP.logdensity_and_gradient(rp, point)
+        @test value ≈ LDP.logdensity(rp, point)
+        @test gradient ≈ finite_gradient(x -> LDP.logdensity(rp, x), point) rtol = 2e-7 atol = 2e-7
+        _, forward = WarmupHMC.with_logabsdet_jacobian!(copy(point), ir, point)
+        _, inverse = WarmupHMC.with_logabsdet_jacobian!(copy(forward),
+            WarmupHMC.InverseFunctions.inverse(ir), forward)
+        @test inverse ≈ point
+        @test endpoints == snapshots
+        @test (u, offsets, scales) == inputs
+        @test last(first_result) == first_gradient
+    end
+    @test LDP.logdensity_and_gradient(rp, u) == first_result
 end
 
 @testset "a graph-derived spatial cell preserves the original density" begin

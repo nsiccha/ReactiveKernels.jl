@@ -56,6 +56,10 @@ const _CENTERING_VALUE = :_ppl_centering_value
 # arrays retain Julia's linear coordinate order. This conversion is a graph
 # recipe, so the ordinary backend differentiates through it with the model.
 _centering_values(value::Real) = Float64[value]
+# Accessors only read the graph's outputs. A dense Float64 array already has
+# the required storage, so flatten it without copying its elements. This also
+# leaves bound, cached arrays read-only during maps and ordinary reverse AD.
+_centering_values(value::Array{Float64}) = vec(value)
 _centering_values(value::AbstractArray{<:Real}) = collect(Float64, vec(value))
 
 function _centering_kernel(built, plan, name::Symbol; on_error)
