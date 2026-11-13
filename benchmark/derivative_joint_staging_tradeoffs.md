@@ -1,10 +1,12 @@
 # Joint derivative staging: bounded comparison
 
 This experiment compares selecting a primal and its active cotangents together
-with selecting the reverse branch first. The private implementation is
-`56241c299c7e1d16e019f287dd3a449b576d88f8`, based on `6358fa81`. It is a proposal,
-not a selected production architecture. It changes general `DerivativeRule`
-staging; it does not change the plate-specific reverse adapter.
+with selecting the reverse branch first. The initial prototype is
+`56241c299c7e1d16e019f287dd3a449b576d88f8`, based on `6358fa81`. The installed
+candidate is `429d7ec78065eeec1f6fad47c219c5739f4fc7ab`, integrated with main
+`f91621d6472664039d6b498247bc97b58a0931f6`. It changes general `DerivativeRule`
+staging and Enzyme residual retention. The plate-specific reverse adapter is
+outside this increment. Adoption remains a proposal pending review.
 
 ## Selection and execution
 
@@ -19,6 +21,23 @@ The focused joint, multi-output and general derivative suites passed 483 checks
 in the initial combined run. A later matched comparison passed the 165 joint
 checks on each Enzyme environment. These overlapping counts establish the
 tested selection and numerical behavior, not globally optimal runtime.
+
+The joint and readonly drivers construct each rule once, before their runtime
+length loops, and reuse that same prepared program across all sizes. The
+planner receives ports and types, not the arrays or their extents; the
+call-count fixture also verifies that preparation executes no recipe. The
+array operations retain their runtime lengths. The tuple traversal in residual
+retention follows the fixed graph frontier, not an observation count. Existing
+derivative acceptance additionally covers lazy callers, activity cuts, plates
+and scans. These facts establish the bounded representation for this increment;
+they do not make a claim about unrelated backend traces.
+
+The general staging selection is also consumed by the ChainRules adapter;
+its existing scalar, vector and activity regressions are included in the
+derivative suite. Snapshot retention is implemented in the Enzyme adapter.
+The mutation and retention-cost results below therefore establish Enzyme
+behavior, not a new snapshot guarantee for manual stage calls or ChainRules
+pullbacks.
 
 ## Warm work and storage
 
@@ -212,10 +231,50 @@ Fleet `011673db3f9848dd` exited 0 after 363 seconds on registered Enzyme.
 This removes the large readonly-matrix copy. The old helper remains cheaper
 in several observations but fails the ownership controls; borrowing does not
 establish a general speedup over native AD. Candidate `429d7ec78065` installs
-this refinement and its tests. Verification on both Enzyme environments and
-remeasurement of the final array sharing/recomputation tradeoff are in progress
-in fleet `d915cb8e74714485`; earlier whole-copy ratios are not final-candidate
-measurements.
+this refinement and its tests. The final installed measurements follow;
+earlier whole-copy ratios describe that earlier retention policy.
+
+## Final installed candidate
+
+Fleet `d915cb8e74714485` exited 0 after 1,569 seconds at 2026-11-13 13:04:14 UTC.
+Both registered Enzyme 0.13.219 and dogfood 0.13.220 with libEnzyme `4990aa11`
+pass 770 checks each: 287 snapshot/borrowing checks, 165 joint-selection checks,
+38 multi-output checks and 280 existing derivative checks. Both affected
+Enzyme and ChainRules extensions are loaded. The installed retention method is
+used directly, with no benchmark replacement. These are focused checks, not a
+claim of a full-repository test run.
+
+The following are the final ordinary-Reverse adapter ratios. Each entry is the
+median of 12 paired round ratios, with its within-run bootstrap interval.
+
+| Family | Length | Registered shared / independent | Dogfood shared / independent | Shared / native, registered / dogfood |
+| --- | ---: | ---: | ---: | ---: |
+| Exponential | 1,000 | 0.659 (0.638–0.672) | 0.710 (0.681–0.809) | 0.677 / 0.711 |
+| Exponential | 100,000 | 0.510 (0.471–0.521) | 0.515 (0.474–0.527) | 0.511 / 0.519 |
+| Square | 1,000 | 2.173 (2.061–2.268) | 2.355 (2.287–2.443) | 5.105 / 3.343 |
+| Square | 100,000 | 1.412 (1.364–1.474) | 1.437 (1.416–1.483) | 2.429 / 1.652 |
+
+Both builds allocate 8,544/24,800 Julia bytes in 6/8 allocations for the
+independent/shared arms at length 1,000, and 800,464/2,400,560 bytes in 7/11
+allocations at length 100,000. Native controls report zero Julia allocations;
+native backend allocations were not measured. Borrowing makes recomputation
+cheaper too, increasing the relative penalty for sharing cheap square partials.
+At length 8 even exponential sharing remains slower than native ordinary AD.
+
+The readonly matrix comparison also completes in both installed environments:
+
+| Matrix shape | Registered rule / native time | Dogfood rule / native time | Rule bytes, both builds | Paired rule / native ratio, registered / dogfood |
+| --- | ---: | ---: | ---: | ---: |
+| 128 × 8 | 0.854 / 0.869 µs | 0.814 / 0.934 µs | 3,968 | 0.983 / 0.868 |
+| 2,048 × 32 | 13.031 / 13.994 µs | 12.851 / 15.377 µs | 50,656 | 0.905 / 0.829 |
+| 8,192 × 64 | 113.544 / 120.203 µs | 112.758 / 119.024 µs | 198,352 | 0.946 / 0.955 |
+
+The large readonly matrix is no longer copied on every gradient call. Nested
+containers, views and mutable primal outputs still take conservative snapshots,
+which can copy whole view parents. These results support the bounded selection
+and ownership increment, not an automatic runtime-optimal storage policy.
+The graph's declared costs still need to represent the intended tradeoff;
+the planner does not yet price retention, copying or backend execution.
 
 ## Preparation and evidence limits
 
@@ -276,6 +335,9 @@ controls, not that the alias arm passed correctness.
 - Flat-array borrowing and nested snapshot fallback: fleet `011673db3f9848dd`,
   exit 0, 363 seconds, 287 checks;
   [exact prototype, mutation controls, manifests, raw timing rounds, summary and receipt](http://localhost:4200/code/download?path=/home/niko/.local/state/kb-agents/uploads/b46b44e5ed384eaa4ae868fdef9f2dabb98b033458df4c74d70f7f1fbe30fa19.tgz).
+- Final installed candidate on both builds: fleet `d915cb8e74714485`, exit 0,
+  1,569 seconds, 770 checks per build and all readonly/array timing phases;
+  [source digests verified against the tested commit, complete logs, manifests, summaries and terminal receipt](http://localhost:4200/code/download?path=/home/niko/.local/state/kb-agents/uploads/aa1856afbcf97e3cd68eb0bf881da351f720990684482f0a2316b0f5e503374f.tgz).
 
 Conservative fallback can still duplicate readonly nested data and whole
 parents of small views. The prototype does not account for these measured

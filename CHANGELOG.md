@@ -23,7 +23,7 @@ are recorded in the git history only.
   producers and shares their retained work; a primal requiring the unavailable
   reverse seed retains the existing independent staging. Declared recipe costs
   determine selection and do not guarantee the fastest runtime strategy.
-- Retained derivative values preserve snapshots across caller mutation,
+- Enzyme's retained derivative values preserve snapshots across caller mutation,
   including views and nested containers that alias an input or returned value.
   Shared references remain shared within the snapshot. Flat scalar/array
   environments can retain direct array inputs without copying when the backend
