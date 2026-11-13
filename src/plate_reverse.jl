@@ -508,9 +508,10 @@ end
 # Calls whose results carry no derivative at the program level: type, shape
 # and schedule queries, and the plate's own scaffolding.
 const _PR_PROGRAM_INERT = Set{Any}(Any[Base.typeof, Base.eltype, Base.axes, Base.size,
-    Base.length, Base.isempty, Base.CartesianIndices, Base.CartesianIndex, Base.:!,
+    Base.length, Base.eachindex, Base.isempty, Base.CartesianIndices, Base.CartesianIndex, Base.:!,
     _promote_op, _plate_result_eltype, _plate_require_axes, _plate_broadcast_shape,
-    _plate_simd_cells, _plate_total_seed, Base.zero, Base.one, Base.:<, Base.:(==)])
+    _plate_simd_cells, _plate_spans_axis, _plate_total_seed,
+    Base.zero, Base.one, Base.:<, Base.:(==)])
 
 function _pr_call_function(head, mod::Module, values::Dict{Symbol,Any})
     head isa Symbol && haskey(values, head) && return values[head]
@@ -523,15 +524,17 @@ function _pr_call_function(head, mod::Module, values::Dict{Symbol,Any})
 end
 
 # Symbols an expression reads, outside inert calls.
-function _pr_reads!(found::Set{Symbol}, ex, mod, values; ignore_bindings = false)
+function _pr_reads!(found::Set{Symbol}, ex, mod, values;
+                    ignore_bindings = false, cell_reads = nothing)
     if ex isa Symbol
         push!(found, ex)
     elseif ex isa Expr
+        cell_reads !== nothing && haskey(cell_reads, ex) && return found
         ex.head in (:quote, :meta, :inbounds, :loopinfo, :line) && return found
         if ignore_bindings && Meta.isexpr(ex, :(=), 2)
             lhs = ex.args[1]
             if lhs isa Symbol || Meta.isexpr(lhs, :(::), 2) && lhs.args[1] isa Symbol
-                return _pr_reads!(found, ex.args[2], mod, values; ignore_bindings)
+                return _pr_reads!(found, ex.args[2], mod, values; ignore_bindings, cell_reads)
             end
         elseif ignore_bindings && ex.head === :local
             for a in ex.args
@@ -539,7 +542,7 @@ function _pr_reads!(found::Set{Symbol}, ex, mod, values; ignore_bindings = false
                 # through an indexed destination still do.
                 a isa Symbol && continue
                 Meta.isexpr(a, :(::), 2) && a.args[1] isa Symbol && continue
-                _pr_reads!(found, a, mod, values; ignore_bindings)
+                _pr_reads!(found, a, mod, values; ignore_bindings, cell_reads)
             end
             return found
         end
@@ -547,13 +550,14 @@ function _pr_reads!(found::Set{Symbol}, ex, mod, values; ignore_bindings = false
             f = _pr_call_function(ex.args[1], mod, values)
             f !== nothing && f in _PR_PROGRAM_INERT && return found
             for a in ex.args[2:end]
-                _pr_reads!(found, a, mod, values; ignore_bindings)
+                _pr_reads!(found, a, mod, values; ignore_bindings, cell_reads)
             end
-            ex.args[1] isa Expr && _pr_reads!(found, ex.args[1], mod, values; ignore_bindings)
+            ex.args[1] isa Expr && _pr_reads!(found, ex.args[1], mod, values;
+                                            ignore_bindings, cell_reads)
             return found
         end
         for a in ex.args
-            _pr_reads!(found, a, mod, values; ignore_bindings)
+            _pr_reads!(found, a, mod, values; ignore_bindings, cell_reads)
         end
     end
     found
@@ -748,7 +752,62 @@ function _pr_prepared_operands(body, params = Symbol[])
     prepared, broadcastables
 end
 
-_pr_is_read(s, st) = s isa _PRCall && s.f === Base.Broadcast._broadcast_getindex &&
+# Native direct reads retain the parameter's cell provenance. Approve each
+# call, rather than its containing assignment or operand name: another read
+# of that operand outside the cell, or at a different index, still needs an
+# ordinary derivative. The shadow write below uses the cell's linear index.
+function _pr_direct_operands!(prepared, body, params, active_params, broadcastables, mod, values)
+    operands = Dict{Symbol,Symbol}(p => p for p in params)
+    merge!(operands, broadcastables)
+    reads = IdDict{Expr,Nothing}()
+    function visit(node)
+        node isa Expr && node.head !== :quote || return
+        loop = _pr_cell_loop(node)
+        if loop === nothing
+            foreach(visit, node.args)
+            return
+        end
+        _, linear, cell = loop
+        statements = Any[s for s in cell.args if !(s isa LineNumberNode)]
+        isempty(statements) && return
+        binding = first(statements)
+        Meta.isexpr(binding, :(=), 2) && binding.args[1] isa Symbol || return
+        index, rhs = binding.args
+        Meta.isexpr(rhs, :call, 2) && rhs.args[2] === linear &&
+            _pr_call_function(rhs.args[1], mod, values) === Base.CartesianIndex || return
+        rebound = _program_bound!(Set{Symbol}(), Expr(:block, statements[2:end]...))
+        (index in rebound || linear in rebound) && return
+        function read(ex)
+            ex isa Expr && ex.head !== :quote || return
+            if Meta.isexpr(ex, :call, 3) &&
+                    _pr_call_function(ex.args[1], mod, values) === _plate_read &&
+                    ex.args[2] isa Symbol && haskey(operands, ex.args[2]) &&
+                    ex.args[3] in (index, linear)
+                raw = ex.args[2]
+                prepared[raw] = operands[raw]
+                reads[ex] = nothing
+            end
+            foreach(read, ex.args)
+        end
+        foreach(read, statements[2:end])
+    end
+    visit(body)
+    function check(node)
+        node isa Expr && node.head !== :quote || return
+        if Meta.isexpr(node, :call, 3) &&
+                _pr_call_function(node.args[1], mod, values) === _plate_read &&
+                get(operands, node.args[2], nothing) in active_params &&
+                !haskey(reads, node)
+            _pr_fail("a direct plate read does not use its cell index")
+        end
+        foreach(check, node.args)
+    end
+    check(body)
+    reads
+end
+
+_pr_is_read(s, st) = s isa _PRCall &&
+    s.f in (Base.Broadcast._broadcast_getindex, _plate_read) &&
     s.args[1] isa Symbol && haskey(st.prepared, s.args[1])
 
 # Reads of active batched operands are active.
@@ -1386,19 +1445,31 @@ function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict
     # Running totals: seeded (`_plate_total_seed`) or accumulated
     # (`_plate_total_add`), including a total the body seeds and passes in.
     totals = Set{Symbol}()
-    for (lhs, rhs) in _pr_assignments!(Pair{Symbol,Any}[], body)
+    assignments = _pr_assignments!(Pair{Symbol,Any}[], body)
+    for (lhs, rhs) in assignments
         Meta.isexpr(rhs, :call) && (_pr_is_ref(rhs.args[1], @__MODULE__, :_plate_total_add) ||
             _pr_is_ref(rhs.args[1], @__MODULE__, :_plate_total_seed)) && push!(totals, lhs)
     end
     isempty(totals) && _pr_fail("no plate total")
-    output in totals || any(((lhs, rhs),) -> lhs === output && Meta.isexpr(rhs, :call, 2) &&
-        _pr_is_ref(rhs.args[1], @__MODULE__, :_plate_total_value) && rhs.args[2] in totals,
-        _pr_assignments!(Pair{Symbol,Any}[], body)) || _pr_fail("the program's result is not its plate total")
+    terminal_totals = Set{Symbol}(t for t in totals if t === output)
+    for (lhs, rhs) in assignments
+        lhs === output && Meta.isexpr(rhs, :call, 2) &&
+            _pr_is_ref(rhs.args[1], @__MODULE__, :_plate_total_value) &&
+            rhs.args[2] in totals && push!(terminal_totals, rhs.args[2])
+    end
+    isempty(terminal_totals) && _pr_fail("the program's result is not its plate total")
+    # A factored reduction also has a partial total whose adjoint is scaled
+    # by later arithmetic. Seeding that partial with the output's seed would
+    # be wrong. Distinct terminal totals in mutually exclusive branches may
+    # each use that seed; counting totals alone would reject those programs.
+    issubset(totals, terminal_totals) ||
+        _pr_fail("an intermediate plate total needs a propagated adjoint")
     prepared, broadcastables = _pr_prepared_operands(body, params)
+    cell_reads = _pr_direct_operands!(prepared, body, params, active_params,
+                                    broadcastables, mod, values)
     active = _pr_program_activity(body, active_params, mod, values)
     batched = Symbol[p for p in params if p in active_params && p in Base.values(prepared)]
     scalar = Symbol[p for p in params if p in active_params && !(p in batched)]
-    assignments = _pr_assignments!(Pair{Symbol,Any}[], body)
     # A marker returns an operand alias, not detached metadata. Permit it
     # only when its result is read exclusively by derivative-inert queries.
     # Keep the call and its checks in the program; a numerical read, another
@@ -1413,7 +1484,7 @@ function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict
         # operand (aliases such as the plate's axis marker are inert).
         for (lhs, rhs) in assignments
             rhs === p && continue
-            p in _pr_reads!(Set{Symbol}(), rhs, mod, values) || continue
+            p in _pr_reads!(Set{Symbol}(), rhs, mod, values; cell_reads) || continue
             haskey(broadcastables, lhs) && continue
             # `preprocess(nothing, p)`: the body passed p in already broadcastable.
             get(prepared, lhs, nothing) === p && continue
@@ -1709,8 +1780,8 @@ the source is eligible for generated reverse, or its fallback reason.
 Accepts a `PreparedKernel` or `NonAllocatingKernel`. This is a static report,
 independent of whether the preference is enabled; cache rewrites and backend
 operand annotations can affect the rule used by a prepared gradient.
-Plates the lowering keeps inline (a body with one plate) are not programs
-and are not listed.
+Single-plate programs are listed even when ordinary native execution inlines
+them.
 """
 function plate_reverse_report(kernel::Union{PreparedKernel,NonAllocatingKernel}, active = 1)
     _has_plate_programs(kernel.ast) || return Pair{Symbol,String}[]

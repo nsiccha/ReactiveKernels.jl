@@ -387,9 +387,9 @@ _ls_check_product(X, v) = throw(ArgumentError(
 
 The operation `(stats, response, data..., live..., rest...) -> _LSLocation`:
 the location of structure `S` over `ND` data and `NL` live arguments. Trailing
-arguments are not read: the plan passes the authored location there while
-its binding is undecided. `DROP` names the recipes that compute only that
-authored location, which a usable binding drops (`_ls_class_residual`).
+arguments are not read: the plan passes the authored location there before
+forming runtime eligibility regions. `DROP` names the recipes that compute
+only that location, which the eligible arm drops (`_ls_class_residual`).
 """
 struct _LSLocationCall{S,ND,NL,DROP} end
 _LSLocationCall(S, ndata::Int, nlive::Int, drop::Tuple) = _LSLocationCall{S,ndata,nlive,drop}()
@@ -490,11 +490,11 @@ end
 #     loc = _LSLocationCall{S}()(stats, y, data..., live..., mu)
 #     plate(..., y, ..., loc, ...)                             # was mu
 #
-# Per binding (`_ls_class_residual`, keyed by `stats.usable` among the plate
-# classes): a usable binding drops `mu` and its producers from the residual, so
-# the plate reads `loc` row by row only where its own loop runs, and the
-# lowering sums the squared residuals from `stats` (`_lower_bound_statistics_native`);
-# an unusable one gives the plate `mu` back and drops `loc`: today's program.
+# Runtime regions (`_ls_class_residual`) retain both arms. When `stats.usable`,
+# the arm omits `mu` and its exclusive producers, so the plate reads `loc` row
+# by row only where its own loop runs; the lowering sums squared residuals
+# from `stats` (`_lower_bound_statistics_native`). Otherwise the plate reads
+# its authored `mu`. Numerical eligibility never changes the program's type.
 
 # A recipe's parameter names and authored source, its called names resolved:
 # a source operation's in its module, and a bare call's (`log(scale)`, whose
@@ -570,6 +570,11 @@ function _ls_operand(p::Plan, v::Value, dataonly, seen, depth)
     depth > _LS_MAX_DEPTH && return nothing
     r = get(p.producer, id, nothing)
     r === nothing && return _LSLive(id, v)
+    # Reading through a declared local also reads through its conversion.
+    # Only a proved identity conversion is affine in the producer's inputs.
+    declared = valtype(v)
+    declared === Any || _promote_op(r.op, map(valtype, r.inputs)...) <: declared ||
+        return _LSLive(id, v)
     # A gather of a live source by a data index.
     if length(r.inputs) == 2 && length(r.outputs) == 1 && !r.effectful &&
             (_index_run_gather(r.op) || r.op === _readonly_gather_runs)
@@ -879,7 +884,7 @@ end
 
 # The recipes that compute only the authored location for this plate: none
 # of their outputs is `kept` (wanted, or read by the location operation) or
-# read by anything else. A usable binding drops them (`_ls_class_residual`).
+# read by anything else. The eligible arm drops them (`_ls_class_residual`).
 function _ls_exclusive(p::Plan, location::ValueId, plate::Recipe, kept, dataonly)
     g = p.graph
     readers = Dict{ValueId,Vector{Int}}()
@@ -904,39 +909,29 @@ function _ls_exclusive(p::Plan, location::ValueId, plate::Recipe, kept, dataonly
     Tuple(sort!(collect(drop)))
 end
 
-# --- per binding -----------------------------------------------------------------
+# --- runtime eligibility ----------------------------------------------------------
 
-# Whether each bound least-squares location's statistics are usable for this
-# binding, in residual order: classes of the compiled residual
-# (`_partial_plate_classes`), so a usable and an unusable binding never share
-# one.
-function _ls_classes(b::_PartialBoundary, @nospecialize(hoisted))
-    usable = Bool[]
-    for r in b.residual
-        r.op isa _LSLocationCall || continue
-        stats = first(r.inputs)
-        slot = findfirst(c -> c.id == stats.id, b.constants)
-        value = slot === nothing ? nothing : hoisted[slot]
-        push!(usable, value isa _LSStatistics && value.usable)
-    end
-    usable
+# Keep both plans until lowering chooses declarations and storage. The callable
+# kernel is the ordinary native interpretation used by plan/type consumers.
+struct _LSRegion{K}
+    fast::Plan
+    literal::Plan
+    statistics::Vector{Value}
+    kernel::K
 end
+(r::_LSRegion)(args...) = r.kernel(args...)
+_embedded_kernel(r::_LSRegion) = r.kernel
 
-# The residual recipes for this binding's classes: a usable location stops
-# reading the authored one, whose exclusive producers are dropped; an unusable
-# one is dropped and its plate reads the authored location again.
-function _ls_class_residual(g::Graph, b::_PartialBoundary, @nospecialize(classes::Tuple),
-                            residual::Vector{Recipe})
+# Build one arm: usable locations replace their exclusive authored producers;
+# the literal arm drops the statistics calls and restores authored locations.
+function _ls_select_residual(g::Graph, residual::Vector{Recipe}, usable::Bool)
     any(r -> r.op isa _LSLocationCall, residual) || return residual
-    offset = length(b.plate_slots)
     drop = Set{Int}()
     restore = Dict{ValueId,Value}()   # an unusable location => the authored one
     replaced = Dict{Int,Recipe}()
-    j = 0
     for r in residual
         r.op isa _LSLocationCall || continue
-        j += 1
-        if get(classes, offset + j, false) === true
+        if usable
             replaced[r.id] = Recipe(r.id, r.inputs[1:end-1], r.outputs, r.op, r.cost,
                                     r.cse_key, r.effectful, r.source)
             union!(drop, _ls_drop(r.op))
@@ -956,6 +951,121 @@ function _ls_class_residual(g::Graph, b::_PartialBoundary, @nospecialize(classes
         push!(out, r)
     end
     out
+end
+
+# Contiguous regions from a location's exclusive producers through its scalar
+# total. Overlapping regions share a guard; disjoint regions decide separately.
+# Keeping intervening recipes inside the region preserves evaluation order.
+function _ls_regions(p::Plan, residual::Vector{Recipe})
+    g = p.graph
+    positions = Dict(r.id => i for (i, r) in enumerate(residual))
+    regions = UnitRange{Int}[]
+    for (i, r) in enumerate(residual)
+        r.op isa _LSLocationCall || continue
+        output = canon_id(g, only(r.outputs).id)
+        plate = findfirst(q -> q.op isa _AuthoredPlateOp &&
+            any(v -> canon_id(g, v.id) == output, q.inputs), residual)
+        plate === nothing && return nothing
+        total = _authored_plate_sum_recipe(p, residual[plate])
+        total === nothing && return nothing
+        stop = get(positions, total.id, 0)
+        stop >= i || return nothing
+        start = minimum((get(positions, id, i) for id in _ls_drop(r.op)); init = i)
+        push!(regions, start:stop)
+    end
+    sort!(regions; by = first)
+    merged = UnitRange{Int}[]
+    for region in regions
+        if !isempty(merged) && first(region) <= last(merged[end])
+            merged[end] = first(merged[end]):max(last(merged[end]), last(region))
+        else
+            push!(merged, region)
+        end
+    end
+    # A check that becomes ready inside a region must retain that exact point
+    # in the recipe order. Keep the authored plan until such checks can be
+    # represented inside both arms without moving them past a calculation.
+    checked = Set(canon_id(g, a.id) for c in p.checks for a in c.args if a isa Value)
+    any(region -> any(r -> any(v -> canon_id(g, v.id) in checked, r.outputs),
+                      residual[region]), merged) && return nothing
+    merged
+end
+
+function _ls_class_residual(p::Plan, residual::Vector{Recipe})
+    any(r -> r.op isa _LSLocationCall, residual) || return residual
+    regions = _ls_regions(p, residual)
+    regions === nothing && return _ls_select_residual(p.graph, residual, false)
+    out = Recipe[]
+    start = 1
+    fresh = minimum((r.id for r in residual); init = 0) - 1
+    for region in regions
+        append!(out, residual[start:first(region)-1])
+        push!(out, _ls_region_recipe(p, residual, region, fresh))
+        fresh -= 1
+        start = last(region) + 1
+    end
+    append!(out, residual[start:end])
+    out
+end
+
+function _ls_region_recipe(p::Plan, residual::Vector{Recipe}, region::UnitRange{Int}, id::Int)
+    g = p.graph
+    selected = residual[region]
+    locations = Recipe[r for r in selected if r.op isa _LSLocationCall]
+    fast = _ls_select_residual(g, selected, true)
+    literal = _ls_select_residual(g, selected, false)
+    produced = Set(canon_id(g, v.id) for r in selected for v in r.outputs)
+    have = unique(v -> canon_id(g, v.id), Value[v for r in selected for v in r.inputs
+                                               if !(canon_id(g, v.id) in produced)])
+    outside = Set(canon_id(g, v.id) for (i, r) in enumerate(residual)
+                   if !(i in region) for v in r.inputs)
+    union!(outside, (canon_id(g, v.id) for v in p.want))
+    union!(outside, (canon_id(g, a.id) for c in p.checks for a in c.args if a isa Value))
+    want = unique(v -> canon_id(g, v.id), Value[v for r in selected for v in r.outputs
+                                               if canon_id(g, v.id) in outside])
+    fast_plan = _partial_subplan(p, have, want, fast)
+    literal_plan = _partial_subplan(p, have, want, literal)
+    fast_plan, literal_plan = _lowering_plan(fast_plan), _lowering_plan(literal_plan)
+    statistics = Value[first(r.inputs) for r in locations]
+    ast, constants, ops, recipes = _ls_region_program(fast_plan, literal_plan, statistics)
+    kernel = _prepared_kernel(_ArrayFunction(compile(ast)), constants, _native_table(ast, ops),
+        Tuple(have), Tuple(want), literal_plan, ast, recipes)
+    Recipe(id, Tuple(have), Tuple(want), _LSRegion(fast_plan, literal_plan, statistics, kernel),
+           sum(r.cost for r in selected; init = 0.0), nothing, any(r -> r.effectful, selected))
+end
+
+function _ls_region_program(fast::Plan, literal::Plan, statistics;
+                            recycle = Pair{ValueId,Symbol}[], value_ids = nothing, kwargs...)
+    # The containing plan runs the checks. Remove them at target lowering,
+    # after plate fusion or storage preparation may have rebuilt either plan.
+    # A region is compiler structure, not another checked call boundary.
+    without_checks(q) = Plan(q.graph, q.have, q.want, q.recipes, q.producer,
+                            q.cost, q.candidates, InputCheck[])
+    fast, literal = without_checks(fast), without_checks(literal)
+    fast_ids = value_ids === nothing ? nothing : Dict{Symbol,ValueId}()
+    literal_ids = value_ids === nothing ? nothing : Dict{Symbol,ValueId}()
+    fast_ast, fast_constants, fast_ops, fast_recipes =
+        _lower_with_ops(fast; recycle, value_ids = fast_ids, kwargs...)
+    literal_ast, literal_constants, literal_ops, literal_recipes =
+        _lower_with_ops(literal; recycle, value_ids = literal_ids, kwargs...)
+    g = literal.graph
+    names = _varnames(literal)
+    args = Any[names[canon_id(g, v.id)] for v in literal.have]
+    lanes = last.(recycle)
+    result = gensym(:least_squares_result)
+    checks = Any[Expr(:call, GlobalRef(Core, :getfield),
+        names[canon_id(g, v.id)], QuoteNode(:usable)) for v in statistics]
+    condition = foldl((a, c) -> Expr(:&&, a, c), checks)
+    ast = Expr(:function, Expr(:tuple, _CONSTANTS_ARG, _CALLABLES_ARG,
+        (Expr(:(::), a, valtype(v)) for (a, v) in zip(args, literal.have))..., lanes...),
+        Expr(:block, Expr(:if, condition,
+            Expr(:block, _embedded_statements(fast_ast, [args; lanes], result, 0;
+                source_ids = fast_ids, value_ids)...),
+            Expr(:block, _embedded_statements(literal_ast, [args; lanes], result, length(fast_ops);
+                source_ids = literal_ids, value_ids)...)),
+            Expr(:return, result)))
+    ast, (fast_constants..., literal_constants...), (fast_ops..., literal_ops...),
+        (fast_recipes..., literal_recipes...)
 end
 
 # --- lowering ----------------------------------------------------------------------
