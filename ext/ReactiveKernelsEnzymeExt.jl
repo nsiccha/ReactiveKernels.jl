@@ -837,8 +837,10 @@ end
 # The reverse pass of a call with a vector tape (width 1, by `_pr_one_pass`):
 # under one pass only the seed's scaling of what the augmented primal computed;
 # for a plate below the threshold (the empty tape) the sweep, as two passes do.
-function _pr_vector_tape_reverse(r, ::Val{S}, ::Val{B}, dret, tape::Vector{Float64},
-                                 args::Tuple) where {S,B}
+# `r::R`: Julia does not otherwise specialize on a `Function` it only reads
+# fields of, and the sweep's call would dispatch dynamically.
+function _pr_vector_tape_reverse(r::R, ::Val{S}, ::Val{B}, dret, tape::Vector{Float64},
+                                 args::Tuple) where {R,S,B}
     ȳ = dret isa Active ? dret.val : dret
     if isempty(tape)
         shadows = _pr_shadows(Val(B), args, Val(1), 1)
