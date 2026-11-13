@@ -269,6 +269,7 @@ const _PPL_TEST_FILES = (
     "test_bound_data_reuse.jl",
     "test_duplicate_cells.jl",
     "test_predictive_draws.jl",
+    "test_absent_plate_shapes.jl",
     "test_discrete_latents.jl",
     "test_glm_object_values.jl",
     "test_native_plain_plate_emission.jl",
