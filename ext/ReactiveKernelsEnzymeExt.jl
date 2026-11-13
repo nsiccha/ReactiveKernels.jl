@@ -572,7 +572,7 @@ function EnzymeRules.augmented_primal(
     S, B = _pr_scalar_positions(r), _pr_batched_positions(r)
     if _pr_covers(Val(S), Val(B), args) && _pr_one_pass(Val(B), args)
         buffers = _pr_buffers(Val(B), args)
-        swept = r.reverse(values..., one(_pr_seed_type(r, values)), buffers...)
+        swept = r.reverse(values..., 1.0, Val(true), buffers...)
         tape = _PROnePass(Base.tail(swept), buffers)
         return AugmentedReturn(needs_primal(config) ? first(swept) : nothing, nothing, tape)
     end
@@ -580,7 +580,6 @@ function EnzymeRules.augmented_primal(
     tape = _pr_tape(Val(overwritten(config)), values)
     AugmentedReturn(needs_primal(config) ? primal : nothing, nothing, tape)
 end
-@inline _pr_seed_type(r, values) = Float64
 
 # One pass when no batched operand needs a buffer as long as the cells: each is
 # constant, a float tuple, or a gathered view (`view(z, g)` with an index
@@ -764,7 +763,7 @@ function EnzymeRules.reverse(
     if W == 1
         ȳ = dret isa Active ? dret.val : dret
         shadows = _pr_shadows(Val(B), args, Val(1), 1)
-        cot = Base.tail(r.reverse(operands..., ȳ, shadows...))
+        cot = Base.tail(r.reverse(operands..., ȳ, Val(false), shadows...))
         return _pr_reverse_return(Val(S), args, cot, Val(B), shadows)
     end
     # The lanes' own names: a closure assigning the `ȳ` and `shadows` of the
@@ -773,7 +772,7 @@ function EnzymeRules.reverse(
     lanes = ntuple(Val(W)) do w
         lane_ȳ = dret.val[w]
         lane_shadows = _pr_shadows(Val(B), args, Val(W), w)
-        Base.tail(r.reverse(operands..., lane_ȳ, lane_shadows...))
+        Base.tail(r.reverse(operands..., lane_ȳ, Val(false), lane_shadows...))
     end
     # Active scalars of a batched call take one cotangent per lane.
     ntuple(Val(N)) do i

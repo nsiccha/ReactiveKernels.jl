@@ -1156,6 +1156,84 @@ function _pr_direct_reads(stmts, st::_PRProgramState, linear::Symbol, found::Vec
     out, found
 end
 
+# Whether the generated sweep also computes the program's value: the name of
+# its `Val{true}` / `Val{false}` parameter. A sweep that only feeds cotangents
+# (the two-pass schedule) compiles the value away.
+const _PR_WANT_VALUE = :_pr_want_value
+
+# The cell's value `result` as affine terms `(num, inv, var)` over the cell's
+# top-level statements: `num · ∏ inv · var`, `inv` invariant atoms and `var` a
+# cell-varying symbol or `nothing`. A statement that is not a sum, difference,
+# negation or product by invariants is a varying term of its own, so the worst
+# case is the density itself.
+function _pr_value_terms(stmts, invariant::Set{Symbol}, cellvars::Set{Symbol}, result)
+    defs = Dict{Symbol,Any}(s.lhs => s for s in stmts if s isa Union{_PRAlias,_PRCall})
+    isinv(x) = (x isa Real && !(x isa Bool)) ||
+               (x isa Symbol && (!(x in cellvars) || x in invariant))
+    terms = Tuple{Float64,Vector{Any},Any}[]
+    function walk(x, num::Float64, inv::Vector{Any})
+        if x isa Real && !(x isa Bool)
+            push!(terms, (num * Float64(x), inv, nothing))
+        elseif isinv(x)
+            push!(terms, (num, vcat(inv, Any[x]), nothing))
+        elseif x isa Symbol && haskey(defs, x)
+            d = defs[x]
+            args = d isa _PRCall ? d.args : Any[]
+            simple = all(a -> a isa Symbol || (a isa Real && !(a isa Bool)), args)
+            if d isa _PRAlias
+                d.rhs isa Symbol || (d.rhs isa Real && !(d.rhs isa Bool)) ?
+                    walk(d.rhs, num, inv) : push!(terms, (num, inv, x))
+            elseif simple && d.f === Base.:+
+                foreach(a -> walk(a, num, inv), args)
+            elseif simple && d.f === Base.:- && length(args) == 2
+                walk(args[1], num, inv); walk(args[2], -num, inv)
+            elseif simple && d.f === Base.:- && length(args) == 1
+                walk(args[1], -num, inv)
+            elseif simple && (d.f === Base.:* || d.f === _native_mul) && length(args) == 2 &&
+                    count(a -> !isinv(a), args) == 1
+                k = findfirst(a -> !isinv(a), args)
+                other = args[3 - k]
+                other isa Real ? walk(args[k], num * Float64(other), inv) :
+                                 walk(args[k], num, vcat(inv, Any[other]))
+            else
+                push!(terms, (num, inv, x))
+            end
+        else
+            push!(terms, (num, inv, x))
+        end
+    end
+    walk(result, 1.0, Any[])
+    terms
+end
+
+# The statements that add the cell values into `total`: above the loop, in it
+# and after it, each only when the sweep wants the value.
+function _pr_value_accumulation(stmts, invariant, cellvars, result, total, add, ncells,
+                                st::_PRProgramState)
+    want = :($_PR_WANT_VALUE isa Val{true})
+    coef(num, inv) = isempty(inv) ? num :
+        num == 1.0 ? Expr(:call, GlobalRef(Base, :*), inv...) :
+        Expr(:call, GlobalRef(Base, :*), num, inv...)
+    pre = Any[]; inloop = Any[]; parts = Any[]; constant = Any[]
+    for (num, inv, var) in _pr_value_terms(stmts, invariant, cellvars, result)
+        if var === nothing
+            push!(constant, coef(num, inv))
+        else
+            st.counter += 1
+            s = Symbol(:_pr_value, st.counter)
+            push!(pre, :($s = 0.0))
+            push!(inloop, :($want && ($s = $s + $var)))
+            push!(parts, :($(coef(num, inv)) * $s))
+        end
+    end
+    isempty(constant) || push!(parts, :($ncells * $(Expr(:call, GlobalRef(Base, :+), 0.0, constant...))))
+    value = Expr(:call, GlobalRef(Base, :+), 0.0, parts...)
+    post = Any[:(if $want && $ncells > 0
+                     $total = $add($total, $value)
+                 end)]
+    pre, inloop, post
+end
+
 function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState)
     body = Any[a for a in cell.args if !(a isa LineNumberNode)]
     isempty(body) && _pr_fail("empty cell")
@@ -1257,26 +1335,28 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState)
             coefficients, flush = fc.pre, fc.post
             _pr_reverse_exprs!(after, hoisted, active, copy(defined); touched = st.touched)
         end
-        # The cell's density also accumulates into the plate total, in the same
-        # pass: the rule's value and its cotangents come from one sweep.
-        accumulate = :($total = $(acc.args[1])($total, $result))
+        # The cell's value, for a sweep that also returns the plate's total
+        # (`_PR_WANT_VALUE`): its invariant terms once, `ncells` times, after
+        # the loop, and one partial sum per cell-varying term in it.
+        value_pre, value_in, value_post = _pr_value_accumulation(
+            inloop, inv2, cellvars, result, total, acc.args[1], ncells, st)
         direct_in, read_operands = _pr_direct_reads(inloop, st, linear)
         loop = isempty(read_operands) ?
             :(@inbounds for $linear in $cells
                   $(forward_in...)
-                  $accumulate
+                  $(value_in...)
                   $(reverse...)
               end) :
             :(if $(GlobalRef(@__MODULE__, :_pr_spans_all))($cells, $(read_operands...))
                   @inbounds for $linear in $cells
                       $(_pr_forward_exprs(direct_in)...)
-                      $accumulate
+                      $(value_in...)
                       $(reverse...)
                   end
               else
                   @inbounds for $linear in $cells
                       $(forward_in...)
-                      $accumulate
+                      $(value_in...)
                       $(reverse...)
                   end
               end)
@@ -1286,7 +1366,9 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState)
             $cells = $range
             $ncells = Float64(length($cells))
             $(coefficients...)
+            $(value_pre...)
             $loop
+            $(value_post...)
             $(flush...)
             $(after...)
         end
@@ -1376,11 +1458,12 @@ end
 The reverse of plate program `ast` (a `function (params...) body; result end`
 expression). `active_params` are the parameters that carry derivatives;
 `values` maps program-local callable parameters to their values. Returns the
-reverse function's expression `(params..., ȳ, shadows...) -> (value,
+reverse function's expression `(params..., ȳ, want, shadows...) -> (value,
 cotangents of the scalar active parameters...)`, the scalar active parameters
-in order, and the batched (per-cell) active parameters, whose shadows follow ȳ
-in order. One pass over the cells computes the program's value and the
-cotangents for seed ȳ, adding each batched operand's cotangent into its shadow.
+in order, and the batched (per-cell) active parameters, whose shadows follow
+`want` in order. One pass over the cells computes the cotangents for seed ȳ,
+adding each batched operand's cotangent into its shadow, and, when `want` is
+`Val(true)`, the program's value (otherwise the returned value is not it).
 """
 function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict{Symbol,Any})
     Meta.isexpr(ast, :function, 2) && Meta.isexpr(ast.args[1], :tuple) ||
@@ -1456,7 +1539,7 @@ function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict
     seeds = Any[:($(_pr_bar(t)) = $seed) for t in sort!(collect(totals))]
     checks = Any[:($(GlobalRef(@__MODULE__, :_pr_check_shadow))($(shadow[p]), $p)) for p in batched]
     fexpr = Expr(:function,
-        Expr(:tuple, params..., seed, (shadow[p] for p in batched)...),
+        Expr(:tuple, params..., seed, _PR_WANT_VALUE, (shadow[p] for p in batched)...),
         Expr(:block, checks..., init..., seeds..., new_body...,
              Expr(:tuple, output, (_pr_bar(p) for p in scalar)...)))
     fexpr, scalar, batched
@@ -1482,9 +1565,10 @@ end
 
 An RK-owned callable for one summed plate program: calling it runs the
 program (`program`, the plate's own compiled loop, so values are unchanged).
-`reverse` is generated from the program's source: `(args..., ȳ, shadows...)`
-runs the cells once, adds each batched operand's cotangent into its shadow and
-returns the value with the scalar operands' cotangents (positions `S`); `B`
+`reverse` is generated from the program's source: `(args..., ȳ, want,
+shadows...)` runs the cells once, adds each batched operand's cotangent into
+its shadow and returns the value (when `want` is `Val(true)`) with the scalar
+operands' cotangents (positions `S`); `B`
 are the positions of the batched operands. The Enzyme extension runs it either
 in the augmented primal with a unit seed (scaling afterwards) or in the reverse
 pass with the seed; see `_pr_one_pass` there.
