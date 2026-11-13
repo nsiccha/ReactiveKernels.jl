@@ -1214,8 +1214,8 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState)
                               for s in stmts], known)
         inv2 = _pr_invariant_statements(folded, st, cellvars)
         # A cell value divided by an invariant one multiplies by the divisor's
-        # inverse, computed once above the loop. This recomputed forward only
-        # feeds partials; the primal value is the program's own.
+        # inverse, computed once above the loop. The rule's value comes from
+        # this loop too, so it can differ from the program's by rounding.
         folded = _pr_hoist_inverse_divisors(folded, inv2, cellvars)
         hoisted = Any[s for s in folded if (s isa _PRAlias || s isa _PRCall) && s.lhs in inv2]
         inloop = Any[s for s in folded if !((s isa _PRAlias || s isa _PRCall) && s.lhs in inv2)]
@@ -1257,20 +1257,26 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState)
             coefficients, flush = fc.pre, fc.post
             _pr_reverse_exprs!(after, hoisted, active, copy(defined); touched = st.touched)
         end
+        # The cell's density also accumulates into the plate total, in the same
+        # pass: the rule's value and its cotangents come from one sweep.
+        accumulate = :($total = $(acc.args[1])($total, $result))
         direct_in, read_operands = _pr_direct_reads(inloop, st, linear)
         loop = isempty(read_operands) ?
             :(@inbounds for $linear in $cells
                   $(forward_in...)
+                  $accumulate
                   $(reverse...)
               end) :
             :(if $(GlobalRef(@__MODULE__, :_pr_spans_all))($cells, $(read_operands...))
                   @inbounds for $linear in $cells
                       $(_pr_forward_exprs(direct_in)...)
+                      $accumulate
                       $(reverse...)
                   end
               else
                   @inbounds for $linear in $cells
                       $(forward_in...)
+                      $accumulate
                       $(reverse...)
                   end
               end)
@@ -1370,9 +1376,12 @@ end
 The reverse of plate program `ast` (a `function (params...) body; result end`
 expression). `active_params` are the parameters that carry derivatives;
 `values` maps program-local callable parameters to their values. Returns the
-reverse function's expression `(params..., ȳ, shadows...) -> cotangents of the
-scalar active parameters`, the scalar active parameters in order, and the
-batched (per-cell) active parameters, whose shadows follow ȳ in order.
+reverse function's expression `(params..., shadows...) -> (value, cotangents
+of the scalar active parameters...)`, the scalar active parameters in order,
+and the batched (per-cell) active parameters, whose shadows follow the
+parameters in order. One pass over the cells computes the program's value and
+the cotangents for a unit seed, adding each batched operand's cotangent into
+its shadow; a cotangent is linear in the seed, so the caller scales them.
 """
 function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict{Symbol,Any})
     Meta.isexpr(ast, :function, 2) && Meta.isexpr(ast.args[1], :tuple) ||
@@ -1422,7 +1431,6 @@ function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict
             _pr_fail("batched operand `$p` is also read directly by `$lhs`")
         end
     end
-    seed = gensym(:ybar)
     shadow = Dict{Symbol,Symbol}(p => Symbol(p, :_shadow) for p in batched)
     # Values bound inside a cell are per cell: their adjoints restart in every
     # cell. Only values bound outside every cell loop accumulate across cells.
@@ -1443,14 +1451,16 @@ function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict
     st = _PRProgramState(mod, values, active, prepared, shadow, totals, output,
                          Set{Symbol}(), 0, outer)
     new_body = _pr_program_block(stmts, st)
-    # Every outer adjoint starts at zero; every total's adjoint is the seed.
+    # Every outer adjoint starts at zero; every total's adjoint is the unit
+    # seed. A cotangent is linear in the seed, so the caller scales the
+    # results by the actual seed afterwards.
     init = Any[:($(_pr_bar(a)) = 0.0) for a in sort!(collect(outer)) if !(a in totals)]
-    seeds = Any[:($(_pr_bar(t)) = $seed) for t in sort!(collect(totals))]
+    seeds = Any[:($(_pr_bar(t)) = 1.0) for t in sort!(collect(totals))]
     checks = Any[:($(GlobalRef(@__MODULE__, :_pr_check_shadow))($(shadow[p]), $p)) for p in batched]
     fexpr = Expr(:function,
-        Expr(:tuple, params..., seed, (shadow[p] for p in batched)...),
+        Expr(:tuple, params..., (shadow[p] for p in batched)...),
         Expr(:block, checks..., init..., seeds..., new_body...,
-             Expr(:tuple, (_pr_bar(p) for p in scalar)...)))
+             Expr(:tuple, output, (_pr_bar(p) for p in scalar)...)))
     fexpr, scalar, batched
 end
 
@@ -1474,10 +1484,11 @@ end
 
 An RK-owned callable for one summed plate program: calling it runs the
 program (`program`, the plate's own compiled loop, so values are unchanged).
-`reverse` is generated from the program's source: `(args..., ȳ, shadows...)`
-re-runs the cells, adds each batched operand's cotangent into its shadow and
-returns the cotangents of the scalar operands at positions `S`; `B` are the
-positions of the batched operands. The Enzyme extension stages it.
+`reverse` is generated from the program's source: `(args..., shadows...)` runs
+the cells once, adds each batched operand's cotangent for a unit seed into its
+shadow and returns the value with the scalar operands' cotangents (positions
+`S`); `B` are the positions of the batched operands. The Enzyme extension runs
+it in the augmented primal and scales its results by the seed in the reverse.
 """
 struct _PlateSumRule{S,B,P,R} <: Function
     program::P
