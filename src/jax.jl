@@ -68,7 +68,14 @@ struct _PyVal
     limit::String
     padded::Int
     origin::Any
+    # A tuple's individual length expressions. Keeping them separate lets
+    # projection retain a field's prepared-input provenance, even when other
+    # fields have different ragged lengths. Empty for non-tuple values.
+    field_extents::Tuple{Vararg{String}}
 end
+_PyVal(code::AbstractString, @nospecialize(T), static::Bool, extent::AbstractString,
+       limit::AbstractString, padded::Int, origin) =
+    _PyVal(String(code), T, static, String(extent), String(limit), padded, origin, ())
 _PyVal(code::AbstractString, @nospecialize(T), static::Bool, extent::AbstractString,
        limit::AbstractString, padded::Int) =
     _PyVal(String(code), T, static, String(extent), String(limit), padded, nothing)
@@ -129,7 +136,7 @@ _jax_upper_end(v::_PyVal, origin::_JaxBetween) = _jax_upper_end(origin.hi)
 _jax_range_index(index::AbstractString, lo::_PyVal, hi::_PyVal) =
     _PyVal(index, Int, false, "", "", 0, _JaxBetween(lo, hi))
 _jax_with_origin(v::_PyVal, origin) =
-    _PyVal(v.code, v.T, v.static, v.extent, v.limit, v.padded, origin)
+    _PyVal(v.code, v.T, v.static, v.extent, v.limit, v.padded, origin, v.field_extents)
 struct _JaxCallable{F}
     f::F
 end
@@ -155,7 +162,7 @@ _PyVal(code::AbstractString, @nospecialize(T), static::Bool, extent::AbstractStr
     _PyVal(String(code), T, static, String(extent), "", 0)
 _PyVal(code::AbstractString, @nospecialize(T), static::Bool, extent::AbstractString,
        limit::AbstractString) = _PyVal(String(code), T, static, String(extent), String(limit), 0)
-_jax_static(v::_PyVal) = _PyVal(v.code, v.T, true, v.extent, v.limit, v.padded)
+_jax_static(v::_PyVal) = _PyVal(v.code, v.T, true, v.extent, v.limit, v.padded, v.origin, v.field_extents)
 _jax_ragged(@nospecialize(T)) = T isa Type && T <: AbstractArray && eltype(T) isa Type &&
     eltype(T) <: AbstractArray
 function _jax_extent(args)
@@ -241,7 +248,7 @@ function _jax_common_extent(ctx, args::Vector{_PyVal})
     name = _jax_helper!(ctx, "_rk_broadcast_length", _JAX_BROADCAST_LENGTH)
     extent = name * "(" * join(parts, ", ") * ")"
     ctx.mod.helper_names[(:broadcast_length, extent)] = parts
-    [isempty(a.extent) ? a : _PyVal(a.code, a.T, a.static, extent, "", a.padded, a.origin)
+    [isempty(a.extent) ? a : _PyVal(a.code, a.T, a.static, extent, "", a.padded, a.origin, a.field_extents)
      for a in args]
 end
 # The padded axes an elementwise function of `x` keeps: `x`'s, unless `x` is
@@ -468,7 +475,7 @@ function _jax_bind!(ctx::_JaxContext, hint, v::_PyVal)
     (_jax_translation_only(v) || occursin(r"^[A-Za-z_][A-Za-z0-9_]*$", v.code)) && return v
     name = _jax_fresh(ctx, hint)
     _jax_emit!(ctx, name * " = " * v.code)
-    _PyVal(name, v.T, v.static, v.extent, v.limit, v.padded, v.origin)
+    _PyVal(name, v.T, v.static, v.extent, v.limit, v.padded, v.origin, v.field_extents)
 end
 
 # --- types and ranks ----------------------------------------------------------------
@@ -832,7 +839,7 @@ function _jax_destructure!(ctx::_JaxContext, lhs, v::_PyVal)
         _jax_translation_only(v) && (ctx.locals[lhs] = v; return)
         name = _jax_fresh(ctx, lhs)
         _jax_emit!(ctx, name * " = " * v.code)
-        ctx.locals[lhs] = _PyVal(name, v.T, v.static, v.extent, v.limit, v.padded, v.origin)
+        ctx.locals[lhs] = _PyVal(name, v.T, v.static, v.extent, v.limit, v.padded, v.origin, v.field_extents)
         return
     end
     if lhs isa Expr && lhs.head === :ref && lhs.args[1] isa Symbol && haskey(ctx.locals, lhs.args[1])
@@ -919,6 +926,7 @@ _jax_padded_fields(v::_PyVal) = isempty(v.extent) || !_jax_tuple_valued(v.T) ? 0
 # extent when it has a length, else none ("").
 function _jax_field_extent(x::_PyVal, k::Int, @nospecialize(T))
     (isempty(x.extent) || !_jax_is_array(T)) && return ""
+    isempty(x.field_extents) || return x.field_extents[k]
     fields = _jax_padded_fields(x)
     fields == 0 || fields & (1 << (k - 1)) != 0 || return ""
     _py_atom(x.extent) * "[" * string(k - 1) * "]"
@@ -3046,7 +3054,7 @@ function _jax_float_static(ctx::_JaxContext, a::_PyVal)
     a.static && ctx.host === nothing && _jax_float_type() !== Float64 || return a
     occursin(_JAX_WEAK_OR_SINGLE, a.code) && return a
     code = _host_float_value(a.code, a.T)
-    code == a.code ? a : _PyVal(code, a.T, true, a.extent, a.limit, a.padded, a.origin)
+    code == a.code ? a : _PyVal(code, a.T, true, a.extent, a.limit, a.padded, a.origin, a.field_extents)
 end
 
 # A call on scalars is its elementwise form. A call with an array argument
@@ -3107,7 +3115,7 @@ function _jax_shifted_integer_limit(f, args::Vector{_PyVal}, v::_PyVal)
     else
         return v
     end
-    _PyVal(v.code, v.T, v.static, v.extent, limit, v.padded, v.origin)
+    _PyVal(v.code, v.T, v.static, v.extent, limit, v.padded, v.origin, v.field_extents)
 end
 # `k * j` of static integers `k` and one integer `j` with a static bound
 # keeps a bound: an entry of the prepared data keeps its origin, scaled
@@ -3120,7 +3128,7 @@ function _jax_scaled_integer_limit(args::Vector{_PyVal}, v::_PyVal)
     j.origin isa _JaxOrigin && j.origin.position !== nothing &&
         return _jax_with_origin(v, _jax_scaled_origin(j.origin, k))
     !isempty(j.limit) && occursin(r"^[0-9]+$", k) || return v
-    _PyVal(v.code, v.T, v.static, v.extent, _jax_scaled(k, j.limit), v.padded, v.origin)
+    _PyVal(v.code, v.T, v.static, v.extent, _jax_scaled(k, j.limit), v.padded, v.origin, v.field_extents)
 end
 # `k` times an entry's origin: its scale and offset times `k`.
 _jax_scaled_origin(o::_JaxOrigin, k::AbstractString) =
@@ -4794,7 +4802,8 @@ function _jax_call_positional(ctx::_JaxContext, ::typeof(tuple), args::Vector{_P
     any(_jax_translation_only, args) &&
         return _PyVal("<tuple>", _JaxAggregate(T, args), all(a -> a.static, args))
     _PyVal(_jax_tuple_code(args), T, all(a -> a.static, args),
-           _jax_tuple_extent(args), _jax_tuple_limit(args), _jax_tuple_fields(args))
+           _jax_tuple_extent(args), _jax_tuple_limit(args), _jax_tuple_fields(args),
+           nothing, Tuple(a.extent for a in args))
 end
 # A shape tuple may carry a padded vector's length through a local or helper.
 # Its bound refers to the padded input shape, not an observed length literal.
@@ -4849,7 +4858,8 @@ function _jax_tuple_element(ctx::_JaxContext, x::_PyVal, i::_PyVal)
     m === nothing && _jax_error("a tuple read at a computed index", _jax_where(ctx))
     k = parse(Int, i.code)
     x.T isa _JaxAggregate && return x.T.fields[k]
-    _PyVal(_py_atom(x.code) * "[" * string(k - 1) * "]", fieldtype(x.T, k), x.static)
+    _PyVal(_py_atom(x.code) * "[" * string(k - 1) * "]", fieldtype(x.T, k), x.static,
+           _jax_field_extent(x, k, fieldtype(x.T, k)))
 end
 _jax_is_tuple(@nospecialize(T)) = T isa Type && T <: Union{Tuple,NamedTuple} && isconcretetype(T)
 # Indexing called with values (lowered code). A view is the gather: JAX
@@ -4955,7 +4965,7 @@ function _jax_define!(ctx::_JaxContext, g::Graph, v::Value, val::_PyVal; bind::B
     if bind
         name = _jax_fresh(ctx, v.name)
         _jax_emit!(ctx, name * " = " * val.code)
-        val = _PyVal(name, val.T, val.static, val.extent, val.limit, val.padded, val.origin)
+        val = _PyVal(name, val.T, val.static, val.extent, val.limit, val.padded, val.origin, val.field_extents)
     end
     ctx.scope.values[id] = val
     val
@@ -5289,10 +5299,23 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     E = _jax_typeof(want)
     axes = String[]
     args = String[]
+    # Tuple lengths are a structural tuple of columns, not a row array.
+    # Selecting one field commutes with vmap; retain that field's own outer
+    # expression when translating a cell's length back into this scope.
+    field_lengths = Dict{String,Tuple{String,String}}()
     for (i, v) in enumerate(inputs)
         push!(axes, mapped[i] ? "0" : "None"); push!(args, v.code)
         if ragged[i]
             push!(axes, mapped[i] ? "0" : "None"); push!(args, v.extent)
+            if _jax_tuple_valued(v.T)
+                T = v.T <: Tuple ? v.T : eltype(v.T)
+                for k in 1:fieldcount(T)
+                    extent = _jax_field_extent(v, k, fieldtype(T, k))
+                    isempty(extent) && continue
+                    field_lengths[cell_params[length(args)] * "[" * string(k - 1) * "]"] =
+                        (extent, last(axes))
+                end
+            end
         end
     end
     if masked
@@ -5328,11 +5351,30 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     end
     if E <: Tuple && !(E <: NamedTuple)
         R == 1 || _jax_error("a plate of rank ", R, " whose cell returns a tuple", _jax_where(ctx))
+        if all(F -> F <: Number || F <: AbstractArray{<:Number}, fieldtypes(E))
+            columns = [_PyVal("jnp.zeros((" * join(fill("0", F <: Number ? 1 : ndims(F) + 1),
+                ", ") * ",), dtype=" * _jax_dtype(F <: Number ? F : eltype(F)) * ")", F)
+                for F in fieldtypes(E)]
+            empty_value = _jax_tuple_code(columns)
+            if only(with_length)
+                lengths = [_PyVal(isempty(_jax_field_extent(want, k, F)) ? "None" :
+                    "jnp.zeros((0,), dtype=" * _jax_dtype(Int) * ")", Any)
+                    for (k, F) in enumerate(fieldtypes(E))]
+                empty_value = "(" * empty_value * ", " * _jax_tuple_code(lengths) * ")"
+            end
+            call = "(" * empty_value * " if " * empty * " else " * call * ")"
+        end
         result = _jax_fresh(ctx, :plate_value)
         if only(with_length)
             lengths = _jax_fresh(ctx, :plate_lengths)
             _jax_emit!(ctx, result * ", " * lengths * " = " * call)
-            return [_PyVal(result, Vector{E}, false, lengths, "", _jax_padded_fields(want))]
+            extents = Tuple(begin
+                extent = _jax_field_extent(want, k, fieldtype(E, k))
+                outer = _jax_outer_extent(extent, cell_params, args, axes; field_lengths)
+                outer === nothing ? lengths * "[" * string(k - 1) * "]" : outer
+            end for k in 1:fieldcount(E))
+            return [_PyVal(result, Vector{E}, false, lengths, "", _jax_padded_fields(want),
+                           nothing, extents)]
         end
         _jax_emit!(ctx, result * " = " * call)
         return [_PyVal(result, Vector{E})]
@@ -5356,7 +5398,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
             # The cell's length in terms of the plate's arguments (an input's
             # lengths, or their gather by the plate index) keeps their link
             # to the input, whose flat positions a flattening reads.
-            outer = _jax_outer_extent(want.extent, cell_params, args, axes)
+            outer = _jax_outer_extent(want.extent, cell_params, args, axes; field_lengths)
             outer === nothing || return [_PyVal(result, Vector{E}, false, outer)]
         else
             _jax_emit!(ctx, result * " = " * call)
@@ -5387,7 +5429,8 @@ end
 # plate's: each parameter replaced by its argument (`args`, mapped where `axes`
 # is "0"), or `nothing` when it reads anything else or reads a mapped argument
 # by more than its value (`row.shape`, `row[i]`).
-function _jax_outer_extent(extent::AbstractString, params, args, axes)
+function _jax_outer_extent(extent::AbstractString, params, args, axes;
+                           field_lengths = Dict{String,Tuple{String,String}}())
     mapping = Dict(zip(params, zip(args, axes)))
     out = IOBuffer()
     last = 1
@@ -5398,8 +5441,15 @@ function _jax_outer_extent(extent::AbstractString, params, args, axes)
             print(out, m.match)
             continue
         end
-        haskey(mapping, m.match) || return nothing
-        arg, axis = mapping[m.match]
+        field = match(r"^\[[0-9]+\]", SubString(extent, last))
+        key = field === nothing ? "" : m.match * field.match
+        if haskey(field_lengths, key)
+            arg, axis = field_lengths[key]
+            last += ncodeunits(field.match)
+        else
+            haskey(mapping, m.match) || return nothing
+            arg, axis = mapping[m.match]
+        end
         next = last <= ncodeunits(extent) ? extent[last] : ' '
         axis == "0" && next in ('.', '[') && return nothing
         print(out, _py_atom(arg))
@@ -6324,7 +6374,8 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
         end
     end
     _jax_plan!(ctx, p)
-    wants = [_jax_returned(ctx, _jax_lookup(ctx, p.graph, v)) for v in p.want]
+    wants = [_jax_returned(ctx, _jax_lookup(ctx, p.graph, v); arrays = reserve && !host)
+             for v in p.want]
     returned = if w isa NamedTuple
         _jax_nested_dict(w, Iterators.Stateful(wants))
     elseif w isa Symbol
@@ -6401,11 +6452,29 @@ function _jax_nested_dict(w::NamedTuple, wants)
     "{" * join(entries, ", ") * "}"
 end
 
+# Public numerical results are arrays, including constants and nested leaves.
+# Helpers and host preparation keep static scalars usable as shapes and bounds.
 # A returned named tuple is a `dict` keyed by its field names.
-function _jax_returned(ctx::_JaxContext, v::_PyVal)
+function _jax_returned(ctx::_JaxContext, v::_PyVal; arrays::Bool = false)
     v.T === Union{} && return v # an unconditional diagnostic has no returned fields
     _jax_translation_only(v) && _jax_error("returning a callable or reference as a module output ",
                                           "has no JAX translation", _jax_where(ctx))
+    if arrays && v.T isa Type &&
+            (v.T <: Number || v.T <: AbstractArray && eltype(v.T) <: Number)
+        dtype = v.T <: Union{Bool,Integer,AbstractFloat} ? ", dtype=" * _jax_dtype(v.T) :
+            _jax_input_dtype(v.T)
+        return _PyVal("jnp.asarray(" * v.code * dtype * ")", v.T, false,
+                      v.extent, v.limit, v.padded, v.origin)
+    elseif arrays && _jax_is_tuple(v.T)
+        bound = _jax_bind!(ctx, :result, v)
+        fields = [_jax_returned(ctx, _jax_tuple_element(ctx, bound, _PyVal(string(i), Int));
+                               arrays = true) for i in 1:fieldcount(v.T)]
+        code = v.T <: NamedTuple ?
+            "{" * join((repr(string(n)) * ": " * x.code
+                        for (n, x) in zip(fieldnames(v.T), fields)), ", ") * "}" :
+            _jax_tuple_code(fields)
+        return _PyVal(code, v.T, false, v.extent, v.limit, v.padded, v.origin)
+    end
     v.T isa Type && v.T <: NamedTuple && fieldcount(v.T) > 0 || return v
     bound = _jax_bind!(ctx, :result, v)
     names = fieldnames(v.T)
