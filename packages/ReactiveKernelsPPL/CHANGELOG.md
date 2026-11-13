@@ -16,6 +16,14 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.176
+
+- Absent responses retain the outer extent of collected scalar `@plate`
+  outputs, including helper calls and iterators over computed values. Binding
+  derives the extent from the iterator's data and declared axes without
+  evaluating the cell. Predictive targets and draws follow the new design's
+  observation count when replaying a fitted model with responses omitted.
+
 ## 0.1.175
 
 - Adaptive affine cells prepare one joint endpoint kernel, sharing common
