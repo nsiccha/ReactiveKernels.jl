@@ -130,14 +130,30 @@ loading the missing scratch dependency `ChainRulesCore`, before costs ran.
 That failed run is retained below; installed-candidate verification with the
 required dependency and the remaining costs are separate work.
 
-The installed candidate uses the same tuple snapshot plus a bits-only fast
-path. Its registered run passes 722 checks: 239 new mutation/retention checks
-and the existing joint, multi-output and general derivative suites. This is a
-completed phase of fleet `489475552ac94380`; the overall run is still active.
-The registered scalar ordinary-Reverse comparison reports zero Julia allocations
-and a 30 ns median for independent, shared and native arms. At that timing
-resolution it establishes no scalar adapter speed advantage. The explicit
-forward/reverse stage-loop gains above must not be transferred to that result.
+The installed candidate `971320df83db0e442c722a11b1978b85f810be72` uses the same
+tuple snapshot plus a bits-only fast path. Both registered and dogfood runs
+pass 722 checks: 239 new mutation/retention checks and the existing joint,
+multi-output and general derivative suites. Fleet `489475552ac94380` exited 0
+after 1,992 seconds. These runs use the installed retention method, without a
+benchmark method replacement. Adding the missing scratch `ChainRulesCore`
+dependency also normalized the Julia 1.10 stdlib metadata, including
+OpenBLAS_jll from 0.3.34+1 to 0.3.23+5; exact resulting manifests are retained.
+
+Both scalar ordinary-Reverse comparisons report zero Julia allocations and a
+30 ns median for independent, shared and native arms. At that timing resolution
+they establish no scalar adapter speed advantage. The explicit forward/reverse
+stage-loop gains above must not be transferred to that result.
+
+The completed dogfood array measurements give the same qualitative tradeoff:
+
+| Family | Length | Shared / independent | Within-run 95% interval | Shared / native ordinary AD |
+| --- | ---: | ---: | ---: | ---: |
+| Array exponential | 1,000 | 0.625 | 0.616–0.638 | 0.702 |
+| Array exponential | 100,000 | 0.524 | 0.519–0.533 | 0.519 |
+| Array square | 1,000 | 1.424 | 1.362–1.527 | 3.219 |
+| Array square | 100,000 | 1.228 | 1.163–1.258 | 1.638 |
+
+Julia allocation counts match the registered snapshot comparison above.
 
 ## Preparation and evidence limits
 
@@ -183,9 +199,11 @@ controls, not that the alias arm passed correctness.
 - Dogfood snapshot and partial regression verification: fleet
   `384fa7c25ec248db`, exit 1, 334 seconds, missing `ChainRulesCore`;
   [successful phases, loader failure, exact sources and terminal receipt](http://localhost:4200/code/download?path=/home/niko/.local/state/kb-agents/uploads/868e12a94eeca7395c3987ff0c8964ef831a9e1742383e522ad60c152bb0dd91.tgz).
+- Installed candidate, both 722-check suites, scalar ordinary AD and dogfood
+  array timings: fleet `489475552ac94380`, exit 0, 1,992 seconds;
+  [matching source digests, manifests, complete logs, summaries and receipt](http://localhost:4200/code/download?path=/home/niko/.local/state/kb-agents/uploads/4699e336a84baf398a46152bd51bb33c23504be20dd17aa7c40ff3cdff1922ab.tgz).
 
-The remaining work includes installed-source repair verification, scalar
-ordinary-adapter costs and a readonly design-matrix comparison. Conservative
+The remaining cost comparison covers a readonly design matrix. Conservative
 copying can duplicate readonly data and whole parents of small views; it is not
 an ownership analysis. The prototype does not account for these measured
 storage costs when selecting recipes. No general preference follows from the
