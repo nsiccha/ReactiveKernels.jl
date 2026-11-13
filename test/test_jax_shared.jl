@@ -277,3 +277,56 @@ end
         @test_skip false
     end
 end
+
+@traceable jax_tuple_identity(rows) = rows
+
+@kernel jax_returned_tuple(a::Float64, x::Vector{Float64},
+                           R::Vector{Vector{Float64}}, S::Vector{Vector{Float64}}) = begin
+    paired = plate(eachindex(x), Ref(x), Ref(R), Ref(S)) do i, xs, rs, ss
+        (a .* rs[i] .+ xs[i], (a + xs[i]) .* ss[i], a * xs[i])
+    end
+    retained = jax_tuple_identity(paired)
+    firsts = plate(retained) do pair
+        pair[1]
+    end
+    seconds = plate(retained) do pair
+        pair[2]
+    end
+    first_flat = isempty(firsts) ? Float64[] : reduce(vcat, firsts)
+    second_flat = isempty(seconds) ? Float64[] : reduce(vcat, seconds)
+    total = sum(first_flat) + sum(second_flat)
+end
+
+@testset "named boundaries retain each ragged tuple field" begin
+    cases = (
+        (; x = [0.2, -0.5, 0.9], R = [[1., 2.], Float64[], [3.]],
+           S = [[0.5], [1.5, 2.5], Float64[]]),
+        (; x = Float64[], R = Vector{Float64}[], S = Vector{Float64}[]),
+        (; x = collect(range(-0.4, 0.7; length = 23)),
+           R = [collect(1.0:(i % 7)) for i in 1:23],
+           S = [collect(0.5:(i % 5)) for i in 1:23]),
+    )
+    have = (:a, :x, :R, :S)
+    native = prepare(jax_returned_tuple; have, want = :total)
+    region = ReactiveKernels._JaxSourceRegion(:tuple_group, [:paired], [:retained],
+        Dict(:retained => :value), "Retain independently sized tuple fields.")
+    for regions in (ReactiveKernels._JaxSourceRegion[], [region])
+        sources = [jax_source(jax_returned_tuple; have, want = :total, data,
+                              source_regions = regions) for data in cases]
+        structure(text) = [count(pattern, text) for pattern in
+            (r"(?m)^\s*def ", "jax.vmap(", "jax.lax.cond(", "jax.lax.fori_loop(")]
+        @test all(src -> structure(src.text) == structure(first(sources).text), sources)
+        @test count(r"(?m)^def jax_tuple_identity\w*\(", first(sources).text) == 1
+        if rk_jax_available()
+            for data in cases
+                args = (0.4, data.x, data.R, data.S)
+                result = rk_jax_evaluate(first(sources), :kernel, args;
+                                        grad = true, prepare = :arguments)
+                @test result.value ≈ native(args...)
+                @test result.grad ≈ sum(sum, data.R; init = 0.0) + sum(sum, data.S; init = 0.0)
+            end
+        else
+            @test_skip false
+        end
+    end
+end

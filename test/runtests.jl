@@ -141,6 +141,7 @@ const _MATRIX_CORE_TESTS = (
     "test_jax_allocations.jl",
     "test_jax_keep.jl",
     "test_jax_empty_plate.jl",
+    "test_jax_flat_provenance.jl",
     "test_jax_translations.jl",
     "test_jax_elementwise.jl",
     "test_jax_type_checks.jl",

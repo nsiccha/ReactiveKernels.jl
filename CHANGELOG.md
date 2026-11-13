@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.231
+## 0.1.232
 
 - JAX source retains named, documented functions for source-backed helpers and
   shares compatible public entries through one computation body. Static entry
@@ -24,6 +24,13 @@ are recorded in the git history only.
   carry runtime extents, ragged positions and integer bounds; helpers using scan
   history remain nested in the scan's lexical scope. Nested plate cells and
   scan steps take names from their authored values.
+
+## 0.1.231
+
+- JAX export keeps each retained tuple-plate field's ragged lengths tied to
+  its prepared input. Flattening a projected field now drops padding and
+  supports rebinding the emitted module to different row and cell counts.
+  Empty tuple-valued plates skip indexed cell reads, as empty numeric plates do.
 
 ## 0.1.230
 
