@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.230
+## 0.1.231
 
 - The opt-in generated summed-plate reverse (`with_plate_reverse`) runs one
   pass over the cells for a plate with a gathered operand (`view(z, g)` with an
@@ -37,6 +37,13 @@ are recorded in the git history only.
   gradient goes from about 1.9 to about 1.45 times a hand-written closed form
   at 2,000 cells, and to about 1.3 times at 100,000 cells. The rule remains
   opt-in.
+
+## 0.1.230
+
+- JAX numerical functions return typed JAX arrays for constant terms and numeric
+  leaves of tuple/dict results as well as computed values. Eager constant outputs
+  follow `jax.default_device`, so device-placement checks also cover a zero log
+  Jacobian. Host preparation and static shape/coordinate metadata remain host values.
 
 ## 0.1.229
 
