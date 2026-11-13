@@ -16,6 +16,21 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.217
+
+- A partition of one cell per label (`plate_partition(…; single = true)`) and
+  a plate computed at one row of a cell run their one cell once, checked to
+  be one cell, instead of a loop over a one-cell domain; plates nested in the
+  cell keep their loops. A matrix row product's entry (`_CellRowProduct`) sums
+  over a counted range, and `_gather_copy(array, indices)` copies a gather
+  with a counted loop (ReactiveKernelsPPL 0.1.169 gathers its compact
+  overlay's constant base with it). Under Enzyme Reverse each loop entry
+  allocated the caches its reverse pass reads through libc (`malloc`, and
+  `realloc` per entry when the trip count is not known on entry), which a
+  one-subject call paid per call. BRM's joint NLME toy's one-subject gradient
+  made 79 such calls and now makes 22, about its share of the sweep's; the PK
+  toy's made 6 and now none. Values and gradients are unchanged, bit for
+  bit, on both toys.
 ## 0.1.216
 
 - The stable rewrites compute a symmetric law's standardized log kernel at a
