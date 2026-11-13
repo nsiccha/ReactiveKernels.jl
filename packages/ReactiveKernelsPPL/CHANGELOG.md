@@ -16,6 +16,21 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.170
+
+- A categorical-logit response reads its logits as one slice per
+  observation: `y .~ CategoricalLogit.(eachrow(E))` (or `eachcol(E)`, or
+  an inline matrix expression), and the `@plate` cell
+  `y[i] ~ CategoricalLogit(E[i, :])`. A slice holds the K−1 non-reference
+  logits with class 1 the zero reference, as the positional
+  `CategoricalLogit.(eta_2, …, eta_K)` reads its arguments, and K is the
+  slice length + 1 when the model runs. One lowered program, query type and
+  sampler type therefore serve every class count. The slice form takes
+  weights, censoring and missing responses like the positional form; an
+  observation beyond its slice has log density `-Inf`. `mi()` missingness
+  does not select logit slices yet. `jax_source` translates every form;
+  requires ReactiveKernels 0.1.221.
+
 ## 0.1.169
 
 - `SMCOptions(cloud_kernels=J)` fits each stage's NUTS kernels to the stage
