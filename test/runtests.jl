@@ -132,6 +132,7 @@ const _MATRIX_CORE_TESTS = (
     "test_input_checks.jl",
     "test_authored_loops.jl",
     "test_jax_source.jl",
+    "test_jax_specialfunctions.jl",
     "test_jax_search.jl",
     "test_jax_scalar_rules.jl",
     "test_jax_shared_softplus.jl",

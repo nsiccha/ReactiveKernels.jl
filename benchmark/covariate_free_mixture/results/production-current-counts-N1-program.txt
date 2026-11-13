@@ -1,0 +1,842 @@
+:(function (__constants__, __callables__, __caches__, __cache_apply__, unconstrained::Vector{Float64})
+      _ppl_last_mean_p = __constants__[1]
+      _ppl_first_eps_raw = __constants__[2]
+      _ppl_last_eps_raw = __constants__[3]
+      ReactiveKernels._input_check(ReactiveKernelsPPL._ppl_check_packed, unconstrained, _ppl_last_eps_raw)
+      var"#plate_argument#712100006165000007" = __constants__[4]
+      _ppl_external_observed_histories = __constants__[5]
+      var"_ppl_prior_omega.valid_bounds" = __constants__[6]
+      var"_ppl_prior_omega.lower" = __constants__[7]
+      var"_ppl_prior_omega.upper" = __constants__[8]
+      var"_ppl_prior_omega.width" = __constants__[9]
+      var"_ppl_prior_gamma.location" = __constants__[10]
+      var"_ppl_prior_gamma.scale" = __constants__[11]
+      var"_ppl_prior_gamma.log_scale" = __constants__[12]
+      var"_ppl_prior_sigma.valid_bounds" = __constants__[13]
+      var"_ppl_prior_sigma.lower" = __constants__[14]
+      var"_ppl_prior_sigma.upper" = __constants__[15]
+      var"_ppl_prior_sigma.width" = __constants__[16]
+      _ppl_int_omega = Base.getindex(unconstrained, 1)
+      omega = ReactiveKernelsPPL.PPLGeneratedModels.rk_affine_logistic(0.0, 1.0, _ppl_int_omega)
+      gamma = Base.getindex(unconstrained, 2)
+      _ppl_int_sigma = Base.getindex(unconstrained, 3)
+      sigma = ReactiveKernelsPPL.PPLGeneratedModels.rk_affine_logistic(0.0, 3.0, _ppl_int_sigma)
+      _ppl_int_mean_p = ReactiveKernelsPPL.PPLGeneratedModels.view(unconstrained, 4:_ppl_last_mean_p)
+      mean_p = __cache_apply__(__caches__[139], __callables__[139], ReactiveKernels._cell_array_materialize(ReactiveKernels._native_broadcasted(ReactiveKernelsPPL.PPLGeneratedModels.rk_affine_logistic, 0.0, 1.0, _ppl_int_mean_p)))
+      eps_raw = Base.view(unconstrained, _ppl_first_eps_raw:_ppl_last_eps_raw)
+      bound_plate___plate_value___part1 = __constants__[25]
+      bound_plate_observed = __constants__[26]
+      bound_plate_successes = __constants__[27]
+      bound_plate_failures = __constants__[28]
+      var"##plate_axis#12454" = var"#plate_argument#712100006165000007"
+      var"##plate_argument#12455" = Base.broadcastable(var"#plate_argument#712100006165000007")
+      var"##plate_argument#12457" = Base.broadcastable(_ppl_external_observed_histories)
+      var"##plate_argument#12459" = Base.broadcastable(bound_plate___plate_value___part1)
+      var"##plate_argument#12461" = Base.broadcastable(bound_plate_observed)
+      var"##plate_argument#12463" = Base.broadcastable(bound_plate_successes)
+      var"##plate_argument#12465" = Base.broadcastable(bound_plate_failures)
+      var"##plate_axes#12467" = ReactiveKernels._plate_require_axes(ReactiveKernels._plate_broadcast_shape((Base.axes(var"##plate_argument#12455"), Base.axes(var"##plate_argument#12457"), Base.axes(var"##plate_argument#12459"), Base.axes(var"##plate_argument#12461"), Base.axes(var"##plate_argument#12463"), Base.axes(var"##plate_argument#12465"))))
+      var"##native_type#13027" = Base.typeof(omega)
+      var"##native_type#13028" = ReactiveKernels._promote_op(__callables__[49], var"##native_type#13027")
+      var"##native_type#13029" = ReactiveKernels._promote_op(__callables__[50], var"##native_type#13028")
+      var"##native_type#13030" = ReactiveKernels._promote_op(__callables__[55], var"##native_type#13029")
+      var"##native_type#13031" = ReactiveKernels._plate_argument_type(var"##native_type#13030", false)
+      var"##native_type#13032" = Base.typeof(mean_p)
+      var"##native_type#13033" = ReactiveKernels._promote_op(__callables__[44], var"##native_type#13032")
+      var"##native_type#13034" = Base.typeof(sigma)
+      var"##native_type#13035" = Base.typeof(eps_raw)
+      var"##native_type#13036" = Base.eltype(var"##plate_argument#12455")
+      var"##native_type#13037" = ReactiveKernels._promote_op(__callables__[45], var"##native_type#13033", var"##native_type#13034", var"##native_type#13035", var"##native_type#13036")
+      var"##native_type#13038" = Base.eltype(var"##plate_argument#12459")
+      var"##native_type#13039" = ReactiveKernels._promote_op(__callables__[46], var"##native_type#13037", var"##native_type#13038")
+      var"##native_type#13040" = ReactiveKernels._promote_op(__callables__[47], var"##native_type#13039")
+      var"##native_type#13041" = Base.eltype(var"##plate_argument#12461")
+      var"##native_type#13042" = ReactiveKernels._promote_op(__callables__[48], var"##native_type#13040", var"##native_type#13041")
+      var"##native_type#13043" = ReactiveKernels._promote_op(__callables__[51], var"##native_type#13042", var"##native_type#13029")
+      var"##native_type#13044" = ReactiveKernels._promote_op(__callables__[52], var"##native_type#13043")
+      var"##native_type#13045" = ReactiveKernels._plate_argument_type(var"##native_type#13044", true)
+      var"##native_type#13046" = ReactiveKernels._plate_argument_type(var"##native_type#13045", true)
+      var"##native_type#13047" = Base.eltype(var"##plate_argument#12463")
+      var"##native_type#13048" = ReactiveKernels._plate_argument_type(var"##native_type#13047", true)
+      var"##native_type#13049" = ReactiveKernels._plate_argument_type(var"##native_type#13048", true)
+      var"##native_type#13050" = ReactiveKernels._plate_argument_type(var"##native_type#13043", true)
+      var"##native_type#13051" = ReactiveKernels._plate_argument_type(var"##native_type#13050", true)
+      var"##native_type#13052" = ReactiveKernels._promote_op(__callables__[59], var"##native_type#13045")
+      var"##native_type#13053" = ReactiveKernels._plate_argument_type(var"##native_type#13052", false)
+      var"##native_type#13054" = ReactiveKernels._promote_op(__callables__[53], var"##native_type#13029")
+      var"##native_type#13055" = ReactiveKernels._plate_argument_type(var"##native_type#13054", false)
+      var"##native_type#13056" = ReactiveKernels._plate_argument_type(var"##native_type#13055", true)
+      var"##native_type#13057" = ReactiveKernels._promote_op(__callables__[62], var"##native_type#13051", var"##native_type#13053", var"##native_type#13056")
+      var"##native_type#13058" = Base.eltype(var"##plate_argument#12465")
+      var"##native_type#13059" = ReactiveKernels._plate_argument_type(var"##native_type#13058", true)
+      var"##native_type#13060" = ReactiveKernels._plate_argument_type(var"##native_type#13059", true)
+      var"##native_type#13061" = ReactiveKernels._plate_argument_type(var"##native_type#13041", true)
+      var"##native_type#13062" = ReactiveKernels._plate_argument_type(var"##native_type#13061", true)
+      var"##native_type#13063" = ReactiveKernels._promote_op(__callables__[63], var"##native_type#13046", var"##native_type#13049", var"##native_type#13057", var"##native_type#13060", var"##native_type#13062", var"##native_type#13053")
+      var"##native_type#13064" = ReactiveKernels._plate_result_eltype(var"##native_type#13063", Any)
+      var"##native_type#13065" = Base.Val($(QuoteNode((2, 3, 4, 5, 6, 7))))
+      var"##native_type#13066" = ReactiveKernels._plate_array_type(var"##native_type#13064", var"##native_type#13065", var"##native_type#13052", var"##native_type#13050", var"##native_type#13055", var"##native_type#13045", var"##native_type#13048", var"##native_type#13059", var"##native_type#13061")
+      var"##native_type#13067" = ReactiveKernels._promote_op(__callables__[61], var"##native_type#13066")
+      var"##native_type#13068" = ReactiveKernels._plate_result_eltype(var"##native_type#13067", Any)
+      var"##native_type#13069" = Base.Val($(QuoteNode((2, 3, 4, 5, 6))))
+      var"##native_type#13070" = ReactiveKernels._plate_array_type(var"##native_type#13068", var"##native_type#13069", var"##native_type#13054", var"##native_type#13044", var"##native_type#13043", var"##native_type#13047", var"##native_type#13058", var"##native_type#13041")
+      var"##native_type#13071" = ReactiveKernels._plate_argument_type(var"##native_type#13070", false)
+      var"##native_type#13072" = ReactiveKernels._promote_op(__callables__[64], var"##native_type#13031", var"##native_type#13071")
+      var"##native_type#13073" = ReactiveKernels._plate_result_eltype(var"##native_type#13072", Any)
+      var"##native_type#13074" = Base.Val($(QuoteNode(())))
+      var"##native_type#13075" = ReactiveKernels._plate_array_type(var"##native_type#13073", var"##native_type#13074", var"##native_type#13070", var"##native_type#13030")
+      var"##native_type#13076" = ReactiveKernels._promote_op(__callables__[57], var"##native_type#13075")
+      var"##native_type#13077" = ReactiveKernels._promote_op(__callables__[58], var"##native_type#13076")
+      var"##plate_eltype#12468" = ReactiveKernels._plate_result_eltype(var"##native_type#13077", Float64)
+      var"##plate_total#13083" = ReactiveKernels._plate_total_seed(var"##plate_eltype#12468", var"##plate_axis#12454")
+      if !(Base.isempty(Base.CartesianIndices(var"##plate_axes#12467")))
+          var"##plate_total#13083" = ((function (var"##plate_argument#12455", var"##plate_argument#12457", var"##plate_argument#12459", var"##plate_argument#12461", var"##plate_argument#12463", var"##plate_argument#12465", __cache_apply__, __caches__, mean_p, omega, var"##plate_axes#12467", sigma, eps_raw, var"##plate_total#13083", var"##plate_callable#140", var"##plate_callable#44", var"##plate_callable#45", var"##plate_callable#46", var"##plate_callable#47", var"##plate_callable#48", var"##plate_callable#49", var"##plate_callable#50", var"##plate_callable#51", var"##plate_callable#52", var"##plate_callable#53", var"##plate_callable#59", var"##plate_callable#62", var"##plate_callable#63", var"##plate_callable#61", var"##plate_callable#55", var"##plate_callable#64", var"##plate_callable#57", var"##plate_callable#58", var"##plate_callable#75", var"##plate_callable#79", var"##plate_callable#80", var"##plate_callable#77", var"##plate_callable#78", var"##plate_callable#81", var"##plate_callable#82", var"##plate_callable#84", var"##plate_callable#89", var"##plate_callable#92", var"##plate_callable#93", var"##plate_callable#94", var"##plate_callable#96", var"##plate_callable#95", var"##plate_callable#97", var"##plate_callable#98", var"##plate_callable#101", var"##plate_callable#103", var"##plate_callable#104", var"##plate_callable#105", var"##plate_callable#106", var"##plate_callable#107", var"##plate_callable#108", var"##plate_callable#109", var"##plate_callable#110", var"##plate_callable#112", var"##plate_callable#111", var"##plate_callable#113")
+    var"##plate_prepared#12456" = Base.Broadcast.preprocess(nothing, var"##plate_argument#12455")
+    var"##plate_prepared#12458" = Base.Broadcast.preprocess(nothing, var"##plate_argument#12457")
+    var"##plate_prepared#12460" = Base.Broadcast.preprocess(nothing, var"##plate_argument#12459")
+    var"##plate_prepared#12462" = Base.Broadcast.preprocess(nothing, var"##plate_argument#12461")
+    var"##plate_prepared#12464" = Base.Broadcast.preprocess(nothing, var"##plate_argument#12463")
+    var"##plate_prepared#12466" = Base.Broadcast.preprocess(nothing, var"##plate_argument#12465")
+    var"##plate_##cell_invariant#712100006165000008#12472" = __cache_apply__(__caches__[140], var"##plate_callable#140", ReactiveKernels._cell_array_materialize(ReactiveKernels._native_broadcasted(Main.CountsDriver.logit, mean_p)))
+    var"##plate__ppl_c4#12477" = let var"#omega#op34" = omega
+            Base.vect(var"#omega#op34", 1 - var"#omega#op34")
+        end
+    var"##plate_##kernel_argument#712100006165000015#12478" = var"##plate__ppl_c4#12477"
+    var"##plate_##plate_argument#829940376620000007#12481" = let var"#weights#op38" = var"##plate_##kernel_argument#712100006165000015#12478"
+            1:ReactiveKernelsDistributionKernels.DistributionKernelSources.length(var"#weights#op38")
+        end
+    var"##plate_log_weights#12483" = ReactiveKernels._cell_array_broadcast(ReactiveKernels._native_broadcasted(ReactiveKernelsDistributionKernels.DistributionKernelSources.log, var"##plate_##kernel_argument#712100006165000015#12478"))
+    for var"##plate_index#12469" = ReactiveKernels._plate_cells(Base.CartesianIndices(var"##plate_axes#12467"))
+        var"##native_type#13091" = Base.eltype(var"##plate_argument#12455")
+        var"##native_type#13092" = Base.typeof(mean_p)
+        var"##native_type#13093" = Base.typeof(sigma)
+        var"##native_type#13094" = Base.typeof(eps_raw)
+        var"##native_type#13095" = Base.eltype(var"##plate_argument#12457")
+        var"##native_type#13096" = Base.typeof(omega)
+        var"##native_type#13097" = Base.eltype(var"##plate_argument#12459")
+        var"##native_type#13098" = Base.eltype(var"##plate_argument#12461")
+        var"##native_type#13099" = Base.eltype(var"##plate_argument#12463")
+        var"##native_type#13100" = Base.eltype(var"##plate_argument#12465")
+        var"##native_type#13101" = ReactiveKernels._promote_op(var"##plate_callable#44", var"##native_type#13092")
+        var"##native_type#13102" = ReactiveKernels._promote_op(var"##plate_callable#45", var"##native_type#13101", var"##native_type#13093", var"##native_type#13094", var"##native_type#13091")
+        var"##native_type#13103" = ReactiveKernels._promote_op(var"##plate_callable#46", var"##native_type#13102", var"##native_type#13097")
+        var"##native_type#13104" = ReactiveKernels._promote_op(var"##plate_callable#47", var"##native_type#13103")
+        var"##native_type#13105" = ReactiveKernels._promote_op(var"##plate_callable#48", var"##native_type#13104", var"##native_type#13098")
+        var"##native_type#13106" = ReactiveKernels._promote_op(var"##plate_callable#49", var"##native_type#13096")
+        var"##native_type#13107" = ReactiveKernels._promote_op(var"##plate_callable#50", var"##native_type#13106")
+        var"##native_type#13108" = ReactiveKernels._promote_op(var"##plate_callable#51", var"##native_type#13105", var"##native_type#13107")
+        var"##native_type#13109" = ReactiveKernels._promote_op(var"##plate_callable#52", var"##native_type#13108")
+        var"##native_type#13110" = ReactiveKernels._promote_op(var"##plate_callable#53", var"##native_type#13107")
+        var"##native_type#13111" = ReactiveKernels._plate_argument_type(var"##native_type#13109", true)
+        var"##native_type#13112" = ReactiveKernels._plate_argument_type(var"##native_type#13111", true)
+        var"##native_type#13113" = ReactiveKernels._plate_argument_type(var"##native_type#13099", true)
+        var"##native_type#13114" = ReactiveKernels._plate_argument_type(var"##native_type#13113", true)
+        var"##native_type#13115" = ReactiveKernels._plate_argument_type(var"##native_type#13108", true)
+        var"##native_type#13116" = ReactiveKernels._plate_argument_type(var"##native_type#13115", true)
+        var"##native_type#13117" = ReactiveKernels._promote_op(var"##plate_callable#59", var"##native_type#13111")
+        var"##native_type#13118" = ReactiveKernels._plate_argument_type(var"##native_type#13117", false)
+        var"##native_type#13119" = ReactiveKernels._plate_argument_type(var"##native_type#13110", false)
+        var"##native_type#13120" = ReactiveKernels._plate_argument_type(var"##native_type#13119", true)
+        var"##native_type#13121" = ReactiveKernels._promote_op(var"##plate_callable#62", var"##native_type#13116", var"##native_type#13118", var"##native_type#13120")
+        var"##native_type#13122" = ReactiveKernels._plate_argument_type(var"##native_type#13100", true)
+        var"##native_type#13123" = ReactiveKernels._plate_argument_type(var"##native_type#13122", true)
+        var"##native_type#13124" = ReactiveKernels._plate_argument_type(var"##native_type#13098", true)
+        var"##native_type#13125" = ReactiveKernels._plate_argument_type(var"##native_type#13124", true)
+        var"##native_type#13126" = ReactiveKernels._promote_op(var"##plate_callable#63", var"##native_type#13112", var"##native_type#13114", var"##native_type#13121", var"##native_type#13123", var"##native_type#13125", var"##native_type#13118")
+        var"##native_type#13127" = ReactiveKernels._plate_result_eltype(var"##native_type#13126", Any)
+        var"##native_type#13128" = Base.Val($(QuoteNode((2, 3, 4, 5, 6, 7))))
+        var"##native_type#13129" = ReactiveKernels._plate_array_type(var"##native_type#13127", var"##native_type#13128", var"##native_type#13117", var"##native_type#13115", var"##native_type#13119", var"##native_type#13111", var"##native_type#13113", var"##native_type#13122", var"##native_type#13124")
+        var"##native_type#13130" = ReactiveKernels._promote_op(var"##plate_callable#61", var"##native_type#13129")
+        var"##native_type#13131" = ReactiveKernels._plate_result_eltype(var"##native_type#13130", Any)
+        var"##native_type#13132" = Base.Val($(QuoteNode((2, 3, 4, 5, 6))))
+        var"##native_type#13133" = ReactiveKernels._plate_array_type(var"##native_type#13131", var"##native_type#13132", var"##native_type#13110", var"##native_type#13109", var"##native_type#13108", var"##native_type#13099", var"##native_type#13100", var"##native_type#13098")
+        var"##native_type#13134" = ReactiveKernels._promote_op(var"##plate_callable#55", var"##native_type#13107")
+        var"##native_type#13135" = ReactiveKernels._plate_argument_type(var"##native_type#13134", false)
+        var"##native_type#13136" = ReactiveKernels._plate_argument_type(var"##native_type#13133", false)
+        var"##native_type#13137" = ReactiveKernels._promote_op(var"##plate_callable#64", var"##native_type#13135", var"##native_type#13136")
+        var"##native_type#13138" = ReactiveKernels._plate_result_eltype(var"##native_type#13137", Any)
+        var"##native_type#13139" = Base.Val($(QuoteNode(())))
+        var"##native_type#13140" = ReactiveKernels._plate_array_type(var"##native_type#13138", var"##native_type#13139", var"##native_type#13133", var"##native_type#13134")
+        var"##native_type#13141" = ReactiveKernels._promote_op(var"##plate_callable#57", var"##native_type#13140")
+        var"##native_type#13142" = ReactiveKernels._promote_op(var"##plate_callable#58", var"##native_type#13141")
+        var"##embedded_argument__ppl_pi_##_rkppl_selected#955473241787000001#13143" = begin
+                $(Expr(:inbounds, true))
+                local var"##inbounds_value#13085" = Base.Broadcast._broadcast_getindex(var"##plate_prepared#12456", var"##plate_index#12469")
+                $(Expr(:inbounds, :pop))
+                var"##inbounds_value#13085"
+            end
+        var"##embedded_argument__ppl_external_observed_histories#13144" = begin
+                $(Expr(:inbounds, true))
+                local var"##inbounds_value#13086" = Base.Broadcast._broadcast_getindex(var"##plate_prepared#12458", var"##plate_index#12469")
+                $(Expr(:inbounds, :pop))
+                var"##inbounds_value#13086"
+            end
+        var"##embedded_argument___plate_value___part1#13145" = begin
+                $(Expr(:inbounds, true))
+                local var"##inbounds_value#13087" = Base.Broadcast._broadcast_getindex(var"##plate_prepared#12460", var"##plate_index#12469")
+                $(Expr(:inbounds, :pop))
+                var"##inbounds_value#13087"
+            end
+        var"##embedded_argument_observed#13146" = begin
+                $(Expr(:inbounds, true))
+                local var"##inbounds_value#13088" = Base.Broadcast._broadcast_getindex(var"##plate_prepared#12462", var"##plate_index#12469")
+                $(Expr(:inbounds, :pop))
+                var"##inbounds_value#13088"
+            end
+        var"##embedded_argument_successes#13147" = begin
+                $(Expr(:inbounds, true))
+                local var"##inbounds_value#13089" = Base.Broadcast._broadcast_getindex(var"##plate_prepared#12464", var"##plate_index#12469")
+                $(Expr(:inbounds, :pop))
+                var"##inbounds_value#13089"
+            end
+        var"##embedded_argument_failures#13148" = begin
+                $(Expr(:inbounds, true))
+                local var"##inbounds_value#13090" = Base.Broadcast._broadcast_getindex(var"##plate_prepared#12466", var"##plate_index#12469")
+                $(Expr(:inbounds, :pop))
+                var"##inbounds_value#13090"
+            end
+        var"##embedded_eta#13293" = ReactiveKernels._cell_array_broadcast(ReactiveKernels._native_broadcasted(ReactiveKernelsPPL.PPLGeneratedModels.:+, var"##plate_##cell_invariant#712100006165000008#12472", ReactiveKernels._native_broadcasted(ReactiveKernelsPPL.PPLGeneratedModels.:*, sigma, let var"##embedded_##lane_array#13026#13204" = eps_raw
+                            ReactiveKernels._lane_gathered(var"##embedded_##lane_array#13026#13204", var"##embedded_argument__ppl_pi_##_rkppl_selected#955473241787000001#13143")
+                        end)))
+        var"##embedded___plate_value__#13327" = ReactiveKernels._cell_array_hcat(var"##embedded_eta#13293", var"##embedded_argument___plate_value___part1#13145")
+        local var"##embedded_logits#13187"
+        var"##embedded_logits#13187" = ReactiveKernels._cell_array_as(Matrix{Float64}, var"##embedded___plate_value__#13327")
+        var"##embedded_rows_checked#13367" = if ReactiveKernelsDistributionKernels.DistributionKernelSources.size(var"##embedded_logits#13187", 1) == 1 || ReactiveKernelsDistributionKernels.DistributionKernelSources.size(var"##embedded_logits#13187", 1) == ReactiveKernelsDistributionKernels.DistributionKernelSources.length(var"##embedded_argument_observed#13146")
+                var"##embedded_logits#13187"
+            else
+                ReactiveKernelsDistributionKernels.DistributionKernelSources.throw(ReactiveKernelsDistributionKernels.DistributionKernelSources.DimensionMismatch("logits need one row or one per observation"))
+            end
+        var"##embedded_checked_logits#13151" = if ReactiveKernelsDistributionKernels.DistributionKernelSources.size(var"##embedded_rows_checked#13367", 2) == ReactiveKernelsDistributionKernels.DistributionKernelSources.length(var"##plate_##kernel_argument#712100006165000015#12478")
+                var"##embedded_rows_checked#13367"
+            else
+                ReactiveKernelsDistributionKernels.DistributionKernelSources.throw(ReactiveKernelsDistributionKernels.DistributionKernelSources.DimensionMismatch("mixture weights must match components"))
+            end
+        var"##embedded_nrows#13349" = ReactiveKernelsDistributionKernels.DistributionKernelSources.size(var"##embedded_checked_logits#13151", 1)
+        var"##embedded_##plate_axis#12512#13391" = ReactiveKernels._authored_plate_marker(Base.Val($(QuoteNode((2, 3, 4, 5, 6)))), var"##plate_##plate_argument#829940376620000007#12481", var"##embedded_nrows#13349", var"##embedded_checked_logits#13151", var"##embedded_argument_successes#13147", var"##embedded_argument_failures#13148", var"##embedded_argument_observed#13146", var"##plate_log_weights#12483")
+        var"##embedded_##plate_argument#12513#13171" = Base.broadcastable(var"##plate_##plate_argument#829940376620000007#12481")
+        var"##embedded_##plate_prepared#12514#13260" = Base.Broadcast.preprocess(nothing, var"##embedded_##plate_argument#12513#13171")
+        var"##embedded_##plate_argument#12515#13394" = Base.broadcastable(var"##plate_log_weights#12483")
+        var"##embedded_##plate_prepared#12516#13390" = Base.Broadcast.preprocess(nothing, var"##embedded_##plate_argument#12515#13394")
+        ReactiveKernels._plate_require_axes(ReactiveKernels._plate_broadcast_shape((Base.axes(var"##embedded_##plate_argument#12513#13171"),)))
+        ReactiveKernels._plate_require_axes(ReactiveKernels._plate_broadcast_shape((Base.axes(var"##embedded_##plate_argument#12513#13171"), Base.axes(var"##embedded_##plate_argument#12515#13394"))))
+        var"##embedded_##plate_axes#12517#13363" = ReactiveKernels._plate_require_axes(ReactiveKernels._plate_broadcast_shape((Base.axes(var"##embedded_##plate_argument#12513#13171"), Base.axes(var"##embedded_##plate_argument#12515#13394"))))
+        var"##embedded_##native_type#12772#13175" = Base.eltype(var"##embedded_##plate_argument#12515#13394")
+        var"##embedded_##native_type#12773#13344" = ReactiveKernels._plate_argument_type(var"##native_type#13134", false)
+        var"##embedded_##native_type#12774#13220" = ReactiveKernels._plate_coordinate_type(var"##embedded_##native_type#12772#13175", var"##embedded_##native_type#12773#13344")
+        var"##embedded_##native_type#12775#13370" = Base.typeof(var"##embedded_nrows#13349")
+        var"##embedded_##native_type#12776#13347" = ReactiveKernels._plate_argument_type(var"##native_type#13109", true)
+        var"##embedded_##native_type#12777#13244" = ReactiveKernels._plate_coordinate_type(var"##embedded_##native_type#12775#13370", var"##embedded_##native_type#12776#13347")
+        var"##embedded_##native_type#12778#13331" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12777#13244", true)
+        var"##embedded_##native_type#12779#13365" = Base.typeof(var"##embedded_argument_successes#13147")
+        var"##embedded_##native_type#12780#13196" = ReactiveKernels._plate_argument_type(var"##native_type#13099", true)
+        var"##embedded_##native_type#12781#13255" = ReactiveKernels._plate_coordinate_type(var"##embedded_##native_type#12779#13365", var"##embedded_##native_type#12780#13196")
+        var"##embedded_##native_type#12782#13172" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12781#13255", true)
+        var"##embedded_##native_type#12783#13416" = Base.typeof(var"##embedded_checked_logits#13151")
+        var"##embedded_##native_type#12784#13223" = ReactiveKernels._plate_argument_type(var"##native_type#13108", true)
+        var"##embedded_##native_type#12785#13224" = ReactiveKernels._plate_coordinate_type(var"##embedded_##native_type#12783#13416", var"##embedded_##native_type#12784#13223")
+        var"##embedded_##native_type#12786#13159" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12785#13224", true)
+        var"##embedded_##native_type#12787#13178" = ReactiveKernels._promote_op(var"##plate_callable#75", var"##embedded_##native_type#12777#13244")
+        var"##embedded_##native_type#12788#13180" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12787#13178", false)
+        var"##embedded_##native_type#12789#13263" = Base.eltype(var"##embedded_##plate_argument#12513#13171")
+        var"##embedded_##native_type#12790#13281" = ReactiveKernels._plate_argument_type(var"##native_type#13110", false)
+        var"##embedded_##native_type#12791#13306" = ReactiveKernels._plate_coordinate_type(var"##embedded_##native_type#12789#13263", var"##embedded_##native_type#12790#13281")
+        var"##embedded_##native_type#12792#13404" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12791#13306", true)
+        var"##embedded_##native_type#12793#13272" = ReactiveKernels._promote_op(var"##plate_callable#79", var"##embedded_##native_type#12786#13159", var"##embedded_##native_type#12788#13180", var"##embedded_##native_type#12792#13404")
+        var"##embedded_##native_type#12794#13316" = Base.typeof(var"##embedded_argument_failures#13148")
+        var"##embedded_##native_type#12795#13341" = ReactiveKernels._plate_argument_type(var"##native_type#13100", true)
+        var"##embedded_##native_type#12796#13245" = ReactiveKernels._plate_coordinate_type(var"##embedded_##native_type#12794#13316", var"##embedded_##native_type#12795#13341")
+        var"##embedded_##native_type#12797#13155" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12796#13245", true)
+        var"##embedded_##native_type#12798#13210" = Base.typeof(var"##embedded_argument_observed#13146")
+        var"##embedded_##native_type#12799#13371" = ReactiveKernels._plate_argument_type(var"##native_type#13098", true)
+        var"##embedded_##native_type#12800#13345" = ReactiveKernels._plate_coordinate_type(var"##embedded_##native_type#12798#13210", var"##embedded_##native_type#12799#13371")
+        var"##embedded_##native_type#12801#13268" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12800#13345", true)
+        var"##embedded_##native_type#12802#13192" = ReactiveKernels._promote_op(var"##plate_callable#80", var"##embedded_##native_type#12778#13331", var"##embedded_##native_type#12782#13172", var"##embedded_##native_type#12793#13272", var"##embedded_##native_type#12797#13155", var"##embedded_##native_type#12801#13268", var"##embedded_##native_type#12788#13180")
+        var"##embedded_##native_type#12803#13318" = ReactiveKernels._plate_result_eltype(var"##embedded_##native_type#12802#13192", Any)
+        var"##embedded_##native_type#12804#13256" = Base.Val($(QuoteNode((2, 3, 4, 5, 6, 7))))
+        var"##embedded_##native_type#12805#13161" = ReactiveKernels._plate_array_type(var"##embedded_##native_type#12803#13318", var"##embedded_##native_type#12804#13256", var"##embedded_##native_type#12787#13178", var"##embedded_##native_type#12785#13224", var"##embedded_##native_type#12791#13306", var"##embedded_##native_type#12777#13244", var"##embedded_##native_type#12781#13255", var"##embedded_##native_type#12796#13245", var"##embedded_##native_type#12800#13345")
+        var"##embedded_##native_type#12806#13249" = ReactiveKernels._promote_op(var"##plate_callable#77", var"##embedded_##native_type#12805#13161")
+        var"##embedded_##native_type#12807#13377" = ReactiveKernels._promote_op(var"##plate_callable#78", var"##embedded_##native_type#12774#13220", var"##embedded_##native_type#12806#13249")
+        var"##embedded_##plate_eltype#12518#13267" = ReactiveKernels._plate_result_eltype(var"##embedded_##native_type#12807#13377", Any)
+        var"##embedded_##plate_total#12809#13218" = ReactiveKernels._plate_total_seed(LogExpFunctions.logsumexp, var"##embedded_##plate_eltype#12518#13267", var"##embedded_##plate_axis#12512#13391")
+        if !(Base.isempty(Base.CartesianIndices(var"##embedded_##plate_axes#12517#13363")))
+            var"##embedded_##plate_##plate_argument#829940376620000014#12522#13177" = let var"#nrows#op71" = var"##embedded_nrows#13349"
+                    1:var"#nrows#op71"
+                end
+            for var"##embedded_##plate_index#12519#13284" = ReactiveKernels._plate_cells(Base.CartesianIndices(var"##embedded_##plate_axes#12517#13363"))
+                var"##embedded_##native_type#12813#13231" = Base.eltype(var"##embedded_##plate_argument#12513#13171")
+                var"##embedded_##native_type#12814#13279" = ReactiveKernels._plate_argument_type(var"##native_type#13110", false)
+                var"##embedded_##native_type#12815#13321" = ReactiveKernels._plate_coordinate_type(var"##embedded_##native_type#12813#13231", var"##embedded_##native_type#12814#13279")
+                var"##embedded_##native_type#12816#13339" = Base.typeof(var"##embedded_nrows#13349")
+                var"##embedded_##native_type#12817#13230" = ReactiveKernels._plate_argument_type(var"##native_type#13109", true)
+                var"##embedded_##native_type#12818#13182" = ReactiveKernels._plate_coordinate_type(var"##embedded_##native_type#12816#13339", var"##embedded_##native_type#12817#13230")
+                var"##embedded_##native_type#12819#13216" = Base.typeof(var"##embedded_checked_logits#13151")
+                var"##embedded_##native_type#12820#13358" = ReactiveKernels._plate_argument_type(var"##native_type#13108", true)
+                var"##embedded_##native_type#12821#13354" = ReactiveKernels._plate_coordinate_type(var"##embedded_##native_type#12819#13216", var"##embedded_##native_type#12820#13358")
+                var"##embedded_##native_type#12822#13242" = Base.typeof(var"##embedded_argument_successes#13147")
+                var"##embedded_##native_type#12823#13372" = ReactiveKernels._plate_argument_type(var"##native_type#13099", true)
+                var"##embedded_##native_type#12824#13173" = ReactiveKernels._plate_coordinate_type(var"##embedded_##native_type#12822#13242", var"##embedded_##native_type#12823#13372")
+                var"##embedded_##native_type#12825#13413" = Base.typeof(var"##embedded_argument_failures#13148")
+                var"##embedded_##native_type#12826#13237" = ReactiveKernels._plate_argument_type(var"##native_type#13100", true)
+                var"##embedded_##native_type#12827#13160" = ReactiveKernels._plate_coordinate_type(var"##embedded_##native_type#12825#13413", var"##embedded_##native_type#12826#13237")
+                var"##embedded_##native_type#12828#13197" = Base.typeof(var"##embedded_argument_observed#13146")
+                var"##embedded_##native_type#12829#13324" = ReactiveKernels._plate_argument_type(var"##native_type#13098", true)
+                var"##embedded_##native_type#12830#13398" = ReactiveKernels._plate_coordinate_type(var"##embedded_##native_type#12828#13197", var"##embedded_##native_type#12829#13324")
+                var"##embedded_##native_type#12831#13417" = Base.eltype(var"##embedded_##plate_argument#12515#13394")
+                var"##embedded_##native_type#12832#13198" = ReactiveKernels._plate_argument_type(var"##native_type#13134", false)
+                var"##embedded_##native_type#12833#13295" = ReactiveKernels._plate_coordinate_type(var"##embedded_##native_type#12831#13417", var"##embedded_##native_type#12832#13198")
+                var"##embedded_##native_type#12834#13269" = ReactiveKernels._promote_op(var"##plate_callable#75", var"##embedded_##native_type#12818#13182")
+                var"##embedded_##native_type#12835#13325" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12818#13182", true)
+                var"##embedded_##native_type#12836#13292" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12824#13173", true)
+                var"##embedded_##native_type#12837#13254" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12821#13354", true)
+                var"##embedded_##native_type#12838#13183" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12834#13269", false)
+                var"##embedded_##native_type#12839#13411" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12815#13321", true)
+                var"##embedded_##native_type#12840#13303" = ReactiveKernels._promote_op(var"##plate_callable#79", var"##embedded_##native_type#12837#13254", var"##embedded_##native_type#12838#13183", var"##embedded_##native_type#12839#13411")
+                var"##embedded_##native_type#12841#13320" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12827#13160", true)
+                var"##embedded_##native_type#12842#13167" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12830#13398", true)
+                var"##embedded_##native_type#12843#13313" = ReactiveKernels._promote_op(var"##plate_callable#80", var"##embedded_##native_type#12835#13325", var"##embedded_##native_type#12836#13292", var"##embedded_##native_type#12840#13303", var"##embedded_##native_type#12841#13320", var"##embedded_##native_type#12842#13167", var"##embedded_##native_type#12838#13183")
+                var"##embedded_##native_type#12844#13252" = ReactiveKernels._plate_result_eltype(var"##embedded_##native_type#12843#13313", Any)
+                var"##embedded_##native_type#12845#13322" = Base.Val($(QuoteNode((2, 3, 4, 5, 6, 7))))
+                var"##embedded_##native_type#12846#13265" = ReactiveKernels._plate_array_type(var"##embedded_##native_type#12844#13252", var"##embedded_##native_type#12845#13322", var"##embedded_##native_type#12834#13269", var"##embedded_##native_type#12821#13354", var"##embedded_##native_type#12815#13321", var"##embedded_##native_type#12818#13182", var"##embedded_##native_type#12824#13173", var"##embedded_##native_type#12827#13160", var"##embedded_##native_type#12830#13398")
+                var"##embedded_##native_type#12847#13300" = ReactiveKernels._promote_op(var"##plate_callable#77", var"##embedded_##native_type#12846#13265")
+                var"##embedded_##native_type#12848#13240" = ReactiveKernels._promote_op(var"##plate_callable#78", var"##embedded_##native_type#12833#13295", var"##embedded_##native_type#12847#13300")
+                var"##embedded_##embedded_argument_k#12849#13165" = begin
+                        $(Expr(:inbounds, true))
+                        local var"##embedded_##inbounds_value#12811#13299" = Base.Broadcast._broadcast_getindex(var"##embedded_##plate_prepared#12514#13260", var"##embedded_##plate_index#12519#13284")
+                        $(Expr(:inbounds, :pop))
+                        var"##embedded_##inbounds_value#12811#13299"
+                    end
+                var"##embedded_##embedded_argument_log_weight#12850#13294" = begin
+                        $(Expr(:inbounds, true))
+                        local var"##embedded_##inbounds_value#12812#13410" = Base.Broadcast._broadcast_getindex(var"##embedded_##plate_prepared#12516#13390", var"##embedded_##plate_index#12519#13284")
+                        $(Expr(:inbounds, :pop))
+                        var"##embedded_##inbounds_value#12812#13410"
+                    end
+                var"##embedded_##embedded_##plate_axis#12537#12873#13343" = ReactiveKernels._authored_plate_marker(Base.Val($(QuoteNode((2, 3, 4, 5, 6, 7)))), var"##embedded_##plate_##plate_argument#829940376620000014#12522#13177", var"##embedded_checked_logits#13151", var"##embedded_##embedded_argument_k#12849#13165", var"##embedded_nrows#13349", var"##embedded_argument_successes#13147", var"##embedded_argument_failures#13148", var"##embedded_argument_observed#13146")
+                var"##embedded_##embedded_##plate_argument#12538#13010#13335" = Base.broadcastable(var"##embedded_##plate_##plate_argument#829940376620000014#12522#13177")
+                var"##embedded_##embedded_##plate_prepared#12539#12990#13246" = Base.Broadcast.preprocess(nothing, var"##embedded_##embedded_##plate_argument#12538#13010#13335")
+                var"##embedded_##embedded_##plate_axes#12540#12899#13340" = ReactiveKernels._plate_require_axes(ReactiveKernels._plate_broadcast_shape((Base.axes(var"##embedded_##embedded_##plate_argument#12538#13010#13335"),)))
+                var"##embedded_##embedded_##native_type#12541#12859#13248" = Base.typeof(var"##embedded_nrows#13349")
+                var"##embedded_##embedded_##native_type#12542#12996#13258" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12818#13182", true)
+                var"##embedded_##embedded_##native_type#12543#12877#13402" = ReactiveKernels._plate_coordinate_type(var"##embedded_##embedded_##native_type#12541#12859#13248", var"##embedded_##embedded_##native_type#12542#12996#13258")
+                var"##embedded_##embedded_##native_type#12544#12908#13353" = Base.typeof(var"##embedded_argument_successes#13147")
+                var"##embedded_##embedded_##native_type#12545#12895#13238" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12824#13173", true)
+                var"##embedded_##embedded_##native_type#12546#12897#13239" = ReactiveKernels._plate_coordinate_type(var"##embedded_##embedded_##native_type#12544#12908#13353", var"##embedded_##embedded_##native_type#12545#12895#13238")
+                var"##embedded_##embedded_##native_type#12547#12866#13247" = Base.typeof(var"##embedded_checked_logits#13151")
+                var"##embedded_##embedded_##native_type#12548#12978#13380" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12821#13354", true)
+                var"##embedded_##embedded_##native_type#12549#12876#13304" = ReactiveKernels._plate_coordinate_type(var"##embedded_##embedded_##native_type#12547#12866#13247", var"##embedded_##embedded_##native_type#12548#12978#13380")
+                var"##embedded_##embedded_##native_type#12550#13022#13334" = Base.eltype(var"##embedded_##embedded_##plate_argument#12538#13010#13335")
+                var"##embedded_##embedded_##native_type#12551#12867#13243" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12834#13269", false)
+                var"##embedded_##embedded_##native_type#12552#12885#13188" = ReactiveKernels._plate_coordinate_type(var"##embedded_##embedded_##native_type#12550#13022#13334", var"##embedded_##embedded_##native_type#12551#12867#13243")
+                var"##embedded_##embedded_##native_type#12553#12989#13276" = Base.typeof(var"##embedded_##embedded_argument_k#12849#13165")
+                var"##embedded_##embedded_##native_type#12554#12938#13176" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12815#13321", true)
+                var"##embedded_##embedded_##native_type#12555#12935#13195" = ReactiveKernels._plate_coordinate_type(var"##embedded_##embedded_##native_type#12553#12989#13276", var"##embedded_##embedded_##native_type#12554#12938#13176")
+                var"##embedded_##embedded_##native_type#12556#12931#13206" = ReactiveKernels._promote_op(var"##plate_callable#81", var"##embedded_##embedded_##native_type#12549#12876#13304", var"##embedded_##embedded_##native_type#12552#12885#13188", var"##embedded_##embedded_##native_type#12555#12935#13195")
+                var"##embedded_##embedded_##native_type#12557#12911#13312" = Base.typeof(var"##embedded_argument_failures#13148")
+                var"##embedded_##embedded_##native_type#12558#12904#13282" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12827#13160", true)
+                var"##embedded_##embedded_##native_type#12559#12890#13368" = ReactiveKernels._plate_coordinate_type(var"##embedded_##embedded_##native_type#12557#12911#13312", var"##embedded_##embedded_##native_type#12558#12904#13282")
+                var"##embedded_##embedded_##native_type#12560#12872#13408" = Base.typeof(var"##embedded_argument_observed#13146")
+                var"##embedded_##embedded_##native_type#12561#12887#13271" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12830#13398", true)
+                var"##embedded_##embedded_##native_type#12562#12879#13241" = ReactiveKernels._plate_coordinate_type(var"##embedded_##embedded_##native_type#12560#12872#13408", var"##embedded_##embedded_##native_type#12561#12887#13271")
+                var"##embedded_##embedded_##native_type#12563#12933#13184" = ReactiveKernels._promote_op(var"##plate_callable#82", var"##embedded_##embedded_##native_type#12543#12877#13402", var"##embedded_##embedded_##native_type#12546#12897#13239", var"##embedded_##embedded_##native_type#12556#12931#13206", var"##embedded_##embedded_##native_type#12559#12890#13368", var"##embedded_##embedded_##native_type#12562#12879#13241", var"##embedded_##embedded_##native_type#12552#12885#13188")
+                var"##embedded_##embedded_##plate_eltype#12564#12991#13326" = ReactiveKernels._plate_result_eltype(var"##embedded_##embedded_##native_type#12563#12933#13184", Any)
+                if !(Base.isempty(Base.CartesianIndices(var"##embedded_##embedded_##plate_axes#12540#12899#13340")))
+                    if (getfield(var"##plate_callable#82", :condition))(var"##embedded_nrows#13349")
+                        if (getfield(var"##plate_callable#84", :condition))(var"##embedded_argument_successes#13147")
+                            if (getfield(var"##plate_callable#89", :condition))(var"##embedded_argument_failures#13148")
+                                var"##embedded_##embedded_##native_type#12573#12896#13273" = ReactiveKernels._promote_op(var"##plate_callable#92")
+                                var"##embedded_##embedded_##native_type#12574#13016#13387" = ReactiveKernels._promote_op(var"##plate_callable#93")
+                                var"##embedded_##embedded_##native_type#12575#12874#13362" = ReactiveKernels._promote_op(var"##plate_callable#94", var"##embedded_##embedded_##native_type#12573#12896#13273", var"##embedded_##embedded_##native_type#12574#13016#13387")
+                                var"##embedded_##embedded_##plate_eltype#12565#12884#13393" = var"##embedded_##embedded_##plate_eltype#12564#12991#13326"
+                                local var"##embedded_##embedded_##plate_logit#12569#12868#13149"
+                                var"##embedded_##embedded_##plate_total#12578#12986#13418" = ReactiveKernels._plate_total_seed(var"##embedded_##embedded_##plate_eltype#12565#12884#13393", var"##embedded_##embedded_##plate_axis#12537#12873#13343")
+                                var"##embedded_##embedded_##plate_previous#12567#12862#13409" = nothing
+                                var"##embedded_##embedded_##plate_first#12568#12914#13366" = true
+                                var"##embedded_##embedded_##plate_success_mass#12570#12983#13395" = 0.0
+                                var"##embedded_##embedded_##plate_failure_mass#12571#13007#13297" = 0.0
+                                var"##embedded_##embedded_##plate_value#12572#12883#13386" = var"##plate_callable#94"(var"##embedded_##embedded_##plate_success_mass#12570#12983#13395", var"##embedded_##embedded_##plate_failure_mass#12571#13007#13297")
+                                for var"##embedded_##embedded_##plate_index#12566#12974#13278" = ReactiveKernels._plate_cells(Base.CartesianIndices(var"##embedded_##embedded_##plate_axes#12540#12899#13340"))
+                                    if ReactiveKernels._plate_unconditional_root(var"##embedded_##plate_##plate_argument#829940376620000014#12522#13177") || (var"##embedded_##embedded_##plate_first#12568#12914#13366" || ReactiveKernels._authored_plate_is_axis(var"##embedded_##plate_##plate_argument#829940376620000014#12522#13177") && ReactiveKernels._plate_dependency_changed(var"##embedded_##embedded_##plate_index#12566#12974#13278", var"##embedded_##embedded_##plate_previous#12567#12862#13409", var"##embedded_##plate_##plate_argument#829940376620000014#12522#13177"))
+                                        var"##embedded_##embedded_##plate_logit#12569#12868#13149" = var"##embedded_checked_logits#13151"[($(Expr(:inbounds, true));
+                                                    local var"##embedded_##embedded_##inbounds_value#12580#12969#13298" = Base.Broadcast._broadcast_getindex(var"##embedded_##embedded_##plate_prepared#12539#12990#13246", var"##embedded_##embedded_##plate_index#12566#12974#13278");
+                                                    $(Expr(:inbounds, :pop));
+                                                    var"##embedded_##embedded_##inbounds_value#12580#12969#13298"), var"##embedded_##embedded_argument_k#12849#13165"]
+                                    end
+                                    var"##embedded_##embedded_##plate_total#12578#12986#13418" = ReactiveKernels._plate_total_add(var"##embedded_##embedded_##plate_total#12578#12986#13418", var"##embedded_##embedded_##plate_value#12572#12883#13386")
+                                    var"##embedded_##embedded_##plate_previous#12567#12862#13409" = var"##embedded_##embedded_##plate_index#12566#12974#13278"
+                                    var"##embedded_##embedded_##plate_first#12568#12914#13366" = false
+                                end
+                                var"##embedded_##embedded___plate_value__#12956#13270" = ReactiveKernels._plate_total_value(var"##embedded_##embedded_##plate_total#12578#12986#13418")
+                            else
+                                var"##embedded_##embedded_##native_type#12593#12949#13156" = ReactiveKernels._promote_op(var"##plate_callable#96")
+                                var"##embedded_##embedded_##native_type#12594#12993#13378" = Base.typeof(var"##embedded_argument_failures#13148")
+                                var"##embedded_##embedded_##native_type#12595#12856#13328" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12827#13160", true)
+                                var"##embedded_##embedded_##native_type#12596#12898#13355" = ReactiveKernels._plate_coordinate_type(var"##embedded_##embedded_##native_type#12594#12993#13378", var"##embedded_##embedded_##native_type#12595#12856#13328")
+                                var"##embedded_##embedded_##native_type#12597#12875#13163" = Base.typeof(var"##embedded_checked_logits#13151")
+                                var"##embedded_##embedded_##native_type#12598#12950#13168" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12821#13354", true)
+                                var"##embedded_##embedded_##native_type#12599#12942#13227" = ReactiveKernels._plate_coordinate_type(var"##embedded_##embedded_##native_type#12597#12875#13163", var"##embedded_##embedded_##native_type#12598#12950#13168")
+                                var"##embedded_##embedded_##native_type#12600#12905#13286" = Base.eltype(var"##embedded_##embedded_##plate_argument#12538#13010#13335")
+                                var"##embedded_##embedded_##native_type#12601#12975#13152" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12834#13269", false)
+                                var"##embedded_##embedded_##native_type#12602#12888#13350" = ReactiveKernels._plate_coordinate_type(var"##embedded_##embedded_##native_type#12600#12905#13286", var"##embedded_##embedded_##native_type#12601#12975#13152")
+                                var"##embedded_##embedded_##native_type#12603#12992#13275" = Base.typeof(var"##embedded_##embedded_argument_k#12849#13165")
+                                var"##embedded_##embedded_##native_type#12604#13023#13228" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12815#13321", true)
+                                var"##embedded_##embedded_##native_type#12605#12910#13162" = ReactiveKernels._plate_coordinate_type(var"##embedded_##embedded_##native_type#12603#12992#13275", var"##embedded_##embedded_##native_type#12604#13023#13228")
+                                var"##embedded_##embedded_##native_type#12606#13005#13181" = ReactiveKernels._promote_op(var"##plate_callable#95", var"##embedded_##embedded_##native_type#12599#12942#13227", var"##embedded_##embedded_##native_type#12602#12888#13350", var"##embedded_##embedded_##native_type#12605#12910#13162")
+                                var"##embedded_##embedded_##native_type#12607#12982#13225" = ReactiveKernels._promote_op(var"##plate_callable#97", var"##embedded_##embedded_##native_type#12596#12898#13355", var"##embedded_##embedded_##native_type#12606#13005#13181")
+                                var"##embedded_##embedded_##native_type#12608#12973#13401" = ReactiveKernels._promote_op(var"##plate_callable#98", var"##embedded_##embedded_##native_type#12593#12949#13156", var"##embedded_##embedded_##native_type#12607#12982#13225")
+                                var"##embedded_##embedded_##plate_eltype#12585#12902#13283" = var"##embedded_##embedded_##plate_eltype#12564#12991#13326"
+                                local var"##embedded_##embedded_##plate_logit#12589#12958#13203"
+                                local var"##embedded_##embedded_##plate_failure_mass#12591#12891#13296"
+                                local var"##embedded_##embedded_##plate_value#12592#12865#13381"
+                                var"##embedded_##embedded_##plate_total#12609#12892#13261" = ReactiveKernels._plate_total_seed(var"##embedded_##embedded_##plate_eltype#12585#12902#13283", var"##embedded_##embedded_##plate_axis#12537#12873#13343")
+                                var"##embedded_##embedded_##plate_previous#12587#12977#13379" = nothing
+                                var"##embedded_##embedded_##plate_first#12588#12854#13253" = true
+                                var"##embedded_##embedded_##plate_success_mass#12590#12962#13226" = 0.0
+                                for var"##embedded_##embedded_##plate_index#12586#13008#13193" = ReactiveKernels._plate_cells(Base.CartesianIndices(var"##embedded_##embedded_##plate_axes#12540#12899#13340"))
+                                    if ReactiveKernels._plate_unconditional_root(var"##embedded_##plate_##plate_argument#829940376620000014#12522#13177") || (var"##embedded_##embedded_##plate_first#12588#12854#13253" || ReactiveKernels._authored_plate_is_axis(var"##embedded_##plate_##plate_argument#829940376620000014#12522#13177") && ReactiveKernels._plate_dependency_changed(var"##embedded_##embedded_##plate_index#12586#13008#13193", var"##embedded_##embedded_##plate_previous#12587#12977#13379", var"##embedded_##plate_##plate_argument#829940376620000014#12522#13177"))
+                                        var"##embedded_##embedded_##plate_logit#12589#12958#13203" = var"##embedded_checked_logits#13151"[($(Expr(:inbounds, true));
+                                                    local var"##embedded_##embedded_##inbounds_value#12611#13014#13289" = Base.Broadcast._broadcast_getindex(var"##embedded_##embedded_##plate_prepared#12539#12990#13246", var"##embedded_##embedded_##plate_index#12586#13008#13193");
+                                                    $(Expr(:inbounds, :pop));
+                                                    var"##embedded_##embedded_##inbounds_value#12611#13014#13289"), var"##embedded_##embedded_argument_k#12849#13165"]
+                                    end
+                                    if ReactiveKernels._plate_unconditional_root(var"##embedded_##plate_##plate_argument#829940376620000014#12522#13177") || (var"##embedded_##embedded_##plate_first#12588#12854#13253" || ReactiveKernels._authored_plate_is_axis(var"##embedded_##plate_##plate_argument#829940376620000014#12522#13177") && ReactiveKernels._plate_dependency_changed(var"##embedded_##embedded_##plate_index#12586#13008#13193", var"##embedded_##embedded_##plate_previous#12587#12977#13379", var"##embedded_##plate_##plate_argument#829940376620000014#12522#13177"))
+                                        var"##embedded_##embedded_##plate_failure_mass#12591#12891#13296" = let var"#failures#op97" = var"##embedded_argument_failures#13148", var"#logit#op97" = var"##embedded_##embedded_##plate_logit#12589#12958#13203"
+                                                ReactiveKernels._native_mul(var"#failures#op97", ($(QuoteNode(ReactiveKernels._KernelSourceOp{ReactiveKernels._KernelSource{@NamedTuple{}, RuntimeGeneratedFunctions.RuntimeGeneratedFunction{(Symbol("##captures#1"), :observed, :logit), ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", (0x25371c18, 0xb29f9c41, 0xf5d58261, 0xdec63f66, 0x12426801), Nothing}, Nothing}, ReactiveKernels._KernelSourceOp{ReactiveKernels._KernelSource{@NamedTuple{}, RuntimeGeneratedFunctions.RuntimeGeneratedFunction{(Symbol("##captures#1"), :observed, :logit), ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", (0xc63508c1, 0x94e2b796, 0xa016c3d3, 0xd7f49036, 0x423842d3), Nothing}, Nothing}, Nothing, Nothing}, Nothing}(Symbol("##rk_srcop#1885"), :fused, ReactiveKernels._KernelSource{@NamedTuple{}, RuntimeGeneratedFunctions.RuntimeGeneratedFunction{(Symbol("##captures#1"), :observed, :logit), ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", (0x25371c18, 0xb29f9c41, 0xf5d58261, 0xdec63f66, 0x12426801), Nothing}, Nothing}(NamedTuple(), RuntimeGeneratedFunctions.RuntimeGeneratedFunction{(Symbol("##captures#1"), :observed, :logit), ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", (0x25371c18, 0xb29f9c41, 0xf5d58261, 0xdec63f66, 0x12426801), Nothing}(nothing), nothing), ReactiveKernels._KernelSourceOp{ReactiveKernels._KernelSource{@NamedTuple{}, RuntimeGeneratedFunctions.RuntimeGeneratedFunction{(Symbol("##captures#1"), :observed, :logit), ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", (0xc63508c1, 0x94e2b796, 0xa016c3d3, 0xd7f49036, 0x423842d3), Nothing}, Nothing}, Nothing, Nothing}(Symbol("##rk_srcop#1886"), :fused, ReactiveKernels._KernelSource{@NamedTuple{}, RuntimeGeneratedFunctions.RuntimeGeneratedFunction{(Symbol("##captures#1"), :observed, :logit), ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", (0xc63508c1, 0x94e2b796, 0xa016c3d3, 0xd7f49036, 0x423842d3), Nothing}, Nothing}(NamedTuple(), RuntimeGeneratedFunctions.RuntimeGeneratedFunction{(Symbol("##captures#1"), :observed, :logit), ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", (0xc63508c1, 0x94e2b796, 0xa016c3d3, 0xd7f49036, 0x423842d3), Nothing}(nothing), nothing), nothing, nothing, ReactiveKernelsDistributionKernels.DistributionKernelSources), nothing, ReactiveKernelsDistributionKernels.DistributionKernelSources))))(false, var"#logit#op97"))
+                                            end
+                                        var"##embedded_##embedded_##plate_value#12592#12865#13381" = var"##plate_callable#98"(var"##embedded_##embedded_##plate_success_mass#12590#12962#13226", var"##embedded_##embedded_##plate_failure_mass#12591#12891#13296")
+                                    end
+                                    var"##embedded_##embedded_##plate_total#12609#12892#13261" = ReactiveKernels._plate_total_add(var"##embedded_##embedded_##plate_total#12609#12892#13261", var"##embedded_##embedded_##plate_value#12592#12865#13381")
+                                    var"##embedded_##embedded_##plate_previous#12587#12977#13379" = var"##embedded_##embedded_##plate_index#12586#13008#13193"
+                                    var"##embedded_##embedded_##plate_first#12588#12854#13253" = false
+                                end
+                                var"##embedded_##embedded___plate_value__#12956#13270" = ReactiveKernels._plate_total_value(var"##embedded_##embedded_##plate_total#12609#12892#13261")
+                            end
+                        else
+                            if (getfield(var"##plate_callable#101", :condition))(var"##embedded_argument_failures#13148")
+                                var"##embedded_##embedded_##native_type#12628#12869#13351" = Base.typeof(var"##embedded_argument_successes#13147")
+                                var"##embedded_##embedded_##native_type#12629#12943#13415" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12824#13173", true)
+                                var"##embedded_##embedded_##native_type#12630#12944#13373" = ReactiveKernels._plate_coordinate_type(var"##embedded_##embedded_##native_type#12628#12869#13351", var"##embedded_##embedded_##native_type#12629#12943#13415")
+                                var"##embedded_##embedded_##native_type#12631#13003#13205" = Base.typeof(var"##embedded_checked_logits#13151")
+                                var"##embedded_##embedded_##native_type#12632#12921#13399" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12821#13354", true)
+                                var"##embedded_##embedded_##native_type#12633#13002#13397" = ReactiveKernels._plate_coordinate_type(var"##embedded_##embedded_##native_type#12631#13003#13205", var"##embedded_##embedded_##native_type#12632#12921#13399")
+                                var"##embedded_##embedded_##native_type#12634#12857#13315" = Base.eltype(var"##embedded_##embedded_##plate_argument#12538#13010#13335")
+                                var"##embedded_##embedded_##native_type#12635#12946#13384" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12834#13269", false)
+                                var"##embedded_##embedded_##native_type#12636#12980#13207" = ReactiveKernels._plate_coordinate_type(var"##embedded_##embedded_##native_type#12634#12857#13315", var"##embedded_##embedded_##native_type#12635#12946#13384")
+                                var"##embedded_##embedded_##native_type#12637#12894#13405" = Base.typeof(var"##embedded_##embedded_argument_k#12849#13165")
+                                var"##embedded_##embedded_##native_type#12638#12988#13202" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12815#13321", true)
+                                var"##embedded_##embedded_##native_type#12639#12889#13259" = ReactiveKernels._plate_coordinate_type(var"##embedded_##embedded_##native_type#12637#12894#13405", var"##embedded_##embedded_##native_type#12638#12988#13202")
+                                var"##embedded_##embedded_##native_type#12640#12985#13319" = ReactiveKernels._promote_op(var"##plate_callable#103", var"##embedded_##embedded_##native_type#12633#13002#13397", var"##embedded_##embedded_##native_type#12636#12980#13207", var"##embedded_##embedded_##native_type#12639#12889#13259")
+                                var"##embedded_##embedded_##native_type#12641#12880#13153" = ReactiveKernels._promote_op(var"##plate_callable#104", var"##embedded_##embedded_##native_type#12630#12944#13373", var"##embedded_##embedded_##native_type#12640#12985#13319")
+                                var"##embedded_##embedded_##native_type#12642#12864#13364" = ReactiveKernels._promote_op(var"##plate_callable#105")
+                                var"##embedded_##embedded_##native_type#12643#12948#13186" = ReactiveKernels._promote_op(var"##plate_callable#106", var"##embedded_##embedded_##native_type#12641#12880#13153", var"##embedded_##embedded_##native_type#12642#12864#13364")
+                                var"##embedded_##embedded_##plate_eltype#12620#12972#13199" = var"##embedded_##embedded_##plate_eltype#12564#12991#13326"
+                                local var"##embedded_##embedded_##plate_logit#12624#12903#13170"
+                                local var"##embedded_##embedded_##plate_success_mass#12625#12959#13194"
+                                local var"##embedded_##embedded_##plate_value#12627#12901#13333"
+                                var"##embedded_##embedded_##plate_total#12644#12984#13314" = ReactiveKernels._plate_total_seed(var"##embedded_##embedded_##plate_eltype#12620#12972#13199", var"##embedded_##embedded_##plate_axis#12537#12873#13343")
+                                var"##embedded_##embedded_##plate_previous#12622#12893#13158" = nothing
+                                var"##embedded_##embedded_##plate_first#12623#12855#13389" = true
+                                var"##embedded_##embedded_##plate_failure_mass#12626#12906#13217" = 0.0
+                                for var"##embedded_##embedded_##plate_index#12621#13004#13329" = ReactiveKernels._plate_cells(Base.CartesianIndices(var"##embedded_##embedded_##plate_axes#12540#12899#13340"))
+                                    if ReactiveKernels._plate_unconditional_root(var"##embedded_##plate_##plate_argument#829940376620000014#12522#13177") || (var"##embedded_##embedded_##plate_first#12623#12855#13389" || ReactiveKernels._authored_plate_is_axis(var"##embedded_##plate_##plate_argument#829940376620000014#12522#13177") && ReactiveKernels._plate_dependency_changed(var"##embedded_##embedded_##plate_index#12621#13004#13329", var"##embedded_##embedded_##plate_previous#12622#12893#13158", var"##embedded_##plate_##plate_argument#829940376620000014#12522#13177"))
+                                        var"##embedded_##embedded_##plate_logit#12624#12903#13170" = var"##embedded_checked_logits#13151"[($(Expr(:inbounds, true));
+                                                    local var"##embedded_##embedded_##inbounds_value#12646#12995#13285" = Base.Broadcast._broadcast_getindex(var"##embedded_##embedded_##plate_prepared#12539#12990#13246", var"##embedded_##embedded_##plate_index#12621#13004#13329");
+                                                    $(Expr(:inbounds, :pop));
+                                                    var"##embedded_##embedded_##inbounds_value#12646#12995#13285"), var"##embedded_##embedded_argument_k#12849#13165"]
+                                        var"##embedded_##embedded_##plate_success_mass#12625#12959#13194" = let var"#successes#op104" = var"##embedded_argument_successes#13147", var"#logit#op104" = var"##embedded_##embedded_##plate_logit#12624#12903#13170"
+                                                ReactiveKernels._native_mul(var"#successes#op104", ($(QuoteNode(ReactiveKernels._KernelSourceOp{ReactiveKernels._KernelSource{@NamedTuple{}, RuntimeGeneratedFunctions.RuntimeGeneratedFunction{(Symbol("##captures#1"), :observed, :logit), ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", (0x25371c18, 0xb29f9c41, 0xf5d58261, 0xdec63f66, 0x12426801), Nothing}, Nothing}, ReactiveKernels._KernelSourceOp{ReactiveKernels._KernelSource{@NamedTuple{}, RuntimeGeneratedFunctions.RuntimeGeneratedFunction{(Symbol("##captures#1"), :observed, :logit), ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", (0xc63508c1, 0x94e2b796, 0xa016c3d3, 0xd7f49036, 0x423842d3), Nothing}, Nothing}, Nothing, Nothing}, Nothing}(Symbol("##rk_srcop#1885"), :fused, ReactiveKernels._KernelSource{@NamedTuple{}, RuntimeGeneratedFunctions.RuntimeGeneratedFunction{(Symbol("##captures#1"), :observed, :logit), ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", (0x25371c18, 0xb29f9c41, 0xf5d58261, 0xdec63f66, 0x12426801), Nothing}, Nothing}(NamedTuple(), RuntimeGeneratedFunctions.RuntimeGeneratedFunction{(Symbol("##captures#1"), :observed, :logit), ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", (0x25371c18, 0xb29f9c41, 0xf5d58261, 0xdec63f66, 0x12426801), Nothing}(nothing), nothing), ReactiveKernels._KernelSourceOp{ReactiveKernels._KernelSource{@NamedTuple{}, RuntimeGeneratedFunctions.RuntimeGeneratedFunction{(Symbol("##captures#1"), :observed, :logit), ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", (0xc63508c1, 0x94e2b796, 0xa016c3d3, 0xd7f49036, 0x423842d3), Nothing}, Nothing}, Nothing, Nothing}(Symbol("##rk_srcop#1886"), :fused, ReactiveKernels._KernelSource{@NamedTuple{}, RuntimeGeneratedFunctions.RuntimeGeneratedFunction{(Symbol("##captures#1"), :observed, :logit), ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", (0xc63508c1, 0x94e2b796, 0xa016c3d3, 0xd7f49036, 0x423842d3), Nothing}, Nothing}(NamedTuple(), RuntimeGeneratedFunctions.RuntimeGeneratedFunction{(Symbol("##captures#1"), :observed, :logit), ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", (0xc63508c1, 0x94e2b796, 0xa016c3d3, 0xd7f49036, 0x423842d3), Nothing}(nothing), nothing), nothing, nothing, ReactiveKernelsDistributionKernels.DistributionKernelSources), nothing, ReactiveKernelsDistributionKernels.DistributionKernelSources))))(true, var"#logit#op104"))
+                                            end
+                                    end
+                                    if ReactiveKernels._plate_unconditional_root(var"##embedded_##plate_##plate_argument#829940376620000014#12522#13177") || (var"##embedded_##embedded_##plate_first#12623#12855#13389" || ReactiveKernels._authored_plate_is_axis(var"##embedded_##plate_##plate_argument#829940376620000014#12522#13177") && ReactiveKernels._plate_dependency_changed(var"##embedded_##embedded_##plate_index#12621#13004#13329", var"##embedded_##embedded_##plate_previous#12622#12893#13158", var"##embedded_##plate_##plate_argument#829940376620000014#12522#13177"))
+                                        var"##embedded_##embedded_##plate_value#12627#12901#13333" = var"##plate_callable#106"(var"##embedded_##embedded_##plate_success_mass#12625#12959#13194", var"##embedded_##embedded_##plate_failure_mass#12626#12906#13217")
+                                    end
+                                    var"##embedded_##embedded_##plate_total#12644#12984#13314" = ReactiveKernels._plate_total_add(var"##embedded_##embedded_##plate_total#12644#12984#13314", var"##embedded_##embedded_##plate_value#12627#12901#13333")
+                                    var"##embedded_##embedded_##plate_previous#12622#12893#13158" = var"##embedded_##embedded_##plate_index#12621#13004#13329"
+                                    var"##embedded_##embedded_##plate_first#12623#12855#13389" = false
+                                end
+                                var"##embedded_##embedded___plate_value__#12956#13270" = ReactiveKernels._plate_total_value(var"##embedded_##embedded_##plate_total#12644#12984#13314")
+                            else
+                                var"##embedded_##embedded_##native_type#12663#12858#13310" = Base.typeof(var"##embedded_argument_successes#13147")
+                                var"##embedded_##embedded_##native_type#12664#13015#13317" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12824#13173", true)
+                                var"##embedded_##embedded_##native_type#12665#12916#13280" = ReactiveKernels._plate_coordinate_type(var"##embedded_##embedded_##native_type#12663#12858#13310", var"##embedded_##embedded_##native_type#12664#13015#13317")
+                                var"##embedded_##embedded_##native_type#12666#12932#13208" = Base.typeof(var"##embedded_checked_logits#13151")
+                                var"##embedded_##embedded_##native_type#12667#13000#13251" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12821#13354", true)
+                                var"##embedded_##embedded_##native_type#12668#12926#13164" = ReactiveKernels._plate_coordinate_type(var"##embedded_##embedded_##native_type#12666#12932#13208", var"##embedded_##embedded_##native_type#12667#13000#13251")
+                                var"##embedded_##embedded_##native_type#12669#12915#13332" = Base.eltype(var"##embedded_##embedded_##plate_argument#12538#13010#13335")
+                                var"##embedded_##embedded_##native_type#12670#12863#13359" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12834#13269", false)
+                                var"##embedded_##embedded_##native_type#12671#12919#13330" = ReactiveKernels._plate_coordinate_type(var"##embedded_##embedded_##native_type#12669#12915#13332", var"##embedded_##embedded_##native_type#12670#12863#13359")
+                                var"##embedded_##embedded_##native_type#12672#12953#13291" = Base.typeof(var"##embedded_##embedded_argument_k#12849#13165")
+                                var"##embedded_##embedded_##native_type#12673#12939#13234" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12815#13321", true)
+                                var"##embedded_##embedded_##native_type#12674#12882#13412" = ReactiveKernels._plate_coordinate_type(var"##embedded_##embedded_##native_type#12672#12953#13291", var"##embedded_##embedded_##native_type#12673#12939#13234")
+                                var"##embedded_##embedded_##native_type#12675#12967#13166" = ReactiveKernels._promote_op(var"##plate_callable#107", var"##embedded_##embedded_##native_type#12668#12926#13164", var"##embedded_##embedded_##native_type#12671#12919#13330", var"##embedded_##embedded_##native_type#12674#12882#13412")
+                                var"##embedded_##embedded_##native_type#12676#12999#13414" = ReactiveKernels._promote_op(var"##plate_callable#108", var"##embedded_##embedded_##native_type#12665#12916#13280", var"##embedded_##embedded_##native_type#12675#12967#13166")
+                                var"##embedded_##embedded_##native_type#12677#13020#13221" = Base.typeof(var"##embedded_argument_failures#13148")
+                                var"##embedded_##embedded_##native_type#12678#13019#13211" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12827#13160", true)
+                                var"##embedded_##embedded_##native_type#12679#13018#13212" = ReactiveKernels._plate_coordinate_type(var"##embedded_##embedded_##native_type#12677#13020#13221", var"##embedded_##embedded_##native_type#12678#13019#13211")
+                                var"##embedded_##embedded_##native_type#12680#12851#13157" = ReactiveKernels._promote_op(var"##plate_callable#109", var"##embedded_##embedded_##native_type#12679#13018#13212", var"##embedded_##embedded_##native_type#12675#12967#13166")
+                                var"##embedded_##embedded_##native_type#12681#12951#13357" = ReactiveKernels._promote_op(var"##plate_callable#110", var"##embedded_##embedded_##native_type#12676#12999#13414", var"##embedded_##embedded_##native_type#12680#12851#13157")
+                                var"##embedded_##embedded_##plate_eltype#12655#12881#13288" = var"##embedded_##embedded_##plate_eltype#12564#12991#13326"
+                                local var"##embedded_##embedded_##plate_logit#12659#12970#13233"
+                                local var"##embedded_##embedded_##plate_success_mass#12660#12971#13403"
+                                local var"##embedded_##embedded_##plate_failure_mass#12661#12912#13301"
+                                local var"##embedded_##embedded_##plate_value#12662#12994#13200"
+                                var"##embedded_##embedded_##plate_total#12682#12852#13232" = ReactiveKernels._plate_total_seed(var"##embedded_##embedded_##plate_eltype#12655#12881#13288", var"##embedded_##embedded_##plate_axis#12537#12873#13343")
+                                var"##embedded_##embedded_##plate_previous#12657#12920#13361" = nothing
+                                var"##embedded_##embedded_##plate_first#12658#13006#13215" = true
+                                for var"##embedded_##embedded_##plate_index#12656#12987#13400" = ReactiveKernels._plate_cells(Base.CartesianIndices(var"##embedded_##embedded_##plate_axes#12540#12899#13340"))
+                                    if ReactiveKernels._plate_unconditional_root(var"##embedded_##plate_##plate_argument#829940376620000014#12522#13177") || (var"##embedded_##embedded_##plate_first#12658#13006#13215" || ReactiveKernels._authored_plate_is_axis(var"##embedded_##plate_##plate_argument#829940376620000014#12522#13177") && ReactiveKernels._plate_dependency_changed(var"##embedded_##embedded_##plate_index#12656#12987#13400", var"##embedded_##embedded_##plate_previous#12657#12920#13361", var"##embedded_##plate_##plate_argument#829940376620000014#12522#13177"))
+                                        var"##embedded_##embedded_##plate_logit#12659#12970#13233" = var"##embedded_checked_logits#13151"[($(Expr(:inbounds, true));
+                                                    local var"##embedded_##embedded_##inbounds_value#12684#12860#13154" = Base.Broadcast._broadcast_getindex(var"##embedded_##embedded_##plate_prepared#12539#12990#13246", var"##embedded_##embedded_##plate_index#12656#12987#13400");
+                                                    $(Expr(:inbounds, :pop));
+                                                    var"##embedded_##embedded_##inbounds_value#12684#12860#13154"), var"##embedded_##embedded_argument_k#12849#13165"]
+                                        var"##embedded_##embedded_##plate_success_mass#12660#12971#13403" = let var"#successes#op108" = var"##embedded_argument_successes#13147", var"#logit#op108" = var"##embedded_##embedded_##plate_logit#12659#12970#13233"
+                                                ReactiveKernels._native_mul(var"#successes#op108", ($(QuoteNode(ReactiveKernels._KernelSourceOp{ReactiveKernels._KernelSource{@NamedTuple{}, RuntimeGeneratedFunctions.RuntimeGeneratedFunction{(Symbol("##captures#1"), :observed, :logit), ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", (0x25371c18, 0xb29f9c41, 0xf5d58261, 0xdec63f66, 0x12426801), Nothing}, Nothing}, ReactiveKernels._KernelSourceOp{ReactiveKernels._KernelSource{@NamedTuple{}, RuntimeGeneratedFunctions.RuntimeGeneratedFunction{(Symbol("##captures#1"), :observed, :logit), ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", (0xc63508c1, 0x94e2b796, 0xa016c3d3, 0xd7f49036, 0x423842d3), Nothing}, Nothing}, Nothing, Nothing}, Nothing}(Symbol("##rk_srcop#1885"), :fused, ReactiveKernels._KernelSource{@NamedTuple{}, RuntimeGeneratedFunctions.RuntimeGeneratedFunction{(Symbol("##captures#1"), :observed, :logit), ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", (0x25371c18, 0xb29f9c41, 0xf5d58261, 0xdec63f66, 0x12426801), Nothing}, Nothing}(NamedTuple(), RuntimeGeneratedFunctions.RuntimeGeneratedFunction{(Symbol("##captures#1"), :observed, :logit), ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", (0x25371c18, 0xb29f9c41, 0xf5d58261, 0xdec63f66, 0x12426801), Nothing}(nothing), nothing), ReactiveKernels._KernelSourceOp{ReactiveKernels._KernelSource{@NamedTuple{}, RuntimeGeneratedFunctions.RuntimeGeneratedFunction{(Symbol("##captures#1"), :observed, :logit), ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", (0xc63508c1, 0x94e2b796, 0xa016c3d3, 0xd7f49036, 0x423842d3), Nothing}, Nothing}, Nothing, Nothing}(Symbol("##rk_srcop#1886"), :fused, ReactiveKernels._KernelSource{@NamedTuple{}, RuntimeGeneratedFunctions.RuntimeGeneratedFunction{(Symbol("##captures#1"), :observed, :logit), ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", (0xc63508c1, 0x94e2b796, 0xa016c3d3, 0xd7f49036, 0x423842d3), Nothing}, Nothing}(NamedTuple(), RuntimeGeneratedFunctions.RuntimeGeneratedFunction{(Symbol("##captures#1"), :observed, :logit), ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", (0xc63508c1, 0x94e2b796, 0xa016c3d3, 0xd7f49036, 0x423842d3), Nothing}(nothing), nothing), nothing, nothing, ReactiveKernelsDistributionKernels.DistributionKernelSources), nothing, ReactiveKernelsDistributionKernels.DistributionKernelSources))))(true, var"#logit#op108"))
+                                            end
+                                        var"##embedded_##embedded_##plate_failure_mass#12661#12912#13301" = let var"#failures#op109" = var"##embedded_argument_failures#13148", var"#logit#op109" = var"##embedded_##embedded_##plate_logit#12659#12970#13233"
+                                                ReactiveKernels._native_mul(var"#failures#op109", ($(QuoteNode(ReactiveKernels._KernelSourceOp{ReactiveKernels._KernelSource{@NamedTuple{}, RuntimeGeneratedFunctions.RuntimeGeneratedFunction{(Symbol("##captures#1"), :observed, :logit), ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", (0x25371c18, 0xb29f9c41, 0xf5d58261, 0xdec63f66, 0x12426801), Nothing}, Nothing}, ReactiveKernels._KernelSourceOp{ReactiveKernels._KernelSource{@NamedTuple{}, RuntimeGeneratedFunctions.RuntimeGeneratedFunction{(Symbol("##captures#1"), :observed, :logit), ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", (0xc63508c1, 0x94e2b796, 0xa016c3d3, 0xd7f49036, 0x423842d3), Nothing}, Nothing}, Nothing, Nothing}, Nothing}(Symbol("##rk_srcop#1885"), :fused, ReactiveKernels._KernelSource{@NamedTuple{}, RuntimeGeneratedFunctions.RuntimeGeneratedFunction{(Symbol("##captures#1"), :observed, :logit), ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", (0x25371c18, 0xb29f9c41, 0xf5d58261, 0xdec63f66, 0x12426801), Nothing}, Nothing}(NamedTuple(), RuntimeGeneratedFunctions.RuntimeGeneratedFunction{(Symbol("##captures#1"), :observed, :logit), ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", (0x25371c18, 0xb29f9c41, 0xf5d58261, 0xdec63f66, 0x12426801), Nothing}(nothing), nothing), ReactiveKernels._KernelSourceOp{ReactiveKernels._KernelSource{@NamedTuple{}, RuntimeGeneratedFunctions.RuntimeGeneratedFunction{(Symbol("##captures#1"), :observed, :logit), ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", (0xc63508c1, 0x94e2b796, 0xa016c3d3, 0xd7f49036, 0x423842d3), Nothing}, Nothing}, Nothing, Nothing}(Symbol("##rk_srcop#1886"), :fused, ReactiveKernels._KernelSource{@NamedTuple{}, RuntimeGeneratedFunctions.RuntimeGeneratedFunction{(Symbol("##captures#1"), :observed, :logit), ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", (0xc63508c1, 0x94e2b796, 0xa016c3d3, 0xd7f49036, 0x423842d3), Nothing}, Nothing}(NamedTuple(), RuntimeGeneratedFunctions.RuntimeGeneratedFunction{(Symbol("##captures#1"), :observed, :logit), ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", ReactiveKernelsDistributionKernels.var"#_RGF_ModTag", (0xc63508c1, 0x94e2b796, 0xa016c3d3, 0xd7f49036, 0x423842d3), Nothing}(nothing), nothing), nothing, nothing, ReactiveKernelsDistributionKernels.DistributionKernelSources), nothing, ReactiveKernelsDistributionKernels.DistributionKernelSources))))(false, var"#logit#op109"))
+                                            end
+                                        var"##embedded_##embedded_##plate_value#12662#12994#13200" = var"##plate_callable#110"(var"##embedded_##embedded_##plate_success_mass#12660#12971#13403", var"##embedded_##embedded_##plate_failure_mass#12661#12912#13301")
+                                    end
+                                    var"##embedded_##embedded_##plate_total#12682#12852#13232" = ReactiveKernels._plate_total_add(var"##embedded_##embedded_##plate_total#12682#12852#13232", var"##embedded_##embedded_##plate_value#12662#12994#13200")
+                                    var"##embedded_##embedded_##plate_previous#12657#12920#13361" = var"##embedded_##embedded_##plate_index#12656#12987#13400"
+                                    var"##embedded_##embedded_##plate_first#12658#13006#13215" = false
+                                end
+                                var"##embedded_##embedded___plate_value__#12956#13270" = ReactiveKernels._plate_total_value(var"##embedded_##embedded_##plate_total#12682#12852#13232")
+                            end
+                        end
+                    else
+                        var"##embedded_##embedded_##native_type#12702#12930#13219" = Base.typeof(var"##embedded_argument_observed#13146")
+                        var"##embedded_##embedded_##native_type#12703#12928#13308" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12830#13398", true)
+                        var"##embedded_##embedded_##native_type#12704#12929#13250" = ReactiveKernels._plate_coordinate_type(var"##embedded_##embedded_##native_type#12702#12930#13219", var"##embedded_##embedded_##native_type#12703#12928#13308")
+                        var"##embedded_##embedded_##native_type#12705#12960#13396" = Base.eltype(var"##embedded_##embedded_##plate_argument#12538#13010#13335")
+                        var"##embedded_##embedded_##native_type#12706#12945#13213" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12834#13269", false)
+                        var"##embedded_##embedded_##native_type#12707#13024#13169" = ReactiveKernels._plate_coordinate_type(var"##embedded_##embedded_##native_type#12705#12960#13396", var"##embedded_##embedded_##native_type#12706#12945#13213")
+                        var"##embedded_##embedded_##native_type#12708#12936#13201" = ReactiveKernels._promote_op(var"##plate_callable#112", var"##embedded_##embedded_##native_type#12704#12929#13250", var"##embedded_##embedded_##native_type#12707#13024#13169")
+                        var"##embedded_##embedded_##native_type#12709#13017#13266" = Base.typeof(var"##embedded_checked_logits#13151")
+                        var"##embedded_##embedded_##native_type#12710#12954#13388" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12821#13354", true)
+                        var"##embedded_##embedded_##native_type#12711#12909#13406" = ReactiveKernels._plate_coordinate_type(var"##embedded_##embedded_##native_type#12709#13017#13266", var"##embedded_##embedded_##native_type#12710#12954#13388")
+                        var"##embedded_##embedded_##native_type#12712#13012#13214" = Base.typeof(var"##embedded_##embedded_argument_k#12849#13165")
+                        var"##embedded_##embedded_##native_type#12713#12861#13235" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12815#13321", true)
+                        var"##embedded_##embedded_##native_type#12714#13021#13392" = ReactiveKernels._plate_coordinate_type(var"##embedded_##embedded_##native_type#12712#13012#13214", var"##embedded_##embedded_##native_type#12713#12861#13235")
+                        var"##embedded_##embedded_##native_type#12715#12925#13383" = ReactiveKernels._promote_op(var"##plate_callable#111", var"##embedded_##embedded_##native_type#12711#12909#13406", var"##embedded_##embedded_##native_type#12707#13024#13169", var"##embedded_##embedded_##native_type#12714#13021#13392")
+                        var"##embedded_##embedded_##native_type#12716#12968#13382" = ReactiveKernels._promote_op(var"##plate_callable#113", var"##embedded_##embedded_##native_type#12708#12936#13201", var"##embedded_##embedded_##native_type#12715#12925#13383")
+                        var"##embedded_##embedded_##plate_eltype#12695#12923#13337" = var"##embedded_##embedded_##plate_eltype#12564#12991#13326"
+                        local var"##embedded_##embedded_##plate_logit#12699#12907#13185"
+                        local var"##embedded_##embedded_##plate_##observed_argument#829940376620000045#12700#12937#13342"
+                        local var"##embedded_##embedded_##plate_value#12701#12870#13346"
+                        var"##embedded_##embedded_##plate_total#12717#12878#13209" = ReactiveKernels._plate_total_seed(var"##embedded_##embedded_##plate_eltype#12695#12923#13337", var"##embedded_##embedded_##plate_axis#12537#12873#13343")
+                        var"##embedded_##embedded_##plate_previous#12697#12886#13338" = nothing
+                        var"##embedded_##embedded_##plate_first#12698#13013#13309" = true
+                        for var"##embedded_##embedded_##plate_index#12696#12997#13356" = ReactiveKernels._plate_cells(Base.CartesianIndices(var"##embedded_##embedded_##plate_axes#12540#12899#13340"))
+                            if ReactiveKernels._plate_unconditional_root(var"##embedded_##plate_##plate_argument#829940376620000014#12522#13177") || (var"##embedded_##embedded_##plate_first#12698#13013#13309" || ReactiveKernels._authored_plate_is_axis(var"##embedded_##plate_##plate_argument#829940376620000014#12522#13177") && ReactiveKernels._plate_dependency_changed(var"##embedded_##embedded_##plate_index#12696#12997#13356", var"##embedded_##embedded_##plate_previous#12697#12886#13338", var"##embedded_##plate_##plate_argument#829940376620000014#12522#13177"))
+                                var"##embedded_##embedded_##plate_logit#12699#12907#13185" = var"##embedded_checked_logits#13151"[($(Expr(:inbounds, true));
+                                            local var"##embedded_##embedded_##inbounds_value#12719#12924#13307" = Base.Broadcast._broadcast_getindex(var"##embedded_##embedded_##plate_prepared#12539#12990#13246", var"##embedded_##embedded_##plate_index#12696#12997#13356");
+                                            $(Expr(:inbounds, :pop));
+                                            var"##embedded_##embedded_##inbounds_value#12719#12924#13307"), var"##embedded_##embedded_argument_k#12849#13165"]
+                                var"##embedded_##embedded_##plate_##observed_argument#829940376620000045#12700#12937#13342" = let var"#observed#op112" = var"##embedded_argument_observed#13146", var"#i#op112" = begin
+                                                $(Expr(:inbounds, true))
+                                                local var"##embedded_##embedded_##inbounds_value#12723#12927#13376" = Base.Broadcast._broadcast_getindex(var"##embedded_##embedded_##plate_prepared#12539#12990#13246", var"##embedded_##embedded_##plate_index#12696#12997#13356")
+                                                $(Expr(:inbounds, :pop))
+                                                var"##embedded_##embedded_##inbounds_value#12723#12927#13376"
+                                            end
+                                        var"#observed#op112"[var"#i#op112"]
+                                    end
+                                var"##embedded_##embedded_##plate_value#12701#12870#13346" = let var"#observed#op113" = var"##embedded_##embedded_##plate_##observed_argument#829940376620000045#12700#12937#13342", var"#logit#op113" = var"##embedded_##embedded_##plate_logit#12699#12907#13185"
+                                        -(ReactiveKernelsDistributionKernels.DistributionKernelSources.log1pexp(ReactiveKernelsDistributionKernels.DistributionKernelSources.ifelse(var"#observed#op113", -var"#logit#op113", var"#logit#op113")))
+                                    end
+                            end
+                            var"##embedded_##embedded_##plate_total#12717#12878#13209" = ReactiveKernels._plate_total_add(var"##embedded_##embedded_##plate_total#12717#12878#13209", var"##embedded_##embedded_##plate_value#12701#12870#13346")
+                            var"##embedded_##embedded_##plate_previous#12697#12886#13338" = var"##embedded_##embedded_##plate_index#12696#12997#13356"
+                            var"##embedded_##embedded_##plate_first#12698#13013#13309" = false
+                        end
+                        var"##embedded_##embedded___plate_value__#12956#13270" = ReactiveKernels._plate_total_value(var"##embedded_##embedded_##plate_total#12717#12878#13209")
+                    end
+                else
+                    var"##embedded_##embedded_##native_type#12735#12952#13407" = Base.typeof(var"##embedded_nrows#13349")
+                    var"##embedded_##embedded_##native_type#12736#13009#13311" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12818#13182", true)
+                    var"##embedded_##embedded_##native_type#12737#12918#13262" = ReactiveKernels._plate_coordinate_type(var"##embedded_##embedded_##native_type#12735#12952#13407", var"##embedded_##embedded_##native_type#12736#13009#13311")
+                    var"##embedded_##embedded_##native_type#12738#12966#13305" = Base.typeof(var"##embedded_argument_successes#13147")
+                    var"##embedded_##embedded_##native_type#12739#12922#13287" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12824#13173", true)
+                    var"##embedded_##embedded_##native_type#12740#12917#13323" = ReactiveKernels._plate_coordinate_type(var"##embedded_##embedded_##native_type#12738#12966#13305", var"##embedded_##embedded_##native_type#12739#12922#13287")
+                    var"##embedded_##embedded_##native_type#12741#12957#13374" = Base.typeof(var"##embedded_checked_logits#13151")
+                    var"##embedded_##embedded_##native_type#12742#12871#13174" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12821#13354", true)
+                    var"##embedded_##embedded_##native_type#12743#12979#13336" = ReactiveKernels._plate_coordinate_type(var"##embedded_##embedded_##native_type#12741#12957#13374", var"##embedded_##embedded_##native_type#12742#12871#13174")
+                    var"##embedded_##embedded_##native_type#12744#12981#13179" = Base.eltype(var"##embedded_##embedded_##plate_argument#12538#13010#13335")
+                    var"##embedded_##embedded_##native_type#12745#12947#13150" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12834#13269", false)
+                    var"##embedded_##embedded_##native_type#12746#12941#13257" = ReactiveKernels._plate_coordinate_type(var"##embedded_##embedded_##native_type#12744#12981#13179", var"##embedded_##embedded_##native_type#12745#12947#13150")
+                    var"##embedded_##embedded_##native_type#12747#12963#13236" = Base.typeof(var"##embedded_##embedded_argument_k#12849#13165")
+                    var"##embedded_##embedded_##native_type#12748#13001#13348" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12815#13321", true)
+                    var"##embedded_##embedded_##native_type#12749#12965#13352" = ReactiveKernels._plate_coordinate_type(var"##embedded_##embedded_##native_type#12747#12963#13236", var"##embedded_##embedded_##native_type#12748#13001#13348")
+                    var"##embedded_##embedded_##native_type#12750#12934#13277" = ReactiveKernels._promote_op(var"##plate_callable#81", var"##embedded_##embedded_##native_type#12743#12979#13336", var"##embedded_##embedded_##native_type#12746#12941#13257", var"##embedded_##embedded_##native_type#12749#12965#13352")
+                    var"##embedded_##embedded_##native_type#12751#13011#13222" = Base.typeof(var"##embedded_argument_failures#13148")
+                    var"##embedded_##embedded_##native_type#12752#12998#13191" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12827#13160", true)
+                    var"##embedded_##embedded_##native_type#12753#12940#13274" = ReactiveKernels._plate_coordinate_type(var"##embedded_##embedded_##native_type#12751#13011#13222", var"##embedded_##embedded_##native_type#12752#12998#13191")
+                    var"##embedded_##embedded_##native_type#12754#12955#13189" = Base.typeof(var"##embedded_argument_observed#13146")
+                    var"##embedded_##embedded_##native_type#12755#12913#13375" = ReactiveKernels._plate_argument_type(var"##embedded_##native_type#12830#13398", true)
+                    var"##embedded_##embedded_##native_type#12756#12900#13229" = ReactiveKernels._plate_coordinate_type(var"##embedded_##embedded_##native_type#12754#12955#13189", var"##embedded_##embedded_##native_type#12755#12913#13375")
+                    var"##embedded_##embedded_##native_type#12757#12976#13264" = ReactiveKernels._promote_op(var"##plate_callable#82", var"##embedded_##embedded_##native_type#12737#12918#13262", var"##embedded_##embedded_##native_type#12740#12917#13323", var"##embedded_##embedded_##native_type#12750#12934#13277", var"##embedded_##embedded_##native_type#12753#12940#13274", var"##embedded_##embedded_##native_type#12756#12900#13229", var"##embedded_##embedded_##native_type#12746#12941#13257")
+                    var"##embedded_##embedded_##plate_eltype#12729#12961#13385" = var"##embedded_##embedded_##plate_eltype#12564#12991#13326"
+                    local var"##plate_logit#12733"
+                    local var"##plate_value#12734"
+                    var"##embedded_##embedded_##plate_total#12758#12964#13360" = ReactiveKernels._plate_total_seed(var"##embedded_##embedded_##plate_eltype#12729#12961#13385", var"##embedded_##embedded_##plate_axis#12537#12873#13343")
+                    var"##embedded_##embedded___plate_value__#12956#13270" = ReactiveKernels._plate_total_value(var"##embedded_##embedded_##plate_total#12758#12964#13360")
+                end
+                var"##embedded_##embedded___plate_value___11#12853#13190" = var"##embedded_##embedded_argument_log_weight#12850#13294" + var"##embedded_##embedded___plate_value__#12956#13270"
+                var"##embedded_##plate_nested_result#12810#13302" = var"##embedded_##embedded___plate_value___11#12853#13190"
+                var"##embedded_##plate_total#12809#13218" = ReactiveKernels._plate_total_add(LogExpFunctions.logsumexp, var"##embedded_##plate_total#12809#13218", var"##embedded_##plate_nested_result#12810#13302")
+            end
+        end
+        var"##embedded___return__#13369" = ReactiveKernels._plate_total_value(var"##embedded_##plate_total#12809#13218")
+        local var"##embedded__ppl_density#13290"::Float64
+        var"##embedded__ppl_density#13290" = var"##embedded___return__#13369"
+        var"##plate_nested_result#13084" = var"##embedded__ppl_density#13290"
+        var"##plate_total#13083" = ReactiveKernels._plate_total_add(var"##plate_total#13083", var"##plate_nested_result#13084")
+    end
+    var"##plate_total#13083"
+end))(var"##plate_argument#12455", var"##plate_argument#12457", var"##plate_argument#12459", var"##plate_argument#12461", var"##plate_argument#12463", var"##plate_argument#12465", __cache_apply__, __caches__, mean_p, omega, var"##plate_axes#12467", sigma, eps_raw, var"##plate_total#13083", __callables__[140], __callables__[44], __callables__[45], __callables__[46], __callables__[47], __callables__[48], __callables__[49], __callables__[50], __callables__[51], __callables__[52], __callables__[53], __callables__[59], __callables__[62], __callables__[63], __callables__[61], __callables__[55], __callables__[64], __callables__[57], __callables__[58], __callables__[75], __callables__[79], __callables__[80], __callables__[77], __callables__[78], __callables__[81], __callables__[82], __callables__[84], __callables__[89], __callables__[92], __callables__[93], __callables__[94], __callables__[96], __callables__[95], __callables__[97], __callables__[98], __callables__[101], __callables__[103], __callables__[104], __callables__[105], __callables__[106], __callables__[107], __callables__[108], __callables__[109], __callables__[110], __callables__[112], __callables__[111], __callables__[113])
+      end
+      _ppl_prior_histories = ReactiveKernels._plate_total_value(var"##plate_total#13083")
+      var"_ppl_prior_omega.logpdf__valid" = (var"_ppl_prior_omega.valid_bounds" & (omega >= var"_ppl_prior_omega.lower")) & (omega <= var"_ppl_prior_omega.upper")
+      _ppl_prior_omega = if var"_ppl_prior_omega.logpdf__valid"
+              -(ReactiveKernelsDistributionKernels.DistributionKernelSources.log(var"_ppl_prior_omega.width"))
+          else
+              -ReactiveKernelsDistributionKernels.DistributionKernelSources.Inf
+          end
+      var"_ppl_prior_gamma.standardized" = (__callables__[118])(gamma, var"_ppl_prior_gamma.location", var"_ppl_prior_gamma.scale")
+      var"_ppl_prior_gamma.standard.logpdf" = -0.5 * ReactiveKernelsDistributionKernels.DistributionKernelSources.log(2 * ReactiveKernelsDistributionKernels.DistributionKernelSources.π) - 0.5 * var"_ppl_prior_gamma.standardized" ^ 2
+      _ppl_prior_gamma = (__callables__[120])(var"_ppl_prior_gamma.standard.logpdf", var"_ppl_prior_gamma.scale", gamma, var"_ppl_prior_gamma.location", var"_ppl_prior_gamma.log_scale")
+      var"_ppl_prior_sigma.logpdf__valid" = (var"_ppl_prior_sigma.valid_bounds" & (sigma >= var"_ppl_prior_sigma.lower")) & (sigma <= var"_ppl_prior_sigma.upper")
+      _ppl_prior_sigma = if var"_ppl_prior_sigma.logpdf__valid"
+              -(ReactiveKernelsDistributionKernels.DistributionKernelSources.log(var"_ppl_prior_sigma.width"))
+          else
+              -ReactiveKernelsDistributionKernels.DistributionKernelSources.Inf
+          end
+      var"##plate_axis#13420" = mean_p
+      var"##plate_argument#13421" = Base.broadcastable(mean_p)
+      var"##plate_axes#13423" = ReactiveKernels._plate_require_axes(ReactiveKernels._plate_broadcast_shape((Base.axes(var"##plate_argument#13421"),)))
+      var"##native_type#13434" = ReactiveKernels._promote_op(__callables__[123])
+      var"##native_type#13435" = ReactiveKernels._promote_op(__callables__[124])
+      var"##native_type#13436" = ReactiveKernels._promote_op(__callables__[126], var"##native_type#13434", var"##native_type#13435")
+      var"##native_type#13437" = Base.eltype(var"##plate_argument#13421")
+      var"##native_type#13438" = ReactiveKernels._promote_op(__callables__[127], var"##native_type#13436", var"##native_type#13437", var"##native_type#13434", var"##native_type#13435")
+      var"##native_type#13439" = ReactiveKernels._promote_op(__callables__[125], var"##native_type#13435", var"##native_type#13434")
+      var"##native_type#13440" = ReactiveKernels._promote_op(__callables__[128], var"##native_type#13438", var"##native_type#13439")
+      var"##plate_eltype#13424" = Float64
+      var"##plate_total#13445" = ReactiveKernels._plate_total_seed(var"##plate_eltype#13424", var"##plate_axis#13420")
+      local var"##arm___plate_value__#13453"
+      var"##arm_ready#13452" = false
+      if !(Base.isempty(Base.CartesianIndices(var"##plate_axes#13423")))
+          (var"##arm_ready#13452", var"##plate_total#13445") = ((function (var"##plate_argument#13421", var"##plate_axes#13423", var"##arm_ready#13452", var"##plate_total#13445", var"##plate_callable#125", var"##plate_callable#126", var"##plate_callable#128", var"##plate_callable#129")
+    local var"##arm___plate_value__#13453"
+    var"##plate_prepared#13422" = Base.Broadcast.preprocess(nothing, var"##plate_argument#13421")
+    var"##plate_##lower_binding#712100006165000023#13428" = 0.0
+    var"##plate_##upper_binding#712100006165000024#13429" = 1.0
+    var"##plate_width#13430" = var"##plate_callable#125"(var"##plate_##upper_binding#712100006165000024#13429", var"##plate_##lower_binding#712100006165000023#13428")
+    var"##plate_valid_bounds#13431" = var"##plate_callable#126"(var"##plate_##lower_binding#712100006165000023#13428", var"##plate_##upper_binding#712100006165000024#13429")
+    begin
+        #= simdloop.jl:69 =#
+        let var"#2621#r" = ReactiveKernels._plate_simd_cells(var"##plate_axes#13423")
+            #= simdloop.jl:70 =#
+            for var"#2622#j" = (Base.SimdLoop.Base).simd_outer_range(var"#2621#r")
+                #= simdloop.jl:71 =#
+                let var"#2623#n" = (Base.SimdLoop.Base).simd_inner_length(var"#2621#r", var"#2622#j")
+                    #= simdloop.jl:72 =#
+                    if Base.SimdLoop.zero(var"#2623#n") < var"#2623#n"
+                        #= simdloop.jl:74 =#
+                        let var"#2624#i" = Base.SimdLoop.zero(var"#2623#n")
+                            #= simdloop.jl:75 =#
+                            while var"#2624#i" < var"#2623#n"
+                                #= simdloop.jl:76 =#
+                                local var"##plate_linear#13455" = (Base.SimdLoop.Base).simd_index(var"#2621#r", var"#2622#j", var"#2624#i")
+                                #= simdloop.jl:77 =#
+                                begin
+                                    var"##plate_index#13425" = Base.CartesianIndex(var"##plate_linear#13455")
+                                    var"##plate_logpdf__valid#13432" = (var"##plate_valid_bounds#13431" & (begin
+                                                        $(Expr(:inbounds, true))
+                                                        local var"##inbounds_value#13447" = ReactiveKernels._plate_read(var"##plate_argument#13421", var"##plate_index#13425")
+                                                        $(Expr(:inbounds, :pop))
+                                                        var"##inbounds_value#13447"
+                                                    end >= var"##plate_##lower_binding#712100006165000023#13428")) & (begin
+                                                    $(Expr(:inbounds, true))
+                                                    local var"##inbounds_value#13447" = ReactiveKernels._plate_read(var"##plate_argument#13421", var"##plate_index#13425")
+                                                    $(Expr(:inbounds, :pop))
+                                                    var"##inbounds_value#13447"
+                                                end <= var"##plate_##upper_binding#712100006165000024#13429")
+                                    var"##plate_logpdf#13433" = if (getfield(var"##plate_callable#128", :condition))(var"##plate_logpdf__valid#13432")
+                                            if !var"##arm_ready#13452"
+                                                var"##arm___plate_value__#13453" = var"##plate_callable#129"(var"##plate_width#13430")
+                                                var"##arm_ready#13452" = true
+                                            end
+                                            var"##arm___plate_value__#13453"
+                                        else
+                                            (getfield(var"##plate_callable#128", :else_arm))()
+                                        end
+                                    var"##plate_total#13445" = ReactiveKernels._plate_total_add(var"##plate_total#13445", var"##plate_logpdf#13433")
+                                end
+                                #= simdloop.jl:78 =#
+                                var"#2624#i" += 1
+                                #= simdloop.jl:79 =#
+                                $(Expr(:loopinfo, Symbol("julia.simdloop"), nothing))
+                                #= simdloop.jl:80 =#
+                            end
+                        end
+                    end
+                end
+                #= simdloop.jl:84 =#
+            end
+        end
+        #= simdloop.jl:86 =#
+        Base.SimdLoop.nothing
+    end
+    (var"##arm_ready#13452", var"##plate_total#13445")
+end))(var"##plate_argument#13421", var"##plate_axes#13423", var"##arm_ready#13452", var"##plate_total#13445", __callables__[125], __callables__[126], __callables__[128], __callables__[129])
+      end
+      _ppl_prior_mean_p = ReactiveKernels._plate_total_value(var"##plate_total#13445")
+      var"##plate_axis#13456" = eps_raw
+      var"##plate_argument#13457" = Base.broadcastable(eps_raw)
+      var"##plate_axes#13459" = ReactiveKernels._plate_require_axes(ReactiveKernels._plate_broadcast_shape((Base.axes(var"##plate_argument#13457"),)))
+      var"##native_type#13470" = Base.eltype(var"##plate_argument#13457")
+      var"##native_type#13471" = ReactiveKernels._promote_op(__callables__[130])
+      var"##native_type#13472" = ReactiveKernels._promote_op(__callables__[131])
+      var"##native_type#13473" = ReactiveKernels._promote_op(__callables__[133], var"##native_type#13470", var"##native_type#13471", var"##native_type#13472")
+      var"##native_type#13474" = ReactiveKernels._promote_op(__callables__[134], var"##native_type#13473")
+      var"##native_type#13475" = ReactiveKernels._promote_op(__callables__[132], var"##native_type#13472")
+      var"##native_type#13476" = ReactiveKernels._promote_op(__callables__[135], var"##native_type#13474", var"##native_type#13472", var"##native_type#13470", var"##native_type#13471", var"##native_type#13475")
+      var"##plate_eltype#13460" = Float64
+      var"##plate_total#13478" = ReactiveKernels._plate_total_seed(var"##plate_eltype#13460", var"##plate_axis#13456")
+      if !(Base.isempty(Base.CartesianIndices(var"##plate_axes#13459")))
+          var"##plate_total#13478" = ((function (var"##plate_argument#13457", var"##plate_axes#13459", var"##plate_total#13478", var"##plate_callable#132")
+    var"##plate_prepared#13458" = Base.Broadcast.preprocess(nothing, var"##plate_argument#13457")
+    var"##plate_##location_binding#712100006165000033#13464" = 0.0
+    var"##plate_##scale_binding#712100006165000034#13465" = 1.0
+    var"##plate_log_scale#13466" = var"##plate_callable#132"(var"##plate_##scale_binding#712100006165000034#13465")
+    begin
+        #= simdloop.jl:69 =#
+        begin
+            var"##plate_total#13478#factored_count" = Base.length(Base.CartesianIndices(var"##plate_axes#13459"))
+            var"##plate_total#13478#factored" = (var"##plate_total#13478#factored_count" > 0 && !(var"##plate_##scale_binding#712100006165000034#13465" == 0)) && var"##plate_total#13478" isa Base.Number
+            #= /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/summed_plate_factors.jl:436 =#
+            if var"##plate_total#13478#factored"
+                #= /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/summed_plate_factors.jl:437 =#
+                var"##plate_total#13478#factored_partial" = ReactiveKernels._plate_run_seed(var"##plate_total#13478")
+                #= /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/summed_plate_factors.jl:438 =#
+                let var"#2644#r" = ReactiveKernels._plate_simd_cells(var"##plate_axes#13459")
+                    #= simdloop.jl:70 =#
+                    for var"#2645#j" = (Base.SimdLoop.Base).simd_outer_range(var"#2644#r")
+                        #= simdloop.jl:71 =#
+                        let var"#2646#n" = (Base.SimdLoop.Base).simd_inner_length(var"#2644#r", var"#2645#j")
+                            #= simdloop.jl:72 =#
+                            if Base.SimdLoop.zero(var"#2646#n") < var"#2646#n"
+                                #= simdloop.jl:74 =#
+                                let var"#2647#i" = Base.SimdLoop.zero(var"#2646#n")
+                                    #= simdloop.jl:75 =#
+                                    while var"#2647#i" < var"#2646#n"
+                                        #= simdloop.jl:76 =#
+                                        local var"##plate_linear#13492" = (Base.SimdLoop.Base).simd_index(var"#2644#r", var"#2645#j", var"#2647#i")
+                                        #= simdloop.jl:77 =#
+                                        begin
+                                            var"##plate_index#13461" = Base.CartesianIndex(var"##plate_linear#13492")
+                                            var"##plate_total#13478#factored_read_1" = begin
+                                                    $(Expr(:inbounds, true))
+                                                    local var"##plate_total#13478#factored_read_1_value" = ReactiveKernels._plate_read(var"##plate_argument#13457", var"##plate_index#13461")
+                                                    $(Expr(:inbounds, :pop))
+                                                    var"##plate_total#13478#factored_read_1_value"
+                                                end
+                                            var"##plate_standardized#13467" = (var"##plate_total#13478#factored_read_1" - var"##plate_##location_binding#712100006165000033#13464") / var"##plate_##scale_binding#712100006165000034#13465"
+                                            var"##plate_total#13478#factored_term" = var"##plate_standardized#13467" ^ 2
+                                            var"##plate_total#13478#factored_partial" = ReactiveKernels._plate_total_add(var"##plate_total#13478#factored_partial", var"##plate_total#13478#factored_term")
+                                        end
+                                        #= simdloop.jl:78 =#
+                                        var"#2647#i" += 1
+                                        #= simdloop.jl:79 =#
+                                        $(Expr(:loopinfo, Symbol("julia.simdloop"), nothing))
+                                        #= simdloop.jl:80 =#
+                                    end
+                                end
+                            end
+                        end
+                        #= simdloop.jl:84 =#
+                    end
+                end
+                #= /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/summed_plate_factors.jl:439 =#
+                begin
+                    #= /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/summed_plate_factors.jl:432 =#
+                    var"##plate_total#13478#factored_total" = var"##plate_total#13478#factored_count" * (ReactiveKernels._native_mul(-0.5, ReactiveKernelsDistributionKernels.DistributionKernelSources.log(ReactiveKernels._native_mul(2, ReactiveKernelsDistributionKernels.DistributionKernelSources.π))) - var"##plate_log_scale#13466") + -0.5 * var"##plate_total#13478#factored_partial"
+                    #= /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/summed_plate_factors.jl:433 =#
+                    var"##plate_total#13478" = ReactiveKernels._plate_total_add(var"##plate_total#13478", var"##plate_total#13478#factored_total")
+                end
+            end
+            #= /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/summed_plate_factors.jl:441 =#
+            if !var"##plate_total#13478#factored"
+                #= /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/summed_plate_factors.jl:442 =#
+                let var"#2644#r" = ReactiveKernels._plate_simd_cells(var"##plate_axes#13459")
+                    #= simdloop.jl:70 =#
+                    for var"#2645#j" = (Base.SimdLoop.Base).simd_outer_range(var"#2644#r")
+                        #= simdloop.jl:71 =#
+                        let var"#2646#n" = (Base.SimdLoop.Base).simd_inner_length(var"#2644#r", var"#2645#j")
+                            #= simdloop.jl:72 =#
+                            if Base.SimdLoop.zero(var"#2646#n") < var"#2646#n"
+                                #= simdloop.jl:74 =#
+                                let var"#2647#i" = Base.SimdLoop.zero(var"#2646#n")
+                                    #= simdloop.jl:75 =#
+                                    while var"#2647#i" < var"#2646#n"
+                                        #= simdloop.jl:76 =#
+                                        local var"##plate_linear#13492" = (Base.SimdLoop.Base).simd_index(var"#2644#r", var"#2645#j", var"#2647#i")
+                                        #= simdloop.jl:77 =#
+                                        begin
+                                            var"##plate_index#13461" = Base.CartesianIndex(var"##plate_linear#13492")
+                                            var"##plate_standardized#13467" = let var"#x#op133" = begin
+                                                            $(Expr(:inbounds, true))
+                                                            local var"##inbounds_value#13480" = ReactiveKernels._plate_read(var"##plate_argument#13457", var"##plate_index#13461")
+                                                            $(Expr(:inbounds, :pop))
+                                                            var"##inbounds_value#13480"
+                                                        end, var"#location#op133" = var"##plate_##location_binding#712100006165000033#13464", var"#scale#op133" = var"##plate_##scale_binding#712100006165000034#13465"
+                                                    (var"#x#op133" - var"#location#op133") / if var"#scale#op133" == 0 && var"#x#op133" == var"#location#op133"
+                                                            1.0
+                                                        else
+                                                            var"#scale#op133"
+                                                        end
+                                                end
+                                            var"##plate_standard.logpdf#13468" = let var"#z#op134" = var"##plate_standardized#13467"
+                                                    ReactiveKernels._native_mul(-0.5, ReactiveKernelsDistributionKernels.DistributionKernelSources.log(ReactiveKernels._native_mul(2, ReactiveKernelsDistributionKernels.DistributionKernelSources.π))) - ReactiveKernels._native_mul(0.5, var"#z#op134" ^ 2)
+                                                end
+                                            var"##plate_logpdf#13469" = let var"#standard.logpdf#op135" = var"##plate_standard.logpdf#13468", var"#scale#op135" = var"##plate_##scale_binding#712100006165000034#13465", var"#x#op135" = begin
+                                                            $(Expr(:inbounds, true))
+                                                            local var"##inbounds_value#13485" = ReactiveKernels._plate_read(var"##plate_argument#13457", var"##plate_index#13461")
+                                                            $(Expr(:inbounds, :pop))
+                                                            var"##inbounds_value#13485"
+                                                        end, var"#location#op135" = var"##plate_##location_binding#712100006165000033#13464", var"#log_scale#op135" = var"##plate_log_scale#13466"
+                                                    var"#standard.logpdf#op135" - if var"#scale#op135" == 0 && var"#x#op135" != var"#location#op135"
+                                                            0.0
+                                                        else
+                                                            var"#log_scale#op135"
+                                                        end
+                                                end
+                                            var"##plate_total#13478" = ReactiveKernels._plate_total_add(var"##plate_total#13478", var"##plate_logpdf#13469")
+                                        end
+                                        #= simdloop.jl:78 =#
+                                        var"#2647#i" += 1
+                                        #= simdloop.jl:79 =#
+                                        $(Expr(:loopinfo, Symbol("julia.simdloop"), nothing))
+                                        #= simdloop.jl:80 =#
+                                    end
+                                end
+                            end
+                        end
+                        #= simdloop.jl:84 =#
+                    end
+                end
+            end
+        end
+        #= simdloop.jl:86 =#
+        Base.SimdLoop.nothing
+    end
+    var"##plate_total#13478"
+end))(var"##plate_argument#13457", var"##plate_axes#13459", var"##plate_total#13478", __callables__[132])
+      end
+      _ppl_prior_eps_raw = ReactiveKernels._plate_total_value(var"##plate_total#13478")
+      prior = (((_ppl_prior_omega + _ppl_prior_gamma) + _ppl_prior_sigma) + _ppl_prior_mean_p) + _ppl_prior_eps_raw
+      var"##step#13493" = __cache_apply__(__caches__[141], __callables__[141], Base.Broadcast.broadcasted(ReactiveKernelsPPL.PPLGeneratedModels.:-, Base.Broadcast.broadcasted(ReactiveKernelsPPL.PPLGeneratedModels.:-, 0.0, Base.Broadcast.broadcasted(ReactiveKernelsPPL.PPLGeneratedModels.log1pexp, Base.Broadcast.broadcasted(ReactiveKernelsPPL.PPLGeneratedModels.:-, ReactiveKernelsPPL.PPLGeneratedModels.view(unconstrained, 4:_ppl_last_mean_p)))), Base.Broadcast.broadcasted(ReactiveKernelsPPL.PPLGeneratedModels.log1pexp, ReactiveKernelsPPL.PPLGeneratedModels.view(unconstrained, 4:_ppl_last_mean_p))))
+      log_jacobian = (((0.0 - ReactiveKernelsPPL.PPLGeneratedModels.log1pexp(-(Base.getindex(unconstrained, 1)))) - ReactiveKernelsPPL.PPLGeneratedModels.log1pexp(Base.getindex(unconstrained, 1))) + ((ReactiveKernelsPPL.PPLGeneratedModels.log(3.0) - ReactiveKernelsPPL.PPLGeneratedModels.log1pexp(-(Base.getindex(unconstrained, 3)))) - ReactiveKernelsPPL.PPLGeneratedModels.log1pexp(Base.getindex(unconstrained, 3)))) + ReactiveKernelsPPL.PPLGeneratedModels.sum(var"##step#13493")
+      posterior = (__callables__[138])(prior, _ppl_prior_histories, log_jacobian)
+      return posterior
+  end)

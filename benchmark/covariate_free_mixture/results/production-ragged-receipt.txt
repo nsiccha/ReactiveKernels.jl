@@ -1,0 +1,16 @@
+queue position: 0 waiter(s) ahead of you
+pool: held=4/32 longest=tok3/7m08s mem_avail_kb=95388844 next_grant_floor_kb=13628867 load=9.31/9.86/12.02 cpus=32 cores=16 grants_last_hour=46 last_grant=1m02s bound=none
+MEM_OK mem_avail_kb=95382600 floor_kb=13628867 holders=7 reserve_kb=1024000
+TOKEN_ACQUIRED tok1 (queue)
+HOST_LOAD at=grant load=9.31/9.86/12.02 cpus=32 cores=16 holders=7 (a token reserves no CPU: compare timings only at similar load)
+CPU_CAP cpus=1 (standard lane; the run gets at most 1 CPU of time however many threads it starts; thread pools: OPENBLAS_NUM_THREADS=1 (lane), OMP_NUM_THREADS=1 (lane))
+SOURCE_HEAD 0987481070ee9b08b738ef5e201bd2bf843a0d47
+2d969a4a5e4a2ac790e82b7f06e94ad1e2cc79535b8b2fb58064405312adcc77  packages/ReactiveKernelsDistributionKernels/src/distribution_kernel_sources.jl
+86029cd981c8c6364a2158706e70f55858ec5596bcf58a732c4c1d62650c8f20  /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/benchmark/covariate_free_mixture/ragged-logit-tests.jl
+STAGE_BEGIN env=current label=ragged-logit at=2026-11-13T15:34:12+01:00
+Test Summary:                                                    | Pass  Total     Time
+logit-scale whole-event mixture with a structural-zero component |   19     19  4m29.4s
+STAGE_END env=current label=ragged-logit exit=0 at=2026-11-13T15:38:45+01:00
+HOST_LOAD at=release load=18.14/12.58/12.39 held=274s
+MEM_PEAK anon=1.05GiB total=1.09GiB figure=none (anon: the highest anonymous memory read, every 1s, so a last burst can be missed, and what --memory compares; total: the kernel's peak, with file cache it can reclaim)
+[production-ragged-exit] exit=0 at=2026-11-13T15:38:47+01:00
