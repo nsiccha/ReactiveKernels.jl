@@ -1,0 +1,84 @@
+queue position: 0 waiter(s) ahead of you
+pool: held=5/32 longest=tok6/26m37s mem_avail_kb=65060876 next_grant_floor_kb=15676867 load=20.51/20.37/20.38 cpus=32 cores=16 grants_last_hour=45 last_grant=43s bound=none
+MEM_OK mem_avail_kb=65060712 floor_kb=15676867 holders=9 reserve_kb=1024000
+TOKEN_ACQUIRED tok2 (queue)
+HOST_LOAD at=grant load=20.51/20.37/20.38 cpus=32 cores=16 holders=13 (a token reserves no CPU: compare timings only at similar load)
+CPU_CAP cpus=1 (standard lane; the run gets at most 1 CPU of time however many threads it starts; thread pools: OPENBLAS_NUM_THREADS=1 (lane), OMP_NUM_THREADS=1 (lane))
+SOURCE_HEAD 0987481070ee9b08b738ef5e201bd2bf843a0d47
+2d969a4a5e4a2ac790e82b7f06e94ad1e2cc79535b8b2fb58064405312adcc77  packages/ReactiveKernelsDistributionKernels/src/distribution_kernel_sources.jl
+7cf2cb5e0f89ace770ee2806b8e5096ec6e0d26a7737e613738250accdd4d852  /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/benchmark/covariate_free_mixture/paired-counts.jl
+STAGE_BEGIN env=current label=product-mixture-recheck at=2026-11-13T15:01:53+01:00
+Test Summary:                                    | Pass  Total   Time
+one component governs each whole observed vector |    9      9  59.7s
+Test Summary:                                     | Pass  Total   Time
+logit-scale whole-event laws keep saturated tails |   30     30  27.5s
+Test Summary:                                 | Pass  Total  Time
+whole-event laws keep no per-component vector |   12     12  0.7s
+Test Summary:                                               | Pass  Total   Time
+events that share the weights take their logs once per call |   14     14  30.8s
+STAGE_END env=current label=product-mixture-recheck exit=0 at=2026-11-13T15:04:00+01:00
+STAGE_BEGIN env=current label=whole-event-invariants at=2026-11-13T15:04:00+01:00
+Test Summary:                             | Pass  Broken  Total     Time
+natural whole-event invariant expressions |   50       1     51  6m13.7s
+STAGE_END env=current label=whole-event-invariants exit=0 at=2026-11-13T15:10:17+01:00
+RESOLVE_BEGIN env=old at=2026-11-13T15:10:17+01:00
+  7 dependencies successfully precompiled in 388 seconds. 98 already precompiled.
+KB-DOGFOOD-LIBENZYME	eea6a012bc319b5a20d68a945f816dfc0312e4ab	llvm20	/home/niko/.local/state/kb-agents/libenzyme-dogfood/eea6a012bc319b5a20d68a945f816dfc0312e4ab/llvm20
+RESOLVE-ACCEPTANCE-PRECOMPILE	complete	passes=1	checked=103	tolerated=0
+KB-DEVELOPED	ReactiveKernels	0987481070ee9b08b738ef5e201bd2bf843a0d47	/home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad
+KB-DEVELOPED	ReactiveKernelsDistributionKernels	0987481070ee9b08b738ef5e201bd2bf843a0d47	/home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsDistributionKernels
+KB-DEVELOPED	Enzyme	1ed42fb9984ff3f49a8adcba7732382e0f22c9bb	/home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/Enzyme-old
+KB-DEVELOPED	OutputSignatures	f971381f760e91986b3a728a719341e7e7761f55	/home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/OutputSignatures
+KB-DEVELOPED	MutatingFunctions	02eb981b9770e767f47a7fda287fcbfb9531d587	/home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/MutatingFunctions
+KB-DEVELOPED	EnzymeCore	1ed42fb9984ff3f49a8adcba7732382e0f22c9bb	/home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/Enzyme-old/lib/EnzymeCore
+KB-DEVELOPED	ReactiveKernelsPPL	0987481070ee9b08b738ef5e201bd2bf843a0d47	/home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsPPL
+RESOLVE_END env=old exit=0 at=2026-11-13T15:16:55+01:00
+STAGE_BEGIN env=old label=edges at=2026-11-13T15:16:55+01:00
+Test Summary:                                                     | Pass  Total   Time
+Bernoulli mixture counts preserve empty and saturated derivatives |  110    110  52.5s
+Test Summary:                                        | Pass  Total  Time
+full-row Bernoulli mixtures retain runtime iteration |    5      5  0.3s
+STAGE_END env=old label=edges exit=0 at=2026-11-13T15:17:50+01:00
+STAGE_BEGIN env=old label=paired at=2026-11-13T15:17:51+01:00
+(julia = v"1.13.1", enzyme = v"0.13.220", library = "/home/niko/.local/state/kb-agents/libenzyme-dogfood/eea6a012bc319b5a20d68a945f816dfc0312e4ab/llvm20/libEnzyme-20.so", rk = v"0.1.225", rk_path = "/home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad", rkppl = v"0.1.175")
+(julia = v"1.13.1", enzyme = v"0.13.220", library = "/home/niko/.local/state/kb-agents/libenzyme-dogfood/eea6a012bc319b5a20d68a945f816dfc0312e4ab/llvm20/libEnzyme-20.so", rk = v"0.1.225", rk_path = "/home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad", rkppl = v"0.1.175")
+(rk_commit = "0987481070ee9b08b738ef5e201bd2bf843a0d47", baseline_sha256 = "ee75fca526af2a6b70403036aaba5a67e524177e64145c23241bd86a29eed6b8", driver_sha256 = "7cf2cb5e0f89ace770ee2806b8e5096ec6e0d26a7737e613738250accdd4d852", common_sha256 = "4c275d906b5f381c9e848f43ca4de5ad21012d1172543cfb0daea696fbba0f80", law_source_sha256 = "2d969a4a5e4a2ac790e82b7f06e94ad1e2cc79535b8b2fb58064405312adcc77")
+(N = 1, initial_gradient_error = 0.0, changed_gradient_error = 0.0, baseline = (native = (malloc = 0x000000000000000e, calloc = 0x0000000000000000, realloc = 0x0000000000000000, free = 0x000000000000000e, requested_bytes = (malloc = 0x0000000000000190, calloc = 0x0000000000000000, realloc = 0x0000000000000000)), julia_bytes = 96, structure = (1197, 9), bound_bytes = 562), counts = (native = (malloc = 0x000000000000000f, calloc = 0x0000000000000000, realloc = 0x0000000000000000, free = 0x000000000000000f, requested_bytes = (malloc = 0x00000000000001a4, calloc = 0x0000000000000000, realloc = 0x0000000000000000)), julia_bytes = 96, structure = (1653, 13), bound_bytes = 573))
+(N = 1, baseline_median_us = 0.9003939393939395, counts_median_us = 0.9463214285714285, ratio = 1.051008216701684, load_before = "13.74 13.30 15.20 10/2899 269866", load_after = "13.36 13.23 15.16 35/2900 271497")
+(N = 11, initial_gradient_error = 0.0, changed_gradient_error = 0.0, baseline = (native = (malloc = 0x0000000000000018, calloc = 0x0000000000000000, realloc = 0x0000000000000000, free = 0x0000000000000018, requested_bytes = (malloc = 0x00000000000007d0, calloc = 0x0000000000000000, realloc = 0x0000000000000000)), julia_bytes = 96, structure = (1197, 9), bound_bytes = 2662), counts = (native = (malloc = 0x000000000000000f, calloc = 0x0000000000000000, realloc = 0x0000000000000000, free = 0x000000000000000f, requested_bytes = (malloc = 0x00000000000008ac, calloc = 0x0000000000000000, realloc = 0x0000000000000000)), julia_bytes = 96, structure = (1653, 13), bound_bytes = 2303))
+(N = 11, baseline_median_us = 2.256923076923077, counts_median_us = 2.1715384615384616, ratio = 0.9621676891615543, load_before = "13.36 13.23 15.16 15/2888 272975", load_after = "13.01 13.16 15.13 15/2958 274937")
+(N = 146, initial_gradient_error = 0.0, changed_gradient_error = 0.0, baseline = (native = (malloc = 0x000000000000009f, calloc = 0x0000000000000000, realloc = 0x0000000000000000, free = 0x000000000000009f, requested_bytes = (malloc = 0x0000000000005c30, calloc = 0x0000000000000000, realloc = 0x0000000000000000)), julia_bytes = 96, structure = (1197, 9), bound_bytes = 31012), counts = (native = (malloc = 0x000000000000000f, calloc = 0x0000000000000000, realloc = 0x0000000000000000, free = 0x000000000000000f, requested_bytes = (malloc = 0x0000000000006798, calloc = 0x0000000000000000, realloc = 0x0000000000000000)), julia_bytes = 96, structure = (1653, 13), bound_bytes = 25658))
+(N = 146, baseline_median_us = 23.0, counts_median_us = 19.815, ratio = 0.8615217391304348, load_before = "13.01 13.16 15.13 10/3013 275230", load_after = "12.69 13.09 15.10 9/3028 276129")
+STAGE_END env=old label=paired exit=0 at=2026-11-13T15:22:18+01:00
+RESOLVE_BEGIN env=registry at=2026-11-13T15:22:18+01:00
+ 101.3 s  ✓ ReactiveKernelsDistributionKernels
+ 160.9 s  ✓ ReactiveKernelsPPL
+   1.5 s  ✓ ReactiveKernelsPPL → ReactiveKernelsPPLDistributionsExt
+  8 dependencies successfully precompiled in 381 seconds. 135 already precompiled.
+RESOLVE-ACCEPTANCE-PRECOMPILE	complete	passes=1	checked=139	tolerated=0
+KB-DEVELOPED	ReactiveKernels	0987481070ee9b08b738ef5e201bd2bf843a0d47	/home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad
+KB-DEVELOPED	ReactiveKernelsDistributionKernels	0987481070ee9b08b738ef5e201bd2bf843a0d47	/home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsDistributionKernels
+KB-DEVELOPED	OutputSignatures	f971381f760e91986b3a728a719341e7e7761f55	/home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/OutputSignatures
+KB-DEVELOPED	MutatingFunctions	02eb981b9770e767f47a7fda287fcbfb9531d587	/home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/MutatingFunctions
+KB-DEVELOPED	ReactiveKernelsPPL	0987481070ee9b08b738ef5e201bd2bf843a0d47	/home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsPPL
+RESOLVE_END env=registry exit=0 at=2026-11-13T15:28:46+01:00
+STAGE_BEGIN env=registry label=edges at=2026-11-13T15:28:46+01:00
+Test Summary:                                                     | Pass  Total   Time
+Bernoulli mixture counts preserve empty and saturated derivatives |  110    110  49.2s
+Test Summary:                                        | Pass  Total  Time
+full-row Bernoulli mixtures retain runtime iteration |    5      5  0.2s
+STAGE_END env=registry label=edges exit=0 at=2026-11-13T15:29:38+01:00
+STAGE_BEGIN env=registry label=paired at=2026-11-13T15:29:38+01:00
+(julia = v"1.13.1", enzyme = v"0.13.219", library = "/home/niko/.julia/artifacts/e1daa6b140cf75505b106c5ec781e57c2beaae0a/lib/libEnzyme-20.so", rk = v"0.1.225", rk_path = "/home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad", rkppl = v"0.1.175")
+(julia = v"1.13.1", enzyme = v"0.13.219", library = "/home/niko/.julia/artifacts/e1daa6b140cf75505b106c5ec781e57c2beaae0a/lib/libEnzyme-20.so", rk = v"0.1.225", rk_path = "/home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad", rkppl = v"0.1.175")
+(rk_commit = "0987481070ee9b08b738ef5e201bd2bf843a0d47", baseline_sha256 = "ee75fca526af2a6b70403036aaba5a67e524177e64145c23241bd86a29eed6b8", driver_sha256 = "7cf2cb5e0f89ace770ee2806b8e5096ec6e0d26a7737e613738250accdd4d852", common_sha256 = "4c275d906b5f381c9e848f43ca4de5ad21012d1172543cfb0daea696fbba0f80", law_source_sha256 = "2d969a4a5e4a2ac790e82b7f06e94ad1e2cc79535b8b2fb58064405312adcc77")
+(N = 1, initial_gradient_error = 0.0, changed_gradient_error = 0.0, baseline = (native = (malloc = 0x000000000000001c, calloc = 0x0000000000000000, realloc = 0x0000000000000000, free = 0x000000000000001c, requested_bytes = (malloc = 0x0000000000000202, calloc = 0x0000000000000000, realloc = 0x0000000000000000)), julia_bytes = 96, structure = (1197, 9), bound_bytes = 562), counts = (native = (malloc = 0x000000000000001f, calloc = 0x0000000000000000, realloc = 0x0000000000000000, free = 0x000000000000001f, requested_bytes = (malloc = 0x00000000000001ee, calloc = 0x0000000000000000, realloc = 0x0000000000000000)), julia_bytes = 96, structure = (1653, 13), bound_bytes = 573))
+(N = 1, baseline_median_us = 1.1428000000000003, counts_median_us = 1.1714375000000001, ratio = 1.0250590654532725, load_before = "10.55 10.12 12.20 11/2885 664022", load_after = "10.50 10.12 12.19 8/2884 665693")
+(N = 11, initial_gradient_error = 0.0, changed_gradient_error = 0.0, baseline = (native = (malloc = 0x000000000000006c, calloc = 0x0000000000000000, realloc = 0x0000000000000000, free = 0x000000000000006c, requested_bytes = (malloc = 0x0000000000000bee, calloc = 0x0000000000000000, realloc = 0x0000000000000000)), julia_bytes = 96, structure = (1197, 9), bound_bytes = 2662), counts = (native = (malloc = 0x000000000000001f, calloc = 0x0000000000000000, realloc = 0x0000000000000000, free = 0x000000000000001f, requested_bytes = (malloc = 0x0000000000000b12, calloc = 0x0000000000000000, realloc = 0x0000000000000000)), julia_bytes = 96, structure = (1653, 13), bound_bytes = 2303))
+(N = 11, baseline_median_us = 3.703095238095238, counts_median_us = 2.131147435897436, ratio = 0.5755043548363166, load_before = "10.50 10.12 12.19 8/2873 666245", load_after = "10.30 10.08 12.16 9/2883 670332")
+(N = 146, initial_gradient_error = 0.0, changed_gradient_error = 0.0, baseline = (native = (malloc = 0x00000000000004a4, calloc = 0x0000000000000000, realloc = 0x0000000000000000, free = 0x00000000000004a4, requested_bytes = (malloc = 0x00000000000091e0, calloc = 0x0000000000000000, realloc = 0x0000000000000000)), julia_bytes = 96, structure = (1197, 9), bound_bytes = 31012), counts = (native = (malloc = 0x000000000000001f, calloc = 0x0000000000000000, realloc = 0x0000000000000000, free = 0x000000000000001f, requested_bytes = (malloc = 0x0000000000008678, calloc = 0x0000000000000000, realloc = 0x0000000000000000)), julia_bytes = 96, structure = (1653, 13), bound_bytes = 25658))
+(N = 146, baseline_median_us = 43.275000000000006, counts_median_us = 18.955, ratio = 0.43801270941652215, load_before = "10.30 10.08 12.16 11/2880 670521", load_after = "10.20 10.06 12.15 13/2989 673744")
+STAGE_END env=registry label=paired exit=0 at=2026-11-13T15:33:46+01:00
+HOST_LOAD at=release load=10.10/10.05/12.13 held=1915s
+MEM_PEAK anon=3.01GiB total=3.81GiB figure=none (anon: the highest anonymous memory read, every 1s, so a last burst can be missed, and what --memory compares; total: the kernel's peak, with file cache it can reclaim)
+[production-other-exit] exit=0 at=2026-11-13T15:33:48+01:00

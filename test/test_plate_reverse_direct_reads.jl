@@ -151,6 +151,43 @@ end
     @test err isa RK._PRIneligible
 end
 
+seeded_plate(program, x, seed) = seed * program(x)
+
+@testset "tuple operands return cotangents through ordinary reverse" begin
+    # Compile one runtime loop. The same source and rule also accept arrays
+    # of changing length; tuple lengths are inherent in their Julia types.
+    ast = direct_program()
+    rexpr, scalar, batched = RK._pr_program_reverse(ast, [:x], RK, Dict{Symbol,Any}())
+    @test isempty(scalar)
+    @test batched == [:x]
+    # @simd may wrap the runtime iteration in additional loops.
+    @test last(structure(ast)) > 0
+    primal, reverse = RK.compile(ast), RK.compile(rexpr)
+    rule = RK._PlateSumRule{(),(1,),typeof(primal),typeof(reverse)}(primal, reverse)
+    ext = Base.get_extension(RK, :ReactiveKernelsEnzymeExt)
+    for n in (1, 3, 17), seed in (1.0, 1.7, -0.4)
+        x = ntuple(i -> 0.2 * cos(i), n)
+        expected = seed .* cos.(x)
+        @test @inferred(ext._pr_reverse_return(Val(()), (Enzyme.Active(x),), (),
+            Val((1,)), (collect(expected),))) == (expected,)
+        gradients = map((primal, rule)) do program
+            first(Enzyme.autodiff(Enzyme.Reverse, seeded_plate, Enzyme.Active,
+                Enzyme.Const(program), Enzyme.Active(x), Enzyme.Const(seed)))[2]
+        end
+        @test collect(gradients[1]) ≈ collect(expected)
+        @test collect(gradients[2]) ≈ collect(gradients[1])
+        @test seeded_plate(rule, x, seed) ≈ seed * sum(sin, x; init = 0.0)
+    end
+    for n in (0, 1, 73, 7)
+        x = [0.2 * cos(i) for i in 1:n]
+        dx = zeros(n)
+        Enzyme.autodiff(Enzyme.Reverse, seeded_plate, Enzyme.Active,
+            Enzyme.Const(rule), Enzyme.Duplicated(x, dx), Enzyme.Const(1.7))
+        @test dx ≈ 1.7 .* cos.(x)
+        @test rule(x) ≈ sum(sin, x; init = 0.0)
+    end
+end
+
 @testset "branch-specific terminal totals use the output adjoint" begin
     function arm(total, density)
         ast = direct_program(; density)

@@ -1,0 +1,89 @@
+# Independent modules keep each model's prepared function and measurement
+# closure concretely typed; neither model overrides production methods.
+using ReactiveKernels, ReactiveKernelsPPL, ReactiveKernelsDistributionKernels
+using Chairmarks, JSON, SHA
+Base.include(ReactiveKernelsDistributionKernels.DistributionKernelSources,
+    joinpath(@__DIR__, "counts-law.jl"))
+module BaselineDriver
+include(joinpath(@__DIR__, "portable-bench.jl"))
+end
+module CountsDriver
+path = joinpath(@__DIR__, "portable-bench.jl")
+source = replace(read(path, String),
+    "bernoulli_logit_product_mixture_logdensity" => "counts_product_mixture")
+include_string(@__MODULE__, source, path)
+end
+
+Base.include(BaselineDriver, joinpath(@__DIR__, "full-counter-method.jl"))
+
+function gradient_only!(case)
+    sampler_value_and_gradient!(case.sampler, case.g, case.u)
+    nothing
+end
+function gradient_stats(case)
+    f() = gradient_only!(case)
+    f(); f()
+    (; native=BaselineDriver.native_counts(f), julia_bytes=@allocated(f()),
+        structure=BaselineDriver.structure(code_expr(case.sampler.kernel)),
+        bound_bytes=Base.summarysize(case.sampler.kernel.constants))
+end
+function time_gradient(case)
+    f() = gradient_only!(case)
+    minimum(Chairmarks.benchmark(nothing, f, _->nothing; seconds=0.1)).time*1e6
+end
+function check_and_measure(a, b)
+    @assert a.u == b.u
+    @assert isapprox(a.value, b.value; rtol=2e-13, atol=2e-13)
+    @assert isapprox(a.g, b.g; rtol=2e-13, atol=2e-13)
+    initial_gradient_error = maximum(abs.(a.g .- b.g); init=0.0)
+    saved_u = copy(a.u)
+    changed_gradient_error = 0.0
+    for scale in (0.03, -0.1)
+        for j in eachindex(a.u)
+            a.u[j] = saved_u[j] + scale*cos(j)
+            b.u[j] = a.u[j]
+        end
+        va, _ = sampler_value_and_gradient!(a.sampler, a.g, a.u)
+        vb, _ = sampler_value_and_gradient!(b.sampler, b.g, b.u)
+        @assert isapprox(va, vb; rtol=2e-13, atol=2e-13)
+        @assert isapprox(a.g, b.g; rtol=2e-13, atol=2e-13)
+        changed_gradient_error = max(changed_gradient_error,
+            maximum(abs.(a.g .- b.g); init=0.0))
+    end
+    copyto!(a.u, saved_u); copyto!(b.u, saved_u)
+    gradient_only!(a); gradient_only!(b)
+    println((; N=a.N, initial_gradient_error, changed_gradient_error,
+        baseline=gradient_stats(a), counts=gradient_stats(b)))
+    at, bt = Float64[], Float64[]
+    load_before = strip(read("/proc/loadavg", String))
+    for round in 1:20
+        if isodd(round)
+            push!(at, time_gradient(a)); push!(bt, time_gradient(b))
+        else
+            push!(bt, time_gradient(b)); push!(at, time_gradient(a))
+        end
+    end
+    println((; N=a.N, baseline_median_us=BaselineDriver.median(at),
+        counts_median_us=BaselineDriver.median(bt),
+        ratio=BaselineDriver.median(bt)/BaselineDriver.median(at),
+        load_before, load_after=strip(read("/proc/loadavg", String))))
+    if haskey(ENV, "DUMP_PREFIX")
+        for (label, case) in (("baseline", a), ("counts", b))
+            prefix = ENV["DUMP_PREFIX"] * "-$label-N$(case.N)"
+            open(prefix * "-program.txt", "w") do io
+                show(io, Base.remove_linenums!(deepcopy(code_expr(case.sampler.kernel))))
+                println(io)
+            end
+        end
+    end
+    flush(stdout)
+end
+
+println((; driver_sha256=bytes2hex(sha256(read(@__FILE__))),
+    common_sha256=bytes2hex(sha256(read(joinpath(@__DIR__, "portable-bench.jl")))),
+    law_sha256=bytes2hex(sha256(read(joinpath(@__DIR__, "counts-law.jl"))))))
+fixture = JSON.parsefile(joinpath(@__DIR__, "fixture.json"))
+for N in parse.(Int, split(get(ENV, "EVENT_COUNTS", "1,11,146"), ','))
+    check_and_measure(BaselineDriver.make_case(N, fixture),
+        CountsDriver.make_case(N, fixture))
+end

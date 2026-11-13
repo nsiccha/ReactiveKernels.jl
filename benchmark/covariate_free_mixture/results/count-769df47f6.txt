@@ -1,0 +1,3 @@
+(tag = "769df47f6", julia = v"1.13.1", enzyme = v"0.13.220", library = "/home/niko/.local/state/kb-agents/libenzyme-dogfood/eea6a012bc319b5a20d68a945f816dfc0312e4ab/llvm20/libEnzyme-20.so", rk = v"0.1.206", rk_dir = "/home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/rk-bisect", rkppl = v"0.1.166", count = true)
+PREPARED nocov in 160.3 s; value -480.2676232908929; grad[1:3] [26.46820230941377, -0.011920608730989, -9.596994955614804]; gradsum -13.30570971479065
+NATIVE nocov gradient (malloc = 12, free = 12)

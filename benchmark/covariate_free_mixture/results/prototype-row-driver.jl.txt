@@ -1,0 +1,18 @@
+using ReactiveKernels, ReactiveKernelsDistributionKernels
+mode = get(ENV, "ROW_LAW", "canonical")
+if mode !== "canonical"
+    mode in ("stride", "extent", "counts") || error("Unknown row law: $mode")
+    Base.include(ReactiveKernelsDistributionKernels.DistributionKernelSources,
+        joinpath(@__DIR__, "$mode-law.jl"))
+end
+file = joinpath(pkgdir(ReactiveKernelsDistributionKernels), "test", "test_product_mixture_rows.jl")
+source = read(file, String)
+if mode !== "canonical"
+    source = replace(source, "bernoulli_logit_product_mixture_logdensity" => "$(mode)_product_mixture")
+end
+# Repair only the diagnostic traversal; retain every existing assertion.
+# _PlateProgram.ast is the actual emitted loop body, not a presentation view.
+source = replace(source, "function structure(ex)\n" =>
+    "function structure(ex)\n    ex isa ReactiveKernels._PlateProgram && return structure(ex.ast)\n")
+println("ROW_LAW_TEST mode=", mode, " walker_descends_plate_program=true")
+include_string(Main, source, file)
