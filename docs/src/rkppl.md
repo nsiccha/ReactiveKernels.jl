@@ -99,9 +99,12 @@ its centering and returns draws in the original model frame. A cell can set
 `target = 1.0` for an authored centered coordinate and `source` for a different
 initial sampler frame. Zero means non-centered; one means centered.
 
-The location and log-scale may be scalars or arrays matching the latent shape.
-Their values and derivatives come from the graph, including dependencies on
-unselected latent parameters. The adapter selects identity-transformed real
+Each location or log-scale accepts either a `Real` constant shared by the
+block or a symbol naming a scalar or latent-shaped array in the model graph.
+For a zero-centered block, use
+`cells = (z = (location = 0.0, log_scale = :z_log_scale),)`;
+the zero needs no declaration in the model. Graph values and their derivatives
+may depend on unselected latent parameters. The adapter selects identity-transformed real
 coordinates, without changing their priors. For example, a real ICAR block
 keeps its ICAR density and any soft sum constraint.
 

@@ -13,10 +13,13 @@ exports a different `adaptive_centering_problem`. Import it with
 Select whole real-valued latent parameters by their graph names, for example
 `cells = (z = (location = :z_location, log_scale = :z_log_scale),)`.
 
-The location and log-scale are named values in the model graph. Each is a
-scalar (shared by the selected coordinates) or an array with the latent's
-shape, indexed in Julia's linear order. Their numerical work and derivatives
-stay in the graph. WarmupHMC 0.2.19 or later evaluates each named quantity once
+Each location and log-scale is either a `Real` constant shared by the block
+or a symbol naming a value in the model graph. For example,
+`cells = (z = (location = 0.0, log_scale = :z_log_scale),)` needs no named zero
+in the model. A named value is a scalar (shared by the selected coordinates)
+or an array with the latent's shape, indexed in Julia's linear order. Named
+values' numerical work and derivatives stay in the graph. WarmupHMC 0.2.19
+or later evaluates each named quantity once
 per contiguous latent block and shares its result across the coordinates,
 including when the quantity contains a reduction over unselected latents.
 
@@ -108,7 +111,7 @@ function _centering_cells(built, plan::StructuralPlan, cells::NamedTuple;
     graph = built.spec.graph
     selected_ids = Set(RK.canon_id(graph, built.spec[n].id) for n in selected)
     kernels = Any[]
-    kernel_names = Symbol[]
+    kernel_names = Union{Nothing,Symbol}[]
     values = Dict{Symbol,Any}()
     records = NamedTuple[]
     for name in selected
@@ -129,9 +132,19 @@ function _centering_cells(built, plan::StructuralPlan, cells::NamedTuple;
         scalars = Bool[]
         for field in (:location, :log_scale)
             node = cell[field]
+            if node isa Real
+                # Store configuration as runtime data behind the same accessor
+                # type as graph queries. Give each constant its own slot: merging
+                # equal constants would make the tuple type depend on their values.
+                push!(kernels, Base.Returns(_centering_values(node)))
+                push!(kernel_names, nothing)
+                push!(families, length(kernels))
+                push!(scalars, true)
+                continue
+            end
             node isa Symbol && haskey(built.spec.ports, node) ||
                 throw(ContractValidationError("[centering] `$name.$field` must " *
-                    "name an existing graph value; got $(repr(node))"))
+                    "be a real constant or name an existing graph value; got $(repr(node))"))
             RK._cell_factor_reads(built.spec, built.spec[node], selected_ids) &&
                 throw(ContractValidationError("[centering] `$node` reads a selected " *
                     "latent; indexed affine accessors must be invariant under " *
