@@ -40,23 +40,21 @@ rowwise(A, y, t) = sum(abs2, y .- A * t)
         end
     end
 
-    @testset "a rank-deficient design" begin
+    @testset "a rank-deficient design keeps its rows" begin
         N = 60
         Z = randn(rng, N, 2)
         A = [Z Z[:, 1]]
         y = randn(rng, N) .+ 3
         s = RK._ls_statistics_dense(A, y)
-        t = randn(rng, 3)
-        @test relerr(RK._ls_rss_dense(s, (t,)), rss_ref(A, y, t)) < 1e-14
+        @test !s.usable
+        @test isnan(RK._ls_rss_dense(s, (randn(rng, 3),)))
     end
 
     @testset "one block per index value: $(label)" for (label, shift) in (
             ("unshifted", 0.0), ("shifted response", 1e4))
         J, N = 30, 600
         g = rand(rng, 1:J, N)          # unsorted, not contiguous
-        g[1] = J + 2                   # a value with one row
-        f = Float64.(rand(rng, 0:1, N))
-        f[g .== 3] .= 0.0              # a constant coefficient within one group
+        f = Float64.(rand(rng, 0:1, N)) .+ 0.1 .* randn(rng, N)
         y = randn(rng, N) .+ 1.3 .+ 0.5 .* f .+ shift
         alpha = randn(rng, J + 2) .+ 1.3 .+ shift
         beta = randn(rng, J + 2)
@@ -72,7 +70,7 @@ rowwise(A, y, t) = sum(abs2, y .- A * t)
         v = RK._ls_rss_grouped(s, (alpha, beta))
         @test relerr(v, ref) <= max(4 * relerr(rowwise(A, y, t), ref), 1e-15)
         # A gathered source too short for an index value raises, as the gather does.
-        @test_throws BoundsError RK._ls_rss_grouped(s, (alpha[1:J], beta))
+        @test_throws BoundsError RK._ls_rss_grouped(s, (alpha[1:J-1], beta))
     end
 
     @testset "unusable bindings return NaN" begin
@@ -298,6 +296,36 @@ end
     end
     # A source too short for an index value raises, as the gather does.
     @test_throws BoundsError k(alpha[1:J-1], beta, 0.5)
+end
+
+@testset "rank-deficient gathered blocks use the authored fallback" begin
+    cache = PreparationCache()
+    kernels = []
+    # Include a full-rank control, a constant column, and a singleton group.
+    for kind in (:independent, :constant, :singleton)
+        idx = repeat(collect(1:3), 40)
+        f = collect(range(-1.0, 1.0; length = length(idx)))
+        kind === :constant && (f[idx .== 3] .= 0.0)
+        kind === :singleton && (idx[1] = 4)
+        y = 1.3 .+ 0.5 .* f
+        alpha, beta = fill(1.1, 4), fill(0.4, 4)
+        original = deepcopy((idx, f, y))
+        k = prepare!(cache, ls_gathered; bound = (; idx, f, y))
+        push!(kernels, k)
+        s = only(filter(x -> x isa RK._LSStatistics, k.constants))
+        @test s.usable == (kind === :independent)
+        literal = prepare(ls_gathered; bound = (; idx, f, y), bound_statistics = false)
+        v, g = _value_gradient(k, alpha, beta, 0.7)
+        vl, gl = _value_gradient(literal, alpha, beta, 0.7)
+        @test v ≈ vl rtol = 1e-12
+        for (a, b) in zip(g, gl)
+            @test a ≈ b rtol = 1e-12 atol = 1e-12
+        end
+        @test (idx, f, y) == original
+        @test_throws BoundsError k(alpha[1:2], beta, 0.7)
+    end
+    @test allequal(typeof.(kernels))
+    @test allequal(_shape.(kernels))
 end
 
 @testset "with_bound_statistics scopes the setting" begin

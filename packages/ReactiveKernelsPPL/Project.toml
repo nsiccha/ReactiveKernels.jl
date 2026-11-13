@@ -1,7 +1,7 @@
 name = "ReactiveKernelsPPL"
 uuid = "e266ea2a-6817-46cd-8bec-6238f0035f44"
 authors = ["Nikolas Siccha <nikolassiccha@gmail.com>"]
-version = "0.1.173"
+version = "0.1.174"
 
 [deps]
 Compat = "34da2185-b29b-5c13-b0c7-acf172513d20"
@@ -54,7 +54,7 @@ Treebars = "0.1.5"
 WarmupHMC = "0.2.19"
 PrecompileTools = "1.2"
 ReactiveKernels = "0.1.222"
-ReactiveKernelsDistributionKernels = "0.1.7"
+ReactiveKernelsDistributionKernels = "0.1.10"
 SpecialFunctions = "2"
 StatsFuns = "1, 2"
 Statistics = "1"

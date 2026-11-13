@@ -19,9 +19,10 @@
 # carried as an unevaluated sum of two doubles (`hi + lo`), refined against the
 # residual in compensated arithmetic, and `θ - θ̂` is evaluated as
 # `(θ - hi) - lo`. Measured against a 256-bit row-wise sum (decision `1gq53h7`,
-# precision table), this keeps the value and gradient at least as accurate as
-# the row-wise plate, and more accurate when the response is far from zero,
-# where the row-wise sum itself loses digits.
+# precision table), the tested full-rank cases keep value and gradient at
+# least as accurate as the row-wise plate, with improvements for shifted
+# responses. This is not a guarantee over arbitrary conditioning or live
+# parameter magnitudes; deficient factors need the row fallback below.
 #
 # Blocks. A location read through a bound matrix (`X * beta`, plus live scalars
 # with bound per-row coefficients) is one block over every row. A location
@@ -30,7 +31,11 @@
 # is the gathered entries at that value. Rows need not be sorted or contiguous.
 #
 # Admission. The statistics are usable only when every bound entry is finite
-# and they are cheaper than the rows (`_LS_MINIMUM_ROWS_PER_PARAMETER`). An
+# and pass a row-count cost heuristic (`_LS_MINIMUM_ROWS_PER_PARAMETER`), and
+# each block has numerically independent columns. A deficient block keeps the
+# authored rows: roundoff in its QR factor can turn a null-space direction
+# into a nonzero residual, and refinement can amplify an unstable fitted centre.
+# This is an optimization guard, not a restriction on accepted input data. An
 # unusable binding stores `usable = false` and `rss₀ = NaN`, with a zero factor,
 # so an evaluation returns NaN with finite intermediate values: a caller that
 # falls back to its own loop on a non-finite result differentiates a zero
@@ -101,12 +106,19 @@ function _ls_unusable(k::Int, blocks::Int, groups::Vector{Int}, rows::Int)
 end
 
 # One block: fill block `j` from the rows of `A` and `b`; return its rss₀ as a
-# double-double (hi, lo) pair.
+# double-double (hi, lo) pair, or `nothing` when the factor cannot safely
+# represent independent parameter directions.
 function _ls_block!(factor::Array{Float64,3}, perm::Matrix{Int}, hi::Matrix{Float64},
                     lo::Matrix{Float64}, j::Int, A::Matrix{Float64}, b::Vector{Float64})
     n, k = size(A)
     F = qr(A, ColumnNorm())
     R = F.R
+    # Test the small factor, reusing the QR already needed for preparation.
+    # Include the original row count in the tolerance: accumulated QR roundoff
+    # can otherwise make exactly repeated columns appear independent when n≫k.
+    # The rank-deficient counterexample in statistics_alternatives.jl has exact
+    # RSS zero but the unguarded statistic returns 15.6 and gradient [120,120].
+    rank(R; rtol = max(n, k) * eps(Float64)) == k || return nothing
     @inbounds for c in 1:k, r in 1:min(n, k, c)
         factor[r, c, j] = R[r, c]
     end
@@ -159,7 +171,9 @@ function _ls_statistics_dense(A::AbstractMatrix{<:Real}, b::AbstractVector{<:Rea
     perm = Matrix{Int}(undef, k, 1)
     hi = zeros(k, 1)
     lo = zeros(k, 1)
-    sh, sl = _ls_block!(factor, perm, hi, lo, 1, Af, bf)
+    result = _ls_block!(factor, perm, hi, lo, 1, Af, bf)
+    result === nothing && return _ls_unusable(k, 1, Int[], n)
+    sh, sl = result
     _LSStatistics(k, 1, factor, perm, hi, lo, Int[], sh + sl, n, true)
 end
 
@@ -208,7 +222,9 @@ function _ls_statistics_grouped(index::AbstractVector{<:Integer},
             A[r, c] = column[i]
         end
         bj = Float64[b[i] for i in rows]
-        bh, bl = _ls_block!(factor, perm, hi, lo, j, A, bj)
+        result = _ls_block!(factor, perm, hi, lo, j, A, bj)
+        result === nothing && return _ls_unusable(k, blocks, Vector{Int}(groups), n)
+        bh, bl = result
         sh, sl = _ls_dd_add(sh, sl, bh, bl)
     end
     _LSStatistics(k, blocks, factor, perm, hi, lo, Vector{Int}(groups), sh + sl, n, true)
