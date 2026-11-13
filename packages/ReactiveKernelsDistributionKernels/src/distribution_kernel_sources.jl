@@ -402,16 +402,16 @@ const _HALF_CAUCHY_BASE = ReactiveKernels._kernel_latest_prepared(prepare(CAUCHY
 #     never runs (CONTRIBUTING.md). Exact impossible events (p = 1 &
 #     observed = false, p = 0 & observed = true) still return -Inf.
 const BERNOULLI_KERNEL_SOURCE = raw"""
-using LogExpFunctions: log1pexp
+using ReactiveKernels: rk_log1pexp
 
 @kernel bernoulli(p::Float64) = begin
     logit::Float64 = log(p) - log1p(-p)
     p::Float64 = 1 / (1 + exp(-logit))
-    logp::Float64 = -log1pexp(-logit)
-    log1mp::Float64 = -log1pexp(logit)
+    logp::Float64 = -rk_log1pexp(-logit)
+    log1mp::Float64 = -rk_log1pexp(logit)
 
     logpdf(observed::Bool)::Float64 = begin
-        lp::Float64 = -log1pexp(ifelse(observed, -logit, logit))
+        lp::Float64 = -rk_log1pexp(ifelse(observed, -logit, logit))
         lp::Float64 = observed ? log(p) : log1p(-p)
         lp
     end
