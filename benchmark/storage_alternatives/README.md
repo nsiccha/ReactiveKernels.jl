@@ -137,3 +137,31 @@ planner logic in this diagnostic. Late placement can reuse the established
 plan and target known storage steps, but builds and revisits that plan and
 must preserve cache ownership. Both need the same snapshot/effect semantics;
 neither earns a general performance preference from these natural workloads.
+
+## Registered Enzyme control
+
+`results/registered-20261113.json` records the same 80 arithmetic cases, 55
+edge cases, 10 natural-model arms and 20 mutation controls under registered
+Enzyme 0.13.219, EnzymeCore 0.8.27 and Enzyme_jll 0.0.307+0. It includes
+the manifest identity, dependency versions, loaded library digest and source
+hashes. All arithmetic/edge/natural cases pass; the mutation outcomes are
+unchanged. Full recursive type audits, including every natural-model arm,
+report zero findings. All recorded warm gradient allocations are zero.
+
+Registered-run gradient medians, microseconds:
+
+| Workload | Control | Early snapshot | Late snapshot |
+| --- | ---: | ---: | ---: |
+| Stored, n=1000 | 20.82 | 24.38 | 23.70 |
+| Explicit algebra, n=1000 | 35.03 | 35.11 | 35.05 |
+| Retained producer, n=1000 | 20.80 | 33.23 | 21.77 |
+| Logarithmic, n=1000 | 15.87 | 18.98 | 19.11 |
+| LogisticRHSOvarian | 85.70 | 87.27 | 86.25 |
+| LogisticRHSProstate | 424.09 | 508.95 | 425.51 |
+
+The apparent synthetic-workload gains in the earlier run do not persist in
+this run. The backend libraries and host conditions differ, so this does not
+isolate an Enzyme performance effect; it strengthens the practical conclusion
+that no consistent general speed benefit has been demonstrated. The raw rounds
+are retained so their variability remains visible. No production lowering,
+extension, derivative authority or dependency pin is changed by this work.
