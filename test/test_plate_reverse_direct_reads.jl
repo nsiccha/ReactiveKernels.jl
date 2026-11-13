@@ -135,8 +135,15 @@ end
         for x in (Float64[], [0.3, -0.2], collect(range(-0.5, 0.5; length = 73)))
             shadow = zeros(length(x))
             @test primal(x) ≈ sum(sin, x; init = 0.0)
-            @test reverse(x, 1.7, shadow) == ()
+            # The sweep returns the value first; `Val(false)`: not computed.
+            @test Base.tail(reverse(x, 1.7, Val(false), shadow)) == ()
             @test shadow ≈ 1.7 .* cos.(x)
+            # `Val(true)` also returns the value, into a zeroed owned shadow.
+            owned = zeros(length(x))
+            value, rest... = reverse(x, 1.7, Val(true), owned)
+            @test rest == ()
+            @test value ≈ sum(sin, x; init = 0.0)
+            @test owned ≈ 1.7 .* cos.(x)
         end
         for bad in (direct_program(; raw, at = 1),
                     direct_program(; raw, outside = true),
@@ -168,8 +175,13 @@ end
     for x in (Float64[], [0.2, -0.3, 0.4]), choose in (false, true)
         shadow = zeros(length(x))
         @test primal(x, choose) ≈ sum(choose ? sin : cos, x; init = 0.0)
-        @test reverse(x, choose, 1.7, shadow) == ()
+        @test Base.tail(reverse(x, choose, 1.7, Val(false), shadow)) == ()
         @test shadow ≈ 1.7 .* (choose ? cos.(x) : -sin.(x))
+        owned = zeros(length(x))
+        value, rest... = reverse(x, choose, 1.7, Val(true), owned)
+        @test rest == ()
+        @test value ≈ sum(choose ? sin : cos, x; init = 0.0)
+        @test owned ≈ 1.7 .* (choose ? cos.(x) : -sin.(x))
     end
 end
 

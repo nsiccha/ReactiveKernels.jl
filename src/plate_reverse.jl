@@ -764,6 +764,42 @@ mutable struct _PRProgramState
     touched::Set{Symbol}              # outer values whose adjoints received a contribution
     counter::Int
     outer::Set{Symbol}                # active values bound outside every cell loop
+    reads::Dict{Symbol,Int}           # batched parameter => its reads in the program
+end
+
+# How many reads of each batched parameter one call of the program can make,
+# through any of its prepared operands: read sites in sequence add up (another
+# cell loop, another alias in a cell), the arms of a branch take the larger
+# (the native direct and extruded copies of a cell loop). Under one pass a read
+# may add unscaled partials into the shadow and scale it once after its loop
+# (`_pr_read_reverse!`); that is only right when no other read adds into the
+# same shadow.
+function _pr_read_counts(body, prepared, mod, values)
+    function count(ex)
+        counts = Dict{Symbol,Int}()
+        ex isa Expr && ex.head !== :quote || return counts
+        if ex.head in (:if, :elseif) && length(ex.args) >= 2
+            mergewith!(+, counts, count(ex.args[1]))
+            arms = Dict{Symbol,Int}()
+            for arm in ex.args[2:end]
+                mergewith!(max, arms, count(arm))
+            end
+            return mergewith!(+, counts, arms)
+        end
+        if Meta.isexpr(ex, :call) && length(ex.args) >= 2 && ex.args[2] isa Symbol &&
+                haskey(prepared, ex.args[2])
+            f = _pr_call_function(ex.args[1], mod, values)
+            if f === Base.Broadcast._broadcast_getindex || f === _plate_read
+                p = prepared[ex.args[2]]
+                counts[p] = get(counts, p, 0) + 1
+            end
+        end
+        for a in ex.args
+            mergewith!(+, counts, count(a))
+        end
+        counts
+    end
+    count(body)
 end
 
 # The prepared operands of batched parameters:
@@ -1221,7 +1257,9 @@ function _pr_factored_sweep!(out, fc::_PRFactored, stmts, adj, mutable, toplevel
 end
 
 # The reads of batched operands that the cell reads once, at its top level, and
-# every alias of their values: `alias => read`.
+# every alias of their values: `alias => read`. The program must read the
+# operand nowhere else either: another loop, or another prepared alias of the
+# same parameter, adds into the same shadow.
 function _pr_single_reads(stmts, st::_PRProgramState, active)
     counts = Dict{Symbol,Int}()
     function count!(ss)
@@ -1234,7 +1272,8 @@ function _pr_single_reads(stmts, st::_PRProgramState, active)
     readof = Dict{Symbol,Symbol}()
     for s in stmts
         if _pr_is_read(s, st) && counts[s.args[1]] == 1 && st.prepared[s.args[1]] in active &&
-                haskey(st.shadow, st.prepared[s.args[1]])
+                haskey(st.shadow, st.prepared[s.args[1]]) &&
+                get(st.reads, st.prepared[s.args[1]], 0) == 1
             readof[s.lhs] = s.lhs
         elseif s isa _PRAlias && s.rhs isa Symbol && haskey(readof, s.rhs)
             readof[s.lhs] = readof[s.rhs]
@@ -1302,13 +1341,25 @@ function _pr_gather_dot(x::SubArray, buffer::SubArray)
     end
     acc
 end
+# A buffer that is its own storage (an `Array` the caller owns) is indexed as
+# the operand is: the cell's index, or the single entry of a broadcast operand.
+function _pr_gather_dot(x::AbstractArray, buffer::Array)
+    acc = zero(eltype(x)) * zero(eltype(buffer))
+    @inbounds for j in eachindex(x, buffer)
+        acc += x[j] * buffer[j]
+    end
+    acc
+end
 _pr_gather_dot(x, buffer) = throw(ArgumentError(
     "plate reverse: a one-pass product through a read of $(typeof(x)) with a buffer $(typeof(buffer))"))
 # The plate's own buffer scaled in place, once (`_pr_scaled` per entry, so an
-# entry no cell reached stays zero under a coefficient that is not finite).
+# entry no cell reached stays zero under a coefficient that is not finite): a
+# gathered buffer through its parent, each entry once however often the index
+# vector repeats it.
 _pr_scale_buffer!(::Nothing, k) = nothing
-function _pr_scale_buffer!(buffer::SubArray, k)
-    q = parent(buffer)
+_pr_scale_buffer!(buffer::SubArray, k) = _pr_scale_owned!(parent(buffer), k)
+_pr_scale_buffer!(buffer::Array, k) = _pr_scale_owned!(buffer, k)
+function _pr_scale_owned!(q, k)
     @inbounds for j in eachindex(q)
         q[j] = _pr_scaled(k, q[j])
     end
@@ -1681,6 +1732,12 @@ in order, and the batched (per-cell) active parameters, whose shadows follow
 `want` in order. One pass over the cells computes the cotangents for seed ȳ,
 adding each batched operand's cotangent into its shadow, and, when `want` is
 `Val(true)`, the program's value (otherwise the returned value is not it).
+
+Under `Val(true)` each shadow must be a zeroed buffer the caller owns: an
+`Array`, or a gathered operand's buffer, a view of owned storage through the
+operand's own index vector. The sweep may add unscaled partials into it and
+scale it in place after the loop, and the caller adds it into the operand's
+real shadow. Under `Val(false)` the cotangents add into the shadows as given.
 """
 function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict{Symbol,Any})
     Meta.isexpr(ast, :function, 2) && Meta.isexpr(ast.args[1], :tuple) ||
@@ -1761,7 +1818,7 @@ function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict
     collect_cells(body)
     outer = Set{Symbol}(a for a in active if !(a in cell_locals))
     st = _PRProgramState(mod, values, active, prepared, shadow, totals, output,
-                         Set{Symbol}(), 0, outer)
+                         Set{Symbol}(), 0, outer, _pr_read_counts(body, prepared, mod, values))
     new_body = _pr_program_block(stmts, st)
     # Every outer adjoint starts at zero; every total's adjoint is the seed.
     init = Any[:($(_pr_bar(a)) = 0.0) for a in sort!(collect(outer)) if !(a in totals)]
