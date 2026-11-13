@@ -11,8 +11,14 @@ import SpecialFunctions
 const _HELPERS = Dict{String,String}(
     "_rk_trigamma" => """
 def _rk_trigamma(x):
-    # SpecialFunctions.trigamma.
-    return jsp.polygamma(1, x)
+    # SpecialFunctions.trigamma. The reciprocal expansion (DLMF 5.15.8)
+    # retains the 1/x tail where JAX's polygamma underflows, including +Inf.
+    # Above 1e8 the omitted -1/(30*x^5) is below Float64 rounding error.
+    large = x > 1e8
+    r = 1.0 / jnp.where(large, x, 1.0)
+    tail = r * (1.0 + r * (0.5 + r / 6.0))
+    regular = jsp.polygamma(1, jnp.where(large, 1.0, x))
+    return jnp.where(large, tail, regular)
 """,
     # `jax.scipy.special.betaln` (JAX 0.12) is accurate to about 1e-6 in float64
     # once an argument reaches 8: its Stirling correction is single-precision.
@@ -208,7 +214,9 @@ _rk_besselix.defjvp(_rk_besselix_jvp, symbolic_zeros=True)
 _HELPERS["_rk_besseli"] = """
 def _rk_besseli(nu, x):
     # SpecialFunctions.besseli(nu, x) = exp(|x|) besselix(nu, x), elementwise.
-    return jnp.exp(jnp.abs(x)) * _rk_besselix(nu, x)
+    # sign(x)*x has the same value as abs(x), with slope zero at zero,
+    # matching the scaled function's sign convention so the cusp cancels.
+    return jnp.exp(jnp.sign(x) * x) * _rk_besselix(nu, x)
 """
 
 for (f, literal, host, helper) in

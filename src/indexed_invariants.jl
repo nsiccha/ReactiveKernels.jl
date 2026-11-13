@@ -442,7 +442,12 @@ end
 # table's root; the caller binds each name to a lane slot it keeps across
 # calls (`_nonallocating_program`). With `nothing`, every call allocates its
 # tables.
-function _lower_indexed_invariants(ast::Expr, recipes; lanes = nothing)
+# The table describes the graph, not this pass's executable types. Keeping its
+# tuple length in the recursive walkers compiled them again for every model.
+Base.@nospecializeinfer _lower_indexed_invariants(ast::Expr, @nospecialize(recipes); lanes = nothing) =
+    _lower_indexed_invariants(ast, collect(Recipe, recipes); lanes)
+
+function _lower_indexed_invariants(ast::Expr, recipes::Vector{Recipe}; lanes = nothing)
     any(r -> r.effectful, recipes) && return ast
     definitions = Dict{Symbol,Any}()
     statements = Dict{Symbol,Expr}()

@@ -16,6 +16,29 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.229
+
+- Partition plans retain constant row calculations used to size fresh scan
+  outputs, including buffers selected by a conditional. Mutating an output no
+  longer pulls its marker's row calculations into each gradient call. Aliases
+  of existing storage and mutations in conditions stay in ordinary execution.
+
+## 0.1.228
+
+- JAX emission resolves `isa` checks when Julia argument types prove the answer,
+  including the checks in lowered `oftype` calls. Plain callees can now use
+  `oftype(float(x), NaN)` or `oftype(float(x), Inf)` in guarded branches.
+  Partially overlapping abstract types still require an unsupported runtime
+  type check; they are not folded to a false result.
+
+## 0.1.227
+
+- Preserve the reciprocal tail of `trigamma` in JAX emission at large positive
+  inputs and return zero at positive infinity.
+- Correct the JAX derivative of `besseli(n, x)` at `x = 0` for a runtime order
+  `n = 0`; its exponential scale now matches the scaled function's sign
+  convention at zero.
+
 ## 0.1.226
 
 - Add `rk_log1pexp`, an owned scalar softplus callable whose stable value and
