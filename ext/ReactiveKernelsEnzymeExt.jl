@@ -574,18 +574,19 @@ end
 
 
 # ------------------------------------------------ generated plate reverse ----
-# `_PlateSumRule` (src/plate_reverse.jl): a summed plate program with a reverse
-# generated from its own code. The augmented primal runs the program, so the
+# `_PlateSumRuleBody` (src/plate_reverse.jl): the storage-compatible call of a
+# summed plate program with a reverse generated from its own code. The
+# augmented primal runs the program, so the
 # primal is unchanged; the reverse pass runs the generated reverse once per
 # lane with the covector, which adds each batched operand's cotangent into its
 # shadow and returns the scalar operands' cotangents. A call whose activity
 # the generated reverse does not take differentiates the program with
 # Enzyme's ordinary reverse instead.
 
-using ReactiveKernels: _PlateSumRule, _pr_scalar_positions, _pr_batched_positions, _CellArray
+using ReactiveKernels: _PlateSumRuleBody, _pr_scalar_positions, _pr_batched_positions, _CellArray
 
 function EnzymeRules.augmented_primal(
-        config::RevConfig, rule::Const{<:_PlateSumRule}, ::Type{RT},
+        config::RevConfig, rule::Const{<:_PlateSumRuleBody}, ::Type{RT},
         args::Vararg{Annotation,N}) where {RT,N}
     values = _pr_values(args)
     primal = rule.val(values...)
@@ -712,9 +713,9 @@ function _pr_ordinary_reverse(program::F, ȳ, tape, args::Tuple) where {F}
 end
 
 function EnzymeRules.reverse(
-        config::RevConfig, rule::Const{<:_PlateSumRule}, dret, tape,
+        config::RevConfig, rule::Const{<:_PlateSumRuleBody}, dret, tape,
         args::Vararg{Annotation,N}) where {N}
-    r = rule.val
+    r = rule.val.rule
     S = _pr_scalar_positions(r)
     B = _pr_batched_positions(r)
     if tape === nothing

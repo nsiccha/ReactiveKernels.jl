@@ -1602,6 +1602,17 @@ struct _PlateSumRule{S,B,P,R} <: Function
     program::P
     reverse::R
 end
+
+# Attach the backend rule only after checking the operands' storage types.
+# A lazy cell array has no writable cell shadow. Let ordinary AD see its
+# program before custom-rule annotation construction creates shadow references.
+struct _PlateSumRuleBody{S,B,R} <: Function
+    rule::R
+end
+@generated function _pr_rule_target(rule::_PlateSumRule{S,B}, args::Tuple) where {S,B}
+    any(b -> args.parameters[b] <: _CellArray, B) && return :(getfield(rule, :program))
+    :(_PlateSumRuleBody{$S,$B,typeof(rule)}(rule))
+end
 # One method per operand count, each operand's type a parameter of its own:
 # Julia does not otherwise specialize on a `Function` operand it only passes on
 # (the program's callables), and the call would dispatch dynamically
@@ -1611,7 +1622,9 @@ for count in 0:_PLATE_CALL_MAX_ARGUMENTS
     local types = Any[Symbol("Argument", index) for index in 1:count]
     local typed = Any[:($a::$T) for (a, T) in zip(arguments, types)]
     @eval @inline (rule::_PlateSumRule)($(typed...)) where {$(types...)} =
-        getfield(rule, :program)($(arguments...))
+        _pr_rule_target(rule, ($(arguments...),))($(arguments...))
+    @eval @inline (call::_PlateSumRuleBody)($(typed...)) where {$(types...)} =
+        getfield(getfield(call, :rule), :program)($(arguments...))
 end
 _pr_scalar_positions(::_PlateSumRule{S}) where {S} = S
 _pr_batched_positions(::_PlateSumRule{S,B}) where {S,B} = B
