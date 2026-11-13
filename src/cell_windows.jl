@@ -427,8 +427,13 @@ Base.IndexStyle(::Type{<:_CellRowProduct}) = IndexLinear()
     @boundscheck checkbounds(p, k)
     row, factor = p.row, p.factor
     total = zero(T)
-    @inbounds for (i, j) in zip(eachindex(row), axes(factor, 1))
-        total += row[i] * factor[j, k]
+    # A counted loop over `1:n`: under Enzyme Reverse a loop whose trip count is
+    # known on entry caches its values in one allocation, while the `zip` of two
+    # ranges grew its cache by one libc `realloc` per entry, per read.
+    i0 = firstindex(row) - 1
+    j0 = first(axes(factor, 1)) - 1
+    @inbounds for t in 1:min(length(row), size(factor, 1))
+        total += row[i0 + t] * factor[j0 + t, k]
     end
     total
 end
