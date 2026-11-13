@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.223
+## 0.1.224
 
 - Bound Gaussian statistics choose between the collapsed sum and authored rows
   with a runtime guard. Changing bound values or row counts across the statistics
@@ -36,6 +36,23 @@ are recorded in the git history only.
   read uses the current cell index. Factored reductions with intermediate totals
   keep ordinary AD until their adjoints can be propagated; the report names that
   fallback. The generated rule remains opt-in and is not a general speedup.
+
+## 0.1.223
+
+- `jax_source`: a padded (ragged) row's length less a constant bounds what
+  it sizes. `n = length(x)` of a row padded to width `L` has the static bound
+  `L`, and `n - c` now has `L - c` (it had `L`), so a range or an array of
+  length `n - c` pads to the width Julia's has when the row is longest.
+  Before, `x[2:n] .- x[1:(n - 1)]` padded the two ranges to `L - 1` and `L`
+  entries and failed in Python with `incompatible shapes for broadcasting`.
+  Past its stop, a range to such a length repeats the stop, as padding
+  repeats a row's last entry, so a gather by it pads with its own last entry
+  and the differences' padding is the last valid difference.
+- `jax_source` translates `diff(x)` of a vector and `diff(x; dims = d)` of an
+  unpadded array along a literal axis. A padded row's differences have one
+  valid entry fewer, and their padding repeats the last valid difference.
+  Before, `diff` raised `JAXEmissionError` (keyword arguments to `diff` have
+  no JAX translation), also in a data-only cell recipe.
 
 ## 0.1.222
 
