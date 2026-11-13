@@ -62,10 +62,13 @@ Tutorials.html(model_view(built; bound))
 
 Select affine cells when setting up WarmupHMC. Declare their location and
 log-scale as ordinary named values in the model, then pass those names to
-`adaptive_centering_problem`:
+`adaptive_centering_problem`. It is public but not exported, because
+BayesianRegressionModels exports a different function of that name; import it
+explicitly:
 
 ```@example adaptive_centering
 using ReactiveKernelsPPL, WarmupHMC, LogDensityProblems, Enzyme
+using ReactiveKernelsPPL: adaptive_centering_problem
 using DifferentiationInterface: AutoEnzyme
 
 model = @rkppl begin
@@ -96,19 +99,27 @@ its centering and returns draws in the original model frame. A cell can set
 `target = 1.0` for an authored centered coordinate and `source` for a different
 initial sampler frame. Zero means non-centered; one means centered.
 
-The location and log-scale may be scalars or arrays matching the latent shape.
-Their values and derivatives come from the graph, including dependencies on
-unselected latent parameters. The adapter selects identity-transformed real
+Each location or log-scale accepts either a `Real` constant shared by the
+block or a symbol naming a scalar or latent-shaped array in the model graph.
+For a zero-centered block, use
+`cells = (z = (location = 0.0, log_scale = :z_log_scale),)`;
+the zero needs no declaration in the model. Graph values and their derivatives
+may depend on unselected latent parameters. The adapter selects identity-transformed real
 coordinates, without changing their priors. For example, a real ICAR block
 keeps its ICAR density and any soft sum constraint.
 
 Every selected affine quantity must remain invariant under the selected maps.
 A location that reads another selected latent needs a coupled transform;
 WarmupHMC's independent indexed maps do not supply that transport. The adapter
-checks this graph dependency before sampling. With WarmupHMC 0.2.19 or later,
-each named graph quantity is evaluated once per latent block and its result
-is shared across coordinates. Scalar reductions and array-valued locations
-therefore avoid repeating graph work for each coordinate. Ordinary AD
-differentiates these graph queries.
+checks this graph dependency before sampling. RKPPL 0.1.175 with WarmupHMC
+0.2.21 or later prepares one joint endpoint kernel, sharing common graph work
+across selected cells and their location/log-scale roles. It runs once per
+vector on a map or inverse, and shares results across scoring candidates.
+Cells are ordered by packed coordinate, regardless of keyword order. Identity
+maps skip endpoint evaluation. Ordinary AD differentiates the joint graph;
+arrays remain read-only, without concatenation into a new endpoint buffer.
+For Enzyme differentiation through cached matrix endpoints, use the
+`const_array_reshape` repair (dogfood `9c4df614` or later); the acceptance
+suite checks ordinary reverse differentiation and unchanged cached inputs.
 
 The [Eight-schools example](eight-schools.md) checks the complete density decomposition and its coordinate transformation.

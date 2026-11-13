@@ -4,6 +4,7 @@
 # This script prints its actual digest before checking target agreement and
 # comparing four chains per arm. Timing includes each arm's first-use compilation.
 using ReactiveKernelsPPL, WarmupHMC, Enzyme, Random, Statistics, SHA, Test
+using ReactiveKernelsPPL: adaptive_centering_problem
 using DifferentiationInterface: AutoEnzyme
 import LogDensityProblems as LDP
 import MCMCDiagnosticTools as MCD

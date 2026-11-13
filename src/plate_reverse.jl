@@ -9,7 +9,8 @@
 #
 # The reverse is generated from the program's own lowered source, which is
 # the plate's cell graph after every lowering decision (inline sources, lazy
-# branches, hoisted invariants): each call's partials come from DiffRules
+# branches, hoisted invariants): owned scalar rules provide joint cuts of
+# their value/partial graph. Other calls' partials come from DiffRules
 # (the established table ForwardDiff and ReverseDiff use) or, for RK's own
 # primitives and calls whose derivative is better spelled through their own
 # result, from the overrides below. No rule attaches to a function this
@@ -127,6 +128,7 @@ function _pr_flatten!(stmts::Vector{Any}, ex, ctx::_PRCtx)
         lhs = ex.args[1] isa Symbol ? ex.args[1] : ex.args[1].args[1]
         rhs = _pr_flatten!(stmts, ex.args[2], ctx)
         push!(stmts, _PRAlias(lhs, rhs))
+        rhs isa Symbol && haskey(ctx.values, rhs) && (ctx.values[lhs] = ctx.values[rhs])
         return lhs
     elseif Meta.isexpr(ex, :let, 2)
         # `let a = x, b = y; body end`: the bindings are aliases (the inline
@@ -153,6 +155,17 @@ function _pr_flatten!(stmts::Vector{Any}, ex, ctx::_PRCtx)
         args = Any[_pr_flatten!(stmts, a, ctx) for a in ex.args[2:end]]
         lhs = _pr_tmp!(ctx)
         push!(stmts, _PRCall(lhs, f, fref, args))
+        # An immutable closure can carry an owned rule. Resolve its field for
+        # call identity only; retain the runtime getfield and its aliases in
+        # the emitted program. Mutable records may change after preparation.
+        if f === Core.getfield && length(args) == 2 &&
+                args[1] isa Symbol && haskey(ctx.values, args[1])
+            object = ctx.values[args[1]]
+            field = args[2] isa QuoteNode ? args[2].value : args[2]
+            if !ismutabletype(typeof(object)) && field isa Union{Symbol,Int} && isdefined(object, field)
+                ctx.values[lhs] = getfield(object, field)
+            end
+        end
         return lhs
     elseif Meta.isexpr(ex, :if) && length(ex.args) in (2, 3)
         cond = _pr_flatten!(stmts, ex.args[1], ctx)
@@ -356,6 +369,26 @@ function _pr_partials(f, y::Symbol, args::Vector{Any})
         Expr(:let, Expr(:block), _pr_resolve_heads(r)) for (k, r) in enumerate(rules)]
 end
 
+# Owned scalar rules already provide one graph for their value and partials.
+# Record a joint cut only when the reverse sweep reaches the call; an active
+# value used solely by a predicate must still execute just its primal. The
+# forward sweep later emits this cut at the original (possibly lazy) call site.
+function _pr_call_partials(s::_PRCall, active, cuts; cellvars = nothing)
+    s.f isa ScalarDerivativeRule || return _pr_partials(s.f, s.lhs, s.args)
+    flags = Tuple(a isa Symbol && a in active for a in s.args)
+    mask = _activity_mask(flags, 1)
+    cut = gensym(:scalar_rule_cut)
+    call = Expr(:call, GlobalRef(@__MODULE__, :_derivative_cut_call),
+                s.fref, QuoteNode(Val(mask)), s.args...)
+    cuts[s.lhs] = (cut, call)
+    # A tuple holding cell partials varies with the cell too. Otherwise the
+    # factored sweep would treat its fields as shared coefficients.
+    cellvars === nothing || push!(cellvars, cut)
+    index = 1
+    Any[flag ? Expr(:call, GlobalRef(Core, :getfield), cut, index += 1) : nothing
+        for flag in flags]
+end
+
 # ---------------------------------------------------------------- reverse
 
 # Which statements' results depend on an active symbol.
@@ -378,17 +411,23 @@ function _pr_activity!(active::Set{Symbol}, stmts)
 end
 
 # Forward statements as Julia expressions; a branch stores its condition.
-function _pr_forward_exprs(stmts)
+function _pr_forward_exprs(stmts, cuts = Dict{Symbol,Tuple{Symbol,Expr}}())
     out = Any[]
     for s in stmts
         if s isa _PRAlias
             push!(out, :($(s.lhs) = $(s.rhs)))
         elseif s isa _PRCall
-            push!(out, :($(s.lhs) = $(Expr(:call, s.fref, s.args...))))
+            if haskey(cuts, s.lhs)
+                cut, call = cuts[s.lhs]
+                push!(out, :($cut = $call),
+                      :($(s.lhs) = $(GlobalRef(Core, :getfield))($cut, 1)))
+            else
+                push!(out, :($(s.lhs) = $(Expr(:call, s.fref, s.args...))))
+            end
         elseif s isa _PRBranch
-            then_block = Expr(:block, _pr_forward_exprs(s.then_stmts)..., :($(s.lhs) = $(s.then_result)))
+            then_block = Expr(:block, _pr_forward_exprs(s.then_stmts, cuts)..., :($(s.lhs) = $(s.then_result)))
             # An `if` without an `else` arm has the value `nothing` there.
-            else_block = Expr(:block, _pr_forward_exprs(s.else_stmts)..., :($(s.lhs) = $(s.else_result)))
+            else_block = Expr(:block, _pr_forward_exprs(s.else_stmts, cuts)..., :($(s.lhs) = $(s.else_result)))
             push!(out, Expr(:if, s.cond, then_block, else_block))
         end
     end
@@ -433,7 +472,8 @@ end
 # of a batched operand): it returns the expression that sends the complete
 # adjoint `bar` on, or `nothing` to differentiate the call as usual.
 function _pr_reverse_exprs!(out, stmts, active::Set{Symbol}, defined::Set{Symbol};
-                            leaf = s -> nothing, touched = nothing)
+                            leaf = s -> nothing, touched = nothing,
+                            cuts = Dict{Symbol,Tuple{Symbol,Expr}}())
     for s in Iterators.reverse(stmts)
         if s isa _PRAlias
             s.lhs in active && _pr_bar(s.lhs) in defined || continue
@@ -446,7 +486,7 @@ function _pr_reverse_exprs!(out, stmts, active::Set{Symbol}, defined::Set{Symbol
                 push!(out, claimed)
                 continue
             end
-            partials = _pr_partials(s.f, s.lhs, s.args)
+            partials = _pr_call_partials(s, active, cuts)
             partials === nothing && _pr_fail("no derivative for `$(s.fref)`")
             ybar = _pr_bar(s.lhs)
             for (a, p) in zip(s.args, partials)
@@ -468,7 +508,7 @@ function _pr_reverse_exprs!(out, stmts, active::Set{Symbol}, defined::Set{Symbol
                 if result isa Symbol && result in active
                     _pr_accumulate!(o, d, result, _pr_bar(s.lhs); touched)
                 end
-                _pr_reverse_exprs!(o, stmts_, active, d; leaf, touched)
+                _pr_reverse_exprs!(o, stmts_, active, d; leaf, touched, cuts)
                 Expr(:block, o...)
             end
             push!(out, Expr(:if, s.cond, arm(s.then_stmts, s.then_result),
@@ -491,14 +531,15 @@ function _pr_scalar_reverse(ex, active_inputs::Vector{Symbol}, mod::Module; seed
     stmts = Any[]
     result = _pr_flatten!(stmts, ex, ctx)
     active = _pr_activity!(Set{Symbol}(active_inputs), stmts)
-    forward = _pr_forward_exprs(stmts)
+    cuts = Dict{Symbol,Tuple{Symbol,Expr}}()
     reverse = Any[]
     defined = Set{Symbol}()
     if result isa Symbol && result in active
         push!(reverse, :($(_pr_bar(result)) = $seed))
         push!(defined, _pr_bar(result))
-        _pr_reverse_exprs!(reverse, stmts, active, defined)
+        _pr_reverse_exprs!(reverse, stmts, active, defined; cuts)
     end
+    forward = _pr_forward_exprs(stmts, cuts)
     bars = Dict{Symbol,Symbol}(a => _pr_bar(a) for a in active_inputs if _pr_bar(a) in defined)
     (; forward, reverse, result, bars)
 end
@@ -508,9 +549,10 @@ end
 # Calls whose results carry no derivative at the program level: type, shape
 # and schedule queries, and the plate's own scaffolding.
 const _PR_PROGRAM_INERT = Set{Any}(Any[Base.typeof, Base.eltype, Base.axes, Base.size,
-    Base.length, Base.isempty, Base.CartesianIndices, Base.CartesianIndex, Base.:!,
+    Base.length, Base.eachindex, Base.isempty, Base.CartesianIndices, Base.CartesianIndex, Base.:!,
     _promote_op, _plate_result_eltype, _plate_require_axes, _plate_broadcast_shape,
-    _plate_simd_cells, _plate_total_seed, Base.zero, Base.one, Base.:<, Base.:(==)])
+    _plate_simd_cells, _plate_spans_axis, _plate_total_seed,
+    Base.zero, Base.one, Base.:<, Base.:(==)])
 
 function _pr_call_function(head, mod::Module, values::Dict{Symbol,Any})
     head isa Symbol && haskey(values, head) && return values[head]
@@ -523,15 +565,17 @@ function _pr_call_function(head, mod::Module, values::Dict{Symbol,Any})
 end
 
 # Symbols an expression reads, outside inert calls.
-function _pr_reads!(found::Set{Symbol}, ex, mod, values; ignore_bindings = false)
+function _pr_reads!(found::Set{Symbol}, ex, mod, values;
+                    ignore_bindings = false, cell_reads = nothing)
     if ex isa Symbol
         push!(found, ex)
     elseif ex isa Expr
+        cell_reads !== nothing && haskey(cell_reads, ex) && return found
         ex.head in (:quote, :meta, :inbounds, :loopinfo, :line) && return found
         if ignore_bindings && Meta.isexpr(ex, :(=), 2)
             lhs = ex.args[1]
             if lhs isa Symbol || Meta.isexpr(lhs, :(::), 2) && lhs.args[1] isa Symbol
-                return _pr_reads!(found, ex.args[2], mod, values; ignore_bindings)
+                return _pr_reads!(found, ex.args[2], mod, values; ignore_bindings, cell_reads)
             end
         elseif ignore_bindings && ex.head === :local
             for a in ex.args
@@ -539,7 +583,7 @@ function _pr_reads!(found::Set{Symbol}, ex, mod, values; ignore_bindings = false
                 # through an indexed destination still do.
                 a isa Symbol && continue
                 Meta.isexpr(a, :(::), 2) && a.args[1] isa Symbol && continue
-                _pr_reads!(found, a, mod, values; ignore_bindings)
+                _pr_reads!(found, a, mod, values; ignore_bindings, cell_reads)
             end
             return found
         end
@@ -547,13 +591,14 @@ function _pr_reads!(found::Set{Symbol}, ex, mod, values; ignore_bindings = false
             f = _pr_call_function(ex.args[1], mod, values)
             f !== nothing && f in _PR_PROGRAM_INERT && return found
             for a in ex.args[2:end]
-                _pr_reads!(found, a, mod, values; ignore_bindings)
+                _pr_reads!(found, a, mod, values; ignore_bindings, cell_reads)
             end
-            ex.args[1] isa Expr && _pr_reads!(found, ex.args[1], mod, values; ignore_bindings)
+            ex.args[1] isa Expr && _pr_reads!(found, ex.args[1], mod, values;
+                                            ignore_bindings, cell_reads)
             return found
         end
         for a in ex.args
-            _pr_reads!(found, a, mod, values; ignore_bindings)
+            _pr_reads!(found, a, mod, values; ignore_bindings, cell_reads)
         end
     end
     found
@@ -748,7 +793,62 @@ function _pr_prepared_operands(body, params = Symbol[])
     prepared, broadcastables
 end
 
-_pr_is_read(s, st) = s isa _PRCall && s.f === Base.Broadcast._broadcast_getindex &&
+# Native direct reads retain the parameter's cell provenance. Approve each
+# call, rather than its containing assignment or operand name: another read
+# of that operand outside the cell, or at a different index, still needs an
+# ordinary derivative. The shadow write below uses the cell's linear index.
+function _pr_direct_operands!(prepared, body, params, active_params, broadcastables, mod, values)
+    operands = Dict{Symbol,Symbol}(p => p for p in params)
+    merge!(operands, broadcastables)
+    reads = IdDict{Expr,Nothing}()
+    function visit(node)
+        node isa Expr && node.head !== :quote || return
+        loop = _pr_cell_loop(node)
+        if loop === nothing
+            foreach(visit, node.args)
+            return
+        end
+        _, linear, cell = loop
+        statements = Any[s for s in cell.args if !(s isa LineNumberNode)]
+        isempty(statements) && return
+        binding = first(statements)
+        Meta.isexpr(binding, :(=), 2) && binding.args[1] isa Symbol || return
+        index, rhs = binding.args
+        Meta.isexpr(rhs, :call, 2) && rhs.args[2] === linear &&
+            _pr_call_function(rhs.args[1], mod, values) === Base.CartesianIndex || return
+        rebound = _program_bound!(Set{Symbol}(), Expr(:block, statements[2:end]...))
+        (index in rebound || linear in rebound) && return
+        function read(ex)
+            ex isa Expr && ex.head !== :quote || return
+            if Meta.isexpr(ex, :call, 3) &&
+                    _pr_call_function(ex.args[1], mod, values) === _plate_read &&
+                    ex.args[2] isa Symbol && haskey(operands, ex.args[2]) &&
+                    ex.args[3] in (index, linear)
+                raw = ex.args[2]
+                prepared[raw] = operands[raw]
+                reads[ex] = nothing
+            end
+            foreach(read, ex.args)
+        end
+        foreach(read, statements[2:end])
+    end
+    visit(body)
+    function check(node)
+        node isa Expr && node.head !== :quote || return
+        if Meta.isexpr(node, :call, 3) &&
+                _pr_call_function(node.args[1], mod, values) === _plate_read &&
+                get(operands, node.args[2], nothing) in active_params &&
+                !haskey(reads, node)
+            _pr_fail("a direct plate read does not use its cell index")
+        end
+        foreach(check, node.args)
+    end
+    check(body)
+    reads
+end
+
+_pr_is_read(s, st) = s isa _PRCall &&
+    s.f in (Base.Broadcast._broadcast_getindex, _plate_read) &&
     s.args[1] isa Symbol && haskey(st.prepared, s.args[1])
 
 # Reads of active batched operands are active.
@@ -1047,7 +1147,7 @@ function _pr_bound!(found::Set{Symbol}, stmts)
 end
 
 # The factored reverse sweep of `stmts`.
-function _pr_factored_sweep!(out, fc::_PRFactored, stmts, adj, mutable, toplevel::Bool)
+function _pr_factored_sweep!(out, fc::_PRFactored, stmts, adj, mutable, toplevel::Bool, cuts)
     st = fc.st; active = fc.active
     for s in Iterators.reverse(stmts)
         if s isa _PRAlias
@@ -1064,7 +1164,7 @@ function _pr_factored_sweep!(out, fc::_PRFactored, stmts, adj, mutable, toplevel
                 continue
             end
             terms === nothing && continue
-            partials = _pr_partials(s.f, s.lhs, s.args)
+            partials = _pr_call_partials(s, active, cuts; cellvars = fc.cellvars)
             partials === nothing && _pr_fail("no derivative for `$(s.fref)`")
             for (a, p) in zip(s.args, partials)
                 a isa Symbol && a in active || continue
@@ -1110,7 +1210,7 @@ function _pr_factored_sweep!(out, fc::_PRFactored, stmts, adj, mutable, toplevel
                 a2 = Dict{Symbol,Vector{_PRTerm}}(k => copy(v) for (k, v) in adj)
                 result isa Symbol && result in active &&
                     _pr_contribute!(o, fc, a2, mutable, result, terms, false)
-                _pr_factored_sweep!(o, fc, stmts_, a2, mutable, false)
+                _pr_factored_sweep!(o, fc, stmts_, a2, mutable, false, cuts)
                 Expr(:block, o...)
             end
             push!(out, Expr(:if, s.cond, arm(s.then_stmts, s.then_result),
@@ -1411,9 +1511,7 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState)
             _pr_mark_reads!(active, folded, st)
             _pr_activity!(active, folded)
         end
-        # The cell's forward: hoisted invariants above the loop, the rest in it.
-        forward_in = _pr_forward_exprs(inloop)
-        forward_pre = _pr_forward_exprs(hoisted)
+        cuts = Dict{Symbol,Tuple{Symbol,Expr}}()
         reverse = Any[]
         after = Any[]
         # A hoisted invariant is a shared value of the loop: its adjoint
@@ -1440,11 +1538,15 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState)
             mutable = Dict{Symbol,Symbol}()
             _pr_contribute!(reverse, fc, adj, mutable, result,
                             [_PRTerm(1.0, Any[_pr_bar(total)], nothing)], true)
-            _pr_factored_sweep!(reverse, fc, inloop, adj, mutable, true)
+            _pr_factored_sweep!(reverse, fc, inloop, adj, mutable, true, cuts)
             _pr_flush_counts!(fc)
             coefficients, flush = fc.pre, fc.post
-            _pr_reverse_exprs!(after, hoisted, active, copy(defined); touched = st.touched)
+            _pr_reverse_exprs!(after, hoisted, active, copy(defined); touched = st.touched, cuts)
         end
+        # Select joint cuts from the reverse's actual uses before emitting the
+        # forward. Hoisted calls stay above the loop; branch-local calls stay lazy.
+        forward_in = _pr_forward_exprs(inloop, cuts)
+        forward_pre = _pr_forward_exprs(hoisted, cuts)
         # The cell's value, for a sweep that also returns the plate's total
         # (`_PR_WANT_VALUE`): its invariant terms once, `ncells` times, after
         # the loop, and one partial sum per cell-varying term in it.
@@ -1459,7 +1561,7 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState)
               end) :
             :(if $(GlobalRef(@__MODULE__, :_pr_spans_all))($cells, $(read_operands...))
                   @inbounds for $linear in $cells
-                      $(_pr_forward_exprs(direct_in)...)
+                      $(_pr_forward_exprs(direct_in, cuts)...)
                       $(value_in...)
                       $(reverse...)
                   end
@@ -1494,7 +1596,11 @@ end
 
 @inline _pr_shadow_add!(::Nothing, i, v) = nothing
 @inline function _pr_shadow_add!(shadow::AbstractArray, i, v)
-    @inbounds shadow[i] += v
+    # Batched operands are one-dimensional, but may broadcast a single entry
+    # over the plate. Its cotangent sums at that entry, just as its primal
+    # reads do; the cell index would write beyond a singleton shadow.
+    index = length(shadow) == 1 ? firstindex(shadow) : i
+    @inbounds shadow[index] += v
     nothing
 end
 
@@ -1553,10 +1659,11 @@ function _pr_program_block(stmts, st::_PRProgramState)
         active = _pr_activity!(copy(st.active), sub)
         defined = Set{Symbol}(_pr_bar(a) for a in st.outer if !(a in st.totals))
         if r isa Symbol && r in active && r !== s.lhs
-            append!(rev, _pr_forward_exprs(sub))
-            push!(rev, :($(_pr_bar(r)) = $(_pr_bar(s.lhs))))
+            cuts = Dict{Symbol,Tuple{Symbol,Expr}}()
+            subrev = Any[:($(_pr_bar(r)) = $(_pr_bar(s.lhs)))]
             push!(defined, _pr_bar(r))
-            _pr_reverse_exprs!(rev, sub, active, defined; touched = st.touched)
+            _pr_reverse_exprs!(subrev, sub, active, defined; touched = st.touched, cuts)
+            append!(rev, _pr_forward_exprs(sub, cuts), subrev)
         end
     end
     vcat(fwd, rev)
@@ -1587,19 +1694,31 @@ function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict
     # Running totals: seeded (`_plate_total_seed`) or accumulated
     # (`_plate_total_add`), including a total the body seeds and passes in.
     totals = Set{Symbol}()
-    for (lhs, rhs) in _pr_assignments!(Pair{Symbol,Any}[], body)
+    assignments = _pr_assignments!(Pair{Symbol,Any}[], body)
+    for (lhs, rhs) in assignments
         Meta.isexpr(rhs, :call) && (_pr_is_ref(rhs.args[1], @__MODULE__, :_plate_total_add) ||
             _pr_is_ref(rhs.args[1], @__MODULE__, :_plate_total_seed)) && push!(totals, lhs)
     end
     isempty(totals) && _pr_fail("no plate total")
-    output in totals || any(((lhs, rhs),) -> lhs === output && Meta.isexpr(rhs, :call, 2) &&
-        _pr_is_ref(rhs.args[1], @__MODULE__, :_plate_total_value) && rhs.args[2] in totals,
-        _pr_assignments!(Pair{Symbol,Any}[], body)) || _pr_fail("the program's result is not its plate total")
+    terminal_totals = Set{Symbol}(t for t in totals if t === output)
+    for (lhs, rhs) in assignments
+        lhs === output && Meta.isexpr(rhs, :call, 2) &&
+            _pr_is_ref(rhs.args[1], @__MODULE__, :_plate_total_value) &&
+            rhs.args[2] in totals && push!(terminal_totals, rhs.args[2])
+    end
+    isempty(terminal_totals) && _pr_fail("the program's result is not its plate total")
+    # A factored reduction also has a partial total whose adjoint is scaled
+    # by later arithmetic. Seeding that partial with the output's seed would
+    # be wrong. Distinct terminal totals in mutually exclusive branches may
+    # each use that seed; counting totals alone would reject those programs.
+    issubset(totals, terminal_totals) ||
+        _pr_fail("an intermediate plate total needs a propagated adjoint")
     prepared, broadcastables = _pr_prepared_operands(body, params)
+    cell_reads = _pr_direct_operands!(prepared, body, params, active_params,
+                                    broadcastables, mod, values)
     active = _pr_program_activity(body, active_params, mod, values)
     batched = Symbol[p for p in params if p in active_params && p in Base.values(prepared)]
     scalar = Symbol[p for p in params if p in active_params && !(p in batched)]
-    assignments = _pr_assignments!(Pair{Symbol,Any}[], body)
     # A marker returns an operand alias, not detached metadata. Permit it
     # only when its result is read exclusively by derivative-inert queries.
     # Keep the call and its checks in the program; a numerical read, another
@@ -1614,7 +1733,7 @@ function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict
         # operand (aliases such as the plate's axis marker are inert).
         for (lhs, rhs) in assignments
             rhs === p && continue
-            p in _pr_reads!(Set{Symbol}(), rhs, mod, values) || continue
+            p in _pr_reads!(Set{Symbol}(), rhs, mod, values; cell_reads) || continue
             haskey(broadcastables, lhs) && continue
             # `preprocess(nothing, p)`: the body passed p in already broadcastable.
             get(prepared, lhs, nothing) === p && continue
@@ -1913,8 +2032,8 @@ the source is eligible for generated reverse, or its fallback reason.
 Accepts a `PreparedKernel` or `NonAllocatingKernel`. This is a static report,
 independent of whether the preference is enabled; cache rewrites and backend
 operand annotations can affect the rule used by a prepared gradient.
-Plates the lowering keeps inline (a body with one plate) are not programs
-and are not listed.
+Single-plate programs are listed even when ordinary native execution inlines
+them.
 """
 function plate_reverse_report(kernel::Union{PreparedKernel,NonAllocatingKernel}, active = 1)
     _has_plate_programs(kernel.ast) || return Pair{Symbol,String}[]

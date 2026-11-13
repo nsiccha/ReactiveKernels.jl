@@ -296,6 +296,112 @@ end
     end
 end
 
+# A partition of one cell per label, and a plate computed at one row, run their
+# one cell once rather than as a loop over a one-cell domain (`_plate_one_cell`):
+# under Enzyme Reverse every loop entry allocates the caches its reverse pass
+# reads through libc, which a one-cell call paid per call (todo
+# `ReactiveKernels:compact-cells/todos/2026-11-11T11-26-41-444-16tgigp`). A
+# plate nested in the cell, over a subject's observations, keeps its loop.
+@kernel _pp_one_cell_nested(u::AbstractVector{Float64}, X::AbstractMatrix{Float64},
+                            ids::AbstractVector{Int}, t::AbstractVector{Vector{Float64}},
+                            y::AbstractVector{Vector{Float64}},
+                            subject::AbstractVector{Int}) = begin
+    a::Float64 = u[1]
+    beta::AbstractVector{Float64} = view(u, 2:3)
+    z::AbstractVector{Float64} = view(u, 4:8)
+    log_k = a .+ X * beta .+ z
+    rates = plate(log_k) do lk
+        (exp(lk), exp(-lk / 2))
+    end
+    dens = plate(ids, t, y) do i, ti, yi
+        k, v = rates[i]
+        terms = plate(ti, yi) do tj, yj
+            -(yj - v * exp(-k * tj))^2 / 2
+        end
+        sum(terms)
+    end
+    total = sum(dens)
+    return total
+end
+
+@testset "plate_partition: one-cell domains run their cell without a loop" begin
+    n = 5
+    data(len) = (; u = [0.2, -0.3, 0.5, 0.1, -0.2, 0.4, -0.1, 0.3],
+                   X = [sin(i + j) for i in 1:n, j in 1:2], ids = collect(1:n),
+                   t = [collect(range(0.5, 4.0; length = len + i % 3)) for i in 1:n],
+                   y = [cos.(range(0.1, 1.0; length = len + i % 3)) for i in 1:n],
+                   subject = collect(1:n))
+    have = (:u, :X, :ids, :t, :y, :subject, :label)
+    loops(source) = count("_plate_cells(", source) + count("_plate_simd_cells(", source)
+    sources = String[]
+    for len in (2, 9)
+        d = data(len)
+        bound = (; d.X, d.ids, d.t, d.y, d.subject)
+        rows = prepare(plate_partition(_pp_one_cell_nested, :dens; by = :subject,
+                                       index = :label); have, want = :partition_total, bound)
+        single = prepare(plate_partition(_pp_one_cell_nested, :dens; by = :subject,
+                                         index = :label, single = true);
+                         have, want = :partition_total, bound)
+        dens = prepare(_pp_one_cell_nested; have = (:u, :X, :ids, :t, :y, :subject),
+                       want = :dens)(d.u, d.X, d.ids, d.t, d.y, d.subject)
+        for s in 1:n
+            @test single(d.u, s) ≈ rows(d.u, s) rtol = 1e-14
+            @test single(d.u, s) ≈ dens[s] rtol = 1e-14
+        end
+        source = string(code_expr(single))
+        push!(sources, source)
+        # The partition's cell and the per-subject plate at one row run once.
+        @test count("_plate_one_cell(", source) >= 2
+        @test !occursin("_plate_one_cell(", string(code_expr(rows)))
+        # The observation plate inside the cell still iterates its data.
+        @test loops(source) >= 1
+        backend = AutoEnzyme(; mode = Enzyme.Reverse)
+        for s in (1, 4)
+            g1, g2 = similar(d.u), similar(d.u)
+            v1, _ = ad_value_and_gradient!(prepare_ad(single, backend, d.u, s; active = :u),
+                                           g1, d.u, s)
+            v2, _ = ad_value_and_gradient!(prepare_ad(rows, backend, d.u, s; active = :u),
+                                           g2, d.u, s)
+            @test v1 ≈ v2 rtol = 1e-14
+            @test g1 ≈ g2 rtol = 1e-12
+            @test findall(!iszero, g1) == [1, 2, 3, 3 + s]
+        end
+    end
+    # More observations per subject replicate no body: the same one-cell sites
+    # and the same loops.
+    @test count("_plate_one_cell(", sources[1]) == count("_plate_one_cell(", sources[2])
+    @test loops(sources[1]) == loops(sources[2])
+    # A domain that is not one cell is refused, not read at its first cell.
+    @test_throws "one cell by construction" ReactiveKernels._plate_one_cell((Base.OneTo(2),))
+    @test ReactiveKernels._plate_one_cell((Base.OneTo(1),)) == CartesianIndex(1)
+end
+
+@testset "_gather_copy is a fresh copy of the gather" begin
+    array = [0.5, -1.25, 3.0, 7.5, -2.0]
+    for indices in ([2, 5, 2], Int[], [4])
+        out = ReactiveKernels._gather_copy(array, indices)
+        @test out == array[indices] && axes(out) == axes(indices)
+        @test out isa Vector{Float64} && !Base.mightalias(out, array)
+    end
+    @test_throws BoundsError ReactiveKernels._gather_copy(array, [1, 6])
+    @test ReactiveKernels._gather_copy(array, 4) === 7.5
+end
+
+@testset "a row product's entry is the in-order sum of its terms" begin
+    values = [0.3, -1.7, 2.9]
+    F = [sin(3i + j) for i in 1:3, j in 1:4]
+    for factor in (F, transpose(F'), view(F, :, :))
+        p = ReactiveKernels._native_mul(ReactiveKernels._CellOneRow(view(values, 1:3)), factor)
+        for k in 1:4
+            expected = 0.0
+            for j in 1:3
+                expected += values[j] * factor[j, k]
+            end
+            @test p[k] === expected
+        end
+    end
+end
+
 # Two one-cell members reading one predictor as a batched argument, each at its
 # own row of it. The second member lists the subjects in another order, so a
 # label's two rows differ for some labels and agree for others. The predictor

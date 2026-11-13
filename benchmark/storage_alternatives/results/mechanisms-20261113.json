@@ -1,0 +1,3786 @@
+{
+  "base": "0a6b45626c23c20425de836b99215de97d317a9f",
+  "enzyme": "0.13.220",
+  "enzyme_source": "/home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-storage-alternatives/.rk-deps/storage-alternatives/Enzyme/src/Enzyme.jl",
+  "julia": "1.10.12",
+  "libenzyme": "/home/niko/.local/state/kb-agents/libenzyme-dogfood/e316a076ef438970e339876079acd02ce48d3d21/llvm15/libEnzyme-15.so",
+  "measurements": [
+    {
+      "ad_prepare_s": 1.102061268,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 4.474586657,
+      "loops": 2,
+      "mode": "control",
+      "n": 0,
+      "nodes": 98,
+      "prepare_bytes": 374840460,
+      "prepare_s": 6.18386238,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 30.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 20.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 30.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 30.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "stored"
+    },
+    {
+      "ad_prepare_s": 0.2696804,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 0.243098337,
+      "loops": 2,
+      "mode": "early",
+      "n": 0,
+      "nodes": 99,
+      "prepare_bytes": 108025352,
+      "prepare_s": 1.25852784,
+      "rounds": [
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 60.0,
+          "primal_allocs": 1,
+          "primal_bytes": 64,
+          "primal_ns": 30.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 40.0,
+          "primal_allocs": 1,
+          "primal_bytes": 64,
+          "primal_ns": 30.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 40.0,
+          "primal_allocs": 1,
+          "primal_bytes": 64,
+          "primal_ns": 30.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "stored"
+    },
+    {
+      "ad_prepare_s": 0.345423248,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 1.322508773,
+      "loops": 2,
+      "mode": "early_snapshot",
+      "n": 0,
+      "nodes": 104,
+      "prepare_bytes": 34758616,
+      "prepare_s": 0.40559663,
+      "rounds": [
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 40.0,
+          "primal_allocs": 1,
+          "primal_bytes": 64,
+          "primal_ns": 30.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 40.0,
+          "primal_allocs": 1,
+          "primal_bytes": 64,
+          "primal_ns": 30.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 40.0,
+          "primal_allocs": 1,
+          "primal_bytes": 64,
+          "primal_ns": 30.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "stored"
+    },
+    {
+      "ad_prepare_s": 0.19248123,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 0.235712032,
+      "loops": 2,
+      "mode": "late",
+      "n": 0,
+      "nodes": 103,
+      "prepare_bytes": 6051248,
+      "prepare_s": 0.14420874,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 30.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 20.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 20.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 20.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "stored"
+    },
+    {
+      "ad_prepare_s": 0.176228967,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 0.247609835,
+      "loops": 2,
+      "mode": "late_snapshot",
+      "n": 0,
+      "nodes": 105,
+      "prepare_bytes": 6691600,
+      "prepare_s": 0.087399362,
+      "rounds": [
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 40.0,
+          "primal_allocs": 2,
+          "primal_bytes": 72,
+          "primal_ns": 40.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 50.0,
+          "primal_allocs": 2,
+          "primal_bytes": 72,
+          "primal_ns": 30.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 40.0,
+          "primal_allocs": 2,
+          "primal_bytes": 72,
+          "primal_ns": 40.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "stored"
+    },
+    {
+      "ad_prepare_s": 0.002814967,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 5.97e-06,
+      "loops": 2,
+      "mode": "control",
+      "n": 1,
+      "nodes": 98,
+      "prepare_bytes": 2500248,
+      "prepare_s": 0.00608593,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 50.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 40.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 50.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 40.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 50.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 40.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "stored"
+    },
+    {
+      "ad_prepare_s": 0.003105285,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 1.171e-05,
+      "loops": 2,
+      "mode": "early",
+      "n": 1,
+      "nodes": 99,
+      "prepare_bytes": 1315216,
+      "prepare_s": 0.004737097,
+      "rounds": [
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 90.0,
+          "primal_allocs": 1,
+          "primal_bytes": 64,
+          "primal_ns": 60.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 90.0,
+          "primal_allocs": 1,
+          "primal_bytes": 64,
+          "primal_ns": 60.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 90.0,
+          "primal_allocs": 1,
+          "primal_bytes": 64,
+          "primal_ns": 70.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "stored"
+    },
+    {
+      "ad_prepare_s": 0.004380469,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 9.87e-06,
+      "loops": 2,
+      "mode": "early_snapshot",
+      "n": 1,
+      "nodes": 104,
+      "prepare_bytes": 1434600,
+      "prepare_s": 0.005057846,
+      "rounds": [
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 90.0,
+          "primal_allocs": 1,
+          "primal_bytes": 64,
+          "primal_ns": 60.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 90.0,
+          "primal_allocs": 1,
+          "primal_bytes": 64,
+          "primal_ns": 60.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 130.0,
+          "primal_allocs": 1,
+          "primal_bytes": 64,
+          "primal_ns": 60.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "stored"
+    },
+    {
+      "ad_prepare_s": 0.002598427,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 5.67e-06,
+      "loops": 2,
+      "mode": "late",
+      "n": 1,
+      "nodes": 103,
+      "prepare_bytes": 3110928,
+      "prepare_s": 0.009446545,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 60.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 50.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 90.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 60.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 60.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 50.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "stored"
+    },
+    {
+      "ad_prepare_s": 0.002435568,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 4.89e-06,
+      "loops": 2,
+      "mode": "late_snapshot",
+      "n": 1,
+      "nodes": 105,
+      "prepare_bytes": 3201168,
+      "prepare_s": 0.005533114,
+      "rounds": [
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 80.0,
+          "primal_allocs": 2,
+          "primal_bytes": 72,
+          "primal_ns": 60.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 90.0,
+          "primal_allocs": 2,
+          "primal_bytes": 72,
+          "primal_ns": 60.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 120.0,
+          "primal_allocs": 2,
+          "primal_bytes": 72,
+          "primal_ns": 80.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "stored"
+    },
+    {
+      "ad_prepare_s": 0.003611973,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 1.012e-05,
+      "loops": 2,
+      "mode": "control",
+      "n": 17,
+      "nodes": 98,
+      "prepare_bytes": 2517288,
+      "prepare_s": 0.007352855,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 400.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 190.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 420.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 200.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 400.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 190.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "stored"
+    },
+    {
+      "ad_prepare_s": 0.002639058,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 7.55e-06,
+      "loops": 2,
+      "mode": "early",
+      "n": 17,
+      "nodes": 99,
+      "prepare_bytes": 1314912,
+      "prepare_s": 0.004272479,
+      "rounds": [
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 384,
+          "gradient_ns": 380.0,
+          "primal_allocs": 1,
+          "primal_bytes": 192,
+          "primal_ns": 220.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 384,
+          "gradient_ns": 380.0,
+          "primal_allocs": 1,
+          "primal_bytes": 192,
+          "primal_ns": 210.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 384,
+          "gradient_ns": 650.0,
+          "primal_allocs": 1,
+          "primal_bytes": 192,
+          "primal_ns": 330.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "stored"
+    },
+    {
+      "ad_prepare_s": 0.002655707,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 7.64e-06,
+      "loops": 2,
+      "mode": "early_snapshot",
+      "n": 17,
+      "nodes": 104,
+      "prepare_bytes": 1418664,
+      "prepare_s": 0.004052671,
+      "rounds": [
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 384,
+          "gradient_ns": 640.0,
+          "primal_allocs": 1,
+          "primal_bytes": 192,
+          "primal_ns": 340.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 384,
+          "gradient_ns": 635.0,
+          "primal_allocs": 1,
+          "primal_bytes": 192,
+          "primal_ns": 220.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 384,
+          "gradient_ns": 400.0,
+          "primal_allocs": 1,
+          "primal_bytes": 192,
+          "primal_ns": 220.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "stored"
+    },
+    {
+      "ad_prepare_s": 0.003302764,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 9.03e-06,
+      "loops": 2,
+      "mode": "late",
+      "n": 17,
+      "nodes": 103,
+      "prepare_bytes": 3094480,
+      "prepare_s": 0.009353165,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 590.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 210.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 590.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 280.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 380.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 210.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "stored"
+    },
+    {
+      "ad_prepare_s": 0.002753727,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 9.64e-06,
+      "loops": 2,
+      "mode": "late_snapshot",
+      "n": 17,
+      "nodes": 105,
+      "prepare_bytes": 3184656,
+      "prepare_s": 0.008855947,
+      "rounds": [
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 384,
+          "gradient_ns": 660.0,
+          "primal_allocs": 2,
+          "primal_bytes": 200,
+          "primal_ns": 220.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 384,
+          "gradient_ns": 590.0,
+          "primal_allocs": 2,
+          "primal_bytes": 200,
+          "primal_ns": 230.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 384,
+          "gradient_ns": 430.0,
+          "primal_allocs": 2,
+          "primal_bytes": 200,
+          "primal_ns": 220.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "stored"
+    },
+    {
+      "ad_prepare_s": 0.003880961,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 5.074e-05,
+      "loops": 2,
+      "mode": "control",
+      "n": 1000,
+      "nodes": 98,
+      "prepare_bytes": 2500760,
+      "prepare_s": 0.00630165,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 22940.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 10020.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 22015.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 9600.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 22700.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 9920.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "stored"
+    },
+    {
+      "ad_prepare_s": 0.002415778,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 3.786e-05,
+      "loops": 2,
+      "mode": "early",
+      "n": 1000,
+      "nodes": 99,
+      "prepare_bytes": 1314976,
+      "prepare_s": 0.003770012,
+      "rounds": [
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 16256,
+          "gradient_ns": 20385.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8128,
+          "primal_ns": 15779.5,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 16256,
+          "gradient_ns": 38050.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8128,
+          "primal_ns": 10990.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 16256,
+          "gradient_ns": 20865.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8128,
+          "primal_ns": 10520.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "stored"
+    },
+    {
+      "ad_prepare_s": 0.002953115,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 3.973e-05,
+      "loops": 2,
+      "mode": "early_snapshot",
+      "n": 1000,
+      "nodes": 104,
+      "prepare_bytes": 1418664,
+      "prepare_s": 0.00430102,
+      "rounds": [
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 16256,
+          "gradient_ns": 20035.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8128,
+          "primal_ns": 16100.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 16256,
+          "gradient_ns": 21454.5,
+          "primal_allocs": 1,
+          "primal_bytes": 8128,
+          "primal_ns": 11565.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 16256,
+          "gradient_ns": 21920.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8128,
+          "primal_ns": 11129.5,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "stored"
+    },
+    {
+      "ad_prepare_s": 0.003085445,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 3.384e-05,
+      "loops": 2,
+      "mode": "late",
+      "n": 1000,
+      "nodes": 103,
+      "prepare_bytes": 3094432,
+      "prepare_s": 0.007742573,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 19460.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 9700.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 19460.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 9710.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 19530.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 9700.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "stored"
+    },
+    {
+      "ad_prepare_s": 0.002541818,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 3.236e-05,
+      "loops": 2,
+      "mode": "late_snapshot",
+      "n": 1000,
+      "nodes": 105,
+      "prepare_bytes": 3184048,
+      "prepare_s": 0.00825937,
+      "rounds": [
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 16256,
+          "gradient_ns": 22535.0,
+          "primal_allocs": 2,
+          "primal_bytes": 8136,
+          "primal_ns": 16560.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 16256,
+          "gradient_ns": 22580.0,
+          "primal_allocs": 2,
+          "primal_bytes": 8136,
+          "primal_ns": 10850.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 16256,
+          "gradient_ns": 33960.0,
+          "primal_allocs": 2,
+          "primal_bytes": 8136,
+          "primal_ns": 11130.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "stored"
+    },
+    {
+      "ad_prepare_s": 0.483256949,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 0.284075841,
+      "loops": 2,
+      "mode": "control",
+      "n": 0,
+      "nodes": 91,
+      "prepare_bytes": 71645952,
+      "prepare_s": 1.157381674,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 20.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 20.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 20.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "explicit"
+    },
+    {
+      "ad_prepare_s": 0.246931838,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 0.207453668,
+      "loops": 2,
+      "mode": "early",
+      "n": 0,
+      "nodes": 91,
+      "prepare_bytes": 7534984,
+      "prepare_s": 0.204289402,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 20.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 20.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 20.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "explicit"
+    },
+    {
+      "ad_prepare_s": 0.002193159,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 2.93e-06,
+      "loops": 2,
+      "mode": "early_snapshot",
+      "n": 0,
+      "nodes": 91,
+      "prepare_bytes": 1141360,
+      "prepare_s": 0.003467074,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 20.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 20.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 20.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "explicit"
+    },
+    {
+      "ad_prepare_s": 0.002835546,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 3.52e-06,
+      "loops": 2,
+      "mode": "late",
+      "n": 0,
+      "nodes": 91,
+      "prepare_bytes": 4246512,
+      "prepare_s": 0.077013542,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 20.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 20.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 20.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "explicit"
+    },
+    {
+      "ad_prepare_s": 0.00421626,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 5.2e-06,
+      "loops": 2,
+      "mode": "late_snapshot",
+      "n": 0,
+      "nodes": 91,
+      "prepare_bytes": 2766896,
+      "prepare_s": 0.01661848,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 20.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 20.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 20.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "explicit"
+    },
+    {
+      "ad_prepare_s": 0.002758147,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 5.56e-06,
+      "loops": 2,
+      "mode": "control",
+      "n": 1,
+      "nodes": 91,
+      "prepare_bytes": 2140472,
+      "prepare_s": 0.008533849,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 60.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 50.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 60.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 50.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 60.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 50.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "explicit"
+    },
+    {
+      "ad_prepare_s": 0.002379789,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 4.77e-06,
+      "loops": 2,
+      "mode": "early",
+      "n": 1,
+      "nodes": 91,
+      "prepare_bytes": 1076016,
+      "prepare_s": 0.004039941,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 60.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 50.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 60.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 50.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 60.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 50.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "explicit"
+    },
+    {
+      "ad_prepare_s": 0.002355809,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 2.66e-06,
+      "loops": 2,
+      "mode": "early_snapshot",
+      "n": 1,
+      "nodes": 91,
+      "prepare_bytes": 1141360,
+      "prepare_s": 0.003761612,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 60.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 50.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 60.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 50.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 60.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 50.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "explicit"
+    },
+    {
+      "ad_prepare_s": 0.002259189,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 3.95e-06,
+      "loops": 2,
+      "mode": "late",
+      "n": 1,
+      "nodes": 91,
+      "prepare_bytes": 2604576,
+      "prepare_s": 0.007844142,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 60.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 50.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 60.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 50.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 60.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 50.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "explicit"
+    },
+    {
+      "ad_prepare_s": 0.005303945,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 7.04e-06,
+      "loops": 2,
+      "mode": "late_snapshot",
+      "n": 1,
+      "nodes": 91,
+      "prepare_bytes": 2685216,
+      "prepare_s": 0.008048892,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 60.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 50.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 60.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 50.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 60.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 50.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "explicit"
+    },
+    {
+      "ad_prepare_s": 0.002652207,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 6.63e-06,
+      "loops": 2,
+      "mode": "control",
+      "n": 17,
+      "nodes": 91,
+      "prepare_bytes": 2140168,
+      "prepare_s": 0.007131296,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 560.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 320.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 560.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 330.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 850.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 480.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "explicit"
+    },
+    {
+      "ad_prepare_s": 0.002467758,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 5.52e-06,
+      "loops": 2,
+      "mode": "early",
+      "n": 17,
+      "nodes": 91,
+      "prepare_bytes": 1076016,
+      "prepare_s": 0.003270865,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 570.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 330.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 570.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 330.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 850.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 485.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "explicit"
+    },
+    {
+      "ad_prepare_s": 0.002688297,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 6.22e-06,
+      "loops": 2,
+      "mode": "early_snapshot",
+      "n": 17,
+      "nodes": 91,
+      "prepare_bytes": 1141424,
+      "prepare_s": 0.022055764,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 570.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 330.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 870.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 430.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 860.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 490.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "explicit"
+    },
+    {
+      "ad_prepare_s": 0.00212094,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 7.51e-06,
+      "loops": 2,
+      "mode": "late",
+      "n": 17,
+      "nodes": 91,
+      "prepare_bytes": 2604880,
+      "prepare_s": 0.007300085,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 560.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 330.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 880.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 445.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 990.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 430.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "explicit"
+    },
+    {
+      "ad_prepare_s": 0.002564488,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 1.0779e-05,
+      "loops": 2,
+      "mode": "late_snapshot",
+      "n": 17,
+      "nodes": 91,
+      "prepare_bytes": 2684912,
+      "prepare_s": 0.007204626,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 560.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 330.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 560.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 330.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 850.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 490.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "explicit"
+    },
+    {
+      "ad_prepare_s": 0.002513098,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 4.105e-05,
+      "loops": 2,
+      "mode": "control",
+      "n": 1000,
+      "nodes": 91,
+      "prepare_bytes": 2140472,
+      "prepare_s": 0.006862997,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 30999.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 16980.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 30920.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 16970.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 30840.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 16920.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "explicit"
+    },
+    {
+      "ad_prepare_s": 0.002580478,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 4.068e-05,
+      "loops": 2,
+      "mode": "early",
+      "n": 1000,
+      "nodes": 91,
+      "prepare_bytes": 1076016,
+      "prepare_s": 0.003006685,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 31040.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 17004.5,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 30914.5,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 16990.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 49185.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 26375.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "explicit"
+    },
+    {
+      "ad_prepare_s": 0.003297454,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 4.216e-05,
+      "loops": 2,
+      "mode": "early_snapshot",
+      "n": 1000,
+      "nodes": 91,
+      "prepare_bytes": 1141360,
+      "prepare_s": 0.004966036,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 31000.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 17000.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 30880.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 16950.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 31150.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 17070.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "explicit"
+    },
+    {
+      "ad_prepare_s": 0.003552873,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 6.137e-05,
+      "loops": 2,
+      "mode": "late",
+      "n": 1000,
+      "nodes": 91,
+      "prepare_bytes": 2604576,
+      "prepare_s": 0.008933867,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 31029.5,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 17020.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 30850.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 16940.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 30790.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 16930.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "explicit"
+    },
+    {
+      "ad_prepare_s": 0.002501208,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 4.373e-05,
+      "loops": 2,
+      "mode": "late_snapshot",
+      "n": 1000,
+      "nodes": 91,
+      "prepare_bytes": 2684976,
+      "prepare_s": 0.007622843,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 48259.5,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 24979.5,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 30940.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 17010.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 30789.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 16960.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "explicit"
+    },
+    {
+      "ad_prepare_s": 0.410539936,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 0.257480018,
+      "loops": 2,
+      "mode": "control",
+      "n": 1,
+      "nodes": 99,
+      "prepare_bytes": 14598568,
+      "prepare_s": 0.129345501,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 60.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 40.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 60.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 40.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 60.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 40.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "retained"
+    },
+    {
+      "ad_prepare_s": 0.339670705,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 0.237189596,
+      "loops": 2,
+      "mode": "early",
+      "n": 1,
+      "nodes": 96,
+      "prepare_bytes": 2473416,
+      "prepare_s": 0.035850549,
+      "rounds": [
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 70.0,
+          "primal_allocs": 1,
+          "primal_bytes": 64,
+          "primal_ns": 70.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 70.0,
+          "primal_allocs": 1,
+          "primal_bytes": 64,
+          "primal_ns": 50.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 70.0,
+          "primal_allocs": 1,
+          "primal_bytes": 64,
+          "primal_ns": 50.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "retained"
+    },
+    {
+      "ad_prepare_s": 0.002660707,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 3.83e-06,
+      "loops": 2,
+      "mode": "early_snapshot",
+      "n": 1,
+      "nodes": 96,
+      "prepare_bytes": 1324528,
+      "prepare_s": 0.003941381,
+      "rounds": [
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 70.0,
+          "primal_allocs": 1,
+          "primal_bytes": 64,
+          "primal_ns": 70.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 70.0,
+          "primal_allocs": 1,
+          "primal_bytes": 64,
+          "primal_ns": 80.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 70.0,
+          "primal_allocs": 1,
+          "primal_bytes": 64,
+          "primal_ns": 50.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "retained"
+    },
+    {
+      "ad_prepare_s": 0.004084511,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 7.49e-06,
+      "loops": 2,
+      "mode": "late",
+      "n": 1,
+      "nodes": 99,
+      "prepare_bytes": 4741800,
+      "prepare_s": 0.04792222,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 60.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 40.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 60.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 40.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 50.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 40.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "retained"
+    },
+    {
+      "ad_prepare_s": 0.003205445,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 6.89e-06,
+      "loops": 2,
+      "mode": "late_snapshot",
+      "n": 1,
+      "nodes": 99,
+      "prepare_bytes": 3286200,
+      "prepare_s": 0.019990294,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 60.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 40.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 80.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 50.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 70.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 50.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "retained"
+    },
+    {
+      "ad_prepare_s": 0.002545848,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 6.28e-06,
+      "loops": 2,
+      "mode": "control",
+      "n": 17,
+      "nodes": 99,
+      "prepare_bytes": 2586040,
+      "prepare_s": 0.005941632,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 410.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 190.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 420.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 200.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 760.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 335.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "retained"
+    },
+    {
+      "ad_prepare_s": 0.002351299,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 5.72e-06,
+      "loops": 2,
+      "mode": "early",
+      "n": 17,
+      "nodes": 96,
+      "prepare_bytes": 1253616,
+      "prepare_s": 0.003134605,
+      "rounds": [
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 384,
+          "gradient_ns": 670.0,
+          "primal_allocs": 1,
+          "primal_bytes": 192,
+          "primal_ns": 330.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 384,
+          "gradient_ns": 690.0,
+          "primal_allocs": 1,
+          "primal_bytes": 192,
+          "primal_ns": 200.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 384,
+          "gradient_ns": 680.0,
+          "primal_allocs": 1,
+          "primal_bytes": 192,
+          "primal_ns": 330.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "retained"
+    },
+    {
+      "ad_prepare_s": 0.002656088,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 6.129e-06,
+      "loops": 2,
+      "mode": "early_snapshot",
+      "n": 17,
+      "nodes": 96,
+      "prepare_bytes": 1323952,
+      "prepare_s": 0.003490893,
+      "rounds": [
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 384,
+          "gradient_ns": 420.0,
+          "primal_allocs": 1,
+          "primal_bytes": 192,
+          "primal_ns": 210.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 384,
+          "gradient_ns": 410.0,
+          "primal_allocs": 1,
+          "primal_bytes": 192,
+          "primal_ns": 330.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 384,
+          "gradient_ns": 410.0,
+          "primal_allocs": 1,
+          "primal_bytes": 192,
+          "primal_ns": 360.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "retained"
+    },
+    {
+      "ad_prepare_s": 0.003467333,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 7.68e-06,
+      "loops": 2,
+      "mode": "late",
+      "n": 17,
+      "nodes": 99,
+      "prepare_bytes": 3134296,
+      "prepare_s": 0.009384405,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 420.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 200.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 430.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 300.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 740.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 350.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "retained"
+    },
+    {
+      "ad_prepare_s": 0.002503679,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 6.52e-06,
+      "loops": 2,
+      "mode": "late_snapshot",
+      "n": 17,
+      "nodes": 99,
+      "prepare_bytes": 3203688,
+      "prepare_s": 0.007034237,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 670.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 310.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 430.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 200.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 715.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 320.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "retained"
+    },
+    {
+      "ad_prepare_s": 0.004754208,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 5.057e-05,
+      "loops": 2,
+      "mode": "control",
+      "n": 1000,
+      "nodes": 99,
+      "prepare_bytes": 2602632,
+      "prepare_s": 0.013105427,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 22970.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 9680.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 24510.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 10310.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 35280.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 9670.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "retained"
+    },
+    {
+      "ad_prepare_s": 0.002552368,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 3.202e-05,
+      "loops": 2,
+      "mode": "early",
+      "n": 1000,
+      "nodes": 96,
+      "prepare_bytes": 1253616,
+      "prepare_s": 0.003608482,
+      "rounds": [
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 16256,
+          "gradient_ns": 34330.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8128,
+          "primal_ns": 16150.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 16256,
+          "gradient_ns": 32885.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8128,
+          "primal_ns": 10294.5,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 16256,
+          "gradient_ns": 34909.5,
+          "primal_allocs": 1,
+          "primal_bytes": 8128,
+          "primal_ns": 10480.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "retained"
+    },
+    {
+      "ad_prepare_s": 0.002477628,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 2.912e-05,
+      "loops": 2,
+      "mode": "early_snapshot",
+      "n": 1000,
+      "nodes": 96,
+      "prepare_bytes": 1324016,
+      "prepare_s": 0.003668022,
+      "rounds": [
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 16256,
+          "gradient_ns": 22140.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8128,
+          "primal_ns": 12465.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 16256,
+          "gradient_ns": 22310.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8128,
+          "primal_ns": 10335.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 16256,
+          "gradient_ns": 23270.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8128,
+          "primal_ns": 10180.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "retained"
+    },
+    {
+      "ad_prepare_s": 0.002399658,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 2.911e-05,
+      "loops": 2,
+      "mode": "late",
+      "n": 1000,
+      "nodes": 99,
+      "prepare_bytes": 3134520,
+      "prepare_s": 0.006736858,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 23990.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 10070.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 22870.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 9630.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 22810.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 9600.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "retained"
+    },
+    {
+      "ad_prepare_s": 0.003431533,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 3.015e-05,
+      "loops": 2,
+      "mode": "late_snapshot",
+      "n": 1000,
+      "nodes": 99,
+      "prepare_bytes": 3204216,
+      "prepare_s": 0.01056637,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 23880.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 10030.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 22810.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 9620.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 22965.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 9620.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "retained"
+    },
+    {
+      "ad_prepare_s": 0.367408733,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 0.275534032,
+      "loops": 2,
+      "mode": "control",
+      "n": 0,
+      "nodes": 97,
+      "prepare_bytes": 28299800,
+      "prepare_s": 0.155212697,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 30.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 20.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 20.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 20.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "logarithmic"
+    },
+    {
+      "ad_prepare_s": 0.318648066,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 0.248548381,
+      "loops": 2,
+      "mode": "early",
+      "n": 0,
+      "nodes": 101,
+      "prepare_bytes": 1585584,
+      "prepare_s": 0.010677849,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 20.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 20.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 20.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "logarithmic"
+    },
+    {
+      "ad_prepare_s": 0.297011899,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 0.273465902,
+      "loops": 2,
+      "mode": "early_snapshot",
+      "n": 0,
+      "nodes": 106,
+      "prepare_bytes": 2561536,
+      "prepare_s": 0.032360735,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 20.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 20.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 20.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "logarithmic"
+    },
+    {
+      "ad_prepare_s": 0.212281694,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 0.286062872,
+      "loops": 2,
+      "mode": "late",
+      "n": 0,
+      "nodes": 102,
+      "prepare_bytes": 4885288,
+      "prepare_s": 0.064506381,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 20.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 20.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 20.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "logarithmic"
+    },
+    {
+      "ad_prepare_s": 0.189754702,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 0.270779025,
+      "loops": 2,
+      "mode": "late_snapshot",
+      "n": 0,
+      "nodes": 104,
+      "prepare_bytes": 6611624,
+      "prepare_s": 0.088424037,
+      "rounds": [
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 40.0,
+          "primal_allocs": 1,
+          "primal_bytes": 64,
+          "primal_ns": 40.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 40.0,
+          "primal_allocs": 1,
+          "primal_bytes": 64,
+          "primal_ns": 30.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 40.0,
+          "primal_allocs": 1,
+          "primal_bytes": 64,
+          "primal_ns": 30.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "logarithmic"
+    },
+    {
+      "ad_prepare_s": 0.002373478,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 4.93e-06,
+      "loops": 2,
+      "mode": "control",
+      "n": 1,
+      "nodes": 97,
+      "prepare_bytes": 2452520,
+      "prepare_s": 0.005769163,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 50.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 40.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 50.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 40.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 50.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 40.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "logarithmic"
+    },
+    {
+      "ad_prepare_s": 0.002307929,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 4.29e-06,
+      "loops": 2,
+      "mode": "early",
+      "n": 1,
+      "nodes": 101,
+      "prepare_bytes": 1299976,
+      "prepare_s": 0.003053246,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 60.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 50.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 60.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 50.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 60.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 50.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "logarithmic"
+    },
+    {
+      "ad_prepare_s": 0.002536378,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 5.78e-06,
+      "loops": 2,
+      "mode": "early_snapshot",
+      "n": 1,
+      "nodes": 106,
+      "prepare_bytes": 1415816,
+      "prepare_s": 0.003770282,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 70.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 50.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 70.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 50.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 70.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 50.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "logarithmic"
+    },
+    {
+      "ad_prepare_s": 0.002547717,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 5.53e-06,
+      "loops": 2,
+      "mode": "late",
+      "n": 1,
+      "nodes": 102,
+      "prepare_bytes": 3074520,
+      "prepare_s": 0.006709098,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 60.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 50.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 60.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 50.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 60.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 50.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "logarithmic"
+    },
+    {
+      "ad_prepare_s": 0.002421419,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 5.51e-06,
+      "loops": 2,
+      "mode": "late_snapshot",
+      "n": 1,
+      "nodes": 104,
+      "prepare_bytes": 3125048,
+      "prepare_s": 0.011208456,
+      "rounds": [
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 80.0,
+          "primal_allocs": 1,
+          "primal_bytes": 64,
+          "primal_ns": 60.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 80.0,
+          "primal_allocs": 1,
+          "primal_bytes": 64,
+          "primal_ns": 60.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 80.0,
+          "primal_allocs": 1,
+          "primal_bytes": 64,
+          "primal_ns": 60.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "logarithmic"
+    },
+    {
+      "ad_prepare_s": 0.002697387,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 7.41e-06,
+      "loops": 2,
+      "mode": "control",
+      "n": 17,
+      "nodes": 97,
+      "prepare_bytes": 2452760,
+      "prepare_s": 0.008479249,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 330.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 230.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 340.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 170.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 320.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 160.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "logarithmic"
+    },
+    {
+      "ad_prepare_s": 0.002430348,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 9.83e-06,
+      "loops": 2,
+      "mode": "early",
+      "n": 17,
+      "nodes": 101,
+      "prepare_bytes": 1300040,
+      "prepare_s": 0.003367904,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 310.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 180.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 320.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 180.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 300.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 170.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "logarithmic"
+    },
+    {
+      "ad_prepare_s": 0.003396344,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 1.146e-05,
+      "loops": 2,
+      "mode": "early_snapshot",
+      "n": 17,
+      "nodes": 106,
+      "prepare_bytes": 1399304,
+      "prepare_s": 0.005618454,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 320.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 190.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 320.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 190.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 310.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 180.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "logarithmic"
+    },
+    {
+      "ad_prepare_s": 0.001978441,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 6.54e-06,
+      "loops": 2,
+      "mode": "late",
+      "n": 17,
+      "nodes": 102,
+      "prepare_bytes": 3057416,
+      "prepare_s": 0.00627267,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 310.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 180.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 320.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 180.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 315.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 190.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "logarithmic"
+    },
+    {
+      "ad_prepare_s": 0.001845091,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 7.6e-06,
+      "loops": 2,
+      "mode": "late_snapshot",
+      "n": 17,
+      "nodes": 104,
+      "prepare_bytes": 3130248,
+      "prepare_s": 0.005121726,
+      "rounds": [
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 384,
+          "gradient_ns": 330.0,
+          "primal_allocs": 1,
+          "primal_bytes": 192,
+          "primal_ns": 200.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 384,
+          "gradient_ns": 340.0,
+          "primal_allocs": 1,
+          "primal_bytes": 192,
+          "primal_ns": 200.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 384,
+          "gradient_ns": 330.0,
+          "primal_allocs": 1,
+          "primal_bytes": 192,
+          "primal_ns": 280.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "logarithmic"
+    },
+    {
+      "ad_prepare_s": 0.002854177,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 3.706e-05,
+      "loops": 2,
+      "mode": "control",
+      "n": 1000,
+      "nodes": 97,
+      "prepare_bytes": 2469272,
+      "prepare_s": 0.006207971,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 16910.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 7790.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 17694.5,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 8170.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 26729.5,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 12470.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "logarithmic"
+    },
+    {
+      "ad_prepare_s": 0.002770617,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 2.4509e-05,
+      "loops": 2,
+      "mode": "early",
+      "n": 1000,
+      "nodes": 101,
+      "prepare_bytes": 1299400,
+      "prepare_s": 0.00419375,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 14894.5,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 7980.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 15410.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 8320.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 25330.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 12540.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "logarithmic"
+    },
+    {
+      "ad_prepare_s": 0.002981676,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 2.735e-05,
+      "loops": 2,
+      "mode": "early_snapshot",
+      "n": 1000,
+      "nodes": 106,
+      "prepare_bytes": 1399880,
+      "prepare_s": 0.00411854,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 14895.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 8080.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 15465.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 8360.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 25440.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 12870.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "logarithmic"
+    },
+    {
+      "ad_prepare_s": 0.003596613,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 3.9949e-05,
+      "loops": 2,
+      "mode": "late",
+      "n": 1000,
+      "nodes": 102,
+      "prepare_bytes": 3040904,
+      "prepare_s": 0.007515964,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 14999.5,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 8000.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 15469.5,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 8330.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 15460.0,
+          "primal_allocs": 0,
+          "primal_bytes": 0,
+          "primal_ns": 8300.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "logarithmic"
+    },
+    {
+      "ad_prepare_s": 0.002681687,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 2.618e-05,
+      "loops": 2,
+      "mode": "late_snapshot",
+      "n": 1000,
+      "nodes": 104,
+      "prepare_bytes": 3130184,
+      "prepare_s": 0.008056941,
+      "rounds": [
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 16256,
+          "gradient_ns": 17515.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8128,
+          "primal_ns": 8680.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 16256,
+          "gradient_ns": 17555.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8128,
+          "primal_ns": 8955.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 16256,
+          "gradient_ns": 27300.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8128,
+          "primal_ns": 9069.5,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "logarithmic"
+    },
+    {
+      "ad_prepare_s": 1.251452712,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 5.343908313,
+      "loops": 2,
+      "mode": "control",
+      "n": 0,
+      "nodes": 99,
+      "prepare_bytes": 375451564,
+      "prepare_s": 7.228711542,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 30.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 20.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 20.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 20.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "retained"
+    },
+    {
+      "ad_prepare_s": 0.351751178,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 0.247520207,
+      "loops": 2,
+      "mode": "early",
+      "n": 0,
+      "nodes": 96,
+      "prepare_bytes": 97309184,
+      "prepare_s": 1.641098081,
+      "rounds": [
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 50.0,
+          "primal_allocs": 1,
+          "primal_bytes": 64,
+          "primal_ns": 30.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 60.0,
+          "primal_allocs": 1,
+          "primal_bytes": 64,
+          "primal_ns": 30.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 70.0,
+          "primal_allocs": 1,
+          "primal_bytes": 64,
+          "primal_ns": 30.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "retained"
+    },
+    {
+      "ad_prepare_s": 0.002745601,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 3.73e-06,
+      "loops": 2,
+      "mode": "early_snapshot",
+      "n": 0,
+      "nodes": 96,
+      "prepare_bytes": 27382704,
+      "prepare_s": 0.304786596,
+      "rounds": [
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 40.0,
+          "primal_allocs": 1,
+          "primal_bytes": 64,
+          "primal_ns": 40.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 60.0,
+          "primal_allocs": 1,
+          "primal_bytes": 64,
+          "primal_ns": 30.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 2,
+          "gradient_bytes": 128,
+          "gradient_ns": 70.0,
+          "primal_allocs": 1,
+          "primal_bytes": 64,
+          "primal_ns": 50.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "retained"
+    },
+    {
+      "ad_prepare_s": 0.013658466,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 4.61e-06,
+      "loops": 2,
+      "mode": "late",
+      "n": 0,
+      "nodes": 99,
+      "prepare_bytes": 5594184,
+      "prepare_s": 0.137599585,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 20.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 20.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 30.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 20.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "retained"
+    },
+    {
+      "ad_prepare_s": 0.002972861,
+      "audit": [],
+      "audit_findings": 0,
+      "first_gradient_s": 3.56e-06,
+      "loops": 2,
+      "mode": "late_snapshot",
+      "n": 0,
+      "nodes": 99,
+      "prepare_bytes": 3307768,
+      "prepare_s": 0.033603763,
+      "rounds": [
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 20.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 20.0,
+          "round": 1
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 30.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 30.0,
+          "round": 2
+        },
+        {
+          "gradient_allocs": 0,
+          "gradient_bytes": 0,
+          "gradient_ns": 30.0,
+          "primal_allocs": 1,
+          "primal_bytes": 8,
+          "primal_ns": 30.0,
+          "round": 3
+        }
+      ],
+      "semantic_pass": true,
+      "workload": "retained"
+    }
+  ],
+  "notes": [
+    "Mechanism workloads, not natural models. Ordinary Enzyme Reverse; generated plate reverse disabled.",
+    "Preparation and first-gradient times share one process and compiler in fixed order; only warm timings rotate.",
+    "Raw early and late variants deliberately expose unsafe borrowing and fail mutation counterexamples. No production candidate is accepted.",
+    "The initial retained/0 reference used sum(exp, x), which fails on an empty vector. It was corrected to sum(exp.(x)); the five cases passed in the follow-up.",
+    "Initial host load at grant/release: 17.45/24.25 on 32 logical CPUs; standard one-CPU quota.",
+    "Early exposed materialization can fall outside the storage decomposition grammar; extra allocation is an integration gap."
+  ],
+  "prototype_commit": "c968db361",
+  "receipts": {
+    "empty_followup_log": "/home/niko/scratch/kb-agent-tmp/ReactiveKerne-9a2557d4d9/kb-run-compact.fNH6Br",
+    "initial_elapsed_s": 224,
+    "initial_exit": 0,
+    "initial_log": "/home/niko/scratch/kb-agent-tmp/ReactiveKerne-9a2557d4d9/kb-run-compact.q1HV2g"
+  },
+  "snapshot_checks": [
+    {
+      "effect_reports": [
+        "(recipe = 1, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 2, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 3, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\")",
+        "(recipe = 4, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")",
+        "(recipe = 5, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")"
+      ],
+      "effects_gate": false,
+      "expected": 3.2957401737350835,
+      "kind": "readonly",
+      "mode": "control",
+      "preserved": true,
+      "value": 3.295740173735083
+    },
+    {
+      "effect_reports": [
+        "(recipe = 1, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 2, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 3, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\")",
+        "(recipe = 4, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")",
+        "(recipe = 5, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")"
+      ],
+      "effects_gate": false,
+      "expected": 3.2957401737350835,
+      "kind": "readonly",
+      "mode": "early",
+      "preserved": true,
+      "value": 3.2957401737350835
+    },
+    {
+      "effect_reports": [
+        "(recipe = 1, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 2, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 3, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\")",
+        "(recipe = 4, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")",
+        "(recipe = 5, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")"
+      ],
+      "effects_gate": false,
+      "expected": 3.2957401737350835,
+      "kind": "readonly",
+      "mode": "early_snapshot",
+      "preserved": true,
+      "value": 3.2957401737350835
+    },
+    {
+      "effect_reports": [
+        "(recipe = 1, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 2, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 3, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\")",
+        "(recipe = 4, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")",
+        "(recipe = 5, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")"
+      ],
+      "effects_gate": false,
+      "expected": 3.2957401737350835,
+      "kind": "readonly",
+      "mode": "late",
+      "preserved": true,
+      "value": 3.2957401737350835
+    },
+    {
+      "effect_reports": [
+        "(recipe = 1, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 2, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 3, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\")",
+        "(recipe = 4, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")",
+        "(recipe = 5, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")"
+      ],
+      "effects_gate": false,
+      "expected": 3.2957401737350835,
+      "kind": "readonly",
+      "mode": "late_snapshot",
+      "preserved": true,
+      "value": 3.2957401737350835
+    },
+    {
+      "effect_reports": [
+        "(recipe = 1, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 2, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 3, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\")",
+        "(recipe = 4, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")",
+        "(recipe = 5, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")"
+      ],
+      "effects_gate": false,
+      "expected": 3.2957401737350835,
+      "kind": "mutating",
+      "mode": "control",
+      "preserved": true,
+      "value": 3.295740173735083
+    },
+    {
+      "effect_reports": [
+        "(recipe = 1, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 2, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 3, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\")",
+        "(recipe = 4, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")",
+        "(recipe = 5, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")"
+      ],
+      "effects_gate": false,
+      "expected": 3.2957401737350835,
+      "kind": "mutating",
+      "mode": "early",
+      "preserved": false,
+      "value": -23.717432475105085
+    },
+    {
+      "effect_reports": [
+        "(recipe = 1, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 2, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 3, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\")",
+        "(recipe = 4, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")",
+        "(recipe = 5, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")"
+      ],
+      "effects_gate": false,
+      "expected": 3.2957401737350835,
+      "kind": "mutating",
+      "mode": "early_snapshot",
+      "preserved": true,
+      "value": 3.2957401737350835
+    },
+    {
+      "effect_reports": [
+        "(recipe = 1, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 2, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 3, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\")",
+        "(recipe = 4, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")",
+        "(recipe = 5, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")"
+      ],
+      "effects_gate": false,
+      "expected": 3.2957401737350835,
+      "kind": "mutating",
+      "mode": "late",
+      "preserved": false,
+      "value": -23.717432475105085
+    },
+    {
+      "effect_reports": [
+        "(recipe = 1, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 2, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 3, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\")",
+        "(recipe = 4, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")",
+        "(recipe = 5, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")"
+      ],
+      "effects_gate": false,
+      "expected": 3.2957401737350835,
+      "kind": "mutating",
+      "mode": "late_snapshot",
+      "preserved": true,
+      "value": 3.2957401737350835
+    },
+    {
+      "effect_reports": [
+        "(recipe = 1, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 2, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 3, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\")",
+        "(recipe = 4, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")",
+        "(recipe = 5, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")"
+      ],
+      "effects_gate": false,
+      "expected": 3.2957401737350835,
+      "kind": "global",
+      "mode": "control",
+      "preserved": true,
+      "value": 3.295740173735083
+    },
+    {
+      "effect_reports": [
+        "(recipe = 1, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 2, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 3, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\")",
+        "(recipe = 4, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")",
+        "(recipe = 5, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")"
+      ],
+      "effects_gate": false,
+      "expected": 3.2957401737350835,
+      "kind": "global",
+      "mode": "early",
+      "preserved": false,
+      "value": -23.717432475105085
+    },
+    {
+      "effect_reports": [
+        "(recipe = 1, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 2, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 3, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\")",
+        "(recipe = 4, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")",
+        "(recipe = 5, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")"
+      ],
+      "effects_gate": false,
+      "expected": 3.2957401737350835,
+      "kind": "global",
+      "mode": "early_snapshot",
+      "preserved": true,
+      "value": 3.2957401737350835
+    },
+    {
+      "effect_reports": [
+        "(recipe = 1, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 2, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 3, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\")",
+        "(recipe = 4, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")",
+        "(recipe = 5, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")"
+      ],
+      "effects_gate": false,
+      "expected": 3.2957401737350835,
+      "kind": "global",
+      "mode": "late",
+      "preserved": false,
+      "value": -23.717432475105085
+    },
+    {
+      "effect_reports": [
+        "(recipe = 1, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 2, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 3, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\")",
+        "(recipe = 4, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")",
+        "(recipe = 5, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")"
+      ],
+      "effects_gate": false,
+      "expected": 3.2957401737350835,
+      "kind": "global",
+      "mode": "late_snapshot",
+      "preserved": true,
+      "value": 3.2957401737350835
+    },
+    {
+      "effect_reports": [
+        "(recipe = 1, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\")",
+        "(recipe = 2, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 3, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 4, accepted = true, effects = \"(+c,+e,+n,+t,+s,?m,+i)\")",
+        "(recipe = 5, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\")",
+        "(recipe = 6, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")",
+        "(recipe = 7, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")"
+      ],
+      "effects_gate": false,
+      "expected": 3.2957401737350835,
+      "kind": "owned",
+      "mode": "control",
+      "preserved": true,
+      "value": 3.295740173735083
+    },
+    {
+      "effect_reports": [
+        "(recipe = 1, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\")",
+        "(recipe = 2, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 3, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 4, accepted = true, effects = \"(+c,+e,+n,+t,+s,?m,+i)\")",
+        "(recipe = 5, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\")",
+        "(recipe = 6, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")",
+        "(recipe = 7, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")"
+      ],
+      "effects_gate": false,
+      "expected": 3.2957401737350835,
+      "kind": "owned",
+      "mode": "early",
+      "preserved": false,
+      "value": -23.717432475105085
+    },
+    {
+      "effect_reports": [
+        "(recipe = 1, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\")",
+        "(recipe = 2, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 3, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 4, accepted = true, effects = \"(+c,+e,+n,+t,+s,?m,+i)\")",
+        "(recipe = 5, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\")",
+        "(recipe = 6, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")",
+        "(recipe = 7, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")"
+      ],
+      "effects_gate": false,
+      "expected": 3.2957401737350835,
+      "kind": "owned",
+      "mode": "early_snapshot",
+      "preserved": true,
+      "value": 3.2957401737350835
+    },
+    {
+      "effect_reports": [
+        "(recipe = 1, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\")",
+        "(recipe = 2, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 3, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 4, accepted = true, effects = \"(+c,+e,+n,+t,+s,?m,+i)\")",
+        "(recipe = 5, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\")",
+        "(recipe = 6, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")",
+        "(recipe = 7, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")"
+      ],
+      "effects_gate": false,
+      "expected": 3.2957401737350835,
+      "kind": "owned",
+      "mode": "late",
+      "preserved": false,
+      "value": -23.717432475105085
+    },
+    {
+      "effect_reports": [
+        "(recipe = 1, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\")",
+        "(recipe = 2, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 3, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\u2032\")",
+        "(recipe = 4, accepted = true, effects = \"(+c,+e,+n,+t,+s,?m,+i)\")",
+        "(recipe = 5, accepted = false, effects = \"(!c,!e,!n,!t,!s,!m,+i)\")",
+        "(recipe = 6, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")",
+        "(recipe = 7, accepted = true, effects = \"(!c,+e,!n,!t,+s,!m,+i)\")"
+      ],
+      "effects_gate": false,
+      "expected": 3.2957401737350835,
+      "kind": "owned",
+      "mode": "late_snapshot",
+      "preserved": true,
+      "value": 3.295740173735083
+    }
+  ],
+  "source_sha256": {
+    "compare.jl": "60a1bc96481a2546e3b019363e7324169417cd34b6d2f265cc3b199f017f59bf",
+    "prototypes.jl": "9c00645b2ec74ea922fa03f2271babae4871cbfff62f9f4d6c7d8c2560271c04",
+    "workloads.jl": "55c93d63303ad83171b25b608c5eb62331193307b012bf1b091d97bda316925e"
+  },
+  "source_sha256_followup": {
+    "compare.jl": "c670c7a27eeb38fe4bcb353a9ae72c1a4155f1280d0ca541e88bbf47cd4c345b",
+    "prototypes.jl": "9c00645b2ec74ea922fa03f2271babae4871cbfff62f9f4d6c7d8c2560271c04",
+    "workloads.jl": "6ef37f35c654447f554cb91d688ba266294ace79ea58471b7c04468a4c1591ce"
+  }
+}

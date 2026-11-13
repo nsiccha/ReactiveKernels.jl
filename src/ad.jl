@@ -490,6 +490,50 @@ end
     return bc.f, bc.args, hoisted
 end
 
+# The element loop of the AD-only fills (`_ad_na_plate_loop!`,
+# `_ad_na_materialize_loop!`, `_ad_na_arith_loop!`): `dest[index] =
+# f(args at index...)` for every index of the instantiated `bc`, whose axes
+# are `axes`. A broadcast over two or more axes runs one explicit loop per
+# axis, first axis innermost, instead of iterating its `CartesianIndices`:
+# Enzyme differentiates a `CartesianIndices` iteration over three or more axes
+# many times slower than its primal (a 2 x 2 x 199 build with one extruded
+# leaf: primal 2.3 us, reverse 62 us under the iteration, 7 us under nested
+# loops; Julia 1.10.12, Enzyme 0.13.219; snag `hmm-per-step-tra-0e27954b`),
+# which is why Enzyme's own broadcast override (`override_bc_copyto!`) also
+# runs nested loops (EnzymeAD/Enzyme.jl#1434). The indices, their order and
+# each element read are exactly those of `eachindex(bc)`, so values are
+# unchanged; derivatives agree to rounding (the reverse may sum an extruded
+# leaf's adjoint in another order). One axis or none keeps `eachindex(bc)`, a
+# plain range (or the single zero-dimensional index).
+@generated function _ad_na_fill!(dest, f, args::Tuple, hoisted::Tuple,
+                                 bc::Base.Broadcast.Broadcasted, axes::Tuple)
+    N = length(axes.parameters)
+    if N <= 1
+        return quote
+            Base.@_inline_meta
+            @inbounds for index in eachindex(bc)
+                dest[index] = f(_ad_na_scalar_args(args, hoisted, index)...)
+            end
+            return dest
+        end
+    end
+    loop_indices = [Symbol(:index_, d) for d in 1:N]
+    loop = quote
+        index = CartesianIndex($(loop_indices...))
+        dest[index] = f(_ad_na_scalar_args(args, hoisted, index)...)
+    end
+    for d in 1:N
+        loop = :(for $(loop_indices[d]) in axes[$d]
+            $loop
+        end)
+    end
+    return quote
+        Base.@_inline_meta
+        @inbounds $loop
+        return dest
+    end
+end
+
 @inline function _ad_na_plate_loop!(
         slot::Base.RefValue, kernel, ::Val{A}, args...) where {A}
     wrapped = _authored_plate_arguments(Val(A), args...)
@@ -525,12 +569,10 @@ end
     # `_ad_na_broadcast_hoisted`): the descriptor re-derefs its `Ref` scalars
     # and re-reads its fields per element, and under reverse-mode Enzyme on
     # Julia 1.12 with `--check-bounds=yes` that per-element work through the
-    # descriptor allocates. The per-element values are unchanged.
+    # descriptor allocates. The per-element values are unchanged. A plate
+    # over several axes runs nested loops (`_ad_na_fill!`).
     _, args_tuple, hoisted = _ad_na_broadcast_hoisted(batch)
-    @inbounds for index in eachindex(batch)
-        scalar_args = _ad_na_scalar_args(args_tuple, hoisted, index)
-        result[index] = kernel(scalar_args...)
-    end
+    _ad_na_fill!(result, kernel, args_tuple, hoisted, batch, Base.axes(batch))
     # The slot is read-only here (`_ad_na_cache_driver`): a fresh result for
     # another shape is returned, not kept.
     return result
@@ -574,11 +616,10 @@ end
         # when execution runs with `--check-bounds=yes`; the fetch helper is
         # exactly the per-element read `getindex` performs after its bounds
         # check, so the values and the differentiated form are unchanged.
+        # Several axes run nested loops (`_ad_na_fill!`).
         f, args_tuple, hoisted = _ad_na_broadcast_hoisted(instantiated)
-        @inbounds for index in eachindex(instantiated)
-            cache[index] = f(_ad_na_scalar_args(args_tuple, hoisted, index)...)
-        end
-        return cache
+        return _ad_na_fill!(cache, f, args_tuple, hoisted, instantiated,
+                            Base.axes(instantiated))
     end
     # Read-only slot (`_ad_na_cache_driver`): another shape's result is not kept.
     return Base.Broadcast.materialize(bc)
@@ -606,12 +647,11 @@ end
         # and apply the hoisted function and scalar-likes instead of
         # dispatching through the descriptor per element, for the same reason
         # as the materialize loop above: the 1.12 per-element `Broadcasted`
-        # allocation survives `@inbounds` under `--check-bounds=yes`.
+        # allocation survives `@inbounds` under `--check-bounds=yes`. Several
+        # axes run nested loops (`_ad_na_fill!`).
         f, args_tuple, hoisted = _ad_na_broadcast_hoisted(instantiated)
-        @inbounds for index in eachindex(instantiated)
-            cache[index] = f(_ad_na_scalar_args(args_tuple, hoisted, index)...)
-        end
-        return cache
+        return _ad_na_fill!(cache, f, args_tuple, hoisted, instantiated,
+                            Base.axes(instantiated))
     end
     # Read-only slot (`_ad_na_cache_driver`): another shape's result is not kept.
     return f(args...)
@@ -628,6 +668,17 @@ end
     all(a -> Base.axes(a) == Base.axes(args[1]), args) &&
     Base.axes(cache) == Base.axes(args[1])
 @inline _ad_na_arith_matches(cache, args) = false
+
+# An untaken branch can still have a concrete array destination. Its AD slot
+# starts with zero capacity, without evaluating that branch. Shape checks in
+# the ordinary cache driver allocate if the branch later needs other axes.
+# Rank-zero arrays have no empty shape and retain the unseeded fallback.
+function _ad_na_cache_array_type(::Base.RefValue{S}) where {S}
+    A = _nonalloc_slot_value(S)
+    A isa DataType && isconcretetype(A) && A <: Array && ndims(A) > 0 ? A : nothing
+end
+_ad_na_cache_array_type(slot) = nothing
+_ad_na_empty_array(::Type{A}) where {A<:Array} = A(undef, ntuple(_ -> 0, ndims(A)))
 
 # Taint-walk one program node, rewriting cache steps whose arguments are all
 # free of the active input into plain operation calls. Steps free of every
@@ -658,10 +709,11 @@ function _ad_na_walk(node, tainted::Set{Symbol}, have_free::Set{Symbol},
             step_tainted = step_tainted || arg_tainted
             step_free = step_free && arg_free
         end
-        if caches[step] isa Base.RefValue && caches[step][] === nothing
-            # A step the exemplar call never ran (an untaken branch arm) has no
-            # buffer to offer: it allocates there, as the ordinary program does,
-            # and keeps no slot (as an unfilled lane, `_ad_na_concretize_cache`).
+        if caches[step] isa Base.RefValue && caches[step][] === nothing &&
+                !(step_tainted && _ad_na_cache_array_type(caches[step]) !== nothing)
+            # An unseeded step without a concrete active array destination
+            # keeps its ordinary call. In particular, never fold an untaken
+            # bound-only step to a value it has not computed.
             push!(elided, step)
             return Expr(:call, Expr(:ref, _CALLABLES_ARG, step), rewritten...),
                 step_tainted, !step_tainted && step_free
@@ -683,7 +735,8 @@ function _ad_na_walk(node, tainted::Set{Symbol}, have_free::Set{Symbol},
         # (the MutatingFunctions extension's nested plate cache), not one
         # array: its own driver fills it, below.
         if step_tainted && ops[step] isa _AuthoredPlateOp &&
-           caches[step] isa Base.RefValue && caches[step][] isa AbstractArray
+           caches[step] isa Base.RefValue &&
+           (caches[step][] isa AbstractArray || _ad_na_cache_array_type(caches[step]) !== nothing)
             # Hoist the nested cell kernel out of the constant operation table
             # into a direct literal: calling a closure-held nested RGF under
             # reverse-mode Enzyme trips activity analysis, while the identical
@@ -786,6 +839,10 @@ end
 
 # Re-wrap one seeded primal slot as a concretely-typed AD-owned slot.
 function _ad_na_concretize_cache(slot::Base.RefValue, step::Int, op)
+    if slot[] === nothing
+        A = _ad_na_cache_array_type(slot)
+        A === nothing || return Base.RefValue{A}(_ad_na_empty_array(A))
+    end
     value = _ad_na_seed_value(slot, step, op)
     Base.RefValue{typeof(value)}(value)
 end

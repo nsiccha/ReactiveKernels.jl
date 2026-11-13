@@ -9,7 +9,7 @@ const DOCS_SOURCE_PINS = [
     ("HTMXObjects", "0dce4099357c224236ca9b9a2f7d2dfd0e3334b7"),
     ("ReparametrizableDistributions", "8f7d382df700d3780ed31d093bc4983d3734a6c6"),
     ("Treebars", "e03f2c7be5579fafce38d8759b531a6e22996ba5"),
-    ("WarmupHMC", "1ab808360c5f8f00ec53bb3556562f8a48180a74"),
+    ("WarmupHMC", "6da3299e09e14547ceb922461c71e4d833e21658"),
 ]
 
 Pkg.activate(@__DIR__)

@@ -20,11 +20,12 @@ using ReactiveKernels: _history_generator_env, _history_interval,
     _history_range_interval, _history_proves_earlier, _history_is_earlier,
     _history_is_slice, _history_lag_form, _history_foreach_read,
     _history_statement_reads, _history_has_reads, _history_fold_closure
+using Compat: @compat
 import DataAPI
 import SpecialFunctions
 using SpecialFunctions: erfc, loggamma
 import LogExpFunctions
-using LogExpFunctions: logaddexp, log1pexp, logit
+using LogExpFunctions: logaddexp, log1pexp, logit, logsumexp
 using Statistics: mean, std, var
 using SparseArrays: sparsevec
 using PrecompileTools: @setup_workload, @compile_workload
@@ -79,7 +80,10 @@ export preprocessing_recipes
 export PPL_NODES, WORKFLOW_WANTS, workflow_wants
 export prepare_query, prepare_sampler, SamplerQuery, sampler_value_and_gradient!,
     sampler_value_gradient_and_retained!
-export adaptive_centering_problem
+# Public but not exported: BayesianRegressionModels exports a different
+# `adaptive_centering_problem`, and two exports of one name leave it undefined
+# in every module that loads both (snag rkppl-export-ada-38f23f30).
+@compat public adaptive_centering_problem
 export QueryAD, prepare_query_ad
 export DensityFactor, DensityFactors, FactorSelection, density_factors, select_factors,
     factor_coordinates, factor_support, FactorQueryAD

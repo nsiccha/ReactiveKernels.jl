@@ -149,10 +149,12 @@ export WEIBULL_SOURCE
 
 include("lognormal_moments.jl")
 
+include("discrete_checks.jl")
+
 # Constructor parameter validation for structural Distributions adapters. The
 # numerical law itself remains in the objects below; this scalar operation is
 # shared with the parameter it checks and never constructs a Distribution.
-function _checked_distribution_parameter(value::Real, nonnegative::Bool)
+@traceable function _checked_distribution_parameter(value::Real, nonnegative::Bool)
     valid = nonnegative ? value >= 0 : value > 0
     valid || throw(DomainError(value, nonnegative ?
         "distribution parameter must be nonnegative" : "distribution parameter must be positive"))
@@ -597,7 +599,7 @@ end
 # straight-line endpoint), so only `logpdf` and `cdf` are exposed. `cdf` is the
 # regularized upper incomplete gamma Q(k+1, λ).
 const POISSON_KERNEL_SOURCE = raw"""
-using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma, _integer_observation
 using SpecialFunctions: gamma_inc
 
 @kernel poisson(rate::Float64) = begin
@@ -606,15 +608,15 @@ using SpecialFunctions: gamma_inc
 
     # The data-only log factorial term, `-log(observed!)`: zero at zero and at
     # invalid counts, which never form it.
-    lognormalizer(observed::Int)::Float64 =
-        observed > 0 ? -loggamma(observed + 1.0) : 0.0
+    lognormalizer(observed::Real)::Float64 =
+        _integer_observation(observed) && observed > 0 ? -loggamma(observed + 1.0) : 0.0
     # `logpdf` without `lognormalizer`: the terms that read the rate.
-    logkernel(observed::Int)::Float64 = begin
+    logkernel(observed::Real)::Float64 = begin
         lp::Float64 =
-            observed >= 0 ?
+            _integer_observation(observed) && observed >= 0 ?
                 (observed == 0 ? -rate : observed * log_rate - rate) : -Inf
         lp::Float64 =
-            observed >= 0 ?
+            _integer_observation(observed) && observed >= 0 ?
                 (observed == 0 ? -rate : observed * log(rate) - rate) : -Inf
         lp
     end
@@ -622,21 +624,28 @@ using SpecialFunctions: gamma_inc
     # out rather than summed: summing the two endpoints in one cell makes
     # released Enzyme fail reverse compilation ("Illegal cached pointer").
     # The DK test pins the identity.
-    logpdf(observed::Int)::Float64 = begin
+    logpdf(observed::Real)::Float64 = begin
         lp::Float64 =
-            observed >= 0 ?
+            _integer_observation(observed) && observed >= 0 ?
                 (observed == 0 ? -rate :
                     observed * log_rate - rate - loggamma(observed + 1.0)) : -Inf
         lp::Float64 =
-            observed >= 0 ?
+            _integer_observation(observed) && observed >= 0 ?
                 (observed == 0 ? -rate :
                     observed * log(rate) - rate - loggamma(observed + 1.0)) : -Inf
         lp
     end
-    cdf(observed::Int)::Float64 =
-        observed >= 0 ? last(gamma_inc(observed + 1.0, rate)) : 0.0
-    ccdf(observed::Int)::Float64 =
-        observed >= 0 ? first(gamma_inc(observed + 1.0, rate)) : 1.0
+    # All endpoints share one observation port. At a real-valued CDF boundary
+    # the last included count is floor(observed); the density still requires
+    # an integer. Handle infinite bounds before forming the gamma argument.
+    cdf(observed::Real)::Float64 =
+        observed >= 0 ? (observed == Inf ? 1.0 :
+            last(gamma_inc(floor(observed) + 1.0, rate))) :
+            (isnan(observed) ? NaN : 0.0)
+    ccdf(observed::Real)::Float64 =
+        observed >= 0 ? (observed == Inf ? 0.0 :
+            first(gamma_inc(floor(observed) + 1.0, rate))) :
+            (isnan(observed) ? NaN : 1.0)
 
 end
 """
@@ -1272,6 +1281,7 @@ const zero_inflated_binomial_logit_zi = _OTHER_DISTRIBUTION_BINDINGS[23]
 
 include("dirichlet_multinomial.jl")
 include("positive_families.jl")
+include("discrete_adapters.jl")
 
 # One component is chosen for the entire observed vector. Columns of the
 # parameter matrices are component laws; rows are positions within the one

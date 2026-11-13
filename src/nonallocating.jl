@@ -924,10 +924,20 @@ end
 # Static types of every value of `p`, keyed by canonical value id, from the
 # HAVE argument types.
 function _nonalloc_value_types(p::Plan, argument_types)
-    _plan_value_types(p, argument_types) do recipe, inputs
+    types = _plan_value_types(p, argument_types) do recipe, inputs
         _recipe_output_types(recipe, _nonalloc_recipe_type(recipe.op, inputs,
             length(recipe.outputs) == 1 ? valtype(only(recipe.outputs)) : Any))
     end
+    for r in p.recipes
+        r.op isa _LSRegion || continue
+        for arm in (r.op.fast, r.op.literal)
+            inputs = [get(types, canon_id(p.graph, v.id), Any) for v in arm.have]
+            for (id, T) in _nonalloc_value_types(arm, inputs)
+                types[id] = haskey(types, id) ? typejoin(types[id], T) : T
+            end
+        end
+    end
+    types
 end
 _nonalloc_recipe_type(op, types, declared::Type = Any) = _static_type(op, types...)
 function _nonalloc_recipe_type(op::_AuthoredScanOp{K,A,I,H}, types,
@@ -991,6 +1001,16 @@ function _nonalloc_nested_plates(p::Plan, types::AbstractDict)
     g = p.graph
     changed = false
     recipes = map(p.recipes) do r
+        if r.op isa _LSRegion
+            op = r.op
+            fast, literal = _nonalloc_nested_plates(op.fast, types),
+                            _nonalloc_nested_plates(op.literal, types)
+            fast === op.fast && literal === op.literal && return r
+            changed = true
+            return Recipe(r.id, r.inputs, r.outputs,
+                _LSRegion(fast, literal, op.statistics, op.kernel), r.cost,
+                r.cse_key, r.effectful, r.source)
+        end
         r.op isa _AuthoredPlateOp && length(r.outputs) == 1 || return r
         argtypes = Any[get(types, canon_id(g, v.id), Any) for v in r.inputs]
         declared = valtype(only(r.outputs))
@@ -1019,6 +1039,12 @@ function _nonalloc_lanes(p::Plan, types::AbstractDict)
     have_ids = Set(canon_id(g, v.id) for v in p.have)
     recycle = Pair{ValueId,Symbol}[]
     for r in p.recipes
+        if r.op isa _LSRegion
+            for arm in (r.op.fast, r.op.literal), pair in _nonalloc_lanes(arm, types)
+                any(p -> first(p) == first(pair), recycle) || push!(recycle, pair)
+            end
+            continue
+        end
         # An effect may retain the value it was given; its storage stays fresh.
         length(r.outputs) == 1 && !r.effectful || continue
         cid = canon_id(g, only(r.outputs).id)
@@ -1047,6 +1073,25 @@ end
 # sources, control flow) is kept.
 function _nonalloc_statement!(prog::_StepProgram, recipes::Tuple,
                               types::Dict{Symbol,Any}, stmt)
+    if Meta.isexpr(stmt, :if)
+        arms = Any[]
+        armtypes = Dict{Symbol,Any}[]
+        for arm in stmt.args[2:end]
+            localtypes = copy(types)
+            statements = Meta.isexpr(arm, :block) ? arm.args : Any[arm]
+            body = Any[]
+            for statement in statements
+                append!(body, _nonalloc_statement!(prog, recipes, localtypes, statement))
+            end
+            push!(arms, Expr(:block, body...))
+            push!(armtypes, localtypes)
+        end
+        length(armtypes) == 1 && push!(armtypes, copy(types))
+        for name in union(keys(armtypes[1]), keys(armtypes[2]))
+            types[name] = typejoin(get(armtypes[1], name, Any), get(armtypes[2], name, Any))
+        end
+        return Any[Expr(:if, stmt.args[1], arms...)]
+    end
     stmt isa Expr && stmt.head === :(=) && stmt.args[1] isa Symbol &&
         stmt.args[2] isa Expr && stmt.args[2].head === :call || return Any[stmt]
     call = stmt.args[2]
@@ -1237,6 +1282,54 @@ function _nonalloc_exact_signature(ast::Expr, have_types::Tuple)
     Expr(:function, Expr(:tuple, signature.args[1:4]..., typed...), ast.args[2])
 end
 
+# The names a program body assigns exactly once, with their right-hand sides:
+# the definitions a table root's static type is read through.
+function _nonalloc_table_definitions(body)
+    definitions = Dict{Symbol,Any}()
+    repeated = Set{Symbol}()
+    _index_run_visit(body) do ex
+        ex.head === :(=) && length(ex.args) == 2 && ex.args[1] isa Symbol || return
+        haskey(definitions, ex.args[1]) && push!(repeated, ex.args[1])
+        definitions[ex.args[1]] = ex.args[2]
+    end
+    foreach(name -> delete!(definitions, name), repeated)
+    definitions
+end
+
+# The static type of `x` in a program body (`_nonallocating_program`): a
+# value's inferred type, a constant's own type, or what Julia infers for a call
+# of a constant function or operation on arguments of such types. `nothing`
+# when no concrete type follows.
+function _nonalloc_static_type(x, types, definitions, constants, ops,
+                               seen = Set{Symbol}())
+    x isa Union{Number,Nothing} && return typeof(x)
+    x isa QuoteNode && return typeof(x.value)
+    if x isa Symbol
+        T = get(types, x, nothing)
+        T isa Type && isconcretetype(T) && return T
+        (x in seen || !haskey(definitions, x)) && return nothing
+        return _nonalloc_static_type(definitions[x], types, definitions, constants, ops,
+                                     push!(seen, x))
+    end
+    slot = _constant_slot(x)
+    slot === nothing || return typeof(constants[slot])
+    x isa Expr && x.head === :call || return nothing
+    head = first(x.args)
+    slot = _callable_slot(head)
+    f = slot !== nothing ? ops[slot] :
+        head isa GlobalRef && isdefined(head.mod, head.name) &&
+            isconst(head.mod, head.name) ? getglobal(head.mod, head.name) : nothing
+    f === nothing && return nothing
+    argtypes = Any[]
+    for argument in x.args[2:end]
+        T = _nonalloc_static_type(argument, types, definitions, constants, ops, copy(seen))
+        T === nothing && return nothing
+        push!(argtypes, T)
+    end
+    T = Base.promote_op(f, argtypes...)
+    isconcretetype(T) ? T : nothing
+end
+
 """
     _nonallocating_program(p::Plan; have_types, cache_apply, passes) -> (ast, constants, callables, caches)
 
@@ -1273,18 +1366,23 @@ function _nonallocating_program(p::Plan; have_types = nothing,
     # value types of `lowered`, so its cells outline nothing (`outline`), and
     # the step program keys its caches on the operation calls
     # (`_nonalloc_statement!`), so this emitter keeps every recipe's call in
-    # the table rather than its inlined source.
+    # the table rather than its inlined source. Tables of work reused across
+    # an enclosing plate's cells (`_lower_indexed_invariants`) keep lane slots
+    # too (`table_lanes`).
+    table_lanes = Pair{Symbol,Symbol}[]
+    value_ids = Dict{Symbol,ValueId}()
     ast, constants, callables, recipes = _lower_with_ops(lowered;
                                         exemplar_types = have_types,
+                                        value_ids,
                                         declare = false, recycle,
                                         pushdowns = true, outline = false,
                                         plate_element_types = true,
                                         plate_programs = true,
-                                        inline_sources = false)
+                                        inline_sources = false,
+                                        indexed_lanes = table_lanes)
     isempty(passes) || (ast = transform(ast, passes...))
-    names = _varnames(lowered)
-    types = Dict{Symbol,Any}(names[cid] => T for (cid, T) in values
-                             if haskey(names, cid))
+    types = Dict{Symbol,Any}(name => values[cid] for (name, cid) in value_ids
+                             if haskey(values, cid))
     prog = _StepProgram(Any[callables...], Any[nothing for _ in callables], cache_apply)
     body = Expr(:block)
     for stmt in ast.args[2].args
@@ -1311,6 +1409,19 @@ function _nonallocating_program(p::Plan; have_types = nothing,
         # Typed by the value's inferred array type, so the program reads it
         # concretely (`_lane_reuse`); an uninferred value keeps a `Ref{Any}`.
         A = get(values, cid, Any)
+        slot = A isa Type && A <: Array && isconcretetype(A) ?
+            Base.RefValue{Union{Nothing,A}}(nothing) : Ref{Any}(nothing)
+        j = _step!(prog, _NonallocLane(), slot)
+        push!(lanes, Expr(:(=), lane, Expr(:ref, _CACHES_ARG, j)))
+    end
+    # A table's slot is typed by the array its allocation returns for the
+    # root's static type, as a lane is by its value's type; a root whose type
+    # is not inferred keeps a `Ref{Any}`.
+    definitions = _nonalloc_table_definitions(body)
+    for (lane, root) in table_lanes
+        lane in mentioned || continue
+        R = _nonalloc_static_type(root, types, definitions, constants, prog.ops)
+        A = R === nothing ? Any : Base.promote_op(_indexed_table, R)
         slot = A isa Type && A <: Array && isconcretetype(A) ?
             Base.RefValue{Union{Nothing,A}}(nothing) : Ref{Any}(nothing)
         j = _step!(prog, _NonallocLane(), slot)

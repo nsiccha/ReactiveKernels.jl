@@ -2538,6 +2538,23 @@ function _jax_call(ctx::_JaxContext, ::typeof(cumsum), args::Vector{_PyVal}, kw)
     _PyVal(np * "cumsum(" * x.code * ", axis=" * _py_infix("-", [d.code, "1"]) * ")", x.T)
 end
 
+# `diff(x; dims = d)` along a literal axis `d`: a vector's differences
+# (`_jax_function_call(::typeof(diff))`, which Base's `diff(x)` calls), or an
+# unpadded array's along that axis.
+function _jax_call(ctx::_JaxContext, ::typeof(diff), args::Vector{_PyVal}, kw)
+    isempty(kw) && return _jax_call_positional(ctx, diff, args)
+    first.(kw) == [:dims] || _jax_error("keyword arguments ", join(first.(kw), ", "),
+        " to `diff` have no JAX translation", _jax_where(ctx))
+    x, d = only(args), last(only(kw))
+    _jax_known(ctx, d) && d.T isa Type && d.T <: Integer && occursin(r"^[0-9]+$", d.code) ||
+        _jax_error("`diff` over a computed `dims`", _jax_where(ctx))
+    _jax_rank(x.T) == 1 && d.code == "1" && return _jax_function_call(ctx, diff, [x])
+    _jax_is_array(x.T) && isempty(x.extent) && !_jax_ragged(x.T) ||
+        _jax_error("`diff` over `dims` of a `", x.T, "`", _jax_where(ctx))
+    np = ctx.host === nothing ? "jnp." : "np."
+    _PyVal(np * "diff(" * x.code * ", axis=" * _py_infix("-", [d.code, "1"]) * ")", x.T)
+end
+
 # `stack(rows; dims)` of a vector of equal-length vectors, held as the 2-D
 # array of its rows: a matrix with those rows (`dims = 1`) or columns. On the
 # host a plate of vectors is a list of arrays, which `np.stack` joins.
@@ -3050,8 +3067,10 @@ function _jax_call_positional(ctx::_JaxContext, f::Function, args::Vector{_PyVal
 end
 
 # `j ± c` of an integer `j` with a static bound and a static integer `c`
-# keeps a bound (`j - 1` of a step index is at most its bound, `j + c` at most
-# the bound plus `c`), so a loop up to it still runs to a static limit.
+# keeps a bound (`j + c` at most the bound plus `c`, `j - c` at most the bound
+# less `c`), so a loop up to it still runs to a static limit, and ranges and
+# arrays it sizes pad to the width Julia's have when `j` is at its bound:
+# `x[2:n] .- x[1:(n - 1)]` of a padded row's length `n` pads both alike.
 function _jax_shifted_limit(f, args::Vector{_PyVal}, v::_PyVal)
     # A history index can also be a prepared integer used as a loop bound.
     # Propagate the ordinary integer origin before adding its lag proof.
@@ -3081,7 +3100,7 @@ function _jax_shifted_integer_limit(f, args::Vector{_PyVal}, v::_PyVal)
                                               o.path, o.scale))
     end
     if !isempty(a.limit) && b.static && (f === (+) || occursin(r"^[0-9]+$", b.code))
-        limit = f === (-) ? a.limit : _py_infix("+", [a.limit, b.code])
+        limit = f === (-) ? _jax_limit_minus(a.limit, b.code) : _py_infix("+", [a.limit, b.code])
     elseif f === (+) && !isempty(b.limit) && a.static
         limit = _py_infix("+", [b.limit, a.code])
     else
@@ -3106,6 +3125,13 @@ end
 _jax_scaled_origin(o::_JaxOrigin, k::AbstractString) =
     _JaxOrigin(o.key, o.position, o.offset == "0" ? "0" : _jax_static_integer_op("*", k, o.offset),
                o.path, o.scale == "1" ? k : _jax_static_integer_op("*", k, o.scale))
+# The static bound `limit - c` of `j - c`, a literal `c`: never below zero,
+# since it sizes arrays and ranges.
+function _jax_limit_minus(limit::AbstractString, c::AbstractString)
+    c == "0" && return String(limit)
+    occursin(r"^[0-9]+$", limit) && return string(max(parse(Int, limit) - parse(Int, c), 0))
+    "max(" * _py_infix("-", [limit, c]) * ", 0)"
+end
 
 """
     _jax_function_call(ctx::_JaxContext, f, args::Vector{_PyVal}) -> _PyVal
@@ -3201,6 +3227,18 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(permutedims), args::Vecto
         _jax_error("`permutedims` by a permutation that is not a static tuple", _jax_where(ctx))
     axes = "tuple(a - 1 for a in " * perm.code * ")"
     _PyVal("jnp.transpose(" * x.code * ", " * axes * ")", Array{E,R})
+end
+# `eachrow(M)` / `eachcol(M)`: a matrix's slices, one per entry, as a plate's
+# collection. The slices are the matrix's leading axis (rows) or its
+# transpose's (columns), so the plate's `jax.vmap` hands each cell one slice.
+function _jax_function_call(ctx::_JaxContext, f::Union{typeof(eachrow),typeof(eachcol)},
+                            args::Vector{_PyVal})
+    length(args) == 1 && _jax_rank(args[1].T) == 2 ||
+        _jax_error("`", f, "` of a value that is not one matrix has no JAX translation",
+                   _jax_where(ctx))
+    x = only(args)
+    code = f === eachrow ? x.code : "jnp.transpose(" * x.code * ")"
+    _PyVal(code, Vector{Vector{_jax_eltype(x.T)}})
 end
 function _jax_function_call(ctx::_JaxContext, ::typeof(/), args::Vector{_PyVal})
     _jax_error("a matrix division has no JAX translation", _jax_where(ctx))
@@ -3866,10 +3904,14 @@ function _jax_call_positional(ctx::_JaxContext, ::Colon, args::Vector{_PyVal})
     a, b = args
     # A stop that is data with a static limit (a padded group's length): the
     # range runs to the limit, and its extent is the number of entries up to
-    # the stop, as a padded value's (reductions and scans mask the rest).
+    # the stop, as a padded value's (reductions and scans mask the rest). Past
+    # the stop it repeats the stop, as padding repeats a row's last entry, so
+    # a gather by it (`x[1:(n - 1)]`) pads with its own last entry.
     if !_jax_known(ctx, b) && !isempty(b.limit) && _jax_known(ctx, a)
+        b = _jax_bind!(ctx, :last, b)
         count = _py_infix("-", [_jax_plus_one(b), a.code])
-        return _PyVal("jnp.arange(" * a.code * ", " * _jax_plus_one(_PyVal(b.limit, Int)) * ")",
+        return _PyVal("jnp.minimum(jnp.arange(" * a.code * ", " *
+                      _jax_plus_one(_PyVal(b.limit, Int)) * "), " * b.code * ")",
                       UnitRange{Int}, false, count)
     end
     _jax_with_origin(_PyVal("jnp.arange(" * a.code * ", " * _jax_plus_one(b) * ")", UnitRange{Int}),
@@ -3911,6 +3953,26 @@ _jax_function_call(ctx::_JaxContext, ::typeof(cumsum), args::Vector{_PyVal}) =
     length(args) == 1 && _jax_rank(args[1].T) == 1 ?
     _jax_result(cumsum, args, "jnp.cumsum(" * args[1].code * ")") :
     _jax_error("this `cumsum` call", _jax_where(ctx))
+# `diff(x)` of a vector: the differences of neighbouring entries. A padded
+# row's differences are padded too, with one valid entry fewer (none for an
+# empty or one-entry row); their padding repeats the last valid difference, as
+# a padded row's repeats its last entry, so a function of it stays finite
+# where the differences are in its domain.
+function _jax_function_call(ctx::_JaxContext, ::typeof(diff), args::Vector{_PyVal})
+    x = only(args)
+    _jax_is_array(x.T) && _jax_rank(x.T) == 1 && !_jax_ragged(x.T) ||
+        _jax_error("`diff` of a `", x.T, "`", _jax_where(ctx))
+    np = ctx.host === nothing ? "jnp." : "np."
+    isempty(x.extent) && return _jax_result(diff, args, np * "diff(" * x.code * ")")
+    ctx.host === nothing ||
+        _jax_error("`diff` of a padded vector in `prepare_data`", _jax_where(ctx))
+    x = _jax_bind!(ctx, :x, x)
+    n = _jax_bind!(ctx, :n, _PyVal("jnp.maximum(" * _py_infix("-", [x.extent, "1"]) * ", 0)", Int))
+    stored = _py_infix("-", [_py_atom(x.code) * ".shape[0]", "1"])
+    code = "jnp.diff(" * x.code * ")[jnp.minimum(jnp.arange(" * stored * "), jnp.maximum(" *
+        _py_infix("-", [n.code, "1"]) * ", 0))]"
+    _PyVal(code, _jax_return_type(diff, [x.T]), false, n.code)
+end
 
 # Type-level calls run now, on the values' Julia types.
 _jax_type_value(T) = _PyVal("<type>", _JaxCallable(T), true)
