@@ -16,6 +16,13 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.172
+
+- Adaptive affine cells accept `Real` constants for `location` and `log_scale`,
+  shared across the selected block. Constants can mix with named graph queries
+  without adding sampler-only declarations to the model; their values remain
+  runtime configuration and use the same concrete accessor type across blocks.
+
 ## 0.1.171
 
 - A compact cell or partition query gathers its constant base rows with a

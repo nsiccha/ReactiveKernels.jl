@@ -141,6 +141,70 @@ end
     @test isempty(ir0.pairs)
 end
 
+@testset "constant affine quantities" begin
+    s = setup()
+    (; built, plan, u, problem) = s
+    entries = Dict(e.name => e for e in s.layout.entries)
+    zi = entries[:z].offset .+ (0:entries[:z].size-1)
+    ti = entries[:t].offset
+    mu = u[entries[:mu].offset]
+    ls = u[entries[:sigma].offset]
+    # Exercise both constant fields, nonzero constants, and mixtures with
+    # graph queries in the same indexed map (one concrete pair type).
+    for (location, log_scale, loc, scale) in
+            ((0.0, :log_scale, 0.0, ls),
+             (:z_location, log(1.4), mu .+ collect(range(-0.3, 0.4; length = length(zi))), log(1.4)),
+             (0.3f0, 0, Float64(0.3f0), 0.0),
+             (1//4, -0.2, 0.25, -0.2))
+        for (target, source) in ((0.0, 0.0), (0.0, 1.0), (1.0, 0.0), (0.7, 0.2))
+            cells = (z = (; location, log_scale, target, source),
+                t = (; location = :t_location, log_scale = :log_scale, target, source))
+            ir, p = map_for(built, plan, cells; u0 = u)
+            @test isconcretetype(eltype(ir.pairs))
+            @test @inferred(last(first(ir.pairs)).args[1](u)) isa Float64
+            expected = copy(u)
+            expected[zi] .= target .* loc .+ (u[zi] .- source .* loc) .* exp(scale * (target - source))
+            expected[ti] = target * mu + (u[ti] - source * mu) * exp(ls * (target - source))
+            jac, mapped = WarmupHMC.with_logabsdet_jacobian!(copy(u), ir, u)
+            @test mapped ≈ expected
+            @test jac ≈ (length(zi) * scale + ls) * (target - source)
+            ijac, back = WarmupHMC.with_logabsdet_jacobian!(copy(mapped),
+                WarmupHMC.InverseFunctions.inverse(ir), mapped)
+            @test back ≈ u
+            @test ijac ≈ -jac
+            rp = ReactiveKernelsPPL.adaptive_centering_problem(built, plan, problem,
+                BACKEND; cells, u0 = u)
+            value, gradient = LDP.logdensity_and_gradient(rp, u)
+            @test value ≈ LDP.logdensity(problem, expected) + jac
+            @test gradient ≈ finite_gradient(x -> LDP.logdensity(rp, x), u) rtol = 2e-7 atol = 2e-7
+            @test LDP.logdensity_and_gradient(deepcopy(rp), u) == (value, gradient)
+            column = view(hcat(u, 2u), :, 1)
+            @test LDP.logdensity_and_gradient(rp, column) == (value, gradient)
+        end
+    end
+    # Configuration numbers stay runtime values; changing them or a latent's
+    # bound length does not create a new accessor program.
+    cells = (z = (location = 0.0, log_scale = 0.2, source = 0.5),)
+    ir1, p1 = map_for(built, plan, cells; u0 = u)
+    other = (z = (location = 1.3, log_scale = -0.7, source = 0.5),)
+    ir2, p2 = map_for(built, plan, other; u0 = u)
+    @test typeof(ir1) == typeof(ir2)
+    @test typeof(p1.kernels) == typeof(p2.kernels)
+    @test last(first(ir1.pairs)).args[1](u) == 0.0
+    @test last(first(ir2.pairs)).args[1](u) == 1.3
+    equal_constants = (z = (location = 0.0, log_scale = 0.0, source = 0.5),)
+    ir_equal, p_equal = map_for(built, plan, equal_constants; u0 = u)
+    @test typeof(ir_equal) == typeof(ir1)
+    @test typeof(p_equal.kernels) == typeof(p1.kernels)
+    for n in (0, 23)
+        resized = setup(n; built)
+        ir, p = map_for(resized.built, resized.plan, cells; u0 = resized.u)
+        @test typeof(ir) == typeof(ir1)
+        @test length(ir.pairs) == n
+        @test typeof(p.kernels) == typeof(p1.kernels)
+    end
+end
+
 const SPATIAL = @rkppl begin
     mu ~ Normal(0, mu_sd)
     sigma ~ Exponential(sigma_scale)
