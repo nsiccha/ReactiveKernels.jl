@@ -924,10 +924,20 @@ end
 # Static types of every value of `p`, keyed by canonical value id, from the
 # HAVE argument types.
 function _nonalloc_value_types(p::Plan, argument_types)
-    _plan_value_types(p, argument_types) do recipe, inputs
+    types = _plan_value_types(p, argument_types) do recipe, inputs
         _recipe_output_types(recipe, _nonalloc_recipe_type(recipe.op, inputs,
             length(recipe.outputs) == 1 ? valtype(only(recipe.outputs)) : Any))
     end
+    for r in p.recipes
+        r.op isa _LSRegion || continue
+        for arm in (r.op.fast, r.op.literal)
+            inputs = [get(types, canon_id(p.graph, v.id), Any) for v in arm.have]
+            for (id, T) in _nonalloc_value_types(arm, inputs)
+                types[id] = haskey(types, id) ? typejoin(types[id], T) : T
+            end
+        end
+    end
+    types
 end
 _nonalloc_recipe_type(op, types, declared::Type = Any) = _static_type(op, types...)
 function _nonalloc_recipe_type(op::_AuthoredScanOp{K,A,I,H}, types,
@@ -991,6 +1001,16 @@ function _nonalloc_nested_plates(p::Plan, types::AbstractDict)
     g = p.graph
     changed = false
     recipes = map(p.recipes) do r
+        if r.op isa _LSRegion
+            op = r.op
+            fast, literal = _nonalloc_nested_plates(op.fast, types),
+                            _nonalloc_nested_plates(op.literal, types)
+            fast === op.fast && literal === op.literal && return r
+            changed = true
+            return Recipe(r.id, r.inputs, r.outputs,
+                _LSRegion(fast, literal, op.statistics, op.kernel), r.cost,
+                r.cse_key, r.effectful, r.source)
+        end
         r.op isa _AuthoredPlateOp && length(r.outputs) == 1 || return r
         argtypes = Any[get(types, canon_id(g, v.id), Any) for v in r.inputs]
         declared = valtype(only(r.outputs))
@@ -1019,6 +1039,12 @@ function _nonalloc_lanes(p::Plan, types::AbstractDict)
     have_ids = Set(canon_id(g, v.id) for v in p.have)
     recycle = Pair{ValueId,Symbol}[]
     for r in p.recipes
+        if r.op isa _LSRegion
+            for arm in (r.op.fast, r.op.literal), pair in _nonalloc_lanes(arm, types)
+                any(p -> first(p) == first(pair), recycle) || push!(recycle, pair)
+            end
+            continue
+        end
         # An effect may retain the value it was given; its storage stays fresh.
         length(r.outputs) == 1 && !r.effectful || continue
         cid = canon_id(g, only(r.outputs).id)
@@ -1047,6 +1073,25 @@ end
 # sources, control flow) is kept.
 function _nonalloc_statement!(prog::_StepProgram, recipes::Tuple,
                               types::Dict{Symbol,Any}, stmt)
+    if Meta.isexpr(stmt, :if)
+        arms = Any[]
+        armtypes = Dict{Symbol,Any}[]
+        for arm in stmt.args[2:end]
+            localtypes = copy(types)
+            statements = Meta.isexpr(arm, :block) ? arm.args : Any[arm]
+            body = Any[]
+            for statement in statements
+                append!(body, _nonalloc_statement!(prog, recipes, localtypes, statement))
+            end
+            push!(arms, Expr(:block, body...))
+            push!(armtypes, localtypes)
+        end
+        length(armtypes) == 1 && push!(armtypes, copy(types))
+        for name in union(keys(armtypes[1]), keys(armtypes[2]))
+            types[name] = typejoin(get(armtypes[1], name, Any), get(armtypes[2], name, Any))
+        end
+        return Any[Expr(:if, stmt.args[1], arms...)]
+    end
     stmt isa Expr && stmt.head === :(=) && stmt.args[1] isa Symbol &&
         stmt.args[2] isa Expr && stmt.args[2].head === :call || return Any[stmt]
     call = stmt.args[2]
@@ -1325,8 +1370,10 @@ function _nonallocating_program(p::Plan; have_types = nothing,
     # an enclosing plate's cells (`_lower_indexed_invariants`) keep lane slots
     # too (`table_lanes`).
     table_lanes = Pair{Symbol,Symbol}[]
+    value_ids = Dict{Symbol,ValueId}()
     ast, constants, callables, recipes = _lower_with_ops(lowered;
                                         exemplar_types = have_types,
+                                        value_ids,
                                         declare = false, recycle,
                                         pushdowns = true, outline = false,
                                         plate_element_types = true,
@@ -1334,9 +1381,8 @@ function _nonallocating_program(p::Plan; have_types = nothing,
                                         inline_sources = false,
                                         indexed_lanes = table_lanes)
     isempty(passes) || (ast = transform(ast, passes...))
-    names = _varnames(lowered)
-    types = Dict{Symbol,Any}(names[cid] => T for (cid, T) in values
-                             if haskey(names, cid))
+    types = Dict{Symbol,Any}(name => values[cid] for (name, cid) in value_ids
+                             if haskey(values, cid))
     prog = _StepProgram(Any[callables...], Any[nothing for _ in callables], cache_apply)
     body = Expr(:block)
     for stmt in ast.args[2].args

@@ -38,6 +38,19 @@ Public = true
 Private = false
 ```
 
+## Public names that are not exported
+
+Import these explicitly, for example
+`using ReactiveKernelsPPL: adaptive_centering_problem`, or call them qualified.
+On Julia 1.11 and later their docstrings appear in the sections above.
+
+```@autodocs
+Modules = [ReactiveKernelsPPL]
+Public = false
+Private = true
+Filter = f -> f === Main.ReactiveKernelsPPL.adaptive_centering_problem
+```
+
 ## Additional exports
 
 These exported bindings have no separate docstring. Their definitions are linked below.
