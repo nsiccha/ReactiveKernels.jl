@@ -57,7 +57,8 @@ for label, dtype in [('f64', np.float64), ('f32', np.float32)]:
                             assert result.dtype == dtype, (name, result.dtype, dtype)
                         if name == 'single': assert result.dtype == np.float32
                         if name == 'count':
-                            assert result.dtype == (np.int64 if label == 'f64' else np.int32)
+                            # The f64 import enabled x64; f32 keeps JAX's default integer.
+                            assert result.dtype == np.int64
                         if name == 'valid': assert result.dtype == np.bool_
                     if name in ('zero_term', 'host_term', 'single'):
                         grad = jax.grad(f)(x)
