@@ -169,7 +169,7 @@ end
 
 # Graph provenance does not prove storage ownership. Preserve derivative
 # snapshots across caller mutation, borrowing only backend-proven stable input
-# arrays in flat environments with no mutable primal escape.
+# arrays in flat environments when no mutable primal alias escapes.
 # Use Julia's documented deepcopy specialization hook on an owned wrapper. The
 # memo is shared across the flat environment, preserving repeated array
 # references. Nested containers retain the existing whole-tuple snapshot path.
@@ -192,7 +192,9 @@ function _seed_borrowed_residuals!(memo, residuals::Tuple, sources::Tuple, flags
     # flag must establish that its memory is unchanged through the reverse.
     if value isa Array && isbitstype(eltype(value)) && source > 0 &&
             !flags[source + 1]
-        memo[value] = value
+        # Keep Base's heterogeneous memo implementation at its Base boundary;
+        # the caller and the retained tuple positions stay concretely typed.
+        Base.@noinline setindex!(memo, value, value)
     end
     _seed_borrowed_residuals!(memo, Base.tail(residuals), Base.tail(sources), flags)
 end
@@ -209,14 +211,55 @@ function Base.deepcopy_internal(env::_DerivativeResidualEnvironment{R}, memo::Id
     _DerivativeResidualEnvironment(retained, env.sources, env.overwritten, env.borrow_inputs)
 end
 
+# Dense bits arrays have contiguous payloads. Compare their occupied byte
+# ranges, including distinct array headers that wrap overlapping storage.
+# Subtract the smaller address so an end-address addition cannot overflow.
+@inline function _residual_storage_overlaps(a::Array, b::Array)
+    isempty(a) && return false
+    isempty(b) && return false
+    GC.@preserve a b begin
+        pa, pb = UInt(pointer(a)), UInt(pointer(b))
+        pa <= pb ? pb - pa < sizeof(a) : pa - pb < sizeof(b)
+    end
+end
+
+_protect_primal_aliases(::Tuple{}, ::Tuple{}, flags, primal) = flags
+function _protect_primal_aliases(residuals::Tuple, sources::Tuple, flags, primal)
+    value, source = first(residuals), first(sources)
+    if value isa Array && isbitstype(eltype(value)) && source > 0 &&
+            !flags[source + 1] && _residual_storage_overlaps(value, primal)
+        flags = Base.setindex(flags, true, source + 1)
+    end
+    _protect_primal_aliases(Base.tail(residuals), Base.tail(sources), flags, primal)
+end
+
+_borrow_all_residuals(::Tuple{}, ::Tuple{}, flags) = true
+function _borrow_all_residuals(residuals::Tuple, sources::Tuple, flags)
+    value, source = first(residuals), first(sources)
+    (isbitstype(typeof(value)) || (source > 0 && !flags[source + 1])) &&
+        _borrow_all_residuals(Base.tail(residuals), Base.tail(sources), flags)
+end
+
 @inline function _retain_residuals(sources::NTuple{R,Int}, residuals::NTuple{R,Any},
         primal, flags) where {R}
     isbitstype(typeof(residuals)) && return residuals
-    # A mutable returned value can expose input storage independently of the
-    # original argument's write flag. Keep the complete snapshot in that case.
-    if !isbitstype(typeof(primal)) || !_flat_residual_environment(residuals)
+    if !_flat_residual_environment(residuals)
         return Base.@noinline deepcopy(residuals)
     end
+    # A mutable result can expose input storage independently of its write
+    # flag. For a dense bits-array result, protect only inputs whose storage
+    # overlaps it; a fresh result need not force copies of readonly inputs.
+    # Other mutable result structures retain the complete snapshot path.
+    if !isbitstype(typeof(primal))
+        if primal isa Array && isbitstype(eltype(primal))
+            flags = _protect_primal_aliases(residuals, sources, flags, primal)
+        else
+            return Base.@noinline deepcopy(residuals)
+        end
+    end
+    # Flat readonly inputs need neither a copy nor a deepcopy identity memo.
+    # Check after protecting storage exposed by the mutable primal result.
+    _borrow_all_residuals(residuals, sources, flags) && return residuals
     env = _DerivativeResidualEnvironment(residuals, sources, flags, true)
     saved = Base.@noinline deepcopy(env)
     saved.residuals
