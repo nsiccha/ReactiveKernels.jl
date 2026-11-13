@@ -87,17 +87,34 @@ end
     SMCOptions(; ess_fraction=0.8, stepsize=0.25, metric=nothing,
                moves=2, max_tree_depth=6, max_stages=1000,
                min_increment=1e-12, history_limit=128, tuning=nothing,
-               nthreads=Threads.nthreads())
+               nthreads=Threads.nthreads(), cloud_kernels=0)
 
 Adaptive bridge and fixed NUTS configuration. `metric` is a vector of positive
 diagonal **scales**, or WarmupHMC's plain `scale_data` record for a correlated
-bounded-reflection scale; `nothing` means ones. These are not precisions. The
-metric, step size and tree depth stay fixed during mutation, with no adaptation
-using the particles being moved. `tuning=tune_smc(...)` instead selects a fixed
-kernel from an independent, precomputed, bridge-specific pilot schedule.
-Scheduled kernel settings override `stepsize`, `metric`, `moves` and
-`max_tree_depth` for production mutation. Each stage resamples, then takes `moves`
-invariant NUTS transitions. `ess_fraction` selects the next temperature by
+bounded-reflection scale; `nothing` means ones. These are not precisions. With
+the default `cloud_kernels=0` the metric, step size and tree depth stay fixed
+during mutation, with no adaptation using the particles being moved.
+`tuning=tune_smc(...)` instead selects a fixed kernel from an independent,
+precomputed, bridge-specific pilot schedule. Scheduled kernel settings override
+`stepsize`, `metric`, `moves` and `max_tree_depth` for production mutation.
+Each stage resamples, then takes `moves` invariant NUTS transitions.
+
+`cloud_kernels=J` (`J >= 1`) instead fits each stage's kernels to the stage
+target's weighted cloud before moving it: a diagonal Gaussian mixture with at
+most `J` components (count chosen by BIC, each component holding at least ten
+effective particles) gives every component its own diagonal scales, and its
+step size is tuned on discarded trial transitions towards a mean NUTS
+acceptance statistic of 0.8, starting from `stepsize` (or the scheduled
+kernel's). Each move selects a component from the mixture responsibilities at
+the particle's position and accepts the NUTS proposal with probability
+`min(1, r_j(x')/r_j(x))`, so every move leaves the stage target invariant
+given the fit; `J=1` is one cloud-fitted diagonal metric. Particles in
+different modes, such as relabelled mixture components, then move with scales
+fitted near them rather than those of one pilot chain. The stage history's
+`kernel` records the fit, step sizes, `tuning_evaluations` (included in
+`evaluations`) and `selection_rejections`. Work is linear in particles,
+dimensions and components. Like the ESS temperature rule, this adapts to the
+cloud, so the evidence estimate is consistent but not exactly unbiased. `ess_fraction` selects the next temperature by
 bisection on the weight ESS, before resampling. A bridge that cannot progress
 by `min_increment`, or needs more than `max_stages`, throws without advancing
 its input state. `nthreads` bounds the number of concurrent particle-mutation
@@ -121,9 +138,11 @@ struct SMCOptions
     history_limit::Int
     tuning::Union{Nothing,SMCTuningSchedule}
     nthreads::Int
+    cloud_kernels::Int
     function SMCOptions(; ess_fraction=0.8, stepsize=0.25, metric=nothing,
             moves=2, max_tree_depth=6, max_stages=1000, min_increment=1e-12,
-            history_limit=128, tuning=nothing, nthreads=Threads.nthreads())
+            history_limit=128, tuning=nothing, nthreads=Threads.nthreads(),
+            cloud_kernels=0)
         0 < ess_fraction < 1 || throw(ArgumentError("ess_fraction must be between 0 and 1"))
         isfinite(stepsize) && stepsize > 0 || throw(ArgumentError("stepsize must be finite and positive"))
         metric = metric === nothing ? nothing : _smc_scale(metric)
@@ -135,8 +154,11 @@ struct SMCOptions
         history_limit >= 1 || throw(ArgumentError("history_limit must be positive"))
         tuning === nothing || tuning isa SMCTuningSchedule ||
             throw(ArgumentError("tuning must be a SMCTuningSchedule or nothing"))
+        cloud_kernels isa Integer && cloud_kernels >= 0 ||
+            throw(ArgumentError("cloud_kernels must be a nonnegative integer"))
         new(ess_fraction, stepsize, metric,
-            moves, max_tree_depth, max_stages, min_increment, history_limit, deepcopy(tuning), nthreads)
+            moves, max_tree_depth, max_stages, min_increment, history_limit, deepcopy(tuning), nthreads,
+            Int(cloud_kernels))
     end
 end
 

@@ -522,6 +522,22 @@ end
     view(array, indices)
 # One position (a cell's gather read as a number): that element.
 @inline _readonly_gather(array::AbstractVector, index::Integer) = array[index]
+# `array[indices]` copied into a fresh vector by a counted loop. Under Enzyme
+# Reverse, Base's vector-index `getindex` left the reverse caches of its loops
+# to libc on every call (`malloc`, and `realloc` per entry where the trip count
+# is not known on entry); a gather made once per call, as RKPPL's compact
+# overlay gathers its constant base per partition call, paid that per call.
+@inline function _gather_copy(array::AbstractVector, indices::AbstractVector{<:Integer})
+    checkbounds(array, indices)
+    out = similar(array, axes(indices))
+    o, i0 = firstindex(out) - 1, firstindex(indices) - 1
+    @inbounds for t in 1:length(indices)
+        out[o + t] = array[indices[i0 + t]]
+    end
+    out
+end
+# One position (a gather at one row, read as a number): that element.
+@inline _gather_copy(array::AbstractVector, index::Integer) = array[index]
 @inline function _readonly_gather(
         array::Union{Vector,SubArray{Float64,1,Vector{Float64},Tuple{UnitRange{Int}},true}},
         indices::Vector{Int})
@@ -2123,6 +2139,14 @@ end
 @inline _plate_cells(cells::CartesianIndices{1}) =
     Base.Generator(CartesianIndex, only(cells.indices))
 @inline _plate_cells(cells::CartesianIndices) = cells
+# The one cell of a plate whose domain is one cell by construction (a `cell`
+# plate, a partition of one cell per label): its body runs once, at this cell.
+@inline function _plate_one_cell(axes::Tuple)
+    all(a -> length(a) == 1, axes) || _plate_one_cell_error(axes)
+    CartesianIndex(map(first, axes))
+end
+@noinline _plate_one_cell_error(axes) = throw(ArgumentError(
+    "internal: a plate of one cell by construction has axes $(axes)"))
 # The `@simd` iteration space of a pure total-only plate (see
 # `_lower_authored_plate_cells_native!`): one axis is its own indexable range,
 # several are their `CartesianIndices`. The loop body rebuilds the cell index

@@ -4014,13 +4014,17 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
         pointwise_lhs, total_lhs; recycled = nothing,
         input_type_hints = nothing, element_type = nothing, into::Bool = false,
         total_fold = sum, program::Bool = false, readonly_slices = Set{Int}(),
-        batch = nothing, cell::Union{Nothing,Symbol} = nothing)
+        batch = nothing, cell::Union{Nothing,Symbol} = nothing, one::Bool = false)
     # `into`: `pointwise_lhs` already holds a buffer at least as long as the
     # plate, of its element type; the cells are written into it in place and
     # the binding is left alone (a strip refill, `_lower_authored_scan_strips!`).
     # `cell`: the plate has exactly one cell (a plate computed at one row of a
     # cell, `_cell_window!`), whose value is bound to `cell`; there is no
     # pointwise buffer and no total.
+    # `one`: the plate's domain is one cell by construction (a partition of one
+    # cell per label, `_partition_single`); its body runs once at that cell,
+    # checked (`_plate_one_cell`), as a `cell` plate's does. Its nested plates
+    # keep their loops.
     cell === nothing || pointwise_lhs === nothing && total_lhs === nothing ||
         throw(ArgumentError("internal: a one-cell plate has no pointwise or total output"))
     cell === nothing || push!(body.args, Expr(:local, cell))
@@ -4178,7 +4182,7 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
         inner_kernel, atomic, callargs, callvalues, raw_arguments,
         prepared_arguments, marker, output_axes, pointwise_lhs, total_lhs;
         recycled, input_type_hints, element_type, into, total_fold, program,
-        deferred, readonly_slices, batch, cell)
+        deferred, readonly_slices, batch, cell, one)
     # No program took the prepared arguments: prepare them where they stood.
     deferred === nothing || isempty(deferred) ||
         splice!(body.args, deferred_at:deferred_at-1, deferred)
@@ -4199,9 +4203,11 @@ Base.@nospecializeinfer function _lower_authored_plate_cells_native!(
         unswitch::Bool = true, cells::Bool = true, nonempty::Bool = false,
         types = nothing, total_fold = sum, program::Bool = false,
         deferred = nothing, readonly_slices = Set{Int}(), batch = nothing,
-        cell = nothing)
-    # One cell (`cell`): a shared branch is decided at that cell, in the loop.
-    unswitch &= cell === nothing
+        cell = nothing, one::Bool = false)
+    # One cell (`cell`, or a domain of one cell by construction, `one`): a
+    # shared branch is decided at that cell, where its body runs.
+    one |= cell !== nothing
+    unswitch &= !one
     inner = getfield(inner_kernel, :plan)
     if unswitch
         branch = _plate_shared_branch(inner_kernel, atomic, callargs, callvalues)
@@ -4263,7 +4269,7 @@ Base.@nospecializeinfer function _lower_authored_plate_cells_native!(
         dependencies, locals, op_offset, scan_offsets, plate_type_exprs, nested,
         lane_arms; nonempty, total_fold, runtime_ops, runtime_recipes, program,
         deferred, readonly_slices,
-        batch = element_type === nothing && cell === nothing ? batch : nothing, cell)
+        batch = element_type === nothing && !one ? batch : nothing, cell, one)
 end
 
 # Append a cell kernel's operations to the table and build the type expression
@@ -4345,7 +4351,7 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         dependencies, locals, op_offset, scan_offsets, plate_type_exprs, nested,
         lane_arms; nonempty::Bool = false, total_fold = sum,
         runtime_ops, runtime_recipes, program::Bool = false, deferred = nothing,
-        readonly_slices = Set{Int}(), batch = nothing, cell = nothing)
+        readonly_slices = Set{Int}(), batch = nothing, cell = nothing, one::Bool = false)
     groups = nested === nothing ? _authored_plate_recipe_groups(
         inner, dependencies, root_positions, atomic, callvalues) :
         [(Set{ValueId}(), nested.invariants)]
@@ -4653,7 +4659,15 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
     carried = has_scheduled_groups && cells ?
         Any[:($previous = nothing), :($first_coordinate = true)] : Any[]
     program || append!(body.args, carried)
-    cell_loop = Expr(:for, Expr(:(=), index, iteration), loopbody)
+    # A domain of one cell by construction (`one`) runs the body once, at the
+    # cell `_plate_one_cell` checks it has. Under Enzyme Reverse each loop entry
+    # allocates the caches of the values its reverse pass reads (libc `malloc`,
+    # `realloc` and `free`), which a one-cell call pays per call; straight-line
+    # values need none.
+    cell_loop = one ?
+        Expr(:block, :($index = $(GlobalRef(@__MODULE__, :_plate_one_cell))($output_axes)),
+             loopbody.args...) :
+        Expr(:for, Expr(:(=), index, iteration), loopbody)
     isempty(table_entries) ||
         (cell_loop = Expr(:block, :($cell_number = 0), take_flags..., cell_loop))
     # A pure total-only plate is a scalar reduction, so it runs under `@simd`.
@@ -4665,9 +4679,9 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
     # before an embedded kernel renames locals: late macro expansion can
     # interpret its renamed index as a module global.
     # A cell that fills lane slots carries state from one cell to the next.
-    summed = accumulator !== nothing && pointwise_lhs === nothing && total_fold === sum &&
-        !has_scheduled_groups && nested === nothing && isempty(released) &&
-        all(r -> !r.effectful, inner.recipes)
+    summed = !one && accumulator !== nothing && pointwise_lhs === nothing &&
+        total_fold === sum && !has_scheduled_groups && nested === nothing &&
+        isempty(released) && all(r -> !r.effectful, inner.recipes)
     if summed
         linear = gensym(:plate_linear)
         simd_body = Expr(:block,
@@ -4680,7 +4694,7 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
             LineNumberNode(0), simd_loop)
         cell_loop = macroexpand(@__MODULE__, simd)
     end
-    if parallel_cells
+    if parallel_cells && !one
         cell_loop = _scheduled_prefix_loop!(runtime_ops, runtime_recipes, body,
             invariants, declarations, loopbody, callargs, index, previous,
             first_coordinate, shares, output_axes; deferred)
@@ -4692,7 +4706,7 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         # the plain cell loop only: a strip refill, lane slots, cell tables,
         # scheduled groups, branch arms, scan slices, shared calls, nested
         # plates and a scheduled prefix keep it.
-        batched = batch isa _PlateBatchPlan && batch.inner === inner && nested === nothing &&
+        batched = !one && batch isa _PlateBatchPlan && batch.inner === inner && nested === nothing &&
             !has_scheduled_groups && isempty(lane_arms) && !into && recycled === nothing &&
             cell_slots === nothing && !stores_cells && isempty(slices) && !parallel_cells &&
             isempty(shares) && total_fold === sum
@@ -4718,7 +4732,7 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         # groups from cell to cell keeps one loop, as does a scheduled prefix.
         # The generated plate reverse (`plate_reverse.jl`) differentiates the
         # loop as it is.
-        direct_reads = !parallel_cells && nested === nothing && cell === nothing &&
+        direct_reads = !parallel_cells && nested === nothing && !one &&
             !has_scheduled_groups && isempty(slotted) && isempty(table_entries) &&
             isempty(shares) && !any(r -> r.op isa _AuthoredScanOp, inner.recipes) &&
             !_plate_reverse_enabled()
@@ -4980,9 +4994,10 @@ function _lower_authored_plate_cell_state!(body, runtime_ops, runtime_recipes, s
                            :gathered, reads)
     end
     if s.partition
-        # A partition's rows run batched like its plate (plate_batching.jl).
+        # A partition's rows run batched like its plate (plate_batching.jl); a
+        # partition of one cell per label runs that cell once (`one`).
         _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
-            s.plate, s.slices, s.plate_values, nothing, s.lhs; batch)
+            s.plate, s.slices, s.plate_values, nothing, s.lhs; batch, one = s.single)
         return
     end
     # The checked slices contain exactly one cell. Use the existing scalar
@@ -5751,6 +5766,18 @@ struct _ComprehensionElement{F,C<:Tuple}
 end
 @inline (element::_ComprehensionElement)(x) =
     getfield(element, :program)(getfield(element, :captures)..., x)
+# An element reading more locals than a program call takes operands
+# (`_PLATE_CALL_MAX_ARGUMENTS`) receives them as one tuple, which its program
+# unpacks into those locals first. A guarded partition plan of a wide model
+# reads well over a hundred (109 and 175 in one real plan), and left as a
+# closure it failed while an image was generated (snag
+# `partition-plan-o-f7bf3fd9`).
+struct _PackedComprehensionElement{F,C<:Tuple}
+    program::F
+    captures::C
+end
+@inline (element::_PackedComprehensionElement)(x) =
+    getfield(element, :program)(getfield(element, :captures), x)
 
 _has_generator(node) = node isa Expr && node.head !== :quote &&
     (node.head === :generator || any(_has_generator, node.args))
@@ -5814,8 +5841,9 @@ end
 # where the element cannot leave the body: more than one iteration
 # specification or a filter, an element that assigns or declares a local of
 # the body (a closure writes the body's variable, a lifted program its own
-# copy), a construct whose scope the walk does not follow, or more operands
-# than a program call takes.
+# copy), or a construct whose scope the walk does not follow. Past
+# `_PLATE_CALL_MAX_ARGUMENTS` operands the locals travel as one tuple
+# (`_PackedComprehensionElement`).
 function _lift_generator(gen::Expr, visible::Set{Symbol})
     length(gen.args) == 2 || return nothing
     element, spec = gen.args
@@ -5824,12 +5852,18 @@ function _lift_generator(gen::Expr, visible::Set{Symbol})
     captures = Symbol[]
     _comprehension_captures!(captures, element, visible, Set{Symbol}((variable,))) ||
         return nothing
-    length(captures) + 1 <= _PLATE_CALL_MAX_ARGUMENTS || return nothing
     domain = _lift_comprehensions!(spec.args[2], visible)
-    program = _PlateProgram(Expr(:function, Expr(:tuple, captures..., variable), element))
+    callable, parameters, body = if length(captures) + 1 <= _PLATE_CALL_MAX_ARGUMENTS
+        :_ComprehensionElement, Any[captures..., variable], element
+    else
+        packed = gensym(:captures)
+        :_PackedComprehensionElement, Any[packed, variable],
+        Expr(:block, (Expr(:(=), name, Expr(:call, GlobalRef(Core, :getfield), packed, k))
+                      for (k, name) in enumerate(captures))..., element)
+    end
+    program = _PlateProgram(Expr(:function, Expr(:tuple, parameters...), body))
     Expr(:call, GlobalRef(Base, :Generator),
-         Expr(:call, GlobalRef(@__MODULE__, :_ComprehensionElement), program,
-              Expr(:tuple, captures...)),
+         Expr(:call, GlobalRef(@__MODULE__, callable), program, Expr(:tuple, captures...)),
          domain)
 end
 
@@ -6067,6 +6101,7 @@ end
 # barrier each lowering is inferred on its own, and an image keeps its code.
 function _lower_with_ops(p::Plan; cell_slots::Union{Nothing,Vector{Symbol}} = nothing,
                          cell_tables::Union{Nothing,Vector{Symbol}} = nothing,
+                         indexed_lanes::Union{Nothing,Vector{Pair{Symbol,Symbol}}} = nothing,
                          kwargs...)
     depth = get(task_local_storage(), _INDEXED_INVARIANT_DEPTH, 0)
     result = task_local_storage(_INDEXED_INVARIANT_DEPTH, depth + 1) do
@@ -6079,11 +6114,12 @@ function _lower_with_ops(p::Plan; cell_slots::Union{Nothing,Vector{Symbol}} = no
     ast, constants, callables, recipes = result
     # Analyze spliced nested cells together, so reusable indexed work moves to
     # the widest enclosing plate. Footprints and position scratch retain their
-    # own read and storage protocols.
+    # own read and storage protocols. `indexed_lanes` collects the names a
+    # non-allocating program binds to the tables' lane slots.
     if depth == 0 && get(kwargs, :inline_embedded, true) &&
             !get(kwargs, :footprint, false) && !get(kwargs, :partition_plan, false) &&
             cell_slots === nothing && cell_tables === nothing
-        ast = _lower_indexed_invariants(ast, recipes)
+        ast = _lower_indexed_invariants(ast, recipes; lanes = indexed_lanes)
     end
     ast, constants, callables, recipes
 end

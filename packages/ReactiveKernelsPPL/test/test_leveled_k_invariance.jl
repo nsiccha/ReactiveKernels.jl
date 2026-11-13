@@ -57,6 +57,12 @@ function _kinv_plans(K::Int)
                 s ~ Dirichlet($K, 1.0)
                 y .~ Categorical(s)
             end, (:y,); conditioned = (:y,)), data(:y => y)),
+        # The class count is the logit row length + 1 at run time.
+        "categorical_logit_slices" => bind_data(lower_rkppl(quote
+                B[1:1, 1:(length(levels(y)) - 1)] .~ Normal.(0, 1)
+                E = x .* B
+                y .~ CategoricalLogit.(eachrow(E))
+            end, (:y, :x); conditioned = (:y, :x)), data(:y => y, :x => x)),
         "monotonic" => bind_data(lower_rkppl(quote
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)

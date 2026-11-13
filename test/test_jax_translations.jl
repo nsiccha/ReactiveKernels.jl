@@ -94,3 +94,30 @@ end
     end
 end
 
+
+# A plate over a matrix's slices: `eachrow(M)` maps M's rows and `eachcol(M)`
+# its transpose's, so each cell reads one slice as natively.
+@kernel jax_slice_plates(M::Matrix{Float64}, w::Vector{Float64}) = begin
+    rows = plate(eachrow(M), w) do row, weight
+        weight * sum(row .* row)
+    end
+    cols = plate(eachcol(M)) do col
+        sum(col) * 2.0
+    end
+    total = sum(rows) + sum(cols)
+    return total
+end
+
+@testset "jax_source: plates over eachrow and eachcol" begin
+    src = jax_source(jax_slice_plates; have = (:M, :w), want = :total)
+    @test occursin("jnp.transpose(", string(src))
+    native = prepare(jax_slice_plates; have = (:M, :w), want = :total)
+    if !rk_jax_available()
+        @test_skip false
+    else
+        for M in ([0.2 -0.4 0.1; 0.3 0.5 -0.2; 1.0 0.0 0.7], zeros(0, 3))
+            w = collect(1.0:size(M, 1))
+            @test rk_jax_evaluate(src, :kernel, (M, w)).value ≈ native(M, w) atol = 1e-12
+        end
+    end
+end
