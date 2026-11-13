@@ -16,6 +16,13 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.217
+
+- `jax_source` translates a plate over `eachrow(M)` or `eachcol(M)`: the
+  plate maps the matrix's rows (or its transpose's) with `jax.vmap`, and each
+  cell reads one slice, as natively. A categorical-logit response over one
+  logit row per observation (ReactiveKernelsPPL 0.1.169) emits this plate.
+
 ## 0.1.216
 
 - The stable rewrites compute a symmetric law's standardized log kernel at a

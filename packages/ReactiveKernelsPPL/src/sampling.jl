@@ -57,13 +57,32 @@ sampling_logdensity(d::LogDensity, value) = d.f(value, d.args...; d.kwargs...)
 # logits (class 1 the zero reference), observed from a plate cell:
 # `y[i] ~ CategoricalLogit(E[i, :])`. It is RK's `categorical_logit_ref`
 # law, the observed logit minus `logaddexp(0, logsumexp(logits))`; a class
-# beyond the slice is outside the support.
-function _ppl_categorical_logit_logdensity(value::Integer,
-        nonreference::AbstractVector)
-    T = float(eltype(nonreference))
-    1 <= value <= length(nonreference) + 1 || return T(-Inf)
-    observed = value == 1 ? zero(T) : T(nonreference[value - 1])
-    return observed - logaddexp(zero(T), logsumexp(nonreference))
+# beyond the slice is outside the support. Its source is recorded so a JAX
+# module translates it; the logits are Float64, as the response's are.
+@traceable _ppl_categorical_logit_logdensity(value::Integer,
+        nonreference::AbstractVector) =
+    1 <= value && value <= length(nonreference) + 1 ?
+        _ppl_categorical_logit_ref_logpdf(nonreference, value) : -Inf
+
+# The reference-coded log-softmax of class `value` (in `1:length + 1`) over
+# its K−1 non-reference logits: the observed logit minus
+# `m + log(exp(-m) + Σ exp(x - m))` with `m` the largest logit and 0, as the
+# positional emitter's cell computes it, with the class loop kept at run
+# time. Two passes over the slice and no temporary, so a cell over a row view
+# allocates nothing in either direction; the shift cancels from the value
+# and the derivative. Its source is recorded so a JAX module translates it.
+@traceable function _ppl_categorical_logit_ref_logpdf(nonreference::AbstractVector,
+        value::Integer)
+    m = 0.0
+    for j in eachindex(nonreference)
+        m = max(m, nonreference[j])
+    end
+    total = exp(-m)
+    for j in eachindex(nonreference)
+        total += exp(nonreference[j] - m)
+    end
+    observed = value == 1 ? 0.0 : nonreference[value - 1]
+    return observed - (m + log(total))
 end
 
 # A categorical probability vector computed in a plate cell is an ordinary

@@ -231,6 +231,51 @@ end
         sum(_cls_oracle(E[i, :], d.y[i]) for i in (1:3..., 5:9...)) rtol = 1e-12
 end
 
+# JAX parity uses the helpers test_jax_source.jl loads (it runs earlier).
+@testset "categorical logit slices: JAX module log density and gradient" begin
+    if !(@isdefined(rk_jax_available) && @isdefined(jax_raw_data) && rk_jax_available())
+        @info "RK_JAX_PYTHON or the JAX test helpers are missing: categorical logit slice JAX parity skipped"
+        @test_skip false
+    else
+        d = (; _cls_data(9, 4)..., lo = fill(2.0, 9), hi = fill(3.0, 9))
+        d = (; d..., y = [2 + mod(i, 2) for i in 1:9])
+        models = (
+            rows = _CLS_ROWS,
+            cols = quote
+                B[1:2, 1:Km1] .~ Normal.(0, 1)
+                Et = transpose(B) * transpose(X)
+                y .~ CategoricalLogit.(eachcol(Et))
+            end,
+            cell = quote
+                B[1:2, 1:Km1] .~ Normal.(0, 1)
+                E = X * B
+                @plate for i in eachindex(y)
+                    y[i] ~ CategoricalLogit(E[i, :])
+                end
+            end,
+            censored = quote
+                B[1:2, 1:Km1] .~ Normal.(0, 1)
+                E = X * B
+                y .~ censored.(CategoricalLogit.(eachrow(E)), lo, hi)
+            end,
+        )
+        for (name, ast) in pairs(models)
+            @testset "$name" begin
+                bound = _cls_bind(ast, d)
+                built = build_kernel(bound)
+                src = jax_source(built, bound)
+                u = [0.25 * sin(3j) for j in 1:built.layout.total]
+                native = _cls_q(built, bound, :sampler, u)
+                r = rk_jax_evaluate(src, "log_density", (u, jax_raw_data(bound, src)...);
+                    grad = true, prepare = true)
+                @test r.value ≈ native rtol = 1e-10
+                reference = _cls_fd(v -> _cls_q(built, bound, :sampler, v), u)
+                @test maximum(abs.(r.grad .- reference) ./ max.(1, abs.(reference))) < 1e-5
+            end
+        end
+    end
+end
+
 @testset "categorical logit slices: refusals name the form" begin
     d = _cls_data(6, 3)
     @test_throws SurfaceLoweringError lower_rkppl(quote

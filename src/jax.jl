@@ -3148,6 +3148,18 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(permutedims), args::Vecto
     axes = "tuple(a - 1 for a in " * perm.code * ")"
     _PyVal("jnp.transpose(" * x.code * ", " * axes * ")", Array{E,R})
 end
+# `eachrow(M)` / `eachcol(M)`: a matrix's slices, one per entry, as a plate's
+# collection. The slices are the matrix's leading axis (rows) or its
+# transpose's (columns), so the plate's `jax.vmap` hands each cell one slice.
+function _jax_function_call(ctx::_JaxContext, f::Union{typeof(eachrow),typeof(eachcol)},
+                            args::Vector{_PyVal})
+    length(args) == 1 && _jax_rank(args[1].T) == 2 ||
+        _jax_error("`", f, "` of a value that is not one matrix has no JAX translation",
+                   _jax_where(ctx))
+    x = only(args)
+    code = f === eachrow ? x.code : "jnp.transpose(" * x.code * ")"
+    _PyVal(code, Vector{Vector{_jax_eltype(x.T)}})
+end
 function _jax_function_call(ctx::_JaxContext, ::typeof(/), args::Vector{_PyVal})
     _jax_error("a matrix division has no JAX translation", _jax_where(ctx))
 end

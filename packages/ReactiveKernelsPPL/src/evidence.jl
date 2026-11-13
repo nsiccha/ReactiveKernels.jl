@@ -180,7 +180,7 @@ function _wrap_evidence!(r, plan, pre, inputs, base;
         base = _evidence_integer_observation(base, y)
         base = :((isfinite($y) && floor($y) == $y) ? $base : -Inf)
         if family in (CategoricalFam, CategoricalLogitFam, OrderedLogisticFam, OrdinalFam)
-            base = :(1 <= $y <= $levels ? $base : -Inf)
+            base = :(1 <= $y && $y <= $levels ? $base : -Inf)
         end
     end
     bounds = map((r.evidence.lower, r.evidence.upper)) do b

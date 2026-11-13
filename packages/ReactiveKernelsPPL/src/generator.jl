@@ -823,7 +823,7 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     uniform, laplace, logistic,
     student_t, zero_inflated_poisson, zero_inflated_binomial,
     zero_inflated_binomial_logit_zi,
-    normal_id_glm, bernoulli_logit_glm, poisson_log_glm, categorical_logit_ref,
+    normal_id_glm, bernoulli_logit_glm, poisson_log_glm,
     rk_inverse_gaussian_tail, rk_von_mises_cdf, rk_logprob_tail,
     rk_von_mises_periodic_cdf, rk_ordinal_stopping_logpdf, rk_ordinal_stopping_tail,
     _half_normal_logpdf_on_support, _half_cauchy_logpdf_on_support
@@ -4203,12 +4203,14 @@ end
 
 # Reference-coded multi-logit categorical over the slices of one logit
 # matrix (`y .~ CategoricalLogit.(eachrow(E))` / `eachcol(E)`). One plate
-# pairs observation `i` with its slice, and the cell is RK's
-# `categorical_logit_ref` law over that slice: the observed class's logit
-# minus the log-sum-exp over the slice and the zero reference. The class
-# count is the slice length + 1 when the model runs, so the emitted program
-# is the same for every K. An observation beyond its slice is outside the
-# law's support; the lazy guard keeps the gather in bounds.
+# pairs observation `i` with its slice, and the cell is the
+# `categorical_logit_ref` law over that slice
+# (`_ppl_categorical_logit_ref_logpdf`): the observed class's logit minus
+# the log-sum-exp over the slice and the zero reference, in two passes that
+# allocate nothing. The class count is the slice length + 1 when the model
+# runs, so the emitted program is the same for every K. An observation
+# beyond its slice is outside the law's support; the lazy guard keeps the
+# gather in bounds.
 function _categorical_slices_plate_stmts(r::LikelihoodSpec,
         plan::StructuralPlan, node::Symbol, pw::Symbol)
     pre = Expr[]
@@ -4216,10 +4218,10 @@ function _categorical_slices_plate_stmts(r::LikelihoodSpec,
     inputs = Any[r.response, :($slices($(r.predictor)))]
     yv, row = _dovar(1), _dovar(2)
     levels = :(length($row) + 1)
-    law = :(categorical_logit_ref($row).logpdf($yv))
+    law = :(ReactiveKernelsPPL._ppl_categorical_logit_ref_logpdf($row, $yv))
     tail = (b, upper) -> :(ReactiveKernelsPPL._ppl_categorical_logit_ref_tail(
         $row, $b, $upper))
-    cell = r.evidence.kind === :none ? :(1 <= $yv <= $levels ? $law : -Inf) :
+    cell = r.evidence.kind === :none ? :(1 <= $yv && $yv <= $levels ? $law : -Inf) :
         _wrap_evidence!(r, plan, pre, inputs, law;
             cdf = b -> tail(b, false), ccdf = b -> tail(b, true), levels)
     if r.weights !== nothing
@@ -4233,17 +4235,21 @@ end
 # P(y > b)) tail of the reference-coded categorical over its K−1
 # non-reference logits, the positional emitter's `categorical_tail` with
 # its class loop kept at run time. Each tail sums its own classes, so
-# neither is formed as one minus the other.
-function _ppl_categorical_logit_ref_tail(nonreference::AbstractVector, b,
-        upper::Bool)
-    m = max(zero(eltype(nonreference)), maximum(nonreference; init = -Inf))
+# neither is formed as one minus the other. Its source is recorded so a JAX
+# module translates it; the logits are Float64, as the response's are.
+@traceable function _ppl_categorical_logit_ref_tail(nonreference::AbstractVector,
+        b, upper::Bool)
+    m = 0.0
+    for j in eachindex(nonreference)
+        m = max(m, nonreference[j])
+    end
     reference = exp(-m)
     total = reference
-    part = (upper ? b < 1 : b >= 1) ? reference : zero(reference)
-    for j in 2:(length(nonreference) + 1)
-        term = exp(nonreference[j - 1] - m)
+    part = (upper ? b < 1 : b >= 1) ? reference : 0.0
+    for j in eachindex(nonreference)
+        term = exp(nonreference[j] - m)
         total += term
-        (upper ? b < j : b >= j) && (part += term)
+        part += (upper ? b < j + 1 : b >= j + 1) ? term : 0.0
     end
     return part / total
 end

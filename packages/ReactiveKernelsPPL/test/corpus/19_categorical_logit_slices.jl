@@ -9,7 +9,8 @@
 # `y[i] ~ CategoricalLogit(E[i, :])` (or a cell local bound to that row)
 # observes the same law. Weights, censoring and missing responses work as
 # for the positional form; `mi()` missingness cannot select rows yet; a
-# class beyond its row has log density -Inf. Tests:
+# class beyond its row has log density -Inf. `jax_source` translates every
+# form (ReactiveKernels 0.1.217). Tests:
 # test_categorical_logit_slices.jl, test_leveled_k_invariance.jl.
 begin
     B[axes(X, 2), 1:Km1] .~ Normal.(0, 1)

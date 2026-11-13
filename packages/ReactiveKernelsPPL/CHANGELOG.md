@@ -28,7 +28,8 @@ are recorded in the git history only.
   sampler type therefore serve every class count. The slice form takes
   weights, censoring and missing responses like the positional form; an
   observation beyond its slice has log density `-Inf`. `mi()` missingness
-  does not select logit slices yet.
+  does not select logit slices yet. `jax_source` translates every form;
+  requires ReactiveKernels 0.1.217.
 
 ## 0.1.168
 
