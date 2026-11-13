@@ -6,17 +6,17 @@ ResidualBorrowPrototype.install!()
 @testset "borrowed snapshots retain ownership and concrete audits" begin
     include(joinpath(@__DIR__, "..", "test", "test_derivative_rule_snapshots.jl"))
     r = ResidualBorrowPrototype.retain
-    a = [1.0, 2.0]; record = DerivativeRuleSnapshotTests.Record(a)
-    tape = (a, record, view(a, :))
+    a = [1.0, 2.0]
+    tape = (a, a, 1.5)
     borrowed = @inferred r((1, -1, -1), tape, 1.0, (false, false))
     @test borrowed[1] === a
-    @test borrowed[2].data === a
-    @test parent(borrowed[3]) === a
+    @test borrowed[2] === a
+    @test borrowed[3] === 1.5
     for (primal, flags) in ((1.0, (false,true)), (a, (false,false)))
         saved = @inferred r((1, -1, -1), tape, primal, flags)
         @test saved[1] !== a
-        @test saved[2].data === saved[1]
-        @test parent(saved[3]) === saved[1]
+        @test saved[2] === saved[1]
+        @test saved[3] === 1.5
     end
     nested = [a]
     saved = @inferred r((1,), (nested,), 1.0, (false,false))
@@ -30,12 +30,21 @@ ResidualBorrowPrototype.install!()
         (typeof(env), IdDict{Any,Any}))
     println("OWNED_SNAPSHOT_HOOK_AUDIT ", findings)
     @test isempty(findings)
-    for value in (a, view(a,:), (a,), (;data=a), record,
+    record = DerivativeRuleSnapshotTests.Record(a)
+    for value in (view(a,:), (a,), (;data=a), record,
             DerivativeRuleSnapshotTests.MutableRecord(a), [a])
-        mixed = ResidualBorrowPrototype.Environment((a,value), (1,-1),
-            (false,false), true)
+        @test !ResidualBorrowPrototype.flat_environment((a,value))
+        saved = r((1,-1), (a,value), 1.0, (false,false))
+        @test saved[1] !== a
+        if value isa SubArray
+            @test parent(saved[2]) === saved[1]
+        else
+            @test DerivativeRuleSnapshotTests.unwrap(saved[2]) === saved[1]
+        end
+        # Unsupported borrowing forms retain the original snapshot path. Audit
+        # that reachable path, rather than a hook it never calls.
         @test isempty(ReactiveKernels._level_code_findings(:all,
-            Base.deepcopy_internal, (typeof(mixed), IdDict{Any,Any})))
+            r, (Tuple{Int,Int}, typeof((a,value)), Float64, Tuple{Bool,Bool})))
     end
 end
 

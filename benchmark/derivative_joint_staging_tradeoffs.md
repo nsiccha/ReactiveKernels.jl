@@ -182,8 +182,10 @@ generally efficient retention policy. A separate benchmark-only refinement is
 testing reuse of direct dense bits-array inputs when the backend's write flags
 prove they stay unchanged and the primal cannot expose mutable storage. It
 uses Julia's documented deepcopy specialization hook on an owned wrapper to
-preserve references shared between borrowed inputs and nested residuals. Its
-mutation and type checks must pass before measuring its costs.
+preserve repeated array references. Only flat tuples of bits values and dense
+bits arrays use this optimization; nested containers retain the complete
+snapshot path. This is an optimization eligibility condition, not an authoring
+restriction. Mutation and type checks must pass before measuring its costs.
 
 The first borrowing run passed all 239 existing snapshot checks and 11 new
 alias checks, then failed its direct audit of the owned copying hook. Base's
@@ -192,7 +194,12 @@ residuals. That failed run stopped before the direct/view/global mutation
 controls or timing; it provides no borrowing performance result. The revised
 prototype uses a structural tuple map, retaining each position's concrete
 type, and directly audits the owned hook for seven additional container forms.
-That revision remains under verification.
+That second run passed 257 checks but found one `deepcopy_internal::Any` call
+for a mutable record in the hook. It again stopped before mutation controls
+and timing. The third revision confines the owned hook to flat tuples of
+scalars and dense arrays, and verifies that nested containers still snapshot
+and preserve their internal sharing through the existing Base boundary.
+That revision remains under verification on the integrated `f91621d64` base.
 
 ## Preparation and evidence limits
 
@@ -247,6 +254,9 @@ controls, not that the alias arm passed correctness.
 - First borrowing prototype: fleet `a62b3a9dca8b4baa`, exit 1, 160 seconds,
   250 pass / 1 owned-hook type-audit failure;
   [exact failed source, successful checks, audit finding and terminal receipt](http://localhost:4200/code/download?path=/home/niko/.local/state/kb-agents/uploads/fddd0f69bbbe8962a91725e2ed6d8a17334d7e0a10bc336b4a0c7f88c1249313.tgz).
+- Heterogeneous tuple borrowing revision: fleet `8504836267c34445`, exit 1,
+  163 seconds, 257 pass / 1 mutable-record hook audit failure;
+  [exact failed source, successful checks, audit finding and terminal receipt](http://localhost:4200/code/download?path=/home/niko/.local/state/kb-agents/uploads/49005104ec9c9d235d5936fd902e960413010127e0e336508d9aaf79c528702c.tgz).
 
 The remaining ownership refinement targets readonly inputs. Conservative
 copying can duplicate readonly data and whole parents of small views; it is not
