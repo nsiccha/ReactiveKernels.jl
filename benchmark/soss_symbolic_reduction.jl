@@ -19,15 +19,16 @@ product(xs) = foldl(*, xs; init=1)
 
 """Discover sum_i coefficient(a,b) * basis(y_i), or decline a mixed factor.
 
-SymbolicUtils performs the algebraic expansion. This routine only partitions
+By default SymbolicUtils performs the algebraic expansion; expand=false keeps
+the supplied expression's factors intact. This routine only partitions
 its factors by their input dependencies and groups equal data bases. It does
 not implement an algebra rewrite engine, inspect a law name, or select an
 alternative by cost. Expressions are straight-line scalar arithmetic; guards
 and extra demanded outputs require a richer representation than this fixture.
 """
-function separate(expr)
+function separate(expr; expand=true)
     grouped = Dict{Any,Any}()
-    for term in terms(SU.expand(expr))
+    for term in terms(expand ? SU.expand(expr) : expr)
         data, live = Any[], Any[]
         for factor in factors(term)
             dy = reads(factor, y)
