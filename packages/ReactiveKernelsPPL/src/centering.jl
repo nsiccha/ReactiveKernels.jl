@@ -6,6 +6,10 @@ Wrap a packed-coordinate LogDensityProblems target for WarmupHMC's adaptive
 partial centering. Load `WarmupHMC` and `LogDensityProblems` to enable this
 extension. `built` and the bound `plan` describe the same model as `problem`.
 
+This function is public but not exported, because BayesianRegressionModels
+exports a different `adaptive_centering_problem`. Import it with
+`using ReactiveKernelsPPL: adaptive_centering_problem`, or call it qualified.
+
 Select whole real-valued latent parameters by their graph names, for example
 `cells = (z = (location = :z_location, log_scale = :z_log_scale),)`.
 
