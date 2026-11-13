@@ -143,13 +143,14 @@ end
 
 @testset "recovered plate arms preserve bound endpoint captures" begin
     backend = AutoEnzyme(; mode = Enzyme.Reverse)
-    function regions(ex, counts = Dict(:for => 0, :while => 0, :if => 0))
+    function regions(ex, counts = Dict(:for => 0, :while => 0, :if => 0, :expr => 0))
+        ex isa ReactiveKernels._PlateProgram && return regions(ex.ast, counts)
         ex isa Expr || return counts
+        counts[:expr] += 1
         haskey(counts, ex.head) && (counts[ex.head] += 1)
         foreach(arg -> regions(arg, counts), ex.args)
         counts
     end
-    structures = Dict{Any,Any}()
     # The shared scale guard makes lowering recover the arm's graph from its
     # source. Its prepared base endpoint must remain a lexical capture in
     # every split part, including on subsequent bindings and other aliases.
@@ -170,15 +171,31 @@ end
                 @test gradient ≈ 2sum(abs2, data) / scale^3 - n / scale
             end
             @test bound(0.0) == (n == 0 ? 0.0 : -Inf)
-            # Growing bound data retains the same emitted loop/branch bodies.
-            # An empty domain may simplify them away (CONTRIBUTING.md).
+            # Inspect reachable plate programs as well as the outer expression
+            # (CONTRIBUTING.md, "Data-dependent iteration"). An empty domain
+            # may simplify them away.
             if n > 0
                 shape = regions(code_expr(bound))
-                @test shape == get!(structures, policy, shape)
                 @test shape[:for] + shape[:while] > 0
             end
         end
         @test data == saved
+    end
+
+    # Distinct rows and duplicate rows can select different emitted programs:
+    # grouping duplicates adds multiplicity handling. Within each case, grow
+    # the number of distinct rows and inspect both control flow and body size,
+    # so a surviving loop cannot hide bodies duplicated with the data length.
+    for repetitions in (1, 2), policy in (nothing, :ignore)
+        shapes = map((2, 19, 190)) do n
+            data = repeat(collect(range(0.2, 0.7; length = n)); inner = repetitions)
+            bound = prepare(quadratic_scores; bound = (; data), on_error = policy,
+                            type_stability = :error)
+            shape = regions(code_expr(bound))
+            @test shape[:for] + shape[:while] > 0
+            shape
+        end
+        @test all(==(first(shapes)), shapes)
     end
     @test prepare(quadratic_scores; bound = (data = [0.2, 0.7],))(1.0) ≈ -0.53
 

@@ -1071,7 +1071,7 @@ end
 # `lhs = (__callables__[i])(callargs...)` takes the step rule; everything else
 # (a constant's read, the inlined plates, scans and cells, lane-filling
 # sources, control flow) is kept.
-function _nonalloc_statement!(prog::_StepProgram, recipes::Tuple,
+function _nonalloc_statement!(prog::_StepProgram, recipes::Vector{Recipe},
                               types::Dict{Symbol,Any}, stmt)
     if Meta.isexpr(stmt, :if)
         arms = Any[]
@@ -1385,8 +1385,11 @@ function _nonallocating_program(p::Plan; have_types = nothing,
                              if haskey(values, cid))
     prog = _StepProgram(Any[callables...], Any[nothing for _ in callables], cache_apply)
     body = Expr(:block)
+    # The statement walker is shared across graph sizes; the executable tables
+    # below still retain their exact tuple types.
+    recipe_list = collect(Recipe, recipes)
     for stmt in ast.args[2].args
-        append!(body.args, _nonalloc_statement!(prog, recipes, types, stmt))
+        append!(body.args, _nonalloc_statement!(prog, recipe_list, types, stmt))
     end
     # The same stable forms as `prepare` (`stable_rewrites.jl`). After the step
     # rule, whose decomposition spells out the fused sources `prepare` inlines:
