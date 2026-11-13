@@ -191,6 +191,7 @@ end
 
 # The `for` depth of each assignment whose target name contains `name`.
 function loop_depths(ex, name, depth = 0, found = Int[])
+    ex isa ReactiveKernels._PlateProgram && return loop_depths(ex.ast, name, depth, found)
     ex isa Expr || return found
     ex.head === :(=) && ex.args[1] isa Symbol && occursin(name, String(ex.args[1])) &&
         push!(found, depth)

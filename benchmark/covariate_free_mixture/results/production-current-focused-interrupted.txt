@@ -1,0 +1,322 @@
+(julia = v"1.13.1", enzyme = v"0.13.220", library = "/home/niko/.local/state/kb-agents/libenzyme-dogfood/e316a076ef438970e339876079acd02ce48d3d21/llvm20/libEnzyme-20.so", source = "0987481070ee9b08b738ef5e201bd2bf843a0d47")
+TEST_BEGIN ReactiveKernelsDistributionKernels/test_product_mixture.jl
+Test Summary:                                    | Pass  Total   Time
+one component governs each whole observed vector |    9      9  58.4s
+Test Summary:                                     | Pass  Total   Time
+logit-scale whole-event laws keep saturated tails |   30     30  28.0s
+Test Summary:                                 | Pass  Total  Time
+whole-event laws keep no per-component vector |   12     12  0.9s
+
+events that share the weights take their logs once per call: Test Failed at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsDistributionKernels/test/test_product_mixture.jl:239
+  Expression: !(isempty(depths)) && all((==)(0), depths)
+  Stacktrace:
+   [1] top-level scope
+     @ ~/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsDistributionKernels/test/test_product_mixture.jl:220
+   [2] macro expansion
+     @ ~/.julia/juliaup/julia-1.13.1+0.x64.linux.gnu/share/julia/stdlib/v1.13/Test/src/Test.jl:1967 [inlined]
+   [3] macro expansion
+     @ ~/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsDistributionKernels/test/test_product_mixture.jl:239 [inlined]
+   [4] macro expansion
+     @ ~/.julia/juliaup/julia-1.13.1+0.x64.linux.gnu/share/julia/stdlib/v1.13/Test/src/Test.jl:758 [inlined]
+
+events that share the weights take their logs once per call: Test Failed at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsDistributionKernels/test/test_product_mixture.jl:239
+  Expression: !(isempty(depths)) && all((==)(0), depths)
+  Stacktrace:
+   [1] top-level scope
+     @ ~/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsDistributionKernels/test/test_product_mixture.jl:220
+   [2] macro expansion
+     @ ~/.julia/juliaup/julia-1.13.1+0.x64.linux.gnu/share/julia/stdlib/v1.13/Test/src/Test.jl:1967 [inlined]
+   [3] macro expansion
+     @ ~/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsDistributionKernels/test/test_product_mixture.jl:239 [inlined]
+   [4] macro expansion
+     @ ~/.julia/juliaup/julia-1.13.1+0.x64.linux.gnu/share/julia/stdlib/v1.13/Test/src/Test.jl:758 [inlined]
+Test Summary:                                               | Pass  Fail  Total   Time
+events that share the weights take their logs once per call |   12     2     14  31.0s
+RNG of the outermost testset: Random.Xoshiro(0x43404e3518af53ba, 0xa36404dab1b0187b, 0xf47312d8e82ef904, 0x032db75a03a42226, 0x09ebbe77d0276949)
+LoadError: Test.TestSetException(12, 2, 0, 0, Union{Test.Error, Test.Fail}[Test.Fail(:test, "!(isempty(depths)) && all((==)(0), depths)", nothing, "false", nothing, :(#= /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsDistributionKernels/test/test_product_mixture.jl:239 =#), false, nothing), Test.Fail(:test, "!(isempty(depths)) && all((==)(0), depths)", nothing, "false", nothing, :(#= /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsDistributionKernels/test/test_product_mixture.jl:239 =#), false, nothing)])
+Stacktrace:
+ [1] finish(ts::Test.DefaultTestSet; print_results::Bool)
+   @ Test ~/.julia/juliaup/julia-1.13.1+0.x64.linux.gnu/share/julia/stdlib/v1.13/Test/src/Test.jl:1458
+ [2] finish(ts::Test.DefaultTestSet)
+   @ Test ~/.julia/juliaup/julia-1.13.1+0.x64.linux.gnu/share/julia/stdlib/v1.13/Test/src/Test.jl:1431
+ [3] top-level scope
+   @ ~/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsDistributionKernels/test/test_product_mixture.jl:220
+ [4] macro expansion
+   @ ~/.julia/juliaup/julia-1.13.1+0.x64.linux.gnu/share/julia/stdlib/v1.13/Test/src/Test.jl:1983 [inlined]
+ [5] include(mapexpr::Function, mod::Module, _path::String)
+   @ Base ./Base.jl:310
+ [6] top-level scope
+   @ ~/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/focused-counts-production.jl:20
+ [7] include(mod::Module, _path::String)
+   @ Base ./Base.jl:309
+ [8] exec_options(opts::Base.JLOptions)
+   @ Base ./client.jl:344
+ [9] _start()
+   @ Base ./client.jl:577
+in expression starting at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsDistributionKernels/test/test_product_mixture.jl:219
+TEST_END ReactiveKernelsDistributionKernels/test_product_mixture.jl seconds=125.03672981262207
+TEST_BEGIN ReactiveKernelsDistributionKernels/test_bound_binomial_mixture.jl
+Test Summary:                                              | Pass  Total   Time
+bound mixture coefficients retain invalid-component guards |   24     24  18.5s
+Test Summary:                                                | Pass  Total  Time
+probability coefficient preserves lazy support and endpoints |   10     10  2.3s
+TEST_END ReactiveKernelsDistributionKernels/test_bound_binomial_mixture.jl seconds=25.670103073120117
+TEST_BEGIN ReactiveKernelsDistributionKernels/test_zero_inflated_product_mixture.jl
+Test Summary:                                                   | Pass  Total  Time
+zero-inflated Binomial product mixture streams component scores |    5      5  9.0s
+Test Summary:                                                    | Pass  Total  Time
+zero-inflated Binomial whole-event law keeps both log-odds tails |   31     31  3.4s
+TEST_END ReactiveKernelsDistributionKernels/test_zero_inflated_product_mixture.jl seconds=12.437632083892822
+TEST_BEGIN ReactiveKernelsDistributionKernels/test_product_mixture_rows.jl
+Test Summary:                                 | Pass  Total   Time
+product laws broadcast only the position rows |  158    158  33.5s
+TEST_END ReactiveKernelsDistributionKernels/test_product_mixture_rows.jl seconds=33.564671993255615
+TEST_BEGIN ReactiveKernelsDistributionKernels/test_bernoulli_mixture_counts.jl
+Test Summary:                                                     | Pass  Total  Time
+Bernoulli mixture counts preserve empty and saturated derivatives |  110    110  4.9s
+Test Summary:                                        | Pass  Total  Time
+full-row Bernoulli mixtures retain runtime iteration |    5      5  0.2s
+TEST_END ReactiveKernelsDistributionKernels/test_bernoulli_mixture_counts.jl seconds=5.248854875564575
+TEST_BEGIN ReactiveKernelsPPL/test_whole_event_mixture.jl
+
+[3219152] signal 15: Terminated
+in expression starting at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsPPL/test/test_whole_event_mixture.jl:187
+unknown function (ip: 0x7d7f2a0ac7c0) at /usr/lib/x86_64-linux-gnu/libc.so.6
+unknown function (ip: 0x7d7f2a0a02cb) at /usr/lib/x86_64-linux-gnu/libc.so.6
+unknown function (ip: 0x7d7f2a0a06a6) at /usr/lib/x86_64-linux-gnu/libc.so.6
+pthread_cond_wait at /usr/lib/x86_64-linux-gnu/libc.so.6 (unknown line)
+uv_cond_wait at /workspace/srcdir/libuv/src/unix/thread.c:822
+ijl_task_get_next at /cache/build/builder-amdci4-8/julialang/julia-ci/src/scheduler.c:599
+wait at ./task.jl:1297
+#wait#392 at ./condition.jl:141
+wait at ./condition.jl:136 [inlined]
+_trywait at ./asyncevent.jl:186
+profile_printing_listener at ./Base.jl:335
+#start_profile_listener##0 at ./Base.jl:355
+jfptr_YY.start_profile_listenerYY.YY.0_16783.1 at /home/niko/.julia/juliaup/julia-1.13.1+0.x64.linux.gnu/lib/julia/sys.so (unknown line)
+jl_apply at /cache/build/builder-amdci4-8/julialang/julia-ci/src/julia.h:2318 [inlined]
+start_task at /cache/build/builder-amdci4-8/julialang/julia-ci/src/task.c:1285
+unknown function (ip: (nil)) at (unknown file)
+_ZN4llvm17ScheduleDAGInstrs15buildSchedGraphEPNS_9AAResultsEPNS_18RegPressureTrackerEPNS_13PressureDiffsEPNS_13LiveIntervalsEb at /home/niko/.julia/juliaup/julia-1.13.1+0.x64.linux.gnu/bin/../lib/julia/libLLVM.so.20.1jl (unknown line)
+_ZN4llvm17ScheduleDAGMILive23buildDAGWithRegPressureEv at /home/niko/.julia/juliaup/julia-1.13.1+0.x64.linux.gnu/bin/../lib/julia/libLLVM.so.20.1jl (unknown line)
+_ZN4llvm17ScheduleDAGMILive8scheduleEv at /home/niko/.julia/juliaup/julia-1.13.1+0.x64.linux.gnu/bin/../lib/julia/libLLVM.so.20.1jl (unknown line)
+_ZN12_GLOBAL__N_120MachineSchedulerBase15scheduleRegionsERN4llvm17ScheduleDAGInstrsEb at /home/niko/.julia/juliaup/julia-1.13.1+0.x64.linux.gnu/bin/../lib/julia/libLLVM.so.20.1jl (unknown line)
+_ZN12_GLOBAL__N_116MachineScheduler20runOnMachineFunctionERN4llvm15MachineFunctionE at /home/niko/.julia/juliaup/julia-1.13.1+0.x64.linux.gnu/bin/../lib/julia/libLLVM.so.20.1jl (unknown line)
+_ZN4llvm19MachineFunctionPass13runOnFunctionERNS_8FunctionE.part.0 at /home/niko/.julia/juliaup/julia-1.13.1+0.x64.linux.gnu/bin/../lib/julia/libLLVM.so.20.1jl (unknown line)
+_ZN4llvm13FPPassManager13runOnFunctionERNS_8FunctionE at /home/niko/.julia/juliaup/julia-1.13.1+0.x64.linux.gnu/bin/../lib/julia/libLLVM.so.20.1jl (unknown line)
+_ZN4llvm13FPPassManager11runOnModuleERNS_6ModuleE at /home/niko/.julia/juliaup/julia-1.13.1+0.x64.linux.gnu/bin/../lib/julia/libLLVM.so.20.1jl (unknown line)
+_ZN4llvm6legacy15PassManagerImpl3runERNS_6ModuleE at /home/niko/.julia/juliaup/julia-1.13.1+0.x64.linux.gnu/bin/../lib/julia/libLLVM.so.20.1jl (unknown line)
+warning: address range table at offset 0x3970 has a premature terminator entry at offset 0x42c0
+warning: address range table at offset 0x3970 has a premature terminator entry at offset 0x4320
+operator() at /cache/build/builder-amdci4-8/julialang/julia-ci/src/jitlayers.cpp:1627
+addModule at /cache/build/builder-amdci4-8/julialang/julia-ci/src/jitlayers.cpp:2130
+jl_compile_codeinst_now at /cache/build/builder-amdci4-8/julialang/julia-ci/src/jitlayers.cpp:681
+jl_compile_codeinst_impl at /cache/build/builder-amdci4-8/julialang/julia-ci/src/jitlayers.cpp:875
+jl_fptr_wait_for_compiled at /cache/build/builder-amdci4-8/julialang/julia-ci/src/gf.c:3812
+unknown function (ip: 0x7d7ea92ceae9) at (unknown file)
+unknown function (ip: 0x7d7ea92ceab5) at (unknown file)
+collect_to_with_first! at ./array.jl:864 [inlined]
+collect at ./array.jl:838
+unknown function (ip: 0x7d7ea92cc618) at (unknown file)
+unknown function (ip: 0x7d7ea9279cd9) at (unknown file)
+unknown function (ip: 0x7d7ea9279c9e) at (unknown file)
+_totuple at ./tuple.jl:484 [inlined]
+Tuple at ./tuple.jl:450 [inlined]
+_indexed_flags at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/indexed_invariants.jl:236
+unknown function (ip: 0x7d7ea92778f5) at (unknown file)
+_indexed_flags at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/indexed_invariants.jl:233
+_indexed_flags at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/indexed_invariants.jl:228 [inlined]
+#_indexed_loop##9 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/indexed_invariants.jl:339
+get! at ./dict.jl:460
+cached_read at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/indexed_invariants.jl:336
+unknown function (ip: 0x7d7ea92a8a2a) at (unknown file)
+#_indexed_loop##13 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/indexed_invariants.jl:375
+_index_run_replace at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/index_runs.jl:151
+unknown function (ip: 0x7d7ea92719cc) at (unknown file)
+#_indexed_loop##11 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/indexed_invariants.jl:364
+_index_run_visit at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/index_runs.jl:145 [inlined]
+#_index_run_visit##0 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/index_runs.jl:146
+unknown function (ip: 0x7d7ea926af43) at (unknown file)
+foreach at ./abstractarray.jl:3212
+_index_run_visit at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/index_runs.jl:146 [inlined]
+#_index_run_visit##0 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/index_runs.jl:146
+unknown function (ip: 0x7d7ea926af43) at (unknown file)
+foreach at ./abstractarray.jl:3212
+_index_run_visit at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/index_runs.jl:146 [inlined]
+#_index_run_visit##0 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/index_runs.jl:146
+unknown function (ip: 0x7d7ea926af43) at (unknown file)
+foreach at ./abstractarray.jl:3212
+_index_run_visit at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/index_runs.jl:146 [inlined]
+#_index_run_visit##0 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/index_runs.jl:146
+unknown function (ip: 0x7d7ea926af43) at (unknown file)
+foreach at ./abstractarray.jl:3212
+_index_run_visit at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/index_runs.jl:146 [inlined]
+#_index_run_visit##0 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/index_runs.jl:146
+unknown function (ip: 0x7d7ea926af43) at (unknown file)
+foreach at ./abstractarray.jl:3212
+_index_run_visit at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/index_runs.jl:146 [inlined]
+#_index_run_visit##0 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/index_runs.jl:146
+unknown function (ip: 0x7d7ea926af43) at (unknown file)
+foreach at ./abstractarray.jl:3212
+_index_run_visit at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/index_runs.jl:146 [inlined]
+#_index_run_visit##0 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/index_runs.jl:146
+unknown function (ip: 0x7d7ea926af43) at (unknown file)
+foreach at ./abstractarray.jl:3212
+_index_run_visit at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/index_runs.jl:146 [inlined]
+#_index_run_visit##0 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/index_runs.jl:146
+unknown function (ip: 0x7d7ea926af43) at (unknown file)
+foreach at ./abstractarray.jl:3212
+_index_run_visit at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/index_runs.jl:146 [inlined]
+#_index_run_visit##0 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/index_runs.jl:146
+unknown function (ip: 0x7d7ea926af43) at (unknown file)
+foreach at ./abstractarray.jl:3212
+_index_run_visit at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/index_runs.jl:146 [inlined]
+_indexed_loop at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/indexed_invariants.jl:357
+unknown function (ip: 0x7d7ea9258313) at (unknown file)
+rewrite at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/indexed_invariants.jl:465
+unknown function (ip: 0x7d7ea922780b) at (unknown file)
+rewrite at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/indexed_invariants.jl:472
+unknown function (ip: 0x7d7ea922780b) at (unknown file)
+rewrite at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/indexed_invariants.jl:472
+unknown function (ip: 0x7d7ea922780b) at (unknown file)
+rewrite at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/indexed_invariants.jl:472
+unknown function (ip: 0x7d7ea922780b) at (unknown file)
+rewrite at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/indexed_invariants.jl:472
+unknown function (ip: 0x7d7ea922780b) at (unknown file)
+#_lower_indexed_invariants#3344 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/indexed_invariants.jl:489
+_lower_indexed_invariants at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/indexed_invariants.jl:445
+unknown function (ip: 0x7d7ea9207df8) at (unknown file)
+#_lower_with_ops#759 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/codegen.jl:6164
+_lower_with_ops at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/codegen.jl:6144
+unknown function (ip: 0x7d7eaebe7b5e) at (unknown file)
+#1124 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/codegen.jl:9682
+task_local_storage at ./task.jl:298
+_with_plan_exemplars at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/graphops.jl:126 [inlined]
+#1122 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/codegen.jl:9681 [inlined]
+task_local_storage at ./task.jl:298
+_sharing_cell_plans at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/codegen.jl:3927 [inlined]
+#_prepare_plan_body#1113 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/codegen.jl:9680
+_prepare_plan_body at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/codegen.jl:9651 [inlined]
+#_prepare_plan#1109 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/codegen.jl:9648 [inlined]
+_prepare_plan at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/codegen.jl:9643 [inlined]
+#1107 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/codegen.jl:9631 [inlined]
+_with_type_stability_setting at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/type_stability.jl:376 [inlined]
+#_with_type_stability##0 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/type_stability.jl:374 [inlined]
+_with_type_stability_setting at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/type_stability.jl:376 [inlined]
+_with_type_stability at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/type_stability.jl:372 [inlined]
+#1105 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/codegen.jl:9630 [inlined]
+_with_setting at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/simplify_setting.jl:51 [inlined]
+_with_bound_statistics at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/simplify_setting.jl:61 [inlined]
+#_with_settings##0 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/simplify_setting.jl:75 [inlined]
+_with_setting at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/simplify_setting.jl:51 [inlined]
+_with_simplify at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/simplify_setting.jl:58 [inlined]
+_with_settings at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/simplify_setting.jl:74 [inlined]
+#1103 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/codegen.jl:9629 [inlined]
+_with_type_stability_setting at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/type_stability.jl:376 [inlined]
+_with_branch_arms at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/type_stability.jl:368 [inlined]
+#prepare#1099 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/codegen.jl:9628 [inlined]
+prepare at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/codegen.jl:9624 [inlined]
+#1134 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/codegen.jl:9720 [inlined]
+_with_type_stability_setting at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/type_stability.jl:376 [inlined]
+#_with_type_stability##0 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/type_stability.jl:374 [inlined]
+_with_type_stability_setting at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/type_stability.jl:376
+unknown function (ip: 0x7d7eaebd7d52) at (unknown file)
+_with_type_stability at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/type_stability.jl:372 [inlined]
+#1132 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/codegen.jl:9715 [inlined]
+_with_setting at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/simplify_setting.jl:51 [inlined]
+_with_bound_statistics at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/simplify_setting.jl:61 [inlined]
+#_with_settings##0 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/simplify_setting.jl:75 [inlined]
+_with_setting at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/simplify_setting.jl:51
+unknown function (ip: 0x7d7eaebd4926) at (unknown file)
+_with_simplify at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/simplify_setting.jl:58
+_with_settings at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/simplify_setting.jl:74 [inlined]
+#1130 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/codegen.jl:9714 [inlined]
+_with_type_stability_setting at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/type_stability.jl:376
+unknown function (ip: 0x7d7eaebd47d2) at (unknown file)
+_with_branch_arms at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/type_stability.jl:368
+#prepare#1126 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/codegen.jl:9713
+prepare at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/codegen.jl:9707 [inlined]
+#2087 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/authoring.jl:5748
+_with_type_stability_setting at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/type_stability.jl:376 [inlined]
+#_with_type_stability##0 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/type_stability.jl:374 [inlined]
+_with_type_stability_setting at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/type_stability.jl:376 [inlined]
+_with_type_stability at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/type_stability.jl:372 [inlined]
+#2085 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/authoring.jl:5747 [inlined]
+_with_setting at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/simplify_setting.jl:51 [inlined]
+_with_bound_statistics at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/simplify_setting.jl:61 [inlined]
+#_with_settings##0 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/simplify_setting.jl:75 [inlined]
+_with_setting at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/simplify_setting.jl:51 [inlined]
+_with_simplify at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/simplify_setting.jl:58 [inlined]
+_with_settings at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/simplify_setting.jl:74 [inlined]
+#2083 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/authoring.jl:5746 [inlined]
+_with_type_stability_setting at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/type_stability.jl:376 [inlined]
+_with_branch_arms at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/type_stability.jl:368 [inlined]
+#prepare#2079 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/authoring.jl:5745 [inlined]
+prepare at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/src/authoring.jl:5739 [inlined]
+#1631 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsPPL/src/query.jl:126
+unknown function (ip: 0x7d7ea93be11c) at (unknown file)
+#_with_query_data##0 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsPPL/src/query.jl:112
+lock at ./lock.jl:335
+_with_query_data at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsPPL/src/query.jl:99 [inlined]
+#_prepare_cached#1629 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsPPL/src/query.jl:125 [inlined]
+_prepare_cached at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsPPL/src/query.jl:124
+unknown function (ip: 0x7d7ea93bbf9d) at (unknown file)
+invokelatest at ./Base_compiler.jl:253 [inlined]
+#1649 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsPPL/src/query.jl:257 [inlined]
+_absent_refusal at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsPPL/src/query.jl:140
+unknown function (ip: 0x7d7ea93bb82c) at (unknown file)
+#_prepare_wants#1647 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsPPL/src/query.jl:256
+_prepare_wants at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsPPL/src/query.jl:247 [inlined]
+#prepare_query#1645 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsPPL/src/query.jl:216 [inlined]
+prepare_query at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsPPL/src/query.jl:214 [inlined]
+#prepare_sampler#1663 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsPPL/src/query.jl:535
+prepare_sampler at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsPPL/src/query.jl:523
+unknown function (ip: 0x7d7ea93b8ec6) at (unknown file)
+#15 at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/packages/ReactiveKernelsPPL/test/test_whole_event_mixture.jl:211
+map at ./tuple.jl:355
+unknown function (ip: 0x7d7ea9519afe) at (unknown file)
+jl_apply at /cache/build/builder-amdci4-8/julialang/julia-ci/src/julia.h:2318 [inlined]
+do_call at /cache/build/builder-amdci4-8/julialang/julia-ci/src/interpreter.c:123
+eval_value at /cache/build/builder-amdci4-8/julialang/julia-ci/src/interpreter.c:243
+eval_body at /cache/build/builder-amdci4-8/julialang/julia-ci/src/interpreter.c:581
+eval_body at /cache/build/builder-amdci4-8/julialang/julia-ci/src/interpreter.c:550
+eval_body at /cache/build/builder-amdci4-8/julialang/julia-ci/src/interpreter.c:558
+eval_body at /cache/build/builder-amdci4-8/julialang/julia-ci/src/interpreter.c:558
+eval_body at /cache/build/builder-amdci4-8/julialang/julia-ci/src/interpreter.c:558
+jl_interpret_toplevel_thunk at /cache/build/builder-amdci4-8/julialang/julia-ci/src/interpreter.c:884
+jl_toplevel_eval_flex at /cache/build/builder-amdci4-8/julialang/julia-ci/src/toplevel.c:742
+jl_eval_toplevel_stmts at /cache/build/builder-amdci4-8/julialang/julia-ci/src/toplevel.c:585
+jl_eval_module_expr at /cache/build/builder-amdci4-8/julialang/julia-ci/src/toplevel.c:248 [inlined]
+jl_toplevel_eval_flex at /cache/build/builder-amdci4-8/julialang/julia-ci/src/toplevel.c:650
+jl_eval_toplevel_stmts at /cache/build/builder-amdci4-8/julialang/julia-ci/src/toplevel.c:585
+jl_toplevel_eval_flex at /cache/build/builder-amdci4-8/julialang/julia-ci/src/toplevel.c:683
+ijl_toplevel_eval at /cache/build/builder-amdci4-8/julialang/julia-ci/src/toplevel.c:754
+ijl_toplevel_eval_in at /cache/build/builder-amdci4-8/julialang/julia-ci/src/toplevel.c:799
+eval at ./boot.jl:489
+include_string at ./loading.jl:3033
+_include at ./loading.jl:3093
+include at ./Base.jl:310
+IncludeInto at ./Base.jl:311
+jfptr_IncludeInto_61126.1 at /home/niko/.julia/juliaup/julia-1.13.1+0.x64.linux.gnu/lib/julia/sys.so (unknown line)
+top-level scope at /home/niko/.local/state/kb-agents-worktrees/ReactiveKernels-snag.covariate-free-w-d9d10aad/.scratch/covariate-free/focused-counts-production.jl:20
+jl_toplevel_eval_flex at /cache/build/builder-amdci4-8/julialang/julia-ci/src/toplevel.c:731
+jl_eval_toplevel_stmts at /cache/build/builder-amdci4-8/julialang/julia-ci/src/toplevel.c:585
+jl_toplevel_eval_flex at /cache/build/builder-amdci4-8/julialang/julia-ci/src/toplevel.c:683
+ijl_toplevel_eval at /cache/build/builder-amdci4-8/julialang/julia-ci/src/toplevel.c:754
+ijl_toplevel_eval_in at /cache/build/builder-amdci4-8/julialang/julia-ci/src/toplevel.c:799
+eval at ./boot.jl:489
+include_string at ./loading.jl:3033
+_include at ./loading.jl:3093
+include at ./Base.jl:309
+exec_options at ./client.jl:344
+_start at ./client.jl:577
+jfptr__start_58396.1 at /home/niko/.julia/juliaup/julia-1.13.1+0.x64.linux.gnu/lib/julia/sys.so (unknown line)
+jl_apply at /cache/build/builder-amdci4-8/julialang/julia-ci/src/julia.h:2318 [inlined]
+true_main at /cache/build/builder-amdci4-8/julialang/julia-ci/src/jlapi.c:985
+jl_repl_entrypoint at /cache/build/builder-amdci4-8/julialang/julia-ci/src/jlapi.c:1152
+main at /cache/build/builder-amdci4-8/julialang/julia-ci/cli/loader_exe.c:58
+unknown function (ip: 0x7d7f2a02a600) at /usr/lib/x86_64-linux-gnu/libc.so.6
+__libc_start_main at /usr/lib/x86_64-linux-gnu/libc.so.6 (unknown line)
+unknown function (ip: 0x4010b8) at /workspace/srcdir/glibc-2.17/csu/../sysdeps/x86_64/start.S
+unknown function (ip: (nil)) at (unknown file)
+Allocations: 450877755 (Pool: 450689535; Big: 188220); GC: 153

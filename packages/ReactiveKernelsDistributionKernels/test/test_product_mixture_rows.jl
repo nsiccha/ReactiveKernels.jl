@@ -34,6 +34,7 @@ function zib_cell(y, n, l, z)
 end
 expand(a, n) = size(a, 1) == 1 ? repeat(a, n, 1) : a
 function structure(ex)
+    ex isa ReactiveKernels._PlateProgram && return structure(ex.ast)
     ex isa Expr || return (0, 0)
     foldl(.+, (structure(a) for a in ex.args);
         init=(1, Int(ex.head in (:for, :while))))

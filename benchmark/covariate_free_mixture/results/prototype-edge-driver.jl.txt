@@ -1,0 +1,40 @@
+using Test, ReactiveKernels, ReactiveKernelsDistributionKernels
+using DifferentiationInterface: AutoEnzyme
+import Enzyme
+const DK = ReactiveKernelsDistributionKernels.DistributionKernelSources
+isdefined(DK, :counts_product_mixture) ||
+    Base.include(DK, joinpath(@__DIR__, "counts-law.jl"))
+canonical = prepare(DK.bernoulli_logit_product_mixture_logdensity; type_stability=:error)
+candidate = prepare(DK.counts_product_mixture; type_stability=:error)
+weights = [0.3, 0.7]
+backend = AutoEnzyme(; mode=Enzyme.Reverse)
+ads = [(prepare_ad(canonical, backend, Bool[true, false], [0.2 0.7], weights; active),
+        prepare_ad(candidate, backend, Bool[true, false], [0.2 0.7], weights; active))
+       for active in (:logits, :weights)]
+@testset "singleton count summaries preserve empty and saturated laws" begin
+    cases = [
+        (Bool[], [NaN NaN]),
+        (Bool[], [Inf -Inf]),
+        (Bool[], zeros(0, 2)),
+        (Bool[true], [Inf 0.4]),
+        (Bool[false], [-Inf -0.4]),
+        (Bool[true, false, true], [Inf 0.4]),
+        (Bool[true, false, true], [-Inf -0.4]),
+        (Bool[false, false, false], [-700.0 700.0]),
+        (Bool[true, true, true], [700.0 -700.0]),
+        (Bool[true, false, true], [0.2 -0.7; -0.3 0.6; 1.2 -1.8]),
+    ]
+    for (observed, logits) in cases
+        saved = deepcopy((observed, logits, weights))
+        expected = canonical(observed, logits, weights)
+        @test candidate(observed, logits, weights) ≈ expected rtol=2e-13 atol=2e-13
+        for (base_ad, next_ad) in ads
+            base_value, base_gradient = ad_value_and_gradient(base_ad, observed, logits, weights)
+            next_value, next_gradient = ad_value_and_gradient(next_ad, observed, logits, weights)
+            @test next_value ≈ base_value rtol=2e-13 atol=2e-13
+            @test all(isfinite, base_gradient)
+            @test next_gradient ≈ base_gradient rtol=2e-13 atol=2e-13
+        end
+        @test isequal((observed, logits, weights), saved)
+    end
+end

@@ -1,0 +1,2 @@
+Test Summary:                                               | Pass  Total   Time
+singleton count summaries preserve empty and saturated laws |   80     80  19.3s
