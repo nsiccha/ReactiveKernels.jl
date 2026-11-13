@@ -1,0 +1,141 @@
+using ReactiveKernels, Test
+include(joinpath(@__DIR__, "jax_python.jl"))
+
+@kernel jax_shared_outputs(x::Vector{Float64}, y::Vector{Float64}) = begin
+    squared = sum(abs2, x)
+    # This access must never execute for the squared-only entry.
+    first_y = y[1]
+    shifted = squared + first_y
+    return shifted
+end
+
+"Sum the squared entries with an authored loop."
+@traceable function jax_authored_energy(x)
+    total = 0.0
+    for i in eachindex(x)
+        total += abs2(x[i])
+    end
+    total
+end
+
+@kernel jax_repeated_helper(x::Vector{Float64}, y::Vector{Float64}) = begin
+    left = jax_authored_energy(x)
+    right = jax_authored_energy(y)
+    total = left + right
+    return total
+end
+
+@testset "recorded helpers retain named reusable functions" begin
+    src = jax_source(jax_repeated_helper; want = :total, name = :total)
+    @test count(r"(?m)^def jax_authored_energy\w*\(", src.text) == 1
+    @test occursin("Sum the squared entries with an authored loop.", src.text)
+    if rk_jax_available()
+        for n in (0, 3, 13)
+            x, y = fill(0.4, n), fill(-0.7, n + 1)
+            got = rk_jax_evaluate(src, :total, (x, y); grad = true)
+            @test got.value ≈ jax_authored_energy(x) + jax_authored_energy(y)
+            @test got.grad ≈ 2x
+        end
+    else
+        @test_skip false
+    end
+end
+
+@traceable function jax_assert_positive(x)
+    x > 0 || throw(ArgumentError("expected a positive helper input"))
+    nothing
+end
+
+@kernel jax_cached_checks(x::Float64, y::Float64) = begin
+    a = if x > 0
+        jax_assert_positive(x)
+        x
+    else
+        x
+    end
+    b = if y > 0
+        jax_assert_positive(-y)
+        y
+    else
+        y
+    end
+    total = a + b
+    return total
+end
+
+@testset "reused helper checks retain their calling conditions" begin
+    src = jax_source(jax_cached_checks; want = :total)
+    @test count(r"(?m)^def jax_assert_positive\w*\(", src.text) == 1
+    if rk_jax_available()
+        got = rk_jax_evaluate(src, :kernel, (1.0, -2.0); grad = true)
+        @test got.value ≈ -1.0
+        @test got.grad ≈ 1.0
+        @test_throws "expected a positive helper input" rk_jax_evaluate(src, :kernel, (1.0, 2.0))
+    else
+        @test_skip false
+    end
+end
+
+@kernel jax_selector_collision(_entry::Float64, shift::Float64) = begin
+    squared = _entry^2
+    shifted = squared + shift
+    return shifted
+end
+
+@testset "shared selector preserves authored input names" begin
+    src = jax_source(jax_selector_collision; data = (; shift = 2.0),
+        functions = (squared = :squared, shifted = :shifted))
+    @test first(only(f for f in src.functions if f.name == "squared").inputs).first == "_entry"
+    if rk_jax_available()
+        got = rk_jax_evaluate(src, :shifted, (0.3, 2.0); grad = true, prepare = :arguments)
+        @test got.value ≈ 2.09
+        @test got.grad ≈ 0.6
+    else
+        @test_skip false
+    end
+end
+
+@testset "shared JAX entry computations" begin
+    src = jax_source(jax_shared_outputs;
+        functions = (squared = :squared, shifted = :shifted,
+                     values = (squared = :squared, shifted = :shifted)))
+    text = src.text
+    @test count("jnp.sum", text) == 1
+    @test occursin("def model(", text)
+    @test [f.name for f in src.functions] == ["squared", "shifted", "values"]
+    x = [0.3, -0.7, 1.2]
+    if rk_jax_available()
+        for y in (Float64[], [2.5])
+            out = rk_jax_evaluate(src, :squared, (x, y); grad = true)
+            @test out.value ≈ sum(abs2, x)
+            @test out.grad ≈ 2x
+        end
+        out = rk_jax_evaluate(src, :shifted, (x, [2.5]); grad = true)
+        @test out.value ≈ sum(abs2, x) + 2.5
+        @test out.grad ≈ 2x
+        vals = rk_jax_evaluate(src, :values, (x, [2.5])).value
+        @test vals["squared"] ≈ sum(abs2, x)
+        @test vals["shifted"] ≈ sum(abs2, x) + 2.5
+    else
+        @test_skip false
+    end
+end
+
+jax_joint_alternative(x) = (sin(x), cos(x))
+
+@testset "entry sharing preserves alternative producers" begin
+    g = Graph()
+    x, a, b = (value!(g, n, Float64) for n in (:x, :a, :b))
+    add!(g, x => a, abs2; cost = 1)
+    # Joint and independent queries choose different producers for a.
+    add!(g; inputs = x, outputs = (a, b), op = jax_joint_alternative, cost = 1.5)
+    independent = plan(g; have = x, want = a)
+    joint = plan(g; have = x, want = (a, b))
+    @test !ReactiveKernels._jax_compatible_plans(independent, joint)
+    mod = ReactiveKernels._JaxModule()
+    bodies, functions = String[], ReactiveKernels.JAXFunction[]
+    ReactiveKernels._jax_functions!(mod, bodies, functions,
+        [:independent => (independent, :a), :joint => (joint, (:a, :b))], (Float64,))
+    @test length(bodies) == 2
+    @test [f.name for f in functions] == ["independent", "joint"]
+end

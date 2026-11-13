@@ -133,9 +133,68 @@ function _jax_module_of(built, plan; values, doc, float_type)
         # (`_eval_callee`): in the generated scope, whatever the caller imported.
         jax_source(built.spec; have, functions, types, constants, doc = module_doc, data,
                    definitions, definitions_module = PPLGeneratedModels,
-                   keep = Tuple(sizes), function_docs, float_type)
+                   keep = Tuple(sizes), function_docs, float_type,
+                   source_regions = _jax_submodel_regions(built, plan))
     end
     _jax_with_layout(src, built.layout)
+end
+
+# Authored scope provenance, translated to RK's generic region boundary. The
+# constrained coordinates stay outside a submodel's value/density function;
+# the native graph, its layout and all ordinary queries remain transparent.
+function _jax_submodel_regions(built, plan)
+    regions = ReactiveKernels._JaxSourceRegion[]
+    ports = built.spec.ports
+    for scope in plan.submodel_scopes
+        scope.source === nothing && continue
+        sm = scope.source.definition
+        names = Dict{Symbol,Symbol}(v => k for (k, v) in scope.locals)
+        names[scope.binding] = :value
+        locals = copy(scope.locals)
+        for child in plan.submodel_scopes
+            length(child.path) > length(scope.path) && child.path[1:length(scope.path)] == scope.path || continue
+            for (local_name, identifier) in child.locals
+                relative = Symbol(join(String.((child.path[length(scope.path)+1:end]..., local_name)), "."))
+                locals[relative] = identifier
+                names[identifier] = relative
+            end
+        end
+        inputs = Symbol[]
+        for (formal, actual) in scope.source.arguments
+            actual isa Symbol && (names[actual] = formal)
+            append!(inputs, (s for s in _value_symbols(actual) if haskey(ports, s)))
+        end
+        for entry in built.layout.entries
+            path = get(built.layout.name_paths, entry.name, (entry.name,))
+            length(path) > length(scope.path) && path[1:length(scope.path)] == scope.path || continue
+            push!(inputs, entry.name)
+        end
+        # Conditioned coordinates are data, but still own an authored local.
+        append!(inputs, (n for n in values(locals) if n in plan.conditioned))
+        outputs = Symbol[scope.binding; collect(values(locals))]
+        for local_name in values(locals), prefix in
+                (:_ppl_prior_, :_ppl_pw_prior_, :_ppl_lik_, :_ppl_pw_)
+            density = Symbol(prefix, local_name)
+            haskey(ports, density) && push!(outputs, density)
+        end
+        # Name generated intermediates by their relative authored local. This
+        # is emission metadata, never a rewrite of a printed native program.
+        substitutions = sort!(collect(locals); by = kv -> -length(String(last(kv))))
+        for n in keys(ports)
+            haskey(names, n) && continue
+            label = String(n)
+            for (local_name, identifier) in substitutions
+                label = replace(label, String(identifier) => String(local_name))
+            end
+            label == String(n) || (names[n] = Symbol(label))
+        end
+        documentation = join((isempty(d.path) ? d.markdown :
+            "`" * join(String.(d.path), ".") * "`: " * d.markdown for d in sm.documentation), "\n\n")
+        isempty(documentation) && (documentation = "Values and density terms of `$(sm.name)`.")
+        push!(regions, ReactiveKernels._JaxSourceRegion(sm.name, unique(inputs),
+            unique(filter(n -> haskey(ports, n), outputs)), names, documentation))
+    end
+    regions
 end
 
 # A nested `NamedTuple` of the program's `names`, keyed by their author

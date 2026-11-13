@@ -67,7 +67,55 @@ Unless `simplify = false`, each emitted recipe computes numerically fragile comp
 
 The [Eight-schools example](eight-schools.md) explains the model and coordinate boundary that a PPL export must preserve.
 
+## Named submodels and shared entries
+
+Repeated calls to an authored submodel share a Python function when their
+selected computations agree. A scoped rewrite that changes the computation
+gets a separate function. Each function carries the submodel's documentation.
+The native model retains its expanded graph, so individual locals remain
+queryable.
+
+The public density functions and `constrain` call a shared model function.
+Their output selectors are fixed by the wrappers, allowing JAX to trace only
+the requested computation. Call them as before: `log_density(u, **prepared)`.
+The submodel functions likewise take a static `outputs` selection; their
+arguments and array lengths remain runtime inputs.
+
+A plate may use separate functions for a scalar return value and a batched
+density. Combined computations, such as grouped scalar priors, retain their
+shared graph boundary.
+
+```@example jax_submodels
+using ReactiveKernels, ReactiveKernelsPPL
+
+@rkppl effect(loc, scale, spread_rate, n) = begin
+    "Mean of the effect."
+    mean ~ Normal(loc, scale)
+    "Spread of the members around the mean."
+    spread ~ Exponential(spread_rate)
+    "Standardised member deviations."
+    z[1:n] .~ Normal.(0, 1)
+    return mean .+ spread .* z
+end
+
+model = @rkppl begin
+    a ~ effect(a_loc, a_scale, a_rate, n)
+    b ~ effect(b_loc, b_scale, b_rate, n)
+    y .~ Normal.(a .+ b, noise)
+end
+bound = model(; n = 3, a_loc = 0.0, a_scale = 1.0, a_rate = 1.0,
+               b_loc = 0.0, b_scale = 1.0, b_rate = 1.0, noise = 1.0) |
+        (; y = [0.1, 0.2, 0.3])
+built = build_kernel(bound)
+print(jax_source(built, bound))
+```
+
 ## Helpers with loops and branches
+
+A helper with recorded source becomes a named Python function, reused by
+calls with the same argument representation. Its Julia docstring accompanies
+the emitted body. Arrays, captured numerical values and padded lengths are
+explicit arguments.
 
 A helper translates from recorded source when available: `@traceable` records it, and a trailing Vararg argument (`args...`, `args::Vararg{T,N}`) reads as the tuple of the trailing arguments, as the method receives them, and `sum(f, t; init)` folds such a tuple over its fixed length; `for` becomes `jax.lax.fori_loop`, `if` becomes `jax.lax.cond`, and `A[i] = v` becomes `A.at[i].set(v)`. Plain lowered helpers support straight-line code and terminal forward branches, including size guards. They can create immutable closures and fold fixed argument lists with `Base.afoldl`. Broadcasting `Ref(x)` passes `x` whole to each call. Captures remain runtime inputs; host `prepare_data` uses the same translation.
 
