@@ -197,6 +197,10 @@ function _derivative_cut_lowering(spec::KernelSpec, name::Symbol, have, want;
     Tuple(v.name for v in p.have) == have || throw(ArgumentError(
         "$(generator)($(name)): the planned HAVE order " *
         "$(Tuple(v.name for v in p.have)) differs from the signature order $(have)"))
+    _derivative_plan_lowering(p, name; generator)
+end
+
+function _derivative_plan_lowering(p::Plan, name::Symbol; generator::Symbol)
     p = _fuse_authored_plate_chains(_partial_apply(p, ()))
     _owns_array_regions(p) && return _rule_region_cut(p, name)
     # The cut is encoded from the operation calls (`_encode_cut_body`), so
@@ -339,11 +343,11 @@ end
 #
 # Cross-stage liveness. That recompute form rebuilds every covector-independent
 # intermediate from the inputs. For reverse mode the generator also plans a
-# two-stage split per activity pattern: the covector-independent frontier of
-# the reverse cut (the values its covector-dependent statements read — inputs,
-# the primal output, or graph intermediates such as a shared `exp`) is computed
-# once by a primal-stage cut and retained, and the reverse stage is planned from
-# that frontier plus the covector. Backend adapters stage through
+# two-stage split per activity pattern. It first selects recipes for the
+# primal and active cotangents together, then retains the covector-independent
+# frontier needed by that selected reverse. If that joint plan requires the
+# covector to produce the primal, it retains the independent staging instead.
+# Backend adapters stage through
 # `stage_primal`/`stage_reverse`; `reverse_cut` stays for callers that hold the
 # inputs and want the self-contained VJP (the ODE backsolve adjoint).
 
@@ -518,9 +522,9 @@ end
 """
     stage_residuals(rule::DerivativeRule, ::Val{mask}) -> Tuple{Vararg{Symbol}}
 
-The residual environment of the reverse branch for activity `mask`: the
-covector-independent values its VJP reads, found by cross-stage liveness on the
-lowered reverse cut — inputs (in signature order), the primal output, or graph
+The residual environment of the staged reverse branch for activity `mask`:
+the covector-independent values its selected VJP reads — inputs (in signature
+order), the primal output, or graph
 intermediates (a stable residual such as a shared `exp`). [`stage_primal`](@ref)
 computes them once; [`stage_reverse`](@ref) reads them instead of recomputing
 the intermediates from the inputs.
@@ -627,6 +631,12 @@ that runs one is compiled from its native lowering, so its values are those
 of `prepare(graph; have, want)`. In a position residual
 (`vectorize`, `prepare_batched`) the primal cut fills lane buffers like the
 same mathematics spliced into the caller.
+
+Reverse staging selects the primal and active cotangents together using the
+graph's declared recipe costs, then splits that selected plan at the covector
+boundary. This can reuse a joint producer that an independently selected VJP
+would miss. Costs do not model tape storage or measured execution time. If the
+selected primal needs the covector, staging keeps the independent cuts.
 """
 function derivative_rule(spec::KernelSpec; primal::Symbol,
         directions = nothing, tangent = nothing, covector = nothing,
@@ -706,11 +716,17 @@ function derivative_rule(spec::KernelSpec; primal::Symbol,
     staged = if has_reverse
         ntuple(2^N - 1) do mask
             mask & ~differentiable == 0 || return nothing
+            active = Tuple(cotangents[i] for i in 1:N if (mask >> (i - 1)) & 1 == 1)
+            joint = _derivative_joint_stages(spec, name, inputs, primal, covector,
+                                              active; generator)
+            joint === nothing || return joint
+            # A joint alternative that needs the seed to produce the primal
+            # cannot run in the augmented forward stage. Keep the existing
+            # independently executable staging for that graph.
             frontier = _reverse_frontier(reverse[mask][3], covector, inputs)
             extra = Tuple(n for n in frontier if !(n in inputs) && n !== primal)
             stage_want = isempty(extra) ? primal : (primal, extra...)
             stage_spec, stage_ops = cut(inputs, stage_want)
-            active = Tuple(cotangents[i] for i in 1:N if (mask >> (i - 1)) & 1 == 1)
             want = length(active) == 1 ? active[1] : active
             back_spec, back_ops = cut((frontier..., covector), want)
             ((stage_spec, back_spec, frontier), (stage_ops, back_ops))
@@ -727,6 +743,43 @@ function derivative_rule(spec::KernelSpec; primal::Symbol,
                                   Result,differentiable}(
         primal_ops, forward_ops, reverse_ops, staged_ops, lane)
     rule(_rule_result_type(rule(nothing), spec, inputs))
+end
+
+# Select the primal and requested cotangents together before fixing the tape
+# boundary. A reverse-only optimum can hide a producer that shares its work
+# with the primal. Split the selected recipes by seed dependence, preserving
+# their producer choices in both stages instead of replanning each half.
+function _derivative_joint_stages(spec::KernelSpec, name::Symbol, inputs,
+                                  primal::Symbol, covector::Symbol, active;
+                                  generator::Symbol)
+    p = plan(spec; have = (inputs..., covector), want = (primal, active...))
+    g = p.graph
+    seed = last(p.have)
+    forward_inputs = p.have[1:end-1]
+    input_ids = Set(canon_id(g, v.id) for v in forward_inputs)
+    prefix, residual, available = _partial_split(p, input_ids)
+    value = first(p.want)
+    canon_id(g, value.id) in available || return nothing
+
+    cotangents = p.want[2:end]
+    reverse_plan = _partial_subplan(p, p.have, cotangents, p.recipes)
+    boundary = _partial_constants(reverse_plan, available, residual)
+    # The public residual order keeps input ports in signature order, then
+    # intermediates in first-use order, as `_reverse_frontier` does.
+    frontier_ids = Set(canon_id(g, v.id) for v in boundary)
+    frontier = Value[v for v in forward_inputs if canon_id(g, v.id) in frontier_ids]
+    append!(frontier, (v for v in boundary
+                        if !(canon_id(g, v.id) in input_ids)))
+    stage_want = Value[value]
+    append!(stage_want, (v for v in frontier if !(canon_id(g, v.id) in input_ids) &&
+                        canon_id(g, v.id) != canon_id(g, value.id)))
+
+    forward_plan = _partial_subplan(p, forward_inputs, stage_want, prefix)
+    backward_plan = _partial_subplan(p, Value[frontier..., seed], cotangents, residual)
+    stage_spec, stage_ops, _ = _derivative_plan_lowering(forward_plan, name; generator)
+    back_spec, back_ops, _ = _derivative_plan_lowering(backward_plan, name; generator)
+    residual_names = Tuple(v.name for v in frontier)
+    ((stage_spec, back_spec, residual_names), (stage_ops, back_ops))
 end
 
 # `Tuple{Tuple{declared input types...}, inferred primal result type}`, or `nothing`
