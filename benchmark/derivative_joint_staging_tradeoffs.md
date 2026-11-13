@@ -177,15 +177,14 @@ helper and 1.897/2.718/2.610 for the whole snapshot. Native-control medians are
 0.931/14.120/120.641 µs and 0.909/14.177/119.244 µs respectively.
 
 Whole copying fixes the demonstrated ownership failures but duplicates a
-readonly matrix on every evaluation. It is not ready to recommend as a
-generally efficient retention policy. A separate benchmark-only refinement is
-testing reuse of direct dense bits-array inputs when the backend's write flags
+readonly matrix on every evaluation. A separate benchmark-only refinement
+tests reuse of direct dense bits-array inputs when the backend's write flags
 prove they stay unchanged and the primal cannot expose mutable storage. It
 uses Julia's documented deepcopy specialization hook on an owned wrapper to
 preserve repeated array references. Only flat tuples of bits values and dense
 bits arrays use this optimization; nested containers retain the complete
 snapshot path. This is an optimization eligibility condition, not an authoring
-restriction. Mutation and type checks must pass before measuring its costs.
+restriction. Mutation and type checks gate its cost measurements.
 
 The first borrowing run passed all 239 existing snapshot checks and 11 new
 alias checks, then failed its direct audit of the owned copying hook. Base's
@@ -199,7 +198,24 @@ for a mutable record in the hook. It again stopped before mutation controls
 and timing. The third revision confines the owned hook to flat tuples of
 scalars and dense arrays, and verifies that nested containers still snapshot
 and preserve their internal sharing through the existing Base boundary.
-That revision remains under verification on the integrated `f91621d64` base.
+That revision passed 287 checks on the integrated `f91621d64` base, including
+ordinary Reverse through readonly, direct-mutation, view-mutation and
+global-mutation callers. The owned hook's recursive type audit is empty.
+Fleet `011673db3f9848dd` exited 0 after 363 seconds on registered Enzyme.
+
+| Matrix shape | Borrowing rule | Native ordinary AD | Rule bytes | Rule / native paired ratio (95% interval) |
+| --- | ---: | ---: | ---: | ---: |
+| 128 × 8 | 0.951 µs | 0.934 µs | 3,968 | 1.024 (0.979–1.069) |
+| 2,048 × 32 | 13.785 µs | 15.294 µs | 50,656 | 0.897 (0.831–0.964) |
+| 8,192 × 64 | 118.549 µs | 116.914 µs | 198,352 | 1.016 (0.909–1.094) |
+
+This removes the large readonly-matrix copy. The old helper remains cheaper
+in several observations but fails the ownership controls; borrowing does not
+establish a general speedup over native AD. Candidate `429d7ec78065` installs
+this refinement and its tests. Verification on both Enzyme environments and
+remeasurement of the final array sharing/recomputation tradeoff are in progress
+in fleet `d915cb8e74714485`; earlier whole-copy ratios are not final-candidate
+measurements.
 
 ## Preparation and evidence limits
 
@@ -257,9 +273,11 @@ controls, not that the alias arm passed correctness.
 - Heterogeneous tuple borrowing revision: fleet `8504836267c34445`, exit 1,
   163 seconds, 257 pass / 1 mutable-record hook audit failure;
   [exact failed source, successful checks, audit finding and terminal receipt](http://localhost:4200/code/download?path=/home/niko/.local/state/kb-agents/uploads/49005104ec9c9d235d5936fd902e960413010127e0e336508d9aaf79c528702c.tgz).
+- Flat-array borrowing and nested snapshot fallback: fleet `011673db3f9848dd`,
+  exit 0, 363 seconds, 287 checks;
+  [exact prototype, mutation controls, manifests, raw timing rounds, summary and receipt](http://localhost:4200/code/download?path=/home/niko/.local/state/kb-agents/uploads/b46b44e5ed384eaa4ae868fdef9f2dabb98b033458df4c74d70f7f1fbe30fa19.tgz).
 
-The remaining ownership refinement targets readonly inputs. Conservative
-copying can duplicate readonly data and whole parents of small views; it is not
-an ownership analysis. The prototype does not account for these measured
+Conservative fallback can still duplicate readonly nested data and whole
+parents of small views. The prototype does not account for these measured
 storage costs when selecting recipes. No general preference follows from the
 additive recipe costs alone.
