@@ -124,7 +124,20 @@ in 9/11 allocations. The native control still reports zero Julia allocations.
 The snapshot-inclusive exponential sharing gain survives this conservative
 copying strategy; cheap square partials still favor recomputation. These are
 controlled producer-selection comparisons, not a general production speedup.
-The second Enzyme environment is being checked separately.
+The second Enzyme environment passed the same 151 ownership checks and 203
+joint/multi-output checks. Its first broader-regression process stopped while
+loading the missing scratch dependency `ChainRulesCore`, before costs ran.
+That failed run is retained below; installed-candidate verification with the
+required dependency and the remaining costs are separate work.
+
+The installed candidate uses the same tuple snapshot plus a bits-only fast
+path. Its registered run passes 722 checks: 239 new mutation/retention checks
+and the existing joint, multi-output and general derivative suites. This is a
+completed phase of fleet `489475552ac94380`; the overall run is still active.
+The registered scalar ordinary-Reverse comparison reports zero Julia allocations
+and a 30 ns median for independent, shared and native arms. At that timing
+resolution it establishes no scalar adapter speed advantage. The explicit
+forward/reverse stage-loop gains above must not be transferred to that result.
 
 ## Preparation and evidence limits
 
@@ -167,8 +180,13 @@ controls, not that the alias arm passed correctness.
   registered snapshot-inclusive costs: fleet `287b0545ab4c4558`, exit 0,
   605 seconds;
   [exact sources, typed IR, manifests, raw rounds, summary and terminal receipt](http://localhost:4200/code/download?path=/home/niko/.local/state/kb-agents/uploads/db20ada0d0f59502be1f4cf098390991cc80c5473105de0bb7c3a145f791529f.tgz).
+- Dogfood snapshot and partial regression verification: fleet
+  `384fa7c25ec248db`, exit 1, 334 seconds, missing `ChainRulesCore`;
+  [successful phases, loader failure, exact sources and terminal receipt](http://localhost:4200/code/download?path=/home/niko/.local/state/kb-agents/uploads/868e12a94eeca7395c3987ff0c8964ef831a9e1742383e522ad60c152bb0dd91.tgz).
 
-The remaining work includes the second-backend snapshot check and a reviewable
-retention repair. The prototype does not account for these measured storage
-costs when selecting recipes. No general preference follows from the additive
-recipe costs alone.
+The remaining work includes installed-source repair verification, scalar
+ordinary-adapter costs and a readonly design-matrix comparison. Conservative
+copying can duplicate readonly data and whole parents of small views; it is not
+an ownership analysis. The prototype does not account for these measured
+storage costs when selecting recipes. No general preference follows from the
+additive recipe costs alone.

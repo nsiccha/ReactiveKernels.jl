@@ -167,20 +167,17 @@ end
 @inline _zero_like(x::AbstractArray) = zero(x)
 @inline _zero_like(x::Number) = zero(x)
 
-# Retain the staged residuals across the reverse pass. An input array Enzyme
-# says may be overwritten before then is copied, and so is a residual that IS
-# the returned primal array (the caller owns it and may overwrite it); fresh
-# intermediates of the primal stage are owned here and kept as they are.
+# Graph provenance does not prove storage ownership: an intermediate may be a
+# view or contain references to an input or the returned primal. Snapshot the
+# environment together using Julia's deepcopy protocol, preserving aliases
+# within it while detaching ordinary containers from subsequent caller mutation.
+# Bits-only environments are unchanged by deepcopy.
 @inline function _retain_residuals(sources::NTuple{R,Int}, residuals::NTuple{R,Any},
         primal, overwritten_flags) where {R}
-    ntuple(Val(R)) do k
-        value = residuals[k]
-        value isa AbstractArray || return value
-        source = sources[k]
-        # `overwritten` includes the function object at position 1.
-        source > 0 ? (overwritten_flags[source + 1] ? copy(value) : value) :
-            value === primal ? copy(value) : value
-    end
+    isbitstype(typeof(residuals)) && return residuals
+    # Keep this Base operation at its call boundary, consistent with the
+    # recursive type audit's existing exclusion of Julia's own callees.
+    Base.@noinline deepcopy(residuals)
 end
 
 function EnzymeRules.augmented_primal(

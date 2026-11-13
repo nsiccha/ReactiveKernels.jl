@@ -1,8 +1,9 @@
 # Bounded ownership experiment for general DerivativeRule staging.
-# Usage: julia --project=<prepared environment> this_file current|snapshot|snapshot_leaf
+# Usage: julia --project=<environment> this_file current|snapshot|snapshot_leaf|installed
 # `snapshot` replaces only residual retention in this process. It uses Julia's
 # deep copy as a conservative comparison, not as a selected production design.
 # `current` records wrong gradients without treating them as passing checks.
+# `installed` requires correct snapshots from the loaded adapter without replacing it.
 using ReactiveKernels, Test, BenchmarkTools, Statistics
 import Enzyme
 using ReactiveKernels: stage_primal, stage_reverse, stage_residuals
@@ -86,7 +87,7 @@ end
 end
 
 function run_snapshot_experiment(mode)
-    snapshots = mode in (:snapshot, :snapshot_leaf)
+    snapshots = mode in (:snapshot, :snapshot_leaf, :installed)
     ext = Base.get_extension(ReactiveKernels, :ReactiveKernelsEnzymeExt)
     @assert ext !== nothing
     G = ResidualSnapshotExperiment
@@ -196,9 +197,10 @@ function install_snapshot_retention!(; leaf=false)
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    length(ARGS) == 1 || error("usage: derivative_residual_snapshots.jl current|snapshot|snapshot_leaf")
+    length(ARGS) == 1 || error("usage: derivative_residual_snapshots.jl current|snapshot|snapshot_leaf|installed")
     mode = Symbol(only(ARGS))
-    mode in (:current, :snapshot, :snapshot_leaf) || error("unknown mode")
-    mode == :current || install_snapshot_retention!(; leaf=mode == :snapshot_leaf)
+    mode in (:current, :snapshot, :snapshot_leaf, :installed) || error("unknown mode")
+    mode in (:snapshot, :snapshot_leaf) &&
+        install_snapshot_retention!(; leaf=mode == :snapshot_leaf)
     run_snapshot_experiment(mode)
 end
