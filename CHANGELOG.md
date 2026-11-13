@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.227
+
+- Preserve the reciprocal tail of `trigamma` in JAX emission at large positive
+  inputs and return zero at positive infinity.
+- Correct the JAX derivative of `besseli(n, x)` at `x = 0` for a runtime order
+  `n = 0`; its exponential scale now matches the scaled function's sign
+  convention at zero.
+
 ## 0.1.226
 
 - Add `rk_log1pexp`, an owned scalar softplus callable whose stable value and
