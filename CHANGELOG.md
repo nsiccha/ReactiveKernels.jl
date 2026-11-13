@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.228
+
+- JAX emission resolves `isa` checks when Julia argument types prove the answer,
+  including the checks in lowered `oftype` calls. Plain callees can now use
+  `oftype(float(x), NaN)` or `oftype(float(x), Inf)` in guarded branches.
+  Partially overlapping abstract types still require an unsupported runtime
+  type check; they are not folded to a false result.
+
 ## 0.1.227
 
 - Preserve the reciprocal tail of `trigamma` in JAX emission at large positive
