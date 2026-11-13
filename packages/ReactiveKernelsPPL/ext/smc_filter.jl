@@ -191,6 +191,8 @@ function PPL.initialize_filter_smc(target::SMCFilterTarget; rng::Xoshiro,
     max_reflections >= 0 || throw(ArgumentError("max_reflections must be nonnegative"))
     d = length(target.calibration.reference.location)
     d > 0 || throw(ArgumentError("parameter learning needs an unconstrained coordinate"))
+    options.cloud_kernels == 0 || throw(ArgumentError(
+        "filter parameter learning uses a fixed kernel; cloud_kernels applies to smc_step"))
     options = _options(options,d,target.proposal.prior,target.proposal)
     kernel,_ = _stage_kernel(options,d,1.0)
     r = copy(rng)

@@ -5766,6 +5766,18 @@ struct _ComprehensionElement{F,C<:Tuple}
 end
 @inline (element::_ComprehensionElement)(x) =
     getfield(element, :program)(getfield(element, :captures)..., x)
+# An element reading more locals than a program call takes operands
+# (`_PLATE_CALL_MAX_ARGUMENTS`) receives them as one tuple, which its program
+# unpacks into those locals first. A guarded partition plan of a wide model
+# reads well over a hundred (109 and 175 in one real plan), and left as a
+# closure it failed while an image was generated (snag
+# `partition-plan-o-f7bf3fd9`).
+struct _PackedComprehensionElement{F,C<:Tuple}
+    program::F
+    captures::C
+end
+@inline (element::_PackedComprehensionElement)(x) =
+    getfield(element, :program)(getfield(element, :captures), x)
 
 _has_generator(node) = node isa Expr && node.head !== :quote &&
     (node.head === :generator || any(_has_generator, node.args))
@@ -5829,8 +5841,9 @@ end
 # where the element cannot leave the body: more than one iteration
 # specification or a filter, an element that assigns or declares a local of
 # the body (a closure writes the body's variable, a lifted program its own
-# copy), a construct whose scope the walk does not follow, or more operands
-# than a program call takes.
+# copy), or a construct whose scope the walk does not follow. Past
+# `_PLATE_CALL_MAX_ARGUMENTS` operands the locals travel as one tuple
+# (`_PackedComprehensionElement`).
 function _lift_generator(gen::Expr, visible::Set{Symbol})
     length(gen.args) == 2 || return nothing
     element, spec = gen.args
@@ -5839,12 +5852,18 @@ function _lift_generator(gen::Expr, visible::Set{Symbol})
     captures = Symbol[]
     _comprehension_captures!(captures, element, visible, Set{Symbol}((variable,))) ||
         return nothing
-    length(captures) + 1 <= _PLATE_CALL_MAX_ARGUMENTS || return nothing
     domain = _lift_comprehensions!(spec.args[2], visible)
-    program = _PlateProgram(Expr(:function, Expr(:tuple, captures..., variable), element))
+    callable, parameters, body = if length(captures) + 1 <= _PLATE_CALL_MAX_ARGUMENTS
+        :_ComprehensionElement, Any[captures..., variable], element
+    else
+        packed = gensym(:captures)
+        :_PackedComprehensionElement, Any[packed, variable],
+        Expr(:block, (Expr(:(=), name, Expr(:call, GlobalRef(Core, :getfield), packed, k))
+                      for (k, name) in enumerate(captures))..., element)
+    end
+    program = _PlateProgram(Expr(:function, Expr(:tuple, parameters...), body))
     Expr(:call, GlobalRef(Base, :Generator),
-         Expr(:call, GlobalRef(@__MODULE__, :_ComprehensionElement), program,
-              Expr(:tuple, captures...)),
+         Expr(:call, GlobalRef(@__MODULE__, callable), program, Expr(:tuple, captures...)),
          domain)
 end
 
@@ -6082,6 +6101,7 @@ end
 # barrier each lowering is inferred on its own, and an image keeps its code.
 function _lower_with_ops(p::Plan; cell_slots::Union{Nothing,Vector{Symbol}} = nothing,
                          cell_tables::Union{Nothing,Vector{Symbol}} = nothing,
+                         indexed_lanes::Union{Nothing,Vector{Pair{Symbol,Symbol}}} = nothing,
                          kwargs...)
     depth = get(task_local_storage(), _INDEXED_INVARIANT_DEPTH, 0)
     result = task_local_storage(_INDEXED_INVARIANT_DEPTH, depth + 1) do
@@ -6094,11 +6114,12 @@ function _lower_with_ops(p::Plan; cell_slots::Union{Nothing,Vector{Symbol}} = no
     ast, constants, callables, recipes = result
     # Analyze spliced nested cells together, so reusable indexed work moves to
     # the widest enclosing plate. Footprints and position scratch retain their
-    # own read and storage protocols.
+    # own read and storage protocols. `indexed_lanes` collects the names a
+    # non-allocating program binds to the tables' lane slots.
     if depth == 0 && get(kwargs, :inline_embedded, true) &&
             !get(kwargs, :footprint, false) && !get(kwargs, :partition_plan, false) &&
             cell_slots === nothing && cell_tables === nothing
-        ast = _lower_indexed_invariants(ast, recipes)
+        ast = _lower_indexed_invariants(ast, recipes; lanes = indexed_lanes)
     end
     ast, constants, callables, recipes
 end

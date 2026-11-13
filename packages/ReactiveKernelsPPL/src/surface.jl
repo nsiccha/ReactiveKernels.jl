@@ -1637,8 +1637,11 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     for p in predictors, t in p.terms
         union!(needed, t.columns)
     end
-    # A GLM object reads its arguments whole, by name.
+    # A GLM object reads its arguments whole, by name, and so do categorical
+    # logit slices their matrix.
     for r in responses
+        _categorical_logit_slices(r) && !haskey(ctx.matrices, r.predictor) &&
+            push!(needed, r.predictor)
         _is_glm_family(r.family) || continue
         for nm in (r.predictor, r.glm_alpha, r.glm_beta, r.scale)
             nm isa Symbol && !haskey(ctx.matrices, nm) && push!(needed, nm)
@@ -3402,6 +3405,9 @@ function _observation_call_definitions(ast::Expr, data::Set{Symbol},
                 rhs = _glm_argument_names(st.args[3]) do value, role
                     name!(value, stem, role)
                 end
+                rhs = _categorical_logit_slice_names(rhs) do value, role
+                    name!(value, stem, role)
+                end
                 rhs = _map_rhs_arguments(rhs) do value, head, position, nargs
                     # Base's numbers are literals here too, so the predictor
                     # analysis reads `exp.(ifelse.(f, -Inf, 0.0))` as written.
@@ -3419,6 +3425,31 @@ function _observation_call_definitions(ast::Expr, data::Set{Symbol},
         push!(out, st)
     end
     return Expr(:block, out...)
+end
+
+# Categorical logit slices read their matrix whole, so an inline matrix
+# (`CategoricalLogit.(eachrow(X * B))`) is its named definition
+# (`y_logits`), including inside a `weighted`, `truncated` or censoring
+# wrapper. A name stays.
+function _categorical_logit_slice_names(name, rhs)
+    rhs isa Expr || return rhs
+    dotted = _is_dotted_call(rhs)
+    (dotted || rhs.head === :call) && !isempty(rhs.args) || return rhs
+    head = _rhs_head_symbol(rhs.args[1])
+    args = dotted ? rhs.args[2].args : rhs.args[2:end]
+    rebuild(new) = dotted ? Expr(:., rhs.args[1], Expr(:tuple, new...)) :
+        Expr(:call, rhs.args[1], new...)
+    if head in (:weighted, :truncated, :censored, :interval_censored) &&
+            !isempty(args)
+        return rebuild(Any[_categorical_logit_slice_names(name, args[1]),
+            args[2:end]...])
+    end
+    head === :CategoricalLogit && length(args) == 1 &&
+        _is_slice_iterator(only(args)) && only(args).args[2] isa Expr ||
+        return rhs
+    slices = only(args)
+    return rebuild(Any[Expr(:call, slices.args[1],
+        name(slices.args[2], :logits))])
 end
 
 # A GLM object reads each argument whole, so an inline argument is its
@@ -4723,7 +4754,10 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol};
             push!(plate_defs, lc.args[1])
         end
     end
-    cells = Any[_mvnormal_plate_cell(_categorical_plate_cell(c, plate_defs, data), data)
+    slice_locals = Dict{Symbol,Any}(c.args[1] => c.args[2] for c in cells
+        if Meta.isexpr(c, :(=), 2) && c.args[1] isa Symbol)
+    cells = Any[_mvnormal_plate_cell(_categorical_plate_cell(
+            _categorical_logit_plate_cell(c, slice_locals, data), plate_defs, data), data)
         for c in cells]
     # A cell reading a value that holds one array per index computes an
     # array per index too: its outputs and locals are such values for
@@ -4808,6 +4842,41 @@ function _categorical_plate_cell(c, plate_defs::Set{Symbol}, data::Set{Symbol})
         GlobalRef(@__MODULE__, :_ppl_categorical_logdensity), probabilities)
     return Expr(:call, c.args[1], c.args[2], density)
 end
+
+# A categorical logit in a cell over one slice of logits,
+# `y[i] ~ CategoricalLogit(E[i, :])` (or `E[:, i]`, or a cell local bound to
+# such a slice): the cell's argument is that observation's K−1
+# non-reference logits, as in `y .~ CategoricalLogit.(eachrow(E))`, and K is
+# the slice length + 1. It is observed through the sampling-RHS path, the
+# computed `Categorical` precedent, so the slice is read in the cell and the
+# program holds no class count. One scalar argument keeps its positional
+# meaning (K = 2).
+function _categorical_logit_plate_cell(c, slice_locals::Dict{Symbol,Any},
+        data::Set{Symbol})
+    c isa Expr && (_is_sample(c) || _is_broadcast_sample(c)) || return c
+    lhs, rhs = c.args[2], c.args[3]
+    Meta.isexpr(lhs, :ref) && lhs.args[1] in data || return c
+    head = _is_dotted_call(rhs) ? rhs.args[1] :
+        Meta.isexpr(rhs, :call) && !isempty(rhs.args) ? rhs.args[1] : nothing
+    head === :CategoricalLogit || return c
+    args = _is_dotted_call(rhs) ? rhs.args[2].args : rhs.args[2:end]
+    length(args) == 1 || return c
+    row = only(args)
+    _is_logit_slice_read(row) ||
+        (row isa Symbol && _is_logit_slice_read(get(slice_locals, row, nothing))) ||
+        return c
+    (_is_dotted_call(rhs) || _is_broadcast_sample(c)) && _sfail("cell " *
+        "observation $(repr(lhs)): `CategoricalLogit` over a slice of logits " *
+        "observes one class, so a cell writes it undotted, " *
+        "`$(repr(lhs)) ~ CategoricalLogit($(repr(row)))`")
+    density = Expr(:call, GlobalRef(@__MODULE__, :LogDensity),
+        GlobalRef(@__MODULE__, :_ppl_categorical_logit_logdensity), row)
+    return Expr(:call, :~, lhs, density)
+end
+
+# One slice of a matrix: a read with a whole axis (`E[i, :]`, `E[:, i]`).
+_is_logit_slice_read(ex) = Meta.isexpr(ex, :ref) && length(ex.args) == 3 &&
+    any(a -> a === :(:), ex.args[2:end])
 
 # A multivariate normal in a cell observes that index's vector jointly, as in
 # the Julia loop: `y[i] ~ MvNormal(mu, Sigma)` with `y[i]` one vector per
@@ -8893,12 +8962,49 @@ function _lower_categorical_logit_response(lhs, call, range, weights,
     isempty(args) && _sfail("response $lhs: `CategoricalLogit` takes the " *
                             "K−1 non-reference etas " *
                             "(`y .~ CategoricalLogit.(eta_2, eta_3)` for K=3)")
+    if length(args) == 1 && _is_slice_iterator(only(args))
+        return _lower_categorical_logit_slices(lhs, only(args), range,
+            weights, evidence, label, ctx)
+    end
+    any(_is_slice_iterator, args) && _sfail("response $lhs: " *
+        "`CategoricalLogit` takes one logit per non-reference class " *
+        "(`CategoricalLogit.(eta_2, eta_3)`) or all of them as one slice " *
+        "per observation (`CategoricalLogit.(eachrow(E))`), not both")
     pnames = Symbol[_lower_location(lhs, a, IdentityLink, ctx, predictors,
         pred_idx, coefuse; synth = Symbol(lhs, "_eta_", j), value = true)
         for (j, a) in enumerate(args)]
     return LikelihoodSpec(CategoricalLogitFam, LogitLink, lhs, pnames[1],
         nothing, weights, evidence, label, nothing, range;
         extra_predictors = pnames[2:end])
+end
+
+# `y .~ CategoricalLogit.(eachrow(E))`: as in Julia, broadcasting pairs
+# observation `i` with row `i` of `E` (`eachcol(E)`: column `i`), and the
+# slice holds the K−1 non-reference logits, class 1 the zero reference,
+# exactly as the positional `CategoricalLogit.(eta_2, …, eta_K)` reads its
+# arguments. K is the slice length + 1 when the model runs, so one program
+# serves every class count. The response reads `E` whole, by name (the
+# GLM-object precedent); an inline matrix expression is one named value.
+function _lower_categorical_logit_slices(lhs, slices, range, weights,
+        evidence, label, ctx)
+    axis = slices.args[1] === :eachrow ? :rows : :cols
+    logits = _lower_whole_matrix_value(lhs, slices.args[2], ctx)
+    return LikelihoodSpec(CategoricalLogitFam, LogitLink, lhs, logits,
+        nothing, weights, evidence, label, nothing, range;
+        logit_slices = axis)
+end
+
+# The matrix value a response reads whole, by name: bound data, a
+# definition or a declared array. An inline matrix arrives here as its
+# named definition (`_categorical_logit_slice_names`).
+function _lower_whole_matrix_value(lhs, value, ctx)
+    where = "response $lhs logits"
+    value isa Symbol || _sfail("$where must be a matrix value, got " *
+        "$(repr(value)) — define it first (`E = X * B`)")
+    value in ctx.taken || _sfail("$where reference undeclared name " *
+        "$value — bind it as data or define it (`$value = X * B`)")
+    haskey(ctx.matrices, value) && push!(ctx.matrices_used, value)
+    return value
 end
 
 # Explicit cutpoints/thresholds of an ordinal response: `Ref(c)` shares

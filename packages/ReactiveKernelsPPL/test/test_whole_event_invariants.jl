@@ -8,6 +8,9 @@ import DifferentiationInterface as DI
 import Enzyme
 
 function call_depths!(depths, expression, target, depth=0)
+    # A plate block runs as its own program where it stood (`_PlateProgram`).
+    expression isa ReactiveKernels._PlateProgram &&
+        return call_depths!(depths, expression.ast, target, depth)
     expression isa Expr || return depths
     expression.head in (:quote,:inert) && return depths
     if expression.head === :call &&
@@ -64,6 +67,12 @@ function reference(raw, events, offsets, kind)
     end
     prior + event_likelihood(logits,weight,events,offsets,scale)
 end
+
+# The cache positions a non-allocating program binds to its tables' lanes.
+table_slots(kernel) = [s.args[2].args[2] for s in kernel.ast.args[2].args
+    if Meta.isexpr(s,:(=)) && startswith(string(s.args[1]),"##indexed_lane")]
+# Fewest bytes over a few warm calls.
+allocations(f) = (f(); minimum(_ -> @allocated(f()), 1:3))
 
 function make_sampler(kind, events, offsets, raw)
     T = maximum(length,events; init=3)
@@ -123,6 +132,13 @@ end
             lanes = filter(cache -> cache isa Base.RefValue,sampler.kernel.caches)
             @test !isempty(lanes)
             @test ReactiveKernels._indexed_data_safe((lanes,sampler.kernel.constants,raw))
+            # Each table keeps a lane slot typed by its array.
+            tables = table_slots(sampler.kernel)
+            @test length(tables) == 2
+            @test all(j -> sampler.kernel.caches[j] isa
+                Base.RefValue{Union{Nothing,Matrix{Float64}}},tables)
+            @test isempty(ReactiveKernels._level_code_findings(:all,sampler.kernel,
+                                                               (typeof(raw),)))
         end
         for values in (raw,raw .+ 0.15)
             expected_gradient = zero(values)
@@ -133,6 +149,33 @@ end
             @test sampler(values) ≈ expected rtol=1e-12
             @test actual ≈ expected rtol=1e-12
             @test gradient ≈ expected_gradient rtol=1e-11 atol=1e-12
+        end
+        if kind !== :event_dependent
+            # The tables refill buffers the sampler keeps: with the pass, a
+            # density or gradient call allocates exactly what it does without
+            # it (snag posteriordb-mt-c-01c1a87b: 4 and 8 more allocations).
+            kept = [sampler.kernel.caches[j][] for j in table_slots(sampler.kernel)]
+            # The logit kind's `location` is a view of the unconstrained point,
+            # which `_indexed_safe` does not take yet, so it builds no tables
+            # (ReactiveKernels todo 10kg7nx).
+            @test all(table -> table isa Matrix{Float64}, kept) broken = kind === :logit
+            baseline = task_local_storage(ReactiveKernels._INDEXED_INVARIANT_DEPTH, 1) do
+                make_sampler(kind,events,offsets,raw)
+            end
+            @test isempty(call_depths!(Int[],code_expr(baseline.kernel),
+                                       ReactiveKernels._indexed_map))
+            gradient = similar(raw)
+            @test allocations(() -> sampler(raw)) == allocations(() -> baseline(raw))
+            # Under `--check-bounds=yes` the hoisted loop's gradient keeps 64 B
+            # more, whatever the table size, with fresh tables too
+            # (ReactiveKernels todo 0qx2ebp).
+            forced_bounds = Base.JLOptions().check_bounds == 1
+            built = all(table -> table isa Matrix{Float64}, kept)
+            @test allocations(() -> sampler_value_and_gradient!(sampler,gradient,raw)) ==
+                allocations(() -> sampler_value_and_gradient!(baseline,gradient,raw)) broken =
+                forced_bounds && built
+            @test all(((j,table),) -> sampler.kernel.caches[j][] === table,
+                      zip(table_slots(sampler.kernel),kept))
         end
         empty_sampler = make_sampler(kind,Vector{Bool}[],Float64[],raw)
         actual, gradient = sampler_value_and_gradient!(empty_sampler,similar(raw),raw)
