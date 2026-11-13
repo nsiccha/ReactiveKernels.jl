@@ -2,8 +2,8 @@
 # Run in a consumer env containing this checkout, its nested PPL/distribution
 # packages, Enzyme, DifferentiationInterface and MutatingFunctions.
 # Only deterministic synthetic data. Optional ARGS select sections:
-# selection, guard, numerical, accuracy, ppl. Known rank-deficient accuracy
-# gaps are reported as broken checks, not successful numerical acceptance.
+# selection, guard, numerical, accuracy, ppl. Rank-deficient cases must retain
+# accurate row fallback, including the former exact-null-space regression.
 using ReactiveKernels, ReactiveKernelsPPL, LinearAlgebra, Random, Test
 using DifferentiationInterface: AutoEnzyme
 import Enzyme, MutatingFunctions
@@ -121,7 +121,7 @@ if isempty(ARGS) || "guard" in ARGS
         @test grad ≈ 2d.X'*(d.X*d.beta-d.y)
         @test (d.X,d.y,d.beta) == original
         stats = only(filter(x->x isa RK._LSStatistics,q.constants))
-        @test stats.usable == (n >= 6)
+        @test stats.usable == (n >= 6 && !rank_deficient)
         println((stage=:runtime_guard,n,rank_deficient,usable=stats.usable,
             stats_bytes=Base.summarysize(stats),constants_bytes=Base.summarysize(q.constants),
             source_structure=last(structures)))
@@ -220,25 +220,19 @@ if isempty(ARGS) || "accuracy" in ARGS
         # rather than an ill-conditioned relative error.
         graderr = Float64(norm(big.(grad)-reference[2]))
         rowgraderr = Float64(norm(big.(-2d.X'*(d.y-d.X*beta))-reference[2]))
-        if rank_deficient
-            # Existing gap 17bzmgx also affects bounded live coefficients:
-            # the statistic's own fitted centre can be ill-conditioned.
-            @test_broken err(stable) <= max(4err(row),1e-13)
-            @test_broken graderr <= max(10rowgraderr,1e-11)
-        else
-            @test err(stable) <= max(4err(row),1e-13)
-            @test graderr <= max(10rowgraderr,1e-11)
-        end
+        @test s.usable == !rank_deficient
+        @test err(stable) <= max(4err(row),1e-13)
+        @test graderr <= max(10rowgraderr,1e-11)
         println((stage=:accuracy,shift,rank_deficient,reference=Float64(reference[1]),
             stable_error=err(stable),row_error=err(row),expanded_error=err(naive),
             stable_gradient_absolute_error=graderr,row_gradient_absolute_error=rowgraderr))
     end
 end
-@testset "known rank-deficient cancellation gap" begin
+@testset "rank-deficient cancellation regression" begin
     # No solver or probabilistic semantics are needed to trigger this gap.
     # Exact reference: beta[1] + beta[2] == 1, hence residual and gradient zero.
-    # Tracked as statistics-alternatives todo 17bzmgx. Do not count these
-    # broken checks as passing accuracy, or replace them with looser tolerance.
+    # Regression from statistics-alternatives todo 17bzmgx. The compressed
+    # factor formerly returned RSS 15.6055 and gradient approximately [120,120].
     X, y = ones(400,2), ones(400)
     beta = [1e14,1-1e14]
     reference = sum(abs2,big.(y)-big.(X)*big.(beta))
@@ -248,14 +242,9 @@ end
         ad = prepare_ad(q,AutoEnzyme(;mode=Enzyme.Reverse),beta,1.0;active=:beta)
         grad = zeros(2)
         value = first(ad_value_and_gradient!(ad,grad,beta,1.0))
-        if statistics
-            @test_broken abs(value) < 1e-12
-            @test_broken norm(grad) < 1e-12
-        else
-            @test value == 0
-            @test all(iszero,grad)
-        end
-        println((stage=:known_accuracy_gap,statistics,beta,value,gradient=copy(grad),
+        @test value == 0
+        @test all(iszero,grad)
+        println((stage=:cancellation_regression,statistics,beta,value,gradient=copy(grad),
             reference=Float64(reference)))
     end
 end

@@ -30,8 +30,10 @@ end
         kernels = []
         structures = []
         beta = [0.1, -0.2]
-        for n in (2, 20, 0, 200)
+        for (n, deficient) in ((2, false), (20, false), (0, false), (200, false),
+                               (20, true), (200, true))
             X = hcat(ones(n), collect(1.0:n) ./ max(n, 1))
+            deficient && (X[:, 2] .= X[:, 1])
             y = fill(0.4, n)
             original = deepcopy((X, y))
             k = prepare!(cache, dense; bound = (; X, y))
@@ -49,11 +51,28 @@ end
             @test result[1][2] ≈ sum(abs2, residual) / 0.7^3 - n / 0.7
             statistics = filter(x -> x isa RK._LSStatistics, k.constants)
             @test length(statistics) == 1
-            @test only(statistics).usable == (n >= 4)
+            @test only(statistics).usable == (n >= 4 && !deficient)
             @test (X, y) == original
         end
         @test allequal(typeof.(kernels))
         @test allequal(structures)
+    end
+end
+
+@testset "exact null-space cancellation survives ordinary reverse and reuse" begin
+    X, y = ones(400, 2), ones(400)
+    beta = [1e14, 1.0 - 1e14]
+    native = prepare(dense; bound = (; X, y))
+    @test !only(filter(x -> x isa RK._LSStatistics, native.constants)).usable
+    literal = prepare(dense; bound = (; X, y), bound_statistics = false)
+    @test sum(abs2, y - X * beta) == 0.0
+    for k in (native, prepare_nonallocating(native, beta, 0.7))
+        dbeta = zeros(2)
+        result = Enzyme.autodiff(Enzyme.ReverseWithPrimal, Enzyme.Const(k), Enzyme.Active,
+            Enzyme.Duplicated(copy(beta), dbeta), Enzyme.Active(0.7))
+        @test result[2] == literal(beta, 0.7)
+        @test dbeta == zeros(2)
+        @test result[1][2] ≈ -length(y) / 0.7
     end
 end
 
