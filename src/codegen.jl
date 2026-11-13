@@ -319,6 +319,11 @@ _plate_fold_ref(::typeof(LogExpFunctions.logsumexp)) =
 @inline _plate_similar_output(marker::Tuple, ::Type{T}, output_axes) where {T} =
     similar(Array{T}, output_axes)
 
+# Keep scan allocation identifiable to the partition planner: the fresh output
+# cannot alias the sequence used to choose its container type and dimensions.
+@inline _scan_similar_output(marker, ::Type{T}, dims...) where {T} =
+    similar(marker, T, dims...)
+
 # A column projection's element type: the field's type in a concrete
 # named-tuple scan output, else `Any`, as the projection plate infers it.
 @inline _scan_column_eltype(::Type{T}, ::Val{name}) where {T,name} =
@@ -1099,7 +1104,7 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
     end
     axes_ref = GlobalRef(Base, :axes)
     if lhs !== nothing && _scan_includes_init(op)
-        seed, similar_ref = callargs[1], GlobalRef(Base, :similar)
+        seed, similar_ref = callargs[1], GlobalRef(@__MODULE__, :_scan_similar_output)
         promote_ref, length_ref = GlobalRef(Base, :promote_type), GlobalRef(Base, :length)
         trajectory_type = :($promote_ref($typeof_ref($seed), $output_type))
         allocation = :($similar_ref($xs, $trajectory_type, $length_ref($indices) + 1))
@@ -1115,7 +1120,7 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
         # `position` stays within the `length(indices) + 1` buffer.
         push!(loop_output.args, _inbounds_expr(:($lhs[$position] = $output)))
     elseif lhs !== nothing
-        allocation = :($(GlobalRef(Base, :similar))($xs, $output_type))
+        allocation = :($(GlobalRef(@__MODULE__, :_scan_similar_output))($xs, $output_type))
         buffer!(lhs, recycled === nothing ? allocation :
             _lane_allocation(recycled, output_type, :($axes_ref($xs)), allocation))
         push!(initial_output.args, :($lhs[$index] = $output))
@@ -1130,7 +1135,7 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
             field = QuoteNode(column.field)
             column_type = :($(GlobalRef(@__MODULE__, :_scan_column_eltype))(
                 $output_type, $(GlobalRef(Base, :Val))($field)))
-            allocation = :($(GlobalRef(Base, :similar))($xs, $column_type))
+            allocation = :($(GlobalRef(@__MODULE__, :_scan_similar_output))($xs, $column_type))
             buffer!(column.lhs, column.recycled === nothing ? allocation :
                 _lane_allocation(column.recycled, column_type, :($axes_ref($xs)),
                                  allocation))
@@ -1158,7 +1163,7 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
         # does; a cell type that is not a number may have none.
         push!(unpeeled_conditions, :($plate_eltype <: $(Number)))
         if pointwise_lhs !== nothing
-            allocation = :($(GlobalRef(Base, :similar))($xs, $plate_eltype))
+            allocation = :($(GlobalRef(@__MODULE__, :_scan_similar_output))($xs, $plate_eltype))
             buffer!(pointwise_lhs, pointwise_recycled === nothing ? allocation :
                 _lane_allocation(pointwise_recycled, plate_eltype,
                     :($axes_ref($xs)), allocation))
