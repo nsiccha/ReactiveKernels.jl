@@ -640,8 +640,11 @@ end
         name = Symbol(:buffer, j)
         if args.parameters[b] <: Union{Duplicated,DuplicatedNoNeed}
             push!(body, :(n = length(parent(getfield(args, $b).dval))))
-            push!(body, :($name = view(view(tape, offset+1:offset+n),
-                                       parentindices(getfield(args, $b).val)...)))
+            # `Base.SubArray`, not `view`: a view of a view composes the
+            # indices into the whole tape, and the buffer's parent must be its
+            # own slice (as `_readonly_gather` keeps its parent).
+            push!(body, :($name = Base.SubArray(view(tape, offset+1:offset+n),
+                                                parentindices(getfield(args, $b).val))))
             push!(body, :(offset += n))
         else
             push!(body, :($name = nothing))
