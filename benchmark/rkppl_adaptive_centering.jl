@@ -2,6 +2,7 @@
 # dependencies. Reports warmed gradient time and allocation as N increases;
 # the focused suite also checks that emitted body structure stays bounded.
 using ReactiveKernels, ReactiveKernelsPPL, WarmupHMC, Enzyme, Test, Random, Statistics
+using ReactiveKernelsPPL: adaptive_centering_problem
 using DifferentiationInterface: AutoEnzyme
 import LogDensityProblems as LDP
 
