@@ -16,6 +16,16 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.169
+
+- A compact cell or partition query gathers its constant base rows with a
+  counted loop (ReactiveKernels 0.1.217's `_gather_copy`) instead of Base's
+  vector-index read, whose loops left their Enzyme Reverse caches to libc
+  allocations on every call. With ReactiveKernels 0.1.217's one-cell
+  partitions, a one-subject gradient of BRM's joint NLME toy makes 22 libc
+  allocator calls instead of 79 and costs about its share of the whole-cohort
+  sweep; values and gradients are unchanged bit for bit. Needs
+  ReactiveKernels 0.1.217.
 ## 0.1.168
 
 - A categorical response binds outcomes that hold only some of its classes

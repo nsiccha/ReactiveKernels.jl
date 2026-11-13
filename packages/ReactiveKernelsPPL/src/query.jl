@@ -1074,7 +1074,10 @@ function ReactiveKernels._cell_lazy_rows(::typeof(_local_cell_point), inputs, ro
     # Gather the constant base separately before mixing it with active values.
     # Otherwise the outlined mixed read carries the whole packed vector and
     # ordinary reverse can allocate a shadow for that entire inactive base.
-    base_rows = bind(:cell_base_rows, Expr(:ref, inputs[1], rows))
+    # The gather is a counted loop (`_gather_copy`): Base's vector-index read
+    # left its reverse caches to libc allocations on every call.
+    base_rows = bind(:cell_base_rows, Expr(:call,
+        GlobalRef(ReactiveKernels, :_gather_copy), inputs[1], rows))
     Expr(:call, GlobalRef(@__MODULE__, :_local_cell_rows), base_rows, inputs[2], slots)
 end
 @inline _local_cell_rows(base_rows::AbstractVector, active, slots::AbstractVector) =
