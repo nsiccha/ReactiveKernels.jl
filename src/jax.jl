@@ -739,7 +739,8 @@ _jax_is_singleton_value(v::_PyVal) = v.T isa Type && v.T !== Nothing && !(v.T <:
 # lowered code and type-level calls (`Float64` read as a global, a `where T`
 # parameter, `promote_type(...)`), as `clamp`'s `convert(T, x)` passes it.
 _jax_type_of_value(v::_PyVal) = v.T isa _JaxCallable ? (v.T.f isa Type ? v.T.f : nothing) :
-    v.T isa Type && v.T <: Type && !(v.T isa UnionAll) ? v.T.parameters[1] : nothing
+    v.T isa DataType && v.T <: Type && length(v.T.parameters) == 1 ?
+        v.T.parameters[1] : nothing
 _jax_dtype(@nospecialize(E)) = E <: Bool ? "jnp.bool_" : E <: Integer ? _jax_int_dtype() :
     E <: AbstractFloat ? "jnp." * _jax_dtype_name(E) : "jnp." * _jax_float_name()
 
@@ -3997,6 +3998,18 @@ _jax_call_positional(ctx::_JaxContext, ::typeof(eltype), args::Vector{_PyVal}) =
     _jax_type_value(eltype(_jax_type_of(only(args))))
 _jax_call_positional(ctx::_JaxContext, ::typeof(typeof), args::Vector{_PyVal}) =
     _jax_type_value(_jax_argument_type(only(args)))
+function _jax_call_positional(ctx::_JaxContext, ::typeof(isa), args::Vector{_PyVal})
+    x, target = args
+    S, T = _jax_argument_type(x), _jax_type_of_value(target)
+    if S isa Type && T isa Type
+        S <: T && return _jax_literal(true)
+        # An abstract annotation is an upper bound. Only disjoint types prove
+        # false; a partial overlap still needs a runtime type test.
+        typeintersect(S, T) === Union{} && return _jax_literal(false)
+    end
+    _jax_error("`isa` cannot be decided from the Julia argument type `", S,
+               "` and target type `", T, "`", _jax_where(ctx))
+end
 _jax_call_positional(ctx::_JaxContext, ::typeof(promote_type), args::Vector{_PyVal}) =
     _jax_type_value(promote_type(map(_jax_type_of, args)...))
 function _jax_call_positional(ctx::_JaxContext, f::Union{typeof(one),typeof(zero)},

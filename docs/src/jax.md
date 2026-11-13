@@ -49,6 +49,30 @@ A `Bool` array index (a `BitVector` or `Vector{Bool}`, such as `table[table[:, 2
 
 Translation errors identify an unsupported operation instead of substituting a different computation. JAX compilation, device placement and differentiation belong to the Python consumer.
 
+### Accelerator runtime checks
+
+Data-dependent checks use `jax.debug.callback`: their predicates are computed
+on the numerical device and checked on the host. JAX needs a local CPU device
+for these callbacks, even for valid inputs on CUDA. Start the Python process
+with `JAX_PLATFORMS=cuda,cpu`; `JAX_PLATFORMS=cuda` alone fails when a runtime
+check executes. CPU-only execution remains supported.
+
+An explicit platform list makes CUDA initialization mandatory and CUDA the
+default; it does not silently fall back to CPU if CUDA initialization fails.
+For a GPU-required consumer, select `gpu = jax.devices("gpu")[0]`, place
+numerical inputs with `jax.device_put(value, gpu)`, and verify result and
+gradient arrays with `array.devices() == {gpu}`. The host validates the check
+predicates; it does not evaluate the numerical kernel. Call
+`jax.block_until_ready(result)` and `jax.effects_barrier()` when checking
+completion and callback errors. Host callbacks incur transfer and
+synchronization costs; `prepare_data` also runs on the host.
+
+See JAX's [callback semantics](https://docs.jax.dev/en/latest/external-callbacks.html)
+and [platform configuration](https://docs.jax.dev/en/latest/config_options.html#platforms).
+`python benchmark/jax_runtime_checks.py` verifies the helper's values,
+gradients, device placement, invalid-input rejection and missing-GPU failure
+with a CUDA-enabled JAX installation.
+
 For `scalar_derivative_rule`, the module generates a `jax.custom_jvp` adapter
 from the rule's mathematical graph. It selects the primal and named partials
 for the active arguments, then applies the scalar chain rule. An inactive

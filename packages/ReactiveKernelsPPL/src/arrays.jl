@@ -792,6 +792,23 @@ function _value_metadata(plan::StructuralPlan, ex, seen::Set{Symbol};
     ex isa Expr || return _OS.ValueInfo()
     levelaxis = _level_plate_axis(ex)
     levelaxis === nothing || return _sampled_metadata(Any[:(levels($levelaxis))])
+    # A retained cell contributes one value per selected index, regardless
+    # of what its body computes. Resolve only its iterator's bound extent;
+    # neither the cell nor a sampled value is evaluated for shape discovery.
+    if data_axes && !symbolic_data
+        indices = _selected_plate_indices(ex)
+        if Meta.isexpr(indices, :call) &&
+                ((length(indices.args) == 2 &&
+                    indices.args[1] === GlobalRef(Base, :eachindex)) ||
+                 (length(indices.args) == 3 &&
+                    indices.args[1] === GlobalRef(Base, :axes) &&
+                    indices.args[3] isa Int))
+            n = _value_iterator_length(plan, :plate, _authored_spelling(indices),
+                seen; required = false)
+            n === nothing || return _OS.ValueInfo(; type_bound = AbstractVector,
+                axes = (Base.OneTo(n),))
+        end
+    end
     meta(a) = _value_metadata(plan, a, seen; data_axes, symbolic_data, throw_conflicts)
     anchor = _matrix_intercept_anchor(ex)
     if anchor !== nothing

@@ -2432,17 +2432,36 @@ function _size_absent_responses!(plan::StructuralPlan, columns::AbstractDict)
             if k ∉ modelvals && k ∉ managed && v isa AbstractArray && !(v isa _Absent))
     end
     designs = _observation_design_columns(axis_plan)
+    # Retained plates capture their inputs whole. Their result still has
+    # one cell per iterator index, so use that domain rather than walking
+    # through the cell's shared captures as aligned observation operands.
+    plate_axes = Dict{Symbol,Tuple}()
+    for d in _definitions(axis_plan)
+        indices = _selected_plate_indices(d.expr)
+        indices === nothing && continue
+        # An absent response still has a provisional singleton stand-in;
+        # it is not independent evidence of a plate's domain.
+        Meta.isexpr(indices, :call) && length(indices.args) >= 2 &&
+            get(columns, indices.args[2], nothing) isa _Absent && continue
+        ax = _OS.value_axes(_value_metadata(axis_plan, d.expr, Set([d.name]);
+            data_axes = true))
+        ax === nothing || (plate_axes[d.name] = ax)
+    end
+    plates = Set(keys(plate_axes))
+    operands = union(perobs, plates)
     for r in plan.responses
         names = filter(in(absent), [r.response, r.count_columns..., r.extra_responses...])
         isempty(names) && continue
         shape = ()
-        for c in sort!(collect(_response_reads(axis_plan, _with(r; range = nothing), perobs)))
-            ax = c in designs ? (axes(columns[c], 1),) : axes(columns[c])
+        for c in sort!(collect(_response_reads(axis_plan, _with(r; range = nothing),
+                operands; stop = plates)))
+            ax = haskey(plate_axes, c) ? plate_axes[c] :
+                c in designs ? (axes(columns[c], 1),) : axes(columns[c])
             shape = try
                 Base.Broadcast.broadcast_shape(shape, ax)
             catch e
                 e isa DimensionMismatch || rethrow()
-                _fail(c, "column shape $(size(columns[c])) is not broadcast-" *
+                _fail(c, "column shape $(map(length, ax)) is not broadcast-" *
                     "compatible with the other operands of the absent response " *
                     "$(r.response): " * sprint(showerror, e))
             end
