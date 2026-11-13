@@ -32,6 +32,10 @@ are recorded in the git history only.
     on the random-intercept one (Julia 1.10.12 and 1.13.1, Enzyme dogfood).
   - The default preparation is still faster on the PosteriorDB ports measured
     (the rule at 0.3–0.98× the default on Julia 1.13.1), and on small plates.
+  - With registered Enzyme 0.13.219, the rule's allocating program
+    (`nonallocating = false`) can raise `EnzymeMutabilityException` at an
+    `.innerparm` store (reactivekernels-use §7aq); Enzyme dogfood
+    differentiates it.
 
 ## 0.1.210
 
