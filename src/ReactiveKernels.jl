@@ -81,6 +81,7 @@ include("expm_rule.jl")
 include("stable_rewrites.jl")
 include("symmetric_eigen_rules.jl")
 include("affine_logistic.jl")
+include("shared_softplus.jl")
 include("cholesky.jl")
 include("gaussian_projection.jl")
 include("native_ode.jl")
@@ -108,6 +109,7 @@ export ScalarDerivativeRule, scalar_derivative_rule, derivative_cut
 export DerivativeRule, derivative_rule, forward_cut, reverse_cut, reverse_residuals
 export rk_expm, rk_symmetric_eigvals, rk_symmetric_eigvecs
 export rk_affine_logistic
+export rk_log1pexp
 export rk_cholesky_lower
 export rk_ode_bdf_tol, rk_ode_rk45_tol
 export has_forward_branch, has_reverse_branch, rule_inputs

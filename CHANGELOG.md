@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.226
+
+- Add `rk_log1pexp`, an owned scalar softplus callable whose stable value and
+  partial share one exponential in a pure numerical graph. Its generated
+  derivative adapters compose with ordinary AD and plate reductions.
+- Bernoulli logit densities and the whole-vector Bernoulli GLM use the shared
+  primitive. The probability-input route retains its lazy boundary handling.
+
 ## 0.1.225
 
 - General derivative rules select their primal and active cotangents together

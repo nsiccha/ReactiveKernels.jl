@@ -72,6 +72,49 @@ Bernoulli sign-selected logit formula and retains its independent lazy
 probability-input route. `pbr_ppl_bernoulli.jl` measures the actual distribution
 and PPL sampler paths, accounting for PPL's Normal prior constants.
 
+## Production Bernoulli and PPL integration
+
+The candidate exposes the smaller graph as `rk_log1pexp` in RK, and uses it
+in DistributionKernels' scalar Bernoulli logit and whole-vector GLM paths.
+PPL reaches it through its existing distribution lowering. The direct
+probability-input route keeps its lazy boundary formula.
+
+`pbr_ppl_bernoulli.jl` ran before this change at `ad965e2b0` and again with
+the candidate. Each run passed 30 value/gradient checks, including empty
+and three-row data. PPL uses ordinary Enzyme reverse with forward batching
+disabled. These are medians of five randomized round medians, in microseconds:
+
+| Path | 2,048 before | 2,048 candidate | 8,192 before | 8,192 candidate |
+| --- | ---: | ---: | ---: | ---: |
+| PBR, in-place control | 16.470 | 16.510 | 66.190 | 68.445 |
+| RK distribution, plate reverse off | 31.169 | 22.130 | 124.955 | 91.200 |
+| RK distribution, plate reverse on | 27.590 | 31.959 | 110.200 | 131.869 |
+| PPL sampler | 32.030 | 23.570 | 128.010 | 96.980 |
+
+Every entry allocated zero bytes. PPL's observed time falls by 26% and 24%,
+but remains about 43% and 42% above the concurrent PBR control. Explicit
+plate reverse regresses by 16% and 20%; this increment does not solve its
+schedule. No default-mode change is included. The wider full-cell prototype
+and the plate regression are retained as evidence, rather than omitted
+from the comparison.
+
+The production runs were separate processes on a shared host. The candidate
+run followed correctness tests and had additional test dependencies loaded;
+the resolver also updated ForwardDiff and OrderedCollections. The PBR,
+Enzyme, libEnzyme, MutatingFunctions, OutputSignatures and LogExpFunctions
+sources stayed fixed. Treat these as before/after workload measurements,
+supported by the isolated same-process attribution above, not a controlled
+whole-system speedup or a general PBR parity claim.
+
+Candidate numerical acceptance passed 282 core checks, 52 focused
+distribution checks, and 155 PPL tail/integer-offset checks. They cover
+512-bit references, ordinary forward/reverse AD, nonfinite tails, exact
+probability boundaries, empty/changed lengths, and caller-owned outputs.
+The PPL runner also passed 31 harness checks. The production comparison
+adds the 30 checks noted above.
+Emitted JAX execution and ordinary JAX reverse passed 26 further checks for
+the primitive's empty/vector reductions and actual scalar Bernoulli tails.
+
 ## Reproduction
 
 Julia 1.12.7, PBR `6c6d9300160be5432becd801ec602ad06d0e87f8`, Enzyme
