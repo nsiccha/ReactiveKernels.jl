@@ -400,6 +400,8 @@ function PPL.tune_smc(target::AbstractSMCTarget; rng::Xoshiro, init::AbstractVec
     isfinite(reference_inflation) && reference_inflation > 0 ||
         throw(ArgumentError("reference_inflation must be finite and positive"))
     options.tuning === nothing || throw(ArgumentError("pilot options must not already contain tuning"))
+    options.cloud_kernels == 0 || throw(ArgumentError(
+        "pilot options must not request cloud_kernels; pass them to the production SMCOptions"))
     grid = _temperatures(temperatures)
     scale = options.metric === nothing ? ones(d) : options.metric
     scale isa AbstractVector || throw(ArgumentError("pilot initialization requires diagonal scales"))
@@ -470,6 +472,7 @@ end
 
 include("smc_tuning.jl")
 include("smc_tuning_parallel.jl")
+include("smc_cloud.jl")
 
 PPL.smc_reference(state::SMCState) =
     state.source isa ReferenceTarget ? deepcopy(state.source.reference) : nothing
@@ -619,6 +622,8 @@ _worker_target(t::BridgeTarget) = BridgeTarget(_worker_target(t.source),
     _worker_target(t.target), t.temperature, t.dimension)
 
 function _mutate_particles!(positions, state, ancestors, seeds, target, options, indices)
+    haskey(options, :components) &&
+        return _mutate_cloud!(positions, state, ancestors, seeds, target, options, indices)
     divergences, evaluations, movement, acceptance = 0, 0, 0.0, 0.0
     metric = _metric(options.metric)
     for i in indices
@@ -642,7 +647,7 @@ end
 function _mutation!(positions, state, ancestors, seeds, beta;
         kernel=first(_stage_kernel(state.options, size(positions, 1), beta)))
     d, n = size(positions)
-    d == 0 && return (0, 0, 0.0, nothing, 1)
+    d == 0 && return (0, 0, 0.0, nothing, 1, 0)
     options = kernel
     target = BridgeTarget(state.source, state.target, beta, d)
     workers = min(state.options.nthreads, Threads.nthreads(), n)
@@ -680,10 +685,12 @@ function _mutation!(positions, state, ancestors, seeds, beta;
     evaluations = sum(r.evaluations for r in results)
     movement = foldl((a,r) -> a+r.movement, results; init=0.0)
     acceptance = foldl((a,r) -> a+r.acceptance, results; init=0.0)
-    return divergences, evaluations, movement/n, acceptance/(n*options.moves), workers
+    rejections = sum(get(r, :rejections, 0) for r in results)
+    return divergences, evaluations, movement/n, acceptance/(n*options.moves), workers, rejections
 end
 
-function _library_stage(state, beta, delta, seed)
+function _library_stage(state, beta, delta, seed;
+        kernel=first(_stage_kernel(state.options, size(state.positions, 1), beta)))
     d, n = size(state.positions)
     positions = similar(state.positions)
     ancestors = Vector{Int}(undef, n)
@@ -715,10 +722,10 @@ function _library_stage(state, beta, delta, seed)
     end
     schedule(task)
     fetch(task)
-    divergences, evaluations, movement, acceptance, workers =
-        _mutation!(positions, state, ancestors, seeds, beta)
+    divergences, evaluations, movement, acceptance, workers, rejections =
+        _mutation!(positions, state, ancestors, seeds, beta; kernel)
     return positions, ancestors, output.logZhats[end], n*output.esses[1],
-        divergences, evaluations, movement, acceptance, workers
+        divergences, evaluations, movement, acceptance, workers, rejections
 end
 
 # Compare values, not variances (roundoff can give identical columns a nonzero
@@ -763,13 +770,22 @@ function PPL.smc_step(state::SMCState)
     end
     beta = _temperature(delta, state.temperature, state.options)
     rng = copy(state.rng)
-    positions, ancestors, increment, ess, divergences, evaluations, movement, acceptance, workers =
-        _library_stage(state, beta, delta, rand(rng, UInt64))
+    library_seed = rand(rng, UInt64)
+    kernel, tuning_index = _stage_kernel(state.options, d, beta)
+    # Cloud kernels draw their own seed after the library's, so the random
+    # stream of a run without them is unchanged.
+    cloud = state.options.cloud_kernels > 0 && d > 0
+    cloud && (kernel = _cloud_kernel(state, beta, delta, rand(rng, UInt64), kernel))
+    positions, ancestors, increment, ess, divergences, evaluations, movement, acceptance, workers, rejections =
+        _library_stage(state, beta, delta, library_seed; kernel)
+    if cloud
+        evaluations += kernel.tuning_evaluations
+        kernel = merge(kernel, (; selection_rejections=rejections))
+    end
     isfinite(increment) || throw(DomainError(increment, "non-finite SMC normalizer increment"))
     log_normalizer = state.log_normalizer+increment
     isfinite(log_normalizer) || throw(DomainError(log_normalizer, "SMC log normalizer overflowed"))
     lineage = state.lineage[ancestors]
-    kernel, tuning_index = _stage_kernel(state.options, d, beta)
     stage = SMCStage(state.update, state.stage+1, beta, ess, increment,
         length(Set(ancestors)), length(Set(lineage)), d == 0 ? 0 : n*kernel.moves,
         divergences, deepcopy(kernel), tuning_index, evaluations, movement, acceptance,
@@ -793,7 +809,7 @@ function PPL.rejuvenate_smc(state::SMCState; tuning::SMCTuningSchedule, moves::I
     ancestors = collect(1:n)
     seeds = d == 0 ? UInt64[] : rand(rng, UInt64, n)
     positions = similar(state.positions)
-    divergences, evaluations, movement, acceptance, workers =
+    divergences, evaluations, movement, acceptance, workers, _ =
         _mutation!(positions, state, ancestors, seeds, state.temperature; kernel)
     stage = SMCStage(state.update, state.stage, state.temperature, Float64(n), 0.0,
         n, length(Set(state.lineage)), d == 0 ? 0 : n*kernel.moves,
