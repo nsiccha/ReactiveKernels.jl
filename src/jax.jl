@@ -321,11 +321,13 @@ mutable struct _JaxScope
     links::Dict{ValueId,Any}
     hints::Dict{ValueId,Symbol}
     named_hints::Dict{Symbol,Symbol}
+    flat_positions::Dict{String,String}
 end
 _JaxScope(parent::Union{Nothing,_JaxScope} = nothing) =
     _JaxScope(String[], 1, parent === nothing ? Set{String}() : copy(parent.used),
               Dict{ValueId,_PyVal}(), parent, Dict{ValueId,Any}(), Dict{ValueId,Symbol}(),
-              parent === nothing ? Dict{Symbol,Symbol}() : parent.named_hints)
+              parent === nothing ? Dict{Symbol,Symbol}() : parent.named_hints,
+              parent === nothing ? Dict{String,String}() : copy(parent.flat_positions))
 
 # An authored lexical region of an otherwise transparent graph. The authoring
 # frontend supplies its explicit boundary and names; RK owns the graph cut and
@@ -468,6 +470,20 @@ function _jax_key_name(used::Set{String}, name; stable::Bool = true)
         return text
     end
     _jax_identifier(used, name)
+end
+
+# A helper may be emitted after locals in its caller. Reserve against both
+# sets so a local result cannot shadow a later callable with the same name.
+function _jax_named_function(ctx::_JaxContext, hint)
+    name = _jax_identifier(union(ctx.scope.used, ctx.mod.used), hint)
+    push!(ctx.mod.used, name)
+    name
+end
+
+function _jax_body_hint(ctx, recipe, suffix)
+    value = first(recipe.outputs)
+    name = get(ctx.scope.hints, value.id, value.name)
+    Symbol(get(ctx.scope.named_hints, name, name), :_, suffix)
 end
 
 function _jax_fresh(ctx::_JaxContext, hint)
@@ -3768,9 +3784,8 @@ end
 # The flat positions of the prepared ragged input whose lengths `extent` reads.
 function _jax_flat_positions(ctx::_JaxContext, extent::AbstractString)
     found = String[]
-    for (key, flat) in ctx.mod.helper_names
-        key isa Tuple && length(key) == 2 && key[1] === :flat || continue
-        occursin(Regex("(?<![.\\w])" * key[2] * "(?!\\w)"), extent) && push!(found, flat)
+    for (key, flat) in ctx.scope.flat_positions
+        occursin(Regex("(?<![.\\w])\\Q" * key * "\\E(?!\\w)"), extent) && push!(found, flat)
     end
     length(unique(found)) == 1 ? only(unique(found)) : nothing
 end
@@ -4491,20 +4506,28 @@ function _jax_call_positional(ctx::_JaxContext, k::PreparedKernel, args::Vector{
                    length(args), _jax_where(ctx))
     types = Any[a.T for a in args]
     host = ctx.host !== nothing
-    key = (:kernel, objectid(k), types, host)
+    guard = host ? nothing : _jax_active_condition(ctx)
+    key = (:kernel, objectid(k), types, host, guard !== nothing, ctx.traced_branches > 0)
     name = get(ctx.mod.helper_names, key, nothing)
     if name === nothing
         name = _jax_private_identifier(ctx.mod.used, Symbol("_rk_", hint, host ? "_np" : ""))
         ctx.mod.helper_names[key] = name
+        before = _JAX_EFFECTS[]
         lines, f = _jax_function!(ctx.mod, name, p, Tuple(types),
                                   length(p.want) == 1 ? only(p.want).name : Tuple(v.name for v in p.want);
-                                  reserve = false, host)
+                                  reserve = false, host, active = guard !== nothing,
+                                  traced_branches = ctx.traced_branches)
+        ctx.mod.helper_names[(:kernel_effects, name)] = _JAX_EFFECTS[] - before
         push!(ctx.mod.helpers, host ? _host_helper_text(ctx, join(lines, "\n")) : join(lines, "\n"))
         ctx.mod.helper_names[(:kernel_type, name)] = f
+    else
+        _JAX_EFFECTS[] += ctx.mod.helper_names[(:kernel_effects, name)]
     end
     f = ctx.mod.helper_names[(:kernel_type, name)]
     T = length(f.outputs) == 1 ? last(only(f.outputs)) : Tuple{(last(o) for o in f.outputs)...}
-    _jax_bind!(ctx, :value, _PyVal(name * "(" * _jax_args(args) * ")", T))
+    passed = String[a.code for a in args]
+    guard === nothing || push!(passed, guard)
+    _jax_bind!(ctx, :value, _PyVal(name * "(" * join(passed, ", ") * ")", T))
 end
 
 # A prepared child a source calls (a distribution's `standardized` step):
@@ -4553,22 +4576,34 @@ end
 # extra extent/bound arguments are the same runtime representation used by
 # plates; none is a value baked into the module from a particular dataset.
 function _jax_authored_function_call(ctx, f, names, body, source_module, inputs)
+    # Integer provenance and history access proofs refer to the surrounding
+    # loop/scan. Keep those helpers lexically nested so the scan can still
+    # resolve its access placeholders and prove a bounded history carry.
+    contextual = any(_jax_contextual_value, inputs)
     key = (:authored_function, objectid(f),
            Tuple((a.T, a.static, !isempty(a.extent), !isempty(a.limit), a.padded, a.origin,
-                  haskey(ctx.mod.helper_names, (:flat, a.extent)))
-                 for a in inputs), !isempty(_JAX_GUARDS), ctx.traced_branches > 0)
+                  haskey(ctx.scope.flat_positions, a.extent))
+                 for a in inputs), !isempty(_JAX_GUARDS), ctx.traced_branches > 0,
+           contextual ? (ctx.scope, Tuple((a.code, a.extent, a.limit) for a in inputs),
+                         Tuple(last.(copy(_JAX_GUARDS)))) : nothing)
     cached = get(ctx.mod.helper_names, key, nothing)
-    scope = _JaxScope()
+    scope = _JaxScope(contextual ? ctx.scope : nothing)
     params, passed = String[], String[]
-    arguments = [_jax_function_input!(ctx.mod, scope, params, passed, n, a) for (n, a) in zip(names, inputs)]
-    guard = _jax_function_guard!(ctx, scope, params, passed)
+    arguments = contextual ? inputs :
+        [_jax_function_input!(ctx, scope, params, passed, n, a) for (n, a) in zip(names, inputs)]
+    guard = contextual ? nothing : _jax_function_guard!(ctx, scope, params, passed)
     if cached === nothing
         inner = _JaxContext(ctx.mod, scope, ctx.recipe, source_module,
                             Dict{Symbol,_PyVal}(), nothing)
         inner.traced_branches = ctx.traced_branches
         before = _JAX_EFFECTS[]
-        v = _jax_with_function_guard(scope, guard) do
-            _jax_source_expr(inner, body, names, arguments, source_module, nothing)
+        emit_body() = _jax_source_expr(inner, body, names, arguments, source_module, nothing)
+        v = if contextual
+            emit_body()
+        else
+            _jax_with_function_guard(scope, guard) do
+                emit_body()
+            end
         end
         effects = _JAX_EFFECTS[] - before
         # Types and callable closures belong to translation. Their captured
@@ -4576,46 +4611,84 @@ function _jax_authored_function_call(ctx, f, names, body, source_module, inputs)
         if _jax_translation_only(v) || _jax_type_of_value(v) !== nothing
             return _jax_source_expr(ctx, body, names, inputs, source_module, nothing)
         end
-        name = _jax_identifier(ctx.mod.used, nameof_or(f))
+        name = _jax_named_function(ctx, nameof_or(f))
         text = join(scope.lines, "\n") * "\n" * v.code * "\n" * v.extent * "\n" * v.limit
-        bounds = [bn for (bn, _, _) in _jax_prepared_bounds(ctx.mod)
+        bounds = contextual ? String[] : [bn for (bn, _, _) in _jax_prepared_bounds(ctx.mod)
                   if occursin(Regex("\\b" * bn * "\\b"), text)]
         append!(params, bounds)
-        description = Base.Docs.doc(f)
-        doc = description === nothing ? "Compute `$(nameof_or(f))` from its authored source." :
-              string(description)
+        binding = Base.Docs.Binding(parentmodule(typeof(f)), nameof_or(f))
+        documented = any(Base.Docs.modules) do m
+            metadata = Base.Docs.meta(m; autoinit = false)
+            metadata !== nothing && haskey(metadata, binding)
+        end
+        doc = documented ? string(Base.Docs.doc(f)) :
+              "Compute `$(nameof_or(f))` from its authored source."
         signature = [n * ": ArrayLike" for n in params]
         lines = ["def " * name * "(" * join(signature, ", ") * ") -> " *
-                 (isempty(v.extent) && isempty(v.limit) ? _jax_return_annotation(:value, [v]) : "tuple") * ":",
+                 (isempty(v.extent) && isempty(v.limit) && v.origin === nothing ?
+                    _jax_return_annotation(:value, [v]) : "tuple") * ":",
                  _jax_docstring(doc, "    ")]
         append!(lines, scope.lines)
-        returned = [v.code]
-        isempty(v.extent) || push!(returned, v.extent)
-        isempty(v.limit) || push!(returned, v.limit)
-        push!(lines, "    return " * (length(returned) == 1 ? only(returned) :
-                                      "(" * join(returned, ", ") * ")"))
-        push!(ctx.mod.helpers, join(lines, "\n"))
-        cached = (name, v, bounds, effects)
+        returned, result, flat = _jax_function_result(inner, v)
+        push!(lines, "    return " * returned)
+        if contextual
+            foreach(line -> _jax_emit!(ctx, line), lines)
+        else
+            push!(ctx.mod.helpers, join(lines, "\n"))
+        end
+        cached = (name, result, bounds, effects, flat)
         ctx.mod.helper_names[key] = cached
     else
         # A reused check still prevents its caller's branch from being
         # discarded, even though this call emits no new helper definition.
         _JAX_EFFECTS[] += cached[4]
     end
-    name, v, bounds, _ = cached
+    name, v, bounds, _, flat = cached
     call = name * "(" * join([passed; bounds], ", ") * ")"
-    if isempty(v.extent) && isempty(v.limit)
+    if isempty(v.extent) && isempty(v.limit) && v.origin === nothing
         return _jax_bind!(ctx, nameof_or(f), _PyVal(call, v.T, v.static))
     end
     result = _jax_bind!(ctx, nameof_or(f), _PyVal(call, Any))
-    extent = isempty(v.extent) ? "" : result.code * "[1]"
-    limit = isempty(v.limit) ? "" : result.code * (isempty(extent) ? "[1]" : "[2]")
-    _PyVal(result.code * "[0]", v.T, v.static, extent, limit, v.padded)
+    _jax_function_return!(ctx, v, flat, result.code)
 end
+
+_jax_contextual_value(v::_PyVal) = v.origin !== nothing || _jax_contextual_type(v.T)
+_jax_contextual_type(T) = false
+_jax_contextual_type(T::_JaxAggregate) = any(_jax_contextual_value, T.fields)
+_jax_contextual_type(T::_JaxCallable) = T.f isa _JaxClosure && any(_jax_contextual_value, T.f.captures)
+
+# A returned value's extents and integer proofs are part of its execution
+# boundary too. Return their numerical leaves explicitly, rather than losing
+# the proof or retaining a name local to the helper's body.
+function _jax_function_result(ctx, v)
+    isempty(v.extent) && isempty(v.limit) && v.origin === nothing && return v.code, v, nothing
+    parts = String[]
+    pack(code) = isempty(code) ? "" : begin
+        push!(parts, code)
+        "__rk_function_result__[" * string(length(parts) - 1) * "]"
+    end
+    result = _jax_map_value(v, pack)
+    flat = isempty(v.extent) ? nothing : _jax_flat_positions(ctx, v.extent)
+    flat === nothing || (flat = pack(flat))
+    "(" * join(parts, ", ") * (length(parts) == 1 ? ",)" : ")"), result, flat
+end
+function _jax_function_return!(ctx, v, flat, returned)
+    code(s) = replace(s, "__rk_function_result__" => returned)
+    result = _jax_map_value(v, code)
+    flat === nothing || (ctx.scope.flat_positions[result.extent] = code(flat))
+    result
+end
+_jax_map_value(v::_PyVal, code) = _PyVal(code(v.code), v.T, v.static,
+    code(v.extent), code(v.limit), v.padded, _jax_map_origin(v.origin, code))
+_jax_map_origin(origin, code) = origin
+_jax_map_origin(o::_JaxOrigin, code) =
+    _JaxOrigin(o.key, o.position, code(o.offset), o.path, code(o.scale))
+_jax_map_origin(o::_JaxBetween, code) =
+    _JaxBetween(_jax_map_value(o.lo, code), _jax_map_value(o.hi, code))
 
 # A module-level function cannot close over a caller's branch/plate mask.
 # Pass that mask explicitly, then translate the body in its own guard scope.
-function _jax_function_guard!(ctx, scope, params, passed)
+function _jax_active_condition(ctx)
     isempty(_JAX_GUARDS) && return nothing
     guards = String[]
     for (parent, guard) in _JAX_GUARDS
@@ -4623,9 +4696,14 @@ function _jax_function_guard!(ctx, scope, params, passed)
             _jax_error("a function's active condition is outside its caller's scope", _jax_where(ctx))
         push!(guards, guard)
     end
+    foldl((a, b) -> "jnp.logical_and(" * a * ", " * b * ")", guards)
+end
+function _jax_function_guard!(ctx, scope, params, passed)
+    guard = _jax_active_condition(ctx)
+    guard === nothing && return nothing
     name = _jax_identifier(scope.used, :active)
     push!(params, name)
-    push!(passed, foldl((a, b) -> "jnp.logical_and(" * a * ", " * b * ")", guards))
+    push!(passed, guard)
     name
 end
 function _jax_with_function_guard(f, scope, guard)
@@ -4639,25 +4717,26 @@ function _jax_with_function_guard(f, scope, guard)
     end
 end
 
-_jax_function_input!(mod, scope, params, passed, hint, v::_PyVal) =
-    _jax_function_input!(mod, scope, params, passed, hint, v, v.T)
-function _jax_function_input!(mod, scope, params, passed, hint, v::_PyVal, T)
+_jax_function_input!(ctx, scope, params, passed, hint, v::_PyVal) =
+    _jax_function_input!(ctx, scope, params, passed, hint, v, v.T)
+function _jax_function_input!(ctx, scope, params, passed, hint, v::_PyVal, T)
     if T isa Type && T <: Function && Base.issingletontype(T)
         return _PyVal(v.code, _JaxCallable(T.instance), true)
     end
     type = _jax_type_of_value(v)
     type === nothing || return _PyVal(v.code, _JaxCallable(type), true)
+    union!(scope.used, ctx.mod.used)
     name = _jax_identifier(scope.used, hint)
     push!(params, name); push!(passed, v.code)
     extent = isempty(v.extent) ? "" : _jax_identifier(scope.used, Symbol(hint, :_lengths))
     limit = isempty(v.limit) ? "" : _jax_identifier(scope.used, Symbol(hint, :_bound))
     if !isempty(extent)
         push!(params, extent); push!(passed, v.extent)
-        flat = get(mod.helper_names, (:flat, v.extent), nothing)
+        flat = get(ctx.scope.flat_positions, v.extent, nothing)
         if flat !== nothing
             flat_name = _jax_identifier(scope.used, Symbol(hint, :_flat))
             push!(params, flat_name); push!(passed, flat)
-            mod.helper_names[(:flat, extent)] = flat_name
+            scope.flat_positions[extent] = flat_name
         end
     end
     if !isempty(limit)
@@ -4665,14 +4744,14 @@ function _jax_function_input!(mod, scope, params, passed, hint, v::_PyVal, T)
     end
     _PyVal(name, T, v.static, extent, limit, v.padded, v.origin)
 end
-function _jax_function_input!(mod, scope, params, passed, hint, v::_PyVal, T::_JaxCallable)
+function _jax_function_input!(ctx, scope, params, passed, hint, v::_PyVal, T::_JaxCallable)
     T.f isa _JaxClosure || return v
-    captures = [_jax_function_input!(mod, scope, params, passed, Symbol(hint, :_, i), a)
+    captures = [_jax_function_input!(ctx, scope, params, passed, Symbol(hint, :_, i), a)
                 for (i, a) in enumerate(T.f.captures)]
     _PyVal(v.code, _JaxCallable(_JaxClosure(T.f.F, captures)), v.static)
 end
-function _jax_function_input!(mod, scope, params, passed, hint, v::_PyVal, T::_JaxAggregate)
-    fields = [_jax_function_input!(mod, scope, params, passed, Symbol(hint, :_, i), a)
+function _jax_function_input!(ctx, scope, params, passed, hint, v::_PyVal, T::_JaxAggregate)
+    fields = [_jax_function_input!(ctx, scope, params, passed, Symbol(hint, :_, i), a)
               for (i, a) in enumerate(T.fields)]
     _PyVal(v.code, _JaxAggregate(T.T, fields), v.static)
 end
@@ -5430,7 +5509,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     masks = [_jax_padded_mask(v) for v in inputs[padded]]
     masked = any(padded) && all(m -> m !== nothing, masks)
     effects_before = _JAX_EFFECTS[]
-    cell, wants, with_length, cell_params = _jax_plan_function!(ctx, :cell, body, cell_types;
+    cell, wants, with_length, cell_params = _jax_plan_function!(ctx, _jax_body_hint(ctx, recipe, :cell), body, cell_types;
                                                                 extents = cell_extents,
                                                                 statics = cell_statics,
                                                                 links = cell_links,
@@ -5605,7 +5684,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     shared = [i for i in 2:length(inputs) if i in A]
     types = Any[inputs[1].T; [eltype(inputs[i].T) for i in iterated]; [inputs[i].T for i in shared]]
     # The step is called with (carry, xs); unpack xs and bind shared operands.
-    step = _jax_fresh(ctx, :step)
+    step = _jax_fresh(ctx, _jax_body_hint(ctx, recipe, :step))
     carry = _jax_fresh(ctx, :carry)
     xs = _jax_fresh(ctx, :xs)
     outer = ctx.scope
@@ -5728,7 +5807,7 @@ function _jax_history_scan(ctx::_JaxContext, recipe::Recipe,
     dtype = _jax_dtype(E)
     steps = _py_atom(args[iterated[1]].code) * ".shape[0]"
     offset = HT <: Number ? "0" : _py_atom(history.code) * ".shape[0]"
-    step = _jax_fresh(ctx, :step)
+    step = _jax_fresh(ctx, _jax_body_hint(ctx, recipe, :step))
     state = _jax_fresh(ctx, :state)
     xs = _jax_fresh(ctx, :xs)
     outer = ctx.scope
@@ -6393,7 +6472,10 @@ end
 # separate: choosing a cheaper cut for one entry must not change another.
 function _jax_compatible_plans(a::Plan, b::Plan)
     a.graph === b.graph && a.have == b.have || return false
-    all(!haskey(b.producer, id) || b.producer[id].id == r.id
+    # Host preparation can replace a recipe's operator and inputs while
+    # retaining its graph id. Only the same executable recipe can be shared.
+    all(!haskey(b.producer, id) || (b.producer[id].id == r.id &&
+        b.producer[id].inputs == r.inputs && b.producer[id].op === r.op)
         for (id, r) in a.producer)
 end
 
@@ -6421,12 +6503,13 @@ function _jax_functions!(mod, bodies, functions, plans, types;
         first_plan = first(group).second[1]
         g = first_plan.graph
         producer = merge((p.producer for (_, (p, _)) in group)...)
-        selected = unique([r.id for (_, (p, _)) in group for r in p.recipes])
+        selected = unique(Int[r.id for (_, (p, _)) in group for r in p.recipes])
+        recipes = Dict(r.id => r for (_, (p, _)) in group for r in p.recipes)
         order = _topo(g, selected, Set(canon_id(g, v.id) for v in first_plan.have))
         order === nothing && error("compatible JAX plans have no joint execution order")
-        all_wants = unique(v -> canon_id(g, v.id), [v for (_, (q, _)) in group for v in q.want])
-        checks = unique([c for (_, (q, _)) in group for c in q.checks])
-        p = Plan(g, first_plan.have, all_wants, [g.recipes[r] for r in order],
+        all_wants = unique(v -> canon_id(g, v.id), Value[v for (_, (q, _)) in group for v in q.want])
+        checks = unique(InputCheck[c for (_, (q, _)) in group for c in q.checks])
+        p = Plan(g, first_plan.have, all_wants, Recipe[recipes[r] for r in order],
                  producer, 0.0, Recipe[], checks)
         labels = [fname for (fname, _) in group]
         selections = Dict(fname => Set(r.id for r in q.recipes) for (fname, (q, _)) in group)
@@ -6509,7 +6592,8 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
                         host::Bool = false, names = nothing, doc = nothing,
                         keyword_from::Union{Nothing,Int} = nothing,
                         emit = nothing, selector::Union{Nothing,String} = nothing,
-                        name_override::Union{Nothing,AbstractString} = nothing)
+                        name_override::Union{Nothing,AbstractString} = nothing,
+                        active::Bool = false, traced_branches::Int = 0)
     argtypes = _jax_have_types(p, types)
     name = name_override === nothing ?
         (reserve ? _jax_identifier(mod.used, fname) : String(fname)) : name_override
@@ -6517,6 +6601,7 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
     selector === nothing || push!(scope.used, selector)
     ctx = _JaxContext(mod, scope, nothing, Main, Dict{Symbol,_PyVal}(), nothing)
     host && (ctx.host = _HostState())
+    ctx.traced_branches = traced_branches
     params = String[]
     inputs = Pair{String,Any}[]
     # Each input's Python local, beside its key in `inputs`. A prepared input
@@ -6552,7 +6637,7 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
                 flat = keyed ? _jax_param_name(scope.used, flat_key; stable = false) :
                     (push!(scope.used, flat_key); flat_key)
                 push!(params, flat); push!(inputs, flat_key => Vector{Int}); push!(input_locals, flat)
-                mod.helper_names[(:flat, extent)] = flat
+                scope.flat_positions[extent] = flat
             end
         end
         # A prepared integer is a `StaticInt` (`prepare_data`), an `int` under
@@ -6572,18 +6657,22 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
         if _jax_is_array(T) && (eltype(T) <: Number || _jax_ragged(T))
             _jax_emit!(ctx, param * " = jnp.asarray(" * param * _jax_input_dtype(T) * ")")
             isempty(extent) || _jax_emit!(ctx, extent * " = jnp.asarray(" * extent * ")")
-            haskey(mod.helper_names, (:flat, extent)) && names !== nothing &&
+            haskey(scope.flat_positions, extent) && names !== nothing &&
                 _jax_emit!(ctx, flat * " = jnp.asarray(" * flat * ")")
         elseif T isa Type && T <: AbstractFloat && !isempty(_jax_input_dtype(T))
             _jax_emit!(ctx, param * " = jnp.asarray(" * param * _jax_input_dtype(T) * ")")
         end
     end
-    returned, wants = if emit === nothing
-        _jax_plan!(ctx, p)
-        values = [_jax_returned(ctx, _jax_lookup(ctx, p.graph, v)) for v in p.want]
-        _jax_result_code(w, values), values
-    else
-        emit(ctx)
+    guard = active ? _jax_identifier(scope.used, :active) : nothing
+    active && push!(params, guard)
+    returned, wants = _jax_with_function_guard(scope, guard) do
+        if emit === nothing
+            _jax_plan!(ctx, p)
+            values = [_jax_returned(ctx, _jax_lookup(ctx, p.graph, v)) for v in p.want]
+            _jax_result_code(w, values), values
+        else
+            emit(ctx)
+        end
     end
     # A module function is annotated and documented; a helper is not. With
     # `keyword_from`, the inputs after the first `keyword_from` are the

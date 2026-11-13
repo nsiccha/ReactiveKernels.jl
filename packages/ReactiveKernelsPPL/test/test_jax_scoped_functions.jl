@@ -82,9 +82,20 @@ end
         a ~ jax_scope_unsafe(n, loc)
         y .~ Normal.(a, 1.0)
     end
-    raw = (; n = 0, loc = 0.3, y = [0.1])
+    raw = (; n = 3, loc = 0.3, y = [0.1])
     bound = model(; raw.n, raw.loc) | (; raw.y)
-    jax_scope_check(bound, raw; entries = ((:log_prior, :prior),))
+    src, _ = jax_scope_check(bound, raw; entries = ((:log_prior, :prior),))
+    # Bind a valid native model, then reuse its emitted prior entry with an
+    # empty latent block. The unused return's z[1] must not execute. Native
+    # binding itself rejects that empty model, so it is not our n=0 oracle.
+    if rk_jax_available()
+        empty_data = Dict("n" => 0, "loc" => raw.loc, "y" => raw.y)
+        names = first.(only(f for f in src.functions if f.name == "prepare_data").inputs)
+        args = Tuple(empty_data[name] for name in names)
+        result = rk_jax_evaluate(src, :log_prior, (Float64[], args...); grad = true, prepare = :arguments)
+        @test result.value ≈ 0.0
+        @test isempty(result.grad)
+    end
 end
 
 @testset "submodel calls in ragged plates" begin

@@ -82,8 +82,8 @@ end
 
 # Contract each lexical region to a scheduling unit. Contraction may expose a
 # cycle when a caller consumes an early local and feeds a later local back
-# through an argument. Keep the ordinary recipe order in that case; the graph
-# remains executable rather than acquiring a new authoring restriction.
+# through an argument. Split only that region into executable portions; each
+# portion remains a named function and the original dependency order survives.
 function _jax_region_schedule(p, regions)
     ordinary() = [(region = nothing, members = Set([r.id]), have = collect(Value, r.inputs),
                    want = collect(Value, r.outputs)) for r in p.recipes]
@@ -110,7 +110,28 @@ function _jax_region_schedule(p, regions)
     while !isempty(units)
         index = findfirst(u -> all(canon_id(p.graph, v.id) in available for v in u.have), units)
         if index === nothing
-            return ordinary()
+            # The underlying recipe graph is acyclic even when its region
+            # contraction is not. Expose a ready prefix of one blocked unit.
+            for (i, unit) in enumerate(units)
+                ready = copy(available)
+                prefix = Set{Int}()
+                for r in p.recipes
+                    r.id in unit.members || continue
+                    all(canon_id(p.graph, v.id) in ready for v in r.inputs) || continue
+                    push!(prefix, r.id)
+                    union!(ready, (canon_id(p.graph, v.id) for v in r.outputs))
+                end
+                isempty(prefix) && continue
+                prefix == unit.members && error("a JAX region boundary has unavailable captures")
+                have, want = _jax_region_boundary(p, prefix)
+                tail = setdiff(unit.members, prefix)
+                rest_have, rest_want = _jax_region_boundary(p, tail)
+                units[i] = (region = unit.region, members = prefix, have = have, want = want)
+                push!(units, (region = unit.region, members = tail, have = rest_have, want = rest_want))
+                index = i
+                break
+            end
+            index === nothing && error("selected JAX recipes have no executable region prefix")
         end
         unit = splice!(units, index)
         push!(ordered, unit)
@@ -126,13 +147,14 @@ _jax_entry_condition(selector, needed, ::Val{true}) =
 
 function _jax_demanded_recipes!(ctx, p, demand, labels, selector, available;
                                  outputs = Val(false), regions = ctx.mod.regions)
+    recipes = Dict(r.id => r for r in p.recipes)
     for unit in _jax_region_schedule(p, regions)
         needed = [label for label in labels if any(label in demand[id] for id in unit.members)]
         guarded = needed != labels || outputs === Val(true)
         guarded && _jax_emit!(ctx, "if " * _jax_entry_condition(selector, needed, outputs) * ":")
         guarded && (ctx.scope.indent += 1)
         if unit.region === nothing
-            r = p.graph.recipes[only(unit.members)]
+            r = recipes[only(unit.members)]
             saved = ctx.scope.values
             ctx.scope.values = Dict(id => value for (id, value) in saved
                 if all(in(available[id]), needed))
@@ -180,7 +202,7 @@ function _jax_region_call!(ctx, p, unit, demand, labels, selector, available, mo
     argument_slots = UnitRange{Int}[]
     for (v, a) in zip(have, inputs)
         start = length(passed) + 1
-        value = _jax_function_input!(ctx.mod, scope, params, passed, hint(v), a)
+        value = _jax_function_input!(ctx, scope, params, passed, hint(v), a)
         scope.values[canon_id(g, v.id)] = value
         push!(argument_slots, start:length(passed))
     end
@@ -233,15 +255,14 @@ function _jax_region_call!(ctx, p, unit, demand, labels, selector, available, mo
                                 outputs = Val(true), regions = nested)
     end
     results = _PyVal[]
+    flat_results = Union{Nothing,String}[]
     for (v, key) in zip(want, keys)
         _jax_emit!(inner, "if " * repr(key) * " in outputs:")
         scope.indent += 1
         result = _jax_returned(inner, _jax_lookup(inner, g, v))
-        push!(results, result)
-        pieces = [result.code]
-        isempty(result.extent) || push!(pieces, result.extent)
-        isempty(result.limit) || push!(pieces, result.limit)
-        returned = length(pieces) == 1 ? only(pieces) : "(" * join(pieces, ", ") * ")"
+        returned, template, flat = _jax_function_result(inner, result)
+        push!(results, template)
+        push!(flat_results, flat)
         _jax_emit!(inner, "results[" * repr(key) * "] = " * returned)
         scope.indent -= 1
     end
@@ -259,9 +280,13 @@ function _jax_region_call!(ctx, p, unit, demand, labels, selector, available, mo
     if name === nothing
         has_value = any(v -> get(names, v.name, v.name) === :value, want)
         hint = has_value ? region.name : Symbol(region.name, :_density)
-        name = _jax_identifier(ctx.mod.used, hint)
+        name = _jax_named_function(ctx, hint)
         ctx.mod.helper_names[cache_key] = name
-        push!(ctx.mod.helpers, join([String["def " * name * "(" * join(signature, ", ") * ") -> dict:",
+        declaration = "def " * name * "(" * join(signature, ", ") * ") -> dict:"
+        if length(declaration) > 100
+            declaration = "def " * name * "(\n    " * join(signature, ",\n    ") * ",\n) -> dict:"
+        end
+        push!(ctx.mod.helpers, join([String[declaration,
             _jax_docstring(region.doc, "    ")]; scope.lines], "\n"))
     end
     output_demand = Dict(key => demand[p.producer[canon_id(g, v.id)].id]
@@ -276,18 +301,29 @@ function _jax_region_call!(ctx, p, unit, demand, labels, selector, available, mo
             end
         end
     end
-    selected = "tuple(name for name, needed in " * _jax_py_literal(Tuple(
-        (key, Tuple(String.(output_demand[key]))) for key in keys)) *
-        " if " * (mode === Val(true) ? "any(n in " * selector * " for n in needed)" : selector * " in needed") * ")"
-    call = name * "(" * join([passed[used_params]; bounds; "outputs=" * selected], ", ") * ")"
-    result = _jax_bind!(ctx, first(region.outputs), _PyVal(call, Any))
-    for (v, key, value) in zip(want, keys, results)
+    result = _PyVal(_jax_fresh(ctx, first(region.outputs)), Any)
+    _jax_emit!(ctx, result.code * " = " * name * "(")
+    for (parameter, argument) in zip([params[used_params]; bounds], [passed[used_params]; bounds])
+        _jax_emit!(ctx, "    " * parameter * "=" * argument * ",")
+    end
+    _jax_emit!(ctx, "    outputs=tuple(")
+    _jax_emit!(ctx, "        name for name, needed in (")
+    for key in keys
+        _jax_emit!(ctx, "            " * _jax_py_literal((key, Tuple(String.(output_demand[key])))) * ",")
+    end
+    _jax_emit!(ctx, "        )")
+    condition = mode === Val(true) ? "any(n in " * selector * " for n in needed)" : selector * " in needed"
+    _jax_emit!(ctx, "        if " * condition)
+    _jax_emit!(ctx, "    ),")
+    _jax_emit!(ctx, ")")
+    for (v, key, value, flat) in zip(want, keys, results, flat_results)
         id = canon_id(g, v.id)
         code = result.code * "[" * repr(key) * "]"
-        extent = isempty(value.extent) ? "" : code * "[1]"
-        limit = isempty(value.limit) ? "" : code * (isempty(extent) ? "[1]" : "[2]")
-        isempty(extent) && isempty(limit) || (code *= "[0]")
-        ctx.scope.values[id] = _PyVal(code, value.T, value.static, extent, limit, value.padded, value.origin)
+        ctx.scope.values[id] = if isempty(value.extent) && isempty(value.limit) && value.origin === nothing
+            _PyVal(code, value.T, value.static, "", "", value.padded)
+        else
+            _jax_function_return!(ctx, value, flat, code)
+        end
         available[id] = output_demand[key]
     end
 end

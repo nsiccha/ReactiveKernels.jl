@@ -107,7 +107,8 @@ arguments and array lengths remain runtime inputs.
 
 A plate may use separate functions for a scalar return value and a batched
 density. Combined computations, such as grouped scalar priors, retain their
-shared graph boundary.
+shared graph boundary. Interleaved dependencies split a submodel into named
+portions that execute in the original dependency order.
 
 ```@example jax_submodels
 using ReactiveKernels, ReactiveKernelsPPL
@@ -139,7 +140,10 @@ print(jax_source(built, bound))
 A helper with recorded source becomes a named Python function, reused by
 calls with the same argument representation. Its Julia docstring accompanies
 the emitted body. Arrays, captured numerical values and padded lengths are
-explicit arguments.
+normally explicit arguments. A helper that carries loop bounds or reads scan
+history stays nested in that scope, preserving the bounds and history access
+analysis. Nested plate cells and scan steps are named after the authored
+values they compute.
 
 A helper translates from recorded source when available: `@traceable` records it, and a trailing Vararg argument (`args...`, `args::Vararg{T,N}`) reads as the tuple of the trailing arguments, as the method receives them, and `sum(f, t; init)` folds such a tuple over its fixed length; `for` becomes `jax.lax.fori_loop`, `if` becomes `jax.lax.cond`, and `A[i] = v` becomes `A.at[i].set(v)`. Plain lowered helpers support straight-line code and terminal forward branches, including size guards. They can create immutable closures and fold fixed argument lists with `Base.afoldl`. Broadcasting `Ref(x)` passes `x` whole to each call. Captures remain runtime inputs; host `prepare_data` uses the same translation.
 
