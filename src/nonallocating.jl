@@ -438,17 +438,37 @@ function _decompose_call_resolved(ctx::_FusedDecomposition, callee, f, fref,
     if callee isa Symbol
         haskey(ctx.argmap, callee) && return nothing
     end
-    # Keyword calls: only the reduction family with a preparation-constant
-    # `dims` keyword leaves the whole-recipe fallback, via `_RowReduceStep`.
-    # Every other keyword shape (including port-valued `dims`) is outside the
-    # step grammar and keeps the fused closure, which applies the keywords
-    # with its original semantics.
+    # Scalar sum with runtime `init` keeps the exact keyword call, while its
+    # array operands can use the ordinary reusable steps. Dimensional
+    # reductions use `_RowReduceStep` below. Other keyword shapes retain the
+    # whole-recipe fallback.
     kwargs = nothing
     positional = rawargs
     if !isempty(rawargs) && rawargs[1] isa Expr &&
        rawargs[1].head === :parameters
         kwargs = rawargs[1].args
         positional = rawargs[2:end]
+        if f === Base.sum && length(kwargs) == 1 &&
+           Meta.isexpr(only(kwargs), :kw, 2) && only(kwargs).args[1] === :init
+            args = Any[]
+            types = Any[]
+            # Julia evaluates positional operands before keywords. Bind each
+            # operand here so a step inside `init` cannot run ahead of it.
+            for raw in positional
+                d = _decompose(ctx, raw, false)
+                d === nothing && return nothing
+                expr, T = _traced_value!(ctx, d)
+                push!(args, expr)
+                push!(types, T)
+            end
+            init = _decompose(ctx, only(kwargs).args[2], false)
+            init === nothing && return nothing
+            kwtype = NamedTuple{(:init,),Tuple{init[2]}}
+            T = _static_type(Core.kwcall, kwtype, typeof(f), types...)
+            isconcretetype(T) && isbitstype(T) || return nothing
+            return (Expr(:call, fref,
+                Expr(:parameters, Expr(:kw, :init, init[1])), args...), T)
+        end
         for kw in kwargs
             kw isa Expr && kw.head === :kw && length(kw.args) == 2 &&
                 kw.args[1] === :dims || return nothing
