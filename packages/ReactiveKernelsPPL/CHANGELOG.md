@@ -16,6 +16,18 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.182
+
+- A location whose per-row summands are all computed by the model, such as
+  `m = level .+ state` over a top-level `@scan` carried array, takes its rows
+  from those summands instead of from its response. On a design that leaves
+  the response absent, `prepare_query(built, design, (:m,))` therefore
+  evaluates the location by its authored name, as other definitions do,
+  instead of refusing that it reads the absent response. The absent response
+  takes the scan's length from its supplied bound, so `:observations`,
+  `prepare_predictive` and `predictive_laws` give one entry per step. Values,
+  densities and gradients of bindings that supply the response are unchanged.
+
 ## 0.1.181
 
 - **Breaking:** `jax_source(built, plan; doc)` no longer replaces the module

@@ -254,11 +254,13 @@ end
 # plate broadcasts it as a shared argument, with no row vector.
 function _broadcast_affine(plan::StructuralPlan, pred::PredictorSpec)
     # Beside structured axes (a design matrix, a `@scan`, a latent `@plate`)
-    # too, except where a packed `mi` response gathers every plate input by
-    # job index and so needs the rows.
-    _scalar_valued_predictor(plan, pred) &&
-        !any(r -> r.mi_jobs !== nothing, plan.responses) && return true
-    _uses_structured_observation_axes(plan) && return false
+    # too, and so is a predictor whose rows only its computed summands carry,
+    # except where a packed `mi` response gathers every plate input by job
+    # index and so needs the rows.
+    packed = any(r -> r.mi_jobs !== nothing, plan.responses)
+    _scalar_valued_predictor(plan, pred) && !packed && return true
+    _uses_structured_observation_axes(plan) &&
+        return !packed && _computed_rows_predictor(plan, pred)
     _scalar_valued_predictor(plan, pred) && return true
     _factor_gather_affine(plan, pred) && return true
     # An intercept added to a vector expression remains a scalar broadcast.
@@ -284,6 +286,33 @@ function _broadcast_affine(plan::StructuralPlan, pred::PredictorSpec)
     # array response or several independent observation domains.
     return any(a -> length(a) != 1 || length(only(a)) != plan.n_obs,
         values(observations.domains))
+end
+
+# Every summand is an intercept, a proven scalar or a value the graph
+# computes (a `@scan` carried array, a definition reading sampled values, a
+# call over one), and at least one is computed: no bound column gives the
+# predictor its rows, so its computed summands carry them, as broadcasting
+# retains. A ones-column design would take its rows from a response instead,
+# and a binding may leave that response absent, so a query of the location by
+# its authored name would read it (snag rkppl-response-a-0d9dd693).
+function _computed_rows_predictor(plan::StructuralPlan, pred::PredictorSpec)
+    computed = false
+    for t in pred.terms
+        t.kind === InterceptTerm && continue
+        if t.kind === ScanSummandTerm
+            computed = true
+            continue
+        end
+        t.kind in (ContinuousTerm, OffsetTerm) || return false
+        for c in t.columns
+            if haskey(plan.columns, c)
+                _proven_scalar(plan, c) || return false
+            else
+                computed = true
+            end
+        end
+    end
+    return computed
 end
 
 # Every summand is a proven scalar (`_value_axes` is `Any[]`): an intercept
