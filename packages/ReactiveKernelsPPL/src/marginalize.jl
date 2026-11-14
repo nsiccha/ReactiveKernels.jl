@@ -40,7 +40,9 @@ A marginalized array `x` qualifies when
   enter the write;
 - one statement reads it, a Normal observation of a whole observed data
   vector whose location is affine in it and whose scale does not read it:
-  `y .~ Normal.(offset .+ loading .* x, noise)`.
+  `y .~ Normal.(offset .+ loading .* x, noise)`. A `missing` entry of `y` is
+  a step that only predicts: the filter carries the state through it
+  without an update, and the likelihood has no term for it.
 
 Any other form is refused with a `SurfaceLoweringError` naming the
 statement. Each scalar coefficient may vary by step (irregular gaps
@@ -59,7 +61,8 @@ one value per entry of `y[g]` (data holding one vector per index read as
 The marginalized program's density is the exact marginal density of the
 observations given the remaining parameters, so `coordinate_names` and the
 layout no longer contain `x` or its innovations. `:pointwise.y` holds the
-one-step-ahead predictive densities, whose sum is the marginal likelihood.
+one-step-ahead predictive densities (0 at a missing entry), whose sum is the
+marginal likelihood.
 Exact draws of `x` given the parameters come from
 [`prepare_marginalized_latents`](@ref) and
 [`marginalized_latent_draws`](@ref).
@@ -586,14 +589,25 @@ function _marginalize_latent(ast::Expr, x::Symbol, values, observing)
     t = law.loopvar
     defs = Any[]
     seed, step = _marginal_pieces!(defs, x, y, form, scale, leaf, t)
-    filter = _filter_scan(x, y, law, seed, step)
+    filter = if Missing <: eltype(values[y])
+        # Missing entries: the filter reads the presence of each entry and
+        # the values with absent entries filled; an absent entry only
+        # predicts (its gain is zero). The response keeps its presence mask,
+        # so its likelihood skips the absent entries.
+        present, filled = _marginal_name(x, :present), _marginal_name(x, :observed)
+        push!(defs, :($present = $(GlobalRef(@__MODULE__, :_rkppl_presence))($y)),
+            :($filled = $(GlobalRef(@__MODULE__, :_rkppl_fill_missing))($y, 0.0)))
+        _filter_scan(x, filled, law, seed, step; present, response = y)
+    else
+        (_filter_scan(x, y, law, seed, step),)
+    end
     transition = _transition_scan(x, law)
     out = Any[]
     for (i, st) in enumerate(stmts)
         i == k && continue
         if i == j
             append!(out, defs)
-            push!(out, filter, transition)
+            push!(out, filter..., transition)
             continue
         end
         push!(out, st)
@@ -686,7 +700,12 @@ function _marginalize_cell_latent(ast::Expr, p, x::Symbol, values, observing)
         y -> Meta.isexpr(y, :ref, 2) && y.args[1] isa Symbol && y.args[2] === ivar,
         "y[$ivar]")
     yname = y.args[1]
-    (yname in observing && _entry_shape(get(values, yname, nothing)) === :vector) ||
+    yvalue = get(values, yname, nothing)
+    yvalue isa AbstractVector && any(e -> e isa AbstractVector && Missing <: eltype(e), yvalue) &&
+        _marginal_fail(x, "its observation `$y` admits `missing` entries; a missing " *
+            "entry in a `@plate` cell's series is not marginalized yet (at top level it " *
+            "is a step that only predicts)")
+    (yname in observing && _entry_shape(yvalue) === :vector) ||
         _marginal_fail(x, "its observation `$y` is not observed data holding one " *
             "vector per index; marginalize a recurrence observed through bound data " *
             "(`| (; $yname)`, one vector per `$ivar`)")
@@ -881,35 +900,55 @@ _scan_macro(block) = Expr(:macrocall, Symbol("@scan"), LineNumberNode(0), block)
 # `SS`: the one-step-ahead predictive law, the gain, and the filtered mean and
 # variance, which read the gain through `gain` (its expression in a seed, its
 # local in a step).
-function _kalman_update(yt, pm, pv, (O, L, LL, SS), gain)
+function _kalman_update(yt, pm, pv, (O, L, LL, SS), gain; present = nothing)
     fv = something(_madd(_mmul(LL, pv, false), SS, false), 0.0)
     loc = something(_madd(O, _mmul(L, pm, false), false), 0.0)
     predictive = Expr(:call, :~, yt, Expr(:call, :Normal, loc, Expr(:call, :sqrt, fv)))
     gain_ex = Expr(:call, :/, something(_mmul(L, pv, false), 0.0), fv)
+    # An absent entry (`present` false) updates nothing: the filtered state
+    # is the prediction.
+    present === nothing || (gain_ex = Expr(:call, :*, present, gain_ex))
     gain === nothing && (gain = gain_ex)
     filtered_mean = _madd(pm, _mmul(gain, Expr(:call, :-, yt, loc), false), false)
     filtered_var = Expr(:call, :-, pv, something(_mmul(gain,
         _mmul(L, pv, false), false), 0.0))
-    return predictive, gain_ex, filtered_mean, filtered_var
+    return predictive, gain_ex, filtered_mean, filtered_var, loc, fv
 end
 
+#
+# Observed through bound data without missing entries, the scan observes
+# each entry, `y[t] ~ Normal(…)` (an observed carried array). Otherwise
+# (`response`, read by the filter as the values `y`), the scan carries each
+# entry's one-step-ahead predictive mean and variance, and an ordinary
+# observation `response .~ Normal.(mean, sqrt.(var))` follows it; `present`
+# names a vector whose false entries only predict. Returns the statements.
 function _filter_scan(x, y, law::_GaussianTransition, seed_pieces, step_pieces;
-        M = _marginal_name(x, :mean), V = _marginal_name(x, :var))
+        M = _marginal_name(x, :mean), V = _marginal_name(x, :var), present = nothing,
+        response = nothing)
     t = law.loopvar
-    obs1, _, mean1, var1 = _kalman_update(:($y[1]), law.m0, law.P0, seed_pieces, nothing)
+    entry(i) = present === nothing ? nothing : Expr(:ref, present, i)
+    # Not `…_mean`: `_marginalized_names` finds latents by their filtered mean.
+    PM, PV = _marginal_name(x, :predictive_location), _marginal_name(x, :predictive_variance)
+    observe(obs, i, loc, fv) = response === nothing ? (obs,) :
+        (Expr(:(=), Expr(:ref, PM, i), loc), Expr(:(=), Expr(:ref, PV, i), fv))
+    obs1, _, mean1, var1, loc1, fv1 = _kalman_update(:($y[1]), law.m0, law.P0,
+        seed_pieces, nothing; present = entry(1))
     pm, pv, g = _marginal_name(x, :predicted_mean),
         _marginal_name(x, :predicted_var), _marginal_name(x, :gain)
     prev(a) = Expr(:ref, a, Expr(:call, :-, t, 1))
     pm_ex = something(_madd(_mmul(law.coef, prev(M), false), law.shift, false), 0.0)
     pv_ex = something(_madd(_mmul(_mmul(law.coef, law.coef, false), prev(V), false),
         law.innovation_var, false), 0.0)
-    obst, gain, meant, vart = _kalman_update(:($y[$t]), pm, pv, step_pieces, g)
+    obst, gain, meant, vart, loct, fvt = _kalman_update(:($y[$t]), pm, pv, step_pieces, g;
+        present = entry(t))
     body = Expr(:block, law.locals...,
-        Expr(:(=), pm, pm_ex), Expr(:(=), pv, pv_ex), obst, Expr(:(=), g, gain),
-        Expr(:(=), :($M[$t]), meant), Expr(:(=), :($V[$t]), vart))
+        Expr(:(=), pm, pm_ex), Expr(:(=), pv, pv_ex), observe(obst, t, loct, fvt)...,
+        Expr(:(=), g, gain), Expr(:(=), :($M[$t]), meant), Expr(:(=), :($V[$t]), vart))
     loop = Expr(:for, Expr(:(=), t, Expr(:call, :(:), 2, law.hi)), body)
-    return _scan_macro(Expr(:block, obs1,
+    scan = _scan_macro(Expr(:block, observe(obs1, 1, loc1, fv1)...,
         Expr(:(=), :($M[1]), mean1), Expr(:(=), :($V[1]), var1), loop))
+    response === nothing && return scan
+    return (scan, :($response .~ Normal.($PM, sqrt.($PV))))
 end
 
 function _transition_scan(x, law::_GaussianTransition)

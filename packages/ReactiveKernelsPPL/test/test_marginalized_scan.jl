@@ -50,15 +50,15 @@ function sequential_logpdfs(mu, S, y)
     end
 end
 
-# x | y from the joint Gaussian of (x, y).
-function latent_posterior(lat, offset, loading, noise, y)
+# x | y[present] from the joint Gaussian of (x, y).
+function latent_posterior(lat, offset, loading, noise, y; present = eachindex(y))
     mx, Sx = lat
     n = length(mx)
-    L = Diagonal(loading .* ones(n))
-    my = offset .+ L * mx
-    Sy = L * Sx * L + Diagonal((noise .* ones(n)) .^ 2)
-    K = Sx * L / Sy
-    return mx + K * (y - my), Symmetric(Sx - K * L * Sx)
+    L = Matrix(Diagonal(loading .* ones(n)))[present, :]
+    my = (offset .+ loading .* mx)[present]
+    Sy = L * Sx * L' + Diagonal(((noise .* ones(n)) .^ 2)[present])
+    K = Sx * L' / Sy
+    return mx + K * (y[present] - my), Symmetric(Sx - K * L * Sx)
 end
 
 # The reporter's spelling: per-group OU deviations in one series, reset where a
@@ -119,7 +119,8 @@ end
 
 ou_plan(d) = marginalize(OU(; d.inputs...), :ou) | (; y = d.y)
 
-function ou_oracle(built, d)
+# `present`: the observed entries of `d.y` (the others are missing).
+function ou_oracle(built, d; present = eachindex(d.y))
     (; N, R, area, continues, gap) = d.inputs
     function (u)
         c = constrain(built.layout, u)
@@ -129,8 +130,10 @@ function ou_oracle(built, d)
         a = continues .* exp.(-gap ./ c.ou_range)
         lat = latent_moments(0.0, 1.0, a, zeros(R), 1 .- a .^ 2)
         mu, S = observation_moments(lat, c.level[area], c.ou_sd, c.noise)
-        pointwise = sequential_logpdfs(mu, S, d.y)
-        likelihood = logpdf(MvNormal(mu, S), d.y)
+        P = present
+        pointwise = zeros(R)
+        pointwise[P] = sequential_logpdfs(mu[P], S[P, P], d.y[P])
+        likelihood = logpdf(MvNormal(mu[P], Symmetric(S[P, P])), d.y[P])
         jac = logjac(built.layout, u)
         (; total = prior + likelihood + jac, likelihood, pointwise)
     end
@@ -260,6 +263,39 @@ end
     # A seeded generator reproduces the draws.
     @test marginalized_latent_draws(q, u, Random.Xoshiro(3)) ==
         marginalized_latent_draws(q, u, Random.Xoshiro(3))
+end
+
+# A missing entry of the observed vector is a step that only predicts: the
+# filter reads the response's presence, and the likelihood skips the entry.
+@testset "missing entries are steps that only predict" begin
+    d = ou_data(2, 6; seed = 5)
+    absent = [1, 4, 5, 9]
+    y = Vector{Union{Missing,Float64}}(d.y)
+    y[absent] .= missing
+    present = setdiff(eachindex(y), absent)
+    plan = marginalize(OU(; d.inputs...), :ou) | (; y)
+    built = build_kernel(plan)
+    @test coordinate_names(built.layout) == coordinate_names(build_kernel(ou_plan(d)).layout)
+    check_density(built, plan, ou_oracle(built, d; present))
+    # One program serves every absence pattern, none included, and every length.
+    shape(y, d = d) = structure(build_kernel(marginalize(OU(; d.inputs...), :ou) | (; y)).spec)
+    @test shape(y) == shape(Vector{Union{Missing,Float64}}(d.y))
+    grown = ou_data(5, 12; seed = 6)
+    ygrown = Vector{Union{Missing,Float64}}(grown.y)
+    ygrown[2:7:end] .= missing
+    @test shape(y) == shape(ygrown, grown)
+    q = prepare_marginalized_latents(built, plan)
+    u = 0.3 .* cos.(1:built.layout.total)
+    c = constrain(built.layout, u)
+    (; R, area, continues, gap) = d.inputs
+    a = continues .* exp.(-gap ./ c.ou_range)
+    lat = latent_moments(0.0, 1.0, a, zeros(R), 1 .- a .^ 2)
+    mean, cov = latent_posterior(lat, c.level[area], c.ou_sd, c.noise, d.y; present)
+    rng = Random.Xoshiro(4)
+    n = 40_000
+    draws = reduce(hcat, (marginalized_latent_draws(q, u, rng).ou for _ in 1:n))
+    @test all(abs.(vec(Statistics.mean(draws; dims = 2)) .- mean) .< 5 .* sqrt.(diag(cov) ./ n))
+    @test Statistics.cov(draws; dims = 2) ≈ cov rtol = 0.05 atol = 0.02 * maximum(diag(cov))
 end
 
 # Each form the Kalman filter does not cover is refused at lowering, naming
@@ -543,6 +579,10 @@ end
         s ~ Exponential(1)
         v[1:3] .~ Normal.(0, 1)
     end), :h, (;), y))
+    # A missing entry in a cell's series is not a predict-only step yet.
+    @test occursin("missing entry in a `@plate` cell", refusal(cellmodel(quote
+        y[g] .~ Normal.(h, 1)
+    end), :h, (;), [Union{Missing,Float64}[0.1, missing, 0.4], [0.3, 0.2]]))
 end
 
 # ── `jax_source` of a marginalized program ────────────────────────────────
@@ -569,7 +609,10 @@ end
 
 @testset "jax_source of a marginalized program" begin
     d, c = ou_data(2, 4), cell_data([3, 1, 5])
+    gaps = Vector{Union{Missing,Float64}}(d.y)
+    gaps[[1, 3]] .= missing
     plans = (; toplevel = ou_plan(d), cell = cell_ou_plan(c),
+        missing_entries = marginalize(OU(; d.inputs...), :ou) | (; y = gaps),
         cell_ar = marginalize(CELL_AR(; c.G, c.se, c.m0), :h) | (; c.y),
         observed = OBSERVED_AR() | (; y = [0.1, -0.3, 0.4, 0.2]))
     for (name, plan) in pairs(plans)
