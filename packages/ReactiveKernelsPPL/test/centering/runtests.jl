@@ -388,12 +388,15 @@ function nested_setup(G = 3, per = 2; built = nothing)
     plan = NESTED(; G, U, group, mu_sd = 2.0, tau_g_scale = 1.0,
         tau_u_scale = 0.5, sigma = 0.3) | (; y = collect(range(-0.5, 0.7; length = U)))
     built = built === nothing ? build_kernel(plan) : built
-    u = 0.1 .* sin.(1:built.layout.total)
+    # A reused build keeps its own exemplar layout; this binding's sizes come
+    # from the plan.
+    layout = assign_layout(plan)
+    u = 0.1 .* sin.(1:layout.total)
     problem = prepare_sampler(built, plan, u; backend = BACKEND)
-    entries = Dict(e.name => e for e in built.layout.entries)
+    entries = Dict(e.name => e for e in layout.entries)
     gi = entries[:z_g].offset .+ (0:G-1)
     ui = entries[:z_u].offset .+ (0:U-1)
-    (; built, plan, u, problem, group, G, U, gi, ui)
+    (; built, plan, layout, u, problem, group, G, U, gi, ui)
 end
 
 nested_cells(tg, sg, tu, su) = (
@@ -403,7 +406,7 @@ nested_cells(tg, sg, tu, su) = (
 # The written-out composition: the group level about mu, then the unit level
 # about mu + tau_g * z_g[group] at the group level's model values.
 function nested_reference(s, x, (tg, sg, tu, su))
-    c = constrain(s.built.layout, x)
+    c = constrain(s.layout, x)
     y = copy(x)
     y[s.gi] .= tg .* c.mu .+ (x[s.gi] .- sg .* c.mu) .* c.tau_g^(tg - sg)
     loc = c.mu .+ c.tau_g .* y[s.gi][s.group]
@@ -482,7 +485,7 @@ end
     ir, _ = map_for(built, plan, cells; u0 = u)
     @test first.(ir.pairs) == [s.ui; s.gi]
     @test [last(q).args[1].stage for q in ir.pairs] == [fill(1, s.U); fill(2, s.G)]
-    c = constrain(built.layout, u)
+    c = constrain(s.layout, u)
     expected = copy(u)
     expected[s.ui] .= (u[s.ui] .- 0.5 * c.mu) .* c.tau_u^-0.5
     unit_mean = sum(expected[s.ui]) / s.U
