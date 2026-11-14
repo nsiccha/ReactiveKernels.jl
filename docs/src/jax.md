@@ -20,6 +20,8 @@ print(source)
 
 Input annotations tell the emitter each port's rank. For untyped ports, supply the corresponding `types` keyword. The emitted input order follows the selected input boundary.
 
+The module docstring starts with the generated line shown above. The `doc` keyword adds the author's description of the program after it: a string, or a binding's docstring as `@doc(NAME)`. A docstring written above `const NAME = …` belongs to the binding, not to the value `jax_source` receives, so the caller passes it. For a PPL model, `jax_source(built, bound; doc)` places it before the generated `Data:` and `Model documentation:` lists. Docstrings keep their text as written, backslashes and quotes included.
+
 Typed `Float32` values keep `float32`, also in `prepare_data`; other floats
 take `jax_source`'s `float_type` (`Float64`, or `Float32` without JAX's 64-bit
 mode), as metadata reports.
@@ -60,6 +62,8 @@ A dotted cell latent, `v[i] .~ D.(args…)` with a length per index that data de
 Host preparation translates `findfirst(predicate, vector)`, including captured predicates such as `isequal(label)`, `Base.Fix1` and `Base.Fix2`. It searches in order, stops at the first match, and returns a one-based index or `nothing`. A positional kernel can therefore compute group indices with `plate(values) do value; Int(findfirst(isequal(value), levels)); end` inside the emitted module. Label values and the lengths of both vectors remain runtime inputs.
 
 Host preparation also orders vectors of numbers or strings as Julia's `isless` does (-0.0 before 0.0, every NaN last): `sort`, `unique` (and `sort!`, `unique!` of a list built with `push!`), `searchsortedfirst` and `searchsortedlast` (one-based), and `sortperm(v)`, whose one-based positions keep equal values in ascending position. `invperm(p)` of a vector of integers is the inverse permutation and raises `ArgumentError: argument is not a permutation` as Julia does. A data-only definition such as `pos = invperm(vcat(rows_a, rows_b))` therefore runs in `prepare_data`. Keyword orders (`rev`, `by`, `lt`) have no translation. In the JAX functions these calls have none either: a recipe that also reads a parameter (`theta[sortperm(rows)]`) raises `JAXEmissionError` naming the function, so give the permutation a definition of its own that reads data alone.
+
+`repeat(A, counts...)` tiles `A` `counts[d]` times along axis `d`, as Julia's `repeat(A; outer = counts)` does, and `repeat(A; inner, outer)` first repeats each entry `inner[d]` times along axis `d`; each keyword takes an integer or a tuple of them. Counts past `A`'s rank add trailing axes, as Julia's do (`repeat(v, 1, k)` of a vector is a matrix with `k` columns). Shapes are static while JAX traces, so the JAX functions need static counts (literals, or integers static to `jax.jit`); a count of data is computed in `prepare_data` when the recipe reads data alone. A categorical model's prior scale per coefficient term, repeated once per non-reference category (`repeat([intercept_scale, slope_scale], 1, k)`), therefore runs in `prepare_data`, and one module serves every category count. Julia's argument checks hold: a negative count, or with `inner` a count list shorter than `A`'s rank, raises with Julia's `ArgumentError` message. A recipe that repeats by a count the functions trace raises `JAXEmissionError` naming the recipe; a padded (ragged) value has no `repeat` translation.
 
 A `Bool` array index (a `BitVector` or `Vector{Bool}`, such as `table[table[:, 2] .!= 1, 4]` or `values[present]`) selects the entries where it is true, as Julia's logical indexing does; it is not shifted as one-based positions. A mask of the array's whole shape (`A[A .> 0]`) selects in column-major order. `prepare_data` and other host code use a NumPy boolean mask, which fails on a mask of another length as Julia's `BoundsError` does; a list built with `push!` keeps the entries whose mask entry is true. In device code the count of selected entries depends on data, so the gather is padded to the mask's length: the selected entries come first, padding repeats the last of them, and reductions, `length` and broadcasts mask the padding as they do for a ragged row. A write through a mask writes only the selected entries. A device mask beside another kept dimension (`A[mask, :]`) and a mask of the groups of a ragged value raise `JAXEmissionError`, as does a single `Bool` index into an array, which Julia refuses.
 
@@ -161,9 +165,12 @@ print(jax_source(built, bound))
 
 ## Helpers with loops and branches
 
-A helper with recorded source becomes a named Python function, reused by
-calls with the same argument representation. Its Julia docstring accompanies
-the emitted body. Arrays, captured numerical values and padded lengths are
+A helper becomes a named Python function with its method's argument names,
+reused by calls with the same argument representation: from recorded source,
+or, for a plain helper outside Julia and ReactiveKernels, from its lowered
+code. Its Julia docstring accompanies the body; a broadcast vectorizes the
+function itself. A leading underscore and ReactiveKernels' own helpers stay
+private (`_name`). Arrays, captured numerical values and padded lengths are
 normally explicit arguments. A helper that carries loop bounds or reads scan
 history stays nested in that scope, preserving the bounds and history access
 analysis. Nested plate cells and scan steps are named after the authored

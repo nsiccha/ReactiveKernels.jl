@@ -278,3 +278,48 @@ _rk_jax_unarray(x) = x
 # Central finite differences of `f` at `u`.
 rk_fd_gradient(f, u; h = 1e-6) = [(f(u .+ h .* (1:length(u) .== i)) -
                                    f(u .- h .* (1:length(u) .== i))) / 2h for i in eachindex(u)]
+
+# A Python that parses an emitted module's text: `RK_JAX_PYTHON`, else any
+# `python3` (parsing needs no JAX); `nothing` without one.
+rk_python_parser() = rk_jax_available() ? RK_JAX_PYTHON : Sys.which("python3")
+
+const _RK_PY_DOCSTRING_DRIVER = raw"""
+import ast, sys, warnings
+warnings.simplefilter("error")
+with open(sys.argv[1], encoding="utf-8") as f:
+    tree = ast.parse(f.read())
+doc = ast.get_docstring(tree, clean=False)
+if doc is None:
+    sys.exit("the module has no docstring")
+sys.stdout.buffer.write(doc.encode("utf-8"))
+"""
+
+"""
+    rk_python_docstring(src) -> Union{String,Nothing}
+
+The module docstring of the emitted module `src` as Python reads it, with
+every warning an error (an invalid escape sequence among them); `nothing`
+without a Python (`rk_python_parser`).
+"""
+function rk_python_docstring(src)
+    py = rk_python_parser()
+    py === nothing && return nothing
+    mktempdir() do dir
+        module_path = joinpath(dir, "module.py")
+        write(module_path, string(src))
+        driver = joinpath(dir, "docstring.py")
+        write(driver, _RK_PY_DOCSTRING_DRIVER)
+        read(`$py $driver $module_path`, String)
+    end
+end
+
+# Python reads `expected` as the module docstring of `src`; a multi-line one
+# ends in the newline before its closing quotes. Skipped without a Python.
+function rk_test_python_docstring(src, expected)
+    doc = rk_python_docstring(src)
+    if doc === nothing
+        @test_skip false
+    else
+        @test chomp(doc) == expected
+    end
+end

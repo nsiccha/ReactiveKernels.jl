@@ -2453,6 +2453,19 @@ function _size_absent_responses!(plan::StructuralPlan, columns::AbstractDict)
             data_axes = true))
         ax === nothing || (plate_axes[d.name] = ax)
     end
+    # A `@scan` carried array holds one entry per step up to its bound, which
+    # bound data supply (`for t in 2:n`), so a response it locates (`m =
+    # level .+ state; y .~ Normal.(m, s)`) has those rows, as in the fit
+    # (snag rkppl-response-a-0d9dd693). A bound the binding does not supply
+    # (the observed array's length) or leaves absent is no evidence of them.
+    for s in axis_plan.scans
+        _scan_length_bound(axis_plan, s) || continue
+        s.hi isa Symbol && axis_plan.columns[s.hi] isa _Absent && continue
+        T = _scan_length(axis_plan, s)
+        for a in s.states
+            plate_axes[a] = (Base.OneTo(T),)
+        end
+    end
     plates = Set(keys(plate_axes))
     operands = union(perobs, plates)
     for r in plan.responses
