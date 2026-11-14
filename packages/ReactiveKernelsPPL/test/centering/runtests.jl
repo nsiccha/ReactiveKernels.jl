@@ -45,6 +45,14 @@ function finite_gradient(f, x)
       f(x .- h .* (eachindex(x) .== j))) / (2h) for j in eachindex(x)]
 end
 
+# Primal-only observation of the actual prepared cuts. AD tests use the
+# unmodified kernels and the backend's ordinary reverse path.
+struct CountedKernel{K}
+    kernel::K
+    calls::Base.RefValue{Int}
+end
+(c::CountedKernel)(x) = (c.calls[] += 1; c.kernel(x))
+
 function emission_shape(kernel)
     heads = Dict{Symbol,Int}()
     function visit(ex)
@@ -322,10 +330,188 @@ end
             WarmupHMC.InverseFunctions.inverse(ir), mapped)
         @test back ≈ u
     end
-    # theta_location depends on phi. Independent source-vector accessors do
-    # not implement the triangular transport needed to transform both.
-    @test_throws ContractValidationError adaptive_centering_problem(
-        built, plan, problem, BACKEND; cells = (; theta, phi), u0 = u)
+    # theta_location reads phi, so theta is centred about phi's model value:
+    # phi maps first, then theta's endpoints are evaluated on the mapped phi.
+    entries = Dict(e.name => e for e in built.layout.entries)
+    phii = entries[:phi].offset .+ (0:3)
+    thetai = entries[:theta].offset .+ (0:3)
+    function reference(x)
+        c = constrain(built.layout, x)
+        phi_ls = log(c.sigma) + log(c.rho * 0.8) / 2
+        theta_ls = log(c.sigma) + log1p(-c.rho) / 2
+        y = copy(x)
+        y[phii] .= x[phii] .* exp(-0.4 * phi_ls)
+        loc = c.mu .+ c.sigma .* sqrt(c.rho * 0.8) .* y[phii]
+        y[thetai] .= (x[thetai] .- 0.6 .* loc) .* exp(-0.6 * theta_ls)
+        y, -4 * (0.4 * phi_ls + 0.6 * theta_ls)
+    end
+    for cells in ((; theta, phi), (; phi, theta))
+        ir, p = map_for(built, plan, cells; u0 = u)
+        @test first.(ir.pairs) == [phii; thetai]
+        @test [last(q).args[1].stage for q in ir.pairs] == [fill(1, 4); fill(2, 4)]
+        expected, expected_jac = reference(u)
+        jac, mapped = WarmupHMC.with_logabsdet_jacobian!(copy(u), ir, u)
+        @test mapped ≈ expected
+        @test jac ≈ expected_jac
+        ijac, back = WarmupHMC.with_logabsdet_jacobian!(copy(mapped),
+            WarmupHMC.InverseFunctions.inverse(ir), mapped)
+        @test back ≈ u
+        @test ijac ≈ -jac
+        rp = adaptive_centering_problem(built, plan, problem, BACKEND; cells, u0 = u)
+        value, gradient = LDP.logdensity_and_gradient(rp, u)
+        @test value ≈ LDP.logdensity(problem, expected) + expected_jac
+        reference_density(x) = (r = reference(x); LDP.logdensity(problem, r[1]) + r[2])
+        @test gradient ≈ finite_gradient(reference_density, u) rtol = 2e-7 atol = 2e-7
+    end
+end
+
+# A nested two-level hierarchy (snag adaptive-affine-d6c2fa03). The unit level
+# is declared before the group level it is centred on, so the packed order is
+# the reverse of the dependency order.
+const NESTED = @rkppl begin
+    mu ~ Normal(0, mu_sd)
+    tau_g ~ Exponential(tau_g_scale)
+    tau_u ~ Exponential(tau_u_scale)
+    z_u[1:U] .~ Normal.(0, 1)
+    z_g[1:G] .~ Normal.(0, 1)
+    unit_location = mu .+ tau_g .* z_g[group]
+    log_tau_g = log(tau_g)
+    log_tau_u = log(tau_u)
+    unit_mean = sum(z_u) / U
+    theta = unit_location .+ tau_u .* z_u
+    y .~ Normal.(theta, sigma)
+end
+
+function nested_setup(G = 3, per = 2; built = nothing)
+    group = repeat(1:G; inner = per)
+    U = length(group)
+    plan = NESTED(; G, U, group, mu_sd = 2.0, tau_g_scale = 1.0,
+        tau_u_scale = 0.5, sigma = 0.3) | (; y = collect(range(-0.5, 0.7; length = U)))
+    built = built === nothing ? build_kernel(plan) : built
+    # A reused build keeps its own exemplar layout; this binding's sizes come
+    # from the plan.
+    layout = assign_layout(plan)
+    u = 0.1 .* sin.(1:layout.total)
+    problem = prepare_sampler(built, plan, u; backend = BACKEND)
+    entries = Dict(e.name => e for e in layout.entries)
+    gi = entries[:z_g].offset .+ (0:G-1)
+    ui = entries[:z_u].offset .+ (0:U-1)
+    (; built, plan, layout, u, problem, group, G, U, gi, ui)
+end
+
+nested_cells(tg, sg, tu, su) = (
+    z_g = (location = :mu, log_scale = :log_tau_g, target = tg, source = sg),
+    z_u = (location = :unit_location, log_scale = :log_tau_u, target = tu, source = su))
+
+# The written-out composition: the group level about mu, then the unit level
+# about mu + tau_g * z_g[group] at the group level's model values.
+function nested_reference(s, x, (tg, sg, tu, su))
+    c = constrain(s.layout, x)
+    y = copy(x)
+    y[s.gi] .= tg .* c.mu .+ (x[s.gi] .- sg .* c.mu) .* c.tau_g^(tg - sg)
+    loc = c.mu .+ c.tau_g .* y[s.gi][s.group]
+    y[s.ui] .= tu .* loc .+ (x[s.ui] .- su .* loc) .* c.tau_u^(tu - su)
+    y, s.G * (tg - sg) * log(c.tau_g) + s.U * (tu - su) * log(c.tau_u)
+end
+
+@testset "nested cells centre on their parents' model values" begin
+    s = nested_setup()
+    (; built, plan, u, problem) = s
+    for centering in ((0.0, 0.5, 0.0, 0.5), (0.0, 1.0, 0.0, 1.0), (0.0, 1.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0, 1.0), (0.0, 0.3, 0.0, 0.8), (1.0, 0.2, 0.5, 0.0))
+        cells = nested_cells(centering...)
+        ir, p = map_for(built, plan, cells; u0 = u)
+        @test isconcretetype(eltype(ir.pairs))
+        @test first.(ir.pairs) == [s.gi; s.ui]
+        @test [last(q).args[1].stage for q in ir.pairs] == [fill(1, s.G); fill(2, s.U)]
+        expected, expected_jac = nested_reference(s, u, centering)
+        jac, mapped = WarmupHMC.with_logabsdet_jacobian!(copy(u), ir, u)
+        @test mapped ≈ expected
+        @test jac ≈ expected_jac
+        ijac, back = WarmupHMC.with_logabsdet_jacobian!(copy(mapped),
+            WarmupHMC.InverseFunctions.inverse(ir), mapped)
+        @test back ≈ u
+        @test ijac ≈ -jac
+        rp = adaptive_centering_problem(built, plan, problem, BACKEND; cells, u0 = u)
+        reference_density(x) = (r = nested_reference(s, x, centering);
+            LDP.logdensity(problem, r[1]) + r[2])
+        for point in (u, u .+ 0.05, view(hcat(u, u .+ 0.05), :, 2))
+            value, gradient = LDP.logdensity_and_gradient(rp, point)
+            @test value ≈ reference_density(point)
+            @test gradient ≈ finite_gradient(reference_density, point) rtol = 2e-7 atol = 2e-7
+        end
+        @test LDP.logdensity_and_gradient(deepcopy(rp), u) == LDP.logdensity_and_gradient(rp, u)
+
+        # Re-centering the group level alone keeps the unit coordinates of a
+        # model point: they are relative to the group level's model values.
+        moved = (centering[1], 1 - centering[2], centering[3], centering[4])
+        ir_moved, _ = map_for(built, plan, nested_cells(moved...); u0 = u)
+        _, recentered = WarmupHMC.with_logabsdet_jacobian!(copy(mapped),
+            WarmupHMC.InverseFunctions.inverse(ir_moved), mapped)
+        @test recentered[s.ui] ≈ u[s.ui]
+        @test nested_reference(s, recentered, moved)[1] ≈ mapped
+    end
+
+    # The joint kernel runs once per level on a map and on its inverse.
+    ir, p = map_for(built, plan, nested_cells(0.0, 0.6, 0.0, 0.4); u0 = u)
+    @test length(p.kernel(u).values) == 4
+    counted = CountedKernel(p.kernel, Ref(0))
+    observed = EXT._centering_reparametrization(counted, p.records)
+    _, mapped = WarmupHMC.with_logabsdet_jacobian!(copy(u), observed, u)
+    @test counted.calls[] == 2
+    counted.calls[] = 0
+    _, back = WarmupHMC.with_logabsdet_jacobian!(copy(mapped),
+        WarmupHMC.InverseFunctions.inverse(observed), mapped)
+    @test counted.calls[] == 2
+    @test back ≈ u
+
+    # Level structure is graph structure: a larger binding reuses the program.
+    large = nested_setup(5, 4; built)
+    ir_large, p_large = map_for(large.built, large.plan, nested_cells(0.0, 0.6, 0.0, 0.4);
+        u0 = large.u)
+    @test typeof(ir_large) == typeof(ir)
+    @test emission_shape(p_large.kernel) == emission_shape(p.kernel)
+    expected, _ = nested_reference(large, large.u, (0.0, 0.6, 0.0, 0.4))
+    @test last(WarmupHMC.with_logabsdet_jacobian!(copy(large.u), ir_large, large.u)) ≈ expected
+end
+
+@testset "nested levels follow log-scale reads; own reads and cycles refuse" begin
+    s = nested_setup()
+    (; built, plan, u, problem) = s
+    # z_g's log-scale reads z_u, so z_u is level 1 and z_g level 2; here the
+    # dependency order matches the packed order.
+    cells = (z_g = (location = :mu, log_scale = :unit_mean, source = 0.5),
+        z_u = (location = :mu, log_scale = :log_tau_u, source = 0.5))
+    ir, _ = map_for(built, plan, cells; u0 = u)
+    @test first.(ir.pairs) == [s.ui; s.gi]
+    @test [last(q).args[1].stage for q in ir.pairs] == [fill(1, s.U); fill(2, s.G)]
+    c = constrain(s.layout, u)
+    expected = copy(u)
+    expected[s.ui] .= (u[s.ui] .- 0.5 * c.mu) .* c.tau_u^-0.5
+    unit_mean = sum(expected[s.ui]) / s.U
+    expected[s.gi] .= (u[s.gi] .- 0.5 * c.mu) .* exp(-0.5 * unit_mean)
+    jac, mapped = WarmupHMC.with_logabsdet_jacobian!(copy(u), ir, u)
+    @test mapped ≈ expected
+    @test jac ≈ -0.5 * (s.U * log(c.tau_u) + s.G * unit_mean)
+    _, back = WarmupHMC.with_logabsdet_jacobian!(copy(mapped),
+        WarmupHMC.InverseFunctions.inverse(ir), mapped)
+    @test back ≈ u
+
+    message(cells) = try
+        adaptive_centering_problem(built, plan, problem, BACKEND; cells, u0 = u)
+        ""
+    catch err
+        err isa ContractValidationError || rethrow()
+        sprint(showerror, err)
+    end
+    # theta reads z_u itself (and z_g); unit_mean reads z_u.
+    @test occursin("`z_u.location` (`theta`) reads `z_u` itself",
+        message((z_u = (location = :theta, log_scale = :log_tau_u),)))
+    @test occursin("`z_u.log_scale` (`unit_mean`) reads `z_u` itself",
+        message((z_u = (location = 0.0, log_scale = :unit_mean),)))
+    @test occursin("cells `z_g` → `z_u` → `z_g` read each other's latents",
+        message((z_g = (location = :unit_mean, log_scale = :log_tau_g),
+            z_u = (location = :unit_location, log_scale = :log_tau_u))))
 end
 
 const SHARED = @rkppl begin
@@ -347,14 +533,6 @@ function shared_setup(n = 4; built = nothing)
     problem = prepare_sampler(built, plan, u; backend = BACKEND)
     (; built, plan, layout, u, problem, offsets)
 end
-
-# Primal-only observation of the actual prepared cuts. AD tests below use
-# the unmodified kernels and the backend's ordinary reverse path.
-struct CountedKernel{K}
-    kernel::K
-    calls::Base.RefValue{Int}
-end
-(c::CountedKernel)(x) = (c.calls[] += 1; c.kernel(x))
 
 @testset "one joint evaluation across cells and affine roles" begin
     s = setup()
