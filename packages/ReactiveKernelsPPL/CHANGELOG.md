@@ -16,6 +16,20 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.195
+
+- RKPPL's density targets answer `-Inf` where a numerical method cannot
+  evaluate the model, such as an ODE its solver cannot integrate there
+  (`ReactiveKernels.NumericalFailure`, needs ReactiveKernels 0.1.251): the
+  sampler query's value `q(u)` and `sampler_value_and_gradient!` (and so its
+  LogDensityProblems `logdensity` and `logdensity_and_gradient`),
+  `SliceProblem` and `JoinedWindowsProblem`. The gradient is filled with
+  `NaN`. Every other exception still propagates. This is Stan's rejection of
+  a proposal whose ODE solve fails: WarmupHMC takes the point as a divergent
+  leaf and Pathfinder's line search backs off it, where before the first such
+  point ended the run. `sampler_value_gradient_and_retained!` keeps throwing
+  the failure, since its retained presets have no value there.
+
 ## 0.1.194
 
 - `marginalize` integrates out a recurrence a submodel holds, named by its

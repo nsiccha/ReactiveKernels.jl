@@ -419,7 +419,9 @@ end
 
 [`JoinedWindows`](@ref) as a log density over its joined coordinates. With
 `LogDensityProblems` loaded it implements `dimension`, `capabilities` (first
-order), `logdensity` and `logdensity_and_gradient`. Not thread-safe.
+order), `logdensity` and `logdensity_and_gradient`. Not thread-safe. Like
+[`SamplerQuery`](@ref), it answers `-Inf` (gradient `NaN`) where a numerical
+method cannot evaluate the model (`ReactiveKernels.NumericalFailure`).
 """
 struct JoinedWindowsProblem{W<:JoinedWindows}
     joined::W
@@ -435,6 +437,14 @@ Pathfinder, a sampler or a variational fit.
 joined_problem(w::JoinedWindows) = JoinedWindowsProblem(w, zeros(length(w.coordinates)))
 
 function _joined_problem_value_and_gradient(p::JoinedWindowsProblem, x::AbstractVector{<:Real})
-    value, _ = joined_value_and_gradient!(p.joined, p.gradient, x)
+    value = try
+        first(joined_value_and_gradient!(p.joined, p.gradient, x))
+    catch err
+        # A point a numerical method cannot evaluate is outside the support,
+        # as for `SamplerQuery`; anything else propagates.
+        err isa ReactiveKernels.NumericalFailure || rethrow()
+        fill!(p.gradient, NaN)
+        -Inf
+    end
     value, copy(p.gradient)
 end

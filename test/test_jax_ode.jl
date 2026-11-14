@@ -128,7 +128,7 @@ end
     native = prepare(jax_ode_budget; have = (:u, :ts, :limit), want = :total)
     u, ts = [log(2.0)], [1.0, 2.0, 30.0]
     @test native(u, ts, 10_000) ≈ sum(exp.(-2.0 .* ts)) rtol = 1e-8
-    @test_throws ErrorException native(u, ts, 2)
+    @test_throws ReactiveKernels.ODESolveFailure native(u, ts, 2)
     if _JAX_ODE_PYTHON
         @test rk_jax_evaluate(source, "kernel", (u, ts, 10_000)).value ≈ sum(exp.(-2.0 .* ts)) rtol = 1e-8
         @test_throws r"exceeded maxsteps between requested outputs" rk_jax_evaluate(source, "kernel", (u, ts, 2))

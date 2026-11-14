@@ -1,4 +1,46 @@
 """
+    ReactiveKernels.NumericalFailure <: Exception
+
+Supertype of the exceptions a numerical method throws when it cannot produce
+a value at the point it was asked about although its inputs are valid: an ODE
+the solver cannot integrate there (`ReactiveKernels.ODESolveFailure`). Invalid inputs (an empty state, unordered
+output times, a negative tolerance) throw `ArgumentError`, `DomainError` or
+`DimensionMismatch` instead, and a bug in the caller's code throws whatever it
+throws.
+
+A log-density target may treat such a point as outside the model's support and
+answer `-Inf`, as Stan rejects a proposal whose ODE solve fails. ReactiveKernelsPPL's
+sampler targets do that for this type only; every other exception propagates.
+"""
+abstract type NumericalFailure <: Exception end
+
+"""
+    ReactiveKernels.ODESolveFailure(method, retcode, t) <: NumericalFailure
+
+[`rk_ode_bdf_tol`](@ref) or [`rk_ode_rk45_tol`](@ref) could not integrate the
+system from valid inputs: the solver stopped with an unsuccessful return code,
+or a step budget `maxsteps` between two requested outputs ran out.
+
+- `method::String`: the solver, for example `"native DP5"`.
+- `retcode::Symbol`: the name of the SciML return code, for example
+  `:Unstable` or `:DtLessThanMin`; `:MaxIters` when `maxsteps` ran out.
+- `t::Float64`: the time, in the caller's units, the solver had reached.
+"""
+struct ODESolveFailure <: NumericalFailure
+    method::String
+    retcode::Symbol
+    t::Float64
+end
+function Base.showerror(io::IO, e::ODESolveFailure)
+    if e.retcode === :MaxIters
+        print(io, e.method, " exceeded maxsteps between requested outputs")
+    else
+        print(io, e.method, " failed: ", e.retcode)
+    end
+    print(io, " at t = ", e.t)
+end
+
+"""
     rk_ode_bdf_tol(f, y0, t0, ts, reltol, abstol, maxsteps, args...)
 
 Integrate `dy/dt = f(t, y, args...)` with Julia's standard
@@ -13,8 +55,12 @@ increasing and starts after finite `t0`. Tolerances must be finite and
 nonnegative, with at least one positive; `maxsteps` is a positive integer.
 The limit counts accepted solver steps between consecutive requested outputs
 (starting at `t0`), without
-restarting the solver. Invalid inputs, a wrong RHS length, a failed solve, and
-exceeding the limit throw. Caller tolerances are passed to the solver unchanged.
+restarting the solver. Caller tolerances are passed to the solver unchanged.
+Invalid inputs throw `ArgumentError` or `DomainError`, and a wrong RHS length
+throws `DimensionMismatch`. A solve the method cannot complete from valid
+inputs (an unsuccessful return code, or the limit exceeded) throws
+`ReactiveKernels.ODESolveFailure`, a `ReactiveKernels.NumericalFailure`: a
+sampler target may answer `-Inf` there, as Stan rejects such a proposal.
 
 The RHS returns a state-length vector and reads its arguments without mutating
 them. Extra arguments may be floating scalars or arrays, integer scalars or

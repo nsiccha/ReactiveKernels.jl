@@ -35,7 +35,10 @@ LogDensityProblems.logdensity_and_gradient(p::SliceProblem, x) =
 LogDensityProblems.capabilities(::Type{<:JoinedWindowsProblem}) =
     LogDensityProblems.LogDensityOrder{1}()
 LogDensityProblems.dimension(p::JoinedWindowsProblem) = length(p.gradient)
-LogDensityProblems.logdensity(p::JoinedWindowsProblem, x) = p.joined(x)
+# Through the problem, which answers -Inf where a numerical method cannot
+# evaluate the model (the joined windows' own call throws there).
+LogDensityProblems.logdensity(p::JoinedWindowsProblem, x) =
+    first(ReactiveKernelsPPL._joined_problem_value_and_gradient(p, x))
 LogDensityProblems.logdensity_and_gradient(p::JoinedWindowsProblem, x) =
     ReactiveKernelsPPL._joined_problem_value_and_gradient(p, x)
 

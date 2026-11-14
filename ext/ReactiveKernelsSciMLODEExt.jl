@@ -1,6 +1,6 @@
 module ReactiveKernelsSciMLODEExt
 
-import ReactiveKernels: _native_ode_tol, _native_ode_steps_to_outputs
+import ReactiveKernels: _native_ode_tol, _native_ode_steps_to_outputs, ODESolveFailure
 using SciMLBase
 using SciMLSensitivity: ForwardDiffSensitivity
 
@@ -16,12 +16,16 @@ _native_ode_steps_to_outputs(::SciMLBase.AbstractODEAlgorithm) = false
 # Owned solver adapter: the numerical integration and its history remain the
 # wrapped algorithm's. Stepping explicitly keeps each output budget in local
 # scalar state, instead of a mutable callback capture that must also survive
-# the library's adjoint.
+# the library's adjoint. `origin` and `span` map the solver's normalized time
+# back to the caller's, for the time a failure reports.
 struct OutputBudget{A,T} <: SciMLBase.AbstractODEAlgorithm
     alg::A
     times::T
     limit::Int
+    origin::Float64
+    span::Float64
 end
+OutputBudget(alg, times, limit::Integer) = OutputBudget(alg, times, Int(limit), 0.0, 1.0)
 SciMLBase.forwarddiffs_model(budget::OutputBudget) = SciMLBase.forwarddiffs_model(budget.alg)
 # Forward sensitivities integrate dual-number states and parameters with the
 # same solver, so the wrapper accepts the number types its algorithm accepts.
@@ -37,10 +41,10 @@ function SciMLBase.__solve(prob::ODEProblem, budget::OutputBudget; kwargs...)
         while integrator.t < output
             step!(integrator)
             integrator.stats.naccept - previous <= budget.limit ||
-                error(_name(budget.alg), " exceeded maxsteps between requested outputs")
+                _failed(budget, :MaxIters, integrator.t)
             code = integrator.sol.retcode
             (SciMLBase.successful_retcode(code) || code == ReturnCode.Default) ||
-                error(_name(budget.alg), " failed: ", code)
+                _failed(budget, Symbol(code), integrator.t)
         end
     end
     solve!(integrator)
@@ -48,6 +52,16 @@ function SciMLBase.__solve(prob::ODEProblem, budget::OutputBudget; kwargs...)
 end
 SciMLBase.__init(prob::ODEProblem, budget::OutputBudget; kwargs...) =
     SciMLBase.__init(prob, budget.alg; kwargs...)
+
+# A solve the method cannot complete from valid inputs is a numerical failure
+# (`ReactiveKernels.ODESolveFailure`), distinct from invalid input and from
+# bugs, so a density target can reject the point (Stan's `domain_error`).
+@noinline _failed(budget::OutputBudget, retcode::Symbol, s) =
+    throw(ODESolveFailure(_name(budget.alg), retcode,
+        budget.origin + _primal(s) * budget.span))
+# Forward sensitivities may step in dual-number time; report its value.
+_primal(s::AbstractFloat) = Float64(s)
+_primal(s::Real) = Float64(SciMLBase.value(s))
 
 struct ScalarLayout
     offset::Int
@@ -162,11 +176,13 @@ function _native_ode_tol(alg::SciMLBase.AbstractODEAlgorithm, f::F,
     # test covers the sensitivities as well as the states, like CVODES with
     # sensitivity error control. Saving only the requested outputs keeps the
     # primal and dual solves on the same saved times.
-    sol = solve(prob, OutputBudget(alg, times, Int(mx));
+    origin, span = Float64(t0), Float64(last(ts) - t0)
+    sol = solve(prob, OutputBudget(alg, times, Int(mx), origin, span);
         saveat = times, save_start = true, save_everystep = false,
         maxiters = typemax(Int), reltol = rt, abstol = at,
         sensealg = ForwardDiffSensitivity())
-    SciMLBase.successful_retcode(sol) || error(name, " failed: ", sol.retcode)
+    SciMLBase.successful_retcode(sol) ||
+        throw(ODESolveFailure(name, Symbol(sol.retcode), origin + last(sol.t) * span))
     saved_t, saved_u = sol.t, sol.u
     result = Matrix{Float64}(undef, length(ts), length(y0))
     for i in eachindex(ts)

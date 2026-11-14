@@ -52,6 +52,7 @@ const _PPL_TEST_FILES = (
     "test_query_barrier.jl",
     "test_query_inputs.jl",
     "test_sampler_logdensity.jl",
+    "test_sampler_numerical_failure.jl",
     "test_model_view.jl",
     "test_emitted_names.jl",
     "test_native_generator_capture.jl",
