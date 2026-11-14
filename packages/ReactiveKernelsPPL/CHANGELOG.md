@@ -16,6 +16,18 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.192
+
+- `prepare_sampler` prepares a density that throws at `u0` (needs
+  ReactiveKernels 0.1.250). The default non-allocating sampler evaluates the
+  density once at `u0` to give its operations their buffers; an error there
+  (an ODE that does not integrate at `u0 = zeros`, say) used to fail
+  preparation, although `u0` is documented as a type/shape exemplar. It now
+  warns, naming the error: the operations that evaluation did not reach
+  allocate on every gradient call, with unchanged values and gradients. The
+  docstring says so, and that a point where the model evaluates reuses every
+  buffer.
+
 ## 0.1.191
 
 - `marginalize(model, :x)` integrates out a recurrence whose rows observe
