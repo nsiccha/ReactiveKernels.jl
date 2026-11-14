@@ -91,6 +91,7 @@ include("jax.jl")
 include("jax_regions.jl")
 include("jax_history.jl")
 include("jax_host.jl")
+include("jax_ode.jl")
 
 export Value, Recipe, Graph, Plan, PreparedKernel, PreparedADKernel, PreparedADPullback, ReplicatedKernel, NonAllocatingKernel, PlanningError
 export TypeInstabilityError
