@@ -48,9 +48,10 @@ A captured `@rkppl` block. `model(; x, g)` binds inputs and pins any named
 declaration. Observe values explicitly: `model(; x, g) | (; y)`, or
 `condition(model(; x, g); y)`, returns a bound `StructuralPlan`.
 `fixed` stores merge pins, `rewrites` stores scoped statement replacements,
-`conditioned` stores explicit observations and `marginalized` the latent
-recurrences integrated out by [`marginalize`](@ref). Operations return new
-models.
+`conditioned` stores explicit observations, `marginalized` the latent
+recurrences integrated out by [`marginalize`](@ref) and `chains` those
+[`markov_chains`](@ref) lowers in their states for WarmupHMC's Markov
+chains. Operations return new models.
 """
 struct RKPPLModel
     ast::Expr
@@ -60,9 +61,10 @@ struct RKPPLModel
     conditioned::Dict{Symbol,ColumnData}
     documentation::Vector{RKPPLDocumentation}
     marginalized::Vector{Symbol}
+    chains::Vector{Symbol}
 end
 RKPPLModel(ast, mod, fixed, rewrites, conditioned, documentation) =
-    RKPPLModel(ast, mod, fixed, rewrites, conditioned, documentation, Symbol[])
+    RKPPLModel(ast, mod, fixed, rewrites, conditioned, documentation, Symbol[], Symbol[])
 RKPPLModel(ast, mod, fixed, rewrites, conditioned) =
     RKPPLModel(ast, mod, fixed, rewrites, conditioned, last(_documentation_source(ast)))
 RKPPLModel(ast, mod) = RKPPLModel(ast, mod, Dict{Symbol,ColumnData}(), Expr[], Dict{Symbol,ColumnData}())
@@ -296,7 +298,7 @@ function condition(m::RKPPLModel; kwargs...)
     observations = merge(copy(m.conditioned),
         Dict{Symbol,ColumnData}(k => _check_col(k, v) for (k, v) in kwargs))
     return RKPPLModel(m.ast, m.mod, copy(m.fixed), copy(m.rewrites), observations,
-        copy(m.documentation), copy(m.marginalized))
+        copy(m.documentation), copy(m.marginalized), copy(m.chains))
 end
 condition(m::RKPPLBoundModel; kwargs...) =
     bind_data(RKPPLBoundModel(condition(m.model; kwargs...), copy(m.data)))
@@ -482,7 +484,7 @@ function Base.merge(m::RKPPLModel, override::Expr)
     end
     docs = _merge_documentation(m.documentation, last(_documentation_source(override)))
     return RKPPLModel(Expr(:block, out...), m.mod, fixed, rewrites, copy(m.conditioned), docs,
-        copy(m.marginalized))
+        copy(m.marginalized), copy(m.chains))
 end
 
 Base.merge(m::RKPPLModel, fix::NamedTuple) = _merge_fixes(m, fix)
@@ -530,7 +532,7 @@ function _merge_fixes(m::RKPPLModel, fix::NamedTuple; scoped_keys::Bool = true)
     end
     kept = Any[a for (i, a) in enumerate(out) if i ∉ drop]
     return RKPPLModel(Expr(:block, kept...), m.mod, new_fixed, copy(m.rewrites), observations,
-        copy(m.documentation), copy(m.marginalized))
+        copy(m.documentation), copy(m.marginalized), copy(m.chains))
 end
 
 function Base.merge(m::RKPPLModel, first, rest...)
@@ -724,6 +726,8 @@ function _lower_model_latest(m::RKPPLModel, supplied; conditioned = keys(m.condi
     ast = _indexed_observation_definitions(ast, data)
     # Latent recurrences the author integrates out become their Kalman filter.
     ast = _marginalize_latents(ast, m.marginalized, values, observing)
+    # Recurrences marked as WarmupHMC Markov chains are lowered in their states.
+    ast = _chain_latents(ast, m.chains, values, observing)
     # Pinned values bind as definitions from here on, not as data.
     pinned = setdiff(Set{Symbol}(keys(values)), data)
     plan = _lower_rkppl_once(ast, data, m.mod;
