@@ -16,6 +16,38 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.247
+
+- The opt-in generated summed-plate reverse (`with_plate_reverse`) now covers a
+  plate whose cells the compiler sums by contiguous index runs: a gathered
+  operand whose index vector is sorted into runs of mean length at least 8
+  (RKPPL's `z[group]` with rows sorted by group). The rule is generated from
+  the plate's flat cell loop, and its cells are then scheduled by the same
+  runs: the gathered read is taken once per run and the run's cotangent is
+  added once. Such a plate used to keep the backend's reverse, reported as
+  "an intermediate plate total needs a propagated adjoint". A dense shadow or
+  overlapping storage keeps the per-cell loop, and an operand gathered through
+  another index vector keeps its per-cell reads and writes inside the runs.
+  Values and gradients are unchanged, apart from rounding.
+  - On PosteriorDB's RadonVariableInterceptNCMN (919 rows in 85 counties),
+    with Julia 1.13.1 and Enzyme dogfood `d37eb448`, the opted-in complete
+    gradient's median paired time is 0.87 of default (seven rounds, range
+    0.82–1.23; five wins) on a loaded shared host. The variability does not
+    establish a consistent speedup. It allocates the one-pass buffer on each
+    call (784 B), where default allocates nothing. Earlier dogfood measurements
+    gave 0.58–0.67 on this model and 0.37 on a variable-slope Radon port;
+    forced two-pass grouping gave 1.11 with zero allocations. Those results
+    predate the backend's SIMD adjoint improvement. Schedule selection is
+    unchanged.
+- The Enzyme extension schedules by runs only where a rule can read the run
+  metadata in its reverse pass: on Julia before 1.12, or when Enzyme reports
+  dogfood repair `unchanged_custom_rule_roots` (dogfood `c036eb1`). Without
+  the repair, the first gradient of such a plate that takes two passes
+  segfaulted on Julia 1.13.1. There the plate keeps the backend's reverse and
+  `plate_reverse_report` gives "an index-run reverse needs Enzyme dogfood
+  repair `unchanged_custom_rule_roots`". The backend-only reproducer is
+  `benchmark/repro_enzyme_unchanged_rule_roots.jl`.
+
 ## 0.1.246
 
 - JAX source binds a comprehension straight to its target:
