@@ -16,6 +16,31 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.188
+
+- `markov_chains(model, :x)` marks a latent linear-Gaussian `@scan` array as a
+  WarmupHMC Markov chain (WarmupHMC 0.3.1 or later). The recurrence qualifies
+  as for `marginalize`: one carried array seeded once, each step linear in
+  `x[t - 1]` with Normal innovations, at top level or in a `@plate` cell. It is
+  lowered in its states: a non-centred step (`e ~ Normal(0, 1);
+  x[t] = a * x[t - 1] + s * e`) becomes its centred law, so the packed
+  coordinates are the states. A frame scan the density does not read records
+  each state's coefficient, drift and log step SD.
+  `adaptive_centering_problem` then gives each marked recurrence one
+  `WarmupHMC.MarkovChain`, whose warm-up adapts its centring per time step.
+  A recurrence per `@plate` index is one chain restarting at each index.
+  `cells` is now optional. Models without marked recurrences are unchanged.
+- The transition scans of `marginalize` record literal coefficients as
+  floats, so their carried arrays keep one element type.
+
+## 0.1.187
+
+- `jax_source` translates the length check of a top-level observed `@scan`
+  array, so the module of a program with one is standalone
+  (`UNTRANSLATED = {}`), including a top-level recurrence integrated out by
+  `marginalize`. When the module runs, an array whose length differs from
+  the scan's raises, as the native check does.
+
 ## 0.1.186
 
 - `marginalize(model, :x)` also integrates out a recurrence inside a `@plate`

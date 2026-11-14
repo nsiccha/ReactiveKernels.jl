@@ -7,8 +7,10 @@ using ReactiveKernelsPPL, Test
 # recompiled nearly all of lowering, binding and `build_kernel` on its first
 # model (snag `rkppl-cold-port-72991c9f`). A fresh child builds a model the
 # workload does not build, through the `@rkppl` surface, and reports how much
-# of its compilation was recompilation of invalidated code.
-@testset "a process that loads Enzyme keeps RKPPL's construction cached" begin
+# of its compilation was recompilation of invalidated code. It loads Enzyme
+# after RK and RKPPL; loading Enzyme first still recompiles (snag
+# `downstream-workl-75f8cba4`).
+@testset "a process that loads Enzyme after RKPPL keeps RKPPL's construction cached" begin
     fixture = """
         using ReactiveKernels, ReactiveKernelsPPL, Enzyme
         ext = Base.get_extension(ReactiveKernelsPPL, :ReactiveKernelsPPLEnzymeExt) !== nothing
