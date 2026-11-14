@@ -26,10 +26,11 @@ end
 
 # Walk nested call/branch jaxprs too: a short outer trace alone would miss
 # data-sized expansion in a reachable body.
-function trace_inventory(src, data)
+trace_inventory(src, data::NamedTuple) = trace_inventory(src, (0.4, data.x, data.R, data.S))
+function trace_inventory(src, args::Tuple)
     mktempdir() do dir
         write(joinpath(dir, "model.py"), src)
-        write(joinpath(dir, "args.py"), _rk_jax_args((0.4, data.x, data.R, data.S), src))
+        write(joinpath(dir, "args.py"), _rk_jax_args(args, src))
         driver = joinpath(dir, "trace.py")
         write(driver, raw"""
 import collections, importlib.util, json, sys
@@ -100,6 +101,112 @@ end
                 Enzyme.Active(a), map(Enzyme.Const, Base.tail(args))...)[1][1]
             @test result.grad ≈ derivative
             @test args == original
+        end
+    end
+end
+
+# A plate cell returning a vector whose length its own expression fixes
+# (`vcat` of scalars, a vector literal, a tuple field of that kind) fills its
+# stored row in every cell, so `reduce(vcat, cells)` reads the stored array in
+# order. No prepared ragged input carries those lengths (snag
+# jax-source-value-3bf4c69e: BRM's `mean_y[i] = vcat(level[i], level[i] - fall[i])`).
+# The helper is translated from its authored body, as BRM's `values` recipe is.
+@traceable flatten_cells(cells) = isempty(cells) ? Float64[] : reduce(vcat, cells)
+
+@kernel fixed_rows(a::Float64, x::Vector{Float64}) = begin
+    groups = eachindex(x)
+    pairs = plate(groups, Ref(x)) do i, xs
+        vcat(a * xs[i], a - xs[i])
+    end
+    triples = plate(groups, Ref(x)) do i, xs
+        [a + xs[i], a * xs[i], xs[i] - a]
+    end
+    tupled = plate(groups, Ref(x)) do i, xs
+        (vcat(xs[i], a * xs[i]), a + xs[i])
+    end
+    fields = plate(tupled) do t
+        t[1]
+    end
+    p_flat = isempty(pairs) ? Float64[] : reduce(vcat, pairs)
+    q_flat = flatten_cells(triples)
+    f_flat = flatten_cells(fields)
+    total = sum(abs2, p_flat) + sum(q_flat) + sum(abs2, f_flat)
+end
+
+# One helper flattens full rows and rows of a prepared ragged input: each
+# keeps its own translation.
+@kernel shared_flatten(a::Float64, x::Vector{Float64}, R::Vector{Vector{Float64}}) = begin
+    groups = eachindex(x)
+    pairs = plate(groups, Ref(x)) do i, xs
+        vcat(a * xs[i], a - xs[i])
+    end
+    rows = plate(groups, Ref(x), Ref(R)) do i, xs, rs
+        a .* rs[i] .+ xs[i]
+    end
+    p_flat = flatten_cells(pairs)
+    r_flat = flatten_cells(rows)
+    total = sum(abs2, p_flat) + sum(abs2, r_flat)
+end
+
+@testset "fixed-length plate cells flatten row by row" begin
+    data = [(; x = [0.2, -0.5, 0.9]), (; x = [0.1]), (; x = Float64[]),
+            (; x = collect(range(-0.4, 0.7; length = 23)))]
+    sources = [jax_source(fixed_rows; have = (:a, :x), data = d,
+        functions = (p = :p_flat, q = :q_flat, f = :f_flat, total = :total)) for d in data]
+    # CONTRIBUTING.md: more rows never replicate the plate bodies.
+    @test all(src -> src.text == first(sources).text, sources)
+    src = first(sources)
+    @test occursin("jax.vmap(", src.text)
+    # Full rows need neither the masked gather nor its runtime check.
+    @test !occursin("jnp.nonzero", src.text)
+    @test !occursin("do not add up", src.text)
+    native = prepare(fixed_rows; have = (:a, :x), want = :total)
+    if !rk_jax_available()
+        @test_skip "RK_JAX_PYTHON not set"
+    else
+        @test trace_inventory(src, (0.4, first(data).x)) ==
+              trace_inventory(src, (0.4, last(data).x))
+        for d in data, a in (-0.7, 0.4)
+            args = (a, d.x)
+            original = deepcopy(args)
+            expected_p = [v for x in d.x for v in (a * x, a - x)]
+            expected_q = [v for x in d.x for v in (a + x, a * x, x - a)]
+            expected_f = [v for x in d.x for v in (x, a * x)]
+            for (name, expected) in ((:p, expected_p), (:q, expected_q), (:f, expected_f))
+                value = rk_jax_evaluate(src, name, args; prepare = :arguments).value
+                @test length(value) == length(expected)
+                @test isempty(expected) || value ≈ expected
+            end
+            result = rk_jax_evaluate(src, :total, args; grad = true, prepare = :arguments)
+            @test result.value ≈ native(args...)
+            derivative = Enzyme.autodiff(Enzyme.Reverse, native, Enzyme.Active,
+                Enzyme.Active(a), Enzyme.Const(d.x))[1][1]
+            @test result.grad ≈ derivative
+            @test args == original
+        end
+    end
+
+    ragged = [(; x = [0.2, -0.5, 0.9], R = [[1., 2.], [3.], Float64[]]),
+              (; x = collect(range(-0.4, 0.7; length = 23)),
+                 R = [collect(1.0:(i % 7)) for i in 1:23])]
+    shared = [jax_source(shared_flatten; have = (:a, :x, :R), data = d,
+        functions = (p = :p_flat, r = :r_flat, total = :total)) for d in ragged]
+    @test first(shared).text == last(shared).text
+    # The ragged rows keep their checked flattening beside the full rows.
+    @test occursin("do not add up", first(shared).text)
+    if rk_jax_available()
+        native = prepare(shared_flatten; have = (:a, :x, :R), want = :total)
+        for d in ragged, a in (-0.7, 0.4)
+            args = (a, d.x, d.R)
+            @test rk_jax_evaluate(first(shared), :p, args; prepare = :arguments).value ≈
+                  [v for x in d.x for v in (a * x, a - x)]
+            @test rk_jax_evaluate(first(shared), :r, args; prepare = :arguments).value ≈
+                  [a * r + x for (x, row) in zip(d.x, d.R) for r in row]
+            result = rk_jax_evaluate(first(shared), :total, args; grad = true, prepare = :arguments)
+            @test result.value ≈ native(args...)
+            derivative = Enzyme.autodiff(Enzyme.Reverse, native, Enzyme.Active,
+                Enzyme.Active(a), Enzyme.Const(d.x), Enzyme.Const(d.R))[1][1]
+            @test result.grad ≈ derivative
         end
     end
 end
