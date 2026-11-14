@@ -16,6 +16,14 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.178
+
+- A range that reads `end` or `begin` inside an index over data or over a
+  computed array (`x[1:(end - 1)]`, `P[2:end, :]`) stays in its reference and
+  reads that array's extent when the model runs. Lowering had named such an
+  index as a data-only gather index of its own, which left `end` unbound:
+  preparing the model raised `UndefVarError: end not defined`.
+
 ## 0.1.177
 
 - JAX modules retain authored submodel names and documentation, reuse compatible

@@ -1957,6 +1957,13 @@ function _hoist_data_gather_indices!(sample, det, data, taken; resolve = identit
         # Literal ranges already carry their vector shape. Hoisting one as an
         # opaque module call loses that shape before observation validation.
         _literal_row_range(ex) && return ex
+        # `end` / `begin` are positions of the array this reference indexes,
+        # so an index reading them (`P[2:end, :]`, `x[1:(end - 1)]`) has no
+        # value apart from that array: naming it would leave the endpoint
+        # unbound. It stays in place, where RK reads it against the array at
+        # run time. A nested reference resolves its own endpoints, so
+        # `z[g[2:end]]` still names `g[2:end]`.
+        ReactiveKernels._kernel_ref_has_endpoint(ex) && return ex
         value = resolve(ex)
         # A broadcast over data (`start .+ size`) is an index vector exactly
         # as its named definition is.
