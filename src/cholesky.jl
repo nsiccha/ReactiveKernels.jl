@@ -9,8 +9,10 @@ upper triangle does not participate in the factorization.
 
 `A` must be square (`ArgumentError` otherwise). A non-positive or NaN pivot
 throws `LinearAlgebra.PosDefException`, whose `info` identifies the pivot.
-An empty square matrix has an empty factor. This is a native numerical
-callable; it does not provide a compiled lowering or a custom AD rule.
+An empty square matrix has an empty factor. `jax_source` translates the
+factorization with the same lower-triangle convention and runtime validity
+checks. Both native and JAX execution use ordinary backend differentiation;
+this callable has no custom AD rule.
 """
 function rk_cholesky_lower(A::AbstractMatrix)
     n = size(A, 1)

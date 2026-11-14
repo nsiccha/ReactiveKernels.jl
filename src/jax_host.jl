@@ -1378,18 +1378,24 @@ function _jax_prepare_bounds_lines(mod::_JaxModule, lines::Vector{String}, bound
 end
 
 const _JAX_PAD_ROWS = """
-def _rk_pad_rows(rows, dtype):
+def _rk_pad_rows(rows, dtype, rank=1):
     # A ragged value as the functions take it: the padded array (each row
     # repeats its last entry; an empty row is zeros), the lengths, and the
     # positions of the valid entries in the flattened padded array, whose
     # length is the total. `dtype` is the element type the program declares,
     # so an empty row (`[]`) keeps an integer column integer.
     rows = [np.asarray(r, dtype=dtype) for r in rows]
+    # One length per cell describes its first axis. Other axes retain a
+    # common shape; independently ragged axes need separate extents.
+    tail = rows[0].shape[1:] if rows else (1,) * (rank - 1)
+    if any(r.ndim != rank or r.shape[1:] != tail for r in rows):
+        raise ValueError("ragged cells need their declared rank and common trailing dimensions")
     lengths = np.asarray([r.shape[0] for r in rows], dtype=np.int64)
-    width = max([0] + [int(n) for n in lengths])
-    padded = np.stack([np.pad(r, (0, width - r.shape[0]), mode="edge") if r.shape[0] > 0
-                       else np.zeros(width, dtype=dtype) for r in rows]) if rows \
-        else np.zeros((0, width), dtype=dtype)
+    width = max([1 if rank > 1 and not rows else 0] + [int(n) for n in lengths])
+    padded = np.stack([np.pad(r, ((0, width - r.shape[0]),) + ((0, 0),) * (rank - 1),
+                             mode="edge") if r.shape[0] > 0
+                       else np.zeros((width,) + tail, dtype=dtype) for r in rows]) if rows \
+        else np.zeros((0, width) + tail, dtype=dtype)
     flat = np.flatnonzero(np.arange(width)[None, :] < lengths[:, None])
     return padded, lengths, flat
 """
@@ -1934,7 +1940,7 @@ function _jax_prepare_function!(mod::_JaxModule, split, raw_types, names, types;
             lengths = _jax_fresh(ctx, Symbol(name, :_lengths))
             flat = _jax_fresh(ctx, Symbol(name, :_flat))
             _jax_emit!(ctx, padded * ", " * lengths * ", " * flat * " = _rk_pad_rows(" * v.code *
-                            ", " * _host_dtype(eltype(eltype(T))) * ")")
+                            ", " * _host_dtype(eltype(eltype(T))) * ", " * string(ndims(eltype(T))) * ")")
             push!(entries, "\"" * name * "\": " * padded, "\"" * name * "_lengths\": " * lengths,
                   "\"" * name * "_flat\": " * flat)
         elseif _host_is_numeric_array(T)
