@@ -112,6 +112,7 @@ const _MATRIX_CORE_TESTS = (
     "test_plate_direct_reads.jl",
     "test_plate_reverse_direct_reads.jl",
     "test_plate_reverse_one_pass.jl",
+    "test_plate_reverse_index_runs.jl",
     "test_plate_reverse_scalar_rules.jl",
     "test_plate_reverse_single.jl",
     "test_nested_plate_shared_branch.jl",

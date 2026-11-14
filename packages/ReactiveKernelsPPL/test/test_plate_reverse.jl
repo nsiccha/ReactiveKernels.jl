@@ -92,14 +92,10 @@ end
 
     @testset "gauss_ri with sorted groups: contiguous index runs (N = $N)" for (N, J) in
             ((64, 4), (200, 5))
-        # Rows sorted by group, runs of at least 8: the likelihood plate sums
-        # each run's cells into a partial (src/index_runs.jl), an outer loop
-        # the generated reverse does not differentiate. Before RK 0.1.182 the
-        # plate still took the rule, ran that loop forward only and returned a
-        # gradient without the likelihood (relative error about 1 on every
-        # Julia; RadonCounty in snag plate-reverse-wr-8f83d36c). It keeps the
-        # backend's reverse until the generator covers index runs. The partial
-        # total is rejected before inspecting the enclosing active loop.
+        # The primal sums contiguous groups into run partials. Its preserved
+        # flat arm supplies the derivative graph, whose cell loop can then use
+        # the same runs. Check both the two-pass and one-pass size regimes:
+        # coverage must never omit the likelihood's contribution.
         rng = MersenneTwister(13)
         x = _prv_stdz(randn(rng, N))
         g = [cld(i * J, N) for i in 1:N]
@@ -114,8 +110,7 @@ end
             y .~ Normal.(mu, sigma)
         end, Dict(:y => y, :x => x, :g => g, :J => J), (:y, :x, :g, :J))
         report = _prv_compare(built, bound)
-        @test any(r -> first(r) === :_ppl_lik_y_resp &&
-            last(r) == "an intermediate plate total needs a propagated adjoint", report)
+        @test any(r -> first(r) === :_ppl_lik_y_resp && last(r) == "rule", report)
     end
 
     @testset "stable rewrites: sigma = exp(u) at the edges of exp" begin
