@@ -422,6 +422,8 @@ end
 @inline _shadow_disjoint(dx, x::Base.RefValue{T}) where {T} =
     T !== Any && dx !== x && (!isassigned(x) || _shadow_disjoint(dx, x[]))
 @inline _shadow_disjoint(dx, x::NamedTuple) = _shadow_disjoint(dx, values(x))
+@inline _shadow_disjoint(dx, x::ReactiveKernels._PlateTapeSlot) =
+    _shadow_disjoint(dx, x.tape) && _shadow_disjoint(dx, x.empty)
 @inline _shadow_disjoint(dx, x::Tuple{}) = true
 function _shadow_disjoint(dx, x::NTuple{N,T}) where {N,T}
     for value in x
@@ -485,6 +487,9 @@ end
     T !== Any && (!isassigned(x) || _push_shadow_interval!(work, x[], kind))
 end
 @inline _push_shadow_interval!(work, x::Tuple{}, kind) = true
+@inline _push_shadow_interval!(work, x::ReactiveKernels._PlateTapeSlot, kind) =
+    _push_shadow_interval!(work, x.tape, kind) &&
+    _push_shadow_interval!(work, x.empty, kind)
 function _push_shadow_interval!(work, x::NTuple{N,T}, kind) where {N,T}
     for value in x
         _push_shadow_interval!(work, value, kind) || return false
@@ -866,7 +871,25 @@ end
 # and differentiates it with Enzyme's ordinary reverse instead.
 
 using ReactiveKernels: _PlateSumRuleBody, _PlateSumRuleOnePass, _pr_gather_value,
-    _pr_scalar_positions, _pr_batched_positions, _CellArray
+    _pr_scalar_positions, _pr_batched_positions, _CellArray, _PlateTapeSlot,
+    _pr_take_tape!, _pr_return_tape!
+
+# A one-pass call made by a preparation that owns AD caches ends with its tape
+# slot (`_PlateTapeSlot`, src/plate_reverse.jl), which is no operand of the
+# program. `_pr_operand_args` are the program operands' annotations, `_pr_slot`
+# the slot (or `nothing`), and `_pr_with_slot` appends the slot's empty
+# cotangent to a reverse return built for the operands.
+_pr_slotted(::Type{<:Annotation{_PlateTapeSlot}}) = true
+_pr_slotted(::Type) = false
+_pr_slotted_args(types) = !isempty(types) && _pr_slotted(types[end])
+@generated function _pr_operand_args(args::Tuple)
+    _pr_slotted_args(args.parameters) || return :(args)
+    Expr(:tuple, (:(getfield(args, $i)) for i in 1:length(args.parameters)-1)...)
+end
+@generated _pr_slot(args::Tuple) = _pr_slotted_args(args.parameters) ?
+    :(getfield(args, $(length(args.parameters))).val) : :(nothing)
+@generated _pr_with_slot(args::Tuple, result::Tuple) =
+    _pr_slotted_args(args.parameters) ? :((result..., nothing)) : :(result)
 
 # A generated plate reverse scheduled by index runs (src/plate_reverse_runs.jl)
 # reads the run metadata, an unchanged `Const` tuple holding two index vectors,
@@ -902,16 +925,22 @@ end
 # The one-pass tape is one `Vector{Float64}`: each gathered operand's buffer,
 # then the scalar operands' unit-seed cotangents. It is a heap array already,
 # so Enzyme keeps it without boxing a tape struct (a struct holding the buffers
-# cost each eight-schools plate a 64 B box).
+# cost each eight-schools plate a 64 B box). With a tape slot the vector is the
+# preparation's own, taken out of the slot here and put back by the reverse
+# pass; without one, or when the slot is empty or holds another length, it is
+# allocated. The trailing entry of `overwritten(config)` that belongs to the
+# slot is never read: the helpers index it by operand position.
 function EnzymeRules.augmented_primal(
         config::RevConfig, rule::Const{<:_PlateSumRuleOnePass}, ::Type{RT},
-        args::Vararg{Annotation,N}) where {RT,N}
+        annotations::Vararg{Annotation,N}) where {RT,N}
+    args = _pr_operand_args(annotations)
     values = _pr_values(args)
     r = rule.val.rule
     S, B = _pr_scalar_positions(r), _pr_batched_positions(r)
     if !(RT <: Const) && _pr_covers(Val(S), Val(B), args) &&
             _pr_one_pass(Val(S), Val(B), Val(overwritten(config)), args)
-        tape = zeros(Float64, _pr_buffer_length(Val(B), args) + length(S))
+        tape = _pr_take_tape!(_pr_slot(annotations),
+                              _pr_buffer_length(Val(B), args) + length(S))
         swept = r.reverse(values..., 1.0, Val(true), _pr_tape_buffers(Val(B), args, tape)...)
         _pr_store_cotangents!(tape, Base.tail(swept))
         return AugmentedReturn(needs_primal(config) ? first(swept) : nothing, nothing, tape)
@@ -1121,8 +1150,17 @@ end
 
 function EnzymeRules.reverse(
         config::RevConfig, rule::Const{<:Union{_PlateSumRuleBody,_PlateSumRuleOnePass}},
-        dret, tape, args::Vararg{Annotation,N}) where {N}
-    r = rule.val.rule
+        dret, tape, annotations::Vararg{Annotation,N}) where {N}
+    cotangents = _pr_rule_reverse(config, rule.val.rule, dret, tape,
+                                  _pr_operand_args(annotations))
+    # The seed's scaling is done: the vector goes back to its slot for the
+    # next call. A two-pass or constant call of the site took none out.
+    tape isa Vector{Float64} && _pr_return_tape!(_pr_slot(annotations), tape)
+    _pr_with_slot(annotations, cotangents)
+end
+
+function _pr_rule_reverse(config::RevConfig, r::R, dret, tape,
+                          args::Tuple{Vararg{Annotation,N}}) where {R,N}
     S = _pr_scalar_positions(r)
     B = _pr_batched_positions(r)
     W = width(config)
