@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.184
+## 0.1.185
 
 - `adaptive_centering_problem` accepts nested cells: a cell's location or
   log-scale may read another selected cell's latent, for example
@@ -32,6 +32,18 @@ are recorded in the git history only.
   their model values; with WarmupHMC 0.2 they are refused. The compat bound
   is widened to `"0.2.21, 0.3"`, and single-level cells behave as before on
   both.
+
+## 0.1.184
+
+- `prepare_query(built, plan, want; inputs = (:x,))` prepares once and leaves
+  the named data values as call arguments: `q(u, xx)` gives what preparing on
+  a binding with `x = xx` gives, without binding or preparing again. Data
+  definitions and value matrices binding computes from an input are evaluated
+  again on every call. A call checks that each input keeps its bound type and
+  size, and that nothing other than floating-point values changes in what
+  binding computes from it. Preparation refuses observations and the data
+  binding checks against them, factor labels, and integer or Boolean data,
+  naming why. Queries without `inputs` are unchanged.
 
 ## 0.1.183
 

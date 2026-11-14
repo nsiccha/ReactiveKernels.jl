@@ -2,7 +2,7 @@
 # adaptive-affine-d6c2fa03: group effects z_g about mu, unit effects z_u about
 # mu + tau_g * z_g[group], with data that pin every unit value much more tightly
 # than its spread. Compares the reporter's two single-level shapes with both
-# levels centred about their parents (RKPPL 0.1.184, WarmupHMC >= 0.3.0),
+# levels centred about their parents (RKPPL 0.1.185, WarmupHMC >= 0.3.0),
 # adaptive and at two fixed centerings.
 #
 # Run single-threaded in an environment with ReactiveKernelsPPL, WarmupHMC,
@@ -36,7 +36,7 @@ nested_cells(sg = 0.0, su = 0.0) = (
 
 # Each arm: cells, and whether WarmupHMC adapts their centering.
 const ARMS = (
-    # The reporter's shapes before RKPPL 0.1.184:
+    # The reporter's shapes before RKPPL 0.1.185:
     unit_only = ((z_u = (location = :unit_location, log_scale = :log_tau_u),), true),
     both_about_mu = ((z_g = (location = :mu, log_scale = :log_tau_g),
         z_u = (location = :mu, log_scale = :log_tau_u)), true),

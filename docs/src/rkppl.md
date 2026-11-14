@@ -158,7 +158,7 @@ Such a read sees the other cell's model-frame values. The reads order the
 cells into levels, which WarmupHMC maps in order, so re-centering a parent level
 keeps the meaning of the coordinates centred on it. The adapter checks these
 graph dependencies before sampling and refuses own reads and cycles. Nested
-levels need RKPPL 0.1.184 and WarmupHMC 0.3.0 or later.
+levels need RKPPL 0.1.185 and WarmupHMC 0.3.0 or later.
 
 RKPPL 0.1.175 with WarmupHMC
 0.2.21 or later prepares one joint endpoint kernel, sharing common graph work
