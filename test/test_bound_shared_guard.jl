@@ -27,6 +27,19 @@ end
     end
     total = sum(scores)
 end
+@kernel whole_bound_arm(y, upper, a::Float64) = begin
+    scores = plate(y, upper) do yi, ui
+        isinf(ui) ? yi : yi * exp(a + ui)
+    end
+    total = sum(scores)
+end
+struct ReadCountVector{T} <: AbstractVector{T}
+    values::Vector{T}
+    reads::Base.RefValue{Int}
+end
+Base.size(x::ReadCountVector) = size(x.values)
+Base.IndexStyle(::Type{<:ReadCountVector}) = IndexLinear()
+Base.getindex(x::ReadCountVector, i::Int) = (x.reads[] += 1; x.values[i])
 @kernel counted(y, upper, a::Float64) = begin
     scores = plate(y, upper) do yi, ui
         z = isinf(ui) ? 1.0 : counted_exp(a + ui)
@@ -96,6 +109,52 @@ end
 
 const backend = AutoEnzyme(; mode=Enzyme.Reverse)
 nodes(x) = x isa Expr ? 1 + sum(nodes, x.args; init=0) : 1
+
+@testset "a wholly bound arm retains its prepared reduction" begin
+    for n in (0, 1, 7, 257), branch_arms in (:taken, :all)
+        values = collect(range(0.25; step=0.125, length=n))
+        reads = Ref(0)
+        y = ReadCountVector(values, reads)
+        k = prepare(whole_bound_arm; want=:total, bound=(; y, upper=Inf), branch_arms)
+        reads[] = 0
+        @test k(0.2) ≈ sum(values)
+        @test k(-0.7) ≈ sum(values)
+        @test reads[] == 0
+        ad = prepare_ad(k, backend, 0.2; active=:a)
+        @test ad_value_and_gradient(ad, 0.2) == (sum(values), 0.0)
+        @test reads[] == 0
+    end
+end
+
+@testset "a shared numerical guard stays runtime across bindings" begin
+    for branch_arms in (:taken, :all)
+        for n in (0, 1, 7, 257), repeated in (false, true)
+            y = repeated ? fill(0.5, n) : collect(range(0.25; step=0.125, length=n))
+            kernels = [prepare(guarded_total; want=:total,
+                bound=(; y, upper), branch_arms) for upper in (2.0, Inf)]
+            # Changing this shared guard must not change the program. Row
+            # grouping is independent: repeated and distinct data can have
+            # different programs, both with bounded loop-body growth.
+            same_type = typeof(kernels[1]) == typeof(kernels[2])
+            same_code = code_expr(kernels[1]) == code_expr(kernels[2])
+            @test same_type
+            @test same_code
+            for (k, upper) in zip(kernels, (2.0, Inf)), a in (-0.25, 0.5)
+                expected = sum(y) * (isinf(upper) ? 1.0 : exp(a + upper))
+                @test k(a) ≈ expected
+            end
+        end
+        for repeated in (false, true)
+            sizes = map((7, 257)) do n
+                y = repeated ? fill(0.5, n) : collect(range(0.25; step=0.125, length=n))
+                k = prepare(guarded_total; want=:total,
+                    bound=(; y, upper=2.0), branch_arms)
+                nodes(code_expr(k))
+            end
+            @test sizes[1] == sizes[2]
+        end
+    end
+end
 
 @testset "a bound shared guard keeps its arm shared" begin
     # User principle 1om0yie: plate-invariant work is hoisted automatically.

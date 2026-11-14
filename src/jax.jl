@@ -3707,10 +3707,31 @@ for (f, name) in ((trunc, "jnp.trunc"), (floor, "jnp.floor"), (ceil, "jnp.ceil")
     end
 end
 _jax_call_positional(ctx::_JaxContext, ::typeof(typeassert), args::Vector{_PyVal}) = args[1]
+# Zero predicates over built-in real scalars are pure and total, so testing
+# every entry preserves all/any's short-circuit result and observable behavior.
+# Do not apply this reduction to arbitrary predicates: those may throw or have
+# effects in entries Julia would not visit.
+function _jax_zero_predicate_reduction(ctx::_JaxContext, f, name, args)
+    length(args) == 2 || _jax_error("this `", f, "` call", _jax_where(ctx))
+    predicate = _jax_function_of(args[1])
+    predicate_type = _jax_callable_type(predicate)
+    x = args[2]
+    E = _jax_eltype(x.T)
+    E in (Bool, Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64,
+          Float16, Float32, Float64) &&
+        (predicate_type === typeof(iszero) || predicate_type === typeof(!iszero)) ||
+        _jax_error("this `", f, "` predicate call", _jax_where(ctx))
+    comparison = predicate_type === typeof(iszero) ? (==) : (!=)
+    mapped = _jax_broadcast(ctx, comparison, [x, _jax_literal(0)])
+    code = _jax_padded_reduced(ctx, f, mapped, f === all ? "True" : "False")
+    text = name * "(" * code * ")"
+    x.static && (text = _host_static_text(text))
+    _PyVal(text, Bool, x.static)
+end
 for (f, name) in ((all, "jnp.all"), (any, "jnp.any"))
     @eval _jax_function_call(ctx::_JaxContext, ::typeof($f), args::Vector{_PyVal}) =
         length(args) == 1 ? _PyVal($name * "(" * args[1].code * ")", Bool, args[1].static) :
-        _jax_error("this `", $f, "` call", _jax_where(ctx))
+        _jax_zero_predicate_reduction(ctx, $f, $name, args)
 end
 # Identity comparisons decide while tracing, on static values only.
 for (f, op) in (((===), " is "), ((!==), " is not "))

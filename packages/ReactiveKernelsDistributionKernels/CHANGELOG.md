@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.11
+
+- Normal HMM emissions share one runtime nonzero-scale check across the
+  emission plate, retaining the existing guarded Normal calculation whenever
+  a scale is zero. Empty inputs, scale checks and ordinary gradients preserve
+  their behavior. In a paired three-process comparison, the natural HMM's
+  ordinary density takes 3–6% less time with unchanged allocations. Native and
+  JAX emission retain runtime observation lengths. Requires ReactiveKernels
+  0.1.234.
+
 ## 0.1.10
 
 - Add guarded density adapters and authored constructor checks for discrete
