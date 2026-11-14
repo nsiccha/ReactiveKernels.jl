@@ -123,7 +123,11 @@ The public density functions and `constrain` call a shared model function.
 Their output selectors are fixed by the wrappers, allowing JAX to trace only
 the requested computation. Call them as before: `log_density(u, **prepared)`.
 The submodel functions likewise take a static `outputs` selection; their
-arguments and array lengths remain runtime inputs.
+arguments and array lengths remain runtime inputs. Consecutive statements
+that the same outputs need share one selection block (`if _entry in (...):`,
+or `if any(name in outputs for name in (...)):` in a submodel function), and
+the checks every public function runs, such as the packed-length check, run
+once before the per-function returns.
 
 A plate may use separate functions for a scalar return value and a batched
 density. Combined computations, such as grouped scalar priors, retain their
@@ -165,7 +169,7 @@ history stays nested in that scope, preserving the bounds and history access
 analysis. Nested plate cells and scan steps are named after the authored
 values they compute.
 
-A helper translates from recorded source when available: `@traceable` records it, and a trailing Vararg argument (`args...`, `args::Vararg{T,N}`) reads as the tuple of the trailing arguments, as the method receives them, and `sum(f, t; init)` folds such a tuple over its fixed length; `for` becomes `jax.lax.fori_loop`, `if` becomes `jax.lax.cond`, and `A[i] = v` becomes `A.at[i].set(v)`. Plain lowered helpers support straight-line code and terminal forward branches, including size guards. They can create immutable closures and fold fixed argument lists with `Base.afoldl`. Broadcasting `Ref(x)` passes `x` whole to each call. Captures remain runtime inputs; host `prepare_data` uses the same translation.
+A helper translates from recorded source when available: `@traceable` records it, and a trailing Vararg argument (`args...`, `args::Vararg{T,N}`) reads as the tuple of the trailing arguments, as the method receives them, and `sum(f, t; init)` folds such a tuple over its fixed length; `for` becomes `jax.lax.fori_loop`, `if` becomes `jax.lax.cond`, and `A[i] = v` becomes `A.at[i].set(v)`. A `jax.lax.cond` arm that is one expression is a `lambda`, and a branch between two values already bound or literal (`s == 0 && x == m ? 1.0 : s`) is `jnp.where`, whose value and derivative are the conditional's; an arm that computes anything stays lazy. A condition decided while tracing (a shape or literal test) is Python's own `if`, so a guard `n == k || throw(...)` reads `if not (n == k): raise ValueError(...)`. Plain lowered helpers support straight-line code and terminal forward branches, including size guards. They can create immutable closures and fold fixed argument lists with `Base.afoldl`. Broadcasting `Ref(x)` passes `x` whole to each call. Captures remain runtime inputs; host `prepare_data` uses the same translation.
 
 A method that a package generates, such as one its macro writes into the caller's module, cannot carry `@traceable`. The generating package keeps the method's source as a `TraceableSource` (argument names, body, and the module whose globals the body reads) and hands it over through a provider. It registers the provider with `register_source_provider!`, once, from the `__init__` of the package extension that loads with ReactiveKernels. The emitter asks the provider for a call that has no other translation and no `@traceable` source, with the function and the `Tuple` type of the argument types. The provider answers `nothing` or the source of the method those arguments call natively.
 

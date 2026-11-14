@@ -16,6 +16,17 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.239
+
+- JAX source names only what a reader needs. A traced branch between two
+  values already bound or literal is `jnp.where` (same value and derivative),
+  other `jax.lax.cond` arms that are one expression are `lambda`s, and a
+  condition decided while tracing is Python's own `if`, so a shape guard reads
+  `if not (n == k): raise ValueError(...)` instead of two nested functions and
+  a `value` binding. Consecutive statements needed by the same entries share
+  one output-selection block, and checks every entry runs (the packed-length
+  check) run once before the entries' returns.
+
 ## 0.1.238
 
 - A prepared reverse Enzyme gradient whose active ports are all of the
