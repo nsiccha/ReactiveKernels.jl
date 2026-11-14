@@ -3562,13 +3562,14 @@ function _ad_check_cotangent_destination(destination::Tuple, source::Tuple)
     length(destination) == length(source) || throw(DimensionMismatch(
         "gradient destination has $(length(destination)) components; " *
         "the active tuple has $(length(source))"))
-    foreach(_ad_check_cotangent_destination, destination, source)
+    _ad_cotangent_pairs(_ad_check_cotangent_destination, destination, source)
 end
 function _ad_check_cotangent_destination(destination::NamedTuple, source::NamedTuple)
     keys(destination) == keys(source) || throw(ArgumentError(
         "gradient destination fields $(keys(destination)) do not match " *
         "cotangent fields $(keys(source))"))
-    foreach(_ad_check_cotangent_destination, values(destination), values(source))
+    _ad_cotangent_pairs(_ad_check_cotangent_destination,
+        values(destination), values(source))
 end
 _ad_check_cotangent_destination(destination, source) = throw(ArgumentError(
     "structured active gradients require matching mutable array, Ref, " *
@@ -3580,9 +3581,26 @@ _ad_check_cotangent_destination(destination, source) = throw(ArgumentError(
 _ad_write_cotangent!(destination::AbstractArray, source) = copyto!(destination, source)
 _ad_write_cotangent!(destination::Base.RefValue, source) = (destination[] = source)
 _ad_write_cotangent!(destination::Tuple, source::Tuple) =
-    foreach(_ad_write_cotangent!, destination, source)
+    _ad_cotangent_pairs(_ad_write_cotangent!, destination, source)
 _ad_write_cotangent!(destination::NamedTuple, source::NamedTuple) =
-    foreach(_ad_write_cotangent!, values(destination), values(source))
+    _ad_cotangent_pairs(_ad_write_cotangent!, values(destination), values(source))
+
+# Apply `f` to corresponding components of two tuples of equal length. A
+# homogeneous pair keeps a runtime loop; heterogeneous components are visited
+# structurally, so neither form dispatches at run time.
+function _ad_cotangent_pairs(f::F, destination::NTuple{N,D},
+        source::NTuple{N,S}) where {F,N,D,S}
+    for i in 1:N
+        f(destination[i], source[i])
+    end
+    nothing
+end
+@generated function _ad_cotangent_pairs(f::F, destination::D,
+        source::S) where {F,D<:Tuple,S<:Tuple}
+    calls = [:(f(getfield(destination, $i), getfield(source, $i)))
+             for i in 1:min(fieldcount(D), fieldcount(S))]
+    Expr(:block, Expr(:meta, :inline), calls..., nothing)
+end
 
 inputs(prepared::PreparedADOperator) = inputs(prepared.kernel)
 outputs(prepared::PreparedADOperator) = outputs(prepared.kernel)
