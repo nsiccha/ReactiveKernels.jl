@@ -16,6 +16,21 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.183
+
+- `marginalize(model, :x)` integrates a linear-Gaussian latent `@scan` array out
+  of the density exactly, as a Kalman filter, on the model as written. It
+  applies to a model or a binding and composes with `|`, `condition` and
+  `merge`. The recurrence carries `x` alone from a Normal or fixed seed, each
+  step is linear in `x[t - 1]` with Normal innovations and coefficients that
+  may read parameters, data and the loop index, and one Normal observation
+  `y .~ Normal.(offset .+ loading .* x, noise)` of bound data reads it
+  (directly or through a definition read only by it). The layout drops `x` and
+  its innovations; `:pointwise.y` holds one-step-ahead predictive densities.
+  `prepare_marginalized_latents` and `marginalized_latent_draws` return exact
+  draws of `x` by forward filtering, backward sampling. Other forms, including
+  recurrences in `@plate` cells or submodels, are refused naming the statement.
+
 ## 0.1.182
 
 - A location whose per-row summands are all computed by the model, such as
