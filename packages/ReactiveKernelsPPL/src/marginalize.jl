@@ -47,7 +47,12 @@ A marginalized array `x` qualifies when
   merged in time order with bounded latents of censored ones (data
   augmentation: `gap[1:K] .~ restricted.(Flat.(), 0, Inf)`,
   `y = vcat(measured, limit .- gap)[order]`). The filter then observes each
-  entry at its value, and the scan's length is supplied.
+  entry at its value, and the scan's length is supplied. Rows may instead
+  observe the state at their steps, `y .~ Normal.(offset .+ loading .*
+  x[step], noise)` with `step` bound integer data: a step may have several
+  rows or none. The filter then runs over events (each step, then its rows
+  in order), the scan's length is supplied, and each row's pointwise density
+  is its predictive given the rows before it in that order.
 
 Any other form is refused with a `SurfaceLoweringError` naming the
 statement. Each scalar coefficient may vary by step (irregular gaps
@@ -535,11 +540,13 @@ function _marginalized_lengths!(values, data, ast::Expr, marginalized)
         k = findfirst(st -> _is_scan_of(st, x), stmts)
         k === nothing && continue
         hi = _scan_upper_bound(stmts[k].args[end])
+        _marginalized_events!(values, data, stmts, k, x, hi)
         (hi isa Symbol && !haskey(values, hi)) || continue
         inlined, _ = _inline_latent_definitions(stmts, k, x)
         for st in inlined
             (Meta.isexpr(st, :call, 3) && st.args[1] === :.~ && st.args[2] isa Symbol &&
                 _mentions_symbol(st.args[3], x)) || continue
+            _observation_gather(st, x) === nothing || break
             v = get(values, st.args[2], nothing)
             if v isa AbstractVector
                 values[hi] = length(v)
@@ -549,6 +556,164 @@ function _marginalized_lengths!(values, data, ast::Expr, marginalized)
         end
     end
     return values
+end
+
+# Rows observing the state at their steps (`y .~ Normal.(… x[step] …)`): the
+# filter runs over events, one per step and one per row, so their count
+# `steps + rows` is bound here, with a supplied length (rows do not say how
+# many steps there are).
+function _marginalized_events!(values, data, stmts, k, x, hi)
+    inlined, _ = _inline_latent_definitions(stmts, k, x)
+    for st in inlined
+        idx = _observation_gather(st, x)
+        idx === nothing && continue
+        steps = hi isa Integer ? hi : get(values, hi, nothing)
+        rows = get(values, idx, nothing)
+        (steps isa Integer && rows isa AbstractVector) || return
+        E = _marginal_name(x, :events)
+        values[E] = steps + length(rows)
+        push!(data, E)
+        return
+    end
+end
+
+# The events of rows observing steps `step` of a recurrence of `T` steps, in
+# order: each step, then each of its rows in their order. `_rkppl_marginal_
+# event_rows` holds each event's row (0 for a step), `…_event_steps` its step,
+# `…_row_events` each row's event, `…_step_ends` each step's last event.
+function _rkppl_marginal_event_rows(step::AbstractVector{<:Integer}, T::Integer)
+    all(s -> 1 <= s <= T, step) || throw(ContractValidationError("[bind] a row " *
+        "observes a step outside 1:$T of its marginalized recurrence"))
+    out = zeros(Int, T + length(step))
+    for (i, e) in enumerate(_rkppl_marginal_row_events(step, T))
+        out[e] = i
+    end
+    return out
+end
+_rkppl_marginal_row_events(step::AbstractVector{<:Integer}, T::Integer) =
+    step .+ invperm(sortperm(step))
+function _rkppl_marginal_event_steps(step::AbstractVector{<:Integer}, T::Integer)
+    rows = _rkppl_marginal_event_rows(step, T)
+    return cumsum(rows .== 0)
+end
+_rkppl_marginal_step_ends(step::AbstractVector{<:Integer}, T::Integer) =
+    [s + count(<=(s), step) for s in 1:T]
+
+# Rows observing the state at their steps, `y .~ Normal.(offset .+ loading .*
+# x[step], noise)`: the filter runs over events. A step's event applies its
+# transition (from the transition scan) and observes nothing; a row's event
+# keeps the state and observes the row. Each row's one-step-ahead predictive
+# law, at its event, is its observation; the draws read the moments at each
+# step's last event.
+function _marginalize_gathered(stmts, k, j, x, law, y, form, scale, idx, ast, values, bound)
+    E = _marginal_name(x, :events)
+    (bound && !(Missing <: eltype(values[y]))) || _marginal_fail(x, "its observation " *
+        "`$y` reads `$x[$idx]`; rows observing their steps are marginalized when `$y` " *
+        "is bound data without missing entries")
+    rows = get(values, idx, nothing)
+    (rows isa AbstractVector{<:Integer} && length(rows) == length(values[y])) ||
+        _marginal_fail(x, "its observation reads `$x[$idx]`; `$idx` must be bound " *
+            "integer data, one step per entry of `$y`")
+    haskey(values, E) || _marginal_fail(x, "the length `$(law.hi)` of its `@scan` is " *
+        "not supplied; rows observing their steps (`$x[$idx]`) do not say how many " *
+        "steps there are, so supply it (`model(; $(law.hi) = …)`)")
+    T = law.hi
+    leaf = _toplevel_shape_leaf(_marginal_names(ast), values)
+    name(role) = _marginal_name(x, role)
+    ER, ES, RE, ENDS = name(:event_rows), name(:event_steps), name(:row_events), name(:step_ends)
+    OBS, G, EY = name(:event_observes), name(:event_row), name(:event_observed)
+    C, D, Q = (name(r) for r in (:coef, :shift, :innovation_var))
+    EC, ED, EQ = name(:event_coef), name(:event_shift), name(:event_innovation_var)
+    call(f, args...) = Expr(:call, GlobalRef(@__MODULE__, f), args...)
+    defs = Any[
+        :($ER = $(call(:_rkppl_marginal_event_rows, idx, T))),
+        :($ES = $(call(:_rkppl_marginal_event_steps, idx, T))),
+        :($RE = $(call(:_rkppl_marginal_row_events, idx, T))),
+        :($ENDS = $(call(:_rkppl_marginal_step_ends, idx, T))),
+        :($OBS = $ER .> 0),
+        :($G = max.($ER, 1)),
+        :($EY = $y[$G])]
+    pieces = _event_pieces!(defs, x, y, form, scale, leaf, G)
+    transition_reads = Any[:($EC = $C[$ES]), :($ED = $D[$ES]), :($EQ = $Q[$ES])]
+    filter = _event_filter_scan(x, E, OBS, EY, EC, ED, EQ, D, Q, pieces)
+    EM, EV = name(:event_location), name(:event_variance)
+    PL, PV = name(:predictive_location), name(:predictive_variance)
+    tail = Any[filter,
+        :($y .~ Normal.($PL[$RE], sqrt.($PV[$RE]))),
+        # The draws' filtered moments: each step's last event.
+        :($(name(:mean)) = $EM[$ENDS]), :($(name(:var)) = $EV[$ENDS])]
+    out = Any[]
+    for (i, st) in enumerate(stmts)
+        i == k && continue
+        if i == j
+            push!(out, _transition_scan(x, law))
+            append!(out, defs, transition_reads, tail)
+            continue
+        end
+        push!(out, st)
+    end
+    return Expr(:block, out...)
+end
+
+# The observation's pieces at event `e`: a one-value piece as it is, a piece
+# with one value per row gathered at each event's row (`piece[G]`).
+function _event_pieces!(defs, x, y, form, scale, leaf, G)
+    e = _marginal_name(x, :event)
+    function piece(p, role; square = false)
+        p === nothing && return (nothing, nothing)
+        p isa Real && return (p, p * p)
+        shape = _shape_of(p, leaf)
+        shape === :unknown && _marginal_fail(x, "cannot tell whether the observation's " *
+            "$role `$p` is one value or one value per entry of `$y`; write it " *
+            "from declared parameters, bound data and definitions of them")
+        n = p
+        if !(p isa Symbol)
+            n = _marginal_name(x, role)
+            push!(defs, Expr(:(=), n, p))
+        end
+        if shape === :scalar
+            square || return (n, nothing)
+            sq = _marginal_name(x, Symbol(role, :_squared))
+            push!(defs, Expr(:(=), sq, Expr(:call, :*, n, n)))
+            return (n, sq)
+        end
+        ev = _marginal_name(x, Symbol(:event_, role))
+        push!(defs, Expr(:(=), ev, Expr(:ref, n, G)))
+        at = Expr(:ref, ev, e)
+        return (at, Expr(:call, :*, at, at))
+    end
+    O, _ = piece(form.constant, :offset)
+    L, LL = piece(form.coefs[x], :loading; square = true)
+    _, SS = piece(scale, :scale; square = true)
+    return (O, L, LL, SS)
+end
+
+# The filter over events: event 1 is step 1's seed law; a step's event
+# predicts through its transition, a row's event updates on its row (its
+# gain is the event's `OBS`).
+function _event_filter_scan(x, E, OBS, EY, EC, ED, EQ, D, Q, pieces)
+    e = _marginal_name(x, :event)
+    name(role) = _marginal_name(x, role)
+    EM, EV = name(:event_location), name(:event_variance)
+    PL, PV = name(:predictive_location), name(:predictive_variance)
+    a, c, w = name(:event_step_coef), name(:event_step_shift), name(:event_step_var)
+    pm, pv, g = name(:predicted_location), name(:predicted_variance), name(:gain)
+    at(v) = Expr(:ref, v, e)
+    prev(v) = Expr(:ref, v, Expr(:call, :-, e, 1))
+    _, gain, mean_e, var_e, loc_e, fv_e = _kalman_update(at(EY), pm, pv, pieces, g;
+        present = at(OBS))
+    body = Expr(:block,
+        :($a = ifelse($(at(OBS)), 1.0, $(at(EC)))),
+        :($c = ifelse($(at(OBS)), 0.0, $(at(ED)))),
+        :($w = ifelse($(at(OBS)), 0.0, $(at(EQ)))),
+        :($pm = $a * $(prev(EM)) + $c),
+        :($pv = $a * $a * $(prev(EV)) + $w),
+        Expr(:(=), at(PL), loc_e), Expr(:(=), at(PV), fv_e),
+        Expr(:(=), g, gain), Expr(:(=), at(EM), mean_e), Expr(:(=), at(EV), var_e))
+    loop = Expr(:for, Expr(:(=), e, Expr(:call, :(:), 2, E)), body)
+    return _scan_macro(Expr(:block,
+        :($(EM)[1] = $D[1]), :($(EV)[1] = $Q[1]),
+        :($(PL)[1] = 0.0), :($(PV)[1] = 1.0), loop))
 end
 
 # The upper bound of a `@scan` block's loop, read syntactically.
@@ -586,8 +751,10 @@ function _marginalize_latent(ast::Expr, x::Symbol, values, observing)
     law = _gaussian_transition(parse_scan_block(stmts[k].args[end]), x)
     stmts, k = _inline_latent_definitions(stmts, k, x)
     j = _marginal_reader(x, stmts, k)
-    y, loc, scale, form = _marginal_observation(x, stmts[j], y -> y isa Symbol, "y")
+    y, loc, scale, form, idx = _marginal_observation(x, stmts[j], y -> y isa Symbol, "y")
     bound = y in observing && get(values, y, nothing) isa AbstractVector
+    idx === nothing || return _marginalize_gathered(stmts, k, j, x, law, y, form, scale,
+        idx, ast, values, bound)
     # Otherwise a vector the model computes without `x` (data augmentation:
     # measured rows merged with bounded latents of censored rows), which the
     # filter reads entry by entry.
@@ -658,10 +825,30 @@ function _marginal_observation(x, obs, response, spelled)
     scale = length(rhs.args[2].args) == 2 ? rhs.args[2].args[2] : 1.0
     _mentions_symbol(scale, x) && wrong()
     readsx(ex) = _mentions_symbol(ex, x)
-    leafx(ex) = ex === x ? _Affine(nothing, Dict{Any,Any}(x => 1)) : nothing
+    # `x` itself, or one gather `x[idx]` of it by a name (each row observes
+    # the state at its step); never both, never two gathers.
+    gathers = Set{Any}()
+    function leafx(ex)
+        whole = ex === x
+        gathered = Meta.isexpr(ex, :ref, 2) && ex.args[1] === x && ex.args[2] isa Symbol
+        (whole || gathered) || return nothing
+        push!(gathers, whole ? nothing : ex.args[2])
+        return _Affine(nothing, Dict{Any,Any}(x => 1))
+    end
     form = _affine(loc, leafx, readsx, true)
-    (form === nothing || !haskey(form.coefs, x)) && wrong()
-    return y, loc, scale, form
+    (form === nothing || !haskey(form.coefs, x) || length(gathers) != 1) && wrong()
+    return y, loc, scale, form, only(gathers)
+end
+
+# The gather `idx` of an observation `y .~ Normal.(… x[idx] …)` reading `x`
+# through one, read syntactically (`nothing` for any other statement).
+function _observation_gather(st, x)
+    (Meta.isexpr(st, :call, 3) && st.args[1] === :.~) || return nothing
+    found = Ref{Any}(nothing)
+    visit(ex) = ex isa Expr && (Meta.isexpr(ex, :ref, 2) && ex.args[1] === x &&
+        ex.args[2] isa Symbol ? (found[] = ex.args[2]) : foreach(visit, ex.args))
+    visit(st.args[3])
+    return found[]
 end
 
 # The observation's offset, loading and scale at the seed and at step `t`.
@@ -712,9 +899,12 @@ function _marginalize_cell_latent(ast::Expr, p, x::Symbol, values, observing)
     cell, k = _inline_cell_latent_definitions(cell, k, x, ivar, others)
     j = _marginal_reader(x, cell, k;
         observation = "y[$ivar] .~ Normal.(offset .+ loading .* $x, noise)")
-    y, loc, scale, form = _marginal_observation(x, cell[j],
+    y, loc, scale, form, idx = _marginal_observation(x, cell[j],
         y -> Meta.isexpr(y, :ref, 2) && y.args[1] isa Symbol && y.args[2] === ivar,
         "y[$ivar]")
+    idx === nothing || _marginal_fail(x, "its observation `$y` reads `$x[$idx]`; " *
+        "gathered rows in a `@plate` cell are not marginalized yet (at top level " *
+        "each row observes the state at its step)")
     yname = y.args[1]
     yvalue = get(values, yname, nothing)
     yvalue isa AbstractVector && any(e -> e isa AbstractVector && Missing <: eltype(e), yvalue) &&
@@ -998,13 +1188,14 @@ struct MarginalizedLatentQuery{Q}
 end
 
 # The marginalized latents of a lowered program: those whose filter scan
-# (carrying `_rkppl_marginal_<x>_mean`) it holds at top level, or whose draws'
-# plate returns `_rkppl_marginal_<x>_mean[g]` per index.
+# (carrying `_rkppl_marginal_<x>_mean`) it holds at top level, whose event
+# filter's per-step moments it defines (`_rkppl_marginal_<x>_mean = …`), or
+# whose draws' plate returns `_rkppl_marginal_<x>_mean[g]` per index.
 function _marginalized_names(plan::StructuralPlan)
     out = Symbol[]
     suffix = "_mean"
     names = Iterators.flatten(((s for sp in plan.scans for s in sp.states),
-        (d.name for d in plan.derived)))
+        (d.name for d in plan.derived), (a.name for a in plan.assignments)))
     for s in names
         str = String(s)
         startswith(str, _MARGINAL_PREFIX) && endswith(str, suffix) || continue

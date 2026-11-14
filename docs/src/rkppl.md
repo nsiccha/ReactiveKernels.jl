@@ -132,6 +132,32 @@ augmented = marginalize(censored(; T = 6, K = 2, measured, limit, order), :x)
 coordinate_names(build_kernel(augmented).layout)
 ```
 
+Rows may also observe the state at their steps, `x[step]` with `step` bound integer data, so that a step has several rows or none (several sensors, irregular sampling). The filter then runs over the steps and their rows in order, and the scan's length is supplied:
+
+```@example marginal
+sensors = @rkppl begin
+    phi ~ Uniform(-1, 1)
+    sigma ~ Exponential(1)
+    bias[1:S] .~ Normal.(0, 1)
+    noise ~ Exponential(0.5)
+    @scan begin
+        x[1] ~ Normal(0, sigma / sqrt(1 - phi^2))
+        for t in 2:T
+            x[t] ~ Normal(phi * x[t - 1], sigma)
+        end
+    end
+    y .~ Normal.(bias[sensor] .+ x[step], noise)
+end
+step = [1, 1, 2, 4, 4, 5]                       # step 3 has no row
+sensor = [1, 2, 1, 1, 2, 2]
+readings = [0.2, 0.4, -0.1, 0.3, 0.1, 0.0]
+rows = marginalize(sensors(; T = 5, S = 2, step, sensor), :x) | (; y = readings)
+built_rows = build_kernel(rows)
+u = zeros(built_rows.layout.total)
+(; coordinates=coordinate_names(built_rows.layout),
+    x=marginalized_latent_draws(prepare_marginalized_latents(built_rows, rows), u, Xoshiro(1)).x)
+```
+
 A recurrence in a `@plate` cell integrates out the same way, one filter per index, when the cell observes it through `y[g] .~ Normal.(offset .+ loading .* x, noise)` and the bound `y` holds one vector per index. The draws then hold one trajectory per index:
 
 ```@example marginal
@@ -159,7 +185,7 @@ latents = prepare_marginalized_latents(built_cells, cells)
     x=marginalized_latent_draws(latents, u, Xoshiro(1)).x)
 ```
 
-Recurrences carrying several arrays, a lag above one, recurrences inside nested `@plate` cells or submodels, missing entries in a `@plate` cell's series, and observations that are not Normal are refused with an error naming the statement.
+Recurrences carrying several arrays, a lag above one, recurrences inside nested `@plate` cells or submodels, missing entries or gathered rows in a `@plate` cell's series, and observations that are not Normal are refused with an error naming the statement.
 
 ## Adaptive partial centering
 

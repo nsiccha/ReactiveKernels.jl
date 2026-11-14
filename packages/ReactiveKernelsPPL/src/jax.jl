@@ -423,6 +423,33 @@ function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
                            filler.code * ")", Any, true)
 end
 
+# The events of a marginalized recurrence observed through rows at their
+# steps (`_rkppl_marginal_event_rows` and kin, marginalize.jl), as
+# `prepare_data` computes them from the raw steps: 1-based, as in Julia.
+function _jax_marginal_events(ctx, what, args)
+    ctx.host === nothing && ReactiveKernels._jax_error(
+        "a marginalized recurrence's events outside `prepare_data`", ReactiveKernels._jax_where(ctx))
+    step, T = args
+    s = "np.asarray(" * step.code * ", dtype=np.int64)"
+    rank = "(np.argsort(np.argsort(" * s * ", kind=\"stable\"), kind=\"stable\") + 1)"
+    row_events = "(" * s * " + " * rank * ")"
+    n = "int(" * T.code * ")"
+    event_rows = "np.bincount(" * row_events * ", weights=np.arange(1, len(" * s *
+        ") + 1), minlength=" * n * " + len(" * s * ") + 1)[1:].astype(np.int64)"
+    code = what === :row_events ? row_events :
+        what === :event_rows ? event_rows :
+        what === :event_steps ? "np.cumsum(" * event_rows * " == 0).astype(np.int64)" :
+        "(np.arange(1, " * n * " + 1) + np.searchsorted(np.sort(" * s *
+            "), np.arange(1, " * n * " + 1), side=\"right\")).astype(np.int64)"
+    return ReactiveKernels._PyVal(code, Vector{Int}, true)
+end
+for (f, what) in ((:_rkppl_marginal_event_rows, :event_rows),
+        (:_rkppl_marginal_event_steps, :event_steps),
+        (:_rkppl_marginal_row_events, :row_events), (:_rkppl_marginal_step_ends, :step_ends))
+    @eval ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof($f), args::Vector{ReactiveKernels._PyVal}) = _jax_marginal_events(ctx, $(QuoteNode(what)), args)
+end
+
 # --- translations of RKPPL's own functions ---------------------------------------
 
 # A law constructed in a cell (`y[g] ~ MvNormal(mu, Sigma)` lowers to

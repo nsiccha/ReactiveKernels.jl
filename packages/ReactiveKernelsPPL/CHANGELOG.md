@@ -16,6 +16,21 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.191
+
+- `marginalize(model, :x)` integrates out a recurrence whose rows observe
+  the state at their steps, `y .~ Normal.(offset .+ loading .* x[step], noise)`
+  with `step` bound integer data: a step may have several rows or none
+  (several sensors, irregular sampling). The Kalman filter runs over events,
+  each step and then each of its rows in their order, so its density is
+  exact for any pattern, and `:pointwise` holds each row's predictive density
+  given the rows before it in that order. `offset`, `loading` and `noise` may
+  be one value or one value per row. The scan's length is supplied, since the
+  rows do not say how many steps there are; an unsupplied length is refused,
+  naming it, as are missing entries beside gathered rows and gathered rows in
+  a `@plate` cell. One program serves every number of steps, rows and rows
+  per step. `jax_source` translates it.
+
 ## 0.1.190
 
 - `marginalize(model, :x)` observes a vector the model computes, as long as
