@@ -16,6 +16,19 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.234
+
+- JAX emission translates `rk_cholesky_lower` with lower-triangle semantics,
+  runtime square/positive-pivot checks, ordinary backend derivatives and
+  empty or padded leading blocks. Lower-triangular solves, `diag(A)` and
+  `diagm(v)` translate on device and in host preparation. Source loops and
+  comprehensions over `axes(A, d)` retain the selected dimension instead of
+  refusing matrix inputs.
+- Prepared matrix-valued plate inputs retain their rank and row extents,
+  including empty plates. Ragged packing pads the first axis and checks
+  that trailing dimensions agree; raw `pad_ragged` accepts `rank=2` for
+  an empty list of matrix cells.
+
 ## 0.1.233
 
 - JAX source retains named, documented functions for source-backed helpers and
