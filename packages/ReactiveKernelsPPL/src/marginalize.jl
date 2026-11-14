@@ -40,7 +40,9 @@ A marginalized array `x` qualifies when
   enter the write;
 - one statement reads it, a Normal observation of a whole observed data
   vector whose location is affine in it and whose scale does not read it:
-  `y .~ Normal.(offset .+ loading .* x, noise)`.
+  `y .~ Normal.(offset .+ loading .* x, noise)`. A `missing` entry of `y` is
+  a step that only predicts: the filter carries the state through it
+  without an update, and the likelihood has no term for it.
 
 Any other form is refused with a `SurfaceLoweringError` naming the
 statement. Each scalar coefficient may vary by step (irregular gaps
@@ -59,7 +61,8 @@ one value per entry of `y[g]` (data holding one vector per index read as
 The marginalized program's density is the exact marginal density of the
 observations given the remaining parameters, so `coordinate_names` and the
 layout no longer contain `x` or its innovations. `:pointwise.y` holds the
-one-step-ahead predictive densities, whose sum is the marginal likelihood.
+one-step-ahead predictive densities (0 at a missing entry), whose sum is the
+marginal likelihood.
 Exact draws of `x` given the parameters come from
 [`prepare_marginalized_latents`](@ref) and
 [`marginalized_latent_draws`](@ref).
@@ -697,7 +700,12 @@ function _marginalize_cell_latent(ast::Expr, p, x::Symbol, values, observing)
         y -> Meta.isexpr(y, :ref, 2) && y.args[1] isa Symbol && y.args[2] === ivar,
         "y[$ivar]")
     yname = y.args[1]
-    (yname in observing && _entry_shape(get(values, yname, nothing)) === :vector) ||
+    yvalue = get(values, yname, nothing)
+    yvalue isa AbstractVector && any(e -> e isa AbstractVector && Missing <: eltype(e), yvalue) &&
+        _marginal_fail(x, "its observation `$y` admits `missing` entries; a missing " *
+            "entry in a `@plate` cell's series is not marginalized yet (at top level it " *
+            "is a step that only predicts)")
+    (yname in observing && _entry_shape(yvalue) === :vector) ||
         _marginal_fail(x, "its observation `$y` is not observed data holding one " *
             "vector per index; marginalize a recurrence observed through bound data " *
             "(`| (; $yname)`, one vector per `$ivar`)")
@@ -919,7 +927,8 @@ function _filter_scan(x, y, law::_GaussianTransition, seed_pieces, step_pieces;
         response = nothing)
     t = law.loopvar
     entry(i) = present === nothing ? nothing : Expr(:ref, present, i)
-    PM, PV = _marginal_name(x, :predictive_mean), _marginal_name(x, :predictive_var)
+    # Not `…_mean`: `_marginalized_names` finds latents by their filtered mean.
+    PM, PV = _marginal_name(x, :predictive_location), _marginal_name(x, :predictive_variance)
     observe(obs, i, loc, fv) = response === nothing ? (obs,) :
         (Expr(:(=), Expr(:ref, PM, i), loc), Expr(:(=), Expr(:ref, PV, i), fv))
     obs1, _, mean1, var1, loc1, fv1 = _kalman_update(:($y[1]), law.m0, law.P0,

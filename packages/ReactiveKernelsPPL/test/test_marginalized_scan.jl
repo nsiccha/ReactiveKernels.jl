@@ -277,9 +277,13 @@ end
     built = build_kernel(plan)
     @test coordinate_names(built.layout) == coordinate_names(build_kernel(ou_plan(d)).layout)
     check_density(built, plan, ou_oracle(built, d; present))
-    # One program serves every absence pattern, none included.
-    shape(y) = structure(build_kernel(marginalize(OU(; d.inputs...), :ou) | (; y)).spec)
+    # One program serves every absence pattern, none included, and every length.
+    shape(y, d = d) = structure(build_kernel(marginalize(OU(; d.inputs...), :ou) | (; y)).spec)
     @test shape(y) == shape(Vector{Union{Missing,Float64}}(d.y))
+    grown = ou_data(5, 12; seed = 6)
+    ygrown = Vector{Union{Missing,Float64}}(grown.y)
+    ygrown[2:7:end] .= missing
+    @test shape(y) == shape(ygrown, grown)
     q = prepare_marginalized_latents(built, plan)
     u = 0.3 .* cos.(1:built.layout.total)
     c = constrain(built.layout, u)
@@ -575,6 +579,10 @@ end
         s ~ Exponential(1)
         v[1:3] .~ Normal.(0, 1)
     end), :h, (;), y))
+    # A missing entry in a cell's series is not a predict-only step yet.
+    @test occursin("missing entry in a `@plate` cell", refusal(cellmodel(quote
+        y[g] .~ Normal.(h, 1)
+    end), :h, (;), [Union{Missing,Float64}[0.1, missing, 0.4], [0.3, 0.2]]))
 end
 
 # ── `jax_source` of a marginalized program ────────────────────────────────
@@ -601,7 +609,10 @@ end
 
 @testset "jax_source of a marginalized program" begin
     d, c = ou_data(2, 4), cell_data([3, 1, 5])
+    gaps = Vector{Union{Missing,Float64}}(d.y)
+    gaps[[1, 3]] .= missing
     plans = (; toplevel = ou_plan(d), cell = cell_ou_plan(c),
+        missing_entries = marginalize(OU(; d.inputs...), :ou) | (; y = gaps),
         cell_ar = marginalize(CELL_AR(; c.G, c.se, c.m0), :h) | (; c.y),
         observed = OBSERVED_AR() | (; y = [0.1, -0.3, 0.4, 0.2]))
     for (name, plan) in pairs(plans)

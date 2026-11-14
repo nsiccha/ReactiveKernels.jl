@@ -16,6 +16,16 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.189
+
+- `marginalize(model, :x)` accepts an observed vector with `missing`
+  entries: each missing entry is a step that only predicts. The Kalman filter
+  carries the state through it without an update, the likelihood has no
+  term for it (its `:pointwise` entry is 0), and the exact draws condition on
+  the present entries alone. One program serves every pattern of missing
+  entries. A missing entry in a `@plate` cell's series is refused at lowering,
+  naming the observation.
+
 ## 0.1.188
 
 - `markov_chains(model, :x)` marks a latent linear-Gaussian `@scan` array as a

@@ -97,6 +97,16 @@ latents = prepare_marginalized_latents(built, plan)
 marginalized_latent_draws(latents, u, Xoshiro(1)).x
 ```
 
+A `missing` entry of `y` is a step that only predicts: the filter carries the state through it without an update, and the likelihood has no term for it. The draws then condition on the present entries alone, and one program serves every pattern of missing entries:
+
+```@example marginal
+y_gaps = Union{Missing,Float64}[0.3, missing, -0.1, 0.0, missing, 0.2]
+with_gaps = marginalize(model(; gap, T = length(y_gaps)), :x) | (; y = y_gaps)
+built_gaps = build_kernel(with_gaps)
+latents_gaps = prepare_marginalized_latents(built_gaps, with_gaps)
+marginalized_latent_draws(latents_gaps, u, Xoshiro(1)).x
+```
+
 A recurrence in a `@plate` cell integrates out the same way, one filter per index, when the cell observes it through `y[g] .~ Normal.(offset .+ loading .* x, noise)` and the bound `y` holds one vector per index. The draws then hold one trajectory per index:
 
 ```@example marginal
@@ -124,7 +134,7 @@ latents = prepare_marginalized_latents(built_cells, cells)
     x=marginalized_latent_draws(latents, u, Xoshiro(1)).x)
 ```
 
-Recurrences carrying several arrays, a lag above one, recurrences inside nested `@plate` cells or submodels, and observations that are not Normal are refused with an error naming the statement.
+Recurrences carrying several arrays, a lag above one, recurrences inside nested `@plate` cells or submodels, missing entries in a `@plate` cell's series, and observations that are not Normal are refused with an error naming the statement.
 
 ## Adaptive partial centering
 
