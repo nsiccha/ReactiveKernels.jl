@@ -415,6 +415,102 @@ end
     @test Statistics.cov(draws; dims = 2) ≈ cov rtol = 0.05 atol = 0.02 * maximum(diag(cov))
 end
 
+# ── Rows observing the state at their steps ───────────────────────────────
+#
+# Several sensors read one series at irregular steps: a step may have several
+# rows or none. The filter runs over events (each step, then its rows), and
+# each row's pointwise density is its predictive given the rows before it in
+# that order.
+
+const GATHERED = @rkppl begin
+    phi ~ Uniform(-1, 1)
+    sigma ~ Exponential(1)
+    bias[1:S] .~ Normal.(0, 1)
+    noise ~ Exponential(0.5)
+    @scan begin
+        x[1] ~ Normal(0, sigma / sqrt(1 - phi^2))
+        for t in 2:T
+            x[t] ~ Normal(phi * x[t - 1], sigma)
+        end
+    end
+    y .~ Normal.(bias[sensor] .+ x[step], noise .* scale)
+end
+
+function gathered_data(T, N; S = 3, seed = 4)
+    rng = Random.Xoshiro(seed)
+    step = rand(rng, 1:T, N)
+    step[1:2] .= 2                       # one step with several rows, for sure
+    inputs = (; T, S, step, sensor = rand(rng, 1:S, N), scale = 0.5 .+ rand(rng, N))
+    return (; inputs, y = randn(rng, N))
+end
+
+gathered_plan(d) = marginalize(GATHERED(; d.inputs...), :x) | (; d.y)
+
+function gathered_moments(c, d)
+    (; T, step, sensor, scale) = d.inputs
+    lat = latent_moments(0.0, c.sigma^2 / (1 - c.phi^2), fill(c.phi, T), zeros(T),
+        fill(c.sigma^2, T))
+    L = [step[i] == t ? 1.0 : 0.0 for i in eachindex(step), t in 1:T]
+    mu = c.bias[sensor] .+ L * lat[1]
+    S = Symmetric(L * lat[2] * L' + Diagonal((c.noise .* scale) .^ 2))
+    return lat, L, mu, S
+end
+
+function gathered_oracle(built, d)
+    function (u)
+        c = constrain(built.layout, u)
+        prior = logpdf(Uniform(-1, 1), c.phi) + logpdf(Exponential(1), c.sigma) +
+            sum(logpdf.(Normal(0, 1), c.bias)) + logpdf(Exponential(0.5), c.noise)
+        _, _, mu, S = gathered_moments(c, d)
+        p = sortperm(d.inputs.step)
+        pointwise = zeros(length(d.y))
+        pointwise[p] = sequential_logpdfs(mu[p], S[p, p], d.y[p])
+        likelihood = logpdf(MvNormal(mu, S), d.y)
+        (; total = prior + likelihood + logjac(built.layout, u), likelihood, pointwise)
+    end
+end
+
+@testset "rows observe the state at their steps" begin
+    d = gathered_data(7, 12)
+    @test any(t -> !(t in d.inputs.step), 1:7)       # a step without rows
+    plan = gathered_plan(d)
+    built = build_kernel(plan)
+    @test !any(n -> occursin(r"(^|_)x\.", String(n)), coordinate_names(built.layout))
+    check_density(built, plan, gathered_oracle(built, d))
+    # One program as steps, rows and sensors per step grow.
+    shape(d) = structure(build_kernel(gathered_plan(d)).spec)
+    @test shape(d) == shape(gathered_data(30, 75; seed = 9))
+    # Exact draws: x given every row.
+    q = prepare_marginalized_latents(built, plan)
+    u = 0.3 .* cos.(1:built.layout.total)
+    c = constrain(built.layout, u)
+    lat, L, mu, S = gathered_moments(c, d)
+    K = lat[2] * L' / S
+    mean, cov = lat[1] + K * (d.y - mu), Symmetric(lat[2] - K * L * lat[2])
+    rng = Random.Xoshiro(5)
+    n = 40_000
+    draws = reduce(hcat, (marginalized_latent_draws(q, u, rng).x for _ in 1:n))
+    @test all(abs.(vec(Statistics.mean(draws; dims = 2)) .- mean) .< 5 .* sqrt.(diag(cov) ./ n))
+    @test Statistics.cov(draws; dims = 2) ≈ cov rtol = 0.05 atol = 0.02 * maximum(diag(cov))
+    # Rows do not say how many steps there are; missing rows are not built.
+    unsized = try
+        (; S, step, sensor, scale) = d.inputs
+        marginalize(GATHERED(; S, step, sensor, scale), :x) | (; d.y)
+        "no error"
+    catch e
+        sprint(showerror, e)
+    end
+    @test occursin("the length `T` of its `@scan` is not supplied", unsized)
+    ym = Vector{Union{Missing,Float64}}(d.y)
+    ym[3] = missing
+    @test occursin("without missing entries", try
+        marginalize(GATHERED(; d.inputs...), :x) | (; y = ym)
+        "no error"
+    catch e
+        sprint(showerror, e)
+    end)
+end
+
 # Each form the Kalman filter does not cover is refused at lowering, naming
 # the statement.
 function refusal(body, x, data, y)
@@ -719,6 +815,10 @@ end
     @test occursin("missing entry in a `@plate` cell", refusal(cellmodel(quote
         y[g] .~ Normal.(h, 1)
     end), :h, (;), [Union{Missing,Float64}[0.1, missing, 0.4], [0.3, 0.2]]))
+    # Rows observing a cell's state at their steps are not an event filter yet.
+    @test occursin("gathered rows in a `@plate` cell", refusal(cellmodel(quote
+        y[g] .~ Normal.(h[step], 1)
+    end), :h, (; step = [1, 2, 3]), y))
 end
 
 # ── `jax_source` of a marginalized program ────────────────────────────────
@@ -750,6 +850,7 @@ end
     plans = (; toplevel = ou_plan(d), cell = cell_ou_plan(c),
         missing_entries = marginalize(OU(; d.inputs...), :ou) | (; y = gaps),
         censored = bind_data(censored_plan(censored_data(9))),
+        gathered = gathered_plan(gathered_data(5, 8)),
         cell_ar = marginalize(CELL_AR(; c.G, c.se, c.m0), :h) | (; c.y),
         observed = OBSERVED_AR() | (; y = [0.1, -0.3, 0.4, 0.2]))
     for (name, plan) in pairs(plans)
