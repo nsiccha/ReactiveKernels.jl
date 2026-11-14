@@ -22,27 +22,7 @@ include(joinpath(pkgdir(ReactiveKernels), "test", "jax_python.jl"))
     return W
 end
 
-# The data the caller bound, in `prepare_data`'s order: every input is a
-# name the caller wrote (a column, a scalar value), never a value only the
-# Julia binder computes.
-function jax_raw_data(plan, src)
-    names = first.(only(f for f in src.functions if f.name == "prepare_data").inputs)
-    # A value the program reads only through its bound copy, and the observed
-    # value of a conditioned declaration, are passed by their authored names;
-    # the plan holds them as `_rkppl_value_<name>` and
-    # `_rkppl_conditioned_<name>`. A definition `prepare_data` takes as an
-    # input (`UNTRANSLATED`) is the binding's own value of it (a submodel's
-    # `r.g` is the input `r_g`).
-    held = plan.data_values === nothing ? Symbol[] : collect(keys(plan.data_values.values))
-    function value(n)
-        for k in (Symbol(n), Symbol("_rkppl_value_", n), Symbol("_rkppl_conditioned_", n))
-            haskey(plan.columns, k) && return plan.columns[k]
-        end
-        ReactiveKernelsPPL._bound_value(plan, plan.columns,
-            only(h for h in held if replace(String(h), "." => "_") == n))
-    end
-    Tuple(value(n) for n in names)
-end
+include("jax_ppl_data.jl")
 
 # A data helper with a loop and no recorded source: no host translation.
 function jax_ppl_opaque_cumsum(x::AbstractVector)

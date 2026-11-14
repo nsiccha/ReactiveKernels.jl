@@ -1,7 +1,7 @@
 name = "ReactiveKernelsPPL"
 uuid = "e266ea2a-6817-46cd-8bec-6238f0035f44"
 authors = ["Nikolas Siccha <nikolassiccha@gmail.com>"]
-version = "0.1.186"
+version = "0.1.187"
 
 [deps]
 Compat = "34da2185-b29b-5c13-b0c7-acf172513d20"
