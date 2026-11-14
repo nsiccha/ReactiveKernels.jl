@@ -8,7 +8,7 @@
   their behavior. In a paired three-process comparison, the natural HMM's
   ordinary density takes 3–6% less time with unchanged allocations. Native and
   JAX emission retain runtime observation lengths. Requires ReactiveKernels
-  0.1.234.
+  0.1.235.
 
 ## 0.1.10
 

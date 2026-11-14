@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.234
+## 0.1.235
 
 - Bound plates retain a shared scalar guard at runtime when its arms contain
   no work over bound inputs to prepare. The selected loop keeps shared work
@@ -26,6 +26,19 @@ are recorded in the git history only.
 - JAX export supports `all` and `any` with `iszero` or `!iszero` over built-in
   real numeric inputs, including empty and ragged arrays. Padding contributes
   the reduction's identity; other predicates retain the existing refusal.
+
+## 0.1.234
+
+- JAX emission translates `rk_cholesky_lower` with lower-triangle semantics,
+  runtime square/positive-pivot checks, ordinary backend derivatives and
+  empty or padded leading blocks. Lower-triangular solves, `diag(A)` and
+  `diagm(v)` translate on device and in host preparation. Source loops and
+  comprehensions over `axes(A, d)` retain the selected dimension instead of
+  refusing matrix inputs.
+- Prepared matrix-valued plate inputs retain their rank and row extents,
+  including empty plates. Ragged packing pads the first axis and checks
+  that trailing dimensions agree; raw `pad_ragged` accepts `rank=2` for
+  an empty list of matrix cells.
 
 ## 0.1.233
 
