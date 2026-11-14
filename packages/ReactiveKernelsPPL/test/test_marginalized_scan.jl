@@ -298,6 +298,123 @@ end
     @test Statistics.cov(draws; dims = 2) ≈ cov rtol = 0.05 atol = 0.02 * maximum(diag(cov))
 end
 
+# ── Data augmentation: censored rows as bounded latents ───────────────────
+#
+# Rows below a detection limit and rounded rows enter the filter at latent
+# values bounded by their own ranges (per-element bounds, RKPPL 0.1.179); the
+# observed vector merges them with the measured rows in time order. The
+# source without `marginalize` is the augmented latent model itself.
+
+const CENSORED = @rkppl begin
+    mu ~ Normal(0, 1)
+    phi ~ Uniform(-1, 1)
+    sigma ~ Exponential(1)
+    noise ~ Exponential(0.5)
+    @scan begin
+        x[1] ~ Normal(0, sigma / sqrt(1 - phi^2))
+        for t in 2:T
+            x[t] ~ Normal(phi * x[t - 1], sigma)
+        end
+    end
+    gap[1:K] .~ restricted.(Flat.(), 0, Inf)
+    position[1:J] .~ restricted.(Flat.(), 0, 1)
+    value = vcat(measured, limit .- gap, lo .+ (hi .- lo) .* position)[order]
+    value .~ Normal.(mu .+ x, noise)
+end
+
+# `T` rows: every third below its limit, every fifth rounded to [lo, hi].
+function censored_data(T; seed = 2)
+    rng = Random.Xoshiro(seed)
+    y = cumsum(0.4 .* randn(rng, T))
+    below = [t for t in 1:T if t % 3 == 0]
+    rounded = [t for t in 1:T if t % 5 == 0 && !(t in below)]
+    seen = setdiff(1:T, below, rounded)
+    limit = y[below] .+ 0.2 .+ 0.3 .* rand(rng, length(below))
+    lo = floor.(y[rounded])
+    inputs = (; T, K = length(below), J = length(rounded), measured = y[seen], limit, lo,
+        hi = lo .+ 1, order = invperm(vcat(seen, below, rounded)))
+    return (; inputs, seen, below, rounded)
+end
+
+censored_plan(d) = marginalize(CENSORED(; d.inputs...), :x)
+
+# The augmented model's density with `x` integrated out: the Gaussian
+# marginal of the merged vector, the priors, and the bounded latents' Jacobians.
+function censored_oracle(built, d)
+    (; T, measured, limit, lo, hi, order) = d.inputs
+    function (u)
+        c = constrain(built.layout, u)
+        prior = logpdf(Normal(0, 1), c.mu) + logpdf(Uniform(-1, 1), c.phi) +
+            logpdf(Exponential(1), c.sigma) + logpdf(Exponential(0.5), c.noise)
+        value = vcat(measured, limit .- c.gap, lo .+ (hi .- lo) .* c.position)[order]
+        _, Sx = latent_moments(0.0, c.sigma^2 / (1 - c.phi^2), fill(c.phi, T), zeros(T),
+            fill(c.sigma^2, T))
+        S = Symmetric(Sx + c.noise^2 * I)
+        logpdf(MvNormal(fill(c.mu, T), S), value) + prior + logjac(built.layout, u)
+    end
+end
+
+# The sampler's density and gradient against the oracle and its finite
+# differences.
+function check_total(built, plan, oracle; points = 3, seed = 1)
+    n = built.layout.total
+    rng = Random.Xoshiro(seed)
+    sampler = prepare_sampler(built, plan, zeros(n);
+        backend = DI.AutoEnzyme(; mode = Enzyme.Reverse))
+    for _ in 1:points
+        u = 0.4 .* randn(rng, n)
+        value, gradient = sampler_value_and_gradient!(sampler, similar(u), u)
+        @test value ≈ oracle(u) rtol = 1e-10
+        h = cbrt(eps(Float64))
+        fd = map(1:n) do i
+            up, dn = copy(u), copy(u)
+            up[i] += h
+            dn[i] -= h
+            (oracle(up) - oracle(dn)) / (2h)
+        end
+        @test gradient ≈ fd rtol = 2e-6 atol = 2e-7
+    end
+end
+
+@testset "censored rows enter the filter at bounded latent values" begin
+    d = censored_data(16)
+    plan = censored_plan(d)
+    built = build_kernel(plan)
+    # The layout keeps the augmentation and drops the recurrence.
+    latent = coordinate_names(build_kernel(CENSORED(; d.inputs...)).layout)
+    @test coordinate_names(built.layout) ==
+        filter(n -> !occursin(r"(^|_)x\.", String(n)), latent)
+    @test any(n -> occursin(r"(^|_)x\.", String(n)), latent)
+    check_total(built, plan, censored_oracle(built, d))
+    # The merged vector reads parameters, so its term is a factor, as in the
+    # source without `marginalize`: no likelihood or pointwise term.
+    let u = 0.2 .* cos.(1:built.layout.total), latent = bind_data(CENSORED(; d.inputs...))
+        lbuilt = build_kernel(latent)
+        lu = 0.2 .* cos.(1:lbuilt.layout.total)
+        for (b, p, v) in ((built, plan, u), (lbuilt, latent, lu))
+            @test Base.invokelatest(prepare_query(b, p, :likelihood), v) == 0
+            @test isempty(Base.invokelatest(prepare_query(b, p, :pointwise), v))
+        end
+    end
+    # One program as rows and censored rows grow.
+    shape(d) = structure(build_kernel(censored_plan(d)).spec)
+    @test shape(d) == shape(censored_data(41; seed = 3))
+    # Exact draws of `x` given the parameters and the latent values.
+    q = prepare_marginalized_latents(built, plan)
+    u = 0.3 .* cos.(1:built.layout.total)
+    c = constrain(built.layout, u)
+    (; T, measured, limit, lo, hi, order) = d.inputs
+    value = vcat(measured, limit .- c.gap, lo .+ (hi .- lo) .* c.position)[order]
+    lat = latent_moments(0.0, c.sigma^2 / (1 - c.phi^2), fill(c.phi, T), zeros(T),
+        fill(c.sigma^2, T))
+    mean, cov = latent_posterior(lat, c.mu, 1.0, c.noise, value)
+    rng = Random.Xoshiro(4)
+    n = 40_000
+    draws = reduce(hcat, (marginalized_latent_draws(q, u, rng).x for _ in 1:n))
+    @test all(abs.(vec(Statistics.mean(draws; dims = 2)) .- mean) .< 5 .* sqrt.(diag(cov) ./ n))
+    @test Statistics.cov(draws; dims = 2) ≈ cov rtol = 0.05 atol = 0.02 * maximum(diag(cov))
+end
+
 # Each form the Kalman filter does not cover is refused at lowering, naming
 # the statement.
 function refusal(body, x, data, y)
@@ -382,7 +499,26 @@ end
     catch e
         sprint(showerror, e)
     end
-    @test occursin("is not observed data", unobserved)
+    @test occursin("is neither observed data nor a definition", unobserved)
+    # A defined observed vector does not say the scan's length: it is supplied.
+    unsized = try
+        bind_data(marginalize(RKPPLModel(quote
+            s ~ Exponential(1)
+            g[1:2] .~ restricted.(Flat.(), 0, Inf)
+            @scan begin
+                x[1] ~ Normal(0, 1)
+                for t in 2:T
+                    x[t] ~ Normal(x[t - 1], s)
+                end
+            end
+            v = vcat(m, 1 .- g)
+            v .~ Normal.(x, 1)
+        end, @__MODULE__)(; m = [0.1, 0.2]), :x))
+        "no error"
+    catch e
+        sprint(showerror, e)
+    end
+    @test occursin("the length `T` of its `@scan` is not supplied", unsized)
     # A plan is already lowered.
     d = ou_data(1, 3)
     @test_throws SurfaceLoweringError marginalize(OU(; d.inputs...) | (; y = d.y), :ou)
@@ -613,6 +749,7 @@ end
     gaps[[1, 3]] .= missing
     plans = (; toplevel = ou_plan(d), cell = cell_ou_plan(c),
         missing_entries = marginalize(OU(; d.inputs...), :ou) | (; y = gaps),
+        censored = bind_data(censored_plan(censored_data(9))),
         cell_ar = marginalize(CELL_AR(; c.G, c.se, c.m0), :h) | (; c.y),
         observed = OBSERVED_AR() | (; y = [0.1, -0.3, 0.4, 0.2]))
     for (name, plan) in pairs(plans)
