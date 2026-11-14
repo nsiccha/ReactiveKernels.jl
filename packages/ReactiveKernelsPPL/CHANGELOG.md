@@ -23,6 +23,11 @@ are recorded in the git history only.
   reads that array's extent when the model runs. Lowering had named such an
   index as a data-only gather index of its own, which left `end` unbound:
   preparing the model raised `UndefVarError: end not defined`.
+- A data definition or inline gather index whose reference reads `end` or
+  `begin` (`idx = g[2:end]`, then `z[idx]`, or `z[g[2:end]]`) binds as the
+  integer column it evaluates to. Binding had counted that `end` as a name
+  the definition reads, so it refused the read as `not a bound column`. An
+  endpoint outside every reference is still no bound value.
 
 ## 0.1.177
 

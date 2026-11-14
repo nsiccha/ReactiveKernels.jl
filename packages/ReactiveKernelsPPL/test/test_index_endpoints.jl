@@ -156,42 +156,44 @@ end
             exp(sum(p.L[2, :]) + (p.sd .* p.L)'[2, 2] - p.Z[3, 2])), d.y)))
 end
 
-@testset "end in ranges over data and computed arrays" begin
+@testset "end in ranges over data, gather indices and computed arrays" begin
     # A range reading `end` holds positions of the array it indexes, read
     # from that array when the model runs: `w[1:(end - 1)]` of data, `v[2:end]`
-    # of a computed array, beside a data gather `z[g]`. It is never a value of
-    # its own, which left `end` unbound in the generated program (snag
-    # rkppl-hmm-input-2fa3636f), and one program serves every data length.
-    ast = quote
+    # of a computed array. It is never a value of its own, which left `end`
+    # unbound in the generated program (snag rkppl-hmm-input-2fa3636f). A
+    # data gather index reading `end` (`g[2:end]`) binds as one integer
+    # column, inline or named, and one program serves every data length.
+    inline = quote
         z[1:3] .~ Normal.(0, 1)
         b ~ Normal(0, 1)
         v = exp.(b .* w)
-        loc = b .* w[1:(end - 1)] .+ z[g] .+ v[2:end] ./ sum(v)
+        loc = b .* w[1:(end - 1)] .+ z[g[2:end]] .+ v[2:end] ./ sum(v)
+        y .~ Normal.(loc, 0.5)
+    end
+    named = quote
+        z[1:3] .~ Normal.(0, 1)
+        b ~ Normal(0, 1)
+        v = exp.(b .* w)
+        idx = g[2:end]
+        loc = b .* w[1:(end - 1)] .+ z[idx] .+ v[2:end] ./ sum(v)
         y .~ Normal.(loc, 0.5)
     end
     oracle(p, d) = sum(logpdf.(Normal(0, 1), p.z)) + logpdf(Normal(0, 1), p.b) +
-        sum(logpdf.(Normal.(p.b .* d.w[1:(end - 1)] .+ p.z[d.g] .+
+        sum(logpdf.(Normal.(p.b .* d.w[1:(end - 1)] .+ p.z[d.g[2:end]] .+
             exp.(p.b .* d.w)[2:end] ./ sum(exp.(p.b .* d.w)), 0.5), d.y))
     detached(ex) = ex isa Expr && ((ex.head === :(=) &&
         ReactiveKernels._kernel_ref_has_endpoint(ex.args[2])) || any(detached, ex.args))
-    data(n) = (; w=collect(range(-1.0, 1.0; length=n)), g=[mod1(i, 3) for i in 2:n],
-        y=sin.(1:(n - 1)))
-    plan = lowered(ast, data(4))
-    programs = map((4, 9)) do n
-        built = check(plan, data(n), oracle)
-        program = kernel_expr(bind_data(plan, data(n)), built.layout)
-        @test !detached(program)
-        ReactiveKernelsPPL._program_identity(program)
-    end
-    @test ReactiveKernelsPPL._same_program(programs...)
-    # A data gather index reading its own `end` (`g[2:end]`, inline or
-    # named) is still refused at bind as "not a bound column": binding
-    # counts that `end` as a name the index reads (todo 1xf7rhj).
-    for (index, defs) in ((:(g[2:end]), ()), (:idx, (:(idx = g[2:end]),)))
-        gathered = Expr(:block, :(z[1:3] .~ Normal.(0, 1)), defs...,
-            :(y .~ Normal.(z[$index], 0.5)))
-        d = (; g=[mod1(i, 3) for i in 1:5], y=sin.(1:4))
-        @test_broken (bind_data(lowered(gathered, d), d); true)
+    for ast in (inline, named)
+        plan = lowered(ast, (; w=nothing, g=nothing, y=nothing))
+        programs = map((4, 9)) do n
+            data = (; w=collect(range(-1.0, 1.0; length=n)), g=[mod1(i, 3) for i in 1:n],
+                y=sin.(1:(n - 1)))
+            built = check(plan, data, oracle)
+            program = kernel_expr(bind_data(plan, data), built.layout)
+            @test !detached(program)
+            ReactiveKernelsPPL._program_identity(program)
+        end
+        @test ReactiveKernelsPPL._same_program(programs...)
     end
 end
 
