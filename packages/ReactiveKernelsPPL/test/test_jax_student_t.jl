@@ -124,3 +124,54 @@ end
         end
     end
 end
+
+@testset "upper-censored, interval-censored and truncated Student-t emit JAX" begin
+    # BRM emits `censored(LocationScale(mu, sigma, TDist(nu)); upper = hi)`,
+    # `interval_censored(...)` and `truncated(...)` responses as these
+    # `StudentT` laws (snag jax-source-censo-d3b707c4). Each evaluates a
+    # Student-t tail, and with it the `beta_inc_cf` rule's shared functions,
+    # under a data branch; on RK 0.1.233 to 0.1.242 each raised "a function's
+    # active condition is outside its caller's scope".
+    priors = (; location_prior=0.0, location_scale=2.0, scale_prior=1.0,
+              df_shape=2.0, df_scale=2.0)
+    cases = (
+        # Row 2 sits at its upper bound, so both arms of the branch run.
+        (:(censored.(StudentT.(nu, location, scale), -Inf, upper)),
+         (; y=[0.3, 1.5, -0.2], upper=[1.0, 1.5, 2.0])),
+        # The last interval lies in the upper tail.
+        (:(interval_censored.(StudentT.(nu, location, scale), hi)),
+         (; y=[-0.6, 0.1, 2.5], hi=[-0.2, 0.4, 3.0])),
+        # Both bounds per row: the normalizer takes both tails.
+        (:(truncated.(StudentT.(nu, location, scale), lo, hi)),
+         (; y=[0.0, 0.2, -1.0], lo=[-0.5, -5.0, -2.0], hi=[0.5, 5.0, 3.0])),
+        (:(truncated.(StudentT.(nu, location, scale), -5.0, Inf)),
+         (; y=[0.1, 0.2, -0.4])),
+    )
+    for (law, rows) in cases
+        expr = quote
+            location ~ Normal(location_prior, location_scale)
+            scale ~ Exponential(scale_prior)
+            nu ~ Gamma(df_shape, df_scale)
+            y .~ $law
+        end
+        data = merge(priors, rows)
+        bound = bind_data(lower_rkppl(expr, data; conditioned=(:y,)), data)
+        built = build_kernel(bound)
+        source = jax_source(built, bound)
+        @test occursin("UNTRANSLATED = {}", string(source))
+        rk_jax_available() || (@test_skip false; continue)
+        inputs = first.(only(f for f in source.functions if f.name == "prepare_data").inputs)
+        raw = Tuple(getproperty(data, Symbol(name)) for name in inputs)
+        query = prepare_query(built, bound, :sampler)
+        for point in ((; location=0.1, scale=0.9, nu=5.0),
+                      (; location=-0.3, scale=1.7, nu=0.8),
+                      (; location=0.0, scale=0.4, nu=60.0))
+            u = unconstrain(built.layout, point)
+            got = rk_jax_evaluate(source, "log_density", (u, raw...);
+                                  grad=true, prepare=:arguments)
+            @test isfinite(got.value)
+            @test got.value ≈ query(u) rtol=1e-11
+            @test got.grad ≈ rk_fd_gradient(query, u) rtol=2e-5 atol=2e-7
+        end
+    end
+end
