@@ -19,7 +19,7 @@ half-Normal/half-Cauchy style, `:truncated`, `:interval`, or `:upper`).
 literal args and takes no override. Loud on unknown families and
 inapplicable overrides.
 """
-function support_of(family::Symbol, override::SupportOverride)
+function support_of(family::Symbol, override::BoundOverride)
     haskey(SAMPLED_SUPPORT, family) ||
         throw(ContractValidationError("[layout] sampled family $family unknown"))
     inferred = SAMPLED_SUPPORT[family]
@@ -61,11 +61,13 @@ function support_of(family::Symbol, override::SupportOverride)
 end
 
 # Fold bound data and data-only definitions, retaining sampled dependencies.
-_bound_override(::StructuralPlan, ov) = ov
-function _bound_override(plan::StructuralPlan, ov::Tuple)
-    return (ov[1], (_layout_bound(plan, x) for x in ov[2:end])...)
+# `elementwise` admits an array of bounds, one per element of a declared array;
+# every other parameter takes one number per bound.
+_bound_override(::StructuralPlan, ov; elementwise::Bool = false) = ov
+function _bound_override(plan::StructuralPlan, ov::Tuple; elementwise::Bool = false)
+    return (ov[1], (_layout_bound(plan, x; elementwise) for x in ov[2:end])...)
 end
-function _layout_bound(plan::StructuralPlan, x)
+function _layout_bound(plan::StructuralPlan, x; elementwise::Bool = false)
     x isa Real && return Float64(x)
     exprs = Dict{Symbol,Any}(a.name => a.expr for a in plan.assignments)
     merge!(exprs, Dict(d.name => d.expr for d in plan.derived))
@@ -86,37 +88,78 @@ function _layout_bound(plan::StructuralPlan, x)
     end
     all(isdata, refs) || return x
     v = _eval_value_expr(x, lookup, :truncation_bound)
+    if v isa AbstractArray
+        elementwise || throw(ContractValidationError(
+            "[layout] truncation bound `$(x)` is an array ($(summary(v))); " *
+            "one bound per element applies to a declared array " *
+            "(`x[1:n] .~ restricted.(D.(…), lo, hi)`), not to this parameter"))
+        all(b -> b isa Real && !isnan(b), v) || throw(ContractValidationError(
+            "[layout] truncation bound `$(x)` must hold numbers (±Inf leaves " *
+            "an element unbounded), got $(summary(v))"))
+        # An owned copy: the layout keeps this binding's numbers.
+        return Array{Float64}(v)
+    end
     v isa Real && !isnan(v) || throw(ContractValidationError(
         "[layout] truncation bound must be a number, got $(summary(v))"))
     return Float64(v)
 end
 
+# Whether a bound side constrains: `:none` for an infinite number or an array
+# of that one infinity (a nonempty one), `:mixed` for an array holding finite
+# and infinite entries, else `:bounded` (a finite number, finite entries, an
+# empty array, or a graph value).
+function _bound_side(b, infinity::Float64)
+    b isa Real && return b == infinity ? :none : :bounded
+    b isa AbstractArray || return :bounded
+    all(isfinite, b) && return :bounded
+    !isempty(b) && all(==(infinity), b) && return :none
+    return :mixed
+end
+
+_bound_summary(b::AbstractArray) = repr(b)
+_bound_summary(b) = string(b)
+
 # The transform kind and (for :interval/:upper) the constrained bounds a
 # layout entry needs, from a parameter's family + support override (+ args:
 # a uniform's bounds come from its literal args, not an override).
-function _entry_transform(family::Symbol, override::SupportOverride,
-        args::NamedTuple)
+function _entry_transform(family::Symbol, override::BoundOverride,
+        args::NamedTuple; elementwise::NTuple{2,Bool} = (false, false))
     support = support_of(family, override)
     if support === :truncated
         lo, hi = override[2], override[3]
         natural = SAMPLED_SUPPORT[family]
-        clip(fn, a, b) = a isa Real && b isa Real ? fn(a, b) :
-            Expr(:call, nameof(fn), a, b)
+        # Per element when either operand holds one bound per element.
+        clip(fn, a, b, dot) = _static_bound(a) && _static_bound(b) ?
+            (a isa AbstractArray || b isa AbstractArray ? fn.(a, b) : fn(a, b)) :
+            dot ? Expr(:., nameof(fn), Expr(:tuple, a, b)) : Expr(:call, nameof(fn), a, b)
         if natural === :positive || natural === :unit
-            lo = clip(max, lo, 0.0)
+            lo = clip(max, lo, 0.0, elementwise[1])
         end
-        natural === :unit && (hi = clip(min, hi, 1.0))
+        natural === :unit && (hi = clip(min, hi, 1.0, elementwise[2]))
         if natural === :interval
-            lo = clip(max, lo, args.arg1)
-            hi = clip(min, hi, args.arg2)
+            lo = clip(max, lo, args.arg1, elementwise[1])
+            hi = clip(min, hi, args.arg2, elementwise[2])
         end
-        if lo isa Real && hi isa Real
-            lo < hi || throw(ContractValidationError(
-                "[layout] truncation has no mass in the base support: ($lo, $hi)"))
+        if _static_bound(lo) && _static_bound(hi)
+            all(lo .< hi) || throw(ContractValidationError(
+                "[layout] truncation has no mass in the base support: " *
+                "($(_bound_summary(lo)), $(_bound_summary(hi)))"))
         end
-        lo == -Inf && hi == Inf && return (:identity, NaN, NaN)
-        hi == Inf && return (:floored, lo, NaN)
-        lo == -Inf && return (:upper, NaN, hi)
+        # Bounds per element from data: each element takes the transform its
+        # own bounds state (`_bounded_constrain`), as Stan's
+        # `vector<lower=L, upper=U>` does, infinite entries included. The
+        # program branches on the data, so it does not depend on which
+        # entries are infinite.
+        (lo isa AbstractArray || hi isa AbstractArray) &&
+            _static_bound(lo) && _static_bound(hi) && return (:bounded, lo, hi)
+        lower, upper = _bound_side(lo, -Inf), _bound_side(hi, Inf)
+        (lower === :mixed || upper === :mixed) && throw(ContractValidationError(
+            "[layout] per-element bounds $(_bound_summary(lower === :mixed ? lo : hi)) " *
+            "mix finite and infinite entries beside a bound computed from " *
+            "parameters, which is taken to be finite; name finite bounds"))
+        lower === :none && upper === :none && return (:identity, NaN, NaN)
+        upper === :none && return (:floored, lo, NaN)
+        lower === :none && return (:upper, NaN, hi)
         return (:interval, lo, hi)
     end
     if support === :interval
@@ -147,7 +190,9 @@ elementwise array parameter
 bound of an `:interval`/`:floored` transform (`:interval` also sets
 `hi`; an `:upper` transform sets `hi` only; `NaN` otherwise). A real
 bound is stored as `Float64`, or in the number type of the sampled values it
-was resolved from (an AD dual while differentiating `constrain`). `dims` is
+was resolved from (an AD dual while differentiating `constrain`). An
+elementwise array's bound may instead be an array of its declared shape, one
+bound per element (`elementwise`). `dims` is
 the axes of a declared array, including an LKJ factor (empty for legacy
 scalar/block entries)."""
 struct LayoutEntry
@@ -158,8 +203,8 @@ struct LayoutEntry
     offset::Int # 1-based packed offset
     size::Int
     transform::Symbol # :identity | :exp | :logistic | :interval | :floored | :upper | :ordered | :simplex | :lkj
-    lo::Union{Real,Symbol,Expr} # constrained lower bound (else NaN)
-    hi::Union{Real,Symbol,Expr} # constrained upper bound (else NaN)
+    lo::Union{Real,Symbol,Expr,AbstractArray{<:Real}} # constrained lower bound (else NaN)
+    hi::Union{Real,Symbol,Expr,AbstractArray{<:Real}} # constrained upper bound (else NaN)
     dims::Vector{Int} # declared-array axes, including :cholesky_corr (else empty)
     scan_blocks::Vector{LayoutEntry} # structural latent-family blocks (else empty)
     sampling::Union{Nothing,NamedTuple} # external RHS and its geometry
@@ -172,12 +217,18 @@ struct LayoutEntry
     positions::Union{Nothing,NTuple{2,Union{Int,Symbol}}}
     axes::Union{Nothing,Vector{Any}}
     bound_reads::NTuple{2,Any}
+    # Whether `lo`/`hi` is an array with one bound per element (`x[1:n] .~
+    # restricted.(Flat.(), -Inf, limit)` with a data vector `limit`), so the
+    # program's edges and Jacobian broadcast it with the coordinates. Its
+    # authored read, or a graph value's expression, does not show that.
+    elementwise::NTuple{2,Bool}
     LayoutEntry(kind, predictor, name, labels, offset, size, transform, lo, hi,
             dims, scan_blocks, sampling, positions = nothing, axes = nothing,
-            bound_reads = (nothing, nothing)) =
+            bound_reads = (nothing, nothing),
+            elementwise = (lo isa AbstractArray, hi isa AbstractArray)) =
         new(kind, predictor, name, labels, offset, size, transform,
             _layout_bound(lo), _layout_bound(hi), dims, scan_blocks, sampling,
-            positions, axes, bound_reads)
+            positions, axes, bound_reads, elementwise)
 end
 
 # Host transforms (`constrain`, `unconstrain`, `logjac` and the exported
@@ -191,7 +242,13 @@ _host_real(x::Real) = convert(_host_type(typeof(x)), x)
 _layout_bound(x::Real) = _host_real(x)
 _layout_bound(x) = x
 _bound_type(x::Real) = typeof(x)
+_bound_type(x::AbstractArray{<:Real}) = eltype(x)
 _bound_type(x) = Float64
+# Element `k` of a bound: a shared number, or the `k`th of an elementwise one
+# (column-major, the order of the entry's packed coordinates).
+_bound_at(b, k::Integer) = b isa AbstractArray ? b[k] : b
+# A number or a per-element array of numbers: a bound the host holds.
+_static_bound(b) = b isa Real || b isa AbstractArray{<:Real}
 # Element type of an entry's constrained values for input type `T`: a bound
 # resolved from sampled values can carry a dual of its own.
 _entry_eltype(e::LayoutEntry, ::Type{T}) where {T} =
@@ -502,14 +559,19 @@ function assign_layout(plan::StructuralPlan)
             offset += size
             continue
         end
-        transform, lo, hi =
-            _entry_transform(p.family, _bound_override(plan, p.support_override),
-                p.family === :uniform ? map(x -> _layout_bound(plan, x), p.args) : p.args)
         # An `eachindex(v)` plate has the rows of its authored range.
         size = _plate_rows(plan, p)
+        # A cell's own bound (`x[i] ~ restricted(D, lo[i], hi[i])`) is a
+        # definition with one entry per cell: one bound per element.
+        ov = _bound_override(plan, p.support_override; elementwise = true)
+        args = p.family === :uniform ?
+            map(x -> _layout_bound(plan, x; elementwise = true), p.args) : p.args
+        sides = _cell_bound_sides(plan, p, ov, args, size)
+        transform, lo, hi = _entry_transform(p.family, ov, args; elementwise = sides)
         push!(entries,
             LayoutEntry(:plate, nothing, p.name, [p.name], offset, size, transform,
-                lo, hi))
+                lo, hi, Int[], LayoutEntry[], nothing, nothing, nothing,
+                (nothing, nothing), (sides[1] && !(lo isa Real), sides[2] && !(hi isa Real))))
         offset += size
     end
     for p in plan.vector_parameters
@@ -1172,7 +1234,7 @@ function _constrain_coefficient(entries::Vector{LayoutEntry}, u)
         if e.transform === :identity
             append!(out, convert.(T, seg))
         else
-            append!(out, [_constrain_elt(e, convert(T, x)) for x in seg])
+            append!(out, [_constrain_elt(e, convert(T, x), k) for (k, x) in enumerate(seg)])
         end
     end
     return out
@@ -1241,8 +1303,8 @@ end
 
 # Bounds read the same constrained values and ordinary definitions as the
 # graph. Packing order stays fixed; evaluation follows bound dependencies.
-_dynamic_bounds(e::LayoutEntry) = e.sampling !== nothing || !(e.lo isa Real && e.hi isa Real) ||
-    any(_dynamic_bounds, e.scan_blocks)
+_dynamic_bounds(e::LayoutEntry) = e.sampling !== nothing ||
+    !(_static_bound(e.lo) && _static_bound(e.hi)) || any(_dynamic_bounds, e.scan_blocks)
 function _layout_lookup(layout::LayoutTable, values)
     active = Set{Symbol}()
     function lookup(name)
@@ -1261,21 +1323,28 @@ end
 function _resolved_entry(layout::LayoutTable, e::LayoutEntry, values)
     (_dynamic_bounds(e) && e.sampling === nothing) || return e
     lookup = _layout_lookup(layout, values)
-    resolve(x) = x isa Real ? x : _eval_value_expr(x, lookup, e.name)
+    resolve(x) = _static_bound(x) ? x : _eval_value_expr(x, lookup, e.name)
     lo, hi = resolve(e.lo), resolve(e.hi)
-    lo isa Real && hi isa Real ||
-        throw(ContractValidationError("[layout] bounds for $(e.name) must be real scalars"))
+    # A side holds one number, or one per element when the entry's bound does.
+    valid(b, elementwise) = elementwise ?
+        b isa AbstractArray{<:Real} && length(b) == e.size : b isa Real
+    valid(lo, e.elementwise[1]) && valid(hi, e.elementwise[2]) ||
+        throw(ContractValidationError("[layout] bounds for $(e.name) must be " *
+            (any(e.elementwise) ? "arrays of its $(e.size) elements or real scalars" :
+                "real scalars") * ", got ($(summary(lo)), $(summary(hi)))"))
     if e.transform === :interval
-        isfinite(lo) && isfinite(hi) && lo < hi || throw(ContractValidationError(
-            "[layout] bounds for $(e.name) require finite lo < hi, got ($lo, $hi)"))
+        all(isfinite, lo) && all(isfinite, hi) && all(lo .< hi) || throw(ContractValidationError(
+            "[layout] bounds for $(e.name) require finite lo < hi, got " *
+            "($(_bound_summary(lo)), $(_bound_summary(hi)))"))
     elseif e.transform === :floored
-        isfinite(lo) || throw(ContractValidationError("[layout] lower bound for $(e.name) must be finite"))
+        all(isfinite, lo) || throw(ContractValidationError("[layout] lower bound for $(e.name) must be finite"))
     elseif e.transform === :upper
-        isfinite(hi) || throw(ContractValidationError("[layout] upper bound for $(e.name) must be finite"))
+        all(isfinite, hi) || throw(ContractValidationError("[layout] upper bound for $(e.name) must be finite"))
     end
     return LayoutEntry(e.kind, e.predictor, e.name, e.labels, e.offset,
         e.size, e.transform, lo, hi, e.dims,
-        [_resolved_entry(layout, b, values) for b in e.scan_blocks])
+        [_resolved_entry(layout, b, values) for b in e.scan_blocks], nothing,
+        nothing, nothing, (nothing, nothing), e.elementwise)
 end
 function _bound_entry_order(layout::LayoutTable)
     any(_dynamic_bounds, layout.entries) || return layout.entries
@@ -1357,7 +1426,7 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
             push!(pairs, p => _constrain_coefficient(coef_groups[p], u))
         elseif e.kind === :plate ||
                e.kind === :glm
-            v = _entry_eltype(e, T)[_constrain_elt(e, convert(T, x)) for x in seg]
+            v = _entry_eltype(e, T)[_constrain_elt(e, convert(T, x), k) for (k, x) in enumerate(seg)]
             push!(pairs, e.name => v)
         elseif e.kind === :scan
             push!(pairs, e.name => (isempty(e.scan_blocks) ? Vector{T}(seg) :
@@ -1371,10 +1440,10 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
         elseif e.kind === :array && _is_slice_transform(e.transform)
             push!(pairs, e.name => _array_slices_constrain(e, seg))
         elseif e.kind === :array && haskey(layout.cell_latents, e.name)
-            v = _entry_eltype(e, T)[_constrain_elt(e, convert(T, x)) for x in seg]
+            v = _entry_eltype(e, T)[_constrain_elt(e, convert(T, x), k) for (k, x) in enumerate(seg)]
             push!(pairs, e.name => _cell_latent_nested(layout, e.name, v))
         elseif e.kind === :array
-            v = _entry_eltype(e, T)[_constrain_elt(e, convert(T, x)) for x in seg]
+            v = _entry_eltype(e, T)[_constrain_elt(e, convert(T, x), k) for (k, x) in enumerate(seg)]
             push!(pairs, e.name =>
                 (length(e.dims) == 1 ? v : reshape(v, e.dims...)))
         elseif e.kind === :cholesky_corr
@@ -1450,7 +1519,7 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
                 else
                     for (k, x) in enumerate(seg)
                         u[e2.offset + k - 1] =
-                            _unconstrain_elt(e2, convert(T, x))
+                            _unconstrain_elt(e2, convert(T, x), k)
                     end
                 end
                 pos += e2.size
@@ -1467,7 +1536,7 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
                 ContractValidationError("[layout] $what $(e.name) length mismatch"),
             )
             for (k, x) in enumerate(v)
-                u[e.offset + k - 1] = _unconstrain_elt(e, convert(T, x))
+                u[e.offset + k - 1] = _unconstrain_elt(e, convert(T, x), k)
             end
         elseif e.kind === :scan
             haskey(nt, e.name) || throw(
@@ -1503,7 +1572,7 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
                 continue
             end
             for (k, x) in enumerate(vec(v))
-                u[e.offset + k - 1] = _unconstrain_elt(e, convert(T, x))
+                u[e.offset + k - 1] = _unconstrain_elt(e, convert(T, x), k)
             end
         elseif e.kind === :vector
             haskey(nt, e.name) || throw(
@@ -1607,8 +1676,8 @@ function logjac(layout::LayoutTable, u::AbstractVector{<:Real})
             total += lkj_chol_logjac(seg, _lkj_dim(e.size))
             continue
         end
-        for v in seg
-            total += _logjac_elt(e, convert(T, v))
+        for (k, v) in enumerate(seg)
+            total += _logjac_elt(e, convert(T, v), k)
         end
     end
     return total
@@ -1655,27 +1724,48 @@ _logjac_value(transform::Symbol, u) =
 # The in-graph interval constrain edge calls that same rule. The other edges
 # fold literal bounds (`_bound_add`), so host and graph agree bit-for-bit up
 # to the sign of an exact zero.
-function _constrain_elt(e::LayoutEntry, u)
+# One element of a `:bounded` entry takes the transform its own bounds state:
+# both finite (interval), a finite lower bound (floored), a finite upper bound
+# (upper), or neither (identity). The program's cells branch the same way on
+# the same data (`_bounded_cell`).
+_bounded_constrain(lo, hi, u) = isfinite(lo) ?
+    (isfinite(hi) ? rk_affine_logistic(lo, hi, u) : lo + exp(u)) :
+    (isfinite(hi) ? hi - exp(u) : u)
+_bounded_unconstrain(lo, hi, x) = isfinite(lo) ?
+    (isfinite(hi) ? log(x - lo) - log(hi - x) : log(x - lo)) :
+    (isfinite(hi) ? log(hi - x) : x)
+_bounded_logjac(lo, hi, u) = isfinite(lo) ?
+    (isfinite(hi) ? log(oftype(u, hi - lo)) - log1pexp(-u) - log1pexp(u) : u) :
+    (isfinite(hi) ? u : zero(u))
+
+# `k` is the element's position in the entry's block, which selects its own
+# bound when the entry holds one bound per element.
+function _constrain_elt(e::LayoutEntry, u, k::Integer = 1)
+    lo, hi = _bound_at(e.lo, k), _bound_at(e.hi, k)
+    e.transform === :bounded && return _bounded_constrain(lo, hi, u)
     e.transform === :interval &&
-        return rk_affine_logistic(e.lo, e.hi, u)
-    e.transform === :floored && return e.lo + exp(u)
-    e.transform === :upper && return e.hi - exp(u)
+        return rk_affine_logistic(lo, hi, u)
+    e.transform === :floored && return lo + exp(u)
+    e.transform === :upper && return hi - exp(u)
     return _constrain_value(e.transform, u)
 end
-function _unconstrain_elt(e::LayoutEntry, x)
-    e.transform === :interval && return log(x - e.lo) - log(e.hi - x)
-    e.transform === :floored && return log(x - e.lo)
-    e.transform === :upper && return log(e.hi - x)
+function _unconstrain_elt(e::LayoutEntry, x, k::Integer = 1)
+    lo, hi = _bound_at(e.lo, k), _bound_at(e.hi, k)
+    e.transform === :bounded && return _bounded_unconstrain(lo, hi, x)
+    e.transform === :interval && return log(x - lo) - log(hi - x)
+    e.transform === :floored && return log(x - lo)
+    e.transform === :upper && return log(hi - x)
     return _unconstrain_value(e.transform, x)
 end
-function _logjac_elt(e::LayoutEntry, u)
+function _logjac_elt(e::LayoutEntry, u, k::Integer = 1)
+    e.transform === :bounded && return _bounded_logjac(_bound_at(e.lo, k), _bound_at(e.hi, k), u)
     e.transform === :interval || e.transform === :floored ||
         e.transform === :upper || return _logjac_value(e.transform, u)
     e.transform === :floored && return u
     e.transform === :upper && return u
     # The width takes the coordinate's number type, so a wide input keeps
     # its precision; no rounded constrained value enters the logarithms.
-    return log(oftype(u, e.hi - e.lo)) - log1pexp(-u) - log1pexp(u)
+    return log(oftype(u, _bound_at(e.hi, k) - _bound_at(e.lo, k))) - log1pexp(-u) - log1pexp(u)
 end
 
 # The program's check of its packed point (snag `rk-prepared-cut-0e0b98ed`):
@@ -1941,15 +2031,18 @@ function _scan_read_ranges(plan::StructuralPlan, s::ScanSpec, ranges, T::Int)
 end
 
 # A data-derived bound is read as authored; a literal one stays a literal. A
-# bound that evaluated to a finite number read data alone (`_layout_bound`).
+# bound that evaluated to a finite number, or to an array of numbers (one per
+# element, infinite entries included: `:bounded`), read data alone
+# (`_layout_bound`).
+_finite_bound(b) = b isa Real ? isfinite(b) : b isa AbstractArray
 _data_bound_reads(authored, lo, hi) =
-    (!(authored[1] isa Real) && lo isa Real && isfinite(lo) ? authored[1] : nothing,
-     !(authored[2] isa Real) && hi isa Real && isfinite(hi) ? authored[2] : nothing)
+    (!(authored[1] isa Real) && _finite_bound(lo) ? authored[1] : nothing,
+     !(authored[2] isa Real) && _finite_bound(hi) ? authored[2] : nothing)
 
-function _authored_bounds(p)
+function _authored_bounds(p; elementwise::NTuple{2,Bool} = (false, false))
     ov = p.support_override
     if ov isa Tuple && length(ov) == 3 && support_of(p.family, ov) === :truncated
-        _, lo, hi = _entry_transform(p.family, ov, p.args)
+        _, lo, hi = _entry_transform(p.family, ov, p.args; elementwise)
         return lo, hi
     elseif ov isa Tuple && length(ov) == 2
         return ov[1] === :upper ? (NaN, ov[2]) : (ov[2], NaN)
@@ -1976,10 +2069,15 @@ function _layout_reads(plan::StructuralPlan, entries::Vector{LayoutEntry})
     at = 1
     out = LayoutEntry[]
     for e in entries
-        bound_reads = e.transform in (:interval, :floored, :upper) &&
+        bound_reads = e.transform in (:interval, :floored, :upper, :bounded) &&
             haskey(parameters, e.name) && parameters[e.name].family !== :external ?
-            _data_bound_reads(_authored_bounds(parameters[e.name]), e.lo, e.hi) : e.bound_reads
-        bound_reads = map(x -> x !== nothing && tests.reads_data(x) ? x : nothing, bound_reads)
+            _data_bound_reads(_authored_bounds(parameters[e.name];
+                elementwise = e.elementwise), e.lo, e.hi) : e.bound_reads
+        # A per-element bound is always read as authored (a literal array too):
+        # the program holds no binding's numbers.
+        bound_reads = map((x, b) -> x !== nothing &&
+            (tests.reads_data(x) || b isa AbstractArray) ? x : nothing,
+            bound_reads, (e.lo, e.hi))
         entry, at = _entry_reads!(reads, plan, tests, e, at, get(scans, e.name, nothing), bound_reads)
         push!(out, entry)
     end
@@ -2002,7 +2100,8 @@ end
 function _entry_reads!(reads, plan, tests, e::LayoutEntry, at, scan, bound_reads)
     with(positions, axes = nothing, blocks = e.scan_blocks) =
         LayoutEntry(e.kind, e.predictor, e.name, e.labels, e.offset, e.size, e.transform,
-            e.lo, e.hi, e.dims, blocks, e.sampling, positions, axes, bound_reads)
+            e.lo, e.hi, e.dims, blocks, e.sampling, positions, axes, bound_reads,
+            e.elementwise)
     if !_reads_positions(e)
         return with(nothing), _read_add(at, e.size)
     end
@@ -2025,7 +2124,8 @@ function _entry_reads!(reads, plan, tests, e::LayoutEntry, at, scan, bound_reads
             push!(blocks, LayoutEntry(b.kind, b.predictor, b.name, b.labels, b.offset, b.size,
                 b.transform, b.lo, b.hi, b.dims, b.scan_blocks, b.sampling,
                 start === nothing ? nothing : (start, stop), nothing,
-                map(x -> x !== nothing && tests.reads_data(x) ? x : nothing, b.bound_reads)))
+                map(x -> x !== nothing && tests.reads_data(x) ? x : nothing, b.bound_reads),
+                b.elementwise))
             at = next
         end
         return with(nothing, nothing, blocks), at
@@ -2072,11 +2172,14 @@ end
 # The entry as its generated program reads it: a data-derived bound is its
 # authored expression, never this binding's number.
 function _program_entry(e::LayoutEntry)
+    lo, hi = something(e.bound_reads[1], e.lo), something(e.bound_reads[2], e.hi)
+    (lo isa AbstractArray || hi isa AbstractArray) && throw(ContractValidationError(
+        "[layout] the per-element bound of $(e.name) has no authored read; " *
+        "the program would hold this binding's numbers"))
     e.bound_reads === (nothing, nothing) && return e
     return LayoutEntry(e.kind, e.predictor, e.name, e.labels, e.offset, e.size,
-        e.transform, something(e.bound_reads[1], e.lo),
-        something(e.bound_reads[2], e.hi), e.dims, e.scan_blocks, e.sampling,
-        e.positions, e.axes)
+        e.transform, lo, hi, e.dims, e.scan_blocks, e.sampling,
+        e.positions, e.axes, (nothing, nothing), e.elementwise)
 end
 
 # Bound arithmetic of the parameterized (`:interval`/`:floored`/`:upper`)
@@ -2118,9 +2221,10 @@ end
 _interval_unconstrain(lo, hi, x; dot::Bool = false) = dot ?
     :(log.($(_bound_sub(x, lo; dot))) .- log.($(_bound_sub(hi, x; dot)))) :
     :(log($(_bound_sub(x, lo))) - log($(_bound_sub(hi, x))))
-function _interval_logjac(lo, hi, u; dot::Bool = false)
-    w = _bound_sub(hi, lo)
-    logw = _literal_bound(w) && isone(w) ? 0.0 : :(log($w))
+function _interval_logjac(lo, hi, u; dot::Bool = false, elementwise::Bool = false)
+    # A width per element is a vector of logarithms; a shared one is one.
+    w = _bound_sub(hi, lo; dot = elementwise)
+    logw = _literal_bound(w) && isone(w) ? 0.0 : elementwise ? :(log.($w)) : :(log($w))
     dot || return :($logw - log1pexp(-$u) - log1pexp($u))
     return :(sum($logw .- log1pexp.(-$u) .- log1pexp.($u)))
 end
@@ -2285,6 +2389,7 @@ function _plate_transform_statements(e::LayoutEntry)
                 $(_bound_add(e.lo, :(exp.($u)); dot = true))),
         ]
     end
+    e.transform === :bounded && return _bounded_transform_statements(e, view_read)
     if e.transform === :upper
         # Parameterized bound ⇒ not in the (parameterless) bijector registry;
         # hand-rolled broadcast edges over the block view, with the host
@@ -2308,6 +2413,86 @@ function _plate_transform_statements(e::LayoutEntry)
         :($(ljcells)::AbstractVector{Float64} =
             $(_plate_map(view_read, cell, :($(bij)().logjac($cell))))),
     ]
+end
+
+# A `:bounded` block: per-element bounds that mix finite and infinite entries.
+# Each edge is a plate whose cell branches on its own bounds' finiteness, as
+# the host `_bounded_*` functions do. The condition reads bound data only, so
+# preparation splits the plate into one plate per arm over its own lanes
+# (RK's data-bound branch partition): no lane evaluates an arm it does not
+# take, and one program serves every pattern of infinite entries. A literal
+# (shared) side decides its branch here.
+function _bounded_transform_statements(e::LayoutEntry, view_read)
+    u = Symbol(:_ppl_bnd_, e.name)
+    inputs, names = Any[u], Symbol[:_ppl_bnd_u]
+    side(b, tag) = if b isa Real
+        b
+    else
+        nm = Symbol(:_ppl_bnd_, tag, :_, e.name)
+        push!(inputs, nm)
+        push!(names, Symbol(:_ppl_bnd_, tag))
+        last(names)
+    end
+    stmts = Expr[:($u::AbstractVector{Float64} = $view_read)]
+    for (b, tag) in ((e.lo, :lo), (e.hi, :hi))
+        b isa Real || push!(stmts, :($(Symbol(:_ppl_bnd_, tag, :_, e.name)) = $b))
+    end
+    l, h = side(e.lo, :lo), side(e.hi, :hi)
+    cells(body, first = :_ppl_bnd_u) = Expr(:do, Expr(:call, :plate, inputs...),
+        Expr(:(->), Expr(:tuple, first, names[2:end]...),
+            Expr(:block, LineNumberNode(0, :layout), body)))
+    push!(stmts,
+        :($(e.name)::AbstractVector{Float64} =
+            $(cells(_bounded_cell(:constrain, l, h, :_ppl_bnd_u)))),
+        :($(_plate_logjac_name(e.name))::AbstractVector{Float64} =
+            $(cells(_bounded_cell(:logjac, l, h, :_ppl_bnd_u)))))
+    inputs[1] = e.name
+    push!(stmts, :($u::AbstractVector{Float64} =
+        $(cells(_bounded_cell(:unconstrain, l, h, :_ppl_bnd_x), :_ppl_bnd_x))))
+    return stmts
+end
+
+# One cell of a `:bounded` edge (`:constrain`, `:logjac` or `:unconstrain`
+# of `v`), the lazy branch of the host `_bounded_*` functions. A literal bound
+# decides its branch at emission.
+function _bounded_cell(edge::Symbol, l, h, v)
+    branch(c, a, b) = c isa Bool ? (c ? a : b) : Expr(:if, c, a, b)
+    finite(b) = b isa Real ? isfinite(b) : :(isfinite($b))
+    edge === :constrain && return branch(finite(l),
+        branch(finite(h), :(rk_affine_logistic($l, $h, $v)), :($l + exp($v))),
+        branch(finite(h), :($h - exp($v)), v))
+    edge === :logjac && return branch(finite(l),
+        branch(finite(h), :(log($h - $l) - log1pexp(-$v) - log1pexp($v)), v),
+        branch(finite(h), v, 0.0))
+    return branch(finite(l),
+        branch(finite(h), :(log($v - $l) - log($h - $v)), :(log($v - $l))),
+        branch(finite(h), :(log($h - $v)), v))
+end
+
+# A per-element bound as an elementwise array's cells read it: column-major,
+# after the check that it has the array's size (`_array_prior_cells`, as for a
+# per-element prior argument; a graph value is checked where it is computed).
+# A plate's bound is already one entry per cell.
+_elementwise_bound_read(e::LayoutEntry, b) = e.kind === :array ?
+    :(_array_prior_cells($b, ($(_entry_axes(e)...),))) : b
+
+# Which bounds of a per-cell latent hold one bound per cell: a cell's own
+# bound, hoisted to a definition over the plate's rows (data, folded here, or a
+# graph value with an axis), never a vector read whole by every cell.
+function _cell_bound_sides(plan::StructuralPlan, p, ov, args, rows::Int)
+    bounds = p.family === :uniform ? (args.arg1, args.arg2) :
+        _has_interval_bounds(ov) ? (ov[2], ov[3]) : (nothing, nothing)
+    return map(bounds) do b
+        (b === nothing || b isa Real) && return false
+        if b isa AbstractArray
+            size(b) == (rows,) || throw(ContractValidationError(
+                "[layout] plate latent $(p.name): a per-cell bound has size " *
+                "$(size(b)); it needs one bound per cell ($rows)"))
+            return true
+        end
+        axes = _value_axes(plan, b; data_axes = true)
+        return axes !== nothing && length(axes) == 1
+    end
 end
 
 # Per-element scalar names of a positive (`:exp`) `:vector` entry
@@ -2524,7 +2709,9 @@ function jacobian_term(e::LayoutEntry)
         # `_plate_transform_statements`. GLM vectors use the same shape.
         # Missing companion plates must fail explicitly.
         e.transform === :interval &&
-            return _interval_logjac(e.lo, e.hi, _entry_view(e); dot = true)
+            return _interval_logjac(e.lo, e.hi, _entry_view(e); dot = true,
+                elementwise = any(e.elementwise))
+        e.transform === :bounded && return :(sum($(_plate_logjac_name(e.name))))
         if e.transform === :upper || e.transform === :floored
             # Both one-sided exp transforms have the bare-coordinate Jacobian.
             return :(sum($(_entry_view(e))))

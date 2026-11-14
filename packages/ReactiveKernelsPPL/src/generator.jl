@@ -5197,7 +5197,7 @@ function _vector_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
         float64_variate::Bool = false, label::Symbol = name,
         float64_inputs = (), cell_names = Dict{Symbol,Symbol}(),
         node::Symbol = Symbol(:_ppl_prior_, label),
-        pw::Symbol = Symbol(:_ppl_pw_prior_, label))
+        pw::Symbol = Symbol(:_ppl_pw_prior_, label), open_bounds::Bool = false)
     if family === :flat
         # An improper density contributes zero; evaluating a posterior does
         # not request a draw from the unnormalizable prior.
@@ -5224,7 +5224,8 @@ function _vector_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
     threaded_support = support isa Tuple ?
         (support[1], map(thread, support[2:end])...) : support
     pre = Expr[]
-    corr = _support_correction(family, threaded_support, argvals; pre, stem = name)
+    corr = _support_correction(family, threaded_support, argvals; pre, stem = name,
+        open_bounds)
     corr === nothing || (cell = :($cell + $corr))
     if conditioned
         cell = _conditioned_support_guard(tv, threaded_support,
@@ -5313,8 +5314,11 @@ end
 # Normalize the base density over the declared support. Symmetric halves
 # at literal zero add log(2); general bounds share the observation log-mass
 # algebra, including the owned log-tail endpoints.
+# `open_bounds`: a bound read at run time may be its side's infinity (one
+# bound per element, `-Inf`/`Inf` entries leaving that element open), so the
+# mass takes the one-sided form lazily there, as an observation's does.
 function _support_correction(family::Symbol, ov::SupportOverride, argvals;
-        pre::Vector{Expr} = Expr[], stem::Symbol = :prior)
+        pre::Vector{Expr} = Expr[], stem::Symbol = :prior, open_bounds::Bool = false)
     ov === nothing && return nothing
     ov isa Tuple && ov[1] === :restricted && return nothing
     ov isa Tuple && ov[1] === :restricted_half && return :(log(2))
@@ -5323,8 +5327,9 @@ function _support_correction(family::Symbol, ov::SupportOverride, argvals;
         logcdf = x -> _evidence_logtail(_prior_endpoint_expr(family, argvals, :cdf, x))
         logccdf = x -> _evidence_logtail(_prior_endpoint_expr(family, argvals, :ccdf, x))
         lo == -Inf && hi == Inf && return nothing
-        return :(-$(_evidence_logmass(logcdf, logccdf,
-            lo == -Inf ? nothing : lo, hi == Inf ? nothing : hi)))
+        lo, hi = lo == -Inf ? nothing : lo, hi == Inf ? nothing : hi
+        open_bounds && return :(-$(_evidence_open_logmass(logcdf, logccdf, lo, lo, hi, hi)))
+        return :(-$(_evidence_logmass(logcdf, logccdf, lo, hi)))
     end
     if ov isa Tuple
         if ov[1] === :lower
