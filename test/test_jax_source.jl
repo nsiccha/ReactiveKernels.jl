@@ -1235,8 +1235,12 @@ end
     @test !occursin(r"<[a-z]", plain)
     # Module reads, `Val` tags and Vararg splats resolve while emitting: only
     # the arithmetic they reach is emitted.
+    # Each plain helper the call reaches is a named function (`applied(f, x)`
+    # with `f = sin`, a translation-time value, takes `x` alone).
     dispatch = string(jax_source(jax_dispatch; have = (:w, :x), want = :s))
-    @test occursin("jnp.sin(w)", dispatch)
+    @test occursin("jnp.sin(x)", dispatch)
+    @test occursin("def applied(x: ArrayLike)", dispatch)
+    @test occursin("applied(w)", dispatch)
     @test !occursin(r"<[a-z]", dispatch)
     @test !occursin("None", dispatch)
     # Static guards are Python conditionals over NumPy values, not `lax.cond`.
