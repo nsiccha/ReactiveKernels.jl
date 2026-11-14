@@ -957,8 +957,8 @@ function _partial_nested_shared_recipes(inner::Plan, bound, bound_types,
         copied === nothing && (copied = Graph(copy(g.values), copy(g.recipes),
             copy(g.producers), copy(g.aliases), g.version, nothing, copy(g.checks)))
         ng = nested.inner.graph
-        available = Dict{ValueId,Value}(canon_id(ng, v.id) => input
-            for (v, input) in zip(nested.inner.have, r.inputs))
+        available = _dict_from(Dict{ValueId,Value}, (canon_id(ng, v.id) => input
+            for (v, input) in zip(nested.inner.have, r.inputs)))
         for q in nested.selected
             output = only(q.outputs)
             shared = canon_id(ng, output.id) in nested.shared
@@ -1011,7 +1011,7 @@ end
 
 function _partial_nested_shared_recipe(g, r, dataonly, outer_types, refused)
     op = r.op
-    original = op.kernel.plan
+    original = op.kernel.plan::Plan
     length(original.have) == length(r.inputs) || return nothing
     excluded = _partial_plate_excluded(original)
     excluded === nothing && return nothing
@@ -1034,8 +1034,8 @@ function _partial_nested_shared_recipe(g, r, dataonly, outer_types, refused)
     prefix_key = (:nested_recipe, r.id)
     node_key = (:nested_node, r.id)
     union!(excluded, (q.id for q in original.recipes if (prefix_key..., q.id) in refused))
-    readable = Dict{Int,Any}(q.id => source for (q, source) in
-        zip(original.recipes, op.kernel.lowered_recipes))
+    readable = _dict_from(Dict{Int,Any}, (q.id => source for (q, source) in
+        zip(original.recipes, op.kernel.lowered_recipes)))
     inner = _partial_split_recipes(original, bound, excluded, readable)
     union!(excluded, (q.id for q in inner.recipes if (prefix_key..., q.id) in refused))
     nested_refused = Set(key[3] for key in refused
@@ -1103,9 +1103,9 @@ Base.@nospecializeinfer function _partial_plate_analysis(
         original_excluded::Set{Int}, bound::Set{ValueId},
         bound_types::Dict{ValueId,Any})
     atomic_inputs = typeof(op).parameters[2]
-    original = op.kernel.plan
-    original_readable = Dict{Int,Any}(r.id => source for (r, source) in
-                                      zip(original.recipes, op.kernel.lowered_recipes))
+    original = op.kernel.plan::Plan
+    original_readable = _dict_from(Dict{Int,Any}, (r.id => source for (r, source) in
+                                   zip(original.recipes, op.kernel.lowered_recipes)))
     refused = copy(key.refused)
     while true
     readable, excluded = copy(original_readable), copy(original_excluded)
@@ -1284,7 +1284,7 @@ Base.@nospecializeinfer function _partial_plate_recipe(
         g, recipe, known, @nospecialize(op::_AuthoredPlateOp), rewrites,
         one_object::Set{ValueId})
     atomic_inputs = typeof(op).parameters[2]
-    inner = _plate_cell_kernel(op).plan
+    inner = _plate_cell_kernel(op).plan::Plan
     length(inner.have) == length(recipe.inputs) || return nothing
     length(inner.want) == 1 || return nothing
     _plate_cell_ops_length(op) == length(inner.recipes) || return nothing
@@ -1677,7 +1677,7 @@ Base.@nospecializeinfer function _partition_plate_recipe(
         g, recipe, known, @nospecialize(op::_AuthoredPlateOp),
         pending::Vector{Recipe}, want, fresh, lane_lengths::Dict{ValueId,Int})
     atomic_inputs = typeof(op).parameters[2]
-    inner = _plate_cell_kernel(op).plan
+    inner = _plate_cell_kernel(op).plan::Plan
     length(inner.have) == length(recipe.inputs) || return nothing
     all_arms = _all_branch_arms()
     length(inner.want) == 1 || return nothing
@@ -1841,8 +1841,8 @@ Base.@nospecializeinfer function _partition_plate_recipe(
     lane_roots = intersect(lane_values, keys(root_positions))
     shared_roots = setdiff(Set(keys(root_positions)), lane_roots)
     cell_ids = Set(r.id for r in inner.recipes)
-    readable = Dict(r.id => source for (r, source) in
-                    zip(inner.recipes, op.kernel.lowered_recipes))
+    readable = _dict_from(Dict{Int,Any}, (r.id => source for (r, source) in
+                          zip(inner.recipes, op.kernel.lowered_recipes)))
     for (side, lanes) in arms
         # The arm's scalar body: the branch recipe runs only this arm (a
         # nested branch arm stays a `_KernelBranch` and partitions again).
@@ -2080,10 +2080,13 @@ function _partial_fold_bound(p::Plan)
     hoisted = _partial_hoisted(p, boundary, ())
     # Fresh ids below every id in the plan, as the inner-plate pass assigns.
     base = minimum((r.id for r in p.recipes); init = 0) - 1
-    recipes = Recipe[Recipe(base - index + 1, (), (value,), _BoundConstant(data),
-                            0.0, nothing, false)
-                     for (index, (value, data)) in
-                         enumerate(zip(boundary.constants, hoisted))]
+    # A loop, not a comprehension: `hoisted` is untyped
+    # (`construction_iteration.jl`).
+    recipes = Recipe[]
+    for (index, (value, data)) in enumerate(zip(boundary.constants, hoisted))
+        push!(recipes, Recipe(base - index + 1, (), (value,), _BoundConstant(data),
+                              0.0, nothing, false))
+    end
     _partial_subplan(p, boundary.remaining, p.want, vcat(recipes, boundary.residual))
 end
 

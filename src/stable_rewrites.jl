@@ -514,7 +514,7 @@ function _rw_arm_view(ctx::_RwContext, callee, args::Vector{Any}, env)
     names = _recipe_source_names(r)
     length(names) == length(r.inputs) && length(positions) == length(args) &&
         all(p -> 1 <= p <= length(names), positions) || return nothing
-    subst = Dict{Symbol,Any}(names[p] => args[i] for (i, p) in enumerate(positions))
+    subst = _dict_from(Dict{Symbol,Any}, (names[p] => args[i] for (i, p) in enumerate(positions)))
     _rw_view(_rw_substitute(_rw_qualify(arm, mod), subst), ctx, env)
 end
 

@@ -3102,7 +3102,7 @@ end
 function _plate_entry_parts(producer::Recipe, groups::Vector)
     op = producer.op
     body = _plate_body(op)
-    inner = body.plan
+    inner = body.plan::Plan
     ig = inner.graph
     length(body.lowered_recipes) == length(inner.recipes) || return nothing
     at = _plate_tuple_statement(inner)

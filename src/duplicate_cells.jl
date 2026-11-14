@@ -127,9 +127,9 @@ end
 # times the cell's value. Its other operands and their positions are unchanged.
 Base.@nospecializeinfer function _cell_group_kernel(@nospecialize(op::_AuthoredPlateOp))
     cell = _plate_cell_kernel(op)
-    inner = cell.plan
-    readable = Dict(r.id => source for (r, source) in
-                    zip(inner.recipes, cell.lowered_recipes))
+    inner = cell.plan::Plan
+    readable = _dict_from(Dict{Int,Any}, (r.id => source for (r, source) in
+                          zip(inner.recipes, cell.lowered_recipes)))
     ig = inner.graph
     ig = Graph(copy(ig.values), copy(ig.recipes), copy(ig.producers),
                copy(ig.aliases), ig.version, nothing, copy(ig.checks))
@@ -207,7 +207,7 @@ Base.@nospecializeinfer function _cell_group_recipe(
     length(recipe.outputs) == 1 || return nothing
     recipe.effectful && return nothing
     atomic_inputs = typeof(op).parameters[2]
-    inner = _plate_cell_kernel(op).plan
+    inner = _plate_cell_kernel(op).plan::Plan
     length(inner.have) == length(recipe.inputs) || return nothing
     length(inner.want) == 1 || return nothing
     _plate_cell_ops_length(op) == length(inner.recipes) || return nothing

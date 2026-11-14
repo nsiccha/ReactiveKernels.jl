@@ -7658,8 +7658,15 @@ function _eval_plate_column(ex, lookup, label)
         "[bind] $label: plate inputs differ in length"))
     formals = Meta.isexpr(lam.args[1], :tuple) ? lam.args[1].args : Any[lam.args[1]]
     return [begin
-        cell = Dict{Symbol,Any}(f => _plate_lane_value(lane, k)
-            for (f, lane) in zip(formals, lanes))
+        # A loop, not `Dict(… for (f, lane) in zip(formals, lanes))`: the
+        # comprehension's closure holds `formals` and `lanes` untyped, and
+        # `Dict` of a generator over them asks `IteratorSize`, which a
+        # package defining it for its own iterator invalidates (snag
+        # downstream-workl-75f8cba4).
+        cell = Dict{Symbol,Any}()
+        for (f, lane) in zip(formals, lanes)
+            cell[f] = _plate_lane_value(lane, k)
+        end
         read(nm) = haskey(cell, nm) ? cell[nm] : lookup(nm)
         _eval_plate_cell(lam.args[2], cell, read, label)
     end for k in 1:n]

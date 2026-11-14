@@ -143,8 +143,12 @@ function _absent_refusal(f, plan::StructuralPlan, spec, have, want)
     catch e
         e isa ReactiveKernels.PlanningError || rethrow()
         selected = try
+            # Typed: `Set(… for r in selected.recipes for v in r.inputs)` below
+            # over an untyped plan asks `IteratorSize`, which a package
+            # defining it for its own iterator invalidates (snag
+            # downstream-workl-75f8cba4).
             Base.invokelatest(ReactiveKernels.plan, spec;
-                have = (have..., absent...), want)
+                have = (have..., absent...), want)::ReactiveKernels.Plan
         catch
             rethrow(e)
         end
