@@ -596,6 +596,18 @@ const _JAX_CASES = (
            off = [[0.1, 0.0], [0.2], [0.0, 0.1, -0.1]], x = [0.3, -0.2, 0.1],
            rows = [[1, 3], [2], [2, 2, 1]], shared = [0.1, 0.2], level = [0.1, -0.1, 0.4]) |
         (; y = [[0.1, 0.7], [-0.6], [-0.5, 0.4, 1.1]]),
+    # The position of every row in the concatenation of two row lists, and
+    # ranks with ties and signed zeros: `invperm` and `sortperm` of data run
+    # in `prepare_data` (RK 0.1.237, snag jax-host-transla-e885b100).
+    row_positions = () -> (@rkppl(begin
+        a ~ Normal(0, 1); b ~ Normal(0, 2); s ~ Exponential(1.0)
+        pos = invperm(vcat(rows_a, rows_b))
+        ranks = invperm(sortperm(x))
+        mu = a .+ b .* vcat(x_a, x_b)[pos] .+ 0.1 .* ranks
+        y .~ Normal.(mu, s)
+    end))(; rows_a = [1, 3, 4], rows_b = [2, 5], x_a = [0.3, -1.2, 0.8],
+           x_b = [1.5, -0.4], x = [0.5, -0.0, 0.0, 0.5, -1.0]) |
+        (; y = [0.4, 1.9, -1.0, 1.1, 0.2]),
 )
 # ICAR priors (snag independent-icar-2e025fad): one field over a graph, and K
 # independent fields over the same graph as the rows or the columns of one
