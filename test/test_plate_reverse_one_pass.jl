@@ -48,6 +48,11 @@ const PROGRAMS = [
     "one loop" => (program([:($MUL(s, v1))]),
         (x, s) -> s * sum(x; init = 0.0), (x, s) -> fill(s, length(x)),
         (x, s) -> sum(x; init = 0.0), true),
+    # Two cotangent terms reach one read. Select the ordinary per-cell sum
+    # before extracting a single factored term.
+    "one read with two terms" => (program([:($ADD($MUL(s, v1), $SIN(v1)))]),
+        (x, s) -> s * sum(x; init = 0.0) + sum(sin, x; init = 0.0),
+        (x, s) -> s .+ cos.(x), (x, s) -> sum(x; init = 0.0), false),
     # The same operand in two cell loops of one program.
     "two loops" => (program([:($MUL(s, v1)), :($SIN(v1))]),
         (x, s) -> s * sum(x; init = 0.0) + sum(sin, x; init = 0.0),
@@ -78,8 +83,7 @@ end
     @test batched == [:x]
     @test occursin("_pr_scale_buffer!", string(rexpr)) == factors
     primal, reverse = RK.compile(ast), RK.compile(rexpr)
-    ȳ = 1.7
-    for n in (0, 3, 200), s in (-0.6, 0.6)
+    for n in (0, 3, 200), s in (-0.6, 0.0, 0.6), ȳ in (0.0, 1.7)
         # A plain operand: its own storage is the buffer.
         x = [0.4 * sin(i) for i in 1:n]
         @test primal(x, s) ≈ value(x, s)
@@ -127,9 +131,10 @@ end
 # otherwise (an identity gather on a small plate, as RKPPL's `b[axes(n, 1)]`,
 # or a parent as long as the plate). Gradients through Enzyme agree either way.
 seeded(rule, x, s, ȳ) = ȳ * rule(x, s)
-@testset "one pass is chosen per call: $n cells, parent of $J" for (n, J, onepass) in
-        ((40, 8, false), (200, 30, true), (200, 250, false), (21, 21, false))
-    ast = program([:($MUL(s, v1))])
+@testset "one pass is chosen per call: $name, $n cells, parent of $J" for
+        (name, (ast, value, dx, ds, _)) in PROGRAMS[1:2],
+        (n, J, onepass) in ((0, 5, false), (40, 8, false), (200, 30, true),
+                           (200, 250, false), (21, 21, false))
     rexpr, scalar, batched = RK._pr_program_reverse(ast, [:x, :s], RK, Dict{Symbol,Any}())
     primal, reverse = RK.compile(ast), RK.compile(rexpr)
     rule = RK._PlateSumRule{(2,),(1,),typeof(primal),typeof(reverse)}(primal, reverse)
@@ -140,12 +145,61 @@ seeded(rule, x, s, ȳ) = ȳ * rule(x, s)
           (onepass ? RK._PlateSumRuleOnePass : RK._PlateSumRuleBody)
     @test RK._pr_rule_target(rule, (collect(x), 0.6)) isa RK._PlateSumRuleBody
     @test RK._pr_rule_target(rule, (view(zeros(n + 3), 2:n+1), 0.6)) isa RK._PlateSumRuleBody
-    @test rule(x, 0.6) ≈ 0.6 * sum(x)
+    @test rule(x, 0.6) ≈ value(x, 0.6)
     dz = zeros(J)
     cot = first(Enzyme.autodiff(Enzyme.Reverse, seeded, Enzyme.Active, Enzyme.Const(rule),
         Enzyme.Duplicated(x, view(dz, g)), Enzyme.Active(0.6), Enzyme.Const(1.7)))
-    @test dz ≈ scatter(g, fill(1.7 * 0.6, n), J)
-    @test cot[3] ≈ 1.7 * sum(x)
+    @test dz ≈ scatter(g, 1.7 .* dx(x, 0.6), J)
+    @test cot[3] ≈ 1.7 * ds(x, 0.6)
+end
+
+# The original public preparation reproducer, without a diagnostic adapter or
+# generator hook. Reuse each preparation with changed values and lengths.
+@kernel gathered_fanout(z::Vector{Float64}, groups::Vector{Int}, s::Float64) = begin
+    terms = plate(z[groups]) do v
+        s * v + sin(v)
+    end
+    total::Float64 = sum(terms)
+    return total
+end
+
+structure(x) = (1, 0)
+structure(x::RK._PlateProgram) = structure(x.ast)
+structure(x::RK._PlateCall) = structure(RK._program_expression(x.program))
+structure(x::RK._PlateSumRule) = structure(x.program) .+ structure(x.reverse)
+function structure(x::Expr)
+    children = map(structure, x.args)
+    (1 + sum(first, children; init = 0),
+     (x.head in (:for, :while)) + sum(last, children; init = 0))
+end
+
+@testset "gathered read fan-out through public ordinary Reverse" begin
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    z0 = [0.3 * cos(j) for j in 1:30]
+    groups0 = [mod1(3i, 29) for i in 1:200]
+    for enabled in (false, true)
+        q, shape = with_plate_reverse(enabled) do
+            k = prepare_nonallocating(gathered_fanout, z0, groups0, 0.6)
+            ast = RK._program_expression(first(RK._ad_na_program(k, (1,), (z0, groups0, 0.6))))
+            prepare_ad(k, backend, z0, groups0, 0.6; active = :z), structure(ast)
+        end
+        for (n, J) in ((0, 5), (40, 8), (200, 30), (200, 250), (2000, 71)), s in (-0.6, 0.0, 0.6)
+            z = [0.2 * sin(j) for j in 1:J]
+            groups = [mod1(3i, J - 1) for i in 1:n]
+            before = deepcopy((z, groups))
+            v, dz = ad_value_and_gradient!(q, zero(z), z, groups, s)
+            @test v ≈ sum((s * z[j] + sin(z[j]) for j in groups); init = 0.0)
+            @test dz ≈ scatter(groups, [s + cos(z[j]) for j in groups], J)
+            @test dz[end] == 0.0
+            @test (z, groups) == before
+        end
+        with_plate_reverse(enabled) do
+            groups = [mod1(7i, 29) for i in 1:2000]
+            k = prepare_nonallocating(gathered_fanout, z0, groups, 0.6)
+            ast = RK._program_expression(first(RK._ad_na_program(k, (1,), (z0, groups, 0.6))))
+            @test structure(ast) == shape
+        end
+    end
 end
 
 # End to end: a grouped model whose plate reads `sd .* z[group]` (a gathered

@@ -1295,9 +1295,13 @@ function _pr_read_reverse!(out, fc::_PRFactored, adj, mutable, s, terms, topleve
     prepared = s.args[1]
     deferred = toplevel ? pop!(fc.deferred, s.lhs, Any[]) : Any[]
     terms = terms === nothing ? _PRTerm[] : terms
-    u = isempty(terms) ? (isempty(deferred) ? nothing : deferred[1][4]) : only(terms).var
     factorable = toplevel && haskey(fc.readof, s.lhs) && length(terms) <= 1 &&
-        !(isempty(terms) && isempty(deferred)) && all(d -> d[4] == u, deferred)
+        !(isempty(terms) && isempty(deferred))
+    u = nothing
+    if factorable
+        u = isempty(terms) ? deferred[1][4] : only(terms).var
+        factorable = all(d -> d[4] == u, deferred)
+    end
     # The per-cell form: the deferred partials as products, the read's cotangent scaled.
     plain = Any[]
     for (a, num, inv, u, value) in deferred

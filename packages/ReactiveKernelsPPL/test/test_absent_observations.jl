@@ -597,6 +597,106 @@ _ao_code(values, levels) = [findfirst(isequal(v), levels) for v in values]
     @test_throws "yraw" bind_data(fit, Dict{Symbol,Any}(:x => X[1:2]))
 end
 
+# A location whose every per-row summand the graph computes, here from a
+# top-level `@scan` (`m = level .+ state`), has its rows from that summand. Its
+# authored name evaluates on a design without the response, and the absent
+# response takes the scan's length (snag rkppl-response-a-0d9dd693: the
+# location took its rows from `y`, so the query read the absent `y`, and the
+# stand-in kept one entry, so predictive laws did not fit it).
+_ao_scan_source(location...) = Expr(:block,
+    :(rho ~ LogNormal(0.0, 1.0)), :(level ~ Normal(0.0, 1.0)), :(b ~ Normal(0.0, 1.0)),
+    :(@scan begin
+        state[1] = x[1]
+        for t in 2:n
+            state[t] = exp(-rho) * state[t - 1] + x[t]
+        end
+    end),
+    location..., :(y .~ Normal.(m, 1.0)))
+
+function _ao_scan_state(rho, x)
+    state = similar(x)
+    state[1] = x[1]
+    for t in 2:length(x)
+        state[t] = exp(-rho) * state[t - 1] + x[t]
+    end
+    return state
+end
+
+@testset "absent observations: a location computed from a scan's carried array" begin
+    T = 9
+    X = collect(range(0.1, 1.3; length = T))
+    Y = 0.3 .+ sin.(1:T)
+    cases = (
+        "intercept plus the carried array" =>
+            ((:(m = level .+ state),), (p, s) -> p.level .+ s),
+        "scaled carried array plus a number" =>
+            ((:(m = b .* state .+ 0.5),), (p, s) -> p.b .* s .+ 0.5),
+        "intercept plus a call over it" =>
+            ((:(m = level .+ exp.(state)),), (p, s) -> p.level .+ exp.(s)),
+        "a definition over it plus a number" =>
+            ((:(background = level .+ state), :(m = background .+ 0.0)),
+                (p, s) -> p.level .+ s),
+    )
+    for (label, (location, expected)) in cases
+        @testset "$label" begin
+            src = _ao_scan_source(location...)
+            data = Dict{Symbol,Any}(:n => T, :x => X, :y => Y)
+            fit = bind_data(lower_rkppl(src, data; conditioned = (:y,),
+                mod = @__MODULE__), data)
+            design = bind_data(fit, Dict{Symbol,Any}(:n => T, :x => X))
+            @test ReactiveKernelsPPL._absent_observations(design) == [:y]
+            @test size(design.columns[:y]) == (T,)
+            built = build_kernel(fit)
+            for p in ((rho = 0.4, level = -0.3, b = 1.7), (rho = 2.1, level = 0.8, b = -0.6))
+                u = unconstrain(built.layout, p)
+                m = expected(p, _ao_scan_state(p.rho, X))
+                for graph in (built, build_kernel(design))
+                    @test _ao_eval(prepare_query(graph, design, (:m,)), u) ≈ m rtol = 1e-12
+                    @test _ao_eval(prepare_query(graph, design, :observations), u).y.location ≈
+                        m rtol = 1e-12
+                    laws = predictive_laws(prepare_predictive(graph, design), u).y
+                    @test size(laws) == (T,)
+                    @test mean.(laws) ≈ m rtol = 1e-12
+                end
+                # The fit evaluates the same values and its posterior.
+                @test _ao_eval(prepare_query(built, fit, (:m,)), u) ==
+                    _ao_eval(prepare_query(built, design, (:m,)), u)
+                @test _ao_eval(prepare_query(built, fit, :likelihood), u) ≈
+                    sum(logpdf.(Normal.(m, 1.0), Y)) rtol = 1e-12
+            end
+            @test _ao_refused(() -> prepare_query(built, design, :sampler), :y)
+            # Ordinary Reverse gradients of the fit's posterior.
+            u = unconstrain(built.layout, (rho = 0.7, level = 0.2, b = 0.9))
+            sampler = prepare_sampler(built, fit, u; backend = _AO_BACKEND)
+            value, g = sampler_value_and_gradient!(sampler, zeros(length(u)), u)
+            post = prepare_query(built, fit, :sampler)
+            @test value ≈ _ao_eval(post, u) rtol = 1e-12
+            h = 1e-6
+            fd = [(_ao_eval(post, u .+ h .* (1:length(u) .== k)) -
+                _ao_eval(post, u .- h .* (1:length(u) .== k))) / 2h for k in eachindex(u)]
+            @test g ≈ fd rtol = 1e-6
+        end
+    end
+    # The reporter's spelling: a model call that leaves the response out.
+    model = @rkppl begin
+        rho ~ LogNormal(0.0, 1.0)
+        level ~ Normal(0.0, 1.0)
+        @scan begin
+            state[1] = x[1]
+            for t in 2:n
+                state[t] = exp(-rho) * state[t - 1] + x[t]
+            end
+        end
+        m = level .+ state
+        y .~ Normal.(m, 1.0)
+    end
+    design = model(; n = T, x = X)
+    built = build_kernel(design)
+    u = unconstrain(built.layout, (rho = 0.5, level = 1.1))
+    @test _ao_eval(prepare_query(built, design, (:m,)), u) ≈
+        1.1 .+ _ao_scan_state(0.5, X) rtol = 1e-12
+end
+
 @testset "absent observations: what stays refused" begin
     X = _ao_x(6)
     data = Dict{Symbol,Any}(:x => X, :x_fit => X, :y => X)
