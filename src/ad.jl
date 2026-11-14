@@ -972,9 +972,14 @@ function _ad_na_program(kernel::NonAllocatingKernel, active_selector,
     # another extraction pass. Only the rule needs plate boundaries after
     # the ownership rewrite.
     if plate_reverse
+        # Each generated rule's one-pass tape slot follows the step caches in
+        # the cache table, so the backend owns and shadows it with them.
+        slots = Ref(0)
         rewritten = first(_pr_inline_plate_programs(_extract_plate_programs(rewritten),
             (; constants = ad_constants, callables = ops),
-            have_syms[collect(_ad_selector_indices(active_selector))]))
+            have_syms[collect(_ad_selector_indices(active_selector))];
+            tape_slot = () -> Expr(:ref, _CACHES_ARG, length(caches) + (slots[] += 1))))
+        ad_caches = (ad_caches..., ntuple(_ -> _PlateTapeSlot(), slots[])...)
     end
     f = compile(rewritten)
     f, ad_caches, ad_constants, ops, new_stmts

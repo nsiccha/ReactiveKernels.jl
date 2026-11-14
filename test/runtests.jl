@@ -114,6 +114,8 @@ const _MATRIX_CORE_TESTS = (
     "test_plate_reverse_one_pass.jl",
     "test_plate_reverse_index_runs.jl",
     "test_plate_reverse_index_runs_ad.jl",
+    "test_plate_reverse_tape_slot.jl",
+    "test_plate_reverse_tape_slot_split.jl",
     "test_plate_reverse_scalar_rules.jl",
     "test_plate_reverse_single.jl",
     "test_nested_plate_shared_branch.jl",
