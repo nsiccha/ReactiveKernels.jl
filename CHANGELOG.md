@@ -16,6 +16,19 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.245
+
+- `jax_source` translates `repeat`: `repeat(A, counts...)` (Julia's
+  `outer`) and the `inner`/`outer` keywords, in Julia's axis order, counts
+  past `A`'s rank adding trailing axes, and Julia's argument checks (no
+  negative count; with `inner`, count lists naming every axis) raising with
+  Julia's message. The JAX functions need static counts;
+  `prepare_data` computes a repeat of data with counts of data, so a
+  categorical model's per-term prior scales repeated once per category
+  (`repeat([a, b], 1, k)`) emit one module for every category count. Before,
+  the call failed with "keyword arguments to `repeat` have no JAX
+  translation".
+
 ## 0.1.244
 
 - A partition plan (`plate_partition(…; plan)`) holds the row bookkeeping of
