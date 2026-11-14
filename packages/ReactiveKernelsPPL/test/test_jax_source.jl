@@ -681,7 +681,10 @@ end
     @test occursin("return {\"a\": ", text)
     ragged = _JAX_CASES.ragged_recurrence()
     rsrc = jax_source(build_kernel(ragged), ragged)
-    @test occursin("def _rk_pad_rows(rows, dtype):", string(rsrc))
+    # The module carries the ragged-row helper as `src/jax_host.jl` defines
+    # it, and pads `R` (one vector per cell, so rank 1) through it.
+    @test occursin(rstrip(ReactiveKernels._JAX_PAD_ROWS), string(rsrc))
+    @test occursin(r"= _rk_pad_rows\([^\n]*, 1\)\n", string(rsrc))
     @test "R_lengths" in first.(rsrc.functions[2].inputs)
     @test occursin("\"ragged\": True", string(rsrc))
     @test occursin("jax.lax.fori_loop(", string(rsrc))

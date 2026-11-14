@@ -58,6 +58,74 @@ Tutorials.html(model_view(built; bound))
 
 `prepare_query` returns a raw prepared callable. Calls made from an already compiled Julia function may require a world-age barrier; `prepare_sampler` supplies the managed sampler boundary. See the [PPL reference](ppl-api.md) for derivative, predictive and conditional-latent queries.
 
+## Integrating out a linear-Gaussian recurrence
+
+A latent `@scan` whose steps are linear in the previous state with Normal innovations, observed through a Normal law whose location is affine in it, can be integrated out exactly. `marginalize(model, :x)` keeps the model source as written and lowers the recurrence and its observation into a Kalman filter. The sampler then has no coordinates for `x` or its innovations, and the likelihood is the exact marginal density of the observations given the remaining parameters.
+
+```@example marginal
+using ReactiveKernelsPPL, Random
+
+model = @rkppl begin
+    level ~ Normal(0, 2)
+    sd ~ Exponential(1)
+    length_scale ~ LogNormal(0, 1)
+    noise ~ Exponential(0.5)
+    @scan begin
+        x[1] ~ Normal(0, 1)
+        for t in 2:T
+            e ~ Normal(0, 1)
+            r = exp(-gap[t] / length_scale)
+            x[t] = r * x[t - 1] + sqrt(1 - r * r) * e
+        end
+    end
+    y .~ Normal.(level .+ sd .* x, noise)
+end
+
+gap = [1.0, 0.5, 2.0, 1.0, 0.7, 1.3]
+y = [0.3, 0.5, -0.1, 0.0, 0.4, 0.2]
+latent = build_kernel(model(; gap, T = length(y)) | (; y))
+plan = marginalize(model(; gap, T = length(y)), :x) | (; y)
+built = build_kernel(plan)
+(; latent=coordinate_names(latent.layout), marginal=coordinate_names(built.layout))
+```
+
+Each step's coefficients may read parameters, data and the loop index, so irregular gaps and resets where a new series begins are covered. The pointwise query holds each observation's one-step-ahead predictive density. Draws of the integrated-out trajectory come afterward, one per parameter draw, by forward filtering and backward sampling:
+
+```@example marginal
+u = unconstrain(built.layout, (; level=0.2, sd=0.3, length_scale=1.5, noise=0.2))
+latents = prepare_marginalized_latents(built, plan)
+marginalized_latent_draws(latents, u, Xoshiro(1)).x
+```
+
+A recurrence in a `@plate` cell integrates out the same way, one filter per index, when the cell observes it through `y[g] .~ Normal.(offset .+ loading .* x, noise)` and the bound `y` holds one vector per index. The draws then hold one trajectory per index:
+
+```@example marginal
+grouped = @rkppl begin
+    phi ~ Uniform(-1, 1)
+    sigma ~ Exponential(1)
+    noise ~ Exponential(0.5)
+    level[1:G] .~ Normal.(0, 2)
+    @plate for g in eachindex(y)
+        @scan begin
+            x[1] ~ Normal(0, 1)
+            for t in 2:length(y[g])
+                x[t] ~ Normal(phi * x[t - 1], sigma)
+            end
+        end
+        y[g] .~ Normal.(level[g] .+ x, noise)
+    end
+end
+ys = [[0.3, 0.5, -0.1], [0.0, 0.4], [0.2, 0.1, 0.6, 0.3]]
+cells = marginalize(grouped(; G = length(ys)), :x) | (; y = ys)
+built_cells = build_kernel(cells)
+u = zeros(built_cells.layout.total)
+latents = prepare_marginalized_latents(built_cells, cells)
+(; coordinates=coordinate_names(built_cells.layout),
+    x=marginalized_latent_draws(latents, u, Xoshiro(1)).x)
+```
+
+Recurrences carrying several arrays, a lag above one, recurrences inside nested `@plate` cells or submodels, and observations that are not Normal are refused with an error naming the statement.
+
 ## Adaptive partial centering
 
 Select affine cells when setting up WarmupHMC. Declare their location and
@@ -108,14 +176,23 @@ may depend on unselected latent parameters. The adapter selects identity-transfo
 coordinates, without changing their priors. For example, a real ICAR block
 keeps its ICAR density and any soft sum constraint.
 
-Every selected affine quantity must remain invariant under the selected maps.
-A location that reads another selected latent needs a coupled transform;
-WarmupHMC's independent indexed maps do not supply that transport. The adapter
-checks this graph dependency before sampling. RKPPL 0.1.175 with WarmupHMC
+A cell's location and log-scale must not read its own latent. They may read
+another selected cell's latent, as in a nested hierarchy where unit effects
+`z_u` are centred about `unit_location = mu .+ tau_g .* z_g[group]` and the
+group effects `z_g` about `mu`:
+`cells = (z_g = (location = :mu, log_scale = :log_tau_g), z_u = (location = :unit_location, log_scale = :log_tau_u))`.
+Such a read sees the other cell's model-frame values. The reads order the
+cells into levels, which WarmupHMC maps in order, so re-centering a parent level
+keeps the meaning of the coordinates centred on it. The adapter checks these
+graph dependencies before sampling and refuses own reads and cycles. Nested
+levels need RKPPL 0.1.185 and WarmupHMC 0.3.0 or later.
+
+RKPPL 0.1.175 with WarmupHMC
 0.2.21 or later prepares one joint endpoint kernel, sharing common graph work
 across selected cells and their location/log-scale roles. It runs once per
-vector on a map or inverse, and shares results across scoring candidates.
-Cells are ordered by packed coordinate, regardless of keyword order. Identity
+vector and level on a map or inverse, and shares results across scoring
+candidates. Within a level, cells are ordered by packed coordinate, regardless
+of keyword order. Identity
 maps skip endpoint evaluation. Ordinary AD differentiates the joint graph;
 arrays remain read-only, without concatenation into a new endpoint buffer.
 For Enzyme differentiation through cached matrix endpoints, use the

@@ -24,6 +24,7 @@ include("test_ad_atomic_shadows.jl")
 include("test_ad_structured_buffers.jl")
 include("test_ad_scalar_storage.jl")
 include("test_ad_structured_aliases.jl")
+include("test_ad_pullback_aliases.jl")
 
 const TEST_AD_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 

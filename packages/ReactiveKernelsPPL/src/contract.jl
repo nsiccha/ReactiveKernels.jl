@@ -2453,6 +2453,19 @@ function _size_absent_responses!(plan::StructuralPlan, columns::AbstractDict)
             data_axes = true))
         ax === nothing || (plate_axes[d.name] = ax)
     end
+    # A `@scan` carried array holds one entry per step up to its bound, which
+    # bound data supply (`for t in 2:n`), so a response it locates (`m =
+    # level .+ state; y .~ Normal.(m, s)`) has those rows, as in the fit
+    # (snag rkppl-response-a-0d9dd693). A bound the binding does not supply
+    # (the observed array's length) or leaves absent is no evidence of them.
+    for s in axis_plan.scans
+        _scan_length_bound(axis_plan, s) || continue
+        s.hi isa Symbol && axis_plan.columns[s.hi] isa _Absent && continue
+        T = _scan_length(axis_plan, s)
+        for a in s.states
+            plate_axes[a] = (Base.OneTo(T),)
+        end
+    end
     plates = Set(keys(plate_axes))
     operands = union(perobs, plates)
     for r in plan.responses
@@ -8531,17 +8544,20 @@ function _materialize_module_data!(plan::StructuralPlan,
             # can fold them without imposing a column type.
             v isa ColumnData || continue
         end
-        # Dense storage retains every observation operand's rank and axes.
-        # An `Array` is dense already, and no step writes a bound value. A sparse
-        # value keeps its axes too, and its stored entries are structure a cell
-        # reads through (`L * eta`, RK's `_cell_sparse_products`).
-        columns[nm] = v isa _Absent || v isa Array ||
-                ReactiveKernels._cell_sparse_type(typeof(v)) ? v :
-            v isa AbstractVector ? collect(v) : v isa AbstractArray ? Array(v) : v
+        columns[nm] = _bound_column_value(v)
         memo[nm] = columns[nm]
     end
     return names
 end
+
+# The value a data definition binds as a column. Dense storage retains every
+# observation operand's rank and axes. An `Array` is dense already, and no step
+# writes a bound value. A sparse value keeps its axes too, and its stored
+# entries are structure a cell reads through (`L * eta`, RK's
+# `_cell_sparse_products`).
+_bound_column_value(v) = v isa _Absent || v isa Array ||
+        ReactiveKernels._cell_sparse_type(typeof(v)) ? v :
+    v isa AbstractVector ? collect(v) : v isa AbstractArray ? Array(v) : v
 
 # The definitions of `plan` by name, and the names of its derived (per
 # observation) ones. Once per structure (shared: callers only read them).
@@ -8691,16 +8707,21 @@ function _materialize_value_matrices!(plan::StructuralPlan,
                 "[bind] matrix $(m.name): column $c must be a vector, got " *
                 "$(summary(columns[c]))"))
         end
-        n = length(columns[first(datacols)])
-        parts = [c === nothing ? ones(n) : columns[c] for c in m.columns]
-        columns[m.name] = try
-            Float64.(hcat(parts...))
-        catch e
-            throw(ContractValidationError("[bind] matrix $(m.name) = " *
-                "hcat(...) failed: " * sprint(showerror, e)))
-        end
+        columns[m.name] = _value_matrix(m, c -> columns[c])
     end
     return names
+end
+
+# One value matrix over the values `column(c)` of its data columns.
+function _value_matrix(m::DesignMatrix, column)
+    n = length(column(first(c for c in m.columns if c !== nothing)))
+    parts = [c === nothing ? ones(n) : column(c) for c in m.columns]
+    return try
+        Float64.(hcat(parts...))
+    catch e
+        throw(ContractValidationError("[bind] matrix $(m.name) = " *
+            "hcat(...) failed: " * sprint(showerror, e)))
+    end
 end
 
 # Plain-Julia evaluation of a resolved definition expression (functions as

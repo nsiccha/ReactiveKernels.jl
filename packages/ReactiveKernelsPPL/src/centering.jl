@@ -21,20 +21,35 @@ or an array with the latent's shape, indexed in Julia's linear order. Named
 values' numerical work and derivatives stay in the graph. One joint kernel
 computes all selected endpoints, sharing their common graph work across cells
 and both affine roles. WarmupHMC 0.2.21
-or later evaluates it once per vector on a map or inverse, and shares it
-across scoring candidates. Identity maps do not evaluate the endpoints.
+or later evaluates it once per vector and level (below) on a map or inverse,
+and shares it across scoring candidates. Identity maps do not evaluate the
+endpoints.
 
 Each cell optionally supplies `target` and `source` in `[0, 1]`: zero is
 non-centered, one is centered. Both default to `0.0`. `target` describes the
 model's fixed coordinates; WarmupHMC adapts `source`. Unselected coordinates
 pass through, and sampling returns the original model coordinates.
 
-The selected latent must have an identity support transform. Locations and
-log-scales may read unselected latents, but must not read any selected latent:
-WarmupHMC's indexed affine maps evaluate accessors on the source vector, and
-their inverse and log-Jacobian require these quantities to stay unchanged by
-the map. This condition concerns coordinates, not prior families (a real
-ICAR block, for example, can be selected).
+The selected latent must have an identity support transform. This condition
+concerns coordinates, not prior families (a real ICAR block, for example, can
+be selected). Locations and log-scales may read unselected latents and the
+latents of other selected cells, but never their own cell's latent.
+
+A cell whose location or log-scale reads another selected cell's latent is
+centred about that latent's model-frame value, as in a nested hierarchy:
+
+    cells = (z_g = (location = :mu, log_scale = :log_tau_g),
+             z_u = (location = :unit_location, log_scale = :log_tau_u))
+
+with `unit_location = mu .+ tau_g .* z_g[group]`. The reads order the cells
+into levels: a cell that reads no selected latent is on level 1, and a cell
+that reads latents of levels up to `k` is on level `k + 1`. WarmupHMC maps the
+levels in order, so re-centering a parent level keeps the meaning of the
+coordinates centred on it. The joint kernel runs once per level, after the
+levels before it are mapped. Cells that read each other's latents, directly
+or through other cells, form a cycle and are refused. Nested levels need
+WarmupHMC 0.3.0 or later, whose accessors read earlier pairs at their model
+values; with WarmupHMC 0.2 they are refused.
 
 Construction evaluates each named value once to check its shape, using `u0`
 (default zeros) as a model-coordinate exemplar. The joint execution kernel
@@ -131,7 +146,9 @@ function _centering_cells(built, plan::StructuralPlan, cells::NamedTuple;
     end
     RK = ReactiveKernels
     graph = built.spec.graph
-    selected_ids = Set(RK.canon_id(graph, built.spec[n].id) for n in selected)
+    selected_ids = [n => RK.canon_id(graph, built.spec[n].id) for n in selected]
+    # The selected latents each cell's endpoints read, in cell keyword order.
+    reads = Dict(n => Symbol[] for n in selected)
     kernel_names = Union{Float64,Symbol}[]
     families_by_name = Dict{Symbol,Int}()
     values = Dict{Symbol,Any}()
@@ -166,10 +183,13 @@ function _centering_cells(built, plan::StructuralPlan, cells::NamedTuple;
             node isa Symbol && haskey(built.spec.ports, node) ||
                 throw(ContractValidationError("[centering] `$name.$field` must " *
                     "be a real constant or name an existing graph value; got $(repr(node))"))
-            RK._cell_factor_reads(built.spec, built.spec[node], selected_ids) &&
-                throw(ContractValidationError("[centering] `$node` reads a selected " *
-                    "latent; indexed affine accessors must be invariant under " *
-                    "the selected coordinate transforms"))
+            for (other, id) in selected_ids
+                RK._cell_factor_reads(built.spec, built.spec[node], (id,)) || continue
+                other === name && throw(ContractValidationError("[centering] " *
+                    "`$name.$field` (`$node`) reads `$name` itself; a cell's " *
+                    "location and log-scale must not depend on its own coordinates"))
+                other in reads[name] || push!(reads[name], other)
+            end
             value = get!(values, node) do
                 full = prepare_query(built, plan, (node,); on_error, exemplars = (exemplar,))
                 Base.invokelatest(full, exemplar)
@@ -184,16 +204,43 @@ function _centering_cells(built, plan::StructuralPlan, cells::NamedTuple;
             push!(families, family)
             push!(scalars, value isa Real)
         end
-        push!(records, (; offset = entry.offset, size = entry.size,
+        push!(records, (; name, offset = entry.offset, size = entry.size,
             location = families[1], log_scale = families[2],
             scalar_location = scalars[1], scalar_log_scale = scalars[2], target, source))
     end
-    # Cell keyword order need not match packed coordinate order. Increasing
-    # indices let WarmupHMC share this callable over the whole selected set.
-    sort!(records; by = cell -> cell.offset)
+    levels = _centering_levels(selected, reads)
+    records = [merge(cell, (; stage = levels[cell.name])) for cell in records]
+    # Levels map in order, each after the cells it reads. Cell keyword order
+    # need not match packed coordinate order: within a level, increasing
+    # indices let WarmupHMC share one kernel evaluation over the level's cells.
+    sort!(records; by = cell -> (cell.stage, cell.offset))
     kernel = isempty(kernel_names) ? nothing :
         _centering_kernel(built, plan, Tuple(kernel_names); on_error)
     (; kernel, records, dimension = layout.total)
+end
+
+# A cell reading no selected latent is on level 1; a cell reading cells of
+# levels up to `k` is on level `k + 1`. Reads that return to a cell are a cycle,
+# which no order of the affine maps can evaluate on model-frame values.
+function _centering_levels(selected, reads)
+    levels = Dict{Symbol,Int}()
+    path = Symbol[]
+    function visit(name)
+        haskey(levels, name) && return levels[name]
+        at = findfirst(==(name), path)
+        if at !== nothing
+            cycle = join(("`$n`" for n in (path[at:end]..., name)), " → ")
+            throw(ContractValidationError("[centering] cells $cycle read each " *
+                "other's latents through their locations or log-scales; nested " *
+                "cells must form levels, each read only by later ones"))
+        end
+        push!(path, name)
+        level = 1 + maximum(visit, reads[name]; init = 0)
+        pop!(path)
+        levels[name] = level
+    end
+    foreach(visit, selected)
+    levels
 end
 
 function _centering_endpoint(value, name, field)

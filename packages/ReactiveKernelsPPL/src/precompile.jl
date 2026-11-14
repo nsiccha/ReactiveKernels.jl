@@ -4,8 +4,12 @@
 # per-model code; without a workload a fresh process still compiled this
 # package code once, and Julia serializes that compilation across threads.
 # The workload runs a small synthetic hierarchical regression end to end.
-@setup_workload begin
-    workload_body = :(begin
+#
+# `ext/ReactiveKernelsPPLEnzymeExt.jl` runs the same workload again while its
+# own image is generated with Enzyme loaded: loading Enzyme invalidates part of
+# the code this image caches, and that image caches it again.
+function _construction_workload()
+    body = :(begin
         a ~ Normal(0, 5)
         b ~ Normal(0, 2)
         s ~ Exponential(1)
@@ -14,14 +18,25 @@
         mu = a .+ b .* x .+ c[g]
         y .~ Normal.(mu, s)
     end)
-    workload_columns = Dict{Symbol,AbstractVector}(
+    columns = Dict{Symbol,AbstractVector}(
         :x => [-1.0, 0.0, 1.0, 0.5], :g => [1, 2, 1, 2], :y => [0.5, 1.0, 2.0, 1.5])
-    workload_names = (:y, :x, :g)
+    names = (:y, :x, :g)
+    plan = bind_data(lower_rkppl(body, names; mod = @__MODULE__, conditioned = names),
+        columns)
+    built = build_kernel(plan)
+    kernel = prepare_query(built, plan, :sampler)
+    Base.invokelatest(kernel, zeros(built.layout.total))
+    # The same model through the `@rkppl` surface: called with keyword data,
+    # then conditioned with `|`. Binding and lowering take their own entry
+    # points there (`condition`, `_lower_model_latest`).
+    model = RKPPLModel(body, @__MODULE__)
+    surface = model(; x = columns[:x], g = columns[:g]) | (; y = columns[:y])
+    build_kernel(surface)
+    return nothing
+end
+
+@setup_workload begin
     @compile_workload begin
-        workload_plan = bind_data(lower_rkppl(workload_body, workload_names; mod = @__MODULE__,
-                                     conditioned = workload_names), workload_columns)
-        workload_built = build_kernel(workload_plan)
-        workload_kernel = prepare_query(workload_built, workload_plan, :sampler)
-        Base.invokelatest(workload_kernel, zeros(workload_built.layout.total))
+        _construction_workload()
     end
 end

@@ -1830,8 +1830,13 @@ end
 
 # Keep branch-local plan values behind the same label-only guard. A 0/1-element
 # vector retains the inferred tuple element type across branch occupancy.
-# The main guard stays in place.
-function _partition_guarded_plan(st, data, ops, forced)
+# The main guard stays in place. A shape of a value computed in the arm is
+# planned as at the top level (`_cell_plan_check` in the arm), so the rows
+# derived from it are too: the shared guard of several members' windows holds
+# a product's shape (`_cell_product_shape` of a parameter-derived factor).
+# `read_later(name)` tells whether a statement after this one reads `name`;
+# the arm binds such a planned name from the plan, as it binds its own reads.
+function _partition_guarded_plan(st, data, ops, forced, read_later = Returns(false))
     Meta.isexpr(st, :if) && _plan_eligible(st.args[1], data, ops) || return nothing
     cond = st.args[1]
     arms = Any[st.args[2:end]...]
@@ -1842,7 +1847,7 @@ function _partition_guarded_plan(st, data, ops, forced)
         # Nested cached comprehensions lose concrete element inference on an
         # empty outer branch. Leave nested branches in the original main body.
         split = _partition_plan_classify(arm, data, ops, forced;
-                                         allow_shapes = false, allow_guards = false)
+                                         allow_shapes = true, allow_guards = false, read_later)
         split === nothing && continue
         plan, main, needed, _ = split
         cache = gensym(:guarded_plan)
@@ -1873,17 +1878,29 @@ function _partition_guarded_plan(st, data, ops, forced)
     isempty(planned) ? nothing : (planned, Expr(:if, cond, arms...))
 end
 function _partition_plan_classify(body::Expr, data_names, ops, forced::Set{Symbol};
-                                  allow_shapes::Bool = true, allow_guards::Bool = true)
+                                  allow_shapes::Bool = true, allow_guards::Bool = true,
+                                  read_later = Returns(false))
     # Every symbol the body assigns anywhere is data until a plan statement
     # assigns it, so a reference ahead of a later or nested assignment can
     # never leave the body; the hidden cache arguments are data too.
     data = union!(_assigned_names!(Set{Symbol}(), body), data_names,
                   (_CACHES_ARG, _CACHE_APPLY_ARG))
+    # The last statement reading each symbol: a guard's arm hands the body every
+    # name it plans that a later statement reads (a member's own guard reads
+    # the rows the shared guard computed for it).
+    last_read = Dict{Symbol,Int}()
+    if allow_guards
+        for (i, st) in enumerate(body.args)
+            foreach(s -> last_read[s] = i, _symbol_refs!(Set{Symbol}(), st))
+        end
+    end
     kinds = Symbol[]
     statements = Any[]
-    for original in body.args
+    for (i, original) in enumerate(body.args)
         st = original
-        guarded = allow_guards ? _partition_guarded_plan(st, data, ops, forced) : nothing
+        guarded = allow_guards ? _partition_guarded_plan(st, data, ops, forced,
+                                                         name -> get(last_read, name, 0) > i) :
+            nothing
         if guarded !== nothing
             planned, st = guarded
             append!(statements, planned)
@@ -1974,7 +1991,7 @@ function _partition_plan_classify(body::Expr, data_names, ops, forced::Set{Symbo
     end
     refs = Set{Symbol}()
     foreach(st -> _symbol_refs!(refs, st), main)
-    needed = Symbol[name for name in assigned if name in refs]
+    needed = Symbol[name for name in assigned if name in refs || read_later(name)]
     isempty(needed) && return nothing
     fields = Symbol[Symbol(:plan_, k) for k in eachindex(needed)]
     # A typed declaration of a plan symbol (`local x::T`) precedes its read
