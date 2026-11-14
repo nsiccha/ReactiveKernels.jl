@@ -709,6 +709,40 @@ end
     end, @__MODULE__)
     @test occursin("gathers entries of a carried array",
         named(gathered(; T = 8, step = [1, 2, 2, 5]), :level, :slope; y = [0.1, 0.2, 0.3, 0.4]))
+    defined = RKPPLModel(quote
+        s ~ Exponential(1)
+        @scan begin
+            level[1] ~ Normal(0, 1)
+            slope[1] ~ Normal(0, 1)
+            for t in 2:T
+                level[t] ~ Normal(level[t - 1] + slope[t - 1], s)
+                slope[t] ~ Normal(slope[t - 1], s)
+            end
+        end
+        v = vcat(m, m)
+        v .~ Normal.(level, 1)
+    end, @__MODULE__)
+    unbound = try
+        build_kernel(bind_data(marginalize(defined(; T = 4, m = [0.1, 0.2]), :level, :slope)))
+        "no error"
+    catch e
+        sprint(showerror, e)
+    end
+    @test occursin("its observation `v` is not bound data", unbound)
+    # The draws read a group's layout back from its generated names.
+    dunder = RKPPLModel(quote
+        s ~ Exponential(1)
+        @scan begin
+            a__b[1] ~ Normal(0, 1)
+            c[1] ~ Normal(0, 1)
+            for t in 2:T
+                a__b[t] ~ Normal(a__b[t - 1], s)
+                c[t] ~ Normal(c[t - 1], s)
+            end
+        end
+        y .~ Normal.(a__b .+ c, 1)
+    end, @__MODULE__)
+    @test occursin("must not hold `__`", named(dunder(; T = 8), :a__b, :c; y = d.trend.y))
 end
 
 # Each form the Kalman filter does not cover is refused at lowering, naming
