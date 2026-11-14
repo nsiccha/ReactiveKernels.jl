@@ -16,6 +16,29 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.246
+
+- JAX source binds a comprehension straight to its target:
+  `c = [f(k) for k in 1:K]` emits `c = jax.vmap(lambda k: ...)(jnp.arange(1, K + 1))`
+  (guarded for an empty range as before). The element is a `lambda` when it
+  is one expression and a nested function named after the target
+  (`c_element`) when it has statements, as branch arms are. The range is bound
+  only when a mask reads it, and no `element`/`indices`/`values` temporaries
+  or `c = values` alias remain. Generators and `map` do-blocks share the rule.
+- A spliced law or kernel operation (a `censored(Normal)` density, a
+  location-scale family's endpoints) translates in place like authored code:
+  its value is an expression instead of a `value_N` binding, so its one-expression
+  `jax.lax.cond` arms are `lambda:` or `jnp.where`, its locals keep their
+  names (`logcdf_z = jax.lax.cond(...)`), and a `let` result is not bound as
+  `let_value`. An argument the body reads more than once is bound under the
+  body's name for it. A prepared helper call is bound only when the helper runs
+  a runtime check, so the check still runs where Julia's call does.
+- A literal the authoring layer materialized under a generated port name
+  (`normal(0, s)`'s location) is read as the literal (`amp != 0.0`), not bound
+  as `location_binding = 0.0`.
+- Values, `jax.grad`, `jax.jit` values and raised errors are unchanged; only
+  local names and statement layout inside the generated functions change.
+
 ## 0.1.245
 
 - `jax_source` translates `repeat`: `repeat(A, counts...)` (Julia's
