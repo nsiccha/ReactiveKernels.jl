@@ -45,6 +45,14 @@ function finite_gradient(f, x)
       f(x .- h .* (eachindex(x) .== j))) / (2h) for j in eachindex(x)]
 end
 
+# Primal-only observation of the actual prepared cuts. AD tests use the
+# unmodified kernels and the backend's ordinary reverse path.
+struct CountedKernel{K}
+    kernel::K
+    calls::Base.RefValue{Int}
+end
+(c::CountedKernel)(x) = (c.calls[] += 1; c.kernel(x))
+
 function emission_shape(kernel)
     heads = Dict{Symbol,Int}()
     function visit(ex)
@@ -522,14 +530,6 @@ function shared_setup(n = 4; built = nothing)
     problem = prepare_sampler(built, plan, u; backend = BACKEND)
     (; built, plan, layout, u, problem, offsets)
 end
-
-# Primal-only observation of the actual prepared cuts. AD tests below use
-# the unmodified kernels and the backend's ordinary reverse path.
-struct CountedKernel{K}
-    kernel::K
-    calls::Base.RefValue{Int}
-end
-(c::CountedKernel)(x) = (c.calls[] += 1; c.kernel(x))
 
 @testset "one joint evaluation across cells and affine roles" begin
     s = setup()

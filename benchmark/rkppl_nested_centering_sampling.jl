@@ -2,7 +2,8 @@
 # adaptive-affine-d6c2fa03: group effects z_g about mu, unit effects z_u about
 # mu + tau_g * z_g[group], with data that pin every unit value much more tightly
 # than its spread. Compares the reporter's two single-level shapes with both
-# levels centred about their parents (RKPPL 0.1.184, WarmupHMC >= 0.3.0).
+# levels centred about their parents (RKPPL 0.1.184, WarmupHMC >= 0.3.0),
+# adaptive and at two fixed centerings.
 #
 # Run single-threaded in an environment with ReactiveKernelsPPL, WarmupHMC,
 # Enzyme, DifferentiationInterface, LogDensityProblems and MCMCDiagnosticTools:
@@ -29,14 +30,22 @@ const NESTED = @rkppl begin
     y .~ Normal.(theta, sigma)
 end
 
+nested_cells(sg = 0.0, su = 0.0) = (
+    z_g = (location = :mu, log_scale = :log_tau_g, source = sg),
+    z_u = (location = :unit_location, log_scale = :log_tau_u, source = su))
+
+# Each arm: cells, and whether WarmupHMC adapts their centering.
 const ARMS = (
     # The reporter's shapes before RKPPL 0.1.184:
-    unit_only = (z_u = (location = :unit_location, log_scale = :log_tau_u),),
-    both_about_mu = (z_g = (location = :mu, log_scale = :log_tau_g),
-        z_u = (location = :mu, log_scale = :log_tau_u)),
+    unit_only = ((z_u = (location = :unit_location, log_scale = :log_tau_u),), true),
+    both_about_mu = ((z_g = (location = :mu, log_scale = :log_tau_g),
+        z_u = (location = :mu, log_scale = :log_tau_u)), true),
     # Both levels, each about its parent's model value:
-    nested = (z_g = (location = :mu, log_scale = :log_tau_g),
-        z_u = (location = :unit_location, log_scale = :log_tau_u)),
+    nested = (nested_cells(), true),
+    # Fixed controls. (0, 1) is the same map as unit_only with the unit level
+    # centred, the centering unit_only adapts to; (1, 1) centres both levels.
+    nested_fixed_0_1 = (nested_cells(0.0, 1.0), false),
+    nested_fixed_1_1 = (nested_cells(1.0, 1.0), false),
 )
 
 function simulate(seed; G = 3, per = 3, sigma = 0.05)
@@ -55,7 +64,7 @@ function compare(seed)
     built = build_kernel(plan)
     u0 = zeros(built.layout.total)
     names = string.(coordinate_names(built.layout))
-    for (arm, cells) in pairs(ARMS)
+    for (arm, (cells, adapt)) in pairs(ARMS)
         results = []
         controls = []
         t0 = time()
@@ -63,7 +72,7 @@ function compare(seed)
             problem = prepare_sampler(built, plan, u0; backend = AutoEnzyme())
             rp = adaptive_centering_problem(built, plan, problem, AutoEnzyme(); cells, u0)
             result = adaptive_warmup_mcmc(Xoshiro(100 + chain), rp;
-                n_draws = 1000, monitor_ess = true)
+                n_draws = 1000, monitor_ess = true, nonlinear_adapt = adapt)
             push!(results, result)
             push!(controls, unique(round.([last(p).c for p in WarmupHMC.reparam_sources(rp)];
                 digits = 2)))
@@ -77,12 +86,14 @@ function compare(seed)
         divergent = sum(r.n_divergent_samples for r in results)
         # Posterior means agree across arms when every arm returns model-frame draws.
         means = vec(mean(cube; dims = (1, 2)))
-        println((; seed, arm, common_draws = nd, max_rhat = maximum(rhat),
+        mu = findfirst(==("mu"), names)
+        println((; seed, arm, adapt, common_draws = nd, max_rhat = maximum(rhat),
             slowest = names[argmax(rhat)],
             min_bulk_ess = minimum(MCD.ess(cube; kind = :bulk)),
             min_tail_ess = minimum(MCD.ess(cube; kind = :tail)), divergent,
             divergent_percent = 100 * divergent / draws,
-            mean_mu = means[findfirst(==("mu"), names)],
+            mean_mu = means[mu], sd_mu = std(vec(cube[:, :, mu])),
+            mcse_mu = MCD.mcse(cube[:, :, mu:mu])[1],
             mean_z_g = means[findall(startswith("z_g"), names)],
             elapsed, adapted_sources = controls))
         flush(stdout)
