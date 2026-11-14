@@ -3438,8 +3438,10 @@ to DI position one, and every other current argument is rebound as a fresh
 `DifferentiationInterface.Constant` context. For a tuple selector, `gradient`
 is a matching tuple of mutable destinations. Reverse Enzyme can fill matching
 tuples of disjoint dense arrays and scalar `Ref`s directly when the prepared
-call has DI contexts. Other destination shapes and backends copy the structured
-gradient after the same single reverse pass. Before that copy writes anything,
+call has DI contexts, and also without contexts when Enzyme reports dogfood
+repair `structured_gradient_inplace`. Other destination shapes and backends
+copy the structured gradient after the same single reverse pass. Before that
+copy writes anything,
 a tuple of another length, a named tuple with other keys, an array of another
 length or an unsupported destination raises. Scalar normalization storage is
 owned by the preparation and reused by mutating calls.
