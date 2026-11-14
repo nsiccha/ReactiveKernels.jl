@@ -16,6 +16,25 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.241
+
+- A partition plan (`plate_partition(…; plan)`) holds the row bookkeeping of
+  the windows several partition members read, also when those rows follow
+  the shape of a value computed from the parameters (a product `z * F` with
+  `F = transpose(tau .* L)`). That bookkeeping sits under the guard the
+  members share, where a shape was not planned, so every planned call
+  recomputed the reshape rows, their union, the range rows and the positions
+  as fresh integer vectors and allocated what an unplanned call did. The plan
+  now holds such a shape and the arm checks it against the value's shape on
+  every call, as at the top level; a name the arm plans that a later member's
+  guard reads is bound from the plan as well. The plan of such a partition
+  therefore has other fields: a declared plan type (`plan = :port => T`) is
+  the type of a plan this version's `partition_plan_kernel` computes.
+  On a two-member kernel whose members read one row of that product each, a
+  planned call allocates 560 instead of 1056 bytes (one cell per label) and
+  592 instead of 832 (rows) on Julia 1.13.1; values and Enzyme gradients are
+  unchanged.
+
 ## 0.1.240
 
 - JAX source emits a plain authored helper (no `@traceable`, defined outside
