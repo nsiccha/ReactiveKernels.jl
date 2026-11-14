@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.234
+## 0.1.238
 
 - A prepared reverse Enzyme gradient whose active ports are all of the
   kernel's inputs (a tuple selector with no DI context) now writes into the
@@ -29,6 +29,53 @@ are recorded in the git history only.
   array whose length differs from its cotangent's, or an unsupported
   destination. An array destination longer than its cotangent used to be
   filled only up to the cotangent's length, without error.
+
+## 0.1.237
+
+- JAX source computes `sortperm(v)` and `invperm(p)` of data in the host
+  `prepare_data`, as it computes `sort` and `unique`. `sortperm` of a vector of
+  numbers or strings orders as Julia's `isless` (-0.0 before 0.0, every NaN
+  last) and keeps equal values in ascending position; `invperm` of a vector of
+  integers raises `ArgumentError: argument is not a permutation` where Julia
+  throws it. Keyword orders (`rev`, `by`, `lt`) still have no translation. In
+  the JAX functions (a recipe that also reads a parameter) neither function
+  has a translation, and the refusal now names it and says to compute it in a
+  definition that reads data alone; `sortperm`'s used to name only a
+  `NamedTuple`.
+
+## 0.1.236
+
+- `rk_cholesky_lower` stores each factor entry once, accumulating its sum in a
+  scalar, instead of updating the factor in place. Values are unchanged and
+  native Enzyme reverse no longer tapes the in-place reads: a per-row 3 x 3
+  factor, solve and log-determinant per mixture component, differentiated
+  through `prepare_sampler`, takes 465 instead of 527 microseconds per
+  gradient. The returned factor's parent storage now has a zero strict upper
+  triangle; it previously held `A`'s upper entries.
+
+## 0.1.235
+
+- Bound plates retain a shared scalar guard at runtime when its arms contain
+  no work over bound inputs to prepare. The selected loop keeps shared work
+  outside its cells; mixed and wholly bound arms retain their existing cached
+  preparation. Changing an eligible guard or the observation count reuses the
+  same emitted program.
+- JAX export supports `all` and `any` with `iszero` or `!iszero` over built-in
+  real numeric inputs, including empty and ragged arrays. Padding contributes
+  the reduction's identity; other predicates retain the existing refusal.
+
+## 0.1.234
+
+- JAX emission translates `rk_cholesky_lower` with lower-triangle semantics,
+  runtime square/positive-pivot checks, ordinary backend derivatives and
+  empty or padded leading blocks. Lower-triangular solves, `diag(A)` and
+  `diagm(v)` translate on device and in host preparation. Source loops and
+  comprehensions over `axes(A, d)` retain the selected dimension instead of
+  refusing matrix inputs.
+- Prepared matrix-valued plate inputs retain their rank and row extents,
+  including empty plates. Ragged packing pads the first axis and checks
+  that trailing dimensions agree; raw `pad_ragged` accepts `rank=2` for
+  an empty list of matrix cells.
 
 ## 0.1.233
 

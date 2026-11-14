@@ -16,6 +16,18 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.178
+
+- A top-level `@scan` reads every model value whole, indexed as in a Julia
+  loop, when the model is lowered as well as when it is bound. A definition
+  the scan reads that combines a parameter with data (`w = 2 .* x;
+  loc = a .+ cos.(w)`, read as `loc[t]` in a step) and the data it reads now
+  have no observation axis of their own: the program binds and evaluates as
+  the Julia loop it reads as, whether the response observes the whole
+  trajectory or a gathered subset (`y .~ Normal.(acc[rows], s)`), and `x` may
+  be longer than the scan. Before, `bind_data` refused it with
+  `w is a derived column` or `derived column is scalar-valued`.
+
 ## 0.1.177
 
 - JAX modules retain authored submodel names and documentation, reuse compatible
