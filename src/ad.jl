@@ -945,7 +945,7 @@ function _ad_na_program(kernel::NonAllocatingKernel, active_selector,
             "AD preparation over a non-allocating kernel requires the " *
             "active selector to name ports among the " *
             "$(length(inputs(kernel))) positional HAVE arguments"))
-    kernel(exemplars...)
+    _ad_na_seed!(kernel, exemplars)
     tainted = Set{Symbol}(
         have_syms[index] for index in _ad_selector_indices(active_selector))
     have_free = Set{Symbol}()
@@ -978,6 +978,31 @@ function _ad_na_program(kernel::NonAllocatingKernel, active_selector,
     end
     f = compile(rewritten)
     f, ad_caches, ad_constants, ops, new_stmts
+end
+
+# Seed the primal caches with one call at the exemplars. Preparation needs the
+# exemplars' types and shapes, not a point where the program evaluates: a call
+# that throws (an ODE that does not integrate at the exemplar, a domain error)
+# leaves the steps it did not reach unseeded, exactly as an untaken branch
+# leaves its steps, and `_ad_na_walk` already gives those their allocating
+# call, or a zero-capacity buffer the driver does not keep. Every step it did
+# reach holds a result of the exemplars, and a step that threw stored nothing.
+# Values and gradients are therefore those of a full seeding; only the
+# unreached steps' buffer reuse is lost, and the warning names the error and
+# that cost. An interrupt is not the program's error: it is rethrown.
+function _ad_na_seed!(kernel::NonAllocatingKernel, exemplars::Tuple)
+    try
+        kernel(exemplars...)
+    catch err
+        err isa InterruptException && rethrow()
+        @warn "Non-allocating AD preparation evaluates the program once at " *
+              "the exemplar to give its operations reusable buffers, and the " *
+              "program threw there. The preparation continues: the operations " *
+              "that evaluation did not reach allocate on every gradient call, " *
+              "with unchanged values and gradients. Prepare at a point where " *
+              "the program evaluates for their buffers to be reused." exception = err
+    end
+    nothing
 end
 
 _ad_na_inline_plate(node, call, declared) = _inline_plate_program(call, declared)
@@ -1266,7 +1291,8 @@ end
 # sampler (frozen Atlas, snag `frozen-atlas-fir-2d4269a6`). Inference is sound,
 # so a `Number` it proves holds for every call with these argument types.
 # Validation runs the exemplar for any other result, and always for a
-# `NonAllocatingKernel`, whose first call seeds its caches.
+# `NonAllocatingKernel`, whose first call seeds its caches. A call that throws
+# falls back to inference (`_ad_exemplar_objective_type`).
 Base.@nospecializeinfer function _ad_inferred_objective_type(
         @nospecialize(kernel::PreparedKernel), @nospecialize(args::Tuple),
         objective::Int, @nospecialize(retain::Tuple))
@@ -1279,6 +1305,35 @@ end
 Base.@nospecializeinfer _ad_inferred_objective_type(
     @nospecialize(kernel), @nospecialize(args::Tuple), objective::Int,
     @nospecialize(retain::Tuple)) = Any
+
+# The objective's type observed by one call at the exemplar. A program that
+# throws there (an ODE that does not integrate at the exemplar) has no observed
+# type, but the exemplar is a type/shape exemplar, not a point where the
+# program must evaluate: inference over the exemplar types then decides, as it
+# already does without a call for a `PreparedKernel`. Only when inference does
+# not prove a `Number` either is the objective unchecked, and preparation
+# refuses, naming both ways out; the program's own error is the cause.
+function _ad_exemplar_objective_type(kernel::_ADKernel, args::Tuple,
+                                     objective::Int, retain::Tuple)
+    value = try
+        kernel(args...)
+    catch err
+        err isa InterruptException && rethrow()
+        T = Base._return_type(kernel, Tuple{Any[Core.Typeof(arg) for arg in args]...})
+        isempty(retain) || (T = T isa DataType && T <: Tuple && !Base.isvatuple(T) &&
+            objective <= fieldcount(T) ? fieldtype(T, objective) : Any)
+        T !== Union{} && T <: Number && return T
+        throw(ArgumentError(
+            "AD gradient preparation checks that the objective :" *
+            "$(outputs(kernel)[objective].name) is a scalar Number by " *
+            "evaluating the kernel at the exemplar, because neither its " *
+            "declared type nor inference proves one, and the kernel threw " *
+            "there (the cause below). Declare the objective's type, for " *
+            "example `$(outputs(kernel)[objective].name)::Float64`, or " *
+            "prepare at a point where the program evaluates"))
+    end
+    isempty(retain) ? typeof(value) : typeof(value[objective])
+end
 
 function _ad_validate_kernel(kernel::_ADKernel, active_selector,
                              args::Tuple; scalar_output::Bool = true,
@@ -1298,10 +1353,8 @@ function _ad_validate_kernel(kernel::_ADKernel, active_selector,
                 output_type
             elseif inferred !== Union{} && inferred <: Number
                 inferred
-            elseif isempty(retain)
-                typeof(kernel(args...))
             else
-                typeof(kernel(args...)[objective])
+                _ad_exemplar_objective_type(kernel, args, objective, retain)
             end
             observed_type <: Number || throw(ArgumentError(
                 "AD gradient preparation requires a scalar Number objective; " *
@@ -2244,21 +2297,39 @@ end
 # then compiles the remaining native callees. It is called through
 # `invokelatest`: a direct call would be inferred, derivative included, while
 # the caller of `prepare_ad` itself compiles, holding that lock. An array
-# point warms the in-place call, any other point the out-of-place one.
+# point warms the in-place call, any other point the out-of-place one. That
+# evaluation only compiles: a program that throws at the exemplar leaves what
+# follows the throw to compile at its first call, and the preparation is kept,
+# as it is after the non-allocating seeding call (`_ad_na_seed!`).
 function _ad_warm!(prepared::PreparedADKernel, point::AbstractArray, contexts)
     gradient = similar(point)
     Base.code_typed(_ad_prepared_value_and_gradient!, Tuple{
         typeof(prepared),typeof(gradient),typeof(point),typeof(contexts)})
-    Base.invokelatest(_ad_prepared_value_and_gradient!,
-        prepared, gradient, copy(point), contexts)
-    nothing
+    _ad_warm_evaluation() do
+        Base.invokelatest(_ad_prepared_value_and_gradient!,
+            prepared, gradient, copy(point), contexts)
+    end
 end
 
 function _ad_warm!(prepared::PreparedADKernel, point, contexts)
     Base.code_typed(_ad_prepared_value_and_gradient,
         Tuple{typeof(prepared),typeof(point),typeof(contexts)})
-    Base.invokelatest(_ad_prepared_value_and_gradient,
-        prepared, deepcopy(point), contexts)
+    _ad_warm_evaluation() do
+        Base.invokelatest(_ad_prepared_value_and_gradient,
+            prepared, deepcopy(point), contexts)
+    end
+end
+
+function _ad_warm_evaluation(evaluate)
+    try
+        evaluate()
+    catch err
+        err isa InterruptException && rethrow()
+        @warn "`warm = true` evaluates the gradient once at the exemplar to " *
+              "compile it, and the program threw there. The preparation is " *
+              "kept: whatever that evaluation did not reach compiles at its " *
+              "first call instead." exception = err
+    end
     nothing
 end
 
@@ -2387,7 +2458,16 @@ reverse-mode `AutoEnzyme`); other backends are refused at preparation.
 
 The ordinary authored call surface is preserved: positional defaults and
 keyword HAVE ports are resolved exactly as they are by `prepare(spec)`. The
-preparation arguments are type/shape exemplars, not frozen data.
+preparation arguments are type/shape exemplars, not frozen data. Some
+preparations also evaluate the program at them: a
+[`NonAllocatingKernel`](@ref) seeds its buffers with one primal call there
+(see its method), `warm = true` runs one gradient there, and an objective
+whose declared type is not a `Number` and whose inferred type is not one
+either is checked by one call there. None needs a point where the program
+evaluates. A program that throws at the exemplars is prepared anyway, with a
+warning that names the error; the objective check then falls back to
+inference, and only an objective that inference does not prove a `Number`
+is refused, with the program's error as the cause.
 
 The backend's package must be loaded in the calling session (`using Enzyme`
 for `AutoEnzyme`); the backend value alone does not load
@@ -2434,6 +2514,9 @@ inference (`AutoEnzyme`) without stalling JIT compilation on other threads,
 then evaluates the gradient once at a copy of the exemplar. An array active
 input warms `ad_value_and_gradient!`; any other warms
 [`ad_value_and_gradient`](@ref). The default compiles at the first evaluation.
+If the program throws at the exemplar, preparation warns and returns the
+prepared gradient: whatever that evaluation did not reach compiles at its
+first call instead.
 
 With `AutoEnzyme()` (no explicit mode), `native_forward_batch = true` requests
 one ordinary Enzyme forward sweep with one tangent lane per coordinate. It applies
@@ -2516,6 +2599,16 @@ only bound values (computed once during preparation), reach the backend as
 hidden `DifferentiationInterface.Constant` contexts, as for a dataflow kernel,
 so the differentiated callable carries no bound data and ordinary reverse-mode
 `AutoEnzyme` needs no function annotation.
+
+The seeding call evaluates the program at the exemplar arguments, so their
+values decide which operations the gradient gives a reusable buffer: those
+that call reaches, which excludes a branch it does not take. The exemplar
+need not be a point where the program evaluates. If the program throws there
+(an ODE that does not integrate at the exemplar, a domain error), preparation
+warns, naming the error, and continues: the operations that call did not
+reach allocate on every gradient call, as an untaken branch's do, and values
+and gradients are unchanged. For every buffer to be reused, prepare at a point
+where the program evaluates. An `InterruptException` is rethrown.
 
 Result types must be stable across calls: a step whose result type changes
 after preparation fails loudly instead of silently reseeding. Each materialized

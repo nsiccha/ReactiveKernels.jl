@@ -484,7 +484,13 @@ end
 Prepare a reusable [`SamplerQuery`](@ref): the `:sampler`-cut value kernel
 plus a `prepare_ad` gradient with `active = :unconstrained`. `u0` is a
 length-consistent type/shape exemplar (checked against `layout.total`
-before any preparation work); `backend` is any
+before any preparation work). The non-allocating sampler (the default, below)
+also evaluates the density once at `u0` to give its operations their buffers:
+operations that evaluation does not reach, including those after a throw (an
+ODE that does not integrate at `u0`, say), allocate on every gradient call,
+with unchanged values and gradients. A density that throws at `u0` is prepared
+anyway, with a warning naming the error; prepare at a point where the model
+evaluates, such as a start point, for every buffer to be reused. `backend` is any
 `DifferentiationInterface.AbstractADType` (e.g. `AutoEnzyme` reverse mode).
 `on_error` is forwarded to [`prepare_query`](@ref). The backend's package
 must be loaded in the calling session (`using Enzyme` for `AutoEnzyme`);

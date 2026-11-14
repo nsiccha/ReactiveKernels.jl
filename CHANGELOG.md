@@ -16,6 +16,25 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.250
+
+- `prepare_ad` over a `NonAllocatingKernel` no longer fails when the program
+  throws at the exemplar. Its seeding call (one primal evaluation that gives
+  the operations their buffers) used to let the error escape, so an exemplar
+  that is a valid type/shape but not a point where the program evaluates (an
+  ODE that does not integrate there) failed the whole preparation. It now
+  warns, naming the error, and continues: the operations that call did not
+  reach allocate on every gradient call, as an untaken branch's do, and values
+  and gradients are unchanged. `warm = true` likewise keeps its preparation
+  when its gradient evaluation at the exemplar throws, with a warning. The
+  check that the objective is a scalar, which calls the kernel at the
+  exemplar when its declared type is not a `Number` and inference (not
+  consulted for a `NonAllocatingKernel`) does not prove one, falls back to
+  inference when that call throws; only an objective inference does not prove a `Number` is then
+  refused, naming `name::Float64` as the declaration that avoids the call.
+  An `InterruptException` is rethrown throughout. The docstrings say which
+  values the exemplar decides.
+
 ## 0.1.249
 
 - `jax_source` translates the native ODE bridges `rk_ode_rk45_tol` and
