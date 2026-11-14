@@ -815,6 +815,10 @@ end
     @test occursin("missing entry in a `@plate` cell", refusal(cellmodel(quote
         y[g] .~ Normal.(h, 1)
     end), :h, (;), [Union{Missing,Float64}[0.1, missing, 0.4], [0.3, 0.2]]))
+    # Rows observing a cell's state at their steps are not an event filter yet.
+    @test occursin("gathered rows in a `@plate` cell", refusal(cellmodel(quote
+        y[g] .~ Normal.(h[step], 1)
+    end), :h, (; step = [1, 2, 3]), y))
 end
 
 # ── `jax_source` of a marginalized program ────────────────────────────────
