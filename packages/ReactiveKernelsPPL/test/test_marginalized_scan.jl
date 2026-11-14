@@ -386,6 +386,16 @@ end
         filter(n -> !occursin(r"(^|_)x\.", String(n)), latent)
     @test any(n -> occursin(r"(^|_)x\.", String(n)), latent)
     check_total(built, plan, censored_oracle(built, d))
+    # The merged vector reads parameters, so its term is a factor, as in the
+    # source without `marginalize`: no likelihood or pointwise term.
+    let u = 0.2 .* cos.(1:built.layout.total), latent = bind_data(CENSORED(; d.inputs...))
+        lbuilt = build_kernel(latent)
+        lu = 0.2 .* cos.(1:lbuilt.layout.total)
+        for (b, p, v) in ((built, plan, u), (lbuilt, latent, lu))
+            @test Base.invokelatest(prepare_query(b, p, :likelihood), v) == 0
+            @test isempty(Base.invokelatest(prepare_query(b, p, :pointwise), v))
+        end
+    end
     # One program as rows and censored rows grow.
     shape(d) = structure(build_kernel(censored_plan(d)).spec)
     @test shape(d) == shape(censored_data(41; seed = 3))
