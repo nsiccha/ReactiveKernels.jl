@@ -4544,9 +4544,17 @@ end
 function _jax_scalar_function!(ctx::_JaxContext, f, types)
     host = ctx.host !== nothing
     key = (:scalar, objectid(f), Tuple(types), host)
-    haskey(ctx.mod.helper_names, key) && return ctx.mod.helper_names[key]
+    if haskey(ctx.mod.helper_names, key)
+        name = ctx.mod.helper_names[key]
+        _jax_shared_guard_check(ctx, name)
+        return name
+    end
+    before = _JAX_EFFECTS[]
     named = _jax_vectorized_named_function!(ctx, f, types)
-    named === nothing || return (ctx.mod.helper_names[key] = named)
+    if named !== nothing
+        _jax_shared_effects!(ctx, named, _JAX_EFFECTS[] - before)
+        return (ctx.mod.helper_names[key] = named)
+    end
     hint = Symbol("_rk_", replace(string(nameof_or(f)), r"[^A-Za-z0-9_]" => "_"), host ? "_np" : "")
     name = _jax_private_identifier(ctx.mod.used, hint)
     ctx.mod.helper_names[key] = name
@@ -4555,11 +4563,14 @@ function _jax_scalar_function!(ctx::_JaxContext, f, types)
     inner = _JaxContext(ctx.mod, scope, ctx.recipe, ctx.source_module,
                         Dict{Symbol,_PyVal}(), nothing)
     host && (inner.host = _HostState(Set{String}(params)))
-    v = _jax_call(inner, f, [_PyVal(p, T) for (p, T) in zip(params, types)])
+    v = _jax_shared_function(ctx, name) do
+        _jax_call(inner, f, [_PyVal(p, T) for (p, T) in zip(params, types)])
+    end
     lines = String["def " * name * "(" * join(params, ", ") * "):"]
     append!(lines, scope.lines)
     push!(lines, "    return " * v.code)
     push!(ctx.mod.helpers, host ? _host_helper_text(ctx, join(lines, "\n")) : join(lines, "\n"))
+    _jax_shared_guard_check(ctx, name)
     name
 end
 nameof_or(f) = f isa Function && Base.issingletontype(typeof(f)) ? nameof(f) :
@@ -4690,13 +4701,14 @@ function _jax_rule_body(ctx::_JaxContext, spec, ops, args::Vector{_PyVal})
     _PyVal(_jax_tuple_code(values), Tuple{(v.T for v in values)...})
 end
 
-function _jax_rule_function!(ctx, name, spec, ops, types)
+function _jax_rule_function!(ctx, name, spec, ops, types; owner = name)
     scope = _JaxScope()
     params = [_jax_identifier(scope.used, Symbol(:x, i)) for i in eachindex(types)]
     inner = _JaxContext(ctx.mod, scope, ctx.recipe, ctx.source_module,
                         Dict{Symbol,_PyVal}(), nothing)
-    result = _jax_rule_body(inner, spec, ops,
-                           [_PyVal(p, T) for (p, T) in zip(params, types)])
+    result = _jax_shared_function(ctx, owner) do
+        _jax_rule_body(inner, spec, ops, [_PyVal(p, T) for (p, T) in zip(params, types)])
+    end
     lines = ["def " * name * "(" * join(params, ", ") * "):"]
     append!(lines, scope.lines)
     push!(lines, "    return " * result.code)
@@ -4734,7 +4746,7 @@ function _jax_scalar_rule(ctx::_JaxContext,
             signature, steps, _ = Cuts[mask]
             cutname = _jax_private_identifier(ctx.mod.used, Symbol(name, "_partials_", mask))
             push!(ctx.mod.helpers, _jax_rule_function!(ctx, cutname,
-                (signature, steps, Tuple(outputs)), rule.cut_ops[mask], types))
+                (signature, steps, Tuple(outputs)), rule.cut_ops[mask], types; owner = name))
             for m in masks
                 calls[m] = (cutname, outputs)
             end
@@ -4760,6 +4772,7 @@ function _jax_scalar_rule(ctx::_JaxContext,
         push!(lines, name * ".defjvp(" * jvp * ", symbolic_zeros=True)")
         push!(ctx.mod.helpers, join(lines, "\n"))
     end
+    _jax_shared_guard_check(ctx, name)
     _jax_bind!(ctx, :value,
         _PyVal(name * "(" * _jax_args(args) * ")", _jax_return_type(rule, collect(types))))
 end
@@ -5178,6 +5191,30 @@ function _jax_with_function_guard(f, scope, guard)
         empty!(_JAX_GUARDS)
         append!(_JAX_GUARDS, saved)
     end
+end
+# A module-level helper every call site shares (a derivative rule's primal
+# and partials, a broadcast scalar function) is keyed without its caller's
+# active condition, and its body cannot read the caller's branch masks: it is
+# translated under none, so a source-backed helper it calls is too. A runtime
+# check inside it would run on lanes a guarded caller masks out, so such a
+# caller refuses it (`_jax_shared_guard_check`), as `_jax_masked_check` does.
+function _jax_shared_function(f, ctx, owner::AbstractString)
+    before = _JAX_EFFECTS[]
+    try
+        return _jax_with_function_guard(f, nothing, nothing)
+    finally
+        _jax_shared_effects!(ctx, owner, _JAX_EFFECTS[] - before)
+    end
+end
+function _jax_shared_effects!(ctx, owner::AbstractString, n::Integer)
+    key = (:shared_effects, owner)
+    ctx.mod.helper_names[key] = get(ctx.mod.helper_names, key, 0) + n
+end
+function _jax_shared_guard_check(ctx, owner::AbstractString)
+    isempty(_JAX_GUARDS) && return nothing
+    get(ctx.mod.helper_names, (:shared_effects, owner), 0) == 0 && return nothing
+    _jax_error("a runtime check in a helper called under a condition that depends on data ",
+               "has no JAX translation", _jax_where(ctx))
 end
 
 _jax_function_input!(ctx, scope, params, passed, hint, v::_PyVal) =

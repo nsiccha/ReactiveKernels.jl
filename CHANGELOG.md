@@ -16,6 +16,19 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.243
+
+- `jax_source` translates a derivative rule's functions and a function
+  broadcast over an array when they run under a condition that depends on
+  data and call a helper with recorded source (`@traceable`, `@_record_source`
+  or a supplied source, each a named module-level function since 0.1.233).
+  From 0.1.233 that raised "a function's active condition is outside its
+  caller's scope": a censored Student-t likelihood's lower tail, for one, runs
+  the incomplete-beta fraction rule under the censoring branch. These
+  functions are shared by every call site, so they are now translated with no
+  caller condition; one that contains a runtime check is still refused when
+  called under such a condition.
+
 ## 0.1.242
 
 - **Breaking:** `jax_source`'s `doc` keyword (kernel and `Plan` methods) no
