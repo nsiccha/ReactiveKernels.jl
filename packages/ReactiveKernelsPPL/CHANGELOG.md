@@ -16,6 +16,57 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.184
+
+- `prepare_query(built, plan, want; inputs = (:x,))` prepares once and leaves
+  the named data values as call arguments: `q(u, xx)` gives what preparing on
+  a binding with `x = xx` gives, without binding or preparing again. Data
+  definitions and value matrices binding computes from an input are evaluated
+  again on every call. A call checks that each input keeps its bound type and
+  size, and that nothing other than floating-point values changes in what
+  binding computes from it. Preparation refuses observations and the data
+  binding checks against them, factor labels, and integer or Boolean data,
+  naming why. Queries without `inputs` are unchanged.
+
+## 0.1.183
+
+- `marginalize(model, :x)` integrates a linear-Gaussian latent `@scan` array out
+  of the density exactly, as a Kalman filter, on the model as written. It
+  applies to a model or a binding and composes with `|`, `condition` and
+  `merge`. The recurrence carries `x` alone from a Normal or fixed seed, each
+  step is linear in `x[t - 1]` with Normal innovations and coefficients that
+  may read parameters, data and the loop index, and one Normal observation
+  `y .~ Normal.(offset .+ loading .* x, noise)` of bound data reads it
+  (directly or through a definition read only by it). The layout drops `x` and
+  its innovations; `:pointwise.y` holds one-step-ahead predictive densities.
+  `prepare_marginalized_latents` and `marginalized_latent_draws` return exact
+  draws of `x` by forward filtering, backward sampling. Other forms, including
+  recurrences in `@plate` cells or submodels, are refused naming the statement.
+
+## 0.1.182
+
+- A location whose per-row summands are all computed by the model, such as
+  `m = level .+ state` over a top-level `@scan` carried array, takes its rows
+  from those summands instead of from its response. On a design that leaves
+  the response absent, `prepare_query(built, design, (:m,))` therefore
+  evaluates the location by its authored name, as other definitions do,
+  instead of refusing that it reads the absent response. The absent response
+  takes the scan's length from its supplied bound, so `:observations`,
+  `prepare_predictive` and `predictive_laws` give one entry per step. Values,
+  densities and gradients of bindings that supply the response are unchanged.
+
+## 0.1.181
+
+- **Breaking:** `jax_source(built, plan; doc)` no longer replaces the module
+  docstring. The docstring keeps its generated first line, then `doc`, the
+  author's description of the model, then the generated `Data:` list and
+  `Model documentation:` statement docstrings. `doc` takes a string or a Julia
+  docstring such as `@doc TOY_MODEL` (a docstring above
+  `const TOY_MODEL = @rkppl …` belongs to the binding, so the caller passes
+  it). A caller that passed `doc` to replace the generated docstring now gets
+  both; no caller in this repository or its known consumers passed it.
+  Requires ReactiveKernels 0.1.242.
+
 ## 0.1.180
 
 - A range that reads `end` or `begin` inside an index over data or over a

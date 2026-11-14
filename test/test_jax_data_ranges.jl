@@ -380,7 +380,7 @@ end
     # The loop runs only for elements; a literal empty range emits none.
     @test occursin(r"jax\.lax\.fori_loop\(1, idx\.\w+ \+ 1, \w+, carry_init\) if 1 <= idx\.\w+ else carry_init",
                    string(plain))
-    # An element of one expression is a `lambda` (RK 0.1.241).
+    # An element of one expression is a `lambda` (RK 0.1.246).
     @test occursin(r"jax\.vmap\((?:\w+|lambda \w+: [^\n]+?)\)\(\w+\) if 0 < \w+\.shape\[0\] else jnp\.zeros\(\(0,\)",
                    string(plain))
     prepared = jax_source(jax_ranges_none; have = (:x, :idx), want = :result, data = (; idx = Int[]))

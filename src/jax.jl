@@ -2857,8 +2857,11 @@ _jax_call_positional(ctx::_JaxContext, f, args::Vector{_PyVal}) =
 # decide a Python conditional: on static operands the call is computed with
 # NumPy instead, as host code is (a guard `isfinite(jitter) || throw(...)` of
 # a literal `jitter`). A call with no NumPy spelling stays staged.
-function _jax_result(f, args::Vector{_PyVal}, code::AbstractString)
-    T = _jax_return_type(f, [a.T isa Type ? a.T : Any for a in args])
+_jax_result(f, args::Vector{_PyVal}, code::AbstractString) =
+    _jax_typed_result(_jax_return_type(f, [a.T isa Type ? a.T : Any for a in args]), args, code)
+# The same, of a result whose Julia type `T` the caller knows (a call with
+# keywords, whose positional types do not determine it).
+function _jax_typed_result(@nospecialize(T), args::Vector{_PyVal}, code::AbstractString)
     static = !isempty(args) && all(a -> a.static, args)
     if static && _jax_stages(code, args)
         host = _host_static_text(code)
@@ -4162,6 +4165,83 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(fill), args::Vector{_PyVa
     shape, N = _jax_dims(ctx, fill, dims)
     _PyVal("jnp.full(" * shape * ", " * x.code * ", dtype=" * _jax_dtype(E) * ")", Array{E,N})
 end
+# `repeat(A, counts...)` is Julia's `repeat(A; outer = counts)`: `A` tiled
+# `counts[d]` times along axis `d`, as `jnp.tile` does. `inner` first repeats
+# each entry along each axis, as `jnp.repeat` does. The result has as many
+# axes as the most of `A` and either count list, `A` taking trailing axes of
+# length one as Julia's `repeat` does (NumPy's `tile` would prepend them).
+# Shapes are static while JAX traces, so the functions need static counts;
+# `prepare_data` computes a repeat whose counts are data (a matrix of
+# per-term prior scales repeated once per category, snag
+# emit-an-independ-8a0b322b).
+function _jax_function_call(ctx::_JaxContext, ::typeof(repeat), args::Vector{_PyVal})
+    _jax_is_array(args[1].T) || return _jax_traceable_or_lowered(ctx, repeat, args)
+    _jax_repeat(ctx, args[1], nothing, args[2:end])
+end
+function _jax_call(ctx::_JaxContext, ::typeof(repeat), args::Vector{_PyVal}, kw)
+    isempty(kw) && return _jax_call_positional(ctx, repeat, args)
+    names = first.(kw)
+    length(args) == 1 && _jax_is_array(args[1].T) && allunique(names) &&
+        all(in((:inner, :outer)), names) ||
+        _jax_error("keyword arguments ", join(names, ", "), " to `repeat` of a `",
+                   args[1].T, "` have no JAX translation", _jax_where(ctx))
+    counts(name) = (i = findfirst(k -> first(k) === name, kw);
+                    i === nothing ? nothing : _jax_repeat_counts(ctx, last(kw[i])))
+    _jax_repeat(ctx, only(args), counts(:inner), counts(:outer))
+end
+# The counts of an `inner` or `outer` keyword: `nothing` (not given), one
+# integer, or a tuple of them.
+function _jax_repeat_counts(ctx::_JaxContext, v::_PyVal)
+    v.T === Nothing && return nothing
+    v.T isa Type && v.T <: Integer && return [v]
+    v.T isa Type && v.T <: Tuple && isconcretetype(v.T) ||
+        _jax_error("`repeat` with counts of type `", v.T, "`", _jax_where(ctx))
+    # A literal tuple (`inner = (1, 2)`) gives its literal counts.
+    m = match(r"^\(\s*(-?[0-9]+(?:\s*,\s*-?[0-9]+)*)\s*,?\s*\)$", v.code)
+    m === nothing || return _PyVal[_jax_literal(parse(Int, strip(c)))
+                                   for c in split(m.captures[1], ',')]
+    _jax_dimension_values([v])
+end
+function _jax_repeat(ctx::_JaxContext, x::_PyVal, inner::Union{Nothing,Vector{_PyVal}},
+                     outer::Union{Nothing,Vector{_PyVal}})
+    isempty(x.extent) && !_jax_ragged(x.T) ||
+        _jax_error("`repeat` of a padded (ragged) value", _jax_where(ctx))
+    inner_counts, outer_counts = something(inner, _PyVal[]), something(outer, _PyVal[])
+    counts = [inner_counts; outer_counts]
+    all(c -> c.T isa Type && c.T <: Integer, counts) ||
+        _jax_error("`repeat` with counts of types ", Tuple(c.T for c in counts), _jax_where(ctx))
+    ctx.host === nothing && !all(c -> c.static, counts) &&
+        _jax_error("`repeat` with counts that are not static while JAX traces (a recipe ",
+                   "of data alone computes it in `prepare_data`)", _jax_where(ctx))
+    n = _jax_rank(x.T)
+    # Julia's own checks (`Base._RepeatInnerOuter.check`), as runtime checks:
+    # no count is negative, and with `inner` both count lists name every
+    # axis of `A`.
+    for (name, list) in (("inner", inner), ("outer", outer)), c in something(list, _PyVal[])
+        occursin(r"^[0-9]+$", c.code) && continue
+        _jax_call(ctx, _runtime_check, [_jax_call(ctx, >=, [c, _jax_literal(0)]),
+            _PyVal(repr("no " * name * " repetition count may be negative"), ArgumentError)])
+    end
+    if inner !== nothing
+        for (name, list) in (("inner", inner), ("outer", outer))
+            list !== nothing && length(list) < n || continue
+            _jax_call(ctx, _runtime_check, [_PyVal("False", Bool, true),
+                _PyVal(repr("number of " * name * " repetitions (" * string(length(list)) *
+                            ") cannot be less than number of dimensions of input array (" *
+                            string(n) * ")"), ArgumentError)])
+        end
+    end
+    r = max(n, length(inner_counts), length(outer_counts))
+    code = r == n ? x.code : _py_atom(x.code) * "[..., " * join(fill("None", r - n), ", ") * "]"
+    for (d, c) in enumerate(inner_counts)
+        c.code == "1" || (code = "jnp.repeat(" * code * ", " * c.code * ", axis=" * string(d - 1) * ")")
+    end
+    reps = String[d <= length(outer_counts) ? outer_counts[d].code : "1" for d in 1:r]
+    # Without an `inner` repeat, `jnp.tile` also makes the copy Julia returns.
+    (startswith(code, "jnp.repeat(") && all(==("1"), reps)) ||
+        (code = "jnp.tile(" * code * ", (" * join(reps, ", ") * (r == 1 ? ",))" : "))"))
+    _jax_typed_result(Array{eltype(x.T),r}, [x; counts], code)
+end
 # `hcat` of scalars, vectors (columns) and matrices.
 function _jax_function_call(ctx::_JaxContext, ::typeof(hcat), args::Vector{_PyVal})
     columns = map(args) do a
@@ -4593,9 +4673,17 @@ end
 function _jax_scalar_function!(ctx::_JaxContext, f, types)
     host = ctx.host !== nothing
     key = (:scalar, objectid(f), Tuple(types), host)
-    haskey(ctx.mod.helper_names, key) && return ctx.mod.helper_names[key]
+    if haskey(ctx.mod.helper_names, key)
+        name = ctx.mod.helper_names[key]
+        _jax_shared_guard_check(ctx, name)
+        return name
+    end
+    before = _JAX_EFFECTS[]
     named = _jax_vectorized_named_function!(ctx, f, types)
-    named === nothing || return (ctx.mod.helper_names[key] = named)
+    if named !== nothing
+        _jax_shared_effects!(ctx, named, _JAX_EFFECTS[] - before)
+        return (ctx.mod.helper_names[key] = named)
+    end
     hint = Symbol("_rk_", replace(string(nameof_or(f)), r"[^A-Za-z0-9_]" => "_"), host ? "_np" : "")
     name = _jax_private_identifier(ctx.mod.used, hint)
     ctx.mod.helper_names[key] = name
@@ -4604,11 +4692,14 @@ function _jax_scalar_function!(ctx::_JaxContext, f, types)
     inner = _JaxContext(ctx.mod, scope, ctx.recipe, ctx.source_module,
                         Dict{Symbol,_PyVal}(), nothing)
     host && (inner.host = _HostState(Set{String}(params)))
-    v = _jax_call(inner, f, [_PyVal(p, T) for (p, T) in zip(params, types)])
+    v = _jax_shared_function(ctx, name) do
+        _jax_call(inner, f, [_PyVal(p, T) for (p, T) in zip(params, types)])
+    end
     lines = String["def " * name * "(" * join(params, ", ") * "):"]
     append!(lines, scope.lines)
     push!(lines, "    return " * v.code)
     push!(ctx.mod.helpers, host ? _host_helper_text(ctx, join(lines, "\n")) : join(lines, "\n"))
+    _jax_shared_guard_check(ctx, name)
     name
 end
 nameof_or(f) = f isa Function && Base.issingletontype(typeof(f)) ? nameof(f) :
@@ -4758,13 +4849,14 @@ function _jax_rule_body(ctx::_JaxContext, spec, ops, args::Vector{_PyVal})
     _PyVal(_jax_tuple_code(values), Tuple{(v.T for v in values)...})
 end
 
-function _jax_rule_function!(ctx, name, spec, ops, types)
+function _jax_rule_function!(ctx, name, spec, ops, types; owner = name)
     scope = _JaxScope()
     params = [_jax_identifier(scope.used, Symbol(:x, i)) for i in eachindex(types)]
     inner = _JaxContext(ctx.mod, scope, ctx.recipe, ctx.source_module,
                         Dict{Symbol,_PyVal}(), nothing)
-    result = _jax_rule_body(inner, spec, ops,
-                           [_PyVal(p, T) for (p, T) in zip(params, types)])
+    result = _jax_shared_function(ctx, owner) do
+        _jax_rule_body(inner, spec, ops, [_PyVal(p, T) for (p, T) in zip(params, types)])
+    end
     lines = ["def " * name * "(" * join(params, ", ") * "):"]
     append!(lines, scope.lines)
     push!(lines, "    return " * result.code)
@@ -4802,7 +4894,7 @@ function _jax_scalar_rule(ctx::_JaxContext,
             signature, steps, _ = Cuts[mask]
             cutname = _jax_private_identifier(ctx.mod.used, Symbol(name, "_partials_", mask))
             push!(ctx.mod.helpers, _jax_rule_function!(ctx, cutname,
-                (signature, steps, Tuple(outputs)), rule.cut_ops[mask], types))
+                (signature, steps, Tuple(outputs)), rule.cut_ops[mask], types; owner = name))
             for m in masks
                 calls[m] = (cutname, outputs)
             end
@@ -4828,6 +4920,7 @@ function _jax_scalar_rule(ctx::_JaxContext,
         push!(lines, name * ".defjvp(" * jvp * ", symbolic_zeros=True)")
         push!(ctx.mod.helpers, join(lines, "\n"))
     end
+    _jax_shared_guard_check(ctx, name)
     _jax_bind!(ctx, :value,
         _PyVal(name * "(" * _jax_args(args) * ")", _jax_return_type(rule, collect(types))))
 end
@@ -5252,6 +5345,30 @@ function _jax_with_function_guard(f, scope, guard)
         empty!(_JAX_GUARDS)
         append!(_JAX_GUARDS, saved)
     end
+end
+# A module-level helper every call site shares (a derivative rule's primal
+# and partials, a broadcast scalar function) is keyed without its caller's
+# active condition, and its body cannot read the caller's branch masks: it is
+# translated under none, so a source-backed helper it calls is too. A runtime
+# check inside it would run on lanes a guarded caller masks out, so such a
+# caller refuses it (`_jax_shared_guard_check`), as `_jax_masked_check` does.
+function _jax_shared_function(f, ctx, owner::AbstractString)
+    before = _JAX_EFFECTS[]
+    try
+        return _jax_with_function_guard(f, nothing, nothing)
+    finally
+        _jax_shared_effects!(ctx, owner, _JAX_EFFECTS[] - before)
+    end
+end
+function _jax_shared_effects!(ctx, owner::AbstractString, n::Integer)
+    key = (:shared_effects, owner)
+    ctx.mod.helper_names[key] = get(ctx.mod.helper_names, key, 0) + n
+end
+function _jax_shared_guard_check(ctx, owner::AbstractString)
+    isempty(_JAX_GUARDS) && return nothing
+    get(ctx.mod.helper_names, (:shared_effects, owner), 0) == 0 && return nothing
+    _jax_error("a runtime check in a helper called under a condition that depends on data ",
+               "has no JAX translation", _jax_where(ctx))
 end
 
 _jax_function_input!(ctx, scope, params, passed, hint, v::_PyVal) =
@@ -6588,7 +6705,8 @@ _jax_needs_x64(mod::_JaxModule) =
                float_type = Float64) -> JAXSource
     jax_source(spec::KernelSpec; have, functions, types = nothing, constants = (;),
                doc = nothing, float_type = Float64) -> JAXSource
-    jax_source(p::Plan; types = nothing, name = :kernel, float_type = Float64) -> JAXSource
+    jax_source(p::Plan; types = nothing, name = :kernel, doc = nothing,
+               float_type = Float64) -> JAXSource
 
 Translate the program that computes `want` from `have` into a Python module
 whose function `name` takes the HAVE values, in order, and returns the WANT
@@ -6598,10 +6716,18 @@ function per entry over the same HAVE values; a WANT is a value name, a tuple
 of them (the function returns a tuple) or a `NamedTuple` of key => value name
 (it returns a `dict`). `constants`, a `NamedTuple`, adds module-level
 constants (numbers, strings, symbols, vectors, tuples, named tuples and
-dictionaries of these), and `doc` replaces the module docstring.
+dictionaries of these).
 `function_docs`, a `NamedTuple` of function name => text, gives functions
 their docstrings; the others state what they compute. Module functions
 annotate their parameters (`ArrayLike`) and results.
+
+The module docstring starts with the generated line `Generated by
+ReactiveKernels.jax_source; do not edit.` `doc` adds the author's description
+of the program after it, separated by a blank line: a string, or a Julia
+docstring such as `@doc TOY_KERNEL` (its Markdown text). A docstring written
+above a `const` binding of a kernel belongs to the binding, not to the kernel
+value `jax_source` receives, so the caller passes it. Docstrings keep their
+text as written: backslashes and quotes are escaped in the Python source.
 
 `types` gives each HAVE value's Julia type, as a `NamedTuple` by port name or
 a tuple in HAVE order; by default the ports' declared types are used, and
@@ -6649,7 +6775,8 @@ function jax_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
                     name = :kernel, constants = NamedTuple(), doc = nothing, data = nothing,
                     definitions = nothing, definitions_module::Module = Main, keep = (),
                     function_docs = NamedTuple(), float_type = Float64,
-                    source_regions = _JaxSourceRegion[])
+                    source_regions = _JaxSourceRegion[], module_docstring = nothing)
+    docstring = _jax_module_docstring(doc, module_docstring)
     functions === nothing && want === nothing && (want = _KERNEL_DEFAULT_BOUNDARY)
     if functions === nothing
         functions = NamedTuple{(Symbol(name),)}((want,))
@@ -6661,8 +6788,8 @@ function jax_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
     plans = [fname => (plan(spec; have, want = _jax_want_names(w)), w)
              for (fname, w) in pairs(functions)]
     _jax_with_float_type(float_type) do
-        _jax_module_source(plans, types, constants, doc; data, definitions, definitions_module,
-                           keep, function_docs, source_regions)
+        _jax_module_source(plans, types, constants, docstring; data, definitions,
+                           definitions_module, keep, function_docs, source_regions)
     end
 end
 
@@ -6672,9 +6799,30 @@ jax_source(p::Plan; types = nothing, name = :kernel, constants = NamedTuple(),
            float_type = Float64) =
     _jax_with_float_type(float_type) do
         _jax_module_source([Symbol(name) => (p, Tuple(v.name for v in p.want))],
-                           types, constants, doc; data, definitions, definitions_module, keep,
-                           function_docs)
+                           types, constants, _jax_module_docstring(doc, nothing);
+                           data, definitions, definitions_module, keep, function_docs)
     end
+
+# The module docstring: the generated line naming the generator, the author's
+# description `doc` (a string, or docstring Markdown such as `@doc X`, as its
+# text), then the generator's further `sections`, separated by blank lines.
+function _jax_compose_docstring(generator::AbstractString, doc, sections::AbstractString...)
+    # Leading blank lines go; a first line's indentation (a docstring's
+    # indented signature) stays.
+    authored = doc === nothing ? "" : replace(rstrip(string(doc)), r"\A(?:[ \t]*\n)+" => "")
+    join(filter(!isempty, String[generator, authored, sections...]), "\n\n")
+end
+
+# `module_docstring` (internal) is a complete docstring a frontend composed
+# with `_jax_compose_docstring` under its own generator line, with its own
+# sections (ReactiveKernelsPPL's data names and statement docstrings).
+function _jax_module_docstring(doc, module_docstring)
+    module_docstring === nothing &&
+        return _jax_compose_docstring("Generated by ReactiveKernels.jax_source; do not edit.", doc)
+    doc === nothing || throw(ArgumentError(
+        "jax_source: `module_docstring` is the complete module docstring; pass it or `doc`, not both"))
+    String(module_docstring)
+end
 
 _jax_want_names(w::Symbol) = (w,)
 _jax_want_names(w::Tuple) = w
@@ -6702,7 +6850,7 @@ _jax_want_names(w) = throw(ArgumentError(
 # the module it emits does not depend on what its caller imported. `keep`
 # names data-only values `prepare_data` also returns (the functions take them
 # too), for a caller that reads them.
-function _jax_module_source(plans, types, constants, doc; data = nothing,
+function _jax_module_source(plans, types, constants, docstring::String; data = nothing,
                             definitions = nothing, definitions_module::Module = Main,
                             keep = (), function_docs = NamedTuple(),
                             source_regions = _JaxSourceRegion[])
@@ -6711,7 +6859,8 @@ function _jax_module_source(plans, types, constants, doc; data = nothing,
             "jax_source: `definitions` compute data values, so they need `data`"))
         isempty(keep) || throw(ArgumentError(
             "jax_source: `keep` names values of `prepare_data`, so it needs `data`"))
-        return _jax_module_text(plans, types, constants, doc, nothing; function_docs, source_regions)
+        return _jax_module_text(plans, types, constants, docstring, nothing;
+                                function_docs, source_regions)
     end
     data isa NamedTuple || data isa Tuple && all(d -> d isa Symbol, data) ||
         throw(ArgumentError("jax_source: `data` is a tuple of HAVE names or a NamedTuple " *
@@ -6761,7 +6910,7 @@ function _jax_module_source(plans, types, constants, doc; data = nothing,
     cell_reasons = Dict{Tuple{Int,Int},JAXEmissionError}()
     while true
         try
-            return _jax_module_text(plans, types, constants, doc,
+            return _jax_module_text(plans, types, constants, docstring,
                                     (data, excluded, defs, untranslated, keep, reasons,
                                      promoted, cells, cell_reasons, definitions_module);
                                     function_docs, source_regions)
@@ -6856,7 +7005,7 @@ import numpy as np
 import scipy.special as ssp
 """
 
-function _jax_module_text(plans, types, constants, doc, prepare;
+function _jax_module_text(plans, types, constants, docstring::String, prepare;
                           function_docs = NamedTuple(), source_regions = _JaxSourceRegion[])
     mod = _JaxModule()
     append!(mod.regions, source_regions)
@@ -6883,10 +7032,7 @@ function _jax_module_text(plans, types, constants, doc, prepare;
     end
     prepare === nothing && any(f -> any(io -> _jax_ragged(last(io)), f.inputs), functions) &&
         pushfirst!(mod.helpers, rstrip(replace(_JAX_PAD_RAGGED, "np.float64" => "np." * _jax_float_name())))
-    lines = String[]
-    docstring = doc === nothing ?
-        "Generated by ReactiveKernels.jax_source; do not edit." : String(doc)
-    push!(lines, "\"\"\"" * replace(docstring, "\"\"\"" => "\\\"\\\"\\\"") * "\"\"\"")
+    lines = String[_jax_docstring(docstring, "")]
     header = rstrip(_jax_needs_x64(mod) ? _JAX_HEADER : replace(_JAX_HEADER, _JAX_X64_LINE => ""))
     # The host code: `prepare_data`, and static values the functions compute
     # with NumPy.
@@ -7375,10 +7521,15 @@ _jax_default_doc(w::Tuple) = "Compute " * join(("`" * string(x) * "`" for x in w
     " from the inputs, as a tuple."
 _jax_default_doc(w::NamedTuple) = "Compute a dict of " *
     join(("`" * string(k) * "`" for k in keys(w)), ", ") * " from the inputs."
-# A Python docstring at `indent`, its text kept as written.
-_jax_docstring(text::AbstractString, indent::AbstractString) =
-    replace(indent * "\"\"\"" * replace(rstrip(text), "\"\"\"" => "\\\"\"\"", "\n" => "\n" * indent) *
-            (occursin('\n', rstrip(text)) ? "\n" * indent : "") * "\"\"\"", r"\n[ ]+\n" => "\n\n")
+# A Python docstring at `indent`, its text kept as written. Backslashes are
+# escaped (an authored `\theta` is no tab, `\sigma` no invalid escape), and so
+# is a quote that could close the string: one followed by another quote, or
+# the text's last character.
+function _jax_docstring(text::AbstractString, indent::AbstractString)
+    body = replace(replace(rstrip(text), "\\" => "\\\\"), r"\"(?=\"|\z)" => "\\\"")
+    replace(indent * "\"\"\"" * replace(body, "\n" => "\n" * indent) *
+            (occursin('\n', body) ? "\n" * indent : "") * "\"\"\"", r"\n[ ]+\n" => "\n\n")
+end
 
 # A (nested) `NamedTuple` WANT as `dict`s of the values `wants` yields in order.
 # A padded (ragged) value comes with its lengths, under `<key>_lengths`.

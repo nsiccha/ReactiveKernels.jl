@@ -514,8 +514,36 @@ end
     end
     code = string(code_expr(single))
     @test occursin("_cell_instance_source(", code)
-    single(d.u, 3); rows(d.u, 3)
-    @test (@allocated single(d.u, 3)) < (@allocated rows(d.u, 3))
+    # The one-row form is measured with a plan, as a caller evaluating a label
+    # repeatedly calls a partition (RKPPL's queries and samplers). Without one,
+    # every call recomputes the integer row bookkeeping, and a row per member
+    # row takes more of it (a reshape's rows and positions per row) than the
+    # 1×2 product array it saves: 1056 against 832 bytes on Julia 1.13, where
+    # 1.10's larger array headers left 1024 against 1056 (snag
+    # test-plate-parti-13fa3aa6). The rows of the windows both members read sit
+    # under their shared guard and follow the product's shape, which reads the
+    # parameter-derived factor `F`: the plan holds them, and the body checks
+    # that shape (`_partition_guarded_plan`).
+    pspec(single) = plate_partition(_pp_matrix_rows, (:dens, :dens2);
+        by = (dens = :subject, dens2 = :subject2), index = :label, single, plan = :plan)
+    planned(single) = prepare(pspec(single); have = (have..., :plan), want = :partition_total,
+                              bound, exemplars = (d.u, 1, nothing))
+    prows, psingle = planned(false), planned(true)
+    body = string(psingle.ast)
+    @test occursin("_cell_plan_check(", body)
+    for helper in ("_cell_reshape_rows(", "_cell_union_rows_sorted(", "_cell_range_rows(")
+        @test !occursin(helper, body)
+    end
+    plans_rows = [partition_plan(prows, d.u, s, nothing) for s in 1:n]
+    plans_single = [partition_plan(psingle, d.u, s, nothing) for s in 1:n]
+    for s in 1:n
+        @test psingle(d.u, s, plans_single[s]) ≈ single(d.u, s) rtol = 1e-14
+        @test prows(d.u, s, plans_rows[s]) ≈ rows(d.u, s) rtol = 1e-14
+    end
+    p3, q3 = plans_single[3], plans_rows[3]
+    psingle(d.u, 3, p3); prows(d.u, 3, q3); single(d.u, 3)
+    @test (@allocated psingle(d.u, 3, p3)) < (@allocated prows(d.u, 3, q3))
+    @test (@allocated psingle(d.u, 3, p3)) < (@allocated single(d.u, 3))
     backend = AutoEnzyme(; mode = Enzyme.Reverse)
     for s in (1, 3)
         g1, g2 = similar(d.u), similar(d.u)
@@ -525,6 +553,11 @@ end
         @test g1 ≈ g2 rtol = 1e-12
         r2 = findfirst(==(s), d.subject2)
         @test findall(!iszero, g1) == sort!(unique([1, 2, 2 + s, 7 + s, 2 + r2, 7 + r2]))
+        g3 = similar(d.u)
+        v3, _ = ad_value_and_gradient!(prepare_ad(psingle, backend, d.u, s, plans_single[s];
+                                                  active = :u), g3, d.u, s, plans_single[s])
+        @test v3 ≈ v1 rtol = 1e-14
+        @test g3 ≈ g1 rtol = 1e-12
     end
 end
 

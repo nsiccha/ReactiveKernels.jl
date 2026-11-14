@@ -230,6 +230,37 @@ end
     end, (0, 1, 4, 31))
 end
 
+@testset "guarded plans hold rows of an active value's shape that a later guard reads" begin
+    # An arm computes a value from `u` and rows from its shape alone, as the
+    # guard several partition members share computes rows from a product's
+    # shape, whose factor is computed from the parameters. The plan holds the
+    # shape and those rows; the arm checks the shape against the value's on
+    # every call. A later guard reads the rows, so the arm binds them from the
+    # plan too (snag test-plate-parti-13fa3aa6).
+    split = _pgp_check(quote
+        rows = collect(1:label)
+        if !isempty(rows)
+            w = [u, 2u, 3u]
+            shape = axes(w)
+            positions = getindex(collect(first(shape)), rows)
+            v = sum(getindex(w, positions))
+        end
+        if !isempty(rows)
+            y = v * length(positions)
+        else
+            y = zero(u)
+        end
+        return y
+    end, (0, 1, 2, 3))
+    main = Expr(:block, split.main...)
+    has_call(x, name) = x isa Expr &&
+        ((x.head === :call && _PGP._plan_call_name(x.args[1]) === name) ||
+         any(a -> has_call(a, name), x.args))
+    @test has_call(main, :_cell_plan_check)
+    @test !has_call(main, :collect)
+    @test has_call(Expr(:block, split.plan...), :collect)
+end
+
 module _PGPScanAllocatorLookalike
 _scan_similar_output(rows, ::Type{T}) where {T} = rows
 end
