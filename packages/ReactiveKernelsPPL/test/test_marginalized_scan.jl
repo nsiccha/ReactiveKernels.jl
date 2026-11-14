@@ -745,6 +745,91 @@ end
     @test occursin("must not hold `__`", named(dunder(; T = 8), :a__b, :c; y = d.trend.y))
 end
 
+# ── A recurrence held in a submodel ───────────────────────────────────────
+#
+# A submodel's `@scan` integrates out by its author path (`z.x`); the program
+# is the one its top-level spelling lowers to, and the draws nest under the
+# call (`draws.z.x`), as `constrain` nests sampled locals.
+
+@rkppl submodel_walk(s) = begin
+    @scan begin
+        x[1] ~ Normal(0, 1)
+        for t in 2:T
+            x[t] ~ Normal(x[t - 1], s)
+        end
+    end
+    x
+end
+
+@rkppl submodel_trend(s_level, s_slope) = begin
+    @scan begin
+        level[1] ~ Normal(0, 2)
+        slope[1] ~ Normal(0, 1)
+        for t in 2:T
+            level[t] ~ Normal(level[t - 1] + slope[t - 1], s_level)
+            slope[t] ~ Normal(slope[t - 1], s_slope)
+        end
+    end
+    level
+end
+
+const SUB_WALK = @rkppl begin
+    s ~ Exponential(1)
+    noise ~ Exponential(1)
+    z ~ submodel_walk(s)
+    y .~ Normal.(z, noise)
+end
+const TOP_WALK = @rkppl begin
+    s ~ Exponential(1)
+    noise ~ Exponential(1)
+    @scan begin
+        x[1] ~ Normal(0, 1)
+        for t in 2:T
+            x[t] ~ Normal(x[t - 1], s)
+        end
+    end
+    y .~ Normal.(x, noise)
+end
+const SUB_TREND = @rkppl begin
+    s_level ~ Exponential(1)
+    s_slope ~ Exponential(0.5)
+    noise ~ Exponential(1)
+    z ~ submodel_trend(s_level, s_slope)
+    y .~ Normal.(z, noise)
+end
+
+submodel_plans(T; y = randn(Random.Xoshiro(2), T)) = (;
+    walk = (marginalize(SUB_WALK(; T), Symbol("z.x")) | (; y),
+        marginalize(TOP_WALK(; T), :x) | (; y), (:x,)),
+    trend = (marginalize(SUB_TREND(; T), Symbol("z.level"), Symbol("z.slope")) | (; y),
+        marginalize(TREND(; T), :level, :slope) | (; y), (:level, :slope)))
+
+@testset "a recurrence held in a submodel integrates out by its path" begin
+    for (name, (sub, top, keys)) in pairs(submodel_plans(7))
+        bs, bt = build_kernel(sub), build_kernel(top)
+        @test coordinate_names(bs.layout) == coordinate_names(bt.layout)
+        u = 0.3 .* cos.(1:bs.layout.total)
+        @test Base.invokelatest(prepare_query(bs, sub, :sampler), u) ==
+            Base.invokelatest(prepare_query(bt, top, :sampler), u)
+        sampler(b, p) = prepare_sampler(b, p, zeros(b.layout.total);
+            backend = DI.AutoEnzyme(; mode = Enzyme.Reverse))
+        gs = sampler_value_and_gradient!(sampler(bs, sub), zeros(length(u)), u)
+        gt = sampler_value_and_gradient!(sampler(bt, top), zeros(length(u)), u)
+        @test gs[2] ≈ gt[2] rtol = 1e-12
+        ds = marginalized_latent_draws(prepare_marginalized_latents(bs, sub), u, Random.Xoshiro(4))
+        dt = marginalized_latent_draws(prepare_marginalized_latents(bt, top), u, Random.Xoshiro(4))
+        @test propertynames(ds) == (:z,) && propertynames(ds.z) == keys
+        @test all(ds.z[k] == dt[k] for k in keys)
+        @test structure(bs.spec) == structure(build_kernel(submodel_plans(30)[name][1]).spec)
+    end
+    @test occursin("`z.q` names no local of a submodel call", try
+        build_kernel(marginalize(SUB_WALK(; T = 4), Symbol("z.q")) | (; y = zeros(4)))
+        "no error"
+    catch e
+        sprint(showerror, e)
+    end)
+end
+
 # Each form the Kalman filter does not cover is refused at lowering, naming
 # the statement.
 function refusal(body, x, data, y)
@@ -1090,6 +1175,7 @@ end
         censored = bind_data(censored_plan(censored_data(9))),
         gathered = gathered_plan(gathered_data(5, 8)),
         trend = vector_cases(6).trend.plan, ar2 = vector_cases(6).ar2.plan,
+        submodel = submodel_plans(6).trend[1],
         cell_ar = marginalize(CELL_AR(; c.G, c.se, c.m0), :h) | (; c.y),
         observed = OBSERVED_AR() | (; y = [0.1, -0.3, 0.4, 0.2]))
     for (name, plan) in pairs(plans)

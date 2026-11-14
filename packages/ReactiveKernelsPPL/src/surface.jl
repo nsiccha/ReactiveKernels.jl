@@ -717,7 +717,10 @@ function _lower_model_latest(m::RKPPLModel, supplied; conditioned = keys(m.condi
     setdiff!(data, observed_parameters)
     # Response LHSs are data only through the explicit conditioning set.
     _check_observed_inputs(expanded.ast, data, observing)
-    _marginalized_lengths!(values, data, expanded.ast, m.marginalized)
+    # A recurrence a submodel holds is named by its author path (`z.x`) and
+    # lowers under the local's private identifier.
+    marginalized = Symbol[_marginalized_identifier(x, ctx) for x in m.marginalized]
+    _marginalized_lengths!(values, data, expanded.ast, marginalized)
     array_entries = _value_array_entries(expanded.ast, data, values, m.mod)
     ast, data = _scalar_value_definitions(expanded.ast, data,
         Set{Symbol}(k for (k, v) in values if v isa Number && k ∉ observed_parameters);
@@ -725,7 +728,7 @@ function _lower_model_latest(m::RKPPLModel, supplied; conditioned = keys(m.condi
             (haskey(m.fixed, k) || haskey(scoped_values, k))))
     ast = _indexed_observation_definitions(ast, data)
     # Latent recurrences the author integrates out become their Kalman filter.
-    ast = _marginalize_latents(ast, m.marginalized, values, observing)
+    ast = _marginalize_latents(ast, marginalized, values, observing)
     # Recurrences marked as WarmupHMC Markov chains are lowered in their states.
     ast = _chain_latents(ast, m.chains, values, observing)
     # Pinned values bind as definitions from here on, not as data.

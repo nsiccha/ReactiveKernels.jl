@@ -72,6 +72,12 @@ filter carries the window `a[t - j]`, `j < p`, of every array, and the draws
 return each array under its name. A vector state observed otherwise or in a
 `@plate` cell is refused.
 
+A recurrence a submodel holds is named by its author path:
+`marginalize(model, Symbol("z.x"))` for the array `x` of `z ~ sm(…)` (a
+nested call: `Symbol("z.w.x")`). It integrates out as its top-level spelling
+does, and its draws nest under the call, `draws.z.x`, as [`constrain`](@ref)
+nests sampled locals.
+
 A recurrence in a `@plate for g in …` cell integrates out one filter per
 index, when the cell's `@scan` carries `x` as above and one statement of the
 cell observes it, `y[g] .~ Normal.(offset .+ loading .* x, noise)`, with `y`
@@ -100,8 +106,6 @@ function marginalize(m::RKPPLModel, names::Symbol...)
         "marginalize needs the latent array to integrate out: `marginalize(model, :x)`"))
     out = copy(m.marginalized)
     for x in names
-        occursin('.', String(x)) && _sfail("marginalize(`$x`): a recurrence " *
-            "inside a submodel is not marginalized yet; name a top-level `@scan` array")
         x in out && _sfail("marginalize(`$x`): `$x` is already marginalized")
         x in m.chains && _sfail("marginalize(`$x`): `$x` is a Markov chain (`markov_chains`)")
         push!(out, x)
@@ -115,6 +119,18 @@ marginalize(::StructuralPlan, names::Symbol...) = _sfail("marginalize(" *
     join(("`$x`" for x in names), ", ") * "): a bound plan is already lowered. " *
     "Marginalize the model or its binding before observing it: " *
     "`marginalize(model(; inputs...), :x) | (; y)`")
+
+# The identifier a marginalized name lowers under: a top-level array as it is;
+# a submodel's local by its author path (`z.x`, `z.w.x`), resolved through the
+# call scopes as a conditioning path is.
+function _marginalized_identifier(x::Symbol, ctx)
+    occursin('.', String(x)) || return x
+    parts = Symbol.(split(String(x), '.'))
+    nm = _resolve_scope_properties(foldl((a, b) -> Expr(:., a, QuoteNode(b)), parts), ctx)
+    nm isa Symbol || _marginal_fail(x, "`$x` names no local of a submodel call; " *
+        "name a `@scan` array by its path (`z.x` for `x` of `z ~ sm(…)`)")
+    return nm
+end
 
 # ── Affine forms ──────────────────────────────────────────────────────────
 #
@@ -1221,6 +1237,8 @@ struct MarginalizedLatentQuery{Q}
     query::Q
     # Vector states (marginalize_vector.jl).
     groups::Vector{_MarginalGroup}
+    # Each lowered name's author path: a submodel's local reads as `z.x`.
+    labels::Dict{Symbol,Symbol}
 end
 
 # The marginalized latents of a lowered program: those whose filter scan
@@ -1254,7 +1272,8 @@ each field. A vector state is one entry keyed by its first array: its
 window's `components` (`(array, j)` for `array[t - j]`), its seed depth
 `lags`, and per step the window's filtered `mean` and `cov`, and the
 transition into it, `coef` and `shift` with noise covariance
-`innovation_cov` (entries up to `lags` hold seeds). At posterior draws of the parameters these determine each
+`innovation_cov` (entries up to `lags` hold seeds). A recurrence a submodel
+holds is keyed by its author path (`Symbol("z.x")`). At posterior draws of the parameters these determine each
 latent's exact conditional posterior; [`marginalized_latent_draws`](@ref)
 samples it. A program with no marginalized recurrence is refused.
 """
@@ -1265,7 +1284,11 @@ function prepare_marginalized_latents(built, plan::StructuralPlan; kwargs...)
         "integrates out no recurrence: marginalize one with `marginalize(model, :x)`"))
     wants = Tuple([(_marginal_name(x, r) for x in names for r in _MARGINAL_ROLES)...,
         (w for gr in groups for w in _vector_wants(gr...))...])
-    return MarginalizedLatentQuery(names, prepare_query(built, plan, wants; kwargs...), groups)
+    paths = _scope_name_paths(plan.submodel_scopes)
+    labels = Dict{Symbol,Symbol}(nm => Symbol(join(paths[nm], '.')) for nm in
+        Iterators.flatten((names, (a for gr in groups for (a, _) in gr[2]))) if haskey(paths, nm))
+    return MarginalizedLatentQuery(names, prepare_query(built, plan, wants; kwargs...), groups,
+        labels)
 end
 prepare_marginalized_latents(built, m::_PlanSource; kwargs...) =
     prepare_marginalized_latents(built, _bound_plan(m); kwargs...)
@@ -1276,12 +1299,14 @@ function (q::MarginalizedLatentQuery)(u::AbstractVector)
     entries = Any[NamedTuple{_MARGINAL_ROLES}(Tuple(values[(i - 1) * k + r] for r in 1:k))
         for i in eachindex(q.names)]
     next = k * length(q.names)
+    label(nm) = get(q.labels, nm, nm)
     for (g, comps, A, Q) in q.groups
         n = length(_vector_wants(g, comps, A, Q))
-        push!(entries, _vector_filtered(values[next+1:next+n], comps, A, Q))
+        f = _vector_filtered(values[next+1:next+n], comps, A, Q)
+        push!(entries, merge(f, (; components = map(((a, j),) -> (label(a), j), f.components))))
         next += n
     end
-    latents = (q.names..., (first(gr) for gr in q.groups)...)
+    latents = Tuple(label(nm) for nm in (q.names..., (first(gr) for gr in q.groups)...))
     return NamedTuple{latents}(Tuple(entries))
 end
 
@@ -1306,7 +1331,26 @@ function marginalized_latent_draws(filtered::NamedTuple, rng)
         haskey(f, :components) ? append!(out, _backward_sample_vector(rng, f)) :
             push!(out, x => _backward_sample(rng, f))
     end
-    return (; out...)
+    return _nest_paths(out)
+end
+
+# Draws keyed by author path: a submodel's local `z.x` nests as `draws.z.x`,
+# as `constrain` nests sampled locals.
+function _nest_paths(pairs)
+    out = Pair{Symbol,Any}[]
+    nested = Dict{Symbol,Vector{Pair{Symbol,Any}}}()
+    for (name, value) in pairs
+        head, rest = let s = String(name), i = findfirst('.', s)
+            i === nothing ? (name, nothing) : (Symbol(s[1:i-1]), Symbol(s[i+1:end]))
+        end
+        if rest === nothing
+            push!(out, name => value)
+        else
+            haskey(nested, head) || push!(out, head => nothing)
+            push!(get!(nested, head, Pair{Symbol,Any}[]), rest => value)
+        end
+    end
+    return (; (k => (v === nothing ? _nest_paths(nested[k]) : v) for (k, v) in out)...)
 end
 
 # A recurrence per `@plate` index holds one filtered series per index: each
