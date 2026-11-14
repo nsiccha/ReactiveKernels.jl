@@ -27,6 +27,10 @@ are recorded in the git history only.
   Modules that solve an ODE import `diffrax`; others do not. Ragged output
   times, traced tolerances and runtime failures (invalid inputs, an exceeded
   budget, a failed solve) are handled as in the docs' "ODE solves" section.
+- Without their solver packages, `rk_ode_rk45_tol` and `rk_ode_bdf_tol`
+  throw an error naming the packages to load instead of a `MethodError`; their
+  inferred result stays `Matrix{Float64}`, so `jax_source` translates code
+  calling them without the Julia solvers loaded.
 - JAX source slices a padded array that keeps each padded axis whole
   (`sol[:, j]` of a matrix padded along its rows): the slice is padded along
   those axes, where it was refused before.
