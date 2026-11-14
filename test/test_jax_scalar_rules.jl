@@ -66,6 +66,13 @@ end
     total = u[1] > 0 ? sum(checked_root.(x)) : 0.0
     return total
 end
+# The same broadcast first unconditionally, then under a data branch: the
+# second call site reuses the first's vectorized function.
+@kernel mixed_roots(u::Vector{Float64}, x::Vector{Float64}) = begin
+    plain = u[1] * sum(checked_root.(x))
+    total = plain + (u[2] > 0 ? sum(checked_root.(x)) : 0.0)
+    return total
+end
 end
 
 @testset "JAX scalar derivative graphs" begin
@@ -157,6 +164,10 @@ end
     # would raise on the lanes that branch discards.
     @test_throws ReactiveKernels.JAXEmissionError jax_source(
         JAXScalarRuleTests.guarded_roots; have=(:u,:x), want=:total)
+    # refused for the same reason when the branch reuses the function an
+    # unconditional call site already emitted.
+    @test_throws ReactiveKernels.JAXEmissionError jax_source(
+        JAXScalarRuleTests.mixed_roots; have=(:u,:x), want=:total)
     if rk_jax_available()
         native = prepare(JAXScalarRuleTests.guarded_fraction; have=(:u,), want=:value)
         for u in ([1.5, 0.5, 0.3], [2.5, 1.5, 0.8], [0.7, 3.0, 0.55])
