@@ -46,6 +46,16 @@ Any other form is refused with a `SurfaceLoweringError` naming the
 statement. Each scalar coefficient may vary by step (irregular gaps
 `exp(-gap[t] / range)`, a reset `r = 0` where a new series starts).
 
+A recurrence in a `@plate for g in …` cell integrates out one filter per
+index, when the cell's `@scan` carries `x` as above and one statement of the
+cell observes it, `y[g] .~ Normal.(offset .+ loading .* x, noise)`, with `y`
+bound data holding one vector per index. A cell definition or per-index
+output read only by that observation (`loc[g] = level[g] .+ x`) is part of
+it. Each of `offset`, `loading` and `noise` is one value per index (a
+declared array or data vector read as `a[g]`, a parameter, a cell scalar) or
+one value per entry of `y[g]` (data holding one vector per index read as
+`w[g]`, and broadcasts of these). The draws hold one trajectory per index.
+
 The marginalized program's density is the exact marginal density of the
 observations given the remaining parameters, so `coordinate_names` and the
 layout no longer contain `x` or its innovations. `:pointwise.y` holds the
@@ -109,6 +119,10 @@ end
 _mneg(a, dotted) = a === nothing ? nothing :
     a isa Real ? -a : Expr(:call, _op(dotted, :-), a)
 _mdiv(a, b, dotted) = a === nothing ? nothing : Expr(:call, _op(dotted, :/), a, b)
+# A literal seed of a carried value the steps compute in floating point
+# (`x[1] = 0`, `Normal(0, 1)`'s variance `1`) is a float, so the carry keeps
+# one type.
+_mfloat(ex) = ex isa Real ? Float64(ex) : ex
 
 function _aff_add(a::_Affine, b::_Affine, dotted)
     coefs = copy(a.coefs)
@@ -207,10 +221,12 @@ end
 
 """The transition `x[t] = coef * x[t - 1] + shift + Normal(0, sqrt(innovation_var))`
 of a linear-Gaussian recurrence, with its seed `x[1] ~ Normal(m0, sqrt(P0))`
-and the deterministic step statements the coefficients read."""
+and the deterministic step statements the coefficients read. `hi` is the
+loop's upper bound as written: a literal, a length name, or in a `@plate`
+cell any data expression (`length(y[g])`)."""
 struct _GaussianTransition
     loopvar::Symbol
-    hi::Union{Symbol,Int}
+    hi::Any
     m0::Any
     P0::Any
     locals::Vector{Any}
@@ -219,7 +235,20 @@ struct _GaussianTransition
     innovation_var::Any
 end
 
-function _gaussian_transition(spec::ScanSpec, x::Symbol)
+# A `@scan` block's spec and its loop's upper bound as written. A cell's
+# bound may be any data expression (`length(y[g])`), which the shared parser
+# does not take; it parses a stand-in name in its place, as the cell scan
+# lowering does (`_stochastic_cell_scan`).
+function _parse_marginal_scan(block)
+    hi = _scan_upper_bound(block)
+    (hi isa Int || hi isa Symbol || hi === nothing) && return parse_scan_block(block), hi
+    parsed = deepcopy(block)
+    forx = last(filter(st -> !(st isa LineNumberNode), parsed.args))
+    forx.args[1].args[2].args[3] = :_rkppl_marginal_bound
+    return parse_scan_block(parsed), hi
+end
+
+function _gaussian_transition(spec::ScanSpec, x::Symbol, hi = spec.hi)
     others = setdiff(spec.states, [x])
     isempty(others) || _marginal_fail(x, "its `@scan` also carries " *
         join(("`$o`" for o in others), ", ") * "; a recurrence carrying " *
@@ -289,7 +318,7 @@ function _gaussian_transition(spec::ScanSpec, x::Symbol)
         c = named(write.coefs[k], Symbol(:innovation_scale_, i))
         innovation_var = _madd(innovation_var, _mmul(c, c, false), false)
     end
-    return _GaussianTransition(t, spec.hi, m0, P0, locals, coef,
+    return _GaussianTransition(t, hi, m0, P0, locals, coef,
         write.constant, innovation_var)
 end
 
@@ -305,10 +334,14 @@ struct _MarginalNames
     scalars::Set{Symbol}
     arrays::Set{Symbol}
     defs::Dict{Symbol,Any}
+    # Arrays written in `@plate` cells: one entry per index, of a shape the
+    # syntax does not tell.
+    plate_arrays::Set{Symbol}
 end
 
 function _marginal_names(ast::Expr)
     scalars, arrays, defs = Set{Symbol}(), Set{Symbol}(), Dict{Symbol,Any}()
+    plate_arrays = Set{Symbol}()
     for st in ast.args
         st isa Expr || continue
         if Meta.isexpr(st, :call, 3) && st.args[1] === :~
@@ -324,10 +357,10 @@ function _marginal_names(ast::Expr)
         elseif Meta.isexpr(st, :macrocall) && st.args[1] === Symbol("@scan")
             union!(arrays, _scan_seed_names(st.args[end]))
         elseif Meta.isexpr(st, :macrocall) && st.args[1] === Symbol("@plate")
-            _plate_written_arrays!(arrays, st.args[end])
+            _plate_written_arrays!(plate_arrays, st.args[end])
         end
     end
-    return _MarginalNames(scalars, arrays, defs)
+    return _MarginalNames(scalars, union(arrays, plate_arrays), defs, plate_arrays)
 end
 
 function _plate_written_arrays!(arrays, ex)
@@ -345,36 +378,21 @@ const _MARGINAL_SCALAR_CALLS = (:sum, :mean, :std, :var, :minimum, :maximum,
 const _MARGINAL_ARRAY_CALLS = (:fill, :zeros, :ones, :collect, :vcat, :hcat,
     :repeat, :range, :reverse, :cumsum, :cumprod, :diff)
 
-function _marginal_shape(ex, names::_MarginalNames, values, active = Set{Symbol}())
+_combine_shapes(shapes) = :unknown in shapes ? :unknown :
+    :vector in shapes ? :vector : :scalar
+
+# The shape of `ex`: `:scalar` (one value), `:vector` (one value per entry of
+# the observation) or `:unknown`. `leaf(ex)` places names and indexed reads
+# (or returns `nothing` for an expression it does not place); literals,
+# broadcasts and calls are combined here.
+function _shape_of(ex, leaf)
     ex isa Real && return :scalar
-    if ex isa Symbol
-        if haskey(values, ex)
-            v = values[ex]
-            return v isa Number ? :scalar : v isa AbstractVector ? :vector : :unknown
-        end
-        ex in names.scalars && return :scalar
-        ex in names.arrays && return :vector
-        if haskey(names.defs, ex)
-            ex in active && return :unknown
-            push!(active, ex)
-            sh = _marginal_shape(names.defs[ex], names, values, active)
-            delete!(active, ex)
-            return sh
-        end
-        ex in (:pi, :π, :ℯ, :Inf, :NaN) && return :scalar
-        return :unknown
-    end
+    l = leaf(ex)
+    l === nothing || return l
     ex isa Expr || return :unknown
-    shape(a) = _marginal_shape(a, names, values, active)
-    combine(shapes) = :unknown in shapes ? :unknown :
-        :vector in shapes ? :vector : :scalar
-    if ex.head === :ref
-        shape(ex.args[1]) === :vector || return :unknown
-        idx = ex.args[2:end]
-        any(i -> i === :(:), idx) && return :vector
-        return combine([shape(i) for i in idx])
-    elseif ex.head === :. && length(ex.args) == 2 && Meta.isexpr(ex.args[2], :tuple)
-        return combine([shape(a) for a in ex.args[2].args])
+    shape(a) = _shape_of(a, leaf)
+    if ex.head === :. && length(ex.args) == 2 && Meta.isexpr(ex.args[2], :tuple)
+        return _combine_shapes([shape(a) for a in ex.args[2].args])
     elseif ex.head === :call && !isempty(ex.args)
         f = ex.args[1]
         if f isa GlobalRef
@@ -384,7 +402,7 @@ function _marginal_shape(ex, names::_MarginalNames, values, active = Set{Symbol}
         f isa Symbol || return :unknown
         args = ex.args[2:end]
         startswith(String(f), '.') && length(String(f)) > 1 &&
-            return combine([shape(a) for a in args])
+            return _combine_shapes([shape(a) for a in args])
         f in _MARGINAL_SCALAR_CALLS && return :scalar
         f in _MARGINAL_ARRAY_CALLS && return :unknown
         shapes = [shape(a) for a in args]
@@ -397,14 +415,87 @@ function _marginal_shape(ex, names::_MarginalNames, values, active = Set{Symbol}
     return :unknown
 end
 
+# A bound value: one number, or a vector of numbers. A vector of vectors
+# holds one array per index, which only a cell reads (below).
+_value_shape(v) = v isa Number ? :scalar :
+    v isa AbstractVector && all(e -> e isa Number, v) ? :vector : :unknown
+
+# The shape of one entry `v[g]` of a bound value read in a `@plate` cell.
+_entry_shape(v) = !(v isa AbstractVector) ? :unknown :
+    all(e -> e isa Number, v) ? :scalar :
+    all(e -> _value_shape(e) === :vector, v) ? :vector : :unknown
+
+# Shapes of the whole program's names: declarations, definitions, bound data.
+function _toplevel_shape_leaf(names::_MarginalNames, values)
+    active = Set{Symbol}()
+    function leaf(ex)
+        if ex isa Symbol
+            haskey(values, ex) && return _value_shape(values[ex])
+            ex in names.scalars && return :scalar
+            ex in names.arrays && return :vector
+            if haskey(names.defs, ex)
+                ex in active && return :unknown
+                push!(active, ex)
+                sh = _shape_of(names.defs[ex], leaf)
+                delete!(active, ex)
+                return sh
+            end
+            ex in (:pi, :π, :ℯ, :Inf, :NaN) && return :scalar
+            return :unknown
+        elseif Meta.isexpr(ex, :ref)
+            _shape_of(ex.args[1], leaf) === :vector || return :unknown
+            idx = ex.args[2:end]
+            any(i -> i === :(:), idx) && return :vector
+            return _combine_shapes([_shape_of(i, leaf) for i in idx])
+        end
+        return nothing
+    end
+    return leaf
+end
+
+# Shapes inside a `@plate for ivar in …` cell, relative to one index: a
+# per-index entry `a[ivar]` of a vector of numbers (bound data, a declared
+# array, a vector definition) is one value; of bound data holding one vector
+# per index it is one value per entry of the observation. Cell-local
+# definitions and per-index outputs are read through their values; a name of
+# the whole program counts only as one value.
+function _cell_shape_leaf(names::_MarginalNames, values, ivar, defs, outputs, drawn)
+    top = _toplevel_shape_leaf(names, values)
+    active = Set{Symbol}()
+    through(name, value) = begin
+        name in active && return :unknown
+        push!(active, name)
+        sh = _shape_of(value, leaf)
+        delete!(active, name)
+        sh
+    end
+    function leaf(ex)
+        if ex isa Symbol
+            (ex === ivar || ex in drawn) && return :scalar
+            haskey(defs, ex) && return through(ex, defs[ex])
+            return top(ex) === :scalar ? :scalar : :unknown
+        elseif Meta.isexpr(ex, :ref, 2) && ex.args[2] === ivar && ex.args[1] isa Symbol
+            a = ex.args[1]
+            haskey(outputs, a) && return through(a, outputs[a])
+            haskey(values, a) && return _entry_shape(values[a])
+            a in names.plate_arrays && return :unknown
+            return top(a) === :vector ? :scalar : :unknown
+        elseif Meta.isexpr(ex, :ref)
+            return :unknown
+        end
+        return nothing
+    end
+    return leaf
+end
+
 # A piece's value at the seed (`piece[1]` or `piece`) and at step `t`, and
 # with `square` its square at each. Compound pieces are named once as
-# top-level definitions; a one-value piece's square too, so the loop does not
-# recompute it.
-function _marginal_piece!(defs, piece, role, x, y, names, values, t; square = false)
+# definitions in `defs` (top-level, or cell-local in a cell); a one-value
+# piece's square too, so the loop does not recompute it.
+function _marginal_piece!(defs, piece, role, x, y, leaf, t; square = false)
     piece === nothing && return (nothing, nothing, nothing, nothing)
     piece isa Real && return (piece, piece, piece * piece, piece * piece)
-    shape = _marginal_shape(piece, names, values)
+    shape = _shape_of(piece, leaf)
     shape === :unknown && _marginal_fail(x, "cannot tell whether the observation's " *
         "$role `$piece` is one value or one value per entry of `$y`; write it " *
         "from declared parameters, bound data and definitions of them")
@@ -474,49 +565,27 @@ function _marginalize_latent(ast::Expr, x::Symbol, values, observing)
     stmts = ast.args
     k = findfirst(st -> _is_scan_of(st, x), stmts)
     if k === nothing
+        p = findfirst(st -> _is_plate_scan_of(st, x), stmts)
+        p === nothing || return _marginalize_cell_latent(ast, p, x, values, observing)
         nested = any(st -> Meta.isexpr(st, :macrocall) && st.args[1] === Symbol("@plate") &&
             _mentions_symbol(st, x), stmts)
         _marginal_fail(x, nested ?
-            "a recurrence inside a `@plate` cell is not marginalized yet" :
-            "no top-level `@scan` carries `$x`")
+            "its `@scan` is not a statement of a `@plate` cell (a recurrence in a " *
+            "nested `@plate` is not marginalized yet)" :
+            "no top-level `@scan` and no `@plate` cell `@scan` carries `$x`")
     end
     law = _gaussian_transition(parse_scan_block(stmts[k].args[end]), x)
     stmts, k = _inline_latent_definitions(stmts, k, x)
-    readers = [j for (j, st) in enumerate(stmts)
-        if j != k && st isa Expr && _mentions_symbol(st, x)]
-    length(readers) == 1 || _marginal_fail(x, "every read of `$x` must be the " *
-        "location of one Normal observation `y .~ Normal.(offset .+ loading .* $x, " *
-        "noise)`; " * (isempty(readers) ? "nothing reads it" : "it is read by " *
-        join(("`$(stmts[j])`" for j in readers), ", ")))
-    j = only(readers)
-    obs = stmts[j]
-    wrong() = _marginal_fail(x, "it is read by `$obs`; the filter needs a Normal " *
-        "observation of a whole observed vector, `y .~ Normal.(offset .+ loading .* $x, noise)`, " *
-        "with `offset`, `loading` and `noise` not reading `$x`")
-    (Meta.isexpr(obs, :call, 3) && obs.args[1] === :.~) || wrong()
-    y, rhs = obs.args[2], obs.args[3]
-    (Meta.isexpr(rhs, :., 2) && rhs.args[1] === :Normal &&
-        Meta.isexpr(rhs.args[2], :tuple) && length(rhs.args[2].args) in (1, 2)) || wrong()
-    y isa Symbol || wrong()
+    j = _marginal_reader(x, stmts, k)
+    y, loc, scale, form = _marginal_observation(x, stmts[j], y -> y isa Symbol, "y")
     (y in observing && get(values, y, nothing) isa AbstractVector) ||
         _marginal_fail(x, "its observation `$y` is not observed data; " *
             "marginalize a recurrence observed through bound data (`| (; $y)`)")
-    loc = rhs.args[2].args[1]
-    scale = length(rhs.args[2].args) == 2 ? rhs.args[2].args[2] : 1.0
-    _mentions_symbol(scale, x) && wrong()
-    readsx(ex) = _mentions_symbol(ex, x)
-    leafx(ex) = ex === x ? _Affine(nothing, Dict{Any,Any}(x => 1)) : nothing
-    form = _affine(loc, leafx, readsx, true)
-    (form === nothing || !haskey(form.coefs, x)) && wrong()
-    names = _marginal_names(ast)
+    leaf = _toplevel_shape_leaf(_marginal_names(ast), values)
     t = law.loopvar
     defs = Any[]
-    O1, Ot = _marginal_piece!(defs, form.constant, :offset, x, y, names, values, t)
-    L1, Lt, LL1, LLt = _marginal_piece!(defs, form.coefs[x], :loading, x, y, names,
-        values, t; square = true)
-    _, _, SS1, SSt = _marginal_piece!(defs, scale, :scale, x, y, names, values, t;
-        square = true)
-    filter = _filter_scan(x, y, law, (O1, L1, LL1, SS1), (Ot, Lt, LLt, SSt))
+    seed, step = _marginal_pieces!(defs, x, y, form, scale, leaf, t)
+    filter = _filter_scan(x, y, law, seed, step)
     transition = _transition_scan(x, law)
     out = Any[]
     for (i, st) in enumerate(stmts)
@@ -529,6 +598,237 @@ function _marginalize_latent(ast::Expr, x::Symbol, values, observing)
         push!(out, st)
     end
     return Expr(:block, out...)
+end
+
+# The one statement besides its scan (statement `k`) that reads `x`.
+function _marginal_reader(x, stmts, k; observation = "y .~ Normal.(offset .+ loading .* $x, noise)")
+    readers = [j for (j, st) in enumerate(stmts)
+        if j != k && st isa Expr && _mentions_symbol(st, x)]
+    length(readers) == 1 || _marginal_fail(x, "every read of `$x` must be the " *
+        "location of one Normal observation `$observation`; " *
+        (isempty(readers) ? "nothing reads it" : "it is read by " *
+            join(("`$(stmts[j])`" for j in readers), ", ")))
+    return only(readers)
+end
+
+# The Normal observation `y .~ Normal.(offset .+ loading .* x, noise)` that
+# reads `x`: its response `y` (which `response(y)` accepts), location, scale
+# and the location's affine form in `x`.
+function _marginal_observation(x, obs, response, spelled)
+    wrong() = _marginal_fail(x, "it is read by `$obs`; the filter needs a Normal " *
+        "observation of a whole observed vector, `$spelled .~ Normal.(offset .+ " *
+        "loading .* $x, noise)`, with `offset`, `loading` and `noise` not reading `$x`")
+    (Meta.isexpr(obs, :call, 3) && obs.args[1] === :.~) || wrong()
+    y, rhs = obs.args[2], obs.args[3]
+    (Meta.isexpr(rhs, :., 2) && rhs.args[1] === :Normal &&
+        Meta.isexpr(rhs.args[2], :tuple) && length(rhs.args[2].args) in (1, 2)) || wrong()
+    response(y) || wrong()
+    loc = rhs.args[2].args[1]
+    scale = length(rhs.args[2].args) == 2 ? rhs.args[2].args[2] : 1.0
+    _mentions_symbol(scale, x) && wrong()
+    readsx(ex) = _mentions_symbol(ex, x)
+    leafx(ex) = ex === x ? _Affine(nothing, Dict{Any,Any}(x => 1)) : nothing
+    form = _affine(loc, leafx, readsx, true)
+    (form === nothing || !haskey(form.coefs, x)) && wrong()
+    return y, loc, scale, form
+end
+
+# The observation's offset, loading and scale at the seed and at step `t`.
+function _marginal_pieces!(defs, x, y, form, scale, leaf, t)
+    O1, Ot = _marginal_piece!(defs, form.constant, :offset, x, y, leaf, t)
+    L1, Lt, LL1, LLt = _marginal_piece!(defs, form.coefs[x], :loading, x, y, leaf, t;
+        square = true)
+    _, _, SS1, SSt = _marginal_piece!(defs, scale, :scale, x, y, leaf, t; square = true)
+    return (O1, L1, LL1, SS1), (Ot, Lt, LLt, SSt)
+end
+
+# ── A recurrence per `@plate` index ───────────────────────────────────────
+#
+# In `@plate for g in …`, a cell `@scan` carrying `x` and one observation
+# `y[g] .~ Normal.(offset .+ loading .* x, noise)` of bound data holding one
+# vector per index become the cell's Kalman filter: the observed cell scan
+# `y[g][t] ~ …` (rkppl-use §5 "Observing a carried array") carrying the
+# filtered mean and variance. A second plate over the same indices, which
+# the density does not read, runs the filter again and records each index's
+# filtered moments and transition as per-index outputs for the draws.
+
+_plate_loop(st) = Meta.isexpr(st, :macrocall) && length(st.args) == 3 &&
+    st.args[1] === Symbol("@plate") && Meta.isexpr(st.args[3], :for) &&
+    Meta.isexpr(st.args[3].args[1], :(=), 2) && st.args[3].args[1].args[1] isa Symbol &&
+    Meta.isexpr(st.args[3].args[2], :block) ? st.args[3] : nothing
+
+function _is_plate_scan_of(st, x)
+    loop = _plate_loop(st)
+    loop === nothing && return false
+    return any(c -> _is_scan_of(c, x), loop.args[2].args)
+end
+
+# The cell carried arrays of the filter (in the density's plate) and of the
+# draws' plate, and the per-index outputs the draws query reads.
+_marginal_cell_carried(x, role) = _marginal_name(x, Symbol(:cell_, role))
+_marginal_draw_carried(x, role) = _marginal_name(x, Symbol(:draw_, role))
+
+function _marginalize_cell_latent(ast::Expr, p, x::Symbol, values, observing)
+    stmts = ast.args
+    loop = _plate_loop(stmts[p])
+    head = loop.args[1]
+    ivar = head.args[1]
+    cell = Any[c for c in loop.args[2].args if !(c isa LineNumberNode)]
+    k = findfirst(c -> _is_scan_of(c, x), cell)
+    spec, hi = _parse_marginal_scan(cell[k].args[end])
+    law = _gaussian_transition(spec, x, hi)
+    others = Any[st for (i, st) in enumerate(stmts) if i != p]
+    cell, k = _inline_cell_latent_definitions(cell, k, x, ivar, others)
+    j = _marginal_reader(x, cell, k;
+        observation = "y[$ivar] .~ Normal.(offset .+ loading .* $x, noise)")
+    y, loc, scale, form = _marginal_observation(x, cell[j],
+        y -> Meta.isexpr(y, :ref, 2) && y.args[1] isa Symbol && y.args[2] === ivar,
+        "y[$ivar]")
+    yname = y.args[1]
+    (yname in observing && _entry_shape(get(values, yname, nothing)) === :vector) ||
+        _marginal_fail(x, "its observation `$y` is not observed data holding one " *
+            "vector per index; marginalize a recurrence observed through bound data " *
+            "(`| (; $yname)`, one vector per `$ivar`)")
+    defs = Dict{Symbol,Any}(c.args[1] => c.args[2] for c in cell
+        if Meta.isexpr(c, :(=), 2) && c.args[1] isa Symbol)
+    outputs = Dict{Symbol,Any}(c.args[1].args[1] => c.args[2] for c in cell
+        if Meta.isexpr(c, :(=), 2) && Meta.isexpr(c.args[1], :ref, 2) &&
+            c.args[1].args[1] isa Symbol && c.args[1].args[2] === ivar)
+    # Scalars drawn in the cell: one value per index (the draws' plate refuses
+    # them below).
+    drawn = Set{Symbol}(c.args[2] for c in cell
+        if Meta.isexpr(c, :call, 3) && c.args[1] === :~ && c.args[2] isa Symbol)
+    leaf = _cell_shape_leaf(_marginal_names(ast), values, ivar, defs, outputs, drawn)
+    t = law.loopvar
+    pieces = Any[]
+    seed, step = _marginal_pieces!(pieces, x, y, form, scale, leaf, t)
+    filter = _filter_scan(x, y, law, seed, step;
+        M = _marginal_cell_carried(x, :mean), V = _marginal_cell_carried(x, :var))
+    density_cell = Any[]
+    for (i, c) in enumerate(cell)
+        i == k && continue
+        if i == j
+            append!(density_cell, pieces)
+            push!(density_cell, filter)
+            continue
+        end
+        push!(density_cell, c)
+    end
+    draws = _cell_draws_plate(x, y, law, seed, step, head, cell, pieces, k, j, observing)
+    out = Any[]
+    for (i, st) in enumerate(stmts)
+        if i == p
+            push!(out, Expr(:macrocall, st.args[1], st.args[2],
+                Expr(:for, head, Expr(:block, density_cell...))), draws)
+        else
+            push!(out, st)
+        end
+    end
+    return Expr(:block, out...)
+end
+
+# The cell form of `_inline_latent_definitions`: a cell definition reading
+# the latent (`mu = offset .+ loading .* x`) or a per-index output of one
+# (`loc[g] = x`) that only the observation reads is substituted there. A
+# per-index output read anywhere else in the program has no value once the
+# latent is integrated out, so it is refused.
+function _inline_cell_latent_definitions(cell, k, x, ivar, others)
+    cell = copy(cell)
+    while true
+        readers = [j for (j, c) in enumerate(cell)
+            if j != k && c isa Expr && _mentions_symbol(c, x)]
+        length(readers) == 1 || return cell, k
+        j = only(readers)
+        c = cell[j]
+        Meta.isexpr(c, :(=), 2) || return cell, k
+        lhs, value = c.args
+        output = Meta.isexpr(lhs, :ref, 2) && lhs.args[1] isa Symbol && lhs.args[2] === ivar
+        (lhs isa Symbol || output) || return cell, k
+        d = output ? lhs.args[1] : lhs
+        users = [i for (i, s) in enumerate(cell)
+            if i != j && s isa Expr && _mentions_symbol(s, d)]
+        outside = output ? [s for s in others if s isa Expr && _mentions_symbol(s, d)] : Any[]
+        (length(users) == 1 && isempty(outside)) || _marginal_fail(x, "its definition " *
+            "`$c` is read by " * (isempty(users) && isempty(outside) ? "nothing" :
+                join(("`$s`" for s in (cell[users]..., outside...)), ", ")) *
+            "; a definition reading `$x` must be read by its observation alone")
+        i = only(users)
+        replaced = _substitute_expr(cell[i], output ? lhs : d, value)
+        _mentions_symbol(replaced, d) && _marginal_fail(x, "its definition `$c` is " *
+            "read as `$d` in `$(cell[i])`; read it as `$lhs` in the observation")
+        cell[i] = replaced
+        deleteat!(cell, j)
+        j < k && (k -= 1)
+    end
+end
+
+# The plate of the draws: the cell's definitions the filter needs, the
+# observation's pieces, and a deterministic scan running the filter and
+# recording the transition, returned per index. The density reads none of it.
+function _cell_draws_plate(x, y, law, seed, step, head, cell, pieces, k, j, observing)
+    ivar = head.args[1]
+    carried = Tuple(_marginal_draw_carried(x, r) for r in _MARGINAL_ROLES)
+    scan = _cell_draws_scan(x, y, law, seed, step, carried)
+    needed = Set{Symbol}()
+    _all_symbols!(needed, Expr(:block, pieces..., scan))
+    sampled = Set{Symbol}()
+    for (i, c) in enumerate(cell)
+        i == j && continue
+        Meta.isexpr(c, :call, 3) && c.args[1] in (:~, :.~) || continue
+        lhs = c.args[2]
+        base = Meta.isexpr(lhs, :ref) ? lhs.args[1] : lhs
+        # An observation of bound data is data to the draws' plate.
+        base isa Symbol && !(base in observing) && push!(sampled, base)
+    end
+    kept = Set{Int}()
+    changed = true
+    while changed
+        changed = false
+        for (i, c) in enumerate(cell)
+            (i in (k, j) || i in kept) && continue
+            (Meta.isexpr(c, :(=), 2) && c.args[1] isa Symbol && c.args[1] in needed) ||
+                continue
+            push!(kept, i)
+            _all_symbols!(needed, c.args[2])
+            changed = true
+        end
+    end
+    drawn = intersect(needed, sampled)
+    isempty(drawn) || _marginal_fail(x, "its transition or observation reads " *
+        join(("`$d`" for d in sort!(collect(drawn))), ", ") * ", drawn inside the " *
+        "`@plate` cell; draw it outside the cell (a declared array read as `$(first(drawn))[$ivar]`)")
+    body = Any[cell[i] for i in sort!(collect(kept))]
+    append!(body, pieces)
+    push!(body, scan)
+    for (r, c) in zip(_MARGINAL_ROLES, carried)
+        push!(body, Expr(:(=), Expr(:ref, _marginal_name(x, r), ivar), c))
+    end
+    return Expr(:macrocall, Symbol("@plate"), LineNumberNode(0),
+        Expr(:for, head, Expr(:block, body...)))
+end
+
+function _cell_draws_scan(x, y, law::_GaussianTransition, seed_pieces, step_pieces, carried)
+    t = law.loopvar
+    M, V, C, D, Q = carried
+    _, _, mean1, var1 = _kalman_update(:($y[1]), law.m0, law.P0, seed_pieces, nothing)
+    pm, pv, g = _marginal_name(x, :predicted_mean),
+        _marginal_name(x, :predicted_var), _marginal_name(x, :gain)
+    prev(a) = Expr(:ref, a, Expr(:call, :-, t, 1))
+    pm_ex = something(_madd(_mmul(law.coef, prev(M), false), law.shift, false), 0.0)
+    pv_ex = something(_madd(_mmul(_mmul(law.coef, law.coef, false), prev(V), false),
+        law.innovation_var, false), 0.0)
+    _, gain, meant, vart = _kalman_update(:($y[$t]), pm, pv, step_pieces, g)
+    body = Expr(:block, law.locals...,
+        Expr(:(=), pm, pm_ex), Expr(:(=), pv, pv_ex), Expr(:(=), g, gain),
+        Expr(:(=), :($M[$t]), meant), Expr(:(=), :($V[$t]), vart),
+        Expr(:(=), :($C[$t]), something(law.coef, 0.0)),
+        Expr(:(=), :($D[$t]), something(law.shift, 0.0)),
+        Expr(:(=), :($Q[$t]), something(law.innovation_var, 0.0)))
+    loop = Expr(:for, Expr(:(=), t, Expr(:call, :(:), 2, law.hi)), body)
+    return _scan_macro(Expr(:block,
+        Expr(:(=), :($M[1]), mean1), Expr(:(=), :($V[1]), var1),
+        Expr(:(=), :($C[1]), 0.0), Expr(:(=), :($D[1]), _mfloat(something(law.m0, 0.0))),
+        Expr(:(=), :($Q[1]), _mfloat(law.P0)), loop))
 end
 
 # A definition that reads the latent (`mu = offset .+ loading .* x`) and is
@@ -561,6 +861,9 @@ end
 
 _substitute_name(ex, name, value) = ex === name ? value :
     ex isa Expr ? Expr(ex.head, (_substitute_name(a, name, value) for a in ex.args)...) : ex
+# Replace every occurrence of the expression `pattern` (`loc[g]`) by `value`.
+_substitute_expr(ex, pattern, value) = ex == pattern ? value :
+    ex isa Expr ? Expr(ex.head, (_substitute_expr(a, pattern, value) for a in ex.args)...) : ex
 
 _scan_macro(block) = Expr(:macrocall, Symbol("@scan"), LineNumberNode(0), block)
 
@@ -581,9 +884,9 @@ function _kalman_update(yt, pm, pv, (O, L, LL, SS), gain)
     return predictive, gain_ex, filtered_mean, filtered_var
 end
 
-function _filter_scan(x, y, law::_GaussianTransition, seed_pieces, step_pieces)
+function _filter_scan(x, y, law::_GaussianTransition, seed_pieces, step_pieces;
+        M = _marginal_name(x, :mean), V = _marginal_name(x, :var))
     t = law.loopvar
-    M, V = _marginal_name(x, :mean), _marginal_name(x, :var)
     obs1, _, mean1, var1 = _kalman_update(:($y[1]), law.m0, law.P0, seed_pieces, nothing)
     pm, pv, g = _marginal_name(x, :predicted_mean),
         _marginal_name(x, :predicted_var), _marginal_name(x, :gain)
@@ -610,8 +913,8 @@ function _transition_scan(x, law::_GaussianTransition)
     loop = Expr(:for, Expr(:(=), t, Expr(:call, :(:), 2, law.hi)), body)
     return _scan_macro(Expr(:block,
         Expr(:(=), :($C[1]), 0.0),
-        Expr(:(=), :($D[1]), something(law.m0, 0.0)),
-        Expr(:(=), :($Q[1]), law.P0), loop))
+        Expr(:(=), :($D[1]), _mfloat(something(law.m0, 0.0))),
+        Expr(:(=), :($Q[1]), _mfloat(law.P0)), loop))
 end
 
 # ── Exact draws of a marginalized recurrence ─────────────────────────────
@@ -631,11 +934,14 @@ struct MarginalizedLatentQuery{Q}
 end
 
 # The marginalized latents of a lowered program: those whose filter scan
-# (carrying `_rkppl_marginal_<x>_mean`) it holds.
+# (carrying `_rkppl_marginal_<x>_mean`) it holds at top level, or whose draws'
+# plate returns `_rkppl_marginal_<x>_mean[g]` per index.
 function _marginalized_names(plan::StructuralPlan)
     out = Symbol[]
     suffix = "_mean"
-    for sp in plan.scans, s in sp.states
+    names = Iterators.flatten(((s for sp in plan.scans for s in sp.states),
+        (d.name for d in plan.derived)))
+    for s in names
         str = String(s)
         startswith(str, _MARGINAL_PREFIX) && endswith(str, suffix) || continue
         push!(out, Symbol(str[length(_MARGINAL_PREFIX)+1:end-length(suffix)]))
@@ -652,9 +958,10 @@ out of `plan`, on the graph `built` (`build_kernel` of the same binding).
 filtered `mean[t]` and `var[t]` of the state given the first `t`
 observations, and the transition `x[t] = coef[t] * x[t - 1] + shift[t] +
 Normal(0, sqrt(innovation_var[t]))` (entry 1 holds the seed's law: `coef[1]
-= 0`). At posterior draws of the parameters these determine each latent's
-exact conditional posterior; [`marginalized_latent_draws`](@ref) samples it.
-A program with no marginalized recurrence is refused.
+= 0`). A recurrence per `@plate` index holds one such vector per index in
+each field. At posterior draws of the parameters these determine each
+latent's exact conditional posterior; [`marginalized_latent_draws`](@ref)
+samples it. A program with no marginalized recurrence is refused.
 """
 function prepare_marginalized_latents(built, plan::StructuralPlan; kwargs...)
     names = _marginalized_names(plan)
@@ -680,9 +987,10 @@ end
     marginalized_latent_draws(filtered::NamedTuple, rng) -> NamedTuple
 
 One exact draw of every marginalized recurrence given the parameters `u`,
-keyed by latent name (`Vector{Float64}`, one value per entry), by forward
+keyed by latent name (`Vector{Float64}`, one value per entry; for a
+recurrence per `@plate` index, one such vector per index), by forward
 filtering, backward sampling over `q(u)`. Only `rng` supplies randomness, in
-key order, so a seeded `rng` reproduces the draws. At posterior draws of the
+key order and then index order, so a seeded `rng` reproduces the draws. At posterior draws of the
 parameters, parameters and latents together are exact draws from the joint
 posterior of the model as written.
 """
@@ -691,9 +999,14 @@ marginalized_latent_draws(q::MarginalizedLatentQuery, u::AbstractVector, rng) =
 marginalized_latent_draws(filtered::NamedTuple, rng) =
     map(f -> _backward_sample(rng, f), filtered)
 
+# A recurrence per `@plate` index holds one filtered series per index: each
+# is drawn on its own, in index order.
+_backward_sample(rng, f) = f.mean isa AbstractVector{<:Number} ? _backward_sample_series(rng, f) :
+    Vector{Float64}[_backward_sample_series(rng, map(r -> r[i], f)) for i in eachindex(f.mean)]
+
 # Backward sampling: `x[T]` from its filtered law, then each `x[t]` from its
 # law given the filtered `x[t]` and the drawn `x[t + 1]`.
-function _backward_sample(rng, f)
+function _backward_sample_series(rng, f)
     m, P, a, c, q = f.mean, f.var, f.coef, f.shift, f.innovation_var
     T = length(m)
     x = Vector{Float64}(undef, T)
