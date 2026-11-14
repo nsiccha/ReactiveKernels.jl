@@ -16,6 +16,17 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.235
+
+- Bound plates retain a shared scalar guard at runtime when its arms contain
+  no work over bound inputs to prepare. The selected loop keeps shared work
+  outside its cells; mixed and wholly bound arms retain their existing cached
+  preparation. Changing an eligible guard or the observation count reuses the
+  same emitted program.
+- JAX export supports `all` and `any` with `iszero` or `!iszero` over built-in
+  real numeric inputs, including empty and ragged arrays. Padding contributes
+  the reduction's identity; other predicates retain the existing refusal.
+
 ## 0.1.234
 
 - JAX emission translates `rk_cholesky_lower` with lower-triangle semantics,
