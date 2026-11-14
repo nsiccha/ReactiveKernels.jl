@@ -310,9 +310,11 @@ function _jax_data_definitions(plan::StructuralPlan, names)
     # Each response with a presence mask: its mask from the raw value, then
     # its stored values, ahead of every definition that reads them.
     missing_responses = Pair{Symbol,Any}[]
+    missing_names = Set{Symbol}()
     for nm in sort!(collect(available))
         mask = _observed_mask_name(nm)
         haskey(plan.columns, mask) || continue
+        push!(missing_names, nm)
         mask in available &&
             push!(missing_responses, mask => :($_rkppl_presence($nm)))
         push!(missing_responses,
@@ -383,10 +385,17 @@ function _jax_data_definitions(plan::StructuralPlan, names)
         push!(order, nm)
     end
     foreach(visit, sort!(collect(keys(found))))
+    # A definition reading a response only through its presence or its values
+    # with absent entries filled (a marginalized recurrence's filter) reads
+    # the raw value, as binding does: it goes ahead of the stored values.
+    raw_read(ex) = _is_presence_read(ex) && ex.args[2] in missing_names &&
+        all(a -> !(a isa Symbol || a isa Expr), ex.args[3:end])
+    raw = [nm for nm in order if raw_read(found[nm])]
     # `jax_source` resolves their callees in the generated scope, as binding
     # does, where the value vocabulary's `logistic` is `_ppl_logistic`.
-    Pair{Symbol,Any}[missing_responses;
-                     [nm => _argument_value_calls(found[nm]) for nm in order]]
+    Pair{Symbol,Any}[[nm => _argument_value_calls(found[nm]) for nm in raw];
+                     missing_responses;
+                     [nm => _argument_value_calls(found[nm]) for nm in order if !(nm in raw)]]
 end
 _jax_data_name(nm::Symbol) = nm
 

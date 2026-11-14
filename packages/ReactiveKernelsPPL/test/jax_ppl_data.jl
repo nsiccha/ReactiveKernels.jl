@@ -14,9 +14,16 @@ function jax_raw_data(plan, src)
     # input (`UNTRANSLATED`) is the binding's own value of it (a submodel's
     # `r.g` is the input `r_g`).
     held = plan.data_values === nothing ? Symbol[] : collect(keys(plan.data_values.values))
+    # A response with a presence mask is passed as the caller had it, its
+    # absent entries `missing`: the plan stores it filled.
+    function raw(n, v)
+        mask = ReactiveKernelsPPL._observed_mask_name(Symbol(n))
+        haskey(plan.columns, mask) && v isa AbstractArray || return v
+        return map((x, p) -> p ? x : missing, v, plan.columns[mask])
+    end
     function value(n)
         for k in (Symbol(n), Symbol("_rkppl_value_", n), Symbol("_rkppl_conditioned_", n))
-            haskey(plan.columns, k) && return plan.columns[k]
+            haskey(plan.columns, k) && return raw(n, plan.columns[k])
         end
         ReactiveKernelsPPL._bound_value(plan, plan.columns,
             only(h for h in held if replace(String(h), "." => "_") == n))

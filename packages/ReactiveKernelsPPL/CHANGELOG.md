@@ -23,8 +23,10 @@ are recorded in the git history only.
   carries the state through it without an update, the likelihood has no
   term for it (its `:pointwise` entry is 0), and the exact draws condition on
   the present entries alone. One program serves every pattern of missing
-  entries. A missing entry in a `@plate` cell's series is refused at lowering,
-  naming the observation.
+  entries, and `jax_source` translates it: `prepare_data` reads the filter's
+  presence and filled values from the raw response, before storing the
+  response filled. A missing entry in a `@plate` cell's series is refused at
+  lowering, naming the observation.
 
 ## 0.1.188
 
