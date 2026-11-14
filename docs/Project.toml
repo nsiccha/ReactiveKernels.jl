@@ -30,7 +30,7 @@ Documenter = "1"
 DocumenterVitepress = "0.3.9"
 LogDensityProblems = "2"
 ReactiveKernelsPPL = "0.1.177"
-WarmupHMC = "0.2.21"
+WarmupHMC = "0.2.21, 0.3"
 
 [sources.ReactiveKernels]
 path = ".."

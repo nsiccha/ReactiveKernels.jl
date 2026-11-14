@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.186
+## 0.1.187
 
 - `jax_source` translates the length check of a top-level observed `@scan`
   array, so the module of a program with one is standalone
@@ -24,7 +24,7 @@ are recorded in the git history only.
   `marginalize`. When the module runs, an array whose length differs from
   the scan's raises, as the native check does.
 
-## 0.1.185
+## 0.1.186
 
 - `marginalize(model, :x)` also integrates out a recurrence inside a `@plate`
   cell, one Kalman filter per index: a cell `@scan` carrying `x` as in 0.1.183,
@@ -34,6 +34,23 @@ are recorded in the git history only.
   scale may be one value per index (`level[g]`, a declared array or data
   vector) or one per entry (`x[g]` of data holding one vector per index).
   `marginalized_latent_draws` returns one trajectory per index.
+
+## 0.1.185
+
+- `adaptive_centering_problem` accepts nested cells: a cell's location or
+  log-scale may read another selected cell's latent, for example
+  `z_u = (location = :unit_location, ...)` with
+  `unit_location = mu .+ tau_g .* z_g[group]` beside a `z_g` cell. The reads
+  order the cells into levels; each level is centred about the model-frame
+  values of the levels it reads, so re-centering a parent keeps the meaning of
+  the coordinates centred on it. WarmupHMC maps the levels in order, and the
+  joint endpoint kernel runs once per level. Before, any read of a selected
+  latent was refused. A cell reading its own latent, and cells reading each
+  other's (a cycle), are refused naming the read or the cycle.
+- Nested levels need WarmupHMC 0.3.0, whose accessors read earlier pairs at
+  their model values; with WarmupHMC 0.2 they are refused. The compat bound
+  is widened to `"0.2.21, 0.3"`, and single-level cells behave as before on
+  both.
 
 ## 0.1.184
 
