@@ -237,7 +237,7 @@ function _window_input_entry(layout::LayoutTable, input::Symbol, k::Int)
         !_is_slice_transform(e.transform) && !_is_lkj_stack(e.transform) &&
         prod(e.dims; init = 1) == e.size && !haskey(layout.cell_latents, e.name) &&
         !haskey(layout.cell_geometries, e.name))
-    elementwise && e.transform in (:identity, :exp, :logistic, :interval, :floored, :upper) ||
+    elementwise && e.transform in (:identity, :exp, :logistic, :interval, :floored, :upper, :bounded) ||
         throw(ContractValidationError(
             "[windows] window $k: the boundary input $input must be a scalar or an array " *
             "of independent entries (support transform $(e.transform), kind $(e.kind))"))
@@ -359,9 +359,11 @@ function _window_forward!(w::JoinedWindows, x::AbstractVector{<:Real})
             for (m, (i, p, j)) in enumerate(w.fed[k])
                 e = w.fed_entries[k][m]
                 v = out[p]
-                u[i] = _unconstrain_elt(e, Float64(v isa Number ? v : vec(v)[j]))
+                # The coordinate's own element of the input, for a bound per element.
+                at = i - e.offset + 1
+                u[i] = _unconstrain_elt(e, Float64(v isa Number ? v : vec(v)[j]), at)
                 # d(unconstrained)/d(output) of the input's support.
-                w.scale[k][i] = exp(-_logjac_elt(e, u[i]))
+                w.scale[k][i] = exp(-_logjac_elt(e, u[i], at))
             end
         end
     end

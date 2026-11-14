@@ -1098,7 +1098,7 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
         isempty(x.extent) && _jax_error("a ragged array without its lengths", _jax_where(ctx))
         # One group's row and length, or several groups' rows and lengths.
         return _PyVal(_py_atom(x.code) * "[" * join(parts, ", ") * "]", T, false,
-                      x.extent * "[" * join(parts, ", ") * "]", "", 0,
+                      x.extent * "[" * join(parts, ", ") * "]", "", kept == 0 ? 1 : 0,
                       kept == 0 && !target ? _jax_selected_origin(x, T, join(parts, ", ")) : nothing)
     end
     if !isempty(x.extent) && kept > 0
@@ -1935,11 +1935,15 @@ function _jax_loop_range(ctx::_JaxContext, iter)
     elseif iter isa Expr && iter.head === :call && length(iter.args) >= 2 &&
            _jax_resolve(ctx, iter.args[1]) in (eachindex, axes)
         x = _jax_expr(ctx, iter.args[2])
-        _jax_rank(x.T) == 1 || _jax_error("a loop over the indices of a `", x.T, "`",
-                                          _jax_where(ctx))
         lo = _jax_literal(1)
-        hi = isempty(x.extent) ? _PyVal(_py_atom(x.code) * ".shape[0]", Int, true) :
-            _PyVal(x.extent, Int, false, "", _py_atom(x.code) * ".shape[0]")
+        if _jax_resolve(ctx, iter.args[1]) === axes && length(iter.args) == 3
+            hi = _jax_function_call(ctx, size, [x, _jax_expr(ctx, iter.args[3])])
+        else
+            _jax_rank(x.T) == 1 || _jax_error("a loop over the indices of a `", x.T, "`",
+                                              _jax_where(ctx))
+            hi = isempty(x.extent) ? _PyVal(_py_atom(x.code) * ".shape[0]", Int, true) :
+                _PyVal(x.extent, Int, false, "", _py_atom(x.code) * ".shape[0]")
+        end
     else
         _jax_error("the loop range `", iter, "` has no JAX translation", _jax_where(ctx))
     end
@@ -3374,6 +3378,99 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(_native_exp), args::Vecto
 end
 _jax_function_call(ctx::_JaxContext, ::typeof(exp), args::Vector{_PyVal}) =
     _jax_function_call(ctx, _native_exp, args)
+
+# RK's factorization uses the lower triangle only, even when the ignored
+# upper entries are nonfinite. JAX otherwise symmetrizes its input. Both
+# libraries supply their ordinary derivatives; no backend-specific rule is
+# authored here. Padding is an independent identity block.
+function _jax_function_call(ctx::_JaxContext, ::typeof(rk_cholesky_lower), args::Vector{_PyVal})
+    A = _jax_bind!(ctx, :covariance, only(args))
+    n = _jax_function_call(ctx, size, [A, _jax_literal(1)])
+    m = _jax_function_call(ctx, size, [A, _jax_literal(2)])
+    _jax_call(ctx, _runtime_check,
+        [_jax_call(ctx, ==, [n, m]),
+         _PyVal(repr("rk_cholesky_lower needs a square matrix"), ArgumentError)])
+    host = _jax_known(ctx, A)
+    api = host ? "np" : "jnp"
+    dtype = host ? _host_dtype(Float64) : _jax_dtype(Float64)
+    code = api * ".asarray(" * A.code * ", dtype=" * dtype * ")"
+    extent = ""
+    if ctx.host === nothing && !isempty(A.extent)
+        # The two stored axes can have different capacities although their
+        # valid square block has one size. Extend storage, never source code.
+        width = _jax_bind!(ctx, :width, _PyVal("max(" * A.code * ".shape)", Int, true))
+        code = "jnp.pad(" * code * ", ((0, " * width.code * " - " * A.code *
+               ".shape[0]), (0, " * width.code * " - " * A.code * ".shape[1])))"
+        mask = _jax_bind!(ctx, :valid_rows,
+            _PyVal("jnp.arange(" * width.code * ") < " * n.code, Vector{Bool}))
+        code = "jnp.where(" * mask.code * "[:, None] & " * mask.code *
+               "[None, :], " * code * ", jnp.eye(" * width.code * ", dtype=" * dtype * "))"
+        extent = n.code
+    end
+    code = api * ".linalg.cholesky(" * code * (host ? ")" : ", symmetrize_input=False)")
+    T = _jax_return_type(rk_cholesky_lower, [A.T])
+    L = _jax_bind!(ctx, :factor, _PyVal(code, T, host, extent, "", isempty(extent) ? 0 : 3))
+    _jax_call(ctx, _runtime_check,
+        [_PyVal(api * ".all(" * api * ".diagonal(" * L.code * ") > 0)", Bool, host),
+         _PyVal(repr("rk_cholesky_lower: a pivot is not positive definite"), PosDefException)])
+    L
+end
+
+function _jax_function_call(ctx::_JaxContext, ::typeof(\), args::Vector{_PyVal})
+    length(args) == 2 && args[1].T isa Type && args[1].T <: LinearAlgebra.LowerTriangular &&
+        _jax_rank(args[2].T) in (1, 2) || return _jax_traceable_or_lowered(ctx, \, args)
+    L, b = args
+    # One _PyVal extent cannot describe independently padded rows and
+    # columns. A padded RHS row axis shares L's extent by the size check.
+    ctx.host === nothing && !isempty(L.extent) && _jax_padded_axes(b) == 2 &&
+        L.extent != b.extent && _jax_error(
+            "a triangular solve with independently padded rows and columns", _jax_where(ctx))
+    n = _jax_function_call(ctx, size, [L, _jax_literal(1)])
+    m = _jax_function_call(ctx, size, [b, _jax_literal(1)])
+    _jax_call(ctx, _runtime_check, [_jax_call(ctx, ==, [n, m]),
+        _PyVal(repr("triangular solve: incompatible dimensions"), DimensionMismatch)])
+    factor, rhs = L.code, b.code
+    if ctx.host === nothing && (!isempty(L.extent) || !isempty(b.extent))
+        L = _jax_bind!(ctx, :factor, L)
+        b = _jax_bind!(ctx, :rhs, b)
+        factor = _jax_masked(L, "jnp.eye(" * L.code * ".shape[0], dtype=" * L.code * ".dtype)")
+        rhs = _jax_masked(b, "0")
+        width = L.code * ".shape[0]"
+        padding = "(0, max(0, " * width * " - " * b.code * ".shape[0]))"
+        _jax_rank(b.T) == 2 && (padding = "(" * padding * ", (0, 0))")
+        rhs = "jnp.pad(" * rhs * ", " * padding * ")[:" * width * "]"
+    end
+    # SciPy's optional full-array finite check would read an ignored upper
+    # triangle; JAX already checks only the selected triangle.
+    code = "jax.scipy.linalg.solve_triangular(" * factor * ", " * rhs *
+           ", lower=True, check_finite=False)"
+    result = _jax_result(\, args, code)
+    padded = _jax_padded_axes(b) | (isempty(L.extent) ? 0 : 1)
+    _PyVal(result.code, result.T, result.static, result.extent, "", padded)
+end
+
+function _jax_function_call(ctx::_JaxContext, ::typeof(LinearAlgebra.diag), args::Vector{_PyVal})
+    length(args) == 1 && _jax_rank(args[1].T) == 2 ||
+        return _jax_traceable_or_lowered(ctx, LinearAlgebra.diag, args)
+    A = only(args)
+    result = _jax_result(LinearAlgebra.diag, args, "jnp.diag(" * A.code * ")")
+    extent = if ctx.host === nothing && !isempty(A.extent)
+        n = _jax_function_call(ctx, size, [A, _jax_literal(1)])
+        m = _jax_function_call(ctx, size, [A, _jax_literal(2)])
+        n.code == m.code ? n.code : "jnp.minimum(" * n.code * ", " * m.code * ")"
+    else
+        ""
+    end
+    _PyVal(result.code, result.T, result.static, extent)
+end
+
+function _jax_function_call(ctx::_JaxContext, ::typeof(LinearAlgebra.diagm), args::Vector{_PyVal})
+    length(args) == 1 && _jax_rank(args[1].T) == 1 ||
+        return _jax_traceable_or_lowered(ctx, LinearAlgebra.diagm, args)
+    result = _jax_result(LinearAlgebra.diagm, args, "jnp.diag(" * only(args).code * ")")
+    _PyVal(result.code, result.T, result.static, result.extent, "", isempty(result.extent) ? 0 : 3)
+end
+
 # The native body's product companion computes Base's `*` (core.jl).
 _jax_function_call(ctx::_JaxContext, ::typeof(_native_mul), args::Vector{_PyVal}) =
     _jax_function_call(ctx, *, args)
@@ -3845,10 +3942,31 @@ for (f, name) in ((trunc, "jnp.trunc"), (floor, "jnp.floor"), (ceil, "jnp.ceil")
     end
 end
 _jax_call_positional(ctx::_JaxContext, ::typeof(typeassert), args::Vector{_PyVal}) = args[1]
+# Zero predicates over built-in real scalars are pure and total, so testing
+# every entry preserves all/any's short-circuit result and observable behavior.
+# Do not apply this reduction to arbitrary predicates: those may throw or have
+# effects in entries Julia would not visit.
+function _jax_zero_predicate_reduction(ctx::_JaxContext, f, name, args)
+    length(args) == 2 || _jax_error("this `", f, "` call", _jax_where(ctx))
+    predicate = _jax_function_of(args[1])
+    predicate_type = _jax_callable_type(predicate)
+    x = args[2]
+    E = _jax_eltype(x.T)
+    E in (Bool, Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64,
+          Float16, Float32, Float64) &&
+        (predicate_type === typeof(iszero) || predicate_type === typeof(!iszero)) ||
+        _jax_error("this `", f, "` predicate call", _jax_where(ctx))
+    comparison = predicate_type === typeof(iszero) ? (==) : (!=)
+    mapped = _jax_broadcast(ctx, comparison, [x, _jax_literal(0)])
+    code = _jax_padded_reduced(ctx, f, mapped, f === all ? "True" : "False")
+    text = name * "(" * code * ")"
+    x.static && (text = _host_static_text(text))
+    _PyVal(text, Bool, x.static)
+end
 for (f, name) in ((all, "jnp.all"), (any, "jnp.any"))
     @eval _jax_function_call(ctx::_JaxContext, ::typeof($f), args::Vector{_PyVal}) =
         length(args) == 1 ? _PyVal($name * "(" * args[1].code * ")", Bool, args[1].static) :
-        _jax_error("this `", $f, "` call", _jax_where(ctx))
+        _jax_zero_predicate_reduction(ctx, $f, $name, args)
 end
 # Identity comparisons decide while tracing, on static values only.
 for (f, op) in (((===), " is "), ((!==), " is not "))
@@ -4038,7 +4156,7 @@ function _jax_index_values(ctx::_JaxContext, x::_PyVal, indices::Vector{_PyVal})
     # Rows of a ragged value keep their lengths, as `x[i]` does (`_jax_index`).
     if _jax_ragged(x.T)
         isempty(x.extent) && _jax_error("a ragged array without its lengths", _jax_where(ctx))
-        return _PyVal(code, T, false, x.extent * "[" * join(parts, ", ") * "]")
+        return _PyVal(code, T, false, x.extent * "[" * join(parts, ", ") * "]", "", kept == 0 ? 1 : 0)
     end
     _PyVal(code, T, false, _jax_gather_extent(ctx, gathered, kept))
 end
@@ -5651,7 +5769,9 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     cell_extents = Bool[ragged[i] for i in eachindex(inputs)]
     # A tuple-valued plate's entries keep which fields have a length: a field
     # without one is `None` in the cell's lengths, and has no extent there.
-    cell_fields = Int[ragged[i] ? _jax_padded_fields(v) : 0 for (i, v) in enumerate(inputs)]
+    cell_fields = Int[!ragged[i] ? 0 : _jax_tuple_valued(v.T) ? _jax_padded_fields(v) :
+                      mapped[i] && _jax_ragged(v.T) ? 1 : _jax_padded_axes(v)
+                      for (i, v) in enumerate(inputs)]
     # `jax.vmap` hands an argument it does not map (`in_axes` `None`) to the
     # cell unchanged, also under `jax.jit`: a Python or NumPy value stays
     # one, and a `StaticInt` of the prepared data stays static (measured with
@@ -6124,22 +6244,30 @@ Base.write(path::AbstractString, src::JAXSource) = write(path, src.text)
 # The host-side helper that turns a ragged input (one array per group) into
 # the padded array and lengths vector the functions take.
 const _JAX_PAD_RAGGED = """
-def pad_ragged(arrays: list) -> tuple:
-    \"\"\"Pad a list of 1-D arrays into one 2-D array and its lengths vector.
+def pad_ragged(arrays: list, rank=None) -> tuple:
+    \"\"\"Pad arrays along their first axis and return the array and lengths.
 
     Each row repeats its last entry up to the longest length, so every padded
     slot holds a valid value; the functions mask padded entries by length.
     Pass the two results as the input and its `_lengths` input.
+    Trailing dimensions must agree. For an empty list of matrix cells,
+    pass `rank=2`; otherwise rank is inferred (or defaults to 1).
     \"\"\"
     import numpy as np
     rows = [np.asarray(a) for a in arrays]
+    rank = rows[0].ndim if rank is None and rows else 1 if rank is None else rank
+    tail = rows[0].shape[1:] if rows else (1,) * (rank - 1)
+    if any(r.ndim != rank or r.shape[1:] != tail for r in rows):
+        raise ValueError("ragged cells need their declared rank and common trailing dimensions")
     kinds = [r.dtype for r in rows if r.shape[0] > 0]
     dtype = np.result_type(*kinds) if kinds else np.float64
     rows = [r.astype(dtype) for r in rows]
     lengths = np.asarray([r.shape[0] for r in rows], dtype=np.int64)
     width = max([1] + [int(n) for n in lengths])
-    padded = np.stack([np.pad(r, (0, width - r.shape[0]), mode="edge") if r.shape[0] > 0
-                       else np.zeros(width, dtype=dtype) for r in rows])
+    padded = np.stack([np.pad(r, ((0, width - r.shape[0]),) + ((0, 0),) * (rank - 1),
+                             mode="edge") if r.shape[0] > 0
+                       else np.zeros((width,) + tail, dtype=dtype) for r in rows]) if rows \
+        else np.zeros((0, width) + tail, dtype=dtype)
     return padded, lengths
 """
 
