@@ -641,6 +641,12 @@ const SupportOverride =
         Tuple{Symbol,Symbol},
         Tuple{Symbol,Union{Float64,Symbol,Expr},Union{Float64,Symbol,Expr}}}
 
+# A support override as the layout reads it, after binding folds bound data
+# (`_bound_override`): an elementwise array's bound may be an array of numbers,
+# one per element.
+const BoundOverride = Union{SupportOverride,
+    Tuple{Symbol,Union{Float64,Symbol,Expr,Array{Float64}},Union{Float64,Symbol,Expr,Array{Float64}}}}
+
 _support_args(ov) = ov isa Tuple ? ov[2:end] : ()
 _has_interval_bounds(ov) = ov isa Tuple &&
     ov[1] in (:truncated, :restricted, :restricted_half)

@@ -13,6 +13,68 @@ using Distributions: Exponential, Normal, logpdf
 import DifferentiationInterface as DI
 import Enzyme
 
+@testset "Normal emission shared scale guard" begin
+    DK = ReactiveKernelsDistributionKernels.DistributionKernelSources
+    emissions = prepare(DK._normal_hmm_log_emissions)
+    scalar = prepare(DK.normal.logpdf)
+    at(x, k, s, t) = x[min(k, size(x, 1)), min(s, size(x, 2)), min(t, size(x, 3))]
+    function reference(y, locations, scales, K)
+        result = zeros(promote_type(eltype(y), eltype(locations), eltype(scales)),
+                       size(y, 1), K)
+        for k in 1:K, t in axes(y, 1)
+            value = zero(eltype(result))
+            for s in axes(y, 2)
+                value += scalar(at(locations, k, s, t), at(scales, k, s, t), y[t, s])
+            end
+            result[t, k] = value
+        end
+        result
+    end
+    for T in (0, 1, 5, 37), K in (1, 3), S in (1, 2)
+        y = [sin(t + s) for t in 1:T, s in 1:S]
+        locations = [0.2k - s for k in 1:K, s in 1:S]
+        for scales in (0.7, 0.0, -0.0, Inf, NaN, fill(0.7, K),
+                       fill(0.7, 1, S), fill(0.7, K, S, max(T, 1)))
+            @test isequal(emissions(y, locations, scales, K),
+                          reference(y, locations, scales, K))
+        end
+    end
+    y = [0.0 1.0; 0.25 -1.0; 0.0 1.0]
+    locations = [0.0 1.0; 0.5 -0.5]
+    for scales in ([0.7 1.3], [0.0 1.3], [-0.0 1.3])
+        @test isequal(emissions(y, locations, scales, 2),
+                      reference(y, locations, scales, 2))
+    end
+    @test_throws DomainError emissions(y, locations, [-1.0 1.0], 2)
+    @test_throws DimensionMismatch emissions(y, locations, zeros(2, 3), 2)
+    @test emissions(zeros(0, 2), locations, [-1.0 1.0], 2) == zeros(0, 2)
+
+    # The same program keeps both lazy arms, independent of bound values and
+    # lengths; the loop bodies are fixed by the authored branch, not the data.
+    bound = [prepare(DK._normal_hmm_log_emissions;
+                 bound=(observed=zeros(T, 2), scales, K=2))
+             for T in (0, 3, 37), scales in ([0.7 1.3], [0.0 1.3])]
+    @test allequal(typeof.(bound))
+    @test allequal(code_expr.(bound))
+
+    scales = [0.7 1.3]
+    for target in (:locations, :scales)
+        losses = let observed=y, kernel=emissions, oracle=reference
+            ((loc, scl) -> sum(kernel(observed, loc, scl, 2)),
+             (loc, scl) -> sum(oracle(observed, loc, scl, 2)))
+        end
+        gradients = map(losses) do loss
+            g = zero(target === :locations ? locations : scales)
+            args = target === :locations ?
+                (Enzyme.Duplicated(locations, g), Enzyme.Const(scales)) :
+                (Enzyme.Const(locations), Enzyme.Duplicated(scales, g))
+            Enzyme.autodiff(Enzyme.Reverse, Enzyme.Const(loss), Enzyme.Active, args...)
+            g
+        end
+        @test gradients[1] ≈ gradients[2] rtol=1e-12
+    end
+end
+
 # Independent oracle: sum the joint density over every state path, in
 # 512-bit arithmetic. `step_weight(i, j, t)` weighs the move into step t.
 hmm_path_reference(log_emissions, step_weight, initial) =
