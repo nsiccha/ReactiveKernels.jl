@@ -16,6 +16,23 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.192
+
+- `marginalize` integrates out a top-level `@scan` with a vector state: one
+  carrying several arrays (a local linear trend, `level` and `slope`), or
+  reading one at a lag above 1 (an AR(p) seeded at `x[1]`, …, `x[p]`). Name
+  every array the scan carries, `marginalize(model, :level, :slope)`; a
+  subset is refused, naming the arrays left out. Seeds may be affine in the
+  seeds above them, and a step may read the values written above it in the
+  same step. One Normal observation of bound data reads the arrays, its
+  location affine in them. The filter carries the window `a[t - j]`, `j < p`,
+  of every array as one Gaussian state, written out entry by entry, and
+  `marginalized_latent_draws` returns each array under its name.
+  `prepare_marginalized_latents` keys a vector state by its first array.
+  Missing entries, a defined observed vector, gathered rows and a vector
+  state in a `@plate` cell are refused, as is an array name holding `__`.
+  `jax_source` translates it.
+
 ## 0.1.191
 
 - `marginalize(model, :x)` integrates out a recurrence whose rows observe

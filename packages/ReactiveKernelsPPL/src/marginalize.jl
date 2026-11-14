@@ -58,6 +58,20 @@ Any other form is refused with a `SurfaceLoweringError` naming the
 statement. Each scalar coefficient may vary by step (irregular gaps
 `exp(-gap[t] / range)`, a reset `r = 0` where a new series starts).
 
+A top-level `@scan` carrying several arrays, or reading one at a lag above
+1 (seeded at `x[1]`, …, `x[p]`, its loop from `p + 1`), has a vector state:
+name every array it carries, `marginalize(model, :level, :slope)`. Each seed
+is a Normal draw or a value affine in the seeds above it, and each step
+writes every array once, affine in the lags `a[t - k]`, the values written
+above it in the same step and Normal innovations (a local linear trend
+`level[t] ~ Normal(level[t - 1] + slope[t - 1], s)`, an AR(2)
+`x[t] ~ Normal(a1 * x[t - 1] + a2 * x[t - 2], s)`). One statement reads the
+arrays, `y .~ Normal.(offset .+ loading_a .* a .+ …, noise)`, an observation
+of bound data without missing entries whose location is affine in them. The
+filter carries the window `a[t - j]`, `j < p`, of every array, and the draws
+return each array under its name. A vector state observed otherwise or in a
+`@plate` cell is refused.
+
 A recurrence in a `@plate for g in …` cell integrates out one filter per
 index, when the cell's `@scan` carries `x` as above and one statement of the
 cell observes it, `y[g] .~ Normal.(offset .+ loading .* x, noise)`, with `y`
@@ -729,8 +743,19 @@ function _scan_upper_bound(block)
 end
 
 function _marginalize_latents(ast::Expr, marginalized, values, observing)
+    done = Set{Symbol}()
     for x in marginalized
-        ast = _marginalize_latent(ast, x, values, observing)
+        x in done && continue
+        # A top-level `@scan` with a vector state (several arrays, or a lag
+        # above one) integrates out as one group (marginalize_vector.jl).
+        group = _marginal_group(ast, x, marginalized)
+        if group === nothing
+            ast = _marginalize_latent(ast, x, values, observing)
+            push!(done, x)
+        else
+            ast = _marginalize_vector_latent(ast, group, values, observing)
+            union!(done, group)
+        end
     end
     return ast
 end
@@ -894,6 +919,9 @@ function _marginalize_cell_latent(ast::Expr, p, x::Symbol, values, observing)
     cell = Any[c for c in loop.args[2].args if !(c isa LineNumberNode)]
     k = findfirst(c -> _is_scan_of(c, x), cell)
     spec, hi = _parse_marginal_scan(cell[k].args[end])
+    (length(spec.states) == 1 && spec.lo == 2) || _marginal_fail(x, "its `@scan` in a " *
+        "`@plate` cell has a vector state (several carried arrays or a lag above 1); " *
+        "a vector state in a `@plate` cell is not marginalized yet (at top level it is)")
     law = _gaussian_transition(spec, x, hi)
     others = Any[st for (i, st) in enumerate(stmts) if i != p]
     cell, k = _inline_cell_latent_definitions(cell, k, x, ivar, others)
@@ -1182,9 +1210,17 @@ filtered means and variances and the transition the filter used;
 [`marginalized_latent_draws`](@ref) draws the latents. Not thread-safe:
 prepare one per thread.
 """
+# A vector state's group (marginalize_vector.jl): its key, its window's
+# components `(array, j)`, and its structural transition and noise entries
+# `(i, k)`.
+const _MarginalGroup = Tuple{Symbol,Vector{Tuple{Symbol,Int}},Vector{Tuple{Int,Int}},
+    Vector{Tuple{Int,Int}}}
+
 struct MarginalizedLatentQuery{Q}
     names::Vector{Symbol}
     query::Q
+    # Vector states (marginalize_vector.jl).
+    groups::Vector{_MarginalGroup}
 end
 
 # The marginalized latents of a lowered program: those whose filter scan
@@ -1214,16 +1250,22 @@ filtered `mean[t]` and `var[t]` of the state given the first `t`
 observations, and the transition `x[t] = coef[t] * x[t - 1] + shift[t] +
 Normal(0, sqrt(innovation_var[t]))` (entry 1 holds the seed's law: `coef[1]
 = 0`). A recurrence per `@plate` index holds one such vector per index in
-each field. At posterior draws of the parameters these determine each
+each field. A vector state is one entry keyed by its first array: its
+window's `components` (`(array, j)` for `array[t - j]`), its seed depth
+`lags`, and per step the window's filtered `mean` and `cov`, and the
+transition into it, `coef` and `shift` with noise covariance
+`innovation_cov` (entries up to `lags` hold seeds). At posterior draws of the parameters these determine each
 latent's exact conditional posterior; [`marginalized_latent_draws`](@ref)
 samples it. A program with no marginalized recurrence is refused.
 """
 function prepare_marginalized_latents(built, plan::StructuralPlan; kwargs...)
     names = _marginalized_names(plan)
-    isempty(names) && throw(ContractValidationError("[query] this program " *
+    groups = _marginalized_groups(plan)
+    isempty(names) && isempty(groups) && throw(ContractValidationError("[query] this program " *
         "integrates out no recurrence: marginalize one with `marginalize(model, :x)`"))
-    wants = Tuple(_marginal_name(x, r) for x in names for r in _MARGINAL_ROLES)
-    return MarginalizedLatentQuery(names, prepare_query(built, plan, wants; kwargs...))
+    wants = Tuple([(_marginal_name(x, r) for x in names for r in _MARGINAL_ROLES)...,
+        (w for gr in groups for w in _vector_wants(gr...))...])
+    return MarginalizedLatentQuery(names, prepare_query(built, plan, wants; kwargs...), groups)
 end
 prepare_marginalized_latents(built, m::_PlanSource; kwargs...) =
     prepare_marginalized_latents(built, _bound_plan(m); kwargs...)
@@ -1231,10 +1273,16 @@ prepare_marginalized_latents(built, m::_PlanSource; kwargs...) =
 function (q::MarginalizedLatentQuery)(u::AbstractVector)
     values = Base.invokelatest(q.query, u)
     k = length(_MARGINAL_ROLES)
-    entries = map(enumerate(q.names)) do (i, x)
-        NamedTuple{_MARGINAL_ROLES}(Tuple(values[(i - 1) * k + r] for r in 1:k))
+    entries = Any[NamedTuple{_MARGINAL_ROLES}(Tuple(values[(i - 1) * k + r] for r in 1:k))
+        for i in eachindex(q.names)]
+    next = k * length(q.names)
+    for (g, comps, A, Q) in q.groups
+        n = length(_vector_wants(g, comps, A, Q))
+        push!(entries, _vector_filtered(values[next+1:next+n], comps, A, Q))
+        next += n
     end
-    return NamedTuple{Tuple(q.names)}(Tuple(entries))
+    latents = (q.names..., (first(gr) for gr in q.groups)...)
+    return NamedTuple{latents}(Tuple(entries))
 end
 
 """
@@ -1251,8 +1299,15 @@ posterior of the model as written.
 """
 marginalized_latent_draws(q::MarginalizedLatentQuery, u::AbstractVector, rng) =
     marginalized_latent_draws(q(u), rng)
-marginalized_latent_draws(filtered::NamedTuple, rng) =
-    map(f -> _backward_sample(rng, f), filtered)
+function marginalized_latent_draws(filtered::NamedTuple, rng)
+    out = Pair{Symbol,Any}[]
+    for (x, f) in pairs(filtered)
+        # A vector state draws its window jointly, then each of its arrays.
+        haskey(f, :components) ? append!(out, _backward_sample_vector(rng, f)) :
+            push!(out, x => _backward_sample(rng, f))
+    end
+    return (; out...)
+end
 
 # A recurrence per `@plate` index holds one filtered series per index: each
 # is drawn on its own, in index order.
