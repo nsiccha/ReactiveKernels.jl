@@ -43,21 +43,98 @@ end
     end
 end
 
-@testset "structured destinations without a DI context" begin
-    x=[1.,2.,3.]; a=2.
-    p=prepare_ad(structured_no_context,AutoEnzyme(mode=Enzyme.Reverse),x,a;
-        active=(:x,:a),want=:total)
-    d=(zero(x),Ref(0.))
-    value,reference=ad_value_and_gradient(p,x,a)
-    actual,returned=ad_value_and_gradient!(p,d,x,a)
-    @test actual≈value
-    @test returned===d
-    @test d[1]≈reference[1] && d[2][]≈reference[2]
-    @test x==[1.,2.,3.]
-end
 function _structured_buffer_bytes(p,d,args::Vararg{Any,N}) where N
     ad_value_and_gradient!(p,d,args...)
     @allocated ad_value_and_gradient!(p,d,args...)
+end
+
+@kernel structured_no_context_pair(x::Vector{Float64}, z::Vector{Float64}) = begin
+    total::Float64 = sum(abs2,x) + 3 * sum(z)
+    return total
+end
+
+@kernel structured_no_context_wide(x1::Vector{Float64}, x2::Vector{Float64},
+        x3::Vector{Float64}, x4::Vector{Float64}, x5::Vector{Float64}) = begin
+    total::Float64 = sum(abs2,x1) + 2 * sum(x2) + sum(abs2,x3) + sum(x4) + sum(abs2,x5)
+    return total
+end
+
+@testset "structured destinations without a DI context" begin
+    backend=AutoEnzyme(mode=Enzyme.Reverse)
+    # Enzyme dogfood's structured_gradient_inplace repair lets a no-context
+    # tuple point write its gradient straight into the destination. Without it,
+    # RK keeps the copy path, so the numerical checks hold on every Enzyme.
+    direct=isdefined(Enzyme,:has_dogfood_repair) &&
+        Enzyme.has_dogfood_repair(:structured_gradient_inplace)
+    zeroing_repaired=isdefined(Enzyme,:has_dogfood_repair) &&
+        Enzyme.has_dogfood_repair(:make_zero_tuple_points)
+    p=prepare_ad(structured_no_context,backend,[1.,2.,3.],2.;
+        active=(:x,:a),want=:total)
+    pz=prepare_ad(structured_no_context_pair,backend,[1.,2.],[3.,4.];
+        active=(:x,:z),want=:total)
+    pw=prepare_ad(structured_no_context_wide,backend,(ones(2) for _ in 1:5)...;
+        active=(:x1,:x2,:x3,:x4,:x5),want=:total)
+    # Changed lengths, empty inputs and repeated calls through one preparation;
+    # stale destination contents must be overwritten, never accumulated.
+    for n in (3,0,1,129,3,0)
+        x=sin.(collect(1.0:n)); z=cos.(collect(1.0:n))
+        for a in (2.,-0.5)
+            d=(fill(NaN,n),Ref(NaN))
+            for _ in 1:2
+                actual,returned=ad_value_and_gradient!(p,d,x,a)
+                @test actual≈a*sum(abs2,x)
+                @test returned===d
+                @test d[1]≈2a .* x && d[2][]≈sum(abs2,x)
+            end
+            @test x==sin.(collect(1.0:n))
+        end
+        dz=(fill(17.,n),fill(-19.,n))
+        @test first(ad_value_and_gradient!(pz,dz,x,z))≈sum(abs2,x)+3sum(z)
+        @test dz[1]≈2 .* x && dz[2]≈fill(3.,n)
+        xs=ntuple(j->j .* x,5)
+        dw=ntuple(_->fill(NaN,n),5)
+        @test first(ad_value_and_gradient!(pw,dw,xs...))≈
+            sum(abs2,xs[1])+2sum(xs[2])+sum(abs2,xs[3])+sum(xs[4])+sum(abs2,xs[5])
+        @test dw[1]≈2 .* xs[1] && dw[2]≈fill(2.,n) && dw[3]≈2 .* xs[3] &&
+            dw[4]≈fill(1.,n) && dw[5]≈2 .* xs[5]
+        n>0 || continue
+        bytes=_structured_buffer_bytes(p,(zero(x),Ref(0.)),x,2.)
+        direct && zeroing_repaired && @test bytes==0
+        bytes=_structured_buffer_bytes(pz,(zero(x),zero(z)),x,z)
+        direct && zeroing_repaired && @test bytes==0
+        bytes=_structured_buffer_bytes(pw,map(zero,xs),xs...)
+        direct && zeroing_repaired && @test bytes==0
+    end
+    # Aliased destinations or inputs keep the copy path and its results.
+    x=[1.,2.,3.];z=[4.,5.,6.]
+    d=zero(x)
+    @test first(ad_value_and_gradient!(pz,(d,x),x,z))≈sum(abs2,[1.,2.,3.])+45
+    @test d≈[2.,4.,6.] && x≈fill(3.,3)
+    x=[1.,2.,3.];d=zero(x)
+    @test first(ad_value_and_gradient!(pz,(d,d),x,z))≈14+45
+    @test d≈fill(3.,3)
+    # One array bound to both active ports shares its shadow, as out of place.
+    value,reference=ad_value_and_gradient(pz,x,x)
+    d1=fill(NaN,3);d2=fill(NaN,3)
+    @test first(ad_value_and_gradient!(pz,(d1,d2),x,x))≈value≈14+18
+    @test d1≈reference[1] && d2≈reference[2] && x==[1.,2.,3.]
+    GC.@preserve x begin
+        alias=unsafe_wrap(Array,pointer(x),length(x);own=false)
+        @test first(ad_value_and_gradient!(pz,(zero(x),alias),x,z))≈14+45
+        @test x≈fill(3.,3)
+    end
+    xs=ntuple(j->fill(Float64(j),2),5); shared=zeros(2)
+    dw=(shared,zeros(2),zeros(2),zeros(2),shared)
+    @test first(ad_value_and_gradient!(pw,dw,xs...))≈2+8+18+8+50
+    @test shared≈2 .* xs[5] && dw[2]≈fill(2.,2)
+    # Destinations of another representation keep the copy path; a mismatch
+    # is still rejected.
+    x=[1.,2.,3.]
+    viewdest=(view(zeros(5),2:4),Ref(0.))
+    @test first(ad_value_and_gradient!(p,viewdest,x,2.))≈28
+    @test viewdest[1]≈4 .* x && viewdest[2][]≈14
+    @test_throws DimensionMismatch ad_value_and_gradient!(p,(zero(x),),x,2.)
+    @test_throws ArgumentError ad_value_and_gradient!(p,(zero(x),0.),x,2.)
 end
 
 @testset "caller-owned structured reverse destinations" begin
