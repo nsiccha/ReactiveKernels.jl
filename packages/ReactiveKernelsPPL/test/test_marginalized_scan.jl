@@ -511,6 +511,206 @@ end
     end)
 end
 
+# ── A vector state ────────────────────────────────────────────────────────
+#
+# A scan carrying several arrays, or reading one at a lag above one, filters
+# its window as one state. The oracle pushes unit vectors through the stated
+# recurrence: the latents are an affine map of independent standard normals.
+
+function affine_moments(rec, nz)
+    base = rec(zeros(nz))
+    M = reduce(hcat, (rec(Float64.(1:nz .== k)) .- base for k in 1:nz))
+    return base, M * M'
+end
+
+# The density of `y ~ Normal(offset(c) + H(c) * latent, noise)` for a latent
+# stack `rec(c)(z)`; `latent` holds its moments for the draws.
+function vector_oracle(built, y, nz, rec, H, offset, prior)
+    function (u)
+        c = constrain(built.layout, u)
+        m, S = affine_moments(rec(c), nz)
+        Hc = H(c)
+        mu = offset(c) .+ Hc * m
+        Sy = Symmetric(Hc * S * Hc' + c.noise^2 * I)
+        (; total = prior(c) + logpdf(MvNormal(mu, Sy), y) + logjac(built.layout, u),
+            likelihood = logpdf(MvNormal(mu, Sy), y),
+            pointwise = sequential_logpdfs(mu, Sy, y), latent = (m, S), noise = c.noise)
+    end
+end
+
+# A local linear trend: the observation reads the level.
+const TREND = @rkppl begin
+    s_level ~ Exponential(1)
+    s_slope ~ Exponential(0.5)
+    noise ~ Exponential(1)
+    @scan begin
+        level[1] ~ Normal(0, 2)
+        slope[1] ~ Normal(0, 1)
+        for t in 2:T
+            level[t] ~ Normal(level[t - 1] + slope[t - 1], s_level)
+            slope[t] ~ Normal(slope[t - 1], s_slope)
+        end
+    end
+    y .~ Normal.(level, noise)
+end
+trend_rec(c, T) = z -> begin
+    level, slope = zeros(T), zeros(T)
+    level[1], slope[1] = 2 * z[1], z[2]
+    for t in 2:T
+        level[t] = level[t - 1] + slope[t - 1] + c.s_level * z[2t - 1]
+        slope[t] = slope[t - 1] + c.s_slope * z[2t]
+    end
+    vcat(level, slope)
+end
+trend_prior(c) = logpdf(Exponential(1), c.s_level) + logpdf(Exponential(0.5), c.s_slope) +
+    logpdf(Exponential(1), c.noise)
+
+# An AR(2) seeded at two entries, the second reading the first.
+const AR2 = @rkppl begin
+    phi1 ~ Uniform(-1, 1)
+    phi2 ~ Uniform(-0.5, 0.5)
+    sigma ~ Exponential(1)
+    noise ~ Exponential(1)
+    @scan begin
+        x[1] ~ Normal(0, 1)
+        x[2] ~ Normal(phi1 * x[1], sigma)
+        for t in 3:T
+            x[t] ~ Normal(phi1 * x[t - 1] + phi2 * x[t - 2], sigma)
+        end
+    end
+    y .~ Normal.(0.5 .+ x, noise)
+end
+ar2_rec(c, T) = z -> begin
+    x = zeros(T)
+    x[1] = z[1]
+    x[2] = c.phi1 * x[1] + c.sigma * z[2]
+    for t in 3:T
+        x[t] = c.phi1 * x[t - 1] + c.phi2 * x[t - 2] + c.sigma * z[t]
+    end
+    x
+end
+ar2_prior(c) = logpdf(Uniform(-1, 1), c.phi1) + logpdf(Uniform(-0.5, 0.5), c.phi2) +
+    logpdf(Exponential(1), c.sigma) + logpdf(Exponential(1), c.noise)
+
+# Non-centred, seeded at two entries per array, a deterministic array: an
+# AR(2) cycle `c` read in the same step by a level, and a clock `v` the
+# observation reads with a per-entry loading.
+const CYCLE = @rkppl begin
+    phi1 ~ Uniform(-1, 1)
+    phi2 ~ Uniform(-0.5, 0.5)
+    sigma ~ Exponential(1)
+    tau ~ Exponential(1)
+    b ~ Normal(0, 1)
+    noise ~ Exponential(1)
+    @scan begin
+        c[1] ~ Normal(0, 1)
+        level[1] ~ Normal(c[1], 1)
+        v[1] = 0.0
+        c[2] ~ Normal(phi1 * c[1], sigma)
+        level[2] ~ Normal(level[1] + c[2], tau)
+        v[2] = 1.0
+        for t in 3:T
+            e ~ Normal(0, 1)
+            c[t] = phi1 * c[t - 1] + phi2 * c[t - 2] + sigma * e
+            level[t] ~ Normal(level[t - 1] + c[t], tau)
+            v[t] = v[t - 1] + 1
+        end
+    end
+    y .~ Normal.(level .+ b .* w .* v, noise)
+end
+cycle_rec(p, T) = z -> begin
+    c, level, v = zeros(T), zeros(T), collect(0.0:(T - 1))
+    c[1] = z[1]
+    level[1] = c[1] + z[2]
+    c[2] = p.phi1 * c[1] + p.sigma * z[3]
+    level[2] = level[1] + c[2] + p.tau * z[4]
+    for t in 3:T
+        c[t] = p.phi1 * c[t - 1] + p.phi2 * c[t - 2] + p.sigma * z[2t - 1]
+        level[t] = level[t - 1] + c[t] + p.tau * z[2t]
+    end
+    vcat(c, level, v)
+end
+cycle_prior(p) = logpdf(Uniform(-1, 1), p.phi1) + logpdf(Uniform(-0.5, 0.5), p.phi2) +
+    logpdf(Exponential(1), p.sigma) + logpdf(Exponential(1), p.tau) +
+    logpdf(Normal(0, 1), p.b) + logpdf(Exponential(1), p.noise)
+
+function vector_cases(T; seed = 11)
+    rng = Random.Xoshiro(seed)
+    y = randn(rng, T)
+    w = collect(range(0.1, 1; length = T))
+    E = Matrix(1.0I, T, T)
+    return (;
+        trend = (plan = marginalize(TREND(; T), :level, :slope) | (; y), y, nz = 2T,
+            rec = c -> trend_rec(c, T), H = c -> [E zeros(T, T)], offset = c -> 0.0,
+            prior = trend_prior, keys = (:level, :slope)),
+        ar2 = (plan = marginalize(AR2(; T), :x) | (; y), y, nz = T,
+            rec = c -> ar2_rec(c, T), H = c -> E, offset = c -> 0.5, prior = ar2_prior,
+            keys = (:x,)),
+        cycle = (plan = marginalize(CYCLE(; T, w), :c, :level, :v) | (; y), y, nz = 2T,
+            rec = c -> cycle_rec(c, T), H = c -> [zeros(T, T) E Diagonal(c.b .* w)],
+            offset = c -> 0.0, prior = cycle_prior, keys = (:c, :level, :v)))
+end
+
+@testset "a vector state integrates out as one filter" begin
+    for (name, case) in pairs(vector_cases(8))
+        built = build_kernel(case.plan)
+        @test !any(n -> any(k -> occursin(Regex("^$k\\."), String(n)), case.keys),
+            coordinate_names(built.layout))
+        oracle = vector_oracle(built, case.y, case.nz, case.rec, case.H, case.offset,
+            case.prior)
+        check_density(built, case.plan, oracle)
+        # Exact draws: every array given every observation.
+        q = prepare_marginalized_latents(built, case.plan)
+        u = 0.3 .* cos.(1:built.layout.total)
+        o = oracle(u)
+        c = constrain(built.layout, u)
+        H = case.H(c)
+        m, S = o.latent
+        K = S * H' / Symmetric(H * S * H' + o.noise^2 * I)
+        mean = m + K * (case.y - (case.offset(c) .+ H * m))
+        cov = Symmetric(S - K * H * S)
+        rng = Random.Xoshiro(5)
+        n = 40_000
+        draws = [marginalized_latent_draws(q, u, rng) for _ in 1:n]
+        @test propertynames(first(draws)) == case.keys
+        X = reduce(hcat, (vcat((d[k] for k in case.keys)...) for d in draws))
+        @test all(abs.(vec(Statistics.mean(X; dims = 2)) .- mean) .<
+            5 .* sqrt.(max.(diag(cov), 0) ./ n) .+ 1e-9)
+        @test Statistics.cov(X; dims = 2) ≈ cov rtol = 0.05 atol = 0.02 * maximum(diag(cov))
+    end
+    # One program as the series grows.
+    shape(T) = map(c -> structure(build_kernel(c.plan).spec), vector_cases(T))
+    @test shape(5) == shape(40)
+    # Refused: a subset of the arrays, and a vector state observed otherwise.
+    d = vector_cases(8)
+    named(model, names...; data...) = try
+        build_kernel(marginalize(model, names...) | (; data...))
+        "no error"
+    catch e
+        sprint(showerror, e)
+    end
+    w = collect(range(0.1, 1; length = 8))
+    @test occursin("also carries `level`, `v`; a recurrence carrying several arrays",
+        named(CYCLE(; T = 8, w), :c; y = d.cycle.y))
+    gaps = Vector{Union{Missing,Float64}}(d.trend.y)
+    gaps[2] = missing
+    @test occursin("admits `missing` entries", named(TREND(; T = 8), :level, :slope; y = gaps))
+    gathered = RKPPLModel(quote
+        s ~ Exponential(1)
+        @scan begin
+            level[1] ~ Normal(0, 1)
+            slope[1] ~ Normal(0, 1)
+            for t in 2:T
+                level[t] ~ Normal(level[t - 1] + slope[t - 1], s)
+                slope[t] ~ Normal(slope[t - 1], s)
+            end
+        end
+        y .~ Normal.(level[step], 1)
+    end, @__MODULE__)
+    @test occursin("gathers entries of a carried array",
+        named(gathered(; T = 8, step = [1, 2, 2, 5]), :level, :slope; y = [0.1, 0.2, 0.3, 0.4]))
+end
+
 # Each form the Kalman filter does not cover is refused at lowering, naming
 # the statement.
 function refusal(body, x, data, y)
@@ -549,7 +749,7 @@ end
         @test occursin("marginalize(`x`)", msg)
         @test occursin(expected, msg)
     end
-    # A second carried array, a lag above one, and a seed that is not Normal.
+    # A second carried array left out, and a seed that is not Normal.
     two = quote
         @scan begin
             x[1] ~ Normal(0, 1)
@@ -562,17 +762,6 @@ end
         y .~ Normal.(x, 1)
     end
     @test occursin("also carries `v`", refusal(two, :x, data, y))
-    lag2 = quote
-        @scan begin
-            x[1] ~ Normal(0, 1)
-            x[2] ~ Normal(0, 1)
-            for t in 3:T
-                x[t] ~ Normal(x[t - 2], 1)
-            end
-        end
-        y .~ Normal.(x, 1)
-    end
-    @test occursin("seeded at 2 entries", refusal(lag2, :x, data, y))
     @test occursin("seed `x[1]` is not an unbounded Normal draw", refusal(observed(
         scan(:(x[t] ~ Normal(x[t - 1], 1)); seed = :(x[1] ~ Exponential(1)))), :x, data, y))
     # Reads other than one Normal observation.
@@ -815,6 +1004,21 @@ end
     @test occursin("missing entry in a `@plate` cell", refusal(cellmodel(quote
         y[g] .~ Normal.(h, 1)
     end), :h, (;), [Union{Missing,Float64}[0.1, missing, 0.4], [0.3, 0.2]]))
+    # A vector state is filtered at top level only.
+    @test occursin("a vector state in a `@plate` cell is not marginalized yet", refusal(quote
+        s ~ Exponential(1)
+        @plate for g in eachindex(y)
+            @scan begin
+                h[1] ~ Normal(0, 1)
+                k[1] ~ Normal(0, 1)
+                for t in 2:length(y[g])
+                    h[t] ~ Normal(h[t - 1] + k[t - 1], s)
+                    k[t] ~ Normal(k[t - 1], s)
+                end
+            end
+            y[g] .~ Normal.(h, 1)
+        end
+    end, :h, (;), y))
     # Rows observing a cell's state at their steps are not an event filter yet.
     @test occursin("gathered rows in a `@plate` cell", refusal(cellmodel(quote
         y[g] .~ Normal.(h[step], 1)
@@ -851,6 +1055,7 @@ end
         missing_entries = marginalize(OU(; d.inputs...), :ou) | (; y = gaps),
         censored = bind_data(censored_plan(censored_data(9))),
         gathered = gathered_plan(gathered_data(5, 8)),
+        trend = vector_cases(6).trend.plan, ar2 = vector_cases(6).ar2.plan,
         cell_ar = marginalize(CELL_AR(; c.G, c.se, c.m0), :h) | (; c.y),
         observed = OBSERVED_AR() | (; y = [0.1, -0.3, 0.4, 0.2]))
     for (name, plan) in pairs(plans)
