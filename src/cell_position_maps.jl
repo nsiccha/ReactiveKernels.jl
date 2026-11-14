@@ -94,7 +94,7 @@ Base.hash(a::_PMValue, h::UInt) = hash(a.data, hash(a.kind, hash(:_PMValue, h)))
 # `(:zip, ds)`. The sources are the arguments whose positions are iterated.
 _pm_sources(d) = d[1] in (:positions, :over) ? Int[d[2]] :
     d[1] === :enumerate ? _pm_sources(d[2]) :
-    unique!(reduce(vcat, map(_pm_sources, d[2]); init = Int[]))
+    unique!(reduce(vcat, map(_pm_sources, d[2]); init = Int[])::Vector{Int})
 _pm_element(d) = d[1] === :positions ? _PMValue(:pos) :
     d[1] === :over ? _PMValue(:elem, d[2]) :
     d[1] === :enumerate ? _PMValue(:tuple, Any[_PMValue(:pos), _pm_element(d[2])]) :
@@ -984,9 +984,9 @@ function _cell_position_form(r::Recipe, input_types; outlined = false)
         rows = [k in proof.positions for k in eachindex(inputs) if inputs[k] == j]
         all(rows) ? (roles[j] = :row) : any(rows) && return nothing
     end
-    sources = unique!(Int[inputs[k] for k in proof.sources])
-    checks = unique!(Tuple{Int,Symbol}[(inputs[k], fact) for (k, fact) in proof.checks])
-    matrices = unique!(Int[inputs[k] for k in proof.matrices])
+    sources = unique!(Int[inputs[k] for k in proof.sources]::Vector{Int})
+    checks = unique!(Tuple{Int,Symbol}[(inputs[k], fact) for (k, fact) in proof.checks]::Vector{Tuple{Int,Symbol}})
+    matrices = unique!(Int[inputs[k] for k in proof.matrices]::Vector{Int})
     extents = Tuple{Symbol,Vararg{Int}}[e[1] === :size ? (:size, inputs[e[2]], e[3]) : e
                                         for e in proof.extents]
     n = length(params)

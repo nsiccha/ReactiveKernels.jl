@@ -2298,8 +2298,12 @@ function _cell_pushdowns(p::Plan; outlined::Set{Int} = Set{Int}(),
     producers = Dict{ValueId,Vector{Recipe}}()
     readers = Dict{ValueId,Vector{Recipe}}()
     for r in p.recipes
-        foreach(o -> push!(get!(producers, cidof(o), Recipe[]), r), r.outputs)
-        foreach(c -> push!(get!(readers, c, Recipe[]), r), unique(map(cidof, r.inputs)))
+        for o in r.outputs
+            push!(get!(producers, cidof(o), Recipe[]), r)
+        end
+        for c in unique(map(cidof, r.inputs))
+            push!(get!(readers, c, Recipe[]), r)
+        end
     end
     types = _cell_value_types(p; argument_types, outlined, known)
     static_type(v) = let candidates = get(producers, cidof(v), Recipe[])
@@ -2862,7 +2866,7 @@ end
 # broadcast operands are read through the row method, never its whole call.
 function _cell_scalar_plates(p::Plan; argument_types = nothing,
                              outlined::Set{Int} = Set{Int}())
-    partitions = Set(r.id for r in p.recipes if r.op isa _AuthoredPlateCellOp && r.op.rows)
+    partitions = Set{Int}(r.id for r in p.recipes if r.op isa _AuthoredPlateCellOp && r.op.rows)
     isempty(partitions) && return p
     cid(v) = canon_id(p.graph, v.id)
     # A partial WANT or bound label can retain fewer plates than the original
@@ -2879,7 +2883,7 @@ function _cell_scalar_plates(p::Plan; argument_types = nothing,
     complete && length(partitions) == 1 && return p
     cells = _cell_pushdowns(p; argument_types, outlined)
     types = cells.types
-    boundary = Set(cid(v) for v in (p.have..., p.want...))
+    boundary = Set{ValueId}(cid(v) for v in (p.have..., p.want...))
     readers = Dict{ValueId,Vector{Recipe}}()
     for r in p.recipes, v in r.inputs
         push!(get!(readers, cid(v), Recipe[]), r)
@@ -2887,7 +2891,7 @@ function _cell_scalar_plates(p::Plan; argument_types = nothing,
     # Every valid label occurs in at least one queried plate. A scalar needed
     # by all of them is therefore always needed, and keeps its scalar form.
     # Boundary outputs are needed independently of the partition as well.
-    needed = Dict(id => copy(partitions) for id in boundary)
+    needed = Dict{ValueId,Set{Int}}(id => copy(partitions) for id in boundary)
     for r in reverse(p.recipes)
         uses = r.id in partitions ? Set((r.id,)) : Set{Int}()
         if !(r.id in partitions)
@@ -3134,7 +3138,7 @@ function _plate_entry_parts(producer::Recipe, groups::Vector)
     all(index -> length(set_of(index)) == length(groups), live) && return nothing
     # A value's statement reads only values serving at least its sets, so larger
     # sets come first.
-    sets = unique!(Vector{Int}[set_of.(live); [[group] for group in eachindex(groups)]])
+    sets = unique!(Vector{Int}[set_of.(live); [[group] for group in eachindex(groups)]]::Vector{Vector{Int}})
     sort!(sets; by = set -> (-length(set), set))
     home = Dict{ValueId,Int}(cid(only(inner.recipes[index].outputs)) =>
                              findfirst(==(set_of(index)), sets) for index in live)
@@ -3476,7 +3480,9 @@ function _cell_guard_group(statements::Vector{Any}, t::_CellRegions,
     # A key's block with every block it may read placed before it.
     order(ks) = sort!(collect(ks); by = k -> (-length(_cell_members(t, k)), k))
     function flush!(key)
-        foreach(k -> k != key && covers(k, key) && place!(k), order(keys(pending)))
+        for k in order(keys(pending))
+            k != key && covers(k, key) && place!(k)
+        end
         place!(key)
     end
     for (k, st) in enumerate(statements)

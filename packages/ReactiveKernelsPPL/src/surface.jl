@@ -1138,14 +1138,17 @@ function _ordinary_sampling(s)
          rhs.args[1] in (:truncated, :restricted)) || _external_rhs(rhs)
 end
 
-function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
+function _lower_rkppl_once(ast, input_data::Set{Symbol}, mod::Module;
         submodel_scopes::Vector{SubmodelScope} = SubmodelScope[],
         conditioned::Set{Symbol} = Set{Symbol}(),
         value_defs::Set{Symbol} = Set{Symbol}(),
         shared_defs::Set{Symbol} = Set{Symbol}(),
         array_entries::Set{Symbol} = Set{Symbol}(),
         observing::Set{Symbol} = Set{Symbol}())
-    input_data = data
+    # `data` is reassigned below and captured by closures, so Julia boxes it;
+    # declared, its uses stay typed (an untyped `union(data, …)` takes Base's
+    # vector path, which a package adding `lastindex` invalidates).
+    data::Set{Symbol} = input_data
     ast = _fold_literal_positions(ast)
     # A `@scan` carried array that is observed data observes its entries
     # (`observed_scan.jl`); the rewrite is an ordinary program.
@@ -2055,7 +2058,10 @@ function _column_reads!(aligned, ex, cands, detmap, visited, data,
     fn isa GlobalRef && !dotted && return nothing
     fn isa Symbol && (fn in REDUCTION_FNS || fn in _WHOLE_READ_FNS) &&
         return nothing
-    args = dotted ? ex.args[2].args : ex.args[2:end]
+    # Typed (`_is_dotted_call` checked `ex.args[2] isa Expr`), so the
+    # `foreach` calls below are not invalidated by a package that adds a
+    # `foreach` method (JSON 1.x; snag downstream-workl-75f8cba4).
+    args = dotted ? (ex.args[2]::Expr).args : ex.args[2:end]
     if fn === :* && !dotted && length(args) == 2
         # A data matrix times a vector: rows from the matrix, the vector
         # whole. (`s * z`, a scalar times a column, reads both.)
@@ -2092,7 +2098,7 @@ function _reads_obs(ex, data, detmap, active::Set{Symbol})
         fn isa GlobalRef && !dotted && return false
         fn isa Symbol && (fn in REDUCTION_FNS || fn in _WHOLE_READ_FNS) &&
             return false
-        args = dotted ? ex.args[2].args : ex.args[2:end]
+        args = dotted ? (ex.args[2]::Expr).args : ex.args[2:end]
         return any(a -> _reads_obs(a, data, detmap, active), args)
     end
     return any(a -> _reads_obs(a, data, detmap, active), ex.args)
@@ -5670,7 +5676,7 @@ function _cell_free_syms!(out::Set{Symbol}, ex)
                 # buffers produced by a shared history scan).
                 _cell_free_syms!(out, ex.args[1])
             elseif ex.args[2] isa Expr
-                foreach(a -> _cell_free_syms!(out, a), ex.args[2].args)
+                foreach(a -> _cell_free_syms!(out, a), (ex.args[2]::Expr).args)
             end
         elseif ex.head === :kw
             _cell_free_syms!(out, ex.args[2])
@@ -6402,7 +6408,7 @@ function _check_plate_bares(ctx, data, prednames, derivedkeys, factorcoefs,
     isempty(ctx) && return nothing
     # A per-cell latent VECTOR read bare in an observation cell also needs
     # `[i]` (it is a vector like data/predictors/derived).
-    vecs = union(data, prednames, derivedkeys, factorcoefs, plate_names)
+    vecs = union(data::AbstractSet{Symbol}, prednames, derivedkeys, factorcoefs, plate_names)
     for (lhs, line, bares) in ctx
         at = line > 0 ? " (line $line)" : ""
         for b in sort!(collect(bares))
@@ -6666,7 +6672,7 @@ function _whole_name_reads!(out::Set{Symbol}, ex)
             _whole_name_reads!(out, ex.args[2])
         elseif ex.head === :. && length(ex.args) == 2 &&
                 ex.args[2] isa Expr && ex.args[2].head === :tuple
-            foreach(a -> _whole_name_reads!(out, a), ex.args[2].args)
+            foreach(a -> _whole_name_reads!(out, a), (ex.args[2]::Expr).args)
         else
             foreach(a -> _whole_name_reads!(out, a), ex.args)
         end
@@ -10793,8 +10799,9 @@ function _check_coefficient_readers(coefuse, ctx, predictors, priors,
     end
     for p in predictors, t in p.terms
         t.kind === ComposedTerm || continue
-        foreach(v -> read!("composed predictor $(p.name)", v),
-            t.options.scalars)
+        for v in t.options.scalars
+            read!("composed predictor $(p.name)", v)
+        end
     end
     for pr in priors
         who = "the prior of ($(pr.predictor), $(pr.addressee))"
@@ -10818,8 +10825,12 @@ function _check_coefficient_readers(coefuse, ctx, predictors, priors,
         for v in (r.scale, r.nu, r.zi, r.mixture_weights)
             read!(who, v)
         end
-        foreach(v -> read!(who, v), r.mixture_locs)
-        foreach(v -> read!(who, v), r.mixture_scales)
+        for v in r.mixture_locs
+            read!(who, v)
+        end
+        for v in r.mixture_scales
+            read!(who, v)
+        end
         for component in r.mixture_components, v in _value_symbols(component.args.rhs)
             read!(who, v)
         end
@@ -11909,7 +11920,7 @@ function _whole_value_symbols!(out::Set{Symbol}, ex)
             return nothing
         elseif ex.head === :. && length(ex.args) == 2 &&
                ex.args[2] isa Expr && ex.args[2].head === :tuple
-            foreach(a -> _whole_value_symbols!(out, a), ex.args[2].args)
+            foreach(a -> _whole_value_symbols!(out, a), (ex.args[2]::Expr).args)
             return nothing
         end
     end
@@ -13062,7 +13073,7 @@ function _slice_elements_arg(a)
         !any(x -> x isa Real, a.args) || return nothing
     lits = all(x -> x isa Expr && x.head === :vect &&
         all(y -> y isa Real, x.args), a.args)
-    if lits && length(unique!([length(x.args) for x in a.args])) == 1
+    if lits && length(unique!(Int[length(x.args) for x in a.args]::Vector{Int})) == 1
         K = length(first(a.args).args)
         return Expr(:call, :eachcol, Expr(:vcat,
             (Expr(:row, (x.args[i] for x in a.args)...) for i in 1:K)...))
@@ -13372,7 +13383,7 @@ function _lower_ordered(lhs, rhs, coefuse, ctx)
     use = get(ctx.threshold_uses, lhs, nothing)
     size = _threshold_size(lhs, n, use === nothing ? nothing : use.response)
     if size isa Expr
-        size = _resolve_module_calls(_resolve_extent_levels(size), ctx.mod, union(ctx.data,ctx.prior_names,keys(ctx.detmap)),
+        size = _resolve_module_calls(_resolve_extent_levels(size), ctx.mod, union(ctx.data::AbstractSet{Symbol},ctx.prior_names,keys(ctx.detmap)),
             "vector $lhs length")
     end
     return VectorParameter(lhs, family, prior_args, size, lhs)
@@ -13392,7 +13403,7 @@ function _lower_plain_thresholds(s, coefuse, ctx)
     size = n isa Int ? n : _threshold_size(lhs, n,
         ctx.threshold_uses[lhs].response)
     if size isa Expr
-        size = _resolve_module_calls(_resolve_extent_levels(size),ctx.mod,union(ctx.data,ctx.prior_names,keys(ctx.detmap)),
+        size = _resolve_module_calls(_resolve_extent_levels(size),ctx.mod,union(ctx.data::AbstractSet{Symbol},ctx.prior_names,keys(ctx.detmap)),
             "vector $lhs length")
     end
     return VectorParameter(lhs, family, args, size, lhs)

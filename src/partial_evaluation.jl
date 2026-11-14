@@ -610,7 +610,10 @@ function _partial_rebuild_branch(native::_KernelBranch, path, plans, count, adde
              all_positions, nothing)
         elseif haskey(plans, key)
             plan = plans[key]
-            if hasproperty(plan, :native)
+            # Base's `hasproperty(x, s)` spelled out: `plan` is untyped, and a
+            # `hasproperty` call on it is invalidated by any package adding a
+            # `hasproperty` method (StructUtils; snag downstream-workl-75f8cba4).
+            if :native in propertynames(plan)
                 (plan.native, plan.positions, plan.spec)
             else
                 (_KernelSplitApply(Val(plan.plan), n),

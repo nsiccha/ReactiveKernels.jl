@@ -76,9 +76,18 @@ function _scheduled_prefix_loop!(runtime_ops, runtime_recipes, body, invariants,
             Expr(:block, :($index = $domain[$linear]), loopbody.args...)),
         :(return nothing))
     bound = _local_symbols!(Set{Symbol}(), body)
-    deferred === nothing || foreach(statement -> _local_symbols!(bound, statement), deferred)
+    # Loops, not `foreach`: `deferred` and `callargs` are untyped here, and a
+    # `foreach` call on an untyped value is invalidated by any package that adds
+    # a `foreach` method (JSON 1.x; snag downstream-workl-75f8cba4).
+    if deferred !== nothing
+        for statement in deferred
+            _local_symbols!(bound, statement)
+        end
+    end
     _local_symbols!(bound, invariants)
-    foreach(arg -> _source_symbols!(bound, arg), callargs)
+    for arg in callargs
+        _source_symbols!(bound, arg)
+    end
     union!(bound, (_CONSTANTS_ARG, _CALLABLES_ARG))
     used = _source_symbols!(Set{Symbol}(), chunk)
     assigned = _local_symbols!(Set{Symbol}(), chunk)

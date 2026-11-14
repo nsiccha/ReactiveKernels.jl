@@ -4590,7 +4590,7 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         only(inner.want), index, true) : nested_result
     # The result leaves the cell: it takes any slot buffer it shares memory
     # with or holds (`_lane_release!`).
-    released = Symbol[(nested === nothing ? Symbol[] : nested.slots); last.(slotted)]
+    released = Symbol[(nested === nothing ? Symbol[] : nested.slots); last.(slotted)]::Vector{Symbol}
     # A plate that stores its cells with tables (`stores_cells`, above) gives
     # each slot of a value computed at every cell a table
     # (`_lane_cell_take!`, `_lane_cell_release!`): cell `k` of the next position
@@ -4935,7 +4935,7 @@ Base.@nospecializeinfer function _lower_authored_plate_cells!(
         # The row each capture is asked for at, when it is read at one
         # position, so a value computed once per row serves its own row.
         capture_rows = Dict{Tuple{Any,Int},Symbol}()
-        request!(emitter, s, (position, value, reads)) = foreach(reads) do (batched, via)
+        request!(emitter, s, (position, value, reads)) = for (batched, via) in reads
             rows = partition && !s.single
             row = _cell_capture_request!(emitter, value, s.slices[batched],
                 via == 0 ? nothing : s.slices[via]; rows,
@@ -5127,7 +5127,9 @@ function _cell_lowering_groups(p::Plan, d)
             v = pop!(work)
             v in d.pushed && !(v in seen) || continue
             push!(seen, v)
-            foreach(input -> push!(work, cid(input)), d.producer[v].inputs)
+            for input in d.producer[v].inputs
+                push!(work, cid(input))
+            end
         end
         seen
     end
@@ -5161,7 +5163,11 @@ function _cell_lowering_groups(p::Plan, d)
             independent = all(first(positions):last(positions)) do position
                 r = p.recipes[position]
                 any(v -> cid(v) in outputs, r.inputs) && return false
-                position in members && foreach(v -> push!(outputs, cid(v)), r.outputs)
+                if position in members
+                    for v in r.outputs
+                        push!(outputs, cid(v))
+                    end
+                end
                 true
             end
             independent || continue
@@ -7016,7 +7022,9 @@ function _replicated_dependency_analysis(p::Plan, batched)
     positions = Tuple(
         findfirst(value -> value.name === name, p.have) for name in names)
     input_types = Tuple{(valtype(p.have[index]) for index in positions)...}
-    foreach(_replica_expected_rank, input_types.parameters)
+    for T in input_types.parameters
+        _replica_expected_rank(T)
+    end
     (; mapped = Tuple(mapped), mapped_ids,
        recipe_dependencies = dependencies.recipes, positions, input_types)
 end
@@ -8930,7 +8938,9 @@ function _replica(target, batched)
     boundary = inputs(target)
     indices = _replica_batch_indices(boundary, batched)
     input_types = Tuple{(valtype(boundary[i]) for i in indices)...}
-    foreach(_replica_expected_rank, input_types.parameters)
+    for T in input_types.parameters
+        _replica_expected_rank(T)
+    end
     output_types = Tuple{(valtype(value) for value in outputs(target))...}
     all(_replica_output_type, output_types.parameters) ||
         throw(ArgumentError(

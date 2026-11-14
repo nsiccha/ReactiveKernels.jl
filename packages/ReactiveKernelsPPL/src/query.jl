@@ -322,7 +322,9 @@ _same_layout(a::LayoutTable, b::LayoutTable) = a.total == b.total &&
 # A value the binding leaves absent has the type its input has in the built
 # program: the binding supplies no value to say otherwise.
 function _check_built_program(built, plan::StructuralPlan)
-    hasproperty(built, :program) || return nothing
+    # Base's `hasproperty` spelled out, so a package adding a `hasproperty`
+    # method does not invalidate this untyped call (snag downstream-workl-75f8cba4).
+    :program in propertynames(built) || return nothing
     _checked_program(plan, built.program) && return nothing
     typed = _absent_typed_as(plan, built.program)
     program = _program_identity(kernel_expr(typed, assign_layout(typed)))
