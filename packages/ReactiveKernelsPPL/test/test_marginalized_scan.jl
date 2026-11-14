@@ -577,6 +577,52 @@ end
     end), :h, (;), y))
 end
 
+# ── `jax_source` of a marginalized program ────────────────────────────────
+#
+# The module is standalone: every data definition, including the observed
+# scan's length check, is translated (`UNTRANSLATED = {}`). Its log density
+# and `jax.grad` match the native sampler and its finite differences.
+
+include(joinpath(pkgdir(ReactiveKernels), "test", "jax_python.jl"))
+include("jax_ppl_data.jl")
+
+# An observed AR(1) series whose length is the response's own: the check
+# without a supplied length.
+const OBSERVED_AR = @rkppl begin
+    phi ~ Uniform(-1, 1)
+    sigma ~ Exponential(1)
+    @scan begin
+        y[1] ~ Normal(0, sigma / sqrt(1 - phi^2))
+        for t in 2:T
+            y[t] ~ Normal(phi * y[t - 1], sigma)
+        end
+    end
+end
+
+@testset "jax_source of a marginalized program" begin
+    d, c = ou_data(2, 4), cell_data([3, 1, 5])
+    plans = (; toplevel = ou_plan(d), cell = cell_ou_plan(c),
+        cell_ar = marginalize(CELL_AR(; c.G, c.se, c.m0), :h) | (; c.y),
+        observed = OBSERVED_AR() | (; y = [0.1, -0.3, 0.4, 0.2]))
+    for (name, plan) in pairs(plans)
+        built = build_kernel(plan)
+        src = jax_source(built, plan)
+        @test occursin("UNTRANSLATED = {}", string(src))
+        if !rk_jax_available()
+            @info "RK_JAX_PYTHON is not set: JAX parity for marginalized $name skipped"
+            @test_skip false
+            continue
+        end
+        query = prepare_query(built, plan, :sampler)
+        u = 0.2 .* randn(Random.Xoshiro(7), built.layout.total)
+        r = rk_jax_evaluate(src, "log_density", (u, jax_raw_data(plan, src)...);
+            grad = true, prepare = true)
+        @test r.value ≈ Base.invokelatest(query, u) rtol = 1e-10
+        reference = rk_fd_gradient(u -> Base.invokelatest(query, u), u)
+        @test maximum(abs.(r.grad .- reference) ./ max.(1, abs.(reference))) < 1e-5
+    end
+end
+
 @testset "marginalize composes with binding, observing and merge" begin
     d = ou_data(2, 4)
     reference = ou_plan(d)
