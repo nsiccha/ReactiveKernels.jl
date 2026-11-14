@@ -16,6 +16,16 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.194
+
+- `marginalize` integrates out a recurrence a submodel holds, named by its
+  author path: `marginalize(model, Symbol("z.x"))` for the `@scan` array `x`
+  of `z ~ sm(…)` (nested calls: `Symbol("z.w.x")`). It lowers as its
+  top-level spelling does, scalar or vector state, and
+  `marginalized_latent_draws` nests its draws under the call (`draws.z.x`),
+  as `constrain` nests sampled locals. A path naming no local of a call is
+  refused, naming it.
+
 ## 0.1.193
 
 - `prepare_sampler` prepares a density that throws at `u0` (needs
