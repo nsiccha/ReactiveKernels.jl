@@ -16,6 +16,14 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.186
+
+- `jax_source` translates the length check of a top-level observed `@scan`
+  array, so the module of a program with one is standalone
+  (`UNTRANSLATED = {}`), including a top-level recurrence integrated out by
+  `marginalize`. When the module runs, an array whose length differs from
+  the scan's raises, as the native check does.
+
 ## 0.1.185
 
 - `marginalize(model, :x)` also integrates out a recurrence inside a `@plate`

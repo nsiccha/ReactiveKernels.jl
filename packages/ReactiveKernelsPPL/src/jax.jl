@@ -625,6 +625,25 @@ function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
     hi
 end
 
+# A top-level observed `@scan` array (`_observed_scan_values`): the scan reads
+# it entry by entry, so its value passes through. With the scan's length, the
+# array holds one entry per scan index, or one entry (an absent array's
+# stand-in), checked when the module runs as the native check does.
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_observed_scan_values), args::Vector{ReactiveKernels._PyVal})
+    name, value = args[1], args[2]
+    length(args) == 3 || return value
+    value.T isa Type && value.T <: _Absent && return value
+    n = ReactiveKernels._jax_call(ctx, length, [value])
+    one = ReactiveKernels._PyVal("1", Int, true)
+    held = ReactiveKernels._jax_call(ctx, |, [ReactiveKernels._jax_call(ctx, ==, [n, args[3]]),
+        ReactiveKernels._jax_call(ctx, ==, [n, one])])
+    message = ReactiveKernels._PyVal(repr("observed `@scan` array " * strip(name.code, ['"', '\'']) *
+        " has a different number of entries than the scan writes"), DimensionMismatch)
+    ReactiveKernels._jax_call(ctx, ReactiveKernels._runtime_check, [held, message])
+    value
+end
+
 # The program's check of its packed point (`_ppl_check_packed`): the
 # `unconstrained` input holds the binding's packed total, checked when the
 # module runs.
