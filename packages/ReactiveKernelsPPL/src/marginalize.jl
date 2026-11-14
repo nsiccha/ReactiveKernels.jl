@@ -42,7 +42,12 @@ A marginalized array `x` qualifies when
   vector whose location is affine in it and whose scale does not read it:
   `y .~ Normal.(offset .+ loading .* x, noise)`. A `missing` entry of `y` is
   a step that only predicts: the filter carries the state through it
-  without an update, and the likelihood has no term for it.
+  without an update, and the likelihood has no term for it. `y` may also be
+  a vector the model defines without reading `x`, such as measured rows
+  merged in time order with bounded latents of censored ones (data
+  augmentation: `gap[1:K] .~ restricted.(Flat.(), 0, Inf)`,
+  `y = vcat(measured, limit .- gap)[order]`). The filter then observes each
+  entry at its value, and the scan's length is supplied.
 
 Any other form is refused with a `SurfaceLoweringError` naming the
 statement. Each scalar coefficient may vary by step (irregular gaps
@@ -582,14 +587,25 @@ function _marginalize_latent(ast::Expr, x::Symbol, values, observing)
     stmts, k = _inline_latent_definitions(stmts, k, x)
     j = _marginal_reader(x, stmts, k)
     y, loc, scale, form = _marginal_observation(x, stmts[j], y -> y isa Symbol, "y")
-    (y in observing && get(values, y, nothing) isa AbstractVector) ||
-        _marginal_fail(x, "its observation `$y` is not observed data; " *
-            "marginalize a recurrence observed through bound data (`| (; $y)`)")
+    bound = y in observing && get(values, y, nothing) isa AbstractVector
+    # Otherwise a vector the model computes without `x` (data augmentation:
+    # measured rows merged with bounded latents of censored rows), which the
+    # filter reads entry by entry.
+    bound || any(st -> Meta.isexpr(st, :(=), 2) && st.args[1] === y, stmts) ||
+        _marginal_fail(x, "its observation `$y` is neither observed data nor a " *
+            "definition; marginalize a recurrence observed through bound data " *
+            "(`| (; $y)`) or through a vector the model defines (`$y = …`)")
+    bound || !(law.hi isa Symbol) || haskey(values, law.hi) ||
+        _marginal_fail(x, "the length `$(law.hi)` of its `@scan` is not supplied; " *
+            "when the observed vector `$y` is a definition, supply it " *
+            "(`model(; $(law.hi) = …)`)")
     leaf = _toplevel_shape_leaf(_marginal_names(ast), values)
     t = law.loopvar
     defs = Any[]
     seed, step = _marginal_pieces!(defs, x, y, form, scale, leaf, t)
-    filter = if Missing <: eltype(values[y])
+    filter = if !bound
+        _filter_scan(x, y, law, seed, step; response = y)
+    elseif Missing <: eltype(values[y])
         # Missing entries: the filter reads the presence of each entry and
         # the values with absent entries filled; an absent entry only
         # predicts (its gain is zero). The response keeps its presence mask,

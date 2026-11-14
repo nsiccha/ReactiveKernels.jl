@@ -107,6 +107,31 @@ latents_gaps = prepare_marginalized_latents(built_gaps, with_gaps)
 marginalized_latent_draws(latents_gaps, u, Xoshiro(1)).x
 ```
 
+The observed vector may also be one the model computes, as long as it does not read `x`. Censored rows enter the filter this way (data augmentation). Each censored row's unknown value is a latent bounded by its own range (per-element bounds), and the measured rows join those values in time order. The scan's length is then supplied, and the measured rows are inputs:
+
+```@example marginal
+censored = @rkppl begin
+    level ~ Normal(0, 2)
+    phi ~ Uniform(-1, 1)
+    sigma ~ Exponential(1)
+    noise ~ Exponential(0.5)
+    @scan begin
+        x[1] ~ Normal(0, sigma / sqrt(1 - phi^2))
+        for t in 2:T
+            x[t] ~ Normal(phi * x[t - 1], sigma)
+        end
+    end
+    gap[1:K] .~ restricted.(Flat.(), 0, Inf)    # a row below its limit: limit - gap
+    value = vcat(measured, limit .- gap)[order]
+    value .~ Normal.(level .+ x, noise)
+end
+measured = [0.3, 0.5, 0.0, 0.4]
+limit = [-0.2, -0.3]                            # rows 3 and 6 fell below these
+order = invperm([1, 2, 4, 5, 3, 6])
+augmented = marginalize(censored(; T = 6, K = 2, measured, limit, order), :x)
+coordinate_names(build_kernel(augmented).layout)
+```
+
 A recurrence in a `@plate` cell integrates out the same way, one filter per index, when the cell observes it through `y[g] .~ Normal.(offset .+ loading .* x, noise)` and the bound `y` holds one vector per index. The draws then hold one trajectory per index:
 
 ```@example marginal

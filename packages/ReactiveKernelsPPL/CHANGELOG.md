@@ -16,6 +16,23 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.190
+
+- `marginalize(model, :x)` observes a vector the model computes, as long as
+  it does not read `x`. Censored rows enter the Kalman filter this way (data
+  augmentation): each censored row's unknown value is a latent bounded by
+  its own range (per-element bounds, 0.1.179), and the measured rows join
+  those values in time order, for example
+  `gap[1:K] .~ restricted.(Flat.(), 0, Inf)`,
+  `value = vcat(measured, limit .- gap)[order]`,
+  `value .~ Normal.(level .+ x, noise)`. The filter observes each entry at its
+  value, so the marginalized density is the augmented model's with `x`
+  integrated out. Its term is classified as the observation it replaces: a
+  definition reading parameters is a factor, not a likelihood term, as
+  without `marginalize`. The scan's length
+  is supplied; an unsupplied length is refused, naming it, as is an
+  observation that is neither bound data nor a definition.
+
 ## 0.1.189
 
 - `marginalize(model, :x)` accepts an observed vector with `missing`
