@@ -56,6 +56,6 @@ The reverse mask uses original input positions. A bit for a data-only input is i
 activity-selected graph cuts. Joint value/partials recipes are shared across
 calls and activity patterns. Host data preparation uses the primal cut;
 general `derivative_rule` calls still emit their primal cut. See
-[JAX source](jax.md).
+[JAX runtime and derivatives](jax-runtime.md).
 
 For adapter and stage APIs, see the [core reference](api.md). The [bound-regression example](bound-regression.md) illustrates the same graph-selection principle for primal outputs.

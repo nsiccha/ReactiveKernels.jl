@@ -1,0 +1,106 @@
+# JAX helpers and submodels
+
+This guide continues [JAX source](jax.md): how emitted modules share submodel functions, and which helpers with loops and branches translate.
+
+## Named submodels and shared entries
+
+Repeated calls to an authored submodel share a Python function when their
+selected computations agree. A scoped rewrite that changes the computation
+gets a separate function. Each function carries the submodel's documentation.
+The native model retains its expanded graph, so individual locals remain
+queryable.
+
+The public density functions and `constrain` call a shared model function.
+Their output selectors are fixed by the wrappers, allowing JAX to trace only
+the requested computation. Call them as before: `log_density(u, **prepared)`.
+The submodel functions likewise take a static `outputs` selection; their
+arguments and array lengths remain runtime inputs. Consecutive statements
+that the same outputs need share one selection block (`if _entry in (...):`,
+or `if any(name in outputs for name in (...)):` in a submodel function), and
+the checks every public function runs, such as the packed-length check, run
+once before the per-function returns.
+
+A plate may use separate functions for a scalar return value and a batched
+density. Combined computations, such as grouped scalar priors, retain their
+shared graph boundary. Interleaved dependencies split a submodel into named
+portions that execute in the original dependency order.
+
+```@example jax_submodels
+using ReactiveKernels, ReactiveKernelsPPL
+
+@rkppl effect(loc, scale, spread_rate, n) = begin
+    "Mean of the effect."
+    mean ~ Normal(loc, scale)
+    "Spread of the members around the mean."
+    spread ~ Exponential(spread_rate)
+    "Standardised member deviations."
+    z[1:n] .~ Normal.(0, 1)
+    return mean .+ spread .* z
+end
+
+model = @rkppl begin
+    a ~ effect(a_loc, a_scale, a_rate, n)
+    b ~ effect(b_loc, b_scale, b_rate, n)
+    y .~ Normal.(a .+ b, noise)
+end
+bound = model(; n = 3, a_loc = 0.0, a_scale = 1.0, a_rate = 1.0,
+               b_loc = 0.0, b_scale = 1.0, b_rate = 1.0, noise = 1.0) |
+        (; y = [0.1, 0.2, 0.3])
+built = build_kernel(bound)
+print(jax_source(built, bound))
+```
+
+## Helpers with loops and branches
+
+A helper becomes a named Python function with its method's argument names,
+reused by calls with the same argument representation: from recorded source,
+or, for a plain helper outside Julia and ReactiveKernels, from its lowered
+code. Its Julia docstring accompanies the body; a broadcast vectorizes the
+function itself. A leading underscore and ReactiveKernels' own helpers stay
+private (`_name`). Arrays, captured numerical values and padded lengths are
+normally explicit arguments. A helper that carries loop bounds or reads scan
+history stays nested in that scope, preserving the bounds and history access
+analysis. Nested plate cells and scan steps are named after the authored
+values they compute.
+
+A helper translates from recorded source when available: `@traceable` records it, and a trailing Vararg argument (`args...`, `args::Vararg{T,N}`) reads as the tuple of the trailing arguments, as the method receives them, and `sum(f, t; init)` folds such a tuple over its fixed length; `for` becomes `jax.lax.fori_loop`, `if` becomes `jax.lax.cond`, and `A[i] = v` becomes `A.at[i].set(v)`. A `jax.lax.cond` arm that is one expression is a `lambda`, and a branch between two values already bound or literal (`s == 0 && x == m ? 1.0 : s`) is `jnp.where`, whose value and derivative are the conditional's; an arm that computes anything stays lazy. A condition decided while tracing (a shape or literal test) is Python's own `if`, so a guard `n == k || throw(...)` reads `if not (n == k): raise ValueError(...)`. Plain lowered helpers support straight-line code and terminal forward branches, including size guards. They can create immutable closures and fold fixed argument lists with `Base.afoldl`. Broadcasting `Ref(x)` passes `x` whole to each call. Captures remain runtime inputs; host `prepare_data` uses the same translation.
+
+A method that a package generates, such as one its macro writes into the caller's module, cannot carry `@traceable`. The generating package keeps the method's source as a `TraceableSource` (argument names, body, and the module whose globals the body reads) and hands it over through a provider. It registers the provider with `register_source_provider!`, once, from the `__init__` of the package extension that loads with ReactiveKernels. The emitter asks the provider for a call that has no other translation and no `@traceable` source, with the function and the `Tuple` type of the argument types. The provider answers `nothing` or the source of the method those arguments call natively.
+
+The example below stands in for such a package. Its macro defines the method and keeps its source.
+
+```@example jax
+using ReactiveKernels
+
+const GENERATED = Dict{Any,TraceableSource}()
+
+macro generate(def)
+    call, body = def.args
+    names = Tuple(arg.args[1] for arg in call.args[2:end])
+    source = TraceableSource(names, body, __module__)
+    :($(esc(def)); GENERATED[$(esc(call.args[1]))] = $source)
+end
+
+@generate function decay_sum(x::Vector{Float64}, rate::Float64)
+    total = zero(rate)
+    for i in 1:3
+        total = total + x[i] * exp(-i * rate)
+    end
+    if rate > 0
+        total = total / rate
+    end
+    return total
+end
+
+provide_source(f, argument_types) = get(GENERATED, f, nothing)
+register_source_provider!(provide_source)
+
+@kernel decayed(x::Vector{Float64}, rate::Float64) = begin
+    value = decay_sum(x, rate)
+    return value
+end
+
+print(jax_source(decayed; have = (:x, :rate), want = :value))
+```
+
+The body follows the rules of an `@traceable` body: a `return` only at its end, and in the JAX functions no `break` or `continue` and a `for` over one range. `prepare_data` runs the body as host Python, which takes both. A provider's source is read only by `jax_source`; native execution runs the method itself.
