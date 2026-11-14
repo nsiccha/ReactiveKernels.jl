@@ -44,6 +44,35 @@ end
     total = sum(values)
     return total
 end
+# A derivative rule and a broadcast scalar function are module-level
+# functions shared by every call site; here each runs under a condition that
+# depends on data, and each calls the source-backed `_beta_cf_math`.
+@kernel guarded_fraction(u::Vector{Float64}) = begin
+    value = u[3] > 0.5 ? ReactiveKernels._rk_beta_inc_cf(u[2], u[1], 1 - u[3]) :
+        ReactiveKernels._rk_beta_inc_cf(u[1], u[2], u[3])
+    return value
+end
+fraction_at(a, x) = ReactiveKernels._beta_cf_value(a, 3.0, x)
+@kernel guarded_fractions(u::Vector{Float64}, x::Vector{Float64}) = begin
+    total = u[2] > 0 ? sum(fraction_at.(u[1], x)) : 0.0
+    return total
+end
+checked_root(x) = x >= 0 ? sqrt(x) : throw(DomainError(x, "negative"))
+@kernel plain_roots(u::Vector{Float64}, x::Vector{Float64}) = begin
+    total = u[1] * sum(checked_root.(x))
+    return total
+end
+@kernel guarded_roots(u::Vector{Float64}, x::Vector{Float64}) = begin
+    total = u[1] > 0 ? sum(checked_root.(x)) : 0.0
+    return total
+end
+# The same broadcast first unconditionally, then under a data branch: the
+# second call site reuses the first's vectorized function.
+@kernel mixed_roots(u::Vector{Float64}, x::Vector{Float64}) = begin
+    plain = u[1] * sum(checked_root.(x))
+    total = plain + (u[2] > 0 ? sum(checked_root.(x)) : 0.0)
+    return total
+end
 end
 
 @testset "JAX scalar derivative graphs" begin
@@ -80,8 +109,9 @@ end
         @test native ≈ reference rtol=1e-5 atol=1e-7
     end
     src = jax_source(JAXScalarRuleTests.fraction; have=(:u,), want=:value)
-    # One primal loop and one joint-partials loop serve every activity mask.
-    @test count("jax.lax.fori_loop(", string(src)) == 2
+    # One loop serves the primal and every activity mask: the value and the
+    # joint partials share `_beta_cf_math`, whose `partials` is static.
+    @test count("jax.lax.fori_loop(", string(src)) == 1
     if rk_jax_available()
         u = [1.5, 0.5, 0.3]
         result = rk_jax_evaluate(src, "kernel", (u,); grad=true)
@@ -110,6 +140,47 @@ end
             driver = joinpath(@__DIR__, "jax_scalar_rules.py")
             @test success(pipeline(`$RK_JAX_PYTHON $driver $candidate $baseline`;
                                    stdout=stdout, stderr=stderr))
+        end
+    else
+        @test_skip false
+    end
+end
+
+@testset "shared rule and scalar functions under a data-dependent branch" begin
+    # Each is a module-level function keyed without its caller's condition,
+    # so a source-backed helper it calls cannot need that condition. From
+    # RK 0.1.233 until they were translated without it, both raised "a
+    # function's active condition is outside its caller's scope".
+    rule = jax_source(JAXScalarRuleTests.guarded_fraction; have=(:u,), want=:value)
+    scalar = jax_source(JAXScalarRuleTests.guarded_fractions; have=(:u,:x), want=:total)
+    @test count("@jax.custom_jvp", string(rule)) == 1
+    @test occursin("jnp.vectorize(", string(scalar))
+    # A runtime check in such a function runs where its own conditions hold.
+    @test occursin("_rk_check(", string(jax_source(JAXScalarRuleTests.plain_roots;
+                                                   have=(:u,:x), want=:total)))
+    # refused: a check is masked by the data conditions it runs under, since
+    # vmap runs an untaken arm (reactivekernels-use §4j); a shared function
+    # cannot read its caller's condition, so under a data branch its check
+    # would raise on the lanes that branch discards.
+    @test_throws ReactiveKernels.JAXEmissionError jax_source(
+        JAXScalarRuleTests.guarded_roots; have=(:u,:x), want=:total)
+    # refused for the same reason when the branch reuses the function an
+    # unconditional call site already emitted.
+    @test_throws ReactiveKernels.JAXEmissionError jax_source(
+        JAXScalarRuleTests.mixed_roots; have=(:u,:x), want=:total)
+    if rk_jax_available()
+        native = prepare(JAXScalarRuleTests.guarded_fraction; have=(:u,), want=:value)
+        for u in ([1.5, 0.5, 0.3], [2.5, 1.5, 0.8], [0.7, 3.0, 0.55])
+            got = rk_jax_evaluate(rule, "kernel", (u,); grad=true)
+            @test got.value ≈ native(u) rtol=1e-12
+            @test got.grad ≈ rk_fd_gradient(native, u) rtol=1e-5 atol=1e-7
+        end
+        native = prepare(JAXScalarRuleTests.guarded_fractions; have=(:u,:x), want=:total)
+        x = [0.1, 0.35, 0.8]
+        for u in ([1.5, 0.5], [2.5, -1.0])
+            got = rk_jax_evaluate(scalar, "kernel", (u, x); grad=true)
+            @test got.value ≈ native(u, x) rtol=1e-12
+            @test got.grad ≈ rk_fd_gradient(v -> native(v, x), u) rtol=1e-5 atol=1e-7
         end
     else
         @test_skip false

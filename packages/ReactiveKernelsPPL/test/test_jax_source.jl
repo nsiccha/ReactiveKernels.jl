@@ -214,6 +214,14 @@ const _JAX_CASES = (
         theta ~ Dirichlet(ones(3))
         y .~ Categorical(theta)
     end))(;) | (; y = rand(_JAX_RNG, 1:3, _JAX_N)),
+    # One bound per element from data, infinite entries included: each
+    # element's transform branches on its own bounds' finiteness.
+    elementwise_bounds = () -> (@rkppl(begin
+        mu ~ Normal(0, 1)
+        x[1:n] .~ truncated.(Normal.(mu, 2), lo, hi)
+        y .~ Normal.(x, 0.5)
+    end))(; n = 4, lo = [-Inf, 0.5, -1.0, -Inf], hi = [0.0, Inf, 1.0, Inf]) |
+        (; y = [-0.4, 0.9, 0.2, 2.0]),
     # A scan of two states, whose step outputs a named tuple.
     two_state_scan = () -> (@rkppl(begin
         beta ~ Uniform(0, 1); sigma ~ Exponential(1.0); s ~ Exponential(1.0)
@@ -228,6 +236,21 @@ const _JAX_CASES = (
         end
         y .~ Normal.(level, s)
     end))(; T = 12) | (; y = cumsum(0.3 .* _JAX_X[1:12])),
+    # A scan reads a definition over data and a parameter whole (`loc[t]`);
+    # the response observes a gathered subset of its trajectory.
+    scan_reads_definition = () -> (@rkppl(begin
+        a ~ Normal(0, 1); s ~ Exponential(1.0)
+        w = 2 .* x
+        loc = a .+ cos.(w)
+        @scan begin
+            acc[1] = loc[1]
+            for t in 2:N
+                acc[t] = 0.5 * acc[t - 1] + loc[t]
+            end
+        end
+        y .~ Normal.(acc[rows], s)
+    end))(; x = _JAX_X, N = _JAX_N, rows = collect(1:3:_JAX_N)) |
+        (; y = _JAX_Y[1:3:_JAX_N]),
     # `logbeta` of arguments above 8 (`jax.scipy.special.betaln` is not
     # float64-accurate there).
     beta_binomial = () -> (@rkppl(begin
@@ -581,6 +604,18 @@ const _JAX_CASES = (
            off = [[0.1, 0.0], [0.2], [0.0, 0.1, -0.1]], x = [0.3, -0.2, 0.1],
            rows = [[1, 3], [2], [2, 2, 1]], shared = [0.1, 0.2], level = [0.1, -0.1, 0.4]) |
         (; y = [[0.1, 0.7], [-0.6], [-0.5, 0.4, 1.1]]),
+    # The position of every row in the concatenation of two row lists, and
+    # ranks with ties and signed zeros: `invperm` and `sortperm` of data run
+    # in `prepare_data` (RK 0.1.237, snag jax-host-transla-e885b100).
+    row_positions = () -> (@rkppl(begin
+        a ~ Normal(0, 1); b ~ Normal(0, 2); s ~ Exponential(1.0)
+        pos = invperm(vcat(rows_a, rows_b))
+        ranks = invperm(sortperm(x))
+        mu = a .+ b .* vcat(x_a, x_b)[pos] .+ 0.1 .* ranks
+        y .~ Normal.(mu, s)
+    end))(; rows_a = [1, 3, 4], rows_b = [2, 5], x_a = [0.3, -1.2, 0.8],
+           x_b = [1.5, -0.4], x = [0.5, -0.0, 0.0, 0.5, -1.0]) |
+        (; y = [0.4, 1.9, -1.0, 1.1, 0.2]),
 )
 # ICAR priors (snag independent-icar-2e025fad): one field over a graph, and K
 # independent fields over the same graph as the rows or the columns of one
@@ -646,7 +681,10 @@ end
     @test occursin("return {\"a\": ", text)
     ragged = _JAX_CASES.ragged_recurrence()
     rsrc = jax_source(build_kernel(ragged), ragged)
-    @test occursin("def _rk_pad_rows(rows, dtype):", string(rsrc))
+    # The module carries the ragged-row helper as `src/jax_host.jl` defines
+    # it, and pads `R` (one vector per cell, so rank 1) through it.
+    @test occursin(rstrip(ReactiveKernels._JAX_PAD_ROWS), string(rsrc))
+    @test occursin(r"= _rk_pad_rows\([^\n]*, 1\)\n", string(rsrc))
     @test "R_lengths" in first.(rsrc.functions[2].inputs)
     @test occursin("\"ragged\": True", string(rsrc))
     @test occursin("jax.lax.fori_loop(", string(rsrc))

@@ -2,7 +2,10 @@
 # Run in an environment with Enzyme and DifferentiationInterface. On Julia
 # 1.13.1, Enzyme dogfood f025967a, the out-of-place call succeeds; the mutating
 # call throws MethodError because the no-context adapter calls gradient! with
-# a tuple active argument. RK retains its out-of-place/copy path in this case.
+# a tuple active argument. Dogfood 0d6d68f carries the repair
+# (`Enzyme.has_dogfood_repair(:structured_gradient_inplace)`) and writes into
+# `destination`; RK takes that direct path only where Enzyme reports the
+# repair and keeps its out-of-place/copy path otherwise.
 using Enzyme, DifferentiationInterface
 
 const DI = DifferentiationInterface

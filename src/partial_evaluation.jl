@@ -1645,6 +1645,28 @@ _lane_whole_part(n, parts::Vararg{Any,N}) where {N} =
 _readable_callee(::_LaneAssemble) = :lane_assemble
 _opname(::_LaneAssemble) = "lane_assemble"
 
+# Whether retaining this branch would hide work over bound inputs from the
+# existing arm preparation. Analyze the split only; evaluate neither arm.
+function _partition_branch_has_bound_work(r::Recipe, inner::Plan, bound)
+    reads = Bool[haskey(bound, canon_id(inner.graph, v.id)) for v in r.inputs]
+    leaves = _partial_branch_leaves!(Any[], getfield(r.op, :f), r.source, (), length(reads))
+    leaves === nothing && return true
+    # The speculative split below handles mixed arms only. An entirely
+    # bound arm (even a direct return of its input) also needs the existing
+    # preparation path, which can cache its plate and downstream reduction.
+    any(leaf -> !isempty(leaf.positions) && all(i -> reads[i], leaf.positions), leaves) &&
+        return true
+    split = _partial_speculate_recipe(r, reads, Set{Any}(); bound_guards = true)
+    split === nothing && return false
+    derived = copy(reads)
+    for node in split.nodes
+        from_bound = any(i -> derived[i], node.inputs)
+        from_bound && return true
+        push!(derived, false)
+    end
+    false
+end
+
 _partition_plate_recipe(g, recipe, known, op, pending, want, fresh, lane_lengths) = nothing
 # Branch partitioning likewise consumes the operation metadata dynamically;
 # its residual operation still retains the precise generated kernel type.
@@ -1736,11 +1758,15 @@ Base.@nospecializeinfer function _partition_plate_recipe(
     # work over bound values evaluates nothing (`_partial_plate_recipe`).
     #
     # With `branch_arms = :taken`, a domain of no lanes keeps a branch its lanes
-    # would decide. A condition no lane varies, such as a written scale's
-    # support guard (`1.0 > 0`), is decided as for a domain with lanes, so the
-    # plate over no rows is the one over rows (`_partial_plate_recipe`). A domain
-    # of no lanes runs no cell, so such a condition that throws keeps the plate.
+    # would decide. Eligible shared conditions stay above the loop in either mode.
     lane_condition = any(cid -> bound[cid] isa AbstractArray, cond_ports)
+    # A shared predicate needs no lane partition when its bound-only work
+    # is already outside the arms. Keep that predicate as runtime data: the
+    # shared-branch lowering chooses one loop before visiting any cells.
+    # Preserve the existing arm preparation where it exposes a bound prefix;
+    # otherwise retaining the branch would move that work into every call.
+    !lane_condition && !_partition_branch_has_bound_work(branch_recipe, inner, bound) &&
+        return nothing
     n == 0 && lane_condition && !all_arms && return nothing
     arms = if n == 0 && lane_condition
         [(:then, Int[]), (:else, Int[])]

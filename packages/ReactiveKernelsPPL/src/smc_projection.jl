@@ -40,6 +40,8 @@ function _smc_parameter_projection(layout::LayoutTable,parameters)
     lookup=_layout_lookup(layout,Dict{Symbol,Any}())
     function freeze(ex)
         ex isa Real && return ex
+        # One bound per element, already this binding's numbers.
+        ex isa AbstractArray{<:Real} && return copy(ex)
         if !any(dynamic,_value_symbols(ex))
             value=_eval_value_expr(ex,lookup,:selected_parameter_bound)
             value isa Real || throw(ArgumentError(
@@ -74,7 +76,8 @@ function _smc_parameter_projection(layout::LayoutTable,parameters)
     for e in selected
         append!(indices,e.offset:e.offset+e.size-1)
         push!(entries,(;kind=e.kind,predictor=e.predictor,name=e.name,labels=copy(e.labels),
-            offset,size=e.size,transform=e.transform,lo=freeze(e.lo),hi=freeze(e.hi),dims=copy(e.dims)))
+            offset,size=e.size,transform=e.transform,lo=freeze(e.lo),hi=freeze(e.hi),dims=copy(e.dims),
+            elementwise=e.elementwise))
         output=_smc_output_name(e)
         haskey(layout.name_paths,output) && (paths[output]=layout.name_paths[output])
         if haskey(layout.cell_latents,e.name)
@@ -93,7 +96,8 @@ end
 
 function _smc_projection_layout(record)
     entries=LayoutEntry[LayoutEntry(e.kind,e.predictor,e.name,e.labels,e.offset,e.size,
-        e.transform,e.lo,e.hi,e.dims) for e in record.entries]
+        e.transform,e.lo,e.hi,e.dims,LayoutEntry[],nothing,nothing,nothing,
+        (nothing,nothing),get(e,:elementwise,(false,false))) for e in record.entries]
     LayoutTable(entries,record.total,record.name_paths,record.bound_values,
         record.bound_exprs,record.cell_latents)
 end

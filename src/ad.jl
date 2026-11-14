@@ -2831,7 +2831,10 @@ cotangent of the selected active HAVE port. For a vector-valued WANT this is the
 vector-Jacobian product `J' * seed`; constructing a full Jacobian still requires
 multiple seeds. Over several WANT ports, `seed` holds one cotangent per port
 and the result is the sum of their vector-Jacobian products, from one primal
-and one reverse sweep (see [`prepare_ad_pullback`](@ref)).
+and one reverse sweep (see [`prepare_ad_pullback`](@ref)). A seed or argument
+that shares memory with a value an earlier call on the same prepared
+non-allocating pullback returned is copied first (see
+[`ad_value_and_pullback`](@ref)).
 
 The one-shot forms require the backend's package to be loaded in the calling
 session (`using Enzyme` for `AutoEnzyme`); the backend value alone does not
@@ -2872,9 +2875,99 @@ _ad_unprepared_pullback_call(call::_ADSeededCall, backend, point, seed,
 _ad_unprepared_pullback_call(::_ADConstantCall, backend, point, seed, contexts) =
     _ad_zero_cotangent(point)
 
-function ad_pullback(prepared::PreparedADPullback, seed, args...; kwargs...)
+# A NonAllocatingKernel pullback writes its port values into storage its
+# preparation owns, the AD cache slots of its `Cache` context, and returns
+# them from there: a returned value is borrowed until the next call on that
+# preparation overwrites it. A caller can pass such a value, or storage
+# overlapping it, back into a later call as an argument or the seed, and that
+# call would overwrite the input while still reading it. Each prepared
+# pullback therefore copies an input that shares memory with that storage
+# before the call, so the call computes with the contents its inputs had when
+# it was made. The box holding the last sweep's port values is left out: the
+# call replaces its contents without writing into the arrays it held. An input
+# disjoint from the owned storage is passed on unchanged, with no copy.
+_ad_owned_storage(prepared) = _ad_cache_contents(
+    _ad_without_value_box(prepared.call, prepared.external_values))
+_ad_without_value_box(::_ADSeededCall{true}, values::Tuple) = Base.front(values)
+_ad_without_value_box(call, values::Tuple) = values
+_ad_cache_contents(::Tuple{}) = ()
+_ad_cache_contents(values::Tuple) = (_ad_cache_content(first(values))...,
+    _ad_cache_contents(Base.tail(values))...)
+_ad_cache_content(context::DifferentiationInterface.Cache) =
+    (DifferentiationInterface.unwrap(context),)
+_ad_cache_content(context) = ()
+
+# Whether a caller's value `x` may share memory with what `held` holds. Arrays
+# compare by `Base.mightalias`, which may report an overlap that is not there
+# (two disjoint views of one parent) but never misses one; such a report costs
+# only a copy. Tuples, named tuples, `Ref`s, arrays of mutable elements and
+# struct fields are searched on both sides.
+_ad_shares_memory(x, held) = false
+_ad_shares_memory(x::Union{Tuple,NamedTuple}, held) =
+    _ad_any_shares_memory(Tuple(x), held)
+_ad_shares_memory(x::Base.RefValue, held) =
+    isassigned(x) && _ad_shares_memory(x[], held)
+_ad_shares_memory(x::AbstractArray, held) = _ad_held_overlap(x, held) ||
+    (!isbitstype(eltype(x)) && any(e -> _ad_shares_memory(e, held), x))
+_ad_any_shares_memory(::Tuple{}, held) = false
+_ad_any_shares_memory(x::Tuple, held) = _ad_shares_memory(first(x), held) ||
+    _ad_any_shares_memory(Base.tail(x), held)
+
+_ad_held_overlap(x::AbstractArray, held::AbstractArray) =
+    Base.mightalias(x, held) ||
+    (!isbitstype(eltype(held)) && any(e -> _ad_held_overlap(x, e), held))
+_ad_held_overlap(x::AbstractArray, held::Union{Tuple,NamedTuple}) =
+    _ad_any_held_overlap(x, Tuple(held))
+_ad_held_overlap(x::AbstractArray, held::Base.RefValue) =
+    isassigned(held) && _ad_held_overlap(x, held[])
+_ad_any_held_overlap(x, ::Tuple{}) = false
+_ad_any_held_overlap(x, held::Tuple) = _ad_held_overlap(x, first(held)) ||
+    _ad_any_held_overlap(x, Base.tail(held))
+@generated function _ad_held_overlap(x::AbstractArray, held::H) where {H}
+    (isstructtype(H) && fieldcount(H) > 0 &&
+     !(H <: Union{Function,Module,Type,Symbol,String})) || return false
+    checks = [:(isdefined(held, $i) && _ad_held_overlap(x, getfield(held, $i)))
+              for i in 1:fieldcount(H)]
+    foldr((a, b) -> Expr(:||, a, b), checks)
+end
+
+# `x` itself when it shares no memory with `held`, else a copy of the same type.
+_ad_unshared(x, held) = _ad_shares_memory(x, held) ? _ad_snapshot(x) : x
+_ad_unshared(x::Union{Tuple,NamedTuple}, held) = map(v -> _ad_unshared(v, held), x)
+_ad_unshared(x::Number, held) = x
+_ad_snapshot(x::Array) = isbitstype(eltype(x)) ? copy(x) : deepcopy(x)
+_ad_snapshot(x) = deepcopy(x)
+
+# The seed, active point and contexts of one prepared pullback call, with every
+# caller input that shares memory with the preparation's owned storage copied.
+# The prepared pullback entries take their arguments as `Vararg{Any,N}`: left
+# to Julia's default, their keyword bodies were compiled for unspecialized
+# trailing arguments once these checks joined them, boxing the argument tuple
+# and reading its fields dynamically (624 B per call for two arguments).
+function _ad_pullback_inputs(prepared, seed, args, kwargs::NamedTuple)
+    owned = _ad_owned_storage(prepared)
     point, contexts = _ad_prepared_arguments(
-        prepared, args, NamedTuple(kwargs))
+        prepared, _ad_unshared(args, owned), _ad_unshared(kwargs, owned))
+    _ad_unshared(seed, owned), point, contexts
+end
+
+# Caller-owned storage for an in-place pullback that overlaps anything the call
+# reads or writes (the seed, the active point, an inactive argument, bound data
+# or the owned storage) would be zeroed or overwritten while still in use. Such
+# a call computes into an owned temporary of the destination's structure, then
+# copies the cotangent into the destination; a returned value that overlaps the
+# destination is copied first, so both results are those of the call.
+_ad_destination_temporary(destination::AbstractArray) = similar(destination)
+_ad_destination_temporary(destination::Base.RefValue{T}) where {T} =
+    Base.RefValue{T}(destination[])
+_ad_destination_temporary(destination::Union{Tuple,NamedTuple}) =
+    map(_ad_destination_temporary, destination)
+_ad_destination_temporary(destination) = destination
+
+function ad_pullback(prepared::PreparedADPullback, seed,
+                     args::Vararg{Any,N}; kwargs...) where {N}
+    seed, point, contexts = _ad_pullback_inputs(
+        prepared, seed, args, NamedTuple(kwargs))
     _ad_restore_cotangent(point,
         _ad_prepared_pullback(prepared.call, prepared, point, seed, contexts))
 end
@@ -2899,11 +2992,20 @@ one-direction tuple. A tuple active selector produces a tuple cotangent in the
 selector's order; several WANT ports produce the tuple of their values. The
 prepared object is reusable with new runtime arguments and seeds compatible
 with its preparation exemplars.
+
+A pullback prepared from a [`NonAllocatingKernel`](@ref) can return its values
+in storage the preparation owns: such a value is borrowed, and the next call on
+the same preparation overwrites it, so copy a value to keep it past that call. A later
+call may take such a value, or storage overlapping it, as the seed or an
+argument. That input is then copied before the call, so the call uses the
+contents the input had when it was made; an input that shares no memory with
+the preparation's storage is used as passed.
 """
 function ad_value_and_pullback(
-        prepared::PreparedADPullback, seed, args...; kwargs...)
-    point, contexts = _ad_prepared_arguments(
-        prepared, args, NamedTuple(kwargs))
+        prepared::PreparedADPullback, seed, args::Vararg{Any,N};
+        kwargs...) where {N}
+    seed, point, contexts = _ad_pullback_inputs(
+        prepared, seed, args, NamedTuple(kwargs))
     value, cotangent = _ad_prepared_value_and_pullback(
         prepared.call, prepared, point, seed, contexts)
     value, _ad_restore_cotangent(point, cotangent)
@@ -2935,14 +3037,32 @@ cotangent into caller-owned `cotangent` storage. Returns `(value, cotangent)`.
 For a scalar active selector, the destination must satisfy the differentiation
 backend's in-place pullback contract. For a tuple selector, supply a matching
 tuple of mutable arrays or `Ref` destinations; the structured cotangent is
-copied into them after the one reverse pass.
+copied into them after the one reverse pass. A tuple of another length, a named
+tuple with other keys, an array of another length or an unsupported destination
+raises before anything is written.
+
+The destination may share memory with the seed, the active point, another
+argument or a borrowed value of the same preparation (see
+[`ad_value_and_pullback`](@ref)). The call then computes into an owned temporary
+and copies the cotangent into the destination, and a returned value that
+overlaps the destination is returned as a copy. A disjoint destination is
+written directly.
 """
 function ad_value_and_pullback!(
-        prepared::PreparedADPullback, cotangent, seed, args...; kwargs...)
-    point, contexts = _ad_prepared_arguments(
-        prepared, args, NamedTuple(kwargs))
-    _ad_prepared_value_and_pullback!(
-        prepared, cotangent, seed, point, contexts)
+        prepared::PreparedADPullback, cotangent, seed, args::Vararg{Any,N};
+        kwargs...) where {N}
+    seed, point, contexts = _ad_pullback_inputs(
+        prepared, seed, args, NamedTuple(kwargs))
+    _ad_shares_memory(cotangent, (seed, point,
+        map(DifferentiationInterface.unwrap,
+            _ad_without_value_box(prepared.call, contexts))...)) ||
+        return _ad_prepared_value_and_pullback!(
+            prepared, cotangent, seed, point, contexts)
+    value, computed = _ad_prepared_value_and_pullback!(
+        prepared, _ad_destination_temporary(cotangent), seed, point, contexts)
+    value = _ad_unshared(value, cotangent)
+    _ad_copy_cotangent!(cotangent, computed)
+    value, cotangent
 end
 
 function _ad_prepared_value_and_pullback!(
@@ -3436,8 +3556,12 @@ to DI position one, and every other current argument is rebound as a fresh
 `DifferentiationInterface.Constant` context. For a tuple selector, `gradient`
 is a matching tuple of mutable destinations. Reverse Enzyme can fill matching
 tuples of disjoint dense arrays and scalar `Ref`s directly when the prepared
-call has DI contexts. Other destination shapes and backends copy the structured
-gradient after the same single reverse pass. Scalar normalization storage is
+call has DI contexts, and also without contexts when Enzyme reports dogfood
+repair `structured_gradient_inplace`. Other destination shapes and backends
+copy the structured gradient after the same single reverse pass. Before that
+copy writes anything,
+a tuple of another length, a named tuple with other keys, an array of another
+length or an unsupported destination raises. Scalar normalization storage is
 owned by the preparation and reused by mutating calls.
 
 Returns the `(value, gradient)` pair from
@@ -3533,40 +3657,67 @@ function _ad_copy_value_and_gradient!(prepared, gradient, point, contexts)
     value, gradient
 end
 
-function _ad_copy_cotangent!(destination::AbstractArray, source)
-    copyto!(destination, source)
+# Copy a computed cotangent into caller-owned storage. The whole destination
+# structure is checked against the cotangent before the first write, so these
+# mismatches raise with nothing written: a tuple of another length or a named
+# tuple with other keys (at any depth), an array whose length differs from its
+# cotangent's, and a destination that is not an array, `Ref`, tuple or named
+# tuple. A write that fails inside one component (an element conversion, an
+# immutable array such as a range) is not covered: earlier components are
+# written by then.
+function _ad_copy_cotangent!(destination, source)
+    _ad_check_cotangent_destination(destination, source)
+    _ad_write_cotangent!(destination, source)
     destination
 end
 
-
-function _ad_copy_cotangent!(destination::Base.RefValue, source)
-    destination[] = source
-    destination
-end
-
-function _ad_copy_cotangent!(destination::Tuple, source::Tuple)
+_ad_check_cotangent_destination(destination::AbstractArray, source) =
+    length(destination) == length(source) ? nothing : throw(DimensionMismatch(
+        "gradient destination has $(length(destination)) elements; " *
+        "its cotangent has $(length(source))"))
+_ad_check_cotangent_destination(::Base.RefValue, source) = nothing
+function _ad_check_cotangent_destination(destination::Tuple, source::Tuple)
     length(destination) == length(source) || throw(DimensionMismatch(
         "gradient destination has $(length(destination)) components; " *
         "the active tuple has $(length(source))"))
-    foreach(_ad_copy_cotangent!, destination, source)
-    destination
+    _ad_cotangent_pairs(_ad_check_cotangent_destination, destination, source)
 end
-
-function _ad_copy_cotangent!(destination::NamedTuple, source::NamedTuple)
+function _ad_check_cotangent_destination(destination::NamedTuple, source::NamedTuple)
     keys(destination) == keys(source) || throw(ArgumentError(
         "gradient destination fields $(keys(destination)) do not match " *
         "cotangent fields $(keys(source))"))
-    foreach(_ad_copy_cotangent!, values(destination), values(source))
-    destination
+    _ad_cotangent_pairs(_ad_check_cotangent_destination,
+        values(destination), values(source))
 end
+_ad_check_cotangent_destination(destination, source) = throw(ArgumentError(
+    "structured active gradients require matching mutable array, Ref, " *
+    "or tuple destinations; got $(typeof(destination)) for a " *
+    "$(typeof(source)) cotangent. Use ad_value_and_gradient for an " *
+    "out-of-place structured gradient."))
 
+# Unchecked writes; `_ad_copy_cotangent!` has validated the structure.
+_ad_write_cotangent!(destination::AbstractArray, source) = copyto!(destination, source)
+_ad_write_cotangent!(destination::Base.RefValue, source) = (destination[] = source)
+_ad_write_cotangent!(destination::Tuple, source::Tuple) =
+    _ad_cotangent_pairs(_ad_write_cotangent!, destination, source)
+_ad_write_cotangent!(destination::NamedTuple, source::NamedTuple) =
+    _ad_cotangent_pairs(_ad_write_cotangent!, values(destination), values(source))
 
-function _ad_copy_cotangent!(destination, source)
-    throw(ArgumentError(
-        "structured active gradients require matching mutable array, Ref, " *
-        "or tuple destinations; got $(typeof(destination)) for a " *
-        "$(typeof(source)) cotangent. Use ad_value_and_gradient for an " *
-        "out-of-place structured gradient."))
+# Apply `f` to corresponding components of two tuples of equal length. A
+# homogeneous pair keeps a runtime loop; heterogeneous components are visited
+# structurally, so neither form dispatches at run time.
+function _ad_cotangent_pairs(f::F, destination::NTuple{N,D},
+        source::NTuple{N,S}) where {F,N,D,S}
+    for i in 1:N
+        f(destination[i], source[i])
+    end
+    nothing
+end
+@generated function _ad_cotangent_pairs(f::F, destination::D,
+        source::S) where {F,D<:Tuple,S<:Tuple}
+    calls = [:(f(getfield(destination, $i), getfield(source, $i)))
+             for i in 1:min(fieldcount(D), fieldcount(S))]
+    Expr(:block, Expr(:meta, :inline), calls..., nothing)
 end
 
 inputs(prepared::PreparedADOperator) = inputs(prepared.kernel)

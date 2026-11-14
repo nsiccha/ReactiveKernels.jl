@@ -20,6 +20,8 @@ print(source)
 
 Input annotations tell the emitter each port's rank. For untyped ports, supply the corresponding `types` keyword. The emitted input order follows the selected input boundary.
 
+The module docstring starts with the generated line shown above. The `doc` keyword adds the author's description of the program after it: a string, or a binding's docstring as `@doc(NAME)`. A docstring written above `const NAME = …` belongs to the binding, not to the value `jax_source` receives, so the caller passes it. For a PPL model, `jax_source(built, bound; doc)` places it before the generated `Data:` and `Model documentation:` lists. Docstrings keep their text as written, backslashes and quotes included.
+
 Typed `Float32` values keep `float32`, also in `prepare_data`; other floats
 take `jax_source`'s `float_type` (`Float64`, or `Float32` without JAX's 64-bit
 mode), as metadata reports.
@@ -27,6 +29,20 @@ mode), as metadata reports.
 `fma` of `Float64` or `Float32` values, also broadcast, rounds once, as in
 Julia; `jax.grad` gives `(y, x, 1)`. Integer `fma` and `muladd` are
 `x * y + z`. Subnormals follow the backend.
+
+`rk_cholesky_lower(A)` uses JAX's lower Cholesky factorization, reading only
+the lower triangle, including when unused upper entries are nonfinite.
+It checks for square input and positive pivots, with runtime checks masked
+by the enclosing branch or plate. Empty factors and padded leading square
+blocks are supported. `L \ b` for a `LowerTriangular` factor uses a triangular
+solve; `diag(L)` reads its diagonal. Data-only factorizations and solves run
+in `prepare_data`. Arithmetic follows the module's `float_type`.
+`diagm(v)` also constructs a diagonal matrix, and source loops or
+comprehensions over `axes(A, d)` retain iteration along that dimension.
+Prepared matrix cells retain their rank and row lengths, including in empty
+plates. Ragged cells can vary along their first axis; trailing dimensions
+must agree because the representation carries one extent per cell.
+For raw empty matrix lists, call `pad_ragged([], rank=2)`.
 
 ## Julia evaluation
 
@@ -44,6 +60,8 @@ A PPL model can emit its sampler boundary through `jax_source(built, bound)`. Th
 A dotted cell latent, `v[i] .~ D.(args…)` with a length per index that data decide, has its dimensions, packed offsets, block table and argument entries computed in `prepare_data` when its arguments read data, scalar parameters or a shared array; an argument that reads a sampled array at the index, or an array of rank 2 or more at each index, raises `JAXEmissionError` for now.
 
 Host preparation translates `findfirst(predicate, vector)`, including captured predicates such as `isequal(label)`, `Base.Fix1` and `Base.Fix2`. It searches in order, stops at the first match, and returns a one-based index or `nothing`. A positional kernel can therefore compute group indices with `plate(values) do value; Int(findfirst(isequal(value), levels)); end` inside the emitted module. Label values and the lengths of both vectors remain runtime inputs.
+
+Host preparation also orders vectors of numbers or strings as Julia's `isless` does (-0.0 before 0.0, every NaN last): `sort`, `unique` (and `sort!`, `unique!` of a list built with `push!`), `searchsortedfirst` and `searchsortedlast` (one-based), and `sortperm(v)`, whose one-based positions keep equal values in ascending position. `invperm(p)` of a vector of integers is the inverse permutation and raises `ArgumentError: argument is not a permutation` as Julia does. A data-only definition such as `pos = invperm(vcat(rows_a, rows_b))` therefore runs in `prepare_data`. Keyword orders (`rev`, `by`, `lt`) have no translation. In the JAX functions these calls have none either: a recipe that also reads a parameter (`theta[sortperm(rows)]`) raises `JAXEmissionError` naming the function, so give the permutation a definition of its own that reads data alone.
 
 A `Bool` array index (a `BitVector` or `Vector{Bool}`, such as `table[table[:, 2] .!= 1, 4]` or `values[present]`) selects the entries where it is true, as Julia's logical indexing does; it is not shifted as one-based positions. A mask of the array's whole shape (`A[A .> 0]`) selects in column-major order. `prepare_data` and other host code use a NumPy boolean mask, which fails on a mask of another length as Julia's `BoundsError` does; a list built with `push!` keeps the entries whose mask entry is true. In device code the count of selected entries depends on data, so the gather is padded to the mask's length: the selected entries come first, padding repeats the last of them, and reductions, `length` and broadcasts mask the padding as they do for a ragged row. A write through a mask writes only the selected entries. A device mask beside another kept dimension (`A[mask, :]`) and a mask of the groups of a ragged value raise `JAXEmissionError`, as does a single `Bool` index into an array, which Julia refuses.
 
@@ -107,7 +125,11 @@ The public density functions and `constrain` call a shared model function.
 Their output selectors are fixed by the wrappers, allowing JAX to trace only
 the requested computation. Call them as before: `log_density(u, **prepared)`.
 The submodel functions likewise take a static `outputs` selection; their
-arguments and array lengths remain runtime inputs.
+arguments and array lengths remain runtime inputs. Consecutive statements
+that the same outputs need share one selection block (`if _entry in (...):`,
+or `if any(name in outputs for name in (...)):` in a submodel function), and
+the checks every public function runs, such as the packed-length check, run
+once before the per-function returns.
 
 A plate may use separate functions for a scalar return value and a batched
 density. Combined computations, such as grouped scalar priors, retain their
@@ -141,15 +163,18 @@ print(jax_source(built, bound))
 
 ## Helpers with loops and branches
 
-A helper with recorded source becomes a named Python function, reused by
-calls with the same argument representation. Its Julia docstring accompanies
-the emitted body. Arrays, captured numerical values and padded lengths are
+A helper becomes a named Python function with its method's argument names,
+reused by calls with the same argument representation: from recorded source,
+or, for a plain helper outside Julia and ReactiveKernels, from its lowered
+code. Its Julia docstring accompanies the body; a broadcast vectorizes the
+function itself. A leading underscore and ReactiveKernels' own helpers stay
+private (`_name`). Arrays, captured numerical values and padded lengths are
 normally explicit arguments. A helper that carries loop bounds or reads scan
 history stays nested in that scope, preserving the bounds and history access
 analysis. Nested plate cells and scan steps are named after the authored
 values they compute.
 
-A helper translates from recorded source when available: `@traceable` records it, and a trailing Vararg argument (`args...`, `args::Vararg{T,N}`) reads as the tuple of the trailing arguments, as the method receives them, and `sum(f, t; init)` folds such a tuple over its fixed length; `for` becomes `jax.lax.fori_loop`, `if` becomes `jax.lax.cond`, and `A[i] = v` becomes `A.at[i].set(v)`. Plain lowered helpers support straight-line code and terminal forward branches, including size guards. They can create immutable closures and fold fixed argument lists with `Base.afoldl`. Broadcasting `Ref(x)` passes `x` whole to each call. Captures remain runtime inputs; host `prepare_data` uses the same translation.
+A helper translates from recorded source when available: `@traceable` records it, and a trailing Vararg argument (`args...`, `args::Vararg{T,N}`) reads as the tuple of the trailing arguments, as the method receives them, and `sum(f, t; init)` folds such a tuple over its fixed length; `for` becomes `jax.lax.fori_loop`, `if` becomes `jax.lax.cond`, and `A[i] = v` becomes `A.at[i].set(v)`. A `jax.lax.cond` arm that is one expression is a `lambda`, and a branch between two values already bound or literal (`s == 0 && x == m ? 1.0 : s`) is `jnp.where`, whose value and derivative are the conditional's; an arm that computes anything stays lazy. A condition decided while tracing (a shape or literal test) is Python's own `if`, so a guard `n == k || throw(...)` reads `if not (n == k): raise ValueError(...)`. Plain lowered helpers support straight-line code and terminal forward branches, including size guards. They can create immutable closures and fold fixed argument lists with `Base.afoldl`. Broadcasting `Ref(x)` passes `x` whole to each call. Captures remain runtime inputs; host `prepare_data` uses the same translation.
 
 A method that a package generates, such as one its macro writes into the caller's module, cannot carry `@traceable`. The generating package keeps the method's source as a `TraceableSource` (argument names, body, and the module whose globals the body reads) and hands it over through a provider. It registers the provider with `register_source_provider!`, once, from the `__init__` of the package extension that loads with ReactiveKernels. The emitter asks the provider for a call that has no other translation and no `@traceable` source, with the function and the `Tuple` type of the argument types. The provider answers `nothing` or the source of the method those arguments call natively.
 

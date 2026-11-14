@@ -641,6 +641,12 @@ const SupportOverride =
         Tuple{Symbol,Symbol},
         Tuple{Symbol,Union{Float64,Symbol,Expr},Union{Float64,Symbol,Expr}}}
 
+# A support override as the layout reads it, after binding folds bound data
+# (`_bound_override`): an elementwise array's bound may be an array of numbers,
+# one per element.
+const BoundOverride = Union{SupportOverride,
+    Tuple{Symbol,Union{Float64,Symbol,Expr,Array{Float64}},Union{Float64,Symbol,Expr,Array{Float64}}}}
+
 _support_args(ov) = ov isa Tuple ? ov[2:end] : ()
 _has_interval_bounds(ov) = ov isa Tuple &&
     ov[1] in (:truncated, :restricted, :restricted_half)
@@ -2446,6 +2452,19 @@ function _size_absent_responses!(plan::StructuralPlan, columns::AbstractDict)
         ax = _OS.value_axes(_value_metadata(axis_plan, d.expr, Set([d.name]);
             data_axes = true))
         ax === nothing || (plate_axes[d.name] = ax)
+    end
+    # A `@scan` carried array holds one entry per step up to its bound, which
+    # bound data supply (`for t in 2:n`), so a response it locates (`m =
+    # level .+ state; y .~ Normal.(m, s)`) has those rows, as in the fit
+    # (snag rkppl-response-a-0d9dd693). A bound the binding does not supply
+    # (the observed array's length) or leaves absent is no evidence of them.
+    for s in axis_plan.scans
+        _scan_length_bound(axis_plan, s) || continue
+        s.hi isa Symbol && axis_plan.columns[s.hi] isa _Absent && continue
+        T = _scan_length(axis_plan, s)
+        for a in s.states
+            plate_axes[a] = (Base.OneTo(T),)
+        end
     end
     plates = Set(keys(plate_axes))
     operands = union(perobs, plates)
@@ -7672,7 +7691,17 @@ function _expr_value_symbols(ex, out::Set{Symbol} = Set{Symbol}())
     if ex isa Symbol
         push!(out, ex)
     elseif ex isa Expr
-        if ex.head === :generator
+        if ex.head === :ref && !isempty(ex.args)
+            # `end` and `begin` in an index are positions of the value this
+            # reference indexes (`g[2:end]`), not names it reads; a nested
+            # reference drops its own. Outside every reference (`2:end`
+            # split from `P[2:end, :]`) they stay reads of no bound name, so
+            # such a piece is never a data-only value of its own.
+            _expr_value_symbols(ex.args[1], out)
+            for i in ex.args[2:end]
+                union!(out, filter!(!_is_endpoint, _expr_value_symbols(i)))
+            end
+        elseif ex.head === :generator
             _generator_symbols!((o, e) -> _expr_value_symbols(e, o), out, ex)
         elseif ex.head === :kw && length(ex.args) == 2
             _expr_value_symbols(ex.args[2], out)
