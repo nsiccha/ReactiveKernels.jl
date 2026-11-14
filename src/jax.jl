@@ -385,6 +385,8 @@ _JaxModule() = _JaxModule(String[], Dict{Any,Any}(), Set{String}(), 0,
 # recipe (for messages) and the module that resolves its source's globals.
 # `host` is `nothing` for JAX code and the host state (`jax_host.jl`) for the
 # NumPy code of `prepare_data`.
+# `target` is the expression being bound to an authored name and that name
+# (`_jax_with_target`), or `nothing`.
 mutable struct _JaxContext
     mod::_JaxModule
     scope::_JaxScope
@@ -394,9 +396,10 @@ mutable struct _JaxContext
     captures::Any
     traced_branches::Int
     host::Any
+    target::Any
 end
 _JaxContext(mod, scope, recipe, source_module, locals, captures) =
-    _JaxContext(mod, scope, recipe, source_module, locals, captures, 0, nothing)
+    _JaxContext(mod, scope, recipe, source_module, locals, captures, 0, nothing, nothing)
 
 # A value known while the code runs its Python control flow: a static value
 # under JAX, any value on the host.
@@ -858,7 +861,8 @@ function _jax_statement(ctx::_JaxContext, ex)
 end
 
 function _jax_assign!(ctx::_JaxContext, lhs, rhs)
-    v = _jax_expr(ctx, rhs)
+    name = lhs isa Expr && lhs.head === :(::) ? lhs.args[1] : lhs
+    v = _jax_with_target(() -> _jax_expr(ctx, rhs), ctx, rhs, name)
     _jax_destructure!(ctx, lhs, v)
     v
 end
@@ -916,8 +920,9 @@ function _jax_expr(ctx::_JaxContext, ::Val{:let}, ex)
                            _jax_where(ctx))
             _jax_assign!(ctx, binding.args[1], binding.args[2])
         end
-        result = _jax_expr(ctx, body)
-        return _jax_bind!(ctx, :let_value, result)
+        # Its locals are Python names of this function, so its value is an
+        # expression as any other: its caller names it or reads it once.
+        return _jax_expr(ctx, body)
     finally
         empty!(ctx.locals)
         merge!(ctx.locals, saved)
@@ -1313,7 +1318,7 @@ function _jax_expr(ctx::_JaxContext, ::Val{:do}, ex)
         _jax_error("a do-block with ", length(names), " arguments over ", length(collections),
                    " collections", _jax_where(ctx))
     elements = [_PyVal(_jax_fresh(ctx, n), eltype(c.T)) for (n, c) in zip(names, collections)]
-    fname = _jax_fresh(ctx, :element)
+    hint = _jax_element_hint(ctx, ex)
     outer = ctx.scope
     inner = _JaxScope(outer)
     inner.indent = outer.indent + 1
@@ -1328,10 +1333,8 @@ function _jax_expr(ctx::_JaxContext, ::Val{:do}, ex)
         ctx.scope = outer
         empty!(ctx.locals); merge!(ctx.locals, saved)
     end
-    push!(outer.lines, "    "^outer.indent * "def " * fname * "(" * join((e.code for e in elements), ", ") * "):")
-    append!(outer.lines, inner.lines)
-    push!(outer.lines, "    "^inner.indent * "return " * result.code)
-    _PyVal("jax.vmap(" * fname * ")(" * _jax_args(collections) * ")", Vector{_jax_typeof(result)},
+    f = _jax_element_callable!(ctx, inner, hint, [e.code for e in elements], result.code)
+    _PyVal("jax.vmap(" * f * ")(" * _jax_args(collections) * ")", Vector{_jax_typeof(result)},
            false, _jax_extent(collections))
 end
 
@@ -1372,6 +1375,45 @@ end
 _jax_no_values(@nospecialize(E), filtered::Bool) =
     filtered ? "(jnp.zeros((0,), dtype=" * _jax_dtype(E) * "), jnp.zeros((0,), dtype=jnp.bool_))" :
     "jnp.zeros((0,), dtype=" * _jax_dtype(E) * ")"
+# `call` where `nonempty` (`_jax_nonempty`) holds, else `empty`, as one
+# expression Python decides while JAX traces (`_jax_emit_unless_empty!` binds
+# it instead).
+_jax_unless_empty(call::AbstractString, empty::AbstractString, nonempty) =
+    nonempty === true ? call : nonempty === false ? empty :
+    call * " if " * nonempty * " else " * empty
+
+# The value a translation is binding to an authored name, `target = <ex>`:
+# a recipe's whole source (`c = [f(k) for k in 1:K]` in a kernel body) or an
+# assignment's right side. A comprehension or `map` that is that whole
+# expression names its element function after the target (`c_element`);
+# any other is an `element`.
+function _jax_with_target(build, ctx::_JaxContext, ex, name)
+    saved = ctx.target
+    ctx.target = name isa Symbol ? (ex, name) : nothing
+    try
+        build()
+    finally
+        ctx.target = saved
+    end
+end
+_jax_element_hint(ctx::_JaxContext, ex) =
+    ctx.target !== nothing && first(ctx.target) === ex ?
+        Symbol(_jax_stable_name(last(ctx.target)), :_element) : :element
+
+# The function a `jax.vmap` maps over the elements: `lambda <params>: <value>`
+# when its body emitted no statement, as a branch arm without statements is
+# (`_jax_emit_arm!`); otherwise a nested function, emitted before the call and
+# named from `hint` against the names its body uses too.
+function _jax_element_callable!(ctx::_JaxContext, inner::_JaxScope, hint, params, value_code)
+    isempty(inner.lines) && return "lambda " * join(params, ", ") * ": " * value_code
+    outer = ctx.scope
+    fname = _jax_identifier(union(outer.used, inner.used, ctx.mod.used), hint)
+    push!(outer.used, fname)
+    push!(outer.lines, "    "^outer.indent * "def " * fname * "(" * join(params, ", ") * "):")
+    append!(outer.lines, inner.lines)
+    push!(outer.lines, "    "^inner.indent * "return " * value_code)
+    fname
+end
 
 # A loop or generator range `_jax_loop_range` reads: `a:b`, `eachindex(x)`,
 # `axes(x, 1)`.
@@ -1383,12 +1425,11 @@ _jax_is_range_form(ctx::_JaxContext, iter) =
 # A generator over a vector's elements (`o.square for o in out`): `jax.vmap`
 # of the element over the vector, or over the columns of a vector of tuples;
 # a padded vector masks its padding as a filter does.
-function _jax_collection_values(ctx::_JaxContext, body, var::Symbol, iter, condition)
+function _jax_collection_values(ctx::_JaxContext, body, var::Symbol, iter, condition, hint)
     xs = _jax_expr(ctx, iter)
     _jax_rank(xs.T) == 1 && !_jax_ragged(xs.T) ||
         _jax_error("a generator over a `", xs.T, "`", _jax_where(ctx))
     element = _jax_fresh(ctx, var)
-    fname = _jax_fresh(ctx, :element)
     outer = ctx.scope
     inner = _JaxScope(outer)
     inner.indent = outer.indent + 1
@@ -1402,22 +1443,25 @@ function _jax_collection_values(ctx::_JaxContext, body, var::Symbol, iter, condi
         ctx.scope = outer
         empty!(ctx.locals); merge!(ctx.locals, saved)
     end
-    push!(outer.lines, "    "^outer.indent * "def " * fname * "(" * element * "):")
-    append!(outer.lines, inner.lines)
-    push!(outer.lines, "    "^inner.indent * "return " *
-          (keep === nothing ? value.code : "(" * value.code * ", " * keep.code * ")"))
+    f = _jax_element_callable!(ctx, inner, hint, [element],
+                               keep === nothing ? value.code : "(" * value.code * ", " * keep.code * ")")
     E = _jax_typeof(value)
     E <: Number || _jax_error("a generator whose elements are `", E, "`", _jax_where(ctx))
     # An empty collection maps no element (`_jax_nonempty`).
     xs = _jax_bind!(ctx, :collection, xs)
     first_column = _jax_columns(xs.T) ? _jax_column(xs, 1) : xs
     nonempty = _py_infix("<", ["0", _py_atom(first_column.code) * ".shape[0]"])
-    values = _jax_fresh(ctx, :values)
     masks = String[]
-    mapped = "jax.vmap(" * fname * ")(" * xs.code * ")"
-    if keep === nothing
+    mapped = "jax.vmap(" * f * ")(" * xs.code * ")"
+    if keep === nothing && isempty(xs.extent)
+        # Values no mask reads are an expression: the comprehension's target,
+        # or the reduction over them, names them.
+        values = _jax_unless_empty(mapped, _jax_no_values(E, false), nonempty)
+    elseif keep === nothing
+        values = _jax_fresh(ctx, :values)
         _jax_emit_unless_empty!(ctx, values, mapped, _jax_no_values(E, false), nonempty)
     else
+        values = _jax_fresh(ctx, :values)
         kept = _jax_fresh(ctx, :kept)
         _jax_emit_unless_empty!(ctx, values * ", " * kept, mapped, _jax_no_values(E, true), nonempty)
         push!(masks, kept)
@@ -1429,7 +1473,7 @@ function _jax_collection_values(ctx::_JaxContext, body, var::Symbol, iter, condi
     _PyVal(values, Vector{E}), masks
 end
 
-function _jax_generator_values(ctx::_JaxContext, gen::Expr)
+function _jax_generator_values(ctx::_JaxContext, gen::Expr, hint::Symbol = :element)
     body, spec = gen.args[1], gen.args[2]
     condition = nothing
     if spec isa Expr && spec.head === :filter
@@ -1439,7 +1483,7 @@ function _jax_generator_values(ctx::_JaxContext, gen::Expr)
         _jax_error("the generator `", gen, "` has no JAX translation", _jax_where(ctx))
     var = spec.args[1]
     _jax_is_range_form(ctx, spec.args[2]) ||
-        return (_jax_collection_values(ctx, body, var, spec.args[2], condition)..., nothing)
+        return (_jax_collection_values(ctx, body, var, spec.args[2], condition, hint)..., nothing)
     lo, hi, bound, steps = _jax_loop_range(ctx, spec.args[2])
     # Ends that are data (`steps`): the element at step `k` is the range's
     # `lo + k` (clamped to `hi`), Julia's while `k <= hi - lo`. It is a lazy
@@ -1450,7 +1494,6 @@ function _jax_generator_values(ctx::_JaxContext, gen::Expr)
     reach = stepped ? _jax_bind!(ctx, :reach, _PyVal(_py_infix("-", [hi.code, lo.code]), Int)) :
         nothing
     index = _jax_fresh(ctx, stepped ? :step : var)
-    fname = _jax_fresh(ctx, :element)
     outer = ctx.scope
     inner = _JaxScope(outer)
     inner.indent = outer.indent + 1
@@ -1499,22 +1542,28 @@ function _jax_generator_values(ctx::_JaxContext, gen::Expr)
         empty!(ctx.locals); merge!(ctx.locals, saved)
     end
     value, keep, element_code = returned
-    push!(outer.lines, "    "^outer.indent * "def " * fname * "(" * index * "):")
-    append!(outer.lines, inner.lines)
-    push!(outer.lines, "    "^inner.indent * "return " * element_code)
-    indices = _jax_fresh(ctx, stepped ? :steps : :indices)
-    _jax_emit!(ctx, indices * " = jnp.arange(" *
-                    (stepped ? steps : lo.code * ", " * _jax_plus_one(hi)) * ")")
-    mapped = "jax.vmap(" * fname * ")(" * indices * ")"
+    f = _jax_element_callable!(ctx, inner, hint, [index], element_code)
+    # The range is bound only when a mask reads it: a data-dependent bound or
+    # end compares each index with it.
+    range = "jnp.arange(" * (stepped ? steps : lo.code * ", " * _jax_plus_one(hi)) * ")"
+    masked = stepped || !isempty(bound)
+    indices = masked ? _jax_bind!(ctx, stepped ? :steps : :indices, _PyVal(range, Vector{Int})).code :
+        range
+    mapped = "jax.vmap(" * f * ")(" * indices * ")"
     E = _jax_typeof(value)
     E <: Number || _jax_error("a generator whose elements are `", E, "`", _jax_where(ctx))
     # An empty range maps no element (`_jax_nonempty`).
     nonempty = stepped ? _jax_nonempty("1", steps) : _jax_nonempty(lo.code, hi.code)
-    values = _jax_fresh(ctx, :values)
     masks = String[]
-    if keep === nothing
+    if keep === nothing && !masked
+        # Values no mask reads are an expression: the comprehension's target,
+        # or the reduction over them, names them.
+        values = _jax_unless_empty(mapped, _jax_no_values(E, false), nonempty)
+    elseif keep === nothing
+        values = _jax_fresh(ctx, :values)
         _jax_emit_unless_empty!(ctx, values, mapped, _jax_no_values(E, false), nonempty)
     else
+        values = _jax_fresh(ctx, :values)
         kept = _jax_fresh(ctx, :kept)
         _jax_emit_unless_empty!(ctx, values * ", " * kept, mapped, _jax_no_values(E, true), nonempty)
         push!(masks, kept)
@@ -1557,7 +1606,7 @@ function _jax_expr(ctx::_JaxContext, ::Val{:comprehension}, ex)
     ctx.host === nothing || return _host_comprehension(ctx, gen)
     gen.args[2] isa Expr && gen.args[2].head === :filter &&
         _jax_error("a filtered comprehension has a data-dependent length", _jax_where(ctx))
-    values, masks, count = _jax_generator_values(ctx, gen)
+    values, masks, count = _jax_generator_values(ctx, gen, _jax_element_hint(ctx, ex))
     isempty(masks) && return values
     if count === nothing
         # The range's data-dependent bound is the vector's length.
@@ -4686,8 +4735,16 @@ function _jax_source_call(ctx::_JaxContext,
     length(params) == length(args) ||
         _jax_error("an embedded operation takes ", length(params), " arguments, not ",
                    length(args), _jax_where(ctx))
-    v = _jax_source_expr(ctx, body, params, args, mod, captures)
-    _jax_bind!(ctx, :value, v)
+    ctx.host === nothing ||
+        return _jax_bind!(ctx, :value, _jax_source_expr(ctx, body, params, args, mod, captures))
+    # The spliced body is translated in place as authored code is: its value
+    # is an expression its caller names or reads once, so an arm made of it
+    # alone is a `lambda:` or a `jnp.where` (`_jax_conditional`). An argument
+    # the body reads more than once is bound first, under the body's own name
+    # for it, so its expression is not repeated.
+    args = _PyVal[_jax_reads(body, p) > 1 && !_jax_atom(a) ? _jax_bind!(ctx, p, a) : a
+                  for (p, a) in zip(params, args)]
+    _jax_source_expr(ctx, body, params, args, mod, captures)
 end
 # A lazy branch called as a value (a cell's branch spliced into its plate's
 # body): its condition over the arguments at `CI`, and an arm over those at
@@ -4698,8 +4755,19 @@ function _jax_source_call(ctx::_JaxContext, b::_KernelBranch{CI,TI,EI},
     v = _jax_conditional(ctx, condition,
                          () -> _jax_source_call(ctx, b.then_arm, args[collect(Int, TI)], mod),
                          () -> _jax_source_call(ctx, b.else_arm, args[collect(Int, EI)], mod))
-    _jax_bind!(ctx, :value, v)
+    ctx.host === nothing ? v : _jax_bind!(ctx, :value, v)
 end
+_jax_numeric_literal(code::AbstractString) =
+    occursin(r"^-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$", code)
+# How often `body` reads the name `name` (assignments to it count too, which
+# only errs towards binding).
+_jax_reads(body, name::Symbol) = body === name ? 1 :
+    body isa Expr ? sum((_jax_reads(a, name) for a in body.args); init = 0) : 0
+# A Python value reading which twice costs nothing: a name, a dotted name
+# (`jnp.inf`) or a number, possibly negated.
+_jax_atom(v::_PyVal) =
+    occursin(r"^-?(?:[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*|(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)$",
+             v.code)
 _jax_source_call(ctx::_JaxContext, f, args::Vector{_PyVal}, mod) = _jax_call(ctx, f, args)
 
 # The parameters, body and captures of a source function: its
@@ -4889,7 +4957,13 @@ function _jax_call_positional(ctx::_JaxContext, k::PreparedKernel, args::Vector{
     T = length(f.outputs) == 1 ? last(only(f.outputs)) : Tuple{(last(o) for o in f.outputs)...}
     passed = String[a.code for a in args]
     guard === nothing || push!(passed, guard)
-    _jax_bind!(ctx, :value, _PyVal(name * "(" * join(passed, ", ") * ")", T))
+    call = _PyVal(name * "(" * join(passed, ", ") * ")", T)
+    # One value is an expression its caller names or reads once, as a spliced
+    # body's is (`_jax_source_call`). A call whose function runs a runtime
+    # check is a statement too, so the check runs where Julia's call does,
+    # and a tuple is bound once for its fields.
+    host || length(f.outputs) != 1 || ctx.mod.helper_names[(:kernel_effects, name)] != 0 ?
+        _jax_bind!(ctx, :value, call) : call
 end
 
 # A prepared child a source calls (a distribution's `standardized` step):
@@ -5791,6 +5865,11 @@ function _jax_define!(ctx::_JaxContext, g::Graph, v::Value, val::_PyVal; bind::B
         key = (last(ctx.mod.path[1]).id, last(ctx.mod.path[2]).id)
         key in ctx.mod.cell_data && (val = _jax_with_origin(val, _JaxCellData(key...)))
     end
+    # A literal the authoring layer materialized under a generated port name
+    # (`normal(0, s)`'s `location_binding`) is read as the literal: the source
+    # spelled a number, not a name.
+    bind && ctx.host === nothing && val.static && !haskey(ctx.scope.hints, id) &&
+        occursin('#', String(v.name)) && _jax_numeric_literal(val.code) && (bind = false)
     if bind
         name = _jax_fresh(ctx, get(ctx.scope.hints, id, v.name))
         _jax_emit!(ctx, name * " = " * val.code)
@@ -5908,9 +5987,14 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe, op::_KernelSourc
         _jax_branch(ctx, p, recipe, f, inputs))
     _has_source(recipe) || _jax_error("a source operation without its source", _jax_where(ctx))
     stable = _jax_stable_rewrite(ctx, p, recipe, inputs)
+    # A recipe's whole source is bound to its one output's name.
+    target = length(recipe.outputs) == 1 ? (out = only(recipe.outputs);
+        get(ctx.scope.hints, canon_id(p.graph, out.id), out.name)) : nothing
     v = stable === nothing ?
-        _jax_source_expr(ctx, recipe.source, _recipe_source_names(recipe), inputs,
-                         _jax_source_module(op), _jax_source_captures(op)) :
+        _jax_with_target(ctx, recipe.source, target) do
+            _jax_source_expr(ctx, recipe.source, _recipe_source_names(recipe), inputs,
+                             _jax_source_module(op), _jax_source_captures(op))
+        end :
         _jax_source_expr(ctx, stable.expr, stable.names, stable.values, stable.mod,
                          _jax_source_captures(op))
     _jax_split_outputs(ctx, recipe, v)

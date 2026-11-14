@@ -1204,7 +1204,9 @@ end
     @test occursin(".at[", loop)
     @test !occursin(r"^\s*for "m, loop)
     generators = string(jax_source(jax_generators; have = (:w, :x), want = :t))
-    @test occursin("jax.vmap(element", generators)
+    # Elements of one expression are `lambda`s, named nowhere (RK 0.1.246).
+    @test occursin("jax.vmap(lambda ", generators)
+    @test !occursin(r"(?m)^\s*def element", generators)
     @test occursin("jnp.where(kept", generators)
     @test !occursin(r"^\s*for "m, generators)
     @test ReactiveKernels._traceable_source(typeof(jax_test_recorded), Float64) !== nothing
