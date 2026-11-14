@@ -141,9 +141,12 @@ print(jax_source(built, bound))
 
 ## Helpers with loops and branches
 
-A helper with recorded source becomes a named Python function, reused by
-calls with the same argument representation. Its Julia docstring accompanies
-the emitted body. Arrays, captured numerical values and padded lengths are
+A helper becomes a named Python function with its method's argument names,
+reused by calls with the same argument representation: from recorded source,
+or, for a plain helper outside Julia and ReactiveKernels, from its lowered
+code. Its Julia docstring accompanies the body; a broadcast vectorizes the
+function itself. A leading underscore and ReactiveKernels' own helpers stay
+private (`_name`). Arrays, captured numerical values and padded lengths are
 normally explicit arguments. A helper that carries loop bounds or reads scan
 history stays nested in that scope, preserving the bounds and history access
 analysis. Nested plate cells and scan steps are named after the authored
