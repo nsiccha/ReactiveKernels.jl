@@ -16,6 +16,18 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.181
+
+- **Breaking:** `jax_source(built, plan; doc)` no longer replaces the module
+  docstring. The docstring keeps its generated first line, then `doc`, the
+  author's description of the model, then the generated `Data:` list and
+  `Model documentation:` statement docstrings. `doc` takes a string or a Julia
+  docstring such as `@doc TOY_MODEL` (a docstring above
+  `const TOY_MODEL = @rkppl …` belongs to the binding, so the caller passes
+  it). A caller that passed `doc` to replace the generated docstring now gets
+  both; no caller in this repository or its known consumers passed it.
+  Requires ReactiveKernels 0.1.242.
+
 ## 0.1.180
 
 - A range that reads `end` or `begin` inside an index over data or over a
