@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.232
+## 0.1.233
 
 - JAX source retains named, documented functions for source-backed helpers and
   shares compatible public entries through one computation body. Static entry
@@ -24,6 +24,27 @@ are recorded in the git history only.
   carry runtime extents, ragged positions and integer bounds; helpers using scan
   history remain nested in the scan's lexical scope. Nested plate cells and
   scan steps take names from their authored values.
+
+## 0.1.232
+
+- The opt-in generated summed-plate reverse (`with_plate_reverse`) runs one
+  pass over the cells for a plate with a gathered operand (`view(z, g)` with an
+  index vector; RKPPL's `z[group]`), at least 128 cells, and fewer groups than
+  cells (the operand's parent shorter than the plate). Its augmented primal
+  computes the value and the unit-seed partials together, gathering the
+  operand's partials per group into a buffer as long as its parent, and the
+  reverse pass only scales them by the seed. Invariant terms of the cell
+  density are summed once per plate rather than per cell, and a shared value's
+  partial through the gathered read is one product per group. The schedule is
+  chosen per call from the operands' sizes; every other plate (fewer cells, no
+  gathered operand, only unit-range views such as a sampler's parameter block,
+  or a parent at least as long as the plate) keeps two passes at its previous
+  cost. A shadow read at more than one site on an execution path keeps per-cell
+  accumulation. Gradients are unchanged up to rounding. The one-pass tape is
+  one allocation per gradient (the buffer plus the scalar partials). On a
+  grouped Gaussian model the rule's gradient goes from about 1.9 to about 1.45
+  times a hand-written closed form at 2,000 cells, and to about 1.3 times at
+  100,000 cells. The rule remains opt-in.
 
 ## 0.1.231
 
