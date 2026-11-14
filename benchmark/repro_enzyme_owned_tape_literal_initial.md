@@ -26,12 +26,15 @@ scheduling, a noinline wrapper, and RuntimeGeneratedFunctions are unnecessary
 to reproduce the failure. Simple carried-total loop reductions pass even with
 the literal, so a literal alone is not a sufficient description of the defect.
 
-The tape draft is private commit `0855f5a9b7adc2d20e3fa3a7a685d4ed38cee4d2`.
-It passes 224 first-order/isolation/recovery/split-tape checks and allocates zero
-warm bytes in the tested first-order cases. Full-kernel higher derivatives
-remain unsupported in that draft; no runtime-activity or mathematical source
-workaround has been applied. The scheduler already landed at `e6c463ac` does
-not contain this tape-reuse draft.
+Enzyme repair `constant_scalar_tangent`, landed in dogfood
+`15ebe6cc77be51cd9fb6f611b9c4db680b7ecfb7`, fixes this failure. The unchanged
+reproducer passes all six checks on that revision, and the RK consumer passes
+2,309 checks including changed-point higher derivatives, tape ownership and
+exception recovery. The native library is
+`342bcb7a0f5a742ee8e52943225bb6870c64c39e`. No runtime-activity or mathematical
+source workaround was added. Check the repair with
+`Enzyme.has_dogfood_repair(:constant_scalar_tangent)`; the upstream report is
+[Enzyme.jl #4060](https://github.com/EnzymeAD/Enzyme.jl/issues/4060).
 
 Retained reduction run: fleet `d593601a85894f9a` on strato2, wrapper receipt
 exit1 at 2026-11-14T17:21:51Z (251 seconds). Minimal loop and gathered-view
