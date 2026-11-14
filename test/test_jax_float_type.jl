@@ -61,9 +61,10 @@ end
     fma32 = string(jax_source(jax_float_fma; have = (:x, :y, :z), want = :result,
                               float_type = Float32))
     @test occursin("_rk_fma32", fma32) && occursin("jax_enable_x64", fma32)
-    # The static arm of a `Float32` program's branch is float32.
+    # The static arm of a `Float32` program's branch is float32: selected
+    # beside the float32 `s`, the Python literal takes its dtype.
     literal = string(jax_source(jax_float32_literal_arm; have = (:x, :s), want = :total))
-    @test occursin("dtype=jnp.float32))", literal)
+    @test occursin("jnp.where(s > 0, s, 1.0)", literal)
 
     if !rk_jax_available()
         @info "RK_JAX_PYTHON is not set: float32 JAX parity skipped"

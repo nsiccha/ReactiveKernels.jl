@@ -1522,17 +1522,57 @@ function _array_layout_entries!(entries::Vector{LayoutEntry},
                 dims))
             offset += n
         else
-            transform, lo, hi =
-                _entry_transform(p.family, _bound_override(plan, p.support_override),
-                    p.family === :uniform ? map(x -> _layout_bound(plan, x), p.args) : p.args)
+            # A bound may hold one number per element, of the array's shape.
+            ov = _bound_override(plan, p.support_override; elementwise = true)
+            args = p.family === :uniform ?
+                map(x -> _layout_bound(plan, x; elementwise = true), p.args) : p.args
+            sides = _array_bound_sides(plan, p, ov, args, dims)
+            transform, lo, hi = _entry_transform(p.family, ov, args; elementwise = sides)
+            p.family === :uniform && _check_uniform_bounds(p, lo, hi)
             n = prod(dims)
             push!(entries, LayoutEntry(:array, nothing, p.name,
                 _array_labels(p.name, dims), offset, n, transform, lo, hi,
-                dims))
+                dims, LayoutEntry[], nothing, nothing, nothing, (nothing, nothing),
+                (sides[1] && !(lo isa Real), sides[2] && !(hi isa Real))))
             offset += n
         end
     end
     return offset
+end
+
+# Which bounds of an elementwise array hold one bound per element: an array
+# of bound data or a data-only definition (folded to numbers here), or a graph
+# value with axes. An array bound has the declared shape: Julia's broadcast of
+# a lower-rank bound over a two-axis array (a vector per row) is not built.
+function _array_bound_sides(plan::StructuralPlan, p::ArrayParameter, ov, args, dims)
+    bounds = p.family === :uniform ? (args.arg1, args.arg2) :
+        _has_interval_bounds(ov) ? (ov[2], ov[3]) : (nothing, nothing)
+    return map(bounds) do b
+        (b === nothing || b isa Real) && return false
+        if b isa AbstractArray
+            size(b) == Tuple(dims) || _fail(p.label, "array $(p.name): a " *
+                "per-element bound has size $(size(b)); it needs the " *
+                "declared size $(Tuple(dims)) (one bound per element)")
+            return true
+        end
+        axes = _value_axes(plan, b; data_axes = true)
+        axes === nothing && return false
+        isempty(axes) && return false
+        length(axes) == length(dims) || _fail(p.label, "array $(p.name): the " *
+            "per-element bound `$(b)` has $(length(axes)) axes; it needs the " *
+            "declared array's $(length(dims)) (one bound per element)")
+        return true
+    end
+end
+
+# Uniform bounds per element are finite and ordered, as for shared numbers.
+function _check_uniform_bounds(p::ArrayParameter, lo, hi)
+    (lo isa AbstractArray || hi isa AbstractArray) || return nothing
+    _static_bound(lo) && _static_bound(hi) || return nothing
+    all(isfinite, lo) && all(isfinite, hi) || _fail(p.label,
+        "array $(p.name): Uniform bounds must be finite")
+    all(lo .< hi) || _fail(p.label, "array $(p.name): Uniform bounds need lo < hi")
+    return nothing
 end
 
 # Layout transform of a slice array: centered multivariate normals are
@@ -1625,9 +1665,15 @@ function _array_transform_statements(e::LayoutEntry)
 end
 
 # The flat `:plate` block of an elementwise array, read at the array's range.
-_array_flat_entry(e::LayoutEntry, flat::Symbol) = LayoutEntry(:plate, nothing,
-    flat, e.labels, e.offset, e.size, e.transform, e.lo, e.hi, Int[],
-    LayoutEntry[], nothing, e.positions)
+# A per-element bound is read in the block's column-major order
+# (`_elementwise_bound_read`).
+function _array_flat_entry(e::LayoutEntry, flat::Symbol)
+    flatten(b, elementwise) = elementwise ? _elementwise_bound_read(e, b) : b
+    return LayoutEntry(:plate, nothing, flat, e.labels, e.offset, e.size,
+        e.transform, flatten(e.lo, e.elementwise[1]), flatten(e.hi, e.elementwise[2]),
+        Int[], LayoutEntry[], nothing, e.positions, nothing, (nothing, nothing),
+        e.elementwise)
+end
 
 # The shape an array's flat packed block has, as its program reads it.
 _entry_axes(e::LayoutEntry) = something(e.axes, _is_slice_transform(e.transform) ?
@@ -2179,9 +2225,26 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
             push!(stmts, :($local_name = $val))
             push!(arg_values, local_name)
         end
+        support = p.support_override
+        # A bound with axes holds one bound per element, which may be infinite.
+        open_bounds = _has_interval_bounds(support) && any(b -> !(b isa Real) &&
+            _value_axes(context, b; data_axes = true) != Any[], support[2:end])
+        # A per-element bound of a two-axis array is read in the same packed
+        # order as a per-element argument; a vector array's cells read its
+        # entries in place.
+        if cells && _has_interval_bounds(support)
+            support = (support[1], map(enumerate(support[2:end])) do (i, b)
+                b isa Real && return b
+                _value_axes(context, b; data_axes = true) == Any[] && return b
+                local_name = Symbol(:_ppl_pbound_, p.name, :_, i)
+                push!(stmts, :($local_name = _array_prior_cells($b,
+                    $(_array_cells_dims(layout, p)))))
+                return local_name
+            end...)
+        end
         _vector_prior_stmts!(stmts, terms, flat, p.family,
             NamedTuple{Tuple(arg_names)}(Tuple(arg_values)),
-            p.support_override; conditioned = p.name in context.conditioned,
+            support; conditioned = p.name in context.conditioned, open_bounds,
             float64_variate = p.name ∉ context.conditioned, label = p.name,
             float64_inputs, cell_names)
         push!(pointwise, p.name => :(reshape($(Symbol(:_ppl_pw_prior_, p.name)), size($(p.name)))))

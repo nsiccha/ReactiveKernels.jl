@@ -16,6 +16,33 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.240
+
+- JAX source emits a plain authored helper (no `@traceable`, defined outside
+  Julia and ReactiveKernels) as a named Python function with its method's
+  argument names and Julia docstring, as recorded-source helpers already are,
+  instead of inlining its lowered code. A broadcast of a named helper
+  vectorizes that function itself (`jnp.vectorize(toy_mean)`) rather than a
+  private positional wrapper. Helpers whose name starts with `_` and
+  ReactiveKernels' own recorded helpers (the stable rewrites' `_rk_div_by_of`)
+  stay private (`_div_by_of`). Lowered helper bodies compose single-use
+  temporaries into expressions and bind assigned locals by their authored names.
+- A named JAX function that returns one of its arguments' lengths unchanged
+  (a retained tuple's field, `getfield(pair, 2)`, also `@traceable`) gives its
+  caller that argument's own length expression, so a later
+  `reduce(vcat, cells)` still finds the prepared flat positions.
+
+## 0.1.239
+
+- JAX source names only what a reader needs. A traced branch between two
+  values already bound or literal is `jnp.where` (same value and derivative),
+  other `jax.lax.cond` arms that are one expression are `lambda`s, and a
+  condition decided while tracing is Python's own `if`, so a shape guard reads
+  `if not (n == k): raise ValueError(...)` instead of two nested functions and
+  a `value` binding. Consecutive statements needed by the same entries share
+  one output-selection block, and checks every entry runs (the packed-length
+  check) run once before the entries' returns.
+
 ## 0.1.238
 
 - A prepared reverse Enzyme gradient whose active ports are all of the

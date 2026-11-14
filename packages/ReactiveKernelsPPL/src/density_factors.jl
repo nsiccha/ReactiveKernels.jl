@@ -66,17 +66,23 @@ function _record_jacobian!(sites, stmts, e::LayoutEntry, total;
     elseif e.kind === :external_plate
         _record_density!(sites, stmts, :log_jacobian, site, total;
             pointwise = _plate_logjac_name(e.name), count = e.size, owner = e)
-    elseif e.kind !== :external && e.transform in (:exp, :logistic, :interval, :floored, :upper)
+    elseif e.kind !== :external && e.transform in (:exp, :logistic, :interval, :floored, :upper, :bounded)
         # The same scalar Jacobian emitter used by the sampler. Parameters
-        # of bounds remain graph inputs, so their support is retained.
+        # of bounds remain graph inputs, so their support is retained. A bound
+        # per element is a cell input beside the coordinate.
         program = _program_entry(e)
-        scalar = LayoutEntry(:sampled, nothing, e.name, Symbol[], 1, 1,
-            e.transform, program.lo, program.hi)
+        inputs = Any[_entry_view(e)]
+        cell_bound(b, elementwise) = elementwise ?
+            (push!(inputs, _elementwise_bound_read(program, b)); _dovar(length(inputs))) : b
+        lo = cell_bound(program.lo, program.elementwise[1])
+        hi = cell_bound(program.hi, program.elementwise[2])
         value = _dovar(1)
-        expression = _replace_density_coordinate(jacobian_term(scalar), value)
+        expression = e.transform === :bounded ? _bounded_cell(:logjac, lo, hi, value) :
+            _replace_density_coordinate(jacobian_term(LayoutEntry(:sampled, nothing,
+                e.name, Symbol[], 1, 1, e.transform, lo, hi)), value)
         pw = Symbol(:_ppl_density_jacobian_cells_, length(sites) + 1)
         append!(stmts, _plate_sum_stmts(pw, Symbol(pw, :_sum),
-            Any[_entry_view(e)], Expr(:block, expression)))
+            inputs, Expr(:block, expression)))
         _record_density!(sites, stmts, :log_jacobian, site, total;
             pointwise = pw, count = e.size, owner = e)
     else
