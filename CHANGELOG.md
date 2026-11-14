@@ -16,6 +16,20 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.238
+
+- A prepared reverse Enzyme gradient whose active ports are all of the
+  kernel's inputs (a tuple selector with no DI context) now writes into the
+  caller's matching dense arrays and `Ref`s directly. This applies when Enzyme
+  reports dogfood repair `structured_gradient_inplace`; registered Enzyme and
+  older dogfood keep the copy path.
+- `ad_value_and_gradient!` and `ad_value_and_pullback!` reject a mismatched
+  structured destination before writing anything when they copy the
+  cotangent: a tuple of another length, a named tuple with other keys, an
+  array whose length differs from its cotangent's, or an unsupported
+  destination. An array destination longer than its cotangent used to be
+  filled only up to the cotangent's length, without error.
+
 ## 0.1.237
 
 - JAX source computes `sortperm(v)` and `invperm(p)` of data in the host
