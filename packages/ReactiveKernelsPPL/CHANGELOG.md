@@ -16,6 +16,14 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.177
+
+- JAX modules retain authored submodel names and documentation, reuse compatible
+  submodel functions across calls, and share computation among the density and
+  constrain entries. Static output selection keeps unused submodel work lazy;
+  distinct lowered forms and interleaved dependencies retain separate named
+  functions. Native graphs, queries and public entry signatures are unchanged.
+
 ## 0.1.176
 
 - Absent responses retain the outer extent of collected scalar `@plate`

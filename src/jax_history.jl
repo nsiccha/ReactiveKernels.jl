@@ -22,6 +22,11 @@ struct _JaxHistoryIndex
     value::_PyVal
 end
 
+_jax_map_origin(o::_JaxScanRange, code) = _JaxScanRange(code(o.first))
+_jax_map_origin(o::_JaxHistoryIndex, code) = _JaxHistoryIndex(o.scan,
+    code(o.divisor), code(o.multiplier), code(o.lo), code(o.hi), code.(o.conditions),
+    _jax_map_value(o.value, code))
+
 # Retain ordinary integer provenance alongside the lag proof. In particular,
 # a scanned prepared range can index history and bound a nested loop.
 _jax_history_value(v::_PyVal) = v.origin isa _JaxHistoryIndex ? v.origin.value : v

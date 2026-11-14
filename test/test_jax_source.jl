@@ -1219,15 +1219,15 @@ end
     # A tuple carry enters the loop as a tuple of coerced elements, the
     # structure the body returns, never as one array of the tuple.
     tupled = string(jax_source(jax_tuple_loop; have = (:w, :x, :n), want = :t))
-    @test occursin("((jnp.asarray(s[0], dtype=jnp.float64), jnp.asarray(s[1], dtype=jnp.float64)),)",
+    @test occursin(r"\(\(jnp\.asarray\((\w+)\[0\], dtype=jnp\.float64\), jnp\.asarray\(\1\[1\], dtype=jnp\.float64\)\),\)",
                    tupled)
-    @test !occursin("jnp.asarray(s, ", tupled)
+    @test !occursin(r"jnp\.asarray\(s(?:_\d+)?, ", tupled)
     named = string(jax_source(jax_named_loop; have = (:w,), want = :t))
     @test occursin("jnp.asarray(s[1], dtype=jnp.int64)", named)
     # Past a row's length each element keeps its value (`jnp.where` of a
     # tuple would stack it into an array).
     rows = string(jax_source(jax_tuple_rows; have = (:a, :R), want = :total))
-    @test occursin(r"\(\(jnp\.where\(t <= r_n, s_3\[0\], s_2\[0\]\), jnp\.where\(t <= r_n, s_3\[1\], s_2\[1\]\)\),\)",
+    @test occursin(r"\(\(jnp\.where\(t <= (\w+), (\w+)\[0\], (\w+)\[0\]\), jnp\.where\(t <= \1, \2\[1\], \3\[1\]\)\),\)",
                    rows)
     @test occursin("jax.lax.while_loop(", string(jax_source(jax_tuple_while; have = (:x,), want = :t)))
     plain = string(jax_source(jax_plain; have = (:w, :x), want = :s))
@@ -1904,10 +1904,15 @@ end
     src = jax_source(jax_cell_shared_length; have = (:theta, :x, :H), want = :total,
                      data = (; x, H = 5))
     device_part = split(string(src), "\ndef kernel")[2]
-    @test occursin(r"jax\.vmap\(cell\w*, in_axes=\(0, None, None\)\)\(theta, x, H\)", device_part)
+    @test occursin(r"jax\.vmap\(\w+_cell\w*, in_axes=\(0, None, None\)\)\(theta, x, H\)", device_part)
     @test occursin(r"jnp\.arange\(2, H\w* \+ 1\)", device_part)
     @test occursin(r"jnp\.full\(\(H\w*,\), t", device_part)
-    @test occursin(r"jax\.lax\.fori_loop\(2, H\w* \+ 1, ", device_part)
+    # The loop belongs to the called authored helper. Follow that call
+    # and check its static length parameter, rather than its caller's name.
+    @test occursin(r"jax_shared_tail\w*\(t\w*, x\w*, H\w*\)", device_part)
+    helper = match(r"(?ms)^def jax_shared_tail\w*\(.*?(?=^def |\z)", string(src))
+    @test helper !== nothing
+    @test occursin(r"jax\.lax\.fori_loop\(2, n\w* \+ 1, ", helper.match)
     if !rk_jax_available()
         @test_skip false
     else

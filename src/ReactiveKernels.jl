@@ -88,6 +88,7 @@ include("native_ode.jl")
 include("streaming.jl")
 include("streaming_helpers.jl")
 include("jax.jl")
+include("jax_regions.jl")
 include("jax_history.jl")
 include("jax_host.jl")
 

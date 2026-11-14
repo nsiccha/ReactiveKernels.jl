@@ -1623,7 +1623,11 @@ function _jax_cell_failure(mod::_JaxModule, split, rp::Plan, e::JAXEmissionError
     path = get(mod.failure_paths, e, nothing)
     (path === nothing || length(path) < 2) && return nothing
     (outer, plate), (cell, recipe) = path[1], path[2]
-    outer === rp && plate.op isa _AuthoredPlateOp && cell === plate.op.kernel.plan ||
+    # Shared entries emit a union plan of the same graph. Its selected
+    # recipe still identifies this residual plan's plate exactly.
+    same_plan = outer === rp || (outer.graph === rp.graph &&
+                                any(r -> r.id == plate.id, rp.recipes))
+    same_plan && plate.op isa _AuthoredPlateOp && cell === plate.op.kernel.plan ||
         return nothing
     length(cell.have) == length(plate.inputs) || return nothing
     g = rp.graph
