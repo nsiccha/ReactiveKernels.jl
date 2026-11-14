@@ -310,9 +310,11 @@ function _jax_data_definitions(plan::StructuralPlan, names)
     # Each response with a presence mask: its mask from the raw value, then
     # its stored values, ahead of every definition that reads them.
     missing_responses = Pair{Symbol,Any}[]
+    missing_names = Set{Symbol}()
     for nm in sort!(collect(available))
         mask = _observed_mask_name(nm)
         haskey(plan.columns, mask) || continue
+        push!(missing_names, nm)
         mask in available &&
             push!(missing_responses, mask => :($_rkppl_presence($nm)))
         push!(missing_responses,
@@ -383,10 +385,17 @@ function _jax_data_definitions(plan::StructuralPlan, names)
         push!(order, nm)
     end
     foreach(visit, sort!(collect(keys(found))))
+    # A definition reading a response only through its presence or its values
+    # with absent entries filled (a marginalized recurrence's filter) reads
+    # the raw value, as binding does: it goes ahead of the stored values.
+    raw_read(ex) = _is_presence_read(ex) && ex.args[2] in missing_names &&
+        all(a -> !(a isa Symbol || a isa Expr), ex.args[3:end])
+    raw = [nm for nm in order if raw_read(found[nm])]
     # `jax_source` resolves their callees in the generated scope, as binding
     # does, where the value vocabulary's `logistic` is `_ppl_logistic`.
-    Pair{Symbol,Any}[missing_responses;
-                     [nm => _argument_value_calls(found[nm]) for nm in order]]
+    Pair{Symbol,Any}[[nm => _argument_value_calls(found[nm]) for nm in raw];
+                     missing_responses;
+                     [nm => _argument_value_calls(found[nm]) for nm in order if !(nm in raw)]]
 end
 _jax_data_name(nm::Symbol) = nm
 
@@ -623,6 +632,25 @@ function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
         " has a different number of entries than the scan writes"), DimensionMismatch)
     ReactiveKernels._jax_call(ctx, ReactiveKernels._runtime_check, [same, message])
     hi
+end
+
+# A top-level observed `@scan` array (`_observed_scan_values`): the scan reads
+# it entry by entry, so its value passes through. With the scan's length, the
+# array holds one entry per scan index, or one entry (an absent array's
+# stand-in), checked when the module runs as the native check does.
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_observed_scan_values), args::Vector{ReactiveKernels._PyVal})
+    name, value = args[1], args[2]
+    length(args) == 3 || return value
+    value.T isa Type && value.T <: _Absent && return value
+    n = ReactiveKernels._jax_call(ctx, length, [value])
+    one = ReactiveKernels._PyVal("1", Int, true)
+    held = ReactiveKernels._jax_call(ctx, |, [ReactiveKernels._jax_call(ctx, ==, [n, args[3]]),
+        ReactiveKernels._jax_call(ctx, ==, [n, one])])
+    message = ReactiveKernels._PyVal(repr("observed `@scan` array " * strip(name.code, ['"', '\'']) *
+        " has a different number of entries than the scan writes"), DimensionMismatch)
+    ReactiveKernels._jax_call(ctx, ReactiveKernels._runtime_check, [held, message])
+    value
 end
 
 # The program's check of its packed point (`_ppl_check_packed`): the

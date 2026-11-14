@@ -1747,7 +1747,8 @@ function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict
     Meta.isexpr(ast, :function, 2) && Meta.isexpr(ast.args[1], :tuple) ||
         _pr_fail("not a plate program")
     params = Symbol[p for p in ast.args[1].args]
-    body = ast.args[2]
+    source, index_runs = _pr_index_run_source(ast)
+    body = source.args[2]
     stmts = Any[a for a in body.args if !(a isa LineNumberNode)]
     output = stmts[end]
     output isa Symbol || _pr_fail("a plate program with several results")
@@ -1832,8 +1833,10 @@ function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict
         Expr(:tuple, params..., seed, _PR_WANT_VALUE, (shadow[p] for p in batched)...),
         Expr(:block, checks..., init..., seeds..., new_body...,
              Expr(:tuple, output, (_pr_bar(p) for p in scalar)...)))
-    fexpr, scalar, batched
+    _pr_index_run_schedule(fexpr, index_runs, prepared, shadow, params, batched), scalar, batched
 end
+
+include("plate_reverse_runs.jl")
 
 _pr_check_shadow(::Nothing, x) = nothing
 # A tuple operand's cotangent accumulates in a vector the adapter provides.

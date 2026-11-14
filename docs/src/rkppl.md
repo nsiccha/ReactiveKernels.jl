@@ -97,6 +97,41 @@ latents = prepare_marginalized_latents(built, plan)
 marginalized_latent_draws(latents, u, Xoshiro(1)).x
 ```
 
+A `missing` entry of `y` is a step that only predicts: the filter carries the state through it without an update, and the likelihood has no term for it. The draws then condition on the present entries alone, and one program serves every pattern of missing entries:
+
+```@example marginal
+y_gaps = Union{Missing,Float64}[0.3, missing, -0.1, 0.0, missing, 0.2]
+with_gaps = marginalize(model(; gap, T = length(y_gaps)), :x) | (; y = y_gaps)
+built_gaps = build_kernel(with_gaps)
+latents_gaps = prepare_marginalized_latents(built_gaps, with_gaps)
+marginalized_latent_draws(latents_gaps, u, Xoshiro(1)).x
+```
+
+The observed vector may also be one the model computes, as long as it does not read `x`. Censored rows enter the filter this way (data augmentation). Each censored row's unknown value is a latent bounded by its own range (per-element bounds), and the measured rows join those values in time order. The scan's length is then supplied, and the measured rows are inputs:
+
+```@example marginal
+censored = @rkppl begin
+    level ~ Normal(0, 2)
+    phi ~ Uniform(-1, 1)
+    sigma ~ Exponential(1)
+    noise ~ Exponential(0.5)
+    @scan begin
+        x[1] ~ Normal(0, sigma / sqrt(1 - phi^2))
+        for t in 2:T
+            x[t] ~ Normal(phi * x[t - 1], sigma)
+        end
+    end
+    gap[1:K] .~ restricted.(Flat.(), 0, Inf)    # a row below its limit: limit - gap
+    value = vcat(measured, limit .- gap)[order]
+    value .~ Normal.(level .+ x, noise)
+end
+measured = [0.3, 0.5, 0.0, 0.4]
+limit = [-0.2, -0.3]                            # rows 3 and 6 fell below these
+order = invperm([1, 2, 4, 5, 3, 6])
+augmented = marginalize(censored(; T = 6, K = 2, measured, limit, order), :x)
+coordinate_names(build_kernel(augmented).layout)
+```
+
 A recurrence in a `@plate` cell integrates out the same way, one filter per index, when the cell observes it through `y[g] .~ Normal.(offset .+ loading .* x, noise)` and the bound `y` holds one vector per index. The draws then hold one trajectory per index:
 
 ```@example marginal
@@ -124,7 +159,7 @@ latents = prepare_marginalized_latents(built_cells, cells)
     x=marginalized_latent_draws(latents, u, Xoshiro(1)).x)
 ```
 
-Recurrences carrying several arrays, a lag above one, recurrences inside nested `@plate` cells or submodels, and observations that are not Normal are refused with an error naming the statement.
+Recurrences carrying several arrays, a lag above one, recurrences inside nested `@plate` cells or submodels, missing entries in a `@plate` cell's series, and observations that are not Normal are refused with an error naming the statement.
 
 ## Adaptive partial centering
 
@@ -186,6 +221,16 @@ cells into levels, which WarmupHMC maps in order, so re-centering a parent level
 keeps the meaning of the coordinates centred on it. The adapter checks these
 graph dependencies before sampling and refuses own reads and cycles. Nested
 levels need RKPPL 0.1.185 and WarmupHMC 0.3.0 or later.
+
+A latent random walk or AR(1) series observed only in parts has no good
+fixed frame: written in its innovations, the step size falls as the series
+grows; written in its states, it mixes badly where nothing is observed.
+Mark its `@scan` with `markov_chains(model, :w)` before binding. The
+recurrence qualifies when it is linear-Gaussian in its previous state, as
+for `marginalize`, written centred or non-centred, at top level or in a
+`@plate` cell. RKPPL lowers it in its states, and `adaptive_centering_problem`
+gives it one WarmupHMC `MarkovChain` (WarmupHMC 0.3.1 or later), which adapts
+how far to centre each time step. `cells` may then be omitted.
 
 RKPPL 0.1.175 with WarmupHMC
 0.2.21 or later prepares one joint endpoint kernel, sharing common graph work

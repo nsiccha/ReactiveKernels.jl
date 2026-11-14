@@ -16,6 +16,60 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.190
+
+- `marginalize(model, :x)` observes a vector the model computes, as long as
+  it does not read `x`. Censored rows enter the Kalman filter this way (data
+  augmentation): each censored row's unknown value is a latent bounded by
+  its own range (per-element bounds, 0.1.179), and the measured rows join
+  those values in time order, for example
+  `gap[1:K] .~ restricted.(Flat.(), 0, Inf)`,
+  `value = vcat(measured, limit .- gap)[order]`,
+  `value .~ Normal.(level .+ x, noise)`. The filter observes each entry at its
+  value, so the marginalized density is the augmented model's with `x`
+  integrated out. Its term is classified as the observation it replaces: a
+  definition reading parameters is a factor, not a likelihood term, as
+  without `marginalize`. The scan's length
+  is supplied; an unsupplied length is refused, naming it, as is an
+  observation that is neither bound data nor a definition.
+
+## 0.1.189
+
+- `marginalize(model, :x)` accepts an observed vector with `missing`
+  entries: each missing entry is a step that only predicts. The Kalman filter
+  carries the state through it without an update, the likelihood has no
+  term for it (its `:pointwise` entry is 0), and the exact draws condition on
+  the present entries alone. One program serves every pattern of missing
+  entries, and `jax_source` translates it: `prepare_data` reads the filter's
+  presence and filled values from the raw response, before storing the
+  response filled. A missing entry in a `@plate` cell's series is refused at
+  lowering, naming the observation.
+
+## 0.1.188
+
+- `markov_chains(model, :x)` marks a latent linear-Gaussian `@scan` array as a
+  WarmupHMC Markov chain (WarmupHMC 0.3.1 or later). The recurrence qualifies
+  as for `marginalize`: one carried array seeded once, each step linear in
+  `x[t - 1]` with Normal innovations, at top level or in a `@plate` cell. It is
+  lowered in its states: a non-centred step (`e ~ Normal(0, 1);
+  x[t] = a * x[t - 1] + s * e`) becomes its centred law, so the packed
+  coordinates are the states. A frame scan the density does not read records
+  each state's coefficient, drift and log step SD.
+  `adaptive_centering_problem` then gives each marked recurrence one
+  `WarmupHMC.MarkovChain`, whose warm-up adapts its centring per time step.
+  A recurrence per `@plate` index is one chain restarting at each index.
+  `cells` is now optional. Models without marked recurrences are unchanged.
+- The transition scans of `marginalize` record literal coefficients as
+  floats, so their carried arrays keep one element type.
+
+## 0.1.187
+
+- `jax_source` translates the length check of a top-level observed `@scan`
+  array, so the module of a program with one is standalone
+  (`UNTRANSLATED = {}`), including a top-level recurrence integrated out by
+  `marginalize`. When the module runs, an array whose length differs from
+  the scan's raises, as the native check does.
+
 ## 0.1.186
 
 - `marginalize(model, :x)` also integrates out a recurrence inside a `@plate`

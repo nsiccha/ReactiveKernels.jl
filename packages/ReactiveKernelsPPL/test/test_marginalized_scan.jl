@@ -50,15 +50,15 @@ function sequential_logpdfs(mu, S, y)
     end
 end
 
-# x | y from the joint Gaussian of (x, y).
-function latent_posterior(lat, offset, loading, noise, y)
+# x | y[present] from the joint Gaussian of (x, y).
+function latent_posterior(lat, offset, loading, noise, y; present = eachindex(y))
     mx, Sx = lat
     n = length(mx)
-    L = Diagonal(loading .* ones(n))
-    my = offset .+ L * mx
-    Sy = L * Sx * L + Diagonal((noise .* ones(n)) .^ 2)
-    K = Sx * L / Sy
-    return mx + K * (y - my), Symmetric(Sx - K * L * Sx)
+    L = Matrix(Diagonal(loading .* ones(n)))[present, :]
+    my = (offset .+ loading .* mx)[present]
+    Sy = L * Sx * L' + Diagonal(((noise .* ones(n)) .^ 2)[present])
+    K = Sx * L' / Sy
+    return mx + K * (y[present] - my), Symmetric(Sx - K * L * Sx)
 end
 
 # The reporter's spelling: per-group OU deviations in one series, reset where a
@@ -119,7 +119,8 @@ end
 
 ou_plan(d) = marginalize(OU(; d.inputs...), :ou) | (; y = d.y)
 
-function ou_oracle(built, d)
+# `present`: the observed entries of `d.y` (the others are missing).
+function ou_oracle(built, d; present = eachindex(d.y))
     (; N, R, area, continues, gap) = d.inputs
     function (u)
         c = constrain(built.layout, u)
@@ -129,8 +130,10 @@ function ou_oracle(built, d)
         a = continues .* exp.(-gap ./ c.ou_range)
         lat = latent_moments(0.0, 1.0, a, zeros(R), 1 .- a .^ 2)
         mu, S = observation_moments(lat, c.level[area], c.ou_sd, c.noise)
-        pointwise = sequential_logpdfs(mu, S, d.y)
-        likelihood = logpdf(MvNormal(mu, S), d.y)
+        P = present
+        pointwise = zeros(R)
+        pointwise[P] = sequential_logpdfs(mu[P], S[P, P], d.y[P])
+        likelihood = logpdf(MvNormal(mu[P], Symmetric(S[P, P])), d.y[P])
         jac = logjac(built.layout, u)
         (; total = prior + likelihood + jac, likelihood, pointwise)
     end
@@ -262,6 +265,156 @@ end
         marginalized_latent_draws(q, u, Random.Xoshiro(3))
 end
 
+# A missing entry of the observed vector is a step that only predicts: the
+# filter reads the response's presence, and the likelihood skips the entry.
+@testset "missing entries are steps that only predict" begin
+    d = ou_data(2, 6; seed = 5)
+    absent = [1, 4, 5, 9]
+    y = Vector{Union{Missing,Float64}}(d.y)
+    y[absent] .= missing
+    present = setdiff(eachindex(y), absent)
+    plan = marginalize(OU(; d.inputs...), :ou) | (; y)
+    built = build_kernel(plan)
+    @test coordinate_names(built.layout) == coordinate_names(build_kernel(ou_plan(d)).layout)
+    check_density(built, plan, ou_oracle(built, d; present))
+    # One program serves every absence pattern, none included, and every length.
+    shape(y, d = d) = structure(build_kernel(marginalize(OU(; d.inputs...), :ou) | (; y)).spec)
+    @test shape(y) == shape(Vector{Union{Missing,Float64}}(d.y))
+    grown = ou_data(5, 12; seed = 6)
+    ygrown = Vector{Union{Missing,Float64}}(grown.y)
+    ygrown[2:7:end] .= missing
+    @test shape(y) == shape(ygrown, grown)
+    q = prepare_marginalized_latents(built, plan)
+    u = 0.3 .* cos.(1:built.layout.total)
+    c = constrain(built.layout, u)
+    (; R, area, continues, gap) = d.inputs
+    a = continues .* exp.(-gap ./ c.ou_range)
+    lat = latent_moments(0.0, 1.0, a, zeros(R), 1 .- a .^ 2)
+    mean, cov = latent_posterior(lat, c.level[area], c.ou_sd, c.noise, d.y; present)
+    rng = Random.Xoshiro(4)
+    n = 40_000
+    draws = reduce(hcat, (marginalized_latent_draws(q, u, rng).ou for _ in 1:n))
+    @test all(abs.(vec(Statistics.mean(draws; dims = 2)) .- mean) .< 5 .* sqrt.(diag(cov) ./ n))
+    @test Statistics.cov(draws; dims = 2) ≈ cov rtol = 0.05 atol = 0.02 * maximum(diag(cov))
+end
+
+# ── Data augmentation: censored rows as bounded latents ───────────────────
+#
+# Rows below a detection limit and rounded rows enter the filter at latent
+# values bounded by their own ranges (per-element bounds, RKPPL 0.1.179); the
+# observed vector merges them with the measured rows in time order. The
+# source without `marginalize` is the augmented latent model itself.
+
+const CENSORED = @rkppl begin
+    mu ~ Normal(0, 1)
+    phi ~ Uniform(-1, 1)
+    sigma ~ Exponential(1)
+    noise ~ Exponential(0.5)
+    @scan begin
+        x[1] ~ Normal(0, sigma / sqrt(1 - phi^2))
+        for t in 2:T
+            x[t] ~ Normal(phi * x[t - 1], sigma)
+        end
+    end
+    gap[1:K] .~ restricted.(Flat.(), 0, Inf)
+    position[1:J] .~ restricted.(Flat.(), 0, 1)
+    value = vcat(measured, limit .- gap, lo .+ (hi .- lo) .* position)[order]
+    value .~ Normal.(mu .+ x, noise)
+end
+
+# `T` rows: every third below its limit, every fifth rounded to [lo, hi].
+function censored_data(T; seed = 2)
+    rng = Random.Xoshiro(seed)
+    y = cumsum(0.4 .* randn(rng, T))
+    below = [t for t in 1:T if t % 3 == 0]
+    rounded = [t for t in 1:T if t % 5 == 0 && !(t in below)]
+    seen = setdiff(1:T, below, rounded)
+    limit = y[below] .+ 0.2 .+ 0.3 .* rand(rng, length(below))
+    lo = floor.(y[rounded])
+    inputs = (; T, K = length(below), J = length(rounded), measured = y[seen], limit, lo,
+        hi = lo .+ 1, order = invperm(vcat(seen, below, rounded)))
+    return (; inputs, seen, below, rounded)
+end
+
+censored_plan(d) = marginalize(CENSORED(; d.inputs...), :x)
+
+# The augmented model's density with `x` integrated out: the Gaussian
+# marginal of the merged vector, the priors, and the bounded latents' Jacobians.
+function censored_oracle(built, d)
+    (; T, measured, limit, lo, hi, order) = d.inputs
+    function (u)
+        c = constrain(built.layout, u)
+        prior = logpdf(Normal(0, 1), c.mu) + logpdf(Uniform(-1, 1), c.phi) +
+            logpdf(Exponential(1), c.sigma) + logpdf(Exponential(0.5), c.noise)
+        value = vcat(measured, limit .- c.gap, lo .+ (hi .- lo) .* c.position)[order]
+        _, Sx = latent_moments(0.0, c.sigma^2 / (1 - c.phi^2), fill(c.phi, T), zeros(T),
+            fill(c.sigma^2, T))
+        S = Symmetric(Sx + c.noise^2 * I)
+        logpdf(MvNormal(fill(c.mu, T), S), value) + prior + logjac(built.layout, u)
+    end
+end
+
+# The sampler's density and gradient against the oracle and its finite
+# differences.
+function check_total(built, plan, oracle; points = 3, seed = 1)
+    n = built.layout.total
+    rng = Random.Xoshiro(seed)
+    sampler = prepare_sampler(built, plan, zeros(n);
+        backend = DI.AutoEnzyme(; mode = Enzyme.Reverse))
+    for _ in 1:points
+        u = 0.4 .* randn(rng, n)
+        value, gradient = sampler_value_and_gradient!(sampler, similar(u), u)
+        @test value ≈ oracle(u) rtol = 1e-10
+        h = cbrt(eps(Float64))
+        fd = map(1:n) do i
+            up, dn = copy(u), copy(u)
+            up[i] += h
+            dn[i] -= h
+            (oracle(up) - oracle(dn)) / (2h)
+        end
+        @test gradient ≈ fd rtol = 2e-6 atol = 2e-7
+    end
+end
+
+@testset "censored rows enter the filter at bounded latent values" begin
+    d = censored_data(16)
+    plan = censored_plan(d)
+    built = build_kernel(plan)
+    # The layout keeps the augmentation and drops the recurrence.
+    latent = coordinate_names(build_kernel(CENSORED(; d.inputs...)).layout)
+    @test coordinate_names(built.layout) ==
+        filter(n -> !occursin(r"(^|_)x\.", String(n)), latent)
+    @test any(n -> occursin(r"(^|_)x\.", String(n)), latent)
+    check_total(built, plan, censored_oracle(built, d))
+    # The merged vector reads parameters, so its term is a factor, as in the
+    # source without `marginalize`: no likelihood or pointwise term.
+    let u = 0.2 .* cos.(1:built.layout.total), latent = bind_data(CENSORED(; d.inputs...))
+        lbuilt = build_kernel(latent)
+        lu = 0.2 .* cos.(1:lbuilt.layout.total)
+        for (b, p, v) in ((built, plan, u), (lbuilt, latent, lu))
+            @test Base.invokelatest(prepare_query(b, p, :likelihood), v) == 0
+            @test isempty(Base.invokelatest(prepare_query(b, p, :pointwise), v))
+        end
+    end
+    # One program as rows and censored rows grow.
+    shape(d) = structure(build_kernel(censored_plan(d)).spec)
+    @test shape(d) == shape(censored_data(41; seed = 3))
+    # Exact draws of `x` given the parameters and the latent values.
+    q = prepare_marginalized_latents(built, plan)
+    u = 0.3 .* cos.(1:built.layout.total)
+    c = constrain(built.layout, u)
+    (; T, measured, limit, lo, hi, order) = d.inputs
+    value = vcat(measured, limit .- c.gap, lo .+ (hi .- lo) .* c.position)[order]
+    lat = latent_moments(0.0, c.sigma^2 / (1 - c.phi^2), fill(c.phi, T), zeros(T),
+        fill(c.sigma^2, T))
+    mean, cov = latent_posterior(lat, c.mu, 1.0, c.noise, value)
+    rng = Random.Xoshiro(4)
+    n = 40_000
+    draws = reduce(hcat, (marginalized_latent_draws(q, u, rng).x for _ in 1:n))
+    @test all(abs.(vec(Statistics.mean(draws; dims = 2)) .- mean) .< 5 .* sqrt.(diag(cov) ./ n))
+    @test Statistics.cov(draws; dims = 2) ≈ cov rtol = 0.05 atol = 0.02 * maximum(diag(cov))
+end
+
 # Each form the Kalman filter does not cover is refused at lowering, naming
 # the statement.
 function refusal(body, x, data, y)
@@ -346,7 +499,26 @@ end
     catch e
         sprint(showerror, e)
     end
-    @test occursin("is not observed data", unobserved)
+    @test occursin("is neither observed data nor a definition", unobserved)
+    # A defined observed vector does not say the scan's length: it is supplied.
+    unsized = try
+        bind_data(marginalize(RKPPLModel(quote
+            s ~ Exponential(1)
+            g[1:2] .~ restricted.(Flat.(), 0, Inf)
+            @scan begin
+                x[1] ~ Normal(0, 1)
+                for t in 2:T
+                    x[t] ~ Normal(x[t - 1], s)
+                end
+            end
+            v = vcat(m, 1 .- g)
+            v .~ Normal.(x, 1)
+        end, @__MODULE__)(; m = [0.1, 0.2]), :x))
+        "no error"
+    catch e
+        sprint(showerror, e)
+    end
+    @test occursin("the length `T` of its `@scan` is not supplied", unsized)
     # A plan is already lowered.
     d = ou_data(1, 3)
     @test_throws SurfaceLoweringError marginalize(OU(; d.inputs...) | (; y = d.y), :ou)
@@ -543,6 +715,60 @@ end
         s ~ Exponential(1)
         v[1:3] .~ Normal.(0, 1)
     end), :h, (;), y))
+    # A missing entry in a cell's series is not a predict-only step yet.
+    @test occursin("missing entry in a `@plate` cell", refusal(cellmodel(quote
+        y[g] .~ Normal.(h, 1)
+    end), :h, (;), [Union{Missing,Float64}[0.1, missing, 0.4], [0.3, 0.2]]))
+end
+
+# ── `jax_source` of a marginalized program ────────────────────────────────
+#
+# The module is standalone: every data definition, including the observed
+# scan's length check, is translated (`UNTRANSLATED = {}`). Its log density
+# and `jax.grad` match the native sampler and its finite differences.
+
+include(joinpath(pkgdir(ReactiveKernels), "test", "jax_python.jl"))
+include("jax_ppl_data.jl")
+
+# An observed AR(1) series whose length is the response's own: the check
+# without a supplied length.
+const OBSERVED_AR = @rkppl begin
+    phi ~ Uniform(-1, 1)
+    sigma ~ Exponential(1)
+    @scan begin
+        y[1] ~ Normal(0, sigma / sqrt(1 - phi^2))
+        for t in 2:T
+            y[t] ~ Normal(phi * y[t - 1], sigma)
+        end
+    end
+end
+
+@testset "jax_source of a marginalized program" begin
+    d, c = ou_data(2, 4), cell_data([3, 1, 5])
+    gaps = Vector{Union{Missing,Float64}}(d.y)
+    gaps[[1, 3]] .= missing
+    plans = (; toplevel = ou_plan(d), cell = cell_ou_plan(c),
+        missing_entries = marginalize(OU(; d.inputs...), :ou) | (; y = gaps),
+        censored = bind_data(censored_plan(censored_data(9))),
+        cell_ar = marginalize(CELL_AR(; c.G, c.se, c.m0), :h) | (; c.y),
+        observed = OBSERVED_AR() | (; y = [0.1, -0.3, 0.4, 0.2]))
+    for (name, plan) in pairs(plans)
+        built = build_kernel(plan)
+        src = jax_source(built, plan)
+        @test occursin("UNTRANSLATED = {}", string(src))
+        if !rk_jax_available()
+            @info "RK_JAX_PYTHON is not set: JAX parity for marginalized $name skipped"
+            @test_skip false
+            continue
+        end
+        query = prepare_query(built, plan, :sampler)
+        u = 0.2 .* randn(Random.Xoshiro(7), built.layout.total)
+        r = rk_jax_evaluate(src, "log_density", (u, jax_raw_data(plan, src)...);
+            grad = true, prepare = true)
+        @test r.value ≈ Base.invokelatest(query, u) rtol = 1e-10
+        reference = rk_fd_gradient(u -> Base.invokelatest(query, u), u)
+        @test maximum(abs.(r.grad .- reference) ./ max.(1, abs.(reference))) < 1e-5
+    end
 end
 
 @testset "marginalize composes with binding, observing and merge" begin

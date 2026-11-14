@@ -5,18 +5,33 @@ import WarmupHMC as WH
 import LogDensityProblems as LDP
 
 function PPL.adaptive_centering_problem(built, plan::PPL.StructuralPlan, problem, backend;
-        cells::NamedTuple, u0 = nothing, on_error = nothing)
+        cells::NamedTuple = (;), u0 = nothing, on_error = nothing)
     prepared = PPL._centering_cells(built, plan, cells; u0, on_error)
     LDP.dimension(problem) == prepared.dimension || throw(DimensionMismatch(
         "problem dimension $(LDP.dimension(problem)) ≠ model dimension $(prepared.dimension)"))
-    map = _centering_reparametrization(prepared.kernel, prepared.records)
+    map = _centering_reparametrization(prepared.kernel, prepared.records,
+        _centering_chains(prepared.chain_kernel, prepared.chains))
     WH.ReparametrizedProblem(map, problem, backend)
+end
+
+# One `MarkovChain` per recurrence `markov_chains` marked, on the frame kernel.
+function _centering_chains(kernel, records)
+    isempty(records) && return ()
+    pkgversion(WH) >= v"0.3.1" && isdefined(WH, :MarkovChain) ||
+        throw(PPL.ContractValidationError("[centering] Markov chains (`markov_chains`) " *
+            "need WarmupHMC 0.3.1 or later; this environment has WarmupHMC $(pkgversion(WH))"))
+    shared = PPL._CenteringAccessor(Ref(kernel))
+    Tuple(WH.MarkovChain(chain.states;
+        log_scale = PPL._ChainAccessor(shared, chain.log_scale),
+        coefficient = PPL._ChainAccessor(shared, chain.coef),
+        drift = PPL._ChainAccessor(shared, chain.drift),
+        initial = PPL._ChainInitial(shared, chain.drift)) for chain in records)
 end
 
 # Records arrive ordered by level. Each level reads the shared kernel at its own
 # stage, so WarmupHMC evaluates the kernel once per level, after the earlier
 # levels are mapped, and those reads see their model values.
-function _centering_reparametrization(kernel, records)
+function _centering_reparametrization(kernel, records, chains = ())
     shared = PPL._CenteringAccessor(Ref(kernel))
     if any(cell -> cell.stage > 1, records) && pkgversion(WH) < v"0.3.0"
         throw(PPL.ContractValidationError("[centering] cells that read other " *
@@ -42,7 +57,8 @@ function _centering_reparametrization(kernel, records)
                 location, log_scale))
         end
     end
-    WH.IndexedReparametrization(pairs)
+    isempty(chains) ? WH.IndexedReparametrization(pairs) :
+        WH.IndexedReparametrization(pairs; chains)
 end
 
 end

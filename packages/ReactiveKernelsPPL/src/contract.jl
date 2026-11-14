@@ -2164,6 +2164,13 @@ _is_shape_read(ex) = Meta.isexpr(ex, :call) && !isempty(ex.args) &&
 # A column read only through its own selections: no other plan value
 # names it. Shape reads (`axes(y, 1)` iterators, index sources) contribute
 # axes, not values.
+# A read that states what an absent entry is: the response's presence, or
+# its values with each absent entry filled (`_rkppl_presence(y)`,
+# `_rkppl_fill_missing(y, filler)`; a marginalized recurrence's filter).
+_is_presence_read(x) = Meta.isexpr(x, :call) && length(x.args) >= 2 &&
+    any(f -> x.args[1] === f || x.args[1] == GlobalRef(@__MODULE__, nameof(f)),
+        (_rkppl_presence, _rkppl_fill_missing))
+
 function _read_only_by_selection(plan::StructuralPlan, name::Symbol)
     found = false
     function visit(x)
@@ -2175,7 +2182,7 @@ function _read_only_by_selection(plan::StructuralPlan, name::Symbol)
             # The observation gather has already been checked for full
             # coverage. It carries the same owned values and presence mask.
             return nothing
-        elseif _is_shape_read(x)
+        elseif _is_shape_read(x) || _is_presence_read(x)
             return nothing
         elseif x isa Expr
             foreach(visit, x.args)

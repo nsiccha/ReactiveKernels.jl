@@ -599,7 +599,13 @@ const _STRUCTURED_GRADIENT_INPLACE = Ref(false)
 _structured_gradient_inplace() =
     isdefined(Enzyme, :has_dogfood_repair) &&
     Enzyme.has_dogfood_repair(:structured_gradient_inplace)
-__init__() = (_STRUCTURED_GRADIENT_INPLACE[] = _structured_gradient_inplace(); nothing)
+
+# Both answers depend on the loaded Enzyme's Julia source alone.
+function __init__()
+    _STRUCTURED_GRADIENT_INPLACE[] = _structured_gradient_inplace()
+    ReactiveKernels._PR_INDEX_RUN_REFUSAL[] = _index_run_refusal()
+    nothing
+end
 
 @inline function ReactiveKernels._ad_prepared_tuple_value_and_gradient!(
         backend::ReactiveKernels.DifferentiationInterface.AutoEnzyme{
@@ -861,6 +867,25 @@ end
 
 using ReactiveKernels: _PlateSumRuleBody, _PlateSumRuleOnePass, _pr_gather_value,
     _pr_scalar_positions, _pr_batched_positions, _CellArray
+
+# A generated plate reverse scheduled by index runs (src/plate_reverse_runs.jl)
+# reads the run metadata, an unchanged `Const` tuple holding two index vectors,
+# in the reverse pass of its rule. Where Enzyme hands a rule the inline roots of
+# such an unboxed operand (`Enzyme.Compiler.inline_roots_type`, nonzero only
+# after Julia `1.12-`), the rule could read them as null before dogfood repair
+# `unchanged_custom_rule_roots`: on Julia 1.13.1 the first prepared gradient of
+# a plate that takes two passes segfaulted (`enzyme-use`, Enzyme snag
+# `readonly-rule-tu-14b643ff`; backend-only reproducer
+# `benchmark/repro_enzyme_unchanged_rule_roots.jl`). An Enzyme that cannot
+# report the repair leaves such a plate to its ordinary reverse.
+const _INDEX_RUN_ROOTS_REFUSAL =
+    "an index-run reverse needs Enzyme dogfood repair `unchanged_custom_rule_roots`"
+function _index_run_refusal()
+    VERSION > v"1.12-" || return nothing
+    isdefined(Enzyme, :has_dogfood_repair) &&
+        Enzyme.has_dogfood_repair(:unchanged_custom_rule_roots) && return nothing
+    _INDEX_RUN_ROOTS_REFUSAL
+end
 
 function EnzymeRules.augmented_primal(
         config::RevConfig, rule::Const{<:_PlateSumRuleBody}, ::Type{RT},
