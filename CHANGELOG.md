@@ -16,6 +16,25 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.247
+
+- `jax_source` translates the native ODE bridges `rk_ode_rk45_tol` and
+  `rk_ode_bdf_tol`, also in plate cells and through helpers such as
+  BayesianRegressionModels' `ode_rk45`: one diffrax solve (`diffrax.Dopri5()`,
+  and `diffrax.Kvaerno5()` for the stiff entry) with the caller's tolerances,
+  the native per-output step budget and dense outputs, reverse-differentiated
+  through the discrete solve so `jax.grad`'s accuracy follows the tolerances.
+  Modules that solve an ODE import `diffrax`; others do not. Ragged output
+  times, traced tolerances and runtime failures (invalid inputs, an exceeded
+  budget, a failed solve) are handled as in the docs' "ODE solves" section.
+- JAX source slices a padded array that keeps each padded axis whole
+  (`sol[:, j]` of a matrix padded along its rows): the slice is padded along
+  those axes, where it was refused before.
+- In a plain helper's lowered code, a splat of a tuple the code built
+  (`g(f, x, args...)` through `Core._apply_iterate`) passes the tuple's
+  elements as they were given, so a function among them stays a function
+  instead of becoming a read of an untranslatable Python tuple.
+
 ## 0.1.246
 
 - JAX source binds a comprehension straight to its target:
