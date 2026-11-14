@@ -228,6 +228,21 @@ const _JAX_CASES = (
         end
         y .~ Normal.(level, s)
     end))(; T = 12) | (; y = cumsum(0.3 .* _JAX_X[1:12])),
+    # A scan reads a definition over data and a parameter whole (`loc[t]`);
+    # the response observes a gathered subset of its trajectory.
+    scan_reads_definition = () -> (@rkppl(begin
+        a ~ Normal(0, 1); s ~ Exponential(1.0)
+        w = 2 .* x
+        loc = a .+ cos.(w)
+        @scan begin
+            acc[1] = loc[1]
+            for t in 2:N
+                acc[t] = 0.5 * acc[t - 1] + loc[t]
+            end
+        end
+        y .~ Normal.(acc[rows], s)
+    end))(; x = _JAX_X, N = _JAX_N, rows = collect(1:3:_JAX_N)) |
+        (; y = _JAX_Y[1:3:_JAX_N]),
     # `logbeta` of arguments above 8 (`jax.scipy.special.betaln` is not
     # float64-accurate there).
     beta_binomial = () -> (@rkppl(begin
