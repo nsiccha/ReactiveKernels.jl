@@ -16,6 +16,18 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.247
+
+- JAX source flattens a plate's cells that return vectors of one length fixed
+  by the cell's own expression (`vcat(level[i], level[i] - fall[i])` of
+  scalars, a vector literal, such a tuple field): `reduce(vcat, cells)` reads
+  the stored rows in order (`jnp.reshape(cells, (-1,))`), with no masked
+  gather or runtime check, also inside a helper. These cells used to raise
+  `JAXEmissionError: flattening a ragged value whose lengths are not those of
+  a prepared ragged input`, so a BRM `jax_source(...; values = (:mean_y,))`
+  of such a kept value failed. Cells whose lengths come from neither a
+  prepared ragged input nor the cell's own expression are still refused.
+
 ## 0.1.246
 
 - JAX source binds a comprehension straight to its target:
