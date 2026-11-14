@@ -224,6 +224,8 @@ function _smc_bound_identity(layout)
     frozen = Dict{Symbol,Any}()
     function freeze(ex)
         ex isa Real && return ex
+        # One bound per element, already this binding's numbers.
+        ex isa AbstractArray{<:Real} && return copy(ex)
         if !any(dynamic, _value_symbols(ex))
             # Fold data-only subexpressions, so a bound depending on a
             # scalar summary retains that summary instead of old data.
@@ -256,7 +258,7 @@ function _smc_coordinate_records(layout::LayoutTable)
         path = _smc_output_path(layout, entry)
         sampling = _smc_sampling_id(entry.sampling)
         coupled = entry.kind !== :external_plate &&
-            (!(entry.transform in (:identity, :exp, :logistic, :interval, :floored, :upper)) ||
+            (!(entry.transform in (:identity, :exp, :logistic, :interval, :floored, :upper, :bounded)) ||
              entry.sampling !== nothing || haskey(layout.cell_geometries, entry.name))
         event_shape = coupled ? (entry.size, Tuple(entry.dims)) : nothing
         if entry.kind === :array && _is_slice_transform(entry.transform)
