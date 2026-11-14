@@ -2807,8 +2807,11 @@ _jax_call_positional(ctx::_JaxContext, f, args::Vector{_PyVal}) =
 # decide a Python conditional: on static operands the call is computed with
 # NumPy instead, as host code is (a guard `isfinite(jitter) || throw(...)` of
 # a literal `jitter`). A call with no NumPy spelling stays staged.
-function _jax_result(f, args::Vector{_PyVal}, code::AbstractString)
-    T = _jax_return_type(f, [a.T isa Type ? a.T : Any for a in args])
+_jax_result(f, args::Vector{_PyVal}, code::AbstractString) =
+    _jax_typed_result(_jax_return_type(f, [a.T isa Type ? a.T : Any for a in args]), args, code)
+# The same, of a result whose Julia type `T` the caller knows (a call with
+# keywords, whose positional types do not determine it).
+function _jax_typed_result(@nospecialize(T), args::Vector{_PyVal}, code::AbstractString)
     static = !isempty(args) && all(a -> a.static, args)
     if static && _jax_stages(code, args)
         host = _host_static_text(code)
@@ -4109,6 +4112,83 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(fill), args::Vector{_PyVa
                                         _jax_dtype(E) * ")", Vector{E}, false, padded[2])
     shape, N = _jax_dims(ctx, fill, dims)
     _PyVal("jnp.full(" * shape * ", " * x.code * ", dtype=" * _jax_dtype(E) * ")", Array{E,N})
+end
+# `repeat(A, counts...)` is Julia's `repeat(A; outer = counts)`: `A` tiled
+# `counts[d]` times along axis `d`, as `jnp.tile` does. `inner` first repeats
+# each entry along each axis, as `jnp.repeat` does. The result has as many
+# axes as the most of `A` and either count list, `A` taking trailing axes of
+# length one as Julia's `repeat` does (NumPy's `tile` would prepend them).
+# Shapes are static while JAX traces, so the functions need static counts;
+# `prepare_data` computes a repeat whose counts are data (a matrix of
+# per-term prior scales repeated once per category, snag
+# emit-an-independ-8a0b322b).
+function _jax_function_call(ctx::_JaxContext, ::typeof(repeat), args::Vector{_PyVal})
+    _jax_is_array(args[1].T) || return _jax_traceable_or_lowered(ctx, repeat, args)
+    _jax_repeat(ctx, args[1], nothing, args[2:end])
+end
+function _jax_call(ctx::_JaxContext, ::typeof(repeat), args::Vector{_PyVal}, kw)
+    isempty(kw) && return _jax_call_positional(ctx, repeat, args)
+    names = first.(kw)
+    length(args) == 1 && _jax_is_array(args[1].T) && allunique(names) &&
+        all(in((:inner, :outer)), names) ||
+        _jax_error("keyword arguments ", join(names, ", "), " to `repeat` of a `",
+                   args[1].T, "` have no JAX translation", _jax_where(ctx))
+    counts(name) = (i = findfirst(k -> first(k) === name, kw);
+                    i === nothing ? nothing : _jax_repeat_counts(ctx, last(kw[i])))
+    _jax_repeat(ctx, only(args), counts(:inner), counts(:outer))
+end
+# The counts of an `inner` or `outer` keyword: `nothing` (not given), one
+# integer, or a tuple of them.
+function _jax_repeat_counts(ctx::_JaxContext, v::_PyVal)
+    v.T === Nothing && return nothing
+    v.T isa Type && v.T <: Integer && return [v]
+    v.T isa Type && v.T <: Tuple && isconcretetype(v.T) ||
+        _jax_error("`repeat` with counts of type `", v.T, "`", _jax_where(ctx))
+    # A literal tuple (`inner = (1, 2)`) gives its literal counts.
+    m = match(r"^\(\s*(-?[0-9]+(?:\s*,\s*-?[0-9]+)*)\s*,?\s*\)$", v.code)
+    m === nothing || return _PyVal[_jax_literal(parse(Int, strip(c)))
+                                   for c in split(m.captures[1], ',')]
+    _jax_dimension_values([v])
+end
+function _jax_repeat(ctx::_JaxContext, x::_PyVal, inner::Union{Nothing,Vector{_PyVal}},
+                     outer::Union{Nothing,Vector{_PyVal}})
+    isempty(x.extent) && !_jax_ragged(x.T) ||
+        _jax_error("`repeat` of a padded (ragged) value", _jax_where(ctx))
+    inner_counts, outer_counts = something(inner, _PyVal[]), something(outer, _PyVal[])
+    counts = [inner_counts; outer_counts]
+    all(c -> c.T isa Type && c.T <: Integer, counts) ||
+        _jax_error("`repeat` with counts of types ", Tuple(c.T for c in counts), _jax_where(ctx))
+    ctx.host === nothing && !all(c -> c.static, counts) &&
+        _jax_error("`repeat` with counts that are not static while JAX traces (a recipe ",
+                   "of data alone computes it in `prepare_data`)", _jax_where(ctx))
+    n = _jax_rank(x.T)
+    # Julia's own checks (`Base._RepeatInnerOuter.check`), as runtime checks:
+    # no count is negative, and with `inner` both count lists name every
+    # axis of `A`.
+    for (name, list) in (("inner", inner), ("outer", outer)), c in something(list, _PyVal[])
+        occursin(r"^[0-9]+$", c.code) && continue
+        _jax_call(ctx, _runtime_check, [_jax_call(ctx, >=, [c, _jax_literal(0)]),
+            _PyVal(repr("no " * name * " repetition count may be negative"), ArgumentError)])
+    end
+    if inner !== nothing
+        for (name, list) in (("inner", inner), ("outer", outer))
+            list !== nothing && length(list) < n || continue
+            _jax_call(ctx, _runtime_check, [_PyVal("False", Bool, true),
+                _PyVal(repr("number of " * name * " repetitions (" * string(length(list)) *
+                            ") cannot be less than number of dimensions of input array (" *
+                            string(n) * ")"), ArgumentError)])
+        end
+    end
+    r = max(n, length(inner_counts), length(outer_counts))
+    code = r == n ? x.code : _py_atom(x.code) * "[..., " * join(fill("None", r - n), ", ") * "]"
+    for (d, c) in enumerate(inner_counts)
+        c.code == "1" || (code = "jnp.repeat(" * code * ", " * c.code * ", axis=" * string(d - 1) * ")")
+    end
+    reps = String[d <= length(outer_counts) ? outer_counts[d].code : "1" for d in 1:r]
+    # Without an `inner` repeat, `jnp.tile` also makes the copy Julia returns.
+    (startswith(code, "jnp.repeat(") && all(==("1"), reps)) ||
+        (code = "jnp.tile(" * code * ", (" * join(reps, ", ") * (r == 1 ? ",))" : "))"))
+    _jax_typed_result(Array{eltype(x.T),r}, [x; counts], code)
 end
 # `hcat` of scalars, vectors (columns) and matrices.
 function _jax_function_call(ctx::_JaxContext, ::typeof(hcat), args::Vector{_PyVal})
