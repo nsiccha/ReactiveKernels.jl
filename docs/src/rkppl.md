@@ -149,14 +149,23 @@ may depend on unselected latent parameters. The adapter selects identity-transfo
 coordinates, without changing their priors. For example, a real ICAR block
 keeps its ICAR density and any soft sum constraint.
 
-Every selected affine quantity must remain invariant under the selected maps.
-A location that reads another selected latent needs a coupled transform;
-WarmupHMC's independent indexed maps do not supply that transport. The adapter
-checks this graph dependency before sampling. RKPPL 0.1.175 with WarmupHMC
+A cell's location and log-scale must not read its own latent. They may read
+another selected cell's latent, as in a nested hierarchy where unit effects
+`z_u` are centred about `unit_location = mu .+ tau_g .* z_g[group]` and the
+group effects `z_g` about `mu`:
+`cells = (z_g = (location = :mu, log_scale = :log_tau_g), z_u = (location = :unit_location, log_scale = :log_tau_u))`.
+Such a read sees the other cell's model-frame values. The reads order the
+cells into levels, which WarmupHMC maps in order, so re-centering a parent level
+keeps the meaning of the coordinates centred on it. The adapter checks these
+graph dependencies before sampling and refuses own reads and cycles. Nested
+levels need RKPPL 0.1.184 and WarmupHMC 0.3.0 or later.
+
+RKPPL 0.1.175 with WarmupHMC
 0.2.21 or later prepares one joint endpoint kernel, sharing common graph work
 across selected cells and their location/log-scale roles. It runs once per
-vector on a map or inverse, and shares results across scoring candidates.
-Cells are ordered by packed coordinate, regardless of keyword order. Identity
+vector and level on a map or inverse, and shares results across scoring
+candidates. Within a level, cells are ordered by packed coordinate, regardless
+of keyword order. Identity
 maps skip endpoint evaluation. Ordinary AD differentiates the joint graph;
 arrays remain read-only, without concatenation into a new endpoint buffer.
 For Enzyme differentiation through cached matrix endpoints, use the
