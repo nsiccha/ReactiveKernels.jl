@@ -1335,7 +1335,7 @@ end
     end
     @test texts[1] == texts[2]
     @test occursin(r"\"H\": StaticInt\(H\w*\)", texts[1])
-    @test occursin(r"jax\.vmap\(cell, in_axes=\(0, None, None, None\)\)\(\w+, x, H, a\)", texts[1])
+    @test occursin(r"jax\.vmap\(\w+_cell, in_axes=\(0, None, None, None\)\)\(\w+, x, H, a\)", texts[1])
     @test occursin(r"scan_argument = jnp\.arange\(2, H\w* \+ 1\)", texts[1])
     @test !occursin("\"scan_argument\"", texts[1])
 end

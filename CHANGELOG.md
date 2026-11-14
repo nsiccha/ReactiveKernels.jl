@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.233
+
+- JAX source retains named, documented functions for source-backed helpers and
+  shares compatible public entries through one computation body. Static entry
+  selection preserves each entry's required work and checks. Helper boundaries
+  carry runtime extents, ragged positions and integer bounds; helpers using scan
+  history remain nested in the scan's lexical scope. Nested plate cells and
+  scan steps take names from their authored values.
+
 ## 0.1.232
 
 - The opt-in generated summed-plate reverse (`with_plate_reverse`) runs one

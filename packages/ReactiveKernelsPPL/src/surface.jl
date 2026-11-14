@@ -7276,12 +7276,12 @@ function _instantiate_documentation!(ctx::_ScopeExpansion, scope, sm)
 end
 
 function _new_submodel_scope!(ctx::_ScopeExpansion, binding::Symbol;
-        per_cell::Bool = false)
+        per_cell::Bool = false, source = nothing)
     haskey(ctx.by_binding, binding) && _sfail(
         "submodel binding `$binding` is defined more than once " *
         "(a call owns one lexical namespace)")
     path = get(ctx.name_paths, binding, (binding,))
-    scope = SubmodelScope(path, binding, Dict{Symbol,Symbol}(), per_cell)
+    scope = SubmodelScope(path, binding, Dict{Symbol,Symbol}(), per_cell, source)
     push!(ctx.scopes, scope)
     ctx.by_binding[binding] = scope
     return scope
@@ -7923,7 +7923,8 @@ function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module,
     # An observed slot binds to the data LHS. A generative slot retains
     # its private name beside every other binder in the call's namespace.
     keep = observed ? Dict{Symbol,Any}(ret => lhs) : Dict{Symbol,Any}()
-    scope = _new_submodel_scope!(used, lhs)
+    scope = _new_submodel_scope!(used, lhs; source =
+        (definition = sm, arguments = Dict{Symbol,Any}(zip(_submodel_args(sm), callargs))))
     _instantiate_documentation!(used, scope, sm)
     submap = _submodel_substitution(sm, stmts, ret,
         callargs, data, _NsRoot(lhs, nothing, scope, used), keep)
@@ -8193,7 +8194,8 @@ function _expand_cell_submodel(colref::Expr, callexpr::Expr, ivar::Symbol,
     keep = scan_return ? Dict{Symbol,Any}(ret => colref) :
         slot === nothing || latent_stream ? Dict{Symbol,Any}() :
         Dict{Symbol,Any}(_stmt_lhs(lines[slot]) => colref)
-    scope = _new_submodel_scope!(used, col; per_cell = true)
+    scope = _new_submodel_scope!(used, col; per_cell = true, source =
+        (definition = sm, arguments = Dict{Symbol,Any}(zip(_submodel_args(sm), callargs))))
     _instantiate_documentation!(used, scope, sm)
     submap = _submodel_substitution(sm, stmts, ret,
         callargs, data, _NsRoot(col, ivar, scope, used), keep)

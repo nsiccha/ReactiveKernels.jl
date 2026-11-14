@@ -988,7 +988,14 @@ struct SubmodelScope
     binding::Symbol
     locals::Dict{Symbol,Symbol}
     per_cell::Bool
+    # The authored callable and its formal-to-actual argument map survive
+    # lexical expansion. Backends may outline this scope without guessing a
+    # definition from dotted names. Native execution still uses the expanded
+    # transparent graph.
+    source::Any
 end
+SubmodelScope(path, binding, locals, per_cell) =
+    SubmodelScope(path, binding, locals, per_cell, nothing)
 
 function _scope_name_paths(scopes::Vector{SubmodelScope})
     paths = Dict{Symbol,Tuple{Vararg{Symbol}}}()
