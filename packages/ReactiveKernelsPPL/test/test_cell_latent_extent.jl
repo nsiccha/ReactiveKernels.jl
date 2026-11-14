@@ -67,6 +67,14 @@ function check_bindings(model, cases)
                                      grad = true, prepare = :arguments)
             @test result.value ≈ oracle(u, data)
             @test result.grad ≈ expected rtol = 1e-7 atol = 1e-8
+            # `prepare_data`'s host NumPy arrays closed over by `jax.jit`, as a
+            # consumer calls the module (snag jax-source-ragge-979061c7: with
+            # RKPPL in a package tree of its own, each cell reads the per-cell
+            # dimensions, a tuple of columns, by its traced index).
+            closed = rk_jax_evaluate(first(sources), :log_density, (u, raw...);
+                                     grad = true, prepare = true)
+            @test closed.value ≈ oracle(u, data)
+            @test closed.grad ≈ expected rtol = 1e-7 atol = 1e-8
             @test rk_jax_layout(first(sources), raw).dimension == length(u)
         else
             @test_skip "RK_JAX_PYTHON not set"

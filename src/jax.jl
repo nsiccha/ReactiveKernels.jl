@@ -7424,6 +7424,20 @@ function _jax_input_dtype(@nospecialize(T))
     end
     E isa Type && E <: AbstractFloat ? ", dtype=" * _jax_dtype(E) : ""
 end
+# The dtype a column of an input vector of tuples is cast to, or `None`.
+_jax_column_dtype(@nospecialize(F)) = (d = _jax_input_dtype(F); isempty(d) ? "None" : chopprefix(d, ", dtype="))
+
+const _JAX_COLUMNS = """
+def _rk_columns(value, dtypes):
+    # A vector of tuples as the functions read it: the tuple of its columns,
+    # as `prepare_data` returns it, each a JAX array, which a cell can index by
+    # its traced index (a NumPy array cannot be).
+    if not (isinstance(value, tuple) and len(value) == len(dtypes)) or \\
+            any(isinstance(c, (tuple, list)) for c in value):
+        raise TypeError("a vector of %d-tuples is passed as the tuple of its columns, "
+                        "as prepare_data returns it" % len(dtypes))
+    return tuple(jnp.asarray(c, dtype=d) for c, d in zip(value, dtypes))
+"""
 
 # A value's dtype and rank, as module metadata describes an input.
 _jax_dtype_name(::Type{<:AbstractArray{T}}) where {T} = _jax_dtype_name(T)
@@ -7509,6 +7523,14 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
             isempty(extent) || _jax_emit!(ctx, extent * " = jnp.asarray(" * extent * ")")
             haskey(scope.flat_positions, extent) && names !== nothing &&
                 _jax_emit!(ctx, flat * " = jnp.asarray(" * flat * ")")
+        elseif _jax_columns(T)
+            # A vector of tuples or of named numbers crosses as the tuple of its
+            # columns (`_jax_columns`, `prepare_data`'s `_rk_columns_np`); a
+            # cell indexes each column by its traced index, so each column is
+            # converted as an array is.
+            helper = _jax_helper!(ctx, "_rk_columns", _JAX_COLUMNS)
+            dtypes = join((_jax_column_dtype(F) * ", " for F in fieldtypes(eltype(T))))
+            _jax_emit!(ctx, param * " = " * helper * "(" * param * ", (" * dtypes * "))")
         elseif T isa Type && T <: AbstractFloat && !isempty(_jax_input_dtype(T))
             _jax_emit!(ctx, param * " = jnp.asarray(" * param * _jax_input_dtype(T) * ")")
         end
