@@ -216,6 +216,17 @@ print(jax_source(decayed; have = (:x, :rate), want = :value))
 
 The body follows the rules of an `@traceable` body: a `return` only at its end, and in the JAX functions no `break` or `continue` and a `for` over one range. `prepare_data` runs the body as host Python, which takes both. A provider's source is read only by `jax_source`; native execution runs the method itself.
 
+## ODE solves
+
+A call of the native ODE bridges `rk_ode_rk45_tol(f, y0, t0, ts, reltol, abstol, maxsteps, args...)` or `rk_ode_bdf_tol` with the same arguments, also inside a plate cell and through a helper such as BayesianRegressionModels' `ode_rk45`, is one [diffrax](https://docs.kidger.site/diffrax/) solve. A module that solves an ODE imports `diffrax` (`pip install diffrax`); other modules do not. Emitting needs none of the Julia solver packages the native bridges load. The right-hand side `f(t, y, args...)` is translated like any helper into a nested Python function, and the extra arguments that are runtime values reach it through diffrax's `args`.
+
+- `rk_ode_rk45_tol` is `diffrax.Dopri5()`, the Dormand–Prince 5(4) method of the native `DP5()`. `rk_ode_bdf_tol` is `diffrax.Kvaerno5()`, diffrax's stiff (L-stable implicit Runge–Kutta) method: diffrax has no BDF method, so the stiff solve uses a different method than the native `FBDF()`, with the same tolerances.
+- The caller's tolerances are passed unchanged and may be traced (data or parameters). The step size follows a PID controller; outputs come from the solver's dense interpolant, so the native and JAX solves agree to the tolerances, not to the last bit.
+- `maxsteps` limits the accepted steps between consecutive requested outputs, as natively, and may be traced too. diffrax's own static bound on attempted steps is the largest int32, which costs nothing: a gradient keeps 64 checkpoints whatever the bound.
+- `jax.grad` differentiates the discrete solve (diffrax's `RecursiveCheckpointAdjoint`, 64 checkpoints a solve), including with respect to the initial and output times, so a gradient's accuracy follows the caller's tolerances, as the native forward sensitivities' does. A backward-solve adjoint such as `jax.experimental.ode.odeint`'s does not: on a seven-state pharmacokinetic model its gradient was about 35 times less accurate at the same tolerances.
+- A ragged row of output times solves to the row's last time; its padded rows repeat that time's state, a column `sol[:, j]` keeps the padding, and reductions mask it.
+- Invalid inputs (non-finite or non-increasing times, invalid tolerances or `maxsteps`), an exceeded per-output budget and a failed solve raise at run time through the module's runtime checks, as the native bridge throws. A row without output times raises nothing.
+
 ## Package translations
 
 A package extension can map its own callable during source emission. Julia execution is unchanged; ordinary `jax.grad` differentiates the emitted primal without a registered derivative rule.

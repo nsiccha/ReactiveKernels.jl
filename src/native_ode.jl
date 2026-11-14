@@ -5,7 +5,8 @@ Integrate `dy/dt = f(t, y, args...)` with Julia's standard
 `OrdinaryDiffEqBDF.FBDF()`, retaining one solver history across all output
 times. Return a fresh `Matrix{Float64}` with output times in rows and state
 coordinates in columns. Load `OrdinaryDiffEqBDF`, `SciMLBase`, and
-`SciMLSensitivity` to activate this native numerical extension.
+`SciMLSensitivity` to activate this native numerical extension; without them a
+call throws an error naming them.
 
 `y0` and `ts` are nonempty real vectors with finite entries; `ts` is strictly
 increasing and starts after finite `t0`. Tolerances must be finite and
@@ -54,7 +55,7 @@ Integrate `dy/dt = f(t, y, args...)` with Julia's standard
 `OrdinaryDiffEqLowOrderRK.DP5()`, the explicit adaptive Dormand–Prince 5(4)
 Runge–Kutta method that Stan's `ode_rk45_tol` also uses. Load
 `OrdinaryDiffEqLowOrderRK`, `SciMLBase`, and `SciMLSensitivity` to activate
-this native numerical extension.
+this native numerical extension; without them a call throws an error naming them.
 
 The arguments, the returned times-by-states `Matrix{Float64}`, the per-output
 step budget, the read-only and dual-number requirements on the RHS, the
@@ -82,3 +83,20 @@ function _native_ode_tol end
 # Whether the adapter ends a solver step at every requested output time
 # (`true`) or takes outputs from the solver's dense interpolant (`false`).
 function _native_ode_steps_to_outputs end
+
+# Without its solver package an entry's call throws, naming what to load (a
+# `MethodError` once the extension is loaded and no method matches). Its
+# inferred result is still the bridges' `Matrix{Float64}`, so code calling an
+# entry types as it does with the solver loaded: `jax_source`, which needs no
+# Julia solver, translates such code either way.
+for (entry, ext, package) in ((:rk_ode_bdf_tol, :ReactiveKernelsBDFExt, "OrdinaryDiffEqBDF"),
+                              (:rk_ode_rk45_tol, :ReactiveKernelsLowOrderRKExt, "OrdinaryDiffEqLowOrderRK"))
+    @eval $entry(f, y0, t0, ts, reltol, abstol, maxsteps, args...) =
+        Base.inferencebarrier(_native_ode_unavailable)($entry, $(QuoteNode(ext)), $package,
+            (f, y0, t0, ts, reltol, abstol, maxsteps, args...))::Matrix{Float64}
+end
+@noinline function _native_ode_unavailable(entry, ext::Symbol, package::String, args::Tuple)
+    Base.get_extension(@__MODULE__, ext) === nothing &&
+        error(nameof(entry), " needs ", package, ", SciMLBase and SciMLSensitivity loaded")
+    throw(MethodError(entry, args))
+end

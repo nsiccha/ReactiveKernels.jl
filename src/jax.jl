@@ -1099,11 +1099,13 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
                    " indices", _jax_where(ctx))
     parts = String[]
     values = Union{Nothing,_PyVal}[]
+    keeps_dims = Int[]
     kept = 0
     for (dim, index) in enumerate(indices)
         part, keeps, value = _jax_index_part(ctx, x, dim, index; target)
         push!(parts, part)
         push!(values, value)
+        push!(keeps_dims, keeps)
         kept += keeps
     end
     E = eltype(x.T)
@@ -1119,8 +1121,15 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
         # A gather from a padded group vector by an index vector: the indices
         # are valid entries, and the result is padded as the index is.
         gather = length(indices) == 1 ? values[1] : nothing
-        gather !== nothing && _jax_is_array(gather.T) && eltype(gather.T) <: Integer ||
-            _jax_error("slicing a padded group vector has no JAX translation", _jax_where(ctx))
+        if !(gather !== nothing && _jax_is_array(gather.T) && eltype(gather.T) <: Integer)
+            # A slice that keeps every padded axis whole (`sol[:, j]` of a
+            # matrix padded along its rows) is padded along those axes.
+            axes = _jax_whole_padded_slice(x, parts, keeps_dims)
+            axes === nothing &&
+                _jax_error("slicing a padded group vector has no JAX translation", _jax_where(ctx))
+            return _PyVal(_py_atom(x.code) * "[" * join(parts, ", ") * "]", T, false, x.extent,
+                          "", axes)
+        end
         return _PyVal(_py_atom(x.code) * "[" * join(parts, ", ") * "]", T, false, gather.extent)
     end
     v = _PyVal(_py_atom(x.code) * "[" * join(parts, ", ") * "]", T, false,
@@ -1146,6 +1155,24 @@ end
 # from the source expression (never a value it evaluates first).
 _jax_written_slice(index) = index === :(:) || index == :(Colon()) ||
     index isa Expr && index.head === :call && index.args[1] === :(:) && length(index.args) == 3
+
+# The padded axes of a slice of `x` (index parts `parts`, `keeps[d]` whether
+# axis `d` is kept) that reads each padded axis of `x` whole, renumbered among
+# the kept axes; `nothing` when an index selects within a padded axis or the
+# padded axes are not known.
+function _jax_whole_padded_slice(x::_PyVal, parts, keeps)
+    axes = _jax_padded_axes(x)
+    (axes == 0 || _jax_vector_like(x.T)) && return nothing
+    result, position = 0, 0
+    for (d, part) in enumerate(parts)
+        padded = axes & (1 << (d - 1)) != 0
+        padded && part != ":" && return nothing
+        keeps[d] == 1 || continue
+        position += 1
+        padded && (result |= 1 << (position - 1))
+    end
+    result
+end
 
 # One index position: the Python index text, whether it keeps a dimension,
 # and the index's value (`nothing` for a literal colon or a written range).
@@ -5623,7 +5650,7 @@ function value_of_rhs(ctx::_JaxContext, rhs, value, mod, splats = Dict{Int,Vecto
         callee isa QuoteNode ? callee.value : callee
     bind(v) = hint === nothing ? v : _jax_bind!(ctx, hint, v)
     g === Core._apply_iterate &&
-        return bind(_jax_lowered_splat(ctx, rhs.args[2:end], value, splats))
+        return bind(_jax_lowered_splat(ctx, rhs.args[2:end], value, splats, fields))
     g === Core.kwcall &&
         return bind(_jax_lowered_kwcall(ctx, rhs.args[2:end], value, fields))
     bind(_jax_call(ctx, g, _PyVal[value(a) for a in rhs.args[2:end]]))
@@ -5666,8 +5693,11 @@ function _jax_lowered_fields!(fields, i::Int, st::Expr, value)
 end
 # `g(xs...)` in lowered code, `Core._apply_iterate(iterate, g, xs...)`: each
 # splatted collection is a tuple of known length, a Vararg method's trailing
-# arguments (`splats`) or a tuple value, and its elements are `g`'s arguments.
-function _jax_lowered_splat(ctx::_JaxContext, args, value, splats)
+# arguments (`splats`), a tuple the lowered code built (`fields`: its elements
+# pass as they were given, so a function among them stays a function) or a
+# tuple value, and its elements are `g`'s arguments.
+function _jax_lowered_splat(ctx::_JaxContext, args, value, splats,
+                            fields = Dict{Int,Vector{_PyVal}}())
     _jax_function_of(value(args[1])) === iterate ||
         _jax_error("a splat that iterates with `", args[1], "` has no JAX translation",
                    _jax_where(ctx))
@@ -5677,6 +5707,10 @@ function _jax_lowered_splat(ctx::_JaxContext, args, value, splats)
         id = x isa Core.SlotNumber ? x.id : x isa Core.Argument ? x.n : 0
         if haskey(splats, id)
             append!(elements, splats[id])
+            continue
+        end
+        if x isa Core.SSAValue && haskey(fields, x.id)
+            append!(elements, fields[x.id])
             continue
         end
         v = value(x)
