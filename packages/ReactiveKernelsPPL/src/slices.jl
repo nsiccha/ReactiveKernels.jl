@@ -203,6 +203,8 @@ One slice of a [`SliceSampler`](@ref) as a log density over its compact
 coordinates, with the binding's other coordinates held at a base point it owns.
 With `LogDensityProblems` loaded it implements `dimension`, `capabilities`
 (first order), `logdensity` and `logdensity_and_gradient`. Not thread-safe.
+Like [`SamplerQuery`](@ref), it answers `-Inf` (gradient `NaN`) where a
+numerical method cannot evaluate the model (`ReactiveKernels.NumericalFailure`).
 """
 struct SliceProblem{S<:SliceSampler}
     slices::S
@@ -238,7 +240,15 @@ function _slice_problem_value_and_gradient(p::SliceProblem, x::AbstractVector{<:
     for (i, c) in enumerate(p.coordinates)
         p.point[c] = x[i]
     end
-    value, _ = slice_value_and_gradient!(p.slices, p.gradient, p.point, p.labels)
+    value = try
+        first(slice_value_and_gradient!(p.slices, p.gradient, p.point, p.labels))
+    catch err
+        # A point a numerical method cannot evaluate is outside the support,
+        # as for `SamplerQuery`; anything else propagates.
+        err isa ReactiveKernels.NumericalFailure || rethrow()
+        fill!(p.gradient, NaN)
+        -Inf
+    end
     value, copy(p.gradient)
 end
 

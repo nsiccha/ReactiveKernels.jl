@@ -10,6 +10,10 @@ const _ODE_ENTRIES = (
 _ode_decay(t, u, k) = -k .* u
 _ode_time_rhs(t, u, k) = (-k * t) .* u
 _ode_bad_rhs(t, u) = [u[1], u[1]]
+# Blows up at t = 1 / (k * y0): no method integrates past it.
+_ode_blowup(t, u, k) = k .* u .^ 2
+_ode_blowup_loss(solve, p, ts) = sum(solve(_ode_blowup, [1.0], 0.0, ts,
+    1e-8, 1e-8, 10^6, p[1]))
 _ode_oscillator(t, u, w) = [u[2], -w^2 * u[1]]
 function _ode_nested_rhs(t, u, gain, cfg)
     dy = similar(u)
@@ -183,6 +187,19 @@ end
         @test value ≈ sum(values) rtol=2e-7
         @test gradient ≈ [point[2] * sum(values), sum(-([0.4, 1.6] .- point[1]) .* values)] rtol=3e-6
         @test point == [0.15, 0.7]
+        # A prepared kernel and its gradient throw the typed failure where the
+        # solve fails, and evaluate the next point as before.
+        blowup_graph = Graph()
+        k = value!(blowup_graph, :k, Vector{Float64})
+        out = value!(blowup_graph, :out, Float64)
+        add!(blowup_graph, k => out, x -> _ode_blowup_loss(solve, x, [0.5, 2.0]))
+        blowup = prepare(blowup_graph; have = (k,), want = out)
+        prepared_blowup = prepare_ad(blowup, backend, [0.1]; active = :k)
+        good = ad_value_and_gradient(prepared_blowup, [0.1])
+        @test_throws ReactiveKernels.ODESolveFailure blowup([1.0])
+        @test_throws ReactiveKernels.ODESolveFailure ad_value_and_gradient(prepared_blowup, [1.0])
+        @test ad_value_and_gradient(prepared_blowup, [0.1]) == good
+        @test blowup([0.1]) == good[1]
     end
     @testset "controls, continuous history, and failure ownership" begin
         u, p, ts = [1.0], [0.7], collect(0.02:0.02:0.4)
@@ -206,7 +223,35 @@ end
         @test reference.stats.naccept > per_output
         out = solve(_ode_decay, u, 0.0, ts, 1e-8, 1e-8, per_output + 2, p[1])
         @test vec(out) ≈ exp.(-p[1] .* ts) rtol=2e-6
-        @test_throws ErrorException solve(_ode_decay, u, 0.0, [1.6], 1e-10, 1e-10, 1, p[1])
+        # A solve the method cannot complete from valid inputs is a typed
+        # numerical failure, distinct from invalid input and from bugs, which
+        # a density target can answer with -Inf (snag rk-ode-solve-fai-3c664466).
+        budget = try
+            solve(_ode_decay, u, 0.0, [1.6], 1e-10, 1e-10, 1, p[1])
+        catch err
+            err
+        end
+        @test budget isa ReactiveKernels.ODESolveFailure
+        @test budget isa ReactiveKernels.NumericalFailure
+        @test budget.method == string("native ", nameof(typeof(alg)))
+        @test budget.retcode === :MaxIters
+        @test 0 < budget.t < 1.6
+        @test startswith(sprint(showerror, budget),
+            string("native ", nameof(typeof(alg)), " exceeded maxsteps between requested outputs at t = "))
+        blowup = try
+            solve(_ode_blowup, [1.0], 0.0, [0.5, 2.0], 1e-8, 1e-8, 10^6, 1.0)
+        catch err
+            err
+        end
+        @test blowup isa ReactiveKernels.ODESolveFailure
+        @test blowup.retcode !== :MaxIters
+        @test 0.5 < blowup.t <= 1.0 + 1e-6
+        @test startswith(sprint(showerror, blowup),
+            string("native ", nameof(typeof(alg)), " failed: ", blowup.retcode, " at t = "))
+        # The gradient's solve fails the same way, uncaught and unwrapped.
+        @test_throws ReactiveKernels.ODESolveFailure Enzyme.autodiff(Enzyme.Reverse,
+            _ode_blowup_loss, Enzyme.Active, Enzyme.Const(solve),
+            Enzyme.Duplicated([1.0], zeros(1)), Enzyme.Const([0.5, 2.0]))
         @test_throws DimensionMismatch solve(_ode_bad_rhs, u, 0.0, ts, 1e-8, 1e-8, 10000)
         @test u == [1.0]
         @test p == [0.7]

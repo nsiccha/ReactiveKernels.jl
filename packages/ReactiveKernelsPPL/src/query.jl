@@ -456,6 +456,13 @@ or an optimizer: it implements `dimension`, `capabilities`
 (`LogDensityOrder{1}`), `logdensity` (`q(u)`) and `logdensity_and_gradient`,
 which returns a fresh gradient vector on every call. Give each concurrent
 chain its own query; a `deepcopy` is an independent query.
+
+A point where a numerical method cannot evaluate the model, such as an ODE
+its solver cannot integrate there (`ReactiveKernels.NumericalFailure`, for
+example `ReactiveKernels.ODESolveFailure`), is outside the target's support:
+the value is `-Inf` and the gradient is filled with `NaN`, as Stan rejects a
+proposal whose ODE solve fails. Every other exception propagates. The query
+evaluates the next point as usual afterwards.
 """
 mutable struct SamplerQuery{K,P,L}
     const kernel::K
@@ -662,8 +669,16 @@ HMC-loop case); any other real vector is converted. `u` must have
 """
 # The generated kernel is scalar-valued, but invokelatest itself infers Any.
 # Assert the public density contract after crossing the world-age barrier.
-(q::SamplerQuery)(u::Vector{Float64}) =
-    Base.invokelatest(_sampler_density, q, u)::Float64
+# A numerical failure (`ReactiveKernels.NumericalFailure`) is a point outside
+# the support: `-Inf`. Anything else is not, so it propagates.
+function (q::SamplerQuery)(u::Vector{Float64})
+    try
+        return Base.invokelatest(_sampler_density, q, u)::Float64
+    catch err
+        err isa ReactiveKernels.NumericalFailure || rethrow()
+        return -Inf
+    end
+end
 (q::SamplerQuery)(u::AbstractVector{<:Real}) = q(Vector{Float64}(u))
 _sampler_density(q::SamplerQuery, u) = q.kernel(u)
 
@@ -673,10 +688,20 @@ _sampler_density(q::SamplerQuery, u) = q.kernel(u)
 Posterior value and gradient at unconstrained `u`, writing the gradient
 into `g` in place. Returns the `(value, g)` pair. `g` must be a
 valid gradient destination for `u`; `u` is converted to `Vector{Float64}`
-unless it already is one.
+unless it already is one. Where a numerical method cannot evaluate the model
+(`ReactiveKernels.NumericalFailure`) the value is `-Inf` and `g` is filled
+with `NaN`; every other exception propagates.
 """
-sampler_value_and_gradient!(q::SamplerQuery, g::AbstractVector, u::Vector{Float64}) =
-    (_latest_value(_sampler_gradient!, q, g, u), g)
+function sampler_value_and_gradient!(q::SamplerQuery, g::AbstractVector, u::Vector{Float64})
+    value = try
+        _latest_value(_sampler_gradient!, q, g, u)
+    catch err
+        err isa ReactiveKernels.NumericalFailure || rethrow()
+        fill!(g, NaN)
+        -Inf
+    end
+    return (value, g)
+end
 sampler_value_and_gradient!(q::SamplerQuery, g::AbstractVector, u::AbstractVector) =
     sampler_value_and_gradient!(q, g, Vector{Float64}(u))
 _sampler_gradient!(q::SamplerQuery, g, u) = first(ad_value_and_gradient!(q.ad, g, u))
@@ -689,7 +714,10 @@ Posterior value and gradient at unconstrained `u` as
 by `prepare_sampler(...; retain)` evaluated by the same primal sweep. Returns
 `(value, g, retained)`, where `retained` is a `NamedTuple` keyed by those
 preset names (`retained.pointwise` has the shape `prepare_query(…, :pointwise)`
-returns). Each call returns freshly computed retained values.
+returns). Each call returns freshly computed retained values. The retained
+presets have no value where a numerical method cannot evaluate the model, so
+this call throws that `ReactiveKernels.NumericalFailure` instead of answering
+`-Inf`.
 """
 function sampler_value_gradient_and_retained!(q::SamplerQuery, g::AbstractVector,
         u::AbstractVector)

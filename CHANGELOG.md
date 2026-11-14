@@ -16,6 +16,26 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.251
+
+- A failed solve of `rk_ode_rk45_tol` or `rk_ode_bdf_tol` throws the new
+  `ReactiveKernels.ODESolveFailure(method, retcode, t)`, a subtype of the new
+  abstract `ReactiveKernels.NumericalFailure`, instead of an untyped
+  `ErrorException`. It covers what the method cannot do from valid inputs:
+  an unsuccessful SciML return code (`retcode`, for example `:Unstable`) and
+  `maxsteps` exceeded between two requested outputs (`retcode === :MaxIters`);
+  `t` is the time, in the caller's units, the solver had reached. Invalid
+  inputs keep throwing `ArgumentError` or `DomainError`, and a wrong RHS
+  length `DimensionMismatch`. A density target can now answer `-Inf` for
+  exactly this failure, as Stan rejects a proposal whose ODE solve fails,
+  while other errors propagate, as ReactiveKernelsPPL's sampler targets now
+  do. The message keeps its old text and adds the time:
+  `native DP5 failed: Unstable at t = …`.
+  **Breaking:** code that caught the failure as `ErrorException` catches
+  `ReactiveKernels.ODESolveFailure` (or `ReactiveKernels.NumericalFailure`)
+  instead. The gradient's solve throws the same exception. `jax_source`
+  modules still raise at a failed solve.
+
 ## 0.1.250
 
 - `prepare_ad` over a `NonAllocatingKernel` no longer fails when the program
