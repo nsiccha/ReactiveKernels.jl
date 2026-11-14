@@ -1,7 +1,7 @@
 name = "ReactiveKernelsPPL"
 uuid = "e266ea2a-6817-46cd-8bec-6238f0035f44"
 authors = ["Nikolas Siccha <nikolassiccha@gmail.com>"]
-version = "0.1.180"
+version = "0.1.183"
 
 [deps]
 Compat = "34da2185-b29b-5c13-b0c7-acf172513d20"
@@ -19,6 +19,7 @@ Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 
 [weakdeps]
 Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
+Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
 LogDensityProblems = "6fdf6af0-433a-55f7-b3ed-c6c6e0b8df7c"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 SequentialMonteCarlo = "8c675823-c5d5-50f8-acb2-29aff48dfc1d"
@@ -27,6 +28,7 @@ WarmupHMC = "60658175-6863-4866-a322-ab51a11c0cfe"
 
 [extensions]
 ReactiveKernelsPPLDistributionsExt = "Distributions"
+ReactiveKernelsPPLEnzymeExt = "Enzyme"
 ReactiveKernelsPPLSMCExt = ["LogDensityProblems", "Random", "SequentialMonteCarlo", "WarmupHMC", "Treebars"]
 ReactiveKernelsPPLFilterExt = ["Distributions", "Random", "SequentialMonteCarlo"]
 ReactiveKernelsPPLLogDensityProblemsExt = "LogDensityProblems"
@@ -53,7 +55,7 @@ SparseArrays = "1"
 Treebars = "0.1.5"
 WarmupHMC = "0.2.21"
 PrecompileTools = "1.2"
-ReactiveKernels = "0.1.233"
+ReactiveKernels = "0.1.242"
 ReactiveKernelsDistributionKernels = "0.1.10"
 SpecialFunctions = "2"
 StatsFuns = "1, 2"

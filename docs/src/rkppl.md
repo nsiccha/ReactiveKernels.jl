@@ -58,6 +58,47 @@ Tutorials.html(model_view(built; bound))
 
 `prepare_query` returns a raw prepared callable. Calls made from an already compiled Julia function may require a world-age barrier; `prepare_sampler` supplies the managed sampler boundary. See the [PPL reference](ppl-api.md) for derivative, predictive and conditional-latent queries.
 
+## Integrating out a linear-Gaussian recurrence
+
+A latent `@scan` whose steps are linear in the previous state with Normal innovations, observed through a Normal law whose location is affine in it, can be integrated out exactly. `marginalize(model, :x)` keeps the model source as written and lowers the recurrence and its observation into a Kalman filter. The sampler then has no coordinates for `x` or its innovations, and the likelihood is the exact marginal density of the observations given the remaining parameters.
+
+```@example marginal
+using ReactiveKernelsPPL, Random
+
+model = @rkppl begin
+    level ~ Normal(0, 2)
+    sd ~ Exponential(1)
+    length_scale ~ LogNormal(0, 1)
+    noise ~ Exponential(0.5)
+    @scan begin
+        x[1] ~ Normal(0, 1)
+        for t in 2:T
+            e ~ Normal(0, 1)
+            r = exp(-gap[t] / length_scale)
+            x[t] = r * x[t - 1] + sqrt(1 - r * r) * e
+        end
+    end
+    y .~ Normal.(level .+ sd .* x, noise)
+end
+
+gap = [1.0, 0.5, 2.0, 1.0, 0.7, 1.3]
+y = [0.3, 0.5, -0.1, 0.0, 0.4, 0.2]
+latent = build_kernel(model(; gap, T = length(y)) | (; y))
+plan = marginalize(model(; gap, T = length(y)), :x) | (; y)
+built = build_kernel(plan)
+(; latent=coordinate_names(latent.layout), marginal=coordinate_names(built.layout))
+```
+
+Each step's coefficients may read parameters, data and the loop index, so irregular gaps and resets where a new series begins are covered. The pointwise query holds each observation's one-step-ahead predictive density. Draws of the integrated-out trajectory come afterward, one per parameter draw, by forward filtering and backward sampling:
+
+```@example marginal
+u = unconstrain(built.layout, (; level=0.2, sd=0.3, length_scale=1.5, noise=0.2))
+latents = prepare_marginalized_latents(built, plan)
+marginalized_latent_draws(latents, u, Xoshiro(1)).x
+```
+
+Recurrences carrying several arrays, a lag above one, recurrences inside `@plate` cells or submodels, and observations that are not Normal are refused with an error naming the statement.
+
 ## Adaptive partial centering
 
 Select affine cells when setting up WarmupHMC. Declare their location and

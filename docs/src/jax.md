@@ -20,6 +20,8 @@ print(source)
 
 Input annotations tell the emitter each port's rank. For untyped ports, supply the corresponding `types` keyword. The emitted input order follows the selected input boundary.
 
+The module docstring starts with the generated line shown above. The `doc` keyword adds the author's description of the program after it: a string, or a binding's docstring as `@doc(NAME)`. A docstring written above `const NAME = …` belongs to the binding, not to the value `jax_source` receives, so the caller passes it. For a PPL model, `jax_source(built, bound; doc)` places it before the generated `Data:` and `Model documentation:` lists. Docstrings keep their text as written, backslashes and quotes included.
+
 Typed `Float32` values keep `float32`, also in `prepare_data`; other floats
 take `jax_source`'s `float_type` (`Float64`, or `Float32` without JAX's 64-bit
 mode), as metadata reports.
@@ -163,9 +165,12 @@ print(jax_source(built, bound))
 
 ## Helpers with loops and branches
 
-A helper with recorded source becomes a named Python function, reused by
-calls with the same argument representation. Its Julia docstring accompanies
-the emitted body. Arrays, captured numerical values and padded lengths are
+A helper becomes a named Python function with its method's argument names,
+reused by calls with the same argument representation: from recorded source,
+or, for a plain helper outside Julia and ReactiveKernels, from its lowered
+code. Its Julia docstring accompanies the body; a broadcast vectorizes the
+function itself. A leading underscore and ReactiveKernels' own helpers stay
+private (`_name`). Arrays, captured numerical values and padded lengths are
 normally explicit arguments. A helper that carries loop bounds or reads scan
 history stays nested in that scope, preserving the bounds and history access
 analysis. Nested plate cells and scan steps are named after the authored
