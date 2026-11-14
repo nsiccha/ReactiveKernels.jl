@@ -187,6 +187,16 @@ keeps the meaning of the coordinates centred on it. The adapter checks these
 graph dependencies before sampling and refuses own reads and cycles. Nested
 levels need RKPPL 0.1.185 and WarmupHMC 0.3.0 or later.
 
+A latent random walk or AR(1) series observed only in parts has no good
+fixed frame: written in its innovations, the step size falls as the series
+grows; written in its states, it mixes badly where nothing is observed.
+Mark its `@scan` with `markov_chains(model, :w)` before binding. The
+recurrence qualifies when it is linear-Gaussian in its previous state, as
+for `marginalize`, written centred or non-centred, at top level or in a
+`@plate` cell. RKPPL lowers it in its states, and `adaptive_centering_problem`
+gives it one WarmupHMC `MarkovChain` (WarmupHMC 0.3.1 or later), which adapts
+how far to centre each time step. `cells` may then be omitted.
+
 RKPPL 0.1.175 with WarmupHMC
 0.2.21 or later prepares one joint endpoint kernel, sharing common graph work
 across selected cells and their location/log-scale roles. It runs once per

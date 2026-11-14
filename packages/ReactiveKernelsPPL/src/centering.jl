@@ -65,6 +65,19 @@ struct _CenteringAccessor{K}
 end
 @inline (a::_CenteringAccessor)(x) = a.kernel[](x)
 
+# A Markov chain's per-state accessor: one family of the chains' frame kernel.
+# Its first entry is the first state's location (`_ChainInitial`).
+struct _ChainAccessor{K}
+    kernel::_CenteringAccessor{K}
+    family::Int
+end
+@inline (a::_ChainAccessor)(x) = a.kernel(x).values[a.family]
+struct _ChainInitial{K}
+    kernel::_CenteringAccessor{K}
+    family::Int
+end
+@inline (a::_ChainInitial)(x) = a.kernel(x).values[a.family][1]
+
 # Runtime family/element selectors keep heterogeneous endpoint shapes concrete
 # without concatenating or copying their arrays into a flat buffer.
 struct _CenteringFrame{N}
@@ -84,6 +97,10 @@ _centering_values(value::Real) = Float64[value]
 # leaves bound, cached arrays read-only during maps and ordinary reverse AD.
 _centering_values(value::Array{Float64}) = vec(value)
 _centering_values(value::AbstractArray{<:Real}) = collect(Float64, vec(value))
+# A recurrence per `@plate` index records one vector per index; its chain reads
+# them concatenated in plate order.
+_centering_values(value::AbstractVector{<:AbstractVector{<:Real}}) =
+    Float64[v for entry in value for v in entry]
 _centering_frame(values...) =
     _CenteringFrame(map(_centering_values, values))
 
@@ -216,7 +233,106 @@ function _centering_cells(built, plan::StructuralPlan, cells::NamedTuple;
     sort!(records; by = cell -> (cell.stage, cell.offset))
     kernel = isempty(kernel_names) ? nothing :
         _centering_kernel(built, plan, Tuple(kernel_names); on_error)
-    (; kernel, records, dimension = layout.total)
+    chains, chain_kernel = _centering_chains(built, plan, layout, entries, exemplar,
+        selected, selected_ids, cells; on_error)
+    (; kernel, records, chains, chain_kernel, dimension = layout.total)
+end
+
+# The recurrences `markov_chains` marked: those whose recorded frame
+# (`_rkppl_chain_<x>_coef`) the graph holds.
+function _centering_chain_names(spec)
+    out = Symbol[]
+    prefix, suffix = _CHAIN_PREFIX, "_coef"
+    for name in keys(spec.ports)
+        str = String(name)
+        startswith(str, prefix) && endswith(str, suffix) && !occursin("_frame_", str) ||
+            continue
+        push!(out, Symbol(str[length(prefix)+1:end-length(suffix)]))
+    end
+    sort!(out)
+end
+
+# One record per marked recurrence: its states in time order (each `@plate`
+# index's in plate order) and the kernel families of its coefficient, drift
+# and log step SD. The frame reads only coordinates no chain or cell
+# transforms, and no cell's endpoint reads a chain's states.
+function _centering_chains(built, plan, layout, entries, exemplar, selected,
+        selected_ids, cells; on_error)
+    RK = ReactiveKernels
+    graph = built.spec.graph
+    names = _centering_chain_names(built.spec)
+    isempty(names) && return NamedTuple[], nothing
+    records = NamedTuple[]
+    frame_names = Symbol[]
+    state_entries = Symbol[]
+    for x in names
+        frames = Tuple(_chain_name(x, r) for r in _CHAIN_ROLES)
+        coef = Base.invokelatest(prepare_query(built, plan, (frames[1],); on_error,
+            exemplars = (exemplar,)), exemplar)
+        lengths = coef isa AbstractVector{<:Real} ? [length(coef)] : length.(coef)
+        seed = Symbol(:_rkppl_scan_, x, :_seed_, x, :_1)
+        draw = Symbol(:_rkppl_scan_, x, :_draw_, x)
+        states = Int[]
+        used = Symbol[]
+        if coef isa AbstractVector{<:Real}
+            entry = haskey(entries, x) ? entries[x] : get(entries, Symbol(:_ppl_scan_z_, x), nothing)
+            entry === nothing || entry.size == only(lengths) || (entry = nothing)
+            entry === nothing && throw(ContractValidationError("[centering] the " *
+                "states of Markov chain `$x` are not one packed block of its length"))
+            append!(states, entry.offset .+ (0:entry.size-1))
+            push!(used, entry.name)
+        else
+            sampled = haskey(entries, seed)
+            haskey(entries, draw) && (!sampled || entries[seed].size == length(lengths)) ||
+                throw(ContractValidationError("[centering] the states of Markov chain " *
+                    "`$x` are not its cells' seed and step blocks"))
+            steps = entries[draw]
+            sum(lengths; init = 0) - (sampled ? length(lengths) : 0) == steps.size ||
+                throw(ContractValidationError("[centering] Markov chain `$x` records " *
+                    "$(sum(lengths; init = 0)) states but packs $(steps.size) steps"))
+            run = 0
+            for (g, n) in enumerate(lengths)
+                sampled && push!(states, entries[seed].offset + g - 1)
+                k = sampled ? n - 1 : n
+                append!(states, steps.offset + run .+ (0:k-1))
+                run += k
+            end
+            sampled && push!(used, seed)
+            push!(used, draw)
+        end
+        for name in used
+            name in selected && throw(ContractValidationError("[centering] `$name` " *
+                "holds the states of Markov chain `$x`; a chain's states take no cell"))
+        end
+        append!(state_entries, used)
+        start = length(frame_names)
+        append!(frame_names, frames)
+        push!(records, (; name = x, states, coef = start + 1, drift = start + 2,
+            log_scale = start + 3))
+    end
+    # Accessors read the source vector. A chain's frame reading transformed
+    # coordinates, or a cell's endpoint reading a chain's states, would read
+    # values whose meaning changes as warm-up adapts.
+    ids = [n => RK.canon_id(graph, built.spec[n].id) for n in state_entries
+        if haskey(built.spec.ports, n)]
+    for name in frame_names, (n, id) in [ids; selected_ids]
+        RK._cell_factor_reads(built.spec, built.spec[name], (id,)) &&
+            throw(ContractValidationError("[centering] the transition of a Markov " *
+                "chain (`$name`) reads `$n`; a chain's coefficients, drift and step " *
+                "size may read only coordinates no chain or cell transforms"))
+    end
+    for (name, cell) in pairs(cells), field in (:location, :log_scale)
+        node = cell[field]
+        node isa Symbol || continue
+        for (n, id) in ids
+            RK._cell_factor_reads(built.spec, built.spec[node], (id,)) &&
+                throw(ContractValidationError("[centering] `$name.$field` (`$node`) " *
+                    "reads `$n`, the states of a Markov chain; a cell's endpoints " *
+                    "may not read a chain's states"))
+        end
+    end
+    kernel = _centering_kernel(built, plan, Tuple(frame_names); on_error)
+    records, kernel
 end
 
 # A cell reading no selected latent is on level 1; a cell reading cells of
