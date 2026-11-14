@@ -16,6 +16,18 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.181
+
+- `prepare_query(built, plan, want; inputs = (:x,))` prepares once and leaves
+  the named data values as call arguments: `q(u, xx)` gives what preparing on
+  a binding with `x = xx` gives, without binding or preparing again. Data
+  definitions and value matrices binding computes from an input are evaluated
+  again on every call. A call checks that each input keeps its bound type and
+  size, and that nothing other than floating-point values changes in what
+  binding computes from it. Preparation refuses observations and the data
+  binding checks against them, factor labels, and integer or Boolean data,
+  naming why. Queries without `inputs` are unchanged.
+
 ## 0.1.180
 
 - A range that reads `end` or `begin` inside an index over data or over a

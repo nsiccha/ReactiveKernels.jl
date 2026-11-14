@@ -191,7 +191,8 @@ function _absent_supply_names(plan::StructuralPlan, name::Symbol)
 end
 
 """
-    prepare_query(built, plan, preset::Symbol; on_error = nothing, exemplars = nothing)
+    prepare_query(built, plan, preset::Symbol; on_error = nothing, exemplars = nothing,
+                  inputs = ())
 
 Prepare the `build_kernel` output `built` for a named workflow `preset`
 over the sampler boundary (`:unconstrained` + data columns, data hoisted
@@ -210,16 +211,47 @@ world-age safe (callable from compiled functions), but the RAW returned
 kernel closes over build-time eval'd code: call it from top level, wrap
 the call in `Base.invokelatest`, or use [`SamplerQuery`](@ref), whose
 call paths carry the barrier.
+
+# Runtime inputs
+
+`inputs` names data values of `plan` that each call supplies instead of the
+binding: `q = prepare_query(built, plan, want; inputs = (:x,))` prepares once,
+and `q(u, xx)` evaluates at `u` with `xx` in place of the bound `x`, giving
+what preparing again on a binding with `x = xx` gives. Values follow `u` in
+the order `inputs` names them. A number the model reads as a value (`s`) is
+named as authored. With `exemplars`, the preparation adds the bound values of
+the inputs to them.
+
+Each call checks that every input has the type and size of its bound value
+(`ArgumentError` otherwise). What binding computes from the inputs (data
+definitions such as `w = f(x)` and value matrices) is evaluated again on every
+call from the call's values, exactly as binding evaluates it, so it never
+keeps the bound value. Only floating-point values may change: when such a
+value changes an integer, a Boolean, a label, a range or the size of an
+array (something that may index, count or size the program), the call throws
+an `ArgumentError` and the value must be bound. Values reach the program as
+given: a call checks their type and size, not the ranges binding checks for
+observations.
+
+Preparation refuses, with a `ContractValidationError` naming the reason, an
+input that is not a data value the binding was given, one that binding checks
+as an observation or against one (a value observed with `|` or `condition`, a
+statistical response, weights, trials, scales, censoring bounds or cutpoints,
+or data an observed definition is computed from), a factor's labels, and data
+other than floating-point numbers and dense `Array`s of them (integer and
+Boolean data index, count, size or select, and binding checks them value by
+value). Bind such values with `bind_data`. A value pinned in the model call
+(`model(; x, y)`) is data, not an observation, and may be an input.
 """
 function prepare_query(built, plan::StructuralPlan, preset::Symbol;
-        on_error = nothing, exemplars = nothing)
+        on_error = nothing, exemplars = nothing, inputs = ())
     return _prepare_wants(built, plan, workflow_wants(preset);
-        on_error, exemplars)
+        on_error, exemplars, inputs)
 end
 
 """
     prepare_query(built, plan, values::Tuple{Vararg{Symbol}}; on_error = nothing,
-                  exemplars = nothing)
+                  exemplars = nothing, inputs = ())
 
 Prepare the authored `values` of the model by name, over the same sampler
 boundary as a preset: a definition (`h_out = h[T]`), a recurrence's carried
@@ -229,9 +261,11 @@ value itself, as one WANT of `ReactiveKernels.prepare` does. A workflow preset
 name is refused (query it with the `Symbol` method). The same tuple is a
 `prepare_query_ad` preset for pullbacks and pushforwards:
 `prepare_query_ad(prepare_ad_pullback, built, plan, (:h_out,), backend, 1.0, u0)`.
+`inputs` leaves data values as call arguments, `q(u, xx)`, exactly as for a
+preset (see "Runtime inputs" there).
 """
 function prepare_query(built, plan::StructuralPlan, values::Tuple{Vararg{Symbol}};
-        on_error = nothing, exemplars = nothing)
+        on_error = nothing, exemplars = nothing, inputs = ())
     isempty(values) && throw(ContractValidationError(
         "[query] name at least one authored value"))
     for name in values
@@ -239,16 +273,19 @@ function prepare_query(built, plan::StructuralPlan, values::Tuple{Vararg{Symbol}
             "[query] $name is a workflow preset, not an authored value; query it as " *
             "`prepare_query(built, plan, :$name)`"))
     end
-    return _prepare_wants(built, plan, values; on_error, exemplars)
+    return _prepare_wants(built, plan, values; on_error, exemplars, inputs)
 end
 
 # Prepare the built graph over the sampler boundary for one WANT node or a
 # tuple of them (a tuple-WANT kernel returns a tuple in that order).
 function _prepare_wants(built, plan::StructuralPlan, want;
-        on_error = nothing, exemplars = nothing)
+        on_error = nothing, exemplars = nothing, inputs = ())
     isbound(plan) || throw(ContractValidationError(
         "[query] prepare_query requires a bound plan (bind_data first)"))
     _check_built_program(built, plan)
+    inputs isa Symbol && (inputs = (inputs,))
+    isempty(inputs) || return _prepare_wants_inputs(built, plan, want, inputs;
+        on_error, exemplars)
     # World-age barrier: `built.spec` holds closures eval'd at build time
     # (newer than any already-compiled caller), so partial evaluation must
     # run at the latest world. Same barrier guards every call below.
