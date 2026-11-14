@@ -481,8 +481,9 @@ end
 
 # A helper may be emitted after locals in its caller. Reserve against both
 # sets so a local result cannot shadow a later callable with the same name.
-function _jax_named_function(ctx::_JaxContext, hint)
-    name = _jax_identifier(union(ctx.scope.used, ctx.mod.used), hint)
+function _jax_named_function(ctx::_JaxContext, hint; private::Bool = false)
+    used = union(ctx.scope.used, ctx.mod.used)
+    name = private ? _jax_private_identifier(used, hint) : _jax_identifier(used, hint)
     push!(ctx.mod.used, name)
     name
 end
@@ -3345,6 +3346,8 @@ function _jax_traceable_or_lowered(ctx::_JaxContext, f, args::Vector{_PyVal})
                        join((string(a.T) for a in args), ", "), ")", _jax_where(ctx))
         return _jax_call(ctx, throw, [_PyVal(repr(string(nameof_or(f), " threw")), ErrorException)])
     end
+    v = _jax_named_lowered_call(ctx, f, args)
+    v === nothing || return v
     v = _jax_lowered_call(ctx, f, args)
     v === nothing || return v
     _jax_error("the function `", f, "` has no JAX translation for argument types (",
@@ -4542,6 +4545,8 @@ function _jax_scalar_function!(ctx::_JaxContext, f, types)
     host = ctx.host !== nothing
     key = (:scalar, objectid(f), Tuple(types), host)
     haskey(ctx.mod.helper_names, key) && return ctx.mod.helper_names[key]
+    named = _jax_vectorized_named_function!(ctx, f, types)
+    named === nothing || return (ctx.mod.helper_names[key] = named)
     hint = Symbol("_rk_", replace(string(nameof_or(f)), r"[^A-Za-z0-9_]" => "_"), host ? "_np" : "")
     name = _jax_private_identifier(ctx.mod.used, hint)
     ctx.mod.helper_names[key] = name
@@ -4818,6 +4823,17 @@ end
 # supplies: its authored body over the arguments, as the compiled
 # path reads it. Its locals are scoped to the call.
 function _jax_traceable_call(ctx::_JaxContext, f, args::Vector{_PyVal})
+    source = _jax_traceable_body(ctx, f, args)
+    source === nothing && return nothing
+    names, body, mod, inputs = source
+    ctx.host === nothing ||
+        return _host_function_call(ctx, f, names, body, mod, args, inputs)
+    _jax_authored_function_call(ctx, f, names, body, mod, inputs)
+end
+
+# `f`'s recorded or provided source over `args`: `(names, body, module,
+# inputs)`, or `nothing`.
+function _jax_traceable_body(ctx::_JaxContext, f, args::Vector{_PyVal})
     # A function passed as an argument dispatches on its own type (a stable
     # rewrite's `_rk_log_of(exp, x)` selects its `::typeof(exp)` method).
     types = Any[_jax_argument_type(a) for a in args]
@@ -4831,15 +4847,190 @@ function _jax_traceable_call(ctx::_JaxContext, f, args::Vector{_PyVal})
     # A Vararg source's last formal is the tuple of the trailing arguments.
     inputs = _traceable_arguments(source, args, rest -> _jax_call_positional(ctx, tuple, rest))
     inputs === nothing && return nothing
-    ctx.host === nothing ||
-        return _host_function_call(ctx, f, collect(Symbol, names), body, mod, args, inputs)
-    _jax_authored_function_call(ctx, f, collect(Symbol, names), body, mod, inputs)
+    collect(Symbol, names), body, mod, inputs
+end
+
+# Whether a call of `f` reaches the default translation (recorded source or
+# lowered code): no translation hook has a method for `f` itself.
+function _jax_default_translation(f)
+    F = typeof(f)
+    which(_jax_call, Tuple{_JaxContext,F,Vector{_PyVal},Any}) ===
+        which(_jax_call, Tuple{_JaxContext,Any,Vector{_PyVal},Any}) &&
+    which(_jax_call_positional, Tuple{_JaxContext,F,Vector{_PyVal}}) ===
+        which(_jax_call_positional, Tuple{_JaxContext,Function,Vector{_PyVal}}) &&
+    which(_jax_function_call, Tuple{_JaxContext,F,Vector{_PyVal}}) ===
+        which(_jax_function_call, Tuple{_JaxContext,Any,Vector{_PyVal}})
+end
+
+# A broadcast of a helper with a named function (`toy_mean.(a, b, t)` of an
+# authored `toy_mean`) vectorizes that function itself when it takes exactly
+# the scalar arguments, rather than a private wrapper around a call of it.
+# Otherwise `nothing` (a function with no named form, or one that needs
+# extra bound/guard arguments, a tuple-valued result or its caller's scope).
+function _jax_vectorized_named_function!(ctx::_JaxContext, f, types)
+    ctx.host === nothing && isempty(_JAX_GUARDS) && f isa Function &&
+        Base.issingletontype(typeof(f)) && _jax_default_translation(f) || return nothing
+    scope = _JaxScope()
+    inner = _JaxContext(ctx.mod, scope, ctx.recipe, ctx.source_module,
+                        Dict{Symbol,_PyVal}(), nothing)
+    params = [_jax_identifier(scope.used, Symbol(:x, i)) for i in eachindex(types)]
+    args = [_PyVal(p, T) for (p, T) in zip(params, types)]
+    defined = nothing
+    source = _jax_traceable_body(inner, f, args)
+    if source !== nothing
+        names, body, mod, inputs = source
+        emit(c, arguments) = _jax_source_expr(c, body, names, arguments, mod, nothing)
+        defined = _jax_named_function!(inner, f, names, inputs, mod, emit,
+                                       "from its authored source")
+    elseif !_jax_internal_function(f) &&
+           _jax_return_type(f, Any[types...]) !== Union{}
+        m = try
+            which(Tuple{typeof(f), types...})
+        catch
+            nothing
+        end
+        if m !== nothing && !m.isva && length(Base.method_argnames(m)) == length(types) + 1 &&
+           length(try _jax_lowered_code(f, types) catch; () end) == 1
+            emit_lowered(c, arguments) = _jax_lowered_call(c, f, arguments)
+            defined = _jax_named_function!(inner, f, Base.method_argnames(m)[2:end], args,
+                                           ctx.source_module, emit_lowered,
+                                           "from its Julia definition")
+        end
+    end
+    defined === nothing && return nothing
+    name, v, bounds, passed, flat, _, _ = defined
+    passed == params && isempty(bounds) && flat === nothing && isempty(v.extent) &&
+        isempty(v.limit) && v.origin === nothing || return nothing
+    name
 end
 
 # Source-backed helpers keep their authored names and formal arguments. The
 # extra extent/bound arguments are the same runtime representation used by
 # plates; none is a value baked into the module from a particular dataset.
 function _jax_authored_function_call(ctx, f, names, body, source_module, inputs)
+    emit(inner, arguments) = _jax_source_expr(inner, body, names, arguments, source_module, nothing)
+    inline() = _jax_source_expr(ctx, body, names, inputs, source_module, nothing)
+    _jax_named_function_call(ctx, f, names, inputs, source_module, emit, inline,
+                             "from its authored source")
+end
+
+# A plain helper without recorded source, outside Julia and ReactiveKernels:
+# its straight-line lowered code becomes a named function as well, with the
+# method's argument names and the function's docstring, so an authored helper
+# reads as one whether or not it is `@traceable`. Julia's and ReactiveKernels'
+# own functions, a Vararg method and a closure stay translated in place.
+function _jax_named_lowered_call(ctx::_JaxContext, f, args::Vector{_PyVal})
+    ctx.host === nothing && f isa Function && Base.issingletontype(typeof(f)) &&
+        !_jax_internal_function(f) || return nothing
+    types = Any[_jax_argument_type(a) for a in args]
+    all(T -> T isa Type, types) || return nothing
+    m = try
+        which(Tuple{typeof(f), types...})
+    catch
+        return nothing
+    end
+    m.isva && return nothing
+    names = Base.method_argnames(m)[2:end]
+    length(names) == length(args) || return nothing
+    infos = try
+        _jax_lowered_code(f, types)
+    catch
+        return nothing
+    end
+    length(infos) == 1 || return nothing
+    emit(inner, arguments) = _jax_lowered_call(inner, f, arguments)
+    inline() = _jax_lowered_call(ctx, f, args)
+    _jax_named_function_call(ctx, f, names, args, ctx.source_module, emit, inline,
+                             "from its Julia definition")
+end
+
+# Julia's own functions (Base, Core, the standard libraries) and those of
+# ReactiveKernels' packages and extensions: translated in place, or, with
+# recorded source (a stable rewrite's `_rk_div_by_of`), a private helper.
+function _jax_internal_function(f)
+    m = Base.moduleroot(parentmodule(typeof(f)))
+    (m === Base || m === Core) && return true
+    path = pathof(m)
+    path !== nothing && startswith(path, Sys.STDLIB) && return true
+    dir, root = pkgdir(m), pkgdir(@__MODULE__)
+    dir !== nothing && root !== nothing && (dir == root || startswith(dir, root * "/"))
+end
+# A helper a reader does not call: an emitter-internal one, or one whose
+# authored name already marks it private (`_scaled`).
+_jax_private_function(f) = startswith(String(nameof_or(f)), "_") || _jax_internal_function(f)
+
+# The value of `f` over `inputs` through its named function, defining that
+# function on its first use (`emit` translates the body in the function's
+# scope); `inline()` translates it in place when its value exists only during
+# translation (a type, a closure).
+function _jax_named_function_call(ctx, f, names, inputs, source_module, emit, inline, origin)
+    defined = _jax_named_function!(ctx, f, names, inputs, source_module, emit, origin)
+    defined === nothing && return inline()
+    name, v, bounds, passed, flat, identity, lengths = defined
+    call = name * "(" * join([passed; bounds], ", ") * ")"
+    if isempty(v.extent) && isempty(v.limit) && v.origin === nothing
+        return _jax_bind!(ctx, name, _PyVal(call, v.T, v.static))
+    end
+    result = _jax_bind!(ctx, name, _PyVal(call, Any))
+    _jax_identity_return(_jax_function_return!(ctx, v, flat, result.code), identity, lengths,
+                         result.code)
+end
+
+# A returned length that is one of the function's own length arguments (the
+# field of a retained tuple passed through, `getfield(pair, 2)`): the caller
+# reads its own expression for that length, which keeps the length's prepared
+# flat positions for a later `reduce(vcat, cells)`. `identity` pairs each
+# packed result length with the function's expression it returns.
+function _jax_identity_extents(v, result)
+    out = Pair{String,String}[]
+    for (e, p) in zip((v.extent, v.field_extents...), (result.extent, result.field_extents...))
+        isempty(e) || isempty(p) || push!(out, p => e)
+    end
+    out
+end
+# Each length expression of a function's arguments (`inner`, its parameters)
+# mapped to the caller's for the same length (`outer`, what it passed).
+function _jax_argument_extents!(out, inner::_PyVal, outer::_PyVal)
+    for (a, b) in zip((inner.extent, inner.limit, inner.field_extents...),
+                      (outer.extent, outer.limit, outer.field_extents...))
+        isempty(a) || isempty(b) || (out[a] = b)
+    end
+    if inner.T isa _JaxAggregate && outer.T isa _JaxAggregate
+        foreach((x, y) -> _jax_argument_extents!(out, x, y), inner.T.fields, outer.T.fields)
+    elseif inner.T isa _JaxCallable && outer.T isa _JaxCallable &&
+           inner.T.f isa _JaxClosure && outer.T.f isa _JaxClosure
+        foreach((x, y) -> _jax_argument_extents!(out, x, y), inner.T.f.captures,
+                outer.T.f.captures)
+    end
+    out
+end
+# The caller's expression for the function's length expression `e`: an
+# argument's own length, or a field of one (`pair_lengths[1]` of a tuple whose
+# fields share one lengths value), else `nothing`.
+function _jax_caller_length(lengths, e)
+    haskey(lengths, e) && return lengths[e]
+    m = match(r"^([A-Za-z_][A-Za-z0-9_]*)((?:\[[0-9]+\])+)$", e)
+    m === nothing && return nothing
+    base = get(lengths, m[1], nothing)
+    base === nothing ? nothing : _py_atom(base) * m[2]
+end
+function _jax_identity_return(v, identity, lengths, returned)
+    sub = Dict{String,String}()
+    for (p, e) in identity
+        caller = _jax_caller_length(lengths, e)
+        caller === nothing || (sub[replace(p, "__rk_function_result__" => returned)] = caller)
+    end
+    isempty(sub) && return v
+    swap(e) = get(sub, e, e)
+    _PyVal(v.code, v.T, v.static, swap(v.extent), v.limit, v.padded, v.origin,
+           map(swap, v.field_extents))
+end
+
+# `f`'s named function for arguments like `inputs`: `(name, value, bounds,
+# passed, flat, identity, lengths)`, the call's arguments being `passed` then
+# `bounds` (`identity` and `lengths` for `_jax_identity_return`), or `nothing`
+# when the value exists only during translation.
+function _jax_named_function!(ctx, f, names, inputs, source_module, emit, origin)
     # Integer provenance and history access proofs refer to the surrounding
     # loop/scan. Keep those helpers lexically nested so the scan can still
     # resolve its access placeholders and prove a bounded history carry.
@@ -4863,21 +5054,18 @@ function _jax_authored_function_call(ctx, f, names, body, source_module, inputs)
                             Dict{Symbol,_PyVal}(), nothing)
         inner.traced_branches = ctx.traced_branches
         before = _JAX_EFFECTS[]
-        emit_body() = _jax_source_expr(inner, body, names, arguments, source_module, nothing)
         v = if contextual
-            emit_body()
+            emit(inner, arguments)
         else
             _jax_with_function_guard(scope, guard) do
-                emit_body()
+                emit(inner, arguments)
             end
         end
         effects = _JAX_EFFECTS[] - before
         # Types and callable closures belong to translation. Their captured
         # runtime leaves still need the caller's lexical names.
-        if _jax_translation_only(v) || _jax_type_of_value(v) !== nothing
-            return _jax_source_expr(ctx, body, names, inputs, source_module, nothing)
-        end
-        name = _jax_named_function(ctx, nameof_or(f))
+        (_jax_translation_only(v) || _jax_type_of_value(v) !== nothing) && return nothing
+        name = _jax_named_function(ctx, nameof_or(f); private = _jax_private_function(f))
         text = join(scope.lines, "\n") * "\n" * v.code * "\n" * v.extent * "\n" * v.limit
         bounds = contextual ? String[] : [bn for (bn, _, _) in _jax_prepared_bounds(ctx.mod)
                   if occursin(Regex("\\b" * bn * "\\b"), text)]
@@ -4888,7 +5076,7 @@ function _jax_authored_function_call(ctx, f, names, body, source_module, inputs)
             metadata !== nothing && haskey(metadata, binding)
         end
         doc = documented ? string(Base.Docs.doc(f)) :
-              "Compute `$(nameof_or(f))` from its authored source."
+              "Compute `$(nameof_or(f))` " * origin * "."
         signature = [n * ": ArrayLike" for n in params]
         lines = ["def " * name * "(" * join(signature, ", ") * ") -> " *
                  (isempty(v.extent) && isempty(v.limit) && v.origin === nothing ?
@@ -4896,26 +5084,24 @@ function _jax_authored_function_call(ctx, f, names, body, source_module, inputs)
                  _jax_docstring(doc, "    ")]
         append!(lines, scope.lines)
         returned, result, flat = _jax_function_result(inner, v)
+        identity = _jax_identity_extents(v, result)
         push!(lines, "    return " * returned)
         if contextual
             foreach(line -> _jax_emit!(ctx, line), lines)
         else
             push!(ctx.mod.helpers, join(lines, "\n"))
         end
-        cached = (name, result, bounds, effects, flat)
+        cached = (name, result, bounds, effects, flat, identity)
         ctx.mod.helper_names[key] = cached
     else
         # A reused check still prevents its caller's branch from being
         # discarded, even though this call emits no new helper definition.
         _JAX_EFFECTS[] += cached[4]
     end
-    name, v, bounds, _, flat = cached
-    call = name * "(" * join([passed; bounds], ", ") * ")"
-    if isempty(v.extent) && isempty(v.limit) && v.origin === nothing
-        return _jax_bind!(ctx, nameof_or(f), _PyVal(call, v.T, v.static))
-    end
-    result = _jax_bind!(ctx, nameof_or(f), _PyVal(call, Any))
-    _jax_function_return!(ctx, v, flat, result.code)
+    name, v, bounds, _, flat, identity = cached
+    lengths = Dict{String,String}()
+    contextual || foreach((a, b) -> _jax_argument_extents!(lengths, a, b), arguments, inputs)
+    (name, v, bounds, passed, flat, identity, lengths)
 end
 
 _jax_contextual_value(v::_PyVal) = v.origin !== nothing || _jax_contextual_type(v.T)
@@ -5112,6 +5298,17 @@ function _jax_lowered_call_body(ctx::_JaxContext, f, args::Vector{_PyVal}, types
                    "`ReactiveKernels.register_source_provider!`")
     mod = parentmodule(_jax_callable_type(f))
     ssa = Vector{Any}(undef, length(ci.code))
+    # A call whose value is read once stays an expression at that read, as an
+    # authored body composes it (`level + trend * t`, not three temporaries); a
+    # value read more than once, or never (its call may be an effect), is
+    # bound. An assignment binds the authored local's name.
+    uses = zeros(Int, length(ci.code))
+    count_uses(x) = x isa Core.SSAValue ? (uses[x.id] += 1; nothing) :
+        x isa Expr ? foreach(count_uses, x.args) : nothing
+    for st in ci.code
+        st isa Core.ReturnNode ? (isdefined(st, :val) && count_uses(st.val)) :
+        st isa Core.GotoIfNot ? count_uses(st.cond) : count_uses(st)
+    end
     m = try
         which(Tuple{_jax_callable_type(f), types...})
     catch
@@ -5180,13 +5377,17 @@ function _jax_lowered_call_body(ctx::_JaxContext, f, args::Vector{_PyVal}, types
                 end
                 return _jax_conditional(ctx, condition, arm(i + 1), arm(Int(st.dest)))
             elseif st isa Expr && st.head === :(=)
-                v = value_of_rhs(ctx, st.args[2], value, mod, splats, fields)
                 id = (st.args[1]::Core.SlotNumber).id
+                hint = _jax_slot_hint(ci, id)
+                # An expression a single-read call left unbound is bound here.
+                v = _jax_bind!(ctx, hint, value_of_rhs(ctx, st.args[2], value, mod, splats,
+                                                       fields; hint))
                 slots[id] = v
                 delete!(splats, id)
                 ssa[i] = v
             elseif st isa Expr && st.head === :call
-                ssa[i] = value_of_rhs(ctx, st, value, mod, splats, fields)
+                ssa[i] = value_of_rhs(ctx, st, value, mod, splats, fields;
+                                      hint = uses[i] == 1 ? nothing : :t)
                 _jax_lowered_fields!(fields, i, st, value)
             elseif st isa Expr && st.head in (:meta, :code_coverage_effect, :inbounds, :boundscheck)
                 ssa[i] = nothing
@@ -5201,18 +5402,26 @@ function _jax_lowered_call_body(ctx::_JaxContext, f, args::Vector{_PyVal}, types
     region(1)
 end
 function value_of_rhs(ctx::_JaxContext, rhs, value, mod, splats = Dict{Int,Vector{_PyVal}}(),
-                      fields = Dict{Int,Vector{_PyVal}}())
+                      fields = Dict{Int,Vector{_PyVal}}(); hint = :t)
     rhs isa Expr && rhs.head === :call || return value(rhs)
     callee = rhs.args[1]
     g = callee isa GlobalRef ? getglobal(callee.mod, callee.name) :
         callee isa Core.SSAValue || callee isa Core.SlotNumber || callee isa Core.Argument ?
             _jax_callable(value(callee)) :
         callee isa QuoteNode ? callee.value : callee
+    bind(v) = hint === nothing ? v : _jax_bind!(ctx, hint, v)
     g === Core._apply_iterate &&
-        return _jax_bind!(ctx, :t, _jax_lowered_splat(ctx, rhs.args[2:end], value, splats))
+        return bind(_jax_lowered_splat(ctx, rhs.args[2:end], value, splats))
     g === Core.kwcall &&
-        return _jax_bind!(ctx, :t, _jax_lowered_kwcall(ctx, rhs.args[2:end], value, fields))
-    _jax_bind!(ctx, :t, _jax_call(ctx, g, _PyVal[value(a) for a in rhs.args[2:end]]))
+        return bind(_jax_lowered_kwcall(ctx, rhs.args[2:end], value, fields))
+    bind(_jax_call(ctx, g, _PyVal[value(a) for a in rhs.args[2:end]]))
+end
+# The name a lowered assignment binds: its authored local's, when it has one.
+function _jax_slot_hint(ci, id)
+    names = ci.slotnames
+    id <= length(names) || return :t
+    name = String(names[id])
+    occursin(r"^[A-Za-z_][A-Za-z0-9_]*$", name) ? Symbol(name) : :t
 end
 # `f(args...; kw...)` in lowered code, `Core.kwcall(NamedTuple{names}(values),
 # f, args...)`: the call with those keyword arguments, as source spells it.
