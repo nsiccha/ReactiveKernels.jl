@@ -5315,7 +5315,7 @@ Base.@nospecializeinfer function _cell_lowering_setup!(body, @nospecialize(recip
     end
     captures = Tuple{Int,ValueId,Vector{Tuple{Int,Int}}}[]
     if windows !== nothing
-        d = windows.pushdowns
+        d = windows.pushdowns::_CellPushdowns
         for (position, reads) in sort!(collect(get(d.captures, recipe.id,
                 Dict{Int,Vector{Tuple{Int,Int}}}())); by = first)
             value = canon_id(d.graph, plate_values[position].id)
@@ -8940,13 +8940,16 @@ function _replica_batch_indices(boundary, batched)
     all(name -> name isa Symbol, names) || throw(ArgumentError(
         "replica batched ports must be Symbols; got $(names)"))
 
-    indices = map(names) do name
+    # A typed vector: `sort!` of an untyped one is invalidated by a package
+    # adding `sort!` methods, such as Pkg (`construction_iteration.jl`).
+    indices = Int[]
+    for name in names
         index = findfirst(value -> value.name === name, boundary)
         index === nothing && throw(ArgumentError(
             "replica batched port :$name is not in the prepared HAVE boundary"))
-        index
+        push!(indices, index)
     end
-    Tuple(sort!(collect(indices)))
+    Tuple(sort!(indices))
 end
 
 function _replica(target, batched)

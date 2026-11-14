@@ -3480,7 +3480,11 @@ function _cell_guard_group(statements::Vector{Any}, t::_CellRegions,
         pending[key] = Any[]
     end
     # A key's block with every block it may read placed before it.
-    order(ks) = sort!(collect(ks); by = k -> (-length(_cell_members(t, k)), k))
+    # `pending` is captured before it is assigned, so it is boxed and its keys
+    # are untyped here: collect them into a typed vector (`sort!` of an
+    # untyped one is invalidated by a package adding `sort!` methods, such as
+    # Pkg; `construction_iteration.jl`).
+    order(ks) = sort!(_push_each!(Int[], ks); by = k -> (-length(_cell_members(t, k)), k))
     function flush!(key)
         for k in order(keys(pending))
             k != key && covers(k, key) && place!(k)

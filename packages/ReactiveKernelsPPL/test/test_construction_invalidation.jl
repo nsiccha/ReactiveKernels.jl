@@ -69,9 +69,10 @@ end
 # loads, and everything compiled on it is compiled again. Loading JSON first
 # cost a cold WellsDist build 51-59 s of recompilation on RK 35f8068d9 (snag
 # `downstream-workl-75f8cba4`), through `foreach(f, ::Any)` calls that the
-# check above does not see. A fresh child defines the methods, loads both
-# images and counts the RK/RKPPL code that fails verification; a control child
-# defines only the types. Julia 1.12+ logs this through
+# check above does not see; with Pkg first (LibGit2's `IteratorSize` and
+# `sort!(::GitRevWalker)`) it cost 7-8 s. A fresh child defines the methods,
+# loads both images and counts the RK/RKPPL code that fails verification; a
+# control child defines only the types. Julia 1.12+ logs this through
 # `Base.Compiler.ReinferUtils`.
 @testset "methods like JSON's and LibGit2's defined first fail no RK/RKPPL image edge" begin
     R = isdefined(Base, :Compiler) && isdefined(Base.Compiler, :ReinferUtils) ?
@@ -87,12 +88,14 @@ end
             struct Selector end
             struct FakeIter end
             Base.iterate(::FakeIter, s = 1) = s > 2 ? nothing : (s, s + 1)
+            struct Walker end
             """
         methods_like_json = raw"""
             Base.lastindex(::LazyVec) = 0
             Base.foreach(f, ::LazyVal) = nothing
             Base.hasproperty(::Selector, ::Symbol) = false
             Base.IteratorSize(::Type{FakeIter}) = Base.SizeUnknown()
+            Base.sort!(w::Walker; kws...) = w
             """
         load = raw"""
             R = Base.Compiler.ReinferUtils
