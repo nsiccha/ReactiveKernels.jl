@@ -16,6 +16,23 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.179
+
+- Declared arrays take one bound per element: `x[1:n] .~ restricted.(D.(…), lo, hi)`,
+  `truncated.(D.(…), lo, hi)` and `Uniform.(lo, hi)` accept arrays of the
+  declared shape beside shared numbers, on one- and two-axis arrays: bound
+  data, data-only definitions, literal arrays, or values computed from
+  parameters with the array's axes. A `@plate` cell's own bounds
+  (`x[i] ~ restricted(D, lo[i], hi[i])`) work the same way. Each element has
+  its own transform and log-Jacobian, as Stan's
+  `vector<lower=L, upper=U>[n]`. A `-Inf`/`Inf` entry
+  leaves its element unbounded on that side, and truncation takes the
+  one-sided mass there. The program reads bounds from data and branches per
+  element on their finiteness, so one program serves every length and every
+  pattern of infinite entries. A bound computed from parameters is taken to be
+  finite. Binding refuses a bound array of another size, a vector bound on a
+  two-axis array, and an array bound on a scalar parameter.
+
 ## 0.1.178
 
 - A top-level `@scan` reads every model value whole, indexed as in a Julia
