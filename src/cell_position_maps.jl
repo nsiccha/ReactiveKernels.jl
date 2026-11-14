@@ -294,7 +294,12 @@ _pm_shared_scalar(T) = T isa Type && T !== Union{} &&
 function _pm_shared_operand!(st::_PMState, a::_PMValue)
     k = a.kind
     _pm_invariant(a) && return
-    k === :tuple && return foreach(x -> _pm_shared_operand!(st, x), a.data)
+    if k === :tuple
+        for x in a.data
+            _pm_shared_operand!(st, x)
+        end
+        return
+    end
     k in (:param, :len, :typeof, :typeread) && return _pm_whole!(st, a.data)
     _pm_fail()
 end
@@ -339,7 +344,12 @@ function _pm_operand!(st::_PMState, v::_PMValue)
     k = v.kind
     k in (:const, :typeval, :local, :elem, :accread, :extent) && return
     k === :shared && return _pm_shared_scalar(v.data) ? nothing : _pm_fail()
-    k === :tuple && return foreach(x -> _pm_operand!(st, x), v.data)
+    if k === :tuple
+        for x in v.data
+            _pm_operand!(st, x)
+        end
+        return
+    end
     k === :param && _pm_array_argument(st, v.data) && _pm_fail()
     k in (:param, :len, :typeof, :typeread) && return _pm_whole!(st, v.data)
     _pm_fail()

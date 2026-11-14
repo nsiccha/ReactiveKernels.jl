@@ -2427,7 +2427,9 @@ function _plate_keeping_entries(producer::Recipe, read::Set{Int})
         q = recipes[index]
         any(v -> canon_id(ig, v.id) in needed, q.outputs) || continue
         keep[index] = true
-        foreach(v -> push!(needed, canon_id(ig, v.id)), q.inputs)
+        for v in q.inputs
+            push!(needed, canon_id(ig, v.id))
+        end
     end
     any(index -> !keep[index] && recipes[index].effectful, eachindex(recipes)) &&
         return nothing
@@ -4946,7 +4948,9 @@ Base.@nospecializeinfer function _lower_authored_plate_cells!(
         member(f, id) = _cell_forced(f, windows, _cell_member_force(windows, id, false))
         for (id, s) in zip(ids, states)
             member(id) do
-                foreach(c -> waits(s, c) || request!(windows, s, c), s.captures)
+                for c in s.captures
+                    waits(s, c) || request!(windows, s, c)
+                end
             end
         end
         _cell_emit_windows!(windows)
@@ -4969,7 +4973,9 @@ Base.@nospecializeinfer function _lower_authored_plate_cells!(
             windows.runtime_recipes; sorted = partition, regions = windows.regions)
         for (id, s) in zip(ids, states)
             member(id) do
-                foreach(c -> waits(s, c) && request!(later, s, c), s.captures)
+                for c in s.captures
+                    waits(s, c) && request!(later, s, c)
+                end
             end
         end
         any(s -> any(c -> waits(s, c), s.captures), states) && _cell_emit_windows!(later)
@@ -5760,7 +5766,9 @@ function _program_local_declarations!(found::Set{Symbol}, node)
             name === nothing || push!(found, name)
         end
     end
-    foreach(arg -> _program_local_declarations!(found, arg), node.args)
+    for arg in node.args
+        _program_local_declarations!(found, arg)
+    end
     found
 end
 _substitute_symbols(node::Symbol, mapping) = get(mapping, node, node)
@@ -6379,7 +6387,9 @@ function _lower_with_ops_collecting(p::Plan;
             push!(runtime_ops, r.op)
             push!(runtime_recipes, r)
             cells.slots[r.id] = length(runtime_ops)
-            foreach(output -> push!(assigned, canon_id(g, output.id)), r.outputs)
+            for output in r.outputs
+                push!(assigned, canon_id(g, output.id))
+            end
             continue
         end
 

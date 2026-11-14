@@ -3122,7 +3122,9 @@ function _plate_entry_parts(producer::Recipe, groups::Vector)
         q = inner.recipes[index]
         users = get(serves, cid(only(q.outputs)), nothing)
         users === nothing && continue
-        foreach(v -> union!(get!(Set{Int}, serves, cid(v)), users), q.inputs)
+        for v in q.inputs
+            union!(get!(Set{Int}, serves, cid(v)), users)
+        end
     end
     # A `vec` of an input only re-indexes it, and the cell lowering sees through
     # it to read a capture at rows (`_cell_capture_root`), which a lane would hide:

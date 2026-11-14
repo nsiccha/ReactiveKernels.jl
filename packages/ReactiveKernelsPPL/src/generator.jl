@@ -2157,9 +2157,13 @@ function _assigned_names!(out::Set{Symbol}, ex)
     name = _assigned_name(ex)
     name === nothing || push!(out, name)
     if Meta.isexpr(ex, :(=), 2) && Meta.isexpr(ex.args[1], :tuple)
-        foreach(a -> a isa Symbol && push!(out, a), ex.args[1].args)
+        for a in ex.args[1].args
+            a isa Symbol && push!(out, a)
+        end
     end
-    foreach(a -> _assigned_names!(out, a), ex.args)
+    for a in ex.args
+        _assigned_names!(out, a)
+    end
     return out
 end
 

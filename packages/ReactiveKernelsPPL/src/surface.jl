@@ -3384,7 +3384,9 @@ function _sampled_lhs_names!(out::Set{Symbol}, lhs)
     Meta.isexpr(lhs, :call) && !isempty(lhs.args) &&
         lhs.args[1] in (:eachrow, :eachcol, :hcat) ||
         return _lhs_base_names!(out, lhs)
-    foreach(a -> _sampled_lhs_names!(out, a), lhs.args[2:end])
+    for a in lhs.args[2:end]
+        _sampled_lhs_names!(out, a)
+    end
     return out
 end
 
