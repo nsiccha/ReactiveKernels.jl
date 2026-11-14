@@ -10,6 +10,9 @@ const SITE_PAGES = [
         "Reusable buffers" => "nonallocating.md",
         "Graph inspection" => "visualization.md",
         "JAX source" => "jax.md",
+        "JAX helpers and submodels" => "jax-helpers.md",
+        "JAX translations" => "jax-translations.md",
+        "JAX runtime and derivatives" => "jax-runtime.md",
         "Derivative graphs" => "manual-derivative-rules.md",
     ],
     "Examples" => [
