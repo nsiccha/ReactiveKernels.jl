@@ -30,12 +30,14 @@ are recorded in the git history only.
   another index vector keeps its per-cell reads and writes inside the runs.
   Values and gradients are unchanged, apart from rounding.
   - On PosteriorDB's RadonVariableInterceptNCMN (919 rows in 85 counties),
-    with Julia 1.13.1 and Enzyme dogfood, the opted-in complete gradient takes
-    0.58–0.67 of the default preparation's time in paired runs on two shared
-    hosts, and 0.37 on a variable-slope Radon port. It allocates the one-pass
-    buffer on each call (784 B), where the default preparation allocates
-    nothing. The same rule forced onto two passes allocates nothing and takes
-    1.11 of the default's time, so the choice between the schedules is
+    with Julia 1.13.1 and Enzyme dogfood `d37eb448`, the opted-in complete
+    gradient's median paired time is 0.87 of default (seven rounds, range
+    0.82–1.23; five wins) on a loaded shared host. The variability does not
+    establish a consistent speedup. It allocates the one-pass buffer on each
+    call (784 B), where default allocates nothing. Earlier dogfood measurements
+    gave 0.58–0.67 on this model and 0.37 on a variable-slope Radon port;
+    forced two-pass grouping gave 1.11 with zero allocations. Those results
+    predate the backend's SIMD adjoint improvement. Schedule selection is
     unchanged.
 - The Enzyme extension schedules by runs only where a rule can read the run
   metadata in its reverse pass: on Julia before 1.12, or when Enzyme reports
