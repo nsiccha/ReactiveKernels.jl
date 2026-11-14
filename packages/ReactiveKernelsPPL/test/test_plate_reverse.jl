@@ -95,7 +95,10 @@ end
         # The primal sums contiguous groups into run partials. Its preserved
         # flat arm supplies the derivative graph, whose cell loop can then use
         # the same runs. Check both the two-pass and one-pass size regimes:
-        # coverage must never omit the likelihood's contribution.
+        # coverage must never omit the likelihood's contribution. Where the
+        # backend cannot hand a rule the run metadata (the Enzyme extension
+        # without dogfood repair `unchanged_custom_rule_roots`), the plate
+        # keeps the backend's reverse and the report names that refusal.
         rng = MersenneTwister(13)
         x = _prv_stdz(randn(rng, N))
         g = [cld(i * J, N) for i in 1:N]
@@ -110,7 +113,8 @@ end
             y .~ Normal.(mu, sigma)
         end, Dict(:y => y, :x => x, :g => g, :J => J), (:y, :x, :g, :J))
         report = _prv_compare(built, bound)
-        @test any(r -> first(r) === :_ppl_lik_y_resp && last(r) == "rule", report)
+        expected = something(ReactiveKernels._PR_INDEX_RUN_REFUSAL[], "rule")
+        @test any(r -> first(r) === :_ppl_lik_y_resp && last(r) == expected, report)
     end
 
     @testset "stable rewrites: sigma = exp(u) at the edges of exp" begin

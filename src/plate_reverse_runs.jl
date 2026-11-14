@@ -81,11 +81,20 @@ function _pr_index_run_arm(ex)
     (ex.args[3], loop[2], _PRIndexRun(metadata, operands, ex.args[1]))
 end
 
+# A reverse scheduled by runs reads the run metadata, a tuple holding the two
+# index vectors, inside the backend's rule for the plate. A backend extension
+# stores a reason here when its rule boundary cannot hand a rule such an
+# unchanged tuple. The plate then keeps the backend's ordinary reverse, as it
+# did before runs were scheduled, and `plate_reverse_report` gives the reason.
+const _PR_INDEX_RUN_REFUSAL = Ref{Union{Nothing,String}}(nothing)
+
 function _pr_index_run_source(ast)
     runs = Dict{Symbol,_PRIndexRun}()
     source = _index_run_replace(ast) do ex
         arm = _pr_index_run_arm(ex)
         arm === nothing && return ex
+        refusal = _PR_INDEX_RUN_REFUSAL[]
+        refusal === nothing || _pr_fail(refusal)
         flat, linear, run = arm
         haskey(runs, linear) && _pr_fail("ambiguous index-run cell binding")
         runs[linear] = run

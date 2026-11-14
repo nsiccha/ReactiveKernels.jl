@@ -45,12 +45,74 @@ function derivatives(q, s, idx, x, direction)
     gradient, hvp
 end
 
+# Whether the loaded backend lets a rule read run metadata (the Enzyme
+# extension refuses without dogfood repair `unchanged_custom_rule_roots`). A
+# refused plate keeps ordinary reverse, and every numerical check still applies.
+runs_scheduled() = RK._PR_INDEX_RUN_REFUSAL[] === nothing
+
+function first_order(q, s, idx, x)
+    value, gradient, scale = 0.0, zeros(length(q)), 0.0
+    for i in eachindex(idx)
+        j = idx[i]
+        argument = s * q[j] + x[i]
+        value += sin(argument)
+        gradient[j] += s * cos(argument)
+        scale += q[j] * cos(argument)
+    end
+    value, gradient, scale
+end
+
+@testset "index-run gradients on both adapters, and a backend's refusal" begin
+    backend = AutoEnzyme(; mode=Enzyme.Reverse)
+    refusal = "this backend's rule cannot read run metadata"
+    saved = RK._PR_INDEX_RUN_REFUSAL[]
+    try
+        for (n, run) in ((24, 8), (128, 32)), enabled in (false, true),
+                refused in (enabled ? (false, true) : (false,))
+            RK._PR_INDEX_RUN_REFUSAL[] = refused ? refusal : saved
+            idx = [mod1(div(i-1, run)+1, 3) for i in 1:n]
+            x = [sin(i/3)/2 for i in 1:n]
+            q = [.1, -.4, .3]
+            kernel = RK.with_bound_statistics(false) do
+                with_plate_reverse(enabled) do
+                    prepare_nonallocating(prepare(nonlinear_runs; bound=(; idx, x)), q, 1.2)
+                end
+            end
+            refused && @test any(r -> last(r) == refusal, plate_reverse_report(kernel, (1, 2)))
+            prepared = with_plate_reverse(enabled) do
+                prepare_ad(kernel, backend, q, 1.2; active=(:q, :s))
+            end
+            rules = rules!(Any[], actual_program(prepared.call))
+            grouped = count(rule -> calls_run_guard(RK._program_expression(rule.reverse.program)), rules)
+            @test (grouped > 0) == (enabled && !refused && runs_scheduled())
+            refused && @test isempty(rules)
+            destination = (fill(71., 3), Ref(81.))
+            for rep in 1:2, (point, scale) in ((q, 1.2), ([-.8, .6, 1.2], .7), (q, 1.4))
+                pristine = copy(point)
+                value, gradient, dscale = first_order(point, scale, idx, x)
+                v, returned = ad_value_and_gradient!(prepared, destination, point, scale)
+                @test v ≈ value rtol=3e-10 atol=3e-10
+                @test destination[1] ≈ gradient rtol=3e-10 atol=3e-10
+                @test destination[2][] ≈ dscale rtol=3e-10 atol=3e-10
+                @test returned === destination
+                @test point == pristine
+            end
+        end
+    finally
+        RK._PR_INDEX_RUN_REFUSAL[] = saved
+    end
+end
+
 @testset "index-run higher derivatives preserve repeated-call semantics" begin
     forward = AutoEnzyme(; mode=Enzyme.Forward)
     reverse = AutoEnzyme(; mode=Enzyme.Reverse)
+    # 24 cells take the two-pass adapter, whose reverse pass reads the run
+    # metadata from the rule's arguments; 128 and 257 take one pass.
     for backend in (SecondOrder(forward, reverse), SecondOrder(reverse, forward)),
-            enabled in (false, true), n in (128, 257)
-        idx = [mod1(div(i-1, 32)+1, 3) for i in 1:n]
+            enabled in (false, true), (n, run) in ((24, 8), (128, 32), (257, 32))
+        @test (n < RK._PR_ONE_PASS_MIN_CELLS) == (n == 24)
+        idx = [mod1(div(i-1, run)+1, 3) for i in 1:n]
+        @test RK._index_run_metadata(idx)[4]
         x = [sin(i/3)/2 for i in 1:n]
         q, direction = [.1, -.4, .3], [.2, -.7, 1.1]
         kernel = RK.with_bound_statistics(false) do
@@ -63,7 +125,7 @@ end
         end
         rules = rules!(Any[], actual_program(prepared.call))
         grouped = count(rule -> calls_run_guard(RK._program_expression(rule.reverse.program)), rules)
-        @test (grouped > 0) == enabled
+        @test (grouped > 0) == (enabled && runs_scheduled())
         gradient_buffer, hvp_buffers = fill(71., 3), (fill(72., 3),)
         # The same preparation and destinations must survive changing points,
         # constants and directions, including returning to an earlier point.

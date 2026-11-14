@@ -50,7 +50,21 @@ function scheduling_program(density;second=false)
     Expr(:function,Expr(:tuple,params...),body)
 end
 
-function compile_scheduling(density;second=false)
+# These checks call the generator directly and cross no backend rule boundary,
+# so they run without a backend's refusal of run scheduling.
+function without_refusal(f)
+    saved=RK._PR_INDEX_RUN_REFUSAL[]
+    RK._PR_INDEX_RUN_REFUSAL[]=nothing
+    try
+        f()
+    finally
+        RK._PR_INDEX_RUN_REFUSAL[]=saved
+    end
+end
+compile_scheduling(density;second=false)=without_refusal() do
+    compile_scheduling_unrefused(density;second)
+end
+function compile_scheduling_unrefused(density;second=false)
     ast=scheduling_program(density;second)
     active=second ? [:x,:s,:z] : [:x,:s]
     flat, runs = RK._pr_index_run_source(ast)
@@ -168,5 +182,28 @@ end
     @test RK._pr_run_shadow_overlap(sx,sz)
     @test RK._pr_run_shadow_overlap(sz,sx)
     @test !RK._pr_run_disjoint((),(sx,sz))
+end
+@testset "A backend's refusal leaves a run program to ordinary reverse" begin
+    ast=scheduling_program(:(-log(s)-0.5*(v/s)^2))
+    flat=without_refusal(()->first(RK._pr_index_run_source(ast)))
+    reason="this backend's rule cannot read run metadata"
+    saved=RK._PR_INDEX_RUN_REFUSAL[]
+    RK._PR_INDEX_RUN_REFUSAL[]=reason
+    try
+        failure=try
+            RK._pr_program_reverse(ast,[:x,:s],RK,Dict{Symbol,Any}())
+            nothing
+        catch err
+            err
+        end
+        @test failure isa RK._PRIneligible
+        @test failure.reason==reason
+        # A program without a run arm reads no run metadata and stays eligible.
+        rev,scalar,batched=RK._pr_program_reverse(flat,[:x,:s],RK,Dict{Symbol,Any}())
+        @test scalar==[:s] && batched==[:x]
+        @test !occursin("_pr_run_disjoint",string(rev))
+    finally
+        RK._PR_INDEX_RUN_REFUSAL[]=saved
+    end
 end
 end # module
