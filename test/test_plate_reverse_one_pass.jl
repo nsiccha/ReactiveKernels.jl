@@ -244,16 +244,20 @@ end
             @test g1 ≈ g0 rtol = 1e-10 atol = 1e-12
             @test point == original
         end
-        # Witness of the schedule: one pass keeps a J-length buffer on its tape,
-        # an allocation per gradient that the non-allocating kernel otherwise
-        # does not make (todo `08gmx4k` may move it to owned storage, which then
-        # needs another witness). The rule off is the control. More groups
-        # than observations: two passes, no buffer.
+        # Witness of the schedule: one pass keeps a buffer as long as `z` (and
+        # the scalars' cotangents) in the preparation's tape slot, which a
+        # call in two passes leaves empty. More groups than observations: two
+        # passes. Either way a warmed gradient no longer allocates the buffer.
         if nonallocating && n >= 128
             g = similar(u)
             sampler_value_and_gradient!(on, g, u)
             sampler_value_and_gradient!(off, g, u)
-            @test ((@allocated sampler_value_and_gradient!(on, g, u)) >= 8J) == (J < n)
+            slots = [c for caches in ReactiveKernels._ad_owned_storage(on.ad)
+                     if caches isa Tuple for c in caches
+                     if c isa ReactiveKernels._PlateTapeSlot]
+            @test any(slot -> length(slot.tape) >= J, slots) == (J < n)
+            @test all(slot -> isempty(slot.tape) || length(slot.tape) >= J, slots)
+            @test (@allocated sampler_value_and_gradient!(on, g, u)) < 8J
             @test (@allocated sampler_value_and_gradient!(off, g, u)) < 8J
         end
     end

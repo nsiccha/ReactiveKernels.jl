@@ -1899,11 +1899,40 @@ const _PR_ONE_PASS_MIN_CELLS = 128
 _pr_gather_value(::Type) = false
 _pr_gather_value(::Type{<:SubArray{Float64,1,<:AbstractVector,<:Tuple{AbstractVector{<:Integer}}}}) = true
 _pr_gather_value(::Type{<:SubArray{Float64,1,<:AbstractVector,<:Tuple{AbstractUnitRange{<:Integer}}}}) = false
+
+# Owned storage for the one-pass tape of one rule call site. A preparation that
+# owns AD caches (`_ad_na_program`) keeps one slot per generated rule there and
+# passes it as the call's last operand; a call without one allocates its tape.
+# The tape is leased by removal: the augmented primal takes the vector out and
+# leaves the empty one, and the reverse pass puts back the tape it used. No
+# flag has to be restored when an exception separates the two passes: the slot
+# is then empty, the next call allocates and its reverse pass refills the slot.
+# A second call at the site before the first one's reverse pass (the call in a
+# loop) finds the slot empty and allocates as well; a changed length does too.
+mutable struct _PlateTapeSlot
+    tape::Vector{Float64}
+    empty::Vector{Float64}
+end
+function _PlateTapeSlot()
+    empty = Float64[]
+    _PlateTapeSlot(empty, empty)
+end
+@inline function _pr_take_tape!(slot::_PlateTapeSlot, n::Int)
+    tape = slot.tape
+    length(tape) == n || return zeros(Float64, n)
+    slot.tape = slot.empty
+    fill!(tape, 0.0)
+end
+@inline _pr_take_tape!(::Nothing, n::Int) = zeros(Float64, n)
+@inline _pr_return_tape!(slot::_PlateTapeSlot, tape::Vector{Float64}) = (slot.tape = tape; nothing)
+@inline _pr_return_tape!(::Nothing, tape::Vector{Float64}) = nothing
+
 # The target of a call with operands of types `types`, as an expression in
 # `rule` and `args` that `make` turns into the result (the target itself, or
 # its call): the program for a lazy cell array, else the two-pass body, or the
-# one-pass call when a gathered operand's sizes allow.
-function _pr_target_expr(S, B, types, make)
+# one-pass call (`one_pass`, which alone receives a tape slot) when a gathered
+# operand's sizes allow.
+function _pr_target_expr(S, B, types, make, one_pass = make)
     any(b -> types[b] <: _CellArray, B) && return make(:(getfield(rule, :program)))
     body = make(:(_PlateSumRuleBody{$S,$B,typeof(rule)}(rule)))
     gathered = [b for b in B if _pr_gather_value(types[b])]
@@ -1912,7 +1941,7 @@ function _pr_target_expr(S, B, types, make)
     quote
         cells = length(getfield(args, $(first(gathered))))
         if cells >= _PR_ONE_PASS_MIN_CELLS && $buffers < cells
-            $(make(:(_PlateSumRuleOnePass{$S,$B,typeof(rule)}(rule))))
+            $(one_pass(:(_PlateSumRuleOnePass{$S,$B,typeof(rule)}(rule))))
         else
             $body
         end
@@ -1921,10 +1950,17 @@ end
 @generated _pr_rule_target(rule::_PlateSumRule{S,B}, args::Tuple) where {S,B} =
     _pr_target_expr(S, B, args.parameters, identity)
 # The call itself, made in each branch: a target chosen by size and then called
-# would be a union of the two wrappers, boxed in the primal.
+# would be a union of the two wrappers, boxed in the primal. A trailing tape
+# slot is not an operand of the program: only the one-pass call takes it on.
 @generated function _pr_rule_call(rule::_PlateSumRule{S,B}, args::Tuple) where {S,B}
-    operands = Any[:(getfield(args, $i)) for i in 1:length(args.parameters)]
-    _pr_target_expr(S, B, args.parameters, target -> Expr(:call, target, operands...))
+    types = args.parameters
+    slotted = !isempty(types) && types[end] === _PlateTapeSlot
+    count = length(types) - slotted
+    operands = Any[:(getfield(args, $i)) for i in 1:count]
+    call = target -> Expr(:call, target, operands...)
+    one_pass = slotted ?
+        (target -> Expr(:call, target, operands..., :(getfield(args, $(count + 1))))) : call
+    _pr_target_expr(S, B, types, call, one_pass)
 end
 # One method per operand count, each operand's type a parameter of its own:
 # Julia does not otherwise specialize on a `Function` operand it only passes on
@@ -1940,6 +1976,11 @@ for count in 0:_PLATE_CALL_MAX_ARGUMENTS
         getfield(getfield(call, :rule), :program)($(arguments...))
     @eval @inline (call::_PlateSumRuleOnePass)($(typed...)) where {$(types...)} =
         getfield(getfield(call, :rule), :program)($(arguments...))
+    # With its tape slot, which the program does not take.
+    count < _PLATE_CALL_MAX_ARGUMENTS &&
+        @eval @inline (call::_PlateSumRuleOnePass)(
+                $(typed...), slot::_PlateTapeSlot) where {$(types...)} =
+            getfield(getfield(call, :rule), :program)($(arguments...))
 end
 _pr_scalar_positions(::_PlateSumRule{S}) where {S} = S
 _pr_batched_positions(::_PlateSumRule{S,B}) where {S,B} = B
@@ -2102,7 +2143,11 @@ end
 # The AD body with each eligible plate program a generated rule and every
 # other program inline, as `_inline_plate_programs` inlines them, and the
 # report of each program: `(result, "rule" or the reason it falls back)`.
-function _pr_inline_plate_programs(ast::Expr, kernel, active_ports)
+# `tape_slot`, when the caller owns AD caches, returns the operand expression
+# of a fresh `_PlateTapeSlot` for one rule call: every rule with a batched
+# operand gets one, because whether a call takes one pass depends on operand
+# types and sizes that only the call knows.
+function _pr_inline_plate_programs(ast::Expr, kernel, active_ports; tape_slot = nothing)
     outer_active = _pr_body_activity(ast.args[2], Set{Symbol}(active_ports))
     lazy = _pr_lazy_cell_arrays(ast.args[2])
     report = Any[]
@@ -2112,7 +2157,12 @@ function _pr_inline_plate_programs(ast::Expr, kernel, active_ports)
             rule, info = _pr_rule_for(node.args[2], outer_active, kernel, lazy)
             push!(report, (node.args[1], rule === nothing ? info : "rule"))
             rule === nothing && return node
-            return Expr(:(=), node.args[1], Expr(:call, rule, node.args[2].args[2:end]...))
+            operands = node.args[2].args[2:end]
+            if tape_slot !== nothing && !isempty(_pr_batched_positions(rule)) &&
+                    length(operands) < _PLATE_CALL_MAX_ARGUMENTS
+                operands = Any[operands..., tape_slot()]
+            end
+            return Expr(:(=), node.args[1], Expr(:call, rule, operands...))
         elseif node isa Expr && node.head !== :quote
             return Expr(node.head, Any[replace(a) for a in node.args]...)
         end
