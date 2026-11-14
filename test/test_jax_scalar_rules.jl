@@ -57,6 +57,15 @@ fraction_at(a, x) = ReactiveKernels._beta_cf_value(a, 3.0, x)
     total = u[2] > 0 ? sum(fraction_at.(u[1], x)) : 0.0
     return total
 end
+checked_root(x) = x >= 0 ? sqrt(x) : throw(DomainError(x, "negative"))
+@kernel plain_roots(u::Vector{Float64}, x::Vector{Float64}) = begin
+    total = u[1] * sum(checked_root.(x))
+    return total
+end
+@kernel guarded_roots(u::Vector{Float64}, x::Vector{Float64}) = begin
+    total = u[1] > 0 ? sum(checked_root.(x)) : 0.0
+    return total
+end
 end
 
 @testset "JAX scalar derivative graphs" begin
@@ -139,6 +148,15 @@ end
     scalar = jax_source(JAXScalarRuleTests.guarded_fractions; have=(:u,:x), want=:total)
     @test count("@jax.custom_jvp", string(rule)) == 1
     @test occursin("jnp.vectorize(", string(scalar))
+    # A runtime check in such a function runs where its own conditions hold.
+    @test occursin("_rk_check(", string(jax_source(JAXScalarRuleTests.plain_roots;
+                                                   have=(:u,:x), want=:total)))
+    # refused: a check is masked by the data conditions it runs under, since
+    # vmap runs an untaken arm (reactivekernels-use §4j); a shared function
+    # cannot read its caller's condition, so under a data branch its check
+    # would raise on the lanes that branch discards.
+    @test_throws ReactiveKernels.JAXEmissionError jax_source(
+        JAXScalarRuleTests.guarded_roots; have=(:u,:x), want=:total)
     if rk_jax_available()
         native = prepare(JAXScalarRuleTests.guarded_fraction; have=(:u,), want=:value)
         for u in ([1.5, 0.5, 0.3], [2.5, 1.5, 0.8], [0.7, 3.0, 0.55])
