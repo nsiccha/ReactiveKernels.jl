@@ -20,6 +20,8 @@ print(source)
 
 Input annotations tell the emitter each port's rank. For untyped ports, supply the corresponding `types` keyword. The emitted input order follows the selected input boundary.
 
+The module docstring starts with the generated line shown above. The `doc` keyword adds the author's description of the program after it: a string, or a binding's docstring as `@doc(NAME)`. A docstring written above `const NAME = …` belongs to the binding, not to the value `jax_source` receives, so the caller passes it. For a PPL model, `jax_source(built, bound; doc)` places it before the generated `Data:` and `Model documentation:` lists. Docstrings keep their text as written, backslashes and quotes included.
+
 Typed `Float32` values keep `float32`, also in `prepare_data`; other floats
 take `jax_source`'s `float_type` (`Float64`, or `Float32` without JAX's 64-bit
 mode), as metadata reports.
