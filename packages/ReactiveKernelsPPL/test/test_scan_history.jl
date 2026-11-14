@@ -611,6 +611,58 @@ end
     @test sampled !== nothing
 end
 
+# A scan body reads a definition whole, indexed as in a Julia loop, also when
+# the definition combines a parameter with data (`loc = a .+ cos.(w)` over a
+# data definition `w = 2 .* x`). Neither the definition nor its data has an
+# observation axis: `x` is longer than the scan, and the response observes a
+# gathered subset of the trajectory or all of it.
+@testset "scan history: a definition over data and a parameter" begin
+    x = [0.1 * k for k in 1:8]
+    day = [3.0, 40.0, 90.0, 180.0, 250.0, 330.0]
+    rows = [1, 3, 5]
+    function recur(loc, T)
+        acc = [loc[1]]
+        for t in 2:T
+            push!(acc, 0.5 * acc[t - 1] + loc[t] + 0.1 * loc[t - 1])
+        end
+        return acc
+    end
+    named = [:(w = 2 .* x), :(loc = a .+ cos.(w))]
+    inline = [:(loc = a .+ cos.(2 .* x))]
+    angle = [:(angle = (2 * pi) .* day ./ year_length),
+        :(loc = a .+ 0.3 .* cos.(angle))]
+    cases = (
+        (named, :(acc[rows]), (; x, rows), a -> a .+ cos.(2 .* x), rows),
+        (inline, :(acc[rows]), (; x, rows), a -> a .+ cos.(2 .* x), rows),
+        (named, :acc, (; x), a -> a .+ cos.(2 .* x), :),
+        (angle, :(acc[rows]), (; day, year_length = 365.25, rows),
+            a -> a .+ 0.3 .* cos.((2 * pi) .* day ./ 365.25), rows),
+    )
+    for (definitions, location, inputs, loc_of, observed) in cases
+        T = 6
+        y = [0.2 * sin(k) for k in 1:(observed === (:) ? T : length(observed))]
+        program = quote
+            a ~ Normal(0, 1)
+            s ~ Exponential(1)
+            $(definitions...)
+            @scan begin
+                acc[1] = loc[1]
+                for t in 2:N
+                    acc[t] = 0.5 * acc[t - 1] + loc[t] + 0.1 * loc[t - 1]
+                end
+            end
+            y .~ Normal.($location, s)
+        end
+        data = Dict{Symbol,Any}(pairs(inputs)..., :N => T, :y => y)
+        f = _hist_sampler(program, data)
+        @test coordinate_names(f.built.layout) == [:a, :s]
+        oracle(u) = logpdf(Normal(0, 1), u[1]) + logpdf(Exponential(1), exp(u[2])) +
+            u[2] + sum(logpdf.(Normal.(recur(loc_of(u[1]), T)[observed], exp(u[2])), y))
+        _hist_check(f, oracle)
+        @test _hist_scans(f.built.spec) == 1
+    end
+end
+
 @testset "scan columns: conditional densities read shared trajectories" begin
     for history in (false, true), T in (1, 2, 8)
         past = history ? :(sum(b[s] for s in 1:(t - 1)) / t) : :(b[t - 1])

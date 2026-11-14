@@ -4,8 +4,8 @@
 Compute the lower Cholesky factor of the symmetric matrix represented by
 the lower triangle of `A`, using an ordinary pure-Julia factorization with
 no LAPACK call. The arithmetic uses `Float64`. The result wraps a fresh
-matrix; `A` is never mutated, and its upper triangle does not participate
-in the factorization.
+matrix whose strict upper triangle is zero; `A` is never mutated, and its
+upper triangle does not participate in the factorization.
 
 `A` must be square (`ArgumentError` otherwise). A non-positive or NaN pivot
 throws `LinearAlgebra.PosDefException`, whose `info` identifies the pivot.
@@ -18,18 +18,25 @@ function rk_cholesky_lower(A::AbstractMatrix)
     n = size(A, 1)
     size(A, 2) == n || throw(ArgumentError(
         "rk_cholesky_lower needs a square matrix, got $(size(A))"))
-    L = Matrix{Float64}(A)
+    # Each entry of `L` is stored exactly once, after its sum is accumulated
+    # in a scalar. Updating `L` in place (`L[j, j] -= …`) between the loop's
+    # reads of `L` makes native Enzyme reverse tape those reads; RKPPL's
+    # `_covariance_cholesky!` follows the same rule.
+    L = zeros(Float64, n, n)
     @inbounds for j in 1:n
+        s = Float64(A[j, j])
         for k in 1:j-1
-            L[j, j] -= L[j, k] * L[j, k]
+            s -= L[j, k] * L[j, k]
         end
-        L[j, j] > 0 || throw(PosDefException(j))
-        L[j, j] = sqrt(L[j, j])
+        s > 0 || throw(PosDefException(j))
+        pivot = sqrt(s)
+        L[j, j] = pivot
         for i in j+1:n
+            t = Float64(A[i, j])
             for k in 1:j-1
-                L[i, j] -= L[i, k] * L[j, k]
+                t -= L[i, k] * L[j, k]
             end
-            L[i, j] /= L[j, j]
+            L[i, j] = t / pivot
         end
     end
     return LowerTriangular(L)
