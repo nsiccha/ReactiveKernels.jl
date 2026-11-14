@@ -35,6 +35,8 @@ end
         @test Matrix(L) * Matrix(L)' ≈ Matrix(Symmetric(A, :L))
         @test isequal(A, before)
         @test parent(L) !== A
+        # The documented storage: the strict upper triangle is zero, not A's.
+        @test all(iszero(parent(L)[i, j]) for j in 1:n for i in 1:j-1)
         if n > 0
             L[1, 1] = -1
             @test isequal(A, before)
