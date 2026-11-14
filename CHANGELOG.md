@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.239
+## 0.1.242
 
 - **Breaking:** `jax_source`'s `doc` keyword (kernel and `Plan` methods) no
   longer replaces the module docstring. The module docstring keeps its
@@ -29,6 +29,45 @@ are recorded in the git history only.
   keep authored text as written: backslashes are escaped, so `\theta` is no
   longer read as a tab and `\sigma` no longer an invalid escape sequence, and
   so is a quote that would close the docstring early, such as a final `"`.
+
+## 0.1.241
+
+- A prepared pullback over a `NonAllocatingKernel` no longer gives wrong
+  cotangents when a caller passes a value an earlier call returned back in.
+  Such values are borrowed: they live in storage the preparation owns, and
+  each call overwrites them. A seed, active point or argument that shares
+  memory with that storage is now copied before the call. A destination of
+  `ad_value_and_pullback!` that shares memory with the seed, the point,
+  another argument or that storage receives the cotangent through an owned
+  temporary; a returned value that overlaps it comes back as a copy. Disjoint
+  calls are unchanged and take no copy.
+
+## 0.1.240
+
+- JAX source emits a plain authored helper (no `@traceable`, defined outside
+  Julia and ReactiveKernels) as a named Python function with its method's
+  argument names and Julia docstring, as recorded-source helpers already are,
+  instead of inlining its lowered code. A broadcast of a named helper
+  vectorizes that function itself (`jnp.vectorize(toy_mean)`) rather than a
+  private positional wrapper. Helpers whose name starts with `_` and
+  ReactiveKernels' own recorded helpers (the stable rewrites' `_rk_div_by_of`)
+  stay private (`_div_by_of`). Lowered helper bodies compose single-use
+  temporaries into expressions and bind assigned locals by their authored names.
+- A named JAX function that returns one of its arguments' lengths unchanged
+  (a retained tuple's field, `getfield(pair, 2)`, also `@traceable`) gives its
+  caller that argument's own length expression, so a later
+  `reduce(vcat, cells)` still finds the prepared flat positions.
+
+## 0.1.239
+
+- JAX source names only what a reader needs. A traced branch between two
+  values already bound or literal is `jnp.where` (same value and derivative),
+  other `jax.lax.cond` arms that are one expression are `lambda`s, and a
+  condition decided while tracing is Python's own `if`, so a shape guard reads
+  `if not (n == k): raise ValueError(...)` instead of two nested functions and
+  a `value` binding. Consecutive statements needed by the same entries share
+  one output-selection block, and checks every entry runs (the packed-length
+  check) run once before the entries' returns.
 
 ## 0.1.238
 

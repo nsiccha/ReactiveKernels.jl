@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.180
+## 0.1.181
 
 - **Breaking:** `jax_source(built, plan; doc)` no longer replaces the module
   docstring. The docstring keeps its generated first line, then `doc`, the
@@ -26,7 +26,20 @@ are recorded in the git history only.
   `const TOY_MODEL = @rkppl …` belongs to the binding, so the caller passes
   it). A caller that passed `doc` to replace the generated docstring now gets
   both; no caller in this repository or its known consumers passed it.
-  Requires ReactiveKernels 0.1.239.
+  Requires ReactiveKernels 0.1.242.
+
+## 0.1.180
+
+- A range that reads `end` or `begin` inside an index over data or over a
+  computed array (`x[1:(end - 1)]`, `P[2:end, :]`) stays in its reference and
+  reads that array's extent when the model runs. Lowering had named such an
+  index as a data-only gather index of its own, which left `end` unbound:
+  preparing the model raised `UndefVarError: end not defined`.
+- A data definition or inline gather index whose reference reads `end` or
+  `begin` (`idx = g[2:end]`, then `z[idx]`, or `z[g[2:end]]`) binds as the
+  integer column it evaluates to. Binding had counted that `end` as a name
+  the definition reads, so it refused the read as `not a bound column`. An
+  endpoint outside every reference is still no bound value.
 
 ## 0.1.179
 
