@@ -120,6 +120,8 @@ export prepare_filter_smc, tune_filter_smc, initialize_filter_smc
 export sampling_logdensity, sampling_geometry, sampling_fragment, LogDensity, ParameterGeometry
 export sampling_distribution_graph
 export RKPPLModel, RKPPLBoundModel, RKPPLSubmodel, lower_rkppl, condition, @rkppl, SurfaceLoweringError
+export marginalize, prepare_marginalized_latents, MarginalizedLatentQuery,
+    marginalized_latent_draws
 export RKPPLDocumentation, rkppl_documentation
 export ScanSpec, ScanStep, ScanSetup, parse_scan_block
 export rk_expm
@@ -163,6 +165,7 @@ include("scan.jl")
 include("cell_scan.jl")
 include("cell_latent.jl")
 include("observed_scan.jl")
+include("marginalize.jl")
 # After the scan lowerings: it translates their helpers.
 include("jax.jl")
 include("mutating.jl")

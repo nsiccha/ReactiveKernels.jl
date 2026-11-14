@@ -218,6 +218,7 @@ const _PPL_TEST_FILES = (
     "test_cell_latent_extent.jl",
     "test_cell_joint_latents.jl",
     "test_observed_scan.jl",
+    "test_marginalized_scan.jl",
     "test_merge.jl",
     "test_rewrites.jl",
     "test_varying_centered.jl",
