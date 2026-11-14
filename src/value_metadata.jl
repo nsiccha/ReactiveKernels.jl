@@ -116,7 +116,7 @@ function _metadata_call(spec::KernelSpec, args; kwargs)
         length(outputs(spec)) == 1 || return unknown
     p = plan(spec)
     cid(v) = canon_id(p.graph, v.id)
-    values = Dict{ValueId,OS.ValueInfo}(cid(v) => a for (v, a) in zip(p.have, args))
+    values = _dict_from(Dict{ValueId,OS.ValueInfo}, (cid(v) => a for (v, a) in zip(p.have, args)))
     for r in p.recipes
         operands = OS.ValueInfo[get(values, cid(v), OS.ValueInfo()) for v in r.inputs]
         result = _recipe_value_metadata(r, operands)

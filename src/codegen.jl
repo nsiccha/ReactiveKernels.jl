@@ -929,8 +929,7 @@ function _authored_scan_step_types(step, input_types, offset; type_offset = noth
         type_offset === nothing && return (nothing, nothing)
         return _scan_step_types!(Any[], Recipe[], step, input_types, type_offset)
     end
-    types = Dict{ValueId,Any}(canon_id(p.graph, v.id) => T
-                          for (v, T) in zip(p.have, input_types))
+    types = _have_types(p, input_types)
     for (i, recipe) in enumerate(p.recipes)
         all(v -> haskey(types, canon_id(p.graph, v.id)), recipe.inputs) ||
             return (nothing, nothing)
@@ -1529,7 +1528,7 @@ end
 
 function _authored_scan_cell_statements(cell, args, positions, output, offset;
                                         output_type = nothing)
-    inner = cell.plan
+    inner = cell.plan::Plan
     nfields(cell.callables) == length(inner.recipes) || throw(ArgumentError(
         "an authored plate body must lower to one operation per transparent scalar recipe"))
     roots = Set(canon_id(inner.graph, inner.have[i].id) for i in positions)
@@ -2246,8 +2245,15 @@ function _compose_authored_plates(g::Graph, producer::Recipe, consumer::Recipe)
         end
         # Preserve all absorbed domain checks, including singleton/empty axes
         # and unused formals. Flattening only the scalar dependencies loses them.
-        remap(group) = Tuple(unique(Int[
-            position for index in group for position in input_positions[index]]))
+        # A loop, not `Int[… for index in group for position in …]`
+        # (`construction_iteration.jl`): `group` is untyped.
+        function remap(group)
+            positions_read = Int[]
+            for index in group, position in input_positions[index]
+                push!(positions_read, position)
+            end
+            return Tuple(unique(positions_read))
+        end
         append!(checks, (remap(group) for group in op.axis_checks))
         axes = remap(Tuple(index for index in eachindex(recipe.inputs)
                            if !(index in old_atomic)))
@@ -2427,7 +2433,9 @@ function _plate_keeping_entries(producer::Recipe, read::Set{Int})
         q = recipes[index]
         any(v -> canon_id(ig, v.id) in needed, q.outputs) || continue
         keep[index] = true
-        foreach(v -> push!(needed, canon_id(ig, v.id)), q.inputs)
+        for v in q.inputs
+            push!(needed, canon_id(ig, v.id))
+        end
     end
     any(index -> !keep[index] && recipes[index].effectful, eachindex(recipes)) &&
         return nothing
@@ -3262,7 +3270,7 @@ end
 Base.@nospecializeinfer function _plate_shared_branch(
         @nospecialize(inner_kernel), @nospecialize(atomic), @nospecialize(callargs),
         @nospecialize(callvalues))
-    inner = getfield(inner_kernel, :plan)
+    inner = getfield(inner_kernel, :plan)::Plan
     for r in inner.recipes
         (r.effectful || length(r.outputs) != 1 ||
          r.op isa Union{_AuthoredPlateOp,_AuthoredScanOp} ||
@@ -3523,8 +3531,8 @@ Base.@nospecializeinfer function _native_plate_lane_branch_expr(
         @nospecialize(branch), reference, args, inputs, names, slots, shared,
         declarations)
     CI, TI, EI = (typeof(branch)::DataType).parameters
-    by_name = Dict(name => (arg, shared(v))
-                   for (name, arg, v) in zip(names, args, inputs))
+    by_name = _dict_from(Dict{Symbol,Any}, (name => (arg, shared(v))
+                         for (name, arg, v) in zip(names, args, inputs)))
     condition = Expr(:call, :(getfield($reference, :condition)),
                      (args[i] for i in CI)...)
     arm_expr(@nospecialize(arm), field, indices, entry) = begin
@@ -3689,7 +3697,7 @@ Base.@nospecializeinfer function _lower_plate_shared_branch_native!(
     types = _plate_cell_types!(runtime_ops, runtime_recipes, inner_kernel, atomic,
         callargs, callvalues, raw_arguments, input_type_hints)
     if element_type === nothing
-        inner = getfield(inner_kernel, :plan)
+        inner = getfield(inner_kernel, :plan)::Plan
         inferred = only(_bind_native_type_exprs!(body, Any[get(types.plate_type_exprs,
             canon_id(inner.graph, only(inner.want).id), GlobalRef(Core, :Any))]))
         element_type = gensym(:plate_eltype)
@@ -3786,7 +3794,7 @@ function _lower_plate_recipe_native!(body, recipe, args, out, operation, slots;
     destination = recycled === nothing ? nothing :
         _lane_source_expr(recipe, names, recycled)
     if destination !== nothing
-        append!(body.args, (Expr(:(=), name, arg) for (name, arg) in zip(names, args)))
+        _push_each!(body.args, (Expr(:(=), name, arg) for (name, arg) in zip(names, args)))
         push!(body.args, Expr(:(=), out, destination))
     elseif recipe.op isa _KernelSourceOp && getfield(recipe.op, :f) isa _KernelBranch
         push!(body.args, Expr(:(=), out,
@@ -3831,8 +3839,7 @@ function _body_types!(runtime_ops, runtime_recipes, p, ops, recipes, input_types
     offset = base + length(runtime_ops)
     append!(runtime_ops, ops)
     append!(runtime_recipes, recipes)
-    types = Dict{ValueId,Any}(canon_id(p.graph, v.id) => T
-                         for (v, T) in zip(p.have, input_types))
+    types = _have_types(p, input_types)
     for (i, recipe) in enumerate(p.recipes)
         args = Any[types[canon_id(p.graph, v.id)] for v in recipe.inputs]
         T = if recipe.op isa _AuthoredPlateOp
@@ -4043,7 +4050,7 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
         throw(ArgumentError("internal: a one-cell plate has no pointwise or total output"))
     cell === nothing || push!(body.args, Expr(:local, cell))
     inner_kernel = op.kernel
-    inner = getfield(inner_kernel, :plan)
+    inner = getfield(inner_kernel, :plan)::Plan
     length(inner.want) == 1 || throw(ArgumentError(
         "an authored plate body must have exactly one distinguished result"))
     nfields(getfield(inner_kernel, :callables)) == length(inner.recipes) || throw(ArgumentError(
@@ -4222,7 +4229,7 @@ Base.@nospecializeinfer function _lower_authored_plate_cells_native!(
     # shared branch is decided at that cell, where its body runs.
     one |= cell !== nothing
     unswitch &= !one
-    inner = getfield(inner_kernel, :plan)
+    inner = getfield(inner_kernel, :plan)::Plan
     if unswitch
         branch = _plate_shared_branch(inner_kernel, atomic, callargs, callvalues)
         branch === nothing || return _lower_plate_shared_branch_native!(
@@ -4292,7 +4299,7 @@ Base.@nospecializeinfer function _plate_cell_types!(
         runtime_ops, runtime_recipes, @nospecialize(inner_kernel),
         @nospecialize(atomic), @nospecialize(callargs), @nospecialize(callvalues),
         raw_arguments, input_type_hints; result_slot::Bool = false)
-    inner = getfield(inner_kernel, :plan)
+    inner = getfield(inner_kernel, :plan)::Plan
     op_offset = length(runtime_ops)
     append!(runtime_ops, _kernel_ops(inner_kernel))
     append!(runtime_recipes, getfield(inner_kernel, :lowered_recipes))
@@ -4590,7 +4597,7 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         only(inner.want), index, true) : nested_result
     # The result leaves the cell: it takes any slot buffer it shares memory
     # with or holds (`_lane_release!`).
-    released = Symbol[(nested === nothing ? Symbol[] : nested.slots); last.(slotted)]
+    released = Symbol[(nested === nothing ? Symbol[] : nested.slots); last.(slotted)]::Vector{Symbol}
     # A plate that stores its cells with tables (`stores_cells`, above) gives
     # each slot of a value computed at every cell a table
     # (`_lane_cell_take!`, `_lane_cell_release!`): cell `k` of the next position
@@ -4935,7 +4942,7 @@ Base.@nospecializeinfer function _lower_authored_plate_cells!(
         # The row each capture is asked for at, when it is read at one
         # position, so a value computed once per row serves its own row.
         capture_rows = Dict{Tuple{Any,Int},Symbol}()
-        request!(emitter, s, (position, value, reads)) = foreach(reads) do (batched, via)
+        request!(emitter, s, (position, value, reads)) = for (batched, via) in reads
             rows = partition && !s.single
             row = _cell_capture_request!(emitter, value, s.slices[batched],
                 via == 0 ? nothing : s.slices[via]; rows,
@@ -4946,7 +4953,9 @@ Base.@nospecializeinfer function _lower_authored_plate_cells!(
         member(f, id) = _cell_forced(f, windows, _cell_member_force(windows, id, false))
         for (id, s) in zip(ids, states)
             member(id) do
-                foreach(c -> waits(s, c) || request!(windows, s, c), s.captures)
+                for c in s.captures
+                    waits(s, c) || request!(windows, s, c)
+                end
             end
         end
         _cell_emit_windows!(windows)
@@ -4969,7 +4978,9 @@ Base.@nospecializeinfer function _lower_authored_plate_cells!(
             windows.runtime_recipes; sorted = partition, regions = windows.regions)
         for (id, s) in zip(ids, states)
             member(id) do
-                foreach(c -> waits(s, c) && request!(later, s, c), s.captures)
+                for c in s.captures
+                    waits(s, c) && request!(later, s, c)
+                end
             end
         end
         any(s -> any(c -> waits(s, c), s.captures), states) && _cell_emit_windows!(later)
@@ -5127,7 +5138,9 @@ function _cell_lowering_groups(p::Plan, d)
             v = pop!(work)
             v in d.pushed && !(v in seen) || continue
             push!(seen, v)
-            foreach(input -> push!(work, cid(input)), d.producer[v].inputs)
+            for input in d.producer[v].inputs
+                push!(work, cid(input))
+            end
         end
         seen
     end
@@ -5161,7 +5174,11 @@ function _cell_lowering_groups(p::Plan, d)
             independent = all(first(positions):last(positions)) do position
                 r = p.recipes[position]
                 any(v -> cid(v) in outputs, r.inputs) && return false
-                position in members && foreach(v -> push!(outputs, cid(v)), r.outputs)
+                if position in members
+                    for v in r.outputs
+                        push!(outputs, cid(v))
+                    end
+                end
                 true
             end
             independent || continue
@@ -5298,11 +5315,14 @@ Base.@nospecializeinfer function _cell_lowering_setup!(body, @nospecialize(recip
     end
     captures = Tuple{Int,ValueId,Vector{Tuple{Int,Int}}}[]
     if windows !== nothing
-        d = windows.pushdowns
-        for (position, reads) in sort!(collect(get(d.captures, recipe.id,
+        # Its own name: `d` above is captured by a closure and so boxed, and
+        # `sort!` of its untyped captures is invalidated by a package adding
+        # `sort!` methods, such as Pkg (`construction_iteration.jl`).
+        pushdowns = windows.pushdowns::_CellPushdowns
+        for (position, reads) in sort!(collect(get(pushdowns.captures, recipe.id,
                 Dict{Int,Vector{Tuple{Int,Int}}}())); by = first)
-            value = canon_id(d.graph, plate_values[position].id)
-            value in d.pushed && push!(captures, (position, value, reads))
+            value = canon_id(pushdowns.graph, plate_values[position].id)
+            value in pushdowns.pushed && push!(captures, (position, value, reads))
         end
     end
     (; plate, atomic, plate_values, partition, single, pushed_lanes, cell, slices, lane_rows,
@@ -5754,7 +5774,9 @@ function _program_local_declarations!(found::Set{Symbol}, node)
             name === nothing || push!(found, name)
         end
     end
-    foreach(arg -> _program_local_declarations!(found, arg), node.args)
+    for arg in node.args
+        _program_local_declarations!(found, arg)
+    end
     found
 end
 _substitute_symbols(node::Symbol, mapping) = get(mapping, node, node)
@@ -6373,7 +6395,9 @@ function _lower_with_ops_collecting(p::Plan;
             push!(runtime_ops, r.op)
             push!(runtime_recipes, r)
             cells.slots[r.id] = length(runtime_ops)
-            foreach(output -> push!(assigned, canon_id(g, output.id)), r.outputs)
+            for output in r.outputs
+                push!(assigned, canon_id(g, output.id))
+            end
             continue
         end
 
@@ -6625,7 +6649,7 @@ function _lower_with_ops_collecting(p::Plan;
                         transform_lhs = transform === nothing ? nothing : nm(only(transform.outputs)),
                         eltype = transform === nothing || !declare_types ? nothing :
                             _scan_terminal_eltype(valtype(only(transform.outputs))),
-                        bindings = Dict{Symbol,Any}(name => arg for (name, arg) in zip(source_names, args)),
+                        bindings = _dict_from(Dict{Symbol,Any}, (name => arg for (name, arg) in zip(source_names, args))),
                         scan_names = transform === nothing ? Set{Symbol}() :
                             Set(name for (name, v) in zip(source_names, transform.inputs)
                                 if canon_id(g, v.id) == scan_id),
@@ -7016,7 +7040,9 @@ function _replicated_dependency_analysis(p::Plan, batched)
     positions = Tuple(
         findfirst(value -> value.name === name, p.have) for name in names)
     input_types = Tuple{(valtype(p.have[index]) for index in positions)...}
-    foreach(_replica_expected_rank, input_types.parameters)
+    for T in input_types.parameters
+        _replica_expected_rank(T)
+    end
     (; mapped = Tuple(mapped), mapped_ids,
        recipe_dependencies = dependencies.recipes, positions, input_types)
 end
@@ -8917,20 +8943,25 @@ function _replica_batch_indices(boundary, batched)
     all(name -> name isa Symbol, names) || throw(ArgumentError(
         "replica batched ports must be Symbols; got $(names)"))
 
-    indices = map(names) do name
+    # A typed vector: `sort!` of an untyped one is invalidated by a package
+    # adding `sort!` methods, such as Pkg (`construction_iteration.jl`).
+    indices = Int[]
+    for name in names
         index = findfirst(value -> value.name === name, boundary)
         index === nothing && throw(ArgumentError(
             "replica batched port :$name is not in the prepared HAVE boundary"))
-        index
+        push!(indices, index)
     end
-    Tuple(sort!(collect(indices)))
+    Tuple(sort!(indices))
 end
 
 function _replica(target, batched)
     boundary = inputs(target)
     indices = _replica_batch_indices(boundary, batched)
     input_types = Tuple{(valtype(boundary[i]) for i in indices)...}
-    foreach(_replica_expected_rank, input_types.parameters)
+    for T in input_types.parameters
+        _replica_expected_rank(T)
+    end
     output_types = Tuple{(valtype(value) for value in outputs(target))...}
     all(_replica_output_type, output_types.parameters) ||
         throw(ArgumentError(
@@ -10033,7 +10064,7 @@ end
 # parameters of its source closure, or as the arguments of an exact bare call.
 # Any other operation (a plate, a scan) reads a scoped input by the part of its
 # name after a scope prefix that its source spells.
-function _recipe_source_names(recipe::Recipe)
+function _recipe_source_names(recipe::Recipe)::Vector{Symbol}
     spelled = Set{Symbol}()
     _source_symbols!(spelled, recipe.source)
     names = _source_parameter_names(recipe.op, recipe.source, length(recipe.inputs))

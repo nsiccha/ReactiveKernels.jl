@@ -549,7 +549,7 @@ end
 function _readonly_slice_statements!(body, recipe::Recipe, args, out)
     form = _readonly_slice_form(recipe)
     names = Any[gensym(:plate_slice_argument) for _ in args]
-    append!(body.args, (Expr(:(=), name, arg) for (name, arg) in zip(names, args)))
+    _push_each!(body.args, (Expr(:(=), name, arg) for (name, arg) in zip(names, args)))
     parts = Any[part isa Int ? names[part] :
                 part isa Colon ? Expr(:call, GlobalRef(Base, :Colon)) : something(part)
                 for part in form.parts]

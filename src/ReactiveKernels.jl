@@ -31,6 +31,7 @@ RuntimeGeneratedFunctions.init(@__MODULE__)
 
 include("core.jl")
 include("planner.jl")
+include("construction_iteration.jl")
 include("simplify_setting.jl")
 include("codegen.jl")
 include("native_scheduling.jl")

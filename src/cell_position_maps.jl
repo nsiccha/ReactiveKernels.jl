@@ -94,7 +94,7 @@ Base.hash(a::_PMValue, h::UInt) = hash(a.data, hash(a.kind, hash(:_PMValue, h)))
 # `(:zip, ds)`. The sources are the arguments whose positions are iterated.
 _pm_sources(d) = d[1] in (:positions, :over) ? Int[d[2]] :
     d[1] === :enumerate ? _pm_sources(d[2]) :
-    unique!(reduce(vcat, map(_pm_sources, d[2]); init = Int[]))
+    unique!(reduce(vcat, map(_pm_sources, d[2]); init = Int[])::Vector{Int})
 _pm_element(d) = d[1] === :positions ? _PMValue(:pos) :
     d[1] === :over ? _PMValue(:elem, d[2]) :
     d[1] === :enumerate ? _PMValue(:tuple, Any[_PMValue(:pos), _pm_element(d[2])]) :
@@ -294,7 +294,12 @@ _pm_shared_scalar(T) = T isa Type && T !== Union{} &&
 function _pm_shared_operand!(st::_PMState, a::_PMValue)
     k = a.kind
     _pm_invariant(a) && return
-    k === :tuple && return foreach(x -> _pm_shared_operand!(st, x), a.data)
+    if k === :tuple
+        for x in a.data
+            _pm_shared_operand!(st, x)
+        end
+        return
+    end
     k in (:param, :len, :typeof, :typeread) && return _pm_whole!(st, a.data)
     _pm_fail()
 end
@@ -339,7 +344,12 @@ function _pm_operand!(st::_PMState, v::_PMValue)
     k = v.kind
     k in (:const, :typeval, :local, :elem, :accread, :extent) && return
     k === :shared && return _pm_shared_scalar(v.data) ? nothing : _pm_fail()
-    k === :tuple && return foreach(x -> _pm_operand!(st, x), v.data)
+    if k === :tuple
+        for x in v.data
+            _pm_operand!(st, x)
+        end
+        return
+    end
     k === :param && _pm_array_argument(st, v.data) && _pm_fail()
     k in (:param, :len, :typeof, :typeread) && return _pm_whole!(st, v.data)
     _pm_fail()
@@ -984,9 +994,9 @@ function _cell_position_form(r::Recipe, input_types; outlined = false)
         rows = [k in proof.positions for k in eachindex(inputs) if inputs[k] == j]
         all(rows) ? (roles[j] = :row) : any(rows) && return nothing
     end
-    sources = unique!(Int[inputs[k] for k in proof.sources])
-    checks = unique!(Tuple{Int,Symbol}[(inputs[k], fact) for (k, fact) in proof.checks])
-    matrices = unique!(Int[inputs[k] for k in proof.matrices])
+    sources = unique!(Int[inputs[k] for k in proof.sources]::Vector{Int})
+    checks = unique!(Tuple{Int,Symbol}[(inputs[k], fact) for (k, fact) in proof.checks]::Vector{Tuple{Int,Symbol}})
+    matrices = unique!(Int[inputs[k] for k in proof.matrices]::Vector{Int})
     extents = Tuple{Symbol,Vararg{Int}}[e[1] === :size ? (:size, inputs[e[2]], e[3]) : e
                                         for e in proof.extents]
     n = length(params)

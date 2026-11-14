@@ -62,6 +62,7 @@ const _PPL_TEST_FILES = (
     "test_fresh_module.jl",
     "test_precompiled_build.jl",
     "test_enzyme_cached_construction.jl",
+    "test_construction_invalidation.jl",
     "test_program_identity.jl",
     "test_preparation_identity.jl",
     "test_bound_statistics_runtime.jl",

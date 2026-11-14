@@ -1166,11 +1166,11 @@ function _footprint_positions(port, records::Tuple)
 end
 @inline _cell_partition_positions(q::Integer) = Int[q]
 
-function _footprint_selected_positions!(out, selection, i::Integer)
+function _footprint_selected_positions!(out, selection::_FootprintSelection, i::Integer)
     checkbounds(Bool, selection.mask, i) && selection.mask[i] && push!(out, i)
     out
 end
-function _footprint_selected_positions!(out, selection, read::AbstractRange{<:Integer})
+function _footprint_selected_positions!(out, selection::_FootprintSelection, read::AbstractRange{<:Integer})
     isempty(read) && return out
     lo, hi = minmax(first(read), last(read))
     indices = selection.indices
@@ -1180,7 +1180,7 @@ function _footprint_selected_positions!(out, selection, read::AbstractRange{<:In
     end
     out
 end
-function _footprint_selected_positions!(out, selection, reads)
+function _footprint_selected_positions!(out, selection::_FootprintSelection, reads)
     for read in reads
         _footprint_selected_positions!(out, selection, read)
     end

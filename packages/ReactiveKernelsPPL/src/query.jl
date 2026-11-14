@@ -143,8 +143,12 @@ function _absent_refusal(f, plan::StructuralPlan, spec, have, want)
     catch e
         e isa ReactiveKernels.PlanningError || rethrow()
         selected = try
+            # Typed: `Set(… for r in selected.recipes for v in r.inputs)` below
+            # over an untyped plan asks `IteratorSize`, which a package
+            # defining it for its own iterator invalidates (snag
+            # downstream-workl-75f8cba4).
             Base.invokelatest(ReactiveKernels.plan, spec;
-                have = (have..., absent...), want)
+                have = (have..., absent...), want)::ReactiveKernels.Plan
         catch
             rethrow(e)
         end
@@ -322,7 +326,9 @@ _same_layout(a::LayoutTable, b::LayoutTable) = a.total == b.total &&
 # A value the binding leaves absent has the type its input has in the built
 # program: the binding supplies no value to say otherwise.
 function _check_built_program(built, plan::StructuralPlan)
-    hasproperty(built, :program) || return nothing
+    # Base's `hasproperty` spelled out, so a package adding a `hasproperty`
+    # method does not invalidate this untyped call (snag downstream-workl-75f8cba4).
+    :program in propertynames(built) || return nothing
     _checked_program(plan, built.program) && return nothing
     typed = _absent_typed_as(plan, built.program)
     program = _program_identity(kernel_expr(typed, assign_layout(typed)))

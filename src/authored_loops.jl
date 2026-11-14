@@ -185,7 +185,9 @@ function _kernel_loop_indexed_writes!(names, ex)
         Meta.isexpr(lhs, :(::), 2) && (lhs = lhs.args[1])
         Meta.isexpr(lhs, :ref) && lhs.args[1] isa Symbol && push!(names, lhs.args[1])
     end
-    foreach(arg -> _kernel_loop_indexed_writes!(names, arg), ex.args)
+    for arg in ex.args
+        _kernel_loop_indexed_writes!(names, arg)
+    end
     names
 end
 
