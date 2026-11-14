@@ -3688,8 +3688,10 @@ end
 
 # Names held by non-definition statements. A gathered
 # value is whole even in a response (`v[g]`); its index is aligned. Plate
-# cells distinguish whole calls from indexed lane reads; scans retain
-# conservative statement-wide alignment. Extracted
+# cells distinguish whole calls from indexed lane reads. A top-level scan
+# reads every model value whole, indexed inside its retained loop, exactly
+# as the finished plan's model-level input rule reads it
+# (`_model_level_inputs`, `_ppl_scan_input_`). Extracted
 # kernel cells remain consumers too: a schedule-chain definition moved out
 # of `det` still reads its subject-level predictors. Otherwise those now
 # apparently unused definitions would be classified as whole values.
@@ -3717,6 +3719,12 @@ function _statement_names(ast::Expr, known::Set{Symbol};
                 _classify_cell_reads!(whole, out, c.args[2], known, ivar)
                 _classify_cell_reads!(whole, out, c.args[3], known, ivar)
             end
+        elseif st isa Expr && st.head === :macrocall &&
+                st.args[1] === Symbol("@scan")
+            # `loc[t]` in a step reads `loc` as one value, like a gather: a
+            # definition the scan reads (`loc = a .+ cos.(w)`) and the data
+            # it is computed from keep no observation axis of their own.
+            _classify_reads!(whole_reads, out, st.args[end], known, true)
         elseif st isa Expr && st.head === :macrocall
             _all_symbols!(out, st)
         elseif st isa Expr && (_is_sample(st) || _is_broadcast_sample(st)) &&

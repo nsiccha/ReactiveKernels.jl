@@ -1662,13 +1662,20 @@ ReactiveKernels.@_record_source @inline _hmm_log_scales(scales, cells) =
     checked_scales = _hmm_broadcasts(scales, K, S, T) ? scales :
         throw(DimensionMismatch("scales must broadcast over states × streams × steps"))
     log_scales = _hmm_log_scales(checked_scales, T * K * S)
+    nonzero_scales = T * K * S > 0 && all(!iszero, checked_scales)
     cells = plate(1:(T * K * S)) do cell
         t = (cell - 1) % T + 1
         k = ((cell - 1) ÷ T) % K + 1
         s = (cell - 1) ÷ (T * K) + 1
-        normal(; location = _hmm_at(checked_locations, k, s, t),
-            scale = _hmm_at(checked_scales, k, s, t),
-            log_scale = _hmm_at(log_scales, k, s, t)).logpdf(checked_observed[t, s])
+        location = _hmm_at(checked_locations, k, s, t)
+        scale = _hmm_at(checked_scales, k, s, t)
+        log_scale = _hmm_at(log_scales, k, s, t)
+        x = checked_observed[t, s]
+        if nonzero_scales
+            standard_normal.logpdf((x - location) / scale) - log_scale
+        else
+            normal(; location, scale, log_scale).logpdf(x)
+        end
     end
     log_emissions = dropdims(sum(reshape(cells, T, K, S); dims = 3); dims = 3)
     return log_emissions
