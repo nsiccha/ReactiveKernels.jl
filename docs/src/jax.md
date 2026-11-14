@@ -28,6 +28,20 @@ mode), as metadata reports.
 Julia; `jax.grad` gives `(y, x, 1)`. Integer `fma` and `muladd` are
 `x * y + z`. Subnormals follow the backend.
 
+`rk_cholesky_lower(A)` uses JAX's lower Cholesky factorization, reading only
+the lower triangle, including when unused upper entries are nonfinite.
+It checks for square input and positive pivots, with runtime checks masked
+by the enclosing branch or plate. Empty factors and padded leading square
+blocks are supported. `L \ b` for a `LowerTriangular` factor uses a triangular
+solve; `diag(L)` reads its diagonal. Data-only factorizations and solves run
+in `prepare_data`. Arithmetic follows the module's `float_type`.
+`diagm(v)` also constructs a diagonal matrix, and source loops or
+comprehensions over `axes(A, d)` retain iteration along that dimension.
+Prepared matrix cells retain their rank and row lengths, including in empty
+plates. Ragged cells can vary along their first axis; trailing dimensions
+must agree because the representation carries one extent per cell.
+For raw empty matrix lists, call `pad_ragged([], rank=2)`.
+
 ## Julia evaluation
 
 The Julia callable evaluates the same authored mathematical expression. Its output establishes the reference value for a consumer testing the emitted module.
@@ -44,6 +58,8 @@ A PPL model can emit its sampler boundary through `jax_source(built, bound)`. Th
 A dotted cell latent, `v[i] .~ D.(args…)` with a length per index that data decide, has its dimensions, packed offsets, block table and argument entries computed in `prepare_data` when its arguments read data, scalar parameters or a shared array; an argument that reads a sampled array at the index, or an array of rank 2 or more at each index, raises `JAXEmissionError` for now.
 
 Host preparation translates `findfirst(predicate, vector)`, including captured predicates such as `isequal(label)`, `Base.Fix1` and `Base.Fix2`. It searches in order, stops at the first match, and returns a one-based index or `nothing`. A positional kernel can therefore compute group indices with `plate(values) do value; Int(findfirst(isequal(value), levels)); end` inside the emitted module. Label values and the lengths of both vectors remain runtime inputs.
+
+Host preparation also orders vectors of numbers or strings as Julia's `isless` does (-0.0 before 0.0, every NaN last): `sort`, `unique` (and `sort!`, `unique!` of a list built with `push!`), `searchsortedfirst` and `searchsortedlast` (one-based), and `sortperm(v)`, whose one-based positions keep equal values in ascending position. `invperm(p)` of a vector of integers is the inverse permutation and raises `ArgumentError: argument is not a permutation` as Julia does. A data-only definition such as `pos = invperm(vcat(rows_a, rows_b))` therefore runs in `prepare_data`. Keyword orders (`rev`, `by`, `lt`) have no translation. In the JAX functions these calls have none either: a recipe that also reads a parameter (`theta[sortperm(rows)]`) raises `JAXEmissionError` naming the function, so give the permutation a definition of its own that reads data alone.
 
 A `Bool` array index (a `BitVector` or `Vector{Bool}`, such as `table[table[:, 2] .!= 1, 4]` or `values[present]`) selects the entries where it is true, as Julia's logical indexing does; it is not shifted as one-based positions. A mask of the array's whole shape (`A[A .> 0]`) selects in column-major order. `prepare_data` and other host code use a NumPy boolean mask, which fails on a mask of another length as Julia's `BoundsError` does; a list built with `push!` keeps the entries whose mask entry is true. In device code the count of selected entries depends on data, so the gather is padded to the mask's length: the selected entries come first, padding repeats the last of them, and reductions, `length` and broadcasts mask the padding as they do for a ragged row. A write through a mask writes only the selected entries. A device mask beside another kept dimension (`A[mask, :]`) and a mask of the groups of a ragged value raise `JAXEmissionError`, as does a single `Bool` index into an array, which Julia refuses.
 
