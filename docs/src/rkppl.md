@@ -158,6 +158,33 @@ u = zeros(built_rows.layout.total)
     x=marginalized_latent_draws(prepare_marginalized_latents(built_rows, rows), u, Xoshiro(1)).x)
 ```
 
+A `@scan` carrying several arrays, or reading one at a lag above one, has a vector state: name every array it carries, and the filter carries them as one Gaussian state. A local linear trend:
+
+```@example marginal
+trend = @rkppl begin
+    s_level ~ Exponential(1)
+    s_slope ~ Exponential(0.5)
+    noise ~ Exponential(1)
+    @scan begin
+        level[1] ~ Normal(0, 2)
+        slope[1] ~ Normal(0, 1)
+        for t in 2:T
+            level[t] ~ Normal(level[t - 1] + slope[t - 1], s_level)
+            slope[t] ~ Normal(slope[t - 1], s_slope)
+        end
+    end
+    y .~ Normal.(level, noise)
+end
+series = [0.1, 0.4, 0.9, 1.1, 1.8, 2.2]
+smooth = marginalize(trend(; T = length(series)), :level, :slope) | (; y = series)
+built_trend = build_kernel(smooth)
+u = zeros(built_trend.layout.total)
+draws = marginalized_latent_draws(prepare_marginalized_latents(built_trend, smooth), u, Xoshiro(1))
+(; coordinates=coordinate_names(built_trend.layout), draws.level, draws.slope)
+```
+
+An AR(p) seeded at `x[1]`, …, `x[p]` integrates out the same way, as `marginalize(model, :x)`.
+
 A recurrence in a `@plate` cell integrates out the same way, one filter per index, when the cell observes it through `y[g] .~ Normal.(offset .+ loading .* x, noise)` and the bound `y` holds one vector per index. The draws then hold one trajectory per index:
 
 ```@example marginal
@@ -185,7 +212,7 @@ latents = prepare_marginalized_latents(built_cells, cells)
     x=marginalized_latent_draws(latents, u, Xoshiro(1)).x)
 ```
 
-Recurrences carrying several arrays, a lag above one, recurrences inside nested `@plate` cells or submodels, missing entries or gathered rows in a `@plate` cell's series, and observations that are not Normal are refused with an error naming the statement.
+Recurrences inside nested `@plate` cells or submodels, missing entries or gathered rows in a `@plate` cell's series, a vector state in a `@plate` cell or observed through missing entries, a defined vector or gathered rows, and observations that are not Normal are refused with an error naming the statement.
 
 ## Adaptive partial centering
 
