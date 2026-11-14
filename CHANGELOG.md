@@ -16,6 +16,18 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.241
+
+- A prepared pullback over a `NonAllocatingKernel` no longer gives wrong
+  cotangents when a caller passes a value an earlier call returned back in.
+  Such values are borrowed: they live in storage the preparation owns, and
+  each call overwrites them. A seed, active point or argument that shares
+  memory with that storage is now copied before the call. A destination of
+  `ad_value_and_pullback!` that shares memory with the seed, the point,
+  another argument or that storage receives the cotangent through an owned
+  temporary; a returned value that overlaps it comes back as a copy. Disjoint
+  calls are unchanged and take no copy.
+
 ## 0.1.240
 
 - JAX source emits a plain authored helper (no `@traceable`, defined outside
