@@ -5315,11 +5315,14 @@ Base.@nospecializeinfer function _cell_lowering_setup!(body, @nospecialize(recip
     end
     captures = Tuple{Int,ValueId,Vector{Tuple{Int,Int}}}[]
     if windows !== nothing
-        d = windows.pushdowns::_CellPushdowns
-        for (position, reads) in sort!(collect(get(d.captures, recipe.id,
+        # Its own name: `d` above is captured by a closure and so boxed, and
+        # `sort!` of its untyped captures is invalidated by a package adding
+        # `sort!` methods, such as Pkg (`construction_iteration.jl`).
+        pushdowns = windows.pushdowns::_CellPushdowns
+        for (position, reads) in sort!(collect(get(pushdowns.captures, recipe.id,
                 Dict{Int,Vector{Tuple{Int,Int}}}())); by = first)
-            value = canon_id(d.graph, plate_values[position].id)
-            value in d.pushed && push!(captures, (position, value, reads))
+            value = canon_id(pushdowns.graph, plate_values[position].id)
+            value in pushdowns.pushed && push!(captures, (position, value, reads))
         end
     end
     (; plate, atomic, plate_values, partition, single, pushed_lanes, cell, slices, lane_rows,
