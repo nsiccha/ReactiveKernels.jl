@@ -16,6 +16,25 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.187
+
+- `jax_source` translates the length check of a top-level observed `@scan`
+  array, so the module of a program with one is standalone
+  (`UNTRANSLATED = {}`), including a top-level recurrence integrated out by
+  `marginalize`. When the module runs, an array whose length differs from
+  the scan's raises, as the native check does.
+
+## 0.1.186
+
+- `marginalize(model, :x)` also integrates out a recurrence inside a `@plate`
+  cell, one Kalman filter per index: a cell `@scan` carrying `x` as in 0.1.183,
+  observed by `y[g] .~ Normal.(offset .+ loading .* x, noise)` of bound data
+  holding one vector per index. A cell definition or per-index output read
+  only by that observation (`loc[g] = …`) is part of it. Offset, loading and
+  scale may be one value per index (`level[g]`, a declared array or data
+  vector) or one per entry (`x[g]` of data holding one vector per index).
+  `marginalized_latent_draws` returns one trajectory per index.
+
 ## 0.1.185
 
 - `adaptive_centering_problem` accepts nested cells: a cell's location or

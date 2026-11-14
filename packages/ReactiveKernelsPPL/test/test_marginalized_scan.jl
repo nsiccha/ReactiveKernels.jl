@@ -337,7 +337,7 @@ end
         msg = refusal(observed(base, obs), :x, data, y)
         @test occursin(expected, msg)
     end
-    @test occursin("no top-level `@scan` carries `q`",
+    @test occursin("no top-level `@scan` and no `@plate` cell `@scan` carries `q`",
         refusal(observed(base), :q, data, y))
     # The observation must be bound data.
     unobserved = try
@@ -347,9 +347,169 @@ end
         sprint(showerror, e)
     end
     @test occursin("is not observed data", unobserved)
-    # A recurrence in a plate cell is not marginalized yet.
-    cell = quote
-        s ~ Exponential(1)
+    # A plan is already lowered.
+    d = ou_data(1, 3)
+    @test_throws SurfaceLoweringError marginalize(OU(; d.inputs...) | (; y = d.y), :ou)
+    @test_throws ArgumentError marginalize(OU)
+end
+
+# ── One recurrence per `@plate` index ─────────────────────────────────────
+#
+# The groups are independent given the parameters, so the oracle is the sum
+# of each group's dense joint Gaussian, and the pointwise densities are each
+# group's sequential conditionals.
+
+# Per-group OU deviations in the cell (rkppl-use §5 "A recurrence per
+# group"): irregular gaps per group, a per-group level, a per-entry covariate
+# in the offset, and the latent returned through a per-index output.
+const CELL_OU = @rkppl begin
+    noise ~ Exponential(0.3)
+    ou_sd ~ Exponential(0.5)
+    ou_range ~ LogNormal(1, 0.5)
+    b ~ Normal(0, 1)
+    level[1:G] .~ Normal.(0, 1)
+    @plate for g in eachindex(y)
+        @scan begin
+            ou[1] ~ Normal(0, 1)
+            for t in 2:length(y[g])
+                e ~ Normal(0, 1)
+                r = exp(-gap[g][t] / ou_range)
+                ou[t] = r * ou[t - 1] + sqrt(1 - r * r) * e
+            end
+        end
+        loc[g] = level[g] .+ b .* x[g] .+ ou_sd .* ou
+        y[g] .~ Normal.(loc[g], noise)
+    end
+end
+
+# Centred AR(1) per group: the seed reads per-group data, the loading is a
+# per-group parameter and the scale is per entry.
+const CELL_AR = @rkppl begin
+    phi ~ Uniform(-1, 1)
+    drift ~ Normal(0, 0.5)
+    sigma ~ Exponential(0.5)
+    noise ~ Exponential(0.5)
+    lam[1:G] .~ LogNormal.(0, 0.3)
+    @plate for g in eachindex(y)
+        @scan begin
+            h[1] ~ Normal(m0[g], 1.5)
+            for t in 2:length(y[g])
+                h[t] ~ Normal(phi * h[t - 1] + drift, sigma)
+            end
+        end
+        y[g] .~ Normal.(lam[g] .* h, sqrt.(noise^2 .+ se[g] .^ 2))
+    end
+end
+
+function cell_data(lengths; seed = 1)
+    rng = Random.Xoshiro(seed)
+    G = length(lengths)
+    y = [cumsum(0.4 .* randn(rng, n)) for n in lengths]
+    gap = [0.3 .+ rand(rng, n) for n in lengths]
+    x = [randn(rng, n) for n in lengths]
+    se = [0.1 .+ 0.2 .* rand(rng, n) for n in lengths]
+    m0 = randn(rng, G)
+    return (; G, y, gap, x, se, m0)
+end
+
+# The oracle over groups: `group(c, g)` gives each group's latent moments and
+# its observation's offset, loading and noise.
+function cell_oracle(built, prior, group, y)
+    function (u)
+        c = constrain(built.layout, u)
+        likelihood, pointwise = 0.0, Vector{Float64}[]
+        for g in eachindex(y)
+            lat, offset, loading, noise = group(c, g)
+            mu, S = observation_moments(lat, offset, loading, noise)
+            likelihood += logpdf(MvNormal(mu, S), y[g])
+            push!(pointwise, sequential_logpdfs(mu, S, y[g]))
+        end
+        (; total = prior(c) + likelihood + logjac(built.layout, u), likelihood, pointwise)
+    end
+end
+
+cell_ou_plan(d) = marginalize(CELL_OU(; d.G, d.gap, d.x), :ou) | (; d.y)
+function cell_ou_oracle(built, d)
+    prior(c) = logpdf(Exponential(0.3), c.noise) + logpdf(Exponential(0.5), c.ou_sd) +
+        logpdf(LogNormal(1, 0.5), c.ou_range) + logpdf(Normal(0, 1), c.b) +
+        sum(logpdf.(Normal(0, 1), c.level))
+    function group(c, g)
+        n = length(d.y[g])
+        a = exp.(-d.gap[g] ./ c.ou_range)
+        lat = latent_moments(0.0, 1.0, a, zeros(n), 1 .- a .^ 2)
+        return lat, c.level[g] .+ c.b .* d.x[g], c.ou_sd, c.noise
+    end
+    return cell_oracle(built, prior, group, d.y)
+end
+
+@testset "a recurrence per @plate index integrates out exactly" begin
+    for lengths in ([1], [3, 1], [2, 5, 4], [6, 1, 3, 8])
+        d = cell_data(lengths; seed = sum(lengths))
+        plan = cell_ou_plan(d)
+        built = build_kernel(plan)
+        @test coordinate_names(built.layout) == [:noise, :ou_sd, :ou_range, :b,
+            (Symbol("level.$i") for i in 1:d.G)...]
+        check_density(built, plan, cell_ou_oracle(built, d))
+
+        plan = marginalize(CELL_AR(; d.G, d.se, d.m0), :h) | (; d.y)
+        built = build_kernel(plan)
+        @test coordinate_names(built.layout) == [:phi, :drift, :sigma, :noise,
+            (Symbol("lam.$i") for i in 1:d.G)...]
+        check_density(built, plan, cell_oracle(built,
+            c -> logpdf(Uniform(-1, 1), c.phi) + logpdf(Normal(0, 0.5), c.drift) +
+                logpdf(Exponential(0.5), c.sigma) + logpdf(Exponential(0.5), c.noise) +
+                sum(logpdf.(LogNormal(0, 0.3), c.lam)),
+            function (c, g)
+                n = length(d.y[g])
+                lat = latent_moments(d.m0[g], 1.5^2, fill(c.phi, n), fill(c.drift, n),
+                    fill(c.sigma^2, n))
+                return lat, 0.0, c.lam[g], sqrt.(c.noise^2 .+ d.se[g] .^ 2)
+            end, d.y))
+    end
+    # The model as written still samples each group's seed and innovations.
+    d = cell_data([3, 2])
+    @test build_kernel(CELL_OU(; d.G, d.gap, d.x) | (; d.y)).layout.total == 4 + 2 + 5
+end
+
+@testset "the cell filter is one retained scan in one plate as groups grow" begin
+    shape(lengths) = (d = cell_data(lengths); structure(build_kernel(cell_ou_plan(d)).spec))
+    small = shape([2, 3])
+    @test small == shape([7, 40, 1, 12, 9])
+end
+
+@testset "exact draws of each index's integrated-out trajectory" begin
+    d = cell_data([4, 1, 6]; seed = 9)
+    plan = cell_ou_plan(d)
+    built = build_kernel(plan)
+    q = prepare_marginalized_latents(built, plan)
+    u = 0.3 .* cos.(1:built.layout.total)
+    c = constrain(built.layout, u)
+    filtered = q(u)
+    @test keys(filtered) == (:ou,)
+    @test length(filtered.ou.mean) == d.G
+    rng = Random.Xoshiro(4)
+    n = 40_000
+    draws = [marginalized_latent_draws(q, u, rng).ou for _ in 1:n]
+    for g in 1:d.G
+        a = exp.(-d.gap[g] ./ c.ou_range)
+        @test filtered.ou.coef[g][2:end] ≈ a[2:end]
+        lat = latent_moments(0.0, 1.0, a, zeros(length(a)), 1 .- a .^ 2)
+        mean, cov = latent_posterior(lat, c.level[g] .+ c.b .* d.x[g], c.ou_sd, c.noise, d.y[g])
+        @test filtered.ou.mean[g][end] ≈ mean[end]
+        @test filtered.ou.var[g][end] ≈ cov[end, end]
+        G = reduce(hcat, (draw[g] for draw in draws))
+        @test size(G) == (length(d.y[g]), n)
+        @test all(abs.(vec(Statistics.mean(G; dims = 2)) .- mean) .< 5 .* sqrt.(diag(cov) ./ n))
+        @test Statistics.cov(G; dims = 2) ≈ cov rtol = 0.05 atol = 0.02 * maximum(diag(cov))
+    end
+    @test marginalized_latent_draws(q, u, Random.Xoshiro(3)) ==
+        marginalized_latent_draws(q, u, Random.Xoshiro(3))
+end
+
+@testset "cell forms the filter does not cover are refused" begin
+    y = [[0.1, -0.2, 0.4], [0.3, 0.2]]
+    cellmodel(cell; before = :(s ~ Exponential(1))) = quote
+        $before
         @plate for g in eachindex(y)
             @scan begin
                 h[1] ~ Normal(0, 1)
@@ -357,15 +517,78 @@ end
                     h[t] ~ Normal(h[t - 1], s)
                 end
             end
-            loc[g] = h
-            y[g] .~ Normal.(loc[g], 1)
+            $(cell.args...)
         end
     end
-    @test occursin("inside a `@plate` cell", refusal(cell, :h, (;), [[0.1, 0.2], [0.3]]))
-    # A plan is already lowered.
-    d = ou_data(1, 3)
-    @test_throws SurfaceLoweringError marginalize(OU(; d.inputs...) | (; y = d.y), :ou)
-    @test_throws ArgumentError marginalize(OU)
+    # The per-index output is read beside the observation.
+    msg = refusal(Expr(:block, cellmodel(quote
+        loc[g] = h
+        y[g] .~ Normal.(loc[g], 1)
+    end).args..., :(total = sum(sum, loc))), :h, (;), y)
+    @test occursin("must be read by its observation alone", msg)
+    # A per-index trajectory observed entry by entry is a different model.
+    @test occursin("every read of `h`", refusal(cellmodel(quote
+        y[g] .~ Normal.(h, 1)
+        z[g] = h[1]
+    end), :h, (;), y))
+    # A loading drawn inside the cell is not in the draws' plate.
+    @test occursin("drawn inside the `@plate` cell", refusal(cellmodel(quote
+        w ~ Normal(0, 1)
+        y[g] .~ Normal.(w .* h, 1)
+    end), :h, (;), y))
+    # A whole program vector read in a cell is not placed.
+    @test occursin("cannot tell whether", refusal(cellmodel(quote
+        y[g] .~ Normal.(v .+ h, 1)
+    end; before = quote
+        s ~ Exponential(1)
+        v[1:3] .~ Normal.(0, 1)
+    end), :h, (;), y))
+end
+
+# ── `jax_source` of a marginalized program ────────────────────────────────
+#
+# The module is standalone: every data definition, including the observed
+# scan's length check, is translated (`UNTRANSLATED = {}`). Its log density
+# and `jax.grad` match the native sampler and its finite differences.
+
+include(joinpath(pkgdir(ReactiveKernels), "test", "jax_python.jl"))
+include("jax_ppl_data.jl")
+
+# An observed AR(1) series whose length is the response's own: the check
+# without a supplied length.
+const OBSERVED_AR = @rkppl begin
+    phi ~ Uniform(-1, 1)
+    sigma ~ Exponential(1)
+    @scan begin
+        y[1] ~ Normal(0, sigma / sqrt(1 - phi^2))
+        for t in 2:T
+            y[t] ~ Normal(phi * y[t - 1], sigma)
+        end
+    end
+end
+
+@testset "jax_source of a marginalized program" begin
+    d, c = ou_data(2, 4), cell_data([3, 1, 5])
+    plans = (; toplevel = ou_plan(d), cell = cell_ou_plan(c),
+        cell_ar = marginalize(CELL_AR(; c.G, c.se, c.m0), :h) | (; c.y),
+        observed = OBSERVED_AR() | (; y = [0.1, -0.3, 0.4, 0.2]))
+    for (name, plan) in pairs(plans)
+        built = build_kernel(plan)
+        src = jax_source(built, plan)
+        @test occursin("UNTRANSLATED = {}", string(src))
+        if !rk_jax_available()
+            @info "RK_JAX_PYTHON is not set: JAX parity for marginalized $name skipped"
+            @test_skip false
+            continue
+        end
+        query = prepare_query(built, plan, :sampler)
+        u = 0.2 .* randn(Random.Xoshiro(7), built.layout.total)
+        r = rk_jax_evaluate(src, "log_density", (u, jax_raw_data(plan, src)...);
+            grad = true, prepare = true)
+        @test r.value ≈ Base.invokelatest(query, u) rtol = 1e-10
+        reference = rk_fd_gradient(u -> Base.invokelatest(query, u), u)
+        @test maximum(abs.(r.grad .- reference) ./ max.(1, abs.(reference))) < 1e-5
+    end
 end
 
 @testset "marginalize composes with binding, observing and merge" begin

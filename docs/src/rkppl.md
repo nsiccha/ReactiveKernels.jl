@@ -97,7 +97,34 @@ latents = prepare_marginalized_latents(built, plan)
 marginalized_latent_draws(latents, u, Xoshiro(1)).x
 ```
 
-Recurrences carrying several arrays, a lag above one, recurrences inside `@plate` cells or submodels, and observations that are not Normal are refused with an error naming the statement.
+A recurrence in a `@plate` cell integrates out the same way, one filter per index, when the cell observes it through `y[g] .~ Normal.(offset .+ loading .* x, noise)` and the bound `y` holds one vector per index. The draws then hold one trajectory per index:
+
+```@example marginal
+grouped = @rkppl begin
+    phi ~ Uniform(-1, 1)
+    sigma ~ Exponential(1)
+    noise ~ Exponential(0.5)
+    level[1:G] .~ Normal.(0, 2)
+    @plate for g in eachindex(y)
+        @scan begin
+            x[1] ~ Normal(0, 1)
+            for t in 2:length(y[g])
+                x[t] ~ Normal(phi * x[t - 1], sigma)
+            end
+        end
+        y[g] .~ Normal.(level[g] .+ x, noise)
+    end
+end
+ys = [[0.3, 0.5, -0.1], [0.0, 0.4], [0.2, 0.1, 0.6, 0.3]]
+cells = marginalize(grouped(; G = length(ys)), :x) | (; y = ys)
+built_cells = build_kernel(cells)
+u = zeros(built_cells.layout.total)
+latents = prepare_marginalized_latents(built_cells, cells)
+(; coordinates=coordinate_names(built_cells.layout),
+    x=marginalized_latent_draws(latents, u, Xoshiro(1)).x)
+```
+
+Recurrences carrying several arrays, a lag above one, recurrences inside nested `@plate` cells or submodels, and observations that are not Normal are refused with an error naming the statement.
 
 ## Adaptive partial centering
 
