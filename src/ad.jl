@@ -2935,7 +2935,9 @@ cotangent into caller-owned `cotangent` storage. Returns `(value, cotangent)`.
 For a scalar active selector, the destination must satisfy the differentiation
 backend's in-place pullback contract. For a tuple selector, supply a matching
 tuple of mutable arrays or `Ref` destinations; the structured cotangent is
-copied into them after the one reverse pass.
+copied into them after the one reverse pass. A tuple of another length, a named
+tuple with other keys, an array of another length or an unsupported destination
+raises before anything is written.
 """
 function ad_value_and_pullback!(
         prepared::PreparedADPullback, cotangent, seed, args...; kwargs...)
@@ -3437,7 +3439,9 @@ to DI position one, and every other current argument is rebound as a fresh
 is a matching tuple of mutable destinations. Reverse Enzyme can fill matching
 tuples of disjoint dense arrays and scalar `Ref`s directly when the prepared
 call has DI contexts. Other destination shapes and backends copy the structured
-gradient after the same single reverse pass. Scalar normalization storage is
+gradient after the same single reverse pass. Before that copy writes anything,
+a tuple of another length, a named tuple with other keys, an array of another
+length or an unsupported destination raises. Scalar normalization storage is
 owned by the preparation and reused by mutating calls.
 
 Returns the `(value, gradient)` pair from
@@ -3533,41 +3537,50 @@ function _ad_copy_value_and_gradient!(prepared, gradient, point, contexts)
     value, gradient
 end
 
-function _ad_copy_cotangent!(destination::AbstractArray, source)
-    copyto!(destination, source)
+# Copy a computed cotangent into caller-owned storage. The whole destination
+# structure is checked against the cotangent before the first write, so these
+# mismatches raise with nothing written: a tuple of another length or a named
+# tuple with other keys (at any depth), an array whose length differs from its
+# cotangent's, and a destination that is not an array, `Ref`, tuple or named
+# tuple. A write that fails inside one component (an element conversion, an
+# immutable array such as a range) is not covered: earlier components are
+# written by then.
+function _ad_copy_cotangent!(destination, source)
+    _ad_check_cotangent_destination(destination, source)
+    _ad_write_cotangent!(destination, source)
     destination
 end
 
-
-function _ad_copy_cotangent!(destination::Base.RefValue, source)
-    destination[] = source
-    destination
-end
-
-function _ad_copy_cotangent!(destination::Tuple, source::Tuple)
+_ad_check_cotangent_destination(destination::AbstractArray, source) =
+    length(destination) == length(source) ? nothing : throw(DimensionMismatch(
+        "gradient destination has $(length(destination)) elements; " *
+        "its cotangent has $(length(source))"))
+_ad_check_cotangent_destination(::Base.RefValue, source) = nothing
+function _ad_check_cotangent_destination(destination::Tuple, source::Tuple)
     length(destination) == length(source) || throw(DimensionMismatch(
         "gradient destination has $(length(destination)) components; " *
         "the active tuple has $(length(source))"))
-    foreach(_ad_copy_cotangent!, destination, source)
-    destination
+    foreach(_ad_check_cotangent_destination, destination, source)
 end
-
-function _ad_copy_cotangent!(destination::NamedTuple, source::NamedTuple)
+function _ad_check_cotangent_destination(destination::NamedTuple, source::NamedTuple)
     keys(destination) == keys(source) || throw(ArgumentError(
         "gradient destination fields $(keys(destination)) do not match " *
         "cotangent fields $(keys(source))"))
-    foreach(_ad_copy_cotangent!, values(destination), values(source))
-    destination
+    foreach(_ad_check_cotangent_destination, values(destination), values(source))
 end
+_ad_check_cotangent_destination(destination, source) = throw(ArgumentError(
+    "structured active gradients require matching mutable array, Ref, " *
+    "or tuple destinations; got $(typeof(destination)) for a " *
+    "$(typeof(source)) cotangent. Use ad_value_and_gradient for an " *
+    "out-of-place structured gradient."))
 
-
-function _ad_copy_cotangent!(destination, source)
-    throw(ArgumentError(
-        "structured active gradients require matching mutable array, Ref, " *
-        "or tuple destinations; got $(typeof(destination)) for a " *
-        "$(typeof(source)) cotangent. Use ad_value_and_gradient for an " *
-        "out-of-place structured gradient."))
-end
+# Unchecked writes; `_ad_copy_cotangent!` has validated the structure.
+_ad_write_cotangent!(destination::AbstractArray, source) = copyto!(destination, source)
+_ad_write_cotangent!(destination::Base.RefValue, source) = (destination[] = source)
+_ad_write_cotangent!(destination::Tuple, source::Tuple) =
+    foreach(_ad_write_cotangent!, destination, source)
+_ad_write_cotangent!(destination::NamedTuple, source::NamedTuple) =
+    foreach(_ad_write_cotangent!, values(destination), values(source))
 
 inputs(prepared::PreparedADOperator) = inputs(prepared.kernel)
 outputs(prepared::PreparedADOperator) = outputs(prepared.kernel)

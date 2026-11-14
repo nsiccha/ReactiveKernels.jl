@@ -137,6 +137,52 @@ end
     @test_throws ArgumentError ad_value_and_gradient!(p,(zero(x),0.),x,2.)
 end
 
+@testset "copied cotangents reject a mismatched destination before writing" begin
+    backend=AutoEnzyme(mode=Enzyme.Reverse)
+    x=[1.,2.,3.];z=[4.,5.,6.];a=2.
+    p=prepare_ad(structured_no_context,backend,x,a;active=(:x,:a),want=:total)
+    pz=prepare_ad(structured_no_context_pair,backend,x,z;active=(:x,:z),want=:total)
+    pc=prepare_ad(structured_buffer_objective,backend,x,z,a;active=(:x,:z),want=:total)
+    pt=prepare_ad(structured_tuple_port,backend,(x,z),a;active=:xs,want=:total)
+    pb=prepare_ad_pullback(structured_buffer_objective,backend,1.,x,z,a;
+        active=(:x,:z),want=:total)
+    sentinel(n)=fill(-7.,n)
+    untouched(d)=all(c->c isa Base.RefValue ? c[]==-7. : all(==(-7.),c),d)
+    # Each component before the invalid one must stay untouched.
+    for (prepared,args) in ((p,(x,a)),(pz,(x,z)),(pc,(x,z,a)))
+        second=prepared===p ? Ref(-7.) : sentinel(3)
+        for (d,E) in (((sentinel(4),second),DimensionMismatch),  # oversized
+                      ((sentinel(2),second),DimensionMismatch),  # undersized
+                      ((sentinel(3),prepared===p ? -7. : (-7.,)),ArgumentError),
+                      ((sentinel(3),sentinel(prepared===p ? 2 : 5)),DimensionMismatch),
+                      ((sentinel(3),second,sentinel(3)),DimensionMismatch))
+            @test_throws E ad_value_and_gradient!(prepared,d,args...)
+            @test untouched(d)
+        end
+    end
+    for d in ((sentinel(3),sentinel(4)),(sentinel(3),-7.))
+        @test_throws Union{DimensionMismatch,ArgumentError} ad_value_and_gradient!(pt,d,(x,z),a)
+        @test untouched(d)
+    end
+    for d in ((sentinel(3),sentinel(2)),(sentinel(3),-7.))
+        @test_throws Union{DimensionMismatch,ArgumentError} ad_value_and_pullback!(pb,d,1.,x,z,a)
+        @test untouched(d)
+    end
+    # Matching layouts the copy path supports keep working: a view, a matrix
+    # of the same length, and a destination that aliases an input.
+    value,reference=ad_value_and_gradient(pc,x,z,a)
+    d=(view(sentinel(5),2:4),reshape(sentinel(3),3,1))
+    @test first(ad_value_and_gradient!(pc,d,x,z,a))≈value
+    @test d[1]≈reference[1] && vec(d[2])≈reference[2]
+    _,cot=ad_value_and_pullback(pb,1.,x,z,a)
+    d=(view(sentinel(5),1:3),sentinel(3))
+    @test ad_value_and_pullback!(pb,d,1.,x,z,a)[2]===d
+    @test d[1]≈cot[1] && d[2]≈cot[2]
+    zz=copy(z)
+    @test first(ad_value_and_gradient!(pc,(sentinel(3),zz),x,zz,a))≈value
+    @test zz≈reference[2]
+end
+
 @testset "caller-owned structured reverse destinations" begin
     backend=AutoEnzyme(mode=Enzyme.Reverse)
     # Registered Enzyme still allocates its tuple-zeroing IdSet (snag
