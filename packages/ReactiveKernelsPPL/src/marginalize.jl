@@ -76,10 +76,11 @@ function marginalize(m::RKPPLModel, names::Symbol...)
         occursin('.', String(x)) && _sfail("marginalize(`$x`): a recurrence " *
             "inside a submodel is not marginalized yet; name a top-level `@scan` array")
         x in out && _sfail("marginalize(`$x`): `$x` is already marginalized")
+        x in m.chains && _sfail("marginalize(`$x`): `$x` is a Markov chain (`markov_chains`)")
         push!(out, x)
     end
     return RKPPLModel(m.ast, m.mod, copy(m.fixed), copy(m.rewrites),
-        copy(m.conditioned), copy(m.documentation), out)
+        copy(m.conditioned), copy(m.documentation), out, copy(m.chains))
 end
 marginalize(m::RKPPLBoundModel, names::Symbol...) =
     RKPPLBoundModel(marginalize(m.model, names...), copy(m.data))
@@ -769,15 +770,29 @@ function _cell_draws_plate(x, y, law, seed, step, head, cell, pieces, k, j, obse
     ivar = head.args[1]
     carried = Tuple(_marginal_draw_carried(x, r) for r in _MARGINAL_ROLES)
     scan = _cell_draws_scan(x, y, law, seed, step, carried)
+    outputs = [Expr(:(=), Expr(:ref, _marginal_name(x, r), ivar), c)
+        for (r, c) in zip(_MARGINAL_ROLES, carried)]
+    return _cell_side_plate(head, cell, (k, j), observing, Any[pieces..., scan], outputs) do drawn
+        _marginal_fail(x, "its transition or observation reads " *
+            join(("`$d`" for d in drawn), ", ") * ", drawn inside the `@plate` cell; " *
+            "draw it outside the cell (a declared array read as `$(first(drawn))[$ivar]`)")
+    end
+end
+
+# A second plate over a cell's indices that the density does not read: the
+# cell's definitions `body` needs (statements `skip` excluded), then `body`,
+# then the per-index `outputs`. A value drawn inside the cell has no draw in
+# this plate, so a read of one calls `refuse` with the names.
+function _cell_side_plate(refuse, head, cell, skip, observing, body, outputs)
     needed = Set{Symbol}()
-    _all_symbols!(needed, Expr(:block, pieces..., scan))
+    _all_symbols!(needed, Expr(:block, body..., outputs...))
     sampled = Set{Symbol}()
     for (i, c) in enumerate(cell)
-        i == j && continue
+        i in skip && continue
         Meta.isexpr(c, :call, 3) && c.args[1] in (:~, :.~) || continue
         lhs = c.args[2]
         base = Meta.isexpr(lhs, :ref) ? lhs.args[1] : lhs
-        # An observation of bound data is data to the draws' plate.
+        # An observation of bound data is data to this plate.
         base isa Symbol && !(base in observing) && push!(sampled, base)
     end
     kept = Set{Int}()
@@ -785,7 +800,7 @@ function _cell_draws_plate(x, y, law, seed, step, head, cell, pieces, k, j, obse
     while changed
         changed = false
         for (i, c) in enumerate(cell)
-            (i in (k, j) || i in kept) && continue
+            (i in skip || i in kept) && continue
             (Meta.isexpr(c, :(=), 2) && c.args[1] isa Symbol && c.args[1] in needed) ||
                 continue
             push!(kept, i)
@@ -794,17 +809,11 @@ function _cell_draws_plate(x, y, law, seed, step, head, cell, pieces, k, j, obse
         end
     end
     drawn = intersect(needed, sampled)
-    isempty(drawn) || _marginal_fail(x, "its transition or observation reads " *
-        join(("`$d`" for d in sort!(collect(drawn))), ", ") * ", drawn inside the " *
-        "`@plate` cell; draw it outside the cell (a declared array read as `$(first(drawn))[$ivar]`)")
-    body = Any[cell[i] for i in sort!(collect(kept))]
-    append!(body, pieces)
-    push!(body, scan)
-    for (r, c) in zip(_MARGINAL_ROLES, carried)
-        push!(body, Expr(:(=), Expr(:ref, _marginal_name(x, r), ivar), c))
-    end
+    isempty(drawn) || refuse(sort!(collect(drawn)))
+    stmts = Any[cell[i] for i in sort!(collect(kept))]
+    append!(stmts, body, outputs)
     return Expr(:macrocall, Symbol("@plate"), LineNumberNode(0),
-        Expr(:for, head, Expr(:block, body...)))
+        Expr(:for, head, Expr(:block, stmts...)))
 end
 
 function _cell_draws_scan(x, y, law::_GaussianTransition, seed_pieces, step_pieces, carried)
@@ -821,9 +830,9 @@ function _cell_draws_scan(x, y, law::_GaussianTransition, seed_pieces, step_piec
     body = Expr(:block, law.locals...,
         Expr(:(=), pm, pm_ex), Expr(:(=), pv, pv_ex), Expr(:(=), g, gain),
         Expr(:(=), :($M[$t]), meant), Expr(:(=), :($V[$t]), vart),
-        Expr(:(=), :($C[$t]), something(law.coef, 0.0)),
-        Expr(:(=), :($D[$t]), something(law.shift, 0.0)),
-        Expr(:(=), :($Q[$t]), something(law.innovation_var, 0.0)))
+        Expr(:(=), :($C[$t]), _mfloat(something(law.coef, 0.0))),
+        Expr(:(=), :($D[$t]), _mfloat(something(law.shift, 0.0))),
+        Expr(:(=), :($Q[$t]), _mfloat(something(law.innovation_var, 0.0))))
     loop = Expr(:for, Expr(:(=), t, Expr(:call, :(:), 2, law.hi)), body)
     return _scan_macro(Expr(:block,
         Expr(:(=), :($M[1]), mean1), Expr(:(=), :($V[1]), var1),
@@ -907,9 +916,9 @@ function _transition_scan(x, law::_GaussianTransition)
     t = law.loopvar
     C, D, Q = (_marginal_name(x, r) for r in (:coef, :shift, :innovation_var))
     body = Expr(:block, law.locals...,
-        Expr(:(=), :($C[$t]), something(law.coef, 0.0)),
-        Expr(:(=), :($D[$t]), something(law.shift, 0.0)),
-        Expr(:(=), :($Q[$t]), something(law.innovation_var, 0.0)))
+        Expr(:(=), :($C[$t]), _mfloat(something(law.coef, 0.0))),
+        Expr(:(=), :($D[$t]), _mfloat(something(law.shift, 0.0))),
+        Expr(:(=), :($Q[$t]), _mfloat(something(law.innovation_var, 0.0))))
     loop = Expr(:for, Expr(:(=), t, Expr(:call, :(:), 2, law.hi)), body)
     return _scan_macro(Expr(:block,
         Expr(:(=), :($C[1]), 0.0),

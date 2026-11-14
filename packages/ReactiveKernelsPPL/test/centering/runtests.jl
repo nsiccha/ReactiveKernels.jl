@@ -644,4 +644,210 @@ end
     @test shapes[2] == shapes[4]
 end
 
+# ── Markov chains: `markov_chains` and WarmupHMC 0.3.1's `MarkovChain` ─────
+#
+# A marked linear-Gaussian recurrence is lowered in its states and gets one
+# `MarkovChain`; a recurrence per `@plate` index is one chain restarting at each
+# index. Oracles are independent: the walk's density written out, and each
+# state's location and step SD from the stated law.
+
+# A non-centred random walk with a sampled step size: re-spelled in its states.
+const WALK = @rkppl begin
+    log_q ~ Normal(-1, 0.5)
+    noise ~ Exponential(1)
+    @scan begin
+        w[1] ~ Normal(0, 2)
+        for t in 2:T
+            e ~ Normal(0, 1)
+            w[t] = w[t - 1] + exp(log_q) * e
+        end
+    end
+    y .~ Normal.(w, noise)
+end
+
+# Per series, a centred AR(1) about a mean from a fixed start: the chain's
+# states are `h[2:end]`, and each series' first state reads the fixed seed.
+const AR_CELLS = @rkppl begin
+    rho ~ Uniform(-1, 1)
+    mu ~ Normal(0, 1)
+    s ~ Exponential(1)
+    noise ~ Exponential(1)
+    @plate for g in eachindex(y)
+        @scan begin
+            h[1] = 0.0
+            for t in 2:length(y[g])
+                h[t] ~ Normal(rho * h[t - 1] + (1 - rho) * mu, s)
+            end
+        end
+        y[g] .~ Normal.(h, noise)
+    end
+end
+
+# The reporter's spelling: a non-centred walk per station with its own step
+# size, from a fixed start.
+const WANDER = @rkppl begin
+    wander_sd[1:G] .~ Exponential.(0.5)
+    noise ~ Exponential(1)
+    @plate for j in eachindex(y)
+        @scan begin
+            wander[1] = 0.0
+            for t in 2:length(y[j])
+                wander_innovation ~ Normal(0, 1)
+                wander[t] = wander[t - 1] + wander_sd[j] * wander_innovation
+            end
+        end
+        y[j] .~ Normal.(wander, noise)
+    end
+end
+
+chain_series(lengths; seed = 3) =
+    [cumsum(0.4 .* sin.(seed .+ (1:n)) .+ 0.1) for n in lengths]
+
+function chain_setup(plan)
+    built = build_kernel(plan)
+    u = 0.1 .* cos.(1:built.layout.total)
+    problem = prepare_sampler(built, plan, u; backend = BACKEND)
+    rp = adaptive_centering_problem(built, plan, problem, BACKEND)
+    (; built, plan, u, problem, rp, ir = rp.reparametrizer)
+end
+
+# Log densities written out (this suite does not load Distributions).
+normal_lpdf(m, s, x) = -0.5 * ((x - m) / s)^2 - log(s) - 0.5 * log(2pi)
+exponential_lpdf(scale, x) = -log(scale) - x / scale
+
+# Map source `x` through the chain's innovation frame (phi, c) = (1, 0):
+# w_k = m_k + x_k * sd_k, the series restarting where `restart[k]`.
+function innovation_walk(x, idx, coef, drift, sd, restart)
+    w = similar(x, length(idx))
+    for k in eachindex(idx)
+        m = restart[k] ? drift[k] : coef[k] * w[k - 1] + drift[k]
+        w[k] = m + x[idx[k]] * sd[k]
+    end
+    w
+end
+
+@testset "markov_chains lowers a non-centred walk in its states" begin
+    T = 6
+    y = chain_series([T])[1]
+    plan = markov_chains(WALK(; T), :w) | (; y)
+    built = build_kernel(plan)
+    # The packed block holds the states (the sampled seed, then each step), not
+    # the innovations; a scan with step locals keeps the `_ppl_scan_z_` name.
+    @test coordinate_names(built.layout) ==
+        [:log_q, :noise, (Symbol("_ppl_scan_z_w.$t") for t in 1:T)...]
+    sampler = prepare_sampler(built, plan, zeros(built.layout.total); backend = BACKEND)
+    oracle(u) = begin
+        c = constrain(built.layout, u)
+        q = exp(c.log_q)
+        w = c._ppl_scan_z_w
+        normal_lpdf(-1, 0.5, c.log_q) + exponential_lpdf(1, c.noise) +
+            normal_lpdf(0, 2, w[1]) +
+            sum(normal_lpdf(w[t - 1], q, w[t]) for t in 2:T) +
+            sum(normal_lpdf.(w, c.noise, y)) + logjac(built.layout, u)
+    end
+    for k in 1:3
+        u = 0.3 .* sin.(k .* (1:built.layout.total))
+        value, gradient = sampler_value_and_gradient!(sampler, similar(u), u)
+        @test value ≈ oracle(u) rtol = 1e-12
+        @test gradient ≈ finite_gradient(oracle, u) rtol = 1e-6 atol = 1e-8
+    end
+    # The model as written packs the innovations: the same coordinates read as
+    # states give another density.
+    plain = WALK(; T) | (; y)
+    plain_sampler = prepare_sampler(build_kernel(plain), plain, zeros(built.layout.total);
+        backend = BACKEND)
+    u = 0.3 .* sin.(1:built.layout.total)
+    @test !(plain_sampler(u) ≈ oracle(u))
+end
+
+@testset "one MarkovChain per marked recurrence" begin
+    T = 5
+    walk = chain_setup(markov_chains(WALK(; T), :w) | (; y = chain_series([T])[1]))
+    lengths = [4, 1, 3]
+    ys = chain_series(lengths)
+    ar = chain_setup(markov_chains(AR_CELLS(), :h) | (; y = ys))
+    wander = chain_setup(markov_chains(WANDER(; G = 3), :wander) | (; y = ys))
+    for (case, f) in ((walk, function (c)
+                # the seed w[1] ~ Normal(0, 2), then steps of SD exp(log_q)
+                coef = [0.0; ones(T - 1)]
+                drift = zeros(T)
+                sd = [2.0; fill(exp(c.log_q), T - 1)]
+                restart = [true; falses(T - 1)]
+                (; idx = collect(3:2 + T), coef, drift, sd, restart)
+            end),
+            (ar, function (c)
+                # per series h[2:end]: the first reads the fixed seed 0
+                coef, drift, sd, restart = Float64[], Float64[], Float64[], Bool[]
+                for n in lengths, t in 2:n
+                    push!(coef, t == 2 ? 0.0 : c.rho)
+                    push!(drift, (1 - c.rho) * c.mu + (t == 2 ? c.rho * 0.0 : 0.0))
+                    push!(sd, c.s)
+                    push!(restart, t == 2)
+                end
+                (; idx = collect(5:4 + length(coef)), coef, drift, sd, restart)
+            end),
+            (wander, function (c)
+                coef, drift, sd, restart = Float64[], Float64[], Float64[], Bool[]
+                for (j, n) in enumerate(lengths), t in 2:n
+                    push!(coef, t == 2 ? 0.0 : 1.0)
+                    push!(drift, 0.0)
+                    push!(sd, c.wander_sd[j])
+                    push!(restart, t == 2)
+                end
+                (; idx = collect(5:4 + length(coef)), coef, drift, sd, restart)
+            end))
+        ir = case.ir
+        @test length(ir.chains) == 1
+        chain = only(ir.chains)
+        x = 0.2 .* cos.(1:length(case.u)) .+ 0.1
+        c = constrain(case.built.layout, x)
+        expected = f(c)
+        @test chain.states == expected.idx
+        # At the default controls the chain is the model as written.
+        @test LDP.logdensity(case.rp, x) == LDP.logdensity(case.problem, x)
+        # The innovation frame: each state is its location plus x times its SD.
+        chain.phi .= 1.0
+        chain.c .= 0.0
+        ljac, y = ir(x)
+        @test y[expected.idx] ≈ innovation_walk(x, expected.idx, expected.coef,
+            expected.drift, expected.sd, expected.restart) rtol = 1e-12
+        @test ljac ≈ sum(log, expected.sd) rtol = 1e-12
+        # The gradient through the chain's accessors (Enzyme over the frame kernel).
+        lp, g = LDP.logdensity_and_gradient(case.rp, x)
+        @test lp ≈ LDP.logdensity(case.rp, x)
+        @test g ≈ finite_gradient(z -> LDP.logdensity(case.rp, z), x) rtol = 1e-5 atol = 1e-7
+        chain.phi .= 0.0
+        chain.c .= 1.0
+    end
+    # A model without marked recurrences gets no chains.
+    (; built, plan, problem) = setup()
+    @test isempty(adaptive_centering_problem(built, plan, problem, BACKEND;
+        cells = (z = (location = :z_location, log_scale = :log_scale),)).reparametrizer.chains)
+end
+
+@testset "markov_chains refusals" begin
+    err(f) = try
+        f()
+        "no error"
+    catch e
+        sprint(showerror, e)
+    end
+    y = chain_series([4])[1]
+    @test occursin("already lowered", err(() -> markov_chains(WALK(; T = 4) | (; y), :w)))
+    @test occursin("no top-level `@scan`", err(() -> markov_chains(WALK(; T = 4), :q) | (; y)))
+    @test occursin("integrated out", err(() -> markov_chains(marginalize(WALK(; T = 4), :w), :w)))
+    nonlinear = RKPPLModel(quote
+        s ~ Exponential(1)
+        @scan begin
+            w[1] ~ Normal(0, 1)
+            for t in 2:T
+                w[t] ~ Normal(tanh(w[t - 1]), s)
+            end
+        end
+        y .~ Normal.(w, 1)
+    end, @__MODULE__)
+    msg = err(() -> markov_chains(nonlinear(; T = 4), :w) | (; y))
+    @test occursin("markov_chains(`w`)", msg) && occursin("is not linear", msg)
+end
+
 end
