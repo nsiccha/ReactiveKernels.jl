@@ -214,6 +214,14 @@ const _JAX_CASES = (
         theta ~ Dirichlet(ones(3))
         y .~ Categorical(theta)
     end))(;) | (; y = rand(_JAX_RNG, 1:3, _JAX_N)),
+    # One bound per element from data, infinite entries included: each
+    # element's transform branches on its own bounds' finiteness.
+    elementwise_bounds = () -> (@rkppl(begin
+        mu ~ Normal(0, 1)
+        x[1:n] .~ truncated.(Normal.(mu, 2), lo, hi)
+        y .~ Normal.(x, 0.5)
+    end))(; n = 4, lo = [-Inf, 0.5, -1.0, -Inf], hi = [0.0, Inf, 1.0, Inf]) |
+        (; y = [-0.4, 0.9, 0.2, 2.0]),
     # A scan of two states, whose step outputs a named tuple.
     two_state_scan = () -> (@rkppl(begin
         beta ~ Uniform(0, 1); sigma ~ Exponential(1.0); s ~ Exponential(1.0)
@@ -673,7 +681,10 @@ end
     @test occursin("return {\"a\": ", text)
     ragged = _JAX_CASES.ragged_recurrence()
     rsrc = jax_source(build_kernel(ragged), ragged)
-    @test occursin("def _rk_pad_rows(rows, dtype):", string(rsrc))
+    # The module carries the ragged-row helper as `src/jax_host.jl` defines
+    # it, and pads `R` (one vector per cell, so rank 1) through it.
+    @test occursin(rstrip(ReactiveKernels._JAX_PAD_ROWS), string(rsrc))
+    @test occursin(r"= _rk_pad_rows\([^\n]*, 1\)\n", string(rsrc))
     @test "R_lengths" in first.(rsrc.functions[2].inputs)
     @test occursin("\"ragged\": True", string(rsrc))
     @test occursin("jax.lax.fori_loop(", string(rsrc))

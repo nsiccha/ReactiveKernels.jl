@@ -589,13 +589,23 @@ end
     _interval_destinations!(prepared.storage.buffers, point, gradient, contexts)
 _prepared_structured_destinations(prepared, point, gradient, contexts) = false
 
+# Without a context, DI's Enzyme path calls `Enzyme.gradient!`. Registered
+# Enzyme and older dogfood accept only an array there, so a tuple point keeps
+# the copy path. Dogfood carrying `structured_gradient_inplace` accepts matching
+# tuples of arrays and `Ref`s (`enzyme-use`, "Reverse `gradient!` into
+# caller-owned structured storage"); the repair is in Enzyme's Julia source, so
+# the answer is fixed for the process and read once when the extension loads.
+const _STRUCTURED_GRADIENT_INPLACE = Ref(false)
+_structured_gradient_inplace() =
+    isdefined(Enzyme, :has_dogfood_repair) &&
+    Enzyme.has_dogfood_repair(:structured_gradient_inplace)
+__init__() = (_STRUCTURED_GRADIENT_INPLACE[] = _structured_gradient_inplace(); nothing)
+
 @inline function ReactiveKernels._ad_prepared_tuple_value_and_gradient!(
         backend::ReactiveKernels.DifferentiationInterface.AutoEnzyme{
             <:Union{Nothing,Enzyme.ReverseMode}},
         prepared, gradient, point, contexts)
-    # DI's no-context Enzyme path currently calls gradient!, whose active
-    # argument must be an AbstractArray. Preserve the copy path for tuples.
-    if !isempty(contexts) &&
+    if (!isempty(contexts) || _STRUCTURED_GRADIENT_INPLACE[]) &&
        _prepared_structured_destinations(prepared, point, gradient, contexts)
         return ReactiveKernels.DifferentiationInterface.value_and_gradient!(
             prepared.call, gradient, prepared.preparation, backend,

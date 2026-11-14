@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.179
+## 0.1.182
 
 - A location whose per-row summands are all computed by the model, such as
   `m = level .+ state` over a top-level `@scan` carried array, takes its rows
@@ -27,6 +27,48 @@ are recorded in the git history only.
   takes the scan's length from its supplied bound, so `:observations`,
   `prepare_predictive` and `predictive_laws` give one entry per step. Values,
   densities and gradients of bindings that supply the response are unchanged.
+
+## 0.1.181
+
+- **Breaking:** `jax_source(built, plan; doc)` no longer replaces the module
+  docstring. The docstring keeps its generated first line, then `doc`, the
+  author's description of the model, then the generated `Data:` list and
+  `Model documentation:` statement docstrings. `doc` takes a string or a Julia
+  docstring such as `@doc TOY_MODEL` (a docstring above
+  `const TOY_MODEL = @rkppl …` belongs to the binding, so the caller passes
+  it). A caller that passed `doc` to replace the generated docstring now gets
+  both; no caller in this repository or its known consumers passed it.
+  Requires ReactiveKernels 0.1.242.
+
+## 0.1.180
+
+- A range that reads `end` or `begin` inside an index over data or over a
+  computed array (`x[1:(end - 1)]`, `P[2:end, :]`) stays in its reference and
+  reads that array's extent when the model runs. Lowering had named such an
+  index as a data-only gather index of its own, which left `end` unbound:
+  preparing the model raised `UndefVarError: end not defined`.
+- A data definition or inline gather index whose reference reads `end` or
+  `begin` (`idx = g[2:end]`, then `z[idx]`, or `z[g[2:end]]`) binds as the
+  integer column it evaluates to. Binding had counted that `end` as a name
+  the definition reads, so it refused the read as `not a bound column`. An
+  endpoint outside every reference is still no bound value.
+
+## 0.1.179
+
+- Declared arrays take one bound per element: `x[1:n] .~ restricted.(D.(…), lo, hi)`,
+  `truncated.(D.(…), lo, hi)` and `Uniform.(lo, hi)` accept arrays of the
+  declared shape beside shared numbers, on one- and two-axis arrays: bound
+  data, data-only definitions, literal arrays, or values computed from
+  parameters with the array's axes. A `@plate` cell's own bounds
+  (`x[i] ~ restricted(D, lo[i], hi[i])`) work the same way. Each element has
+  its own transform and log-Jacobian, as Stan's
+  `vector<lower=L, upper=U>[n]`. A `-Inf`/`Inf` entry
+  leaves its element unbounded on that side, and truncation takes the
+  one-sided mass there. The program reads bounds from data and branches per
+  element on their finiteness, so one program serves every length and every
+  pattern of infinite entries. A bound computed from parameters is taken to be
+  finite. Binding refuses a bound array of another size, a vector bound on a
+  two-axis array, and an array bound on a scalar parameter.
 
 ## 0.1.178
 

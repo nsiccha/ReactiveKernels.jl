@@ -1235,8 +1235,12 @@ end
     @test !occursin(r"<[a-z]", plain)
     # Module reads, `Val` tags and Vararg splats resolve while emitting: only
     # the arithmetic they reach is emitted.
+    # Each plain helper the call reaches is a named function (`applied(f, x)`
+    # with `f = sin`, a translation-time value, takes `x` alone).
     dispatch = string(jax_source(jax_dispatch; have = (:w, :x), want = :s))
-    @test occursin("jnp.sin(w)", dispatch)
+    @test occursin("jnp.sin(x)", dispatch)
+    @test occursin("def applied(x: ArrayLike)", dispatch)
+    @test occursin("applied(w)", dispatch)
     @test !occursin(r"<[a-z]", dispatch)
     @test !occursin("None", dispatch)
     # Static guards are Python conditionals over NumPy values, not `lax.cond`.
@@ -1619,7 +1623,8 @@ end
 # jax-ragged-integ-35502154). A Gaussian's guarded scale over a prepared
 # integer `s` (`StaticInt` in the module) is `1.0` in one arm and `s` in the
 # other; an arm's integer and the other's float; an `if` that assigns a local
-# an integer in one arm and a float in the other.
+# an integer in one arm and a float in the other. Arms that are values already
+# bound or literal are selected by `jnp.where`, converted alike.
 @kernel jax_int_scale_arms(y::Vector{Float64}, s::Int, a::Float64) = begin
     lp = plate(y) do yi
         z = (yi - a) / (s == 0 && yi == a ? 1.0 : s)
@@ -1655,10 +1660,10 @@ end
 @testset "jax_source: a traced branch's arms return one JAX type" begin
     y = [0.1, -0.3, 0.4]
     scaled = jax_source(jax_int_scale_arms; have = (:a, :y, :s), want = :total, data = (; y, s = 1))
-    @test occursin("jax.lax.cond(", string(scaled))
-    @test occursin(r"return jnp\.asarray\(s\w*, dtype=jnp\.float64\)", string(scaled))
+    @test occursin("jnp.where(", string(scaled))
+    @test occursin(r"1\.0, jnp\.asarray\(s\w*, dtype=jnp\.float64\)\)", string(scaled))
     mixed = jax_source(jax_mixed_arms; have = (:x,), want = :t)
-    @test occursin("return jnp.asarray(2, dtype=jnp.float64)", string(mixed))
+    @test occursin("jnp.where(x > 0, jnp.asarray(2, dtype=jnp.float64), 0.5)", string(mixed))
     carried = jax_source(jax_mixed_carried_kernel; have = (:x, :n), want = :t, data = (; n = 3))
     @test occursin("jax.lax.cond(", string(carried))
     if !rk_jax_available()
