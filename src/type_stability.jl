@@ -37,8 +37,7 @@ _concrete_value_type(::Type{Type{T}}) where {T} = true
 # `recipe_types(recipe, input_types)` gives a recipe's output types from its
 # input types, where an unknown input is `Any`.
 function _plan_value_types(recipe_types, p::Plan, argument_types)
-    types = Dict{ValueId,Any}(canon_id(p.graph, v.id) => T
-                          for (v, T) in zip(p.have, argument_types))
+    types = _have_types(p, argument_types)
     for recipe in p.recipes
         input_types = _input_list(v -> get(types, canon_id(p.graph, v.id), Any), recipe.inputs)
         for (output, T) in zip(recipe.outputs, recipe_types(recipe, input_types))
@@ -252,7 +251,10 @@ function _uninferred_recipe_text(u::_UninferredValue)
 end
 
 function _uninferred_value_message(u::_UninferredValue)
-    inputs = join(string.(u.input_types), ", ")
+    # `join` prints each type as `string` would. Broadcasting `string` over the
+    # untyped vector would infer `string(::Any)`, which LibGit2's
+    # `string(::GitShortHash)` invalidates (`construction_iteration.jl`).
+    inputs = join(u.input_types, ", ")
     "ReactiveKernels: $(_uninferred_value_label(u)) is not concretely typed. " *
     "Its recipe `$(_uninferred_recipe_text(u))` infers `$(u.inferred)` from " *
     "input types ($inputs). Recipes and plate cells that read it dispatch " *

@@ -48,7 +48,7 @@ function _cell_helper_ir(F, arguments; closure = nothing, scalar = false,
     ci === nothing && return nothing
     push!(stack, key)
     try
-        slots = Dict{Int,Any}(i + 1 => a for (i, a) in enumerate(arguments))
+        slots = _dict_from(Dict{Int,Any}, (i + 1 => a for (i, a) in enumerate(arguments)))
         slots[1] = closure === nothing ? (Base.issingletontype(F) ? F.instance : nothing) : closure
         ssa = Dict{Int,Any}()
         statements = Any[]

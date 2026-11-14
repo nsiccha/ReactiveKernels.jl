@@ -254,7 +254,7 @@ function _history_fold_closure(statements, reads, output, completed)
         for l in r.locals
             haskey(writer, l) && push!(work, writer[l])
         end
-        for a in union(r.current, r.lagged)
+        for a in union(r.current::Set{Symbol}, r.lagged::Set{Symbol})
             a in completed || push!(work, writer[a])
         end
         for a in r.history

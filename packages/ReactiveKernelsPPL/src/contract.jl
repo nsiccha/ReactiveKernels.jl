@@ -1401,12 +1401,12 @@ end
 # type would have one parameter per definition.
 _definitions(plan::StructuralPlan) = Iterators.flatten((plan.assignments, plan.derived))
 # Their names, once per structure (shared: callers only test membership).
-_defined_names(plan::StructuralPlan) = _structural(plan, (:defined_names,);
+_defined_names(plan::StructuralPlan)::Set{Symbol} = _structural(plan, (:defined_names,);
         columns = :none, fresh = false) do
     Set{Symbol}(d.name for d in _definitions(plan))
 end
 # The derived definitions' expressions by name, once per structure (shared).
-_derived_exprs(plan::StructuralPlan) = _structural(plan, (:derived_exprs,);
+_derived_exprs(plan::StructuralPlan)::Dict{Symbol,Any} = _structural(plan, (:derived_exprs,);
         columns = :none, fresh = false) do
     Dict{Symbol,Any}(d.name => d.expr for d in plan.derived)
 end
@@ -1874,7 +1874,7 @@ follows composed expressions for latent-domain validation. Once per
 structure: it reads the plan's fields and the names it is given, never a
 column."""
 _response_reads(plan::StructuralPlan, r, perobs::Set{Symbol};
-        whole_values::Bool = false, stop::Set{Symbol} = Set{Symbol}()) =
+        whole_values::Bool = false, stop::Set{Symbol} = Set{Symbol}())::Set{Symbol} =
     _structural(plan, (:response_reads, r, _names_id(plan, perobs), whole_values,
             _names_id(plan, stop)); columns = :none) do
         _uncached_response_reads(plan, r, perobs; whole_values, stop)
@@ -2438,7 +2438,7 @@ function _size_absent_responses!(plan::StructuralPlan, columns::AbstractDict)
     absent = Set{Symbol}(k for (k, v) in columns if v isa _AbsentArray && v.name === k)
     isempty(absent) && return columns
     axis_plan = _with(plan; columns = Dict{Symbol,ColumnData}(columns))
-    perobs = _structural(axis_plan, (:absent_response_operands,); columns = :types,
+    perobs::Set{Symbol} = _structural(axis_plan, (:absent_response_operands,); columns = :types,
             fresh = false) do
         modelvals, managed = _axis_exempt_columns(axis_plan)
         Set{Symbol}(k for (k, v) in axis_plan.columns
@@ -2550,12 +2550,13 @@ function _absent_cell_shapes(plan::StructuralPlan, columns, response::Symbol)
     haskey(plan.cell_broadcasts, response) || return nothing
     reads = _structural(plan, (:absent_cell_reads, response); columns = :none,
             fresh = false) do
-        reads = Set{Symbol}(plan.cell_broadcasts[response])
+        # Its own name: assigning the enclosing `reads` here would box it.
+        acc = Set{Symbol}(plan.cell_broadcasts[response])
         for d in _definitions(plan)
             rd = _definition_reads(d.expr)
-            response in rd && union!(reads, rd)
+            response in rd && union!(acc, rd)
         end
-        reads
+        acc
     end
     operands = sort!([c for c in reads if c !== response &&
         _supplied(get(columns, c, nothing)) && _holds_arrays(get(columns, c, nothing))])
@@ -2861,7 +2862,7 @@ end
 
 """Observation count of a response's full domain. Ordinary elementwise
 responses use broadcast cells; structured responses retain their row contract."""
-function _response_rows(plan::StructuralPlan, r::LikelihoodSpec)
+function _response_rows(plan::StructuralPlan, r::LikelihoodSpec)::Int
     if !_uses_structured_observation_axes(plan) && haskey(plan.columns, r.response)
         obs = _observation_axes(plan)
         obs === nothing || return prod(length, obs.domains[r.label]; init = 1)
@@ -2876,7 +2877,7 @@ function _structured_response_rows(plan::StructuralPlan, r::LikelihoodSpec)
     r.mi_jobs === nothing && haskey(plan.columns, r.response) &&
         return _column_nrows(plan.columns[r.response])
     reads = _response_reads(plan, r, _row_columns(plan))
-    ns = unique!([_column_nrows(plan.columns[c]) for c in reads])
+    ns = unique!(Int[_column_nrows(plan.columns[c]) for c in reads]::Vector{Int})
     length(ns) == 1 && return only(ns)
     isempty(ns) && return plan.n_obs
     _fail(r.label, "mi() location reads columns with different rows $ns")
@@ -2898,7 +2899,7 @@ function _value_rows(plan::StructuralPlan, name::Symbol)
     ns = _value_row_counts(plan, name)
     length(ns) == 1 && return only(ns)
     if isempty(ns)
-        axes = unique!([_response_rows(plan, r) for r in plan.responses])
+        axes = unique!(Int[_response_rows(plan, r) for r in plan.responses]::Vector{Int})
         length(axes) == 1 && return only(axes)
         isempty(axes) && return plan.n_obs
         _fail(name, "value $name has no data range or response to establish its rows")
@@ -2912,11 +2913,11 @@ end
 function _value_row_counts(plan::StructuralPlan, name::Symbol)
     haskey(plan.columns, name) && return [_column_nrows(plan.columns[name])]
     reads = _response_reads(plan, name, _row_columns(plan))
-    ns = unique!([_column_nrows(plan.columns[c]) for c in reads])
+    ns = unique!(Int[_column_nrows(plan.columns[c]) for c in reads]::Vector{Int})
     isempty(ns) || return ns
     names = Set{Symbol}([name])
-    return unique!([_response_rows(plan, r) for r in plan.responses
-        if name in _response_reads(plan, r, names)])
+    return unique!(Int[_response_rows(plan, r) for r in plan.responses
+        if name in _response_reads(plan, r, names)]::Vector{Int})
 end
 
 function _plate_rows(plan::StructuralPlan, p::PlateParameter;
@@ -2958,7 +2959,7 @@ end
 # exempt a column when every read is a declared level axis or its gather.
 # A second, numeric read of that same column removes the exemption. Once per
 # structure: it reads the column names, never a column value.
-_label_only_columns(plan::StructuralPlan) = _structural(
+_label_only_columns(plan::StructuralPlan)::Set{Symbol} = _structural(
     () -> _uncached_label_only_columns(plan), plan, (:label_only_columns,))
 
 function _uncached_label_only_columns(plan::StructuralPlan)
@@ -3010,7 +3011,9 @@ function _uncached_label_only_columns(plan::StructuralPlan)
             end
             foreach(visit, x.args)
         elseif x isa Union{AbstractArray,Tuple,NamedTuple,AbstractSet}
-            foreach(visit, x)
+            for v in x
+                visit(v)
+            end
         elseif isstructtype(typeof(x)) && parentmodule(typeof(x)) === @__MODULE__
             for f in fieldnames(typeof(x))
                 isdefined(x, f) && visit(getfield(x, f))
@@ -3309,7 +3312,7 @@ end
 # (`_materialize_derived_responses!`), exactly like the same value bound as
 # data. A caller-owned law observing a parameter-dependent definition
 # reads it in the graph instead.
-_derived_response_names(plan::StructuralPlan) = _structural(
+_derived_response_names(plan::StructuralPlan)::Vector{Symbol} = _structural(
     () -> _uncached_derived_response_names(plan), plan, (:derived_response_names,);
     columns = :none)
 
@@ -3378,12 +3381,16 @@ function _validate_vector_alias(d::VectorAssignmentSpec, plan, bound::Bool)
     return nothing
 end
 
-_union_names(plan::StructuralPlan) = _structural(plan, (:union_names,);
+# `_structural` returns its cached value untyped, so each accessor declares the
+# type its analysis returns: an untyped `union`/`setdiff` on the result takes
+# Base's generic `AbstractVector` path, which any package adding a `lastindex`
+# method invalidates (JSON 1.x; snag downstream-workl-75f8cba4).
+_union_names(plan::StructuralPlan)::Vector{Symbol} = _structural(plan, (:union_names,);
         columns = :none) do
     union([p.name for p in plan.parameters], [a.name for a in plan.assignments])
 end
 # The same names as a set, shared: callers only test membership.
-_union_name_set(plan::StructuralPlan) = _structural(plan, (:union_name_set,);
+_union_name_set(plan::StructuralPlan)::Set{Symbol} = _structural(plan, (:union_name_set,);
     columns = :none, fresh = false) do
     Set{Symbol}(_union_names(plan))
 end
@@ -3392,14 +3399,14 @@ end
 (plate) parameter VECTORS (dependency edges and bind-time reference checks
 admit all; sampled-arg positions stay scalar-only via [`_union_names`](@ref),
 so a scalar arg can never reference a latent vector)."""
-_all_names(plan::StructuralPlan) = _structural(plan, (:all_names,);
+_all_names(plan::StructuralPlan)::Vector{Symbol} = _structural(plan, (:all_names,);
         columns = :none) do
     union(_union_names(plan), [d.name for d in plan.derived],
         [p.name for p in plan.plate_parameters], _vector_value_names(plan),
         _array_names(plan), [a for s in plan.scans for a in s.states])
 end
 # The same names as a set, shared: callers only test membership.
-_all_name_set(plan::StructuralPlan) = _structural(plan, (:all_name_set,);
+_all_name_set(plan::StructuralPlan)::Set{Symbol} = _structural(plan, (:all_name_set,);
     columns = :none, fresh = false) do
     Set{Symbol}(_all_names(plan))
 end
@@ -7460,7 +7467,14 @@ function _validate_evidence_data(r::LikelihoodSpec, plan::StructuralPlan)
     above = hi === nothing ? false : resp .> hi
     bad = lo === nothing && hi === nothing ? Int[] : findall(below .| above)
     if r.mi_jobs !== nothing && r.range !== nothing
-        selected = findall(j -> j in r.range, plan.columns[r.mi_jobs])
+        # A loop, not `findall` on the untyped column: that call dispatches to
+        # SparseArrays' matrix method, which a package adding `lastindex`
+        # invalidates (snag downstream-workl-75f8cba4).
+        jobs = plan.columns[r.mi_jobs]
+        selected = Int[]
+        for i in eachindex(jobs)
+            jobs[i] in r.range && push!(selected, i)
+        end
         filter!(i -> i in selected, bad)
     end
     isempty(bad) || _fail(r.label,
@@ -7590,7 +7604,7 @@ _definition_reads(ex) = _is_plate_column_expr(ex) ? _plate_column_reads(ex) :
 function _plate_column_reads(ex)
     call, lam = ex.args
     reads = Set{Symbol}()
-    foreach(a -> _expr_value_symbols(a, reads), call.args[2:end])
+    foreach(a -> _expr_value_symbols(a, reads), (call::Expr).args[2:end])
     formals = Meta.isexpr(lam.args[1], :tuple) ? lam.args[1].args : Any[lam.args[1]]
     cell = Set{Symbol}(f for f in formals if f isa Symbol)
     body = Meta.isexpr(lam.args[2], :block) ? lam.args[2].args : Any[lam.args[2]]
@@ -7644,8 +7658,15 @@ function _eval_plate_column(ex, lookup, label)
         "[bind] $label: plate inputs differ in length"))
     formals = Meta.isexpr(lam.args[1], :tuple) ? lam.args[1].args : Any[lam.args[1]]
     return [begin
-        cell = Dict{Symbol,Any}(f => _plate_lane_value(lane, k)
-            for (f, lane) in zip(formals, lanes))
+        # A loop, not `Dict(… for (f, lane) in zip(formals, lanes))`: the
+        # comprehension's closure holds `formals` and `lanes` untyped, and
+        # `Dict` of a generator over them asks `IteratorSize`, which a
+        # package defining it for its own iterator invalidates (snag
+        # downstream-workl-75f8cba4).
+        cell = Dict{Symbol,Any}()
+        for (f, lane) in zip(formals, lanes)
+            cell[f] = _plate_lane_value(lane, k)
+        end
         read(nm) = haskey(cell, nm) ? cell[nm] : lookup(nm)
         _eval_plate_cell(lam.args[2], cell, read, label)
     end for k in 1:n]
@@ -7751,7 +7772,7 @@ for caller-supplied column collision checks. Once per structure: it reads
 the raw names it is given, roles and conditioned names, never the column
 table."""
 _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
-        bind_only = false, unbound::Bool=false) =
+        bind_only = false, unbound::Bool=false)::Set{Symbol} =
     _structural(plan, (:module_data_names, _names_id(plan, raw), bind_only, unbound);
             columns = :none) do
         _uncached_module_data_names(plan, raw; bind_only, unbound)
@@ -7976,7 +7997,7 @@ function _preparation_data_names(plan, nodes, raw, onlydata, names;
     return setdiff!(prepared, needed)
 end
 
-_module_data_names(plan::StructuralPlan; unbound::Bool=false) =
+_module_data_names(plan::StructuralPlan; unbound::Bool=false)::Set{Symbol} =
     _structural(plan, (:module_data_names_of_columns, unbound)) do
         nodes = _defined_names(plan)
         raw = Set{Symbol}(k for k in keys(plan.columns) if k ∉ nodes)
@@ -7984,7 +8005,7 @@ _module_data_names(plan::StructuralPlan; unbound::Bool=false) =
     end
 
 """In a bound plan: the module data definitions bound as columns."""
-_bound_module_data_names(plan::StructuralPlan) =
+_bound_module_data_names(plan::StructuralPlan)::Set{Symbol} =
     _structural(plan, (:bound_module_data_names,)) do
         Set{Symbol}(n for n in _module_data_names(plan) if haskey(plan.columns, n))
     end
@@ -8005,7 +8026,7 @@ fail-closed). Prior-only reads keep their declared latent domain.
 Returns `(inputs, defs)`: the columns, and the
 whole-context definitions (whose values may have any length too). Once per
 structure: it reads the column names, never a column value."""
-_model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol}) =
+_model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})::Tuple{Set{Symbol},Any} =
     _structural(() -> _uncached_model_level_inputs(plan, raw), plan,
         (:model_level_inputs, _names_id(plan, raw)))
 
@@ -8271,9 +8292,13 @@ function _classify_reads!(whole::Set{Symbol}, per_obs::Set{Symbol}, ex,
             visit(ex.args[2], inside)
             visit(ex.args[3], true)
         elseif _is_plate_column_expr(ex)
-            foreach(a -> visit(a, inside), ex.args[1].args[2:end])
+            for a in ex.args[1].args[2:end]
+                visit(a, inside)
+            end
             # The cell reads each value it closes over whole.
-            foreach(a -> visit(a, true), _plate_column_captures(ex))
+            for a in _plate_column_captures(ex)
+                visit(a, true)
+            end
         elseif ex.head === :kw && length(ex.args) == 2
             visit(ex.args[2], inside)
         elseif ex.head === :tuple
@@ -8428,7 +8453,7 @@ end
 # The `_bound_value` inputs a plan reads, wherever lowering moved their
 # definitions (a definition used only in a predictor is inlined there).
 # Once per structure: it reads no column.
-_bound_value_inputs(plan::StructuralPlan) = _structural(
+_bound_value_inputs(plan::StructuralPlan)::Set{Symbol} = _structural(
     () -> _uncached_bound_value_inputs(plan), plan, (:bound_value_inputs,);
     columns = :none)
 
@@ -9077,11 +9102,14 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     end
 end
 
-function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
+function _bind_data_latest(input_plan::StructuralPlan, columns::AbstractDict{Symbol};
         roles::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}(),
         dims::AbstractDict{Symbol,<:Integer} = Dict{Symbol,Int}(),
-        conditioned = plan.conditioned, frozen::FrozenValues = plan.frozen)
-    sampled = _structural(plan, (:sampled_names,); columns = :none, fresh = false) do
+        conditioned = input_plan.conditioned, frozen::FrozenValues = input_plan.frozen)
+    # `plan` is reassigned below and captured by closures, so Julia boxes it;
+    # declared, its uses stay typed (snag downstream-workl-75f8cba4).
+    plan::StructuralPlan = input_plan
+    sampled::Set{Symbol} = _structural(plan, (:sampled_names,); columns = :none, fresh = false) do
         Set{Symbol}(p.name for ps in (plan.parameters, plan.factors, plan.array_parameters,
             plan.vector_parameters, plan.plate_parameters) for p in ps)
     end
@@ -9275,7 +9303,7 @@ function _route_conditioned_values!(plan, columns)
     return columns
 end
 
-function _validate_conditioned_values(plan)
+function _validate_conditioned_values(plan::StructuralPlan)
     # Definitions already have a graph value and are validated as factors;
     # they require no separate caller-supplied observed value.
     known = Set{Symbol}(p.name for p in plan.factors if p.name in plan.conditioned)

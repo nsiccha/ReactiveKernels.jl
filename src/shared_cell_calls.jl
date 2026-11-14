@@ -331,7 +331,7 @@ Base.@nospecializeinfer function _shared_data_plate(
     any(v -> canon_id(g, v.id) in kept, recipe.outputs) && return recipe
     atomic = _plate_atomic(op)
     kernel = op.kernel
-    inner = kernel.plan
+    inner = kernel.plan::Plan
     ig = inner.graph
     varying = Set{ValueId}()
     same = Set{ValueId}()
@@ -346,8 +346,8 @@ Base.@nospecializeinfer function _shared_data_plate(
         any(v -> canon_id(ig, v.id) in varying, q.inputs) &&
             push!(varying, canon_id(ig, only(q.outputs).id))
     end
-    readable = Dict{Int,Any}(q.id => source for (q, source) in
-                             zip(inner.recipes, kernel.lowered_recipes))
+    readable = _dict_from(Dict{Int,Any}, (q.id => source for (q, source) in
+                                          zip(inner.recipes, kernel.lowered_recipes)))
     rewritten = _shared_cell_calls(ig, inner.recipes, varying, readable, same;
                                    package_calls_only = true)
     canon_id(ig, only(inner.want).id) in same &&

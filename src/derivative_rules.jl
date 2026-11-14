@@ -808,9 +808,13 @@ function _reverse_frontier(cut_spec, covector::Symbol, inputs)
         # Record the names separately so none becomes a false residual that
         # preparation tries to compute before the covector is available.
         union!(dependent, output isa Symbol ? (output,) : output)
-        foreach(note!, arguments)
+        for a in arguments
+            note!(a)
+        end
     end
-    foreach(note!, ret isa Symbol ? (ret,) : ret)
+    for a in (ret isa Symbol ? (ret,) : ret)
+        note!(a)
+    end
     (Tuple(n for n in inputs if n in read)...,
      Tuple(n for n in read if !(n in inputs))...)
 end

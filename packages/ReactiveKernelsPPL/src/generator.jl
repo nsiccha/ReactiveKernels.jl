@@ -1973,9 +1973,11 @@ function _cell_broadcast_group(plan::StructuralPlan, response::Symbol, node::Sym
     # not among them, so a binding that leaves the response absent evaluates
     # it, with the indices the cell's other per-index values give.
     function readlanes(statements, value)
-        reads = _statement_value_reads!(Set{Symbol}(), value)
-        foreach(st -> _statement_value_reads!(reads, st.args[2]), statements)
-        sub = Symbol[v for v in lanes if aliases[v] in reads]
+        # Its own name: a second assignment to `reads`, which closures above
+        # and here capture, would box it.
+        lawreads = _statement_value_reads!(Set{Symbol}(), value)
+        foreach(st -> _statement_value_reads!(lawreads, st.args[2]), statements)
+        sub = Symbol[v for v in lanes if aliases[v] in lawreads]
         return isempty(sub) ? lanes : sub
     end
     totals = Symbol(pw, :_totals)
@@ -2110,9 +2112,11 @@ end
 # Value names a generated statement reads: call heads and keyword names are
 # skipped. A plate cell or scan step reads the enclosing names it closes
 # over (`_closure_reads`).
-_statement_value_reads!(out, ex) = out
-_statement_value_reads!(out, ex::Symbol) = push!(out, ex)
-function _statement_value_reads!(out, ex::Expr)
+# `out` is always a `Set{Symbol}`; typed, so its `union!` below is not Base's
+# generic vector path that a package adding `lastindex` invalidates.
+_statement_value_reads!(out::Set{Symbol}, ex) = out
+_statement_value_reads!(out::Set{Symbol}, ex::Symbol) = push!(out, ex)
+function _statement_value_reads!(out::Set{Symbol}, ex::Expr)
     if ex.head === :do
         _statement_value_reads!(out, ex.args[1])
         _statement_value_reads!(out, ex.args[2])
@@ -2123,7 +2127,7 @@ function _statement_value_reads!(out, ex::Expr)
     elseif ex.head === :. && length(ex.args) == 2
         ex.args[2] isa QuoteNode && _statement_value_reads!(out, ex.args[1])
         ex.args[2] isa Expr && foreach(a -> _statement_value_reads!(out, a),
-            ex.args[2].args)
+            (ex.args[2]::Expr).args)
     elseif ex.head === :kw
         _statement_value_reads!(out, ex.args[2])
     elseif ex.head === :(->)
@@ -2153,9 +2157,13 @@ function _assigned_names!(out::Set{Symbol}, ex)
     name = _assigned_name(ex)
     name === nothing || push!(out, name)
     if Meta.isexpr(ex, :(=), 2) && Meta.isexpr(ex.args[1], :tuple)
-        foreach(a -> a isa Symbol && push!(out, a), ex.args[1].args)
+        for a in ex.args[1].args
+            a isa Symbol && push!(out, a)
+        end
     end
-    foreach(a -> _assigned_names!(out, a), ex.args)
+    for a in ex.args
+        _assigned_names!(out, a)
+    end
     return out
 end
 
