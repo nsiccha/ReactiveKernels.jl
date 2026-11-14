@@ -21,6 +21,9 @@ include("test_ad_retained_outputs.jl")
 include("test_ad_constant_ports.jl")
 include("test_ad_warm.jl")
 include("test_ad_atomic_shadows.jl")
+include("test_ad_structured_buffers.jl")
+include("test_ad_scalar_storage.jl")
+include("test_ad_structured_aliases.jl")
 
 const TEST_AD_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 

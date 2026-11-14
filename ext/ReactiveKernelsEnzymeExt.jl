@@ -391,6 +391,219 @@ ReactiveKernels._nonallocating_ad_default(
     ::ReactiveKernels.DifferentiationInterface.AutoEnzyme{
         <:Union{Nothing,Enzyme.ReverseMode}}) = true
 
+# --------------------------------------------- structured gradient buffers ----
+
+# DI's reverse interface can write a structured gradient into caller-owned
+# shadows. Keep the existing copy path when the destination representation is
+# different, or when zeroing a shadow could modify a primal/context operand.
+_dense_shadow_pair(x, dx) = false
+_dense_shadow_pair(x::Array{T,N}, dx::Array{T,N}) where {T,N} =
+    isbitstype(T) && size(x) == size(dx)
+_dense_shadow_pair(x::Base.RefValue{T}, dx::Base.RefValue{T}) where {T} =
+    isbitstype(T)
+
+@inline _shadow_disjoint(dx, x) = isbitstype(typeof(x))
+@inline _shadow_disjoint(dx::Array, x::Array) =
+    isbitstype(eltype(x)) && !_residual_storage_overlaps(dx, x)
+@inline function _ref_array_disjoint(ref::Base.RefValue{T}, array::Array) where {T}
+    isbitstype(T) && isbitstype(eltype(array)) || return false
+    isempty(array) && return true
+    GC.@preserve ref array begin
+        pr = UInt(Base.unsafe_convert(Ptr{T}, ref))
+        pa = UInt(pointer(array))
+        pr <= pa ? pa - pr >= sizeof(T) : pr - pa >= sizeof(array)
+    end
+end
+@inline _shadow_disjoint(dx::Base.RefValue, x::Array) = _ref_array_disjoint(dx, x)
+@inline function _shadow_disjoint(dx::Array, x::Base.RefValue{T}) where {T}
+    isbitstype(T) && return _ref_array_disjoint(x, dx)
+    T !== Any && (!isassigned(x) || _shadow_disjoint(dx, x[]))
+end
+@inline _shadow_disjoint(dx, x::Base.RefValue{T}) where {T} =
+    T !== Any && dx !== x && (!isassigned(x) || _shadow_disjoint(dx, x[]))
+@inline _shadow_disjoint(dx, x::NamedTuple) = _shadow_disjoint(dx, values(x))
+@inline _shadow_disjoint(dx, x::Tuple{}) = true
+function _shadow_disjoint(dx, x::NTuple{N,T}) where {N,T}
+    for value in x
+        _shadow_disjoint(dx, value) || return false
+    end
+    true
+end
+@generated function _shadow_disjoint(dx, x::T) where {T<:Tuple}
+    checks = [:(_shadow_disjoint(dx, getfield(x, $i)) || return false)
+              for i in 1:fieldcount(T)]
+    Expr(:block, Expr(:meta, :inline), checks..., true)
+end
+
+# This direct check is used only for up to four active ports. Context tuple
+# traversal stays linear; larger selectors use the sorted interval sweep.
+@inline _dense_shadow_pairs(point::Tuple{}, gradient::Tuple{}) = true
+@inline _dense_shadow_pairs(point::Tuple, gradient::Tuple) =
+    _dense_shadow_pair(first(point), first(gradient)) &&
+    _shadow_disjoint(first(point), Base.tail(point)) &&
+    _shadow_disjoint(first(gradient), Base.tail(gradient)) &&
+    _dense_shadow_pairs(Base.tail(point), Base.tail(gradient))
+@inline _shadows_disjoint(gradient::Tuple{}, sources) = true
+@inline _shadows_disjoint(gradient::Tuple, sources) =
+    _shadow_disjoint(first(gradient), sources) &&
+    _shadows_disjoint(Base.tail(gradient), sources)
+
+@inline function _structured_destinations(point::Tuple, gradient::Tuple, contexts)
+    length(point) == length(gradient) &&
+        _dense_shadow_pairs(point, gradient) &&
+        _shadows_disjoint(gradient, point) &&
+        _shadows_disjoint(gradient,
+            map(ReactiveKernels.DifferentiationInterface.unwrap, contexts))
+end
+_structured_destinations(point, gradient, contexts) = false
+
+struct _ShadowInterval
+    lo::UInt
+    hi::UInt
+    kind::UInt8  # 1: active input, 2: destination, 3: inactive context
+end
+struct _ShadowIntervals
+    ranges::Vector{_ShadowInterval}
+end
+_ShadowIntervals() = _ShadowIntervals(_ShadowInterval[])
+
+@inline function _push_shadow_interval!(work, x::Array, kind)
+    isbitstype(eltype(x)) || return false
+    isempty(x) && return true
+    lo = UInt(pointer(x))
+    bytes = sizeof(x)
+    bytes == 0 || push!(work.ranges, _ShadowInterval(lo, lo + bytes, kind))
+    true
+end
+@inline function _push_shadow_interval!(work, x::Base.RefValue{T}, kind) where {T}
+    if isbitstype(T)
+        lo = UInt(Base.unsafe_convert(Ptr{T}, x))
+        bytes = sizeof(T)
+        bytes == 0 || push!(work.ranges, _ShadowInterval(lo, lo + bytes, kind))
+        return true
+    end
+    T !== Any && (!isassigned(x) || _push_shadow_interval!(work, x[], kind))
+end
+@inline _push_shadow_interval!(work, x::Tuple{}, kind) = true
+function _push_shadow_interval!(work, x::NTuple{N,T}, kind) where {N,T}
+    for value in x
+        _push_shadow_interval!(work, value, kind) || return false
+    end
+    true
+end
+# Heterogeneous fields follow the prepared boundary's structural types;
+# homogeneous tuples above retain a runtime loop without copying tuple tails.
+@generated function _push_shadow_interval!(work, x::T, kind) where {T<:Tuple}
+    checks = [:(_push_shadow_interval!(work, getfield(x, $i), kind) || return false)
+              for i in 1:fieldcount(T)]
+    Expr(:block, Expr(:meta, :inline), checks..., true)
+end
+@inline _push_shadow_interval!(work, x::NamedTuple, kind) =
+    _push_shadow_interval!(work, values(x), kind)
+@inline _push_shadow_interval!(work, x, kind) = isbitstype(typeof(x))
+
+# In-place heapsort keeps worst-case O(m log m) work without a sorting buffer.
+function _sift_shadow_intervals!(a, root, last)
+    saved = a[root]
+    while root <= last ÷ 2
+        child = 2root
+        child < last && a[child].lo < a[child+1].lo && (child += 1)
+        saved.lo >= a[child].lo && break
+        a[root] = a[child]
+        root = child
+    end
+    a[root] = saved
+end
+function _sort_shadow_intervals!(a)
+    for root in length(a)÷2:-1:1
+        _sift_shadow_intervals!(a, root, length(a))
+    end
+    for last in length(a):-1:2
+        a[1], a[last] = a[last], a[1]
+        _sift_shadow_intervals!(a, 1, last-1)
+    end
+    a
+end
+function _shadow_intervals_disjoint!(work)
+    _sort_shadow_intervals!(work.ranges)
+    input_end = UInt(0)
+    destination_end = UInt(0)
+    context_end = UInt(0)
+    for r in work.ranges
+        if r.kind == 0x01
+            r.lo < max(input_end, destination_end) && return false
+            input_end = max(input_end, r.hi)
+        elseif r.kind == 0x02
+            r.lo < max(input_end, destination_end, context_end) && return false
+            destination_end = max(destination_end, r.hi)
+        else
+            r.lo < destination_end && return false
+            context_end = max(context_end, r.hi)
+        end
+    end
+    true
+end
+@inline _compatible_shadow_pairs(::Tuple{}, ::Tuple{}) = true
+function _compatible_shadow_pairs(point::NTuple{N,P}, gradient::NTuple{N,G}) where {N,P,G}
+    for i in eachindex(point)
+        _dense_shadow_pair(point[i], gradient[i]) || return false
+    end
+    true
+end
+@generated function _compatible_shadow_pairs(point::P, gradient::G) where {P<:Tuple,G<:Tuple}
+    fieldcount(P) == fieldcount(G) || return false
+    checks = [:(_dense_shadow_pair(getfield(point, $i), getfield(gradient, $i)) || return false)
+              for i in 1:fieldcount(P)]
+    Expr(:block, Expr(:meta, :inline), checks..., true)
+end
+_interval_destinations!(::Nothing, point, gradient, contexts) = false
+function _interval_destinations!(work, point, gradient, contexts)
+    length(point) == length(gradient) &&
+        _compatible_shadow_pairs(point, gradient) || return false
+    empty!(work.ranges)
+    sources = map(ReactiveKernels.DifferentiationInterface.unwrap, contexts)
+    GC.@preserve point gradient sources begin
+        _push_shadow_interval!(work, point, 0x01) &&
+        _push_shadow_interval!(work, gradient, 0x02) &&
+        _push_shadow_interval!(work, sources, 0x03) &&
+        _shadow_intervals_disjoint!(work)
+    end
+end
+
+function ReactiveKernels._ad_gradient_buffer_storage(
+        ::ReactiveKernels.DifferentiationInterface.AutoEnzyme{
+            <:Union{Nothing,Enzyme.ReverseMode}}, point::Tuple, contexts)
+    length(point) <= 4 && return nothing
+    work = _ShadowIntervals()
+    sources = map(ReactiveKernels.DifferentiationInterface.unwrap, contexts)
+    GC.@preserve point sources begin
+        _push_shadow_interval!(work, point, 0x01)
+        _push_shadow_interval!(work, point, 0x02)
+        _push_shadow_interval!(work, sources, 0x03)
+    end
+    empty!(work.ranges)
+    work
+end
+@inline _prepared_structured_destinations(prepared, point::Tuple, gradient::Tuple, contexts) =
+    length(point) <= 4 ? _structured_destinations(point, gradient, contexts) :
+    _interval_destinations!(prepared.storage.buffers, point, gradient, contexts)
+_prepared_structured_destinations(prepared, point, gradient, contexts) = false
+
+@inline function ReactiveKernels._ad_prepared_tuple_value_and_gradient!(
+        backend::ReactiveKernels.DifferentiationInterface.AutoEnzyme{
+            <:Union{Nothing,Enzyme.ReverseMode}},
+        prepared, gradient, point, contexts)
+    # DI's no-context Enzyme path currently calls gradient!, whose active
+    # argument must be an AbstractArray. Preserve the copy path for tuples.
+    if !isempty(contexts) &&
+       _prepared_structured_destinations(prepared, point, gradient, contexts)
+        return ReactiveKernels.DifferentiationInterface.value_and_gradient!(
+            prepared.call, gradient, prepared.preparation, backend,
+            point, contexts...)
+    end
+    ReactiveKernels._ad_copy_value_and_gradient!(prepared, gradient, point, contexts)
+end
+
 # ------------------------------------------------- atomic shadow updates ----
 
 # Enzyme compiles every shadow accumulation as an atomic update whenever the
