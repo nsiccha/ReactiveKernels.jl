@@ -16,6 +16,19 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.234
+
+- JAX source computes `sortperm(v)` and `invperm(p)` of data in the host
+  `prepare_data`, as it computes `sort` and `unique`. `sortperm` of a vector of
+  numbers or strings orders as Julia's `isless` (-0.0 before 0.0, every NaN
+  last) and keeps equal values in ascending position; `invperm` of a vector of
+  integers raises `ArgumentError: argument is not a permutation` where Julia
+  throws it. Keyword orders (`rev`, `by`, `lt`) still have no translation. In
+  the JAX functions (a recipe that also reads a parameter) neither function
+  has a translation, and the refusal now names it and says to compute it in a
+  definition that reads data alone; `sortperm`'s used to name only a
+  `NamedTuple`.
+
 ## 0.1.233
 
 - JAX source retains named, documented functions for source-backed helpers and

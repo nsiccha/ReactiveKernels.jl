@@ -915,13 +915,13 @@ def _rk_isequal(a, b):
     return True
 """
 
-# --- order: sort, unique, searchsortedfirst --------------------------------------------
+# --- order: sort, sortperm, unique, searchsortedfirst, invperm ---------------------------
 
 # Julia's `isless` order on the host. A float array orders by integer keys:
 # -0.0 before 0.0 and every NaN last, with equal keys exactly for the values
-# `isequal` treats as equal, so `sort`, `unique` and `searchsortedfirst`
-# agree with Julia's on every value. Integer and string arrays are their own
-# keys.
+# `isequal` treats as equal, so `sort`, `sortperm`, `unique` and
+# `searchsortedfirst` agree with Julia's on every value. Integer and string
+# arrays are their own keys.
 const _HOST_ORDER = Dict{Symbol,Pair{String,String}}(
     :key => "_rk_order_key_np" => """
 def _rk_order_key_np(x):
@@ -940,6 +940,30 @@ def _rk_sort_np(x):
     # their order.
     x = np.asarray(x)
     return x[np.argsort(_rk_order_key_np(x), kind="stable")]
+""",
+    :sortperm => "_rk_sortperm_np" => """
+def _rk_sortperm_np(x):
+    # Julia's sortperm of a vector: the 1-based positions that sort it in
+    # isless order, equal values in ascending position.
+    x = np.asarray(x)
+    return np.argsort(_rk_order_key_np(x), kind="stable").astype(np.int64) + 1
+""",
+    :invperm => "_rk_invperm_np" => """
+def _rk_invperm_np(p):
+    # Julia's invperm of a permutation p of 1..n: q with q[p[i]] = i, 1-based.
+    # Anything else (an entry outside 1..n, a repeated entry) raises, as
+    # Julia's ArgumentError does.
+    p = np.asarray(p, dtype=np.int64)
+    n = p.shape[0]
+    q = np.zeros(n, dtype=np.int64)
+    if n == 0:
+        return q
+    if p.min() < 1 or p.max() > n:
+        raise ValueError("ArgumentError: argument is not a permutation")
+    q[p - 1] = np.arange(1, n + 1, dtype=np.int64)
+    if (q == 0).any():
+        raise ValueError("ArgumentError: argument is not a permutation")
+    return q
 """,
     :unique => "_rk_unique_np" => """
 def _rk_unique_np(x):
@@ -968,6 +992,7 @@ def _rk_searchsorted_np(v, x, side):
     return search(v, _rk_isless_key_np(x), key=_rk_isless_key_np)
 """)
 const _HOST_ORDER_KEYS = Dict(:sort => (:key, :sort), :unique => (:key, :unique),
+                              :sortperm => (:key, :sortperm), :invperm => (:invperm,),
                               :search => (:isless, :search))
 
 # The host helper `which` (with the order key it calls), defined once.
@@ -993,12 +1018,15 @@ function _host_ordered_eltype(ctx::_JaxContext, f, @nospecialize(T))
                "strings order on the host)", _jax_where(ctx))
 end
 
+# `sort(v)`, `unique(v)` and `sortperm(v)` in Julia's default order (no
+# keywords); `sortperm` returns the positions, `Int`s.
 function _host_order_call(ctx::_JaxContext, f, which::Symbol, args::Vector{_PyVal})
     length(args) == 1 ||
         _jax_error("`", f, "` with ", length(args), " arguments has no host translation",
                    _jax_where(ctx))
     E = _host_ordered_eltype(ctx, f, args[1].T)
-    _PyVal(_host_order_helper!(ctx, which) * "(" * args[1].code * ")", Vector{E}, true)
+    _PyVal(_host_order_helper!(ctx, which) * "(" * args[1].code * ")",
+           which === :sortperm ? Vector{Int} : Vector{E}, true)
 end
 for (f, which) in ((sort, :sort), (unique, :unique))
     @eval function _jax_call_positional(ctx::_JaxContext, ::typeof($f), args::Vector{_PyVal})
@@ -1007,6 +1035,26 @@ for (f, which) in ((sort, :sort), (unique, :unique))
                           ctx, $f, args)
         _host_order_call(ctx, $f, $(QuoteNode(which)), args)
     end
+end
+# `sortperm` and `invperm` have host translations only. In the JAX functions
+# they take the generic route (a `_jax_function_call` method, then recorded
+# source, then lowered code), and its refusal names the function: Julia's own
+# methods have loops and branches, and `sortperm`'s lowered code fails on
+# building its keyword defaults (a `NamedTuple`), a refusal that would not
+# name `sortperm` otherwise.
+function _jax_host_only(ctx::_JaxContext, f, args::Vector{_PyVal})
+    try
+        invoke(_jax_call_positional, Tuple{_JaxContext,Function,Vector{_PyVal}}, ctx, f, args)
+    catch e
+        e isa JAXEmissionError || rethrow()
+        _jax_error("`", f, "` has no translation in the JAX functions, only in the host ",
+                   "`prepare_data` (compute it in a definition that reads data alone): ",
+                   e.message)
+    end
+end
+function _jax_call_positional(ctx::_JaxContext, ::typeof(sortperm), args::Vector{_PyVal})
+    ctx.host === nothing && return _jax_host_only(ctx, sortperm, args)
+    _host_order_call(ctx, sortperm, :sortperm, args)
 end
 # `searchsortedfirst(v, x)` and `searchsortedlast(v, x)`, 1-based as Julia's:
 # a bisection of `v` (an array, or a list searched in place).
@@ -1029,6 +1077,20 @@ for f in (searchsortedfirst, searchsortedlast)
                        "(`", $f, "(v, x)` has)", _jax_where(ctx))
         _host_search(ctx, $f, args[1], args[2])
     end
+end
+# `invperm(p)` of a vector of integers: the inverse permutation, raising as
+# Julia does when `p` is not a permutation of `1:length(p)`.
+function _jax_call_positional(ctx::_JaxContext, ::typeof(invperm), args::Vector{_PyVal})
+    ctx.host === nothing && return _jax_host_only(ctx, invperm, args)
+    length(args) == 1 ||
+        _jax_error("`invperm` with ", length(args), " arguments has no host translation",
+                   _jax_where(ctx))
+    T = args[1].T
+    E = T isa Type && T <: AbstractVector ? eltype(T) : nothing
+    E isa Type && E <: Integer && !(E <: Bool) ||
+        _jax_error("`invperm` of a `", T, "` has no host translation (a vector of integers ",
+                   "has)", _jax_where(ctx))
+    _PyVal(_host_order_helper!(ctx, :invperm) * "(" * args[1].code * ")", Vector{E}, true)
 end
 
 # A local list read in place where Julia reads one entry or searches it, so a
