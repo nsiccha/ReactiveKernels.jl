@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.184
+## 0.1.185
 
 - `marginalize(model, :x)` also integrates out a recurrence inside a `@plate`
   cell, one Kalman filter per index: a cell `@scan` carrying `x` as in 0.1.183,
@@ -26,6 +26,18 @@ are recorded in the git history only.
   scale may be one value per index (`level[g]`, a declared array or data
   vector) or one per entry (`x[g]` of data holding one vector per index).
   `marginalized_latent_draws` returns one trajectory per index.
+
+## 0.1.184
+
+- `prepare_query(built, plan, want; inputs = (:x,))` prepares once and leaves
+  the named data values as call arguments: `q(u, xx)` gives what preparing on
+  a binding with `x = xx` gives, without binding or preparing again. Data
+  definitions and value matrices binding computes from an input are evaluated
+  again on every call. A call checks that each input keeps its bound type and
+  size, and that nothing other than floating-point values changes in what
+  binding computes from it. Preparation refuses observations and the data
+  binding checks against them, factor labels, and integer or Boolean data,
+  naming why. Queries without `inputs` are unchanged.
 
 ## 0.1.183
 
