@@ -145,14 +145,31 @@ _jax_entry_condition(selector, needed, ::Val{false}) =
 _jax_entry_condition(selector, needed, ::Val{true}) =
     "any(name in " * selector * " for name in " * _jax_py_literal(Tuple(String.(needed))) * ")"
 
+# Each scheduled unit runs only for the outputs (`labels`) that demand it.
+# Consecutive units demanded by the same outputs share one selection block,
+# so the guard reads once per run of statements rather than once per
+# statement; the units keep their schedule order.
 function _jax_demanded_recipes!(ctx, p, demand, labels, selector, available;
                                  outputs = Val(false), regions = ctx.mod.regions)
     recipes = Dict(r.id => r for r in p.recipes)
+    open = nothing      # the outputs of the selection block being emitted
+    opened = 0          # the line count just after its `if`
+    function close!()
+        open === nothing && return
+        ctx.scope.indent -= 1
+        # A block whose statements emitted nothing is no block.
+        length(ctx.scope.lines) == opened && pop!(ctx.scope.lines)
+        open = nothing
+    end
     for unit in _jax_region_schedule(p, regions)
         needed = [label for label in labels if any(label in demand[id] for id in unit.members)]
         guarded = needed != labels || outputs === Val(true)
-        guarded && _jax_emit!(ctx, "if " * _jax_entry_condition(selector, needed, outputs) * ":")
-        guarded && (ctx.scope.indent += 1)
+        open !== nothing && (!guarded || open != needed) && close!()
+        if guarded && open === nothing
+            _jax_emit!(ctx, "if " * _jax_entry_condition(selector, needed, outputs) * ":")
+            ctx.scope.indent += 1
+            open, opened = needed, length(ctx.scope.lines)
+        end
         if unit.region === nothing
             r = recipes[only(unit.members)]
             saved = ctx.scope.values
@@ -172,8 +189,8 @@ function _jax_demanded_recipes!(ctx, p, demand, labels, selector, available;
         else
             _jax_region_call!(ctx, p, unit, demand, labels, selector, available, outputs)
         end
-        guarded && (ctx.scope.indent -= 1)
     end
+    close!()
 end
 
 function _jax_region_call!(ctx, p, unit, demand, labels, selector, available, mode)

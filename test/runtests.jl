@@ -158,6 +158,7 @@ const _MATRIX_CORE_TESTS = (
     "test_jax_padded_fields.jl",
     "test_jax_padded_loops.jl",
     "test_jax_names.jl",
+    "test_jax_branch_forms.jl",
     "test_jax_padded_broadcasts.jl",
     "test_jax_masks.jl",
     "test_jax_padded_ranges.jl",

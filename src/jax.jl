@@ -2097,6 +2097,27 @@ function _jax_if(ctx::_JaxContext, ex, value::Bool)
     _PyVal(_py_atom(result.code) * "[0]", result.T isa Type && result.T <: Tuple ? fieldtype(result.T, 1) : Any)
 end
 
+# An arm of a conditional, translated but not yet emitted: the name hint of
+# its zero-argument nested function, the scope holding its body, and its
+# value. The function is named only when it is emitted as one: a branch
+# whose arms are expressions names nothing (`_jax_emit_arm!`).
+struct _JaxArm
+    hint::Symbol
+    scope::_JaxScope
+    value::_PyVal
+end
+
+# An emitted arm: what `jax.lax.cond` takes (`callable`: a nested function's
+# name, or `lambda: <expression>` for an arm without statements) and the code
+# that evaluates it in place (`call`), with its value's type and staticness.
+struct _JaxEmittedArm
+    callable::String
+    call::String
+    lambda::Bool
+    T::Any
+    static::Bool
+end
+
 # A conditional: a static condition is a Python conditional, decided while JAX
 # traces; any other is `jax.lax.cond`, whose arms JAX traces both of.
 #
@@ -2132,28 +2153,25 @@ function _jax_conditional(ctx::_JaxContext, condition::_PyVal, then_build, else_
     A, B = then_built.value.T, else_built.value.T
     T = A === Union{} ? B : B === Union{} ? A :
         _jax_branch_type(_jax_typeof(then_built.value), _jax_typeof(else_built.value))
-    # A `jax.lax.cond`'s arms return the branch's type (`_jax_branch_value`);
-    # a Python conditional returns the taken arm's value as Julia does.
-    lax = !condition.static && A !== Union{} && B !== Union{}
-    then_arm = _jax_emit_arm!(ctx, then_built, lax ? T : nothing)
-    else_arm = _jax_emit_arm!(ctx, else_built, lax ? T : nothing)
-    # Bound at once, so an arm that raises does so in program order even when
-    # the value is unused (a guard `n == k || throw(...)`).
-    condition.static &&
-        return _jax_bind!(ctx, :value, _PyVal("(" * then_arm.code * "() if " * condition.code *
-                                               " else " * else_arm.code * "())", T,
-                                               then_arm.static && else_arm.static))
+    # A Python conditional returns the taken arm's value as Julia does.
+    condition.static && return _jax_static_branch!(ctx, condition, then_built, else_built, T)
+    # A `jax.lax.cond`'s arms return the branch's type (`_jax_branch_value`).
     # An arm that throws (`scale >= 0 ? scale : throw(...)`) has no value: it
     # is its check, masked by its condition, and the branch is the other arm.
     # Where the check passes the other arm is the one Julia takes; where it
-    # fails the module raises, so nothing computed there is returned.
-    if then_arm.T === Union{} || else_arm.T === Union{}
-        throwing, valued = then_arm.T === Union{} ? (then_arm, else_arm) : (else_arm, then_arm)
-        _jax_emit!(ctx, throwing.code * "()")
-        valued.T === Union{} || return _jax_bind!(ctx, :value, _PyVal(valued.code * "()", T))
-        _jax_emit!(ctx, valued.code * "()")
-        return _PyVal("None", Union{}, true)
+    # fails the module raises, so nothing computed there is returned. Both
+    # arms' statements run in place, the check first.
+    if A === Union{} || B === Union{}
+        throwing, valued = A === Union{} ? (then_built, else_built) : (else_built, then_built)
+        _jax_run_arm!(ctx, throwing)
+        value = _jax_run_arm!(ctx, valued)
+        valued.value.T === Union{} && return _PyVal("None", Union{}, true)
+        return _jax_bind!(ctx, :value, _PyVal(value, T))
     end
+    selected = _jax_selection(ctx, condition, then_built, else_built, T)
+    selected === nothing || return selected
+    then_arm = _jax_emit_arm!(ctx, then_built, T)
+    else_arm = _jax_emit_arm!(ctx, else_built, T)
     branch = _PyVal("jax.lax.cond(" * condition.code * ", " * _jax_typed_arm(then_arm, T) * ", " *
                     _jax_typed_arm(else_arm, T) * ")", T)
     # An arm with a runtime check runs even when the branch value is unused.
@@ -2163,14 +2181,122 @@ end
 # float64 under 64-bit mode, and `jax.lax.cond` refuses arms of different
 # dtypes: where the branch's float dtype is another (a float32 module, a
 # `Float32` program), the arm returns its value as that dtype.
-function _jax_typed_arm(arm::_PyVal, @nospecialize(T))
-    arm.static || return arm.code
-    E = _jax_eltype(T)
-    E isa Type && E <: AbstractFloat && (T === E || T <: AbstractArray) || return arm.code
-    dtype = _jax_dtype(E)
-    dtype == "jnp.float64" && return arm.code
-    "(lambda: jnp.asarray(" * arm.code * "(), dtype=" * dtype * "))"
+function _jax_typed_arm(arm::_JaxEmittedArm, @nospecialize(T))
+    dtype = arm.static ? _jax_static_arm_dtype(T) : nothing
+    dtype === nothing && return arm.callable
+    arm.lambda ? "lambda: jnp.asarray(" * arm.call * ", dtype=" * dtype * ")" :
+        "(lambda: jnp.asarray(" * arm.call * ", dtype=" * dtype * "))"
 end
+# The dtype a static arm's value takes in a branch of type `T`: `nothing`
+# where its Python literal already has it.
+function _jax_static_arm_dtype(@nospecialize(T))
+    E = _jax_eltype(T)
+    E isa Type && E <: AbstractFloat && (T === E || T <: AbstractArray) || return nothing
+    dtype = _jax_dtype(E)
+    dtype == "jnp.float64" ? nothing : dtype
+end
+
+# A branch whose condition JAX traces and whose arms are each an atom, a
+# literal or a value already bound (`s == 0 && y == m ? 1.0 : s`), selects
+# between them: `jnp.where(condition, a, b)`. Both arms are valid values
+# already computed, so selecting one evaluates nothing that the conditional
+# would not, and its value and derivative are the conditional's: the untaken
+# arm receives a zero cotangent from either form. An arm with any statement
+# or computation stays lazy in `jax.lax.cond` (CONTRIBUTING, lazy branches).
+function _jax_selection(ctx::_JaxContext, condition::_PyVal, then_built::_JaxArm,
+                        else_built::_JaxArm, @nospecialize(T))
+    T isa Type && isconcretetype(T) && T <: _JaxBranchReal || return nothing
+    arms = (then_built, else_built)
+    all(arm -> isempty(arm.scope.lines) && _jax_selectable(arm.value), arms) || return nothing
+    values = map(arms) do arm
+        outer = ctx.scope
+        ctx.scope = arm.scope
+        try
+            _jax_branch_value(ctx, arm.value, T)
+        finally
+            ctx.scope = outer
+        end
+    end
+    # A conversion is an expression, never a statement; anything else keeps
+    # the conditional.
+    all(arm -> isempty(arm.scope.lines), arms) || return nothing
+    a, b = values
+    # Two Python literals select a value of the default float dtype: give one
+    # the branch's own (`_jax_typed_arm`).
+    dtype = a.static && b.static ? _jax_static_arm_dtype(T) : nothing
+    a_code = dtype === nothing ? a.code : "jnp.asarray(" * a.code * ", dtype=" * dtype * ")"
+    _PyVal("jnp.where(" * condition.code * ", " * a_code * ", " * b.code * ")", T)
+end
+# An arm value `jnp.where` may select: a scalar literal or a bound name (a
+# dotted constant such as `jnp.inf` too), possibly negated.
+_jax_selectable(v::_PyVal) =
+    isempty(v.extent) && isempty(v.limit) && v.T isa Type && v.T <: _JaxBranchReal &&
+    occursin(r"^-?(?:[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*|(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)$",
+             v.code) && !(v.code in ("None", "-None"))
+
+# A conditional decided while JAX traces: Python's own, over the arms'
+# statements in place. Arms without statements (which therefore cannot raise)
+# are a conditional expression `(a if condition else b)`. An arm that raises
+# runs in program order, even when the branch's value is unused (a guard
+# `n == k || throw(...)` is `if not (n == k): raise ...`).
+function _jax_static_branch!(ctx::_JaxContext, condition::_PyVal, then_built::_JaxArm,
+                             else_built::_JaxArm, @nospecialize(T))
+    a, b = then_built.value, else_built.value
+    plain(arm) = isempty(arm.scope.lines)
+    if plain(then_built) && plain(else_built) && a.T !== Union{} && b.T !== Union{}
+        return _PyVal(_py_conditional(a.code, condition.code, b.code), T, a.static && b.static)
+    end
+    # An arm without statements whose value is unused, or that the other arm
+    # leaves as the branch's only value, needs no block of its own.
+    nothing_value(v) = v.T === Union{} || v.code == "None"
+    valued = [arm for arm in (then_built, else_built) if !nothing_value(arm.value)]
+    result = if isempty(valued)
+        nothing
+    elseif length(valued) == 1 && plain(only(valued)) &&
+            (only(valued) === then_built ? b : a).T === Union{}
+        # The other arm raises: where this one is taken, its expression is
+        # the branch's value, evaluated after the check.
+        only(valued).value
+    else
+        _PyVal(_jax_fresh(ctx, :value), T, a.static && b.static)
+    end
+    named = result !== nothing && !(length(valued) == 1 && result === only(valued).value)
+    block(arm) = begin
+        lines = copy(arm.scope.lines)
+        if named && arm.value.T !== Union{}
+            push!(lines, "    "^arm.scope.indent * result.code * " = " * arm.value.code)
+        end
+        lines
+    end
+    then_lines, else_lines = block(then_built), block(else_built)
+    if isempty(then_lines) && isempty(else_lines)
+        # Nothing runs in either arm.
+    elseif isempty(then_lines)
+        _jax_emit!(ctx, "if " * _py_not(condition.code) * ":")
+        append!(ctx.scope.lines, else_lines)
+    else
+        _jax_emit!(ctx, "if " * condition.code * ":")
+        append!(ctx.scope.lines, then_lines)
+        if !isempty(else_lines)
+            _jax_emit!(ctx, "else:")
+            append!(ctx.scope.lines, else_lines)
+        end
+    end
+    result === nothing &&
+        return _PyVal("None", a.T === Union{} && b.T === Union{} ? Union{} : Nothing, true)
+    result.T === T ? result : _PyVal(result.code, T, result.static, result.extent, result.limit,
+                                     result.padded, result.origin, result.field_extents)
+end
+# Python's `a if condition else b`, parenthesized as one atom.
+_py_conditional(a::AbstractString, condition::AbstractString, b::AbstractString) =
+    "(" * _py_operand(a, "if") * " if " * _py_operand(condition, "if") * " else " *
+    _py_operand(b, "if") * ")"
+_py_operand(x::AbstractString, op::AbstractString) =
+    _py_precedence(x) <= _PY_PRECEDENCE[op] ? "(" * x * ")" : x
+# `not condition`: a comparison or looser operand keeps its parentheses, as a
+# reader takes `not a == b` for `(not a) == b`.
+_py_not(x::AbstractString) =
+    "not " * (_py_precedence(x) <= _PY_PRECEDENCE["<"] ? "(" * x * ")" : x)
 # `throw` in a branch decided while tracing raises then. Under conditions that
 # depend on data it is `_runtime_check(false, e)` there: a check masked by
 # those conditions, which raises when the module runs on values that take the
@@ -2339,17 +2465,8 @@ _jax_expr(ctx::_JaxContext, ::Val{:elseif}, ex) = _jax_expr(ctx, Val(:if),
 
 _jax_typeof(v::_PyVal) = v.T isa Type ? v.T : Any
 
-# An arm of a conditional, translated but not yet emitted: the name of its
-# zero-argument nested function, the scope holding its body, and its value.
-struct _JaxArm
-    name::String
-    scope::_JaxScope
-    value::_PyVal
-end
-
 # Translate an arm's body `build` in a scope of its own.
 function _jax_arm_function(ctx::_JaxContext, hint, build)
-    name = _jax_fresh(ctx, hint)
     outer = ctx.scope
     inner = _JaxScope(outer)
     inner.indent = outer.indent + 1
@@ -2362,12 +2479,12 @@ function _jax_arm_function(ctx::_JaxContext, hint, build)
         empty!(ctx.locals); merge!(ctx.locals, saved_locals)
     end
     union!(outer.used, inner.used)
-    _JaxArm(name, inner, result)
+    _JaxArm(Symbol(hint), inner, result)
 end
 
-# Emit an arm as its nested function, returning its value as type `T` when
-# `T` is given (`_jax_branch_value`). The function's name stands for the arm,
-# with the type and staticness of what it returns.
+# Emit an arm, returning its value as type `T` when `T` is given
+# (`_jax_branch_value`): an arm with statements is a nested function, one
+# without is `lambda: <expression>`, which names nothing.
 function _jax_emit_arm!(ctx::_JaxContext, arm::_JaxArm, @nospecialize(T) = nothing)
     outer = ctx.scope
     result = arm.value
@@ -2380,10 +2497,31 @@ function _jax_emit_arm!(ctx::_JaxContext, arm::_JaxArm, @nospecialize(T) = nothi
         end
         union!(outer.used, arm.scope.used)
     end
-    push!(outer.lines, "    "^outer.indent * "def " * arm.name * "():")
+    if isempty(arm.scope.lines)
+        return _JaxEmittedArm("lambda: " * result.code, result.code, true, result.T, result.static)
+    end
+    name = _jax_fresh(ctx, arm.hint)
+    push!(outer.lines, "    "^outer.indent * "def " * name * "():")
     append!(outer.lines, arm.scope.lines)
     push!(outer.lines, "    "^arm.scope.indent * "return " * result.code)
-    _PyVal(arm.name, result.T, result.static)
+    _JaxEmittedArm(name, name * "()", false, result.T, result.static)
+end
+
+# Run an arm unconditionally where the branch is: its statements in place,
+# one level out, returning its value's code. An arm whose statements do not
+# move out cleanly (a line that is not one statement at the arm's level) runs
+# as its nested function, called here.
+function _jax_run_arm!(ctx::_JaxContext, arm::_JaxArm)
+    prefix = "    "^arm.scope.indent
+    if all(l -> startswith(l, prefix) && !occursin('\n', l), arm.scope.lines)
+        for line in arm.scope.lines
+            push!(ctx.scope.lines, line[5:end])
+        end
+        return arm.value.code
+    end
+    emitted = _jax_emit_arm!(ctx, arm)
+    arm.value.T === Union{} && _jax_emit!(ctx, emitted.call)
+    emitted.call
 end
 
 # The type of a branch whose arms have types `A` and `B`: Julia's promotion,
@@ -6597,12 +6735,24 @@ function _jax_functions!(mod, bodies, functions, plans, types;
         while selector in input_names
             selector *= "_"
         end
+        # The checks every entry runs first, in one order, run once before
+        # the entries' own blocks: at the same point of each entry's run.
+        entry_checks = [e.second[1].checks for e in group]
+        shared_checks = 0
+        while all(cs -> length(cs) > shared_checks, entry_checks) &&
+              allequal(cs[shared_checks + 1] for cs in entry_checks)
+            shared_checks += 1
+        end
         emit = function(ctx)
             _jax_demanded_recipes!(ctx, p, demand, labels, selector, available)
+            for c in first(group).second[1].checks[1:shared_checks]
+                _jax_call(ctx, c.f, _PyVal[a isa Value ? _jax_lookup(ctx, g, a) :
+                    _PyVal(repr(a), typeof(a), true) for a in c.args])
+            end
             for (fname, (q, w)) in group
                 _jax_emit!(ctx, "if " * selector * " == " * repr(String(fname)) * ":")
                 ctx.scope.indent += 1
-                for c in q.checks
+                for c in q.checks[shared_checks + 1:end]
                     _jax_call(ctx, c.f, _PyVal[a isa Value ? _jax_lookup(ctx, g, a) :
                         _PyVal(repr(a), typeof(a), true) for a in c.args])
                 end
