@@ -16,6 +16,23 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.257
+
+- `ReactiveKernels.js_run(source, entry, cases; node, vectors, timeout)`
+  (prototype, not exported) runs a `js_source` module in Node.js: it calls the
+  function `entry` once per case, each a tuple of the HAVE values in `INPUTS`
+  order, in one Node process, and returns one `JSOutcome` per case. A
+  successful call's `value` has the shape and types the native kernel returns
+  (a value, a `Tuple` or a `NamedTuple`); a call that throws gives its error's
+  `name` and `message` and whether it was the module's `JuliaError`; every
+  outcome reports whether the call changed the arrays it was given. A run that
+  fails (no Node.js, a module that does not import, a missing entry, a crash or
+  a timeout) throws `JSRunError`. `vectors = :float64array` passes numeric
+  vectors as `Float64Array`s. Node.js is `node` (an executable or a `Cmd`),
+  by default `ENV["RK_JS_NODE"]`, else `node` on the PATH.
+- `js_source` modules also export `RETURNS`, the WANT's shape, and give each
+  `OUTPUTS` entry its Julia `type`.
+
 ## 0.1.256
 
 - `ReactiveKernels.js_source` translates a range written in a helper or a

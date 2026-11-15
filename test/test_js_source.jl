@@ -4,7 +4,7 @@ using ReactiveKernels
 using Test
 using Base: OneTo
 
-include(joinpath(@__DIR__, "js_node.jl"))
+const NODE = ReactiveKernels._js_default_node() !== nothing
 
 # Plain Julia helpers without annotations: branches, early returns and loops
 # are translated from their typed code.
@@ -229,31 +229,35 @@ agree(a, b) = false
         @test occursin("export const INPUTS", source) && occursin("export class JuliaError", source)
     end
 
-    @testset "Node agrees with native: $name" for (name, k, have, want, types, cases) in CASES
-        if !rk_js_node_available()
+    @testset "Node agrees with native: $name ($vectors)" for (name, k, have, want, types, cases) in CASES,
+                                                             vectors in (:array, :float64array)
+        if !NODE
             @test_skip "no node on the PATH"
             continue
         end
         source = ReactiveKernels.js_source(k; have, want, types, name)
         wants = want isa Symbol ? (want,) : want
         native = prepare(k; have, want = wants)
-        results = rk_js_run(source, [name => c for c in cases])
-        for (c, r) in zip(cases, results)
+        outcomes = ReactiveKernels.js_run(source, name, cases; vectors)
+        for (c, r) in zip(cases, outcomes)
             expected = try
                 native(c...)
             catch e
                 e
             end
+            @test !r.inputs_mutated
             if expected isa Exception
                 # The same Julia exception type, thrown by the JavaScript.
-                @test haskey(r, :error) && r.error == string(nameof(typeof(expected)))
+                @test r.julia_error && r.error == string(nameof(typeof(expected)))
             else
-                @test !haskey(r, :error)
-                haskey(r, :error) && continue
+                @test r.error === nothing
+                r.error === nothing || continue
+                # The native shape and types, and the native values.
+                @test typeof(r.value) == typeof(expected)
                 if want isa Symbol
-                    @test agree(Float64.(expected), r.value)
+                    @test agree(expected, r.value)
                 else
-                    @test all(agree(Float64.(expected[j]), r.value[j]) for j in eachindex(wants))
+                    @test all(agree(expected[j], r.value[j]) for j in eachindex(wants))
                 end
             end
         end
@@ -314,11 +318,11 @@ agree(a, b) = false
     @testset "inputs and names" begin
         @test_throws ArgumentError ReactiveKernels.js_source(js_switch; have = (:x, :flag, :k), want = :y,
             types = (; x = Float64, flag = Bool, k = Int), name = :switch)
-        if rk_js_node_available()
+        if NODE
             source = ReactiveKernels.js_source(js_scalar; have = (:a, :b), want = :c,
                                                types = (; a = Float64, b = Float64), name = :scalar)
-            r = rk_js_call(source, :scalar, [1.0], 2.0)
-            @test r.error == "ArgumentError" && occursin("`a` must be a number", r.message)
+            r = only(ReactiveKernels.js_run(source, :scalar, [([1.0], 2.0)]))
+            @test r.julia_error && r.error == "ArgumentError" && occursin("`a` must be a number", r.message)
         else
             @test_skip "no node on the PATH"
         end
