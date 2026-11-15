@@ -1,4 +1,5 @@
 using ReactiveKernelsPPL
+using ReactiveKernelsPPL: IdentityLink, LogitLink
 using Test
 
 # Self-contained builders (mirror the contract shapes; independent of

@@ -1,4 +1,5 @@
 using ReactiveKernelsPPL
+using ReactiveKernelsPPL: IdentityLink
 using Test
 
 # Eval-based semantics: recipe Exprs run in a fresh module with the raw

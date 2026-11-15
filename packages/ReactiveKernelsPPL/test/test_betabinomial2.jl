@@ -12,6 +12,7 @@ using Distributions: BetaBinomial, Normal, Gamma, logpdf
 using Enzyme
 using ReactiveKernels
 using ReactiveKernelsPPL
+using ReactiveKernelsPPL: LogitLink, LogLink
 using Test
 
 # Lower + bind + build + query a betabinomial program; return

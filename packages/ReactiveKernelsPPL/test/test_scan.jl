@@ -1,5 +1,6 @@
 using Distributions
 using ReactiveKernelsPPL
+using ReactiveKernelsPPL: IdentityLink, LogitLink
 using Test
 
 # A minimal bound Gaussian plan (intercept-only `mu`, scalar `sigma`) carrying

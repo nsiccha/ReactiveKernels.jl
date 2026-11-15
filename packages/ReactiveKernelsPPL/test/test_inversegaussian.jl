@@ -12,6 +12,7 @@ using Distributions: InverseGaussian, Normal, LogNormal, logpdf
 using Enzyme
 using ReactiveKernels
 using ReactiveKernelsPPL
+using ReactiveKernelsPPL: LogLink
 using Test
 
 # Lower + bind + build + query an IG program; return

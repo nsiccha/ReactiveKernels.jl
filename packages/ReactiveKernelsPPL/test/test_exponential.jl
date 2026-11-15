@@ -10,6 +10,7 @@ using Distributions: Exponential, Normal, logpdf
 using Enzyme
 using ReactiveKernels
 using ReactiveKernelsPPL
+using ReactiveKernelsPPL: LogLink
 using Test
 
 # Lower + bind + build + query an exponential program; return

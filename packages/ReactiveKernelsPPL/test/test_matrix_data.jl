@@ -1,5 +1,6 @@
 using ReactiveKernels
 using ReactiveKernelsPPL
+using ReactiveKernelsPPL: IdentityLink
 using Test
 
 # Matrix-valued data columns (whole-design data, Stan `matrix[N,K]`): a

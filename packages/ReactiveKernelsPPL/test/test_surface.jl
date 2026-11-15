@@ -1,6 +1,7 @@
 using Distributions
 using ReactiveKernels
 using ReactiveKernelsPPL
+using ReactiveKernelsPPL: IdentityLink, LogitLink, LogLink, ProbitLink, CloglogLink
 using Test
 
 # Surface tests: `@rkppl` blocks lower to the same unbound plans a careful

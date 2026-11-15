@@ -12,6 +12,7 @@ using Distributions: Poisson, Normal, Exponential, logpdf, cdf
 using Enzyme
 using ReactiveKernels
 using ReactiveKernelsPPL
+using ReactiveKernelsPPL: IdentityLink, LogLink
 using SHA
 using Test
 
