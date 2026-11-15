@@ -285,3 +285,16 @@ include("generated_tuning_replay.jl")
         @test success(pipeline(`$command read $checkpoint`; stdout=stdout,stderr=stderr))
     end
 end
+
+@testset "Fresh-process pooling of checkpoints written by other processes" begin
+    mktempdir() do directory
+        julia = `$(Base.julia_cmd()) --startup-file=no --project=$(dirname(Base.active_project()))`
+        files = [joinpath(directory, "cloud$seed.bin") for seed in 1:2]
+        for (seed, file) in enumerate(files)
+            @test success(pipeline(`$julia $(joinpath(@__DIR__, "pool_writer.jl")) $seed $file`;
+                stdout=stdout, stderr=stderr))
+        end
+        @test success(pipeline(`$julia $(joinpath(@__DIR__, "pool_process.jl")) $files`;
+            stdout=stdout, stderr=stderr))
+    end
+end
