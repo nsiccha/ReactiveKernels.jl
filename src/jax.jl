@@ -5157,16 +5157,50 @@ function _jax_named_lowered_call(ctx::_JaxContext, f, args::Vector{_PyVal})
                              "from its Julia definition")
 end
 
-# Julia's own functions (Base, Core, the standard libraries) and those of
-# ReactiveKernels' packages and extensions: translated in place, or, with
-# recorded source (a stable rewrite's `_rk_div_by_of`), a private helper.
-function _jax_internal_function(f)
-    m = Base.moduleroot(parentmodule(typeof(f)))
-    (m === Base || m === Core) && return true
-    path = pathof(m)
-    path !== nothing && startswith(path, Sys.STDLIB) && return true
-    dir, root = pkgdir(m), pkgdir(@__MODULE__)
-    dir !== nothing && root !== nothing && (dir == root || startswith(dir, root * "/"))
+# Julia's own functions (Base, Core, the standard libraries) and those of the
+# packages of ReactiveKernels' repository and their extensions: translated in
+# place, or, with recorded source (a stable rewrite's `_rk_div_by_of`), a
+# private helper.
+_jax_internal_function(f) = _jax_internal_module(parentmodule(typeof(f)))
+_jax_internal_module(m::Module) = _julia_own_module(m) || _rk_repository_module(m)
+
+# The UUIDs of the packages of ReactiveKernels' repository (its root and each
+# package of `packages/`) and of their extensions, which Julia identifies as
+# `uuid5(<package's UUID>, <extension's name>)`. A package is the
+# repository's by this identity wherever it is installed: a developed
+# checkout has ReactiveKernelsPPL under ReactiveKernels' root, a consumer that
+# adds it by URL (`repo-subdir`) in a package tree of its own, and one model
+# emits one module text in both.
+function _rk_repository_package_uuids(root::AbstractString = pkgdir(@__MODULE__))
+    packages = joinpath(root, "packages")
+    files = [joinpath(root, "Project.toml");
+             isdir(packages) ? [joinpath(packages, d, "Project.toml") for d in readdir(packages)] :
+                               String[]]
+    uuids = Set{Base.UUID}()
+    for file in files
+        isfile(file) || continue
+        project = Base.parsed_toml(file)
+        haskey(project, "uuid") || continue
+        uuid = Base.UUID(project["uuid"])
+        push!(uuids, uuid)
+        for extension in keys(get(project, "extensions", Dict{String,Any}()))
+            push!(uuids, Base.uuid5(uuid, extension))
+        end
+    end
+    uuids
+end
+
+# Read on first use in a process (`__init__` clears a value an image kept).
+const _RK_REPOSITORY_PACKAGE_UUIDS = Ref{Union{Nothing,Set{Base.UUID}}}(nothing)
+function _rk_repository_module(m::Module)
+    uuid = Base.PkgId(Base.moduleroot(m)).uuid
+    uuid === nothing && return false
+    uuids = _RK_REPOSITORY_PACKAGE_UUIDS[]
+    if uuids === nothing
+        uuids = _rk_repository_package_uuids()
+        _RK_REPOSITORY_PACKAGE_UUIDS[] = uuids
+    end
+    uuid in uuids
 end
 # A helper a reader does not call: an emitter-internal one, or one whose
 # authored name already marks it private (`_scaled`).

@@ -92,6 +92,9 @@ function __init__()
     # and its own `simplify` and `bound_statistics` preferences
     # (`simplify_setting.jl`).
     foreach(setting -> setting.preference[] = nothing, _PREPARATION_SETTINGS)
+    # The repository's package UUIDs are read from this process's installed
+    # tree (`_rk_repository_module`).
+    _RK_REPOSITORY_PACKAGE_UUIDS[] = nothing
     nothing
 end
 

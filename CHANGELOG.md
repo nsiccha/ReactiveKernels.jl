@@ -16,6 +16,21 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.253
+
+- `jax_source` treats the functions of every package of ReactiveKernels'
+  repository (ReactiveKernels, ReactiveKernelsPPL,
+  ReactiveKernelsDistributionKernels and the other packages under
+  `packages/`) and of their extensions as its own by package UUID, wherever
+  the package is installed. One model now emits one module text whether
+  ReactiveKernelsPPL is developed under ReactiveKernels' root or added by URL
+  with `repo-subdir` into a package tree of its own. Before, an installed
+  ReactiveKernelsPPL's internal helpers, such as `_ppl_cell_latent_block` of
+  a dotted ragged cell latent, were emitted as named private Python functions
+  ("from its Julia definition") that evaluate every argument, while a
+  developed checkout, and ReactiveKernels' own tests, translated them in
+  place.
+
 ## 0.1.252
 
 - A prepared vector of tuples (or of named numbers) crosses from
