@@ -16,6 +16,27 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.265
+
+- `js_source` translates keyword calls of plain helpers, named tuples built
+  and read in a recipe or helper, and destructuring. `f(x; a, b)` inlines
+  `f`'s keyword sorter: inference decides its checks of the keyword names,
+  defaults computed from other arguments are emitted, and the body function
+  becomes a JavaScript function of the keyword values. A keyword `f` does not
+  take, or a required one left out, throws Julia's `MethodError` or
+  `UndefKeywordError` when the call runs, as natively. `(; a, b)` and
+  `NamedTuple{names}(tuple)` build an object, and `x.name` reads it.
+  `a, b = t` destructures a tuple or named tuple, and a generator over a range
+  written in the source (`a, b, c = (zeros(n) for _ in 1:3)`). A call whose
+  result inference knows to be a constant, and that has no effect and cannot
+  throw, is that constant whatever its arguments: `LogExpFunctions.log1pexp`
+  and `logistic` translate through their type-dependent thresholds. A local
+  that holds values of several types is read with the type inference knows
+  where it is read. Also translated: `Vector{T}(undef, n)` and `similar(x)`
+  (filled with zeros), `x[index]` for a vector of indices (`BoundsError` before
+  any element is read), and `@view x[a:b]` read by `sum`, `length` and
+  indexing. Native execution is unchanged.
+
 ## 0.1.264
 
 - `js_source` translates RK's distribution laws, so a browser module computes

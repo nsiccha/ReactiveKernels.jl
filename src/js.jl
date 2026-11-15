@@ -317,6 +317,24 @@ function _rk_pairwise(x, first, last) {
   const mid = first + Math.floor((last - first) / 2);
   return _rk_pairwise(x, first, mid) + _rk_pairwise(x, mid + 1, last);
 }""", Symbol[]),
+    :_rk_window => ("""
+function _rk_window(x, start, stop) {
+  if (stop >= start && !(Number.isInteger(start) && Number.isInteger(stop) && start >= 1 && stop <= x.length))
+    throw new JuliaError("BoundsError", "attempt to access " + x.length + "-element array at index [" + start + ":" + stop + "]");
+}""", [:JuliaError]),
+    :_rk_sumrange => ("""
+function _rk_sumrange(x, start, stop) {
+  return stop < start ? 0 : _rk_pairwise(x, start - 1, stop - 1);
+}""", [:_rk_sum]),
+    :_rk_gather => ("""
+function _rk_gather(x, index) {
+  for (let k = 0; k < index.length; k++)
+    if (!(index[k] >= 1 && index[k] <= x.length))
+      throw new JuliaError("BoundsError", "attempt to access " + x.length + "-element array at index [[" + Array.from(index).join(", ") + "]]");
+  const y = new Array(index.length);
+  for (let k = 0; k < index.length; k++) y[k] = x[index[k] - 1];
+  return y;
+}""", [:JuliaError]),
     :_rk_extremum => ("""
 function _rk_extremum(pick, x, empty) {
   if (x.length === 0) throw empty();
@@ -522,7 +540,7 @@ function _js_operand(ir::_JsIR, x)
         n = x isa Core.Argument ? x.n : x.id
         v = ir.slots[n]
         v === nothing && _js_error(mod, "the local `", ir.ci.slotnames[n], "` may be read before it is assigned")
-        return v
+        return _js_typedslot(x) ? _js_narrow(v, x.typ) : v
     elseif x isa GlobalRef
         isdefined(x.mod, x.name) || _js_error(mod, "`", x, "` is not defined")
         isconst(x.mod, x.name) ||
@@ -541,6 +559,20 @@ function _js_operand(ir::_JsIR, x)
     else
         return _js_static(x)
     end
+end
+
+# A runtime value read where inference knows a narrower type than the local
+# holding it (one slot reused for values of several types, as a keyword sorter
+# reuses one for every keyword), or its constant value.
+function _js_narrow(v, T)
+    v isa _JsVal && !v.static || return v
+    if T isa Core.Const
+        x = T.val
+        (isbits(x) || x isa Union{Symbol,String,Type}) && return _js_static(x)
+    end
+    RT = Core.Compiler.widenconst(T)
+    RT !== v.T && RT <: v.T && isconcretetype(RT) || return v
+    _JsVal(v.code, RT, false, nothing, v.pure, v.prec, v.ref)
 end
 
 # Bind a value to a name when its code is not simple, so it may be read twice.
@@ -642,7 +674,7 @@ end
 
 function _js_expr!(ir::_JsIR, i, ex, T)
     mod = ir.fn.mod
-    ex isa Expr || return _js_operand(ir, ex)
+    ex isa Expr || return _js_narrow(_js_operand(ir, ex), T)
     if ex.head === :call
         fv = _js_operand(ir, ex.args[1])
         args = Any[_js_operand(ir, a) for a in ex.args[2:end]]
@@ -684,15 +716,18 @@ function _js_expr!(ir::_JsIR, i, ex, T)
     _js_error(mod, "the expression `", ex, "` has no JavaScript translation")
 end
 
-# A call inference folded to a constant, without an effect to keep.
+# A call inference folded to a constant, without an effect to keep. Its
+# arguments may be runtime values: a constant that depends only on their types
+# (`LogExpFunctions._log1pexp_thresholds(x)`, the keyword check of a keyword
+# call) is the same constant for every input.
 function _js_foldable(fv, args)
     fv isa _JsVal && fv.static || return false
     f = fv.value
     f isa Core.Builtin && return true
     f isa Type && return true
-    all(a -> a isa _JsVal && a.static, args) || return false
+    types = Any[a isa _JsVal && a.static ? Core.Typeof(a.value) : _js_argtype(a) for a in args]
     effects = try
-        Base.infer_effects(f, Tuple{(Core.Typeof(a.value) for a in args)...})
+        Base.infer_effects(f, Tuple{types...})
     catch
         return false
     end
@@ -1139,10 +1174,33 @@ method for its own function type.
 """
 _js_function_call(ir, f, args, T) = nothing
 
+# The `MethodError` of a keyword call `f(x; a, b)` that no method of `f`
+# takes: `args` are the keywords, `f` and the positional arguments.
+function _js_kwerr(mod::_JsModule, args)
+    NT = _js_type(args[1])
+    f = args[2] isa _JsVal && args[2].static ? args[2].value : _js_type(args[2])
+    msg = "no method matching " * string(f isa Function ? nameof(f) : f) * "(" *
+          join(("::" * string(_js_argtype(a)) for a in args[3:end]), ", ") * "; " *
+          join((string(k) * "::" * string(S) for (k, S) in zip(fieldnames(NT), fieldtypes(NT))), ", ") * ")"
+    push!(mod.runtime, :JuliaError)
+    _js_rt("throw new JuliaError(\"MethodError\", " * _js_string_literal(msg) * ")", Union{}; pure = false)
+end
+
 function _js_call!(ir::_JsIR, f, args::Vector{Any}, T)
     mod = ir.fn.mod
     v = _js_function_call(ir, f, args, T)
     v === nothing || return v
+    if f === Core.kwcall && length(args) >= 2 && _js_type(args[1]) <: NamedTuple &&
+       args[2] isa _JsVal && args[2].static && !_js_table_only(args[2].value)
+        # `f(x; a, b)`: the keyword sorter of `f`, whose checks of the keyword
+        # names inference decides, then calls `f`'s body function. Without a
+        # keyword method, the call is Julia's `MethodError`.
+        isempty(methods(Core.kwcall, Tuple{(_js_argtype(a) for a in args)...})) &&
+            return _js_kwerr(mod, args)
+        _js_flush!(ir)
+        v, _ = _js_inline!(ir.fn, f, args, "value")
+        return v
+    end
     if f isa Type && f <: Exception
         push!(mod.runtime, :JuliaError)
         rargs = [_js_runtime(mod, a).code for a in args]
@@ -1161,6 +1219,11 @@ function _js_call!(ir::_JsIR, f, args::Vector{Any}, T)
         _js_flush!(ir)
         v, _ = _js_inline!(ir.fn, f, args, "value")
         return v
+    end
+    if f === Core.kwcall && length(args) >= 2 && args[2] isa _JsVal && args[2].static
+        types = join((_js_type(a) isa Type ? _js_type(a) : typeof(_js_type(a)) for a in args[3:end]), ", ")
+        _js_error(mod, "`", args[2].value, "` with argument types (", types, ") and keywords `",
+                  _js_type(args[1]), "` has no JavaScript translation")
     end
     types = join((_js_type(a) isa Type ? _js_type(a) : typeof(_js_type(a)) for a in args), ", ")
     _js_error(mod, "`", f, "` with argument types (", types, ") has no JavaScript translation")
@@ -1415,7 +1478,56 @@ const _JS_COMPARE = Dict{Any,String}(Base.:< => "<", Base.:<= => "<=", Base.:> =
 function _js_function_call(ir::_JsIR, f::Function, args, T)
     mod = ir.fn.mod
     nums = all(a -> _js_isnumber(a) && !(_js_type(a) === Bool), args)
-    if f === Base.literal_pow && length(args) == 3 && _js_isnumber(args[2]) && args[3] isa _JsVal &&
+    if f === Base.indexed_iterate && length(args) in (2, 3) && _js_type(args[1]) <: Union{Tuple,NamedTuple} &&
+       args[2] isa _JsVal && args[2].static && args[2].value isa Int
+        # `a, b = t` for a tuple or named tuple: element `i`, then the next index.
+        i = args[2].value
+        n = fieldcount(_js_type(args[1]))
+        1 <= i <= n || _js_error(mod, "destructuring element ", i, " of a `", _js_type(args[1]), "`")
+        item = _js_function_call(ir, Core.getfield, Any[args[1], _js_static(i)], fieldtype(_js_type(args[1]), i))
+        item === nothing && return nothing
+        return _JsTuple(Any[item, _js_static(i + 1)], Tuple{_js_type(item),Int})
+    elseif f === Base.indexed_iterate && length(args) in (2, 3) && args[1] isa _JsStruct &&
+           args[1].T === Base.Generator && args[1].fields[2] isa _JsVal && args[1].fields[2].static &&
+           all(a -> a isa _JsVal && a.static, args[2:end])
+        # `a, b = (f(k) for k in 1:2)` over a range written in the source: the
+        # generator's next element, a call of its function.
+        g, r = args[1], args[1].fields[2].value
+        y = length(args) == 2 ? iterate(r) : iterate(r, args[3].value)
+        if y === nothing
+            push!(mod.runtime, :JuliaError)
+            return _js_rt("throw new JuliaError(\"BoundsError\", " *
+                          _js_string_literal("attempt to access a generator of " * string(length(r)) *
+                                             " elements at index [" * string(args[2].value) * "]") * ")",
+                          Union{}; pure = false)
+        end
+        fn = g.fields[1]
+        fn = fn isa _JsVal && fn.static ? fn.value : fn
+        item = _js_call!(ir, fn, Any[_js_static(y[1])], _js_return_type(fn, Any[typeof(y[1])]))
+        return _JsTuple(Any[item, _js_static(y[2])], Tuple{_js_type(item),typeof(y[2])})
+    elseif f === Base.structdiff && length(args) == 2 && _js_type(args[1]) <: NamedTuple && T isa DataType &&
+           T <: NamedTuple && isconcretetype(T)
+        # A keyword sorter's keywords that its method does not declare.
+        items = Any[_js_function_call(ir, Core.getfield, Any[args[1], _js_static(k)], fieldtype(T, k))
+                    for k in fieldnames(T)]
+        any(isnothing, items) && return nothing
+        return _JsTuple(items, T)
+    elseif f === pairs && length(args) == 1 && _js_type(args[1]) <: NamedTuple
+        # read only through what inference knows of it (`isempty` in a keyword sorter)
+        return _JsStruct(pairs, Any[args[1]], T)
+    elseif f === isempty && length(args) == 1 && args[1] isa _JsStruct && args[1].T === pairs
+        return _js_static(fieldcount(_js_type(args[1].fields[1])) == 0)
+    elseif f === Base.kwerr && length(args) >= 2 && _js_type(args[1]) <: NamedTuple
+        return _js_kwerr(mod, args)
+    elseif f === getproperty && length(args) == 2 && _js_type(args[1]) <: Union{Tuple,NamedTuple} &&
+           args[2] isa _JsVal && args[2].static && args[2].value isa Union{Symbol,Int}
+        # `x.name` of a named tuple, as Base reads it: `getfield(x, name)`.
+        return _js_function_call(ir, Core.getfield, args, T)
+    elseif f === similar && length(args) == 1 && _js_isvector(args[1]) && T === _js_type(args[1])
+        # The new vector's values are unspecified, as in Julia.
+        return _js_rt("new Array(" * _js_code(mod, args[1], _JS_ATOM) * ".length).fill(" *
+                      (eltype(T) === Bool ? "false" : "0") * ")", T; pure = false)
+    elseif f === Base.literal_pow && length(args) == 3 && _js_isnumber(args[2]) && args[3] isa _JsVal &&
        args[3].static && args[3].value isa Val
         p = typeof(args[3].value).parameters[1]
         x = _js_simple!(ir, args[2])
@@ -1584,6 +1696,31 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
         d isa _JsVal && d.static && d.value == 1 && return _js_call!(ir, length, Any[args[1]], Int64)
     elseif f === getindex && length(args) == 2 && _js_isvector(args[1]) && _js_isint(args[2])
         return _js_fcall(ir, _js_use!(mod, :_rk_at), args, T)
+    elseif f === getindex && length(args) == 2 && _js_isvector(args[1]) && _js_type(args[2]) === Vector{Int64}
+        # `x[index]` for a vector of indices: a new vector, every index checked first.
+        return _js_fcall(ir, _js_use!(mod, :_rk_gather), args, T; pure = false)
+    elseif f === view && length(args) == 2 && _js_isvector(args[1]) && _js_isrange(args[2])
+        # `@view x[a:b]`, read where it is used (`sum`, `length`, `getindex`).
+        x, r = _js_simple!(ir, args[1], "x"), _js_range!(ir, args[2])
+        _js_flush!(ir)
+        _js_line!(ir.fn, _js_use!(mod, :_rk_window) * "(" * x.code * ", " * _js_range_start(r) * ", " *
+                         _js_range_stop(r) * ");")
+        return _JsStruct(view, Any[x, r], T)
+    elseif f === sum && length(args) == 1 && args[1] isa _JsStruct && args[1].T === view &&
+           eltype(_js_type(args[1].fields[1])) <: _JsNumber
+        x, r = args[1].fields
+        return _js_rt(_js_use!(mod, :_rk_sumrange) * "(" * x.code * ", " * _js_range_start(r) * ", " *
+                      _js_range_stop(r) * ")", T)
+    elseif f === length && length(args) == 1 && args[1] isa _JsStruct && args[1].T === view
+        return _js_call!(ir, length, Any[args[1].fields[2]], Int64)
+    elseif f === getindex && length(args) == 2 && args[1] isa _JsStruct && args[1].T === view && _js_isint(args[2])
+        x, r = args[1].fields
+        i = _js_simple!(ir, args[2], "i")
+        _js_flush!(ir)
+        _js_line!(ir.fn, "if (!(" * i.code * " >= 1 && " * i.code * " <= " * _js_range_length(r) * ")) throw new " *
+                         _js_use!(mod, :JuliaError) * "(\"BoundsError\",\"attempt to access \" + " *
+                         _js_range_length(r) * " + \"-element view at index [\" + " * i.code * " + \"]\");")
+        return _js_rt(x.code * "[" * _js_range_start(r) * " + " * _js_code(mod, i, _JS_ADD + 1) * " - 2]", T)
     elseif f === setindex! && length(args) == 3 && _js_isvector(args[1]) && _js_isint(args[3])
         return _js_fcall(ir, _js_use!(mod, :_rk_set), args, T; pure = false)
     elseif f === sum && length(args) == 1 && _js_isvector(args[1]) && eltype(_js_type(args[1])) <: _JsNumber
@@ -1719,7 +1856,7 @@ function _js_function_call(ir::_JsIR, f::Core.Builtin, args, T)
         if x isa _JsTuple
             idx = key isa Symbol ? findfirst(==(key), fieldnames(x.T)) : key
             return x.items[idx]
-        elseif x isa _JsStruct
+        elseif x isa _JsStruct && x.T isa DataType
             idx = key isa Symbol ? findfirst(==(key), fieldnames(x.T)) : key
             return x.fields[idx]
         elseif x isa _JsVal && x.static
@@ -1792,8 +1929,35 @@ function _js_function_call(ir::_JsIR, f::Type, args, T)
         return _js_rt(_js_use!(ir.fn.mod, :_rk_range) * "(1, " * _js_runtime(ir.fn.mod, args[1]).code * ")", T)
     elseif f === Base.Generator && length(args) == 2 && (_js_isvector(args[2]) || _js_isrange(args[2]))
         return _JsStruct(f, Any[args...], T)
+    elseif f in (Vector{Float64}, Vector{Int64}, Vector{Bool}) && length(args) == 2 && args[1] isa _JsVal &&
+           args[1].static && args[1].value === undef && _js_isint(args[2])
+        # `Vector{T}(undef, n)`: the values are unspecified, as in Julia.
+        return _js_rt("new Array(" * _js_runtime(ir.fn.mod, args[2]).code * ").fill(" *
+                      (f === Vector{Bool} ? "false" : "0") * ")", f; pure = false)
+    elseif f <: NamedTuple && length(args) <= 1 && T isa DataType && T <: NamedTuple && isconcretetype(T)
+        # `(; a, b)` and the keywords of `f(x; a, b)`: `NamedTuple{names}(tuple)`.
+        items = isempty(args) ? Any[] : _js_tuple_items(ir, args[1])
+        (items === nothing || length(items) != fieldcount(T)) && return nothing
+        for (k, v) in pairs(items)
+            S = fieldtype(T, k)
+            _js_type(v) === S && continue
+            v isa _JsVal || return nothing
+            items[k] = v.static ? _js_static(convert(S, v.value)) : _js_convert(ir, S, v)
+        end
+        return _JsTuple(items, T)
     end
     nothing
+end
+
+# The elements of a tuple value, or `nothing` for a value that is not a tuple.
+function _js_tuple_items(ir::_JsIR, x)
+    _js_type(x) <: Tuple || return nothing
+    x isa _JsTuple && return copy(x.items)
+    x isa _JsVal || return nothing
+    x.static && return Any[_js_static(e) for e in x.value]
+    fieldcount(x.T) == 0 && return Any[]
+    t = _js_simple!(ir, x, "t")
+    Any[_js_rt(t.code * "[" * string(k - 1) * "]", fieldtype(x.T, k)) for k in 1:fieldcount(x.T)]
 end
 
 # --- the module -----------------------------------------------------------------------------------------
@@ -2072,7 +2236,8 @@ inputs stay runtime arguments. Translated: ordinary kernel recipes,
 broadcasts (fused, with Julia's length rules), `plate` and `scan` as loops,
 arithmetic and comparisons, `Base.Math` functions with Julia's domain errors,
 checked 1-based indexing, `sum`/`maximum`/`minimum`, ranges, comprehensions
-and `map` over vectors. Plain Julia helpers are translated from their typed
+and `map` over vectors, tuples and named tuples (objects) built, read and
+destructured, and keyword calls. Plain Julia helpers are translated from their typed
 code, branches, early returns and loops included, without annotation;
 Julia's own functions translate only through RK's table. A construct without
 a translation (a C call, `fma`, a matrix, a scan with `history`) raises
