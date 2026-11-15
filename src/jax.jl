@@ -674,14 +674,16 @@ _jax_literal(x::NamedTuple) = (t = _jax_literal(Tuple(x)); _PyVal(t.code, typeof
 _jax_literal(x) = _jax_error("no JAX literal for a value of type `", typeof(x), "`")
 
 # A constant the source reads (a captured array, a module constant): small
-# values inline, arrays become module-level constants.
-function _jax_constant(ctx::_JaxContext, hint, x)
-    x isa AbstractArray || return _jax_literal(x)
+# values inline, arrays become module-level constants. `code` is the value's
+# Python text, an array's literal unless given (a captured record's tuple of
+# its field constants).
+function _jax_constant(ctx::_JaxContext, hint, x, code = nothing)
+    x isa Union{AbstractArray,NamedTuple} || return _jax_literal(x)
     host = ctx.host !== nothing
     name = get(ctx.mod.helper_names, (:constant, objectid(x), host), nothing)
     if name === nothing
         name = _jax_identifier(ctx.mod.used, uppercase(string(hint)) * (host ? "_NP" : ""))
-        line = name * " = " * _jax_literal(x).code
+        line = name * " = " * something(code, _jax_literal(x).code)
         push!(ctx.mod.helpers, host ? _host_text(line) : line)
         ctx.mod.helper_names[(:constant, objectid(x), host)] = name
     end
@@ -749,6 +751,28 @@ end
 _jax_value(ctx::_JaxContext, x::Union{Number,Nothing,AbstractString,Symbol}, hint) = _jax_literal(x)
 _jax_value(ctx::_JaxContext, x::AbstractArray{<:Real}, hint) = _jax_constant(ctx, hint, x)
 _jax_value(ctx::_JaxContext, x::Tuple, hint) = _jax_literal(x)
+# A captured record read whole (`metadata = (; weights, indices)` passed to a
+# helper): the Python tuple of its fields, as every named tuple is in a module
+# (a named-tuple HAVE crosses as one, and a field read indexes it by position).
+# Each field is a value of its own, so an array field is a typed module
+# constant named after the record and the field (`METADATA_WEIGHTS`) with
+# Julia's shape and element type. A record of literals stays a static literal;
+# one holding an array is a module constant as well (`METADATA`), so a call
+# reads that one name and not every field.
+function _jax_value(ctx::_JaxContext, x::NamedTuple, hint)
+    # A record of singletons (`(; f = exp)`, `(;)`) carries everything in its
+    # type, as any singleton does.
+    Base.issingletontype(typeof(x)) && return _PyVal("None", typeof(x), true)
+    for k in keys(x)
+        v = getfield(x, k)
+        v isa Union{Function,Type} && _jax_error("the field `", k, "` of the captured value `",
+            hint, "` is a ", v isa Type ? "type" : "function",
+            "; a captured named tuple translates with data fields only", _jax_where(ctx))
+    end
+    fields = _PyVal[_jax_value(ctx, getfield(x, k), Symbol(hint, :_, k)) for k in keys(x)]
+    all(f -> f.static, fields) && return _PyVal(_jax_tuple_code(fields), typeof(x), true)
+    _jax_constant(ctx, hint, x, _jax_tuple_code(fields))
+end
 # A function passed as a value (`sum(abs2, z)`): its type carries it, and only
 # a call that takes a function argument reads it.
 _jax_value(ctx::_JaxContext, x::Function, hint) =
@@ -1290,7 +1314,7 @@ function _jax_expr(ctx::_JaxContext, ::Val{:.}, ex)
                        _jax_where(ctx))
         k = findfirst(==(field), fieldnames(x.T))
         k === nothing && _jax_error("`", x.T, "` has no field `", field, "`", _jax_where(ctx))
-        return _PyVal(_py_atom(x.code) * "[" * string(k - 1) * "]", fieldtype(x.T, k))
+        return _jax_named_field(x, k)
     end
     if length(ex.args) == 2 && ex.args[2] isa Expr && ex.args[2].head === :tuple
         f = _jax_resolve(ctx, ex.args[1])
@@ -5796,8 +5820,12 @@ function _jax_call_positional(ctx::_JaxContext, ::typeof(getproperty), args::Vec
                                                     _jax_where(ctx))
     k = findfirst(==(name), fieldnames(x.T))
     k === nothing && _jax_error("`", x.T, "` has no field `", name, "`", _jax_where(ctx))
-    _PyVal(_py_atom(x.code) * "[" * string(k - 1) * "]", fieldtype(x.T, k))
+    _jax_named_field(x, k)
 end
+# Field `k` of a named tuple, read by position. A field of a static record (a
+# captured record of literals) is static, as a tuple element is.
+_jax_named_field(x::_PyVal, k::Integer) =
+    _PyVal(_py_atom(x.code) * "[" * string(k - 1) * "]", fieldtype(x.T, k), x.static)
 # `getglobal(M, name)` of a module and a name known while emitting (a method's
 # static parameters `where {M,name}`).
 function _jax_call_positional(ctx::_JaxContext, ::typeof(getglobal), args::Vector{_PyVal})

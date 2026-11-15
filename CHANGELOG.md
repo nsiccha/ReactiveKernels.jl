@@ -16,6 +16,21 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.258
+
+- `jax_source` translates a kernel that captures a `NamedTuple` of data and
+  reads it whole, for example by passing it to a `@traceable` helper
+  (`metadata = (; weights, indices)`; `f(x, metadata)`). The record is the
+  Python tuple of its fields, as a named-tuple HAVE already crosses, and a
+  field read indexes it by position. Each array field is a typed module
+  constant named after the record and the field (`METADATA_WEIGHTS`), keeping
+  Julia's shape, axis order and element type (matrices and higher-rank integer
+  arrays included); a record holding an array is itself a module constant
+  (`METADATA`), and a record of literals stays a static literal (it can size
+  an allocation). A field that is a function or a type raises
+  `JAXEmissionError` naming the field. Before, any captured named tuple read
+  whole raised `JAXEmissionError` (snag emit-an-rk-kerne-6bbd4365).
+
 ## 0.1.257
 
 - `ReactiveKernels.js_run(source, entry, cases; node, vectors, timeout)`
