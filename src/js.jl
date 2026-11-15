@@ -1116,16 +1116,22 @@ method for its own function type.
 """
 _js_function_call(ir, f, args, T) = nothing
 
+# The `MethodError` of a keyword call `f(x; a, b)` that no method of `f`
+# takes: `args` are the keywords, `f` and the positional arguments.
+function _js_kwerr(mod::_JsModule, args)
+    NT = _js_type(args[1])
+    f = args[2] isa _JsVal && args[2].static ? args[2].value : _js_type(args[2])
+    msg = "no method matching " * string(f isa Function ? nameof(f) : f) * "(" *
+          join(("::" * string(_js_argtype(a)) for a in args[3:end]), ", ") * "; " *
+          join((string(k) * "::" * string(S) for (k, S) in zip(fieldnames(NT), fieldtypes(NT))), ", ") * ")"
+    push!(mod.runtime, :JuliaError)
+    _js_rt("throw new JuliaError(\"MethodError\", " * _js_string_literal(msg) * ")", Union{}; pure = false)
+end
+
 function _js_call!(ir::_JsIR, f, args::Vector{Any}, T)
     mod = ir.fn.mod
     v = _js_function_call(ir, f, args, T)
     v === nothing || return v
-    if f isa Type && f <: Exception
-        push!(mod.runtime, :JuliaError)
-        rargs = [_js_runtime(mod, a).code for a in args]
-        return _js_rt("new JuliaError(" * _js_string_literal(nameof(f)) * ", [" * join(rargs, ", ") *
-                      "].join(\", \"))", f)
-    end
     if f === Core.kwcall && length(args) >= 2 && _js_type(args[1]) <: NamedTuple &&
        args[2] isa _JsVal && args[2].static && !_js_table_only(args[2].value)
         # `f(x; a, b)`: the keyword sorter of `f`, whose checks of the keyword
@@ -1136,6 +1142,12 @@ function _js_call!(ir::_JsIR, f, args::Vector{Any}, T)
         _js_flush!(ir)
         v, _ = _js_inline!(ir.fn, f, args, "value")
         return v
+    end
+    if f isa Type && f <: Exception
+        push!(mod.runtime, :JuliaError)
+        rargs = [_js_runtime(mod, a).code for a in args]
+        return _js_rt("new JuliaError(" * _js_string_literal(nameof(f)) * ", [" * join(rargs, ", ") *
+                      "].join(\", \"))", f)
     end
     if !(f isa Core.Builtin) && !(f isa Type) && !_js_table_only(f)
         # A function becomes a named JavaScript function; a callable object
@@ -1152,18 +1164,6 @@ function _js_call!(ir::_JsIR, f, args::Vector{Any}, T)
     end
     types = join((_js_type(a) isa Type ? _js_type(a) : typeof(_js_type(a)) for a in args), ", ")
     _js_error(mod, "`", f, "` with argument types (", types, ") has no JavaScript translation")
-end
-
-# The `MethodError` of a keyword call `f(x; a, b)` that no method of `f`
-# takes: `args` are the keywords, `f` and the positional arguments.
-function _js_kwerr(mod::_JsModule, args)
-    NT = _js_type(args[1])
-    f = args[2] isa _JsVal && args[2].static ? args[2].value : _js_type(args[2])
-    msg = "no method matching " * string(f isa Function ? nameof(f) : f) * "(" *
-          join(("::" * string(_js_argtype(a)) for a in args[3:end]), ", ") * "; " *
-          join((string(k) * "::" * string(S) for (k, S) in zip(fieldnames(NT), fieldtypes(NT))), ", ") * ")"
-    push!(mod.runtime, :JuliaError)
-    _js_rt("throw new JuliaError(\"MethodError\", " * _js_string_literal(msg) * ")", Union{}; pure = false)
 end
 
 # A function bound to its name in its module (not a closure or callable object).

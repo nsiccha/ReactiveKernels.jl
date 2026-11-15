@@ -1,9 +1,9 @@
 module TestJSSource
 
 using ReactiveKernels
+using LogExpFunctions: log1pexp, logistic
 using Test
 using Base: OneTo
-using LogExpFunctions: log1pexp, logistic
 
 const NODE = ReactiveKernels._js_default_node() !== nothing
 
@@ -41,6 +41,51 @@ function js_weighted_total(v)
 end
 js_squares(v) = [x^2 for x in v]
 js_c_sin(x) = ccall(:sin, Float64, (Float64,), x)
+
+# Keyword helpers (a required keyword, a default, a default computed from
+# another keyword), named tuples built and read by field, and destructuring.
+function js_kw_split(x, y; share, offset = 0.0, scale = 2 * share)
+    lo, hi = zeros(length(x)), zeros(length(x))
+    for i in eachindex(x)
+        lo[i] = share * x[i] + offset
+        hi[i] = scale * y[i]
+    end
+    return (; lo, hi = hi)
+end
+js_kw_total(r; weight) = weight * sum(r.lo) + sum(r.hi)
+js_record_mean(rec) = (sum(rec.a) + sum(rec.b)) / (length(rec.a) + length(rec.b))
+js_kw_need(x; a) = a * x
+# a keyword `b` that `js_kw_need` does not take, and a missing `a`: Julia's
+# MethodError and UndefKeywordError, when the branch runs
+js_kw_unknown(x) = x > 0 ? js_kw_need(x; a = 2.0) : js_kw_need(x; a = 1.0, b = 3.0)
+js_kw_missing(x) = x < 10 ? js_kw_need(x; a = 2.0) : js_kw_need(x)
+# a keyword call reaches the keyword method, not a more specific one without
+# keywords; a function without keyword methods is a MethodError
+js_kw_pick(x; a) = a * x
+js_kw_pick(x::Float64) = -x
+js_kw_specific(x) = js_kw_pick(x; a = 3.0) + js_kw_pick(x)
+js_kw_none(x) = x
+js_kw_none_use(x) = x > -5 ? x : js_kw_none(x; a = 1.0)
+# a generator over a range written in the source, destructured
+function js_buffers(x)
+    n = length(x)
+    a, b, c = (Vector{Float64}(undef, n) for _ in 1:3)
+    for i in 1:n
+        a[i] = x[i]
+        b[i] = 2 * x[i]
+        c[i] = a[i] + b[i]
+    end
+    out = similar(x)
+    for i in eachindex(out)
+        out[i] = c[i] - a[i]
+    end
+    return out
+end
+js_window_means(x, w) =
+    [sum(@view x[(w * (k - 1) + 1):(w * k)]) / length(@view x[(w * (k - 1) + 1):(w * k)]) for k in 1:(length(x) ÷ w)]
+js_view_second(x) = (v = @view x[2:end]; v[1])
+# `log1pexp` destructures thresholds that depend only on the argument's type
+js_soft(x, s) = s * log1pexp(x / s)
 
 # Loops over a range written in the helper (`for _ in 1:60`): the range is known
 # while translating, needs no kernel input, and a loop over an empty one, like a
@@ -100,51 +145,6 @@ js_powers(x) = x .^ (0:4)
 js_scaled(x) = [x / k for k in 1:5]
 js_squares_scaled(x) = [k^2 for k in 1:5] .* x
 js_multiples(x) = map(k -> k * x, 1:4)
-
-# Keyword helpers (a required keyword, a default, a default computed from
-# another keyword), named tuples built and read by field, and destructuring.
-function js_kw_split(x, y; share, offset = 0.0, scale = 2 * share)
-    lo, hi = zeros(length(x)), zeros(length(x))
-    for i in eachindex(x)
-        lo[i] = share * x[i] + offset
-        hi[i] = scale * y[i]
-    end
-    return (; lo, hi = hi)
-end
-js_kw_total(r; weight) = weight * sum(r.lo) + sum(r.hi)
-js_record_mean(rec) = (sum(rec.a) + sum(rec.b)) / (length(rec.a) + length(rec.b))
-js_kw_need(x; a) = a * x
-# a keyword `b` that `js_kw_need` does not take, and a missing `a`: Julia's
-# MethodError and UndefKeywordError, when the branch runs
-js_kw_unknown(x) = x > 0 ? js_kw_need(x; a = 2.0) : js_kw_need(x; a = 1.0, b = 3.0)
-js_kw_missing(x) = x < 10 ? js_kw_need(x; a = 2.0) : js_kw_need(x)
-# a keyword call reaches the keyword method, not a more specific one without
-# keywords; a function without keyword methods is a MethodError
-js_kw_pick(x; a) = a * x
-js_kw_pick(x::Float64) = -x
-js_kw_specific(x) = js_kw_pick(x; a = 3.0) + js_kw_pick(x)
-js_kw_none(x) = x
-js_kw_none_use(x) = x > -5 ? x : js_kw_none(x; a = 1.0)
-# a generator over a range written in the source, destructured
-function js_buffers(x)
-    n = length(x)
-    a, b, c = (Vector{Float64}(undef, n) for _ in 1:3)
-    for i in 1:n
-        a[i] = x[i]
-        b[i] = 2 * x[i]
-        c[i] = a[i] + b[i]
-    end
-    out = similar(x)
-    for i in eachindex(out)
-        out[i] = c[i] - a[i]
-    end
-    return out
-end
-js_window_means(x, w) =
-    [sum(@view x[(w * (k - 1) + 1):(w * k)]) / length(@view x[(w * (k - 1) + 1):(w * k)]) for k in 1:(length(x) ÷ w)]
-js_view_second(x) = (v = @view x[2:end]; v[1])
-# `log1pexp` destructures thresholds that depend only on the argument's type
-js_soft(x, s) = s * log1pexp(x / s)
 
 @kernel js_scalar(a, b) = begin
     c = a * b + exp(-a) / (1 + b^2)
@@ -225,14 +225,6 @@ end
     m = js_multiples(x)
     return p
 end
-@kernel js_c_call(x) = begin
-    y = js_c_sin(x)
-    return y
-end
-@kernel js_fma(a, b) = begin
-    y = fma(a, b, 1.0)
-    return y
-end
 @kernel js_keywords(x, y, share, weight) = begin
     r = js_kw_split(x, y; share)
     lo = r.lo
@@ -266,10 +258,18 @@ end
     e = exp.(x[index])
     return (; g, e)
 end
-@kernel js_logexp(x, s) = begin
+@kernel js_soft_logistic(x, s) = begin
     a = js_soft.(x, s)
     b = logistic.(x)
     return (; a, b)
+end
+@kernel js_c_call(x) = begin
+    y = js_c_sin(x)
+    return y
+end
+@kernel js_fma(a, b) = begin
+    y = fma(a, b, 1.0)
+    return y
 end
 
 const V = Vector{Float64}
@@ -289,17 +289,6 @@ const CASES = [
      [([1.0, 2.0, 3.0], [0.5, 0.25, 0.125]), ([1.0, 2.0, 3.0], [1.0]), ([2.0], [1.0, 2.0, 3.0]),
       ([1.0, 2.0, 3.0], [1.0, 2.0, 3.0, 4.0])]),
     (:js_comprehension, js_comprehension, (:x,), :y, (; x = V), [([1.0, -2.0, 3.5],), (Float64[],)]),
-    # The arm not taken is not evaluated: `log` of a negative number is never
-    # computed for a > b.
-    (:js_branch, js_branch, (:a, :b), :y, (; a = Float64, b = Float64), [(5.0, 1.0), (1.0, 4.0), (1.0, 1.5)]),
-    (:js_scan, js_scan, (:x, :decay, :initial), :trajectory, (; x = V, decay = Float64, initial = Float64),
-     [([1.0, 0.0, 0.0, 2.0], 0.5, 0.0), (Float64[], 0.5, 1.0), (collect(range(0, 1; length = 1000)), 0.9, 2.0)]),
-    (:js_plate, js_plate, (:y, :mu), :total, (; y = V, mu = V),
-     [([1.0, 2.0, 3.0], [0.5, 2.5, 3.0]), ([1.0, 2.0], [0.0]), (Float64[], Float64[]), ([1.0, 2.0, 3.0], [1.0, 2.0])]),
-    (:js_fixed_ranges, js_fixed_ranges, (:x, :k, :flag, :n), (:h, :s, :u, :e, :c, :p),
-     (; x = Float64, k = Float64, flag = Bool, n = Int),
-     [(0.5, 0.3, true, 10), (-0.9, 2.0, false, 0), (2.0, 1e-3, false, 7)]),
-    (:js_fixed_vectors, js_fixed_vectors, (:x,), (:p, :s, :q, :m), (; x = Float64), [(1.5,), (-0.25,)]),
     (:js_keywords, js_keywords, (:x, :y, :share, :weight), (:lo, :hi, :t),
      (; x = V, y = V, share = Float64, weight = Float64),
      [([1.0, 2.0, 3.0], [0.5, 0.25, 0.0], 0.3, 2.0), (Float64[], Float64[], 0.1, 1.0), ([1.0, 2.0], [1.0], 0.5, 1.0)]),
@@ -312,8 +301,19 @@ const CASES = [
      [(collect(1.0:12.0), 3), (collect(1.0:13.0), 4), ([1.0], 1), (collect(range(0, 1; length = 5000)), 2500)]),
     (:js_gather, js_gather, (:x, :index), (:g, :e), (; x = V, index = Vector{Int}),
      [([1.0, 2.0, 3.0], [3, 1, 1, 2]), ([1.0, 2.0], Int[]), ([1.0, 2.0], [1, 3])]),
-    (:js_logexp, js_logexp, (:x, :s), (:a, :b), (; x = V, s = Float64),
+    (:js_soft_logistic, js_soft_logistic, (:x, :s), (:a, :b), (; x = V, s = Float64),
      [(collect(range(-800, 800; length = 33)), 1.0), ([-40.0, -20.0, 0.0, 20.0, 35.0], 0.5)]),
+    # The arm not taken is not evaluated: `log` of a negative number is never
+    # computed for a > b.
+    (:js_branch, js_branch, (:a, :b), :y, (; a = Float64, b = Float64), [(5.0, 1.0), (1.0, 4.0), (1.0, 1.5)]),
+    (:js_scan, js_scan, (:x, :decay, :initial), :trajectory, (; x = V, decay = Float64, initial = Float64),
+     [([1.0, 0.0, 0.0, 2.0], 0.5, 0.0), (Float64[], 0.5, 1.0), (collect(range(0, 1; length = 1000)), 0.9, 2.0)]),
+    (:js_plate, js_plate, (:y, :mu), :total, (; y = V, mu = V),
+     [([1.0, 2.0, 3.0], [0.5, 2.5, 3.0]), ([1.0, 2.0], [0.0]), (Float64[], Float64[]), ([1.0, 2.0, 3.0], [1.0, 2.0])]),
+    (:js_fixed_ranges, js_fixed_ranges, (:x, :k, :flag, :n), (:h, :s, :u, :e, :c, :p),
+     (; x = Float64, k = Float64, flag = Bool, n = Int),
+     [(0.5, 0.3, true, 10), (-0.9, 2.0, false, 0), (2.0, 1e-3, false, 7)]),
+    (:js_fixed_vectors, js_fixed_vectors, (:x,), (:p, :s, :q, :m), (; x = Float64), [(1.5,), (-0.25,)]),
 ]
 
 agree(a::Real, b::Real) = (isnan(a) && isnan(b)) || isapprox(a, b; rtol = 1e-12, atol = 1e-15)
@@ -413,7 +413,7 @@ agree(a, b) = false
                        "js_buffers")
         @test count("new Array(n).fill(0)", buffers) == 3 && count("while (true)", buffers) == 2
         # thresholds known from the argument's type are literals
-        soft = ReactiveKernels.js_source(js_logexp; have = (:x, :s), want = (:a, :b), types = (; x = V, s = Float64))
+        soft = ReactiveKernels.js_source(js_soft_logistic; have = (:x, :s), want = (:a, :b), types = (; x = V, s = Float64))
         @test occursin("x < -745.1332191019412", soft) && !occursin("indexed_iterate", soft)
     end
 
