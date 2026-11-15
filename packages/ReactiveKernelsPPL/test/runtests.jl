@@ -189,6 +189,7 @@ const _PPL_TEST_FILES = (
     "test_shared_array_location.jl",
     "test_ordinal_explicit.jl",
     "test_data_cutpoints.jl",
+    "test_computed_thresholds.jl",
     "test_capability_shapes.jl",
     "test_capability_scan_priors.jl",
     "test_capability_arguments.jl",

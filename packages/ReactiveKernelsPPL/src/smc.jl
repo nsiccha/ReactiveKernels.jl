@@ -722,12 +722,13 @@ is `:temper` for this operation or `:rejuvenate` for explicit fixed-temperature 
 function smc_step end
 
 """
-    pool_smc(states::AbstractVector) -> (; log_normalizer, cloud_weights,
+    pool_smc(clouds::AbstractVector) -> (; log_normalizer, cloud_weights,
         effective_clouds, positions, weights)
 
 Combine independent SMC clouds of one prepared target into one evidence
-estimate and one weighted sample. Each cloud's normalizer estimate Ẑ_c =
-exp(`log_normalizer`) is unbiased only up to the adaptive temperature and
+estimate and one weighted sample. Each cloud is an SMC state or its
+[`smc_checkpoint`](@ref) record, in any mix. Each cloud's normalizer estimate
+Ẑ_c = exp(`log_normalizer`) is unbiased only up to the adaptive temperature and
 kernel choices, so averaging Ẑ, not log Ẑ, is the consistent combination:
 `log_normalizer` is the log of the clouds' mean Ẑ, `cloud_weights` are
 Ẑ_c / ΣẐ, `effective_clouds` is 1/Σ`cloud_weights`², and `positions` holds every
@@ -744,9 +745,22 @@ are not noise around the truth, and the highest clouds dominate the pool.
 disagree, so more clouds or particles are needed. With probability at least
 1 - α, log Z ≥ `log_normalizer` - log(1/α), to the extent Ẑ is unbiased.
 
-All states must share the temperature and the prepared target's model, binding
+All clouds must share the temperature and the prepared target's model, binding
 and frame identity; below temperature 1 they must also share the source. The
 inputs are not mutated.
+
+Clouds run in separate processes pool through their checkpoints: each process
+saves `smc_checkpoint(state)` with Julia `Serialization`, and one process
+deserializes the records and passes them here. That process needs this
+package's SMC extension loaded to read them, but no prepared target: pooling
+reads each record's stored identity, normalizer, particles and weights and
+evaluates no density, so the records may come from other hosts. A record must
+pass the checks `resume_smc` makes without a target (schema, particles, bridge
+state, a completed stage). Package versions are not compared. Save the
+checkpoint, not the `SMCState`: a serialized state carries its target (prepared
+queries, AD backend, a prepared density's factory and problem), so reading it
+back needs the model's code and backend loaded and holds only what
+`Serialization` can reproduce of them.
 """
 function pool_smc end
 
@@ -832,7 +846,8 @@ instruction set (AVX-512 versus AVX2, for example) can round the same density
 differently in its last bits. Such a checkpoint is refused with its largest
 deviation named; `rescore_smc_checkpoint` re-anchors it on the new host.
 This API does not write files or promise atomic disk persistence. The caller
-owns file replacement and model/data retention.
+owns file replacement and model/data retention. [`pool_smc`](@ref) pools
+checkpoints of independent clouds directly, without a target.
 Omitting `nthreads` preserves the saved worker cap. Pass a positive integer,
 for example `nthreads=Threads.nthreads()`, to override only that cap; actual
 workers remain bounded by available default threads and particle count.

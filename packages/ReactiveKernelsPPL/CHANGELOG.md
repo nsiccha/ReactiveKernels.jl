@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.200
+## 0.1.202
 
 - An observed vector merged with other values is observed entry by entry
   (data augmentation). In
@@ -37,6 +37,38 @@ are recorded in the git history only.
   Other definitions that read observed data and a sampled value are still
   refused, and the message now names both reads. `jax_source` emits the
   split.
+
+## 0.1.201
+
+- Ordinal thresholds may be any vector the model computes, for
+  `OrderedLogistic` and both `Ordinal` structures. `Ref(cuts)` shares one
+  computed vector (a definition such as `cuts = m .+ s .- mean(s)`, or an
+  inline expression); inside a dotted `@plate` cell, `Ref(cuts)` of a cell
+  local gives each index its own vector, as in Julia; a bare argument such
+  as `rows[g]` over a computed value gives each observation its own. Before,
+  sampled thresholds had to name a declared vector, and per-observation
+  thresholds had to be data. The program reads a computed vector's length
+  when it runs: a level beyond it has log density `-Inf`, and cumulative
+  cutpoints that do not increase give `-Inf` through the existing lazy
+  guard. A stopping-ratio response over computed thresholds takes its stage
+  lanes from the observed levels alone (observation `i` visits stages
+  `1..y[i]`), and each lane reads its threshold only within the vector;
+  beside threshold effects it observes one lane per observation through
+  `rk_ordinal_stopping_logpdf`. Native values, ordinary Enzyme Reverse and
+  `jax_source`, where a centring `mean` is ReactiveKernels' Statistics
+  translation (ReactiveKernels 0.1.262).
+
+## 0.1.200
+
+- `pool_smc` also takes `smc_checkpoint` records, alone or mixed with SMC
+  states, so clouds finished in separate processes pool without their
+  target: save each cloud's checkpoint with `Serialization`, deserialize the
+  records in one process with the SMC extension loaded, and pool them. The
+  pooling process prepares no target and evaluates no density, so the records
+  may come from other hosts. A checkpoint passes the target-free checks
+  `resume_smc` makes, and the identity, temperature and source checks of the
+  state method; package versions are not compared. A record that is not a
+  checkpoint is refused (snag `pool-smc-cannot-81731f5b`).
 
 ## 0.1.199
 
