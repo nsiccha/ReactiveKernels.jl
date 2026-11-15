@@ -1551,7 +1551,10 @@ function _js_materialize!(ir::_JsIR, bc::_JsBroadcast, T; dest = nothing)
     elements = Dict{Any,String}()
     for l in arrays
         a = names[l]
-        elements[l] = _js_isrange(l) ? "(" * _js_range_start(a) * " + " * i * ")" :
+        # a range of length one is broadcast like a vector of length one
+        elements[l] = _js_isrange(l) ?
+            (single ? "(" * _js_range_start(a) * " + " * i * ")" :
+             "(" * _js_range_start(a) * " + (" * _js_range_length(a) * " === 1 ? 0 : " * i * "))") :
             single ? a.code * "[" * i * "]" : _js_use!(mod, :_rk_bcat) * "(" * a.code * ", " * i * ")"
     end
     e = _js_element!(ir, bc, elements, i)
@@ -2365,18 +2368,24 @@ ordinary kernel recipes, broadcasts (fused, with Julia's length rules),
 `plate` and `scan` as loops, arithmetic and comparisons, `Base.Math`
 functions with Julia's domain errors, checked 1-based indexing (of a matrix:
 `m[i, j]`, `m[:, j]`, `m[i, :]`, `size`, `axes`), vector literals,
-`sum`/`maximum`/`minimum`, ranges, comprehensions and `map` over vectors,
+`sum`/`prod`/`maximum`/`minimum`, ranges, comprehensions and `map` over vectors,
 tuples and named tuples (objects) built, read and destructured, keyword
 calls, and `rk_ode_rk45_tol`, integrated by the vendored `@reside-ic/dopri`
 Dormand–Prince 5(4) method with the native bridge's arguments, step budget
 and `ODESolveFailure`s (values agree with native to the solvers' accuracy).
-Plain Julia helpers are translated from their typed code, branches, early
-returns and loops included, without annotation; Julia's own functions
-translate only through RK's table. A construct without a translation (a C
-call, `fma`, matrix arithmetic, a scan with `history`, `rk_ode_bdf_tol`) raises
+Matrix arithmetic: `*` of matrices, vectors, scalars and the transposes
+`m'`/`transpose(m)`/`v'` (a chain `A * B * v` included); `+`/`-` of
+matrices; `sum`/`prod`/`maximum`/`minimum` of a matrix, whole or with
+`dims = 1` or `2`; `vec` (a fresh vector in column order); `permutedims`;
+`zeros`/`ones`/`fill(x, m, n)`; and broadcasts over matrices, columns and
+rows with Julia's shape rules. Plain Julia helpers are translated from their
+typed code, branches, early returns and loops included, without annotation;
+Julia's own functions translate only through RK's table. A construct without
+a translation (a C call, `fma`, `\` and factorizations, indexing a transposed
+matrix, a scan with `history`, `rk_ode_bdf_tol`) raises
 `ReactiveKernels.JSEmissionError` naming it and its call chain. Elementary
-functions use JavaScript's `Math`, which may differ from Julia's in the last
-bit.
+functions use JavaScript's `Math` and products sum in their own order, so
+results may differ from Julia's in the last bits.
 """
 function js_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
                    want = _KERNEL_DEFAULT_BOUNDARY, types = nothing, name = :kernel)

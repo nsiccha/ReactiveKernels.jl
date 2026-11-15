@@ -16,6 +16,25 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.268
+
+- `js_source` translates matrix arithmetic on its row-array matrices: `*` of
+  matrices, vectors, scalars and the transposes `m'`, `transpose(m)` and `v'`
+  (chains such as `A * B * v` and RK's own recipe product included); `+` and
+  `-` of matrices; `sum`, `prod`, `maximum` and `minimum` of a matrix, whole
+  or with `dims = 1` or `2`; `vec` (a fresh vector in column order, where
+  Julia's shares the matrix's memory); `permutedims`; `zeros`, `ones` and
+  `fill(x, m, n)`; and broadcasts over matrices, columns and rows with Julia's
+  shape rules, in place into a matrix too. `prod` of a vector translates.
+  Errors are Julia's (`DimensionMismatch`, `ArgumentError`, `MethodError` for
+  an empty `maximum`). `\`, factorizations and indexing a transposed matrix
+  stay refused by name.
+- `js_source`: a range of length one in a broadcast against a longer vector,
+  `(1:1) .+ x`, is broadcast like a vector of length one. It read
+  `start + i` before and returned wrong values silently.
+- `js_run` decodes a `BitVector` or `BitMatrix` output (a comparison
+  broadcast such as `x .> 0`) to that type.
+
 ## 0.1.267
 
 - `ReactiveKernels.js_source` translates `rk_ode_rk45_tol`. The emitted module
