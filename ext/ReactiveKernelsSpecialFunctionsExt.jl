@@ -1,6 +1,7 @@
 # JAX translations of SpecialFunctions functions for `jax_source`
 # (`src/jax.jl`). Each is the `jax.scipy.special` counterpart, or a stable
-# helper the emitted module defines.
+# helper the emitted module defines. JavaScript translations for `js_source`
+# (`src/js.jl`) are at the end.
 module ReactiveKernelsSpecialFunctionsExt
 
 using ReactiveKernels
@@ -251,6 +252,24 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(SpecialFunctions.gamma_in
     a = _jax_args(args[1:2])
     _jax_result(SpecialFunctions.gamma_inc, args,
                 "(jsp.gammainc(" * a * "), jsp.gammaincc(" * a * "))")
+end
+
+
+# JavaScript translations for `js_source`. These functions call C libraries
+# (`erfc`, `erfcx`, `gamma`) or read the bits of a `Float64` (`erf`,
+# `logabsgamma`), so their Julia code has no translation. The emitted module
+# computes them with the stdlib-js implementations RK carries in `src/js_vendor/`,
+# through wrappers with Julia's special cases and errors where those differ. Every
+# other SpecialFunctions function a module uses, such as `logbeta`, `logerfc` or
+# `digamma`, translates from its own Julia code.
+for (f, helper) in ((SpecialFunctions.erf, :_rk_stdlib_erf), (SpecialFunctions.erfc, :_rk_stdlib_erfc),
+                    (SpecialFunctions.erfcx, :_rk_stdlib_erfcx), (SpecialFunctions.gamma, :_rk_gamma),
+                    (SpecialFunctions.loggamma, :_rk_loggamma),
+                    (SpecialFunctions.logabsgamma, :_rk_logabsgamma))
+    @eval function ReactiveKernels._js_function_call(ir::ReactiveKernels._JsIR, ::typeof($f), args, T)
+        length(args) == 1 && ReactiveKernels._js_isnumber(args[1]) || return nothing
+        ReactiveKernels._js_fcall(ir, ReactiveKernels._js_use!(ir.fn.mod, $(QuoteNode(helper))), args, T)
+    end
 end
 
 end # module
