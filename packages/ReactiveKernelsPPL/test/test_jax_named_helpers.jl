@@ -54,3 +54,59 @@ end
         end
     end
 end
+
+# A consumer that adds ReactiveKernelsPPL by URL (`repo-subdir`) has it in a
+# package tree of its own, not under ReactiveKernels' root as a developed
+# checkout does. Its helpers (`_ppl_cell_latent_block`) are still
+# ReactiveKernels' own and translated in place, so one model emits one module
+# text in both layouts (snag jax-source-layou-340a531c). `f()` runs in that
+# installed layout: every package of the repository's `packages/` (and each
+# of their extensions) has its recorded source path outside ReactiveKernels'
+# root, as `pathof` and `pkgdir` report it for an installed package.
+function jax_installed_layout(f)
+    packages = joinpath(pkgdir(ReactiveKernels), "packages", "")
+    installed = joinpath(tempdir(), "rk-installed-layout", "")
+    moved = Pair{Base.PkgOrigin,String}[]
+    @lock Base.require_lock for origin in values(Base.pkgorigins)
+        path = origin.path
+        path isa String && startswith(path, packages) || continue
+        push!(moved, origin => path)
+        origin.path = installed * path[ncodeunits(packages)+1:end]
+    end
+    try
+        f()
+    finally
+        @lock Base.require_lock for (origin, path) in moved
+            origin.path = path
+        end
+    end
+end
+
+const jax_layout_offsets = @rkppl begin
+    a ~ Normal(0, 1)
+    s ~ Exponential(1.0)
+    @plate for g in eachindex(y)
+        e[g] .~ Normal.(0 .* x[g], s)
+        mu = a .+ e[g] .+ 0.5 .* x[g]
+        y[g] .~ Normal.(mu, 1.0)
+    end
+end
+
+@testset "one module text whether ReactiveKernelsPPL is developed or installed" begin
+    x = [[0.1, -0.3, 0.5], [0.2], Float64[], [0.4, -0.1]]
+    y = [[0.3, -0.1, 0.8], [0.0], Float64[], [0.6, 0.1]]
+    plan = jax_layout_offsets(; x) | (; y)
+    emit() = (dir = pkgdir(ReactiveKernelsPPL),
+              internal = ReactiveKernels._jax_internal_function(
+                  ReactiveKernelsPPL._ppl_cell_latent_block),
+              text = string(jax_source(build_kernel(plan), plan)))
+    # The installed layout first, so nothing it emits was cached by the other.
+    installed = jax_installed_layout(emit)
+    developed = emit()
+    root = joinpath(pkgdir(ReactiveKernels), "")
+    @test !startswith(installed.dir, root)
+    @test pkgdir(ReactiveKernelsPPL) == developed.dir
+    @test installed.internal && developed.internal
+    @test installed.text == developed.text
+    @test !occursin(r"(?m)^def _ppl_cell_latent_block", installed.text)
+end

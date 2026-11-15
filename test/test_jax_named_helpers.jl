@@ -1,5 +1,5 @@
 module JAXNamedHelpersTests
-using ReactiveKernels, Test
+using ReactiveKernels, Test, TOML, LinearAlgebra
 include(joinpath(@__DIR__, "jax_python.jl"))
 
 # Plain authored helpers, recorded or not, are named, documented Python
@@ -171,6 +171,41 @@ end
             @test r.grad ≈ -2 * (y / exp(0.2))^2 + 1
         end
     end
+end
+
+# ReactiveKernels' own modules, whose functions are translated in place, are
+# the packages of its repository (its root and each package of `packages/`)
+# and their extensions, by UUID: the same whether a package is developed under
+# ReactiveKernels' root or installed in a tree of its own (snag
+# jax-source-layou-340a531c; the layouts themselves are compared in
+# ReactiveKernelsPPL's test_jax_named_helpers.jl).
+@testset "the repository's packages and extensions are ReactiveKernels' own, by UUID" begin
+    root = pkgdir(ReactiveKernels)
+    uuids = ReactiveKernels._rk_repository_package_uuids()
+    packages = [joinpath(root, "packages", d, "Project.toml") for d in readdir(joinpath(root, "packages"))]
+    projects = [TOML.parsefile(file) for file in [joinpath(root, "Project.toml"); filter(isfile, packages)]]
+    @test any(p -> p["name"] == "ReactiveKernelsPPL", projects)
+    @test any(p -> p["name"] == "ReactiveKernelsDistributionKernels", projects)
+    for project in projects
+        uuid = Base.UUID(project["uuid"])
+        @test uuid in uuids
+        # Julia's identity of a package's extension.
+        for ext in keys(get(project, "extensions", Dict()))
+            @test Base.uuid5(uuid, ext) in uuids
+        end
+    end
+    @test length(uuids) == sum(p -> 1 + length(get(p, "extensions", Dict())), projects)
+    @test ReactiveKernels._jax_internal_module(ReactiveKernels)
+    for ext in keys(projects[1]["extensions"])
+        m = Base.get_extension(ReactiveKernels, Symbol(ext))
+        m === nothing || @test ReactiveKernels._jax_internal_module(m)
+    end
+    # Julia's own functions are internal; a dependency's and an authored
+    # helper of this test are not.
+    @test ReactiveKernels._jax_internal_function(+)
+    @test ReactiveKernels._jax_internal_function(LinearAlgebra.dot)
+    @test !ReactiveKernels._jax_internal_module(ReactiveKernels.OutputSignatures)
+    @test !ReactiveKernels._jax_internal_function(named_mean)
 end
 
 end
