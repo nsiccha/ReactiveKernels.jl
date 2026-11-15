@@ -20,7 +20,7 @@ _marginal_name(x::Symbol, role::Symbol) = Symbol(_MARGINAL_PREFIX, x, :_, role)
 const _MARGINAL_ROLES = (:mean, :var, :coef, :shift, :innovation_var)
 
 """
-    marginalize(model, names::Symbol...) -> model
+    marginalize(model, names::Symbol...; predictive = (;), filtered = (;)) -> model
 
 Integrate the latent `@scan` arrays `names` out of `model` exactly, as a Kalman
 filter. `model` is an `RKPPLModel` or a binding of one (`model(; inputs...)`);
@@ -47,7 +47,11 @@ A marginalized array `x` qualifies when
   merged in time order with bounded latents of censored ones (data
   augmentation: `gap[1:K] .~ restricted.(Flat.(), 0, Inf)`,
   `y = vcat(measured, limit .- gap)[order]`). The filter then observes each
-  entry at its value, and the scan's length is supplied. Rows may instead
+  entry at its value, and the scan's length is supplied. Condition the
+  measured rows, `| (; measured)`: their entries' one-step-ahead predictive
+  densities are then the likelihood and `:pointwise.measured`, and the other
+  entries' are prior factors. Bound as an input instead, `measured` is not
+  conditioned, and every entry's density is a prior factor. Rows may instead
   observe the state at their steps, `y .~ Normal.(offset .+ loading .*
   x[step], noise)` with `step` bound integer data: a step may have several
   rows or none. The filter then runs over events (each step, then its rows
@@ -92,16 +96,36 @@ The marginalized program's density is the exact marginal density of the
 observations given the remaining parameters, so `coordinate_names` and the
 layout no longer contain `x` or its innovations. `:pointwise.y` holds the
 one-step-ahead predictive densities (0 at a missing entry), whose sum is the
-marginal likelihood.
+marginal likelihood; for a merged `y`, `:pointwise.measured` holds those of
+the measured entries.
 Exact draws of `x` given the parameters come from
 [`prepare_marginalized_latents`](@ref) and
 [`marginalized_latent_draws`](@ref).
+
+The filter's values become named values of the program when the call names
+them. `predictive` names the one-step-ahead predictive law of each observed
+entry given the entries before it, any of `predictive = (location = :mu,
+variance = :v, scale = :sd)`; `filtered` names the filtered mean and variance
+of the state given the observations up to each step, `filtered = (mean = :m,
+variance = :v)`, or per array for a call integrating out several,
+`filtered = (level = (mean = :level_mean,), slope = (variance = :slope_var,))`.
+Each name is an ordinary value: `prepare_query(built, plan, (:mu, :sd))`
+returns it, `jax_source(built, plan; values = (:mu, :sd))` emits it in
+`constrain`, `kernel_expr` shows it. A predictive value holds one value per
+entry of `y` (at a `missing` entry, its forecast from the entries before it),
+one per row for rows observing `x[step]`, and in a `@plate` cell one vector
+per index (`mu[g]`); a filtered value holds one value per step (one vector per
+index in a cell). Nothing is added when nothing is named, and naming values
+leaves the density unchanged. A name the model already uses, a name starting
+with `_rkppl`, a name given twice, and a call naming values for recurrences
+that different statements observe are refused: call `marginalize` once per
+recurrence, `marginalize(marginalize(model, :x; …), :z; …)`.
 
 Marginalize the model or its binding before observing it:
 `marginalize(model(; inputs...), :x) | (; y)`. A bound plan (the result of
 `|`) is already lowered and is refused.
 """
-function marginalize(m::RKPPLModel, names::Symbol...)
+function marginalize(m::RKPPLModel, names::Symbol...; predictive = (;), filtered = (;))
     isempty(names) && throw(ArgumentError(
         "marginalize needs the latent array to integrate out: `marginalize(model, :x)`"))
     out = copy(m.marginalized)
@@ -110,15 +134,159 @@ function marginalize(m::RKPPLModel, names::Symbol...)
         x in m.chains && _sfail("marginalize(`$x`): `$x` is a Markov chain (`markov_chains`)")
         push!(out, x)
     end
+    values = copy(m.marginal_values)
+    request = _marginal_values_request(collect(Symbol, names), predictive, filtered, values)
+    request === nothing || push!(values, request)
     return RKPPLModel(m.ast, m.mod, copy(m.fixed), copy(m.rewrites),
-        copy(m.conditioned), copy(m.documentation), out, copy(m.chains))
+        copy(m.conditioned), copy(m.documentation), out, copy(m.chains), values)
 end
-marginalize(m::RKPPLBoundModel, names::Symbol...) =
-    RKPPLBoundModel(marginalize(m.model, names...), copy(m.data))
-marginalize(::StructuralPlan, names::Symbol...) = _sfail("marginalize(" *
+marginalize(m::RKPPLBoundModel, names::Symbol...; kwargs...) =
+    RKPPLBoundModel(marginalize(m.model, names...; kwargs...), copy(m.data))
+marginalize(::StructuralPlan, names::Symbol...; kwargs...) = _sfail("marginalize(" *
     join(("`$x`" for x in names), ", ") * "): a bound plan is already lowered. " *
     "Marginalize the model or its binding before observing it: " *
     "`marginalize(model(; inputs...), :x) | (; y)`")
+
+# ── Named filter values ───────────────────────────────────────────────────
+#
+# `marginalize(model, :x; predictive = (location = :mu, scale = :sd),
+# filtered = (mean = :m, variance = :v))` names values of the filter as
+# ordinary values of the marginalized program: each observed entry's
+# one-step-ahead predictive location, variance or scale, and the filtered
+# mean and variance of each array integrated out. They are definitions (a
+# per-index output in a `@plate` cell), so `prepare_query` and `jax_source`
+# read them by name; nothing is added when nothing is named.
+
+const _PREDICTIVE_ROLES = (:location, :variance, :scale)
+const _FILTERED_ROLES = (:mean, :variance)
+
+_marginal_call(arrays) = "marginalize(" * join((":$a" for a in arrays), ", ") * "; …)"
+
+function _marginal_roles(call, spec, allowed, what)
+    spec isa Union{NamedTuple,AbstractDict} || _sfail("$call: `$what` names values " *
+        "by role, `$what = (" * join(("$r = :name" for r in allowed), ", ") *
+        ")`; got `$(repr(spec))`")
+    out = Pair{Symbol,Symbol}[]
+    for (role, nm) in pairs(spec)
+        role = Symbol(role)
+        role in allowed || _sfail("$call: `$what` takes " *
+            join(("`$r`" for r in allowed), ", ") * "; `$role` is not one of them")
+        nm isa Symbol || _sfail("$call: `$what.$role` is the name of the value, a " *
+            "Symbol such as `:$(role)_name`; got `$(repr(nm))`")
+        push!(out, role => nm)
+    end
+    return out
+end
+
+function _marginal_values_request(arrays, predictive, filtered, earlier)
+    call = _marginal_call(arrays)
+    pred = _marginal_roles(call, predictive, _PREDICTIVE_ROLES, "predictive")
+    filt = Tuple{Symbol,Symbol,Symbol}[]
+    filtered isa Union{NamedTuple,AbstractDict} || _sfail("$call: `filtered` names " *
+        "values by role, `filtered = (mean = :name, variance = :name)`; got `$(repr(filtered))`")
+    if !isempty(filtered) && all(v -> v isa Symbol, values(filtered))
+        # One array: `filtered = (mean = :m, variance = :v)`.
+        length(arrays) == 1 || _sfail("$call: this call integrates out several arrays; " *
+            "name each array's filtered values under it, `filtered = (" *
+            join(("$a = (mean = :name,)" for a in arrays), ", ") * ")`")
+        for (role, nm) in _marginal_roles(call, filtered, _FILTERED_ROLES, "filtered")
+            push!(filt, (only(arrays), role, nm))
+        end
+    else
+        # Per array: `filtered = (level = (mean = :m,), slope = (variance = :v,))`.
+        for (a, spec) in pairs(filtered)
+            a = Symbol(a)
+            a in arrays || _sfail("$call: `filtered` names `$a`, which this call does " *
+                "not integrate out; key it by the call's arrays (" *
+                join(("`$x`" for x in arrays), ", ") * ")")
+            for (role, nm) in _marginal_roles(call, spec, _FILTERED_ROLES, "filtered.$a")
+                push!(filt, (a, role, nm))
+            end
+        end
+    end
+    isempty(pred) && isempty(filt) && return nothing
+    named = Symbol[last.(pred); [t[3] for t in filt]]
+    taken = Set{Symbol}(nm for r in earlier
+        for nm in (last.(r.predictive)..., (t[3] for t in r.filtered)...))
+    seen = Set{Symbol}()
+    for nm in named
+        startswith(String(nm), "_rkppl") && _sfail("$call: `$nm` starts with `_rkppl`, " *
+            "which names RKPPL's own values; choose another name")
+        nm in arrays && _sfail("$call: `$nm` is an array this call integrates out; " *
+            "name its filter values otherwise")
+        (nm in seen || nm in taken) && _sfail("$call: the value name `$nm` is given twice")
+        push!(seen, nm)
+    end
+    return _MarginalValues(arrays, pred, filt)
+end
+
+# The requests of a model's `marginalize` calls by lowered array identifier. A
+# value name the model already uses (a parameter, definition or input) is
+# refused: the named value would shadow it.
+function _marginal_value_requests(requests, ctx, used, values)
+    out = Dict{Symbol,_MarginalValues}()
+    for r in requests
+        for nm in (last.(r.predictive)..., (t[3] for t in r.filtered)...)
+            (nm in used || haskey(values, nm)) && _sfail("$(_marginal_call(r.arrays)): " *
+                "the value name `$nm` is already used in the model; choose another name")
+        end
+        ids = Symbol[_marginalized_identifier(a, ctx) for a in r.arrays]
+        resolved = _MarginalValues(ids, r.predictive,
+            [(_marginalized_identifier(a, ctx), role, nm) for (a, role, nm) in r.filtered])
+        for id in ids
+            out[id] = resolved
+        end
+    end
+    return out
+end
+
+# The one request covering the recurrence `members` integrates out together,
+# merging requests of several calls; `nothing` when none names a value. A call
+# naming values for arrays that different statements observe is refused: each
+# observation has its own predictive law.
+function _marginal_request_for(requests, members)
+    found = _MarginalValues[]
+    for x in members
+        r = get(requests, x, nothing)
+        r === nothing || any(f -> f === r, found) || push!(found, r)
+    end
+    isempty(found) && return nothing
+    for r in found
+        issubset(r.arrays, members) || _marginal_fail(first(members),
+            "a `marginalize` call naming `predictive` or `filtered` values integrates out " *
+            "recurrences observed by different statements (" *
+            join(("`$a`" for a in r.arrays), ", ") * "); call `marginalize` once per " *
+            "recurrence, `marginalize(marginalize(model, :x; …), :z; …)`")
+    end
+    pred = Pair{Symbol,Symbol}[p for r in found for p in r.predictive]
+    length(unique(first.(pred))) == length(pred) || _marginal_fail(first(members),
+        "two `marginalize` calls name its predictive " *
+        join(unique(first(p) for p in pred if count(q -> first(q) == first(p), pred) > 1), ", "))
+    filt = Tuple{Symbol,Symbol,Symbol}[t for r in found for t in r.filtered]
+    slots = [(a, role) for (a, role, _) in filt]
+    length(unique(slots)) == length(slots) || _marginal_fail(first(members),
+        "two `marginalize` calls name the same filtered value of an array")
+    return _MarginalValues(collect(Symbol, members), pred, filt)
+end
+
+# The definitions naming a recurrence's filter values: `loc` and `var` are the
+# predictive location and variance of each observed entry, `moments(a)` the
+# filtered mean and variance of array `a`. `define(name, value)` writes one: a
+# top-level definition, or a per-index output in a `@plate` cell.
+function _marginal_value_defs(req, loc, var, moments; define = (n, v) -> Expr(:(=), n, v))
+    req === nothing && return Any[]
+    defs = Any[]
+    for (role, nm) in req.predictive
+        push!(defs, define(nm, role === :location ? loc : role === :variance ? var :
+            :(sqrt.($var))))
+    end
+    for (a, role, nm) in req.filtered
+        mean, v = moments(a)
+        push!(defs, define(nm, role === :mean ? mean : v))
+    end
+    return defs
+end
+_stores_predictive(req) = req !== nothing && !isempty(req.predictive)
 
 # The identifier a marginalized name lowers under: a top-level array as it is;
 # a submodel's local by its author path (`z.x`, `z.w.x`), resolved through the
@@ -635,7 +803,8 @@ _rkppl_marginal_step_ends(step::AbstractVector{<:Integer}, T::Integer) =
 # keeps the state and observes the row. Each row's one-step-ahead predictive
 # law, at its event, is its observation; the draws read the moments at each
 # step's last event.
-function _marginalize_gathered(stmts, k, j, x, law, y, form, scale, idx, ast, values, bound)
+function _marginalize_gathered(stmts, k, j, x, law, y, form, scale, idx, ast, values, bound,
+        req = nothing)
     E = _marginal_name(x, :events)
     (bound && !(Missing <: eltype(values[y]))) || _marginal_fail(x, "its observation " *
         "`$y` reads `$x[$idx]`; rows observing their steps are marginalized when `$y` " *
@@ -672,6 +841,10 @@ function _marginalize_gathered(stmts, k, j, x, law, y, form, scale, idx, ast, va
         :($y .~ Normal.($PL[$RE], sqrt.($PV[$RE]))),
         # The draws' filtered moments: each step's last event.
         :($(name(:mean)) = $EM[$ENDS]), :($(name(:var)) = $EV[$ENDS])]
+    # Named values: each row's predictive law at its event, in row order, and
+    # the filtered moments per step.
+    append!(tail, _marginal_value_defs(req, :($PL[$RE]), :($PV[$RE]),
+        _ -> (name(:mean), name(:var))))
     out = Any[]
     for (i, st) in enumerate(stmts)
         i == k && continue
@@ -758,30 +931,32 @@ function _scan_upper_bound(block)
     return nothing
 end
 
-function _marginalize_latents(ast::Expr, marginalized, values, observing)
+function _marginalize_latents(ast::Expr, marginalized, values, observing,
+        requests = Dict{Symbol,_MarginalValues}())
     done = Set{Symbol}()
     for x in marginalized
         x in done && continue
         # A top-level `@scan` with a vector state (several arrays, or a lag
         # above one) integrates out as one group (marginalize_vector.jl).
         group = _marginal_group(ast, x, marginalized)
+        req = _marginal_request_for(requests, group === nothing ? Symbol[x] : group)
         if group === nothing
-            ast = _marginalize_latent(ast, x, values, observing)
+            ast = _marginalize_latent(ast, x, values, observing, req)
             push!(done, x)
         else
-            ast = _marginalize_vector_latent(ast, group, values, observing)
+            ast = _marginalize_vector_latent(ast, group, values, observing, req)
             union!(done, group)
         end
     end
     return ast
 end
 
-function _marginalize_latent(ast::Expr, x::Symbol, values, observing)
+function _marginalize_latent(ast::Expr, x::Symbol, values, observing, req = nothing)
     stmts = ast.args
     k = findfirst(st -> _is_scan_of(st, x), stmts)
     if k === nothing
         p = findfirst(st -> _is_plate_scan_of(st, x), stmts)
-        p === nothing || return _marginalize_cell_latent(ast, p, x, values, observing)
+        p === nothing || return _marginalize_cell_latent(ast, p, x, values, observing, req)
         nested = any(st -> Meta.isexpr(st, :macrocall) && st.args[1] === Symbol("@plate") &&
             _mentions_symbol(st, x), stmts)
         _marginal_fail(x, nested ?
@@ -795,7 +970,7 @@ function _marginalize_latent(ast::Expr, x::Symbol, values, observing)
     y, loc, scale, form, idx = _marginal_observation(x, stmts[j], y -> y isa Symbol, "y")
     bound = y in observing && get(values, y, nothing) isa AbstractVector
     idx === nothing || return _marginalize_gathered(stmts, k, j, x, law, y, form, scale,
-        idx, ast, values, bound)
+        idx, ast, values, bound, req)
     # Otherwise a vector the model computes without `x` (data augmentation:
     # measured rows merged with bounded latents of censored rows), which the
     # filter reads entry by entry.
@@ -823,15 +998,20 @@ function _marginalize_latent(ast::Expr, x::Symbol, values, observing)
             :($filled = $(GlobalRef(@__MODULE__, :_rkppl_fill_missing))($y, 0.0)))
         _filter_scan(x, filled, law, seed, step; present, response = y)
     else
-        (_filter_scan(x, y, law, seed, step),)
+        # Observed entry by entry; the predictive moments are carried only
+        # when the author names them.
+        (_filter_scan(x, y, law, seed, step; store = _stores_predictive(req)),)
     end
     transition = _transition_scan(x, law)
+    named = _marginal_value_defs(req, _marginal_name(x, :predictive_location),
+        _marginal_name(x, :predictive_variance),
+        _ -> (_marginal_name(x, :mean), _marginal_name(x, :var)))
     out = Any[]
     for (i, st) in enumerate(stmts)
         i == k && continue
         if i == j
             append!(out, defs)
-            push!(out, filter..., transition)
+            push!(out, filter..., transition, named...)
             continue
         end
         push!(out, st)
@@ -927,7 +1107,7 @@ end
 _marginal_cell_carried(x, role) = _marginal_name(x, Symbol(:cell_, role))
 _marginal_draw_carried(x, role) = _marginal_name(x, Symbol(:draw_, role))
 
-function _marginalize_cell_latent(ast::Expr, p, x::Symbol, values, observing)
+function _marginalize_cell_latent(ast::Expr, p, x::Symbol, values, observing, req = nothing)
     stmts = ast.args
     loop = _plate_loop(stmts[p])
     head = loop.args[1]
@@ -984,7 +1164,7 @@ function _marginalize_cell_latent(ast::Expr, p, x::Symbol, values, observing)
         end
         push!(density_cell, c)
     end
-    draws = _cell_draws_plate(x, y, law, seed, step, head, cell, pieces, k, j, observing)
+    draws = _cell_draws_plate(x, y, law, seed, step, head, cell, pieces, k, j, observing, req)
     out = Any[]
     for (i, st) in enumerate(stmts)
         if i == p
@@ -1035,12 +1215,20 @@ end
 # The plate of the draws: the cell's definitions the filter needs, the
 # observation's pieces, and a deterministic scan running the filter and
 # recording the transition, returned per index. The density reads none of it.
-function _cell_draws_plate(x, y, law, seed, step, head, cell, pieces, k, j, observing)
+# Values the author named (`req`) are per-index outputs of this plate, so the
+# density's cell is unchanged.
+function _cell_draws_plate(x, y, law, seed, step, head, cell, pieces, k, j, observing,
+        req = nothing)
     ivar = head.args[1]
     carried = Tuple(_marginal_draw_carried(x, r) for r in _MARGINAL_ROLES)
-    scan = _cell_draws_scan(x, y, law, seed, step, carried)
+    predictive = _stores_predictive(req) ? (_marginal_draw_carried(x, :predictive_location),
+        _marginal_draw_carried(x, :predictive_variance)) : nothing
+    scan = _cell_draws_scan(x, y, law, seed, step, carried; predictive)
     outputs = [Expr(:(=), Expr(:ref, _marginal_name(x, r), ivar), c)
         for (r, c) in zip(_MARGINAL_ROLES, carried)]
+    loc, var = something(predictive, (nothing, nothing))
+    append!(outputs, _marginal_value_defs(req, loc, var, _ -> (carried[1], carried[2]);
+        define = (n, v) -> Expr(:(=), Expr(:ref, n, ivar), v)))
     return _cell_side_plate(head, cell, (k, j), observing, Any[pieces..., scan], outputs) do drawn
         _marginal_fail(x, "its transition or observation reads " *
             join(("`$d`" for d in drawn), ", ") * ", drawn inside the `@plate` cell; " *
@@ -1085,25 +1273,33 @@ function _cell_side_plate(refuse, head, cell, skip, observing, body, outputs)
         Expr(:for, head, Expr(:block, stmts...)))
 end
 
-function _cell_draws_scan(x, y, law::_GaussianTransition, seed_pieces, step_pieces, carried)
+# `predictive` names carried arrays `(location, variance)` recording each
+# entry's one-step-ahead predictive law, or is `nothing`.
+function _cell_draws_scan(x, y, law::_GaussianTransition, seed_pieces, step_pieces, carried;
+        predictive = nothing)
     t = law.loopvar
     M, V, C, D, Q = carried
-    _, _, mean1, var1 = _kalman_update(:($y[1]), law.m0, law.P0, seed_pieces, nothing)
+    _, _, mean1, var1, loc1, fv1 = _kalman_update(:($y[1]), law.m0, law.P0, seed_pieces,
+        nothing)
     pm, pv, g = _marginal_name(x, :predicted_mean),
         _marginal_name(x, :predicted_var), _marginal_name(x, :gain)
     prev(a) = Expr(:ref, a, Expr(:call, :-, t, 1))
     pm_ex = something(_madd(_mmul(law.coef, prev(M), false), law.shift, false), 0.0)
     pv_ex = something(_madd(_mmul(_mmul(law.coef, law.coef, false), prev(V), false),
         law.innovation_var, false), 0.0)
-    _, gain, meant, vart = _kalman_update(:($y[$t]), pm, pv, step_pieces, g)
+    _, gain, meant, vart, loct, fvt = _kalman_update(:($y[$t]), pm, pv, step_pieces, g)
+    record(i, loc, fv) = predictive === nothing ? () :
+        (Expr(:(=), Expr(:ref, predictive[1], i), loc),
+            Expr(:(=), Expr(:ref, predictive[2], i), fv))
     body = Expr(:block, law.locals...,
-        Expr(:(=), pm, pm_ex), Expr(:(=), pv, pv_ex), Expr(:(=), g, gain),
+        Expr(:(=), pm, pm_ex), Expr(:(=), pv, pv_ex), record(t, loct, fvt)...,
+        Expr(:(=), g, gain),
         Expr(:(=), :($M[$t]), meant), Expr(:(=), :($V[$t]), vart),
         Expr(:(=), :($C[$t]), _mfloat(something(law.coef, 0.0))),
         Expr(:(=), :($D[$t]), _mfloat(something(law.shift, 0.0))),
         Expr(:(=), :($Q[$t]), _mfloat(something(law.innovation_var, 0.0))))
     loop = Expr(:for, Expr(:(=), t, Expr(:call, :(:), 2, law.hi)), body)
-    return _scan_macro(Expr(:block,
+    return _scan_macro(Expr(:block, record(1, loc1, fv1)...,
         Expr(:(=), :($M[1]), mean1), Expr(:(=), :($V[1]), var1),
         Expr(:(=), :($C[1]), 0.0), Expr(:(=), :($D[1]), _mfloat(something(law.m0, 0.0))),
         Expr(:(=), :($Q[1]), _mfloat(law.P0)), loop))
@@ -1171,16 +1367,19 @@ end
 # (`response`, read by the filter as the values `y`), the scan carries each
 # entry's one-step-ahead predictive mean and variance, and an ordinary
 # observation `response .~ Normal.(mean, sqrt.(var))` follows it; `present`
-# names a vector whose false entries only predict. Returns the statements.
+# names a vector whose false entries only predict. `store` also carries the
+# predictive mean and variance beside an entry-by-entry observation (values the
+# author named). Returns the statements.
 function _filter_scan(x, y, law::_GaussianTransition, seed_pieces, step_pieces;
         M = _marginal_name(x, :mean), V = _marginal_name(x, :var), present = nothing,
-        response = nothing)
+        response = nothing, store = false)
     t = law.loopvar
     entry(i) = present === nothing ? nothing : Expr(:ref, present, i)
     # Not `…_mean`: `_marginalized_names` finds latents by their filtered mean.
     PM, PV = _marginal_name(x, :predictive_location), _marginal_name(x, :predictive_variance)
-    observe(obs, i, loc, fv) = response === nothing ? (obs,) :
-        (Expr(:(=), Expr(:ref, PM, i), loc), Expr(:(=), Expr(:ref, PV, i), fv))
+    moments(i, loc, fv) = (Expr(:(=), Expr(:ref, PM, i), loc), Expr(:(=), Expr(:ref, PV, i), fv))
+    observe(obs, i, loc, fv) = response === nothing ?
+        (store ? (obs, moments(i, loc, fv)...) : (obs,)) : moments(i, loc, fv)
     obs1, _, mean1, var1, loc1, fv1 = _kalman_update(:($y[1]), law.m0, law.P0,
         seed_pieces, nothing; present = entry(1))
     pm, pv, g = _marginal_name(x, :predicted_mean),

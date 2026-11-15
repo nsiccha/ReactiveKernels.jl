@@ -16,6 +16,47 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.203
+
+- `marginalize(model, :x; predictive, filtered)` names values of the Kalman
+  filter as ordinary values of the marginalized program. `predictive =
+  (location = :mu, variance = :v, scale = :sd)` (any of the three) names each
+  observed entry's one-step-ahead predictive law given the entries before it;
+  `filtered = (mean = :m, variance = :v)` names the filtered moments of the
+  state given the observations up to each step, keyed by array for a call
+  integrating out several (`filtered = (level = (mean = :level_mean,),)`).
+  `prepare_query(built, plan, (:mu, :sd))` returns them and `jax_source(…;
+  values = (:mu, :sd))` emits them, on every form `marginalize` takes: a bound
+  response, `missing` entries (the forecast of each missing one), a vector the
+  model defines, rows observing `x[step]` (one value per row), a `@plate` cell
+  (one vector per index), a vector state and a submodel's recurrence. The
+  density is unchanged, and nothing is added when nothing is named. A name the
+  model already uses, a name starting with `_rkppl`, a repeated name, and one
+  call naming values for recurrences that different statements observe are
+  refused (snag `marginalize-the-5a1c5f81`).
+
+## 0.1.202
+
+- An observed vector merged with other values is observed entry by entry
+  (data augmentation). In
+  `below[1:K] .~ restricted.(Flat.(), -Inf, limit)`,
+  `value = vcat(measured, below)[order]`, `value .~ Normal.(mu, s)`, the
+  condition `| (; measured)` used to be refused at lowering, with a message
+  that called `value` a scalar definition. Now each entry of `measured` is an
+  observation: it enters `likelihood` and `:pointwise.measured`, in the order
+  of `measured`. The other entries of `value` are one density factor, which
+  enters `prior`. The merge may be `vcat(parts…)[order]` or `vcat(parts…)`
+  (also `[a; b]`), with any number of observed parts in any position, each
+  merged whole, and a built-in family whose arguments are one value or one
+  value per entry. `order` must be a permutation of the merged entries,
+  checked by `bind_data`. The same holds for `marginalize(model, :x)` over
+  such a vector: the measured entries' one-step-ahead predictive densities
+  are the likelihood. Bound as an input instead, `measured` is not
+  conditioned, and every entry's density is a prior factor, as before.
+  Other definitions that read observed data and a sampled value are still
+  refused, and the message now names both reads. `jax_source` emits the
+  split.
+
 ## 0.1.201
 
 - Ordinal thresholds may be any vector the model computes, for

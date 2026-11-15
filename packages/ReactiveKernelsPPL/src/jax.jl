@@ -450,6 +450,44 @@ for (f, what) in ((:_rkppl_marginal_event_rows, :event_rows),
         ::typeof($f), args::Vector{ReactiveKernels._PyVal}) = _jax_marginal_events(ctx, $(QuoteNode(what)), args)
 end
 
+# The positions of a merge of observed data with other values
+# (`_rkppl_merged_rows` and kin, merged_observations.jl), as `prepare_data`
+# computes them from the raw index and the parts' lengths: 1-based, as in Julia.
+function _jax_merged_positions(ctx, what, args)
+    ctx.host === nothing && ReactiveKernels._jax_error(
+        "a merge's positions outside `prepare_data`", ReactiveKernels._jax_where(ctx))
+    lengths(a) = "np.asarray([" * join(("int(" * x.code * ")" for x in a), ", ") *
+        "], dtype=np.int64)"
+    what === :identity && return ReactiveKernels._PyVal(
+        "np.arange(1, int(np.sum(" * lengths(args) * ")) + 1, dtype=np.int64)", Vector{Int}, true)
+    order, key, n = args[1], args[2], lengths(args[3:end])
+    o = "(np.asarray(" * order.code * ", dtype=np.int64) - 1)"
+    k = "int(" * key.code * ")"
+    code = if what === :rows
+        "(np.argsort(" * o * ", kind=\"stable\")[int(np.sum(" * n * "[:" * k * " - 1])):" *
+            "int(np.sum(" * n * "[:" * k * "]))] + 1).astype(np.int64)"
+    else
+        part = "np.searchsorted(np.cumsum(" * n * "), " * o * " + 1, side=\"left\")"
+        rest = "(((" * k * " >> " * part * ") & 1) == 0)"
+        rows = "(np.nonzero(" * rest * ")[0] + 1).astype(np.int64)"
+        what === :rest_rows ? rows : begin
+            c = "(" * o * "[" * rest * "] + 1)"
+            observed = "((" * k * " >> np.arange(len(" * n * "))) & 1)"
+            starts = "(np.cumsum(" * n * ") - " * n * ")"
+            "(" * c * " - np.sum(np.clip(" * c * "[:, None] - 1 - " * starts *
+                "[None, :], 0, " * n * "[None, :]) * " * observed *
+                "[None, :], axis=1)).astype(np.int64)"
+        end
+    end
+    return ReactiveKernels._PyVal(code, Vector{Int}, true)
+end
+for (f, what) in ((:_rkppl_merged_identity, :identity), (:_rkppl_merged_rows, :rows),
+        (:_rkppl_merged_rest_rows, :rest_rows), (:_rkppl_merged_rest_parts, :rest_parts))
+    @eval ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof($f), args::Vector{ReactiveKernels._PyVal}) =
+            _jax_merged_positions(ctx, $(QuoteNode(what)), args)
+end
+
 # --- translations of RKPPL's own functions ---------------------------------------
 
 # A law constructed in a cell (`y[g] ~ MvNormal(mu, Sigma)` lowers to

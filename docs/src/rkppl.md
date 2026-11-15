@@ -97,6 +97,17 @@ latents = prepare_marginalized_latents(built, plan)
 marginalized_latent_draws(latents, u, Xoshiro(1)).x
 ```
 
+The filter's own values become values of the program when the call names them. These are each observation's one-step-ahead predictive location, variance or scale given the observations before it, and the filtered mean and variance of the state given the observations up to each step. They are queried by name and emitted by `jax_source(built, plan; values = …)` like any other value. The density stays as it was:
+
+```@example marginal
+named = marginalize(model(; gap, T = length(y)), :x;
+    predictive = (location = :y_loc, scale = :y_sd),
+    filtered = (mean = :x_mean, variance = :x_var)) | (; y)
+built_named = build_kernel(named)
+values_of = prepare_query(built_named, named, (:y_loc, :y_sd, :x_mean))
+values_of(u)
+```
+
 A `missing` entry of `y` is a step that only predicts: the filter carries the state through it without an update, and the likelihood has no term for it. The draws then condition on the present entries alone, and one program serves every pattern of missing entries:
 
 ```@example marginal
@@ -107,7 +118,7 @@ latents_gaps = prepare_marginalized_latents(built_gaps, with_gaps)
 marginalized_latent_draws(latents_gaps, u, Xoshiro(1)).x
 ```
 
-The observed vector may also be one the model computes, as long as it does not read `x`. Censored rows enter the filter this way (data augmentation). Each censored row's unknown value is a latent bounded by its own range (per-element bounds), and the measured rows join those values in time order. The scan's length is then supplied, and the measured rows are inputs:
+The observed vector may also be one the model computes, as long as it does not read `x`. Censored rows enter the filter this way (data augmentation). Each censored row's unknown value is a latent bounded by its own range (per-element bounds), and the measured rows join those values in time order. The scan's length is then supplied, and the measured rows are conditioned: their entries' one-step-ahead predictive densities are the likelihood and `:pointwise.measured`, and the censored rows' densities are prior factors. Bound as inputs instead, the measured rows are not conditioned, and the whole density is a prior factor:
 
 ```@example marginal
 censored = @rkppl begin
@@ -128,8 +139,11 @@ end
 measured = [0.3, 0.5, 0.0, 0.4]
 limit = [-0.2, -0.3]                            # rows 3 and 6 fell below these
 order = invperm([1, 2, 4, 5, 3, 6])
-augmented = marginalize(censored(; T = 6, K = 2, measured, limit, order), :x)
-coordinate_names(build_kernel(augmented).layout)
+augmented = marginalize(censored(; T = 6, K = 2, limit, order), :x) | (; measured)
+built_censored = build_kernel(augmented)
+censored_pointwise = prepare_query(built_censored, augmented, :pointwise)
+v = zeros(built_censored.layout.total)
+(; coordinates = coordinate_names(built_censored.layout), pointwise = censored_pointwise(v))
 ```
 
 Rows may also observe the state at their steps, `x[step]` with `step` bound integer data, so that a step has several rows or none (several sensors, irregular sampling). The filter then runs over the steps and their rows in order, and the scan's length is supplied:

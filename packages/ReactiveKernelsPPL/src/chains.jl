@@ -84,7 +84,8 @@ function markov_chains(m::RKPPLModel, names::Symbol...)
         push!(out, x)
     end
     return RKPPLModel(m.ast, m.mod, copy(m.fixed), copy(m.rewrites),
-        copy(m.conditioned), copy(m.documentation), copy(m.marginalized), out)
+        copy(m.conditioned), copy(m.documentation), copy(m.marginalized), out,
+        copy(m.marginal_values))
 end
 markov_chains(m::RKPPLBoundModel, names::Symbol...) =
     RKPPLBoundModel(markov_chains(m.model, names...), copy(m.data))
