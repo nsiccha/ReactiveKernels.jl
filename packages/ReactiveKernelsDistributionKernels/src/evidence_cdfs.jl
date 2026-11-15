@@ -1,7 +1,7 @@
 export rk_inverse_gaussian_tail, rk_inverse_gaussian_logtail, rk_von_mises_cdf
 export rk_logprob_tail
 export rk_von_mises_periodic_cdf
-export rk_ordinal_stopping_logpdf, rk_ordinal_stopping_tail
+export rk_ordinal_stopping_logpdf, rk_ordinal_stopping_tail, rk_ordinal_stopping_logtail
 
 # `@_record_source` keeps each plain helper's source for `jax_source`;
 # execution is the methods as written.
@@ -26,14 +26,20 @@ _ordinal_logccdf(::Val{:cloglog}, z) = -exp(z)
 @traceable _ordinal_effect(::Nothing, row, j) = 0.0
 @traceable _ordinal_effect(effects, row, j) = effects[row, j]
 
+# The stage loops run over the static stage count `length(t)`; a stage past
+# `k` reads z = 0 and adds nothing. A fixed trip count keeps the JAX
+# translation a counted loop, which `jax.grad` reverses (a loop to the
+# data-dependent `k` is a forward-only `while_loop`), and the zeroed z keeps an
+# unreached stage's link function and its derivative finite.
 ReactiveKernels.@_record_source function _ordinal_logsurvival(t, eta, d, effects, row, k, link)
     total = zero(eta + d)
     i = 0
-    while i < k
+    while i < length(t)
         j = i + 1
-        z = d * (_evidence_index(t, j) - eta -
-            _ordinal_effect(effects, row, j))
-        total += _ordinal_logccdf(link, z)
+        reached = j <= k
+        z = ifelse(reached, d * (_evidence_index(t, j) - eta -
+            _ordinal_effect(effects, row, j)), zero(eta + d))
+        total += ifelse(reached, _ordinal_logccdf(link, z), zero(eta + d))
         i = i + 1
     end
     return total
@@ -49,25 +55,61 @@ ReactiveKernels.@_record_source function rk_ordinal_stopping_logpdf(t, eta, d, e
     return total
 end
 
-ReactiveKernels.@_record_source function _ordinal_stopping_upper_guard(t, eta, d, effects, row, k, link, upper)
+# log P(Y <= k) for 1 <= k <= length(t). The survival S = P(Y > k) is the
+# sum of the stages' log-CCDFs, exact in both tails. Once S < 1/2,
+# log1mexp(log S) keeps the CDF's distance from one. Otherwise the CDF is
+# taken as the log-sum of the category masses P(Y = m) = F(z_m) prod_{j<m}
+# (1 - F(z_j)), each in log space: `log1mexp` of a survival that rounds to
+# zero would give -Inf for a CDF below floatmin, a finite log mass.
+ReactiveKernels.@_record_source function _ordinal_stopping_logcdf(t, eta, d, effects, row, k, link)
+    z = d * (_evidence_index(t, 1) - eta - _ordinal_effect(effects, row, 1))
+    total = _ordinal_logcdf(link, z)
+    survival = _ordinal_logccdf(link, z)
+    i = 1
+    while i < length(t)
+        j = i + 1
+        reached = j <= k
+        z = ifelse(reached, d * (_evidence_index(t, j) - eta -
+            _ordinal_effect(effects, row, j)), zero(eta + d))
+        total = ifelse(reached, ReactiveKernels._tie_exact_logaddexp(total,
+            survival + _ordinal_logcdf(link, z)), total)
+        survival += ifelse(reached, _ordinal_logccdf(link, z), zero(eta + d))
+        i = i + 1
+    end
+    result = zero(total)
+    if survival < -0.6931471805599453
+        result = LogExpFunctions.log1mexp(survival)
+    else
+        result = total
+    end
+    return result
+end
+
+ReactiveKernels.@_record_source function _ordinal_stopping_upper_logguard(t, eta, d, effects, row, k, link, upper)
     result = zero(eta + d)
     if k > length(t)
-        result = ifelse(upper, zero(eta + d), one(eta + d))
+        result = upper ? -Inf : 0.0
     else
-        ls = _ordinal_logsurvival(t, eta, d, effects, row, k, link)
-        result = ifelse(upper, exp(ls), -expm1(ls))
+        result = upper ? _ordinal_logsurvival(t, eta, d, effects, row, k, link) :
+            _ordinal_stopping_logcdf(t, eta, d, effects, row, k, link)
+    end
+    return result
+end
+
+# log P(Y <= k) (`upper = false`) or log P(Y > k) (`upper = true`) of the
+# stopping-ratio ordinal law, for any integer k.
+ReactiveKernels.@_record_source function rk_ordinal_stopping_logtail(t, eta, d, effects, row, k, link, upper::Bool)
+    result = zero(eta + d)
+    if k < 1
+        result = upper ? 0.0 : -Inf
+    else
+        result = _ordinal_stopping_upper_logguard(t, eta, d, effects, row, k, link, upper)
     end
     return result
 end
 
 ReactiveKernels.@_record_source function rk_ordinal_stopping_tail(t, eta, d, effects, row, k, link, upper::Bool)
-    result = zero(eta + d)
-    if k < 1
-        result = ifelse(upper, one(eta + d), zero(eta + d))
-    else
-        result = _ordinal_stopping_upper_guard(t, eta, d, effects, row, k, link, upper)
-    end
-    return result
+    return exp(rk_ordinal_stopping_logtail(t, eta, d, effects, row, k, link, upper))
 end
 
 ReactiveKernels.@_record_source function _von_mises_periodic_upper_guard(mu, kappa, x, lo, hi)

@@ -722,6 +722,35 @@ is `:temper` for this operation or `:rejuvenate` for explicit fixed-temperature 
 function smc_step end
 
 """
+    pool_smc(states::AbstractVector) -> (; log_normalizer, cloud_weights,
+        effective_clouds, positions, weights)
+
+Combine independent SMC clouds of one prepared target into one evidence
+estimate and one weighted sample. Each cloud's normalizer estimate Ẑ_c =
+exp(`log_normalizer`) is unbiased only up to the adaptive temperature and
+kernel choices, so averaging Ẑ, not log Ẑ, is the consistent combination:
+`log_normalizer` is the log of the clouds' mean Ẑ, `cloud_weights` are
+Ẑ_c / ΣẐ, `effective_clouds` is 1/Σ`cloud_weights`², and `positions` holds every
+cloud's particles side by side, each weighted by its cloud weight times its
+weight in the cloud (`weights` sums to one).
+
+When a mode or grouping takes over along the path, a cloud may hold it with a
+few particles in poor positions that its moves improve only slowly. Until they
+do, the stages weigh that mode too little, so that cloud's log Ẑ is low; ESS,
+temperatures and the stage summaries do not show it. Because Ẑ itself is about
+unbiased, that error is one-sided: clouds that end alike but differ in log Ẑ
+are not noise around the truth, and the highest clouds dominate the pool.
+`effective_clouds` near one says the pool rests on one cloud and the clouds
+disagree, so more clouds or particles are needed. With probability at least
+1 - α, log Z ≥ `log_normalizer` - log(1/α), to the extent Ẑ is unbiased.
+
+All states must share the temperature and the prepared target's model, binding
+and frame identity; below temperature 1 they must also share the source. The
+inputs are not mutated.
+"""
+function pool_smc end
+
+"""
     rejuvenate_smc(state; tuning::SMCTuningSchedule, moves::Integer)
 
 Attempt recovery or additional exploration using exactly `moves` fixed-kernel

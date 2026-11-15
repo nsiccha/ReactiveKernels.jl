@@ -126,6 +126,50 @@ end
 @inline _cell_broadcast_entry(bc, index) = _native_broadcast_wide(bc) ?
     (@inbounds _native_broadcast_getindex(bc, index)) : bc[index]
 
+# A recipe holds the recipes of the values it reads, so a chain of statements
+# that each read the one before (`m_k = m_{k-1} .+ b[k] .* x_k`) nests their
+# types as deeply as the chain is long, and an entry read recurses once per
+# level. Julia's type inference, and Enzyme's, recurse over that nesting and
+# overflow their stack on a chain of about a hundred statements (snag
+# plate-cell-with-b361c7c2). A recipe nested more deeply than
+# `_CELL_RECIPE_DEPTH` levels is therefore stored at its own statement: one
+# fresh array, its entries read through its operands' recipes as any reader
+# reads them. The statements after it compose over that array, so every
+# recipe stays within the bound however long the chain.
+const _CELL_RECIPE_DEPTH = 32
+# Levels of recipe and broadcast nesting in a value's type.
+function _cell_recipe_depth(@nospecialize(T))
+    T isa DataType || return 0
+    inner = if T <: _CellBroadcast
+        T.parameters[3]
+    elseif T <: _CellHcat
+        T.parameters[2]
+    elseif T <: Base.Broadcast.Broadcasted
+        T.parameters[4]
+    elseif T <: Tuple
+        depth = 0
+        for P in T.parameters
+            depth = max(depth, _cell_recipe_depth(P))
+        end
+        return depth
+    else
+        return 0
+    end
+    1 + _cell_recipe_depth(inner)
+end
+_cell_recipe_fits(depth::Int) = depth <= _CELL_RECIPE_DEPTH
+# Decided from the type alone, so the branch it selects folds at compile time.
+@generated _cell_recipe_shallow(a) = _cell_recipe_fits(_cell_recipe_depth(a))
+@inline function _cell_array_store(a::_CellArray{T}) where {T}
+    stored = similar(Array{T}, axes(a))
+    @inbounds for I in CartesianIndices(stored)
+        stored[I] = a[I]
+    end
+    stored
+end
+@inline _cell_array_bounded(a::_CellArray) =
+    _cell_recipe_shallow(a) ? a : _cell_array_store(a)
+
 # Delaying a user function or custom indexing could suppress an exception or
 # change observable effects at an unread element. Compose only total arithmetic
 # over ordinary floating storage. Every other runtime type keeps materialization.
@@ -152,7 +196,8 @@ _cell_total_function(f) = f === (+) || f === (-) || f === (*) || f === (/) ||
         all(a -> size(a, 1) == rows, args) ||
             throw(DimensionMismatch("hcat operands must have equal numbers of rows"))
         T = Base.promote_eltypeof(args...)
-        return _CellHcat{T,typeof(args)}(args, rows, sum(a -> size(a, 2), args))
+        return _cell_array_bounded(
+            _CellHcat{T,typeof(args)}(args, rows, sum(a -> size(a, 2), args)))
     end
     _native_hcat(map(_cell_array_materialize, args)...)
 end
@@ -168,7 +213,7 @@ end
         ready = _cell_broadcast_instantiate(bc)
         T = _cell_broadcast_eltype(ready)
         if (T === Float32 || T === Float64) && length(axes(ready)) == 1
-            return _CellBroadcast{T,1,typeof(ready)}(ready)
+            return _cell_array_bounded(_CellBroadcast{T,1,typeof(ready)}(ready))
         end
     end
     _native_broadcast_materialize(_cell_array_materialize(bc))
