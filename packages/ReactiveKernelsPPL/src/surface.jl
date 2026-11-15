@@ -9048,11 +9048,14 @@ function _lower_whole_matrix_value(lhs, value, ctx)
     return value
 end
 
-# Explicit cutpoints/thresholds of an ordinal response: `Ref(c)` shares
-# one vector, either sampled with its stated prior or supplied as data.
-# Either structure reads an Ordered vector or a one-axis sized vector
-# with its stated element prior and support. A vector may serve several
-# responses; its first use records a size source for `_lower_parameters`.
+# Explicit cutpoints/thresholds of an ordinal response, broadcast as in
+# Julia. `Ref(c)` shares one vector: a declared vector with its stated prior
+# (an Ordered vector or a one-axis sized vector), data, or any vector the
+# model computes (a definition, a cell's value, an inline expression). A
+# bare argument supplies one vector per observation, as data or as a
+# computed value. A declared vector may serve several responses; its first
+# use records a size source for `_lower_parameters`. A computed vector's
+# length, and so the response's support, is read when the model runs.
 function _explicit_thresholds!(ctx, lhs::Symbol, arg, ordered::Bool,
         shown::String)
     if !_is_ref_call(arg)
@@ -9061,12 +9064,19 @@ function _explicit_thresholds!(ctx, lhs::Symbol, arg, ordered::Bool,
             name isa Symbol || _sfail("response $lhs: thresholds must be a vector")
             return ThresholdRows(name)
         end
-        arg isa Symbol && _sfail("response $lhs: the cutpoints $arg are " *
-            "one vector shared by every observation — write `Ref($arg)` " *
-            "(standard broadcasting would pair each observation with one " *
-            "element of $arg)")
-        _sfail("response $lhs: $shown takes its cutpoints as `Ref(c)` of " *
-               "a sampled or data vector, got $(repr(arg))")
+        arg isa Symbol && (_declared_threshold_vector(ctx, arg) ||
+            haskey(ctx.array_dims, arg) || arg in ctx.prior_names) &&
+            _sfail("response $lhs: the cutpoints $arg are one vector " *
+                "shared by every observation — write `Ref($arg)` (standard " *
+                "broadcasting would pair each observation with one element " *
+                "of $arg)")
+        # One computed threshold vector per observation (`rows[g]` over a
+        # value holding one vector per group): observation i reads entry i.
+        name = _lower_argument_value(lhs, :thresholds, arg, ctx)
+        name isa Symbol || _sfail("response $lhs: $shown takes its " *
+            "cutpoints as `Ref(c)` of one shared vector or as one vector " *
+            "per observation, got $(repr(arg))")
+        return ThresholdRows(name)
     end
     value = arg.args[2]
     if _data_only(value, ctx.data, ctx.detmap)
@@ -9074,20 +9084,28 @@ function _explicit_thresholds!(ctx, lhs::Symbol, arg, ordered::Bool,
         name isa Symbol || _sfail("response $lhs: thresholds must be a vector")
         return name
     end
-    name = value isa Symbol ? value : nothing
-    name === nothing && _sfail("response $lhs: sampled thresholds must " *
-        "name a declared vector, got $(repr(value))")
-    if name ∉ ctx.ordered_names
-        dims = get(ctx.array_dims, name, nothing)
-        dims !== nothing && length(dims) == 1 || _sfail("response $lhs: " *
-            "thresholds $name must be a one-axis vector declared in the " *
-            "model (`$name[1:length(levels($lhs)) - 1] .~ Normal.(0, 1)`)")
+    if value isa Symbol && (_declared_threshold_vector(ctx, value) ||
+            haskey(ctx.array_dims, value) || value in ctx.prior_names ||
+            value ∉ ctx.taken)
+        _declared_threshold_vector(ctx, value) || _sfail("response $lhs: " *
+            "thresholds $value must be a one-axis vector declared in the " *
+            "model (`$value[1:length(levels($lhs)) - 1] .~ Normal.(0, 1)`) " *
+            "or a vector the model computes")
+        # A declaration owns its vector; responses only read it. Keep the
+        # first use for an inferred extent, then validate every reader's
+        # extent at bind.
+        get!(ctx.threshold_uses, value, (response = lhs, ordered = ordered))
+        return value
     end
-    # A declaration owns its vector; responses only read it. Keep the first
-    # use for an inferred extent, then validate every reader's extent at bind.
-    get!(ctx.threshold_uses, name, (response = lhs, ordered = ordered))
+    # A vector the model computes is read whole by every observation.
+    name = _lower_argument_value(lhs, :thresholds, value, ctx; whole = true)
+    name isa Symbol || _sfail("response $lhs: shared thresholds must be " *
+        "a vector, got $(repr(value))")
     return name
 end
+
+_declared_threshold_vector(ctx, name::Symbol) = name in ctx.ordered_names ||
+    (dims = get(ctx.array_dims, name, nothing); dims !== nothing && length(dims) == 1)
 
 # Cumulative-logit ordinal reads declared cutpoints. USER 1cmodra (vectors)
 # and 0d5a67r require the prior to be stated in the ordinary model body.
@@ -10111,7 +10129,7 @@ function _argument_value_calls(ex)
     return Expr(ex.head, args...)
 end
 
-function _lower_argument_value(lhs, slot, value, ctx)
+function _lower_argument_value(lhs, slot, value, ctx; whole::Bool = false)
     value isa Real && return value
     if value isa Symbol
         number = _base_number(value, ctx.mod, ctx.taken)
@@ -10138,6 +10156,9 @@ function _lower_argument_value(lhs, slot, value, ctx)
     end
     folded = _fold_literal(rhs)
     folded === nothing || return folded
+    # A value every observation reads whole (the vector inside `Ref(v)`)
+    # has no observation axis: it is one named value of any shape.
+    whole && return _named_argument_value(rhs, ctx)
     shape = _canon_shape(rhs, ctx)
     shape in (:scalar, :vector, :array) || _sfail("response $lhs $slot " *
         "needs a scalar or one value per row, got $shape")
@@ -10147,6 +10168,10 @@ function _lower_argument_value(lhs, slot, value, ctx)
     # A scalar, or a value computed from declared arrays (`exp.(s)` over
     # `s[axes(y, 1)]`): one named value, read as a declared array or its
     # named twin `sd = exp.(s)` is, broadcast against the response.
+    return _named_argument_value(rhs, ctx)
+end
+
+function _named_argument_value(rhs, ctx)
     return get!(ctx.leaf_exprs, rhs) do
         while true
             ctx.synth[] += 1

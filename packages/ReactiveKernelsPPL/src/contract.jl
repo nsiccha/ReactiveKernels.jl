@@ -4582,9 +4582,12 @@ function _validate_vector_parameters(plan::StructuralPlan)
             if haskey(refs, r.thresholds)
                 push!(refs[r.thresholds], r.label)
             else
-                _reads_data_only(plan, _threshold_name(r.thresholds), _all_name_set(plan),
-                    Set{Symbol}()) || _fail(r.label,
-                    "thresholds $(r.thresholds) must be a vector parameter or data")
+                name = _threshold_name(r.thresholds)
+                _reads_data_only(plan, name, _all_name_set(plan), Set{Symbol}()) ||
+                    any(a -> a.name === name, plan.assignments) ||
+                    _is_derived(plan, name) || _fail(r.label,
+                    "thresholds $name must be a vector parameter, data or " *
+                    "a vector the model computes")
             end
         end
         if r.threshold_coefs !== nothing
@@ -6614,6 +6617,17 @@ _cell_broadcast_response(plan::StructuralPlan, r::LikelihoodSpec) =
     _cell_broadcast_observation(plan, r.response)
 _group_thresholds(plan, r) = r.thresholds isa Symbol &&
     _cell_broadcast_response(plan, r) && r.thresholds in plan.cell_broadcasts[r.response]
+
+"""Threshold vectors the model computes from sampled values (a definition, a
+cell's per-index value or one value per observation), rather than a declared
+vector parameter or bound data. Their length, and so the response's support,
+is read when the model runs: binding has no value to check."""
+function _computed_thresholds(plan, r::LikelihoodSpec)
+    _is_ordered_family(r.family) && r.thresholds !== nothing || return false
+    name = _threshold_name(r.thresholds)
+    any(p -> p.name === name, plan.vector_parameters) && return false
+    return !_reads_data_only(plan, name, _all_name_set(plan), Set{Symbol}())
+end
 _cell_broadcast_observation(plan::StructuralPlan, name::Symbol) =
     haskey(plan.cell_broadcasts, name) && _holds_arrays(get(plan.columns, name, nothing))
 
@@ -6646,7 +6660,7 @@ function _cell_broadcast_entries(plan::StructuralPlan, r::LikelihoodSpec)
     perindex = plan.cell_broadcasts[r.response]
     arrays = Set{Symbol}(k for (k, v) in plan.columns if v isa AbstractArray)
     columns = copy(plan.columns)
-    if _group_thresholds(plan, r)
+    if _group_thresholds(plan, r) && !_computed_thresholds(plan, r)
         cells = broadcast(y, columns[r.thresholds]) do yi, cuts
             fill(cuts, size(yi))
         end
@@ -6842,6 +6856,13 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
             all(>=(1), col) || return _fail(r.label,
                 "a categorical response must hold integers 1..K (K = the " *
                 "logit slice length + 1)")
+            return nothing
+        end
+        # Thresholds the model computes have their length when it runs; an
+        # observation beyond them is outside the law's support there.
+        if _computed_thresholds(plan, r)
+            all(>=(1), col) || return _fail(r.label, "an ordinal response " *
+                "must hold integers 1..K (K = the threshold vector's length + 1)")
             return nothing
         end
         K = r.n_levels
@@ -7405,7 +7426,8 @@ function _validate_ordinal_data(r::LikelihoodSpec, plan::StructuralPlan)
         (eltype(col) <: Real && all(isfinite, col)) ||
             _fail(r.label, "threshold column $c must be finite numerics")
     end
-    if r.threshold_effects !== nothing &&
+    # Against computed thresholds the program checks the matrix's width.
+    if r.threshold_effects !== nothing && !_computed_thresholds(plan, r) &&
             haskey(plan.columns, r.threshold_effects)
         _ordinal_effects_matrix(plan.columns[r.threshold_effects],
             _response_rows(plan, r), r.n_levels)
@@ -7798,7 +7820,8 @@ function _uncached_module_data_names(plan::StructuralPlan, raw::AbstractSet{Symb
     # Data cutpoints determine support and must be available to binding's
     # shape and observation checks, including selected plate definitions.
     for r in plan.responses
-        r.thresholds === nothing || push!(required, _threshold_name(r.thresholds))
+        r.thresholds === nothing || _computed_thresholds(plan, r) ||
+            push!(required, _threshold_name(r.thresholds))
     end
     for p in plan.array_parameters, d in p.dims
         g = _level_pool_source(d)
@@ -9477,6 +9500,13 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
             findfirst(p -> p.name === r.thresholds, vectors)
         declared = _is_ordered_family(r.family) && tp !== nothing ?
             vectors[tp].size : nothing
+        if plan !== nothing && _computed_thresholds(plan, r)
+            # No value to read at binding: the program reads the computed
+            # vector's length. Record the largest observed level, which
+            # sizes nothing; every code is checked against the length then.
+            push!(out_r, _with(r; n_levels = _largest_observed_level(plan, r)))
+            continue
+        end
         if _is_ordered_family(r.family) && tp === nothing && r.thresholds !== nothing
             cuts = _bound_data_value(plan, _threshold_name(r.thresholds), r.label, "thresholds")
             if r.thresholds isa ThresholdRows
@@ -9610,6 +9640,16 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
         end
     end
     return out_r, out_v
+end
+
+# The largest level code a response observes (1 when it observes none),
+# read through one array per index. It records the observations' extent for
+# a response whose computed thresholds give the law's support at run time.
+function _largest_observed_level(plan, r::LikelihoodSpec)
+    col = get(plan.columns, r.response, nothing)
+    col isa AbstractArray && _supplied(col) || return 1
+    codes = _holds_arrays(col) ? Iterators.flatten(col) : col
+    return maximum(x -> x isa Integer ? Int(x) : 1, codes; init = 1)
 end
 
 function _infer_response_levels(r::LikelihoodSpec, columns::AbstractDict{Symbol})

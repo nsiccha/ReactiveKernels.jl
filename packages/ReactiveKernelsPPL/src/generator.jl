@@ -1654,10 +1654,22 @@ end
 
 _lik_name(label::Symbol) = Symbol(:_ppl_lik_, label)
 
+# A stopping-ratio response observes one lane per visited stage, built from
+# the bound levels and threshold lengths, or from the levels alone over
+# thresholds the model computes. Evidence, and computed thresholds beside
+# threshold effects, take one lane per observation instead, through the
+# helper that retains the stage loop.
+_ordinal_stage_lanes(plan, r) = r.family === OrdinalFam &&
+    r.ordinal_structure === :stopping && r.evidence.kind === :none &&
+    !(_computed_thresholds(plan, r) &&
+        (r.threshold_effects !== nothing || !isempty(r.threshold_columns)))
+# Whether those lanes visit any stage: over computed thresholds every level
+# visits its own.
+_ordinal_has_stages(plan, r) = _computed_thresholds(plan, r) || r.n_levels > 1
+
 function _ordinal_pointwise_stmts(r, plan; grouped = false)
     pw = _pw_name(r.label)
-    if !(r.family === OrdinalFam && r.ordinal_structure === :stopping &&
-            r.evidence.kind === :none && r.n_levels > 1 &&
+    if !(_ordinal_stage_lanes(plan, r) && _ordinal_has_stages(plan, r) &&
             (_response_rows(plan, r) == 0 || _has_observed_response(plan, r)))
         return Expr[], pw
     end
@@ -1668,7 +1680,10 @@ function _ordinal_pointwise_stmts(r, plan; grouped = false)
     values = Symbol(pw, :_observations)
     observed = !grouped && r.range isa Expr ? Symbol(:_ppl_range_response_, r.label) :
         !grouped && r.mi_jobs !== nothing ? Symbol(:_ppl_mi_response_, r.label) : r.response
-    endexpr = if r.thresholds isa ThresholdRows
+    endexpr = if _computed_thresholds(plan, r)
+        # Observation i has a lane for each of its stages 1..y[i].
+        :(cumsum($observed))
+    elseif r.thresholds isa ThresholdRows
         # Stage membership is prepared after any response selection.
         obs = _stage_lane(r.label, :obs)
         :(searchsortedlast.(Ref($obs), eachindex($observed)))
@@ -2327,8 +2342,7 @@ function _mask_response_stmts(r, plan, stmts)
         push!(pre, Expr(:(=), selected, Expr(:ref, mask, idx, r.range.args[3:end]...)))
         mask = selected
     end
-    if r.family === OrdinalFam && r.ordinal_structure === :stopping &&
-            r.evidence.kind === :none && r.n_levels > 1
+    if _ordinal_stage_lanes(plan, r) && _ordinal_has_stages(plan, r)
         stages = Symbol(:_ppl_present_stages_, r.label)
         obs = _stage_lane(r.label, :obs)
         push!(pre, :($stages = $mask[$obs]))
@@ -4374,6 +4388,12 @@ _threshold_stages(rows::ThresholdRows, obs, stage) =
 # as authored: its thresholds need not be one vector of `K - 1`.
 function _ordinal_read_levels(plan::StructuralPlan, r::LikelihoodSpec)
     _group_thresholds(plan, r) && return :(length($(r.thresholds)) + 1)
+    # Computed thresholds have their length when the model runs. Rows of
+    # them size the response as data rows do at binding: by the longest.
+    if _computed_thresholds(plan, r)
+        r.thresholds isa Symbol && return :(length($(r.thresholds)) + 1)
+        return :(maximum(length, $(r.thresholds.name); init = 0) + 1)
+    end
     (r.thresholds isa Symbol && r.n_levels isa Integer && r.n_levels > 1) || return r.n_levels
     i = findfirst(p -> p.name === r.thresholds, plan.vector_parameters)
     i === nothing && return r.n_levels
@@ -4407,10 +4427,15 @@ function _ordinal_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sym
     else
         push!(inputs, _threshold_input(r.thresholds))
         cutref = _dovar(length(inputs))
-        levels = r.thresholds isa ThresholdRows ? :(length($cutref) + 1) : K
+        computed = _computed_thresholds(plan, r)
+        levels = r.thresholds isa ThresholdRows || computed ?
+            :(length($cutref) + 1) : K
         cumulative = _ordinal_cumulative_cell(r.link, levels, yv, etav, dref, cutref)
-        (r.thresholds isa ThresholdRows || _group_thresholds(plan, r)) &&
+        (r.thresholds isa ThresholdRows || _group_thresholds(plan, r) || computed) &&
             (cumulative = :(isempty($cutref) ? 0.0 * $yv : $cumulative))
+        # Binding cannot check a computed vector's length: a level beyond
+        # it is outside the law's support, and its arm reads nothing.
+        computed && (cumulative = :($yv <= $levels ? $cumulative : -Inf))
         # A response reads the authored vector; it does not impose an
         # Ordered transform or replace its prior. Guard before logarithms,
         # including when only boundary categories are observed.
@@ -4438,7 +4463,8 @@ function _ordinal_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sym
     function ordinal_logtail(b, upper)
         empty, full = upper ? (0.0, -Inf) : (-Inf, 0.0)
         K == 1 && return :($b < 1 ? $empty : $full)
-        levels = r.thresholds isa ThresholdRows ? :(length($c) + 1) : K
+        levels = r.thresholds isa ThresholdRows || _computed_thresholds(plan, r) ?
+            :(length($c) + 1) : K
         z = :($dref * ($c[$b] - $etav))
         logtail = upper ? _ordinal_logCC(r.link, z) : _ordinal_logF(r.link, z)
         :($b < 1 ? $empty : ($b >= $levels ? $full : $logtail))
@@ -4483,26 +4509,40 @@ _stage_lane(label::Symbol, what::Symbol) = Symbol(:_ppl_srl_, what, :_, label)
 # likelihood) and lowers to a zero cell over the observations.
 function _ordinal_stopping_stmts(r::LikelihoodSpec, plan::StructuralPlan,
         node::Symbol, pw::Symbol, K)
-    r.evidence.kind === :none || return _ordinal_stopping_evidence_stmts(r, plan, node, pw, K)
+    _ordinal_stage_lanes(plan, r) || return _ordinal_stopping_evidence_stmts(r, plan, node, pw, K)
     y = r.response
     if K == 1
         return _plate_sum_stmts(pw, node, Any[y], :(0.0 * $(_dovar(1))))
     end
     lp = _location_node(r, plan)
     obs, stage = _stage_lane(r.label, :obs), _stage_lane(r.label, :stage)
-    levels = r.thresholds isa ThresholdRows ? :(length.($(r.thresholds.name)) .+ 1) : K
+    # The lanes come from bound data. Over computed thresholds, whose length
+    # only the running program knows, observation i visits stages 1..y[i]:
+    # a stage beyond the last threshold is the top level's (no stop) or lies
+    # outside the support, and each lane reads its threshold lazily.
+    computed = _computed_thresholds(plan, r)
+    levels = computed ? :($y .+ 1) :
+        r.thresholds isa ThresholdRows ? :(length.($(r.thresholds.name)) .+ 1) : K
     prests = Expr[:($obs = _ordinal_stage_obs($y, $levels)),
         :($stage = _ordinal_stage_idx($y, $levels))]
     level = _stage_lane(r.label, :y)
     eta = _stage_lane(r.label, :eta)
     thr = _stage_lane(r.label, :t)
-    push!(prests, :($level = $y[$obs]), :($eta = _broadcast_gather($lp, $obs)),
-        :($thr = $(_threshold_stages(r.thresholds, obs, stage))))
+    push!(prests, :($level = $y[$obs]), :($eta = _broadcast_gather($lp, $obs)))
+    if computed && r.thresholds isa Symbol
+        thr = :(Ref($(r.thresholds)))
+    elseif computed
+        push!(prests, :($thr = _broadcast_gather($(r.thresholds.name), $obs)))
+    else
+        push!(prests, :($thr = $(_threshold_stages(r.thresholds, obs, stage))))
+    end
     inputs = Any[stage, level, eta, thr]
     sv, yv, etav, tv = _dovar(1), _dovar(2), _dovar(3), _dovar(4)
     dref = _ordinal_lane_ref!(inputs, prests,
         _ordinal_scale_source!(prests, r, plan), obs, _stage_lane(r.label, :d))
-    z = if r.threshold_effects !== nothing
+    z = if computed
+        :($dref * ($tv[$sv] - $etav))
+    elseif r.threshold_effects !== nothing
         matrix = _stage_lane(r.label, :effects_matrix)
         eff = _stage_lane(r.label, :eff)
         push!(prests,
@@ -4522,6 +4562,8 @@ function _ordinal_stopping_stmts(r::LikelihoodSpec, plan::StructuralPlan,
         :($dref * ($tv - $etav - $(_dovar(length(inputs)))))
     end
     cell = :($sv < $yv ? $(_ordinal_logCC(r.link, z)) : $(_ordinal_logF(r.link, z)))
+    computed && (cell = :($sv <= length($tv) ? $cell :
+        (($sv == $yv) & ($yv > length($tv) + 1) ? -Inf : 0.0)))
     if r.discrimination !== nothing
         cell = :(isfinite($dref) && $dref > 0 ? $cell : -Inf)
     end
@@ -4559,6 +4601,9 @@ function _ordinal_stopping_evidence_stmts(r, plan, node, pw, K)
     link = r.link === LogitLink ? :(Val(:logit)) :
         r.link === ProbitLink ? :(Val(:probit)) : :(Val(:cloglog))
     cell = :(rk_ordinal_stopping_logpdf($t, $eta, $d, $effects, $iv, Base.trunc(Int, $yv), $link))
+    # A level beyond a computed vector is outside the law's support, and its
+    # arm reads no stage beyond the vector.
+    _computed_thresholds(plan, r) && (cell = :($yv <= length($t) + 1 ? $cell : -Inf))
     cell = _wrap_evidence!(r, plan, pre, inputs, cell;
         logcdf=b -> :(rk_ordinal_stopping_logtail($t, $eta, $d, $effects, $iv, $b, $link, false)),
         logccdf=b -> :(rk_ordinal_stopping_logtail($t, $eta, $d, $effects, $iv, $b, $link, true)))

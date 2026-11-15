@@ -16,6 +16,26 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.201
+
+- Ordinal thresholds may be any vector the model computes, for
+  `OrderedLogistic` and both `Ordinal` structures. `Ref(cuts)` shares one
+  computed vector (a definition such as `cuts = m .+ s .- mean(s)`, or an
+  inline expression); inside a dotted `@plate` cell, `Ref(cuts)` of a cell
+  local gives each index its own vector, as in Julia; a bare argument such
+  as `rows[g]` over a computed value gives each observation its own. Before,
+  sampled thresholds had to name a declared vector, and per-observation
+  thresholds had to be data. The program reads a computed vector's length
+  when it runs: a level beyond it has log density `-Inf`, and cumulative
+  cutpoints that do not increase give `-Inf` through the existing lazy
+  guard. A stopping-ratio response over computed thresholds takes its stage
+  lanes from the observed levels alone (observation `i` visits stages
+  `1..y[i]`), and each lane reads its threshold only within the vector;
+  beside threshold effects it observes one lane per observation through
+  `rk_ordinal_stopping_logpdf`. Native values, ordinary Enzyme Reverse and
+  `jax_source`, where a centring `mean` is ReactiveKernels' Statistics
+  translation (ReactiveKernels 0.1.262).
+
 ## 0.1.200
 
 - `pool_smc` also takes `smc_checkpoint` records, alone or mixed with SMC
