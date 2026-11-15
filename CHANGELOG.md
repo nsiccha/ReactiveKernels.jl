@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.264
+## 0.1.265
 
 - `js_source` translates keyword calls of plain helpers, named tuples built
   and read in a recipe or helper, and destructuring. `f(x; a, b)` inlines
@@ -36,6 +36,38 @@ are recorded in the git history only.
   (filled with zeros), `x[index]` for a vector of indices (`BoundsError` before
   any element is read), and `@view x[a:b]` read by `sum`, `length` and
   indexing. Native execution is unchanged.
+
+## 0.1.264
+
+- `js_source` translates RK's distribution laws, so a browser module computes
+  the same law the RK, RKPPL and BRM models compute. Examples:
+  `standard_student_t(nu).cdf(z)`, `student_t(nu, location, scale).logpdf(x)`,
+  and `normal`, `lognormal`, `exponential` and the `gamma` density from
+  ReactiveKernelsDistributionKernels, in a recipe, a plate or a comprehension.
+  Before, every law with a special function raised `JSEmissionError`.
+- **Special functions:**
+  - SpecialFunctions' `erf`, `erfc`, `erfcx`, `gamma`, `loggamma` and
+    `logabsgamma` call C libraries or read a `Float64`'s bits. The module
+    computes them with pinned stdlib-js implementations that RK carries in
+    `src/js_vendor/`, copied into a module only when it uses them.
+  - Their Julia special cases and `DomainError`s are kept.
+  - Functions built on them, such as `logbeta`, `logerfc`, `log1pexp` and
+    `log1mexp`, translate from their own Julia code.
+- **Emitter coverage for the code under those laws:**
+  - tuples: a read at a position known while translating or computed at run
+    time, destructuring, and `first`/`last`;
+  - a method's static parameters;
+  - `evalpoly` with a coefficient tuple;
+  - `promote`, and `oftype` with an irrational constant;
+  - `isinteger`, `real`, `copysign`, and `iseven`/`isodd` of a `Float64`;
+  - checked math (`sqrt`, `log`) of an `Int64`;
+  - RK's guarded native calls.
+- **Agreement:** Node agrees with native to about 1e-14 relative or better,
+  far tails included.
+- **Distributions.jl objects:** a law written with them (`cdf(TDist(nu), x)`)
+  is refused with a `JSEmissionError` that names the RK spelling.
+- **Not covered yet:** the Gamma CDF, which needs stepped ranges inside
+  `gamma_inc`, and matrix laws such as `lkj_corr_cholesky`.
 
 ## 0.1.263
 

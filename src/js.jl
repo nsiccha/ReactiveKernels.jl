@@ -199,6 +199,16 @@ _js_code(mod, v, prec) = (r = _js_runtime(mod, v); r.prec < prec ? "(" * r.code 
 
 # --- the runtime ---------------------------------------------------------------------
 
+# Special functions JavaScript lacks, as stdlib-js implements them (prebuilt and
+# pinned in `js_vendor/`, whose README says how to regenerate them). The file
+# defines `_rk_stdlib_<name>`; `ReactiveKernelsSpecialFunctionsExt` maps
+# SpecialFunctions' functions to it.
+function _js_vendored(name::Symbol)
+    file = joinpath(@__DIR__, "js_vendor", string(name, ".js"))
+    include_dependency(file)
+    (String(rstrip(read(file, String))), Symbol[])
+end
+
 # Each helper: (definition, helpers it uses). Emitted only when used.
 const _JS_RUNTIME = Dict{Symbol,Tuple{String,Vector{Symbol}}}(
     :JuliaError => ("""
@@ -369,6 +379,40 @@ function _rk_vector(name, x, element) {
     if (typeof x[i] !== element || (element === "number" && arguments[3] && !Number.isInteger(x[i])))
       throw new JuliaError("ArgumentError", "the input `" + name + "` must hold " + element + "s; entry " + (i + 1) + " is " + x[i]);
 }""", [:JuliaError]),
+    # As Julia's `iseven`/`isodd` of a float: every integer above `maxintfloat` (2^53) is even.
+    :_rk_iseven => ("""
+function _rk_iseven(x) { return Number.isInteger(x) && (Math.abs(x) > 9007199254740992 || x % 2 === 0); }""", Symbol[]),
+    :_rk_isodd => ("""
+function _rk_isodd(x) { return Number.isInteger(x) && Math.abs(x) <= 9007199254740992 && x % 2 !== 0; }""", Symbol[]),
+    :_rk_stdlib_erf => _js_vendored(:erf),
+    :_rk_stdlib_erfc => _js_vendored(:erfc),
+    :_rk_stdlib_erfcx => _js_vendored(:erfcx),
+    :_rk_stdlib_gamma => _js_vendored(:gamma),
+    :_rk_stdlib_gammaln => _js_vendored(:gammaln),
+    # `copysign` reads the sign of a NaN as positive: JavaScript keeps no sign of a NaN.
+    :_rk_copysign => ("""
+function _rk_copysign(x, y) { return y < 0 || Object.is(y, -0) ? -Math.abs(x) : Math.abs(x); }""", Symbol[]),
+    # Julia's special cases of SpecialFunctions' `gamma`, `logabsgamma` and
+    # `loggamma` (the latter two from FreeBSD `e_lgamma_r.c`, as stdlib's `gammaln`).
+    :_rk_gamma => ("""
+function _rk_gamma(x) {
+  const y = _rk_stdlib_gamma(x);
+  return Number.isNaN(y) && !Number.isNaN(x) ? _rk_domain("gamma", x, "NaN result for non-NaN input") : y;
+}""", [:_rk_stdlib_gamma, :_rk_domain]),
+    :_rk_logabsgamma => ("""
+function _rk_logabsgamma(x) {
+  if (!Number.isFinite(x)) return [x * x, 1];
+  if (x === 0) return [Infinity, 1];
+  if (x > 0) return [_rk_stdlib_gammaln(x), 1];
+  if (x > -8.470329472543003e-22) return [-Math.log(-x), -1];
+  const f = Math.floor(x);
+  return f === x ? [Infinity, 1] : [_rk_stdlib_gammaln(x), f % 2 === 0 ? 1 : -1];
+}""", [:_rk_stdlib_gammaln]),
+    :_rk_loggamma => ("""
+function _rk_loggamma(x) {
+  const [y, s] = _rk_logabsgamma(x);
+  return s < 0 ? _rk_domain("loggamma", x, "`gamma(x)` must be non-negative") : y;
+}""", [:_rk_logabsgamma, :_rk_domain]),
 )
 
 function _js_runtime_closure(mod::_JsModule)
@@ -390,6 +434,12 @@ _js_isint(v) = _js_type(v) === Int64
 _js_isbool(v) = _js_type(v) === Bool
 _js_isvector(v) = _js_type(v) <: Vector && eltype(_js_type(v)) <: Union{_JsNumber,Bool}
 _js_isrange(v) = _js_type(v) in (UnitRange{Int64}, Base.OneTo{Int64})
+_js_istuple(v) = v isa _JsTuple || (v isa _JsVal && (v.static ? v.value isa Tuple : v.T <: Tuple))
+_js_tuple_length(v::_JsTuple) = length(v.items)
+_js_tuple_length(v::_JsVal) = v.static ? length(v.value) : fieldcount(v.T)
+# A nonempty tuple whose elements all have the number type `T`.
+_js_number_tuple(S, T) = S <: Tuple && !(S <: NamedTuple) && isconcretetype(S) && fieldcount(S) > 0 &&
+    T <: _JsNumber && all(==(T), fieldtypes(S))
 
 # A range is read through its first element, last element and length. A range
 # known while translating (`for _ in 1:60` in a helper) is read as literals; a
@@ -417,7 +467,8 @@ function _js_typed(mod::_JsModule, f, argtypes)
     ci isa Core.CodeInfo ||
         _js_error(mod, "`", f, "` has no Julia code to translate for argument types (",
                   join(argtypes, ", "), ")")
-    m = which(tt)
+    match = Base._which(tt)
+    m = match.method
     for st in ci.code
         st isa Expr && st.head === :foreigncall || continue
         name = st.args[1]
@@ -425,7 +476,7 @@ function _js_typed(mod::_JsModule, f, argtypes)
         _js_error(mod, "`", f isa _JsStruct ? f.T : f, "` calls the C function `", name,
                   "`, which has no JavaScript translation")
     end
-    (ci, rt, m)
+    (ci, rt, m, match.sparams)
 end
 
 function _js_return_type(f, argtypes)
@@ -469,6 +520,7 @@ mutable struct _JsIR
     result::Union{Nothing,String}  # inline: the variable a return assigns
     exit_label::String
     returned::Vector{Any}
+    sparams::Core.SimpleVector     # the method's static parameters (`where T`)
 end
 
 # Julia 1.10's typed code reads a slot of narrowed type as a `TypedSlot`.
@@ -496,6 +548,12 @@ function _js_operand(ir::_JsIR, x)
         return _js_static(getglobal(x.mod, x.name))
     elseif x isa QuoteNode
         return _js_static(x.value)
+    elseif x isa Expr && x.head === :static_parameter
+        # `T` of a method `where T`: known for the argument types translated.
+        k = x.args[1]
+        k <= length(ir.sparams) && !(ir.sparams[k] isa TypeVar) ||
+            _js_error(mod, "a static parameter whose value the argument types do not determine")
+        return _js_static(ir.sparams[k])
     elseif x isa Expr
         _js_error(mod, "the expression `", x, "` as an operand has no JavaScript translation")
     else
@@ -645,7 +703,7 @@ function _js_expr!(ir::_JsIR, i, ex, T)
         _js_error(mod, "a C call (`", ex.args[1], "`) has no JavaScript translation")
     elseif ex.head === :static_parameter
         T isa Core.Const && return _js_static(T.val)
-        _js_error(mod, "a static parameter whose value inference does not know")
+        return _js_operand(ir, ex)
     elseif ex.head === :boundscheck
         return _js_static(true)
     elseif ex.head in (:enter, :leave, :pop_exception)
@@ -1024,7 +1082,7 @@ function _js_return!(ir::_JsIR, v)
     end
 end
 
-function _js_ir(fn::_JsFn, ci::Core.CodeInfo, nargs::Int)
+function _js_ir(fn::_JsFn, ci::Core.CodeInfo, nargs::Int, sparams::Core.SimpleVector = Core.svec())
     n = length(ci.code)
     uses = zeros(Int, n)
     use_block = zeros(Int, n)
@@ -1054,7 +1112,7 @@ function _js_ir(fn::_JsFn, ci::Core.CodeInfo, nargs::Int)
     end
     _JsIR(fn, ci, nargs, Vector{Any}(nothing, n), Vector{Any}(nothing, nslots),
           fill("", nslots), assigns, uses, use_block, cfg_blocks, length(blocks) > 1, Set{String}(), 0, 0, Int[],
-          nothing, "", Any[])
+          nothing, "", Any[], sparams)
 end
 
 # Declare the locals assigned more than once (or in a loop) at the top.
@@ -1149,6 +1207,11 @@ function _js_call!(ir::_JsIR, f, args::Vector{Any}, T)
         return _js_rt("new JuliaError(" * _js_string_literal(nameof(f)) * ", [" * join(rargs, ", ") *
                       "].join(\", \"))", f)
     end
+    _js_distributions_law(f, args) &&
+        _js_error(mod, "`", f, "` is part of a Distributions.jl law, which has no JavaScript translation. ",
+                  "Write the law with ReactiveKernels' distribution stack (ReactiveKernelsDistributionKernels), ",
+                  "as RK, RKPPL and BRM models do: for example `standard_student_t(nu).cdf(z)`, ",
+                  "`student_t(nu, location, scale).logpdf(x)`, `normal`, `lognormal`, `exponential` or `gamma`")
     if !(f isa Core.Builtin) && !(f isa Type) && !_js_table_only(f)
         # A function becomes a named JavaScript function; a callable object
         # (RK's own operations, closures) is inlined where it is called.
@@ -1164,6 +1227,18 @@ function _js_call!(ir::_JsIR, f, args::Vector{Any}, T)
     end
     types = join((_js_type(a) isa Type ? _js_type(a) : typeof(_js_type(a)) for a in args), ", ")
     _js_error(mod, "`", f, "` with argument types (", types, ") has no JavaScript translation")
+end
+
+# A constructor or function of Distributions.jl, or a call on one of its
+# objects. Its laws reach C libraries and StatsFuns' tails; the browser computes
+# RK's own laws instead (`reactivekernels-use` §4k).
+function _js_distributions_law(f, args)
+    root(m::Module) = nameof(Base.moduleroot(m))
+    owner(x) = x isa Type ? root(parentmodule(x)) :
+        x isa Function && Base.issingletontype(typeof(x)) ? root(parentmodule(x)) : root(parentmodule(typeof(x)))
+    owner(f) === :Distributions && return true
+    any(a -> a isa _JsVal && a.static && !(a.value isa Union{Number,Nothing,String,Symbol,Type}) &&
+             owner(a.value) === :Distributions, args)
 end
 
 # A function bound to its name in its module (not a closure or callable object).
@@ -1199,13 +1274,13 @@ function _js_helper_call!(ir::_JsIR, f, args::Vector{Any}, T)
 end
 
 function _js_helper!(mod::_JsModule, f, args, argtypes, key)
-    ci, RT, m = _js_typed(mod, f, argtypes)
+    ci, RT, m, sparams = _js_typed(mod, f, argtypes)
     name = _js_unique!(mod.taken, nameof(f))
     mod.helpers[key] = (name, RT)
     push!(mod.stack, "`" * string(nameof(f)) * "(" * join(("::" * string(T) for T in argtypes), ", ") * ")`")
     fn = _JsFn(mod)
     nargs = Int(m.nargs)
-    ir = _js_ir(fn, ci, nargs)
+    ir = _js_ir(fn, ci, nargs, sparams)
     ir.slots[1] = _js_static(f)
     params = String[]
     nfixed = m.isva ? nargs - 2 : nargs - 1
@@ -1246,9 +1321,9 @@ end
 function _js_inline!(fn::_JsFn, f, args::Vector{Any}, hint)
     mod = fn.mod
     argtypes = Any[_js_argtype(a) for a in args]
-    ci, RT, m = _js_typed(mod, f, argtypes)
+    ci, RT, m, sparams = _js_typed(mod, f, argtypes)
     nargs = Int(m.nargs)
-    ir = _js_ir(fn, ci, nargs)
+    ir = _js_ir(fn, ci, nargs, sparams)
     ir.slots[1] = f isa _JsStruct ? f : _js_static(f)
     nfixed = m.isva ? nargs - 2 : nargs - 1
     for k in 1:nfixed
@@ -1514,7 +1589,7 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
         return _js_fcall(ir, f === min ? "Math.min" : "Math.max", args, T)
     elseif haskey(_JS_MATH, f) && nums && length(args) == 1
         return _js_fcall(ir, _JS_MATH[f], args, T)
-    elseif haskey(_JS_CHECKED, f) && nums && length(args) == 1 && _js_isfloat(args[1])
+    elseif haskey(_JS_CHECKED, f) && nums && length(args) == 1
         return _js_fcall(ir, _js_use!(mod, _JS_CHECKED[f]), args, T)
     elseif f in (floor, ceil, trunc, round) && length(args) == 2 && args[1] isa _JsVal &&
            args[1].static && args[1].value === Int64 && _js_isfloat(args[2])
@@ -1554,8 +1629,57 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
                       _js_code(mod, hi, _JS_COND) * " : " * _js_code(mod, x, _JS_REL + 1) * " < " *
                       _js_code(mod, lo, _JS_REL + 1) * " ? " * _js_code(mod, lo, _JS_COND) * " : " *
                       _js_code(mod, x, _JS_COND), T; prec = _JS_COND)
-    elseif f in (float, identity) && length(args) == 1 && _js_isnumber(args[1])
+    elseif f in (float, identity, real) && length(args) == 1 && _js_isnumber(args[1])
         return args[1]
+    elseif f === isinteger && length(args) == 1 && _js_isnumber(args[1])
+        _js_isint(args[1]) && return _js_static(true)
+        return _js_fcall(ir, "Number.isInteger", args, Bool)
+    elseif f === copysign && length(args) == 2 && all(_js_isfloat, args)
+        return _js_fcall(ir, _js_use!(mod, :_rk_copysign), args, T)
+    elseif f === promote && !isempty(args) && all(_js_isnumber, args)
+        PT = promote_type(map(_js_type, args)...)
+        return _JsTuple(Any[_js_convert(ir, PT, a) for a in args], T)
+    elseif f === oftype && length(args) == 2 && _js_isnumber(args[1]) && args[2] isa _JsVal &&
+           (_js_isnumber(args[2]) || (args[2].static && args[2].value isa Real))
+        # `oftype(x, loghalf)`: an irrational constant becomes the number it rounds to.
+        args[2].static && return _js_static(convert(_js_type(args[1]), args[2].value))
+        return _js_convert(ir, _js_type(args[1]), args[2])
+    elseif f === getindex && length(args) == 2 && _js_istuple(args[1]) && args[2] isa _JsVal &&
+           args[2].static && args[2].value isa Int
+        # A tuple read at a position known while translating, such as the
+        # operation table of an RK derivative rule: a field read.
+        return _js_function_call(ir, Core.getfield, args, T)
+    elseif f === getindex && length(args) == 2 && _js_istuple(args[1]) && _js_isint(args[2]) &&
+           _js_number_tuple(_js_type(args[1]), T)
+        # A tuple of numbers read at a position computed at run time: as an array.
+        return _js_fcall(ir, _js_use!(mod, :_rk_at), Any[_js_runtime(mod, args[1]), args[2]], T)
+    elseif f === evalpoly && length(args) == 2 && _js_isnumber(args[1]) && _js_istuple(args[2]) &&
+           _js_tuple_length(args[2]) > 0 && !(_js_type(args[2]) <: NamedTuple)
+        # Horner's rule with `muladd`, as Julia evaluates a polynomial of a real argument.
+        x = _js_simple!(ir, args[1], "x")
+        n = _js_tuple_length(args[2])
+        coefficient(k) = _js_function_call(ir, Core.getfield, Any[args[2], _js_static(k)],
+                                           fieldtype(_js_type(args[2]), k))
+        acc = coefficient(n)
+        for k in (n - 1):-1:1
+            c = coefficient(k)
+            all(_js_isnumber, (acc, c)) || return nothing
+            acc = _js_call!(ir, muladd, Any[x, acc, c], T)
+        end
+        return acc
+    elseif f in (first, last) && length(args) == 1 && _js_istuple(args[1]) && _js_tuple_length(args[1]) > 0
+        k = f === first ? 1 : _js_tuple_length(args[1])
+        return _js_function_call(ir, Core.getfield, Any[args[1], _js_static(k)], T)
+    elseif f in (iseven, isodd) && length(args) == 1 && _js_isint(args[1])
+        return _js_rt(_js_code(mod, args[1], _JS_MUL) * " % 2 " * (f === iseven ? "===" : "!==") * " 0",
+                      Bool; prec = _JS_EQ)
+    elseif f in (iseven, isodd) && length(args) == 1 && _js_isfloat(args[1])
+        return _js_fcall(ir, _js_use!(mod, f === iseven ? :_rk_iseven : :_rk_isodd), args, Bool)
+    elseif f === Base.indexed_iterate && length(args) in (2, 3) && _js_istuple(args[1]) &&
+           args[2] isa _JsVal && args[2].static && args[2].value isa Int
+        # Destructuring `(a, b) = t`: the element and the next position.
+        item = _js_function_call(ir, Core.getfield, Any[args[1], args[2]], fieldtype(T, 1))
+        return _JsTuple(Any[item, _js_static(args[2].value + 1)], T)
     elseif f in (zero, one) && length(args) == 1 && _js_isnumber(args[1])
         return _js_static(f(_js_type(args[1])))
     elseif f === convert && length(args) == 2 && args[1] isa _JsVal && args[1].static &&
@@ -1715,6 +1839,14 @@ function _js_function_call(ir::_JsIR, f::Core.IntrinsicFunction, args, T)
     end
     nothing
 end
+# Whether a method exists for a signature known while translating, as RK's
+# guarded native calls ask (`src/core.jl`): native inference folds it to a
+# constant, and here it is answered in the world that translates.
+function _js_function_call(ir::_JsIR, f::typeof(Core._hasmethod), args, T)
+    length(args) == 1 && args[1] isa _JsVal && args[1].static || return nothing
+    _js_static(Core._hasmethod(args[1].value))
+end
+
 function _js_function_call(ir::_JsIR, f::Core.Builtin, args, T)
     mod = ir.fn.mod
     if f === Core.getfield || f === getfield
