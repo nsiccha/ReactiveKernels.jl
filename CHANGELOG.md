@@ -16,6 +16,19 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.256
+
+- `ReactiveKernels.js_source` translates a range written in a helper or a
+  kernel, such as `for _ in 1:60`, `OneTo(3)`, `x .^ (0:4)`,
+  `[f(k) for k in 1:5]`, `map(f, 1:4)` or `plate(1:4) do i ... end`. Such a
+  range is known while translating, so it needs no kernel input, and its
+  bounds are written as number literals. It used to raise `JSEmissionError:
+  the value 1:60 of type UnitRange{Int64} is needed at run time`.
+- A branch whose condition is known while translating (an `if` on a `const`
+  flag, the entry test of a loop over `1:0`, `isempty` of a range a helper is
+  called with) leaves out the code it never runs. It used to raise an internal
+  `JSEmissionError` ("no label for a jump").
+
 ## 0.1.255
 
 - `type_stability_level = :rk` audits the functions of exactly the packages of
