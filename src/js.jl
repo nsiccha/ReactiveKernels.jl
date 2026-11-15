@@ -157,6 +157,11 @@ function _js_runtime(mod::_JsModule, v::_JsVal)
     elseif x isa Tuple && all(e -> e isa Union{Number,Nothing,String,Symbol}, x)
         items = [_js_runtime(mod, _js_static(e)).code for e in x]
         return _js_rt("[" * join(items, ", ") * "]", typeof(x); ref = false)
+    elseif _js_isrange(v)
+        # A range known while translating (`1:60`), where a value is needed:
+        # the runtime range, as `a:b` builds it.
+        return _js_rt(_js_use!(mod, :_rk_range) * "(" * _js_number(first(x)) * ", " * _js_number(last(x)) * ")",
+                      typeof(x); ref = false)
     elseif x isa Exception
         return _js_rt(_js_exception(mod, x), typeof(x); pure = true)
     end
@@ -367,6 +372,15 @@ _js_isint(v) = _js_type(v) === Int64
 _js_isbool(v) = _js_type(v) === Bool
 _js_isvector(v) = _js_type(v) <: Vector && eltype(_js_type(v)) <: Union{_JsNumber,Bool}
 _js_isrange(v) = _js_type(v) in (UnitRange{Int64}, Base.OneTo{Int64})
+
+# A range is read through its first element, last element and length. A range
+# known while translating (`for _ in 1:60` in a helper) is read as literals; a
+# runtime one is a `{ start, stop }` object, bound to a name by `_js_range!`.
+_js_range!(ir, v, hint = "r") = v isa _JsVal && v.static ? v : _js_simple!(ir, v, hint)
+_js_range_start(r::_JsVal) = r.static ? _js_number(first(r.value)) : r.code * ".start"
+_js_range_stop(r::_JsVal) = r.static ? _js_number(last(r.value)) : r.code * ".stop"
+_js_range_length(r::_JsVal) =
+    r.static ? _js_number(length(r.value)) : "(" * r.code * ".stop - " * r.code * ".start + 1)"
 
 # --- typed code ------------------------------------------------------------------------
 
@@ -672,6 +686,25 @@ end
 _js_noreturn(ci, i) = ci.ssavaluetypes isa Vector && ci.ssavaluetypes[i] === Union{} &&
     !(ci.code[i] isa Union{Core.GotoNode,Core.GotoIfNot,Core.ReturnNode})
 
+# The value inference knows a branch condition to have (`if FLAG` on a constant
+# global, the entry test of a loop over `1:0`), or `nothing`. Such a branch
+# takes one edge only, and the code on the other is unreachable.
+function _js_known_cond(ci::Core.CodeInfo, st::Core.GotoIfNot)
+    c = st.cond
+    c isa Bool && return c
+    if c isa Core.SSAValue && ci.ssavaluetypes isa Vector
+        t = ci.ssavaluetypes[c.id]
+        t isa Core.Const && t.val isa Bool && return t.val
+    elseif c isa GlobalRef && isdefined(c.mod, c.name) && isconst(c.mod, c.name)
+        v = getglobal(c.mod, c.name)
+        v isa Bool && return v
+    end
+    nothing
+end
+
+# A forward jump over unreachable blocks only is a fall-through.
+_js_falls_to(reach, from, to) = all(b -> !reach[b], (from + 1):(to - 1))
+
 # The basic blocks of typed code: each starts at a jump target or after a
 # jump, a return or a call that never returns.
 function _js_partition(ci::Core.CodeInfo)
@@ -711,8 +744,9 @@ function _js_cfg(mod::_JsModule, ci::Core.CodeInfo)
         if st isa Core.GotoNode
             push!(succ[b], block_of[st.label])
         elseif st isa Core.GotoIfNot
-            push!(succ[b], block_of[st.dest])
-            b < nb && push!(succ[b], b + 1)
+            known = _js_known_cond(ci, st)
+            known === true || push!(succ[b], block_of[st.dest])
+            known === false || (b < nb && push!(succ[b], b + 1))
         elseif st isa Core.ReturnNode || _js_noreturn(ci, i)
         elseif b < nb
             push!(succ[b], b + 1)
@@ -744,6 +778,7 @@ function _js_cfg(mod::_JsModule, ci::Core.CodeInfo)
             t > b || continue
             fall = !(st isa Core.GotoIfNot && t == block_of[st.dest] && t != b + 1) && t == b + 1
             (fall && !ends_loop(b)) && continue
+            (_js_falls_to(reach, b, t) && !ends_loop(b)) && continue
             push!(get!(Set{Int}, sources, t), b)
         end
     end
@@ -755,7 +790,8 @@ function _js_cfg(mod::_JsModule, ci::Core.CodeInfo)
         length(srcs) == 1 || continue
         o = only(srcs)
         st = code[last(blocks[o])]
-        st isa Core.GotoIfNot && block_of[st.dest] == t && t != o + 1 && (ifs[t] = o)
+        st isa Core.GotoIfNot && block_of[st.dest] == t && t != o + 1 && _js_known_cond(ci, st) === nothing &&
+            (ifs[t] = o)
     end
     function nest()
         # Open each labeled block early enough to nest with the loops, the
@@ -822,7 +858,7 @@ function _js_edge!(ir::_JsIR, cfg::_JsCFG, from, to; conditional = false)
     elseif to in cfg.labeled && (conditional || to != from + 1 ||
                                  any(e == from for e in values(cfg.loop_end)))
         _js_line!(ir.fn, "break L" * string(to) * ";")
-    elseif to != from + 1
+    elseif to != from + 1 && !_js_falls_to(cfg.reach, from, to)
         _js_error(ir.fn.mod, "internal: no label for a jump to block ", to)
     end
 end
@@ -833,42 +869,70 @@ function _js_body!(ir::_JsIR)
     cfg = _js_cfg(mod, ci)
     ir.block_of = cfg.block_of
     stack = Tuple{Int,Int,Symbol,Int}[]
+    shown = Bool[]   # whether each open scope was written
     k = 1
+    # The blocks an emitted edge reaches: a condition known only while
+    # translating (a test of a value a helper is specialized on) takes one
+    # edge. Control enters a scope only at its first block, so a scope that
+    # starts at a block no edge reaches is dead throughout and is not written.
+    live = falses(length(cfg.blocks))
+    live[1] = true
+    dead_until = 0
     for (b, r) in enumerate(cfg.blocks)
         while !isempty(stack) && last(stack)[2] == b - 1
             pop!(stack)
-            ir.fn.indent -= 1
-            _js_line!(ir.fn, "}")
+            if pop!(shown)
+                ir.fn.indent -= 1
+                _js_line!(ir.fn, "}")
+            end
         end
+        reached = cfg.reach[b] && live[b]
         while k <= length(cfg.scopes) && cfg.scopes[k][1] == b
             s = cfg.scopes[k]
             k += 1
-            label = "L" * string(s[4])
-            _js_line!(ir.fn, s[3] === :loop ? label * ": while (true) {" : label * ": {")
-            ir.fn.indent += 1
+            show = reached && b > dead_until
+            if show
+                label = "L" * string(s[4])
+                _js_line!(ir.fn, s[3] === :loop ? label * ": while (true) {" : label * ": {")
+                ir.fn.indent += 1
+            else
+                dead_until = max(dead_until, s[2])
+            end
             push!(stack, s)
+            push!(shown, show)
         end
-        cfg.reach[b] || continue
+        reached || continue
+        b <= dead_until && _js_error(mod, "internal: block ", b, " is reached inside a scope that starts in dead code")
         ended = false
         for i in r
             st = ci.code[i]
             if st isa Core.GotoNode
                 _js_flush!(ir)
+                live[cfg.block_of[st.label]] = true
                 _js_edge!(ir, cfg, b, cfg.block_of[st.label])
                 ended = true
             elseif st isa Core.GotoIfNot
                 c = _js_operand(ir, st.cond)
                 dest = cfg.block_of[st.dest]
-                if c isa _JsVal && c.static
+                known = _js_known_cond(ci, st)
+                known === nothing && c isa _JsVal && c.static && (known = c.value::Bool)
+                if known !== nothing
+                    # An `if` planned over b+1:dest-1 needs no code: its body
+                    # runs by falling through, or is skipped as dead code.
                     _js_flush!(ir)
-                    c.value === false && _js_edge!(ir, cfg, b, dest)
-                    c.value === false && (ended = true)
+                    if known === false
+                        live[dest] = true
+                        get(cfg.ifs, dest, 0) == b || _js_edge!(ir, cfg, b, dest)
+                        ended = true
+                    end
                 elseif get(cfg.ifs, dest, 0) == b
                     code = _js_runtime(mod, c).code
                     _js_flush!(ir)
                     _js_line!(ir.fn, "if (" * code * ") {")
                     ir.fn.indent += 1
                     push!(stack, (b + 1, dest - 1, :if, dest))
+                    push!(shown, true)
+                    live[dest] = true
                 else
                     code = _js_not(mod, c).code
                     _js_flush!(ir)
@@ -877,6 +941,7 @@ function _js_body!(ir::_JsIR)
                     _js_edge!(ir, cfg, b, dest; conditional = true)
                     ir.fn.indent -= 1
                     _js_line!(ir.fn, "}")
+                    live[dest] = true
                 end
             elseif st isa Core.ReturnNode
                 if !isdefined(st, :val)
@@ -896,12 +961,17 @@ function _js_body!(ir::_JsIR)
             end
         end
         _js_flush!(ir)
-        ended || b == length(cfg.blocks) || _js_edge!(ir, cfg, b, b + 1)
+        if !(ended || b == length(cfg.blocks))
+            live[b+1] = true
+            _js_edge!(ir, cfg, b, b + 1)
+        end
     end
     while !isempty(stack)
         pop!(stack)
-        ir.fn.indent -= 1
-        _js_line!(ir.fn, "}")
+        if pop!(shown)
+            ir.fn.indent -= 1
+            _js_line!(ir.fn, "}")
+        end
     end
 end
 
@@ -1192,19 +1262,18 @@ function _js_materialize!(ir::_JsIR, bc::_JsBroadcast, T; dest = nothing)
                           t <: Base.RefValue)) ||
             _js_error(mod, "a broadcast over a `", t, "` has no JavaScript translation (scalars, vectors and ranges are supported)")
     end
-    arrays = filter(l -> l isa _JsVal && !l.static && (_js_isvector(l) || _js_isrange(l)), leaves)
+    arrays = filter(l -> l isa _JsVal && ((!l.static && _js_isvector(l)) || _js_isrange(l)), leaves)
     if isempty(arrays) && dest === nothing
         return _js_element!(ir, bc, Dict{Any,String}(), "")
     end
-    # bind every array operand to a name
-    names = Dict{Any,String}()
+    # bind every array operand to a name (a range known while translating is
+    # read as literals)
+    names = Dict{Any,_JsVal}()
     for l in arrays
         haskey(names, l) && continue
-        s = _js_simple!(ir, l, "x")
-        names[l] = s.code
+        names[l] = _js_isrange(l) ? _js_range!(ir, l, "x") : _js_simple!(ir, l, "x")
     end
-    lengths = unique([_js_isrange(l) ? "(" * names[l] * ".stop - " * names[l] * ".start + 1)" :
-                      names[l] * ".length" for l in arrays])
+    lengths = unique([_js_isrange(l) ? _js_range_length(names[l]) : names[l].code * ".length" for l in arrays])
     dest === nothing || pushfirst!(lengths, dest.code * ".length")
     single = length(lengths) == 1
     n = _js_local!(ir.fn, "n")
@@ -1217,9 +1286,9 @@ function _js_materialize!(ir::_JsIR, bc::_JsBroadcast, T; dest = nothing)
     ir.fn.indent += 1
     elements = Dict{Any,String}()
     for l in arrays
-        name = names[l]
-        elements[l] = _js_isrange(l) ? "(" * name * ".start + " * i * ")" :
-            single ? name * "[" * i * "]" : _js_use!(mod, :_rk_bcat) * "(" * name * ", " * i * ")"
+        a = names[l]
+        elements[l] = _js_isrange(l) ? "(" * _js_range_start(a) * " + " * i * ")" :
+            single ? a.code * "[" * i * "]" : _js_use!(mod, :_rk_bcat) * "(" * a.code * ", " * i * ")"
     end
     e = _js_element!(ir, bc, elements, i)
     _js_line!(ir.fn, out * "[" * i * "] = " * _js_runtime(mod, e).code * ";")
@@ -1383,7 +1452,8 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
     elseif f === length && length(args) == 1 && _js_isvector(args[1])
         return _js_rt(_js_code(mod, args[1], _JS_ATOM) * ".length", Int64)
     elseif f === length && length(args) == 1 && _js_isrange(args[1])
-        r = _js_simple!(ir, args[1])
+        r = _js_range!(ir, args[1])
+        r.static && return _js_static(length(r.value))
         return _js_rt(r.code * ".stop - " * r.code * ".start + 1", Int64; prec = _JS_ADD)
     elseif f === size && length(args) == 2 && _js_isvector(args[1]) && _js_isint(args[2])
         d = args[2]
@@ -1416,16 +1486,19 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
     elseif f === (:) && length(args) == 2 && all(_js_isint, args)
         return _js_fcall(ir, _js_use!(mod, :_rk_range), args, UnitRange{Int64})
     elseif f === iterate && length(args) in (1, 2) && _js_isrange(args[1])
-        r = _js_simple!(ir, args[1], "r")
+        r = _js_range!(ir, args[1])
         if length(args) == 1
+            r.static && return _js_static(iterate(r.value))
             return _js_rt(r.code * ".stop >= " * r.code * ".start ? [" * r.code * ".start, " * r.code *
                           ".start] : null", T; prec = _JS_COND)
         end
         s = _js_simple!(ir, args[2], "s")
-        return _js_rt(s.code * " < " * r.code * ".stop ? [" * s.code * " + 1, " * s.code * " + 1] : null",
+        return _js_rt(s.code * " < " * _js_range_stop(r) * " ? [" * s.code * " + 1, " * s.code * " + 1] : null",
                       T; prec = _JS_COND)
     elseif f in (first, last) && length(args) == 1 && _js_isrange(args[1])
-        return _js_rt(_js_code(mod, args[1], _JS_ATOM) * (f === first ? ".start" : ".stop"), Int64)
+        r = args[1]
+        r isa _JsVal && r.static && return _js_static(f(r.value))
+        return _js_rt(_js_code(mod, r, _JS_ATOM) * (f === first ? ".start" : ".stop"), Int64)
     elseif f === Base.Broadcast.broadcasted || f === _native_broadcasted
         return _js_broadcasted(ir, f, args, T)
     elseif (f === Base.Broadcast.materialize || f === _native_broadcast_materialize) &&
@@ -1448,6 +1521,11 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
         g = args[1]
         return _js_materialize!(ir, _JsBroadcast(g.fields[1] isa _JsVal ? g.fields[1].value : g.fields[1],
                                                  Any[g.fields[2]], Nothing), T)
+    elseif f === collect && length(args) == 1 && args[1] isa _JsVal && args[1].static &&
+           args[1].value isa Base.Generator && _js_isrange(_js_static(args[1].value.iter))
+        # `[f(k) for k in 1:5]` with nothing captured: a generator known while translating
+        g = args[1].value
+        return _js_materialize!(ir, _JsBroadcast(g.f, Any[_js_static(g.iter)], Nothing), T)
     elseif f === map && length(args) == 2 && (_js_isvector(args[2]) || _js_isrange(args[2]))
         return _js_materialize!(ir, _JsBroadcast(args[1] isa _JsVal ? args[1].value : args[1],
                                                  Any[args[2]], Nothing), T)
@@ -1726,8 +1804,9 @@ function _js_plate!(fn::_JsFn, op::_AuthoredPlateOp{K,A}, inputs, hint) where {K
     end
     any(mapped) || _js_error(mod, "a plate without a vector argument")
     kir = _js_ir(fn, only(Base.code_lowered(_js_noop, Tuple{})), 0)
-    args = Any[mapped[i] ? _js_simple!(kir, inputs[i], "x") : inputs[i] for i in eachindex(inputs)]
-    lengths = unique([_js_isrange(a) ? "(" * a.code * ".stop - " * a.code * ".start + 1)" : a.code * ".length"
+    args = Any[!mapped[i] ? inputs[i] : _js_isrange(inputs[i]) ? _js_range!(kir, inputs[i], "x") :
+               _js_simple!(kir, inputs[i], "x") for i in eachindex(inputs)]
+    lengths = unique([_js_isrange(a) ? _js_range_length(a) : a.code * ".length"
                       for (i, a) in enumerate(args) if mapped[i]])
     single = length(lengths) == 1
     n = _js_local!(fn, "n")
@@ -1744,7 +1823,7 @@ function _js_plate!(fn::_JsFn, op::_AuthoredPlateOp{K,A}, inputs, hint) where {K
             T = _js_type(a)
             a isa _JsVal && T <: Base.RefValue && a.static ? _js_static(a.value[]) : a
         elseif _js_isrange(a)
-            _js_rt("(" * a.code * ".start + " * i * ")", Int64; prec = _JS_ATOM)
+            _js_rt("(" * _js_range_start(a) * " + " * i * ")", Int64; prec = _JS_ATOM)
         else
             name = _js_local!(fn, v.name)
             el = single ? a.code * "[" * i * "]" : _js_use!(mod, :_rk_bcat) * "(" * a.code * ", " * i * ")"
@@ -1774,8 +1853,9 @@ function _js_scan!(fn::_JsFn, op::_AuthoredScanOp{K,A,I,H}, inputs, hint) where 
             _js_error(mod, "a scan over a `", _js_type(inputs[i]), "` has no JavaScript translation (vectors and ranges are)")
     end
     kir = _js_ir(fn, only(Base.code_lowered(_js_noop, Tuple{})), 0)
-    seqs = Any[_js_simple!(kir, inputs[i], "x") for i in iterated]
-    lens = [_js_isrange(a) ? "(" * a.code * ".stop - " * a.code * ".start + 1)" : a.code * ".length" for a in seqs]
+    seqs = Any[_js_isrange(inputs[i]) ? _js_range!(kir, inputs[i], "x") : _js_simple!(kir, inputs[i], "x")
+               for i in iterated]
+    lens = [_js_isrange(a) ? _js_range_length(a) : a.code * ".length" for a in seqs]
     n = _js_local!(fn, "n")
     _js_line!(fn, "const " * n * " = " * lens[1] * ";")
     for l in lens[2:end]
@@ -1797,7 +1877,7 @@ function _js_scan!(fn::_JsFn, op::_AuthoredScanOp{K,A,I,H}, inputs, hint) where 
     for (k, a) in enumerate(seqs)
         v = body.have[1+k]
         step[canon_id(body.graph, v.id)] = if _js_isrange(a)
-            _js_rt("(" * a.code * ".start + " * i * ")", Int64; prec = _JS_ATOM)
+            _js_rt("(" * _js_range_start(a) * " + " * i * ")", Int64; prec = _JS_ATOM)
         else
             name = _js_local!(fn, v.name)
             _js_line!(fn, "const " * name * " = " * a.code * "[" * i * "];")

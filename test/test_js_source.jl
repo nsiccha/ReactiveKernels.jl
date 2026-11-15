@@ -2,6 +2,7 @@ module TestJSSource
 
 using ReactiveKernels
 using Test
+using Base: OneTo
 
 include(joinpath(@__DIR__, "js_node.jl"))
 
@@ -39,6 +40,65 @@ function js_weighted_total(v)
 end
 js_squares(v) = [x^2 for x in v]
 js_c_sin(x) = ccall(:sin, Float64, (Float64,), x)
+
+# Loops over a range written in the helper (`for _ in 1:60`): the range is known
+# while translating, needs no kernel input, and a loop over an empty one, like a
+# branch on a constant, is dead code.
+js_decay(x, k) = exp(-k * x)
+function js_half_life(k)
+    low, high = 0.0, 1.0
+    while js_decay(high, k) > 0.5
+        high *= 2
+    end
+    for _ in 1:60
+        middle = (low + high) / 2
+        js_decay(middle, k) > 0.5 ? (low = middle) : (high = middle)
+    end
+    (low + high) / 2
+end
+function js_fixed_series(x)
+    s = 0.0
+    for i in 1:12
+        s += x^i / i
+    end
+    for i in OneTo(3)
+        s = s * i + 1
+    end
+    for i in -3:2
+        s += i * x
+    end
+    for _ in 1:0
+        s = -s
+    end
+    s
+end
+const JS_CHECKED = false
+function js_unchecked(x)
+    if JS_CHECKED
+        x < 0 && error("negative input")
+    end
+    sqrt(abs(x))
+end
+function js_range_sum(r, x)
+    isempty(r) && return x
+    s = 0.0
+    for i in r
+        s += i * x
+    end
+    s
+end
+function js_chosen_range(flag, n)
+    r = flag ? (1:3) : (1:n)
+    s = 0
+    for i in r
+        s += i
+    end
+    s
+end
+js_powers(x) = x .^ (0:4)
+js_scaled(x) = [x / k for k in 1:5]
+js_squares_scaled(x) = [k^2 for k in 1:5] .* x
+js_multiples(x) = map(k -> k * x, 1:4)
 
 @kernel js_scalar(a, b) = begin
     c = a * b + exp(-a) / (1 + b^2)
@@ -101,6 +161,24 @@ end
     total = sum(lp)
     return total
 end
+@kernel js_fixed_ranges(x, k, flag, n) = begin
+    h = js_half_life(k)
+    s = js_fixed_series(x)
+    u = js_unchecked(x)
+    e = js_range_sum(1:0, x) + js_range_sum(1:3, x)
+    c = js_chosen_range(flag, n)
+    p = plate(1:4) do i
+        i * x
+    end
+    return h
+end
+@kernel js_fixed_vectors(x) = begin
+    p = js_powers(x)
+    s = js_scaled(x)
+    q = js_squares_scaled(x)
+    m = js_multiples(x)
+    return p
+end
 @kernel js_c_call(x) = begin
     y = js_c_sin(x)
     return y
@@ -134,6 +212,10 @@ const CASES = [
      [([1.0, 0.0, 0.0, 2.0], 0.5, 0.0), (Float64[], 0.5, 1.0), (collect(range(0, 1; length = 1000)), 0.9, 2.0)]),
     (:js_plate, js_plate, (:y, :mu), :total, (; y = V, mu = V),
      [([1.0, 2.0, 3.0], [0.5, 2.5, 3.0]), ([1.0, 2.0], [0.0]), (Float64[], Float64[]), ([1.0, 2.0, 3.0], [1.0, 2.0])]),
+    (:js_fixed_ranges, js_fixed_ranges, (:x, :k, :flag, :n), (:h, :s, :u, :e, :c, :p),
+     (; x = Float64, k = Float64, flag = Bool, n = Int),
+     [(0.5, 0.3, true, 10), (-0.9, 2.0, false, 0), (2.0, 1e-3, false, 7)]),
+    (:js_fixed_vectors, js_fixed_vectors, (:x,), (:p, :s, :q, :m), (; x = Float64), [(1.5,), (-0.25,)]),
 ]
 
 agree(a::Real, b::Real) = (isnan(a) && isnan(b)) || isapprox(a, b; rtol = 1e-12, atol = 1e-15)
@@ -194,6 +276,22 @@ agree(a, b) = false
         body = body[1:findfirst("\n}", body)[1]]
         @test count("for (let", body) == 1
         @test occursin("x.length", body)
+    end
+
+    @testset "a range written in a helper is read as literals" begin
+        source = ReactiveKernels.js_source(js_fixed_ranges; have = (:x, :k, :flag, :n), want = (:h, :s, :u, :e, :c, :p),
+                                           types = (; x = Float64, k = Float64, flag = Bool, n = Int))
+        body(name) = (i = findfirst("function " * name * "(", source);
+                      source[i[1]:findnext("\n}\n", source, i[1])[end]])
+        half = body("js_half_life")
+        @test occursin("< 60 ?", half) && !occursin("_rk_range", half) && !occursin(".stop", half)
+        # dead code is left out: the loop over `1:0`, the branch on `JS_CHECKED`
+        # and, in the helper specialized on `1:0`, everything after `isempty`
+        @test count("while (true)", body("js_fixed_series")) == 3
+        @test !occursin("negative input", source) && !occursin("if (", body("js_unchecked"))
+        @test occursin(r"function js_range_sum(_\d+)?\(x\) \{\n(  let \w+;\n)*  return x;\n\}", source)
+        # a range assigned in a branch is a value at run time
+        @test occursin("_rk_range(1, 3)", body("js_chosen_range"))
     end
 
     @testset "unsupported constructs are named" begin
