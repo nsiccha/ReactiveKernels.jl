@@ -30,6 +30,12 @@ are recorded in the git history only.
   an allocation). A field that is a function or a type raises
   `JAXEmissionError` naming the field. Before, any captured named tuple read
   whole raised `JAXEmissionError` (snag emit-an-rk-kerne-6bbd4365).
+- Fix (`jax_source`, silent wrong value): a tuple assignment that writes
+  arrays by index inside a loop or a branch (`loc[p], scale[p] = l, s`) now
+  carries those arrays through `jax.lax.fori_loop` / `jax.lax.cond`, as a
+  single `loc[p] = l` already did. Before, only a tuple target's bare names
+  were carried, so the writes were dropped and the arrays kept their values
+  from before the loop.
 
 ## 0.1.257
 

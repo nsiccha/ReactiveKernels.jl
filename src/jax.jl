@@ -2013,16 +2013,22 @@ function _jax_assigned_names!(names::Set{Symbol}, ex)
     ex isa Expr || return names
     ex.head in (:quote, :inert, :->, :function) && return names
     if (ex.head === :(=) || haskey(_JAX_UPDATING, ex.head)) && length(ex.args) == 2
-        target = ex.args[1]
-        target isa Expr && target.head === :(::) && (target = target.args[1])
-        while target isa Expr && target.head === :ref
-            target = target.args[1]
-        end
-        target isa Symbol && push!(names, target)
-        target isa Expr && target.head === :tuple &&
-            foreach(t -> t isa Symbol && push!(names, t), target.args)
+        _jax_assigned_target!(names, ex.args[1])
     end
     foreach(a -> _jax_assigned_names!(names, a), ex.args)
+    names
+end
+# The local an assignment target writes, as `_jax_destructure!` binds it: a
+# name, an array written by index (`A[i]`), or each element of a tuple target,
+# indexed ones included (`loc[p], scale[p] = l, s` writes both arrays).
+function _jax_assigned_target!(names::Set{Symbol}, target)
+    target isa Expr && target.head === :(::) && (target = target.args[1])
+    while target isa Expr && target.head === :ref
+        target = target.args[1]
+    end
+    target isa Symbol && push!(names, target)
+    target isa Expr && target.head === :tuple &&
+        foreach(t -> _jax_assigned_target!(names, t), target.args)
     names
 end
 
