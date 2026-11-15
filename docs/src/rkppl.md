@@ -278,13 +278,10 @@ may depend on unselected latent parameters. The adapter selects identity-transfo
 coordinates, without changing their priors. For example, a real ICAR block
 keeps its ICAR density and any soft sum constraint.
 
-A named value is a latent or any definition. A location or log-scale the model
-does not name yet is appended without editing the model's text:
-`merge(model, quote log_s = log(s); z_location = a_mean .+ effect end)` adds
-both definitions before binding, and the cells then name `:log_s` and
-`:z_location`. A definition that only cells read leaves the sampler's program
-and the `jax_source` module unchanged, so naming an endpoint costs the density
-and its gradient nothing.
+Any latent or definition can be named. Append a missing one before binding,
+without editing the model's text:
+`merge(model, quote log_s = log(s); z_location = a_mean .+ effect end)`.
+Definitions only cells read leave the sampler and `jax_source` unchanged.
 
 A cell's location and log-scale must not read its own latent. They may read
 another selected cell's latent, as in a nested hierarchy where unit effects
@@ -305,9 +302,8 @@ recurrence qualifies when it is linear-Gaussian in its previous state, as
 for `marginalize`, written centred or non-centred, at top level or in a
 `@plate` cell. RKPPL lowers it in its states, and `adaptive_centering_problem`
 gives it one WarmupHMC `MarkovChain` (WarmupHMC 0.3.1 or later), which adapts
-how far to centre each time step. `cells` may then be omitted; given, the one
-call builds both, provided the chain's coefficients, drift and step size read
-no selected cell's latent and no cell reads the chain's states. In a `@plate`
+how far to centre each time step. `cells` may then be omitted, or given in the
+same call when neither reads the other's latents. In a `@plate`
 cell the recurrence is still one chain: every index's states in plate order,
 restarting at each index, so no index's centring reads another's states.
 `WarmupHMC.reparam_sources` lists one `(; phi, c)` per marked array, with one
