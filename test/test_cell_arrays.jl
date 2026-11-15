@@ -655,4 +655,69 @@ end
     adg = prepare_ad(g, AutoEnzyme(; mode=Enzyme.Reverse), w, rows, 2.0; active=:s)
     @test ad_gradient(adg, w, rows, 2.0) ≈ 1.2
 end
+
+# A cell made of a chain of statements, each reading the one before
+# (`m_k = m_{k-1} .+ q[k] .* xs[k][g]`), composes into recipes that hold each
+# other. Unbounded, their types nested as deeply as the chain was long, and
+# Julia's and Enzyme's inference overflowed the stack on about a hundred
+# statements (snag plate-cell-with-b361c7c2). A recipe past
+# `_CELL_RECIPE_DEPTH` levels is stored at its statement instead.
+macro chain_lane(name, length)
+    m(k) = Symbol(:m, k)
+    statements = [:($(m(1)) = off[g] .+ q[1] .* xs[1][g]);
+                  [:($(m(k)) = $(m(k - 1)) .+ q[$k] .* xs[$k][g]) for k in 2:length]]
+    esc(:(@kernel $name(xs::Vector{Vector{Vector{Float64}}}, y::Vector{Vector{Float64}},
+                        off::Vector{Float64}, q::Vector{Float64}) = begin
+        values = plate(eachindex(y)) do g
+            $(statements...)
+            terms = plate($(m(length)), y[g]) do mi, yi
+                abs2(yi - mi)
+            end
+            sum(terms)
+        end
+        total = sum(values)
+        return total
+    end))
+end
+@chain_lane chain_lane8 8
+@chain_lane chain_lane80 80
+
+@testset "a chain of composed statements keeps every recipe within the depth bound" begin
+    RK = ReactiveKernels
+    # Each step composes over the one before until the bound, where the value
+    # is stored and the next step composes over the stored array afresh.
+    x = [0.5, -1.0, 2.0]
+    a = x; deepest = 0; stored = 0
+    for k in 1:3RK._CELL_RECIPE_DEPTH
+        a = RK._cell_array_broadcast(Base.broadcasted(+, a, x))
+        deepest = max(deepest, RK._cell_recipe_depth(typeof(a)))
+        stored += a isa Vector{Float64}
+        @test a[2] == -(k + 1)
+    end
+    # Each step adds two levels: its recipe and its broadcast.
+    @test RK._CELL_RECIPE_DEPTH - 1 <= deepest <= RK._CELL_RECIPE_DEPTH
+    @test stored >= 2
+    @test collect(a) == (3RK._CELL_RECIPE_DEPTH + 1) .* x
+    # A concatenation of composed recipes is bounded the same way.
+    c = RK._cell_array_hcat(a, x)
+    for k in 1:RK._CELL_RECIPE_DEPTH
+        c = RK._cell_array_hcat(c, x)
+        @test RK._cell_recipe_depth(typeof(c)) <= RK._CELL_RECIPE_DEPTH
+    end
+    @test c == hcat(collect(a), fill(x, RK._CELL_RECIPE_DEPTH + 1)...)
+
+    lens = [3, 1, 0, 5]
+    for (length, spec) in ((8, chain_lane8), (80, chain_lane80))
+        xs = [[[0.01k * g + 0.1j for j in 1:lens[g]] for g in eachindex(lens)] for k in 1:length]
+        y = [[0.2j - 0.1g for j in 1:lens[g]] for g in eachindex(lens)]
+        off = 0.1 .* eachindex(lens)
+        q = 0.05 .* sin.(1:length)
+        k = prepare(spec; type_stability=:error)
+        @test occursin("_cell_array_broadcast", string(code_expr(k)))
+        @test k(xs, y, off, q) ≈ wide_lane_value(xs, y, off, q)
+        ad = prepare_ad(k, AutoEnzyme(; mode=Enzyme.Reverse), xs, y, off, q;
+                        active=:q, type_stability=:error)
+        @test ad_gradient(ad, xs, y, off, q) ≈ wide_lane_q(xs, y, off, q)
+    end
+end
 end

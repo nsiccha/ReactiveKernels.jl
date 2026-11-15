@@ -1150,7 +1150,12 @@ function _nonalloc_cell_broadcast!(prog::_StepProgram, types::Dict{Symbol,Any},
     T = BT isa Type ? _static_type(_cell_array_broadcast, BT) : Any
     stmts = d === nothing ? Any[] : ctx.stmts
     types[lhs] = T
-    if !(T isa DataType && isconcretetype(T) && T <: Array)
+    # A recipe nested past `_CELL_RECIPE_DEPTH` is stored at its statement, in
+    # one fresh array read through its operands' recipes. A buffer step would
+    # instead materialize each of those operand recipes into an array of its
+    # own (`_cell_array_materialize`), so the statement keeps its own store.
+    stored = BT isa Type && !_cell_recipe_fits(1 + _cell_recipe_depth(BT))
+    if !(T isa DataType && isconcretetype(T) && T <: Array) || stored
         push!(stmts, Expr(:(=), lhs, Expr(:call,
             GlobalRef(@__MODULE__, :_cell_array_broadcast), bc)))
         return stmts
