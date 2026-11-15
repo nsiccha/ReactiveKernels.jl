@@ -3,6 +3,9 @@ module TestJSSource
 using ReactiveKernels
 using Test
 using Base: OneTo
+using SpecialFunctions: erf, erfc, erfcx, logerfc, gamma, loggamma, logabsgamma, logbeta
+using LogExpFunctions: log1pexp, log1mexp
+import Distributions
 
 const NODE = ReactiveKernels._js_default_node() !== nothing
 
@@ -100,6 +103,22 @@ js_scaled(x) = [x / k for k in 1:5]
 js_squares_scaled(x) = [k^2 for k in 1:5] .* x
 js_multiples(x) = map(k -> k * x, 1:4)
 
+# Tuples, polynomials and type parameters as the special functions' Julia code
+# uses them: destructuring, `evalpoly` of a coefficient tuple, a tuple read at
+# a run-time position, `promote`/`oftype` (of an irrational constant),
+# `copysign`, `iseven` of a `Float64` and a method's static parameter.
+js_poly(x) = evalpoly(x, (1.0, -0.5, 0.25, 2.0))
+js_pick(x, k) = (x, 2x, 3x)[k]
+function js_promoted(x, n)
+    a, b = promote(x, n)
+    a * b + copysign(1.0, -x) + (x < oftype(x, π) ? 1.0 : 0.0) + first((x, n)) + last((n, x))
+end
+js_static_parameter(x::T, n) where {T<:Real} = T(n) * x
+js_parity(x) = iseven(x) ? 1.0 : isodd(x) ? -1.0 : 0.0
+js_logabsgamma_value(a) = first(logabsgamma(a))
+js_logabsgamma_sign(a) = last(logabsgamma(a))
+js_tdist_cdf(x, nu) = Distributions.cdf(Distributions.TDist(nu), x)
+
 @kernel js_scalar(a, b) = begin
     c = a * b + exp(-a) / (1 + b^2)
     return c
@@ -187,6 +206,50 @@ end
     y = fma(a, b, 1.0)
     return y
 end
+@kernel js_core_ops(x, n, k) = begin
+    p = js_poly(x)
+    t = js_pick(x, k)
+    q = js_promoted(x, n)
+    s = js_static_parameter(x, n)
+    r = js_parity(x)
+    return p
+end
+# Special functions: `erf`, `erfc`, `erfcx`, `gamma` and `logabsgamma` (with
+# `loggamma`) from the stdlib-js files in `src/js_vendor`; `logerfc`,
+# `logbeta`, `log1pexp` and `log1mexp` from their own Julia code.
+@kernel js_erfs(x) = begin
+    e = erf(x)
+    c = erfc(x)
+    cx = erfcx(x)
+    lc = logerfc(x)
+    return c
+end
+@kernel js_gamma(a) = begin
+    g = gamma(a)
+    return g
+end
+@kernel js_loggamma(a) = begin
+    lg = loggamma(a)
+    return lg
+end
+@kernel js_logabsgamma(a) = begin
+    v = js_logabsgamma_value(a)
+    s = js_logabsgamma_sign(a)
+    return v
+end
+@kernel js_logbeta(a, b) = begin
+    y = logbeta(a, b)
+    return y
+end
+@kernel js_logexp(x) = begin
+    p = log1pexp(x)
+    m = log1mexp(-abs(x))
+    return p
+end
+@kernel js_tdist(x, nu) = begin
+    p = js_tdist_cdf(x, nu)
+    return p
+end
 
 const V = Vector{Float64}
 const CASES = [
@@ -216,6 +279,27 @@ const CASES = [
      (; x = Float64, k = Float64, flag = Bool, n = Int),
      [(0.5, 0.3, true, 10), (-0.9, 2.0, false, 0), (2.0, 1e-3, false, 7)]),
     (:js_fixed_vectors, js_fixed_vectors, (:x,), (:p, :s, :q, :m), (; x = Float64), [(1.5,), (-0.25,)]),
+    # a position past the tuple raises `BoundsError`; above 2^53 every float is even
+    (:js_core_ops, js_core_ops, (:x, :n, :k), (:p, :t, :q, :s, :r), (; x = Float64, n = Int, k = Int),
+     [(0.5, 3, 2), (-1.5, 0, 1), (2.0, 7, 3), (3.0, 1, 3), (3.0, 1, 4), (1e300, 2, 1), (2.0^53 + 2, 1, 1),
+      (2.0^53 - 1, 1, 1), (4.5, -2, 1)]),
+    (:js_erfs, js_erfs, (:x,), (:e, :c, :cx, :lc), (; x = Float64),
+     [(x,) for x in (-Inf, -30.0, -5.0, -1.0, -1e-20, -0.0, 0.0, 1e-300, 0.3, 0.5, 0.84375, 1.25, 2.857, 6.0,
+                     26.5, 27.5, 1e5, 1e300, Inf, NaN)]),
+    # the poles and negative arguments of `gamma` raise `DomainError`, as does
+    # `loggamma` where the gamma function is negative
+    (:js_gamma, js_gamma, (:a,), :g, (; a = Float64),
+     [(a,) for a in (-Inf, -2.0, -1.5, -0.5, -0.0, 0.0, 1e-300, 0.5, 1.0, 5.0, 23.5, 171.0, 172.0, Inf, NaN)]),
+    (:js_loggamma, js_loggamma, (:a,), :lg, (; a = Float64),
+     [(a,) for a in (-Inf, -40.5, -3.0, -1.5, -0.5, -1e-25, -0.0, 0.0, 1e-25, 0.5, 1.0, 2.0, 7.9, 8.1,
+                     171.6, 1e17, 1e300, Inf, NaN)]),
+    (:js_logabsgamma, js_logabsgamma, (:a,), (:v, :s), (; a = Float64),
+     [(a,) for a in (-Inf, -40.5, -3.0, -2.5, -1.5, -0.5, -1e-25, -0.0, 0.0, 1e-25, 0.5, 2.0, 1e17, Inf, NaN)]),
+    (:js_logbeta, js_logbeta, (:a, :b), :y, (; a = Float64, b = Float64),
+     [(a, b) for a in (0.25, 0.5, 2.5, 40.0, 1e6) for b in (0.5, 3.0, 7.5, 9.0, 1e3)] ∪
+     [(-1.0, -2.0), (-0.5, 2.0), (0.0, 1.0), (-2.5, 0.75)]),
+    (:js_logexp, js_logexp, (:x,), (:p, :m), (; x = Float64),
+     [(x,) for x in (-Inf, -800.0, -40.0, -1.0, -0.0, 0.0, 1e-10, 0.5, 3.0, 40.0, 800.0, Inf, NaN)]),
 ]
 
 agree(a::Real, b::Real) = (isnan(a) && isnan(b)) || isapprox(a, b; rtol = 1e-12, atol = 1e-15)
@@ -313,6 +397,34 @@ agree(a, b) = false
         end
         @test e isa ReactiveKernels.JSEmissionError
         @test occursin("`fma`", e.message)
+        # A Distributions.jl law is named, with the RK distribution stack to use instead.
+        e = try
+            ReactiveKernels.js_source(js_tdist; have = (:x, :nu), want = :p, types = (; x = Float64, nu = Float64))
+        catch err
+            err
+        end
+        @test e isa ReactiveKernels.JSEmissionError
+        @test occursin("Distributions.jl law", e.message) && occursin("standard_student_t(nu).cdf(z)", e.message)
+        @test occursin("js_tdist_cdf", e.message)
+    end
+
+    @testset "a module copies only the special functions it uses" begin
+        gamma_source = ReactiveKernels.js_source(js_gamma; have = (:a,), want = :g, types = (; a = Float64))
+        @test occursin("var _rk_stdlib_gamma=", gamma_source)
+        @test !occursin("_rk_stdlib_erf", gamma_source) && !occursin("_rk_stdlib_gammaln", gamma_source)
+        @test occursin("// @stdlib/math-base-special-gamma ", gamma_source)
+        @test occursin("Apache License, Version 2.0", gamma_source)
+        erfs = ReactiveKernels.js_source(js_erfs; have = (:x,), want = (:e, :c, :cx, :lc), types = (; x = Float64))
+        @test count("var _rk_stdlib_erfc=", erfs) == 1 && !occursin("_rk_stdlib_gamma", erfs)
+        # each vendored file defines its one function and carries the notices
+        # of the implementation it follows
+        for (name, notice) in ((:erf, "Sun Microsystems"), (:erfc, "Sun Microsystems"),
+                               (:erfcx, "Massachusetts Institute of Technology"),
+                               (:gamma, "Cephes"), (:gammaln, "Sun Microsystems"))
+            text = read(joinpath(pkgdir(ReactiveKernels), "src", "js_vendor", string(name, ".js")), String)
+            @test occursin("var _rk_stdlib_" * string(name) * "=", text)
+            @test occursin(notice, text)
+        end
     end
 
     @testset "inputs and names" begin
