@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.257
+## 0.1.261
 
 - A plate cell whose statements each read the one before, such as
   `m_k = m_{k-1} .+ b[k] .* x_k[rows[i]]` for k up to 140, with a later reader
@@ -31,6 +31,73 @@ are recorded in the git history only.
   deep is now stored at its own statement, in one fresh array whose entries
   are read through its operands' recipes. The statements after it compose over
   that array. Values and gradients are unchanged.
+
+## 0.1.260
+
+- `jax_source` translates a kernel that captures a `NamedTuple` of data and
+  reads it whole, for example by passing it to a `@traceable` helper
+  (`metadata = (; weights, indices)`; `f(x, metadata)`). The record is the
+  Python tuple of its fields, as a named-tuple HAVE already crosses, and a
+  field read indexes it by position. Each array field is a typed module
+  constant named after the record and the field (`METADATA_WEIGHTS`), keeping
+  Julia's shape, axis order and element type (matrices and higher-rank integer
+  arrays included); a record holding an array is itself a module constant
+  (`METADATA`), and a record of literals stays a static literal (it can size
+  an allocation). A field that is a function or a type raises
+  `JAXEmissionError` naming the field. Before, any captured named tuple read
+  whole raised `JAXEmissionError` (snag emit-an-rk-kerne-6bbd4365).
+- Fix (`jax_source`, silent wrong value): a tuple assignment that writes
+  arrays by index inside a loop or a branch (`loc[p], scale[p] = l, s`) now
+  carries those arrays through `jax.lax.fori_loop` / `jax.lax.cond`, as a
+  single `loc[p] = l` already did. Before, only a tuple target's bare names
+  were carried, so the writes were dropped and the arrays kept their values
+  from before the loop.
+
+## 0.1.259
+
+- `jax_source` translates a reduction of a tuple of numbers:
+  `logsumexp((a, b))` (a mixture law's candidate log densities),
+  `maximum`, `minimum`, `prod` and `sum` of such a tuple, its entries of
+  mixed types too (`sum((x, n))`). The tuple becomes one array of its entries'
+  promoted type (a float one for `logsumexp`), since `jax.numpy` reductions
+  refuse a Python tuple; the emitted module raised `TypeError: max requires
+  ndarray or scalar arguments, got <class 'tuple'>` on its first call before.
+  `jax.grad` of a tuple's `logsumexp` is its softmax weights, and 0 when every
+  entry is `-Inf`, as an array's is.
+
+## 0.1.258
+
+- `prepare(spec; have, want)` and `prepare!(cache, spec; have, want)` accept a
+  shaped WANT, the WANT `js_source` and `jax_source` already accept: a
+  `NamedTuple`, or a tuple holding a tuple or a `NamedTuple`, whose leaves are
+  port names, nested as deep as wanted. The kernel returns that shape, each
+  name replaced by its port's value: `want = (curve = :curve, count = :n)`
+  returns `(curve = …, count = …)`, aliases included. A port named twice is
+  computed once; bound data, a `PreparationCache` and an authored signature's
+  defaults and keywords work as for a flat WANT. Before, such a WANT raised
+  `ArgumentError: want entries must be port names or Value objects`; other
+  entry points (`plan`, `extract`, `vectorize`, …) still take port names, and
+  now say which ones accept a shape.
+- `js_run` returns a one-name tuple WANT (`want = (:x,)`) as the bare value, as
+  the native kernel of that WANT returns it; it gave a one-element tuple. Every
+  WANT form now comes back exactly as `prepare(spec; have, want)` returns it.
+
+## 0.1.257
+
+- `ReactiveKernels.js_run(source, entry, cases; node, vectors, timeout)`
+  (prototype, not exported) runs a `js_source` module in Node.js: it calls the
+  function `entry` once per case, each a tuple of the HAVE values in `INPUTS`
+  order, in one Node process, and returns one `JSOutcome` per case. A
+  successful call's `value` has the shape and types the native kernel returns
+  (a value, a `Tuple` or a `NamedTuple`); a call that throws gives its error's
+  `name` and `message` and whether it was the module's `JuliaError`; every
+  outcome reports whether the call changed the arrays it was given. A run that
+  fails (no Node.js, a module that does not import, a missing entry, a crash or
+  a timeout) throws `JSRunError`. `vectors = :float64array` passes numeric
+  vectors as `Float64Array`s. Node.js is `node` (an executable or a `Cmd`),
+  by default `ENV["RK_JS_NODE"]`, else `node` on the PATH.
+- `js_source` modules also export `RETURNS`, the WANT's shape, and give each
+  `OUTPUTS` entry its Julia `type`.
 
 ## 0.1.256
 

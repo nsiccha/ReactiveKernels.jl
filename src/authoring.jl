@@ -5609,12 +5609,96 @@ Base.@nospecializeinfer function _kernel_selected_values(@nospecialize(spec::Ker
                 "$label value $(item) does not belong to this KernelSpec"))
             end
             push!(values, owned)
+        elseif label === :want && item isa Union{Tuple,NamedTuple}
+            throw(ArgumentError(
+                "the shaped want $(repr(chosen)) names the fields of a prepared result: " *
+                "`prepare`, `prepare!`, `js_source` and `jax_source` accept one; " *
+                "this call takes port names or Value objects"))
         else
             throw(ArgumentError(
                 "$label entries must be port names or Value objects, got $(repr(item))"))
         end
     end
     values
+end
+
+# --- shaped WANTs ------------------------------------------------------------
+# A WANT is a port name or `Value`, or a tuple of them: the flat boundary, which
+# a prepared kernel returns positionally, a single value bare. A shaped WANT is
+# a `NamedTuple`, or a tuple holding a tuple or one, whose leaves are port names
+# or `Value`s (`(curve = :curve, count = :n)`, nested as deep as wanted): the
+# WANT `js_source` and `jax_source` accept. `prepare` plans a shape's distinct
+# leaves as a flat boundary and returns each result in the shape
+# (`_ShapedKernel`), as an emitted module returns it (snag
+# `kernelspec-prepa-ca8878b6`).
+
+_kernel_want_leaves(w::Union{Symbol,Value}) = (w,)
+_kernel_want_leaves(w::Union{Tuple,NamedTuple}) =
+    Tuple(leaf for x in values(w) for leaf in _kernel_want_leaves(x))
+_kernel_want_leaves(w) = throw(ArgumentError(
+    "a want is a port name, a Value, or a Tuple or NamedTuple of them; got $(repr(w))"))
+
+_kernel_shaped_want(w::NamedTuple) = true
+_kernel_shaped_want(w::Tuple) = any(x -> x isa Union{Tuple,NamedTuple}, w)
+_kernel_shaped_want(w) = false
+
+# The positions of a shape's leaves in its flat boundary, in the shape's form:
+# `S` is a tree of `Int`s, `N` the boundary's length.
+struct _KernelWantShape{S,N} end
+
+# `(flat, shape)`: the WANT to plan, and the shape of its result, or `nothing`
+# for a flat WANT, which is planned as given.
+function _kernel_want_shape(want)
+    _kernel_shaped_want(want) || return want, nothing
+    flat = Any[]
+    for leaf in _kernel_want_leaves(want)
+        any(x -> x === leaf, flat) || push!(flat, leaf)
+    end
+    isempty(flat) && throw(ArgumentError("the want $(repr(want)) names no port"))
+    Tuple(flat), _KernelWantShape{_kernel_want_positions(want, flat),length(flat)}()
+end
+_kernel_want_positions(w::Union{Symbol,Value}, flat) = findfirst(x -> x === w, flat)::Int
+_kernel_want_positions(w::Union{Tuple,NamedTuple}, flat) =
+    map(x -> _kernel_want_positions(x, flat), w)
+
+"""
+A prepared kernel whose result takes the form of a shaped WANT: it calls
+`target`, the kernel of the shape's flat boundary, and arranges its values as
+the shape `S` places them (see `_kernel_want_shape`).
+"""
+struct _ShapedKernel{S,N,F}
+    target::F
+end
+
+_kernel_shaped(::Nothing, kernel) = kernel
+_kernel_shaped(::_KernelWantShape{S,N}, kernel) where {S,N} =
+    _ShapedKernel{S,N,typeof(kernel)}(kernel)
+
+@inline (kernel::_ShapedKernel)(args...; kwargs...) =
+    _kernel_shaped_call(kernel, args, NamedTuple(kwargs))
+@inline _kernel_shaped_call(kernel::_ShapedKernel, args, ::NamedTuple{()}) =
+    _kernel_shape_result(kernel, kernel.target(args...))
+@inline _kernel_shaped_call(kernel::_ShapedKernel, args, kwargs::NamedTuple) =
+    _kernel_shape_result(kernel, kernel.target(args...; kwargs...))
+
+@generated function _kernel_shape_result(::_ShapedKernel{S,N}, out) where {S,N}
+    # A one-value boundary returns its value bare.
+    _kernel_shape_expr(S, N == 1 ? :((out,)) : :out)
+end
+_kernel_shape_expr(position::Int, flat) = :(getfield($flat, $position))
+_kernel_shape_expr(shape::Tuple, flat) =
+    Expr(:tuple, (_kernel_shape_expr(x, flat) for x in shape)...)
+_kernel_shape_expr(shape::NamedTuple, flat) =
+    :(NamedTuple{$(keys(shape))}($(_kernel_shape_expr(Tuple(shape), flat))))
+
+inputs(kernel::_ShapedKernel) = inputs(kernel.target)
+outputs(kernel::_ShapedKernel) = outputs(kernel.target)
+code_expr(kernel::_ShapedKernel) = code_expr(kernel.target)
+
+function Base.show(io::IO, kernel::_ShapedKernel{S}) where {S}
+    print(io, "ShapedKernel(", S, ", ")
+    show(io, kernel.target)
+    print(io, ")")
 end
 
 """
@@ -5736,6 +5820,15 @@ policy continues execution; it does not catch exceptions or return a fallback.
 `type_stability` selects whether preparation warns about a type instability or
 refuses it, and `type_stability_level` how far it checks, as for
 [`prepare`](@ref) on a `Plan`.
+
+`want` is a port name, whose value the kernel returns, or a tuple of them,
+returned as a tuple (one name returns its value). It may also be a shaped
+WANT: a `NamedTuple`, or a tuple holding a tuple or a `NamedTuple`, whose
+leaves are port names, nested as deep as wanted, as `js_source` and
+`jax_source` accept. The kernel then returns that shape, each name replaced by
+its port's value: `want = (curve = :curve, count = :n)` returns
+`(curve = …, count = …)`, and `want = (a = (:x, :y), b = :z)` returns
+`(a = (x, y), b = z)`. A port named twice is computed once.
 """
 function prepare(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
                  want = _KERNEL_DEFAULT_BOUNDARY, passes = (),
@@ -5743,21 +5836,22 @@ function prepare(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
                  exemplars = nothing, type_stability = nothing,
                  type_stability_level = nothing, branch_arms = nothing,
                  simplify = nothing, bound_statistics = nothing, _data_cache = nothing)
-    _with_branch_arms(branch_arms) do
+    flat_want, shape = _kernel_want_shape(want)
+    _kernel_shaped(shape, _with_branch_arms(branch_arms) do
     _with_settings(simplify, bound_statistics) do
         _with_type_stability(type_stability, type_stability_level) do
             isempty(bound) || return prepare(spec.graph;
                 have = _kernel_selected_values(spec, have, spec.have_names, :have),
-                want = _kernel_selected_values(spec, want, spec.want_names, :want),
+                want = _kernel_selected_values(spec, flat_want, spec.want_names, :want),
                 passes = passes, bound = _kernel_bound_pairs(spec, bound),
                 on_error = on_error, exemplars, _data_cache)
-            prepared = prepare(plan(spec; have = have, want = want); passes = passes,
+            prepared = prepare(plan(spec; have = have, want = flat_want); passes = passes,
                                on_error = on_error, exemplars)
             have === _KERNEL_DEFAULT_BOUNDARY || return prepared
             _kernel_signature_callable(prepared, spec.call_signature)
         end
     end
-    end
+    end)
 end
 
 """
@@ -5771,6 +5865,7 @@ rebinding new data to the same ports costs the prefix's execution and nothing
 else. Use it where one graph is prepared repeatedly with fresh bound data (a
 request-time binding per user interaction); the returned kernel is positional
 over the remaining HAVE ports exactly as `prepare(spec; bound)` returns it.
+A shaped `want` returns its shape, as for `prepare`.
 """
 function prepare!(cache::PreparationCache, spec::KernelSpec;
                   have = _KERNEL_DEFAULT_BOUNDARY,
@@ -5778,6 +5873,10 @@ function prepare!(cache::PreparationCache, spec::KernelSpec;
                   bound = NamedTuple(), on_error = nothing, type_stability = nothing,
                   type_stability_level = nothing, simplify = nothing,
                   bound_statistics = nothing)
+    flat_want, shape = _kernel_want_shape(want)
+    shape === nothing || return _kernel_shaped(shape, prepare!(cache, spec; have,
+        want = flat_want, passes, bound, on_error, type_stability, type_stability_level,
+        simplify, bound_statistics))
     isempty(bound) || return prepare!(cache, spec.graph;
         have = _kernel_selected_values(spec, have, spec.have_names, :have),
         want = _kernel_selected_values(spec, want, spec.want_names, :want),

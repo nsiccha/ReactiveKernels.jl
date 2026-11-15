@@ -674,14 +674,16 @@ _jax_literal(x::NamedTuple) = (t = _jax_literal(Tuple(x)); _PyVal(t.code, typeof
 _jax_literal(x) = _jax_error("no JAX literal for a value of type `", typeof(x), "`")
 
 # A constant the source reads (a captured array, a module constant): small
-# values inline, arrays become module-level constants.
-function _jax_constant(ctx::_JaxContext, hint, x)
-    x isa AbstractArray || return _jax_literal(x)
+# values inline, arrays become module-level constants. `code` is the value's
+# Python text, an array's literal unless given (a captured record's tuple of
+# its field constants).
+function _jax_constant(ctx::_JaxContext, hint, x, code = nothing)
+    x isa Union{AbstractArray,NamedTuple} || return _jax_literal(x)
     host = ctx.host !== nothing
     name = get(ctx.mod.helper_names, (:constant, objectid(x), host), nothing)
     if name === nothing
         name = _jax_identifier(ctx.mod.used, uppercase(string(hint)) * (host ? "_NP" : ""))
-        line = name * " = " * _jax_literal(x).code
+        line = name * " = " * something(code, _jax_literal(x).code)
         push!(ctx.mod.helpers, host ? _host_text(line) : line)
         ctx.mod.helper_names[(:constant, objectid(x), host)] = name
     end
@@ -749,6 +751,28 @@ end
 _jax_value(ctx::_JaxContext, x::Union{Number,Nothing,AbstractString,Symbol}, hint) = _jax_literal(x)
 _jax_value(ctx::_JaxContext, x::AbstractArray{<:Real}, hint) = _jax_constant(ctx, hint, x)
 _jax_value(ctx::_JaxContext, x::Tuple, hint) = _jax_literal(x)
+# A captured record read whole (`metadata = (; weights, indices)` passed to a
+# helper): the Python tuple of its fields, as every named tuple is in a module
+# (a named-tuple HAVE crosses as one, and a field read indexes it by position).
+# Each field is a value of its own, so an array field is a typed module
+# constant named after the record and the field (`METADATA_WEIGHTS`) with
+# Julia's shape and element type. A record of literals stays a static literal;
+# one holding an array is a module constant as well (`METADATA`), so a call
+# reads that one name and not every field.
+function _jax_value(ctx::_JaxContext, x::NamedTuple, hint)
+    # A record of singletons (`(; f = exp)`, `(;)`) carries everything in its
+    # type, as any singleton does.
+    Base.issingletontype(typeof(x)) && return _PyVal("None", typeof(x), true)
+    for k in keys(x)
+        v = getfield(x, k)
+        v isa Union{Function,Type} && _jax_error("the field `", k, "` of the captured value `",
+            hint, "` is a ", v isa Type ? "type" : "function",
+            "; a captured named tuple translates with data fields only", _jax_where(ctx))
+    end
+    fields = _PyVal[_jax_value(ctx, getfield(x, k), Symbol(hint, :_, k)) for k in keys(x)]
+    all(f -> f.static, fields) && return _PyVal(_jax_tuple_code(fields), typeof(x), true)
+    _jax_constant(ctx, hint, x, _jax_tuple_code(fields))
+end
 # A function passed as a value (`sum(abs2, z)`): its type carries it, and only
 # a call that takes a function argument reads it.
 _jax_value(ctx::_JaxContext, x::Function, hint) =
@@ -1290,7 +1314,7 @@ function _jax_expr(ctx::_JaxContext, ::Val{:.}, ex)
                        _jax_where(ctx))
         k = findfirst(==(field), fieldnames(x.T))
         k === nothing && _jax_error("`", x.T, "` has no field `", field, "`", _jax_where(ctx))
-        return _PyVal(_py_atom(x.code) * "[" * string(k - 1) * "]", fieldtype(x.T, k))
+        return _jax_named_field(x, k)
     end
     if length(ex.args) == 2 && ex.args[2] isa Expr && ex.args[2].head === :tuple
         f = _jax_resolve(ctx, ex.args[1])
@@ -1989,16 +2013,22 @@ function _jax_assigned_names!(names::Set{Symbol}, ex)
     ex isa Expr || return names
     ex.head in (:quote, :inert, :->, :function) && return names
     if (ex.head === :(=) || haskey(_JAX_UPDATING, ex.head)) && length(ex.args) == 2
-        target = ex.args[1]
-        target isa Expr && target.head === :(::) && (target = target.args[1])
-        while target isa Expr && target.head === :ref
-            target = target.args[1]
-        end
-        target isa Symbol && push!(names, target)
-        target isa Expr && target.head === :tuple &&
-            foreach(t -> t isa Symbol && push!(names, t), target.args)
+        _jax_assigned_target!(names, ex.args[1])
     end
     foreach(a -> _jax_assigned_names!(names, a), ex.args)
+    names
+end
+# The local an assignment target writes, as `_jax_destructure!` binds it: a
+# name, an array written by index (`A[i]`), or each element of a tuple target,
+# indexed ones included (`loc[p], scale[p] = l, s` writes both arrays).
+function _jax_assigned_target!(names::Set{Symbol}, target)
+    target isa Expr && target.head === :(::) && (target = target.args[1])
+    while target isa Expr && target.head === :ref
+        target = target.args[1]
+    end
+    target isa Symbol && push!(names, target)
+    target isa Expr && target.head === :tuple &&
+        foreach(t -> _jax_assigned_target!(names, t), target.args)
     names
 end
 
@@ -3610,12 +3640,28 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(/), args::Vector{_PyVal})
     _jax_error("a matrix division has no JAX translation", _jax_where(ctx))
 end
 
+# A tuple of numbers that a reduction takes as its collection
+# (`logsumexp((a, b))`, `maximum((a, b))`, `sum((x, n))`), as the code of one
+# array of the entries' promoted type (`float` of it for `float = true`), as a
+# vector literal `[a, b]` is: `jax.numpy` reductions refuse a Python tuple.
+# The tuple's type fixes how many entries it stacks. Any other value (an
+# array, a tuple of arrays, whose Julia reductions differ) gives `nothing`.
+function _jax_tuple_array_code(x::_PyVal; float::Bool = false)
+    T = x.T
+    T isa Type && T <: Tuple && isconcretetype(T) && fieldcount(T) > 0 &&
+        all(F -> F <: Number, fieldtypes(T)) || return nothing
+    E = promote_type(fieldtypes(T)...)
+    "jnp.asarray(" * x.code * ", dtype=" * _jax_dtype(float ? Base.float(E) : E) * ")"
+end
+# The code of a reduction's collection: a numeric tuple's array, else its own.
+_jax_collection_code(x::_PyVal; float::Bool = false) =
+    something(_jax_tuple_array_code(x; float), x.code)
+
 function _jax_function_call(ctx::_JaxContext, ::typeof(sum), args::Vector{_PyVal})
-    # Fixed structural lag windows reduce a numeric tuple. JAX reductions
-    # require an array; tuples of arrays have different Julia sum semantics.
-    if length(args) == 1 && _jax_numeric_tuple(args[1].T)
-        return _jax_result(sum, args, "jnp.sum(jnp.asarray(" * args[1].code * "))")
-    end
+    # Fixed structural lag windows reduce a numeric tuple, of mixed element
+    # types too. Tuples of arrays have different Julia sum semantics.
+    stacked = length(args) == 1 ? _jax_tuple_array_code(args[1]) : nothing
+    stacked === nothing || return _jax_result(sum, args, "jnp.sum(" * stacked * ")")
     if length(args) == 1 && !isempty(args[1].extent) && _jax_rank(args[1].T) == 1
         x = args[1]
         return _PyVal("jnp.sum(jnp.where(" * _jax_mask(x) * ", " * x.code * ", 0.0))", eltype(x.T))
@@ -3663,7 +3709,7 @@ for (f, name, neutral) in ((prod, "jnp.prod", "1.0"), (maximum, "jnp.max", "-jnp
         x = args[1]
         isempty(x.extent) || return _PyVal($name * "(" * _jax_padded_reduced(ctx, $f, x, $neutral) *
                                            ")", eltype(x.T))
-        _jax_result($f, args, $name * "(" * x.code * ")")
+        _jax_result($f, args, $name * "(" * _jax_collection_code(x) * ")")
     end
 end
 # `div(a, b)` of integers truncates toward zero, as Julia's does (lowered
@@ -3925,7 +3971,11 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(LogExpFunctions.logsumexp
         _jax_helper!(ctx, "_rk_logsumexp", _JAX_PRELUDE["_rk_logsumexp"]) : "jsp.logsumexp"
     isempty(x.extent) || return _PyVal(name * "(" * _jax_padded_reduced(ctx, LogExpFunctions.logsumexp,
                                                                      x, "-jnp.inf") * ")", eltype(x.T))
-    _jax_result(LogExpFunctions.logsumexp, args, name * "(" * x.code * ")")
+    # A tuple of candidate log densities (`logsumexp((a, b))`) is one float
+    # array: the helper's `jnp.max` refuses a tuple, and its `-inf` neutral
+    # needs a float dtype.
+    _jax_result(LogExpFunctions.logsumexp, args,
+                name * "(" * _jax_collection_code(x; float = true) * ")")
 end
 function _jax_function_call(ctx::_JaxContext, ::typeof(length), args::Vector{_PyVal})
     x = only(args)
@@ -5796,8 +5846,12 @@ function _jax_call_positional(ctx::_JaxContext, ::typeof(getproperty), args::Vec
                                                     _jax_where(ctx))
     k = findfirst(==(name), fieldnames(x.T))
     k === nothing && _jax_error("`", x.T, "` has no field `", name, "`", _jax_where(ctx))
-    _PyVal(_py_atom(x.code) * "[" * string(k - 1) * "]", fieldtype(x.T, k))
+    _jax_named_field(x, k)
 end
+# Field `k` of a named tuple, read by position. A field of a static record (a
+# captured record of literals) is static, as a tuple element is.
+_jax_named_field(x::_PyVal, k::Integer) =
+    _PyVal(_py_atom(x.code) * "[" * string(k - 1) * "]", fieldtype(x.T, k), x.static)
 # `getglobal(M, name)` of a module and a name known while emitting (a method's
 # static parameters `where {M,name}`).
 function _jax_call_positional(ctx::_JaxContext, ::typeof(getglobal), args::Vector{_PyVal})
