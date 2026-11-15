@@ -1,8 +1,9 @@
 {
   "private": true,
-  "description": "Pinned stdlib-js special functions that ReactiveKernels.js_source copies into emitted JavaScript modules. Regenerate with build.mjs; see README.md.",
+  "description": "Pinned JavaScript (stdlib-js special functions, the @reside-ic/dopri ODE integrator) that ReactiveKernels.js_source copies into emitted JavaScript modules. Regenerate with build.mjs; see README.md.",
   "type": "module",
   "dependencies": {
+    "@reside-ic/dopri": "1.0.1",
     "@stdlib/math-base-special-erf": "0.2.6",
     "@stdlib/math-base-special-erfc": "0.2.5",
     "@stdlib/math-base-special-erfcx": "0.3.1",

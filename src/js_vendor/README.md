@@ -22,6 +22,28 @@ module only when the module uses the function. The mappings live in
 `ext/ReactiveKernelsSpecialFunctionsExt.jl`; the native comparisons in
 `test/test_js_source.jl`.
 
+## The ODE integrator
+
+`dopri.js` bundles [`@reside-ic/dopri`](https://github.com/mrc-ide/dopri-js)
+(Imperial College's MRC Centre for Global Infectious Disease Analysis, MIT),
+the Dormand–Prince 5(4) method native Julia runs as OrdinaryDiffEq's `DP5()`.
+It defines `_rk_dopri`, whose `Dopri` class `src/js_ode.jl`'s adapter
+`_rk_ode_rk45` drives when a module calls `rk_ode_rk45_tol`. MIT asks that its
+permission notice travel with every copy, so the file's header carries the
+licence in full (`embedLicense` in `build.mjs`).
+
+The adapter uses these members of 1.0.1 beyond its documented interface, so a
+new version needs `test/test_js_ode.jl` to pass again:
+
+- `_step()`, which takes one accepted step, and `_t`, the time it reached, so
+  that it counts accepted steps between consecutive outputs as
+  `rk_ode_rk45_tol` does;
+- `_history` and `_stepper.history`, the dense-output records `run` would
+  otherwise collect, and `_stepper.interpolate`, which evaluates them;
+- `_control.atol` and `_control.rtol`, set after construction, because the
+  constructor refuses a zero tolerance that `rk_ode_rk45_tol` accepts when the
+  other one is positive.
+
 ## Regenerating
 
 Versions are pinned exactly in `package.json`, and `package-lock.json` pins

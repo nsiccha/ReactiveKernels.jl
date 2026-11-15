@@ -18,6 +18,22 @@ are recorded in the git history only.
 
 ## 0.1.266
 
+- `ReactiveKernels.js_source` translates `rk_ode_rk45_tol`. The emitted module
+  integrates with the Dormand–Prince 5(4) method of the vendored
+  [`@reside-ic/dopri`](https://github.com/mrc-ide/dopri-js) 1.0.1 (MIT,
+  pinned and bundled in `src/js_vendor/`, its licence in the bundle), copied
+  into a module only when it integrates an ODE, and drives it as the native bridge drives OrdinaryDiffEq's `DP5()`:
+  the same argument checks and exception types, one continuous solve on the
+  normalized time span, outputs from the dense interpolant, at most
+  `maxsteps` accepted steps between consecutive outputs, and a
+  `JuliaError` named `ODESolveFailure` with `retcode` and `t` where native
+  throws one: `MaxIters` for the budget, `Unstable` where the step size
+  vanishes (as native's does after a blow-up or a NaN in the right-hand
+  side). The library takes its own step sequence, so values agree with
+  native to the solvers' accuracy, not to rounding: within the requested
+  tolerance on smooth problems, and as close to the true solution as native
+  is where the global error exceeds the tolerance. `rk_ode_bdf_tol` stays
+  refused, now naming itself instead of an internal `isempty`.
 - `js_source` modules take and return `Matrix{Float64}`, `Matrix{Int64}` and
   `Matrix{Bool}` as arrays of row arrays: `m[i][j]` is Julia's `m[i+1, j+1]`.
   A matrix without rows keeps its column count as a `cols` property of the

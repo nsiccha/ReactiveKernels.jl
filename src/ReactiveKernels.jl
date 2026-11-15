@@ -96,6 +96,7 @@ include("jax_ode.jl")
 include("js.jl")
 include("js_run.jl")
 include("js_arrays.jl")
+include("js_ode.jl")
 
 export Value, Recipe, Graph, Plan, PreparedKernel, PreparedADKernel, PreparedADPullback, ReplicatedKernel, NonAllocatingKernel, PlanningError
 export TypeInstabilityError
