@@ -823,6 +823,29 @@ function PPL.rejuvenate_smc(state::SMCState; tuning::SMCTuningSchedule, moves::I
         copy(state.lineage), _history(state, stage), state.update, state.stage)
 end
 
+function PPL.pool_smc(states::AbstractVector{<:SMCState})
+    isempty(states) && throw(ArgumentError("pool_smc needs at least one SMC state"))
+    reference = first(states)
+    for state in states
+        state.temperature == reference.temperature || throw(ArgumentError(
+            "pooled SMC clouds must share one temperature"))
+        _same(state.target.signature, reference.target.signature) || throw(ArgumentError(
+            "pooled SMC clouds must share one prepared target (model, binding and frame)"))
+        reference.temperature == 1 ||
+            _same(_source_id(state.source), _source_id(reference.source)) || throw(ArgumentError(
+            "below temperature 1, pooled SMC clouds must share one source"))
+    end
+    logz = [state.log_normalizer for state in states]
+    peak = maximum(logz)
+    cloud_weights = exp.(logz .- peak)
+    total = sum(cloud_weights)
+    cloud_weights ./= total
+    positions = reduce(hcat, [state.positions for state in states])
+    weights = reduce(vcat, [cloud_weights[c] .* states[c].weights for c in eachindex(states)])
+    return (; log_normalizer=peak + log(total / length(states)), cloud_weights,
+        effective_clouds=1 / sum(abs2, cloud_weights), positions, weights)
+end
+
 function PPL.smc(state::SMCState; stages::Integer=typemax(Int))
     stages >= 0 || throw(ArgumentError("stages must be nonnegative"))
     _check_cloud(state, state.positions, :input)

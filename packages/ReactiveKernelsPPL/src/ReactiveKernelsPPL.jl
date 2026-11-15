@@ -109,7 +109,7 @@ export prepare_discrete_latents, DiscreteLatentQuery, discrete_latents_node,
 export restore_draws
 export prepare_smc, smc, initialize_smc, update_smc, smc_step, smc_checkpoint, resume_smc,
     rescore_smc_checkpoint
-export SMCReference, SMCOptions, SMCNonfiniteError, SMCDegeneracyError, rejuvenate_smc
+export SMCReference, SMCOptions, SMCNonfiniteError, SMCDegeneracyError, rejuvenate_smc, pool_smc
 export SMCTuningSchedule, SMCTuningPartial, tune_smc, smc_reference, rescore_smc_tuning_checkpoint
 export SMCCarriedReference, carry_smc, prepare_smc_window
 export smc_parameters
