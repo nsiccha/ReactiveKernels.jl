@@ -596,6 +596,19 @@ const _JAX_CASES = (
     end))(; rows_a = [1, 3, 4], rows_b = [2, 5], x_a = [0.3, -1.2, 0.8],
            x_b = [1.5, -0.4], x = [0.5, -0.0, 0.0, 0.5, -1.0]) |
         (; y = [0.4, 1.9, -1.0, 1.1, 0.2]),
+    # Centred effects: Statistics' `mean` of a parameter vector, `mean` over
+    # `dims` of a parameter matrix and a keyword `var` in the graph, and a
+    # data-only standardization in `prepare_data` (RK 0.1.260,
+    # `ReactiveKernelsStatisticsExt`; snag brm-mean-reducti-ab8534c4).
+    centred_effects = () -> (@rkppl(begin
+        tau ~ Exponential(1.0); s ~ Exponential(1.0)
+        raw[1:4] .~ Normal(0, 1)
+        M[1:4, 1:3] .~ Normal(0, 1)
+        effect = tau .* (raw .- mean(raw))
+        cell = M .- mean(M; dims = 1)
+        z = (x .- mean(x)) ./ std(x)
+        y .~ Normal.(effect[g] .+ cell[g, 2] .+ 0.5 .* z .+ var(raw; corrected = false), s)
+    end))(; x = _JAX_X, g = _JAX_G) | (; y = _JAX_Y),
 )
 # ICAR priors (snag independent-icar-2e025fad): one field over a graph, and K
 # independent fields over the same graph as the rows or the columns of one

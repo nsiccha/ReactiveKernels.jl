@@ -16,6 +16,19 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.260
+
+- `jax_source` translates Statistics' `mean`, `var` and `std` through a new
+  package extension, `ReactiveKernelsStatisticsExt` (weak dependency
+  Statistics): `mean(x)`, `mean(f, x)`, `mean(x; dims)`, and `var`/`std`
+  with `dims`, `corrected` (a literal) and `mean`. Each composes the existing
+  `sum`, `length` and `size` translations, so padded rows reduce over their
+  valid entries and `prepare_data` (host) calls take NumPy's spelling; an
+  empty argument gives NaN, as in Julia. Before, a centred effect
+  `s * (x - mean(x))`, such as a BayesianRegressionModels assignment exported
+  with `jax_source(rk.model, rk_bound_plan(rk))`, failed with "the function
+  `_mean` has loops or branches". Native execution is unchanged.
+
 ## 0.1.259
 
 - `jax_source` translates a reduction of a tuple of numbers:
