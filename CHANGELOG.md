@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.258
+## 0.1.260
 
 - `jax_source` translates a kernel that captures a `NamedTuple` of data and
   reads it whole, for example by passing it to a `@traceable` helper
@@ -36,6 +36,35 @@ are recorded in the git history only.
   single `loc[p] = l` already did. Before, only a tuple target's bare names
   were carried, so the writes were dropped and the arrays kept their values
   from before the loop.
+
+## 0.1.259
+
+- `jax_source` translates a reduction of a tuple of numbers:
+  `logsumexp((a, b))` (a mixture law's candidate log densities),
+  `maximum`, `minimum`, `prod` and `sum` of such a tuple, its entries of
+  mixed types too (`sum((x, n))`). The tuple becomes one array of its entries'
+  promoted type (a float one for `logsumexp`), since `jax.numpy` reductions
+  refuse a Python tuple; the emitted module raised `TypeError: max requires
+  ndarray or scalar arguments, got <class 'tuple'>` on its first call before.
+  `jax.grad` of a tuple's `logsumexp` is its softmax weights, and 0 when every
+  entry is `-Inf`, as an array's is.
+
+## 0.1.258
+
+- `prepare(spec; have, want)` and `prepare!(cache, spec; have, want)` accept a
+  shaped WANT, the WANT `js_source` and `jax_source` already accept: a
+  `NamedTuple`, or a tuple holding a tuple or a `NamedTuple`, whose leaves are
+  port names, nested as deep as wanted. The kernel returns that shape, each
+  name replaced by its port's value: `want = (curve = :curve, count = :n)`
+  returns `(curve = …, count = …)`, aliases included. A port named twice is
+  computed once; bound data, a `PreparationCache` and an authored signature's
+  defaults and keywords work as for a flat WANT. Before, such a WANT raised
+  `ArgumentError: want entries must be port names or Value objects`; other
+  entry points (`plan`, `extract`, `vectorize`, …) still take port names, and
+  now say which ones accept a shape.
+- `js_run` returns a one-name tuple WANT (`want = (:x,)`) as the bare value, as
+  the native kernel of that WANT returns it; it gave a one-element tuple. Every
+  WANT form now comes back exactly as `prepare(spec; have, want)` returns it.
 
 ## 0.1.257
 

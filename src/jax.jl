@@ -3640,12 +3640,28 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(/), args::Vector{_PyVal})
     _jax_error("a matrix division has no JAX translation", _jax_where(ctx))
 end
 
+# A tuple of numbers that a reduction takes as its collection
+# (`logsumexp((a, b))`, `maximum((a, b))`, `sum((x, n))`), as the code of one
+# array of the entries' promoted type (`float` of it for `float = true`), as a
+# vector literal `[a, b]` is: `jax.numpy` reductions refuse a Python tuple.
+# The tuple's type fixes how many entries it stacks. Any other value (an
+# array, a tuple of arrays, whose Julia reductions differ) gives `nothing`.
+function _jax_tuple_array_code(x::_PyVal; float::Bool = false)
+    T = x.T
+    T isa Type && T <: Tuple && isconcretetype(T) && fieldcount(T) > 0 &&
+        all(F -> F <: Number, fieldtypes(T)) || return nothing
+    E = promote_type(fieldtypes(T)...)
+    "jnp.asarray(" * x.code * ", dtype=" * _jax_dtype(float ? Base.float(E) : E) * ")"
+end
+# The code of a reduction's collection: a numeric tuple's array, else its own.
+_jax_collection_code(x::_PyVal; float::Bool = false) =
+    something(_jax_tuple_array_code(x; float), x.code)
+
 function _jax_function_call(ctx::_JaxContext, ::typeof(sum), args::Vector{_PyVal})
-    # Fixed structural lag windows reduce a numeric tuple. JAX reductions
-    # require an array; tuples of arrays have different Julia sum semantics.
-    if length(args) == 1 && _jax_numeric_tuple(args[1].T)
-        return _jax_result(sum, args, "jnp.sum(jnp.asarray(" * args[1].code * "))")
-    end
+    # Fixed structural lag windows reduce a numeric tuple, of mixed element
+    # types too. Tuples of arrays have different Julia sum semantics.
+    stacked = length(args) == 1 ? _jax_tuple_array_code(args[1]) : nothing
+    stacked === nothing || return _jax_result(sum, args, "jnp.sum(" * stacked * ")")
     if length(args) == 1 && !isempty(args[1].extent) && _jax_rank(args[1].T) == 1
         x = args[1]
         return _PyVal("jnp.sum(jnp.where(" * _jax_mask(x) * ", " * x.code * ", 0.0))", eltype(x.T))
@@ -3693,7 +3709,7 @@ for (f, name, neutral) in ((prod, "jnp.prod", "1.0"), (maximum, "jnp.max", "-jnp
         x = args[1]
         isempty(x.extent) || return _PyVal($name * "(" * _jax_padded_reduced(ctx, $f, x, $neutral) *
                                            ")", eltype(x.T))
-        _jax_result($f, args, $name * "(" * x.code * ")")
+        _jax_result($f, args, $name * "(" * _jax_collection_code(x) * ")")
     end
 end
 # `div(a, b)` of integers truncates toward zero, as Julia's does (lowered
@@ -3955,7 +3971,11 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(LogExpFunctions.logsumexp
         _jax_helper!(ctx, "_rk_logsumexp", _JAX_PRELUDE["_rk_logsumexp"]) : "jsp.logsumexp"
     isempty(x.extent) || return _PyVal(name * "(" * _jax_padded_reduced(ctx, LogExpFunctions.logsumexp,
                                                                      x, "-jnp.inf") * ")", eltype(x.T))
-    _jax_result(LogExpFunctions.logsumexp, args, name * "(" * x.code * ")")
+    # A tuple of candidate log densities (`logsumexp((a, b))`) is one float
+    # array: the helper's `jnp.max` refuses a tuple, and its `-inf` neutral
+    # needs a float dtype.
+    _jax_result(LogExpFunctions.logsumexp, args,
+                name * "(" * _jax_collection_code(x; float = true) * ")")
 end
 function _jax_function_call(ctx::_JaxContext, ::typeof(length), args::Vector{_PyVal})
     x = only(args)
