@@ -16,6 +16,22 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.254
+
+- `ReactiveKernels.js_source(spec; have, want, types, name)` (prototype, not
+  exported) emits a self-contained JavaScript (ES) module that computes a
+  kernel's WANT values from its HAVE values in a browser or Node.js, with no
+  server. Plain Julia helpers the kernel calls are translated from their typed
+  code, branches, early returns and loops included, without `@traceable` or
+  another annotation; ordinary recipes, broadcasts, `plate` and `scan`
+  translate, the last two as loops over runtime lengths. Values are `Float64`,
+  `Int64` and `Bool` scalars and vectors of them; indexing is checked, and
+  `log`, `sqrt`, `^` and the like raise Julia's `DomainError`. The module
+  exports the kernel function, `INPUTS`, `OUTPUTS` and `JuliaError`, whose
+  `name` is the Julia exception type. A construct without a translation (a C
+  call, `fma`, a matrix, a scan with `history`) raises `JSEmissionError`
+  naming it and its call chain.
+
 ## 0.1.253
 
 - `jax_source` treats the functions of every package of ReactiveKernels'
