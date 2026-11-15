@@ -41,6 +41,18 @@ Base.showerror(io::IO, e::SurfaceLoweringError) =
 
 _sfail(msg) = throw(SurfaceLoweringError(msg))
 
+# The filter values one `marginalize(model, arrays...; predictive, filtered)`
+# call names (marginalize.jl): `predictive` pairs a role (`:location`,
+# `:variance`, `:scale`) of the one-step-ahead predictive law of each observed
+# entry with the author's name; `filtered` holds `(array, role, name)` for the
+# filtered `:mean` / `:variance` of an array the call integrates out. Arrays
+# are spelled as the call wrote them (`Symbol("z.x")` in a submodel).
+struct _MarginalValues
+    arrays::Vector{Symbol}
+    predictive::Vector{Pair{Symbol,Symbol}}
+    filtered::Vector{Tuple{Symbol,Symbol,Symbol}}
+end
+
 """
     RKPPLModel
 
@@ -49,9 +61,10 @@ declaration. Observe values explicitly: `model(; x, g) | (; y)`, or
 `condition(model(; x, g); y)`, returns a bound `StructuralPlan`.
 `fixed` stores merge pins, `rewrites` stores scoped statement replacements,
 `conditioned` stores explicit observations, `marginalized` the latent
-recurrences integrated out by [`marginalize`](@ref) and `chains` those
-[`markov_chains`](@ref) lowers in their states for WarmupHMC's Markov
-chains. Operations return new models.
+recurrences integrated out by [`marginalize`](@ref), `marginal_values` the
+filter values each `marginalize` call names (`predictive`, `filtered`) and
+`chains` those [`markov_chains`](@ref) lowers in their states for WarmupHMC's
+Markov chains. Operations return new models.
 """
 struct RKPPLModel
     ast::Expr
@@ -62,9 +75,11 @@ struct RKPPLModel
     documentation::Vector{RKPPLDocumentation}
     marginalized::Vector{Symbol}
     chains::Vector{Symbol}
+    marginal_values::Vector{_MarginalValues}
 end
 RKPPLModel(ast, mod, fixed, rewrites, conditioned, documentation) =
-    RKPPLModel(ast, mod, fixed, rewrites, conditioned, documentation, Symbol[], Symbol[])
+    RKPPLModel(ast, mod, fixed, rewrites, conditioned, documentation, Symbol[], Symbol[],
+        _MarginalValues[])
 RKPPLModel(ast, mod, fixed, rewrites, conditioned) =
     RKPPLModel(ast, mod, fixed, rewrites, conditioned, last(_documentation_source(ast)))
 RKPPLModel(ast, mod) = RKPPLModel(ast, mod, Dict{Symbol,ColumnData}(), Expr[], Dict{Symbol,ColumnData}())
@@ -298,7 +313,7 @@ function condition(m::RKPPLModel; kwargs...)
     observations = merge(copy(m.conditioned),
         Dict{Symbol,ColumnData}(k => _check_col(k, v) for (k, v) in kwargs))
     return RKPPLModel(m.ast, m.mod, copy(m.fixed), copy(m.rewrites), observations,
-        copy(m.documentation), copy(m.marginalized), copy(m.chains))
+        copy(m.documentation), copy(m.marginalized), copy(m.chains), copy(m.marginal_values))
 end
 condition(m::RKPPLBoundModel; kwargs...) =
     bind_data(RKPPLBoundModel(condition(m.model; kwargs...), copy(m.data)))
@@ -484,7 +499,7 @@ function Base.merge(m::RKPPLModel, override::Expr)
     end
     docs = _merge_documentation(m.documentation, last(_documentation_source(override)))
     return RKPPLModel(Expr(:block, out...), m.mod, fixed, rewrites, copy(m.conditioned), docs,
-        copy(m.marginalized), copy(m.chains))
+        copy(m.marginalized), copy(m.chains), copy(m.marginal_values))
 end
 
 Base.merge(m::RKPPLModel, fix::NamedTuple) = _merge_fixes(m, fix)
@@ -532,7 +547,7 @@ function _merge_fixes(m::RKPPLModel, fix::NamedTuple; scoped_keys::Bool = true)
     end
     kept = Any[a for (i, a) in enumerate(out) if i ∉ drop]
     return RKPPLModel(Expr(:block, kept...), m.mod, new_fixed, copy(m.rewrites), observations,
-        copy(m.documentation), copy(m.marginalized), copy(m.chains))
+        copy(m.documentation), copy(m.marginalized), copy(m.chains), copy(m.marginal_values))
 end
 
 function Base.merge(m::RKPPLModel, first, rest...)
@@ -720,6 +735,8 @@ function _lower_model_latest(m::RKPPLModel, supplied; conditioned = keys(m.condi
     # A recurrence a submodel holds is named by its author path (`z.x`) and
     # lowers under the local's private identifier.
     marginalized = Symbol[_marginalized_identifier(x, ctx) for x in m.marginalized]
+    # Filter values a `marginalize` call names (`predictive`, `filtered`).
+    marginal_requests = _marginal_value_requests(m.marginal_values, ctx, used, values)
     _marginalized_lengths!(values, data, expanded.ast, marginalized)
     array_entries = _value_array_entries(expanded.ast, data, values, m.mod)
     ast, data = _scalar_value_definitions(expanded.ast, data,
@@ -728,7 +745,7 @@ function _lower_model_latest(m::RKPPLModel, supplied; conditioned = keys(m.condi
             (haskey(m.fixed, k) || haskey(scoped_values, k))))
     ast = _indexed_observation_definitions(ast, data)
     # Latent recurrences the author integrates out become their Kalman filter.
-    ast = _marginalize_latents(ast, marginalized, values, observing)
+    ast = _marginalize_latents(ast, marginalized, values, observing, marginal_requests)
     # Recurrences marked as WarmupHMC Markov chains are lowered in their states.
     ast = _chain_latents(ast, m.chains, values, observing)
     # Observed vectors merged with other values split by entry.
