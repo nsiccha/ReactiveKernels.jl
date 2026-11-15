@@ -225,17 +225,36 @@ end
 _vector_mean(law, i) = _vname(law.group, i, law.comps[i]..., :m)
 _vector_cov(law, i, k) = _vname(law.group, :v, min(i, k), max(i, k))
 
+# Carried arrays of values the author named (`marginalize(…; predictive,
+# filtered)`): each entry's predictive `:location` / `:variance`, and array
+# `a`'s filtered mean and variance at each step. Two-part names, never ending
+# in `_mean`, so neither `_marginalized_groups` nor `_marginalized_names` reads
+# them as a latent.
+_vector_predictive(law, role) = _vname(law.group, Symbol(:predictive_, role))
+_vector_filtered_mean(law, a) = _vname(law.group, Symbol(:filtered_, a, :_m))
+_vector_filtered_var(law, a) = _vname(law.group, Symbol(:filtered_, a, :_v))
+
 # The filter `@scan`: seeds condition the window's law at step `p` on
 # `y[1..p]`, the loop predicts and updates on each `y[t]`. `loading(a, k)` is
 # array `a`'s loading at entry `k` (absent: 0), `offset(k)` and `ss(k)` the
-# offset and the squared noise scale.
-function _vector_filter_scan(law::_VectorTransition, y, offset, loading, ss)
+# offset and the squared noise scale. `predictive` also carries each entry's
+# predictive location and variance, and `filtered` each listed array's filtered
+# mean and variance: the window component `(a, p - k)` at seed `k` (the window
+# then holds the seeds `a[p - j]`), `(a, 0)` in the loop.
+function _vector_filter_scan(law::_VectorTransition, y, offset, loading, ss;
+        predictive = false, filtered = Symbol[])
     g, p, t, d = law.group, law.p, law.loopvar, length(law.comps)
     M(i, at) = Expr(:ref, _vector_mean(law, i), at)
     V(i, k, at) = Expr(:ref, _vector_cov(law, i, k), at)
     index = Dict(c => i for (i, c) in enumerate(law.comps))
     observed(k, j) = Dict(index[(a, j)] => h for a in law.arrays
         for h in (loading(a, k),) if h !== nothing)
+    named(at, loc, fv, lag) = Any[
+        (predictive ? (Expr(:(=), Expr(:ref, _vector_predictive(law, :location), at), loc),
+            Expr(:(=), Expr(:ref, _vector_predictive(law, :variance), at), fv)) : ())...,
+        (Expr(:(=), Expr(:ref, f(law, a), at), v(index[(a, lag)]))
+            for a in filtered for (f, v) in ((_vector_filtered_mean, i -> M(i, at)),
+                (_vector_filtered_var, i -> V(i, i, at))))...]
     setup = Any[]
     for k in 1:p
         pm = k == 1 ? law.m0 : Any[M(i, k - 1) for i in 1:d]
@@ -247,6 +266,7 @@ function _vector_filter_scan(law::_VectorTransition, y, offset, loading, ss)
         means, covs = _filtered(pm, pv, ph, gain, Expr(:call, :-, yk, loc), d)
         append!(setup, (Expr(:(=), M(i, k), means[i]) for i in 1:d))
         append!(setup, (Expr(:(=), V(i, l, k), covs[(i, l)]) for i in 1:d for l in i:d))
+        append!(setup, named(k, loc, fv, p - k))
     end
     prev = Expr(:call, :-, t, 1)
     body = Any[law.locals...]
@@ -296,6 +316,7 @@ function _vector_filter_scan(law::_VectorTransition, y, offset, loading, ss)
     means, covs = _filtered(pm, pv, phn, i -> gains[i], Expr(:call, :-, yt, locn), d)
     append!(body, (Expr(:(=), M(i, t), means[i]) for i in 1:d))
     append!(body, (Expr(:(=), V(i, k, t), covs[(i, k)]) for i in 1:d for k in i:d))
+    append!(body, named(t, locn, fvn, 0))
     loop = Expr(:for, Expr(:(=), t, Expr(:call, :(:), p + 1, law.hi)), Expr(:block, body...))
     return _scan_macro(Expr(:block, setup..., loop))
 end
@@ -344,7 +365,8 @@ function _marginal_group(ast::Expr, x::Symbol, marginalized)
     return spec.states
 end
 
-function _marginalize_vector_latent(ast::Expr, arrays::Vector{Symbol}, values, observing)
+function _marginalize_vector_latent(ast::Expr, arrays::Vector{Symbol}, values, observing,
+        req = nothing)
     g = first(arrays)
     stmts = ast.args
     k = findfirst(st -> _is_scan_of(st, g), stmts)
@@ -373,14 +395,19 @@ function _marginalize_vector_latent(ast::Expr, arrays::Vector{Symbol}, values, o
     loadings = Dict(a => _vector_piece!(defs, get(form.coefs, a, nothing),
         Symbol(:loading_, i), g, y, leaf) for (i, a) in enumerate(arrays))
     ss = _vector_piece!(defs, scale, :scale, g, y, leaf; square = true)
-    filter = _vector_filter_scan(law, y, offset, (a, k) -> loadings[a](k), ss)
+    stored = req === nothing ? Symbol[] : unique(Symbol[a for (a, _, _) in req.filtered])
+    filter = _vector_filter_scan(law, y, offset, (a, k) -> loadings[a](k), ss;
+        predictive = _stores_predictive(req), filtered = stored)
     transition = _vector_transition_scan(law)
+    named = _marginal_value_defs(req, _vector_predictive(law, :location),
+        _vector_predictive(law, :variance),
+        a -> (_vector_filtered_mean(law, a), _vector_filtered_var(law, a)))
     out = Any[]
     for (i, st) in enumerate(stmts)
         i == k && continue
         if i == j
             append!(out, defs)
-            push!(out, filter, transition)
+            push!(out, filter, transition, named...)
             continue
         end
         push!(out, st)

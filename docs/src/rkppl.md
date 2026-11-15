@@ -97,6 +97,17 @@ latents = prepare_marginalized_latents(built, plan)
 marginalized_latent_draws(latents, u, Xoshiro(1)).x
 ```
 
+The filter's own values become values of the program when the call names them. These are each observation's one-step-ahead predictive location, variance or scale given the observations before it, and the filtered mean and variance of the state given the observations up to each step. They are queried by name and emitted by `jax_source(built, plan; values = …)` like any other value. The density stays as it was:
+
+```@example marginal
+named = marginalize(model(; gap, T = length(y)), :x;
+    predictive = (location = :y_loc, scale = :y_sd),
+    filtered = (mean = :x_mean, variance = :x_var)) | (; y)
+built_named = build_kernel(named)
+values_of = prepare_query(built_named, named, (:y_loc, :y_sd, :x_mean))
+values_of(u)
+```
+
 A `missing` entry of `y` is a step that only predicts: the filter carries the state through it without an update, and the likelihood has no term for it. The draws then condition on the present entries alone, and one program serves every pattern of missing entries:
 
 ```@example marginal

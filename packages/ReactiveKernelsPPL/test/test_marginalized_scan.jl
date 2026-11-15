@@ -1214,4 +1214,375 @@ end
     @test_throws SurfaceLoweringError marginalize(marginalize(OU, :ou), :ou)
 end
 
+# ── Named filter values ───────────────────────────────────────────────────
+#
+# `marginalize(…; predictive, filtered)` names each observed entry's
+# one-step-ahead predictive law and the filtered state moments as ordinary
+# values of the program (snag `marginalize-the-5a1c5f81`: a consumer moving a
+# hand-written Kalman filter onto `marginalize` keeps its `mu` /
+# `predictive_sd`). Oracles: the joint Gaussians above, the location and
+# variance of each sequential conditional, and Gaussian conditioning of the
+# latent on the entries up to each step.
+
+# Each entry's predictive location and variance given the present entries
+# before it, from the joint Gaussian `(mu, S)` of `y`.
+function sequential_moments(mu, S, y; present = eachindex(y))
+    loc, var = zeros(length(y)), zeros(length(y))
+    for t in eachindex(y)
+        p = [s for s in present if s < t]
+        if isempty(p)
+            loc[t], var[t] = mu[t], S[t, t]
+        else
+            w = S[p, p] \ S[p, t]
+            loc[t] = mu[t] + w' * (y[p] - mu[p])
+            var[t] = S[t, t] - S[t, p]' * w
+        end
+    end
+    return loc, var
+end
+
+# The latent stack `(m, S)` given `y[P]`, observed as `offset + H * stack`
+# plus noise of per-entry variance `nv`.
+function condition_stack(m, S, H, offset, nv, y, P)
+    isempty(P) && return m, Matrix(S)
+    n = size(H, 1)
+    Hp = H[P, :]
+    Sy = Symmetric(Hp * S * Hp' + Diagonal((nv .* ones(n))[P]))
+    K = S * Hp' / Sy
+    return m + K * (y[P] - ((offset .* ones(n))[P] + Hp * m)), Matrix(S - K * Hp * S)
+end
+
+# Per step `t`, the mean and variance of stack entry `index(t)` given the
+# entries `observed(t)`.
+function filtered_moments(m, S, H, offset, nv, y, T; index = identity, observed = t -> 1:t)
+    post = [condition_stack(m, S, H, offset, nv, y, collect(Int, observed(t))) for t in 1:T]
+    return [p[1][index(t)] for (t, p) in enumerate(post)],
+        [p[2][index(t), index(t)] for (t, p) in enumerate(post)]
+end
+
+named_values(built, plan, names, u) = Base.invokelatest(prepare_query(built, plan, names), u)
+# The density queries of two plans agree exactly at `u`.
+same_density(b1, p1, b2, p2, u) = all(preset -> isequal(
+    Base.invokelatest(prepare_query(b1, p1, preset), u),
+    Base.invokelatest(prepare_query(b2, p2, preset), u)), (:sampler, :likelihood, :pointwise))
+
+const OU_NAMED = (predictive = (location = :pred_loc, variance = :pred_var, scale = :pred_sd),
+    filtered = (mean = :ou_mean, variance = :ou_var))
+const OU_NAMES = (:pred_loc, :pred_var, :pred_sd, :ou_mean, :ou_var)
+
+@testset "named predictive and filtered values of a top-level filter" begin
+    d = ou_data(2, 5)
+    (; R, area, continues, gap) = d.inputs
+    gaps = Vector{Union{Missing,Float64}}(d.y)
+    gaps[[1, 4, 7]] .= missing
+    for (y, present) in ((d.y, collect(eachindex(d.y))), (gaps, findall(!ismissing, gaps)))
+        plain = marginalize(OU(; d.inputs...), :ou) | (; y)
+        plan = marginalize(OU(; d.inputs...), :ou; OU_NAMED...) | (; y)
+        built, pbuilt = build_kernel(plan), build_kernel(plain)
+        @test coordinate_names(built.layout) == coordinate_names(pbuilt.layout)
+        yv = coalesce.(y, 0.0)
+        for u in (0.3 .* sin.(1:built.layout.total),
+                0.4 .* randn(Random.Xoshiro(3), built.layout.total))
+            # Naming values leaves the density as it was.
+            @test same_density(built, plan, pbuilt, plain, u)
+            c = constrain(built.layout, u)
+            a = continues .* exp.(-gap ./ c.ou_range)
+            lat = latent_moments(0.0, 1.0, a, zeros(R), 1 .- a .^ 2)
+            mu, S = observation_moments(lat, c.level[area], c.ou_sd, c.noise)
+            loc, var = sequential_moments(mu, S, yv; present)
+            fm, fv = filtered_moments(lat..., Matrix(c.ou_sd * I(R)), c.level[area],
+                c.noise^2, yv, R; observed = t -> filter(<=(t), present))
+            v = named_values(built, plan, OU_NAMES, u)
+            @test v[1] ≈ loc rtol = 1e-10 atol = 1e-12
+            @test v[2] ≈ var rtol = 1e-10
+            @test v[3] ≈ sqrt.(var) rtol = 1e-10
+            @test v[4] ≈ fm rtol = 1e-9 atol = 1e-11
+            @test v[5] ≈ fv rtol = 1e-9 atol = 1e-12
+        end
+    end
+    # One program as the series grows, as without names.
+    shape(N, T) = let s = ou_data(N, T)
+        structure(build_kernel(marginalize(OU(; s.inputs...), :ou; OU_NAMED...) | (; s.y)).spec)
+    end
+    @test shape(2, 3) == shape(4, 9)
+    # Names compose with binding, observing, `condition` and `merge`.
+    named = marginalize(OU, :ou; predictive = (location = :pred_loc,))
+    reference = marginalize(OU(; d.inputs...), :ou; predictive = (location = :pred_loc,)) |
+        (; y = d.y)
+    built = build_kernel(reference)
+    u = 0.2 .* cos.(1:built.layout.total)
+    expected = named_values(built, reference, (:pred_loc,), u)
+    for plan in (named(; d.inputs...) | (; y = d.y), condition(named(; d.inputs...); y = d.y),
+            marginalize(OU | (; y = d.y), :ou; predictive = (location = :pred_loc,))(; d.inputs...),
+            Base.merge(named, :(noise ~ Exponential(0.5)))(; d.inputs...) | (; y = d.y))
+        @test named_values(build_kernel(plan), plan, (:pred_loc,), u) == expected
+    end
+end
+
+@testset "named values of a filter observing a defined vector" begin
+    d = censored_data(16)
+    (; T, measured, limit, lo, hi, order) = d.inputs
+    plain = censored_plan(d)
+    plan = marginalize(CENSORED(; d.inputs...), :x;
+        predictive = (location = :value_loc, scale = :value_sd),
+        filtered = (mean = :x_mean, variance = :x_var))
+    built, pbuilt = build_kernel(plan), build_kernel(plain)
+    for u in (0.3 .* cos.(1:built.layout.total), 0.4 .* randn(Random.Xoshiro(5), built.layout.total))
+        @test same_density(built, plan, pbuilt, plain, u)
+        c = constrain(built.layout, u)
+        value = vcat(measured, limit .- c.gap, lo .+ (hi .- lo) .* c.position)[order]
+        lat = latent_moments(0.0, c.sigma^2 / (1 - c.phi^2), fill(c.phi, T), zeros(T),
+            fill(c.sigma^2, T))
+        loc, var = sequential_moments(fill(c.mu, T), lat[2] + c.noise^2 * I, value)
+        fm, fv = filtered_moments(lat..., Matrix(1.0I, T, T), c.mu, c.noise^2, value, T)
+        v = named_values(built, plan, (:value_loc, :value_sd, :x_mean, :x_var), u)
+        @test v[1] ≈ loc rtol = 1e-10
+        @test v[2] ≈ sqrt.(var) rtol = 1e-10
+        @test v[3] ≈ fm rtol = 1e-9 atol = 1e-11
+        @test v[4] ≈ fv rtol = 1e-9 atol = 1e-12
+    end
+end
+
+@testset "named values of rows observing the state at their steps" begin
+    d = gathered_data(7, 12)
+    (; T, step, sensor, scale) = d.inputs
+    plain = gathered_plan(d)
+    plan = marginalize(GATHERED(; d.inputs...), :x;
+        predictive = (location = :row_loc, variance = :row_var),
+        filtered = (mean = :x_mean, variance = :x_var)) | (; d.y)
+    built, pbuilt = build_kernel(plan), build_kernel(plain)
+    for u in (0.3 .* cos.(1:built.layout.total), 0.4 .* randn(Random.Xoshiro(6), built.layout.total))
+        @test same_density(built, plan, pbuilt, plain, u)
+        c = constrain(built.layout, u)
+        lat, L, mu, S = gathered_moments(c, d)
+        # Each row given the rows before it in event order (steps, then rows).
+        p = sortperm(step)
+        loc, var = zeros(length(d.y)), zeros(length(d.y))
+        loc[p], var[p] = sequential_moments(mu[p], S[p, p], d.y[p])
+        # Each step given every row observing it or an earlier step.
+        fm, fv = filtered_moments(lat..., L, c.bias[sensor], (c.noise .* scale) .^ 2, d.y, T;
+            observed = t -> findall(<=(t), step))
+        v = named_values(built, plan, (:row_loc, :row_var, :x_mean, :x_var), u)
+        @test v[1] ≈ loc rtol = 1e-10
+        @test v[2] ≈ var rtol = 1e-10
+        @test v[3] ≈ fm rtol = 1e-9 atol = 1e-11
+        @test v[4] ≈ fv rtol = 1e-9 atol = 1e-12
+    end
+end
+
+@testset "named values of a recurrence per @plate index" begin
+    d = cell_data([3, 1, 5]; seed = 4)
+    plain = cell_ou_plan(d)
+    plan = marginalize(CELL_OU(; d.G, d.gap, d.x), :ou;
+        predictive = (location = :y_loc, scale = :y_sd),
+        filtered = (mean = :ou_mean, variance = :ou_var)) | (; d.y)
+    built, pbuilt = build_kernel(plan), build_kernel(plain)
+    for u in (0.3 .* cos.(1:built.layout.total), 0.4 .* randn(Random.Xoshiro(7), built.layout.total))
+        @test same_density(built, plan, pbuilt, plain, u)
+        c = constrain(built.layout, u)
+        v = named_values(built, plan, (:y_loc, :y_sd, :ou_mean, :ou_var), u)
+        @test length.(v[1]) == length.(d.y)
+        for g in 1:d.G
+            n = length(d.y[g])
+            a = exp.(-d.gap[g] ./ c.ou_range)
+            lat = latent_moments(0.0, 1.0, a, zeros(n), 1 .- a .^ 2)
+            offset = c.level[g] .+ c.b .* d.x[g]
+            mu, S = observation_moments(lat, offset, c.ou_sd, c.noise)
+            loc, var = sequential_moments(mu, S, d.y[g])
+            fm, fv = filtered_moments(lat..., Matrix(c.ou_sd * I(n)), offset, c.noise^2,
+                d.y[g], n)
+            @test v[1][g] ≈ loc rtol = 1e-10
+            @test v[2][g] ≈ sqrt.(var) rtol = 1e-10
+            @test v[3][g] ≈ fm rtol = 1e-9 atol = 1e-11
+            @test v[4][g] ≈ fv rtol = 1e-9 atol = 1e-12
+        end
+    end
+end
+
+@testset "named values of a vector state, its seeds included" begin
+    T = 8
+    cases = vector_cases(T)
+    y = cases.trend.y
+    w = collect(range(0.1, 1; length = T))
+    E = Matrix(1.0I, T, T)
+    named = (;
+        trend = (marginalize(TREND(; T), :level, :slope;
+                predictive = (location = :y_loc, variance = :y_var),
+                filtered = (level = (mean = :level_mean, variance = :level_var),
+                    slope = (mean = :slope_mean,))) | (; y),
+            (:y_loc, :y_var, :level_mean, :level_var, :slope_mean),
+            c -> trend_rec(c, T), 2T, c -> [E zeros(T, T)], c -> 0.0,
+            # (role, stack entry of step t) per filtered name
+            ((:mean, identity), (:var, identity), (:mean, t -> T + t))),
+        # An AR(2): the filtered value at its first entry reads the seed window.
+        ar2 = (marginalize(AR2(; T), :x; predictive = (scale = :y_sd,),
+                filtered = (mean = :x_mean, variance = :x_var)) | (; y),
+            (:y_sd, :x_mean, :x_var), c -> ar2_rec(c, T), T, c -> E, c -> 0.5,
+            ((:mean, identity), (:var, identity))),
+        # Three arrays seeded at two entries, one of them deterministic.
+        cycle = (marginalize(CYCLE(; T, w), :c, :level, :v;
+                filtered = (c = (mean = :c_mean,), v = (variance = :v_var,))) | (; y),
+            (:c_mean, :v_var), c -> cycle_rec(c, T), 2T,
+            c -> [zeros(T, T) E Diagonal(c.b .* w)], c -> 0.0,
+            ((:mean, identity), (:var, t -> 2T + t))))
+    plains = (; trend = cases.trend.plan, ar2 = cases.ar2.plan, cycle = cases.cycle.plan)
+    for (name, (plan, names, rec, nz, H, offset, filtered)) in pairs(named)
+        built, pbuilt = build_kernel(plan), build_kernel(plains[name])
+        u = 0.3 .* cos.(1:built.layout.total)
+        @test same_density(built, plan, pbuilt, plains[name], u)
+        c = constrain(built.layout, u)
+        m, S = affine_moments(rec(c), nz)
+        Hc = H(c)
+        mu = offset(c) .+ Hc * m
+        loc, var = sequential_moments(mu, Hc * S * Hc' + c.noise^2 * I, y)
+        v = named_values(built, plan, names, u)
+        npred = length(names) - length(filtered)
+        expected_pred = Dict(:y_loc => loc, :y_var => var, :y_sd => sqrt.(var))
+        for k in 1:npred
+            @test v[k] ≈ expected_pred[names[k]] rtol = 1e-9
+        end
+        for (k, (role, index)) in enumerate(filtered)
+            fm, fv = filtered_moments(m, S, Hc, offset(c), c.noise^2, y, T; index)
+            @test v[npred + k] ≈ (role === :mean ? fm : fv) rtol = 1e-8 atol = 1e-10
+        end
+    end
+end
+
+@testset "named values of a recurrence held in a submodel" begin
+    T = 7
+    y = randn(Random.Xoshiro(2), T)
+    sub = marginalize(SUB_TREND(; T), Symbol("z.level"), Symbol("z.slope");
+        predictive = (location = :y_loc,),
+        filtered = Dict(Symbol("z.level") => (mean = :level_mean,))) | (; y)
+    top = marginalize(TREND(; T), :level, :slope; predictive = (location = :y_loc,),
+        filtered = (level = (mean = :level_mean,),)) | (; y)
+    bs, bt = build_kernel(sub), build_kernel(top)
+    u = 0.3 .* cos.(1:bs.layout.total)
+    @test named_values(bs, sub, (:y_loc, :level_mean), u) ==
+        named_values(bt, top, (:y_loc, :level_mean), u)
+end
+
+# Two recurrences, each with its own observation.
+const TWO_WALKS = @rkppl begin
+    s ~ Exponential(1)
+    noise ~ Exponential(1)
+    @scan begin
+        x[1] ~ Normal(0, 1)
+        for t in 2:T
+            x[t] ~ Normal(x[t - 1], s)
+        end
+    end
+    @scan begin
+        z[1] ~ Normal(0, 1)
+        for t in 2:T
+            z[t] ~ Normal(z[t - 1], s)
+        end
+    end
+    y .~ Normal.(x, noise)
+    w .~ Normal.(z, noise)
+end
+
+@testset "named values: one call per recurrence, and refused names" begin
+    T = 5
+    y, w = randn(Random.Xoshiro(8), T), randn(Random.Xoshiro(9), T)
+    plan = marginalize(marginalize(TWO_WALKS(; T), :x; predictive = (location = :x_loc,)), :z;
+        predictive = (variance = :z_var,)) | (; y, w)
+    built = build_kernel(plan)
+    u = 0.3 .* cos.(1:built.layout.total)
+    c = constrain(built.layout, u)
+    lat = latent_moments(0.0, 1.0, ones(T), zeros(T), fill(c.s^2, T))
+    S = lat[2] + c.noise^2 * I
+    v = named_values(built, plan, (:x_loc, :z_var), u)
+    @test v[1] ≈ first(sequential_moments(lat[1], S, y)) rtol = 1e-10 atol = 1e-12
+    @test v[2] ≈ last(sequential_moments(lat[1], S, w)) rtol = 1e-10
+
+    message(f) = try
+        f()
+        "no error"
+    catch e
+        e isa SurfaceLoweringError || rethrow()
+        sprint(showerror, e)
+    end
+    d = ou_data(2, 3)
+    lowered(; kw...) = () -> build_kernel(marginalize(OU(; d.inputs...), :ou; kw...) | (; d.y))
+    # refused: the named value would shadow a parameter or an input of the model
+    @test occursin("the value name `mu` is already used in the model",
+        message(lowered(predictive = (location = :mu,))))
+    @test occursin("the value name `gap` is already used in the model",
+        message(lowered(filtered = (mean = :gap,))))
+    # refused at the call: names RKPPL reserves, repeated names, unknown roles,
+    # names that are not Symbols, and the integrated-out array's own name
+    @test occursin("starts with `_rkppl`",
+        message(() -> marginalize(OU, :ou; predictive = (location = :_rkppl_loc,))))
+    @test occursin("the value name `a` is given twice",
+        message(() -> marginalize(OU, :ou; predictive = (location = :a, scale = :a))))
+    @test occursin("the value name `a` is given twice", message(() ->
+        marginalize(marginalize(TWO_WALKS, :x; predictive = (location = :a,)), :z;
+            predictive = (location = :a,))))
+    @test occursin("`predictive` takes `location`, `variance`, `scale`; `mean` is not one",
+        message(() -> marginalize(OU, :ou; predictive = (mean = :a,))))
+    @test occursin("`filtered` takes `mean`, `variance`; `scale` is not one",
+        message(() -> marginalize(OU, :ou; filtered = (scale = :a,))))
+    @test occursin("`predictive.location` is the name of the value, a Symbol",
+        message(() -> marginalize(OU, :ou; predictive = (location = "mu",))))
+    @test occursin("`predictive` names values by role",
+        message(() -> marginalize(OU, :ou; predictive = :mu)))
+    @test occursin("`ou` is an array this call integrates out",
+        message(() -> marginalize(OU, :ou; filtered = (mean = :ou,))))
+    # refused: filtered values of a call with several arrays name their array,
+    # and only arrays of the call
+    @test occursin("this call integrates out several arrays", message(() ->
+        marginalize(TREND, :level, :slope; filtered = (mean = :m,))))
+    @test occursin("`filtered` names `z`, which this call does not integrate out",
+        message(() -> marginalize(AR2, :x; filtered = (z = (mean = :m,),))))
+    # refused: one call naming values for recurrences two statements observe
+    @test occursin("integrates out recurrences observed by different statements",
+        message(() -> build_kernel(marginalize(TWO_WALKS(; T), :x, :z;
+            predictive = (location = :loc,)) | (; y, w))))
+    # refused: two calls naming one recurrence's same value
+    @test occursin("two `marginalize` calls name its predictive location", message(() ->
+        build_kernel(marginalize(marginalize(TREND(; T), :level; predictive = (location = :a,)),
+            :slope; predictive = (location = :b,)) | (; y))))
+end
+
+@testset "jax_source emits named filter values" begin
+    isdefined(@__MODULE__, :rk_jax_available) ||
+        include(joinpath(pkgdir(ReactiveKernels), "test", "jax_python.jl"))
+    isdefined(@__MODULE__, :jax_raw_data) || include(joinpath(@__DIR__, "jax_ppl_data.jl"))
+    d = ou_data(2, 4)
+    gaps = Vector{Union{Missing,Float64}}(d.y)
+    gaps[[2, 5]] .= missing
+    g = gathered_data(5, 8)
+    T = 6
+    cases = (;
+        toplevel = (marginalize(OU(; d.inputs...), :ou; OU_NAMED...) | (; d.y), OU_NAMES),
+        missing_entries = (marginalize(OU(; d.inputs...), :ou; OU_NAMED...) | (; y = gaps),
+            OU_NAMES),
+        censored = (bind_data(marginalize(CENSORED(; censored_data(9).inputs...), :x;
+            predictive = (location = :value_loc, scale = :value_sd),
+            filtered = (mean = :x_mean,))), (:value_loc, :value_sd, :x_mean)),
+        gathered = (marginalize(GATHERED(; g.inputs...), :x;
+            predictive = (location = :row_loc,), filtered = (variance = :x_var,)) | (; g.y),
+            (:row_loc, :x_var)),
+        trend = (marginalize(TREND(; T), :level, :slope; predictive = (scale = :y_sd,),
+            filtered = (level = (mean = :level_mean,),)) | (; y = vector_cases(T).trend.y),
+            (:y_sd, :level_mean)))
+    for (name, (plan, names)) in pairs(cases)
+        built = build_kernel(plan)
+        src = jax_source(built, plan; values = names)
+        @test occursin("UNTRANSLATED = {}", string(src))
+        if !rk_jax_available()
+            @info "RK_JAX_PYTHON is not set: JAX parity of named values for $name skipped"
+            @test_skip false
+            continue
+        end
+        u = 0.2 .* randn(Random.Xoshiro(7), built.layout.total)
+        native = named_values(built, plan, names, u)
+        r = rk_jax_evaluate(src, "constrain", (u, jax_raw_data(plan, src)...); prepare = true).value
+        for (k, nm) in enumerate(names)
+            @test r[String(nm)] ≈ native[k] rtol = 1e-10 atol = 1e-12
+        end
+    end
+end
+
 end # module
