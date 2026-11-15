@@ -1,7 +1,7 @@
 name = "ReactiveKernels"
 uuid = "78e9f072-d36b-4c73-b7a3-751b0eb26cf9"
 authors = ["Nikolas Siccha <nikolassiccha@gmail.com>"]
-version = "0.1.261"
+version = "0.1.262"
 
 [deps]
 DiffRules = "b552c78f-8df3-52c6-915a-8e097449b14b"
@@ -27,6 +27,7 @@ SciMLBase = "0bca4576-84f4-4d90-8ffe-ffa030f20462"
 SciMLSensitivity = "1ed8b502-d754-442c-8d5d-10ac956f44a1"
 SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 
 [extensions]
 ReactiveKernelsBDFExt = ["OrdinaryDiffEqBDF", "SciMLBase", "SciMLSensitivity"]
@@ -37,6 +38,7 @@ ReactiveKernelsMutatingFunctionsExt = "MutatingFunctions"
 ReactiveKernelsSciMLODEExt = ["SciMLBase", "SciMLSensitivity"]
 ReactiveKernelsSparseArraysExt = "SparseArrays"
 ReactiveKernelsSpecialFunctionsExt = "SpecialFunctions"
+ReactiveKernelsStatisticsExt = "Statistics"
 
 [sources]
 Distributions = {url = "https://github.com/nsiccha/Distributions.jl.git", rev = "83cec5e3a8a35167d54f19da9dc5afb54f59273e"}
@@ -65,6 +67,7 @@ SciMLBase = "2.150, 3.46"
 SciMLSensitivity = "7.119"
 SpecialFunctions = "2"
 StableRNGs = "1"
+Statistics = "1"
 julia = "1.10"
 
 [extras]
