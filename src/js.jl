@@ -361,6 +361,56 @@ function _rk_samelen(x, y) {
 function _rk_bcat(x, i) { return x.length === 1 ? x[0] : x[i]; }""", Symbol[]),
     :_rk_range => ("""
 function _rk_range(start, stop) { return { start, stop: Math.max(start - 1, stop) }; }""", Symbol[]),
+    # Matrices as arrays of row arrays (`js_arrays.jl`)
+    :_rk_ncols => ("""
+function _rk_ncols(m) { return m.length > 0 ? m[0].length : Number.isInteger(m.cols) ? m.cols : 0; }""", Symbol[]),
+    :_rk_mcopy => ("""
+function _rk_mcopy(m) {
+  const c = m.map((r) => Array.from(r));
+  if (m.length === 0) c.cols = _rk_ncols(m);
+  return c;
+}""", [:_rk_ncols]),
+    :_rk_at2 => ("""
+function _rk_at2(m, i, j) {
+  const cols = _rk_ncols(m);
+  if (!(Number.isInteger(i) && i >= 1 && i <= m.length && Number.isInteger(j) && j >= 1 && j <= cols))
+    throw new JuliaError("BoundsError", "attempt to access " + m.length + "×" + cols + " array at index [" + i + ", " + j + "]");
+  return m[i - 1][j - 1];
+}""", [:JuliaError, :_rk_ncols]),
+    :_rk_col => ("""
+function _rk_col(m, j) {
+  const cols = _rk_ncols(m);
+  if (!(Number.isInteger(j) && j >= 1 && j <= cols))
+    throw new JuliaError("BoundsError", "attempt to access " + m.length + "×" + cols + " array at index [:, " + j + "]");
+  const out = new Array(m.length);
+  for (let i = 0; i < m.length; i++) out[i] = m[i][j - 1];
+  return out;
+}""", [:JuliaError, :_rk_ncols]),
+    :_rk_row => ("""
+function _rk_row(m, i) {
+  if (!(Number.isInteger(i) && i >= 1 && i <= m.length))
+    throw new JuliaError("BoundsError", "attempt to access " + m.length + "×" + _rk_ncols(m) + " array at index [" + i + ", :]");
+  return Array.from(m[i - 1]);
+}""", [:JuliaError, :_rk_ncols]),
+    :_rk_matrix => ("""
+function _rk_matrix(name, x, element, integer) {
+  if (!Array.isArray(x))
+    throw new JuliaError("ArgumentError", "the input `" + name + "` must be an array of rows; got " + x);
+  if (x.length === 0 && x.cols !== undefined && !(Number.isInteger(x.cols) && x.cols >= 0))
+    throw new JuliaError("ArgumentError", "the input `" + name + "` has no rows and a column count `cols` of " + x.cols);
+  for (let i = 0; i < x.length; i++) {
+    const r = x[i];
+    if (!(Array.isArray(r) || ArrayBuffer.isView(r)))
+      throw new JuliaError("ArgumentError", "the input `" + name + "` must be an array of rows; row " + (i + 1) + " is " + r);
+    if (r.length !== x[0].length)
+      throw new JuliaError("ArgumentError", "the input `" + name + "` must have rows of one length; row " + (i + 1) +
+        " has " + r.length + " entries and row 1 has " + x[0].length);
+    for (let j = 0; j < r.length; j++)
+      if (typeof r[j] !== element || (integer && !Number.isInteger(r[j])))
+        throw new JuliaError("ArgumentError", "the input `" + name + "` must hold " + element + "s; entry [" +
+          (i + 1) + ", " + (j + 1) + "] is " + r[j]);
+  }
+}""", [:JuliaError]),
     :_rk_number => ("""
 function _rk_number(name, x, integer) {
   if (typeof x !== "number" || (integer && !Number.isInteger(x)))
@@ -2231,19 +2281,23 @@ exception type (`DomainError`, `BoundsError`, `DimensionMismatch`, …).
 `types` gives each HAVE value's type, by name, where its port has none.
 
 Values are `Float64` and `Int64` numbers (an `Int64` exact while it stays
-below 2^53 in magnitude), `Bool`s and vectors of them; sizes and numeric
-inputs stay runtime arguments. Translated: ordinary kernel recipes,
-broadcasts (fused, with Julia's length rules), `plate` and `scan` as loops,
-arithmetic and comparisons, `Base.Math` functions with Julia's domain errors,
-checked 1-based indexing, `sum`/`maximum`/`minimum`, ranges, comprehensions
-and `map` over vectors, tuples and named tuples (objects) built, read and
-destructured, and keyword calls. Plain Julia helpers are translated from their typed
-code, branches, early returns and loops included, without annotation;
-Julia's own functions translate only through RK's table. A construct without
-a translation (a C call, `fma`, a matrix, a scan with `history`) raises
-`ReactiveKernels.JSEmissionError` naming it and its
-call chain. Elementary functions use JavaScript's `Math`, which may differ
-from Julia's in the last bit.
+below 2^53 in magnitude), `Bool`s, vectors of them, and matrices of them as
+arrays of row arrays (`m[i][j]` is Julia's `m[i+1, j+1]`; a matrix without
+rows keeps its column count as `cols`, `Object.assign([], { cols: 3 })` for
+`zeros(0, 3)`); sizes and numeric inputs stay runtime arguments. Translated:
+ordinary kernel recipes, broadcasts (fused, with Julia's length rules),
+`plate` and `scan` as loops, arithmetic and comparisons, `Base.Math`
+functions with Julia's domain errors, checked 1-based indexing (of a matrix:
+`m[i, j]`, `m[:, j]`, `m[i, :]`, `size`, `axes`), vector literals,
+`sum`/`maximum`/`minimum`, ranges, comprehensions and `map` over vectors,
+tuples and named tuples (objects) built, read and destructured, and keyword
+calls. Plain Julia helpers are translated from their typed code, branches,
+early returns and loops included, without annotation; Julia's own functions
+translate only through RK's table. A construct without a translation (a C
+call, `fma`, matrix arithmetic, a scan with `history`) raises
+`ReactiveKernels.JSEmissionError` naming it and its call chain. Elementary
+functions use JavaScript's `Math`, which may differ from Julia's in the last
+bit.
 """
 function js_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
                    want = _KERNEL_DEFAULT_BOUNDARY, types = nothing, name = :kernel)

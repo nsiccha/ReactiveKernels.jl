@@ -16,6 +16,19 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.266
+
+- `js_source` modules take and return `Matrix{Float64}`, `Matrix{Int64}` and
+  `Matrix{Bool}` as arrays of row arrays: `m[i][j]` is Julia's `m[i+1, j+1]`.
+  A matrix without rows keeps its column count as a `cols` property of the
+  outer array (`Object.assign([], { cols: 3 })` for `zeros(0, 3)`; `[]` is
+  0×0). Inside a module `m[i, j]`, `m[:, j]`, `m[i, :]`, `size`, `axes`,
+  `length`, `firstindex`, `lastindex` and `copy` translate. `js_run` passes
+  and decodes matrices, with `Float64Array` rows under
+  `vectors = :float64array`.
+- `js_source` translates vector literals, `[a, b]` and `Float64[a, b]`, with
+  Julia's promotions.
+
 ## 0.1.265
 
 - `js_source` translates keyword calls of plain helpers, named tuples built
