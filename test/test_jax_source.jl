@@ -1126,6 +1126,28 @@ end
     total = logaddexp(a, streamed) + logaddexp(-a, direct)
     return total
 end
+# `logsumexp` of a tuple of candidate log densities, a two-component mixture
+# law's: alone, with an integer entry, and per cell of a plate.
+@kernel jax_tuple_lse(a::Float64, b::Float64) = begin
+    result = logsumexp((a, b))
+    return result
+end
+@kernel jax_tuple_lse_mixed(a::Float64, b::Float64, k::Int) = begin
+    result = logsumexp((a, b, k))
+    return result
+end
+@kernel jax_tuple_mixture(mu::Float64, y::Vector{Float64}, nu::Float64, w::Float64) = begin
+    lp = plate(y) do yi
+        logsumexp((log(w) - 0.5 * (yi - mu)^2, log1p(-w) - 0.5 * (yi - nu)^2))
+    end
+    total = sum(lp)
+    return total
+end
+# The other reductions of a numeric tuple, of mixed element types too.
+@kernel jax_tuple_reductions(a::Float64, b::Float64, n::Int) = begin
+    total = sum((a, n)) + maximum((a, b)) + minimum((a, b, n)) + prod((a, b, n))
+    return total
+end
 # Julia's unit indices: past a vector's rank (a literal and a computed one),
 # of a number, and `size` past the rank; `dropdims` of a summed axis.
 @kernel jax_unit_index(x::Vector{Float64}, a::Float64) = begin
@@ -2159,6 +2181,70 @@ end
             else
                 @test same(gu, du) && same(gv, dv)
             end
+        end
+    end
+end
+
+@testset "jax_source: reductions of a tuple of numbers" begin
+    # `jax.numpy` reductions refuse a Python tuple: the tuple is one array of
+    # its entries' promoted type (a float one for `logsumexp`), and a plate's
+    # cells stay one `jax.vmap`.
+    text = string(jax_source(jax_tuple_lse; have = (:a, :b), want = :result))
+    @test occursin("_rk_logsumexp(jnp.asarray((a, b), dtype=jnp.float64))", text)
+    mixed = string(jax_source(jax_tuple_lse_mixed; have = (:a, :b, :k), want = :result))
+    @test occursin("_rk_logsumexp(jnp.asarray((a, b, k), dtype=jnp.float64))", mixed)
+    have = (:mu, :y, :nu, :w)
+    plated = string(jax_source(jax_tuple_mixture; have, want = :total))
+    @test occursin("jax.vmap", plated) && occursin("_rk_logsumexp(jnp.asarray((", plated)
+    reductions = string(jax_source(jax_tuple_reductions; have = (:a, :b, :n), want = :total))
+    for f in ("jnp.sum", "jnp.max", "jnp.min", "jnp.prod")
+        @test occursin(f * "(jnp.asarray((", reductions)
+    end
+    if !rk_jax_available()
+        @test_skip false
+    else
+        lse = jax_source(jax_tuple_lse; have = (:a, :b), want = :result)
+        native = prepare(jax_tuple_lse; have = (:a, :b), want = :result)
+        # Finite entries, a tie, entries whose exponentials overflow or
+        # underflow alone, and non-finite ones. The derivative in `a` is its
+        # softmax weight; 0 when every entry is -Inf, as `_rk_logsumexp`'s.
+        for (a, b) in ((0.3, -1.2), (0.5, 0.5), (700.0, 699.0), (-1000.0, 3.0), (-745.0, -750.0),
+                       (2.0, -Inf), (-Inf, 1.0), (-Inf, -Inf), (Inf, 0.0))
+            r = rk_jax_evaluate(lse, "kernel", (a, b); grad = true)
+            expected = logsumexp((a, b))
+            for value in (native(a, b), r.value)
+                @test isfinite(expected) ? isapprox(value, expected; rtol = 1e-15) :
+                      isequal(value, expected)
+            end
+            # `a - expected` is exact to about one rounding of `expected`
+            # (1e-13 at 700), the weight relative to that.
+            if isfinite(expected)
+                @test r.grad ≈ exp(a - expected) rtol = 1e-12
+            elseif a == b == -Inf
+                @test iszero(r.grad)
+            end
+        end
+        lse_mixed = jax_source(jax_tuple_lse_mixed; have = (:a, :b, :k), want = :result)
+        r = rk_jax_evaluate(lse_mixed, "kernel", (0.3, -1.2, 2); grad = true)
+        expected = logsumexp((0.3, -1.2, 2))
+        @test r.value ≈ expected rtol = 1e-15
+        @test r.grad ≈ exp(0.3 - expected) rtol = 1e-14
+        # The mixture inside a plate: outliers make both components' log
+        # densities about -800, whose exponentials underflow unshifted.
+        src = jax_source(jax_tuple_mixture; have, want = :total)
+        native = prepare(jax_tuple_mixture; have, want = :total)
+        for y in ([0.1, -0.7, 1.9, 0.4], [40.0, -41.0, 0.2])
+            r = rk_jax_evaluate(src, "kernel", (0.4, y, -1.0, 0.3); grad = true)
+            @test isfinite(r.value)
+            @test r.value ≈ native(0.4, y, -1.0, 0.3) rtol = 1e-12
+            @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), y, -1.0, 0.3), [0.4])) rtol = 1e-6
+        end
+        src = jax_source(jax_tuple_reductions; have = (:a, :b, :n), want = :total)
+        native = prepare(jax_tuple_reductions; have = (:a, :b, :n), want = :total)
+        for (a, b, n) in ((0.7, -1.3, 3), (-2.0, 0.5, -4))
+            r = rk_jax_evaluate(src, "kernel", (a, b, n); grad = true)
+            @test r.value ≈ native(a, b, n) rtol = 1e-14
+            @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), b, n), [a])) rtol = 1e-6
         end
     end
 end
