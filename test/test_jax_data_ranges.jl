@@ -219,6 +219,67 @@ end
     total = sum(cells)
     return total
 end
+# Counted `while` loops to a padded row's length (snag
+# jax-source-of-an-6bfaf24a: the stage loop of stopping-ratio ordinal evidence
+# over thresholds computed in a plate cell). Each takes lazy steps to the
+# row's static limit, which `jax.grad` reverses; a `while_loop` to the row's
+# length only goes forward. A step past the length runs no body: there
+# `log(length(r) - i)` would be `log` of zero or less, and its value and
+# derivative would reach the result. Each leaves `i` where the `while` does,
+# and stops at the data-dependent `k` inside the row through `ifelse`.
+@traceable function jax_test_counted_row(r, a, k)
+    total = zero(a)
+    i = 0
+    while i < length(r)
+        j = i + 1
+        total += ifelse(j <= k, log1p(a^2 * r[j]^2), zero(a)) + a * log(length(r) - i)
+        i = i + 1
+    end
+    return total + i
+end
+@traceable function jax_test_counted_row_from_one(r, a)
+    total = zero(a)
+    i = 1
+    while i <= length(r) - 1
+        total += a * r[i + 1] - r[i]
+        i += 1
+    end
+    return total * i
+end
+@kernel jax_ranges_counted_rows(x::Vector{Float64}, R::Vector{Vector{Float64}}, k::Vector{Int}) = begin
+    cells = plate(R, k) do r, kk
+        jax_test_counted_row(r, x[1], kk) + jax_test_counted_row_from_one(r, x[2])
+    end
+    total = sum(cells)
+    return total
+end
+# A body that changes the limit, static or a padded length, is not counted:
+# the `while` reads the new limit at every step, a range only the first.
+@traceable function jax_test_shrinking_limits(r, a)
+    total = zero(a)
+    i = 0
+    m = 3
+    while i < m
+        total += a * (i + 1)
+        m = m - 1
+        i = i + 1
+    end
+    i = 0
+    n = length(r)
+    while i < n
+        total += r[i + 1]
+        n = n - 1
+        i = i + 1
+    end
+    return total
+end
+@kernel jax_ranges_shrinking_limits(a::Float64, R::Vector{Vector{Float64}}) = begin
+    cells = plate(R) do r
+        jax_test_shrinking_limits(r, a)
+    end
+    total = sum(cells)
+    return total
+end
 
 const JAX_RANGES_KERNELS = (jax_ranges_loop, jax_ranges_forms, jax_ranges_plate, jax_ranges_open,
                             jax_ranges_writes, jax_ranges_nested)
@@ -370,6 +431,37 @@ end
         r = rk_jax_evaluate(src, "kernel", (xr, R); grad = true)
         @test r.value ≈ q(xr, R) rtol = 1e-12
         @test r.grad ≈ rk_fd_gradient(u -> q(u, R), xr) rtol = 1e-6 atol = 1e-6
+    end
+end
+
+@testset "jax_source: counted while loops to a padded row's length" begin
+    have = (:x, :R, :k)
+    text = string(jax_source(jax_ranges_counted_rows; have, want = :total))
+    # Both loops are scans of lazy steps to the row's static limit.
+    @test !occursin("while_loop", text)
+    @test count(r"jax\.lax\.fori_loop\(0, max\([^\n]*shape\[0\][^\n]*, 0\), ", text) == 2
+    @test count("jax.lax.cond(kept", text) == 2
+    shrinking = string(jax_source(jax_ranges_shrinking_limits; have = (:a, :R), want = :total))
+    @test count("jax.lax.while_loop(", shrinking) == 2
+    @test !occursin("fori_loop", shrinking)
+    if !rk_jax_available()
+        @test_skip false
+    else
+        f = prepare(jax_ranges_counted_rows; have, want = :total)
+        src = jax_source(jax_ranges_counted_rows; have, want = :total)
+        x = [0.7, -1.3]
+        for (R, k) in (([[1.0, 2.0, 3.0], [4.0], [5.0, -6.0]], [2, 1, 0]),
+                       ([[1.0, 2.0, 3.0, 0.5], Float64[], [0.25, -2.0, 1.5]], [9, 0, 3]))
+            r = rk_jax_evaluate(src, "kernel", (x, R, k); grad = true)
+            @test r.value ≈ f(x, R, k) rtol = 1e-12
+            @test r.grad ≈ rk_fd_gradient(u -> f(u, R, k), x) rtol = 1e-6 atol = 1e-6
+        end
+        g = prepare(jax_ranges_shrinking_limits; have = (:a, :R), want = :total)
+        R = [[1.0, 2.0, 3.0], [4.0], Float64[], [5.0, -6.0, 7.0, 8.0, 9.0]]
+        @test g(0.5, R) == 4 * 0.5 * 3 + 3.0 + 4.0 + (5.0 - 6.0 + 7.0)
+        r = rk_jax_evaluate(jax_source(jax_ranges_shrinking_limits; have = (:a, :R), want = :total),
+                            "kernel", (0.5, R))
+        @test r.value ≈ g(0.5, R) rtol = 1e-12
     end
 end
 

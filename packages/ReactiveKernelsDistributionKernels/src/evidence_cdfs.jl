@@ -26,11 +26,13 @@ _ordinal_logccdf(::Val{:cloglog}, z) = -exp(z)
 @traceable _ordinal_effect(::Nothing, row, j) = 0.0
 @traceable _ordinal_effect(effects, row, j) = effects[row, j]
 
-# The stage loops run over the static stage count `length(t)`; a stage past
-# `k` reads z = 0 and adds nothing. A fixed trip count keeps the JAX
-# translation a counted loop, which `jax.grad` reverses (a loop to the
-# data-dependent `k` is a forward-only `while_loop`), and the zeroed z keeps an
-# unreached stage's link function and its derivative finite.
+# The stage loops run over the stage count `length(t)`, never to the
+# data-dependent `k`: a stage past `k` reads z = 0 and adds nothing.
+# `length(t)` is static for a declared vector and, for one computed in a plate
+# cell, a padded row's length with a static limit; either keeps the JAX
+# translation a counted loop, which `jax.grad` reverses (a loop to `k` is a
+# forward-only `while_loop`), and the zeroed z keeps an unreached stage's link
+# function and its derivative finite.
 ReactiveKernels.@_record_source function _ordinal_logsurvival(t, eta, d, effects, row, k, link)
     total = zero(eta + d)
     i = 0

@@ -16,6 +16,24 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.263
+
+- `jax_source` translates a counted `while i < n` loop (or `<=`) whose `n`
+  is a padded row's length, such as `length(t)` of a vector computed in a
+  plate cell, as a `jax.lax.fori_loop` to the row's static limit whose steps
+  are lazy branches (`jax.lax.cond`): a step past `n` runs no body and keeps
+  the carry, so nothing the body would compute there reaches the value or the
+  gradient. `jax.grad` reverses it. Before, only a static `n` was counted; this
+  one emitted a `jax.lax.while_loop`, and `jax.grad` raised `Reverse-mode
+  differentiation does not work for lax.while_loop or lax.fori_loop with
+  dynamic start/stop values`. ReactiveKernelsPPL's stopping-ratio
+  `interval_censored`, `censored` and `truncated` ordinal evidence over
+  thresholds computed in a cell (`Ref(cuts)` of a cell local) reaches this
+  loop through its stage survival. A `while` whose body assigns a name its
+  limit reads is no longer counted, static limits included: it stays a
+  `jax.lax.while_loop`, which reads the new limit at every step as Julia
+  does. Native execution is unchanged.
+
 ## 0.1.262
 
 - `jax_source` translates Statistics' `mean`, `var` and `std` through a new

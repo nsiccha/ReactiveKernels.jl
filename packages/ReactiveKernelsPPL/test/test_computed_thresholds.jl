@@ -326,3 +326,75 @@ end
         end
     end
 end
+
+# Range, censored and truncated evidence over thresholds computed in a cell
+# (snag jax-source-of-an-6bfaf24a). Its stopping-ratio survival loops run to
+# the vector's length, a padded row's length in JAX: lazy steps to that row's
+# static limit, which `jax.grad` reverses. The second form is the one
+# BayesianRegressionModels emits: the cell's latent thresholds are stored by
+# group and read in a second plate.
+function _ct_evidence(kind, structure, link, eta, cuts)
+    D = :(Ordinal.($structure(), $link(), $eta, Ref($cuts)))
+    kind === :interval ? :(interval_censored.($D, hi[e])) :
+        kind === :censored ? :(censored.($D, 2, 3)) : :(truncated.($D, 1, 3))
+end
+function _ct_cell_evidence_ast(kind, structure, link)
+    quote
+        m ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        lt ~ Normal(0, 1)
+        log_gap[1:n_gaps] .~ Normal.(0, 1)
+        @plate for e in eachindex(y)
+            u[e] .~ Normal.(zeros(n_gaps), exp(lt))
+            s = cumsum(vcat(0.0, exp.(log_gap .+ u[e])))
+            $(_ct_centre(:sum))
+            y[e] .~ $(_ct_evidence(kind, structure, link, :(b .* x[e]), :cuts))
+        end
+    end
+end
+function _ct_stored_evidence_ast(kind, structure, link)
+    quote
+        b ~ Normal(0, 1)
+        @plate for e in eachindex(y)
+            t[e] .~ Normal.(zeros(n_gaps + 1), 1.0)
+            t_cell = t[e]
+            stored[e] = t_cell
+        end
+        @plate for e in eachindex(y)
+            y[e] .~ $(_ct_evidence(kind, structure, link, :(b .* x[e]), :(stored[e])))
+        end
+    end
+end
+function _ct_evidence_cells(kind, n)
+    data = _ct_cells(n)
+    K = data.n_gaps + 2
+    # Censored and truncated responses lie within their bounds.
+    y = kind === :interval ? data.y :
+        [clamp.(ye, kind === :censored ? 2 : 1, 3) for ye in data.y]
+    hi = [[min(ye[i] + 1 + mod(i, 2), K) for i in eachindex(ye)] for ye in y]
+    merge(data, (; y, hi))
+end
+
+@testset "evidence over computed thresholds in jax_source ($kind, $structure)" for
+        kind in (:interval, :censored, :truncated), structure in (:StoppingRatio, :Cumulative)
+    for form in (_ct_cell_evidence_ast, _ct_stored_evidence_ast)
+        texts = String[]
+        for n in (3, 6)
+            data = _ct_evidence_cells(kind, n)
+            bound = _ct_bound(form(kind, structure, :CloglogLink), data)
+            built = build_kernel(bound)
+            # The native gradient is finite where the JAX one is checked.
+            u = collect(range(-0.4, 0.5; length = built.layout.total))
+            sampler = prepare_sampler(built, bound, u; backend = AutoEnzyme(; mode = Enzyme.Reverse))
+            value, grad = sampler_value_and_gradient!(sampler, similar(u), u)
+            @test isfinite(value) && all(isfinite, grad)
+            src = _ct_jax_check(built, bound, data)
+            if rk_jax_available()
+                @test !occursin("while_loop", src.text)
+                push!(texts, src.text)
+            end
+        end
+        # One program for every number of groups.
+        isempty(texts) || @test allequal(texts)
+    end
+end
