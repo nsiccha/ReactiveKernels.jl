@@ -12,6 +12,7 @@ using Enzyme
 using LogExpFunctions: logaddexp
 using ReactiveKernels
 using ReactiveKernelsPPL
+using ReactiveKernelsPPL: LogitLink, LogLink
 using Test
 
 # Lower + bind + build + query a Beta program; return

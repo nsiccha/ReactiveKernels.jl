@@ -1,6 +1,7 @@
 using Distributions
 using ReactiveKernels
 using ReactiveKernelsPPL
+using ReactiveKernelsPPL: IdentityLink, LogitLink
 using Test
 
 # SB-mirroring `me(x, sd)` measurement-error latent-predictor support:

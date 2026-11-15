@@ -1,4 +1,8 @@
 using ReactiveKernelsPPL
+# The link enum is public but not exported. Importing it here keeps its values
+# printing unqualified in every file's output and golden.
+using ReactiveKernelsPPL: LinkFunction, IdentityLink, LogitLink, LogLink, ProbitLink,
+    CloglogLink
 using Test
 
 # Every test file, in execution order. Later files reuse helper functions,

@@ -8,6 +8,7 @@ using Distributions: MixtureModel, Normal, Bernoulli, Poisson, Binomial,
 using Enzyme
 using ReactiveKernels
 using ReactiveKernelsPPL
+using ReactiveKernelsPPL: IdentityLink, LogitLink, LogLink
 using Test
 
 # Lower + bind + build + query a mixture program; return

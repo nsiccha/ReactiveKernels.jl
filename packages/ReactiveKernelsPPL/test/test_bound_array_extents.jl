@@ -6,6 +6,7 @@ using LogExpFunctions: logistic
 using Random
 using ReactiveKernels
 using ReactiveKernelsPPL
+using ReactiveKernelsPPL: IdentityLink
 using Test
 
 _bound_extent_nodes(ex) = ex isa Expr ?

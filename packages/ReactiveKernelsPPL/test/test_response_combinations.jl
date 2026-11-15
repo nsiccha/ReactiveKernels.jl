@@ -3,6 +3,7 @@ using Distributions
 using Enzyme
 using ReactiveKernels
 using ReactiveKernelsPPL
+using ReactiveKernelsPPL: IdentityLink, LogitLink, LogLink
 using Test
 
 # Synthetic public models. Independent Distributions oracles check the

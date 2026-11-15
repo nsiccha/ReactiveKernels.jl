@@ -1,5 +1,6 @@
 using Distributions: Categorical, Exponential, Gamma, Multinomial, Normal, logpdf
 using ReactiveKernelsPPL
+using ReactiveKernelsPPL: IdentityLink
 using Test
 
 # Real matrix-term IR (decision 11m6cwo chose Build): `DesignMatrix`

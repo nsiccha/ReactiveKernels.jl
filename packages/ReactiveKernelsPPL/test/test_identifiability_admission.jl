@@ -3,6 +3,7 @@ using Distributions: Normal, Exponential, Uniform, Logistic, Beta, Dirichlet,
     cdf, logpdf
 using Enzyme
 using ReactiveKernelsPPL
+using ReactiveKernelsPPL: IdentityLink
 using Test
 
 # These oracles use the authored priors and scalar probability formulas.

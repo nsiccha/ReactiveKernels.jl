@@ -13,6 +13,7 @@ import Distributions
 using Enzyme
 using ReactiveKernels
 using ReactiveKernelsPPL
+using ReactiveKernelsPPL: LogitLink, LogLink, ProbitLink
 using Test
 
 # Lower + bind + build + query a bare-location program; return

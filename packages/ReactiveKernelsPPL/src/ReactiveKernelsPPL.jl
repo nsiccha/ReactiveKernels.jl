@@ -43,7 +43,12 @@ export LikelihoodFamily, GaussianFam, BernoulliLogitFam, PoissonLogFam,
     NegativeBinomialFam, ExponentialLogFam, LogNormalFam, WeibullFam,
     GammaValueFam, WeibullValueFam, CauchyFam,
     ZeroInflatedBinomialFam
-export LinkFunction, IdentityLink, LogitLink, LogLink, ProbitLink, CloglogLink
+# Public but not exported: BayesianRegressionModels exports its own `LogitLink`,
+# `ProbitLink` and `CloglogLink` (GLM.jl exports all five value names), and two
+# exports of one name leave it undefined in every module that loads both. The
+# whole enum moves together so the rule is one line: import what you name
+# (snag rkppl-exports-lo-be4414db).
+@compat public LinkFunction, IdentityLink, LogitLink, LogLink, ProbitLink, CloglogLink
 export TermKind, InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm, LatentTerm,
     ScanSummandTerm, MatrixTerm,
     ComposedTerm

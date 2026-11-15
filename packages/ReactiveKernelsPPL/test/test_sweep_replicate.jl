@@ -39,6 +39,7 @@ using Distributions: Beta, Binomial, Cauchy, Exponential, Normal, logpdf
 using Enzyme
 using ReactiveKernels
 using ReactiveKernelsPPL
+using ReactiveKernelsPPL: LogitLink
 using Test
 
 # Lower + bind + build + query a sweep program; return
