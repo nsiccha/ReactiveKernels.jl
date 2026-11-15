@@ -1683,7 +1683,7 @@ end
 function _jax_expr(ctx::_JaxContext, ::Val{:while}, ex)
     ctx.host === nothing || return _host_while(ctx, ex)
     counted = _jax_counted_while(ctx, ex)
-    counted === nothing || return _jax_expr(ctx, counted)
+    counted === nothing || return _jax_counted_for(ctx, counted...)
     condition_ex, body = ex.args
     assigned = Set{Symbol}()
     _jax_assigned_names!(assigned, body)
@@ -1731,9 +1731,12 @@ function _jax_expr(ctx::_JaxContext, ::Val{:while}, ex)
 end
 
 # A counted `while i < n` (or `<=`) whose body ends in its only assignment
-# of `i`, `i = i + 1`, over a static `n`: the `for` over `i:(n - 1)` that sets
-# `i` first, which `jax.grad` reverses (a `while_loop` only goes forward).
-# The loop leaves `i` at the value the `while` would.
+# of `i`, `i = i + 1`, and assigns nothing `n` reads: the `for` over
+# `i:(n - 1)` that sets `i` first, which `jax.grad` reverses (a `while_loop`
+# only goes forward), with that range's translated ends. `n` is static or,
+# from a static `i`, data with a static limit (a padded row's `length`, such
+# as a vector computed in a plate cell). The loop leaves `i` at the value the
+# `while` would.
 function _jax_counted_while(ctx::_JaxContext, ex)
     condition, body = ex.args
     condition isa Expr && condition.head === :call && length(condition.args) == 3 &&
@@ -1748,11 +1751,25 @@ function _jax_counted_while(ctx::_JaxContext, ex)
     assigned = Set{Symbol}()
     foreach(st -> _jax_assigned_names!(assigned, st), statements[1:last-1])
     i in assigned && return nothing
-    n = _jax_expr(ctx, limit)
-    n.static && _jax_typeof(n) <: Integer || return nothing
+    # A body that changes the limit is not counted: the `while` reads it at
+    # every step, a range only once.
+    any(in(assigned), _kernel_collect_symbols!(Set{Symbol}(), limit)) && return nothing
+    last_ex = condition.args[1] === :< ? :($limit - 1) : limit
+    lo, hi = ctx.locals[i], _jax_expr(ctx, last_ex)
+    _jax_typeof(hi) <: Integer || return nothing
+    hi.static || lo.static && !isempty(hi.limit) || return nothing
     k = gensym(i)
-    hi = condition.args[1] === :< ? :($limit - 1) : limit
-    Expr(:for, :($k = $i:$hi), Expr(:block, :($i = $k), statements...))
+    (Expr(:for, :($k = $i:$last_ex), Expr(:block, :($i = $k), statements...)), lo, hi)
+end
+# The `for` of a counted `while` from `lo` to `hi`. To a padded length (`hi`
+# data with a static limit) it takes `_jax_stepped_for`'s steps up to the
+# limit, lazy branches that do not run the body past `hi` (CONTRIBUTING.md,
+# "Lazy branches"), so a value the body would compute there reaches neither
+# the result nor `jax.grad`.
+function _jax_counted_for(ctx::_JaxContext, loop::Expr, lo::_PyVal, hi::_PyVal)
+    hi.static && return _jax_expr(ctx, loop)
+    binding, body = loop.args
+    _jax_stepped_for(ctx, binding.args[1], body, lo, hi, _jax_trip_bound(ctx, lo, hi))
 end
 
 # Loops. A `for` over a range is `jax.lax.fori_loop` over a function of the
