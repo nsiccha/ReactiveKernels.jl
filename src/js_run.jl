@@ -21,8 +21,9 @@ Base.showerror(io::IO, e::JSRunError) = print(io, "JSRunError: ", e.message)
 
 The outcome of one call of a module's entry function by `js_run`.
 
-- `value`: the returned WANT in the shape the native kernel returns (a value,
-  a `Tuple` for a tuple WANT, a `NamedTuple` for a named one), each value
+- `value`: the returned WANT in the shape `prepare(spec; have, want)` returns
+  for the same `want` (a value for a name or a one-name tuple, a `Tuple` for a
+  tuple, a `NamedTuple` for a named one, nested as given), each value
   converted to the Julia type the module's `OUTPUTS` declares; `nothing` when
   the call threw.
 - `error`: `nothing`, or the name of the error the call threw: the Julia
@@ -199,8 +200,15 @@ function _js_run_outcome(r::Dict, types, returns)
     mutated = get(r, "mutated", false) === true
     haskey(r, "error") &&
         return JSOutcome(nothing, string(r["error"]), string(get(r, "message", "")), get(r, "julia", false) === true, mutated)
-    JSOutcome(_js_run_shape(returns, r["value"], types), nothing, "", false, mutated)
+    JSOutcome(_js_run_native_shape(returns, r["value"], types), nothing, "", false, mutated)
 end
+
+# A tuple of one name is a native kernel's flat boundary of one value, which it
+# returns bare; the module returns a one-element array.
+_js_run_native_shape(returns::Vector, x, types) =
+    length(returns) == 1 && only(returns) isa String ?
+    _js_run_shape(only(returns), only(x), types) : _js_run_shape(returns, x, types)
+_js_run_native_shape(returns, x, types) = _js_run_shape(returns, x, types)
 
 # The returned value in the WANT's shape, each output converted to its type.
 _js_run_shape(returns::String, x, types) = _js_run_value(get(types, returns, nothing), x)
