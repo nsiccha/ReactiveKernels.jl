@@ -63,6 +63,17 @@ end
     result = jax_columns_matrix(x)
     return result
 end
+# A prepared vector of tuples crosses as the tuple of its columns, here from the
+# host comprehension's list of rows; each plate cell reads its entry by the
+# traced cell index (snag jax-source-ragge-979061c7).
+@kernel jax_columns_cell_pairs(a::Float64, R::Vector{Vector{Float64}}) = begin
+    pairs = [(sum(r), Float64(length(r))) for r in R]
+    cells = plate(eachindex(R), Ref(pairs)) do i, ps
+        a * ps[i][1] + ps[i][2]
+    end
+    total = sum(cells)
+    return total
+end
 
 @testset "jax_source: reduce(hcat, columns)" begin
     columns = [[1.0, 3.0, 5.0], [2.0, 4.0, 6.0]]
@@ -174,6 +185,27 @@ end
             @test occursin(preparation === false ?
                            "reduce(hcat, columns): the columns differ in length" :
                            "ValueError", sprint(showerror, err))
+        end
+    end
+end
+
+@testset "jax_source: a cell indexes a prepared vector of tuples" begin
+    R = [[0.5, 1.0], [2.0], [0.1, 0.2, 0.3]]
+    src = jax_source(jax_columns_cell_pairs; have = (:a, :R), want = :total, data = (; R))
+    # `prepare_data` returns the columns; the functions convert each one.
+    @test occursin("\"pairs\": _rk_columns_np(", src.text)
+    @test occursin("pairs = _rk_columns(pairs, (None, None, ))", src.text)
+    if !rk_jax_available()
+        @test_skip false
+    else
+        native = prepare(jax_columns_cell_pairs)
+        for data in (R, [[1.5, -0.5, 2.0], Float64[], [0.25]])
+            # `prepare = true` closes the host NumPy prepared data over.
+            for preparation in (true, :arguments)
+                r = rk_jax_evaluate(src, :kernel, (0.7, data); grad = true, prepare = preparation)
+                @test r.value ≈ native(0.7, data) rtol = 1e-12
+                @test r.grad ≈ sum(sum, data) rtol = 1e-12
+            end
         end
     end
 end

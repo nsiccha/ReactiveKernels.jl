@@ -1462,6 +1462,26 @@ def _rk_pad_rows(rows, dtype, rank=1):
     return padded, lengths, flat
 """
 
+# A vector of tuples (or of named numbers) crosses to the functions as the
+# tuple of its columns (`_jax_columns`), the device form. Host code holds it
+# either way: a scan's stacked outputs as columns, a comprehension as a list
+# of row tuples.
+const _JAX_COLUMNS_NP = """
+def _rk_columns_np(value, dtypes):
+    # A vector of tuples as the functions take it: the tuple of its columns,
+    # one NumPy array per field, from its columns or from a list of its rows.
+    n = len(dtypes)
+    if isinstance(value, tuple) and len(value) == n and \\
+            not any(isinstance(c, (tuple, list)) for c in value):
+        return tuple(np.asarray(c, dtype=d) for c, d in zip(value, dtypes))
+    if isinstance(value, list) and all(isinstance(r, tuple) and len(r) == n for r in value):
+        return tuple(np.asarray([r[k] for r in value], dtype=d) for k, d in enumerate(dtypes))
+    raise TypeError("a vector of %d-tuples is the tuple of its columns or a list of its rows, not %r"
+                    % (n, type(value).__name__))
+"""
+# The NumPy dtype of a column: a number field's, or a vector field's entries.
+_host_column_dtype(@nospecialize(F)) = _host_dtype(F isa Type && F <: AbstractArray ? eltype(F) : F)
+
 # --- plate cells' data-only recipes -------------------------------------------------
 #
 # A top-level plate whose cell reads data (a bound input, or a value
@@ -2015,6 +2035,14 @@ function _jax_prepare_function!(mod::_JaxModule, split, raw_types, names, types;
                 push!(mod.helpers, rstrip(_JAX_STATIC_INT))
             end
             push!(entries, "\"" * name * "\": StaticInt(" * v.code * ")")
+        elseif _jax_columns(T)
+            if !haskey(mod.helper_names, (:helper, "_rk_columns_np"))
+                mod.helper_names[(:helper, "_rk_columns_np")] = "_rk_columns_np"
+                push!(mod.used, "_rk_columns_np")
+                push!(mod.helpers, rstrip(_JAX_COLUMNS_NP))
+            end
+            dtypes = join((_host_column_dtype(F) * ", " for F in fieldtypes(eltype(T))))
+            push!(entries, "\"" * name * "\": _rk_columns_np(" * v.code * ", (" * dtypes * "))")
         else
             push!(entries, "\"" * name * "\": " * v.code)
         end

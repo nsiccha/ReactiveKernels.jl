@@ -16,6 +16,26 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.252
+
+- A prepared vector of tuples (or of named numbers) crosses from
+  `prepare_data` to a `jax_source` module's functions as the tuple of its
+  columns, and the functions convert each column with `jnp.asarray`, as they
+  already convert numeric arrays (a float32 module casts each float column).
+  A plate cell then indexes it by its traced index whether the prepared data
+  are host NumPy arrays (eager calls, `jax.jit` with the data closed over) or
+  `jax.jit` arguments. Before, an `@rkppl` model with a dotted ragged cell
+  latent (`e[g] .~ Normal.(…)`) raised `TracerArrayConversionError` in
+  `log_density`, `log_likelihood`, `constrain` and `jax.grad` unless the
+  prepared data were passed to `jax.jit` as arguments, wherever its per-cell
+  dimensions were read inside the cell (since 0.1.240, when RKPPL is
+  installed in a package tree of its own). A data definition that builds the
+  vector with a comprehension (`[(minimum(r), maximum(r)) for r in R]`) was
+  returned as a list of rows, which the functions cannot index by a traced
+  index in any mode; `prepare_data` now returns its columns. A list of rows
+  passed to the functions directly raises a `TypeError` naming the expected
+  form.
+
 ## 0.1.251
 
 - A failed solve of `rk_ode_rk45_tol` or `rk_ode_bdf_tol` throws the new
