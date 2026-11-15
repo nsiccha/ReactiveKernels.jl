@@ -962,6 +962,94 @@ end
     @test LDP.logdensity(named.rp, x) == LDP.logdensity(named.problem, x)
 end
 
+# The shape of snag adaptive-centeri-230d5f0a: a log-normal effect
+# `exp.(m .+ s .* z)` with a positive spread `s`, a second effect whose
+# natural centre is bound data plus the first, and a walk per index whose step
+# SD reads latents no cell selects. The endpoints are definitions `merge`
+# appends, so the model text stays as authored.
+const STATIONS = @rkppl begin
+    m ~ Normal(0, 1)
+    s ~ Exponential(s_prior)
+    z[1:J] .~ Normal.(0, 1)
+    effect = exp.(m .+ s .* z)
+    a[1:J] .~ Normal.(0, 1)
+    other = a_mean .+ a_sd .* a
+    lw_mean ~ Normal(-1, 0.5)
+    lw_spread ~ Exponential(0.5)
+    zw[1:J] .~ Normal.(0, 1)
+    wander_sd = exp.(lw_mean .+ lw_spread .* zw)
+    noise ~ Exponential(1)
+    @plate for j in eachindex(y)
+        @scan begin
+            wander[1] = 0.0
+            for t in 2:length(y[j])
+                wander_innovation ~ Normal(0, 1)
+                wander[t] = wander[t - 1] + wander_sd[j] * wander_innovation
+            end
+        end
+        y[j] .~ Normal.(effect[j] + other[j] .+ wander, noise)
+    end
+end
+
+const STATION_CENTRES = quote
+    log_s = log(s)
+    a_centre = a_mean .+ effect
+    log_a_sd = log(a_sd)
+end
+
+@testset "appended endpoints centre cells beside a chain in one call" begin
+    lengths = [4, 2, 3]
+    J = length(lengths)
+    y = [series .+ 1.0 for series in chain_series(lengths)]
+    data = (; J, s_prior = 1.0, a_mean = [0.1, -0.2, 0.3], a_sd = 0.5)
+    base_plan = markov_chains(STATIONS(; data...), :wander) | (; y)
+    plan = markov_chains(merge(STATIONS, STATION_CENTRES), :wander)(; data...) | (; y)
+    base, built = build_kernel(base_plan), build_kernel(plan)
+    @test coordinate_names(built.layout) == coordinate_names(base.layout)
+    u = 0.1 .* sin.(1:built.layout.total)
+    base_problem = prepare_sampler(base, base_plan, u; backend = BACKEND)
+    problem = prepare_sampler(built, plan, u; backend = BACKEND)
+    # Definitions only the cells read leave the sampler's program as it was:
+    # the two differ in generated-name counters only.
+    program(q) = replace(string(code_expr(q.kernel)), r"#[0-9]+" => "#N")
+    @test program(problem) == program(base_problem)
+    @test !any(n -> occursin(Regex("\\b$n\\b"), program(problem)),
+        ("log_s", "a_centre", "log_a_sd"))
+    @test sampler_value_and_gradient!(problem, similar(u), u) ==
+          sampler_value_and_gradient!(base_problem, similar(u), u)
+
+    cells = (z = (location = :m, log_scale = :log_s),
+        a = (location = :a_centre, log_scale = :log_a_sd))
+    rp = adaptive_centering_problem(built, plan, problem, BACKEND; cells, u0 = u)
+    _, p = map_for(built, plan, cells; u0 = u)
+    # `a_centre` reads `z` through `effect`: `a` is the second level.
+    @test Dict(r.name => r.stage for r in p.records) == Dict(:z => 1, :a => 2)
+    chain = only(rp.reparametrizer.chains)
+    entries = Dict(e.name => e for e in built.layout.entries)
+    block(n) = entries[n].offset .+ (0:entries[n].size-1)
+    zi, ai = block(:z), block(:a)
+    @test length(chain.states) == sum(lengths .- 1)
+    @test isempty(intersect(chain.states, [zi; ai]))
+    @test LDP.logdensity(rp, u) == LDP.logdensity(problem, u)
+    for c in (0.3, 1.0)
+        chosen = map(cell -> merge(cell, (; source = c)), cells)
+        r = adaptive_centering_problem(built, plan, problem, BACKEND; cells = chosen, u0 = u)
+        x = 0.2 .* cos.(1:length(u)) .+ 0.05
+        v = constrain(built.layout, x)
+        expected = copy(x)
+        expected[zi] .= (x[zi] .- c * v.m) .* exp(-c * log(v.s))
+        centre = data.a_mean .+ exp.(v.m .+ v.s .* expected[zi])
+        expected[ai] .= (x[ai] .- c .* centre) .* exp(-c * log(data.a_sd))
+        jac, mapped = WarmupHMC.with_logabsdet_jacobian!(copy(x), r.reparametrizer, x)
+        @test mapped ≈ expected rtol = 1e-12
+        @test jac ≈ -c * J * (log(v.s) + log(data.a_sd)) rtol = 1e-12
+        @test LDP.logdensity(r, x) ≈ LDP.logdensity(problem, expected) + jac rtol = 1e-12
+        value, gradient = LDP.logdensity_and_gradient(r, x)
+        @test value ≈ LDP.logdensity(r, x)
+        @test gradient ≈ finite_gradient(q -> LDP.logdensity(r, q), x) rtol = 1e-5 atol = 1e-7
+    end
+end
+
 @testset "markov_chains refusals" begin
     err(f) = try
         f()

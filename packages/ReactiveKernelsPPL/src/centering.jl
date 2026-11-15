@@ -16,9 +16,21 @@ Select whole real-valued latent parameters by their graph names, for example
 Each location and log-scale is either a `Real` constant shared by the block
 or a symbol naming a value in the model graph. For example,
 `cells = (z = (location = 0.0, log_scale = :z_log_scale),)` needs no named zero
-in the model. A named value is a scalar (shared by the selected coordinates)
-or an array with the latent's shape, indexed in Julia's linear order. Named
-values' numerical work and derivatives stay in the graph. One joint kernel
+in the model. A constant is a runtime input of the endpoint kernel, not part
+of its code. A named value is a latent or a definition, a scalar (shared by
+the selected coordinates) or an array with the latent's shape, indexed in
+Julia's linear order. A definition the model does not have can be appended
+without editing the model's text, before binding:
+
+    merge(model, quote
+        log_s = log(s)
+        z_location = a_mean .+ effect
+    end)
+
+A definition that only cells read leaves the sampler's program and the
+`jax_source` module unchanged, so it costs the density and its gradient
+nothing. Named values' numerical work and derivatives stay in the graph, and
+their arrays are only read. One joint kernel
 computes all selected endpoints, sharing their common graph work across cells
 and both affine roles. WarmupHMC 0.2.21
 or later evaluates it once per vector and level (below) on a map or inverse,
@@ -50,6 +62,11 @@ levels before it are mapped. Cells that read each other's latents, directly
 or through other cells, form a cycle and are refused. Nested levels need
 WarmupHMC 0.3.0 or later, whose accessors read earlier pairs at their model
 values; with WarmupHMC 0.2 they are refused.
+
+Recurrences marked with [`markov_chains`](@ref) get their WarmupHMC
+`MarkovChain`s from the same call, with or without `cells`. A chain's
+coefficients, drift and step size may not read a cell's latent, and no cell's
+location or log-scale may read a chain's states.
 
 Construction evaluates each named value once to check its shape, using `u0`
 (default zeros) as a model-coordinate exemplar. The joint execution kernel
