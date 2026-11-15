@@ -16,6 +16,18 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.255
+
+- `type_stability_level = :rk` audits the functions of exactly the packages of
+  ReactiveKernels' repository (ReactiveKernels, ReactiveKernelsPPL, the other
+  packages under `packages/`, and their extensions), identified by package
+  UUID, the same test `jax_source` uses since 0.1.253. Before, it recursed into
+  every package whose name starts with `ReactiveKernels`, including
+  ReactiveKernelMethods' packages (ReactiveKernelsNUTSExamples,
+  ReactiveKernelsStreamingStats, …), which are now leaves like any other
+  consumer: a call into them must be dispatched statically and return a
+  concrete type, and their bodies are audited at `:all`, the default.
+
 ## 0.1.254
 
 - `ReactiveKernels.js_source(spec; have, want, types, name)` (prototype, not

@@ -296,8 +296,9 @@ end
 #   `ReactiveKernels:snag.type-stability-c-7eeae56d/decisions/2026-10-27T21-12-20-388-04ks7hd`:
 #   "everything", in levels "either everything rk, or everything everything").
 #   `:values` infers the type of every value of the program. `:rk` also audits
-#   the code RK prepares, its generated body and the functions of
-#   ReactiveKernels' packages it calls; every other function is a leaf, whose
+#   the code RK prepares, its generated body and the functions it calls from
+#   the packages of RK's repository (`_rk_repository_module`); every other
+#   function is a leaf, whose
 #   call must be dispatched statically and return a concrete type. `:all` also
 #   audits every function that code calls, except Julia's own (Base, Core and
 #   the standard libraries), which stay leaves.
@@ -388,13 +389,53 @@ function _julia_own_module(m::Module)
     path !== nothing && startswith(path, Sys.STDLIB)
 end
 
-# A module of ReactiveKernels or of a package of its repository
-# (ReactiveKernelsPPL, its extensions, ...), whose names all start so.
-_rk_module(m::Module) = startswith(string(nameof(Base.moduleroot(m))), "ReactiveKernels")
+# The UUIDs of the packages of ReactiveKernels' repository (its root and each
+# package of `packages/`) and of their extensions, which Julia identifies as
+# `uuid5(<package's UUID>, <extension's name>)`. A package is the
+# repository's by this identity wherever it is installed: a developed
+# checkout has ReactiveKernelsPPL under ReactiveKernels' root, a consumer that
+# adds it by URL (`repo-subdir`) in a package tree of its own, and one model
+# emits one module text in both.
+function _rk_repository_package_uuids(root::AbstractString = pkgdir(@__MODULE__))
+    packages = joinpath(root, "packages")
+    files = [joinpath(root, "Project.toml");
+             isdir(packages) ? [joinpath(packages, d, "Project.toml") for d in readdir(packages)] :
+                               String[]]
+    uuids = Set{Base.UUID}()
+    for file in files
+        isfile(file) || continue
+        project = Base.parsed_toml(file)
+        haskey(project, "uuid") || continue
+        uuid = Base.UUID(project["uuid"])
+        push!(uuids, uuid)
+        for extension in keys(get(project, "extensions", Dict{String,Any}()))
+            push!(uuids, Base.uuid5(uuid, extension))
+        end
+    end
+    uuids
+end
+
+# Read on first use in a process (`__init__` clears a value an image kept).
+const _RK_REPOSITORY_PACKAGE_UUIDS = Ref{Union{Nothing,Set{Base.UUID}}}(nothing)
+function _rk_repository_module(m::Module)
+    uuid = Base.PkgId(Base.moduleroot(m)).uuid
+    uuid === nothing && return false
+    uuids = _RK_REPOSITORY_PACKAGE_UUIDS[]
+    if uuids === nothing
+        uuids = _rk_repository_package_uuids()
+        _RK_REPOSITORY_PACKAGE_UUIDS[] = uuids
+    end
+    uuid in uuids
+end
+
+# `_rk_repository_module` is RK's one test of "RK's own": the `:rk` audit
+# recurses into exactly these packages, and `jax_source` names their helpers
+# as internal. A package outside the repository is a consumer, whatever its
+# name (ReactiveKernelMethods' `ReactiveKernels*` packages among them).
 
 # The callees the code audit of a level recurses into.
 _code_recursion(::Val{:rk}) = m::Method ->
-    _rk_module(m.module) || nameof(m.module) === :RuntimeGeneratedFunctions
+    _rk_repository_module(m.module) || nameof(m.module) === :RuntimeGeneratedFunctions
 _code_recursion(::Val{:all}) = m::Method -> !_julia_own_module(m.module)
 
 # The code findings of `f` over `argument_types` at `level`; none at `:values`,
