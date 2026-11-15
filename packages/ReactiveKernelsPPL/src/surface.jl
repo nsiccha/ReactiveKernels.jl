@@ -731,6 +731,8 @@ function _lower_model_latest(m::RKPPLModel, supplied; conditioned = keys(m.condi
     ast = _marginalize_latents(ast, marginalized, values, observing)
     # Recurrences marked as WarmupHMC Markov chains are lowered in their states.
     ast = _chain_latents(ast, m.chains, values, observing)
+    # Observed vectors merged with other values split by entry.
+    ast = _merged_observations(ast, values, observing)
     # Pinned values bind as definitions from here on, not as data.
     pinned = setdiff(Set{Symbol}(keys(values)), data)
     plan = _lower_rkppl_once(ast, data, m.mod;
@@ -1077,6 +1079,7 @@ function _lower_rkppl_latest(ast, data_names, scalars::Set{Symbol},
         _value_array_entries(ast, data, values, mod)
     ast, data = _scalar_value_definitions(ast, data, setdiff(scalars, observed_parameters))
     ast = _indexed_observation_definitions(ast, data)
+    values === nothing || (ast = _merged_observations(ast, values, observing))
     plan = _lower_rkppl_once(ast, data, mod;
         submodel_scopes = scopes, conditioned = observed_parameters, array_entries,
         observing)
@@ -1511,7 +1514,10 @@ function _lower_rkppl_once(ast, input_data::Set{Symbol}, mod::Module;
                     _lower_response(s.lhs, s.rhs, s.range, ctx, predictors,
                         pred_idx, coefuse; count_columns = s.count_columns))
             else
-                _sfail(_broadcast_lhs_msg(s.lhs, detshape))
+                _sfail(something(_observed_definition_msg(s.lhs, detmap,
+                    intersect(observing, data), union(prior_names, plate_names,
+                        Set{Symbol}(st for sc in scans for st in sc.states))),
+                    _broadcast_lhs_msg(s.lhs, detshape)))
             end
         elseif s.lhs in data
             _sfail("$(s.lhs) is data — vector responses broadcast with " *
@@ -3625,7 +3631,7 @@ function _vector_density_factors(sample, factors, det, data, plate_specs, scans,
     union!(model, (st for s in scans for st in s.states))
     factor_value(nm) = haskey(detmap, nm) &&
         _reads_any(detmap[nm], model, detmap) &&
-        !_reads_any(detmap[nm], observed, detmap)
+        !_reads_values_any(detmap[nm], observed, detmap)
     keep = SampleStmt[]
     for s in sample
         if s.broadcast && s.lhs ∉ data && s.range === nothing &&
@@ -3660,6 +3666,22 @@ function _reads_any(ex, names::Set{Symbol}, detmap,
     end
     return false
 end
+
+# Whether `ex` reads the values of any of `names`, directly or through the
+# definitions it reads. A shape read (`length(y)`, `size`, `axes`,
+# `eachindex`) reads its argument's axes, not its values.
+function _reads_values_any(ex, names::Set{Symbol}, detmap,
+        seen::Set{Symbol} = Set{Symbol}())
+    for s in _value_symbols(_without_shape_reads(ex))
+        s in names && return true
+        haskey(detmap, s) && !(s in seen) || continue
+        push!(seen, s)
+        _reads_values_any(detmap[s], names, detmap, seen) && return true
+    end
+    return false
+end
+_without_shape_reads(ex) = !(ex isa Expr) ? ex : _is_shape_read(ex) ? 0 :
+    Expr(ex.head, map(_without_shape_reads, ex.args)...)
 
 # Data-only: every value the expression reads is data or a data-only
 # definition (literals and function values aside).

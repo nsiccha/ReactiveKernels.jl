@@ -16,6 +16,28 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.200
+
+- An observed vector merged with other values is observed entry by entry
+  (data augmentation). In
+  `below[1:K] .~ restricted.(Flat.(), -Inf, limit)`,
+  `value = vcat(measured, below)[order]`, `value .~ Normal.(mu, s)`, the
+  condition `| (; measured)` used to be refused at lowering, with a message
+  that called `value` a scalar definition. Now each entry of `measured` is an
+  observation: it enters `likelihood` and `:pointwise.measured`, in the order
+  of `measured`. The other entries of `value` are one density factor, which
+  enters `prior`. The merge may be `vcat(parts…)[order]` or `vcat(parts…)`
+  (also `[a; b]`), with any number of observed parts in any position, each
+  merged whole, and a built-in family whose arguments are one value or one
+  value per entry. `order` must be a permutation of the merged entries,
+  checked by `bind_data`. The same holds for `marginalize(model, :x)` over
+  such a vector: the measured entries' one-step-ahead predictive densities
+  are the likelihood. Bound as an input instead, `measured` is not
+  conditioned, and every entry's density is a prior factor, as before.
+  Other definitions that read observed data and a sampled value are still
+  refused, and the message now names both reads. `jax_source` emits the
+  split.
+
 ## 0.1.199
 
 - **Breaking:** the link enum `LinkFunction` and its values `IdentityLink`,

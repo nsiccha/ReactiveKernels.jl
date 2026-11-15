@@ -47,7 +47,11 @@ A marginalized array `x` qualifies when
   merged in time order with bounded latents of censored ones (data
   augmentation: `gap[1:K] .~ restricted.(Flat.(), 0, Inf)`,
   `y = vcat(measured, limit .- gap)[order]`). The filter then observes each
-  entry at its value, and the scan's length is supplied. Rows may instead
+  entry at its value, and the scan's length is supplied. Condition the
+  measured rows, `| (; measured)`: their entries' one-step-ahead predictive
+  densities are then the likelihood and `:pointwise.measured`, and the other
+  entries' are prior factors. Bound as an input instead, `measured` is not
+  conditioned, and every entry's density is a prior factor. Rows may instead
   observe the state at their steps, `y .~ Normal.(offset .+ loading .*
   x[step], noise)` with `step` bound integer data: a step may have several
   rows or none. The filter then runs over events (each step, then its rows
@@ -92,7 +96,8 @@ The marginalized program's density is the exact marginal density of the
 observations given the remaining parameters, so `coordinate_names` and the
 layout no longer contain `x` or its innovations. `:pointwise.y` holds the
 one-step-ahead predictive densities (0 at a missing entry), whose sum is the
-marginal likelihood.
+marginal likelihood; for a merged `y`, `:pointwise.measured` holds those of
+the measured entries.
 Exact draws of `x` given the parameters come from
 [`prepare_marginalized_latents`](@ref) and
 [`marginalized_latent_draws`](@ref).
