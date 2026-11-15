@@ -157,7 +157,9 @@ function _wrap_evidence!(r, plan, pre, inputs, base;
         r.family === BernoulliLogitGLMFam ? BernoulliLogitFam :
         r.family === PoissonLogGLMFam ? PoissonLogFam : r.family
     discrete = _evidence_discrete(family)
-    if cdf === nothing
+    # An emitter that supplies both log-space endpoints needs no
+    # probability-space ones; the cells read only the log endpoints.
+    if cdf === nothing && (logcdf === nothing || logccdf === nothing)
         dist = _evidence_endpoint(base)
         cdf = b -> :($dist.cdf($b))
         ccdf = b -> :($dist.ccdf($b))

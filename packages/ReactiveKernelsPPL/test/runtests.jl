@@ -125,6 +125,7 @@ const _PPL_TEST_FILES = (
     "test_evidence_packed_plate.jl",
     "test_evidence_edgecases.jl",
     "test_owned_evidence_tails.jl",
+    "test_ordinal_interval_tails.jl",
     "test_evidence_native_ad.jl",
     "test_lognormal.jl",
     "test_leveled_k_invariance.jl",

@@ -16,6 +16,20 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.198
+
+- `interval_censored`, `censored` and `truncated` evidence on an `Ordinal`
+  or `OrderedLogistic` response keeps a finite, precise log mass in both
+  tails, for both structures and every link. The cumulative cells read the
+  link's log-CDF and log-CCDF at the cutpoints, and the stopping-ratio cells
+  ReactiveKernelsDistributionKernels' `rk_ordinal_stopping_logtail`. They
+  took the logarithm of the exponentiated tails, so an event whose
+  probability lies below `floatmin` read `-Inf` (a Probit event about 60
+  latent standard deviations out), giving NaN gradients, and a log mass
+  within `eps` of zero read `0`. The `jax_source` module of stopping-ratio
+  evidence now has a reverse-mode gradient. Requires
+  ReactiveKernelsDistributionKernels 0.1.12.
+
 ## 0.1.197
 
 - `pool_smc(states)` combines independent SMC clouds of one prepared target:

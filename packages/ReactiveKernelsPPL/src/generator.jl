@@ -825,7 +825,7 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     zero_inflated_binomial_logit_zi,
     normal_id_glm, bernoulli_logit_glm, poisson_log_glm,
     rk_inverse_gaussian_tail, rk_von_mises_cdf, rk_logprob_tail,
-    rk_von_mises_periodic_cdf, rk_ordinal_stopping_logpdf, rk_ordinal_stopping_tail,
+    rk_von_mises_periodic_cdf, rk_ordinal_stopping_logpdf, rk_ordinal_stopping_logtail,
     _half_normal_logpdf_on_support, _half_cauchy_logpdf_on_support
 # This copy is used only by generated PPL code. Its cuts were created at
 # package load, before any model built by a caller; generated model methods
@@ -4432,15 +4432,19 @@ function _ordinal_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sym
         cell = :(isfinite($dref) && $dref > 0 ? $cell : -Inf)
     end
     c = cutref
-    function ordinal_tail(b, upper)
-        K == 1 && return upper ? :($b < 1 ? 1.0 : 0.0) : :($b < 1 ? 0.0 : 1.0)
+    # Evidence reads the link's log-CDF / log-CCDF at a cutpoint directly:
+    # exponentiating them first would underflow a tail mass below floatmin
+    # to zero, and the wrapper's logarithm would then read -Inf.
+    function ordinal_logtail(b, upper)
+        empty, full = upper ? (0.0, -Inf) : (-Inf, 0.0)
+        K == 1 && return :($b < 1 ? $empty : $full)
         levels = r.thresholds isa ThresholdRows ? :(length($c) + 1) : K
-        logtail=upper ? _ordinal_logCC(r.link,:($dref * ($c[$b]-$etav))) :
-            _ordinal_logF(r.link,:($dref * ($c[$b]-$etav)))
-        :($b < 1 ? $(upper ? 1.0 : 0.0) : ($b >= $levels ? $(upper ? 0.0 : 1.0) : exp($logtail)))
+        z = :($dref * ($c[$b] - $etav))
+        logtail = upper ? _ordinal_logCC(r.link, z) : _ordinal_logF(r.link, z)
+        :($b < 1 ? $empty : ($b >= $levels ? $full : $logtail))
     end
-    cell=_wrap_evidence!(r,plan,prests,inputs,cell;
-        cdf=b->ordinal_tail(b,false),ccdf=b->ordinal_tail(b,true))
+    cell = _wrap_evidence!(r, plan, prests, inputs, cell;
+        logcdf=b -> ordinal_logtail(b, false), logccdf=b -> ordinal_logtail(b, true))
     validref === nothing || (cell = :($validref ? $cell : -Inf))
     if r.weights !== nothing
         cell = _weighted_cell(_thread_ref!(inputs, r.weights), cell)
@@ -4556,8 +4560,8 @@ function _ordinal_stopping_evidence_stmts(r, plan, node, pw, K)
         r.link === ProbitLink ? :(Val(:probit)) : :(Val(:cloglog))
     cell = :(rk_ordinal_stopping_logpdf($t, $eta, $d, $effects, $iv, Base.trunc(Int, $yv), $link))
     cell = _wrap_evidence!(r, plan, pre, inputs, cell;
-        cdf=b -> :(rk_ordinal_stopping_tail($t, $eta, $d, $effects, $iv, $b, $link, false)),
-        ccdf=b -> :(rk_ordinal_stopping_tail($t, $eta, $d, $effects, $iv, $b, $link, true)))
+        logcdf=b -> :(rk_ordinal_stopping_logtail($t, $eta, $d, $effects, $iv, $b, $link, false)),
+        logccdf=b -> :(rk_ordinal_stopping_logtail($t, $eta, $d, $effects, $iv, $b, $link, true)))
     if r.discrimination isa ScalePredictorRef
         cell = :(isfinite($d) && $d > 0 ? $cell : -Inf)
     end
@@ -4568,7 +4572,7 @@ end
 function _ordinal_single_evidence_stmts(r, plan, node, pw)
     pre, inputs = Expr[], Any[r.response]
     cell = _wrap_evidence!(r, plan, pre, inputs, :(0.0 * $(_dovar(1)));
-        cdf=b -> :($b < 1 ? 0.0 : 1.0), ccdf=b -> :($b < 1 ? 1.0 : 0.0))
+        logcdf=b -> :($b < 1 ? -Inf : 0.0), logccdf=b -> :($b < 1 ? 0.0 : -Inf))
     r.weights === nothing || (cell = _weighted_cell(_thread_ref!(inputs, r.weights), cell))
     return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
