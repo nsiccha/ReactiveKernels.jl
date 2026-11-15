@@ -16,6 +16,18 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.259
+
+- `jax_source` translates a reduction of a tuple of numbers:
+  `logsumexp((a, b))` (a mixture law's candidate log densities),
+  `maximum`, `minimum`, `prod` and `sum` of such a tuple, its entries of
+  mixed types too (`sum((x, n))`). The tuple becomes one array of its entries'
+  promoted type (a float one for `logsumexp`), since `jax.numpy` reductions
+  refuse a Python tuple; the emitted module raised `TypeError: max requires
+  ndarray or scalar arguments, got <class 'tuple'>` on its first call before.
+  `jax.grad` of a tuple's `logsumexp` is its softmax weights, and 0 when every
+  entry is `-Inf`, as an array's is.
+
 ## 0.1.258
 
 - `prepare(spec; have, want)` and `prepare!(cache, spec; have, want)` accept a
