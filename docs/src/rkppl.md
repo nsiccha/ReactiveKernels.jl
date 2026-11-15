@@ -107,7 +107,7 @@ latents_gaps = prepare_marginalized_latents(built_gaps, with_gaps)
 marginalized_latent_draws(latents_gaps, u, Xoshiro(1)).x
 ```
 
-The observed vector may also be one the model computes, as long as it does not read `x`. Censored rows enter the filter this way (data augmentation). Each censored row's unknown value is a latent bounded by its own range (per-element bounds), and the measured rows join those values in time order. The scan's length is then supplied, and the measured rows are inputs:
+The observed vector may also be one the model computes, as long as it does not read `x`. Censored rows enter the filter this way (data augmentation). Each censored row's unknown value is a latent bounded by its own range (per-element bounds), and the measured rows join those values in time order. The scan's length is then supplied, and the measured rows are conditioned: their entries' one-step-ahead predictive densities are the likelihood and `:pointwise.measured`, and the censored rows' densities are prior factors. Bound as inputs instead, the measured rows are not conditioned, and the whole density is a prior factor:
 
 ```@example marginal
 censored = @rkppl begin
@@ -128,8 +128,11 @@ end
 measured = [0.3, 0.5, 0.0, 0.4]
 limit = [-0.2, -0.3]                            # rows 3 and 6 fell below these
 order = invperm([1, 2, 4, 5, 3, 6])
-augmented = marginalize(censored(; T = 6, K = 2, measured, limit, order), :x)
-coordinate_names(build_kernel(augmented).layout)
+augmented = marginalize(censored(; T = 6, K = 2, limit, order), :x) | (; measured)
+built_censored = build_kernel(augmented)
+censored_pointwise = prepare_query(built_censored, augmented, :pointwise)
+v = zeros(built_censored.layout.total)
+(; coordinates = coordinate_names(built_censored.layout), pointwise = censored_pointwise(v))
 ```
 
 Rows may also observe the state at their steps, `x[step]` with `step` bound integer data, so that a step has several rows or none (several sensors, irregular sampling). The filter then runs over the steps and their rows in order, and the scan's length is supplied:
