@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.260
+## 0.1.262
 
 - `jax_source` translates Statistics' `mean`, `var` and `std` through a new
   package extension, `ReactiveKernelsStatisticsExt` (weak dependency
@@ -28,6 +28,43 @@ are recorded in the git history only.
   `s * (x - mean(x))`, such as a BayesianRegressionModels assignment exported
   with `jax_source(rk.model, rk_bound_plan(rk))`, failed with "the function
   `_mean` has loops or branches". Native execution is unchanged.
+
+## 0.1.261
+
+- A plate cell whose statements each read the one before, such as
+  `m_k = m_{k-1} .+ b[k] .* x_k[rows[i]]` for k up to 140, with a later reader
+  taking the last value entry by entry, now prepares and differentiates
+  however long the chain is. Such statements compose into lazy recipes that
+  hold each other, so their types used to nest as deeply as the chain was
+  long. On a 140-statement cell, Julia's and Enzyme's type inference then
+  overflowed the stack (`Internal error: stack overflow in type inference of
+  _cell_broadcast_entry`, then `StackOverflowError`). Where it did not, the
+  first ordinary Reverse gradient took superlinearly longer: on a toy cell of
+  140 statements, 1322 s against 41 s now. A recipe nested more than 32 levels
+  deep is now stored at its own statement, in one fresh array whose entries
+  are read through its operands' recipes. The statements after it compose over
+  that array. Values and gradients are unchanged.
+
+## 0.1.260
+
+- `jax_source` translates a kernel that captures a `NamedTuple` of data and
+  reads it whole, for example by passing it to a `@traceable` helper
+  (`metadata = (; weights, indices)`; `f(x, metadata)`). The record is the
+  Python tuple of its fields, as a named-tuple HAVE already crosses, and a
+  field read indexes it by position. Each array field is a typed module
+  constant named after the record and the field (`METADATA_WEIGHTS`), keeping
+  Julia's shape, axis order and element type (matrices and higher-rank integer
+  arrays included); a record holding an array is itself a module constant
+  (`METADATA`), and a record of literals stays a static literal (it can size
+  an allocation). A field that is a function or a type raises
+  `JAXEmissionError` naming the field. Before, any captured named tuple read
+  whole raised `JAXEmissionError` (snag emit-an-rk-kerne-6bbd4365).
+- Fix (`jax_source`, silent wrong value): a tuple assignment that writes
+  arrays by index inside a loop or a branch (`loc[p], scale[p] = l, s`) now
+  carries those arrays through `jax.lax.fori_loop` / `jax.lax.cond`, as a
+  single `loc[p] = l` already did. Before, only a tuple target's bare names
+  were carried, so the writes were dropped and the arrays kept their values
+  from before the loop.
 
 ## 0.1.259
 

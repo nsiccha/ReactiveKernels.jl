@@ -598,7 +598,7 @@ const _JAX_CASES = (
         (; y = [0.4, 1.9, -1.0, 1.1, 0.2]),
     # Centred effects: Statistics' `mean` of a parameter vector, `mean` over
     # `dims` of a parameter matrix and a keyword `var` in the graph, and a
-    # data-only standardization in `prepare_data` (RK 0.1.260,
+    # data-only standardization in `prepare_data` (RK 0.1.262,
     # `ReactiveKernelsStatisticsExt`; snag brm-mean-reducti-ab8534c4).
     centred_effects = () -> (@rkppl(begin
         tau ~ Exponential(1.0); s ~ Exponential(1.0)

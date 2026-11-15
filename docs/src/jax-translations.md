@@ -14,7 +14,7 @@ A `Bool` array index (a `BitVector` or `Vector{Bool}`, such as `table[table[:, 2
 
 ## Statistics reductions
 
-With Statistics loaded (`ReactiveKernelsStatisticsExt`, RK 0.1.260), `mean(x)`, `mean(f, x)`, `var(x)` and `std(x)` translate, with the keywords `dims` (one integer known while JAX traces, or `:`), and for `var` and `std` also `corrected` (a literal `true` or `false`) and `mean`. Each is the core `sum`, `length` and `size` translation it composes, `sum(x) / length(x)` and `sum(abs2.(x .- m)) / (n - corrected)`, so a padded row or a `dims` reduction reads only its valid entries and `prepare_data` takes NumPy's spelling. Over `dims` the reduced axis keeps length one, as in Julia. An empty argument, or one entry with `corrected`, gives Julia's NaN. Before, Statistics' own methods, which branch, were refused as "the function `_mean` has loops or branches".
+With Statistics loaded (`ReactiveKernelsStatisticsExt`, RK 0.1.262), `mean(x)`, `mean(f, x)`, `var(x)` and `std(x)` translate, with the keywords `dims` (one integer known while JAX traces, or `:`), and for `var` and `std` also `corrected` (a literal `true` or `false`) and `mean`. Each is the core `sum`, `length` and `size` translation it composes, `sum(x) / length(x)` and `sum(abs2.(x .- m)) / (n - corrected)`, so a padded row or a `dims` reduction reads only its valid entries and `prepare_data` takes NumPy's spelling. Over `dims` the reduced axis keeps length one, as in Julia. An empty argument, or one entry with `corrected`, gives Julia's NaN. Before, Statistics' own methods, which branch, were refused as "the function `_mean` has loops or branches".
 
 ## Package translations
 
