@@ -1694,9 +1694,6 @@ function _js_shape(w::NamedTuple, out)
               for (k, v) in pairs(w)]
     "{ " * join(fields, ", ") * " }"
 end
-_js_want_names(w::Symbol) = (w,)
-_js_want_names(w::Tuple) = Tuple(n for x in w for n in _js_want_names(x))
-_js_want_names(w::NamedTuple) = Tuple(n for x in values(w) for n in _js_want_names(x))
 
 # The kernel function of a plan.
 function _js_plan_function!(mod::_JsModule, fname::String, p::Plan, argtypes, shape)
@@ -1953,7 +1950,7 @@ from Julia's in the last bit.
 """
 function js_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
                    want = _KERNEL_DEFAULT_BOUNDARY, types = nothing, name = :kernel)
-    p = plan(spec; have, want = _js_want_names(want))
+    p = plan(spec; have, want = _kernel_want_leaves(want))
     js_source(p; types, name, shape = want)
 end
 

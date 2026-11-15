@@ -56,6 +56,23 @@ export function spin(x) { for (;;) {} }
             @test only(js_run(tuple, :kernel, [([1.0, 2.0], 1, false)])).value === (2, true)
         end
 
+        @testset "every WANT form comes back as native prepare returns it" begin
+            have = (:x, :k, :flag)
+            types = (; x = Vector{Float64}, k = Int, flag = Bool)
+            cases = [(Float64[], 2, true), ([1.5, -2.0], -3, false)]
+            for want in (:n, (:n,), (:n, :z), (count = :n, scaled = :y, negated = :z),
+                         (a = (:n, :z), b = (c = :y,)), (:n, (s = :y,)), (first = :n, again = :n),
+                         (one = :z,), (:y, :n))
+                source = ReactiveKernels.js_source(js_kinds; have, want, types)
+                native = prepare(js_kinds; have, want)
+                for (c, o) in zip(cases, js_run(source, :kernel, cases))
+                    expected = native(c...)
+                    @test o.error === nothing
+                    @test typeof(o.value) == typeof(expected) && isequal(o.value, expected)
+                end
+            end
+        end
+
         @testset "numbers cross exactly, nonfinite ones and -0.0 included" begin
             x = [NaN, Inf, -Inf, -0.0, 0.1, 1e-310, prevfloat(1.0), 2.0^53]
             o = only(js_run(ECHO, :echo, [(x,)]))

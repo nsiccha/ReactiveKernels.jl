@@ -16,6 +16,23 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.258
+
+- `prepare(spec; have, want)` and `prepare!(cache, spec; have, want)` accept a
+  shaped WANT, the WANT `js_source` and `jax_source` already accept: a
+  `NamedTuple`, or a tuple holding a tuple or a `NamedTuple`, whose leaves are
+  port names, nested as deep as wanted. The kernel returns that shape, each
+  name replaced by its port's value: `want = (curve = :curve, count = :n)`
+  returns `(curve = …, count = …)`, aliases included. A port named twice is
+  computed once; bound data, a `PreparationCache` and an authored signature's
+  defaults and keywords work as for a flat WANT. Before, such a WANT raised
+  `ArgumentError: want entries must be port names or Value objects`; other
+  entry points (`plan`, `extract`, `vectorize`, …) still take port names, and
+  now say which ones accept a shape.
+- `js_run` returns a one-name tuple WANT (`want = (:x,)`) as the bare value, as
+  the native kernel of that WANT returns it; it gave a one-element tuple. Every
+  WANT form now comes back exactly as `prepare(spec; have, want)` returns it.
+
 ## 0.1.257
 
 - `ReactiveKernels.js_run(source, entry, cases; node, vectors, timeout)`
