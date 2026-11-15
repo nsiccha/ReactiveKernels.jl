@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.197
+## 0.1.198
 
 - `interval_censored`, `censored` and `truncated` evidence on an `Ordinal`
   or `OrderedLogistic` response keeps a finite, precise log mass in both
@@ -29,6 +29,20 @@ are recorded in the git history only.
   within `eps` of zero read `0`. The `jax_source` module of stopping-ratio
   evidence now has a reverse-mode gradient. Requires
   ReactiveKernelsDistributionKernels 0.1.12.
+
+## 0.1.197
+
+- `pool_smc(states)` combines independent SMC clouds of one prepared target:
+  `log_normalizer` is the log of the clouds' mean normalizer estimate,
+  `cloud_weights` are proportional to each cloud's estimate,
+  `effective_clouds` counts how many clouds carry the pool, and
+  `positions`/`weights` hold every particle weighted by its cloud weight times
+  its weight in the cloud. It refuses clouds of different targets or
+  temperatures, and of different sources below temperature 1. A cloud that
+  holds a mode which takes over along the path with only a few slowly
+  improving particles has a low log normalizer, and nothing in its own history
+  shows it; the error is one-sided, so the pool is dominated by the highest
+  clouds (snag `tempered-smc-log-c57394d6`).
 
 ## 0.1.196
 
