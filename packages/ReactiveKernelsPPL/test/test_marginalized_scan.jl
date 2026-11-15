@@ -386,8 +386,8 @@ end
         filter(n -> !occursin(r"(^|_)x\.", String(n)), latent)
     @test any(n -> occursin(r"(^|_)x\.", String(n)), latent)
     check_total(built, plan, censored_oracle(built, d))
-    # The merged vector reads parameters, so its term is a factor, as in the
-    # source without `marginalize`: no likelihood or pointwise term.
+    # With `measured` bound as an input, nothing is conditioned: the merged
+    # vector's term is a factor, as in the source without `marginalize`.
     let u = 0.2 .* cos.(1:built.layout.total), latent = bind_data(CENSORED(; d.inputs...))
         lbuilt = build_kernel(latent)
         lu = 0.2 .* cos.(1:lbuilt.layout.total)
@@ -413,6 +413,57 @@ end
     draws = reduce(hcat, (marginalized_latent_draws(q, u, rng).x for _ in 1:n))
     @test all(abs.(vec(Statistics.mean(draws; dims = 2)) .- mean) .< 5 .* sqrt.(diag(cov) ./ n))
     @test Statistics.cov(draws; dims = 2) ≈ cov rtol = 0.05 atol = 0.02 * maximum(diag(cov))
+end
+
+# The measured rows conditioned (`| (; measured)`): their entries' one-step-
+# ahead predictive densities are the likelihood, in the order of `measured`,
+# and the censored rows' are prior factors.
+censored_observed_plan(d) =
+    marginalize(CENSORED(; Base.structdiff(d.inputs, NamedTuple{(:measured,)})...), :x) |
+    (; d.inputs.measured)
+
+@testset "conditioned measured rows are the likelihood of a censored series" begin
+    d = censored_data(16)
+    plan = censored_observed_plan(d)
+    built = build_kernel(plan)
+    # The same coordinates and density as with `measured` bound as an input.
+    @test coordinate_names(built.layout) == coordinate_names(build_kernel(censored_plan(d)).layout)
+    total = censored_oracle(built, d)
+    (; T, measured, limit, lo, hi, order) = d.inputs
+    function split(u)
+        c = constrain(built.layout, u)
+        value = vcat(measured, limit .- c.gap, lo .+ (hi .- lo) .* c.position)[order]
+        lat = latent_moments(0.0, c.sigma^2 / (1 - c.phi^2), fill(c.phi, T), zeros(T),
+            fill(c.sigma^2, T))
+        mu, S = observation_moments(lat, c.mu, 1.0, c.noise)
+        terms = sequential_logpdfs(mu, S, value)
+        (; total = total(u), likelihood = sum(terms[d.seen]), pointwise = terms[d.seen])
+    end
+    check_total(built, plan, total)
+    likelihood = prepare_query(built, plan, :likelihood)
+    pointwise = prepare_query(built, plan, :pointwise)
+    prior = prepare_query(built, plan, :prior)
+    for u in (0.3 .* cos.(1:built.layout.total), 0.4 .* sin.(1:built.layout.total))
+        expected = split(u)
+        @test Base.invokelatest(likelihood, u) ≈ expected.likelihood rtol = 1e-10
+        pw = Base.invokelatest(pointwise, u)
+        @test keys(pw) == (:measured,)
+        @test pw.measured ≈ expected.pointwise rtol = 1e-9 atol = 1e-11
+        @test Base.invokelatest(prior, u) ≈
+            expected.total - expected.likelihood - logjac(built.layout, u) rtol = 1e-10
+    end
+    # Without `marginalize`, the measured rows' Normal densities given `x`.
+    latent = CENSORED(; Base.structdiff(d.inputs, NamedTuple{(:measured,)})...) |
+        (; measured)
+    lbuilt = build_kernel(latent)
+    lu = 0.2 .* cos.(1:lbuilt.layout.total)
+    c = constrain(lbuilt.layout, lu)
+    terms = logpdf.(Normal.(c.mu .+ c.x[d.seen], c.noise), measured)
+    @test Base.invokelatest(prepare_query(lbuilt, latent, :likelihood), lu) ≈ sum(terms) rtol = 1e-10
+    @test Base.invokelatest(prepare_query(lbuilt, latent, :pointwise), lu).measured ≈ terms rtol = 1e-10
+    # One program as rows and censored rows grow.
+    shape(d) = structure(build_kernel(censored_observed_plan(d)).spec)
+    @test shape(d) == shape(censored_data(41; seed = 3))
 end
 
 # ── Rows observing the state at their steps ───────────────────────────────
@@ -1173,6 +1224,7 @@ end
     plans = (; toplevel = ou_plan(d), cell = cell_ou_plan(c),
         missing_entries = marginalize(OU(; d.inputs...), :ou) | (; y = gaps),
         censored = bind_data(censored_plan(censored_data(9))),
+        censored_observed = censored_observed_plan(censored_data(9)),
         gathered = gathered_plan(gathered_data(5, 8)),
         trend = vector_cases(6).trend.plan, ar2 = vector_cases(6).ar2.plan,
         submodel = submodel_plans(6).trend[1],

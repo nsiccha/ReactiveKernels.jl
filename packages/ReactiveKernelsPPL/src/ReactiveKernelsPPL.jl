@@ -173,6 +173,7 @@ include("cell_latent.jl")
 include("observed_scan.jl")
 include("marginalize.jl")
 include("marginalize_vector.jl")
+include("merged_observations.jl")
 include("chains.jl")
 # After the scan lowerings: it translates their helpers.
 include("jax.jl")
