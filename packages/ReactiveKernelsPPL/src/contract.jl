@@ -155,7 +155,13 @@ univariate components, SB `MixtureModel` mirror)."""
 end
 
 """Link functions. The enum crosses the boundary; the thin layer owns the
-inverse-link numerics (R1 counter)."""
+inverse-link numerics (R1 counter).
+
+`LinkFunction` and its values `IdentityLink`, `LogitLink`, `LogLink`,
+`ProbitLink` and `CloglogLink` are public but not exported, because
+BayesianRegressionModels and GLM.jl export link types with the same names.
+Import the ones you name, for example
+`using ReactiveKernelsPPL: LinkFunction, LogitLink`, or write them qualified."""
 @enum LinkFunction::UInt8 begin
     IdentityLink
     LogitLink

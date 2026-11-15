@@ -13,6 +13,7 @@ using Distributions: Normal, Cauchy, TDist, Laplace, Logistic, Uniform,
     Exponential, Bernoulli, logpdf
 using ReactiveKernels
 using ReactiveKernelsPPL
+using ReactiveKernelsPPL: IdentityLink
 using Test
 
 # Lower + bind + build + query a prior-vocab program; return

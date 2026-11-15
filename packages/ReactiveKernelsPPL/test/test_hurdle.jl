@@ -9,6 +9,7 @@ using Distributions: Poisson, Normal, Beta, Exponential, LogNormal, logpdf
 using Enzyme
 using ReactiveKernels
 using ReactiveKernelsPPL
+using ReactiveKernelsPPL: LogitLink, LogLink
 using Test
 
 # Lower + bind + build + query a hurdle program; return

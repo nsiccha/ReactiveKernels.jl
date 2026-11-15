@@ -1,4 +1,5 @@
 using ReactiveKernelsPPL
+using ReactiveKernelsPPL: IdentityLink, LogitLink, LogLink, ProbitLink, CloglogLink
 using Distributions
 using Test
 
@@ -506,6 +507,30 @@ end
     bad.predictors[1] = PredictorSpec(:mu, LogLink, _terms(), :mu)
     # admitted: a noncanonical likelihood/predictor link composition (10gzbm9 support-links)
     @test (validate_plan(bad); true)
+end
+
+# BayesianRegressionModels exports its own `LogitLink`/`ProbitLink`/`CloglogLink`
+# and GLM.jl its own `IdentityLink`/`LogLink`, so a module loading RKPPL beside
+# either must reach the other package's name unqualified
+# (snag rkppl-exports-lo-be4414db).
+@testset "link names are public, not exported" begin
+    for name in (:LinkFunction, :IdentityLink, :LogitLink, :LogLink, :ProbitLink, :CloglogLink)
+        @test !Base.isexported(ReactiveKernelsPPL, name)
+        @static if VERSION >= v"1.11"
+            @test Base.ispublic(ReactiveKernelsPPL, name)
+        end
+    end
+    @test ReactiveKernelsPPL.ProbitLink isa ReactiveKernelsPPL.LinkFunction
+    mod = Module(gensym(:LinkNameClash))
+    Core.eval(mod, :(module OtherLinks
+        export ProbitLink, IdentityLink
+        struct ProbitLink end
+        struct IdentityLink end
+    end))
+    Core.eval(mod, :(using ReactiveKernelsPPL, .OtherLinks))
+    @test Core.eval(mod, :(ProbitLink())) isa mod.OtherLinks.ProbitLink
+    @test Core.eval(mod, :(IdentityLink())) isa mod.OtherLinks.IdentityLink
+    @test Core.eval(mod, :(ReactiveKernelsPPL.ProbitLink)) === ReactiveKernelsPPL.ProbitLink
 end
 
 @testset "slice-2 response validation" begin

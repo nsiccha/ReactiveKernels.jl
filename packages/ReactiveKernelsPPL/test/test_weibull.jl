@@ -9,6 +9,7 @@ using Distributions: LogNormal, Normal, Weibull, logpdf
 using Enzyme
 using ReactiveKernels
 using ReactiveKernelsPPL
+using ReactiveKernelsPPL: LogLink
 using SHA
 using Test
 

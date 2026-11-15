@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.199
+## 0.1.200
 
 - `pool_smc` also takes `smc_checkpoint` records, alone or mixed with SMC
   states, so clouds finished in separate processes pool without their
@@ -27,6 +27,25 @@ are recorded in the git history only.
   `resume_smc` makes, and the identity, temperature and source checks of the
   state method; package versions are not compared. A record that is not a
   checkpoint is refused (snag `pool-smc-cannot-81731f5b`).
+
+## 0.1.199
+
+- **Breaking:** the link enum `LinkFunction` and its values `IdentityLink`,
+  `LogitLink`, `LogLink`, `ProbitLink` and `CloglogLink` are no longer
+  exported. They are declared `public` instead (on Julia 1.11 and later,
+  through Compat), as `adaptive_centering_problem` is since 0.1.172.
+  BayesianRegressionModels exports its own `LogitLink`, `ProbitLink` and
+  `CloglogLink`, and two packages exporting one name leave it undefined in
+  every module that loads both. With this change, BRM's unqualified
+  `Ordinal(Cumulative(), ProbitLink(), ...)` works beside
+  `using ReactiveKernelsPPL`, and GLM.jl's `IdentityLink` and `LogLink` do
+  too. Code that names RKPPL's link values outside an `@rkppl` model, such as
+  a hand-built `PredictorSpec(:eta, LogitLink, terms, :eta)`, adds
+  `using ReactiveKernelsPPL: LinkFunction, IdentityLink, LogitLink, LogLink, ProbitLink, CloglogLink`
+  (or the names it uses), or writes them qualified. `@rkppl` models are
+  unchanged: they name a link by its spelling, such as `ProbitLink()`. A link
+  value printed where its name is not imported now shows qualified, as
+  `ReactiveKernelsPPL.LogitLink`.
 
 ## 0.1.198
 

@@ -9,6 +9,7 @@ using LogExpFunctions: logaddexp
 using Random: Xoshiro, rand, randn
 using ReactiveKernels
 using ReactiveKernelsPPL
+using ReactiveKernelsPPL: LogitLink
 using Test
 
 # Lower + bind + build + query a ZIP program; return

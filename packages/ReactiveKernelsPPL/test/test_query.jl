@@ -2,6 +2,7 @@ using DifferentiationInterface
 using Enzyme
 using ReactiveKernels
 using ReactiveKernelsPPL
+using ReactiveKernelsPPL: IdentityLink, LogitLink
 using Test
 
 # Sampler-query surface tests: preset/registry behavior, prepared value and

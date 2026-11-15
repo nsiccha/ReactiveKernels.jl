@@ -10,6 +10,7 @@ using Distributions: VonMises, Normal, Gamma, LogNormal, logpdf
 using Enzyme
 using ReactiveKernels
 using ReactiveKernelsPPL
+using ReactiveKernelsPPL: IdentityLink, LogLink
 using SpecialFunctions
 using Test
 

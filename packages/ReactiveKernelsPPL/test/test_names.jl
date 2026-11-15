@@ -6,6 +6,7 @@
 # declared prior when a use-site sign negates its contribution. Legacy
 # hand-built coefficient packs retain their predictor-qualified labels.
 using ReactiveKernelsPPL
+using ReactiveKernelsPPL: IdentityLink
 using Test
 using Distributions
 
