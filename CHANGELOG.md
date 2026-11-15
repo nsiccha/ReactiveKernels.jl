@@ -16,6 +16,47 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.256
+
+- `ReactiveKernels.js_source` translates a range written in a helper or a
+  kernel, such as `for _ in 1:60`, `OneTo(3)`, `x .^ (0:4)`,
+  `[f(k) for k in 1:5]`, `map(f, 1:4)` or `plate(1:4) do i ... end`. Such a
+  range is known while translating, so it needs no kernel input, and its
+  bounds are written as number literals. It used to raise `JSEmissionError:
+  the value 1:60 of type UnitRange{Int64} is needed at run time`.
+- A branch whose condition is known while translating (an `if` on a `const`
+  flag, the entry test of a loop over `1:0`, `isempty` of a range a helper is
+  called with) leaves out the code it never runs. It used to raise an internal
+  `JSEmissionError` ("no label for a jump").
+
+## 0.1.255
+
+- `type_stability_level = :rk` audits the functions of exactly the packages of
+  ReactiveKernels' repository (ReactiveKernels, ReactiveKernelsPPL, the other
+  packages under `packages/`, and their extensions), identified by package
+  UUID, the same test `jax_source` uses since 0.1.253. Before, it recursed into
+  every package whose name starts with `ReactiveKernels`, including
+  ReactiveKernelMethods' packages (ReactiveKernelsNUTSExamples,
+  ReactiveKernelsStreamingStats, …), which are now leaves like any other
+  consumer: a call into them must be dispatched statically and return a
+  concrete type, and their bodies are audited at `:all`, the default.
+
+## 0.1.254
+
+- `ReactiveKernels.js_source(spec; have, want, types, name)` (prototype, not
+  exported) emits a self-contained JavaScript (ES) module that computes a
+  kernel's WANT values from its HAVE values in a browser or Node.js, with no
+  server. Plain Julia helpers the kernel calls are translated from their typed
+  code, branches, early returns and loops included, without `@traceable` or
+  another annotation; ordinary recipes, broadcasts, `plate` and `scan`
+  translate, the last two as loops over runtime lengths. Values are `Float64`,
+  `Int64` and `Bool` scalars and vectors of them; indexing is checked, and
+  `log`, `sqrt`, `^` and the like raise Julia's `DomainError`. The module
+  exports the kernel function, `INPUTS`, `OUTPUTS` and `JuliaError`, whose
+  `name` is the Julia exception type. A construct without a translation (a C
+  call, `fma`, a matrix, a scan with `history`) raises `JSEmissionError`
+  naming it and its call chain.
+
 ## 0.1.253
 
 - `jax_source` treats the functions of every package of ReactiveKernels'
