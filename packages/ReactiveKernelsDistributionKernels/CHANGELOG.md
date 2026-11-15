@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.12
+
+- `rk_ordinal_stopping_logtail(t, eta, d, effects, row, k, link, upper)` is
+  the stopping-ratio ordinal law's log tail, `log P(Y <= k)` or
+  `log P(Y > k)`. The upper tail is the sum of the stages' log-CCDFs. The
+  lower tail takes `log1mexp` of that sum once the survival is below 1/2,
+  and otherwise log-sums the category masses, so a CDF below `floatmin` keeps
+  its finite logarithm. `rk_ordinal_stopping_tail` is now its `exp`.
+- The stopping-ratio helpers (`rk_ordinal_stopping_logpdf`, the tails) loop
+  over every stage, `length(t)`, and mask the stages past the level. Their
+  JAX translation is then a counted loop that `jax.grad` reverses; the loop
+  to the observed level was a `while_loop`, which JAX differentiates forward
+  only.
+
 ## 0.1.11
 
 - Normal HMM emissions share one runtime nonzero-scale check across the
