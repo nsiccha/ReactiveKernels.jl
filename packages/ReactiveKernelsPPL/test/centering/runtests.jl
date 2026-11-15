@@ -825,6 +825,143 @@ end
         cells = (z = (location = :z_location, log_scale = :log_scale),)).reparametrizer.chains)
 end
 
+# A walk per cell with a sampled seed: each cell's states are its seed, then
+# its steps, and each cell restarts at its seed's law.
+const SEEDED_CELLS = @rkppl begin
+    s ~ Exponential(1)
+    noise ~ Exponential(1)
+    @plate for g in eachindex(y)
+        @scan begin
+            h[1] ~ Normal(0.5, 2)
+            for t in 2:length(y[g])
+                h[t] ~ Normal(h[t - 1], s)
+            end
+        end
+        y[g] .~ Normal.(h, noise)
+    end
+end
+
+# The shape of snag clarify-per-cell-9b06bb41: two cells of a walk from a
+# fixed zero with unit innovations.
+const UNIT_WALKS = @rkppl begin
+    @plate for j in eachindex(y)
+        @scan begin
+            w[1] = 0.0
+            for t in 2:T
+                innovation ~ Normal(0, 1)
+                w[t] = w[t - 1] + innovation
+            end
+        end
+        y[j] .~ Normal.(w, obs_sd)
+    end
+end
+
+# Three marked walks of different lengths, named so that reading the names
+# back from the graph once failed: `w_frame`'s per-state names contain
+# `_frame_`, and so did `w`'s frame carry, under the same name; `η` ends in a
+# multi-byte character.
+const NAMED_WALKS = @rkppl begin
+    noise ~ Exponential(1)
+    @scan begin
+        w_frame[1] ~ Normal(0, 1)
+        for t in 2:U
+            w_frame[t] ~ Normal(w_frame[t - 1], 0.5)
+        end
+    end
+    @scan begin
+        η[1] ~ Normal(0, 1)
+        for t in 2:V
+            η[t] ~ Normal(η[t - 1], 0.5)
+        end
+    end
+    @scan begin
+        w[1] ~ Normal(0, 1)
+        for t in 2:T
+            w[t] ~ Normal(w[t - 1], 0.5)
+        end
+    end
+    y .~ Normal.(w, noise)
+    v .~ Normal.(w_frame, noise)
+    r .~ Normal.(η, noise)
+end
+
+# The chain's map at controls (phi, c), from WarmupHMC's stated law: state k
+# is phi_k * m_k plus its source coordinate times sd_k^(1 - c_k), where m_k is
+# drift_k at a restart and coef_k * w_(k-1) + drift_k otherwise; the
+# log-Jacobian is sum((1 - c_k) * log(sd_k)).
+function chain_map(x, idx, coef, drift, sd, restart, phi, c)
+    w = similar(x, length(idx))
+    for k in eachindex(idx)
+        m = restart[k] ? drift[k] : coef[k] * w[k - 1] + drift[k]
+        w[k] = phi[k] * m + x[idx[k]] * sd[k]^(1 - c[k])
+    end
+    w, sum((1 .- c) .* log.(sd))
+end
+
+@testset "a per-cell recurrence is one chain that restarts at each cell" begin
+    lengths = [4, 1, 3]
+    n = sum(lengths)
+    seeded = chain_setup(markov_chains(SEEDED_CELLS(), :h) |
+        (; y = chain_series(lengths; seed = 7)))
+    chain = only(seeded.ir.chains)
+    # Coverage: the states are every packed coordinate but `s` and `noise`.
+    names = coordinate_names(seeded.built.layout)
+    @test length(chain.states) == n
+    @test sort(chain.states) == findall(∉((:s, :noise)), names)
+    # What a caller reads before warm-up: one (phi, c) per state, the model
+    # as written.
+    @test WarmupHMC.reparam_sources(seeded.rp).chains == [(phi = zeros(n), c = ones(n))]
+    x = 0.3 .* sin.(1:length(seeded.u)) .+ 0.05
+    s = constrain(seeded.built.layout, x).s
+    restart = reduce(vcat, [[true; falses(m - 1)] for m in lengths])
+    coef = Float64.(.!restart)
+    drift = 0.5 .* restart
+    sd = ifelse.(restart, 2.0, s)
+    starts = cumsum([1; lengths[1:end - 1]])
+    cell(g) = chain.states[starts[g]:starts[g] + lengths[g] - 1]
+    controls = ((zeros(n), ones(n)), (ones(n), zeros(n)),
+        (0.2 .+ 0.6 .* abs.(sin.(1:n)), 0.1 .+ 0.8 .* abs.(cos.(1:n))))
+    for (phi, c) in controls
+        chain.phi .= phi
+        chain.c .= c
+        ljac, y = seeded.ir(x)
+        w, expected_ljac = chain_map(x, chain.states, coef, drift, sd, restart, phi, c)
+        @test y[chain.states] ≈ w rtol = 1e-12
+        @test ljac ≈ expected_ljac atol = 1e-12
+        # Moving one cell's source coordinates moves that cell's states only.
+        for g in eachindex(lengths)
+            bumped = copy(x)
+            bumped[cell(g)] .+= 0.7
+            moved = last(seeded.ir(bumped))
+            others = setdiff(chain.states, cell(g))
+            @test moved[others] == y[others]
+            @test all(moved[cell(g)] .!= y[cell(g)])
+        end
+        lp, gradient = LDP.logdensity_and_gradient(seeded.rp, x)
+        @test lp ≈ LDP.logdensity(seeded.rp, x)
+        @test gradient ≈ finite_gradient(q -> LDP.logdensity(seeded.rp, q), x) rtol = 1e-5 atol = 1e-7
+    end
+    chain.phi .= 0.0
+    chain.c .= 1.0
+    # Two cells of a walk from a fixed zero: four states each, in one chain.
+    toy = chain_setup(markov_chains(UNIT_WALKS(; T = 5, obs_sd = 0.5), :w) |
+        (; y = [zeros(5), zeros(5)]))
+    @test WarmupHMC.reparam_sources(toy.rp).chains == [(phi = zeros(8), c = ones(8))]
+end
+
+@testset "every marked array gets its chain, whatever its name" begin
+    ys = [chain_series([n]; seed = k)[1] for (k, n) in enumerate((4, 6, 3))]
+    named = chain_setup(markov_chains(NAMED_WALKS(; T = 4, U = 6, V = 3), :w_frame, :η, :w) |
+        (; y = ys[1], v = ys[2], r = ys[3]))
+    # One chain per marked array, sorted by name: `w`, `w_frame`, `η`.
+    @test [length(chain.states) for chain in named.ir.chains] == [4, 6, 3]
+    @test sort(reduce(vcat, [chain.states for chain in named.ir.chains])) ==
+        findall(!=(:noise), coordinate_names(named.built.layout))
+    @test [length(src.phi) for src in WarmupHMC.reparam_sources(named.rp).chains] == [4, 6, 3]
+    x = 0.2 .* cos.(1:length(named.u)) .+ 0.1
+    @test LDP.logdensity(named.rp, x) == LDP.logdensity(named.problem, x)
+end
+
 @testset "markov_chains refusals" begin
     err(f) = try
         f()

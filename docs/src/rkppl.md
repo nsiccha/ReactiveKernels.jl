@@ -283,7 +283,11 @@ recurrence qualifies when it is linear-Gaussian in its previous state, as
 for `marginalize`, written centred or non-centred, at top level or in a
 `@plate` cell. RKPPL lowers it in its states, and `adaptive_centering_problem`
 gives it one WarmupHMC `MarkovChain` (WarmupHMC 0.3.1 or later), which adapts
-how far to centre each time step. `cells` may then be omitted.
+how far to centre each time step. `cells` may then be omitted. In a `@plate`
+cell the recurrence is still one chain: every index's states in plate order,
+restarting at each index, so no index's centring reads another's states.
+`WarmupHMC.reparam_sources` lists one `(; phi, c)` per marked array, with one
+entry per state; the `markov_chains` docstring gives the count.
 
 RKPPL 0.1.175 with WarmupHMC
 0.2.21 or later prepares one joint endpoint kernel, sharing common graph work

@@ -16,6 +16,23 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.196
+
+- `markov_chains` reads every marked name back from the lowered graph. A
+  marked array whose name contains `_frame_` or ends in `_frame` got no
+  `MarkovChain` (its per-state values were taken for a frame scan's carry),
+  and marking both `x` and `x_frame` gave two values one name. A name whose
+  last character is multi-byte, such as `η`, made `adaptive_centering_problem`
+  throw a `StringIndexError`. The frame scans now carry
+  `_rkppl_chainframe_<x>_<role>`, a prefix no per-state value has.
+- The `markov_chains` docstring states the chain contract a caller can check.
+  A recurrence per `@plate` index is one chain, not one per index: every
+  index's states in plate order, each index restarting at its own seed law
+  (coefficient 0), with per-state controls, so no centring makes one index's
+  states depend on another's. `WarmupHMC.reparam_sources(rp).chains` holds one
+  `(; phi, c)` per marked array, sorted by name, with one entry per state.
+  This is the behaviour since 0.1.188; only the documentation is new.
+
 ## 0.1.195
 
 - RKPPL's density targets answer `-Inf` where a numerical method cannot
