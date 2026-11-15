@@ -3,6 +3,7 @@ using Distributions
 using Enzyme
 using ReactiveKernels
 using ReactiveKernelsPPL
+using ReactiveKernelsPPL: IdentityLink, LogitLink, LogLink, ProbitLink, CloglogLink
 using Test
 
 # End-to-end generator tests: build → prepare → values vs Distributions.jl

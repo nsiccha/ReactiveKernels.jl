@@ -43,12 +43,15 @@ Private = false
 Import these explicitly, for example
 `using ReactiveKernelsPPL: adaptive_centering_problem`, or call them qualified.
 On Julia 1.11 and later their docstrings appear in the sections above.
+The link enum `LinkFunction` and its values `IdentityLink`, `LogitLink`,
+`LogLink`, `ProbitLink` and `CloglogLink` are public in the same way.
 
 ```@autodocs
 Modules = [ReactiveKernelsPPL]
 Public = false
 Private = true
-Filter = f -> f === Main.ReactiveKernelsPPL.adaptive_centering_problem
+Filter = f -> f === Main.ReactiveKernelsPPL.adaptive_centering_problem ||
+    f === Main.ReactiveKernelsPPL.LinkFunction
 ```
 
 ## Additional exports

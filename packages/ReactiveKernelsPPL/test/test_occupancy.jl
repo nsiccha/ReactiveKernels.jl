@@ -8,6 +8,7 @@ using Distributions: Bernoulli, Exponential, Normal, logpdf
 using Enzyme
 using ReactiveKernels
 using ReactiveKernelsPPL
+using ReactiveKernelsPPL: LogitLink
 using Test
 
 # Lower + bind + build + query an occupancy program; return

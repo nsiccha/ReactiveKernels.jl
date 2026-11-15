@@ -3,6 +3,7 @@ using Distributions
 using Enzyme
 using ReactiveKernels
 using ReactiveKernelsPPL
+using ReactiveKernelsPPL: IdentityLink, LogitLink, LogLink, ProbitLink, CloglogLink
 using Test
 
 # Ordinal latent scale + stage effects (thin-layer slice v12): a modeled

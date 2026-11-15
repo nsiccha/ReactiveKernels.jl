@@ -3,6 +3,7 @@ using Distributions
 using Enzyme
 using ReactiveKernels
 using ReactiveKernelsPPL
+using ReactiveKernelsPPL: IdentityLink, LogitLink, LogLink
 using Test
 
 # Case-A `mi()` missingness (SB parity, log density only): a partly-missing

@@ -4,6 +4,7 @@ using Enzyme
 using LogExpFunctions: logistic, cexpexp, logaddexp
 using ReactiveKernels
 using ReactiveKernelsPPL
+using ReactiveKernelsPPL: LogitLink, LogLink
 using StatsFuns: normcdf
 using Test
 
