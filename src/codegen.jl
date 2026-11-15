@@ -9631,10 +9631,13 @@ checks is `type_stability_level`:
   elements), such as a call to a function whose result is not inferable, is
   reported, naming the value and its recipe.
 - `:rk` also audits the code of the prepared program: the body ReactiveKernels
-  generates and the functions of ReactiveKernels' packages it calls. A used
-  value Julia does not infer concretely, or a call dispatched at run time, is
-  reported with its method. Every other function the code calls is a leaf: its
-  call must be dispatched statically and return a concrete type.
+  generates and the functions it calls from the packages of ReactiveKernels'
+  repository (ReactiveKernels, ReactiveKernelsPPL, the other packages under
+  `packages/`, and their extensions), identified by package UUID. A used value
+  Julia does not infer concretely, or a call dispatched at run time, is
+  reported with its method. Every other function the code calls is a leaf,
+  whatever its package's name: its call must be dispatched statically and
+  return a concrete type.
 - `:all` (the default) also audits every function that code calls, a client
   function's body included, except Julia's own Base, Core and standard
   libraries, which stay leaves.
