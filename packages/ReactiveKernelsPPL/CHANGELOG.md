@@ -16,6 +16,18 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.200
+
+- `pool_smc` also takes `smc_checkpoint` records, alone or mixed with SMC
+  states, so clouds finished in separate processes pool without their
+  target: save each cloud's checkpoint with `Serialization`, deserialize the
+  records in one process with the SMC extension loaded, and pool them. The
+  pooling process prepares no target and evaluates no density, so the records
+  may come from other hosts. A checkpoint passes the target-free checks
+  `resume_smc` makes, and the identity, temperature and source checks of the
+  state method; package versions are not compared. A record that is not a
+  checkpoint is refused (snag `pool-smc-cannot-81731f5b`).
+
 ## 0.1.199
 
 - **Breaking:** the link enum `LinkFunction` and its values `IdentityLink`,

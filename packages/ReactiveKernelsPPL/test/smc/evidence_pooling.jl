@@ -2,7 +2,7 @@ module SMCEvidencePoolingTests
 # Pooling independent SMC clouds (`pool_smc`); snag tempered-smc-log-c57394d6.
 # The prepared Gaussian has exact log evidence `logmass`, so the pooled
 # estimate is checked against the truth.
-using ReactiveKernelsPPL, LogDensityProblems, Random, Statistics, Test
+using ReactiveKernelsPPL, LogDensityProblems, Random, Serialization, Statistics, Test
 include("prepared_fixture.jl")
 using .PreparedSMCFixture
 const F = PreparedSMCFixture
@@ -54,6 +54,37 @@ const E = Base.get_extension(ReactiveKernelsPPL, :ReactiveKernelsPPLSMCExt)
         partial.update, partial.stage)
     @test_throws ArgumentError pool_smc([partial, mixed])
     @test pool_smc([partial, partial]).log_normalizer ≈ partial.log_normalizer rtol=1e-12
+end
+
+# Snag pool-smc-cannot-81731f5b: clouds finished in other processes pool
+# through their checkpoints. test/smc/runtests.jl pools checkpoints written by
+# two other processes in a third that prepares no target (pool_process.jl).
+@testset "pool_smc: smc_checkpoint records pool like their states" begin
+    t = F.target()
+    clouds = [smc(t; rng=Xoshiro(s), particles=300, options=F.options()) for s in 1:3]
+    saved = map(clouds) do cloud
+        buffer = IOBuffer()
+        serialize(buffer, smc_checkpoint(cloud))
+        deserialize(seekstart(buffer))
+    end
+    pooled = pool_smc(clouds)
+    @test pool_smc(saved) == pooled
+    @test pool_smc(Any[saved[1], clouds[2], saved[3]]) == pooled
+    partial = smc(t; rng=Xoshiro(9), particles=300, options=F.options(), stages=1)
+    @test pool_smc([smc_checkpoint(partial), smc_checkpoint(partial)]).log_normalizer ≈
+        partial.log_normalizer rtol=1e-12
+    @test_throws ArgumentError pool_smc(Any[saved[1], smc_checkpoint(partial)])
+    other = smc(F.target(F.GaussianFactory(location=[0.1, 0.2]); binding_id="data-v2");
+        rng=Xoshiro(10), particles=300, options=F.options())
+    @test_throws ArgumentError pool_smc(Any[saved[1], smc_checkpoint(other)])
+    @test_throws ArgumentError pool_smc(Any[clouds[1], smc_checkpoint(other)])
+    # Not a checkpoint: a bare per-cloud record carries no target identity.
+    bare = (; clouds[1].log_normalizer, clouds[1].positions, clouds[1].weights,
+        clouds[1].temperature)
+    @test_throws ArgumentError pool_smc([bare, bare])
+    @test_throws ArgumentError pool_smc(Any[clouds[1], 1.0])
+    reweighted = merge(saved[2], (; weights=[0.5; fill(0.5/299, 299)]))
+    @test_throws ArgumentError pool_smc(Any[saved[1], reweighted])
 end
 
 end

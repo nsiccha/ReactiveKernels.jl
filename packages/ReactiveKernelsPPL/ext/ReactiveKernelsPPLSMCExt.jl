@@ -823,26 +823,37 @@ function PPL.rejuvenate_smc(state::SMCState; tuning::SMCTuningSchedule, moves::I
         copy(state.lineage), _history(state, stage), state.update, state.stage)
 end
 
-function PPL.pool_smc(states::AbstractVector{<:SMCState})
-    isempty(states) && throw(ArgumentError("pool_smc needs at least one SMC state"))
-    reference = first(states)
-    for state in states
-        state.temperature == reference.temperature || throw(ArgumentError(
+# What pool_smc reads of one cloud. A checkpoint stores the same identity and
+# cloud, so clouds finished in other processes pool without their target.
+_pool_cloud(state::SMCState) = (; target=state.target.signature,
+    source=_source_id(state.source), state.temperature, state.log_normalizer,
+    state.positions, state.weights)
+_pool_cloud(checkpoint::NamedTuple) = haskey(checkpoint, :schema_version) ?
+    _checkpoint_record(checkpoint) : _not_a_cloud(checkpoint)
+_pool_cloud(cloud) = _not_a_cloud(cloud)
+_not_a_cloud(cloud) = throw(ArgumentError(string(
+    "pool_smc takes SMC states or smc_checkpoint records, not ", typeof(cloud))))
+
+function PPL.pool_smc(clouds::AbstractVector)
+    isempty(clouds) && throw(ArgumentError("pool_smc needs at least one SMC state or checkpoint"))
+    clouds = map(_pool_cloud, clouds)
+    reference = first(clouds)
+    for cloud in clouds
+        cloud.temperature == reference.temperature || throw(ArgumentError(
             "pooled SMC clouds must share one temperature"))
-        _same(state.target.signature, reference.target.signature) || throw(ArgumentError(
+        _same(cloud.target, reference.target) || throw(ArgumentError(
             "pooled SMC clouds must share one prepared target (model, binding and frame)"))
-        reference.temperature == 1 ||
-            _same(_source_id(state.source), _source_id(reference.source)) || throw(ArgumentError(
+        reference.temperature == 1 || _same(cloud.source, reference.source) || throw(ArgumentError(
             "below temperature 1, pooled SMC clouds must share one source"))
     end
-    logz = [state.log_normalizer for state in states]
+    logz = [cloud.log_normalizer for cloud in clouds]
     peak = maximum(logz)
     cloud_weights = exp.(logz .- peak)
     total = sum(cloud_weights)
     cloud_weights ./= total
-    positions = reduce(hcat, [state.positions for state in states])
-    weights = reduce(vcat, [cloud_weights[c] .* states[c].weights for c in eachindex(states)])
-    return (; log_normalizer=peak + log(total / length(states)), cloud_weights,
+    positions = reduce(hcat, [cloud.positions for cloud in clouds])
+    weights = reduce(vcat, [cloud_weights[c] .* clouds[c].weights for c in eachindex(clouds)])
+    return (; log_normalizer=peak + log(total / length(clouds)), cloud_weights,
         effective_clouds=1 / sum(abs2, cloud_weights), positions, weights)
 end
 
@@ -910,15 +921,32 @@ function PPL.smc_checkpoint(state::SMCState)
         target_scores=_scores(state.target, state.positions, :target, state.temperature)))
 end
 
+# The guards a checkpoint passes on its own, without a target: schema, particle
+# cloud, bridge state, completed-stage weights, ancestry and endpoint scores.
+function _checkpoint_record(cp)
+    cp.schema_version == 1 || throw(ArgumentError("unsupported SMC checkpoint schema"))
+    n = size(cp.positions, 2)
+    n >= 2 && all(isfinite, cp.positions) ||
+        throw(ArgumentError("invalid SMC checkpoint particle positions"))
+    0 <= cp.temperature <= 1 && isfinite(cp.log_normalizer) ||
+        throw(ArgumentError("invalid SMC checkpoint bridge state"))
+    length(cp.weights) == n && all(==(1/n), cp.weights) ||
+        throw(ArgumentError("SMC checkpoint must follow a completed resample/move stage"))
+    length(cp.ancestors) == length(cp.lineage) == n &&
+        all(i -> 1 <= i <= n, cp.ancestors) && all(i -> 1 <= i <= n, cp.lineage) ||
+        throw(ArgumentError("invalid SMC checkpoint ancestry"))
+    length(cp.source_scores) == length(cp.target_scores) == n ||
+        throw(ArgumentError("invalid SMC checkpoint endpoint scores"))
+    return cp
+end
+
 # Every resume guard except the endpoint-score comparison, on a private copy.
 function _checked_checkpoint(target::AbstractSMCTarget, checkpoint, previous)
-    cp = deepcopy(checkpoint)
-    cp.schema_version == 1 || throw(ArgumentError("unsupported SMC checkpoint schema"))
+    cp = _checkpoint_record(deepcopy(checkpoint))
     cp.versions == _versions() || throw(ArgumentError("SMC checkpoint Julia/package versions differ"))
     _same(cp.target, target.signature) || throw(ArgumentError("SMC checkpoint target/model/binding differs"))
     target = _execution_target(target)
-    d, n = size(cp.positions)
-    d == _dimension(target) && n >= 2 && all(isfinite, cp.positions) ||
+    size(cp.positions, 1) == _dimension(target) ||
         throw(ArgumentError("invalid SMC checkpoint particle positions"))
     source = if cp.source.kind === :reference
         previous === nothing || throw(ArgumentError("a reference checkpoint takes no previous posterior"))
@@ -930,15 +958,6 @@ function _checked_checkpoint(target::AbstractSMCTarget, checkpoint, previous)
     else
         throw(ArgumentError("unknown SMC checkpoint source"))
     end
-    0 <= cp.temperature <= 1 && isfinite(cp.log_normalizer) ||
-        throw(ArgumentError("invalid SMC checkpoint bridge state"))
-    length(cp.weights) == n && all(==(1/n), cp.weights) ||
-        throw(ArgumentError("SMC checkpoint must follow a completed resample/move stage"))
-    length(cp.ancestors) == length(cp.lineage) == n &&
-        all(i -> 1 <= i <= n, cp.ancestors) && all(i -> 1 <= i <= n, cp.lineage) ||
-        throw(ArgumentError("invalid SMC checkpoint ancestry"))
-    length(cp.source_scores) == length(cp.target_scores) == n ||
-        throw(ArgumentError("invalid SMC checkpoint endpoint scores"))
     return cp, source, target
 end
 
