@@ -7,7 +7,9 @@
 # `adaptive_centering_problem` then gives the recurrence one `MarkovChain`,
 # whose warm-up adapts its centring per time step. A recurrence per `@plate`
 # index is one chain over every index's states in plate order: each index's
-# first state has `coef = 0`, so the chain restarts there.
+# first state has `coef = 0`, so the chain restarts there. That is the same
+# map as one chain per index, built from one frame-kernel evaluation and one
+# chain pass instead of one per index.
 #
 # The step analysis is `marginalize`'s (`_gaussian_transition`). A
 # non-centred step (`e ~ Normal(0, 1); x[t] = a * x[t - 1] + s * e`) is
@@ -19,6 +21,12 @@
 const _CHAIN_PREFIX = "_rkppl_chain_"
 _chain_name(x::Symbol, role::Symbol) = Symbol(_CHAIN_PREFIX, x, :_, role)
 const _CHAIN_ROLES = (:coef, :drift, :log_scale)
+# The frame scan's carried arrays have a prefix of their own. No marked name
+# then makes one chain's carry another's per-state value (`x` and `x_frame`
+# both marked), and `_centering_chain_names` reads every marked name back
+# from the per-state values' names, whatever it contains.
+const _CHAIN_FRAME_PREFIX = "_rkppl_chainframe_"
+_chain_frame_name(x::Symbol, role::Symbol) = Symbol(_CHAIN_FRAME_PREFIX, x, :_, role)
 
 _chain_fail(x, msg) = _sfail("markov_chains(`$x`): " * msg)
 
@@ -45,9 +53,24 @@ read `x`.
 The program is lowered in the states: a non-centred step becomes its centred
 law, so the packed coordinates are the states of `x` (its sampled seed, then
 each step) instead of its innovations. The density of every other parameter
-is unchanged. A recurrence per `@plate` index is one chain over
-every index's states, restarting at each index. Any other form is refused
-with a `SurfaceLoweringError` naming the statement.
+is unchanged. Any other form is refused with a `SurfaceLoweringError` naming
+the statement.
+
+A recurrence per `@plate` index is one chain too, not one per index: its
+states are every index's, in plate order and in time order within an index.
+Each index's first state has coefficient 0, so its location is that index's
+own seed location and the chain restarts there. Warm-up's controls are per
+state, so no centring makes one index's states depend on another's. Draws
+are in the model's frame under any controls.
+
+`WarmupHMC.reparam_sources(rp)` of the problem `adaptive_centering_problem`
+returns shows the chains as `chains`: one `(; phi, c)` per marked array,
+sorted by name, each with one entry per state. An index contributes its
+scan's length with a sampled seed and one fewer with a fixed seed
+`x[1] = m0`, which is not a state. Before warm-up every entry is
+`phi = 0`, `c = 1`, the model as written. `adaptive_centering_problem`
+throws a `ContractValidationError` rather than build a chain whose recorded
+states do not match the packed seed and step blocks of `x` in number.
 """
 function markov_chains(m::RKPPLModel, names::Symbol...)
     isempty(names) && throw(ArgumentError(
@@ -176,7 +199,7 @@ end
 function _chain_frame_scan(x, law::_GaussianTransition, spec::ScanSpec; cell = false)
     t = law.loopvar
     sampled = _chain_seed_sampled(spec)
-    carried = Dict(r => _chain_name(x, Symbol(:frame_, r)) for r in _CHAIN_ROLES)
+    carried = Dict(r => _chain_frame_name(x, r) for r in _CHAIN_ROLES)
     C, D, L = carried[:coef], carried[:drift], carried[:log_scale]
     # Literal coefficients (`x[t - 1] + …` has coefficient `1`) are floats, so
     # each frame holds one element type, also across `ifelse`.

@@ -238,16 +238,18 @@ function _centering_cells(built, plan::StructuralPlan, cells::NamedTuple;
     (; kernel, records, chains, chain_kernel, dimension = layout.total)
 end
 
-# The recurrences `markov_chains` marked: those whose recorded frame
-# (`_rkppl_chain_<x>_coef`) the graph holds.
+# The recurrences `markov_chains` marked, sorted by name: those whose
+# per-state coefficients (`_rkppl_chain_<x>_coef`) the graph holds. No other
+# name has that prefix and suffix (the frame scans carry
+# `_rkppl_chainframe_<x>_<role>`, and no role ends in another), so `x` may
+# contain anything, `_frame_` or a multi-byte last character included.
 function _centering_chain_names(spec)
     out = Symbol[]
     prefix, suffix = _CHAIN_PREFIX, "_coef"
     for name in keys(spec.ports)
         str = String(name)
-        startswith(str, prefix) && endswith(str, suffix) && !occursin("_frame_", str) ||
-            continue
-        push!(out, Symbol(str[length(prefix)+1:end-length(suffix)]))
+        startswith(str, prefix) && endswith(str, suffix) || continue
+        push!(out, Symbol(chopsuffix(chopprefix(str, prefix), suffix)))
     end
     sort!(out)
 end
