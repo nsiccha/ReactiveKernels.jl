@@ -1773,7 +1773,9 @@ function _jax_expr(ctx::_JaxContext, ::Val{:while}, ex)
             names = [_jax_identifier(inner.used, n) for n in carried]
             _jax_emit!(ctx, "(" * join(names, ", ") * (length(names) == 1 ? ",)" : ")") * " = " * carry)
             for (n, name, v) in zip(carried, names, initial)
-                ctx.locals[n] = _jax_slots(v) ? _PyVal(name, v.T, false, v.extent, v.limit, v.padded, v.origin) : _PyVal(name, v.T)
+                ctx.locals[n] = _jax_slots(v) ?
+                    _PyVal(name, v.T, false, v.extent, v.limit, v.padded, v.origin) :
+                    _PyVal(name, v.T, false, "", "", 0, _jax_carried_origin(v))
             end
             build()
         finally
@@ -1796,7 +1798,8 @@ function _jax_expr(ctx::_JaxContext, ::Val{:while}, ex)
     for (k, (n, v)) in enumerate(zip(carried, initial))
         code = result * "[" * string(k - 1) * "]"
         ctx.locals[n] = _jax_slots(v) ?
-            _PyVal(code, v.T, false, v.extent, v.limit, v.padded, v.origin) : _PyVal(code, v.T)
+            _PyVal(code, v.T, false, v.extent, v.limit, v.padded, v.origin) :
+            _PyVal(code, v.T, false, "", "", 0, _jax_carried_origin(v))
     end
     _PyVal("None", Nothing, true)
 end
