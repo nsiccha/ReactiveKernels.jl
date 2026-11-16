@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.295
+## 0.1.296
 
 - JAX source translates nearest-loop `break`, convergence `while` loops,
   acyclic lowered helper branches, `@simd`, static Boolean `Val` arguments,
@@ -36,6 +36,18 @@ are recorded in the git history only.
 - Derivative regions retain their source plans for backend emission. Native
   calls keep concrete execution tables and do not read the retained plans;
   embedded native copies omit that build-time metadata.
+
+## 0.1.295
+
+- `jax_source` translates empty `NamedTuple()` constructors in prepared
+  recipes and helper bodies, including kernels with no inputs and nested
+  numerical records. Empty records retain the same representation as `(;)`.
+  Literal field-name tuples in type parameters also support the typed
+  constructor spelling `NamedTuple{()}(())`.
+- Numerical record plates retain empty fields and derive their mapped axes
+  from the first stored numerical leaf, including when empty fields come first.
+- Prepared type-constructor recipes use the existing JAX constructor
+  translations, including numeric conversions.
 
 ## 0.1.294
 
