@@ -16,6 +16,22 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.292
+
+- `js_source` lets an authored plate read concrete tuples and named tuples
+  produced by an earlier plate, including records containing ragged vectors.
+  Field projections retain runtime iteration and the producer's shared work.
+- Plates read vector views directly from their parent and broadcast singleton
+  views and ranges alongside other inputs, including empty inputs.
+- Reshaping a vector or vector view into a matrix keeps shared storage and
+  nonnegative runtime dimensions, so hierarchical latent matrices can be emitted too.
+- Numeric-vector and vector-view `cumsum` and `cumprod` use cumulative loops.
+- Matrix columns support a vector of row indices with checked runtime gathering.
+- Borrowed graph gathers retain their parent through plates; ordinary helpers
+  accept view arguments while preserving their loops and lazy reads.
+- Bound numbers, ranges and numeric tuple/named-tuple fields stay in module data
+  storage, including input-check arguments, instead of specializing function bodies.
+
 ## 0.1.291
 
 - `@traceable` and `TraceableSource` accept body-level early returns, including

@@ -12,7 +12,9 @@
 # `_js_function_call` reaches these through `js_calls.jl`, which asks each
 # family of array translations in turn, then the general table (`js.jl`).
 
-_js_ismatrix(v) = (T = _js_type(v); T isa Type && T <: Matrix && eltype(T) <: _JsMatrixElement)
+_js_ismatrix_type(T) = T isa Type && T <: Union{Matrix,Base.ReshapedArray{<:Any,2}} &&
+    eltype(T) <: _JsMatrixElement
+_js_ismatrix(v) = _js_ismatrix_type(_js_type(v))
 _js_iscolon(v) = v isa _JsVal && v.static && v.value isa Colon
 _js_static_int(v) = v isa _JsVal && v.static && v.value isa Integer ? Int(v.value) : nothing
 
@@ -33,6 +35,25 @@ end
 # element type, as Julia's `setindex!` does, and checks its position (and a
 # column's or row's length) as Julia does.
 merge!(_JS_RUNTIME, Dict{Symbol,Tuple{String,Vector{Symbol}}}(
+    :_rk_reshape => ("""
+function _rk_reshape(x, start, length, rows, cols) {
+  if (!(Number.isInteger(rows) && Number.isInteger(cols) && rows * cols === length))
+    throw new JuliaError("DimensionMismatch", "new dimensions must be consistent with array size");
+  if (rows < 0 || cols < 0)
+    throw new JuliaError("ArgumentError", "js_source: reshape requires nonnegative matrix dimensions");
+  const out = new Array(rows);
+  for (let i = 0; i < rows; i++) {
+    const row = new Array(cols);
+    for (let j = 0; j < cols; j++) {
+      const k = start + j * rows + i;
+      Object.defineProperty(row, j, { enumerable: true, configurable: true,
+        get() { return x[k]; }, set(value) { x[k] = value; } });
+    }
+    out[i] = row;
+  }
+  if (rows === 0) out.cols = cols;
+  return out;
+}""", [:JuliaError]),
     :_rk_set2 => ("""
 function _rk_set2(m, v, i, j) {
   const cols = _rk_ncols(m);
@@ -60,6 +81,21 @@ function _rk_mslice(m, i, j) {
     throw new JuliaError("BoundsError", "attempt to access " + m.length + "×" + cols + " array at index [" +
       (i === null ? ":" : i) + ", " + (j === null ? ":" : j) + "]");
 }""", [:JuliaError, :_rk_ncols]),
+    :_rk_checkindices => ("""
+function _rk_checkindices(indices, length) {
+  for (let k = 0; k < indices.length; k++) {
+    const i = indices[k];
+    if (!(Number.isInteger(i) && i >= 1 && i <= length))
+      throw new JuliaError("BoundsError", "attempt to access " + length + "-element view at index [" + i + "]");
+  }
+}""", [:JuliaError]),
+    :_rk_gathercol => ("""
+function _rk_gathercol(m, indices, j) {
+  _rk_mslice(m, null, j);
+  const out = new Array(indices.length);
+  for (let k = 0; k < indices.length; k++) out[k] = _rk_at2(m, indices[k], j);
+  return out;
+}""", [:_rk_mslice, :_rk_at2]),
     :_rk_setrow => ("""
 function _rk_setrow(m, v, i) {
   const cols = _rk_ncols(m);
@@ -226,8 +262,49 @@ function _js_function_call(ir::_JsIR, f::typeof(view), args, T)
     invoke(_js_function_call, Tuple{_JsIR,Function,Any,Any}, ir, f, args, T)
 end
 
+function _js_function_call(ir::_JsIR, ::typeof(reshape), args, T)
+    length(args) == 3 && _js_ismatrix_type(T) && all(_js_isint, args[2:3]) || return nothing
+    source = args[1]
+    if _js_vector_view(source)
+        x, r = source.fields
+        start = _js_rt("(" * _js_range_start(r) * " - 1)", Int64)
+        count = _js_rt(_js_range_length(r), Int64)
+    elseif _js_isflatvector(source)
+        x = _js_simple!(ir, source, "x")
+        start, count = _js_static(0), _js_rt(x.code * ".length", Int64)
+    else
+        return nothing
+    end
+    _js_fcall(ir, _js_use!(ir.fn.mod, :_rk_reshape),
+        Any[x, start, count, args[2], args[3]], T; pure = false)
+end
+
+function _js_function_call(ir::_JsIR, ::typeof(_readonly_gather), args, T)
+    length(args) == 2 || return nothing
+    parent, indices = args
+    (_js_isflatvector(parent) || _js_vector_view(parent) || _js_isslice(parent)) || return nothing
+    _js_isint(indices) && return _js_call!(ir, getindex, args, T)
+    _js_type(indices) === Vector{Int64} || return nothing
+    parent, indices = _js_simple!(ir, parent, "parent"), _js_simple!(ir, indices, "indices")
+    len = _js_call!(ir, length, Any[parent], Int64)
+    _js_flush!(ir)
+    _js_line!(ir.fn, _js_use!(ir.fn.mod, :_rk_checkindices) * "(" * indices.code * ", " *
+                      _js_runtime(ir.fn.mod, len).code * ");")
+    _JsStruct(_readonly_gather, Any[parent, indices], T)
+end
+
 function _js_array_call(ir, f, args, T)
     mod = ir.fn.mod
+    if !isempty(args) && _js_gather_view(args[1])
+        parent, indices = args[1].fields
+        if f === getindex && length(args) == 2 && _js_isint(args[2])
+            index = _js_fcall(ir, _js_use!(mod, :_rk_at), Any[indices, args[2]], Int64)
+            return _js_call!(ir, getindex, Any[parent, index], T)
+        elseif f in (length, lastindex) && length(args) == 1
+            return _js_rt(indices.code * ".length", Int64)
+        end
+        return nothing
+    end
     if f === Base.vect
         return _js_array_literal(ir, args, T)
     elseif f === getindex && !isempty(args) && args[1] isa _JsVal && args[1].static && args[1].value isa Type
@@ -248,6 +325,8 @@ function _js_array_call(ir, f, args, T)
     if f === getindex && length(args) == 3
         i, j = args[2], args[3]
         _js_isint(i) && _js_isint(j) && return _js_fcall(ir, _js_use!(mod, :_rk_at2), Any[m, i, j], T)
+        _js_type(i) === Vector{Int64} && _js_isint(j) &&
+            return _js_fcall(ir, _js_use!(mod, :_rk_gathercol), Any[m, i, j], T; pure = false)
         _js_iscolon(i) && _js_isint(j) && return _js_fcall(ir, _js_use!(mod, :_rk_col), Any[m, j], T; pure = false)
         _js_isint(i) && _js_iscolon(j) && return _js_fcall(ir, _js_use!(mod, :_rk_row), Any[m, i], T; pure = false)
     elseif f === size && length(args) == 1

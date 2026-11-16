@@ -95,8 +95,68 @@ end
     return y
 end
 
+@kernel named_record_groups(xs, scale) = begin
+    records = plate(xs, scale) do row, a
+        values = a .* row
+        (; values, summary = (; total = sum(values)))
+    end
+    rows = plate(records) do record
+        record.values
+    end
+    totals = plate(records) do record
+        record.summary.total
+    end
+    y = (; rows, totals)
+    return y
+end
+
+@kernel tuple_record_groups(xs, scale) = begin
+    records = plate(xs, scale) do row, a
+        values = a .* row
+        (values, sum(values))
+    end
+    rows = plate(records) do record
+        record[1]
+    end
+    totals = plate(records) do record
+        record[2]
+    end
+    y = (; rows, totals)
+    return y
+end
+
 agree(x::Real, y::Real) = isequal(x, y) || isapprox(x, y; rtol = 1e-12, atol = 1e-14)
 agree(x::AbstractArray, y::AbstractArray) = size(x) == size(y) && all(agree.(x, y))
+agree(x::NamedTuple, y::NamedTuple) = keys(x) == keys(y) && all(agree.(values(x), values(y)))
+
+@kernel plate_view(xs, lo, hi, offsets) = begin
+    window = view(xs, lo:hi)
+    y = plate(window, offsets) do value, offset
+        value + offset
+    end
+    return y
+end
+
+@kernel plate_view_range(xs, lo, hi, rlo, rhi) = begin
+    window = view(xs, lo:hi)
+    y = plate(window, rlo:rhi) do value, offset
+        value + offset
+    end
+    return y
+end
+
+@kernel vector_accumulations(xs) = begin
+    sums = cumsum(xs)
+    products = cumprod(xs)
+    return sums, products
+end
+
+@kernel view_accumulations(xs, lo, hi) = begin
+    window = view(xs, lo:hi)
+    sums = cumsum(window)
+    products = cumprod(window)
+    return sums, products
+end
 
 function check(native, source, name, cases)
     for vectors in (:array, :float64array)
@@ -178,6 +238,109 @@ end
             @test all(==(first(bodies)), bodies)
             @test count("for (let ", first(bodies)) >= 2
         end
+    end
+
+    @testset "plates read earlier tuple and named-tuple cells" begin
+        groups = (VV(), [Float64[], [1.0, 2.0]], [collect(1.0:i) for i in 1:23])
+        for spec in (named_record_groups, tuple_record_groups)
+            want = (; rows = :rows, totals = :totals)
+            native = prepare(spec; have = (:xs, :scale), want)
+            source = ReactiveKernels.js_source(spec; have = (:xs, :scale), want,
+                types = (; xs = VV, scale = Float64), name = :records)
+            node && check(native, source, :records, [(xs, a) for xs in groups for a in (0.5, -2.0)])
+            sources = String[]
+            for xs in groups
+                bound = prepare(spec; have = (:xs, :scale), want, bound = (; xs))
+                emitted = ReactiveKernels.js_source(bound; types = (; scale = Float64), name = :bound)
+                push!(sources, emitted)
+                node && check(bound, emitted, :bound, [(0.5,), (-2.0,)])
+            end
+            bodies = [replace(s, r"(?m)^const _rk_bound_.*\n\n" => "") for s in sources]
+            @test all(==(first(bodies)), bodies)
+            @test count("for (let ", first(bodies)) >= 3
+        end
+    end
+
+    @testset "plates read vector views and broadcast singleton ranges" begin
+        native = prepare(plate_view; have = (:xs, :lo, :hi, :offsets), want = :y)
+        types = (; xs = V, lo = Int64, hi = Int64, offsets = V)
+        source = ReactiveKernels.js_source(native; types, name = :window)
+        cases = [(Float64[], 1, 0, Float64[]), (Float64[], 1, 0, [10.0]),
+            ([1.0, 2.0, 3.0], 2, 3, [10.0]), ([1.0, 2.0, 3.0], 2, 2, [10.0, 20.0, 30.0]),
+            (collect(1.0:23.0), 2, 23, ones(22))]
+        node && check(native, source, :window, cases)
+        ranged = prepare(plate_view_range; have = (:xs, :lo, :hi, :rlo, :rhi), want = :y)
+        rangesource = ReactiveKernels.js_source(ranged;
+            types = (; xs = V, lo = Int64, hi = Int64, rlo = Int64, rhi = Int64), name = :ranges)
+        node && check(ranged, rangesource, :ranges,
+            [(Float64[], 1, 0, 1, 0), ([1.0, 2.0, 3.0], 1, 3, 9, 9),
+             ([1.0, 2.0, 3.0], 2, 2, 1, 23)])
+        if node
+            bad = [([1.0, 2.0, 3.0], 0, 2, [10.0]),
+                ([1.0, 2.0, 3.0], 2, 4, [10.0]),
+                ([1.0, 2.0, 3.0], 2, 3, [10.0, 20.0, 30.0])]
+            errors = [BoundsError, BoundsError, DimensionMismatch]
+            for (args, error) in zip(bad, errors)
+                @test_throws error native(args...)
+            end
+            for vectors in (:array, :float64array)
+                @test [o.error for o in ReactiveKernels.js_run(source, :window, bad; vectors)] == string.(nameof.(errors))
+            end
+        end
+        sources = [ReactiveKernels.js_source(
+            prepare(plate_view; have = (:xs, :lo, :hi, :offsets), want = :y, bound = (; xs)),
+            types = (; lo = Int64, hi = Int64, offsets = V), name = :window)
+            for xs in (Float64[], [1.0, 2.0, 3.0], collect(1.0:23.0))]
+        bodies = [replace(s, r"(?m)^const _rk_bound_.*\n\n" => "") for s in sources]
+        @test all(==(first(bodies)), bodies)
+        @test count("for (let ", first(bodies)) >= 1
+    end
+
+    @testset "numeric vector cumulative operations" begin
+        want = (; sums = :sums, products = :products)
+        native = prepare(vector_accumulations; have = (:xs,), want)
+        for (T, cases) in ((V, [(Float64[],), ([-0.0],), ([0.2, 0.1, -2.0],),
+                ([isodd(i) ? 0.99 : 1.01 for i in 1:257],)]),
+                (Vector{Int64}, [(Int64[],), ([1, -2, 0, 3],), (ones(Int64, 257),)]))
+            source = ReactiveKernels.js_source(native; types = (; xs = T), name = :running)
+            node && check(native, source, :running, cases)
+        end
+        source = ReactiveKernels.js_source(native; types = (; xs = V), name = :running)
+        if node
+            result = only(ReactiveKernels.js_run(source, :running, [([-0.0],)]))
+            @test signbit(only(result.value.sums))
+            @test signbit(only(result.value.products))
+        end
+        sources = [ReactiveKernels.js_source(prepare(vector_accumulations;
+            have = (:xs,), want, bound = (; xs)); name = :running)
+            for xs in (Float64[], [0.2, 0.1, -2.0], ones(257))]
+        bodies = [replace(s, r"(?m)^const _rk_bound_.*\n\n" => "") for s in sources]
+        @test all(==(first(bodies)), bodies)
+    end
+
+    @testset "vector view cumulative operations" begin
+        want = (; sums = :sums, products = :products)
+        native = prepare(view_accumulations; have = (:xs, :lo, :hi), want)
+        source = ReactiveKernels.js_source(native; types = (; xs = V, lo = Int64, hi = Int64), name = :running)
+        cases = [(Float64[], 1, 0), ([99.0, -0.0, 88.0], 2, 2),
+                 ([99.0, 0.2, 0.1, -2.0, 88.0], 2, 4), (ones(259), 2, 258),
+                 ([1.0, 2.0], 3, 2)]
+        if node
+            check(native, source, :running, cases)
+            bad = [([1.0], 0, 1), ([1.0], 1, 2)]
+            for args in bad
+                @test_throws BoundsError native(args...)
+            end
+            for vectors in (:array, :float64array)
+                @test all(o -> o.error == "BoundsError", ReactiveKernels.js_run(source, :running, bad; vectors))
+            end
+        end
+        sources = [ReactiveKernels.js_source(prepare(view_accumulations;
+            have = (:xs, :lo, :hi), want, bound = (; xs));
+            types = (; lo = Int64, hi = Int64), name = :running)
+            for xs in (Float64[], ones(3), ones(257))]
+        bodies = [replace(s, r"(?m)^const _rk_bound_.*\n\n" => "") for s in sources]
+        @test all(==(first(bodies)), bodies)
     end
 
     if node

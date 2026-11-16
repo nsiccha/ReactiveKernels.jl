@@ -1790,8 +1790,7 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers,
     return stmts
 end
 
-# The `:observations` query: per observation, the arguments its distribution
-# receives, for every response of a location-scale family. They are read off
+# The original location-scale fields of `:observations` are read off
 # the response's final pointwise plate, whose inputs 1-2 are always the
 # response and its location (`_plate_sum_stmts`); these families thread a
 # non-literal scale as input 3 (`_scale_plate_arg`). Range selection, presence
@@ -1803,19 +1802,21 @@ const _OBSERVATION_LOCATION_SCALE_FAMILIES = (GaussianFam, StudentTFam, LogNorma
 
 function _observation_arguments(r::LikelihoodSpec, plan::StructuralPlan,
         rs::Vector{Expr})
-    r.family in _OBSERVATION_LOCATION_SCALE_FAMILIES || return nothing
     if _cell_broadcast_response(plan, r)
-        name = Symbol(:_ppl_obsargs_, r.label)
+        name = _observation_argument_node(r)
         return any(st -> _assigned_name(st) === name, rs) ? name : nothing
     end
     inputs = _observation_argument_inputs(r, rs)
     inputs === nothing && return nothing
-    location, scale = inputs
-    return :((location = $location, scale = $scale))
+    return _observation_tuple(inputs)
 end
 
 function _observation_argument_inputs(r::LikelihoodSpec, rs::Vector{Expr})
-    r.family in _OBSERVATION_LOCATION_SCALE_FAMILIES || return nothing
+    if r.family ∉ _OBSERVATION_LOCATION_SCALE_FAMILIES
+        i = findlast(st -> _assigned_name(st) === _observation_argument_node(r), rs)
+        i === nothing && return nothing
+        return Pair{Symbol,Any}[f.args[1] => f.args[2] for f in rs[i].args[2].args]
+    end
     pw = _pw_name(r.label)
     i = findlast(st -> Meta.isexpr(st, :(=), 2) && st.args[1] === pw, rs)
     i === nothing && return nothing
@@ -1824,7 +1825,7 @@ function _observation_argument_inputs(r::LikelihoodSpec, rs::Vector{Expr})
         rhs.args[1].args[1] === :plate) || return nothing
     inputs = rhs.args[1].args[2:end]
     scale = r.scale isa Real ? Float64(r.scale) : deepcopy(inputs[3])
-    return deepcopy(inputs[2]), scale
+    return Pair{Symbol,Any}[:location => deepcopy(inputs[2]), :scale => scale]
 end
 
 function _observations_statement(points::Vector{Pair{Symbol,Any}},
@@ -1843,9 +1844,8 @@ function _observations_statement(points::Vector{Pair{Symbol,Any}},
 end
 
 _ppl_observations_unsupported(names::Tuple) = throw(ContractValidationError(
-    "[query] :observations covers responses of the Normal, Student t and " *
-    "LogNormal families observed through a flat, ranged or in-cell plate; " *
-    "this program has no location/scale arguments for " * join(names, ", ")))
+    "[query] :observations has no named distribution parameters for " *
+    join(names, ", ")))
 
 # A dotted `@plate` cell (`y[i] .~ D.(v[i], s)`) broadcasts over its own
 # iteration's values, as Julia does. When the bound response holds one array
@@ -1860,11 +1860,14 @@ function _cell_broadcast_stmts(r::LikelihoodSpec, plan::StructuralPlan,
     # The response's predictor nodes lie on its observation axis, here the
     # indices.
     pointstmts, pointvalue = _ordinal_pointwise_stmts(r, plan; grouped = true)
+    arguments = _observation_argument_inputs(r, stmts)
+    # The flat tuple is rebuilt below from each parameter's group shape.
+    stmts = filter(st -> _assigned_name(st) !== _observation_argument_node(r), stmts)
     return _cell_broadcast_group(plan, r.response, _lik_name(r.label), _pw_name(r.label),
         stmts, upstream, [p.name for p in plan.predictors],
         "response $(r.label) observes one array per index, and its $(r.family) statements";
-        arguments = _observation_argument_inputs(r, stmts),
-        argument_node = Symbol(:_ppl_obsargs_, r.label), pointstmts, pointvalue,
+        arguments,
+        argument_node = _observation_argument_node(r), pointstmts, pointvalue,
         law = _law_name(r.label))
 end
 
@@ -2014,29 +2017,30 @@ function _cell_broadcast_group(plan::StructuralPlan, response::Symbol, node::Sym
         push!(result, :($law = $(groupplate_on(sub, lawcell, lawvalue))))
     end
     if arguments !== nothing
-        location, scale = arguments
         grouped(x) = x isa Symbol && x in argument_pergroup
         append!(result, shared_argument_pre)
-        location_grouped, scale_grouped = grouped(location), grouped(scale)
-        if location_grouped || scale_grouped
+        groupfields = filter(p -> grouped(last(p)), arguments)
+        if !isempty(groupfields)
             argument_cell = Expr[_hsubst(st, aliases) for st in group_argument_pre]
-            _cell_value_types!(argument_cell, Set{Symbol}(aliases[v] for v in lanes))
-            loc = _hsubst(location, aliases)
-            sc = _hsubst(scale, aliases)
-            value = location_grouped && scale_grouped ?
-                :((location = $loc, scale = $sc)) : location_grouped ? loc : sc
+            fields = [field => _hsubst(value, aliases) for (field, value) in groupfields]
+            value = length(fields) == 1 ? last(only(fields)) : _observation_tuple(fields)
+            # Density-only preprocessing (for example converting a numeric
+            # Bernoulli response to Bool) must not make a parameter query
+            # read that response or use it as an otherwise unnecessary axis.
+            groupvalue = Symbol(argument_node, :_value)
+            argument_cell, _ = _needed_statements(Expr[argument_cell..., :($groupvalue = $value)])
+            sub = readlanes(argument_cell, groupvalue)
+            _cell_value_types!(argument_cell, Set{Symbol}(aliases[v] for v in sub))
             grouped_node = Symbol(argument_node, :_groups)
-            push!(result, :($grouped_node = $(groupplate_on(
-                readlanes(argument_cell, value), argument_cell, value))))
+            push!(result, :($grouped_node = $(groupplate_on(sub, argument_cell, groupvalue))))
             project(field) = :(plate($grouped_node) do argument
                 getproperty(argument, $(QuoteNode(field)))
             end)
-            location_grouped && (location = scale_grouped ?
-                project(:location) : grouped_node)
-            scale_grouped && (scale = location_grouped ?
-                project(:scale) : grouped_node)
+            arguments = [field => (grouped(value) ?
+                (length(fields) == 1 ? grouped_node : project(field)) : value)
+                for (field, value) in arguments]
         end
-        push!(result, :($argument_node = (location = $location, scale = $scale)))
+        push!(result, :($argument_node = $(_observation_tuple(arguments))))
     end
     return result
 end
@@ -2281,6 +2285,11 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
         return stmts
     end
     stmts = _response_likelihood_stmts_full(r, plan)
+    parameters = _observation_parameter_stmts(r, stmts)
+    if !isempty(parameters)
+        i = findlast(st -> _assigned_name(st) === _pw_name(r.label), stmts)
+        splice!(stmts, i:i-1, parameters)
+    end
     # The law each observation is drawn from (`prepare_predictive`) is read
     # off the density's own plate before range, presence and packing rewrite
     # it, so those rewrites reach the law exactly as they reach the density.

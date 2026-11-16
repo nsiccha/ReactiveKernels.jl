@@ -37,17 +37,42 @@ name and flat data shape. Conditioned declarations contribute here as
 observations. Summing every field gives `:likelihood`; prior-only models
 return an empty `NamedTuple`.
 
-`:observations` returns, under the same keys, the arguments each
-observation's distribution receives: `(location = …, scale = …)` for
-responses of the Normal, Student t and LogNormal families, where entry `i`
-belongs to entry `i` of the response's `:pointwise` densities and a value
-shared by every observation stays a scalar. Prior-only models return an empty
-`NamedTuple`. For a response holding one array per `@plate` index, locations
-and scales follow the nested `:pointwise` order: a per-entry value holds one
-array per index, a per-index scalar holds one number per index, and a shared
-scalar stays scalar. Preparing it for a program with any other observation
-(another family, a sampling-RHS observation or a conditioned declaration)
-throws a `ContractValidationError` naming them.
+`:observations` returns numeric distribution parameters under the same keys.
+Normal, Student t and LogNormal keep `(location = …, scale = …)`.
+Bernoulli returns `(probability = …, logit = …)` for every link, including
+BernoulliLogit; Exponential returns `(scale = …,)`. These values come from
+the observation's distribution graph, so the same query supports native
+evaluation, ordinary AD and `js_source`.
+
+Other owned distribution objects expose these fields:
+
+| Distribution | Fields |
+|:--|:--|
+| Poisson | `rate` |
+| Binomial | `trials`, `probability`, `logit` |
+| NegativeBinomial | `shape`, `probability` |
+| NegativeBinomial2 | `mean`, `dispersion` |
+| Gamma, Weibull | `shape`, `scale` |
+| InverseGaussian | `mean`, `shape` |
+| Beta (mean/precision form) | `alpha`, `beta` |
+| BetaBinomial | `trials`, `alpha`, `beta` |
+| ZeroInflatedPoisson | `rate`, `zero_probability` |
+| ZeroInflatedBinomial | `trials`, `probability`, `zero_probability` |
+
+Each parameter follows its own broadcast shape, in `:pointwise` order:
+a shared scalar stays scalar, a per-index scalar holds one number per index,
+and a per-entry value in a ragged cell holds one array per index. A new
+design binding can omit responses when the parameters' inputs supply their
+axes. Prior-only models return an empty `NamedTuple`.
+
+The query exposes the underlying distribution's parameters, including for
+censored or truncated responses; it does not return a draw or a conditional
+moment of the censored/truncated law. A response without a recognized
+distribution object (for example a mixture, a sampling-RHS observation, or a
+conditioned declaration) currently causes `ContractValidationError` naming
+the uncovered responses. The direct two-shape Beta form and the specialized
+logit zero-inflation form of ZeroInflatedBinomial are also uncovered.
+Other presets remain available.
 """
 const WORKFLOW_WANTS = (
     sampler = :posterior,

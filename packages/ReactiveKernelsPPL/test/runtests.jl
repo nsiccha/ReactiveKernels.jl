@@ -54,6 +54,7 @@ const _PPL_TEST_FILES = (
     "test_derived_affine_fusion.jl",
     "test_scalar_prior_packing.jl",
     "test_query_derivatives.jl",
+    "test_observation_parameters.jl",
     "test_query_barrier.jl",
     "test_query_inputs.jl",
     "test_sampler_logdensity.jl",
