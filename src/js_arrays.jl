@@ -9,8 +9,8 @@
 # `Object.assign([], { cols: 3 })` for Julia's `zeros(0, 3)`; a bare `[]` is
 # 0×0.
 #
-# These are methods of `_js_function_call` for the functions they translate,
-# falling back to the general table (`js.jl`) for every other argument.
+# `_js_function_call` reaches these through `js_calls.jl`, which asks each
+# family of array translations in turn, then the general table (`js.jl`).
 
 const _JsMatrixElement = Union{Float64,Int64,Bool}
 _js_ismatrix(v) = (T = _js_type(v); T isa Type && T <: Matrix && eltype(T) <: _JsMatrixElement)
@@ -98,12 +98,4 @@ function _js_array_call(ir, f, args, T)
         return _js_fcall(ir, _js_use!(mod, :_rk_mcopy), Any[m], T; pure = false)
     end
     nothing
-end
-
-for F in (Base.vect, getindex, size, length, axes, firstindex, lastindex, copy)
-    @eval function _js_function_call(ir::_JsIR, f::typeof($F), args, T)
-        v = _js_array_call(ir, f, args, T)
-        v === nothing || return v
-        invoke(_js_function_call, Tuple{_JsIR,Function,Any,Any}, ir, f, args, T)
-    end
 end

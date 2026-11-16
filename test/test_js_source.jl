@@ -366,8 +366,113 @@ end
     return v
 end
 
+# Matrix arithmetic. A Hilbert-space approximate Gaussian process surface: a
+# basis matrix times its spectral weights at a length scale (one, or one per
+# axis), on a synthetic sine basis.
+const JS_SQRT2PI = sqrt(2pi)
+js_gp_weights(lambda, sigma, rho::Number) =
+    (sigma * sqrt(rho * JS_SQRT2PI)^size(lambda, 2)) .* exp.(-0.25 .* (rho * rho) .* vec(sum(lambda; dims = 2)))
+js_gp_weights(lambda, sigma, rho::AbstractVector) =
+    (sigma * prod(sqrt.(rho .* JS_SQRT2PI))) .* exp.(-0.25 .* (lambda * (rho .* rho)))
+js_gp_field(phi, lambda, sigma, rho, z) = phi * (js_gp_weights(lambda, sigma, rho) .* z)
+@kernel js_gp_surface(phi, lambda, sigma, rho, z) = begin
+    field = js_gp_field(phi, lambda, sigma, rho, z)
+    return field
+end
+const GP_HALF = 1.3
+const GP_LAMBDA = [((k * pi) / (2GP_HALF))^2 + 0.1 * a for k in 1:6, a in 1:2]
+const GP_PHI = [sin(sqrt(GP_LAMBDA[k, 1]) * (x + GP_HALF)) / sqrt(GP_HALF) for x in range(-1, 1; length = 9), k in 1:6]
+const GP_Z = collect(range(-1.0, 1.0; length = 6))
+@kernel js_matrix_products(A, B, v, w) = begin
+    ab = A * B
+    atv = A' * v
+    vta = (v' * A)'
+    vv = v' * v
+    outer = v * w'
+    btb = transpose(B) * B
+    pb = permutedims(B)
+    chain = A * B * w
+    twice = 2.0 * v
+    return ab
+end
+@kernel js_matrix_arithmetic(A, B, x) = begin
+    s = 2.0 * A .- A / 4
+    total = A + B
+    gap = A - B
+    flip = A' + B'
+    neg = -A
+    scaled = A * x
+    return s
+end
+@kernel js_matrix_sums(A, v) = begin
+    total = sum(A)
+    product = prod(A)
+    cols = sum(A; dims = 1)
+    rows = sum(A; dims = 2)
+    colprod = prod(A; dims = 1)
+    rowprod = prod(A; dims = 2)
+    flat = vec(A)
+    vprod = prod(v)
+    return total
+end
+@kernel js_matrix_extrema(A) = begin
+    top = maximum(A)
+    bottom = minimum(A)
+    rowmax = maximum(A; dims = 2)
+    colmin = minimum(A; dims = 1)
+    return top
+end
+@kernel js_matrix_rowmax(A) = begin
+    rowmax = maximum(A; dims = 2)
+    return rowmax
+end
+function js_doubled(A)
+    out = zeros(size(A, 1), size(A, 2))
+    out .= 2 .* A
+    out
+end
+@kernel js_matrix_broadcasts(A, v, w, k) = begin
+    byrow = A .* v
+    bycol = A .+ w'
+    grid = v .* w'
+    shifted = exp.(A) .- k
+    mask = A .> 0.5
+    kept = ifelse.(A .> 0, A, 0.0)
+    ranged = (1:size(A, 1)) .+ A
+    doubled = js_doubled(A)
+    return byrow
+end
+@kernel js_matrix_fills(m, n, x) = begin
+    z = zeros(m, n)
+    o = ones(Int, m, n)
+    f = fill(x, m, n)
+    return z
+end
+@kernel js_int_algebra(M, u, flags) = begin
+    mu = M * u
+    rows = sum(M; dims = 2)
+    count = sum(flags)
+    colcount = sum(flags; dims = 1)
+    return mu
+end
+# A range of length one broadcast against a longer vector.
+@kernel js_range_broadcast(x, a, b) = begin
+    y = (a:b) .+ x
+    return y
+end
+@kernel js_solve(A, v) = begin
+    y = A \ v
+    return y
+end
+@kernel js_dims3(A) = begin
+    y = sum(A; dims = 3)
+    return y
+end
+
 const V = Vector{Float64}
 const M = Matrix{Float64}
+const GP_TYPES = (; phi = M, lambda = M, sigma = Float64, rho = Float64, z = V)
+const MA = [0.5 -1.0 2.0 0.25; 1.5 0.0 -0.75 3.0; -2.0 0.6 1.0 -0.5]
 const CASES = [
     (:js_scalar, js_scalar, (:a, :b), :c, (; a = Float64, b = Float64),
      [(0.5, 2.0), (-3.0, 0.0), (1e-300, 1e10)]),
@@ -439,6 +544,42 @@ const CASES = [
      [([1 2; 3 4], [true false; false true]), (reshape([5], 1, 1), reshape([true], 1, 1))]),
     (:js_literals, js_literals, (:x, :flag, :k), (:v, :w, :b, :i, :p), (; x = Float64, flag = Bool, k = Int),
      [(0.5, true, 3), (-2.0, false, 0)]),
+    (:js_gp_surface, js_gp_surface, (:phi, :lambda, :sigma, :rho, :z), :field, GP_TYPES,
+     [(GP_PHI, GP_LAMBDA, 0.7, 0.9, GP_Z), (GP_PHI, GP_LAMBDA, 2.0, 0.1, GP_Z),
+      (GP_PHI, GP_LAMBDA, 0.7, 0.9, GP_Z[1:5]), (GP_PHI[:, 1:5], GP_LAMBDA, 0.7, 0.9, GP_Z),
+      (zeros(0, 6), GP_LAMBDA, 0.7, 0.9, GP_Z)]),
+    (:js_gp_axes, js_gp_surface, (:phi, :lambda, :sigma, :rho, :z), :field, merge(GP_TYPES, (; rho = V)),
+     [(GP_PHI, GP_LAMBDA, 0.7, [0.9, 0.4], GP_Z), (GP_PHI, GP_LAMBDA, 0.7, [0.9], GP_Z)]),
+    (:js_matrix_products, js_matrix_products, (:A, :B, :v, :w),
+     (:ab, :atv, :vta, :vv, :outer, :btb, :pb, :chain, :twice),
+     (; A = M, B = M, v = V, w = V),
+     [(MA[:, 1:2], MA[1:2, :], [1.0, -2.0, 0.5], [0.25, 1.0, -1.0, 2.0]),
+      (zeros(0, 2), MA[1:2, :], Float64[], [0.25, 1.0, -1.0, 2.0]),
+      (MA[:, 1:2], MA, [1.0, -2.0, 0.5], [0.25, 1.0, -1.0, 2.0]),
+      (MA[:, 1:2], MA[1:2, :], [1.0, -2.0], [0.25, 1.0, -1.0, 2.0])]),
+    (:js_matrix_arithmetic, js_matrix_arithmetic, (:A, :B, :x), (:s, :total, :gap, :flip, :neg, :scaled),
+     (; A = M, B = M, x = Float64),
+     [(MA, MA .^ 2, -1.5), (MA, MA[:, 1:3], 2.0), (zeros(0, 3), zeros(0, 3), 1.0)]),
+    (:js_matrix_sums, js_matrix_sums, (:A, :v),
+     (:total, :product, :cols, :rows, :colprod, :rowprod, :flat, :vprod), (; A = M, v = V),
+     [(MA, [1.5, -2.0, 0.5]), ([-0.0 -0.0; -0.0 NaN], Float64[]), (zeros(0, 3), [2.0]),
+      (zeros(3, 0), [1.0, 2.0]), (zeros(0, 0), Float64[]), (collect(reshape(range(-1, 1; length = 2400), 40, 60)), [1.0])]),
+    (:js_matrix_extrema, js_matrix_extrema, (:A,), (:top, :bottom, :rowmax, :colmin), (; A = M),
+     [(MA,), ([1.0 NaN 3.0; -0.0 0.0 -1.0],), (reshape([7.0], 1, 1),), (zeros(0, 3),)]),
+    (:js_matrix_rowmax, js_matrix_rowmax, (:A,), :rowmax, (; A = M),
+     [(MA,), (zeros(0, 3),), (zeros(3, 0),), (zeros(0, 0),)]),
+    (:js_matrix_broadcasts, js_matrix_broadcasts, (:A, :v, :w, :k),
+     (:byrow, :bycol, :grid, :shifted, :mask, :kept, :ranged, :doubled), (; A = M, v = V, w = V, k = Float64),
+     [(MA, [1.0, -2.0, 0.5], [0.25, 1.0, -1.0, 2.0], 1.0), (MA, [3.0], [2.0], 0.5),
+      (MA[1:1, :], [1.0, -2.0, 0.5], [0.25, 1.0, -1.0, 2.0], 0.0), (MA, [1.0, 2.0], [0.25, 1.0, -1.0, 2.0], 1.0),
+      (zeros(0, 4), Float64[], [0.25, 1.0, -1.0, 2.0], 1.0)]),
+    (:js_matrix_fills, js_matrix_fills, (:m, :n, :x), (:z, :o, :f), (; m = Int, n = Int, x = Float64),
+     [(2, 3, 1.5), (0, 3, 1.0), (2, 0, -1.0), (-1, 2, 1.0)]),
+    (:js_int_algebra, js_int_algebra, (:M, :u, :flags), (:mu, :rows, :count, :colcount),
+     (; M = Matrix{Int}, u = Vector{Int}, flags = Matrix{Bool}),
+     [([1 2 3; 4 5 6], [1, -1, 2], [true false; true true]), ([1 2; 3 4], [1, 2, 3], reshape([true], 1, 1))]),
+    (:js_range_broadcast, js_range_broadcast, (:x, :a, :b), :y, (; x = V, a = Int, b = Int),
+     [([1.0, 2.0, 3.0], 1, 1), ([1.0, 2.0, 3.0], 2, 4), ([1.0, 2.0, 3.0], 1, 2), ([5.0], 1, 3)]),
 ]
 
 agree(a::Real, b::Real) = (isnan(a) && isnan(b)) || isapprox(a, b; rtol = 1e-12, atol = 1e-15)
@@ -567,6 +708,27 @@ agree(a, b) = false
         @test e isa ReactiveKernels.JSEmissionError
         @test occursin("Distributions.jl law", e.message) && occursin("standard_student_t(nu).cdf(z)", e.message)
         @test occursin("js_tdist_cdf", e.message)
+        e = try
+            ReactiveKernels.js_source(js_solve; have = (:A, :v), want = :y, types = (; A = M, v = V))
+        catch err
+            err
+        end
+        @test e isa ReactiveKernels.JSEmissionError
+        @test occursin("`\\`", e.message)
+        e = try
+            ReactiveKernels.js_source(js_dims3; have = (:A,), want = :y, types = (; A = M))
+        catch err
+            err
+        end
+        @test e isa ReactiveKernels.JSEmissionError
+        @test occursin("dims = 1", e.message) && occursin("(dims = 3,)", e.message)
+    end
+
+    @testset "matrix arithmetic reads rows in place" begin
+        source = ReactiveKernels.js_source(js_gp_surface; have = (:phi, :lambda, :sigma, :rho, :z), want = :field,
+                                           types = GP_TYPES)
+        @test occursin("_rk_matvec(phi, ", source) && occursin("_rk_reduce2(lambda, ", source)
+        @test occursin("_rk_vec(", source) && !occursin("_rk_transpose", source)
     end
 
     @testset "a module copies only the special functions it uses" begin

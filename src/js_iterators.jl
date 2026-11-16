@@ -15,8 +15,8 @@
 # `argmin`, `argmax`, `findmin`, `findmax` and `filter` of a vector translate
 # here too, with Julia's order (`NaN` first, then `-0.0` before `0.0`).
 #
-# These are methods of `_js_function_call` for the functions they translate,
-# falling back to the general table (`js.jl`) for every other argument.
+# `_js_function_call` reaches these through `js_calls.jl`, which asks each
+# family of array translations in turn, then the general table (`js.jl`).
 
 _JS_RUNTIME[:_rk_findmin] = ("""
 function _rk_findmin(x, empty) {
@@ -295,15 +295,6 @@ function _js_iter_call(ir::_JsIR, f, args, T)
         return _js_reduce_iter!(ir, args[2].value, args[3], T; init)
     end
     nothing
-end
-
-for F in (collect, sum, maximum, minimum, count, any, all, isempty, argmin, argmax, findmin, findmax, filter,
-          Base.Iterators.filter, Core.kwcall)
-    @eval function _js_function_call(ir::_JsIR, f::typeof($F), args, T)
-        v = _js_iter_call(ir, f, args, T)
-        v === nothing || return v
-        invoke(_js_function_call, Tuple{_JsIR,Function,Any,Any}, ir, f, args, T)
-    end
 end
 
 # `Iterators.Filter(p, itr)` and a generator over another iterator, built while
