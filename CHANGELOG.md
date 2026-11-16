@@ -16,6 +16,18 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.286
+
+- JAX host preparation translates `findall(vector)`,
+  `findall(predicate, vector)` and `Dict(zip(keys, values))`, including
+  `eachindex` values and dictionary lookups inside data-only plates.
+  Searches return one-based positions, zip remains reusable and stops at its
+  shortest input (its zero-argument form remains infinite). Dictionaries
+  preserve duplicate-key replacement and Julia's `isequal` key semantics.
+  These operations retain runtime loops,
+  including for empty inputs, and can supply standalone `prepare_data`
+  definitions without Julia-computed intermediate values.
+
 ## 0.1.285
 
 - `jax_source` keeps predicates and arithmetic over prepared integers static
