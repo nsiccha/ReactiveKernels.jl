@@ -4,7 +4,8 @@ using ReactiveKernels
 using LogExpFunctions: log1pexp, logistic
 using Test
 using Base: OneTo
-using SpecialFunctions: erf, erfc, erfcx, logerfc, gamma, loggamma, logabsgamma, logbeta
+using SpecialFunctions: erf, erfc, erfcx, logerfc, gamma, loggamma, logabsgamma, logbeta, beta_inc,
+    beta_inc_inv, gamma_inc, gamma_inc_inv
 using LogExpFunctions: log1pexp, log1mexp
 import Distributions
 
@@ -164,6 +165,47 @@ js_parity(x) = iseven(x) ? 1.0 : isodd(x) ? -1.0 : 0.0
 js_logabsgamma_value(a) = first(logabsgamma(a))
 js_logabsgamma_sign(a) = last(logabsgamma(a))
 js_tdist_cdf(x, nu) = Distributions.cdf(Distributions.TDist(nu), x)
+# Stepped ranges, constant or computed at run time, and the tuple tools
+# SpecialFunctions' incomplete gamma function uses: `ntuple`, `cumprod`,
+# `findfirst` with `something`, `minmax`, `map` and an irrational constant.
+function js_countdown(n, x)
+    s = 0.0
+    for k in n:-1:1
+        s = s * x + k
+    end
+    for k in 10:-3:1
+        s += k
+    end
+    s
+end
+js_stride(a, s, b) = (r = a:s:b; isempty(r) ? -length(r) - 1 : length(r) + 10first(r) + 100last(r) + 1000step(r))
+function js_tuple_tools(x)
+    ts = cumprod(ntuple(i -> x / i, Val(6)))
+    k = something(findfirst(<(0.1), ts), 7)
+    lo, hi = minmax(x, 2x)
+    a, b = map(abs, (x, -2x))
+    ts[min(k, 6)] + k + lo * hi + a + b + π * x + (iszero(x) ? 1.0 : 0.0)
+end
+js_beta_inc_inv_x(a, b, p) = first(beta_inc_inv(a, b, p))
+js_beta_inc_inv_y(a, b, p) = last(beta_inc_inv(a, b, p))
+
+# Irrational constants written in the source, through Julia's methods for them:
+# arithmetic rounds the constant to `Float64`; a comparison rounds it up or down
+# (`Float64(π) < π` holds) and `==` is false; `ℯ^x` is `exp(x)`, `sin(π)` is
+# `0.0`; a constant of another package's `@irrational` rounds as Base's do; a
+# helper given `π` is specialized on it.
+Base.@irrational js_half_turn 1.57079632679489661923132169163975144 big(π) / 2
+js_t_density(x, nu) =
+    exp(loggamma((nu + 1) / 2) - loggamma(nu / 2) - log(nu * π) / 2 - (nu + 1) / 2 * log1p(x^2 / nu))
+js_irr_arith(x, n) = x * π + π * x - 2π * n + (n + π) - x / π + inv(π) * x - π * x * x + 2 * π * x +
+                     sqrt(2π) * x + max(x, π) - min(x, ℯ) + x^π + (x > 0) * π
+js_irr_compare(x) = (x < π ? 1 : 0) + (x > π ? 2 : 0) + (x <= ℯ ? 4 : 0) + (x == π ? 8 : 0) +
+                    (π >= x ? 16 : 0) + (x != ℯ ? 32 : 0)
+js_irr_exact(x) = ℯ^x + log(ℯ) * x + sin(π) + cos(π) * x + ℯ^2
+js_irr_custom(x) = x * js_half_turn + (x < js_half_turn ? 1.0 : 0.0) + (x > js_half_turn ? 2.0 : 0.0)
+js_scaled_by(a, c) = c * a
+js_circle(r) = js_scaled_by(r^2, π)
+js_turns(v) = v / ℯ
 
 @kernel js_scalar(a, b) = begin
     c = a * b + exp(-a) / (1 + b^2)
@@ -330,8 +372,60 @@ end
     m = log1mexp(-abs(x))
     return p
 end
+@kernel js_steps(n, x, a, s, b) = begin
+    c = js_countdown(n, x)
+    r = js_stride(a, s, b)
+    return c
+end
+@kernel js_tuple_tools_k(x) = begin
+    y = js_tuple_tools(x)
+    return y
+end
+# The incomplete beta function and its inverse come from stdlib-js; the
+# incomplete gamma function and its inverse translate from their Julia code.
+@kernel js_beta_incs(a, b, x) = begin
+    t = beta_inc(a, b, x)
+    p = first(t)
+    q = last(t)
+    return p
+end
+@kernel js_beta_inc_inv(a, b, p) = begin
+    x = js_beta_inc_inv_x(a, b, p)
+    y = js_beta_inc_inv_y(a, b, p)
+    return x
+end
+@kernel js_gamma_incs(a, x) = begin
+    t = gamma_inc(a, x)
+    p = first(t)
+    q = last(t)
+    return p
+end
+@kernel js_gamma_inc_inv(a, p) = begin
+    x = gamma_inc_inv(a, p, 1 - p)
+    return x
+end
 @kernel js_tdist(x, nu) = begin
     p = js_tdist_cdf(x, nu)
+    return p
+end
+@kernel js_irrationals(x, nu, n) = begin
+    d = js_t_density.(x, nu)
+    w = x .* π
+    a = js_irr_arith.(x, n)
+    c = js_irr_compare.(x)
+    e = js_irr_exact.(x)
+    h = js_irr_custom.(x)
+    q = js_circle.(x)
+    s = π * x
+    u = x * π
+    t = js_turns(x)
+    return d
+end
+# A number times an array is a broadcast in Julia's methods, matrices included.
+@kernel js_irr_matrix(A) = begin
+    p = π * A
+    s = A * ℯ
+    r = A / π
     return p
 end
 
@@ -366,8 +460,159 @@ end
     return v
 end
 
+# Matrix arithmetic. A Hilbert-space approximate Gaussian process surface: a
+# basis matrix times its spectral weights at a length scale (one, or one per
+# axis), on a synthetic sine basis.
+const JS_SQRT2PI = sqrt(2pi)
+js_gp_weights(lambda, sigma, rho::Number) =
+    (sigma * sqrt(rho * JS_SQRT2PI)^size(lambda, 2)) .* exp.(-0.25 .* (rho * rho) .* vec(sum(lambda; dims = 2)))
+js_gp_weights(lambda, sigma, rho::AbstractVector) =
+    (sigma * prod(sqrt.(rho .* JS_SQRT2PI))) .* exp.(-0.25 .* (lambda * (rho .* rho)))
+js_gp_field(phi, lambda, sigma, rho, z) = phi * (js_gp_weights(lambda, sigma, rho) .* z)
+@kernel js_gp_surface(phi, lambda, sigma, rho, z) = begin
+    field = js_gp_field(phi, lambda, sigma, rho, z)
+    return field
+end
+const GP_HALF = 1.3
+const GP_LAMBDA = [((k * pi) / (2GP_HALF))^2 + 0.1 * a for k in 1:6, a in 1:2]
+const GP_PHI = [sin(sqrt(GP_LAMBDA[k, 1]) * (x + GP_HALF)) / sqrt(GP_HALF) for x in range(-1, 1; length = 9), k in 1:6]
+const GP_Z = collect(range(-1.0, 1.0; length = 6))
+@kernel js_matrix_products(A, B, v, w) = begin
+    ab = A * B
+    atv = A' * v
+    vta = (v' * A)'
+    vv = v' * v
+    outer = v * w'
+    btb = transpose(B) * B
+    pb = permutedims(B)
+    chain = A * B * w
+    twice = 2.0 * v
+    return ab
+end
+@kernel js_matrix_arithmetic(A, B, x) = begin
+    s = 2.0 * A .- A / 4
+    total = A + B
+    gap = A - B
+    flip = A' + B'
+    neg = -A
+    scaled = A * x
+    return s
+end
+@kernel js_matrix_sums(A, v) = begin
+    total = sum(A)
+    product = prod(A)
+    cols = sum(A; dims = 1)
+    rows = sum(A; dims = 2)
+    colprod = prod(A; dims = 1)
+    rowprod = prod(A; dims = 2)
+    flat = vec(A)
+    vprod = prod(v)
+    return total
+end
+@kernel js_matrix_extrema(A) = begin
+    top = maximum(A)
+    bottom = minimum(A)
+    rowmax = maximum(A; dims = 2)
+    colmin = minimum(A; dims = 1)
+    return top
+end
+@kernel js_matrix_rowmax(A) = begin
+    rowmax = maximum(A; dims = 2)
+    return rowmax
+end
+function js_doubled(A)
+    out = zeros(size(A, 1), size(A, 2))
+    out .= 2 .* A
+    out
+end
+@kernel js_matrix_broadcasts(A, v, w, k) = begin
+    byrow = A .* v
+    bycol = A .+ w'
+    grid = v .* w'
+    shifted = exp.(A) .- k
+    mask = A .> 0.5
+    kept = ifelse.(A .> 0, A, 0.0)
+    ranged = (1:size(A, 1)) .+ A
+    doubled = js_doubled(A)
+    return byrow
+end
+@kernel js_matrix_fills(m, n, x) = begin
+    z = zeros(m, n)
+    o = ones(Int, m, n)
+    f = fill(x, m, n)
+    return z
+end
+@kernel js_int_algebra(M, u, flags) = begin
+    mu = M * u
+    rows = sum(M; dims = 2)
+    count = sum(flags)
+    colcount = sum(flags; dims = 1)
+    return mu
+end
+# A range of length one broadcast against a longer vector.
+@kernel js_range_broadcast(x, a, b) = begin
+    y = (a:b) .+ x
+    return y
+end
+@kernel js_solve(A, v) = begin
+    y = A \ v
+    return y
+end
+@kernel js_dims3(A) = begin
+    y = sum(A; dims = 3)
+    return y
+end
+# `const` global arrays the code reads are module-level arrays holding their
+# values (snag js-source-stack-1e1692d1: a broadcast over one recursed until
+# the stack overflowed, and a run-time use of one was refused).
+const JS_LEVELS = [50.0, 100.0, 200.0, 300.0, 400.0]
+const JS_COUNTS = [1, -2, 3]
+const JS_FLAGS = [true, false, true]
+const JS_GRID = [1.0 2.0; 3.0 4.0; 5.0 6.0]
+const JS_NOROWS = zeros(0, 2)
+const JS_BUFFER = zeros(3)
+const JS_WORDS = ["a", "b"]
+function js_share_above(line, v)
+    n = 0
+    for i in eachindex(v)
+        v[i] > line && (n += 1)
+    end
+    n / length(v)
+end
+function js_fill_buffer(x)
+    JS_BUFFER .= x
+    sum(JS_BUFFER)
+end
+@kernel js_constants(scale, x, i, line) = begin
+    dose = JS_LEVELS
+    scaled = scale .* JS_LEVELS
+    shifted = x .+ JS_LEVELS
+    times = scale * JS_LEVELS
+    picked = JS_LEVELS[i]
+    total = scale * sum(JS_LEVELS)
+    counts = 2 .* JS_COUNTS
+    signs = ifelse.(JS_FLAGS, scale, -scale)
+    grid = scale .* JS_GRID
+    projected = JS_GRID * [scale, 1.0]
+    norows = JS_NOROWS .+ scale
+    share = js_share_above(line, JS_LEVELS)
+    nested = scale .* (JS_LEVELS .+ 1.0)
+    fused = x .+ (2 .* 3)
+    return scaled
+end
+@kernel js_buffered(x) = begin
+    t = js_fill_buffer(x)
+    return t
+end
+@kernel js_words(scale) = begin
+    y = scale .* length.(JS_WORDS)
+    return y
+end
+
 const V = Vector{Float64}
 const M = Matrix{Float64}
+const GP_TYPES = (; phi = M, lambda = M, sigma = Float64, rho = Float64, z = V)
+const MA = [0.5 -1.0 2.0 0.25; 1.5 0.0 -0.75 3.0; -2.0 0.6 1.0 -0.5]
 const CASES = [
     (:js_scalar, js_scalar, (:a, :b), :c, (; a = Float64, b = Float64),
      [(0.5, 2.0), (-3.0, 0.0), (1e-300, 1e10)]),
@@ -428,6 +673,25 @@ const CASES = [
     (:js_logbeta, js_logbeta, (:a, :b), :y, (; a = Float64, b = Float64),
      [(a, b) for a in (0.25, 0.5, 2.5, 40.0, 1e6) for b in (0.5, 3.0, 7.5, 9.0, 1e3)] ∪
      [(-1.0, -2.0), (-0.5, 2.0), (0.0, 1.0), (-2.5, 0.75)]),
+    # a step of zero raises `ArgumentError`; empty ranges count none
+    (:js_steps, js_steps, (:n, :x, :a, :s, :b), (:c, :r), (; n = Int, x = Float64, a = Int, s = Int, b = Int),
+     [(5, 0.5, 1, 2, 9), (0, 2.0, 9, -3, 1), (-2, 1.0, 1, 1, 0), (3, -1.0, 4, -1, 4), (4, 1.5, 9, 2, 1),
+      (2, 1.0, 1, 0, 3)]),
+    (:js_tuple_tools_k, js_tuple_tools_k, (:x,), :y, (; x = Float64), [(x,) for x in (0.05, 0.5, 2.0, 0.0, -3.0)]),
+    (:js_beta_incs, js_beta_incs, (:a, :b, :x), (:p, :q), (; a = Float64, b = Float64, x = Float64),
+     [(a, b, x) for a in (0.0, 0.25, 2.5, 30.0, 1e4, -1.0, NaN) for b in (0.0, 0.5, 3.0)
+      for x in (0.0, 1e-300, 1e-10, 0.3, 0.9, 1 - 1e-12, 1.0, 1.5, NaN)]),
+    (:js_beta_inc_inv, js_beta_inc_inv, (:a, :b, :p), (:x, :y), (; a = Float64, b = Float64, p = Float64),
+     [(a, b, p) for a in (0.25, 1.0, 2.5, 30.0, 5e5) for b in (0.5, 3.0)
+      for p in (0.0, 1e-12, 0.05, 0.5, 0.95, 1 - 1e-12, 1.0, -0.1, 1.1)]),
+    # large shapes included: there stdlib-js's `gammainc` is inaccurate, and the
+    # module runs SpecialFunctions' own algorithm
+    (:js_gamma_incs, js_gamma_incs, (:a, :x), (:p, :q), (; a = Float64, x = Float64),
+     [(a, x) for a in (0.0, 1e-3, 0.5, 1.0, 2.5, 30.0, 1e4, -1.0, NaN)
+      for x in (0.0, 1e-8, 0.5, 2.0, 30.0, 1e4, Inf, -1.0, NaN)] ∪
+     [(a, a + k * sqrt(a)) for a in (1e3, 2e3, 1e5) for k in (-3, -1, 0, 1, 3)]),
+    (:js_gamma_inc_inv, js_gamma_inc_inv, (:a, :p), :x, (; a = Float64, p = Float64),
+     [(a, p) for a in (1e-3, 0.5, 1.0, 2.5, 30.0, 2e3, 1e4) for p in (0.0, 1e-12, 0.05, 0.5, 0.95, 1 - 1e-12, 1.0)]),
     (:js_logexp, js_logexp, (:x,), (:p, :m), (; x = Float64),
      [(x,) for x in (-Inf, -800.0, -40.0, -1.0, -0.0, 0.0, 1e-10, 0.5, 3.0, 40.0, 800.0, Inf, NaN)]),
     (:js_matrix_reads, js_matrix_reads, (:m, :j), (:col, :row, :corner, :extent), (; m = M, j = Int),
@@ -439,6 +703,59 @@ const CASES = [
      [([1 2; 3 4], [true false; false true]), (reshape([5], 1, 1), reshape([true], 1, 1))]),
     (:js_literals, js_literals, (:x, :flag, :k), (:v, :w, :b, :i, :p), (; x = Float64, flag = Bool, k = Int),
      [(0.5, true, 3), (-2.0, false, 0)]),
+    (:js_gp_surface, js_gp_surface, (:phi, :lambda, :sigma, :rho, :z), :field, GP_TYPES,
+     [(GP_PHI, GP_LAMBDA, 0.7, 0.9, GP_Z), (GP_PHI, GP_LAMBDA, 2.0, 0.1, GP_Z),
+      (GP_PHI, GP_LAMBDA, 0.7, 0.9, GP_Z[1:5]), (GP_PHI[:, 1:5], GP_LAMBDA, 0.7, 0.9, GP_Z),
+      (zeros(0, 6), GP_LAMBDA, 0.7, 0.9, GP_Z)]),
+    (:js_gp_axes, js_gp_surface, (:phi, :lambda, :sigma, :rho, :z), :field, merge(GP_TYPES, (; rho = V)),
+     [(GP_PHI, GP_LAMBDA, 0.7, [0.9, 0.4], GP_Z), (GP_PHI, GP_LAMBDA, 0.7, [0.9], GP_Z)]),
+    (:js_matrix_products, js_matrix_products, (:A, :B, :v, :w),
+     (:ab, :atv, :vta, :vv, :outer, :btb, :pb, :chain, :twice),
+     (; A = M, B = M, v = V, w = V),
+     [(MA[:, 1:2], MA[1:2, :], [1.0, -2.0, 0.5], [0.25, 1.0, -1.0, 2.0]),
+      (zeros(0, 2), MA[1:2, :], Float64[], [0.25, 1.0, -1.0, 2.0]),
+      (MA[:, 1:2], MA, [1.0, -2.0, 0.5], [0.25, 1.0, -1.0, 2.0]),
+      (MA[:, 1:2], MA[1:2, :], [1.0, -2.0], [0.25, 1.0, -1.0, 2.0])]),
+    (:js_matrix_arithmetic, js_matrix_arithmetic, (:A, :B, :x), (:s, :total, :gap, :flip, :neg, :scaled),
+     (; A = M, B = M, x = Float64),
+     [(MA, MA .^ 2, -1.5), (MA, MA[:, 1:3], 2.0), (zeros(0, 3), zeros(0, 3), 1.0)]),
+    (:js_matrix_sums, js_matrix_sums, (:A, :v),
+     (:total, :product, :cols, :rows, :colprod, :rowprod, :flat, :vprod), (; A = M, v = V),
+     [(MA, [1.5, -2.0, 0.5]), ([-0.0 -0.0; -0.0 NaN], Float64[]), (zeros(0, 3), [2.0]),
+      (zeros(3, 0), [1.0, 2.0]), (zeros(0, 0), Float64[]), (collect(reshape(range(-1, 1; length = 2400), 40, 60)), [1.0])]),
+    (:js_matrix_extrema, js_matrix_extrema, (:A,), (:top, :bottom, :rowmax, :colmin), (; A = M),
+     [(MA,), ([1.0 NaN 3.0; -0.0 0.0 -1.0],), (reshape([7.0], 1, 1),), (zeros(0, 3),)]),
+    (:js_matrix_rowmax, js_matrix_rowmax, (:A,), :rowmax, (; A = M),
+     [(MA,), (zeros(0, 3),), (zeros(3, 0),), (zeros(0, 0),)]),
+    (:js_matrix_broadcasts, js_matrix_broadcasts, (:A, :v, :w, :k),
+     (:byrow, :bycol, :grid, :shifted, :mask, :kept, :ranged, :doubled), (; A = M, v = V, w = V, k = Float64),
+     [(MA, [1.0, -2.0, 0.5], [0.25, 1.0, -1.0, 2.0], 1.0), (MA, [3.0], [2.0], 0.5),
+      (MA[1:1, :], [1.0, -2.0, 0.5], [0.25, 1.0, -1.0, 2.0], 0.0), (MA, [1.0, 2.0], [0.25, 1.0, -1.0, 2.0], 1.0),
+      (zeros(0, 4), Float64[], [0.25, 1.0, -1.0, 2.0], 1.0)]),
+    (:js_matrix_fills, js_matrix_fills, (:m, :n, :x), (:z, :o, :f), (; m = Int, n = Int, x = Float64),
+     [(2, 3, 1.5), (0, 3, 1.0), (2, 0, -1.0), (-1, 2, 1.0)]),
+    (:js_int_algebra, js_int_algebra, (:M, :u, :flags), (:mu, :rows, :count, :colcount),
+     (; M = Matrix{Int}, u = Vector{Int}, flags = Matrix{Bool}),
+     [([1 2 3; 4 5 6], [1, -1, 2], [true false; true true]), ([1 2; 3 4], [1, 2, 3], reshape([true], 1, 1))]),
+    (:js_range_broadcast, js_range_broadcast, (:x, :a, :b), :y, (; x = V, a = Int, b = Int),
+     [([1.0, 2.0, 3.0], 1, 1), ([1.0, 2.0, 3.0], 2, 4), ([1.0, 2.0, 3.0], 1, 2), ([5.0], 1, 3)]),
+    # the floats either side of `π`, `ℯ` and `π/2`; a negative base of `x^π`
+    # raises `DomainError`
+    (:js_irrationals, js_irrationals, (:x, :nu, :n), (:d, :w, :a, :c, :e, :h, :q, :s, :u, :t),
+     (; x = V, nu = Float64, n = Int),
+     [([0.0, 0.5, 1.0, float(ℯ), prevfloat(float(ℯ)), nextfloat(float(ℯ)), float(π), prevfloat(float(π)),
+        nextfloat(float(π)), Float64(π / 2), nextfloat(Float64(π / 2)), 10.0, 1e3, Inf, NaN], 4.5, 3),
+      (Float64[], 1.0, 0), ([2.0, 3.0], 0.25, -7), ([1.0, -2.0], 3.0, 1)]),
+    (:js_irr_matrix, js_irr_matrix, (:A,), (:p, :s, :r), (; A = M),
+     [([1.0 -2.0 0.5; 3.0 NaN -Inf],), (reshape([7.5], 1, 1),), (zeros(0, 3),), (zeros(2, 0),)]),
+    # a length-two `x` against five levels is a DimensionMismatch, a sixth level a BoundsError
+    (:js_constants, js_constants, (:scale, :x, :i, :line),
+     (:dose, :scaled, :shifted, :times, :picked, :total, :counts, :signs, :grid, :projected, :norows, :share,
+      :nested, :fused),
+     (; scale = Float64, x = V, i = Int, line = Float64),
+     [(100.0, [1.0, 2.0, 3.0, 4.0, 5.0], 2, 150.0), (-0.5, [1.0], 5, 1e3), (2.0, [1.0, 2.0], 1, 0.0),
+      (2.0, [1.0], 6, 0.0)]),
+    (:js_buffered, js_buffered, (:x,), :t, (; x = V), [([1.0, 2.0, 3.0],), ([4.0],), ([1.0, 2.0],)]),
 ]
 
 agree(a::Real, b::Real) = (isnan(a) && isnan(b)) || isapprox(a, b; rtol = 1e-12, atol = 1e-15)
@@ -543,6 +860,23 @@ agree(a, b) = false
         @test occursin("x < -745.1332191019412", soft) && !occursin("indexed_iterate", soft)
     end
 
+    @testset "irrational constants are translated through Julia's methods" begin
+        source = ReactiveKernels.js_source(js_irrationals; have = (:x, :nu, :n), want = (:d, :a, :c, :e, :h, :q),
+                                           types = (; x = V, nu = Float64, n = Int))
+        body(name) = (i = findfirst("function " * name * "(", source);
+                      source[i[1]:findnext("\n}\n", source, i[1])[end]])
+        @test occursin("nu * 3.141592653589793", body("js_t_density")) && !occursin("Irrational", source)
+        # `2 * π * x` folds from the left: `2 * π` is a constant
+        @test occursin("6.283185307179586 * x", body("js_irr_arith")) && !occursin("afoldl", source)
+        # `x < π` compares with π rounded down, `x > π` with π rounded up
+        compare = body("js_irr_compare")
+        @test occursin("x <= 3.141592653589793", compare) && occursin("3.1415926535897936 <= x", compare)
+        @test occursin("Math.exp(x)", body("js_irr_exact")) && !occursin("_rk_pow", body("js_irr_exact"))
+        @test occursin("1.5707963267948968 <= x", body("js_irr_custom"))
+        # a helper given `π` takes only the other argument
+        @test occursin(r"function js_scaled_by\(a\) \{", source)
+    end
+
     @testset "unsupported constructs are named" begin
         e = try
             ReactiveKernels.js_source(js_c_call; have = (:x,), want = :y, types = (; x = Float64))
@@ -567,6 +901,51 @@ agree(a, b) = false
         @test e isa ReactiveKernels.JSEmissionError
         @test occursin("Distributions.jl law", e.message) && occursin("standard_student_t(nu).cdf(z)", e.message)
         @test occursin("js_tdist_cdf", e.message)
+        e = try
+            ReactiveKernels.js_source(js_solve; have = (:A, :v), want = :y, types = (; A = M, v = V))
+        catch err
+            err
+        end
+        @test e isa ReactiveKernels.JSEmissionError
+        @test occursin("`\\`", e.message)
+        e = try
+            ReactiveKernels.js_source(js_dims3; have = (:A,), want = :y, types = (; A = M))
+        catch err
+            err
+        end
+        @test e isa ReactiveKernels.JSEmissionError
+        @test occursin("dims = 1", e.message) && occursin("(dims = 3,)", e.message)
+    end
+
+    @testset "a const global array is a module-level array" begin
+        source = ReactiveKernels.js_source(js_constants; have = (:scale, :x, :i, :line),
+                                           want = (:dose, :scaled, :grid, :norows, :share),
+                                           types = (; scale = Float64, x = V, i = Int, line = Float64))
+        # emitted once each, named after the global, its values exact
+        @test count("const _rk_const_JS_LEVELS = [50.0, 100.0, 200.0, 300.0, 400.0];", source) == 1
+        @test count("_rk_const_JS_LEVELS = ", source) == 1
+        @test occursin("const _rk_const_JS_GRID = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];", source)
+        @test occursin("const _rk_const_JS_NOROWS = Object.assign([], { cols: 2 });", source)
+        # the broadcast is one loop over the constant
+        @test occursin("_rk_const_JS_LEVELS.length", source)
+        # a global the code writes stays writable, as natively
+        buffered = ReactiveKernels.js_source(js_buffered; have = (:x,), want = :t, types = (; x = V))
+        @test occursin("const _rk_const_JS_BUFFER = [", buffered) && !occursin("Object.freeze", buffered)
+        # an array without a JavaScript value is refused by name
+        e = try
+            ReactiveKernels.js_source(js_words; have = (:scale,), want = :y, types = (; scale = Float64))
+        catch err
+            err
+        end
+        @test e isa ReactiveKernels.JSEmissionError
+        @test occursin("`Vector{String}` is needed at run time", e.message) && occursin("JS_WORDS", e.message)
+    end
+
+    @testset "matrix arithmetic reads rows in place" begin
+        source = ReactiveKernels.js_source(js_gp_surface; have = (:phi, :lambda, :sigma, :rho, :z), want = :field,
+                                           types = GP_TYPES)
+        @test occursin("_rk_matvec(phi, ", source) && occursin("_rk_reduce2(lambda, ", source)
+        @test occursin("_rk_vec(", source) && !occursin("_rk_transpose", source)
     end
 
     @testset "a module copies only the special functions it uses" begin
@@ -577,11 +956,18 @@ agree(a, b) = false
         @test occursin("Apache License, Version 2.0", gamma_source)
         erfs = ReactiveKernels.js_source(js_erfs; have = (:x,), want = (:e, :c, :cx, :lc), types = (; x = Float64))
         @test count("var _rk_stdlib_erfc=", erfs) == 1 && !occursin("_rk_stdlib_gamma", erfs)
+        # the incomplete gamma function is translated, not vendored
+        incgamma = ReactiveKernels.js_source(js_gamma_incs; have = (:a, :x), want = (:p, :q),
+                                             types = (; a = Float64, x = Float64))
+        @test !occursin("gammainc", incgamma) && occursin("while (true)", incgamma)
+        @test occursin("var _rk_stdlib_betainc=", ReactiveKernels.js_source(js_beta_incs; have = (:a, :b, :x),
+                       want = (:p, :q), types = (; a = Float64, b = Float64, x = Float64)))
         # each vendored file defines its one function and carries the notices
         # of the implementation it follows
         for (name, notice) in ((:erf, "Sun Microsystems"), (:erfc, "Sun Microsystems"),
                                (:erfcx, "Massachusetts Institute of Technology"),
-                               (:gamma, "Cephes"), (:gammaln, "Sun Microsystems"))
+                               (:gamma, "Cephes"), (:gammaln, "Sun Microsystems"),
+                               (:betainc, "Boost Software License"), (:betaincinv, "Boost Software License"))
             text = read(joinpath(pkgdir(ReactiveKernels), "src", "js_vendor", string(name, ".js")), String)
             @test occursin("var _rk_stdlib_" * string(name) * "=", text)
             @test occursin(notice, text)

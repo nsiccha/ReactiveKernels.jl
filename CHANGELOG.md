@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.268
+## 0.1.277
 
 - `ReactiveKernels.jax_source` with `data` partitions a top-level plate by the
   branches of its cell whose condition reads only the plate's data (a
@@ -34,6 +34,201 @@ are recorded in the git history only.
   not depend on the data. Values and gradients are unchanged. A plate with
   more than eight patterns, a mapped argument that is not a vector of numbers,
   or a value that is not a vector of numbers stays one `jax.vmap`.
+
+## 0.1.276
+
+- `js_source` translates arithmetic on `Bool`s as Julia does it, with native
+  values and types: a `Bool` operand of `+`, `-`, `*`, `/`, `^`, `min`/`max`,
+  a comparison or another function of Julia's own, next to `Float64`s,
+  `Int64`s or other `Bool`s, runs Julia's method for those operands,
+  translated from its typed code. `(a .> x) .+ (b .> x)` gives `Int`s,
+  `w .* (v .> x)` gives `Float64`s, `true * true` stays a `Bool`, and the
+  zeros keep their signs: `false * -Inf` is `-0.0` and `false + -0.0` is
+  `-0.0`, as natively. `Int(b)`, `Float64(b)`, `float(b)`, `convert`,
+  `promote`, `zero`, `one` and `oneunit` take a `Bool` (`0` or `1`). `sum` of a
+  `Bool` vector counts its `true`s, and `+`, `-`, `*` and `/` of `Bool`
+  vectors translate like those of number vectors. Before, each was refused
+  with "`+` with argument types (Bool, Bool) has no JavaScript translation".
+- `js_source` reads the `BitVector` of a comparison broadcast (`x .> c`) like
+  a `Vector{Bool}`: `sum(x .> c)`, `count(x .> c)`, `any`/`all` of it and
+  `w .* (x .> c)` translate, with Julia's types (`Int` from `sum`). A
+  `BitMatrix` is still refused.
+- `float` of an `Int` is a `Float64` while translating, as natively. It used
+  to keep the `Int` type, so a later `^` or `div` could take the integer path.
+
+## 0.1.275
+
+- `js_source` emits a `const` global array the code reads: a vector, or a
+  matrix as an array of row arrays, of `Float64`, `Int64` or `Bool` becomes a
+  module-level array (`const _rk_const_LEVELS = [50.0, 100.0];`) holding its
+  value at emission, emitted once, which the module reads and writes as the
+  kernel does the global. A broadcast over one (`scale .* LEVELS`, `2 .* LEVELS`,
+  `x .+ GRID`) loops over it with Julia's length rules. Such a broadcast used
+  to recurse until a bare `StackOverflowError`, and any other run-time use
+  was refused with "pass it as a kernel input"; an array without a JavaScript
+  value (a `Vector{String}`) is still refused by name, now also inside a
+  broadcast. `jax_source` already emits these arrays as literals.
+- A matrix bound at preparation is a frozen module constant of frozen rows,
+  as a bound vector is; a run-time use of one was refused.
+- A broadcast known while translating inside another (`x .+ (2 .* 3)`) is
+  fused like any other; it was refused as having a non-concrete element type.
+
+## 0.1.274
+
+- `js_source` translates predicates over tuples, matrix literals, matrices
+  built element by element and matrix slices, with native results and native
+  errors:
+  - `all(f, t)`, `any(f, t)` and `count(f, t)` of a tuple, and `all(t)`,
+    `any(t)`, `count(t)` of a tuple of `Bool`s: `f` is called on each
+    element with that element's own type, and `all`/`any` stop at the first
+    element that decides them, as Julia does (`all(a -> length(a) == n,
+    axes)`, `all(>=(1), rows)`); a function that may return something other
+    than a `Bool` is refused by name;
+  - matrix literals of numbers: `[a b; c d]`, `[a b]` and `Float64[a b; c d]`,
+    in a plain helper (`hvcat`, `hcat`, `typed_hvcat`, `typed_hcat`) and in a
+    kernel's recipe (RK's `_native_hvcat` and `_native_hcat`), in Julia's
+    element type; a layout `hvcat` rejects raises Julia's error where the
+    literal is;
+  - `Matrix{T}(undef, m, n)` for `Float64`, `Int64` and `Bool`, and writes
+    `m[i, j] = x`, `m[:, j] = v`, `m[i, :] = v`, converting to the element
+    type and checking positions and lengths as Julia does;
+  - `diag(m)`, and `extrema(v)` of a vector;
+  - matrix slices `view(m, :, j)` and `view(m, i, :)`, checked where they
+    are made: an element read and `length` read the matrix, and a function
+    of the whole slice (`extrema`, `sum`, `minimum`, `maximum`, `collect`, …)
+    reads it as it is when it is read; a write through a slice is refused;
+  - a tuple of values of one type (pairs of bounds, axis vectors) read at a
+    position computed at run time, where only tuples of numbers were;
+  - a closure built on every pass of a loop (`all(v -> lo <= v <= hi,
+    axes[j])` inside `for j in 1:d`), holding the values it captured on
+    that pass.
+
+  So the LKJ density of a Cholesky factor written as a matrix literal
+  (`lkj_corr_cholesky(eta).logpdf([1.0 0.0; r sqrt(1 - r^2)])`) emits, and a
+  type-stable Hilbert-space GP basis written with these operations emits and
+  matches native (snag `js-source-all-pr-b15faf4f`).
+
+## 0.1.273
+
+- `js_source` translates the quantiles of RK's distribution laws:
+  `standard_student_t`, `student_t`, `normal`, `lognormal`, `exponential`
+  and `gamma`. It also translates the gamma law's `cdf`, `ccdf`, `logcdf`
+  and `logccdf`, and direct calls of SpecialFunctions' `beta_inc`,
+  `beta_inc_inv`, `gamma_inc` and `gamma_inc_inv`. Node agrees with native
+  to about 1e-13 relative or better; far below 1e-15 the vendored code is
+  the more accurate side.
+- **`beta_inc` and `beta_inc_inv`** come from pinned stdlib-js `betainc`
+  and `betaincinv` (Boost's `ibeta`), with Julia's argument checks and
+  special cases. SpecialFunctions' code there is not concretely typed, so it
+  cannot be translated.
+- **`gamma_inc` and `gamma_inc_inv`** translate from SpecialFunctions' own
+  Julia code. stdlib-js's `gammainc` is inaccurate above a shape of about
+  1000.
+- **Emitter coverage for that code:**
+  - stepped ranges (`n:-1:1`, `a:s:b`), constant or computed at run time:
+    iterated, with `length`, `first`, `last`, `step` and `isempty`;
+  - `ntuple(f, Val(n))`, `cumprod` and `cumsum` of a tuple, `map` over a
+    tuple, and `minmax`;
+  - `findfirst` of a predicate over a tuple, with `something`;
+  - `iszero` and `LazyString` exception messages;
+  - splatting a tuple computed at run time.
+
+## 0.1.272
+
+- `jax_source`: a `for` loop to a padded row's length (`for t in 1:length(r)`
+  over a ragged row in a plate cell, or `eachindex(r)`) runs no body past the
+  row's end. It used to run the body at every step up to the padded width and
+  select the carry with `jnp.where`, so a body that is not finite at a step
+  Julia never runs (`log(length(r) - t + 1)`, say) gave the right value but
+  `jax.grad` NaN. Each step is now a lazy branch, as a counted `while` to a
+  padded length has been since 0.1.263 (`jax.lax.cond` per step; under
+  `jax.vmap` the untaken arm's reads go through `stop_gradient`).
+  CONTRIBUTING.md, "Lazy branches".
+- After such a loop, and after a counted `while` to a padded length, an array
+  padded by that length repeats its last valid entry in its padding, the
+  padding every padded value holds. Before, an array written at the loop
+  index got the body's values at the padded steps, which were valid only when
+  the body was.
+
+## 0.1.271
+
+- `js_source` translates more of the Base a plain helper uses over a window
+  of a series, with native results and native errors:
+  - the comparison predicates `==(x)`, `!=(x)`, `<(x)`, `<=(x)`, `>(x)`,
+    `>=(x)` and `isequal(x)`, wherever a predicate is taken: `count`, `any`,
+    `all`, `filter`, a generator's condition, and `findfirst`/`findlast`;
+  - `findfirst(p, v)` and `findlast(p, v)` of a vector or a range, and of a
+    vector of `Bool`s, giving the position or `nothing`, and `isnothing`;
+    a predicate that does not return a `Bool` is refused by name;
+  - `sum(f, v)`, `maximum(f, v)` and `minimum(f, v)` of a vector or a range,
+    `f` a function, a closure or a predicate (`sum(abs2, x .- y)`,
+    `sum(isnan, x)`): a sum is pairwise as Julia's is, and an empty source
+    gives Julia's result (`sum(abs2, Float64[])` is `0.0`) or its
+    `MethodError`;
+  - `x[a:b]`, a checked copy of the window (`BoundsError` out of bounds);
+    `collect` of a range or a vector;
+  - `merge` of named tuples (`merge(nt, (; a))`), later fields winning, in
+    Julia's field order;
+  - `abs2` and `isequal` of numbers.
+
+## 0.1.270
+
+- `js_source` translates Julia's irrational constants (`π`, `ℯ`,
+  `MathConstants.γ`, and those of any package's `@irrational`, such as
+  `IrrationalConstants.log2π`) through Julia's own methods for them, with the
+  native values. Arithmetic rounds the constant to the float it promotes to
+  (`log(tail * π)` multiplies by `Float64(π)`); a comparison rounds it up or
+  down as Julia does, so `x < π` holds for `x == Float64(π)`, and `==` is
+  false; `ℯ^x` is `exp(x)` and `sin(π)` is `0.0`. A call of three or more
+  operands (`2 * π * r`) folds from the left, as Julia's method does. A
+  constant times or over a vector or matrix (`π * v`, `A / ℯ`) is the
+  broadcast Julia's method makes. A helper given `π` is specialized on it
+  rather than taking it as a parameter. Native execution is unchanged.
+
+## 0.1.269
+
+- `js_source` translates matrix arithmetic on its row-array matrices: `*` of
+  matrices, vectors, scalars and the transposes `m'`, `transpose(m)` and `v'`
+  (chains such as `A * B * v` and RK's own recipe product included); `+` and
+  `-` of matrices; `sum`, `prod`, `maximum` and `minimum` of a matrix, whole
+  or with `dims = 1` or `2`; `vec` (a fresh vector in column order, where
+  Julia's shares the matrix's memory); `permutedims`; `zeros`, `ones` and
+  `fill(x, m, n)`; and broadcasts over matrices, columns and rows with Julia's
+  shape rules, in place into a matrix too. `prod` of a vector translates.
+  Errors are Julia's (`DimensionMismatch`, `ArgumentError`, `MethodError` for
+  an empty `maximum`). `\`, factorizations and indexing a transposed matrix
+  stay refused by name.
+- `js_source`: a range of length one in a broadcast against a longer vector,
+  `(1:1) .+ x`, is broadcast like a vector of length one. It read
+  `start + i` before and returned wrong values silently.
+- `js_run` decodes a `BitVector` or `BitMatrix` output (a comparison
+  broadcast such as `x .> 0`) to that type.
+
+## 0.1.268
+
+- `js_source` emits prepared kernels, bound data included. The new
+  `js_source(kernel; types, name)` takes a kernel as `prepare` returns it
+  (a flat, tuple or shaped WANT), such as one prepared with
+  `prepare(spec; have, want, bound)` or an RKPPL query from `prepare_query`:
+  its module's function takes the kernel's remaining HAVE values and returns
+  what the kernel returns. `types` defaults to the kernel's exemplar types.
+  A recipe of another kernel may call such a kernel too
+  (`probability = QUERY(unconstrained)`); the call becomes a module-level
+  function translated from the kernel's plan, once per kernel and argument
+  types, as `jax_source` translates one. In both, bound numbers are literals
+  and bound vectors of `Float64`, `Int64` or `Bool` are frozen module
+  constants, emitted once. Before, `js_source(kernel)` had no method, and a
+  recipe calling a prepared kernel failed (up to 0.1.263 with "the
+  expression `$(Expr(:static_parameter, 4))` as an operand has no
+  JavaScript translation").
+- A kernel's input checks (`input_check!`, such as ReactiveKernelsPPL's
+  packed-length check of `unconstrained`) run at the entry of a `js_source`
+  module's function, raising the native exception. Before, every module
+  skipped them: a packed point of another length returned values where the
+  native kernel raises `ContractValidationError`.
+- `js_source` translates `vcat` of vectors and numbers of the result's
+  element type (RKPPL's `vcat([e])` coefficients) and `*` of strings (the
+  message a check builds). Native execution is unchanged.
 
 ## 0.1.267
 

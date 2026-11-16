@@ -204,7 +204,7 @@ function _js_run_output_types(outputs)
 end
 const _JS_RUN_TYPES = Dict{String,Any}(string(T) => T for T in
     (Float64, Int64, Bool, Vector{Float64}, Vector{Int64}, Vector{Bool},
-     Matrix{Float64}, Matrix{Int64}, Matrix{Bool}))
+     Matrix{Float64}, Matrix{Int64}, Matrix{Bool}, BitVector, BitMatrix))
 _js_run_type(name) = get(_JS_RUN_TYPES, name, nothing)
 
 function _js_run_outcome(r::Dict, types, returns)
@@ -238,6 +238,9 @@ _js_run_value(::Type{Int64}, x) = (v = _js_run_number(x); isinteger(v) ? Int64(v
 _js_run_value(::Type{Bool}, x) = x isa Bool ? x :
     throw(JSRunError("the module returned $(repr(x)) where a Bool was expected"))
 _js_run_value(::Type{Vector{T}}, x) where {T} = T[_js_run_value(T, e) for e in x]
+# A comparison broadcast (`x .> 0`) is a `BitArray` natively and Booleans in the module.
+_js_run_value(::Type{BitVector}, x) = BitVector(_js_run_value(Vector{Bool}, x))
+_js_run_value(::Type{BitMatrix}, x) = BitMatrix(_js_run_value(Matrix{Bool}, x))
 _js_run_value(::Type{Matrix{T}}, x::Dict) where {T} = haskey(x, "__cols") ? Matrix{T}(undef, 0, Int(x["__cols"])) :
     throw(JSRunError("the module returned an object where a Matrix{$T} was expected"))
 function _js_run_value(::Type{Matrix{T}}, x::Vector) where {T}

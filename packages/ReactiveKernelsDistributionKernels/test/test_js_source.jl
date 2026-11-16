@@ -1,10 +1,13 @@
 module DistributionJSSourceTests
-# `ReactiveKernels.js_source` of this package's laws (RK 0.1.264): a browser
+# `ReactiveKernels.js_source` of this package's laws (RK 0.1.264; quantiles and
+# the gamma CDF later): a browser
 # module computes the same law the RK, RKPPL and BRM models compute, its
 # log-domain tails included, and Node agrees with native Julia.
 using Test, ReactiveKernels
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: standard_student_t, student_t, normal,
-    lognormal, exponential, gamma
+    lognormal, exponential, gamma, lkj_corr_cholesky
+import Distributions
+using LinearAlgebra: cholesky
 
 const NODE = ReactiveKernels._js_default_node() !== nothing
 
@@ -77,6 +80,28 @@ end
     lp = gamma(shape, rate).logpdf(x)
     return lp
 end
+const GAMMA_TAILS = Dict(ep => (@eval @kernel $(Symbol(:js_gamma_, ep))(x::Float64, a::Float64, b::Float64) = begin
+    p = gamma(a, b).$ep(x)
+    return p
+end) for ep in (:cdf, :ccdf, :logcdf, :logccdf))
+# Quantiles: the inverse incomplete beta function (Student-t) from stdlib-js,
+# the inverse incomplete gamma function translated from SpecialFunctions.
+@kernel js_quantiles(p::Float64, nu::Float64, m::Float64, s::Float64, a::Float64) = begin
+    t = standard_student_t(nu).quantile(p)
+    ts = student_t(nu, m, s).quantile(p)
+    n = normal(m, s).quantile(p)
+    ln = lognormal(m, s).quantile(p)
+    e = exponential(s).quantile(p)
+    g = gamma(a, s).quantile(p)
+    return t
+end
+# The LKJ density of a two-dimensional correlation as a function of the
+# correlation: the law reads the Cholesky factor written as a matrix literal
+# (RK 0.1.274).
+@kernel js_lkj_correlation(x::Vector{Float64}, shape::Float64) = begin
+    density = [exp(lkj_corr_cholesky(shape).logpdf([1.0 0.0; v sqrt(1.0 - v * v)])) for v in x]
+    return density
+end
 
 @testset "js_source of the distribution laws" begin
     if !NODE
@@ -121,6 +146,31 @@ end
             check_js(js_gamma_density, (:x, :shape, :rate), :lp, (; x = Float64, shape = Float64, rate = Float64),
                      [(x, a, b) for x in (-1.0, 0.0, 0.5, 3.0, 30.0, Inf) for a in (0.5, 1.0, 2.5, 40.0)
                       for b in (0.5, 3.0)])
+        end
+        @testset "gamma(shape, rate).$ep" for ep in (:cdf, :ccdf, :logcdf, :logccdf)
+            check_js(GAMMA_TAILS[ep], (:x, :a, :b), :p, (; x = Float64, a = Float64, b = Float64),
+                     [(x, a, b) for x in (-1.0, 0.0, 1e-8, 0.5, 3.0, 30.0, 1e4, Inf, NaN)
+                      for a in (0.5, 1.0, 2.5, 40.0, 3e3) for b in (0.5, 3.0)])
+        end
+        @testset "quantiles" begin
+            check_js(js_quantiles, (:p, :nu, :m, :s, :a), (:t, :ts, :n, :ln, :e, :g),
+                     (; p = Float64, nu = Float64, m = Float64, s = Float64, a = Float64),
+                     [(p, nu, 0.5, s, a) for p in (0.0, 1e-12, 0.025, 0.3, 0.5, 0.975, 1 - 1e-12, 1.0)
+                      for nu in (0.5, 1.0, 8.0, 1e6) for s in (0.5, 3.0) for a in (0.5, 2.5, 40.0)])
+        end
+        @testset "the LKJ density of a correlation, through a matrix literal" begin
+            r = [-0.9, -0.5, 0.0, 0.3, 0.99]
+            cases = [(r, eta) for eta in (0.5, 1.0, 2.0, 5.0)]
+            push!(cases, ([1.5], 2.0))   # sqrt(1 - v^2) of a correlation beyond 1: a DomainError
+            push!(cases, (Float64[], 2.0))
+            check_js(js_lkj_correlation, (:x, :shape), :density, (; x = Vector{Float64}, shape = Float64), cases)
+            source = ReactiveKernels.js_source(js_lkj_correlation; have = (:x, :shape), want = :density,
+                                               types = (; x = Vector{Float64}, shape = Float64), name = :law)
+            for eta in (0.5, 2.0)
+                value = only(ReactiveKernels.js_run(source, :law, [(r, eta)])).value
+                expected = [Distributions.pdf(Distributions.LKJCholesky(2, eta), cholesky([1.0 v; v 1.0])) for v in r]
+                @test all(isapprox.(value, expected; rtol = 1e-12))
+            end
         end
     end
 end

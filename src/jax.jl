@@ -917,11 +917,7 @@ function _jax_destructure!(ctx::_JaxContext, lhs, v::_PyVal)
         indexed = _jax_index(ctx, target, lhs.args[2:end]; target = true)
         position = indexed.code[ncodeunits(target.code)+1:end]
         name = _jax_fresh(ctx, lhs.args[1])
-        # In a loop's steps past its bound the entry keeps its value.
-        mask = _jax_write_mask(ctx, lhs.args[1], target, lhs.args[2:end])
-        value = mask === nothing ? v.code :
-            "jnp.where(" * mask * ", " * v.code * ", " * _py_atom(target.code) * position * ")"
-        _jax_emit!(ctx, name * " = " * _py_atom(target.code) * ".at" * position * ".set(" * value * ")")
+        _jax_emit!(ctx, name * " = " * _py_atom(target.code) * ".at" * position * ".set(" * v.code * ")")
         ctx.locals[lhs.args[1]] = _PyVal(name, target.T, false, target.extent, target.limit,
                                          target.padded)
         return
@@ -1762,36 +1758,71 @@ function _jax_counted_while(ctx::_JaxContext, ex)
     k = gensym(i)
     (Expr(:for, :($k = $i:$last_ex), Expr(:block, :($i = $k), statements...)), lo, hi)
 end
-# The `for` of a counted `while` from `lo` to `hi`. To a padded length (`hi`
-# data with a static limit) it takes `_jax_stepped_for`'s steps up to the
-# limit, lazy branches that do not run the body past `hi` (CONTRIBUTING.md,
-# "Lazy branches"), so a value the body would compute there reaches neither
-# the result nor `jax.grad`.
+# The `for` of a counted `while` from `lo` to `hi`: to a padded length (`hi`
+# data with a static limit) it is `_jax_padded_for`.
 function _jax_counted_for(ctx::_JaxContext, loop::Expr, lo::_PyVal, hi::_PyVal)
     hi.static && return _jax_expr(ctx, loop)
     binding, body = loop.args
-    _jax_stepped_for(ctx, binding.args[1], body, lo, hi, _jax_trip_bound(ctx, lo, hi))
+    _jax_padded_for(ctx, binding.args[1], body, lo, hi)
+end
+
+# A loop from a static `lo` to a padded length `hi` (data with a static
+# limit, `_jax_padded_stop`) takes `_jax_stepped_for`'s steps up to the
+# limit: lazy branches that do not run the body past `hi` (CONTRIBUTING.md,
+# "Lazy branches"), so a value the body would compute at a step Julia never
+# runs reaches neither the result nor `jax.grad`. Those steps keep the whole
+# carry, so an array padded by `hi` keeps its entries past `hi` as they
+# entered; afterwards each such slot repeats the array's last valid entry,
+# the padding every padded value holds (`_jax_repeat_last_valid`).
+function _jax_padded_for(ctx::_JaxContext, var::Symbol, body, lo::_PyVal, hi::_PyVal)
+    carried = [n for n in _jax_assigned_names!(Set{Symbol}(), body)
+               if n !== var && haskey(ctx.locals, n)]
+    result = _jax_stepped_for(ctx, var, body, lo, hi, _jax_trip_bound(ctx, lo, hi))
+    for n in carried
+        v = ctx.locals[n]
+        _jax_is_array(v.T) && v.extent == hi.code || continue
+        ctx.locals[n] = _jax_repeat_last_valid(ctx, v)
+    end
+    result
+end
+# `x`, a padded array, with each slot past its extent along its padded axes
+# holding the last valid entry along that axis (the first, when there is
+# none): the padding a padded value holds (`_PyVal`'s `extent`). An array
+# whose padded axes are not known is returned as it is.
+function _jax_repeat_last_valid(ctx::_JaxContext, x::_PyVal)
+    axes = _jax_vector_like(x.T) && !(x.T <: AbstractVector) ? 0 : _jax_padded_axes(x)
+    axes == 0 && return x
+    final = _jax_bind!(ctx, :last_valid, _PyVal("jnp.maximum(" * x.extent * " - 1, 0)", Int))
+    for k in 1:_jax_rank(x.T)
+        axes & (1 << (k - 1)) == 0 && continue
+        y = _jax_bind!(ctx, :padded, x)
+        edge = "jax.lax.dynamic_index_in_dim(" * y.code * ", " * final.code * ", " *
+               string(k - 1) * ", keepdims=True)"
+        filled = "jnp.where(" * _jax_padded_mask(y, 1 << (k - 1)) * ", " * y.code * ", " * edge * ")"
+        x = _jax_bind!(ctx, :padded, _PyVal(filled, x.T, false, x.extent, x.limit, x.padded,
+                                              x.origin, x.field_extents))
+    end
+    x
 end
 
 # Loops. A `for` over a range is `jax.lax.fori_loop` over a function of the
 # index and the carry, the outer locals the body assigns (an indexed write
 # assigns its array). The range's bounds are static, so the loop lowers to a
-# scan that `jax.grad` differentiates; a data-dependent upper bound with a
-# static limit (a padded group vector's length) runs to the limit and keeps
-# the carry unchanged past the bound (`_JaxLoopMask`): an array the body
-# rebinds is selected whole, and an indexed write keeps the entry it would
-# change, except a write at the loop index into an array padded by the same
-# length, whose entries past the bound are padding. Ends that are data with a
-# static number of steps (`_jax_loop_range`) run those steps from the first
-# element; past the last element a step repeats the last (as padding does)
-# and keeps the whole carry, arrays included, unchanged.
+# scan that `jax.grad` differentiates. A data-dependent upper bound with a
+# static limit (a padded group vector's length) takes lazy steps to the limit
+# (`_jax_padded_for`). Ends that are data with a static number of steps
+# (`_jax_loop_range`) run those steps from the first element; past the last
+# element a step repeats the last (as padding does) and keeps the whole
+# carry, arrays included, unchanged.
 function _jax_expr(ctx::_JaxContext, ::Val{:for}, ex)
     ctx.host === nothing || return _host_for(ctx, ex)
     binding, body = ex.args
     binding isa Expr && binding.head === :(=) && binding.args[1] isa Symbol ||
         _jax_error("the loop binding `", binding, "` has no JAX translation", _jax_where(ctx))
     var = binding.args[1]
-    lo, hi, bound, steps = _jax_loop_range(ctx, binding.args[2])
+    lo, hi = _jax_range_ends(ctx, binding.args[2])
+    _jax_padded_stop(lo, hi) && return _jax_padded_for(ctx, var, body, lo, hi)
+    lo, hi, _, steps = _jax_loop_range(ctx, lo, hi)
     isempty(steps) || return _jax_stepped_for(ctx, var, body, lo, hi, steps)
     assigned = Set{Symbol}()
     _jax_assigned_names!(assigned, body)
@@ -1815,23 +1846,8 @@ function _jax_expr(ctx::_JaxContext, ::Val{:for}, ex)
         end
         ctx.locals[var] = _jax_range_index(index, lo, hi)
         statements = body isa Expr && body.head === :block ? body.args : Any[body]
-        kept = index * " <= " * bound
-        # Arrays the body rebinds (not only writes by index) are selected
-        # whole past the bound; the others keep their entries at each write.
-        rebound = isempty(bound) ? Set{Symbol}() : _jax_rebound_names!(Set{Symbol}(), body)
-        written = Set{Symbol}(n for (n, v) in zip(carried, initial)
-                              if _jax_is_array(v.T) && !(n in rebound))
-        isempty(bound) ? _jax_statements(ctx, statements; value = false) :
-            _jax_with_guard(inner, kept) do
-                _jax_with_loop_mask(() -> _jax_statements(ctx, statements; value = false),
-                                    _JaxLoopMask(inner, kept, index, bound, written))
-            end
-        map(zip(carried, initial)) do (n, v)
-            new = ctx.locals[n]
-            bound == "" ? new.code : _jax_carry_select(ctx, kept, new.code,
-                                                       _jax_carry_old(names, carried, n), v.T;
-                                                       arrays = n in rebound)
-        end
+        _jax_statements(ctx, statements; value = false)
+        [ctx.locals[n].code for n in carried]
     finally
         ctx.scope = outer
         empty!(ctx.locals); merge!(ctx.locals, saved)
@@ -1853,7 +1869,6 @@ function _jax_expr(ctx::_JaxContext, ::Val{:for}, ex)
     end
     _PyVal("None", Nothing, true)
 end
-_jax_carry_old(names, carried, n) = names[findfirst(==(n), carried)]
 
 # A `for` over a range whose ends are data, `lo:hi`, taking a static number
 # of `steps` (`_jax_loop_range`): step `k` is a lazy branch, `jax.lax.cond`,
@@ -1951,81 +1966,6 @@ function _jax_carry_value(ctx::_JaxContext, v::_PyVal)
     _PyVal("jnp.asarray(" * v.code * ", dtype=" * _jax_dtype(T) * ")", T, false, "", "")
 end
 
-# Past a loop's data-dependent bound (`kept` is false there) the carry keeps
-# its value `old`, of type `T`: a scalar is selected, a tuple element by
-# element. An array passes as it is: past a padded length's bound each write
-# by index keeps its entry or writes padding (`_JaxLoopMask`). With
-# `arrays` (an array the body rebinds) it is selected too.
-function _jax_carry_select(ctx::_JaxContext, kept::AbstractString, new::AbstractString,
-                           old::AbstractString, @nospecialize(T); arrays::Bool = false)
-    _jax_is_array(T) && !arrays && return new
-    _jax_is_tuple(T) || return "jnp.where(" * kept * ", " * new * ", " * old * ")"
-    t = _jax_bind!(ctx, :carried, _PyVal(new, T)).code
-    _jax_tuple_code([_PyVal(_jax_carry_select(ctx, kept, _py_atom(t) * "[" * string(k - 1) * "]",
-                                              _py_atom(old) * "[" * string(k - 1) * "]",
-                                              fieldtype(T, k); arrays), Any)
-                     for k in 1:fieldcount(T)])
-end
-
-# The locals a loop body binds to a new value, `x = ...` or `(x, y) = ...`
-# (not an indexed write `x[i] = ...`).
-function _jax_rebound_names!(names::Set{Symbol}, ex)
-    ex isa Expr || return names
-    ex.head in (:quote, :inert, :->, :function) && return names
-    if (ex.head === :(=) || haskey(_JAX_UPDATING, ex.head)) && length(ex.args) == 2
-        target = ex.args[1]
-        target isa Expr && target.head === :(::) && (target = target.args[1])
-        target isa Symbol && push!(names, target)
-        target isa Expr && target.head === :tuple &&
-            foreach(t -> t isa Symbol && push!(names, t), target.args)
-    end
-    foreach(a -> _jax_rebound_names!(names, a), ex.args)
-    names
-end
-
-# A loop running past its data-dependent bound, a padded length: in its
-# `scope`, steps past `bound` (where `kept` is false) leave the outer arrays
-# it only writes by index (`written`) as they are, except entries along an
-# axis that `bound` pads at the loop `index`, which are padding.
-struct _JaxLoopMask
-    scope::_JaxScope
-    kept::String
-    index::String
-    bound::String
-    written::Set{Symbol}
-end
-const _JAX_LOOP_MASKS = _JaxLoopMask[]
-function _jax_with_loop_mask(f, mask::_JaxLoopMask)
-    push!(_JAX_LOOP_MASKS, mask)
-    try
-        return f()
-    finally
-        pop!(_JAX_LOOP_MASKS)
-    end
-end
-# The condition under which the write `name[indices...] = ...` to `target`
-# runs as Julia's would (`nothing`: always): the conjunction of the masks of
-# the loops it runs in whose steps past their bound would change an entry.
-function _jax_write_mask(ctx::_JaxContext, name::Symbol, target::_PyVal, indices)
-    masks = String[]
-    for m in _JAX_LOOP_MASKS
-        name in m.written && _jax_scope_within(ctx.scope, m.scope) || continue
-        _jax_writes_padding(ctx, target, indices, m) && continue
-        push!(masks, m.kept)
-    end
-    isempty(masks) ? nothing : foldl((a, b) -> "jnp.logical_and(" * a * ", " * b * ")", masks)
-end
-# Whether `target[indices...]` is, at every step past the loop's bound, a
-# padded entry: an index is the loop's own, along an axis padded by its bound.
-function _jax_writes_padding(ctx::_JaxContext, target::_PyVal, indices, m::_JaxLoopMask)
-    target.extent == m.bound || return false
-    axes = _jax_padded_axes(target)
-    any(enumerate(indices)) do (k, i)
-        i isa Symbol && haskey(ctx.locals, i) && ctx.locals[i].code == m.index &&
-            axes & (1 << (k - 1)) != 0
-    end
-end
-
 # The locals a loop body assigns, including arrays it writes by index.
 function _jax_assigned_names!(names::Set{Symbol}, ex)
     ex isa Expr || return names
@@ -2062,7 +2002,12 @@ end
 #   entries of the prepared data, `starts[r]:stops[r]`): the loop takes
 #   `steps` steps, element `first + k` at step `k`, and Julia's elements are
 #   those up to `last`; `first` and `last` are bound to names.
-function _jax_loop_range(ctx::_JaxContext, iter)
+_jax_loop_range(ctx::_JaxContext, iter) = _jax_loop_range(ctx, _jax_range_ends(ctx, iter)...)
+# A stop that is a padded group's length: data with a static limit, from a
+# static start (a `for` takes `_jax_padded_for`'s lazy steps to the limit).
+_jax_padded_stop(lo::_PyVal, hi::_PyVal) = lo.static && !hi.static && !isempty(hi.limit)
+# The translated ends `(first, last)` of a loop range.
+function _jax_range_ends(ctx::_JaxContext, iter)
     if iter isa Expr && iter.head === :call && iter.args[1] === :(:) && length(iter.args) == 3
         lo, hi = _jax_expr(ctx, iter.args[2]), _jax_expr(ctx, iter.args[3])
     elseif iter isa Expr && iter.head === :call && length(iter.args) >= 2 &&
@@ -2080,8 +2025,11 @@ function _jax_loop_range(ctx::_JaxContext, iter)
     else
         _jax_error("the loop range `", iter, "` has no JAX translation", _jax_where(ctx))
     end
+    (lo, hi)
+end
+function _jax_loop_range(ctx::_JaxContext, lo::_PyVal, hi::_PyVal)
     lo.static && hi.static && return (lo, hi, "", "")
-    lo.static && !isempty(hi.limit) && return (lo, _PyVal(hi.limit, Int, true), hi.code, "")
+    _jax_padded_stop(lo, hi) && return (lo, _PyVal(hi.limit, Int, true), hi.code, "")
     steps = _jax_trip_bound(ctx, lo, hi)
     steps === nothing && _jax_error("a loop whose ", lo.static ? "trip count" : "first index",
         " depends on data has no JAX translation: its number of steps needs a static ",

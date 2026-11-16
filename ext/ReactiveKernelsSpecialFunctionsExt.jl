@@ -272,4 +272,28 @@ for (f, helper) in ((SpecialFunctions.erf, :_rk_stdlib_erf), (SpecialFunctions.e
     end
 end
 
+# The regularized incomplete beta function and its inverse: their Julia code is
+# not concretely typed throughout (a range end that is `Union{Float64,Int64}`
+# in `beta_inc_diff`), so stdlib-js's `betainc` and `betaincinv` compute them,
+# each tail from its own evaluation. `gamma_inc` and `gamma_inc_inv` translate
+# from their own Julia code (stdlib-js's `gammainc` is inaccurate for shapes
+# above about 1000).
+function _js_special_call(ir, helper::Symbol, args, T)
+    all(ReactiveKernels._js_isnumber, args) || return nothing
+    ReactiveKernels._js_fcall(ir, ReactiveKernels._js_use!(ir.fn.mod, helper), args, T)
+end
+_js_one_minus(ir, x) = ReactiveKernels._js_call!(ir, -, Any[ReactiveKernels._js_static(1.0), x], Float64)
+function ReactiveKernels._js_function_call(ir::ReactiveKernels._JsIR, ::typeof(SpecialFunctions.beta_inc), args, T)
+    length(args) == 3 && all(ReactiveKernels._js_isnumber, args) || length(args) == 4 || return nothing
+    x = ReactiveKernels._js_simple!(ir, args[3], "x")
+    _js_special_call(ir, :_rk_beta_inc, length(args) == 4 ? Any[args[1], args[2], x, args[4]] :
+                     Any[args[1], args[2], x, _js_one_minus(ir, x)], T)
+end
+function ReactiveKernels._js_function_call(ir::ReactiveKernels._JsIR, ::typeof(SpecialFunctions.beta_inc_inv), args, T)
+    length(args) == 3 && all(ReactiveKernels._js_isnumber, args) || length(args) == 4 || return nothing
+    p = ReactiveKernels._js_simple!(ir, args[3], "p")
+    _js_special_call(ir, :_rk_beta_inc_inv, length(args) == 4 ? Any[args[1], args[2], p, args[4]] :
+                     Any[args[1], args[2], p, _js_one_minus(ir, p)], T)
+end
+
 end # module

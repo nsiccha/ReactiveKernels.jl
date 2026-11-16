@@ -1,7 +1,7 @@
 # Emit a generic censored Student-t regression twice: as `jax_source` emits it
 # (`partitioned.py`), and with the lane partition switched off in this
 # process only (`whole.py`, one `jax.vmap` of the response plate, as before
-# RK 0.1.268). Writes the raw data, native log densities and gradients at the
+# RK 0.1.277). Writes the raw data, native log densities and gradients at the
 # benchmark points, and the parameter layout to `inputs.json`.
 #
 #     julia --project=ENV benchmark/jax_censored_lanes/emit.jl OUT [ROWS] [CENSORED]

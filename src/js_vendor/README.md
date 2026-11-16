@@ -16,6 +16,15 @@ folder carries as pinned, prebuilt files. Everything else, such as `logbeta`,
 | `erfcx.js` | `@stdlib/math-base-special-erfcx` | the Faddeeva package, as libopenspecfun's `erfcx` |
 | `gammaln.js` | `@stdlib/math-base-special-gammaln` | FreeBSD `e_lgamma_r.c`, as SpecialFunctions' `logabsgamma` |
 | `gamma.js` | `@stdlib/math-base-special-gamma` | Cephes (openlibm's `tgamma` is a different algorithm) |
+| `betainc.js` | `@stdlib/math-base-special-betainc` | Boost's `ibeta` (SpecialFunctions' `beta_inc` follows TOMS 708) |
+| `betaincinv.js` | `@stdlib/math-base-special-betaincinv` | Boost's `ibeta_inverse` |
+
+SpecialFunctions' `beta_inc` and `beta_inc_inv` are Julia code, but not
+concretely typed throughout (a range end that is `Union{Float64,Int64}`), so
+they cannot be translated either. `gamma_inc` and `gamma_inc_inv` are
+translated from SpecialFunctions' Julia code instead of vendored: stdlib-js's
+`gammainc` disagrees with it above a shape of about 1000 (0.1339 against
+0.1586 at a = 2000, x = a − √a).
 
 Each file is one statement defining `_rk_stdlib_<name>` and is copied into a
 module only when the module uses the function. The mappings live in

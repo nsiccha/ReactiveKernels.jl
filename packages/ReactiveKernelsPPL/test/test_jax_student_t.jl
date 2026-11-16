@@ -111,7 +111,7 @@ end
         source = jax_source(built, plan)
         @test occursin("UNTRANSLATED = {}", string(source))
         # The censoring test reads data alone: `prepare_data` partitions the
-        # rows (RK 0.1.268), so no batched `jax.lax.cond` decides it and the
+        # rows (RK 0.1.277), so no batched `jax.lax.cond` decides it and the
         # tail's fraction runs only on the censored rows.
         @test occursin("_lane_order", string(source))
         @test !occursin(r"jax\.lax\.cond\([^,]*threshold", string(source))
