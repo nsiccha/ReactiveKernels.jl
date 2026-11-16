@@ -16,6 +16,51 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.269
+
+- `js_source` translates matrix arithmetic on its row-array matrices: `*` of
+  matrices, vectors, scalars and the transposes `m'`, `transpose(m)` and `v'`
+  (chains such as `A * B * v` and RK's own recipe product included); `+` and
+  `-` of matrices; `sum`, `prod`, `maximum` and `minimum` of a matrix, whole
+  or with `dims = 1` or `2`; `vec` (a fresh vector in column order, where
+  Julia's shares the matrix's memory); `permutedims`; `zeros`, `ones` and
+  `fill(x, m, n)`; and broadcasts over matrices, columns and rows with Julia's
+  shape rules, in place into a matrix too. `prod` of a vector translates.
+  Errors are Julia's (`DimensionMismatch`, `ArgumentError`, `MethodError` for
+  an empty `maximum`). `\`, factorizations and indexing a transposed matrix
+  stay refused by name.
+- `js_source`: a range of length one in a broadcast against a longer vector,
+  `(1:1) .+ x`, is broadcast like a vector of length one. It read
+  `start + i` before and returned wrong values silently.
+- `js_run` decodes a `BitVector` or `BitMatrix` output (a comparison
+  broadcast such as `x .> 0`) to that type.
+
+## 0.1.268
+
+- `js_source` emits prepared kernels, bound data included. The new
+  `js_source(kernel; types, name)` takes a kernel as `prepare` returns it
+  (a flat, tuple or shaped WANT), such as one prepared with
+  `prepare(spec; have, want, bound)` or an RKPPL query from `prepare_query`:
+  its module's function takes the kernel's remaining HAVE values and returns
+  what the kernel returns. `types` defaults to the kernel's exemplar types.
+  A recipe of another kernel may call such a kernel too
+  (`probability = QUERY(unconstrained)`); the call becomes a module-level
+  function translated from the kernel's plan, once per kernel and argument
+  types, as `jax_source` translates one. In both, bound numbers are literals
+  and bound vectors of `Float64`, `Int64` or `Bool` are frozen module
+  constants, emitted once. Before, `js_source(kernel)` had no method, and a
+  recipe calling a prepared kernel failed (up to 0.1.263 with "the
+  expression `$(Expr(:static_parameter, 4))` as an operand has no
+  JavaScript translation").
+- A kernel's input checks (`input_check!`, such as ReactiveKernelsPPL's
+  packed-length check of `unconstrained`) run at the entry of a `js_source`
+  module's function, raising the native exception. Before, every module
+  skipped them: a packed point of another length returned values where the
+  native kernel raises `ContractValidationError`.
+- `js_source` translates `vcat` of vectors and numbers of the result's
+  element type (RKPPL's `vcat([e])` coefficients) and `*` of strings (the
+  message a check builds). Native execution is unchanged.
+
 ## 0.1.267
 
 - `ReactiveKernels.js_source` translates `rk_ode_rk45_tol`. The emitted module
