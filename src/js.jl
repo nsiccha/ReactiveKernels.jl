@@ -499,9 +499,9 @@ function _rk_ode_rk45(f, y0, t0, ts, rt, at, mx) {
   return out;
 }""", [:JuliaError, :_rk_dopri]),
     :_rk_cumprod => ("""
-function _rk_cumprod(x) { const r = x.slice(); for (let i = 1; i < r.length; i++) r[i] = r[i - 1] * r[i]; return r; }""", Symbol[]),
+function _rk_cumprod(x, start = 0, end = x.length) { const r = x.slice(start, end); for (let i = 1; i < r.length; i++) r[i] = r[i - 1] * r[i]; return r; }""", Symbol[]),
     :_rk_cumsum => ("""
-function _rk_cumsum(x) { const r = x.slice(); for (let i = 1; i < r.length; i++) r[i] = r[i - 1] + r[i]; return r; }""", Symbol[]),
+function _rk_cumsum(x, start = 0, end = x.length) { const r = x.slice(start, end); for (let i = 1; i < r.length; i++) r[i] = r[i - 1] + r[i]; return r; }""", Symbol[]),
     # `start:step:stop` as Julia builds it: `stop` becomes the last element reached.
     :_rk_steprange => ("""
 function _rk_steprange(start, step, stop) {
@@ -637,7 +637,7 @@ _js_tuple_length(v::_JsVal) = v.static ? length(v.value) : fieldcount(v.T)
 # at run time: a number, a `Bool`, a vector or matrix of them, or a tuple of
 # such values (`domain = ((lo1, hi1), (lo2, hi2))`, a tuple of axis vectors).
 _js_runtime_type(T) = T isa DataType && isconcretetype(T) &&
-    (T <: Union{_JsNumber,Bool} || _js_isvector_type(T) || (T <: Matrix && eltype(T) <: _JsMatrixElement) ||
+    (T <: Union{_JsNumber,Bool} || _js_isvector_type(T) || _js_ismatrix_type(T) ||
      (T <: Tuple && !(T <: NamedTuple) && all(_js_runtime_type, fieldtypes(T))))
 _js_uniform_tuple(S, T) = S <: Tuple && !(S <: NamedTuple) && isconcretetype(S) && fieldcount(S) > 0 &&
     _js_runtime_type(T) && all(==(T), fieldtypes(S))
@@ -650,7 +650,7 @@ _js_number_tuple(S, T) = T <: _JsNumber && _js_uniform_tuple(S, T)
 _js_plate_element(T) = _js_runtime_type(T) ||
     (T isa DataType && isconcretetype(T) && T <: Union{Tuple,NamedTuple} &&
      all(_js_plate_element, fieldtypes(T)))
-_js_vector_view(v) = v isa _JsStruct && v.T === view
+_js_vector_view(v) = v isa _JsStruct && v.T === view && length(v.fields) == 2
 _js_plate_vector(v) = _js_isvector(v) || _js_vector_view(v) ||
     (_js_type(v) <: Vector && _js_plate_element(eltype(_js_type(v))))
 _js_plate_length(v) = _js_isrange(v) ? _js_range_length(v) :
@@ -2241,10 +2241,19 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
                       prec = _JS_OR)
     elseif f === iszero && length(args) == 1 && _js_isnumber(args[1])
         return _js_rt(_js_code(mod, args[1], _JS_EQ + 1) * " === 0", Bool; prec = _JS_EQ)
-    elseif f in (cumprod, cumsum) && length(args) == 1 && _js_istuple(args[1]) &&
-           _js_number_tuple(_js_type(args[1]), eltype(_js_type(args[1]))) && T == _js_type(args[1])
-        # Running products or sums of a tuple, left to right as Julia accumulates them.
+    elseif f in (cumprod, cumsum) && length(args) == 1 &&
+           ((T == _js_type(args[1]) &&
+             ((_js_istuple(args[1]) && _js_number_tuple(T, eltype(T))) ||
+              (_js_isflatvector(args[1]) && eltype(T) <: _JsNumber))) ||
+            (_js_vector_view(args[1]) && T === Vector{eltype(_js_type(args[1]))} && eltype(T) <: _JsNumber))
+        # Running products or sums preserve the first value, including -0.0.
         helper = _js_use!(mod, f === cumprod ? :_rk_cumprod : :_rk_cumsum)
+        if _js_vector_view(args[1])
+            x, r = args[1].fields
+            start = "(" * _js_range_start(r) * " - 1)"
+            return _js_rt(helper * "(" * _js_runtime(mod, x).code * ", " * start *
+                          ", " * start * " + " * _js_range_length(r) * ")", T; pure = false)
+        end
         return _js_rt(helper * "(" * _js_runtime(mod, args[1]).code * ")", T)
     elseif f === ntuple && length(args) == 2 && args[2] isa _JsVal && args[2].static && args[2].value isa Val &&
            T <: Tuple && isconcretetype(T)
@@ -2849,7 +2858,8 @@ ordinary kernel recipes, broadcasts (fused, with Julia's length rules),
 functions with Julia's domain errors, checked 1-based indexing (of a matrix:
 `m[i, j]`, `m[:, j]`, `m[i, :]`, `size`, `axes`), vector literals and
 matrix literals of numbers (`[a b; c d]`), `sum`/`prod`/`maximum`/`minimum`,
-ranges, comprehensions and `map` over vectors, tuples and named tuples
+ranges, comprehensions and `map` over vectors; `cumsum`/`cumprod` of numeric
+vectors, contiguous vector views or tuples; tuples and named tuples
 (objects) built, read and destructured, `all`/`any`/`count` of a tuple,
 keyword calls, and `rk_ode_rk45_tol`, integrated by the vendored `@reside-ic/dopri`
 Dormand–Prince 5(4) method with the native bridge's arguments, step budget
@@ -2861,7 +2871,12 @@ matrices; `sum`/`prod`/`maximum`/`minimum` of a matrix, whole or with
 `zeros`/`ones`/`fill(x, m, n)`, `Matrix{T}(undef, m, n)` and writes
 `m[i, j] = x`, `m[:, j] = v`, `m[i, :] = v`; `diag`; slices `view(m, :, j)`
 and `view(m, i, :)` read in place; and broadcasts over matrices, columns and
-rows with Julia's shape rules. Plain Julia helpers are translated from their
+rows with Julia's shape rules; `m[indices, j]` gathers a column's indexed rows.
+`reshape(vector, rows, cols)`, including a vector view, shares
+storage with the parent. Its dimensions must be nonnegative: Julia can
+construct a `ReshapedArray` view with negative axes, which JavaScript's
+array representation cannot hold and explicitly refuses.
+Plain Julia helpers are translated from their
 typed code, branches, early returns and loops included, without annotation;
 Julia's own functions translate only through RK's table. A construct without
 a translation (a C call, `fma`, `\` and factorizations, indexing a transposed

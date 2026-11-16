@@ -145,6 +145,19 @@ end
     return y
 end
 
+@kernel vector_accumulations(xs) = begin
+    sums = cumsum(xs)
+    products = cumprod(xs)
+    return sums, products
+end
+
+@kernel view_accumulations(xs, lo, hi) = begin
+    window = view(xs, lo:hi)
+    sums = cumsum(window)
+    products = cumprod(window)
+    return sums, products
+end
+
 function check(native, source, name, cases)
     for vectors in (:array, :float64array)
         for (args, outcome) in zip(cases, ReactiveKernels.js_run(source, name, cases; vectors))
@@ -281,6 +294,53 @@ end
         bodies = [replace(s, r"(?m)^const _rk_bound_.*\n\n" => "") for s in sources]
         @test all(==(first(bodies)), bodies)
         @test count("for (let ", first(bodies)) >= 1
+    end
+
+    @testset "numeric vector cumulative operations" begin
+        want = (; sums = :sums, products = :products)
+        native = prepare(vector_accumulations; have = (:xs,), want)
+        for (T, cases) in ((V, [(Float64[],), ([-0.0],), ([0.2, 0.1, -2.0],),
+                ([isodd(i) ? 0.99 : 1.01 for i in 1:257],)]),
+                (Vector{Int64}, [(Int64[],), ([1, -2, 0, 3],), (ones(Int64, 257),)]))
+            source = ReactiveKernels.js_source(native; types = (; xs = T), name = :running)
+            node && check(native, source, :running, cases)
+        end
+        source = ReactiveKernels.js_source(native; types = (; xs = V), name = :running)
+        if node
+            result = only(ReactiveKernels.js_run(source, :running, [([-0.0],)]))
+            @test signbit(only(result.value.sums))
+            @test signbit(only(result.value.products))
+        end
+        sources = [ReactiveKernels.js_source(prepare(vector_accumulations;
+            have = (:xs,), want, bound = (; xs)); name = :running)
+            for xs in (Float64[], [0.2, 0.1, -2.0], ones(257))]
+        bodies = [replace(s, r"(?m)^const _rk_bound_.*\n\n" => "") for s in sources]
+        @test all(==(first(bodies)), bodies)
+    end
+
+    @testset "vector view cumulative operations" begin
+        want = (; sums = :sums, products = :products)
+        native = prepare(view_accumulations; have = (:xs, :lo, :hi), want)
+        source = ReactiveKernels.js_source(native; types = (; xs = V, lo = Int64, hi = Int64), name = :running)
+        cases = [(Float64[], 1, 0), ([99.0, -0.0, 88.0], 2, 2),
+                 ([99.0, 0.2, 0.1, -2.0, 88.0], 2, 4), (ones(259), 2, 258),
+                 ([1.0, 2.0], 3, 2)]
+        if node
+            check(native, source, :running, cases)
+            bad = [([1.0], 0, 1), ([1.0], 1, 2)]
+            for args in bad
+                @test_throws BoundsError native(args...)
+            end
+            for vectors in (:array, :float64array)
+                @test all(o -> o.error == "BoundsError", ReactiveKernels.js_run(source, :running, bad; vectors))
+            end
+        end
+        sources = [ReactiveKernels.js_source(prepare(view_accumulations;
+            have = (:xs, :lo, :hi), want, bound = (; xs));
+            types = (; lo = Int64, hi = Int64), name = :running)
+            for xs in (Float64[], ones(3), ones(257))]
+        bodies = [replace(s, r"(?m)^const _rk_bound_.*\n\n" => "") for s in sources]
+        @test all(==(first(bodies)), bodies)
     end
 
     if node

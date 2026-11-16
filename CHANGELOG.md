@@ -23,6 +23,10 @@ are recorded in the git history only.
   Field projections retain runtime iteration and the producer's shared work.
 - Plates read vector views directly from their parent and broadcast singleton
   views and ranges alongside other inputs, including empty inputs.
+- Reshaping a vector or vector view into a matrix keeps shared storage and
+  nonnegative runtime dimensions, so hierarchical latent matrices can be emitted too.
+- Numeric-vector and vector-view `cumsum` and `cumprod` use cumulative loops.
+- Matrix columns support a vector of row indices with checked runtime gathering.
 
 ## 0.1.286
 

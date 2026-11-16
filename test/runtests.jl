@@ -191,6 +191,7 @@ const _MATRIX_CORE_TESTS = (
     "test_js_bool_arithmetic.jl",
     "test_js_prepared.jl",
     "test_js_nested_vectors.jl",
+    "test_js_reshape.jl",
     "test_shaped_want.jl",
     "test_rk_repository_module.jl",
     "test_scan_columns.jl",
