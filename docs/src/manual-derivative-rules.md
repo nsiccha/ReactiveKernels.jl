@@ -54,8 +54,9 @@ The reverse mask uses original input positions. A bit for a data-only input is i
 
 `jax_source` generates `custom_jvp` adapters for scalar rules from these same
 activity-selected graph cuts. Joint value/partials recipes are shared across
-calls and activity patterns. Host data preparation uses the primal cut;
-general `derivative_rule` calls still emit their primal cut. See
+calls and activity patterns. General rules generate their forward and staged
+reverse adapters from the authored branches too. Host data preparation uses
+the primal cut. See
 [JAX runtime and derivatives](jax-runtime.md).
 
 For adapter and stage APIs, see the [core reference](api.md). The [bound-regression example](bound-regression.md) illustrates the same graph-selection principle for primal outputs.

@@ -9,7 +9,7 @@ flagged(x, ::Val{flag}) where {flag} = flag ? x * x : 2x
 flagged_outer(x) = flagged(x, Val(false)) + flagged(x, Val(true))
 @traceable function simd_sum(x)
     total = 0.0
-    @inbounds @simd for k in eachindex(x)
+    @inbounds @simd for k in firstindex(x):lastindex(x)
         total += x[k]^2
     end
     total

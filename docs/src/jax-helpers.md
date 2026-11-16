@@ -125,7 +125,11 @@ end
 print(jax_source(decayed; have = (:x, :rate), want = :value))
 ```
 
-Body-level early returns, including `condition || return fallback(...)`, keep the continuation in the falling-through branch. The native method retains its original control flow. A return inside a loop remains unsupported. In device code, `continue` skips the remaining iteration statements, `for` binds one name over one range, and `break` remains unsupported. Host `prepare_data` also supports `break`. A provider's source is read only by `jax_source`; native execution runs the method itself.
+Body-level early returns, including `condition || return fallback(...)`, keep the continuation in the falling-through branch. The native method retains its original control flow. A return inside a loop remains unsupported. In device code, `continue` skips the remaining iteration statements and `break` exits the nearest loop. A bounded `for` carries a flag and skips later steps after an exit, preserving reverse differentiation. A loop without a static bound remains a runtime loop; JAX requires an authored derivative rule for reverse differentiation through it. Host `prepare_data` supports the same exits. A provider's source is read only by `jax_source`; native execution runs the method itself.
+
+`@inbounds` and `@simd` preserve the source loop. Chained comparisons evaluate a shared middle operand once and reach later operands only when earlier comparisons succeed. Plain helpers accept acyclic forward joins and static Boolean `Val` parameters. Helpers can destructure numerical arrays and use `firstindex`, `lastindex`, integer parity predicates, and floating-point `copysign`.
+
+A numerical helper may return a scalar or `nothing`; consume that result inside the program with `something` or `isnothing`. Device branches carry a presence flag and the scalar, while host preparation keeps ordinary Python values. A numerical vector prefix `c[1:n]` carries its runtime length and checks bounds. `evalpoly(x, c)` for real vectors retains Horner's loop over that logical length, including a runtime prefix; unused coefficients contribute neither values nor derivatives.
 
 A source `ntuple(j -> expression, Val(N))` records the authored, fixed number of fields with runtime captures. A fixed tuple of numbers of one type supports computed integer reads, such as indexing that basis inside a loop. The device read checks bounds and uses a numerical array view of the tuple; the data-dependent loop remains a runtime loop.
 
