@@ -9,15 +9,16 @@ using ReactiveKernels: _JaxContext, _PyVal, _jax_result, _jax_args
 import ReactiveKernels: _jax_elementwise, _jax_elementwise_call, _jax_function_call
 import SpecialFunctions
 
-ReactiveKernels.@_record_source function ReactiveKernels._logrising_gamma_difference(a, m, partial::Bool)
-    value = SpecialFunctions.loggamma(a + m) - SpecialFunctions.loggamma(a)
-    slope = partial ? SpecialFunctions.digamma(a + m) - SpecialFunctions.digamma(a) : zero(a)
+ReactiveKernels.@_record_source ReactiveKernels._logrising_gamma_value(a, m) =
+    SpecialFunctions.loggamma(a + m) - SpecialFunctions.loggamma(a)
+
+ReactiveKernels.@_record_source function ReactiveKernels._logrising_gamma_difference(a, m)
+    value = ReactiveKernels._logrising_gamma_value(a, m)
+    slope = SpecialFunctions.digamma(a + m) - SpecialFunctions.digamma(a)
     return value, slope
 end
 
-
 ReactiveKernels.@_record_source ReactiveKernels._logrising_count_partial(a, m) = SpecialFunctions.digamma(a + m)
-
 
 const _HELPERS = Dict{String,String}(
     "_rk_trigamma" => """

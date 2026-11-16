@@ -63,21 +63,32 @@ const _LOGRISING_SHAPE_MAX = 1073741824.0
 end
 
 # SpecialFunctions supplies these methods through its optional extension.
+function _logrising_gamma_value end
 function _logrising_gamma_difference end
 function _logrising_count_partial end
 
-# The product runs over `count` factors, zero off its domain, so an
-# evaluation of both arms (a vectorized backend's select) stays bounded.
-@_record_source @inline function _logrising_math(a, m, partial::Bool)
-    product = (m >= 0) & (m <= _LOGRISING_PRODUCT_MAX) & (m == floor(m)) &
+@_record_source @inline function _logrising_product_domain(a, m)
+    return (m >= 0) & (m <= _LOGRISING_PRODUCT_MAX) & (m == floor(m)) &
         (a > 0) & (a <= _LOGRISING_SHAPE_MAX)
-    count = product ? m : zero(m)
-    rising = _logrising_product(a, count, partial)
-    return product ? rising : _logrising_gamma_difference(a, m, partial)
 end
 
-@_record_source @inline _logrising_value(a, m) = first(_logrising_math(a, m, false))
-@_record_source @inline _logrising_joint(a, m) = _logrising_math(a, m, true)
+# The product runs over `count` factors, zero off its domain, so an
+# evaluation of both arms (a vectorized backend's select) stays bounded.
+@_record_source @inline function _logrising_value(a, m)
+    product = _logrising_product_domain(a, m)
+    count = product ? m : zero(m)
+    rising = first(_logrising_product(a, count, false))
+    return product ? rising : _logrising_gamma_value(a, m)
+end
+
+# Keep the gamma partial outside the primal's reachable call graph. Backends
+# that emit only values need not translate an unused digamma calculation.
+@_record_source @inline function _logrising_joint(a, m)
+    product = _logrising_product_domain(a, m)
+    count = product ? m : zero(m)
+    rising = _logrising_product(a, count, true)
+    return product ? rising : _logrising_gamma_difference(a, m)
+end
 
 @kernel _rk_logrising_graph(a::Float64, m::Float64) = begin
     y::Float64 = _logrising_value(a, m)
@@ -88,4 +99,3 @@ end
 const _rk_logrising = scalar_derivative_rule(
     _rk_logrising_graph; primal = :y, partials = (a = :dy_da, m = :dy_dm),
     name = :logrising)
-

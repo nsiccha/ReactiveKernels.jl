@@ -5,7 +5,7 @@
 using ReactiveKernels, ReactiveKernelsDistributionKernels
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: beta_binomial,
     loggamma, logbeta
-using Enzyme, Chairmarks, Random, LinearAlgebra, Printf, Pkg
+using Enzyme, Chairmarks, Random, LinearAlgebra, Printf, Pkg, Libdl
 
 @kernel legacy_beta_binomial(n::Int, alpha::Float64, beta::Float64) = begin
     logpdf(observed::Int)::Float64 =
@@ -38,6 +38,7 @@ function main()
     println("Julia ", VERSION, " ", Base.GIT_VERSION_INFO.commit_short)
     info = Pkg.dependencies()[Base.PkgId(Enzyme).uuid]
     println("Enzyme ", info.version, " source=", info.source)
+    println("Enzyme libraries ", filter(p -> occursin("Enzyme", p), Libdl.dllist()))
     rng = Xoshiro(20261116)
     X = randn(rng, 1770, 30) ./ sqrt(30)
     u = [log(7.0); 0.1 .* randn(rng, 30)]
