@@ -164,6 +164,9 @@ function _js_runtime(mod::_JsModule, v::_JsVal)
         # the runtime range, as `a:b` builds it.
         return _js_rt(_js_use!(mod, :_rk_range) * "(" * _js_number(first(x)) * ", " * _js_number(last(x)) * ")",
                       typeof(x); ref = false)
+    elseif x isa StepRange{Int64,Int64}
+        return _js_rt(_js_use!(mod, :_rk_steprange) * "(" * _js_number(first(x)) * ", " * _js_number(step(x)) *
+                      ", " * _js_number(last(x)) * ")", typeof(x); ref = false)
     elseif x isa Exception
         return _js_rt(_js_exception(mod, x), typeof(x); pure = true)
     end
@@ -486,6 +489,21 @@ function _rk_ode_rk45(f, y0, t0, ts, rt, at, mx) {
   }
   return out;
 }""", [:JuliaError, :_rk_dopri]),
+    :_rk_cumprod => ("""
+function _rk_cumprod(x) { const r = x.slice(); for (let i = 1; i < r.length; i++) r[i] = r[i - 1] * r[i]; return r; }""", Symbol[]),
+    :_rk_cumsum => ("""
+function _rk_cumsum(x) { const r = x.slice(); for (let i = 1; i < r.length; i++) r[i] = r[i - 1] + r[i]; return r; }""", Symbol[]),
+    # `start:step:stop` as Julia builds it: `stop` becomes the last element reached.
+    :_rk_steprange => ("""
+function _rk_steprange(start, step, stop) {
+  if (step === 0) throw new JuliaError("ArgumentError", "step cannot be zero");
+  let last = stop;
+  if (stop !== start) {
+    if ((step > 0) !== (stop > start)) last = start - step;
+    else { const remain = Math.abs(stop - start) % Math.abs(step); last = stop > start ? stop - remain : stop + remain; }
+  }
+  return { start, step, stop: last };
+}""", [:JuliaError]),
     :_rk_number => ("""
 function _rk_number(name, x, integer) {
   if (typeof x !== "number" || (integer && !Number.isInteger(x)))
@@ -516,6 +534,33 @@ function _rk_isodd(x) { return Number.isInteger(x) && Math.abs(x) <= 90071992547
     :_rk_stdlib_gammaln => _js_vendored(:gammaln),
     # `rk_ode_rk45_tol`'s integrator, `@reside-ic/dopri` (`js_ode.jl`)
     :_rk_dopri => _js_vendored(:dopri),
+    :_rk_stdlib_betainc => _js_vendored(:betainc),
+    :_rk_stdlib_betaincinv => _js_vendored(:betaincinv),
+    # SpecialFunctions' incomplete beta function and its inverse, with Julia's
+    # argument checks and special cases. Each tail comes from its own
+    # evaluation, so the smaller one keeps its precision.
+    :_rk_beta_inc => ("""
+function _rk_beta_inc(a, b, x, y) {
+  if (a < 0 || b < 0) _rk_domain("beta_inc", [a, b], "a or b is negative");
+  if (a === 0 && b === 0) _rk_domain("beta_inc", [a, b], "a and b are 0.0");
+  if (x < 0 || x > 1) _rk_domain("beta_inc", x, "x < 0 or x > 1");
+  if (y < 0 || y > 1) _rk_domain("beta_inc", y, "y < 0 or y > 1");
+  if (Math.abs(x + y - 1) > 3 * 2.220446049250313e-16) _rk_domain("beta_inc", [x, y], "x + y != 1.0");
+  if (Number.isNaN(x) || Number.isNaN(y) || Number.isNaN(a) || Number.isNaN(b)) return [NaN, NaN];
+  if (x === 0) return [0, 1];
+  if (y === 0 || a === 0) return [1, 0];
+  if (b === 0) return [0, 1];
+  return x <= 0.5 ? [_rk_stdlib_betainc(x, a, b, true, false), _rk_stdlib_betainc(x, a, b, true, true)]
+                  : [_rk_stdlib_betainc(y, b, a, true, true), _rk_stdlib_betainc(y, b, a, true, false)];
+}""", [:_rk_stdlib_betainc, :_rk_domain]),
+    :_rk_beta_inc_inv => ("""
+function _rk_beta_inc_inv(a, b, p, q) {
+  if (p > 0.5) { const z = _rk_beta_inc_inv(b, a, q, p); return [z[1], z[0]]; }
+  if (p === 0) return [0, 1];
+  if (p < 0) _rk_domain("log", p, "it must be nonnegative");
+  const x = _rk_stdlib_betaincinv(p, a, b, false);
+  return [x, 1 - x];
+}""", [:_rk_stdlib_betaincinv, :_rk_domain]),
     # `copysign` reads the sign of a NaN as positive: JavaScript keeps no sign of a NaN.
     :_rk_copysign => ("""
 function _rk_copysign(x, y) { return y < 0 || Object.is(y, -0) ? -Math.abs(x) : Math.abs(x); }""", Symbol[]),
@@ -561,6 +606,8 @@ _js_isint(v) = _js_type(v) === Int64
 _js_isbool(v) = _js_type(v) === Bool
 _js_isvector(v) = _js_type(v) <: Vector && eltype(_js_type(v)) <: Union{_JsNumber,Bool}
 _js_isrange(v) = _js_type(v) in (UnitRange{Int64}, Base.OneTo{Int64})
+# A stepped range (`n:-1:1`): iterated, measured and read at its ends only.
+_js_isstep(v) = _js_type(v) === StepRange{Int64,Int64}
 _js_istuple(v) = v isa _JsTuple || (v isa _JsVal && (v.static ? v.value isa Tuple : v.T <: Tuple))
 _js_tuple_length(v::_JsTuple) = length(v.items)
 _js_tuple_length(v::_JsVal) = v.static ? length(v.value) : fieldcount(v.T)
@@ -1832,6 +1879,19 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
             acc = _js_call!(ir, muladd, Any[x, acc, c], T)
         end
         return acc
+    elseif f === map && length(args) == 2 && args[1] isa _JsVal && args[1].static && _js_istuple(args[2]) &&
+           !(_js_type(args[2]) <: NamedTuple) && T <: Tuple && isconcretetype(T)
+        # `map(float, (a, b, x))`: a tuple of the function's values, element by element.
+        S = _js_type(args[2])
+        items = Any[_js_call!(ir, args[1].value,
+                              Any[_js_function_call(ir, Core.getfield, Any[args[2], _js_static(k)], fieldtype(S, k))],
+                              fieldtype(T, k)) for k in 1:_js_tuple_length(args[2])]
+        return _JsTuple(items, T)
+    elseif f === minmax && length(args) == 2 && nums
+        x, y = _js_simple!(ir, args[1], "x"), _js_simple!(ir, args[2], "y")
+        lo = _js_runtime(mod, _js_call!(ir, min, Any[x, y], fieldtype(T, 1))).code
+        hi = _js_runtime(mod, _js_call!(ir, max, Any[x, y], fieldtype(T, 2))).code
+        return _js_rt("[" * lo * ", " * hi * "]", T; pure = false)
     elseif f in (first, last) && length(args) == 1 && _js_istuple(args[1]) && _js_tuple_length(args[1]) > 0
         k = f === first ? 1 : _js_tuple_length(args[1])
         return _js_function_call(ir, Core.getfield, Any[args[1], _js_static(k)], T)
@@ -1911,6 +1971,40 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
         return _js_static(1)
     elseif f === (:) && length(args) == 2 && all(_js_isint, args)
         return _js_fcall(ir, _js_use!(mod, :_rk_range), args, UnitRange{Int64})
+    elseif f === (:) && length(args) == 3 && all(_js_isint, args)
+        if all(a -> a isa _JsVal && a.static, args)
+            r = try
+                (:)((a.value for a in args)...)
+            catch
+                nothing
+            end
+            r === nothing || return _js_static(r)
+        end
+        return _js_fcall(ir, _js_use!(mod, :_rk_steprange), args, StepRange{Int64,Int64})
+    elseif f === iterate && length(args) in (1, 2) && _js_isstep(args[1])
+        r = _js_range!(ir, args[1], "r")
+        if length(args) == 1
+            r.static && return _js_static(iterate(r.value))
+            return _js_rt("(" * r.code * ".start !== " * r.code * ".stop && (" * r.code * ".step > 0) !== (" *
+                          r.code * ".stop > " * r.code * ".start)) ? null : [" * r.code * ".start, " * r.code *
+                          ".start]", T; prec = _JS_COND)
+        end
+        s = _js_simple!(ir, args[2], "s")
+        stop, stp = r.static ? (_js_number(last(r.value)), _js_number(step(r.value))) :
+            (r.code * ".stop", r.code * ".step")
+        return _js_rt(s.code * " === " * stop * " ? null : [" * s.code * " + " * stp * ", " * s.code * " + " * stp *
+                      "]", T; prec = _JS_COND)
+    elseif f in (first, last, step, length, isempty) && length(args) == 1 && _js_isstep(args[1])
+        r = _js_range!(ir, args[1], "r")
+        r.static && return _js_static(f(r.value))
+        f === first && return _js_rt(r.code * ".start", Int64)
+        f === last && return _js_rt(r.code * ".stop", Int64)
+        f === step && return _js_rt(r.code * ".step", Int64)
+        empty = "(" * r.code * ".start !== " * r.code * ".stop && (" * r.code * ".step > 0) !== (" * r.code *
+                ".stop > " * r.code * ".start))"
+        f === isempty && return _js_rt(empty, Bool; prec = _JS_ATOM)
+        return _js_rt(empty * " ? 0 : (" * r.code * ".stop - " * r.code * ".start) / " * r.code * ".step + 1",
+                      Int64; prec = _JS_COND)
     elseif f === iterate && length(args) in (1, 2) && _js_isrange(args[1])
         r = _js_range!(ir, args[1])
         if length(args) == 1
@@ -1979,6 +2073,52 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
     elseif f === (*) && length(args) >= 2 && all(a -> a isa _JsVal && _js_type(a) <: AbstractString, args)
         # string concatenation, as an error message builds it
         return _js_rt(join((_js_code(mod, a, _JS_ADD + 1) for a in args), " + "), String; prec = _JS_ADD)
+    elseif f === findfirst && length(args) == 2 && args[1] isa _JsVal && args[1].static && _js_istuple(args[2]) &&
+           !(_js_type(args[2]) <: NamedTuple) && T == Union{Nothing,Int64}
+        # The first position of a tuple whose element satisfies a predicate known
+        # while translating (`findfirst(<(1e-3), ts)`), or `null` for `nothing`.
+        pred = args[1].value
+        S = _js_type(args[2])
+        test(v) = pred isa Base.Fix2 ? _js_call!(ir, pred.f, Any[v, _js_static(pred.x)], Bool) :
+                  pred isa Base.Fix1 ? _js_call!(ir, pred.f, Any[_js_static(pred.x), v], Bool) :
+                  _js_call!(ir, pred, Any[v], Bool)
+        code = "null"
+        for k in _js_tuple_length(args[2]):-1:1
+            v = _js_simple!(ir, _js_function_call(ir, Core.getfield, Any[args[2], _js_static(k)], fieldtype(S, k)), "e")
+            c = test(v)
+            _js_isbool(c) || return nothing
+            code = _js_code(mod, c, _JS_COND + 1) * " ? " * string(k) * " : " * code
+        end
+        return _js_rt("(" * code * ")", T)
+    elseif f === something && length(args) == 2 && Nothing <: _js_type(args[1]) && _js_isnumber(args[2]) &&
+           T === _js_type(args[2])
+        return _js_rt(_js_code(mod, args[1], _JS_OR + 1) * " ?? " * _js_code(mod, args[2], _JS_OR + 1), T;
+                      prec = _JS_OR)
+    elseif f === iszero && length(args) == 1 && _js_isnumber(args[1])
+        return _js_rt(_js_code(mod, args[1], _JS_EQ + 1) * " === 0", Bool; prec = _JS_EQ)
+    elseif f in (cumprod, cumsum) && length(args) == 1 && _js_istuple(args[1]) &&
+           _js_number_tuple(_js_type(args[1]), eltype(_js_type(args[1]))) && T == _js_type(args[1])
+        # Running products or sums of a tuple, left to right as Julia accumulates them.
+        helper = _js_use!(mod, f === cumprod ? :_rk_cumprod : :_rk_cumsum)
+        return _js_rt(helper * "(" * _js_runtime(mod, args[1]).code * ")", T)
+    elseif f === ntuple && length(args) == 2 && args[2] isa _JsVal && args[2].static && args[2].value isa Val &&
+           T <: Tuple && isconcretetype(T)
+        # `ntuple(k -> c[k] * x, Val(21))`: the function at each position, a
+        # tuple known in length while translating.
+        n = typeof(args[2].value).parameters[1]
+        n isa Int && n == fieldcount(T) || return nothing
+        items = String[]
+        for k in 1:n
+            if args[1] isa _JsStruct
+                _js_flush!(ir)
+                push!(items, _js_runtime(mod, first(_js_inline!(ir.fn, args[1], Any[_js_static(k)], "e"))).code)
+            else
+                args[1] isa _JsVal && args[1].static || return nothing
+                push!(items, _js_runtime(mod, _js_call!(ir, args[1].value, Any[_js_static(k)], fieldtype(T, k))).code)
+            end
+        end
+        # An array, computed here: its elements are locals of this block.
+        return _js_rt("[" * join(items, ", ") * "]", T; pure = false)
     elseif f === string && all(a -> a isa _JsVal, args)
         return _js_rt("\"\" + " * join((_js_code(mod, a, _JS_ADD + 1) for a in args), " + "), String;
                       prec = _JS_ADD)
@@ -2078,10 +2218,20 @@ function _js_function_call(ir::_JsIR, f::Core.Builtin, args, T)
         return _js_rt("throw " * _js_runtime(mod, args[1]).code, Union{}; pure = false)
     elseif f === Core._apply_iterate && length(args) >= 2 && args[1] isa _JsVal && args[1].static &&
            args[1].value === iterate && args[2] isa _JsVal && args[2].static &&
-           all(a -> a isa _JsTuple || (a isa _JsVal && a.static && a.value isa Tuple), args[3:end])
+           all(a -> a isa _JsTuple || (a isa _JsVal && a.static && a.value isa Tuple) ||
+                    (a isa _JsVal && !a.static && a.T <: Tuple && !(a.T <: NamedTuple) && isconcretetype(a.T)), args[3:end])
         items = Any[]
         for a in args[3:end]
-            a isa _JsTuple ? append!(items, a.items) : append!(items, (_js_static(x) for x in a.value))
+            if a isa _JsTuple
+                append!(items, a.items)
+            elseif a.static
+                append!(items, (_js_static(x) for x in a.value))
+            else
+                # a tuple computed at run time: its elements, read from one name
+                t = _js_simple!(ir, a, "t")
+                append!(items, (_js_rt(t.code * "[" * string(k - 1) * "]", fieldtype(a.T, k); ref = true)
+                                for k in 1:fieldcount(a.T)))
+            end
         end
         return _js_call!(ir, args[2].value, items, T)
     elseif f === Core.apply_type && all(a -> a isa _JsVal && a.static, args)
@@ -2100,6 +2250,11 @@ end
 
 # Number constructors (`Float64(x)`, `Int(x)`) are calls of the type.
 function _js_function_call(ir::_JsIR, f::Type, args, T)
+    if f === LazyString && all(a -> a isa _JsVal, args)
+        # An exception message built lazily: a string, as `string` builds one.
+        return _js_rt("\"\" + " * join((_js_code(ir.fn.mod, a, _JS_ADD + 1) for a in args), " + "), LazyString;
+                      prec = _JS_ADD)
+    end
     if f in (Float64, Int64) && length(args) == 1 && _js_isnumber(args[1])
         return _js_convert(ir, f, args[1])
     elseif f in (Float64, Float32) && length(args) in (1, 2) && _js_isirrational(args[1]) &&

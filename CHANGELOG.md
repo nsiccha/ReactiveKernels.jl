@@ -16,6 +16,31 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.272
+
+- `js_source` translates the quantiles of RK's distribution laws:
+  `standard_student_t`, `student_t`, `normal`, `lognormal`, `exponential`
+  and `gamma`. It also translates the gamma law's `cdf`, `ccdf`, `logcdf`
+  and `logccdf`, and direct calls of SpecialFunctions' `beta_inc`,
+  `beta_inc_inv`, `gamma_inc` and `gamma_inc_inv`. Node agrees with native
+  to about 1e-13 relative or better; far below 1e-15 the vendored code is
+  the more accurate side.
+- **`beta_inc` and `beta_inc_inv`** come from pinned stdlib-js `betainc`
+  and `betaincinv` (Boost's `ibeta`), with Julia's argument checks and
+  special cases. SpecialFunctions' code there is not concretely typed, so it
+  cannot be translated.
+- **`gamma_inc` and `gamma_inc_inv`** translate from SpecialFunctions' own
+  Julia code. stdlib-js's `gammainc` is inaccurate above a shape of about
+  1000.
+- **Emitter coverage for that code:**
+  - stepped ranges (`n:-1:1`, `a:s:b`), constant or computed at run time:
+    iterated, with `length`, `first`, `last`, `step` and `isempty`;
+  - `ntuple(f, Val(n))`, `cumprod` and `cumsum` of a tuple, `map` over a
+    tuple, and `minmax`;
+  - `findfirst` of a predicate over a tuple, with `something`;
+  - `iszero` and `LazyString` exception messages;
+  - splatting a tuple computed at run time.
+
 ## 0.1.271
 
 - `js_source` translates more of the Base a plain helper uses over a window

@@ -4,7 +4,8 @@ using ReactiveKernels
 using LogExpFunctions: log1pexp, logistic
 using Test
 using Base: OneTo
-using SpecialFunctions: erf, erfc, erfcx, logerfc, gamma, loggamma, logabsgamma, logbeta
+using SpecialFunctions: erf, erfc, erfcx, logerfc, gamma, loggamma, logabsgamma, logbeta, beta_inc,
+    beta_inc_inv, gamma_inc, gamma_inc_inv
 using LogExpFunctions: log1pexp, log1mexp
 import Distributions
 
@@ -164,6 +165,29 @@ js_parity(x) = iseven(x) ? 1.0 : isodd(x) ? -1.0 : 0.0
 js_logabsgamma_value(a) = first(logabsgamma(a))
 js_logabsgamma_sign(a) = last(logabsgamma(a))
 js_tdist_cdf(x, nu) = Distributions.cdf(Distributions.TDist(nu), x)
+# Stepped ranges, constant or computed at run time, and the tuple tools
+# SpecialFunctions' incomplete gamma function uses: `ntuple`, `cumprod`,
+# `findfirst` with `something`, `minmax`, `map` and an irrational constant.
+function js_countdown(n, x)
+    s = 0.0
+    for k in n:-1:1
+        s = s * x + k
+    end
+    for k in 10:-3:1
+        s += k
+    end
+    s
+end
+js_stride(a, s, b) = (r = a:s:b; isempty(r) ? -length(r) - 1 : length(r) + 10first(r) + 100last(r) + 1000step(r))
+function js_tuple_tools(x)
+    ts = cumprod(ntuple(i -> x / i, Val(6)))
+    k = something(findfirst(<(0.1), ts), 7)
+    lo, hi = minmax(x, 2x)
+    a, b = map(abs, (x, -2x))
+    ts[min(k, 6)] + k + lo * hi + a + b + π * x + (iszero(x) ? 1.0 : 0.0)
+end
+js_beta_inc_inv_x(a, b, p) = first(beta_inc_inv(a, b, p))
+js_beta_inc_inv_y(a, b, p) = last(beta_inc_inv(a, b, p))
 
 # Irrational constants written in the source, through Julia's methods for them:
 # arithmetic rounds the constant to `Float64`; a comparison rounds it up or down
@@ -347,6 +371,38 @@ end
     p = log1pexp(x)
     m = log1mexp(-abs(x))
     return p
+end
+@kernel js_steps(n, x, a, s, b) = begin
+    c = js_countdown(n, x)
+    r = js_stride(a, s, b)
+    return c
+end
+@kernel js_tuple_tools_k(x) = begin
+    y = js_tuple_tools(x)
+    return y
+end
+# The incomplete beta function and its inverse come from stdlib-js; the
+# incomplete gamma function and its inverse translate from their Julia code.
+@kernel js_beta_incs(a, b, x) = begin
+    t = beta_inc(a, b, x)
+    p = first(t)
+    q = last(t)
+    return p
+end
+@kernel js_beta_inc_inv(a, b, p) = begin
+    x = js_beta_inc_inv_x(a, b, p)
+    y = js_beta_inc_inv_y(a, b, p)
+    return x
+end
+@kernel js_gamma_incs(a, x) = begin
+    t = gamma_inc(a, x)
+    p = first(t)
+    q = last(t)
+    return p
+end
+@kernel js_gamma_inc_inv(a, p) = begin
+    x = gamma_inc_inv(a, p, 1 - p)
+    return x
 end
 @kernel js_tdist(x, nu) = begin
     p = js_tdist_cdf(x, nu)
@@ -571,6 +627,25 @@ const CASES = [
     (:js_logbeta, js_logbeta, (:a, :b), :y, (; a = Float64, b = Float64),
      [(a, b) for a in (0.25, 0.5, 2.5, 40.0, 1e6) for b in (0.5, 3.0, 7.5, 9.0, 1e3)] ∪
      [(-1.0, -2.0), (-0.5, 2.0), (0.0, 1.0), (-2.5, 0.75)]),
+    # a step of zero raises `ArgumentError`; empty ranges count none
+    (:js_steps, js_steps, (:n, :x, :a, :s, :b), (:c, :r), (; n = Int, x = Float64, a = Int, s = Int, b = Int),
+     [(5, 0.5, 1, 2, 9), (0, 2.0, 9, -3, 1), (-2, 1.0, 1, 1, 0), (3, -1.0, 4, -1, 4), (4, 1.5, 9, 2, 1),
+      (2, 1.0, 1, 0, 3)]),
+    (:js_tuple_tools_k, js_tuple_tools_k, (:x,), :y, (; x = Float64), [(x,) for x in (0.05, 0.5, 2.0, 0.0, -3.0)]),
+    (:js_beta_incs, js_beta_incs, (:a, :b, :x), (:p, :q), (; a = Float64, b = Float64, x = Float64),
+     [(a, b, x) for a in (0.0, 0.25, 2.5, 30.0, 1e4, -1.0, NaN) for b in (0.0, 0.5, 3.0)
+      for x in (0.0, 1e-300, 1e-10, 0.3, 0.9, 1 - 1e-12, 1.0, 1.5, NaN)]),
+    (:js_beta_inc_inv, js_beta_inc_inv, (:a, :b, :p), (:x, :y), (; a = Float64, b = Float64, p = Float64),
+     [(a, b, p) for a in (0.25, 1.0, 2.5, 30.0, 5e5) for b in (0.5, 3.0)
+      for p in (0.0, 1e-12, 0.05, 0.5, 0.95, 1 - 1e-12, 1.0, -0.1, 1.1)]),
+    # large shapes included: there stdlib-js's `gammainc` is inaccurate, and the
+    # module runs SpecialFunctions' own algorithm
+    (:js_gamma_incs, js_gamma_incs, (:a, :x), (:p, :q), (; a = Float64, x = Float64),
+     [(a, x) for a in (0.0, 1e-3, 0.5, 1.0, 2.5, 30.0, 1e4, -1.0, NaN)
+      for x in (0.0, 1e-8, 0.5, 2.0, 30.0, 1e4, Inf, -1.0, NaN)] ∪
+     [(a, a + k * sqrt(a)) for a in (1e3, 2e3, 1e5) for k in (-3, -1, 0, 1, 3)]),
+    (:js_gamma_inc_inv, js_gamma_inc_inv, (:a, :p), :x, (; a = Float64, p = Float64),
+     [(a, p) for a in (1e-3, 0.5, 1.0, 2.5, 30.0, 2e3, 1e4) for p in (0.0, 1e-12, 0.05, 0.5, 0.95, 1 - 1e-12, 1.0)]),
     (:js_logexp, js_logexp, (:x,), (:p, :m), (; x = Float64),
      [(x,) for x in (-Inf, -800.0, -40.0, -1.0, -0.0, 0.0, 1e-10, 0.5, 3.0, 40.0, 800.0, Inf, NaN)]),
     (:js_matrix_reads, js_matrix_reads, (:m, :j), (:col, :row, :corner, :extent), (; m = M, j = Int),
@@ -803,11 +878,18 @@ agree(a, b) = false
         @test occursin("Apache License, Version 2.0", gamma_source)
         erfs = ReactiveKernels.js_source(js_erfs; have = (:x,), want = (:e, :c, :cx, :lc), types = (; x = Float64))
         @test count("var _rk_stdlib_erfc=", erfs) == 1 && !occursin("_rk_stdlib_gamma", erfs)
+        # the incomplete gamma function is translated, not vendored
+        incgamma = ReactiveKernels.js_source(js_gamma_incs; have = (:a, :x), want = (:p, :q),
+                                             types = (; a = Float64, x = Float64))
+        @test !occursin("gammainc", incgamma) && occursin("while (true)", incgamma)
+        @test occursin("var _rk_stdlib_betainc=", ReactiveKernels.js_source(js_beta_incs; have = (:a, :b, :x),
+                       want = (:p, :q), types = (; a = Float64, b = Float64, x = Float64)))
         # each vendored file defines its one function and carries the notices
         # of the implementation it follows
         for (name, notice) in ((:erf, "Sun Microsystems"), (:erfc, "Sun Microsystems"),
                                (:erfcx, "Massachusetts Institute of Technology"),
-                               (:gamma, "Cephes"), (:gammaln, "Sun Microsystems"))
+                               (:gamma, "Cephes"), (:gammaln, "Sun Microsystems"),
+                               (:betainc, "Boost Software License"), (:betaincinv, "Boost Software License"))
             text = read(joinpath(pkgdir(ReactiveKernels), "src", "js_vendor", string(name, ".js")), String)
             @test occursin("var _rk_stdlib_" * string(name) * "=", text)
             @test occursin(notice, text)

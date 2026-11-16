@@ -1,5 +1,6 @@
 module DistributionJSSourceTests
-# `ReactiveKernels.js_source` of this package's laws (RK 0.1.264): a browser
+# `ReactiveKernels.js_source` of this package's laws (RK 0.1.264; quantiles and
+# the gamma CDF later): a browser
 # module computes the same law the RK, RKPPL and BRM models compute, its
 # log-domain tails included, and Node agrees with native Julia.
 using Test, ReactiveKernels
@@ -77,6 +78,21 @@ end
     lp = gamma(shape, rate).logpdf(x)
     return lp
 end
+const GAMMA_TAILS = Dict(ep => (@eval @kernel $(Symbol(:js_gamma_, ep))(x::Float64, a::Float64, b::Float64) = begin
+    p = gamma(a, b).$ep(x)
+    return p
+end) for ep in (:cdf, :ccdf, :logcdf, :logccdf))
+# Quantiles: the inverse incomplete beta function (Student-t) from stdlib-js,
+# the inverse incomplete gamma function translated from SpecialFunctions.
+@kernel js_quantiles(p::Float64, nu::Float64, m::Float64, s::Float64, a::Float64) = begin
+    t = standard_student_t(nu).quantile(p)
+    ts = student_t(nu, m, s).quantile(p)
+    n = normal(m, s).quantile(p)
+    ln = lognormal(m, s).quantile(p)
+    e = exponential(s).quantile(p)
+    g = gamma(a, s).quantile(p)
+    return t
+end
 
 @testset "js_source of the distribution laws" begin
     if !NODE
@@ -121,6 +137,17 @@ end
             check_js(js_gamma_density, (:x, :shape, :rate), :lp, (; x = Float64, shape = Float64, rate = Float64),
                      [(x, a, b) for x in (-1.0, 0.0, 0.5, 3.0, 30.0, Inf) for a in (0.5, 1.0, 2.5, 40.0)
                       for b in (0.5, 3.0)])
+        end
+        @testset "gamma(shape, rate).$ep" for ep in (:cdf, :ccdf, :logcdf, :logccdf)
+            check_js(GAMMA_TAILS[ep], (:x, :a, :b), :p, (; x = Float64, a = Float64, b = Float64),
+                     [(x, a, b) for x in (-1.0, 0.0, 1e-8, 0.5, 3.0, 30.0, 1e4, Inf, NaN)
+                      for a in (0.5, 1.0, 2.5, 40.0, 3e3) for b in (0.5, 3.0)])
+        end
+        @testset "quantiles" begin
+            check_js(js_quantiles, (:p, :nu, :m, :s, :a), (:t, :ts, :n, :ln, :e, :g),
+                     (; p = Float64, nu = Float64, m = Float64, s = Float64, a = Float64),
+                     [(p, nu, 0.5, s, a) for p in (0.0, 1e-12, 0.025, 0.3, 0.5, 0.975, 1 - 1e-12, 1.0)
+                      for nu in (0.5, 1.0, 8.0, 1e6) for s in (0.5, 3.0) for a in (0.5, 2.5, 40.0)])
         end
     end
 end
