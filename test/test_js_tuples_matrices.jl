@@ -25,6 +25,74 @@ js_count_flags(p, q) = count((p, q))
 js_static_rows(x) = all(>=(1), (2, 2)) ? x : -x
 js_empty_tuple(x) = all(<(0), ()) && !any(<(0), ()) ? x + count(<(0), ()) : -x
 
+# Tuple length inside a called validation helper must translate even when
+# Julia only needs the call in the exceptional branch of inferred code.
+function js_check_axis_count(domain, d)
+    length(domain) == d || throw(ArgumentError("expected $d axes, got $(length(domain))"))
+    nothing
+end
+function js_domain_width(lo, hi, d)
+    domain = ((lo, hi), (lo - 1, hi + 1))
+    js_check_axis_count(domain, d)
+    domain[1][2] - domain[1][1] + domain[2][2] - domain[2][1]
+end
+function js_fixed_domain_width(d)
+    domain = ((-2.0, 2.0), (-3.0, 3.0))
+    js_check_axis_count(domain, d)
+    domain[d][2] - domain[d][1]
+end
+@kernel js_tuple_length_validation(lo, hi, d) = begin
+    width = js_domain_width(lo, hi, d)
+    fixed = js_fixed_domain_width(d)
+    return width
+end
+
+function js_fill_owned(v, x)
+    out = copy(v)
+    alias = out
+    fill!(out, x)
+    alias
+end
+function js_fill_ints(n, x)
+    out = Vector{Int}(undef, n)
+    fill!(out, x)
+end
+function js_fill_flags(n, flag)
+    out = Vector{Bool}(undef, n)
+    fill!(out, flag)
+end
+@kernel js_fill_vectors(v, x, n, flag) = begin
+    floats = js_fill_owned(v, x)
+    ints = js_fill_ints(n, x)
+    flags_as_ints = js_fill_ints(n, flag)
+    flags = js_fill_flags(n, flag)
+    flags_as_floats = js_fill_owned(v, flag)
+    return floats
+end
+
+# A keyword sorter reuses an anonymous local for differently typed values.
+# Its earlier SSA reads, and a saved reference to a reassigned argument,
+# must retain the value they read.
+js_kw_values(v; k = [1, 2], c = 1.5, domain = ((0.0, 1.0),), by = nothing) =
+    sum(v) + sum(k) + c + domain[1][2] + (by === nothing ? 0.0 : sum(by))
+js_kw_caller(v, x) = js_kw_values(v; k = [2, 3], domain = ((x, x + 1),))
+function js_saved_array(v, x)
+    saved = v
+    v = [x]
+    sum(saved) + sum(v)
+end
+function js_fill_if(v, x, flag)
+    out = copy(v)
+    flag && fill!(out, x)
+    out
+end
+@kernel js_slot_snapshots(v, x, flag) = begin
+    keywords = js_kw_caller(v, x)
+    saved = js_saved_array(v, x)
+    lazy = js_fill_if([1, 2], x, flag)
+    return keywords
+end
+
 @kernel js_tuple_preds(a, b, x, k, y, z, p, q) = begin
     same = js_same_lengths(a, b)
     first_positive = js_first_positive(a, b)
@@ -164,6 +232,18 @@ end
 const V = Vector{Float64}
 const M = Matrix{Float64}
 const CASES = [
+    (:js_tuple_length_validation, js_tuple_length_validation, (:lo, :hi, :d), (:width, :fixed),
+     (; lo = Float64, hi = Float64, d = Int), [(0.0, 1.0, 2), (-3.0, 5.0, 2), (0.0, 1.0, 1)]),
+    (:js_fill_vectors, js_fill_vectors, (:v, :x, :n, :flag),
+     (:floats, :ints, :flags_as_ints, :flags, :flags_as_floats),
+     (; v = V, x = Float64, n = Int, flag = Bool),
+     [([1.0, 2.0], -2.0, 3, true), (Float64[], 0.0, 0, false),
+      (ones(31), -0.0, 19, false), ([1.0], 0.5, 2, true),
+      (Float64[], 0.5, 0, true)]),
+    (:js_slot_snapshots, js_slot_snapshots, (:v, :x, :flag), (:keywords, :saved, :lazy),
+     (; v = V, x = Float64, flag = Bool),
+     [([1.0, 2.0], 3.0, true), (Float64[], 0.5, false), (ones(31), -2.0, false),
+      ([1.0], 0.5, true)]),
     (:js_tuple_preds, js_tuple_preds, (:a, :b, :x, :k, :y, :z, :p, :q),
      (:same, :first_positive, :any_negative, :nlarge, :both, :either, :nflags, :rows, :empty),
      (; a = V, b = V, x = Float64, k = Int, y = Float64, z = Float64, p = Bool, q = Bool),
