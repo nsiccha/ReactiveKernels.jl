@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.290
+## 0.1.291
 
 - `@traceable` and `TraceableSource` accept body-level early returns, including
   guards before loops. Recorded source preserves their lazy continuations;
@@ -33,6 +33,14 @@ are recorded in the git history only.
   behind an early-return guard. Empty padded buffer cells are guarded before
   evaluation, preserving ordinary gradients of shared arguments; integer
   reductions of cell data request prepared bounds for their allocations.
+
+## 0.1.290
+
+- `jax_source` supports plate cells returning numerical tuples and named
+  records with nested records and array fields over multiple mapped axes.
+  Subsequent plates retain field lengths and the record array's own padding;
+  empty axes skip cell execution. Mapping and ordinary JAX reverse differentiation
+  keep bounded bodies as data sizes grow.
 
 ## 0.1.289
 
