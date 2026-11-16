@@ -19,16 +19,19 @@ const here = fileURLToPath(new URL(".", import.meta.url));
 // check that the global works, and optionally `embedLicense`, a license file
 // whose text the header carries in full (a license that must travel with every
 // copy, as MIT's permission notice must).
-const stdlib = (name) => ({
+const stdlib = (name, license, ...args) => ({
   file: `${name}.js`,
   package: `@stdlib/math-base-special-${name}`,
   url: "https://github.com/stdlib-js/stdlib",
   entry: `module.exports = require("@stdlib/math-base-special-${name}/lib/main.js");`,
   global: `_rk_stdlib_${name}`,
-  license: "the Apache License, Version 2.0, https://www.apache.org/licenses/LICENSE-2.0",
+  license,
   licenseFiles: ["LICENSE", "NOTICE"],
-  check: (f) => typeof f === "function" && Number.isFinite(f(0.5)),
+  check: (f) => typeof f === "function" && Number.isFinite(f(...args)),
 });
+const APACHE = "the Apache License, Version 2.0, https://www.apache.org/licenses/LICENSE-2.0";
+// Boost-derived code is also under the Boost Software License 1.0.
+const APACHE_BOOST = APACHE + ", and the Boost Software License 1.0, https://www.boost.org/LICENSE_1_0.txt";
 // `rk_ode_rk45_tol`'s Dormand–Prince 5(4) integrator (src/js_ode.jl).
 const dopri = {
   file: "dopri.js",
@@ -45,11 +48,17 @@ const dopri = {
     return Math.abs(d.run(1)([1])[0][0] - Math.exp(-1)) < 1e-5;
   },
 };
-const BUNDLES = [...["erf", "erfc", "erfcx", "gamma", "gammaln"].map(stdlib), dopri];
+const BUNDLES = [
+  stdlib("erf", APACHE, 0.5), stdlib("erfc", APACHE, 0.5), stdlib("erfcx", APACHE, 0.5),
+  stdlib("gamma", APACHE, 0.5), stdlib("gammaln", APACHE, 0.5),
+  stdlib("betainc", APACHE_BOOST, 0.3, 4, 0.5), stdlib("betaincinv", APACHE_BOOST, 0.05, 4, 0.5),
+  dopri,
+];
 
 // stdlib-js detects typed arrays, byte order and property support through
-// polyfill modules; every JavaScript engine the modules run in has them built
-// in, so these read the built-in objects instead.
+// polyfill modules, and logs through Node's `debug`. Every JavaScript engine
+// the modules run in has the built-in objects, so these read those instead,
+// and the logger is silent.
 const shim = (file) => join(here, "shims", file);
 const alias = {
   "@stdlib/array-float64": shim("float64array.cjs"),
@@ -60,6 +69,8 @@ const alias = {
   "@stdlib/utils-define-nonenumerable-read-only-property":
     shim("define-nonenumerable-read-only-property.cjs"),
   "@stdlib/utils-define-property": shim("define-property.cjs"),
+  // Node's `debug` logger, which the inverse functions call: silent.
+  debug: shim("debug.cjs"),
 };
 
 // The original implementations' notices, as the sources quote them in fenced
