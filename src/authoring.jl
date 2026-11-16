@@ -3678,8 +3678,8 @@ function _traceable_no_return(ex, signature, owner = "@traceable")
     ex isa Expr || return ex
     ex.head in (:->, :function, :quote, :inert) && return ex
     ex.head === :return && throw(ArgumentError(
-        "$owner does not support a `return` before the end of `$(signature)`; " *
-        "write the branch as an expression (`condition ? a : b`)."))
+        "$owner cannot normalize this nested `return` in `$(signature)`; " *
+        "body-level early returns are supported, but returns crossing loops or other expression scopes are not."))
     foreach(arg -> _traceable_no_return(arg, signature, owner), ex.args)
     ex
 end
