@@ -163,6 +163,7 @@ const _MATRIX_CORE_TESTS = (
     "test_jax_type_checks.jl",
     "test_jax_zero_predicates.jl",
     "test_jax_host_arguments.jl",
+    "test_traceable_keywords.jl",
     "test_jax_host_constructs.jl",
     "test_jax_host_collections.jl",
     "test_jax_products.jl",

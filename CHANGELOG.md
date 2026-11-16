@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.287
+## 0.1.288
 
 - `jax_source` prepares Cartesian products of data-bound numerical ranges
   and arrays with runtime host iteration. Collected products retain Julia's
@@ -24,6 +24,14 @@ are recorded in the git history only.
   tuple arrays cross to JAX as one array per field with the same shape,
   for compiled plates, indexing and reductions; source bodies do not grow
   with supports.
+
+## 0.1.287
+
+- Accept keyword arguments in `@traceable` methods and translate their calls
+  in JAX functions and host data preparation. Required and typed keywords,
+  dependent defaults, shorthand calls and nested helpers retain Julia's
+  semantics. Keyword values remain runtime helper arguments.
+- Preserve `on_error = :ignore` through captured helper calls with keywords.
 
 ## 0.1.286
 
