@@ -954,6 +954,8 @@ function _jax_statement(ctx::_JaxContext, ex)
 end
 
 function _jax_assign!(ctx::_JaxContext, lhs, rhs)
+    ctx.host !== nothing && lhs isa Expr && lhs.head === :call &&
+        return _host_local_function!(ctx, lhs, rhs)
     name = lhs isa Expr && lhs.head === :(::) ? lhs.args[1] : lhs
     # On the host `y = x` of a local names the same value, as Julia's does, so
     # a list grown through either name is grown through both.
@@ -3799,6 +3801,10 @@ end
 # has Julia's array semantics (`exp(A)` is the matrix exponential), except the
 # operators that act elementwise on arrays too: `+` and `-`, and `/` by a scalar.
 function _jax_call_positional(ctx::_JaxContext, f::Function, args::Vector{_PyVal})
+    if ctx.host !== nothing && f in ((==), (!=)) && length(args) == 2 &&
+       all(a -> _host_is_numeric_array(a.T), args)
+        return _host_array_equality(ctx, f, args)
+    end
     # A type or singleton argument (`floor(Int, x)`, `rem(x, y, RoundDown)`)
     # selects a method, not an elementwise form.
     any(a -> _jax_type_of_value(a) !== nothing || _jax_is_singleton_value(a), args) &&
@@ -4662,9 +4668,12 @@ function _jax_zero_predicate_reduction(ctx::_JaxContext, f, name, args)
     _PyVal(text, Bool, x.static)
 end
 for (f, name) in ((all, "jnp.all"), (any, "jnp.any"))
-    @eval _jax_function_call(ctx::_JaxContext, ::typeof($f), args::Vector{_PyVal}) =
-        length(args) == 1 ? _PyVal($name * "(" * args[1].code * ")", Bool, args[1].static) :
+    @eval function _jax_function_call(ctx::_JaxContext, ::typeof($f), args::Vector{_PyVal})
+        length(args) == 1 && return _PyVal($name * "(" * args[1].code * ")", Bool, args[1].static)
+        ctx.host !== nothing && length(args) == 2 &&
+            return _host_predicate_reduce(ctx, $f, _jax_function_of(args[1]), args[2])
         _jax_zero_predicate_reduction(ctx, $f, $name, args)
+    end
 end
 # Identity comparisons decide while tracing, on static values only.
 for (f, op) in (((===), " is "), ((!==), " is not "))
@@ -5058,6 +5067,10 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(collect), args::Vector{_P
     x = only(args)
     ctx.host !== nothing && x.T isa Type && x.T <: Iterators.ProductIterator &&
         return _host_collect_product(ctx, x)
+    if ctx.host !== nothing && x.T isa Type && x.T <: Base.Iterators.Zip
+        iterable, E = _host_iterable_value(ctx, x)
+        return _host_collected("list(" * iterable * ")", E)
+    end
     x.T isa Type && x.T <: AbstractRange &&
         return _PyVal(x.code, Vector{eltype(x.T)})
     _jax_is_array(x.T) || _jax_error("`collect` of `", x.T, "`", _jax_where(ctx))
@@ -5315,7 +5328,7 @@ function _jax_broadcast(ctx::_JaxContext, f, args::Vector{_PyVal})
     name = _jax_scalar_function!(ctx, f, eltypes)
     # NumPy's `vectorize` needs the result type for empty arrays.
     ctx.host === nothing || return _PyVal("np.vectorize(" * name * ", otypes=[" *
-        _host_dtype(E) * "])(" * _jax_args(padded) * ")", T)
+        _host_dtype(E) * "])(" * _jax_args([_host_broadcast_operand(ctx, a) for a in padded]) * ")", T)
     _PyVal("jnp.vectorize(" * name * ")(" * _jax_args(padded) * ")", T, false,
            R == 0 ? "" : _jax_extent(meta), "", _jax_broadcast_padded(meta, R))
 end
@@ -5345,7 +5358,9 @@ function _jax_captured_broadcast(ctx::_JaxContext, f, scalars, padded, reference
     union!(outer.used, inner.used)
     vectorize = ctx.host === nothing ? "jnp.vectorize(" * name * ")" :
         "np.vectorize(" * name * ", otypes=[" * _host_dtype(v.T) * "])"
-    vectorize * "(" * _jax_args(padded[.!excluded]) * ")", v.T
+    operands = padded[.!excluded]
+    ctx.host === nothing || (operands = [_host_broadcast_operand(ctx, a) for a in operands])
+    vectorize * "(" * _jax_args(operands) * ")", v.T
 end
 
 # A dotted literal power in lowered code, `broadcasted(literal_pow, ^, x,
@@ -5824,6 +5839,7 @@ function _jax_bind_keywords!(ctx, f, source, names, inputs, kw)
             end
             # Singleton functions and type values are passed structurally by
             # the helper emitter, never assigned from their display strings.
+            ctx.host === nothing || (value = _host_read(ctx, value))
             callable = value.T isa Type && value.T <: Function && Base.issingletontype(value.T)
             value = _jax_atom(value) || callable || _jax_type_of_value(value) !== nothing ?
                 value : _jax_bind!(ctx, name, value)
@@ -6660,6 +6676,10 @@ function _jax_call_positional(ctx::_JaxContext,
         f::Union{typeof(getindex),typeof(getfield),typeof(view),typeof(Base.maybeview)},
         args::Vector{_PyVal})
     x = args[1]
+    if ctx.host !== nothing && f === getindex && x.T isa Type && x.T <: AbstractDict
+        length(args) == 2 || _jax_error("a dictionary key of several indices", _jax_where(ctx))
+        return _PyVal(_py_atom(x.code) * "[" * args[2].code * "]", Base.valtype(x.T), true)
+    end
     if x.T isa _JaxCallable && x.T.f isa _JaxClosure && f === getfield
         closure = x.T.f
         field = args[2]

@@ -16,6 +16,16 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.297
+
+- `jax_source` host preparation collects and sorts tuple records without
+  coercing their fields, including `by` field projections, dictionary generators and
+  broadcast lookups. Local named helpers preserve writes to captured
+  collections. Chained comparisons and predicate reductions short-circuit;
+  numerical array equality preserves shape and exact integer comparisons.
+  Host loops and generated JAX bodies remain bounded as input lengths change.
+
+
 ## 0.1.296
 
 - JAX source translates nearest-loop `break`, convergence `while` loops,
