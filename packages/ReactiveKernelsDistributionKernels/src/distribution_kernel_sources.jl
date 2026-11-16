@@ -344,16 +344,157 @@ const _LOCATION_SCALE_BINDINGS = _evaluate_source_bindings(
      :standard_logistic,
      :location_scale, :normal, :cauchy, :laplace, :student_t, :logistic),
 )
+# Each law's docstring opens with its call signature: the parameters in the
+# order a positional construction such as `gamma(shape, rate).logpdf(x)` binds
+# them. `test/test_law_docs.jl` checks every signature, named binding,
+# endpoint list and stated Distributions.jl equivalent against the object.
+
+"""
+    standard_normal()
+
+Standard normal law: the same law as `Distributions.Normal()`. It has no
+parameters, so its endpoints are called directly, as in
+`standard_normal.logpdf(z)`.
+
+Endpoints: `logpdf(z)`, `cdf(z)`, `ccdf(z)`, `logcdf(z)`, `logccdf(z)`,
+`quantile(p)`.
+"""
 const standard_normal = _LOCATION_SCALE_BINDINGS[1]
+
+"""
+    standard_cauchy()
+
+Standard Cauchy law: the same law as `Distributions.Cauchy()`. It has no
+parameters, so its endpoints are called directly, as in
+`standard_cauchy.logpdf(z)`.
+
+Endpoints: `logpdf(z)`, `cdf(z)`, `ccdf(z)`, `logcdf(z)`, `logccdf(z)`,
+`quantile(p)`.
+"""
 const standard_cauchy = _LOCATION_SCALE_BINDINGS[2]
+
+"""
+    standard_laplace()
+
+Standard Laplace law, with density `exp(-abs(z)) / 2`: the same law as
+`Distributions.Laplace()`. It has no parameters, so its endpoints are called
+directly, as in `standard_laplace.logpdf(z)`.
+
+Endpoints: `logpdf(z)`, `cdf(z)`, `ccdf(z)`, `logcdf(z)`, `logccdf(z)`,
+`quantile(p)`.
+"""
 const standard_laplace = _LOCATION_SCALE_BINDINGS[3]
+
+"""
+    standard_student_t(nu)
+
+Student-t law with `nu > 0` degrees of freedom, location 0 and scale 1: the
+same law as `Distributions.TDist(nu)`. `nu = Inf` gives the standard normal
+law.
+
+Endpoints: `logpdf(z)`, `cdf(z)`, `ccdf(z)`, `logcdf(z)`, `logccdf(z)`,
+`quantile(p)`.
+"""
 const standard_student_t = _LOCATION_SCALE_BINDINGS[4]
+
+"""
+    standard_logistic()
+
+Standard logistic law, whose CDF is the logistic sigmoid: the same law as
+`Distributions.Logistic()`. It has no parameters, so its endpoints are called
+directly, as in `standard_logistic.logpdf(z)`.
+
+Endpoints: `logpdf(z)`, `cdf(z)`, `ccdf(z)`, `logcdf(z)`, `logccdf(z)`,
+`quantile(p)`.
+"""
 const standard_logistic = _LOCATION_SCALE_BINDINGS[5]
+
+"""
+    location_scale(standard)
+
+Location-scale family of a parameter-free standard law. Binding the standard
+law, outside a kernel, gives the law of `location + scale * z` for `z` drawn
+from `standard`, with parameters `(location, scale)` and `scale > 0`.
+`normal`, `cauchy`, `laplace` and `logistic` are
+`location_scale(standard_normal)` and its siblings, bound once at top level;
+a model's own family is bound the same way, as in
+`const my_law = location_scale(my_standard)`.
+
+Named bindings: `log_scale`, the logarithm of `scale`, in place of `scale`.
+
+Endpoints: `logpdf(x)`, `cdf(x)`, `ccdf(x)`, `logcdf(x)`, `logccdf(x)`,
+`quantile(p)`, and `standardized(x)`, which is `(x - location) / scale`.
+"""
 const location_scale = _LOCATION_SCALE_BINDINGS[6]
+
+"""
+    normal(location, scale)
+
+Normal law with mean `location` and standard deviation `scale > 0`: the same
+law as `Distributions.Normal(location, scale)`.
+
+Named bindings: `log_scale`, the logarithm of `scale`, in place of `scale`,
+as in `normal(; location = μ, log_scale = log_σ).logpdf(x)`.
+
+Endpoints: `logpdf(x)`, `cdf(x)`, `ccdf(x)`, `logcdf(x)`, `logccdf(x)`,
+`quantile(p)`, and `standardized(x)`, which is `(x - location) / scale`.
+"""
 const normal = _LOCATION_SCALE_BINDINGS[7]
+
+"""
+    cauchy(location, scale)
+
+Cauchy law with location `location` and scale `scale > 0`: the same law as
+`Distributions.Cauchy(location, scale)`.
+
+Named bindings: `log_scale`, the logarithm of `scale`, in place of `scale`.
+
+Endpoints: `logpdf(x)`, `cdf(x)`, `ccdf(x)`, `logcdf(x)`, `logccdf(x)`,
+`quantile(p)`, and `standardized(x)`, which is `(x - location) / scale`.
+"""
 const cauchy = _LOCATION_SCALE_BINDINGS[8]
+
+"""
+    laplace(location, scale)
+
+Laplace law with location `location` and scale `scale > 0`, the mean absolute
+deviation: the same law as `Distributions.Laplace(location, scale)`.
+
+Named bindings: `log_scale`, the logarithm of `scale`, in place of `scale`.
+
+Endpoints: `logpdf(x)`, `cdf(x)`, `ccdf(x)`, `logcdf(x)`, `logccdf(x)`,
+`quantile(p)`, and `standardized(x)`, which is `(x - location) / scale`.
+"""
 const laplace = _LOCATION_SCALE_BINDINGS[9]
+
+"""
+    student_t(nu, location, scale)
+
+Student-t law with `nu > 0` degrees of freedom, location `location` and scale
+`scale > 0`: the law of `location + scale * t` for `t` drawn from
+`Distributions.TDist(nu)`, which Distributions.jl writes
+`Distributions.TDist(nu) * scale + location`. The degrees of freedom come
+first. `scale` is not the standard deviation, which is
+`scale * sqrt(nu / (nu - 2))` for `nu > 2`.
+
+Named bindings: `log_scale`, the logarithm of `scale`, in place of `scale`.
+
+Endpoints: `logpdf(x)`, `cdf(x)`, `ccdf(x)`, `logcdf(x)`, `logccdf(x)`,
+`quantile(p)`, and `standardized(x)`, which is `(x - location) / scale`.
+"""
 const student_t = _LOCATION_SCALE_BINDINGS[10]
+
+"""
+    logistic(location, scale)
+
+Logistic law with location `location` and scale `scale > 0`: the same law as
+`Distributions.Logistic(location, scale)`.
+
+Named bindings: `log_scale`, the logarithm of `scale`, in place of `scale`.
+
+Endpoints: `logpdf(x)`, `cdf(x)`, `ccdf(x)`, `logcdf(x)`, `logccdf(x)`,
+`quantile(p)`, and `standardized(x)`, which is `(x - location) / scale`.
+"""
 const logistic = _LOCATION_SCALE_BINDINGS[11]
 
 # Compatibility names for existing consumers.  These are views of the shared
@@ -1255,28 +1396,312 @@ const _OTHER_DISTRIBUTION_BINDINGS = _evaluate_source_bindings(
      :negative_binomial,
      :weibull, :zero_inflated_binomial, :zero_inflated_binomial_logit_zi),
 )
+"""
+    bernoulli(p)
+
+Bernoulli law of a `Bool` outcome with success probability `p`: the same law
+as `Distributions.Bernoulli(p)`.
+
+Named bindings: `logit`, the log-odds `log(p / (1 - p))`, in place of `p`, as
+in `bernoulli(; logit = η).logpdf(y)`; it stays exact where `p` would round to
+0 or 1.
+
+Endpoints: `logpdf(observed)`, `cdf(observed)`, `quantile(q)`.
+"""
 const bernoulli = _OTHER_DISTRIBUTION_BINDINGS[1]
+
+"""
+    lognormal(location, scale)
+
+Log-normal law of `x > 0` whose logarithm has mean `location` and standard
+deviation `scale > 0`: the same law as
+`Distributions.LogNormal(location, scale)`. Both parameters are on the log
+scale; the median is `exp(location)`.
+
+Named bindings: `log_scale`, the logarithm of `scale`, in place of `scale`.
+
+Endpoints: `logpdf(x)`, `cdf(x)`, `ccdf(x)`, `logcdf(x)`, `logccdf(x)`,
+`quantile(p)`, and `standardized_log(x)`, which is
+`(log(x) - location) / scale`.
+"""
 const lognormal = _OTHER_DISTRIBUTION_BINDINGS[2]
+
+"""
+    exponential(scale)
+
+Exponential law of `x ≥ 0` with mean `scale > 0`: the same law as
+`Distributions.Exponential(scale)`. The parameter is a scale, not a rate: a
+law written with rate `λ` is `exponential(1 / λ)`.
+
+Named bindings: `log_scale`, the logarithm of `scale`, in place of `scale`.
+
+Endpoints: `logpdf(x)`, `cdf(x)`, `ccdf(x)`, `logcdf(x)`, `logccdf(x)`,
+`quantile(p)`.
+"""
 const exponential = _OTHER_DISTRIBUTION_BINDINGS[3]
+
+"""
+    geometric(p)
+
+Geometric law of the number of failures before the first success, with
+success probability `p`: the same law as `Distributions.Geometric(p)`.
+
+Named bindings: `logitp`, the log-odds `log(p / (1 - p))`, in place of `p`.
+
+Endpoints: `logpdf(observed)`, `cdf(observed)`, `quantile(q)`.
+"""
 const geometric = _OTHER_DISTRIBUTION_BINDINGS[4]
+
+"""
+    uniform(lower, upper)
+
+Continuous uniform law on `[lower, upper]`, with `lower < upper`: the same law
+as `Distributions.Uniform(lower, upper)`.
+
+Endpoints: `logpdf(x)`, `cdf(x)`, `ccdf(x)`, `quantile(p)`.
+"""
 const uniform = _OTHER_DISTRIBUTION_BINDINGS[5]
+
+"""
+    mvnormal(; μ, covariance)
+    mvnormal(; μ, chol)
+    mvnormal(; μ, precision)
+    mvnormal(; μ, precision_chol)
+
+Multivariate normal law of a vector `x` with mean `μ`. Name the mean and one
+of four descriptions of the covariance: the covariance matrix `covariance`,
+its lower Cholesky factor `chol` (`covariance = chol * chol'`), the precision
+matrix `precision` (`inv(covariance)`), or the lower Cholesky factor
+`precision_chol` of the precision (`precision = precision_chol * precision_chol'`).
+`mvnormal(; μ, covariance)` is the same law as
+`Distributions.MvNormal(μ, covariance)`. A positional construction would bind
+all five, so name the two you supply.
+
+Named bindings: `chol`, `precision` or `precision_chol` in place of
+`covariance`.
+
+Endpoints: `logpdf(x)`.
+"""
 const mvnormal = _OTHER_DISTRIBUTION_BINDINGS[6]
+
+"""
+    ar1(μ, ϕ, scale)
+
+Stationary first-order autoregressive normal law of a series `x`:
+`x[t] - μ = ϕ * (x[t - 1] - μ) + scale * ε[t]` with standard normal `ε`, and
+`x[1]` drawn from the stationary law, of standard deviation
+`scale / sqrt(1 - ϕ^2)`. `scale > 0` is the innovation standard deviation, and
+`logpdf` is `-Inf` unless `abs(ϕ) < 1`. The same law as
+`Distributions.MvNormal` with mean `μ` everywhere and covariance
+`scale^2 * ϕ^abs(i - j) / (1 - ϕ^2)`.
+
+Endpoints: `logpdf(x)`.
+"""
 const ar1 = _OTHER_DISTRIBUTION_BINDINGS[7]
+
+"""
+    categorical_logit(logits)
+
+Categorical law over the classes `1:length(logits)` with probabilities
+`softmax(logits)`: the same law as
+`Distributions.Categorical(LogExpFunctions.softmax(logits))`.
+
+Endpoints: `logpdf(observed)`.
+"""
 const categorical_logit = _OTHER_DISTRIBUTION_BINDINGS[8]
+
+"""
+    categorical_logit_ref(nonreference_logits)
+
+Categorical law over the classes `1:(length(nonreference_logits) + 1)` in
+which class 1 has logit 0 and class `k > 1` has logit
+`nonreference_logits[k - 1]`: the law of
+`categorical_logit([0.0; nonreference_logits])`, without forming the padded
+vector.
+
+Endpoints: `logpdf(observed)`.
+"""
 const categorical_logit_ref = _OTHER_DISTRIBUTION_BINDINGS[9]
+
+"""
+    poisson(rate)
+
+Poisson law of a count with mean `rate > 0`: the same law as
+`Distributions.Poisson(rate)`.
+
+Named bindings: `log_rate`, the logarithm of `rate`, in place of `rate`, as in
+`poisson(; log_rate = η).logpdf(y)` for a log link.
+
+Endpoints: `logpdf(observed)`, `cdf(observed)`, `ccdf(observed)`, and the two
+terms whose sum is `logpdf`: `logkernel(observed)`, which reads the rate, and
+`lognormalizer(observed)`, the data-only `-log(observed!)`.
+"""
 const poisson = _OTHER_DISTRIBUTION_BINDINGS[10]
+
+"""
+    gamma(shape, rate)
+
+Gamma law of `x ≥ 0` with shape `shape > 0` and rate `rate > 0`, so with mean
+`shape / rate`. The second parameter is a rate, not a scale: this is the same
+law as `Distributions.Gamma(shape, 1 / rate)`, whose second argument is the
+scale.
+
+Named bindings: `scale`, which is `1 / rate`, or `log_rate`, the logarithm of
+`rate`, in place of `rate`, as in `gamma(; shape = α, scale = θ).logpdf(x)`.
+
+Endpoints: `logpdf(x)`, `cdf(x)`, `ccdf(x)`, `logcdf(x)`, `logccdf(x)`,
+`quantile(p)`.
+"""
 const gamma = _OTHER_DISTRIBUTION_BINDINGS[11]
+
+"""
+    beta(a, b)
+
+Beta law of `x` in `[0, 1]` with shapes `a > 0` and `b > 0`: the same law as
+`Distributions.Beta(a, b)`.
+
+Endpoints: `logpdf(x)`, `cdf(x)`, `ccdf(x)`, `quantile(p)`.
+"""
 const beta = _OTHER_DISTRIBUTION_BINDINGS[12]
+
+"""
+    binomial(n, p)
+
+Binomial law of the number of successes in `n` trials with success
+probability `p`: the same law as `Distributions.Binomial(n, p)`.
+
+Named bindings: `logit`, the log-odds `log(p / (1 - p))`, in place of `p`.
+
+Endpoints: `logpdf(observed)`, `cdf(observed)`, `ccdf(observed)`, and the two
+terms whose sum is `logpdf`: `logkernel(observed)`, which reads `p`, and
+`lognormalizer(observed)`, the data-only log binomial coefficient.
+"""
 const binomial = _OTHER_DISTRIBUTION_BINDINGS[13]
+
+"""
+    negative_binomial2(mu, phi)
+
+Negative binomial law of a count with mean `mu` and variance
+`mu + mu^2 / phi`, Stan's `neg_binomial_2(mu, phi)`: the same law as
+`Distributions.NegativeBinomial(phi, phi / (mu + phi))`.
+
+Endpoints: `logpdf(observed)`, `cdf(observed)`, `ccdf(observed)`.
+"""
 const negative_binomial2 = _OTHER_DISTRIBUTION_BINDINGS[14]
+
+"""
+    beta_binomial(n, alpha, beta)
+
+Beta-binomial law of a count in `0:n`: binomial over `n` trials with a success
+probability drawn from a beta law with shapes `alpha` and `beta`. The same law
+as `Distributions.BetaBinomial(n, alpha, beta)`.
+
+Endpoints: `logpdf(observed)`, `cdf(observed)`, `ccdf(observed)`.
+"""
 const beta_binomial = _OTHER_DISTRIBUTION_BINDINGS[15]
+
+"""
+    inverse_gamma(shape, scale)
+
+Inverse-gamma law of `x > 0` with shape `shape > 0` and scale `scale > 0`:
+`1 / x` has a gamma law with shape `shape` and rate `scale`. The same law as
+`Distributions.InverseGamma(shape, scale)`.
+
+Named bindings: `log_scale`, the logarithm of `scale`, in place of `scale`.
+
+Endpoints: `logpdf(x)`, `cdf(x)`, `ccdf(x)`, `logcdf(x)`, `logccdf(x)`,
+`quantile(p)`.
+"""
 const inverse_gamma = _OTHER_DISTRIBUTION_BINDINGS[16]
+
+"""
+    dirichlet(alpha)
+
+Dirichlet law of a probability vector `x` with concentrations `alpha`: the
+same law as `Distributions.Dirichlet(alpha)`.
+
+Endpoints: `logpdf(x)`.
+"""
 const dirichlet = _OTHER_DISTRIBUTION_BINDINGS[17]
+
+"""
+    lkj_corr_cholesky(eta)
+
+LKJ law with shape `eta > 0` of the lower Cholesky factor `L` of a correlation
+matrix, Stan's `lkj_corr_cholesky(eta)`; `eta = 1` is uniform over
+correlation matrices. For a `K × K` factor it is the same law as
+`Distributions.LKJCholesky(K, eta, 'L')`.
+
+Endpoints: `logpdf(L)`.
+"""
 const lkj_corr_cholesky = _OTHER_DISTRIBUTION_BINDINGS[18]
+
+"""
+    zero_inflated_poisson(rate, zi)
+
+Zero-inflated Poisson law of a count: a structural zero with probability `zi`,
+otherwise a Poisson count with mean `rate`. The same law as
+`Distributions.MixtureModel([Distributions.Dirac(0), Distributions.Poisson(rate)], [zi, 1 - zi])`.
+
+Named bindings: `log_rate`, the logarithm of `rate`, in place of `rate`.
+
+Endpoints: `logpdf(observed)`, `cdf(observed)`, `ccdf(observed)`.
+"""
 const zero_inflated_poisson = _OTHER_DISTRIBUTION_BINDINGS[19]
+
+"""
+    negative_binomial(r, p)
+
+Negative binomial law of the number of failures before the `r`-th success,
+with success probability `p`: the same law as
+`Distributions.NegativeBinomial(r, p)`, and Stan's
+`neg_binomial(r, p / (1 - p))`.
+
+Endpoints: `logpdf(observed)`, `cdf(observed)`, `ccdf(observed)`.
+"""
 const negative_binomial = _OTHER_DISTRIBUTION_BINDINGS[20]
+
+"""
+    weibull(k, theta)
+
+Weibull law of `x ≥ 0` with shape `k > 0` and scale `theta > 0`: the same law
+as `Distributions.Weibull(k, theta)`.
+
+Named bindings: `log_theta`, the logarithm of `theta`, in place of `theta`.
+
+Endpoints: `logpdf(x)`, `cdf(x)`, `ccdf(x)`, `logcdf(x)`, `logccdf(x)`,
+`quantile(p)`.
+"""
 const weibull = _OTHER_DISTRIBUTION_BINDINGS[21]
+
+"""
+    zero_inflated_binomial(n, p, zi)
+
+Zero-inflated binomial law of a count: a structural zero with probability
+`zi`, otherwise a binomial count over `n` trials with success probability `p`.
+The same law as
+`Distributions.MixtureModel([Distributions.Dirac(0), Distributions.Binomial(n, p)], [zi, 1 - zi])`.
+
+Named bindings: `logit`, the log-odds `log(p / (1 - p))`, in place of `p`.
+
+Endpoints: `logpdf(observed)`, `cdf(observed)`, `ccdf(observed)`,
+`logkernel(observed)`, `lognormalizer(observed)`.
+"""
 const zero_inflated_binomial = _OTHER_DISTRIBUTION_BINDINGS[22]
+
+"""
+    zero_inflated_binomial_logit_zi(n, p, zi_logit)
+
+The law of `zero_inflated_binomial(n, p, zi)` with the zero-inflation
+probability given by its log-odds:
+`zero_inflated_binomial(n, p, 1 / (1 + exp(-zi_logit)))`, without forming a
+rounded `zi`.
+
+Named bindings: `logit`, the log-odds `log(p / (1 - p))`, in place of `p`.
+
+Endpoints: `logpdf(observed)`, `logkernel(observed)`,
+`lognormalizer(observed)`.
+"""
 const zero_inflated_binomial_logit_zi = _OTHER_DISTRIBUTION_BINDINGS[23]
 
 include("dirichlet_multinomial.jl")

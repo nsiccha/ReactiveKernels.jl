@@ -87,6 +87,18 @@ end
 
 const _BERNOULLI_LOGIT_GLM_BINDINGS = _evaluate_source_bindings(
     BERNOULLI_LOGIT_GLM_KERNEL_SOURCE, (:bernoulli_logit_glm,))
+"""
+    bernoulli_logit_glm(X, beta)
+
+Logistic regression law of a 0/1 vector `y`: `y[i]` is Bernoulli with
+success probability `logistic((X * beta)[i])`, so each term is a
+`Distributions.Bernoulli` log density. An intercept is a column of `X`.
+
+Endpoints: `logpdf(y)`, the summed log density; `pointwise(y)`, the
+per-observation log densities; `score(y)`, each term's derivative with
+respect to its linear predictor. The graph also carries `eta`, which is
+`X * beta`, the fitted means `mu`, and the working weights `working_weights`.
+"""
 const bernoulli_logit_glm = _BERNOULLI_LOGIT_GLM_BINDINGS[1]
 
 const BERNOULLI_LOGIT_GLM_SOURCE = BERNOULLI_LOGIT_GLM_KERNEL_SOURCE * raw"""
@@ -143,6 +155,21 @@ end
 
 const _POISSON_LOG_GLM_BINDINGS = _evaluate_source_bindings(
     POISSON_LOG_GLM_KERNEL_SOURCE, (:poisson_log_glm,))
+"""
+    poisson_log_glm(X, beta)
+
+Log-link Poisson regression law of a count vector `y`: `y[i]` is Poisson with
+mean `exp((X * beta)[i])`, so each term is a `Distributions.Poisson` log
+density. An intercept is a column of `X`.
+
+Endpoints: `logpdf(y)`, the summed log density; `pointwise(y)`, the
+per-observation log densities, the sum of `logkernel(y)`, the terms that read
+the linear predictor, and `lognormalizer(y)`, the data-only
+`-loggamma.(y .+ 1)`; `score(y)`, each term's derivative with respect to its
+linear predictor. The
+graph also carries `eta`, which is `X * beta`, the fitted means `mu`, and the
+working weights `working_weights`.
+"""
 const poisson_log_glm = _POISSON_LOG_GLM_BINDINGS[1]
 
 const POISSON_LOG_GLM_SOURCE = POISSON_LOG_GLM_KERNEL_SOURCE * raw"""
@@ -238,6 +265,18 @@ end
 
 const _NORMAL_ID_GLM_BINDINGS = _evaluate_source_bindings(
     NORMAL_ID_GLM_KERNEL_SOURCE, (:normal_id_glm,))
+"""
+    normal_id_glm(X, beta, sigma)
+
+Identity-link normal regression law of a vector `y`: `y[i]` is normal with
+mean `(X * beta)[i]` and standard deviation `sigma > 0`, so each term is a
+`Distributions.Normal` log density. An intercept is a column of `X`.
+
+Endpoints: `logpdf(y)`, the summed log density; `pointwise(y)`, the
+per-observation log densities; `score(y)`, each term's derivative with
+respect to its mean. The graph also carries `eta`, which is `X * beta`, and
+`mu`, the same values.
+"""
 const normal_id_glm = _NORMAL_ID_GLM_BINDINGS[1]
 
 const NORMAL_ID_GLM_SOURCE = NORMAL_ID_GLM_KERNEL_SOURCE * raw"""
