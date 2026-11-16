@@ -131,6 +131,14 @@ Body-level early returns, including `condition || return fallback(...)`, keep th
 
 A numerical helper may return a scalar or `nothing`; consume that result inside the program with `something` or `isnothing`. Device branches carry a presence flag and the scalar, while host preparation keeps ordinary Python values. A numerical vector prefix `c[1:n]` carries its runtime length and checks bounds. `evalpoly(x, c)` for real vectors retains Horner's loop over that logical length, including a runtime prefix; unused coefficients contribute neither values nor derivatives.
 
+Conditional arrays and tuple fields retain their logical lengths, including
+when destructured. A bound such as `min(n, length(row) - 1)` keeps a runtime
+range bounded by the row's capacity. Numerical matrix allocation can use a
+bounded dimension, such as `Matrix{Float64}(undef, length(row), 2)`, and
+several axes may share that logical extent. Independently padded dimensions
+remain unsupported. Array lengths and loop bodies are never copied from a
+sample dataset into emitted source.
+
 A source `ntuple(j -> expression, Val(N))` records the authored, fixed number of fields with runtime captures. A fixed tuple of numbers of one type supports computed integer reads, such as indexing that basis inside a loop. The device read checks bounds and uses a numerical array view of the tuple; the data-dependent loop remains a runtime loop.
 
 A device helper can allocate `Vector{Vector{Float64}}(undef, k)`, fill its slots with fixed-width numerical rows, and use `isassigned(rows, i)` to skip earlier assignments. A size such as `isempty(ids) ? 0 : maximum(ids)` uses bounds computed from prepared integer data, including ragged cells. Allocation and iteration remain runtime array operations; emitted source does not grow with the data. Assignment state travels with the numerical storage through loops and branches. Missing references and invalid indices raise when read; `isassigned` returns false for either.

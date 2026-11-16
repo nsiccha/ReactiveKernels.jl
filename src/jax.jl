@@ -1008,8 +1008,9 @@ function _jax_destructure!(ctx::_JaxContext, lhs, v::_PyVal)
         end
         for (i, target) in enumerate(lhs.args)
             T = _jax_is_tuple(v.T) && i <= fieldcount(v.T) ? fieldtype(v.T, i) : Any
-            _jax_destructure!(ctx, target, _PyVal(_py_atom(bound.code) * "[" * string(i - 1) * "]", T,
-                                                  bound.static))
+            field = _jax_is_tuple(v.T) ? _jax_tuple_element(ctx, bound, _jax_literal(i)) :
+                _PyVal(_py_atom(bound.code) * "[" * string(i - 1) * "]", T, bound.static)
+            _jax_destructure!(ctx, target, field)
         end
         return
     end
@@ -2496,6 +2497,12 @@ function _jax_conditional(ctx::_JaxContext, condition::_PyVal, then_build, else_
         then_built = _jax_optional_arm(ctx, then_built, T)
         else_built = _jax_optional_arm(ctx, else_built, T)
     end
+    # Logical array lengths cross a branch as runtime values alongside the
+    # physical arrays. A local length name cannot escape either arm's scope.
+    if A !== Union{} && B !== Union{}
+        port = _jax_conditional_ports(ctx, condition, then_built, else_built, T)
+        port === nothing || return port
+    end
     # A Python conditional returns the taken arm's value as Julia does.
     bounded(v) = _jax_branch_bound(ctx, v, then_built.value, else_built.value)
     condition.static && return bounded(_jax_static_branch!(ctx, condition, then_built, else_built, T))
@@ -2510,7 +2517,9 @@ function _jax_conditional(ctx::_JaxContext, condition::_PyVal, then_build, else_
         _jax_run_arm!(ctx, throwing)
         value = _jax_run_arm!(ctx, valued)
         valued.value.T === Union{} && return _PyVal("None", Union{}, true)
-        return _jax_bind!(ctx, :value, _PyVal(value, T))
+        v = valued.value
+        return _jax_bind!(ctx, :value, _PyVal(value, T, v.static, v.extent,
+            v.limit, v.padded, v.origin, v.field_extents))
     end
     selected = _jax_selection(ctx, condition, then_built, else_built, T)
     selected === nothing || return bounded(selected)
@@ -2990,13 +2999,15 @@ function _jax_branch_value(ctx::_JaxContext, v::_PyVal, @nospecialize(T))
     S = _jax_typeof(v)
     if S <: Tuple
         t = _jax_bind!(ctx, :arm_value, v)
-        parts = [_jax_branch_value(ctx, _PyVal(_py_atom(t.code) * "[" * string(k - 1) * "]",
-                                               fieldtype(S, k), false), fieldtype(T, k))
+        parts = [_jax_branch_value(ctx, _jax_tuple_element(ctx, t, _jax_literal(k)), fieldtype(T, k))
                  for k in 1:fieldcount(T)]
-        return _PyVal(_jax_tuple_code(parts), T)
+        value = _jax_call_positional(ctx, tuple, parts)
+        return _PyVal(value.code, T, value.static, value.extent, value.limit,
+            value.padded, value.origin, value.field_extents)
     end
     E = T <: AbstractArray ? eltype(T) : T
-    _PyVal("jnp.asarray(" * v.code * ", dtype=" * _jax_dtype(E) * ")", T)
+    _PyVal("jnp.asarray(" * v.code * ", dtype=" * _jax_dtype(E) * ")", T,
+        false, v.extent, v.limit, v.padded, v.origin, v.field_extents)
 end
 function _jax_branch_converts(@nospecialize(S), static::Bool, @nospecialize(T))
     _jax_optional_payload(T) === nothing || return S !== T
@@ -3802,6 +3813,19 @@ end
 # Retain a simpler existing bound when one side suffices (literal positive
 # scaling or a shift), alongside any two-sided proof used by later arithmetic.
 function _jax_one_sided_integer_limit(f, args::Vector{_PyVal}, v::_PyVal)
+    if f === min || f === max
+        upper(a) = a.static ? a.code : isempty(a.limit) ? nothing : a.limit
+        bounds = upper.(args)
+        # min(x, n) is bounded by n even when x has no known bound; max
+        # needs a bound on every operand. Neither operation freezes x or n.
+        f === max && any(isnothing, bounds) && return v
+        limits = String[b for b in bounds if b !== nothing]
+        isempty(limits) && return v
+        limit = length(limits) == 1 ? only(limits) :
+            string(f) * "(" * join(limits, ", ") * ")"
+        return _PyVal(v.code, v.T, v.static, v.extent, "max(" * limit * ", 0)",
+            v.padded, v.origin, v.field_extents)
+    end
     f === (*) && return _jax_scaled_integer_limit(args, v)
     # `-j` is `-1 * j`.
     f === (-) && length(args) == 1 && return _jax_scaled_integer_limit([_jax_literal(-1), args[1]], v)
@@ -4761,22 +4785,32 @@ function _jax_dims(ctx::_JaxContext, f, dims::Vector{_PyVal})
                    _jax_where(ctx))
     "(" * join((a.code for a in dims), ", ") * (length(dims) == 1 ? ",)" : ")"), length(dims)
 end
-# A vector of a data-dependent length is allocated at its static bound and
-# padded, its length the value (as `Vector{T}(undef, n)`).
-function _jax_vector_dims(ctx::_JaxContext, f, dims::Vector{_PyVal})
+# Bounded dimensions allocate at their capacities and retain the logical
+# extent. Several axes may share one extent; independently ragged axes need
+# a richer layout than the current padded-axis bitmap.
+function _jax_padded_dims(ctx::_JaxContext, f, dims::Vector{_PyVal})
     dims = _jax_dimension_values(dims)
-    length(dims) == 1 && dims[1].T isa Type && dims[1].T <: Integer || return nothing
-    size, extent = _jax_allocation_size(ctx, only(dims))
-    isempty(extent) ? nothing : ("(" * size * ",)", extent)
+    all(d -> d.T isa Type && d.T <: Integer, dims) || return nothing
+    all(d -> _jax_known(ctx, d), dims) && return nothing
+    sizes = [_jax_allocation_size(ctx, d) for d in dims]
+    extents = unique(last(s) for s in sizes if !isempty(last(s)))
+    length(extents) == 1 ||
+        _jax_error("an allocation with independently padded dimensions", _jax_where(ctx))
+    extent = only(extents)
+    _jax_call(ctx, _runtime_check, [_PyVal("(" * extent * " >= 0)", Bool),
+        _PyVal(repr("ArgumentError: negative array dimension"), ArgumentError)])
+    axes = sum(1 << (k - 1) for k in eachindex(sizes) if !isempty(last(sizes[k])))
+    shape = "(" * join(first.(sizes), ", ") * (length(sizes) == 1 ? ",)" : ")")
+    shape, extent, axes, length(dims)
 end
 for (f, name) in ((ones, "jnp.ones"), (zeros, "jnp.zeros"))
     @eval function _jax_function_call(ctx::_JaxContext, ::typeof($f), args::Vector{_PyVal})
         E = isempty(args) ? nothing : _jax_type_of_value(args[1])
         E === nothing ? (E = Float64) : (args = args[2:end])
-        padded = _jax_vector_dims(ctx, $f, args)
+        padded = _jax_padded_dims(ctx, $f, args)
         padded === nothing ||
-            return _PyVal($name * "(" * padded[1] * ", dtype=" * _jax_dtype(E) * ")", Vector{E},
-                          false, padded[2])
+            return _PyVal($name * "(" * padded[1] * ", dtype=" * _jax_dtype(E) * ")", Array{E,padded[4]},
+                          false, padded[2], "", padded[3])
         shape, N = _jax_dims(ctx, $f, args)
         v = _PyVal($name * "(" * shape * ", dtype=" * _jax_dtype(E) * ")", Array{E,N})
         dims = _jax_dimension_values(args)
@@ -4787,9 +4821,9 @@ end
 function _jax_function_call(ctx::_JaxContext, ::typeof(fill), args::Vector{_PyVal})
     x, dims = args[1], args[2:end]
     E = _jax_eltype(x.T)
-    padded = _jax_vector_dims(ctx, fill, dims)
+    padded = _jax_padded_dims(ctx, fill, dims)
     padded === nothing || return _PyVal("jnp.full(" * padded[1] * ", " * x.code * ", dtype=" *
-                                        _jax_dtype(E) * ")", Vector{E}, false, padded[2])
+                                        _jax_dtype(E) * ")", Array{E,padded[4]}, false, padded[2], "", padded[3])
     shape, N = _jax_dims(ctx, fill, dims)
     _PyVal("jnp.full(" * shape * ", " * x.code * ", dtype=" * _jax_dtype(E) * ")", Array{E,N})
 end
@@ -4966,7 +5000,7 @@ function _jax_call_positional(ctx::_JaxContext, ::Colon, args::Vector{_PyVal})
     # a gather by it (`x[1:(n - 1)]`) pads with its own last entry.
     if !_jax_known(ctx, b) && !isempty(b.limit) && _jax_known(ctx, a)
         b = _jax_bind!(ctx, :last, b)
-        count = _py_infix("-", [_jax_plus_one(b), a.code])
+        count = "jnp.maximum(" * _py_infix("-", [_jax_plus_one(b), a.code]) * ", 0)"
         return _PyVal("jnp.minimum(jnp.arange(" * a.code * ", " *
                       _jax_plus_one(_PyVal(b.limit, Int)) * "), " * b.code * ")",
                       UnitRange{Int}, false, count)
@@ -5147,15 +5181,10 @@ function _jax_call_positional(ctx::_JaxContext, T::Type, args::Vector{_PyVal})
         E isa TypeVar && (E = Float64)
         E <: AbstractArray && return _jax_slots_allocate(ctx, T, dims)
         dtype = _jax_dtype(E)
-        padded = _jax_vector_dims(ctx, T, dims)
+        padded = _jax_padded_dims(ctx, T, dims)
         padded === nothing ||
-            return _PyVal("jnp.zeros(" * padded[1] * ", dtype=" * dtype * ")", Vector{E}, false, padded[2])
+            return _PyVal("jnp.zeros(" * padded[1] * ", dtype=" * dtype * ")", Array{E,padded[4]}, false, padded[2], "", padded[3])
         shape, N = _jax_dims(ctx, T, dims)
-        # JAX requires concrete dimensions. A vector's bounded length is handled
-        # above; independently padded matrix axes need richer extent metadata.
-        all(d -> _jax_known(ctx, d), dims) ||
-            _jax_error("a multidimensional allocation whose shape depends on data has no JAX translation",
-                       _jax_where(ctx))
         return _PyVal("jnp.zeros(" * shape * ", dtype=" * dtype * ")", Array{E,N})
     end
     if T <: AbstractArray && length(args) == 1 && _jax_is_array(args[1].T)
@@ -5490,19 +5519,24 @@ end
 _jax_rule_function!(ctx, name, spec, ops, types; owner = name) =
     first(_jax_rule_function(ctx, name, spec, ops, types; owner))
 function _jax_rule_function(ctx, name, spec, ops, types; owner = name,
-                            layouts = nothing, pack = false)
+                            layouts = nothing, pack = false, guarded = false)
     scope = _JaxScope()
     params = [_jax_identifier(scope.used, Symbol(:x, i)) for i in eachindex(types)]
+    guard = guarded ? _jax_identifier(scope.used, :active) : nothing
+    guard === nothing || push!(params, guard)
     inner = _JaxContext(ctx.mod, scope, ctx.recipe, ctx.source_module,
                         Dict{Symbol,_PyVal}(), nothing)
-    result = _jax_shared_function(ctx, owner) do
+    inner.traced_branches = ctx.traced_branches
+    function emit()
         arguments = layouts === nothing ? [_PyVal(p, T) for (p, T) in zip(params, types)] :
-            [_jax_rule_unpack(inner, p, T, layout) for (p, T, layout) in zip(params, types, layouts)]
+            [_jax_port_unpack(inner, p, T, layout) for (p, T, layout) in zip(params, types, layouts)]
         _jax_rule_body(inner, spec, ops, arguments)
     end
+    result = guarded ? _jax_with_function_guard(emit, scope, guard) :
+                       _jax_shared_function(emit, ctx, owner)
     lines = ["def " * name * "(" * join(params, ", ") * "):"]
     append!(lines, scope.lines)
-    push!(lines, "    return " * (pack ? first(_jax_rule_pack(inner, result)) : result.code))
+    push!(lines, "    return " * (pack ? first(_jax_port_pack(inner, result)) : result.code))
     join(lines, "\n"), result
 end
 
@@ -5577,10 +5611,18 @@ function _jax_call_positional(ctx::_JaxContext, k::PreparedKernel, args::Vector{
     length(p.have) == length(args) ||
         _jax_error("a prepared kernel of ", length(p.have), " inputs called with ",
                    length(args), _jax_where(ctx))
+    # Internal calls carry logical lengths and record fields in addition to
+    # their physical arrays. The public signature builder below accepts only
+    # types and cannot represent these ports.
+    ctx.host === nothing && return _jax_plan_call(ctx, k, p, args)
+    _jax_typed_plan_call(ctx, k, p, args, hint)
+end
+
+function _jax_typed_plan_call(ctx, owner, p, args, hint)
     types = Any[a.T for a in args]
     host = ctx.host !== nothing
     guard = host ? nothing : _jax_active_condition(ctx)
-    key = (:kernel, objectid(k), types, host, guard !== nothing, ctx.traced_branches > 0)
+    key = (:kernel, objectid(owner), types, host, guard !== nothing, ctx.traced_branches > 0)
     name = get(ctx.mod.helper_names, key, nothing)
     if name === nothing
         name = _jax_private_identifier(ctx.mod.used, Symbol("_rk_", hint, host ? "_np" : ""))
@@ -5607,6 +5649,20 @@ function _jax_call_positional(ctx::_JaxContext, k::PreparedKernel, args::Vector{
     # and a tuple is bound once for its fields.
     host || length(f.outputs) != 1 || ctx.mod.helper_names[(:kernel_effects, name)] != 0 ?
         _jax_bind!(ctx, :value, call) : call
+end
+
+function _jax_plan_call(ctx, owner, p::Plan, args)
+    ctx.host === nothing || return _jax_typed_plan_call(ctx, owner, p, args, nameof_or(owner))
+    function emit(inner, arguments)
+        for (input, argument) in zip(p.have, arguments)
+            _jax_define!(inner, p.graph, input, argument; bind=false)
+        end
+        _jax_plan!(inner, p)
+        values = [_jax_lookup(inner, p.graph, output) for output in p.want]
+        length(values) == 1 ? only(values) : _jax_call_positional(inner, tuple, values)
+    end
+    _jax_named_function_call(ctx, owner, [v.name for v in p.have], args,
+        @__MODULE__, emit, () -> emit(ctx, args), "from its kernel plan")
 end
 
 # A prepared child a source calls (a distribution's `standardized` step):

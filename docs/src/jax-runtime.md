@@ -49,6 +49,14 @@ input raises. Batching maps whole calls and retains each lane's lazy branches.
 These adapters use `jax.experimental.hijax.HiPrim` and are tested with JAX
 0.12.0.1. Only modules containing a general rule import that API.
 
+Ragged array ports carry their logical lengths through primal, forward and
+reverse cuts. Lengths have zero tangent; padded cotangents do not contribute
+to upstream gradients. Runtime checks inside a rule execute only for active
+calls, including rules reached through a lazy branch or an empty plate.
+Rules containing array regions retain their source plans as build-time
+metadata. Native invocation reads only the compiled body and its concrete
+execution tables.
+
 The incomplete-beta continued fraction used by distribution tails supplies
 its value and shape/argument partials through such a shared graph. A first
 JAX gradient retains those partials rather than a reverse tape of all 300

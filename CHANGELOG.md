@@ -16,6 +16,27 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.293
+
+- JAX source translates nearest-loop `break`, convergence `while` loops,
+  acyclic lowered helper branches, `@simd`, static Boolean `Val` arguments,
+  numerical array destructuring, chained comparisons and integer parity.
+  Data-dependent iteration stays in runtime loops. Unbounded loops need an
+  authored rule for reverse differentiation.
+- Optional numerical scalars cross device branches with a presence flag;
+  `something` and `isnothing` retain their native lazy behavior.
+- Real-vector `evalpoly` uses a runtime Horner loop, including checked
+  `c[1:n]` prefixes. Padded lengths survive conditional results and tuple
+  destructuring; bounded `min`/`max` range ends retain their capacity proofs.
+  Matrix allocations can carry one logical extent across padded axes.
+- General `derivative_rule` calls emit authored JVP and activity-selected
+  staged VJP adapters through JAX's `hijax.HiPrim` API (tested with 0.12.0.1).
+  Padded array ports retain their logical lengths and exclude padding from
+  cotangents. Runtime checks remain guarded under branches and batching.
+- Derivative regions retain their source plans for backend emission. Native
+  calls keep concrete execution tables and do not read the retained plans;
+  embedded native copies omit that build-time metadata.
+
 ## 0.1.292
 
 - `js_source` lets an authored plate read concrete tuples and named tuples

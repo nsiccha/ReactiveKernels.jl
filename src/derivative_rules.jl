@@ -202,7 +202,11 @@ end
 
 function _derivative_plan_lowering(p::Plan, name::Symbol; generator::Symbol)
     p = _fuse_authored_plate_chains(_partial_apply(p, ()))
-    _owns_array_regions(p) && return _rule_region_cut(p, name)
+    # A branch's compiled companion can embed execution-only prepared
+    # children. Keep its authored region for source backends, just as for a
+    # plate or scan; a linear operation table has lost that source boundary.
+    (_owns_array_regions(p) || any(r -> r.op isa _KernelSourceOp &&
+        r.op.f isa _KernelBranch, p.recipes)) && return _rule_region_cut(p, name)
     # The cut is encoded from the operation calls (`_encode_cut_body`), so
     # this lowering keeps every recipe's call in the table; a cut holds no
     # constants (`_partial_apply(p, ())`).
@@ -226,7 +230,7 @@ function _rule_region_cut(p::Plan, name::Symbol)
     have = Value[v for v in p.have if canon_id(g, v.id) in read]
     region_plan = _partial_subplan(p, have, p.want, p.recipes)
     ast, constants, callables, _ = _lower_with_ops(region_plan)
-    region = _RuleRegion{name}(compile(ast), constants, _native_table(ast, callables))
+    region = _RuleRegion{name}(compile(ast), constants, _native_table(ast, callables), region_plan)
     names = _varnames(p)
     nm(v) = names[canon_id(g, v.id)]
     signature = Tuple(nm(v) for v in p.have)
@@ -246,15 +250,29 @@ end
 
 The operation of a rule cut whose graph runs a plate, a scan or an embedded
 kernel (`_rule_region_cut`): the cut's compiled native body and the table it
-reads.
+reads, plus its source plan for source backends. Native calls never read the
+plan; keeping it outside the execution tables preserves their concrete types.
 """
 struct _RuleRegion{Name,F,C,O}
     f::F
     constants::C
     callables::O
+    # Source backends translate the same mathematical region. The compiled
+    # native body's embedded execution copies deliberately omit their plans.
+    plan::Plan
 end
-_RuleRegion{Name}(f::F, constants::C, callables::O) where {Name,F,C,O} =
-    _RuleRegion{Name,F,C,O}(f, constants, callables)
+_RuleRegion{Name}(f::F, constants::C, callables::O, plan::Plan) where {Name,F,C,O} =
+    _RuleRegion{Name,F,C,O}(f, constants, callables, plan)
+
+# Embedded native bodies keep only execution state, just as PreparedKernel
+# does. The source plan belongs to the authored callable, not to each copy in
+# a compiled body, and planning identities must not distinguish native code.
+Base.@nospecializeinfer function _execution_copy_object(c::_ExecutionCopier,
+                                                        @nospecialize(r::_RuleRegion))
+    _kernel_new_instance(typeof(r),
+        (_execution_copy(c, r.f), _execution_copy(c, r.constants),
+         _execution_copy(c, r.callables), _EXECUTION_PLAN))
+end
 
 @generated function (region::_RuleRegion{Name,F})(args::Vararg{Any,N}) where {Name,F,N}
     forwarded = Any[:(getfield(args, $index)) for index in 1:N]

@@ -1,5 +1,12 @@
 # Adapter mechanics only. Every primal, forward branch and staged reverse
 # branch below is translated from the owned rule's mathematical graph.
+function _jax_call_positional(ctx::_JaxContext, region::_RuleRegion, args::Vector{_PyVal})
+    p = region.plan
+    length(args) == length(p.have) ||
+        _jax_error("a derivative region's argument count differs from its source plan", _jax_where(ctx))
+    _jax_plan_call(ctx, region, p, args)
+end
+
 const _JAX_DERIVATIVE_RULE = raw"""
 from jax.experimental import hijax as _rk_hijax
 
@@ -76,7 +83,7 @@ class _RKDerivativeRule(_rk_hijax.HiPrim):
             _rk_rule_metadata(primal, layout))
             for i, (primal, ts, layout) in enumerate(zip(primals, tangents, self.layouts))
             if self.differentiable & (1 << i)]
-        value, direction = self.forward(*primals, *directions)
+        value, direction = self.forward(*primals[:-1], *directions, primals[-1])
         return value, _rk_rule_repack(direction, self.out_layout, self.out_layout,
                                       _rk_rule_metadata(value, self.out_layout), True)
 
@@ -84,22 +91,22 @@ class _RKDerivativeRule(_rk_hijax.HiPrim):
         mask = sum(1 << i for i, nz in enumerate(nzs_in) if any(jax.tree.leaves(nz)))
         self._check_activity(mask)
         if mask == 0:
-            return self.primal(*args), (StaticInt(0), (), (), None)
+            return self.primal(*args), (StaticInt(0), (), (), None, args[-1])
         if self.stages is None:
             raise ValueError("derivative_rule has no reverse branch")
         values = self.stages[mask][0](*args)
         metadata = tuple(_rk_rule_metadata(a, l) for a, l in zip(args, self.layouts))
         out_metadata = _rk_rule_metadata(values[0], self.out_layout)
-        return values[0], (StaticInt(mask), values[1:], metadata, out_metadata)
+        return values[0], (StaticInt(mask), values[1:], metadata, out_metadata, args[-1])
 
     def vjp_bwd_retval(self, residuals, covector):
-        mask, values, metadata, out_metadata = residuals
+        mask, values, metadata, out_metadata, active = residuals
         zero = lambda t: isinstance(t, _rk_hijax.Zero)
         covector = jax.tree.map(_rk_hijax.instantiate_zeros, covector, is_leaf=zero)
         cotangents = iter(())
         if mask:
             covector = _rk_rule_repack(covector, self.out_layout, self.out_layout, out_metadata)
-            cotangents = iter(zip(self.stages[mask][1](*values, covector), self.back_layouts[mask]))
+            cotangents = iter(zip(self.stages[mask][1](*values, covector, active), self.back_layouts[mask]))
         result = []
         for i, (aval, layout) in enumerate(zip(self.in_avals, self.layouts)):
             if mask & (1 << i):
@@ -116,33 +123,6 @@ class _RKDerivativeRule(_rk_hijax.HiPrim):
         return result, jax.tree.map(lambda _: 0, self.out_aval)
 """
 
-# An array port carries its physical array and logical extent together. Tuple
-# layouts describe authored structure, never a data length or observed shape.
-function _jax_rule_pack(ctx, v::_PyVal)
-    T = _jax_argument_type(v)
-    if _jax_is_tuple(T)
-        parts = [_jax_rule_pack(ctx, _jax_tuple_element(ctx, v, _jax_literal(k)))
-                 for k in 1:fieldcount(T)]
-        return _jax_tuple_code([_PyVal(first(p), Any) for p in parts]), Tuple(last.(parts))
-    end
-    isempty(v.extent) && return v.code, nothing
-    axes = _jax_padded_axes(v)
-    axes == 0 && _jax_error("a derivative-rule port with an unrepresented padded array layout",
-                            _jax_where(ctx))
-    "(" * v.code * ", " * v.extent * ")", axes
-end
-
-function _jax_rule_unpack(ctx, code, T, layout)
-    if layout isa Tuple
-        values = [_jax_rule_unpack(ctx, _py_atom(code) * "[" * string(k - 1) * "]",
-                                  fieldtype(T, k), layout[k]) for k in eachindex(layout)]
-        value = _jax_call_positional(ctx, tuple, values)
-        return T <: NamedTuple ? _PyVal(value.code, T, value.static, value.extent,
-            value.limit, value.padded, value.origin, value.field_extents) : value
-    end
-    layout === nothing && return _PyVal(code, T)
-    _PyVal(_py_atom(code) * "[0]", T, false, _py_atom(code) * "[1]", "", layout)
-end
 _jax_rule_layout_code(::Nothing) = "None"
 _jax_rule_layout_code(layout::Integer) = string(layout)
 _jax_rule_layout_code(layout::Tuple) = "(" * join(_jax_rule_layout_code.(layout), ", ") *
@@ -154,19 +134,20 @@ function _jax_derivative_rule(ctx::_JaxContext,
     (ctx.host !== nothing || all(a -> a.static, args)) &&
         return _jax_rule_primal(ctx, rule, Primal, args)
     types = Tuple(a.T for a in args)
-    packed = [_jax_rule_pack(ctx, a) for a in args]
+    packed = [_jax_port_pack(ctx, a) for a in args]
     layouts = Tuple(last.(packed))
-    key = (:derivative_rule, objectid(rule), types, layouts)
+    key = (:derivative_rule, objectid(rule), types, layouts, ctx.traced_branches > 0)
     cached = get(ctx.mod.helper_names, key, nothing)
     if cached === nothing
+        effects_before = _JAX_EFFECTS[]
         name = _jax_private_identifier(ctx.mod.used, Symbol("_rk_", Name))
         _jax_helper!(ctx, "StaticInt", _JAX_STATIC_INT)
         _jax_helper!(ctx, "_RKDerivativeRule", _JAX_DERIVATIVE_RULE)
         primal = _jax_private_identifier(ctx.mod.used, Symbol(name, "_primal"))
         primal_text, primal_value = _jax_rule_function(ctx, primal, Primal, rule.primal_ops, types;
-            owner=name, layouts, pack=true)
+            owner=name, layouts, pack=true, guarded=true)
         push!(ctx.mod.helpers, primal_text)
-        out_layout = last(_jax_rule_pack(ctx, primal_value))
+        out_layout = last(_jax_port_pack(ctx, primal_value))
         D = typeof(_rule_activity(rule)).parameters[1]
         forward = "None"
         if Forward !== nothing
@@ -174,8 +155,9 @@ function _jax_derivative_rule(ctx::_JaxContext,
             directions = Tuple(types[i] for i in 1:N if D & (1 << (i - 1)) != 0)
             direction_layouts = Tuple(layouts[i] for i in 1:N if D & (1 << (i - 1)) != 0)
             forward_text, forward_value = _jax_rule_function(ctx, forward, Forward, rule.forward_ops,
-                (types..., directions...); owner=name, layouts=(layouts..., direction_layouts...), pack=true)
-            forward_layout = last(_jax_rule_pack(ctx, forward_value))
+                (types..., directions...); owner=name, layouts=(layouts..., direction_layouts...),
+                pack=true, guarded=true)
+            forward_layout = last(_jax_port_pack(ctx, forward_value))
             forward_layout == (out_layout, out_layout) ||
                 _jax_error("a derivative-rule forward branch with incompatible output layouts", _jax_where(ctx))
             push!(ctx.mod.helpers, forward_text)
@@ -195,34 +177,38 @@ function _jax_derivative_rule(ctx::_JaxContext,
                 stage_name = _jax_private_identifier(ctx.mod.used, Symbol(name, "_stage_", mask))
                 back_name = _jax_private_identifier(ctx.mod.used, Symbol(name, "_back_", mask))
                 stage_text, result = _jax_rule_function(ctx, stage_name, stage,
-                    rule.staged_ops[mask][1], types; owner=name, layouts, pack=true)
+                    rule.staged_ops[mask][1], types; owner=name, layouts, pack=true, guarded=true)
                 push!(ctx.mod.helpers, stage_text)
-                stage_layout = last(_jax_rule_pack(ctx, result))
+                stage_layout = last(_jax_port_pack(ctx, result))
                 first(stage_layout) == out_layout ||
                     _jax_error("a derivative-rule reverse stage with an incompatible primal layout", _jax_where(ctx))
                 back_types = (fieldtypes(result.T)[2:end]..., fieldtype(result.T, 1))
                 back_ret = back[3] isa Symbol ? (back[3],) : back[3]
                 back_text, back_value = _jax_rule_function(ctx, back_name,
                     (back[1], back[2], back_ret), rule.staged_ops[mask][2], back_types;
-                    owner=name, layouts=(stage_layout[2:end]..., out_layout), pack=true)
+                    owner=name, layouts=(stage_layout[2:end]..., out_layout), pack=true, guarded=true)
                 push!(ctx.mod.helpers, back_text)
-                push!(back_layouts, last(_jax_rule_pack(ctx, back_value)))
+                push!(back_layouts, last(_jax_port_pack(ctx, back_value)))
                 push!(pairs, "(" * stage_name * ", " * back_name * ")")
             end
             stages = "(" * join(pairs, ", ") * ",)"
         end
         params = ["x" * string(i) for i in 1:N]
-        arguments = "(" * join(params, ", ") * (N == 1 ? ",)" : ")")
+        push!(params, "active")
+        arguments = "(" * join(params, ", ") * ")"
         push!(ctx.mod.helpers, "def " * name * "(" * join(params, ", ") * "):\n" *
             "    rule = _RKDerivativeRule(" * primal * ", " * forward * ", " * stages * ", " * string(D) *
-            ", " * _jax_rule_layout_code(layouts) * ", " * _jax_rule_layout_code(out_layout) *
+            ", " * _jax_rule_layout_code((layouts..., nothing)) * ", " * _jax_rule_layout_code(out_layout) *
             ", " * _jax_rule_layout_code(Tuple(back_layouts)) *
             ", " * arguments * ")\n    return rule(*" * arguments * ")")
-        cached = (name, _jax_argument_type(primal_value), out_layout)
+        cached = (name, _jax_argument_type(primal_value), out_layout, _JAX_EFFECTS[] - effects_before)
         ctx.mod.helper_names[key] = cached
+    else
+        _JAX_EFFECTS[] += cached[4]
     end
-    name, result_type, out_layout = cached
-    _jax_shared_guard_check(ctx, name)
-    result = _jax_bind!(ctx, :value, _PyVal(name * "(" * join(first.(packed), ", ") * ")", Any))
-    _jax_rule_unpack(ctx, result.code, result_type, out_layout)
+    name, result_type, out_layout, _ = cached
+    guard = something(_jax_active_condition(ctx), "True")
+    result = _jax_bind!(ctx, :value,
+        _PyVal(name * "(" * join([first.(packed); guard], ", ") * ")", Any))
+    _jax_port_unpack(ctx, result.code, result_type, out_layout)
 end

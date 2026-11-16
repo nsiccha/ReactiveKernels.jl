@@ -50,9 +50,16 @@ end
 end
 
 @traceable vector_joint(a, x) = (a .* x.^2, x.^2, 2a .* x)
+@kernel vector_primal(a::Float64, x::Vector{Float64}) = begin
+    y = plate(x, Ref(a)) do x, a
+        a * x^2
+    end
+    return y
+end
 @kernel vector_graph(a::Float64, x::Vector{Float64}, da::Float64,
         dx::Vector{Float64}, bar::Vector{Float64}) = begin
-    (y, pa, px) = vector_joint(a, x)
+    y = a >= 0 ? vector_primal(a, x) : -vector_primal(-a, x)
+    @recipe (cost=100) (y, pa, px) = vector_joint(a, x)
     tangent = pa .* da + px .* dx
     abar = sum(pa .* bar)
     xbar = px .* bar
@@ -97,11 +104,11 @@ end
         @test got.value ≈ 0.7^2 * sum(sum(abs2, row) for row in rows)
         @test got.grad ≈ 1.4 * sum(sum(abs2, row) for row in rows)
         ragged_vector = jax_source(ragged_vector_rule; have=(:a, :rows), functions=(value=:value,))
-        for sample in (Vector{Float64}[], [Float64[]], rows)
+        for a in (-0.7, 0.7), sample in (Vector{Float64}[], [Float64[]], rows)
             derivative = Enzyme.autodiff(Enzyme.Reverse, native_ragged_vector, Enzyme.Active,
-                Enzyme.Active(0.7), Enzyme.Const(sample))[1][1]
-            got = rk_jax_evaluate(ragged_vector, :value, (0.7, sample); grad=:joint)
-            @test got.value ≈ native_ragged_vector(0.7, sample)
+                Enzyme.Active(a), Enzyme.Const(sample))[1][1]
+            got = rk_jax_evaluate(ragged_vector, :value, (a, sample); grad=:joint)
+            @test got.value ≈ native_ragged_vector(a, sample)
             @test got.joint_value ≈ got.value
             @test got.grad ≈ derivative
         end
