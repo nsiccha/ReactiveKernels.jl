@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.292
+
+- JAX emission preserves structural `NamedTuple` field names obtained from
+  type parameters or `keys(record)` through local bindings, tuple selection,
+  and helper arguments and results, including host data preparation. Record
+  values and array lengths remain runtime inputs, with ordinary reverse
+  differentiation preserved.
+
 ## 0.1.291
 
 - `@traceable` and `TraceableSource` accept body-level early returns, including
