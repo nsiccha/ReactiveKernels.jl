@@ -72,6 +72,14 @@ tuples crosses to JAX as one array per tuple field with that same shape;
 compiled plates and indexing read those fields together. Increasing the
 support lengths changes the arrays, not the emitted bodies.
 
+Preparation also accepts recipes with no inputs. For example,
+`states = collect(Iterators.product(0:1, 0:1))` runs in `prepare_data()` when
+emitted with `data = ()` or `data = NamedTuple()`. Call it once and pass the
+result to the functions as `f(x, **prepared)`. This applies to input-free
+host operations generally, including chains of recipes; it requires no
+dummy data dependency. Constants with a device translation remain in the
+functions, and numerical parameters remain runtime inputs.
+
 `prepare_data` takes the data by the names the model reads them, also a name Python reserves or the module's code uses (`class`, `lambda`, `id`). No parameter can have such a name, so `prepare_data` takes it through `**data`: call it by name, `prepare_data(**raw)`. The dict it returns, the functions' `**prepared` and the metadata (`DATA`, `INPUTS`, `PREPARED`, `UNTRANSLATED`) use the same names. A name that is no Python identifier (a submodel's `r.g`) is spelled `r_g` there, and `UNTRANSLATED` keys it as the binding does.
 
 The functions take the prepared data as `prepare_data` returns them, host NumPy arrays, eagerly or under `jax.jit`, whether the data are closed over or passed as arguments. Each prepared array is converted to a JAX array on entry, so a plate cell can index it by its traced index. A prepared vector of numeric tuples of one element type, or of named numbers (a per-cell shape, `[(minimum(r), maximum(r)) for r in R]`), is the tuple of its columns, one array per field; the functions raise a `TypeError` for a list of its rows.
