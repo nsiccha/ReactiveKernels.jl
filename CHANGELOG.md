@@ -16,6 +16,19 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.297
+
+- `js_source` reads, indexes and iterates a vector of records that a recipe
+  or helper builds, such as `[k(d) for d in dose]` where a prepared kernel `k`
+  returns a named tuple, or a helper returns a tuple or named tuple: `length`,
+  `eachindex`, `x[i]`, `x[indices]`, `x[a:b]`, `@view x[a:b]`, `for`,
+  comprehensions and generators with their filters and reductions, `count`,
+  `any`, `all`, `isempty`, `filter`, `map`, `findfirst`,
+  `sum(f, x)`, broadcasts, `copy`, `collect`, `push!` and `x[i] = r`. Field
+  projections such as `[r.a for r in records]` and `getproperty.(records, :a)`
+  give vectors of that field's type. These vectors remain internal values:
+  `types=` inputs and constants keep the vector types listed in the guide.
+
 ## 0.1.296
 
 - JAX source translates nearest-loop `break`, convergence `while` loops,

@@ -125,6 +125,75 @@ end
     return lowest
 end
 
+# Vectors of records a recipe builds: a comprehension of a prepared kernel
+# whose WANT is a named tuple, or of a helper returning a (named) tuple. The
+# records are read, indexed and iterated like any vector (snag
+# javascript-proje-7a012baf: a per-level record projected into columns).
+@kernel js_rec_level(d, scale, shift) = begin
+    a = scale * d
+    b = a + shift
+    c = a * b
+    return (; a, b, c)
+end
+const JS_REC_LEVEL = prepare(js_rec_level; have = (:d, :scale, :shift), want = (; a = :a, b = :b, c = :c))
+@kernel js_rec_prepared(dose, scale, shift) = begin
+    levels = [JS_REC_LEVEL(d, scale, shift) for d in dose]
+    a = [l.a for l in levels]
+    b = [l.b for l in levels]
+    c = [l.c for l in levels]
+    at1 = JS_REC_LEVEL(1.0, scale, shift).c
+    return a
+end
+js_rec(d, s) = (; x = d * s, y = d + s, n = 1, ok = d > 0.7)
+js_rec_pair(d, s) = (d * s, d > s)
+function js_rec_walk(rs)
+    t = 0.0
+    for r in rs
+        t += r.x
+    end
+    for i in eachindex(rs)
+        t += i * rs[i].y
+    end
+    return t + length(rs) + lastindex(rs) + firstindex(rs) + size(rs, 1)
+end
+function js_rec_grow(rs, extra)
+    out = copy(rs)
+    push!(out, extra)
+    out[1] = extra
+    return out
+end
+js_rec_x(r) = r.x
+@kernel js_rec_reads(dose, s, idx) = begin
+    rs = [js_rec(d, s) for d in dose]
+    xs = [r.x for r in rs]
+    tot = sum(r.y for r in rs)
+    big = [r.x for r in rs if r.y > 2.0]
+    ns = sum(r.n for r in rs)
+    nok = count(r -> r.ok, rs)
+    anyok = any(r.ok for r in rs)
+    first_ok = something(findfirst(r -> r.ok, rs), 0)
+    total_x = sum(js_rec_x, rs)
+    mapped = map(r -> r.x + r.y, rs)
+    ys = getproperty.(rs, :y)
+    nkept = length(filter(r -> r.ok, rs))
+    walked = js_rec_walk(rs)
+    grown = [r.x for r in js_rec_grow(rs, js_rec(9.0, s))]
+    window = [r.x for r in rs[2:3]]
+    picked = [r.y for r in rs[idx]]
+    viewed = length(@view rs[2:3]) + (@view rs[2:3])[2].x
+    copied = [r.n for r in collect(rs)]
+    blank = isempty(rs)
+    ps = [js_rec_pair(d, s) for d in dose]
+    pfirst = [p[1] for p in ps]
+    psecond = count(p[2] for p in ps)
+    return xs
+end
+@kernel js_rec_empty(dose, s) = begin
+    rs = [js_rec(d, s) for d in dose if d > 100.0]
+    m = maximum(r.x for r in rs)
+    return m
+end
+
 const V = Vector{Float64}
 const SPREAD = [sin(k) * 10.0^(k % 7) for k in 1:3001]
 const CASES = [
@@ -152,6 +221,16 @@ const CASES = [
       (Float64[],)]),
     (:js_iter_find_int, js_iter_find_int, (:k,), (:lowest, :highest), (; k = Vector{Int}),
      [([3, 1, 1, 7, 7],), ([4],), (Int[],)]),
+    (:js_rec_prepared, js_rec_prepared, (:dose, :scale, :shift), (:a, :b, :c, :at1),
+     (; dose = V, scale = Float64, shift = Float64), [([0.5, 1.0, 2.0], 2.0, -1.0), (Float64[], 1.0, 0.5)]),
+    (:js_rec_reads, js_rec_reads, (:dose, :s, :idx),
+     (:xs, :tot, :big, :ns, :nok, :anyok, :first_ok, :total_x, :mapped, :ys, :nkept, :walked, :grown, :window,
+      :picked, :viewed, :copied, :blank, :pfirst, :psecond),
+     (; dose = V, s = Float64, idx = Vector{Int}),
+     [([0.5, 1.0, 2.0], 1.5, [3, 1, 3]), ([0.2, 0.9, 0.3, 4.0], 0.5, [2]),
+      ([0.5, 1.0, 2.0], 1.5, [4])]),                                    # rs[[4]]: a BoundsError
+    (:js_rec_empty, js_rec_empty, (:dose, :s), (:m,), (; dose = V, s = Float64),
+     [([0.5, 200.0], 1.0), ([0.5], 1.0)]),                             # maximum of nothing: a MethodError
 ]
 
 agree(a::Real, b::Real) = (isnan(a) && isnan(b)) ||
