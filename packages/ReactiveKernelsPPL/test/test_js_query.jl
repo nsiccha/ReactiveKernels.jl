@@ -51,10 +51,12 @@ end
     picture = ReactiveKernels.js_source(js_query_picture; have = (:unconstrained,), want = :probability,
                                         types = (; unconstrained = Vector{Float64}), name = :picture)
     # the binding's data (here `log.(w)`, which the binding computes) are part
-    # of each module, and the packed-length check runs at its entry
+    # of each module, and the packed-length check runs at its entry. The
+    # layout total stays bound data, rather than a function-body literal.
     for source in (direct, picture)
         @test count("Object.freeze([", source) == 1
-        @test occursin("ppl_check_packed(unconstrained, 1);", source)
+        @test occursin("const _rk_bound_check_arg_2 = 1;", source)
+        @test occursin("ppl_check_packed(unconstrained, _rk_bound_check_arg_2);", source)
     end
     @test occursin("function _rk_prepared_p(unconstrained) {", picture)
     if JS_QUERY_NODE
