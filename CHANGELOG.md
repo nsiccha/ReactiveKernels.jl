@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.288
+
+- `jax_source` prepares Cartesian products of data-bound numerical ranges
+  and arrays with runtime host iteration. Collected products retain Julia's
+  shape, first-axis-fastest order and empty axes. Homogeneous numerical
+  tuple arrays cross to JAX as one array per field with the same shape,
+  for compiled plates, indexing and reductions; source bodies do not grow
+  with supports.
+
 ## 0.1.287
 
 - Accept keyword arguments in `@traceable` methods and translate their calls

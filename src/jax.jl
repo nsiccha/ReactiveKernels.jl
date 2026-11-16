@@ -1128,17 +1128,15 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
         return x
     end
     _jax_is_array(x.T) || _jax_error("indexing a value of type `", x.T, "`", _jax_where(ctx))
-    # A vector of (named) numbers is the tuple of its columns (a scan's
-    # stacked outputs): an element, or a slice, reads every column at it.
-    if _jax_columns(x.T)
-        length(indices) == 1 ||
-            _jax_error("indexing a vector of tuples with several indices", _jax_where(ctx))
+    # Tuple arrays cross to JAX as columns. Host arrays retain their rows,
+    # except for a named scan's outputs, which are stacked as columns too.
+    if _jax_columns(x.T) && (ctx.host === nothing || eltype(x.T) <: NamedTuple)
         E = eltype(x.T)
         parts = [_jax_index(ctx, _jax_column(x, k), indices) for k in 1:fieldcount(E)]
         # An element reads each field's value; a slice, each field's column.
         element = all(k -> parts[k].T == fieldtype(E, k), 1:fieldcount(E))
         number = findfirst(k -> fieldtype(E, k) <: Number, 1:fieldcount(E))
-        return _PyVal(_jax_tuple_code(parts), element ? E : Vector{E}, false,
+        return _PyVal(_jax_tuple_code(parts), element ? E : Array{E,ndims(first(parts).T)}, false,
                       element || number === nothing ? "" : parts[number].extent)
     end
     N = ndims(x.T)
@@ -4124,6 +4122,10 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(vec), args::Vector{_PyVal
     (_jax_rank(x.T) == 1 || _jax_ragged(x.T)) && return x
     _jax_is_array(x.T) || _jax_error("`vec` of a `", x.T, "`", _jax_where(ctx))
     E = eltype(x.T)
+    if ctx.host === nothing && _jax_columns(x.T)
+        parts = [_jax_function_call(ctx, vec, [_jax_column(x, k)]) for k in 1:fieldcount(E)]
+        return _PyVal(_jax_tuple_code(parts), Vector{E})
+    end
     isempty(x.extent) && return _PyVal("jnp.ravel(" * x.code * ", order=\"F\")", Vector{E})
     # An adjoint vector is stored as its vector, padded alike.
     _jax_adjoint_vector(x.T) && return _PyVal(x.code, Vector{E}, false, x.extent)
@@ -4201,6 +4203,14 @@ end
 # is data has no static shape entry.
 function _jax_function_call(ctx::_JaxContext, ::typeof(size), args::Vector{_PyVal})
     x = args[1]
+    if ctx.host !== nothing && x.T isa Type && x.T <: Iterators.ProductIterator
+        length(args) == 1 || _jax_error("`size` of a product iterator takes no dimension", _jax_where(ctx))
+        shape = "tuple(n for a in " * x.code * " for n in np.shape(a))"
+        R = ndims(_jax_return_type(collect, Any[x.T]))
+        return _PyVal(shape, NTuple{R,Int}, true)
+    end
+    ctx.host === nothing && _jax_columns(x.T) &&
+        return _jax_function_call(ctx, size, [_jax_column(x, 1); args[2:end]])
     ctx.host === nothing && !isempty(x.extent) && _jax_is_array(x.T) && !_jax_ragged(x.T) &&
         return _jax_padded_size(ctx, x, args[2:end])
     shape = ctx.host === nothing ? _py_atom(args[1].code) * ".shape" : "np.shape(" * args[1].code * ")"
@@ -4698,6 +4708,8 @@ function _jax_axis(ctx::_JaxContext, x::_PyVal, dim::Int)
 end
 function _jax_function_call(ctx::_JaxContext, ::typeof(collect), args::Vector{_PyVal})
     x = only(args)
+    ctx.host !== nothing && x.T isa Type && x.T <: Iterators.ProductIterator &&
+        return _host_collect_product(ctx, x)
     x.T isa Type && x.T <: AbstractRange &&
         return _PyVal(x.code, Vector{eltype(x.T)})
     _jax_is_array(x.T) || _jax_error("`collect` of `", x.T, "`", _jax_where(ctx))
@@ -6843,16 +6855,17 @@ _jax_numeric_namedtuple(@nospecialize(T)) = T isa Type && T <: NamedTuple && isc
 _jax_stacked_namedtuple(@nospecialize(T)) = T isa Type && T <: NamedTuple &&
     isconcretetype(T) && fieldcount(T) > 0 &&
     all(F -> F <: Number || F <: AbstractVector{<:Number} && isconcretetype(F), fieldtypes(T))
-# A vector of named numbers (or numeric vectors) or of numeric tuples is held
-# as the tuple of its columns, as `jax.lax.scan` stacks a step's outputs; a
-# vector field's column is the dense array of its rows, one per element.
-_jax_columns(@nospecialize(T)) = T isa Type && T <: AbstractVector &&
-    (_jax_stacked_namedtuple(eltype(T)) || _jax_numeric_tuple(eltype(T)))
+# An array of numeric tuples, or a vector of named numbers (or numeric
+# vectors), is held as the tuple of its columns, as `jax.lax.scan` stacks a
+# step's outputs. Numeric columns keep the array's rank; a vector field's
+# column is the dense array of its rows, one per element.
+_jax_columns(@nospecialize(T)) = T isa Type && T <: AbstractArray &&
+    (T <: AbstractVector && _jax_stacked_namedtuple(eltype(T)) || _jax_numeric_tuple(eltype(T)))
 function _jax_column(x::_PyVal, k::Integer)
     F = fieldtype(eltype(x.T), k)
     code = _py_atom(x.code) * "[" * string(k - 1) * "]"
     # A vector field's rows all have the stacked width.
-    _PyVal(code, Vector{F}, x.static, F <: Number ? x.extent :
+    _PyVal(code, Array{F,ndims(x.T)}, x.static, F <: Number ? x.extent :
            "jnp.full((" * code * ".shape[0],), " * code * ".shape[1])")
 end
 _jax_numeric_tuple(@nospecialize(T)) = T isa Type && T <: Tuple && isconcretetype(T) && fieldcount(T) > 0 &&
