@@ -7621,11 +7621,12 @@ function _jax_module_source(plans, types, constants, docstring::String; data = n
     # either, with the reason, by (plate, cell recipe).
     cells = Dict{Int,Set{Int}}()
     cell_reasons = Dict{Tuple{Int,Int},JAXEmissionError}()
+    host_constants = Set{Int}()
     while true
         try
             return _jax_module_text(plans, types, constants, docstring,
                                     (data, excluded, defs, untranslated, keep, reasons,
-                                     promoted, cells, cell_reasons, definitions_module);
+                                     promoted, cells, cell_reasons, definitions_module, host_constants);
                                     function_docs, source_regions, rejecting)
         catch e
             if e isa _HostUnsupportedDefinition && !haskey(untranslated, e.name)
@@ -7635,6 +7636,9 @@ function _jax_module_source(plans, types, constants, docstring::String; data = n
                 reasons[e.recipe] = e.error
             elseif e isa _JaxPromote && !(e.recipe in promoted)
                 push!(promoted, e.recipe)
+            elseif e isa _ConstantHostNeeded
+                e.recipe in host_constants && throw(e.error)
+                push!(host_constants, e.recipe)
             elseif e isa _KeepUnavailable
                 more = setdiff(_jax_upstream_recipes(plans, e.name, excluded, defined), promoted)
                 if isempty(more)
@@ -7730,14 +7734,14 @@ function _jax_module_text(plans, types, constants, docstring::String, prepare;
         _jax_functions!(mod, bodies, functions, plans, types; function_docs, rejecting)
     else
         data, excluded, defs, untranslated, keep, reasons, promoted, cells, cell_reasons,
-            mod.definitions_module = prepare
+            mod.definitions_module, host_constants = prepare
         merge!(mod.host_reasons, reasons)
         merge!(mod.cell_reasons, cell_reasons)
         mod.host_graph = first(plans).second[1].graph
         defs === nothing || union!(mod.host_definitions, (first(d) for d in defs))
         meta = _jax_prepared_functions!(mod, bodies, functions, plans, types, data, excluded,
                                         defs, untranslated; keep, function_docs, promoted, cells,
-                                        rejecting)
+                                        rejecting, host_constants)
         constants = merge(constants, meta)
     end
     constant_lines = String[]
@@ -7792,7 +7796,7 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
                                   excluded, defs = nothing,
                                   untranslated = Dict{Symbol,JAXEmissionError}(); keep = (),
                                   function_docs = NamedTuple(), promoted = Set{Int}(),
-                                  cells = Dict{Int,Set{Int}}(), rejecting = ())
+                                  cells = Dict{Int,Set{Int}}(), rejecting = (), host_constants = Set{Int}())
     ports = data isa NamedTuple ? Set(keys(data)) : Set(data)
     # A promoted recipe's values (`_JaxPromote`) are data inputs of every
     # function, which its definitions give: the recipe is not run.
@@ -7813,7 +7817,7 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
                  for (fname, (p, w)) in plans]
         ports = union(ports, (v.name for v in values))
     end
-    split = _jax_prepare_split(plans, ports, excluded; keep, cells)
+    split = _jax_prepare_split(plans, ports, excluded; keep, cells, host_constants)
     p1 = first(plans).second[1]
     # Raw data enters host code, so its types need not be concrete (a column
     # with missing values); the functions' inputs must be.
@@ -7928,6 +7932,8 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
                         keyword_from = length(remaining_names))
     catch e
         e isa JAXEmissionError || rethrow()
+        failure = _jax_constant_failure(mod, plans, excluded, e)
+        failure === nothing || throw(failure)
         # A plate cell's data-only recipe the functions cannot compute:
         # `prepare_data` computes it for every cell instead.
         for (_, (rp, _)) in split.residuals

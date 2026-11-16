@@ -16,6 +16,13 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.293
+
+- `jax_source(...; data = ())` prepares input-free recipes on the host when
+  they have no device translation, including constant Cartesian products.
+  Data preparation needs no dummy input; live numerical parameters remain
+  function inputs, and device-supported constants still fold in the functions.
+
 ## 0.1.292
 
 - `js_source` lets an authored plate read concrete tuples and named tuples

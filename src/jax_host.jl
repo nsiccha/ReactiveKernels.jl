@@ -2237,6 +2237,26 @@ function _jax_cell_failure(mod::_JaxModule, split, rp::Plan, e::JAXEmissionError
                      "`prepare_data` does not compute it on the host either: " * reason.message)
 end
 
+# A recipe that reads no HAVE values normally stays in the JAX functions.
+# If its device translation fails, the existing preparation boundary can
+# compute it instead, including when prepare_data has no arguments.
+struct _ConstantHostNeeded <: Exception
+    recipe::Int
+    error::JAXEmissionError
+end
+
+function _jax_constant_failure(mod::_JaxModule, plans, excluded, e::JAXEmissionError)
+    path = get(mod.failure_paths, e, nothing)
+    (path === nothing || isempty(path)) && return nothing
+    outer, recipe = first(path)
+    for (_, (p, _)) in plans
+        outer.graph === p.graph && any(r -> r.id == recipe.id, p.recipes) || continue
+        prefix, _, _ = _partial_split(p, Set{ValueId}(), excluded)
+        any(r -> r.id == recipe.id, prefix) && return _ConstantHostNeeded(recipe.id, e)
+    end
+    nothing
+end
+
 """
     _jax_prepare_split(plans, data_ports) -> (; prefix, constants, residual)
 
@@ -2247,7 +2267,7 @@ values the functions read from them, and each function's residual plan over
 its remaining ports followed by those values.
 """
 function _jax_prepare_split(plans, data_ports, excluded::Set{Int} = Set{Int}(); keep = (),
-                            cells = Dict{Int,Set{Int}}())
+                            cells = Dict{Int,Set{Int}}(), host_constants = Set{Int}())
     p1 = first(plans).second[1]
     g = p1.graph
     prefix = Recipe[]
@@ -2265,12 +2285,13 @@ function _jax_prepare_split(plans, data_ports, excluded::Set{Int} = Set{Int}(); 
         ids = Set{ValueId}(canon_id(g, v.id) for v in bound)
         pre, residual, _ = _partial_split(p, ids, excluded)
         # A recipe of the prefix that reads no data (a literal, a prior's
-        # scale) stays in the functions too, where JAX folds it: only values
-        # computed from data cross to them.
+        # scale) stays in the functions too, where JAX folds it, unless the
+        # device translation needs the host. Such constants and their
+        # downstream data-only work cross the same preparation boundary.
         dependent = copy(ids)
         independent = Recipe[]
         for r in pre
-            if any(v -> canon_id(g, v.id) in dependent, r.inputs)
+            if r.id in host_constants || any(v -> canon_id(g, v.id) in dependent, r.inputs)
                 foreach(o -> push!(dependent, canon_id(g, o.id)), r.outputs)
             else
                 push!(independent, r)
