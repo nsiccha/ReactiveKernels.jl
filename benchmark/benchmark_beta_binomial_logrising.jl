@@ -6,6 +6,7 @@ using ReactiveKernels, ReactiveKernelsDistributionKernels
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: beta_binomial,
     loggamma, logbeta
 using Enzyme, Chairmarks, Random, LinearAlgebra, Printf, Pkg, Libdl
+using DifferentiationInterface: AutoEnzyme
 
 @kernel legacy_beta_binomial(n::Int, alpha::Float64, beta::Float64) = begin
     logpdf(observed::Int)::Float64 =
@@ -15,21 +16,34 @@ using Enzyme, Chairmarks, Random, LinearAlgebra, Printf, Pkg, Libdl
          logbeta(observed + alpha, n - observed + beta) - logbeta(alpha, beta)) : -Inf
 end
 
-function measure_likelihood(spec, trials, observations, X, u)
-    started = time_ns()
-    cells = plate(spec; have = (:observed, :n, :alpha, :beta), want = :logpdf,
-        batched = (:observed, :n, :alpha, :beta))
-    function density(u)
+# Exercise the prepared RK model interface used by consumers, including bound
+# observations and design matrix. The direct closure/BLAS reproducer remains
+# in repro_enzyme_beta_binomial_captured_blas.jl (Enzyme snag 09891a70).
+for (name, law) in ((:legacy_likelihood, :legacy_beta_binomial),
+                    (:product_likelihood, :beta_binomial))
+    @eval @kernel $name(u::Vector{Float64}, X::Matrix{Float64},
+                       trials::Vector{Int}, observations::Vector{Int}) = begin
         eta = X * view(u, 2:length(u))
         phi = exp(u[1])
-        mu = @. 1 / (1 + exp(-eta))
-        cells(observations, trials, mu .* phi, (1 .- mu) .* phi)
+        terms = plate(eachindex(trials)) do i
+            mu = 1 / (1 + exp(-eta[i]))
+            $law(trials[i], mu * phi, (1 - mu) * phi).logpdf(observations[i])
+        end
+        total = sum(terms)
+        return total
     end
+end
+
+function measure_likelihood(spec, trials, observations, X, u)
+    started = time_ns()
+    density = prepare(spec; have = (:u,), want = :total,
+        bound = (; trials, observations, X))
     value = density(u)
-    first_gradient = only(Enzyme.gradient(Reverse, density, u))
+    ad = prepare_ad(density, AutoEnzyme(; mode = Reverse), u; active = :u)
+    first_gradient = ad_gradient(ad, u)
     first_seconds = (time_ns() - started) / 1e9
     primal = @b $density($u) seconds = 1
-    reverse = @b Enzyme.gradient(Reverse, $density, $u) seconds = 1
+    reverse = @b ad_gradient($ad, $u) seconds = 1
     return (; value, gradient = first_gradient, first_seconds,
         primal_seconds = primal.time, gradient_seconds = reverse.time)
 end
@@ -45,8 +59,8 @@ function main()
     for counts in (10:60, 65:150, 700:1500)
         trials = rand(rng, counts, size(X, 1))
         observations = [rand(rng, 0:n) for n in trials]
-        old = measure_likelihood(legacy_beta_binomial.logpdf, trials, observations, X, u)
-        new = measure_likelihood(beta_binomial.logpdf, trials, observations, X, u)
+        old = measure_likelihood(legacy_likelihood, trials, observations, X, u)
+        new = measure_likelihood(product_likelihood, trials, observations, X, u)
         @assert isapprox(new.value, old.value; rtol = 1e-12)
         @assert isapprox(new.gradient, old.gradient; rtol = 1e-10, atol = 1e-10)
         @printf("counts=%s value_error=%.3g gradient_error=%.3g\n", string(counts),
