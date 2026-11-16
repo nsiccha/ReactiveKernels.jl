@@ -338,10 +338,11 @@ _JaxScope(parent::Union{Nothing,_JaxScope} = nothing) =
               parent === nothing ? Dict{Symbol,Symbol}() : parent.named_hints,
               parent === nothing ? Dict{String,String}() : copy(parent.flat_positions))
 # The `flat_positions` entry of the lengths of cells that each fill their stored
-# row: a plate's cells returning vectors whose length the cell's own expression
-# fixes (`vcat(a, b)` of scalars). Every stored entry is valid, so their
-# flattening reads the rows in order. It is translation-time knowledge, not a
-# Python value: nothing emits it, and a helper receives it without an argument.
+# rows: a plate's cells returning vectors whose length the cell's own expression
+# fixes (`vcat(a, b)` of scalars), or matrices of a fixed shape. Every stored
+# entry is valid, so their flattening reads the rows in order, and a later
+# plate reads each cell as a dense array. It is translation-time knowledge, not
+# a Python value: nothing emits it, and a helper receives it without an argument.
 const _JAX_FULL_ROWS = "<full rows>"
 
 # An authored lexical region of an otherwise transparent graph. The authoring
@@ -4141,8 +4142,8 @@ end
 # `size` of a padded value (a ragged row in its cell, an allocation at a data
 # length): along an axis its extent pads, its length, the extent, bounded by
 # the stored size, as `length` gives it; along another axis, the stored size.
-# The padded width is not a size Julia has, so a value whose padded axes are
-# not known is refused.
+# The dimension is a literal or static while JAX traces. The padded width is
+# not a size Julia has, so a value whose padded axes are not known is refused.
 function _jax_padded_size(ctx::_JaxContext, x::_PyVal, dims::Vector{_PyVal})
     axes = _jax_padded_axes(x)
     axes == 0 && _jax_error("`size` of a padded `", x.T, "` whose padded axes are not known",
@@ -4162,9 +4163,19 @@ function _jax_padded_size(ctx::_JaxContext, x::_PyVal, dims::Vector{_PyVal})
         return _PyVal(_jax_tuple_code(parts), NTuple{R,Int}, false, "", _jax_tuple_limit(parts))
     end
     d = only(dims)
-    occursin(r"^[0-9]+$", d.code) ||
+    occursin(r"^[0-9]+$", d.code) && return entry(parse(Int, d.code))
+    # A dimension static while JAX traces (a helper's argument, as StanBlocks'
+    # dimension check of a typed argument passes it): Python selects the entry
+    # then, and past the rank the size is 1.
+    d.static && d.T isa Type && d.T <: Integer ||
         _jax_error("`size` of a padded value along a computed dimension", _jax_where(ctx))
-    entry(parse(Int, d.code))
+    parts = _PyVal[entry(k) for k in 1:R]
+    select(codes) = foldr((k, rest) -> "(" * codes[k] * " if " * _py_atom(d.code) * " == " *
+                          string(k) * " else " * rest * ")", 1:R; init = "1")
+    static = all(p -> p.static, parts)
+    bounded = all(p -> p.static || !isempty(p.limit), parts)
+    _PyVal(select([p.code for p in parts]), Int, static, "",
+           static || !bounded ? "" : select([p.static ? p.code : p.limit for p in parts]))
 end
 # `lastindex` (the lowered `end` of `x[a:end]` in a plain helper): the length
 # or the dimension's size, static as `end` in source is. A padded (ragged)
@@ -4328,6 +4339,11 @@ function _jax_flat_positions(ctx::_JaxContext, extent::AbstractString)
     end
     length(unique(found)) == 1 ? only(unique(found)) : nothing
 end
+# A ragged value whose cells fill their stored rows (`_JAX_FULL_ROWS`): its
+# lengths are its stored sizes, so it is the dense array of its cells.
+_jax_full_rows(ctx::_JaxContext, v::_PyVal) = !isempty(v.extent) && _jax_ragged(v.T) &&
+    isempty(v.field_extents) && _jax_flat_positions(ctx, v.extent) == _JAX_FULL_ROWS
+_jax_without_lengths(v::_PyVal) = _PyVal(v.code, v.T, v.static, "", "", 0, v.origin)
 # What a flattening of a value with lengths `extent` reads, for keying a helper
 # translated over it: nothing known, full rows, or a prepared input's positions.
 function _jax_flat_kind(ctx::_JaxContext, extent::AbstractString)
@@ -6401,6 +6417,10 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     inputs = [!(i in A) && _jax_numeric_tuple(v.T) ?
               _PyVal("jnp.stack(" * v.code * ")", Vector{eltype(v.T)}) : v
               for (i, v) in enumerate(inputs)]
+    # Arrays whose cells fill their stored rows (an earlier plate's vector or
+    # matrix cells, `_JAX_FULL_ROWS`) hold no padding: the cell reads one as
+    # the dense array it is, so `size` and `length` of it are static.
+    inputs = [_jax_full_rows(ctx, v) ? _jax_without_lengths(v) : v for v in inputs]
     mapped = Bool[!(i in A) && _jax_is_array(v.T) for (i, v) in enumerate(inputs)]
     any(mapped) || _jax_error("a plate without a batched array argument", _jax_where(ctx))
     ranks = unique(_jax_rank(inputs[i].T) for i in eachindex(inputs) if mapped[i])
@@ -6574,9 +6594,10 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
             _jax_emit!(ctx, result * " = " * call)
             _jax_emit!(ctx, lengths * " = jnp.full((" * result * ".shape[0],), " * result *
                             ".shape[1])")
-            # An unpadded cell vector's length is its stored size, the same
-            # in every cell under `vmap`: each cell fills its row.
-            E <: AbstractVector && (ctx.scope.flat_positions[lengths] = _JAX_FULL_ROWS)
+            # An unpadded cell vector's length (a matrix's first size) is its
+            # stored size, the same in every cell under `vmap`: each cell
+            # fills its rows.
+            ctx.scope.flat_positions[lengths] = _JAX_FULL_ROWS
         end
         return [_PyVal(result, Vector{E}, false, lengths)]
     end
