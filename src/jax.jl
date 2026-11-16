@@ -1095,12 +1095,9 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
         v === nothing || return v
     end
     if x.T isa Type && x.T <: Tuple
-        length(indices) == 1 && indices[1] isa Integer ||
-            _jax_error("a tuple is indexed with a literal integer only", _jax_where(ctx))
-        k = indices[1]
-        T = fieldtype(x.T, k)
-        return _PyVal(_py_atom(x.code) * "[" * string(k - 1) * "]", T, x.static,
-                      _jax_field_extent(x, k, T))
+        length(indices) == 1 || _jax_error("a tuple needs one integer index", _jax_where(ctx))
+        i = only(indices) === :end ? _jax_literal(fieldcount(x.T)) : _jax_expr(ctx, only(indices))
+        return _jax_tuple_element(ctx, x, i)
     end
     # A number indexed by ones is itself (`s[1, 1, 1]`, as Julia's).
     if x.T isa Type && x.T <: Number
@@ -5361,6 +5358,8 @@ function _jax_default_translation(f)
     F = typeof(f)
     which(_jax_call, Tuple{_JaxContext,F,Vector{_PyVal},Any}) ===
         which(_jax_call, Tuple{_JaxContext,Any,Vector{_PyVal},Any}) &&
+    which(_jax_call_keywords, Tuple{_JaxContext,F,Vector{_PyVal},Any}) ===
+        which(_jax_call_keywords, Tuple{_JaxContext,Any,Vector{_PyVal},Any}) &&
     which(_jax_call_positional, Tuple{_JaxContext,F,Vector{_PyVal}}) ===
         which(_jax_call_positional, Tuple{_JaxContext,Function,Vector{_PyVal}}) &&
     which(_jax_function_call, Tuple{_JaxContext,F,Vector{_PyVal}}) ===
@@ -5469,8 +5468,8 @@ function _jax_named_function_call(ctx, f, names, inputs, source_module, emit, in
     defined === nothing && return inline()
     name, v, bounds, passed, flat, identity, lengths = defined
     call = name * "(" * join([passed; bounds], ", ") * ")"
-    if isempty(v.extent) && isempty(v.limit) && v.origin === nothing
-        return _jax_bind!(ctx, name, _PyVal(call, v.T, v.static))
+    if _jax_plain_function_result(v)
+        return _jax_bind!(ctx, name, _PyVal(call, v.T, v.static, "", "", v.padded, v.origin))
     end
     result = _jax_bind!(ctx, name, _PyVal(call, Any))
     _jax_identity_return(_jax_function_return!(ctx, v, flat, result.code), identity, lengths,
@@ -5579,7 +5578,7 @@ function _jax_named_function!(ctx, f, names, inputs, source_module, emit, origin
               "Compute `$(nameof_or(f))` " * origin * "."
         signature = [n * ": ArrayLike" for n in params]
         lines = ["def " * name * "(" * join(signature, ", ") * ") -> " *
-                 (isempty(v.extent) && isempty(v.limit) && v.origin === nothing ?
+                 (_jax_plain_function_result(v) ?
                     _jax_return_annotation(:value, [v]) : "tuple") * ":",
                  _jax_docstring(doc, "    ")]
         append!(lines, scope.lines)
@@ -5604,7 +5603,8 @@ function _jax_named_function!(ctx, f, names, inputs, source_module, emit, origin
     (name, v, bounds, passed, flat, identity, lengths)
 end
 
-_jax_contextual_value(v::_PyVal) = v.origin !== nothing || _jax_contextual_type(v.T)
+_jax_contextual_value(v::_PyVal) =
+    (v.origin !== nothing && !(v.origin isa _JaxRowShape)) || _jax_contextual_type(v.T)
 _jax_contextual_type(T) = false
 _jax_contextual_type(T::_JaxAggregate) = any(_jax_contextual_value, T.fields)
 _jax_contextual_type(T::_JaxCallable) = T.f isa _JaxClosure && any(_jax_contextual_value, T.f.captures)
@@ -5612,8 +5612,10 @@ _jax_contextual_type(T::_JaxCallable) = T.f isa _JaxClosure && any(_jax_contextu
 # A returned value's extents and integer proofs are part of its execution
 # boundary too. Return their numerical leaves explicitly, rather than losing
 # the proof or retaining a name local to the helper's body.
+_jax_plain_function_result(v::_PyVal) = isempty(v.extent) && isempty(v.limit) &&
+    (v.origin === nothing || v.origin isa _JaxRowShape)
 function _jax_function_result(ctx, v)
-    isempty(v.extent) && isempty(v.limit) && v.origin === nothing && return v.code, v, nothing
+    _jax_plain_function_result(v) && return v.code, v, nothing
     parts = String[]
     pack(code) = isempty(code) ? "" : begin
         push!(parts, code)
@@ -6104,8 +6106,26 @@ end
 # A tuple element by a static index (lowered `getindex`/`getfield`, and
 # `first`/`last`), or an array's first or last element.
 function _jax_tuple_element(ctx::_JaxContext, x::_PyVal, i::_PyVal)
+    # Tuples accept Bool positions as Julia integers (arrays do not).
+    if i.T === Bool
+        i = i.code == "True" ? _jax_literal(1) : i.code == "False" ? _jax_literal(0) :
+            _PyVal("jnp.asarray(" * i.code * ", dtype=" * _jax_dtype(Int) * ")", Int)
+    end
     m = match(r"^[0-9]+$", i.code)
-    m === nothing && _jax_error("a tuple read at a computed index", _jax_where(ctx))
+    if m === nothing
+        T = _jax_fixed_tuple_type(x)
+        fields = T === nothing ? () : fieldtypes(T)
+        ctx.host === nothing && !isempty(fields) && first(fields) <: Number &&
+            all(==(first(fields)), fields) && i.T isa Type && i.T <: Integer ||
+            _jax_error("a computed tuple index needs homogeneous numerical fields and an integer index",
+                       _jax_where(ctx))
+        code = x.T isa _JaxAggregate ? _jax_tuple_code(x.T.fields) : x.code
+        _jax_call(ctx, _runtime_check, [_PyVal("((" * i.code * " >= 1) & (" * i.code * " <= " *
+            string(length(fields)) * "))", Bool),
+            _PyVal(repr("BoundsError: tuple index out of bounds"), BoundsError)])
+        return _PyVal("jnp.asarray(" * code * ", dtype=" * _jax_dtype(first(fields)) *
+                      ")[" * _jax_minus_one(i) * "]", first(fields))
+    end
     k = parse(Int, i.code)
     x.T isa _JaxAggregate && return x.T.fields[k]
     _PyVal(_py_atom(x.code) * "[" * string(k - 1) * "]", fieldtype(x.T, k), x.static,

@@ -43,6 +43,18 @@ end
     return score
 end
 
+@kernel jax_slots_ragged_plate(a::Float64, labelsets::Vector{Vector{Int}}, ratesets::Vector{Vector{Float64}}) = begin
+    parts = plate(labelsets, ratesets) do labels, rates
+        rows = jax_group_rows(a, labels, rates)
+        terms = plate(rows) do row
+            a * log(row[2])
+        end
+        sum(terms)
+    end
+    score = sum(parts)
+    return score
+end
+
 @traceable function jax_partial_rows(a::Float64, i::Int, guarded::Bool)
     rows = Vector{Vector{Float64}}(undef, 2)
     alias = rows
@@ -115,6 +127,7 @@ end
     src = jax_source(jax_slots_graph; have=(:a, :labels, :rates), data=(:labels,),
         functions=(score=:score, mapped=:mapped))
     ragged = jax_source(jax_slots_ragged; have=(:a, :labelsets, :ratesets), data=(:labelsets,), functions=(score=:score,))
+    ragged_plate = jax_source(jax_slots_ragged_plate; have=(:a, :labelsets, :ratesets), data=(:labelsets,), functions=(score=:score,))
     partial = jax_source(jax_partial_graph; have=(:a, :i, :guarded), functions=(score=:score,))
     @test occursin("jax.lax.fori_loop", string(src))
     @test occursin("jax.lax.cond", string(src))
@@ -152,6 +165,7 @@ end
         mktempdir() do dir
             write(joinpath(dir, "slots.py"), src)
             write(joinpath(dir, "ragged.py"), ragged)
+            write(joinpath(dir, "ragged_plate.py"), ragged_plate)
             write(joinpath(dir, "partial.py"), partial)
             # Keep the generated file for diagnosing a failing Python run.
             get(ENV, "RK_SLOT_SOURCE", "") == "" || write(ENV["RK_SLOT_SOURCE"], src)
@@ -159,7 +173,7 @@ end
                 "\ngradients = " * _rk_py(gradients) * "\nrate_gradients = " * _rk_py(rate_gradients) * "\n" * raw"""
 import jax
 import numpy as np
-import slots, ragged, partial
+import slots, ragged, ragged_plate, partial
 for labels, value, gradient, drates in zip(cases, expected, gradients, rate_gradients):
     labels = np.asarray(labels, dtype=np.int64)
     rates = -0.2 + 0.02*np.arange(labels.size)
@@ -182,6 +196,13 @@ prepared = ragged.prepare_data(labelsets=[np.array([], dtype=np.int64)] * 3)
 rates, prepared['ratesets_lengths'], prepared['ratesets_flat'] = ragged._rk_pad_rows([np.array([])] * 3, np.float64)
 np.testing.assert_allclose(jax.jit(ragged.score)(0.4, rates, **prepared), 0.)
 np.testing.assert_allclose(jax.jit(jax.grad(ragged.score))(0.4, rates, **prepared), 0.)
+# A zero-length buffer inside a nonempty outer plate must not differentiate
+# its unused storage through log(0), including the shared scalar argument.
+prepared = ragged_plate.prepare_data(labelsets=[np.array(x, dtype=np.int64) for x in ([], [1], [1,2,1])])
+rates, prepared['ratesets_lengths'], prepared['ratesets_flat'] = ragged_plate._rk_pad_rows(
+    [np.array([]), np.array([-.2]), np.array([-.2,.1,.8])], np.float64)
+np.testing.assert_allclose(jax.jit(ragged_plate.score)(.4, rates, **prepared), -.12, atol=1e-12)
+np.testing.assert_allclose(jax.jit(jax.grad(ragged_plate.score))(.4, rates, **prepared), -.3, atol=1e-12)
 for a in (-0.4, 0.4):
     np.testing.assert_allclose(jax.jit(partial.score)(a, 1, False), abs(a)+a*a)
     for i in (-1, 0, 2, 3):
@@ -219,7 +240,7 @@ print('slot buffers: empty, duplicate, sparse and growing labels passed')
             write(joinpath(dir, "check.py"), code)
             if haskey(ENV, "RK_SLOT_DIR")
                 mkpath(ENV["RK_SLOT_DIR"])
-                for name in ("slots.py", "ragged.py", "partial.py", "check.py")
+                for name in ("slots.py", "ragged.py", "ragged_plate.py", "partial.py", "check.py")
                     cp(joinpath(dir, name), joinpath(ENV["RK_SLOT_DIR"], name); force=true)
                 end
             end

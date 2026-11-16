@@ -22,15 +22,27 @@ end
     3x
 end
 
+@traceable function jax_guarded_basis(x::Float64, weights::Vector{Float64})
+    n = length(weights)
+    n <= 4 || return x * sum(weights)
+    basis = ntuple(j -> j <= n ? sin(x * j) : zero(x), Val(4))
+    value = 0.0
+    for j in eachindex(weights)
+        value += weights[j] * basis[j]
+    end
+    value
+end
+
 @kernel jax_return_graph(x::Float64, weights::Vector{Float64}) = begin
     guarded = jax_guarded_recurrence(x, weights)
     nested = jax_nested_guard(x)
-    return (guarded, nested)
+    basis = jax_guarded_basis(x, weights)
+    return (guarded, nested, basis)
 end
 
 @testset "body-level early returns preserve lazy continuations" begin
     src = jax_source(jax_return_graph; have=(:x, :weights),
-        functions=(guarded=:guarded, nested=:nested))
+        functions=(guarded=:guarded, nested=:nested, basis=:basis))
     @test occursin("jax.lax.cond", string(src))
     @test occursin("jax.lax.fori_loop", string(src))
     s = TraceableSource((:x,), :(begin x > 0 || return 0.0; log(x) end), @__MODULE__)
@@ -44,12 +56,16 @@ end
         0.0
     end), @__MODULE__)
     weights = [0.2, -0.1, 0.7]
-    native = prepare(jax_return_graph; have=(:x, :weights), want=(:guarded, :nested))
+    native = prepare(jax_return_graph; have=(:x, :weights), want=(:guarded, :nested, :basis))
     for x in (-2.0, -0.75, -0.25, 0.0, 0.5, 2.0)
-        @test native(x, weights) == (jax_guarded_recurrence(x, weights), jax_nested_guard(x))
+        @test native(x, weights) == (jax_guarded_recurrence(x, weights), jax_nested_guard(x),
+                                    jax_guarded_basis(x, weights))
         da = Enzyme.autodiff(Enzyme.Reverse, jax_guarded_recurrence, Enzyme.Active,
             Enzyme.Active(x), Enzyme.Const(weights))[1][1]
         @test da ≈ (x > 0 ? inv(x) + sum(weights) : -2.0)
+        db = Enzyme.autodiff(Enzyme.Reverse, jax_guarded_basis, Enzyme.Active,
+            Enzyme.Active(x), Enzyme.Const(weights))[1][1]
+        @test db ≈ sum(j * weights[j] * cos(x * j) for j in eachindex(weights))
     end
     if rk_jax_available()
         mktempdir() do dir
@@ -67,6 +83,11 @@ for n in (0, 3, 19):
         np.testing.assert_allclose(jax.jit(jax.grad(returns.guarded))(x, weights), derivative)
         nested = x*x if x < -1 else -x if -0.5 < x < 0 else 3*x
         np.testing.assert_allclose(jax.jit(returns.nested)(x, weights), nested)
+        js = np.arange(1,n+1)
+        basis = x*weights.sum() if n > 4 else np.dot(weights, np.sin(x*js))
+        derivative = weights.sum() if n > 4 else np.dot(weights, js*np.cos(x*js))
+        np.testing.assert_allclose(jax.jit(returns.basis)(x, weights), basis, atol=1e-12)
+        np.testing.assert_allclose(jax.jit(jax.grad(returns.basis))(x, weights), derivative, atol=1e-12)
 xs = np.array([-2., 0., 0.5, 2.])
 actual = jax.jit(jax.vmap(jax.grad(returns.guarded), in_axes=(0, None)))(xs, np.array([1., 2.]))
 np.testing.assert_allclose(actual, [-2., -2., 5., 3.5])

@@ -28,6 +28,8 @@ are recorded in the git history only.
   `isempty(ids) ? 0 : maximum(ids)`, including inside ragged cells. Loops retain
   their bodies across changing data sizes. Unsupported row alias mutations,
   helper argument mutation, and direct public buffer outputs are diagnosed.
+- Device loops can read homogeneous numerical tuples at computed integer
+  indices, including fixed `ntuple` bases behind an early-return guard.
 
 ## 0.1.280
 
