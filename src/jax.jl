@@ -3087,7 +3087,18 @@ function _host_float_value(code::AbstractString, @nospecialize(T))
     T === E ? dtype * "(" * code * ")" : "np.asarray(" * code * ", dtype=" * dtype * ")"
 end
 function _jax_stages(code::AbstractString, args::Vector{_PyVal})
-    operation = foldl((c, a) -> isempty(a.code) ? c : replace(c, a.code => ""), args; init = code)
+    # Ignore complete operands, whose static status is already known (a
+    # shape can contain a staged array expression). Substring removal would
+    # erase `n` from `jnp.isfinite(n)` too and hide the staging operation.
+    # Match longer operands first, outside identifiers and string literals.
+    operation = replace(code, _PY_STRING => "\"\"")
+    operands = sort!(unique!([replace(a.code, _PY_STRING => "\"\"") for a in args]);
+                     by = ncodeunits, rev = true)
+    for operand in operands
+        isempty(operand) && continue
+        pattern = Regex("(?<![.\\w])\\Q" * replace(operand, "\\E" => "\\E\\\\E\\Q") * "\\E(?!\\w)")
+        operation = replace(operation, pattern => " ")
+    end
     occursin(r"\b(?:jnp|jsp|jax)\.(?!(?:pi|e|inf|nan)\b)", operation)
 end
 _jax_args(args) = join((a.code for a in args), ", ")

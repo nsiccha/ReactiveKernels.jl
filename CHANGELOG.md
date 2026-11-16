@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.285
+
+- `jax_source` keeps predicates and arithmetic over prepared integers static
+  when argument names overlap backend names, such as `isfinite(n)`. Those
+  calls use the existing NumPy translation instead of leaving a traced JAX
+  value in a Python conditional. Lazy guards and ordinary gradients are
+  preserved, including when prepared data are passed to a jitted function.
+
 ## 0.1.284
 
 - Add the internal log rising-factorial numerical graph used by distribution

@@ -78,8 +78,10 @@ else:
 if sys.argv[5] == "arguments":
     # The prepared data traced as arguments, not closed over.
     value = jax.jit(f)(first, **prepared)
+    derivative_function, derivative_kwargs = f, prepared
 else:
     value = jax.jit(call)(first)
+    derivative_function, derivative_kwargs = call, {}
 
 def jl(x):
     if isinstance(x, dict):
@@ -98,10 +100,10 @@ def jl(x):
 
 out = "(value = " + jl(value)
 if sys.argv[4] == "grad":
-    out += ", grad = " + jl(jax.jit(jax.grad(call))(first))
+    out += ", grad = " + jl(jax.jit(jax.grad(derivative_function))(first, **derivative_kwargs))
 elif sys.argv[4] == "joint":
     # Value and gradient from one jax.value_and_grad, as a sampler takes them.
-    joint_value, joint_grad = jax.jit(jax.value_and_grad(call))(first)
+    joint_value, joint_grad = jax.jit(jax.value_and_grad(derivative_function))(first, **derivative_kwargs)
     out += ", joint_value = " + jl(joint_value) + ", grad = " + jl(joint_grad)
 print(out + ",)")
 """
