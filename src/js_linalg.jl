@@ -199,6 +199,10 @@ function _js_linalg_call(ir, f, args, T)
     fresh(name, xs) = _js_fcall(ir, use(name), Any[xs...], T; pure = false)
     if f === Core.kwcall
         return _js_kwcall(ir, args, T)
+    elseif f === vec && n == 1 && _js_isvector(args[1]) && T === _js_type(args[1])
+        # Julia's vec(::AbstractVector) returns the vector itself, including
+        # nested vectors; it does not flatten its entries or copy them.
+        return _js_runtime(mod, args[1])
     elseif f === vec && n == 1 && _js_matlike(args[1])
         return fresh(:_rk_vec, args)
     elseif f === LinearAlgebra.diag && n == 1 && _js_matlike(args[1])
@@ -206,7 +210,7 @@ function _js_linalg_call(ir, f, args, T)
         return fresh(:_rk_diag, args)
     elseif f in (transpose, adjoint, permutedims) && n == 1 && _js_matlike(args[1])
         return fresh(:_rk_transpose, args)
-    elseif f in (transpose, adjoint) && n == 1 && (_js_isvector(args[1]) || _js_rowlike(args[1]))
+    elseif f in (transpose, adjoint) && n == 1 && (_js_isflatvector(args[1]) || _js_rowlike(args[1]))
         # a row is the vector it transposes, and the transpose of a row is its vector
         r = _js_runtime(mod, args[1])
         return _js_rt(r.code, T; prec = r.prec, ref = r.ref, pure = r.pure)
@@ -214,11 +218,11 @@ function _js_linalg_call(ir, f, args, T)
         return _js_mul_chain!(ir, args, T)
     elseif f === (*) && n == 2
         a, b = args
-        _js_matlike(a) && _js_isvector(b) && return fresh(:_rk_matvec, args)
+        _js_matlike(a) && _js_isflatvector(b) && return fresh(:_rk_matvec, args)
         _js_matlike(a) && _js_matlike(b) && return fresh(:_rk_matmul, args)
         _js_rowlike(a) && _js_matlike(b) && return fresh(:_rk_vecmat, args)
-        _js_rowlike(a) && _js_isvector(b) && return _js_fcall(ir, use(:_rk_dot), args, T)
-        _js_isvector(a) && _js_rowlike(b) && return fresh(:_rk_outer, args)
+        _js_rowlike(a) && _js_isflatvector(b) && return _js_fcall(ir, use(:_rk_dot), args, T)
+        _js_isflatvector(a) && _js_rowlike(b) && return fresh(:_rk_outer, args)
         if (_js_scalar(a) && _js_matlike(b)) || (_js_matlike(a) && _js_scalar(b))
             return _js_materialize2!(ir, _JsBroadcast(f, Any[a, b], Nothing), T)
         end

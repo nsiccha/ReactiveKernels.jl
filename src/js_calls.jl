@@ -13,7 +13,7 @@ const _JS_FAMILIES = (_js_array_call, _js_iter_call, _js_linalg_call, _js_functi
 const _JS_FAMILY_FUNCTIONS = (
     Base.vect, getindex, size, length, axes, firstindex, lastindex, copy,
     hvcat, hcat, Base.typed_hvcat, Base.typed_hcat, _native_hvcat, _native_hcat, setindex!,
-    collect, sum, maximum, minimum, count, any, all, isempty, argmin, argmax, findmin, findmax, filter,
+    collect, reduce, sum, maximum, minimum, count, any, all, isempty, argmin, argmax, findmin, findmax, filter,
     Base.Iterators.filter, Core.kwcall,
     vec, LinearAlgebra.diag, transpose, adjoint, permutedims, *, /, +, -, prod, zeros, ones, fill,
     findfirst, findlast, isnothing, merge, abs2, _JS_FIX2_COMPARISONS...)
