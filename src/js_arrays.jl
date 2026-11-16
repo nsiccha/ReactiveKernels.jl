@@ -12,7 +12,6 @@
 # `_js_function_call` reaches these through `js_calls.jl`, which asks each
 # family of array translations in turn, then the general table (`js.jl`).
 
-const _JsMatrixElement = Union{Float64,Int64,Bool}
 _js_ismatrix(v) = (T = _js_type(v); T isa Type && T <: Matrix && eltype(T) <: _JsMatrixElement)
 _js_iscolon(v) = v isa _JsVal && v.static && v.value isa Colon
 _js_static_int(v) = v isa _JsVal && v.static && v.value isa Integer ? Int(v.value) : nothing

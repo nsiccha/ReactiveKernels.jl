@@ -169,6 +169,12 @@ function _js_runtime(mod::_JsModule, v::_JsVal)
                       ", " * _js_number(last(x)) * ")", typeof(x); ref = false)
     elseif x isa Exception
         return _js_rt(_js_exception(mod, x), typeof(x); pure = true)
+    elseif x isa Union{Vector,Matrix} && eltype(x) <: _JsMatrixElement
+        # An array known while translating (a `const` global the code reads):
+        # a module-level array holding its value at emission, which the module
+        # reads and writes as the kernel does the global.
+        hint = get(mod.helpers, (:global, objectid(x)), ("constant", nothing))[1]
+        return _js_constant(mod, x, "_rk_const_", hint; frozen = false)
     end
     _js_error(mod, "the value `", repr(x; context = :limit => true), "` of type `", typeof(x),
               "` is needed at run time and has no JavaScript translation; pass it as a kernel input")
@@ -600,6 +606,8 @@ _js_use!(mod::_JsModule, s::Symbol) = (push!(mod.runtime, s); String(s))
 # --- supported Julia types -----------------------------------------------------------
 
 const _JsNumber = Union{Float64,Int64}
+# an element of a vector or matrix the module holds (`js_arrays.jl`)
+const _JsMatrixElement = Union{Float64,Int64,Bool}
 _js_isnumber(v) = _js_type(v) <: _JsNumber
 _js_isfloat(v) = _js_type(v) === Float64
 _js_isint(v) = _js_type(v) === Int64
@@ -728,7 +736,10 @@ function _js_operand(ir::_JsIR, x)
         isdefined(x.mod, x.name) || _js_error(mod, "`", x, "` is not defined")
         isconst(x.mod, x.name) ||
             _js_error(mod, "the global `", x, "` is not constant; pass its value as a kernel input")
-        return _js_static(getglobal(x.mod, x.name))
+        v = getglobal(x.mod, x.name)
+        # an array names the module constant it may become (`_js_runtime`)
+        v isa Array && get!(mod.helpers, (:global, objectid(v)), (string(x.name), v))
+        return _js_static(v)
     elseif x isa QuoteNode
         return _js_static(x.value)
     elseif x isa Expr && x.head === :static_parameter
@@ -885,10 +896,10 @@ function _js_expr!(ir::_JsIR, i, ex, T)
     if ex.head === :call
         fv = _js_operand(ir, ex.args[1])
         args = Any[_js_operand(ir, a) for a in ex.args[2:end]]
-        if T isa Core.Const && _js_foldable(fv, args)
+        if T isa Core.Const && _js_foldable(fv, args) && !_js_lazy_broadcast(fv, args)
             return _js_static(T.val)
         end
-        folded = _js_fold(fv, args)
+        folded = _js_lazy_broadcast(fv, args) ? nothing : _js_fold(fv, args)
         folded === nothing || return folded
         RT = Core.Compiler.widenconst(T)
         fv isa _JsVal && fv.static ||
@@ -1637,6 +1648,31 @@ function _js_broadcasted(ir, f, args, T)
     _JsBroadcast(fv.value, Any[args[2:end]...], T)
 end
 
+# An array known while translating (a `const` global), not a range.
+_js_static_array(x) = x isa AbstractArray && !(x isa AbstractRange)
+_js_holds_array(x) = _js_static_array(x) || (x isa Base.RefValue && _js_holds_array(x[])) ||
+    (x isa Base.Broadcast.Broadcasted && any(_js_holds_array, x.args))
+# A broadcast over such an array stays a broadcast while translating, to be
+# read from the module constant the array becomes; one over numbers and
+# ranges alone folds (`(1:3) .+ 1` is the range `2:4`).
+_js_lazy_broadcast(fv, args) =
+    fv isa _JsVal && fv.static && (fv.value === Base.Broadcast.broadcasted || fv.value === _native_broadcasted) &&
+    any(a -> a isa _JsVal && a.static && _js_holds_array(a.value), args)
+
+# A broadcast's operands that are arrays known while translating are read like
+# runtime arrays, from the module constants they become (`_js_runtime`, which
+# refuses an array it cannot emit), and a broadcast known while translating
+# (`2 .* 3` inside `x .+ 2 .* 3`) is fused like any other; numbers, ranges
+# and `Ref`s stay as they are.
+function _js_bcvalues(mod::_JsModule, v)
+    v isa _JsBroadcast && return _JsBroadcast(v.f, Any[_js_bcvalues(mod, a) for a in v.args], v.T)
+    v isa _JsVal && v.static || return v
+    x = v.value
+    x isa Base.Broadcast.Broadcasted &&
+        return _js_bcvalues(mod, _JsBroadcast(x.f, Any[_js_static(a) for a in x.args], Nothing))
+    _js_static_array(x) ? _js_runtime(mod, v) : v
+end
+
 function _js_leaves!(leaves, v)
     if v isa _JsBroadcast
         foreach(a -> _js_leaves!(leaves, a), v.args)
@@ -1648,6 +1684,8 @@ end
 
 function _js_materialize!(ir::_JsIR, bc::_JsBroadcast, T; dest = nothing)
     mod = ir.fn.mod
+    bc = _js_bcvalues(mod, bc)
+    dest === nothing && _js_bc2d(bc) && return _js_materialize2!(ir, bc, T)
     leaves = _js_leaves!(Any[], bc)
     for l in leaves
         t = _js_type(l)
@@ -2531,23 +2569,34 @@ function _js_module_name!(mod::_JsModule, prefix, hint)
     name
 end
 
-# A value bound at preparation (`prepare(...; bound)`, an RKPPL binding's
-# data): a number or Bool is known while translating, so it folds as a
-# literal. A vector of them is a frozen module constant, emitted once per
-# array; its numbers are exact (`Float64` literals round-trip, an `Int64`
-# beyond 2^53 is refused).
-_js_bound(mod::_JsModule, x::Union{Float64,Int64,Bool}, hint) = _js_static(x)
-function _js_bound(mod::_JsModule, x::Vector{T}, hint) where {T<:Union{Float64,Int64,Bool}}
-    key = (:bound, objectid(x))
+# An array known while translating as a module-level constant `prefix * hint`,
+# emitted once per array: a vector is an array, a matrix an array of row
+# arrays (one without rows keeps its column count as `cols`), as values cross
+# the module's boundary. Its numbers are exact (`Float64` literals round-trip,
+# an `Int64` beyond 2^53 is refused). `frozen` freezes it and its rows.
+function _js_constant(mod::_JsModule, x::Union{Vector{T},Matrix{T}}, prefix, hint;
+                      frozen::Bool) where {T<:_JsMatrixElement}
+    key = (Symbol(prefix), objectid(x))
     name, _ = get(mod.helpers, key, ("", nothing))
     if isempty(name)
-        name = _js_module_name!(mod, "_rk_bound_", hint)
-        items = join((_js_runtime(mod, _js_static(e)).code for e in x), ", ")
-        push!(mod.defs, "const " * name * " = Object.freeze([" * items * "]);")
+        name = _js_module_name!(mod, prefix, hint)
+        wrap(code) = frozen ? "Object.freeze(" * code * ")" : code
+        items(xs) = "[" * join((_js_runtime(mod, _js_static(e)).code for e in xs), ", ") * "]"
+        code = x isa Vector ? wrap(items(x)) :
+            size(x, 1) == 0 ? wrap("Object.assign([], { cols: " * string(size(x, 2)) * " })") :
+            wrap("[" * join((wrap(items(r)) for r in eachrow(x)), ", ") * "]")
+        push!(mod.defs, "const " * name * " = " * code * ";")
         mod.helpers[key] = (name, x)  # the array stays alive, so its id stays unique
     end
     _js_rt(name, typeof(x); ref = true)
 end
+
+# A value bound at preparation (`prepare(...; bound)`, an RKPPL binding's
+# data): a number or Bool is known while translating, so it folds as a
+# literal. A vector or matrix of them is a frozen module constant.
+_js_bound(mod::_JsModule, x::Union{Float64,Int64,Bool}, hint) = _js_static(x)
+_js_bound(mod::_JsModule, x::Union{Vector{T},Matrix{T}}, hint) where {T<:_JsMatrixElement} =
+    _js_constant(mod, x, "_rk_bound_", hint; frozen = true)
 # Another bound value stays known while translating: a call reads its fields
 # or folds it, and a run-time use of it raises as for any other such value.
 _js_bound(mod::_JsModule, x, hint) = _js_static(x)
@@ -2730,7 +2779,11 @@ Values are `Float64` and `Int64` numbers (an `Int64` exact while it stays
 below 2^53 in magnitude), `Bool`s, vectors of them, and matrices of them as
 arrays of row arrays (`m[i][j]` is Julia's `m[i+1, j+1]`; a matrix without
 rows keeps its column count as `cols`, `Object.assign([], { cols: 3 })` for
-`zeros(0, 3)`); sizes and numeric inputs stay runtime arguments. Translated:
+`zeros(0, 3)`); sizes and numeric inputs stay runtime arguments. A `const`
+global array of them that the code reads (`const LEVELS = [50.0, 100.0]`)
+becomes a module-level array (`_rk_const_LEVELS`) holding its value at
+emission, which the module reads and writes as the kernel does the global.
+Translated:
 ordinary kernel recipes, broadcasts (fused, with Julia's length rules),
 `plate` and `scan` as loops, arithmetic and comparisons, `Base.Math`
 functions with Julia's domain errors, checked 1-based indexing (of a matrix:
@@ -2804,11 +2857,11 @@ The module of a prepared kernel as [`prepare`](@ref) returns it (a flat or
 shaped WANT), such as a native model's prepared query: its function takes the
 kernel's HAVE values in order and returns what the kernel returns. Data bound
 at preparation (`prepare(spec; have, want, bound)`, the data of an RKPPL
-binding) are part of the module, numbers as literals and vectors as frozen
-module constants, so the module computes what the kernel computes. `types`
-defaults to the exemplar types the kernel was prepared with, if any. A recipe
-of another kernel may call such a kernel too; its function is then translated
-from the kernel's plan the same way.
+binding) are part of the module, numbers as literals and vectors and
+matrices as frozen module constants, so the module computes what the kernel
+computes. `types` defaults to the exemplar types the kernel was prepared
+with, if any. A recipe of another kernel may call such a kernel too; its
+function is then translated from the kernel's plan the same way.
 """
 function js_source(k::PreparedKernel; types = nothing, name = :kernel)
     S = _exact_signature(k)

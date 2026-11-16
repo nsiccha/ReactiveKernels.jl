@@ -320,6 +320,7 @@ _js_bc2d(bc) = any(_js_bc2d_leaf, _js_leaves!(Any[], bc))
 # given, is written in place).
 function _js_materialize2!(ir::_JsIR, bc::_JsBroadcast, T; dest = nothing)
     mod = ir.fn.mod
+    bc = _js_bcvalues(mod, bc)
     leaves = _js_leaves!(Any[], bc)
     for l in leaves
         t = _js_type(l)
