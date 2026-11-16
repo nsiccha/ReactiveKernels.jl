@@ -2,6 +2,8 @@
 # environment with ReactiveKernelsDistributionKernels, Enzyme, Chairmarks and
 # SpecialFunctions. Repeat with registered Enzyme and the dogfood source.
 # This is a synthetic likelihood benchmark, not the RKPPLBench/Wren model.
+# First-call times include preparation and share process/compiler caches;
+# compare the warmed density and gradient timings for runtime performance.
 using ReactiveKernels, ReactiveKernelsDistributionKernels
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: beta_binomial,
     loggamma, logbeta
@@ -36,7 +38,7 @@ end
 
 function measure_likelihood(spec, trials, observations, X, u)
     started = time_ns()
-    density = prepare(spec; have = (:u,), want = :total,
+    density = prepare(spec; have = (:u, :X, :trials, :observations), want = :total,
         bound = (; trials, observations, X))
     value = density(u)
     ad = prepare_ad(density, AutoEnzyme(; mode = Reverse), u; active = :u)
@@ -53,6 +55,7 @@ function main()
     info = Pkg.dependencies()[Base.PkgId(Enzyme).uuid]
     println("Enzyme ", info.version, " source=", info.source)
     println("Enzyme libraries ", filter(p -> occursin("Enzyme", p), Libdl.dllist()))
+    flush(stdout)
     rng = Xoshiro(20261116)
     X = randn(rng, 1770, 30) ./ sqrt(30)
     u = [log(7.0); 0.1 .* randn(rng, 30)]
@@ -69,6 +72,7 @@ function main()
             @printf("  %s first=%.3fs density=%.3fus gradient=%.3fus\n", label,
                 r.first_seconds, 1e6 * r.primal_seconds, 1e6 * r.gradient_seconds)
         end
+        flush(stdout)
     end
 end
 
