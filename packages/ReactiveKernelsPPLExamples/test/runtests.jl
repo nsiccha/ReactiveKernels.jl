@@ -30,6 +30,7 @@ using Test
 
 include(joinpath(@__DIR__, "..", "..", "..", "test", "test_native_ode.jl"))
 include(joinpath(@__DIR__, "..", "..", "..", "test", "test_jax_ode.jl"))
+include(joinpath(@__DIR__, "..", "..", "..", "test", "test_js_ode.jl"))
 include("test_gp_first_use.jl")
 include("test_startup_initialization.jl")
 include("test_ppl_workflow.jl")

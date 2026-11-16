@@ -53,11 +53,16 @@ import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 const [, , modulePath, casesPath] = process.argv;
 const out = (x) => process.stdout.write(JSON.stringify(x) + "\n");
+// A matrix is an array of rows; one without rows carries its column count as
+// `cols`, which crosses JSON as `{ __cols: n }`.
 const decode = (x) => typeof x === "string" ?
   (x === "NaN" ? NaN : x === "Infinity" ? Infinity : x === "-Infinity" ? -Infinity : x === "-0" ? -0 : x) :
-  Array.isArray(x) ? x.map(decode) : x;
+  Array.isArray(x) ? x.map(decode) :
+  x !== null && typeof x === "object" && Object.keys(x).length === 1 && Number.isInteger(x.__cols) ?
+    Object.assign([], { cols: x.__cols }) : x;
 const encode = (x) => typeof x === "number" ?
   (Number.isNaN(x) ? "NaN" : x === Infinity ? "Infinity" : x === -Infinity ? "-Infinity" : Object.is(x, -0) ? "-0" : x) :
+  Array.isArray(x) && x.length === 0 && Number.isInteger(x.cols) && x.cols > 0 ? { __cols: x.cols } :
   Array.isArray(x) || ArrayBuffer.isView(x) ? Array.from(x, encode) :
   x !== null && typeof x === "object" ? Object.fromEntries(Object.entries(x).map(([k, v]) => [k, encode(v)])) :
   x === undefined ? null : x;
@@ -78,7 +83,9 @@ const inputs = Array.isArray(m.INPUTS) ? m.INPUTS : [];
 const results = cases.map((raw) => {
   const args = raw.map(decode).map((a, i) =>
     vectors === "float64array" && Array.isArray(a) && /^Vector\{(Float64|Int64)\}$/.test(inputs[i]?.type ?? "") ?
-      Float64Array.from(a) : a);
+      Float64Array.from(a) :
+    vectors === "float64array" && Array.isArray(a) && /^Matrix\{(Float64|Int64)\}$/.test(inputs[i]?.type ?? "") ?
+      Object.assign(a.map((r) => Float64Array.from(r)), a.length === 0 ? { cols: a.cols } : {}) : a);
   const before = JSON.stringify(encode(args));
   let r;
   try {
@@ -101,6 +108,9 @@ end
 _js_run_json(x::AbstractFloat) = isnan(x) ? "\"NaN\"" : isinf(x) ? (x > 0 ? "\"Infinity\"" : "\"-Infinity\"") :
     iszero(x) && signbit(x) ? "\"-0\"" : repr(Float64(x))
 _js_run_json(x::AbstractVector) = "[" * join(map(_js_run_json, x), ",") * "]"
+# A matrix as an array of rows; one without rows as its column count.
+_js_run_json(x::AbstractMatrix) = size(x, 1) == 0 && size(x, 2) > 0 ? "{\"__cols\":" * string(size(x, 2)) * "}" :
+    "[" * join((_js_run_json(collect(r)) for r in eachrow(x)), ",") * "]"
 _js_run_json(x::Union{Tuple,AbstractString,Symbol}) = x isa Tuple ? _js_run_json(collect(Any, x)) :
     "\"" * escape_string(String(x)) * "\""
 _js_run_json(x) = throw(ArgumentError(
@@ -193,7 +203,8 @@ function _js_run_output_types(outputs)
     types
 end
 const _JS_RUN_TYPES = Dict{String,Any}(string(T) => T for T in
-    (Float64, Int64, Bool, Vector{Float64}, Vector{Int64}, Vector{Bool}))
+    (Float64, Int64, Bool, Vector{Float64}, Vector{Int64}, Vector{Bool},
+     Matrix{Float64}, Matrix{Int64}, Matrix{Bool}))
 _js_run_type(name) = get(_JS_RUN_TYPES, name, nothing)
 
 function _js_run_outcome(r::Dict, types, returns)
@@ -227,6 +238,18 @@ _js_run_value(::Type{Int64}, x) = (v = _js_run_number(x); isinteger(v) ? Int64(v
 _js_run_value(::Type{Bool}, x) = x isa Bool ? x :
     throw(JSRunError("the module returned $(repr(x)) where a Bool was expected"))
 _js_run_value(::Type{Vector{T}}, x) where {T} = T[_js_run_value(T, e) for e in x]
+_js_run_value(::Type{Matrix{T}}, x::Dict) where {T} = haskey(x, "__cols") ? Matrix{T}(undef, 0, Int(x["__cols"])) :
+    throw(JSRunError("the module returned an object where a Matrix{$T} was expected"))
+function _js_run_value(::Type{Matrix{T}}, x::Vector) where {T}
+    rows = [T[_js_run_value(T, e) for e in r] for r in x]
+    all(r -> length(r) == length(first(rows)), rows) ||
+        throw(JSRunError("the module returned rows of different lengths where a Matrix{$T} was expected"))
+    m = Matrix{T}(undef, length(rows), isempty(rows) ? 0 : length(first(rows)))
+    for (i, r) in enumerate(rows), j in eachindex(r)
+        m[i, j] = r[j]
+    end
+    m
+end
 # Without a declared type: numbers as Float64, arrays element by element.
 _js_run_value(::Nothing, x::Union{Real,String}) = x isa Bool ? x : _js_run_number(x)
 _js_run_value(::Nothing, x::Vector) = isempty(x) ? Float64[] : all(e -> e isa Bool, x) ? Bool[x...] :

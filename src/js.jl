@@ -361,6 +361,129 @@ function _rk_samelen(x, y) {
 function _rk_bcat(x, i) { return x.length === 1 ? x[0] : x[i]; }""", Symbol[]),
     :_rk_range => ("""
 function _rk_range(start, stop) { return { start, stop: Math.max(start - 1, stop) }; }""", Symbol[]),
+    # Matrices as arrays of row arrays (`js_arrays.jl`)
+    :_rk_ncols => ("""
+function _rk_ncols(m) { return m.length > 0 ? m[0].length : Number.isInteger(m.cols) ? m.cols : 0; }""", Symbol[]),
+    :_rk_mcopy => ("""
+function _rk_mcopy(m) {
+  const c = m.map((r) => Array.from(r));
+  if (m.length === 0) c.cols = _rk_ncols(m);
+  return c;
+}""", [:_rk_ncols]),
+    :_rk_at2 => ("""
+function _rk_at2(m, i, j) {
+  const cols = _rk_ncols(m);
+  if (!(Number.isInteger(i) && i >= 1 && i <= m.length && Number.isInteger(j) && j >= 1 && j <= cols))
+    throw new JuliaError("BoundsError", "attempt to access " + m.length + "×" + cols + " array at index [" + i + ", " + j + "]");
+  return m[i - 1][j - 1];
+}""", [:JuliaError, :_rk_ncols]),
+    :_rk_col => ("""
+function _rk_col(m, j) {
+  const cols = _rk_ncols(m);
+  if (!(Number.isInteger(j) && j >= 1 && j <= cols))
+    throw new JuliaError("BoundsError", "attempt to access " + m.length + "×" + cols + " array at index [:, " + j + "]");
+  const out = new Array(m.length);
+  for (let i = 0; i < m.length; i++) out[i] = m[i][j - 1];
+  return out;
+}""", [:JuliaError, :_rk_ncols]),
+    :_rk_row => ("""
+function _rk_row(m, i) {
+  if (!(Number.isInteger(i) && i >= 1 && i <= m.length))
+    throw new JuliaError("BoundsError", "attempt to access " + m.length + "×" + _rk_ncols(m) + " array at index [" + i + ", :]");
+  return Array.from(m[i - 1]);
+}""", [:JuliaError, :_rk_ncols]),
+    :_rk_matrix => ("""
+function _rk_matrix(name, x, element, integer) {
+  if (!Array.isArray(x))
+    throw new JuliaError("ArgumentError", "the input `" + name + "` must be an array of rows; got " + x);
+  if (x.length === 0 && x.cols !== undefined && !(Number.isInteger(x.cols) && x.cols >= 0))
+    throw new JuliaError("ArgumentError", "the input `" + name + "` has no rows and a column count `cols` of " + x.cols);
+  for (let i = 0; i < x.length; i++) {
+    const r = x[i];
+    if (!(Array.isArray(r) || ArrayBuffer.isView(r)))
+      throw new JuliaError("ArgumentError", "the input `" + name + "` must be an array of rows; row " + (i + 1) + " is " + r);
+    if (r.length !== x[0].length)
+      throw new JuliaError("ArgumentError", "the input `" + name + "` must have rows of one length; row " + (i + 1) +
+        " has " + r.length + " entries and row 1 has " + x[0].length);
+    for (let j = 0; j < r.length; j++)
+      if (typeof r[j] !== element || (integer && !Number.isInteger(r[j])))
+        throw new JuliaError("ArgumentError", "the input `" + name + "` must hold " + element + "s; entry [" +
+          (i + 1) + ", " + (j + 1) + "] is " + r[j]);
+  }
+}""", [:JuliaError]),
+    # `rk_ode_rk45_tol` (`js_ode.jl`)
+    :_rk_ode_rk45 => ("""
+function _rk_ode_rk45(f, y0, t0, ts, rt, at, mx) {
+  const name = "JavaScript DP5";
+  const domain = (x, what) => { throw new JuliaError("DomainError", name + " " + what + "; got " + x, x); };
+  if (y0.length === 0) throw new JuliaError("ArgumentError", name + " initial state is empty");
+  if (ts.length === 0) throw new JuliaError("ArgumentError", name + " output times are empty");
+  if (!Number.isFinite(t0)) domain(t0, "initial time");
+  for (let j = 0; j < y0.length; j++) if (!Number.isFinite(y0[j])) domain(y0[j], "initial state");
+  if (!(Number.isFinite(rt) && rt >= 0)) domain(rt, "relative tolerance");
+  if (!(Number.isFinite(at) && at >= 0)) domain(at, "absolute tolerance");
+  if (!(rt > 0 || at > 0)) domain("(" + rt + ", " + at + ")", "tolerances are both zero");
+  if (!(mx > 0)) domain(mx, "step limit");
+  let previous = t0;
+  for (let i = 0; i < ts.length; i++) {
+    if (!(Number.isFinite(ts[i]) && ts[i] > previous)) domain(ts[i], "output times");
+    previous = ts[i];
+  }
+  const w = ts[ts.length - 1] - t0, n = y0.length;
+  if (!Number.isFinite(w)) domain(ts[ts.length - 1], "time span");
+  // The library's step size turns NaN after a NaN error estimate, and reaches
+  // the right-hand side as a NaN time.
+  const nan = {};
+  const rhs = (s, y, dy) => {
+    if (s !== s) throw nan;
+    const d = f(t0 + s * w, y);
+    if (!((Array.isArray(d) || ArrayBuffer.isView(d)) && d.length === n))
+      throw new JuliaError("DimensionMismatch", "the ODE right-hand side must return a state-length vector");
+    for (let j = 0; j < n; j++) dy[j] = w * d[j];
+  };
+  const solver = new _rk_dopri.Dopri(rhs, n, { atol: 1, rtol: 1, maxSteps: Infinity,
+    stepSizeMin: 0, stepSizeMax: 1, tcrit: [1] });
+  // The constructor refuses a zero tolerance, which is valid here.
+  solver._control.atol = at;
+  solver._control.rtol = rt;
+  const failure = (retcode) => {
+    const t = t0 + solver._t * w;
+    const e = new JuliaError("ODESolveFailure", retcode === "MaxIters" ?
+      name + " exceeded maxsteps between requested outputs at t = " + t : name + " failed: " + retcode + " at t = " + t);
+    e.method = name;
+    e.retcode = retcode;
+    e.t = t;
+    return e;
+  };
+  const run = (step) => {
+    try {
+      step();
+    } catch (e) {
+      // Native's step size shrinks below eps(t) in both cases: a NaN error
+      // estimate rejects the step with the smallest step factor there.
+      if (e === nan || (e instanceof Error && !(e instanceof JuliaError) &&
+                        String(e.message).startsWith("Integration failure: step size vanished")))
+        throw failure("Unstable");
+      throw e;
+    }
+  };
+  run(() => solver.initialise(0, Array.from(y0)));
+  const history = solver._history, out = new Array(ts.length);
+  let k = 0;
+  for (let i = 0; i < ts.length; i++) {
+    const s = (ts[i] - t0) / w, last = i === ts.length - 1;
+    let steps = 0;
+    // The last step lands on 1 to within rounding of its length.
+    while (solver._t < s && !(last && 1 - solver._t <= 2.220446049250313e-16)) {
+      run(() => solver._step());
+      history.push(solver._stepper.history.clone());
+      if (++steps > mx) throw failure("MaxIters");
+    }
+    while (k < history.length - 1 && history[k].t + history[k].h < s) k++;
+    out[i] = solver._stepper.interpolate(s, history[k]);
+  }
+  return out;
+}""", [:JuliaError, :_rk_dopri]),
     :_rk_number => ("""
 function _rk_number(name, x, integer) {
   if (typeof x !== "number" || (integer && !Number.isInteger(x)))
@@ -389,6 +512,8 @@ function _rk_isodd(x) { return Number.isInteger(x) && Math.abs(x) <= 90071992547
     :_rk_stdlib_erfcx => _js_vendored(:erfcx),
     :_rk_stdlib_gamma => _js_vendored(:gamma),
     :_rk_stdlib_gammaln => _js_vendored(:gammaln),
+    # `rk_ode_rk45_tol`'s integrator, `@reside-ic/dopri` (`js_ode.jl`)
+    :_rk_dopri => _js_vendored(:dopri),
     # `copysign` reads the sign of a NaN as positive: JavaScript keeps no sign of a NaN.
     :_rk_copysign => ("""
 function _rk_copysign(x, y) { return y < 0 || Object.is(y, -0) ? -Math.abs(x) : Math.abs(x); }""", Symbol[]),
@@ -2232,19 +2357,26 @@ exception type (`DomainError`, `BoundsError`, `DimensionMismatch`, …).
 `types` gives each HAVE value's type, by name, where its port has none.
 
 Values are `Float64` and `Int64` numbers (an `Int64` exact while it stays
-below 2^53 in magnitude), `Bool`s and vectors of them; sizes and numeric
-inputs stay runtime arguments. Translated: ordinary kernel recipes,
-broadcasts (fused, with Julia's length rules), `plate` and `scan` as loops,
-arithmetic and comparisons, `Base.Math` functions with Julia's domain errors,
-checked 1-based indexing, `sum`/`maximum`/`minimum`, ranges, comprehensions
-and `map` over vectors, tuples and named tuples (objects) built, read and
-destructured, and keyword calls. Plain Julia helpers are translated from their typed
-code, branches, early returns and loops included, without annotation;
-Julia's own functions translate only through RK's table. A construct without
-a translation (a C call, `fma`, a matrix, a scan with `history`) raises
-`ReactiveKernels.JSEmissionError` naming it and its
-call chain. Elementary functions use JavaScript's `Math`, which may differ
-from Julia's in the last bit.
+below 2^53 in magnitude), `Bool`s, vectors of them, and matrices of them as
+arrays of row arrays (`m[i][j]` is Julia's `m[i+1, j+1]`; a matrix without
+rows keeps its column count as `cols`, `Object.assign([], { cols: 3 })` for
+`zeros(0, 3)`); sizes and numeric inputs stay runtime arguments. Translated:
+ordinary kernel recipes, broadcasts (fused, with Julia's length rules),
+`plate` and `scan` as loops, arithmetic and comparisons, `Base.Math`
+functions with Julia's domain errors, checked 1-based indexing (of a matrix:
+`m[i, j]`, `m[:, j]`, `m[i, :]`, `size`, `axes`), vector literals,
+`sum`/`maximum`/`minimum`, ranges, comprehensions and `map` over vectors,
+tuples and named tuples (objects) built, read and destructured, keyword
+calls, and `rk_ode_rk45_tol`, integrated by the vendored `@reside-ic/dopri`
+Dormand–Prince 5(4) method with the native bridge's arguments, step budget
+and `ODESolveFailure`s (values agree with native to the solvers' accuracy).
+Plain Julia helpers are translated from their typed code, branches, early
+returns and loops included, without annotation; Julia's own functions
+translate only through RK's table. A construct without a translation (a C
+call, `fma`, matrix arithmetic, a scan with `history`, `rk_ode_bdf_tol`) raises
+`ReactiveKernels.JSEmissionError` naming it and its call chain. Elementary
+functions use JavaScript's `Math`, which may differ from Julia's in the last
+bit.
 """
 function js_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
                    want = _KERNEL_DEFAULT_BOUNDARY, types = nothing, name = :kernel)

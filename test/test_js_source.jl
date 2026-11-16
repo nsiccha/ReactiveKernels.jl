@@ -335,7 +335,39 @@ end
     return p
 end
 
+# Matrices cross the boundary and are read as arrays of row arrays.
+js_corner(m) = m[size(m, 1), size(m, 2)] + m[firstindex(m, 1), 1]
+js_extent(m) = length(m) + 10 * last(axes(m, 2)) + 100 * lastindex(m, 1)
+@kernel js_matrix_reads(m, j) = begin
+    col = m[:, j]
+    row = m[1, :]
+    corner = js_corner(m)
+    extent = js_extent(m)
+    return col
+end
+@kernel js_matrix_identity(m) = begin
+    same = copy(m)
+    rows = size(m, 1)
+    cols = size(m, 2)
+    return same
+end
+@kernel js_int_matrix(m, flags) = begin
+    total = sum(m[:, 1]) + m[1, size(m, 2)]
+    flag = flags[1, 2]
+    return total
+end
+# Vector literals: `[a, b]` and `T[a, b]`, with Julia's promotions.
+@kernel js_literals(x, flag, k) = begin
+    v = [x, 2.0, 3x]
+    w = Float64[1, k, x]
+    b = [flag, !flag]
+    i = [k, 2k]
+    p = [k, x]
+    return v
+end
+
 const V = Vector{Float64}
+const M = Matrix{Float64}
 const CASES = [
     (:js_scalar, js_scalar, (:a, :b), :c, (; a = Float64, b = Float64),
      [(0.5, 2.0), (-3.0, 0.0), (1e-300, 1e10)]),
@@ -398,10 +430,20 @@ const CASES = [
      [(-1.0, -2.0), (-0.5, 2.0), (0.0, 1.0), (-2.5, 0.75)]),
     (:js_logexp, js_logexp, (:x,), (:p, :m), (; x = Float64),
      [(x,) for x in (-Inf, -800.0, -40.0, -1.0, -0.0, 0.0, 1e-10, 0.5, 3.0, 40.0, 800.0, Inf, NaN)]),
+    (:js_matrix_reads, js_matrix_reads, (:m, :j), (:col, :row, :corner, :extent), (; m = M, j = Int),
+     [([1.0 2.0 3.0; 4.0 5.0 6.0], 2), ([1.0 2.0 3.0; 4.0 5.0 6.0], 4), ([1.0 2.0 3.0; 4.0 5.0 6.0], 0),
+      (reshape([7.5], 1, 1), 1), (zeros(0, 3), 1)]),
+    (:js_matrix_identity, js_matrix_identity, (:m,), (:same, :rows, :cols), (; m = M),
+     [([1.0 -2.0; 3.5 4.0; NaN Inf],), (zeros(0, 3),), (zeros(2, 0),), (zeros(0, 0),)]),
+    (:js_int_matrix, js_int_matrix, (:m, :flags), (:total, :flag), (; m = Matrix{Int}, flags = Matrix{Bool}),
+     [([1 2; 3 4], [true false; false true]), (reshape([5], 1, 1), reshape([true], 1, 1))]),
+    (:js_literals, js_literals, (:x, :flag, :k), (:v, :w, :b, :i, :p), (; x = Float64, flag = Bool, k = Int),
+     [(0.5, true, 3), (-2.0, false, 0)]),
 ]
 
 agree(a::Real, b::Real) = (isnan(a) && isnan(b)) || isapprox(a, b; rtol = 1e-12, atol = 1e-15)
 agree(a::AbstractVector, b::AbstractVector) = length(a) == length(b) && all(agree.(a, b))
+agree(a::AbstractMatrix, b::AbstractMatrix) = size(a) == size(b) && all(agree.(a, b))
 agree(a, b) = false
 
 @testset "js_source" begin
@@ -554,6 +596,13 @@ agree(a, b) = false
                                                types = (; a = Float64, b = Float64), name = :scalar)
             r = only(ReactiveKernels.js_run(source, :scalar, [([1.0], 2.0)]))
             @test r.julia_error && r.error == "ArgumentError" && occursin("`a` must be a number", r.message)
+            # a matrix input is an array of rows of one length
+            source = ReactiveKernels.js_source(js_matrix_identity; have = (:m,), want = :same,
+                                               types = (; m = M), name = :identity)
+            ragged, scalar = ReactiveKernels.js_run(source, :identity, [([[1.0, 2.0], [3.0]],), (1.0,)])
+            @test ragged.julia_error && ragged.error == "ArgumentError" && occursin("rows of one length", ragged.message)
+            @test scalar.julia_error && scalar.error == "ArgumentError" && occursin("array of rows", scalar.message)
+            @test occursin("{ name: \"m\", type: \"Matrix{Float64}\" }", source)
         else
             @test_skip "no node on the PATH"
         end

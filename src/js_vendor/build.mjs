@@ -15,8 +15,10 @@ const here = fileURLToPath(new URL(".", import.meta.url));
 
 // A bundle: the file it writes, its npm package (for the version and license
 // files), the module source esbuild bundles, the global the file defines, the
-// license line of its header, the license files copied to `licenses/`, and a
-// check that the global works.
+// license line of its header, the license files copied to `licenses/`, a
+// check that the global works, and optionally `embedLicense`, a license file
+// whose text the header carries in full (a license that must travel with every
+// copy, as MIT's permission notice must).
 const stdlib = (name) => ({
   file: `${name}.js`,
   package: `@stdlib/math-base-special-${name}`,
@@ -27,7 +29,23 @@ const stdlib = (name) => ({
   licenseFiles: ["LICENSE", "NOTICE"],
   check: (f) => typeof f === "function" && Number.isFinite(f(0.5)),
 });
-const BUNDLES = ["erf", "erfc", "erfcx", "gamma", "gammaln"].map(stdlib);
+// `rk_ode_rk45_tol`'s Dormand–Prince 5(4) integrator (src/js_ode.jl).
+const dopri = {
+  file: "dopri.js",
+  package: "@reside-ic/dopri",
+  url: "https://github.com/mrc-ide/dopri-js",
+  entry: 'export { Dopri } from "@reside-ic/dopri";',
+  global: "_rk_dopri",
+  license: "the MIT License, below",
+  licenseFiles: ["LICENCE"],
+  embedLicense: "LICENCE",
+  check: (m) => {
+    const d = new m.Dopri((t, y, dy) => { dy[0] = -y[0]; }, 1, {});
+    d.initialise(0, [1]);
+    return Math.abs(d.run(1)([1])[0][0] - Math.exp(-1)) < 1e-5;
+  },
+};
+const BUNDLES = [...["erf", "erfc", "erfcx", "gamma", "gammaln"].map(stdlib), dopri];
 
 // stdlib-js detects typed arrays, byte order and property support through
 // polyfill modules; every JavaScript engine the modules run in has them built
@@ -79,6 +97,7 @@ for (const b of BUNDLES) {
     "// (full text in ReactiveKernels.jl src/js_vendor/licenses)." +
       (original.length ? " It follows original code under these notices:" : ""),
     ...original.map((t) => "/*\n" + t.replaceAll("*/", "* /") + "\n*/"),
+    ...(b.embedLicense ? ["/*\n" + readFileSync(join(pkgDir, b.embedLicense), "utf8").trim().replaceAll("*/", "* /") + "\n*/"] : []),
   ].join("\n");
   // A self-check: the bundle defines the global it names, and it works.
   const f = new Function(`${code}\nreturn ${b.global};`)();
