@@ -844,11 +844,15 @@ _jax_expr(ctx::_JaxContext, ::Val{:break}, ex) = ctx.host === nothing ?
     _jax_error("`break` has no JAX translation", _jax_where(ctx)) : _host_jump(ctx, "break")
 _jax_expr(ctx::_JaxContext, ::Val{:continue}, ex) = ctx.host === nothing ?
     _jax_error("`continue` has no JAX translation", _jax_where(ctx)) : _host_jump(ctx, "continue")
+# Macros that leave a translation's values as they are: `@view x[r]` and
+# `@views` read the same entries as indexing does (a NumPy basic slice is a
+# view, as Julia's is; a JAX array is never written in place).
+const _JAX_TRANSPARENT_MACROS = (Symbol("@inbounds"), Symbol("@fastmath"), Symbol("@inline"),
+                                 Symbol("@noinline"), Symbol("@view"), Symbol("@views"))
 function _jax_expr(ctx::_JaxContext, ::Val{:macrocall}, ex)
     name = ex.args[1]
-    name in (Symbol("@inbounds"), Symbol("@fastmath"), Symbol("@inline"),
-             Symbol("@noinline")) ||
-        (name isa GlobalRef && name.name in (Symbol("@inbounds"), Symbol("@inline"))) ||
+    name isa GlobalRef && (name = name.name)
+    name in _JAX_TRANSPARENT_MACROS ||
         _jax_error("the macro call `", name, "` has no JAX translation", _jax_where(ctx))
     _jax_expr(ctx, ex.args[end])
 end
@@ -894,6 +898,10 @@ end
 
 function _jax_assign!(ctx::_JaxContext, lhs, rhs)
     name = lhs isa Expr && lhs.head === :(::) ? lhs.args[1] : lhs
+    # On the host `y = x` of a local names the same value, as Julia's does, so
+    # a list grown through either name is grown through both.
+    ctx.host !== nothing && name isa Symbol && rhs isa Symbol && haskey(ctx.locals, rhs) &&
+        (v = ctx.locals[rhs]; _jax_destructure!(ctx, lhs, v); return _host_read(ctx, v))
     v = _jax_with_target(() -> _jax_expr(ctx, rhs), ctx, rhs, name)
     _jax_destructure!(ctx, lhs, v)
     v
@@ -920,6 +928,20 @@ function _jax_destructure!(ctx::_JaxContext, lhs, v::_PyVal)
         _jax_emit!(ctx, name * " = " * _py_atom(target.code) * ".at" * position * ".set(" * v.code * ")")
         ctx.locals[lhs.args[1]] = _PyVal(name, target.T, false, target.extent, target.limit,
                                          target.padded)
+        return
+    end
+    if _jax_property_destructuring(lhs)
+        # `(; a, b) = x`: each name takes the field of that name, as Julia's
+        # `getproperty(x, :a)` does; `x` is computed once.
+        v.T isa Type && v.T <: NamedTuple ||
+            _jax_error("the destructuring `", lhs, "` of a value of type `", v.T, "`",
+                       _jax_where(ctx))
+        bound = _jax_bind!(ctx, :record, v)
+        for s in lhs.args[1].args
+            k = findfirst(==(s), fieldnames(v.T))
+            k === nothing && _jax_error("`", v.T, "` has no field `", s, "`", _jax_where(ctx))
+            _jax_destructure!(ctx, s, _jax_named_field(bound, k))
+        end
         return
     end
     if lhs isa Expr && lhs.head === :tuple
@@ -1277,12 +1299,24 @@ function _jax_bound_expr(ctx::_JaxContext, x::_PyVal, dim::Int, index)
         try
             ctx.locals[:end] = _PyVal(_jax_dim_code(ctx, x, dim), Int, true)
             ctx.locals[:begin] = _PyVal("1", Int)
-            return _jax_expr(ctx, index)
+            return _host_index_value(ctx, _jax_expr(ctx, index))
         finally
             empty!(ctx.locals); merge!(ctx.locals, saved)
         end
     end
-    _jax_expr(ctx, index)
+    _host_index_value(ctx, _jax_expr(ctx, index))
+end
+# A host index that may be `nothing` (`findfirst`'s result): checked where it
+# is used, raising as Julia's `x[nothing]` does, and an integer after.
+function _host_index_value(ctx::_JaxContext, v::_PyVal)
+    T = v.T
+    (ctx.host === nothing || !(T isa Union) || !(Nothing <: T)) && return v
+    S = Base.nonnothingtype(T)
+    S isa Type && S <: Integer || return v
+    x = _jax_bind!(ctx, :index, v)
+    _jax_emit!(ctx, "if " * x.code * " is None:")
+    _jax_emit!(ctx, "    raise IndexError(\"ArgumentError: invalid index: nothing of type Nothing\")")
+    _PyVal(x.code, S, true)
 end
 # The length of `x`'s dimension `dim`; a host value may be a Python list.
 _jax_dim_code(ctx::_JaxContext, x::_PyVal, dim::Int) = ctx.host === nothing ?
@@ -1657,6 +1691,8 @@ end
 
 function _jax_expr(ctx::_JaxContext, ::Val{:comprehension}, ex)
     gen = only(ex.args)
+    ctx.host !== nothing && gen isa Expr && gen.head === :flatten &&
+        return _host_comprehension(ctx, gen)
     gen isa Expr && gen.head === :generator ||
         _jax_error("the comprehension `", ex, "` has no JAX translation", _jax_where(ctx))
     ctx.host === nothing || return _host_comprehension(ctx, gen)
@@ -1672,6 +1708,28 @@ function _jax_expr(ctx::_JaxContext, ::Val{:comprehension}, ex)
     # A range with a data-dependent end: the vector is padded to its static
     # length, and its length is the number of the range's elements.
     _PyVal(values.code, values.T, false, count)
+end
+
+# A typed comprehension `T[f(x) for x in xs]`: the comprehension, its
+# elements converted to `T`. On the host each element converts as Julia's
+# `convert` does (`nothing` and an inexact integer raise); in the JAX
+# functions only conversions that cannot fail (to a float type from any
+# real, to an integer type from an integer) cast the array.
+function _jax_expr(ctx::_JaxContext, ::Val{:typed_comprehension}, ex)
+    T = _jax_type_operand(ctx, ex.args[1])
+    gen = ex.args[2]
+    gen isa Expr && (gen.head === :generator || ctx.host !== nothing && gen.head === :flatten) ||
+        _jax_error("the comprehension `", ex, "` has no JAX translation", _jax_where(ctx))
+    ctx.host === nothing || return _host_comprehension(ctx, gen, T)
+    v = _jax_expr(ctx, Expr(:comprehension, gen))
+    E = _jax_eltype(v.T)
+    E isa Type && E <: T && return v
+    T isa Type && T <: Number && E isa Type && E <: Real &&
+        (T <: AbstractFloat || T <: Integer && T !== Bool && E <: Integer) ||
+        _jax_error("converting the elements (`", E, "`) of `", ex, "` to `", T,
+                   "` has no JAX translation", _jax_where(ctx))
+    _PyVal("jnp.asarray(" * v.code * ", dtype=" * _jax_dtype(T) * ")", Array{T,_jax_rank(v.T)},
+           v.static, v.extent, v.limit, v.padded)
 end
 
 # A `while` loop: `jax.lax.while_loop` over the outer locals the body assigns.
@@ -1986,9 +2044,16 @@ function _jax_assigned_target!(names::Set{Symbol}, target)
     end
     target isa Symbol && push!(names, target)
     target isa Expr && target.head === :tuple &&
-        foreach(t -> _jax_assigned_target!(names, t), target.args)
+        foreach(t -> _jax_assigned_target!(names, t), _jax_target_parts(target))
     names
 end
+# `(; a, b)`, a target that binds each name to the field of that name.
+_jax_property_destructuring(lhs) = lhs isa Expr && lhs.head === :tuple && length(lhs.args) == 1 &&
+    lhs.args[1] isa Expr && lhs.args[1].head === :parameters &&
+    all(a -> a isa Symbol, lhs.args[1].args)
+# The targets of a tuple target: its elements, or the names of `(; a, b)`.
+_jax_target_parts(target::Expr) =
+    _jax_property_destructuring(target) ? target.args[1].args : target.args
 
 # A loop range: `a:b`, `eachindex(x)`, `axes(x, 1)`, as
 # `(first, last, bound, steps)`.
@@ -2895,6 +2960,11 @@ _jax_result(f, args::Vector{_PyVal}, code::AbstractString) =
 # The same, of a result whose Julia type `T` the caller knows (a call with
 # keywords, whose positional types do not determine it).
 function _jax_typed_result(@nospecialize(T), args::Vector{_PyVal}, code::AbstractString)
+    # A host `Set` is its `isequal` keys, in no order Julia's follows.
+    any(a -> a.T isa Type && a.T <: AbstractSet, args) &&
+        _jax_error("a `Set` read as a collection of values has no translation (Julia ",
+                   "iterates a set in its hash order); `in`, `push!`, `append!`, `delete!`, ",
+                   "`length` and `isempty` read one")
     static = !isempty(args) && all(a -> a.static, args)
     if static && _jax_stages(code, args)
         host = _host_static_text(code)
@@ -4105,6 +4175,12 @@ end
 function _jax_function_call(ctx::_JaxContext, ::typeof(LinearAlgebra.dot), args::Vector{_PyVal})
     _jax_result(LinearAlgebra.dot, args,
                 "jnp.vdot(" * join((_jax_masked(a, "0") for a in args), ", ") * ")")
+end
+# `sizehint!(x, n)` only reserves room: Julia returns `x` itself.
+function _jax_function_call(ctx::_JaxContext, ::typeof(sizehint!), args::Vector{_PyVal})
+    length(args) == 2 || _jax_error("`sizehint!` with ", length(args), " arguments",
+                                    _jax_where(ctx))
+    args[1]
 end
 function _jax_function_call(ctx::_JaxContext, ::typeof(vcat), args::Vector{_PyVal})
     v = _jax_result(vcat, args, "jnp.concatenate([" * join(

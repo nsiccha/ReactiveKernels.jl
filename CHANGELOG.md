@@ -16,6 +16,42 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.278
+
+- `jax_source`: host `prepare_data` translates more ordinary data-only Julia,
+  with native-equal values, so a `@traceable` data helper keeps its natural
+  spelling:
+  - typed comprehensions `T[f(x) for x in xs]`, each element converted as
+    Julia's `convert` does (`nothing`, or a non-integral value for an integer
+    type, raises), and nested generators `[f(i, j) for j in a for i in b if c]`;
+  - `push!` and `append!` onto any local vector (a literal such as `[0.0]`, a
+    `vcat` or slice result, an input): it becomes a Python list, a fresh copy,
+    so an input is never written; `sizehint!(v, n)` returns `v`;
+  - `x[findfirst(p, x)]` and `x[findfirst(p, x)] = v`, raising
+    `ArgumentError: invalid index: nothing of type Nothing` as Julia does;
+  - `issorted(v)` and a scalar `isless(a, b)` in Julia's order (-0.0 before
+    0.0, every NaN last, then `missing`); `isless` of numbers also in the JAX
+    functions;
+  - `Set`: `Set()`, `Set{T}()`, `Set(v)`, `in`, `push!`, `union!`, `delete!`,
+    `length`, `isempty`, with Julia's `isequal` membership (-0.0 and 0.0 two
+    keys, every NaN one). A set is not iterated: Julia iterates it in its hash
+    order, so that raises `JAXEmissionError`;
+  - `(; a, b) = nt` destructuring (also in the JAX functions), `view(x, r)`,
+    `@view x[r]` and `@views`;
+  - anonymous functions (`d -> d >= 0.0`), called where host code calls them:
+    `filter(f, v)`, `filter!(f, v)` (shrinking a list in place), predicates.
+    One reading locals of its own code is not passed to another helper.
+- `jax_source`: a host helper that writes its argument in place (`rv[k] = x`,
+  `push!(rv, x)`, `sort!(rv)`, also through a helper it calls) writes its
+  caller's vector, as Julia's does, whether or not the caller reads the
+  result: `merge_into!(scratch, a, b)` used to write a copy, so the caller's
+  `scratch` was silently unchanged. The caller passes its own local (a copy of
+  an input or constant first, a list when grown); a slice or other expression
+  there raises `JAXEmissionError`.
+- `jax_source`: after a branch or loop, a host local that is a list on one
+  path and an array on another is read as an array, never as a Python list
+  (`rv .* 2` of a list repeated it).
+
 ## 0.1.277
 
 - `ReactiveKernels.jax_source` with `data` partitions a top-level plate by the
