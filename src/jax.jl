@@ -929,7 +929,7 @@ function _jax_destructure!(ctx::_JaxContext, lhs, v::_PyVal)
         # `A[i] = v`: a functional update rebinding `A`.
         target = ctx.locals[lhs.args[1]]
         _jax_slots(target) && return _jax_slots_write!(ctx, lhs, target, v)
-        target.origin isa _JaxRowShape && target.origin.stored &&
+        (target.origin isa _JaxRowView || target.origin isa _JaxRowShape && target.origin.stored) &&
             _jax_error("mutation through a row shared with a nested-vector buffer", _jax_where(ctx))
         indexed = _jax_index(ctx, target, lhs.args[2:end]; target = true)
         position = indexed.code[ncodeunits(target.code)+1:end]
@@ -2895,7 +2895,8 @@ function _jax_expr(ctx::_JaxContext, ::Val{:call}, ex)
     end
     # Indexing spelled as a call reads its index expressions as indexing does.
     if _jax_is_indexing(f) && length(positional) >= 2 && isempty(kwargs)
-        return _jax_index(ctx, _jax_expr(ctx, positional[1]), positional[2:end])
+        x = _jax_expr(ctx, positional[1])
+        return _jax_row_alias(f, [x], _jax_index(ctx, x, positional[2:end]))
     end
     values = _PyVal[_jax_expr(ctx, a) for a in positional]
     kw = Pair{Symbol,_PyVal}[k => _jax_expr(ctx, v) for (k, v) in kwargs]
@@ -2924,7 +2925,7 @@ function _jax_call(ctx::_JaxContext, f, args::Vector{_PyVal}, kw)
         isempty(kw) || _jax_error("keyword calls on a reference-element buffer", _jax_where(ctx))
         return _jax_traceable_or_lowered(ctx, f, args)
     end
-    _jax_call_keywords(ctx, f, args, kw)
+    _jax_row_alias(f, args, _jax_call_keywords(ctx, f, args, kw))
 end
 function _jax_call_keywords(ctx::_JaxContext, f, args::Vector{_PyVal}, kw)
     isempty(kw) || _jax_error("keyword arguments to `", f, "` have no JAX translation",
@@ -5604,7 +5605,7 @@ function _jax_named_function!(ctx, f, names, inputs, source_module, emit, origin
 end
 
 _jax_contextual_value(v::_PyVal) =
-    (v.origin !== nothing && !(v.origin isa _JaxRowShape)) || _jax_contextual_type(v.T)
+    (v.origin !== nothing && !_jax_row_metadata(v)) || _jax_contextual_type(v.T)
 _jax_contextual_type(T) = false
 _jax_contextual_type(T::_JaxAggregate) = any(_jax_contextual_value, T.fields)
 _jax_contextual_type(T::_JaxCallable) = T.f isa _JaxClosure && any(_jax_contextual_value, T.f.captures)
@@ -5613,7 +5614,7 @@ _jax_contextual_type(T::_JaxCallable) = T.f isa _JaxClosure && any(_jax_contextu
 # boundary too. Return their numerical leaves explicitly, rather than losing
 # the proof or retaining a name local to the helper's body.
 _jax_plain_function_result(v::_PyVal) = isempty(v.extent) && isempty(v.limit) &&
-    (v.origin === nothing || v.origin isa _JaxRowShape)
+    (v.origin === nothing || _jax_row_metadata(v))
 function _jax_function_result(ctx, v)
     _jax_plain_function_result(v) && return v.code, v, nothing
     parts = String[]

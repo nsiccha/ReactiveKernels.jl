@@ -5,6 +5,7 @@ mutable struct _JaxRowShape
     dims::Tuple{Vararg{Int}}
     stored::Bool
 end
+struct _JaxRowView end
 mutable struct _JaxSlotLayout
     scope::_JaxScope
     line::Int
@@ -14,7 +15,13 @@ end
 struct _JaxDenseRows end
 
 _jax_slots(v::_PyVal) = v.origin isa _JaxSlotLayout
-_jax_carried_origin(v::_PyVal) = v.origin isa Union{_JaxSlotLayout,_JaxRowShape} ? v.origin : nothing
+_jax_carried_origin(v::_PyVal) = v.origin isa Union{_JaxSlotLayout,_JaxRowShape,_JaxRowView} ? v.origin : nothing
+_jax_row_metadata(v::_PyVal) = v.origin isa Union{_JaxRowShape,_JaxRowView}
+function _jax_row_alias(f, args, result)
+    f in (view, Base.maybeview, reshape, vec, dropdims, transpose, adjoint) &&
+        !isempty(args) && _jax_row_metadata(first(args)) && _jax_is_array(result.T) ?
+        _jax_with_origin(result, _JaxRowView()) : result
+end
 _jax_outer_rows(v::_PyVal) = _jax_slots(v) || v.origin isa _JaxDenseRows
 _jax_slot_data(v::_PyVal) = _py_atom(v.code) * "[0]"
 _jax_slot_mask(v::_PyVal) = _py_atom(v.code) * "[1]"
