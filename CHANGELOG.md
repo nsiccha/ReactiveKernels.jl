@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.280
+## 0.1.281
 
 - `js_source` translates nested tuple literals and tuple `length`, including
   calls in validation helpers. It also translates `fill!` of numerical and
@@ -27,6 +27,21 @@ are recorded in the git history only.
   These operations let BRM's
   type-stable fixed-domain HSGP basis emit with scalar or per-axis mode counts
   and retain its input checks.
+
+## 0.1.280
+
+- `jax_source`: the cells of a plate whose cells fill their stored rows (an
+  earlier plate's vectors or matrices of one fixed shape, such as one 3×3
+  propagator per step length) reach a later plate that maps them as dense
+  arrays, without lengths, so `size` and `length` of one cell are static there.
+  Before, each cell carried its stored size as a padded length, and a helper
+  that checked a typed argument's dimension (StanBlocks' `@juliacompat`
+  `matrix[3, 3]` check, `size(x, i)` with `i` the helper's argument) raised
+  `JAXEmissionError: size of a padded value along a computed dimension`.
+- `jax_source`: `size(x, d)` of a padded value (a ragged row in its cell) along
+  a dimension `d` that is static while JAX traces, such as a helper's integer
+  argument, is the row's length along its padded axis and the stored size
+  along another, as for a literal dimension. It raised the same error before.
 
 ## 0.1.279
 
