@@ -165,6 +165,24 @@ js_logabsgamma_value(a) = first(logabsgamma(a))
 js_logabsgamma_sign(a) = last(logabsgamma(a))
 js_tdist_cdf(x, nu) = Distributions.cdf(Distributions.TDist(nu), x)
 
+# Irrational constants written in the source, through Julia's methods for them:
+# arithmetic rounds the constant to `Float64`; a comparison rounds it up or down
+# (`Float64(π) < π` holds) and `==` is false; `ℯ^x` is `exp(x)`, `sin(π)` is
+# `0.0`; a constant of another package's `@irrational` rounds as Base's do; a
+# helper given `π` is specialized on it.
+Base.@irrational js_half_turn 1.57079632679489661923132169163975144 big(π) / 2
+js_t_density(x, nu) =
+    exp(loggamma((nu + 1) / 2) - loggamma(nu / 2) - log(nu * π) / 2 - (nu + 1) / 2 * log1p(x^2 / nu))
+js_irr_arith(x, n) = x * π + π * x - 2π * n + (n + π) - x / π + inv(π) * x - π * x * x + 2 * π * x +
+                     sqrt(2π) * x + max(x, π) - min(x, ℯ) + x^π + (x > 0) * π
+js_irr_compare(x) = (x < π ? 1 : 0) + (x > π ? 2 : 0) + (x <= ℯ ? 4 : 0) + (x == π ? 8 : 0) +
+                    (π >= x ? 16 : 0) + (x != ℯ ? 32 : 0)
+js_irr_exact(x) = ℯ^x + log(ℯ) * x + sin(π) + cos(π) * x + ℯ^2
+js_irr_custom(x) = x * js_half_turn + (x < js_half_turn ? 1.0 : 0.0) + (x > js_half_turn ? 2.0 : 0.0)
+js_scaled_by(a, c) = c * a
+js_circle(r) = js_scaled_by(r^2, π)
+js_turns(v) = v / ℯ
+
 @kernel js_scalar(a, b) = begin
     c = a * b + exp(-a) / (1 + b^2)
     return c
@@ -332,6 +350,26 @@ end
 end
 @kernel js_tdist(x, nu) = begin
     p = js_tdist_cdf(x, nu)
+    return p
+end
+@kernel js_irrationals(x, nu, n) = begin
+    d = js_t_density.(x, nu)
+    w = x .* π
+    a = js_irr_arith.(x, n)
+    c = js_irr_compare.(x)
+    e = js_irr_exact.(x)
+    h = js_irr_custom.(x)
+    q = js_circle.(x)
+    s = π * x
+    u = x * π
+    t = js_turns(x)
+    return d
+end
+# A number times an array is a broadcast in Julia's methods, matrices included.
+@kernel js_irr_matrix(A) = begin
+    p = π * A
+    s = A * ℯ
+    r = A / π
     return p
 end
 
@@ -580,6 +618,15 @@ const CASES = [
      [([1 2 3; 4 5 6], [1, -1, 2], [true false; true true]), ([1 2; 3 4], [1, 2, 3], reshape([true], 1, 1))]),
     (:js_range_broadcast, js_range_broadcast, (:x, :a, :b), :y, (; x = V, a = Int, b = Int),
      [([1.0, 2.0, 3.0], 1, 1), ([1.0, 2.0, 3.0], 2, 4), ([1.0, 2.0, 3.0], 1, 2), ([5.0], 1, 3)]),
+    # the floats either side of `π`, `ℯ` and `π/2`; a negative base of `x^π`
+    # raises `DomainError`
+    (:js_irrationals, js_irrationals, (:x, :nu, :n), (:d, :w, :a, :c, :e, :h, :q, :s, :u, :t),
+     (; x = V, nu = Float64, n = Int),
+     [([0.0, 0.5, 1.0, float(ℯ), prevfloat(float(ℯ)), nextfloat(float(ℯ)), float(π), prevfloat(float(π)),
+        nextfloat(float(π)), Float64(π / 2), nextfloat(Float64(π / 2)), 10.0, 1e3, Inf, NaN], 4.5, 3),
+      (Float64[], 1.0, 0), ([2.0, 3.0], 0.25, -7), ([1.0, -2.0], 3.0, 1)]),
+    (:js_irr_matrix, js_irr_matrix, (:A,), (:p, :s, :r), (; A = M),
+     [([1.0 -2.0 0.5; 3.0 NaN -Inf],), (reshape([7.5], 1, 1),), (zeros(0, 3),), (zeros(2, 0),)]),
 ]
 
 agree(a::Real, b::Real) = (isnan(a) && isnan(b)) || isapprox(a, b; rtol = 1e-12, atol = 1e-15)
@@ -682,6 +729,23 @@ agree(a, b) = false
         # thresholds known from the argument's type are literals
         soft = ReactiveKernels.js_source(js_soft_logistic; have = (:x, :s), want = (:a, :b), types = (; x = V, s = Float64))
         @test occursin("x < -745.1332191019412", soft) && !occursin("indexed_iterate", soft)
+    end
+
+    @testset "irrational constants are translated through Julia's methods" begin
+        source = ReactiveKernels.js_source(js_irrationals; have = (:x, :nu, :n), want = (:d, :a, :c, :e, :h, :q),
+                                           types = (; x = V, nu = Float64, n = Int))
+        body(name) = (i = findfirst("function " * name * "(", source);
+                      source[i[1]:findnext("\n}\n", source, i[1])[end]])
+        @test occursin("nu * 3.141592653589793", body("js_t_density")) && !occursin("Irrational", source)
+        # `2 * π * x` folds from the left: `2 * π` is a constant
+        @test occursin("6.283185307179586 * x", body("js_irr_arith")) && !occursin("afoldl", source)
+        # `x < π` compares with π rounded down, `x > π` with π rounded up
+        compare = body("js_irr_compare")
+        @test occursin("x <= 3.141592653589793", compare) && occursin("3.1415926535897936 <= x", compare)
+        @test occursin("Math.exp(x)", body("js_irr_exact")) && !occursin("_rk_pow", body("js_irr_exact"))
+        @test occursin("1.5707963267948968 <= x", body("js_irr_custom"))
+        # a helper given `π` takes only the other argument
+        @test occursin(r"function js_scaled_by\(a\) \{", source)
     end
 
     @testset "unsupported constructs are named" begin

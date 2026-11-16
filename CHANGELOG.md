@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.270
+## 0.1.272
 
 - `jax_source`: a `for` loop to a padded row's length (`for t in 1:length(r)`
   over a ragged row in a plate cell, or `eachindex(r)`) runs no body past the
@@ -32,6 +32,41 @@ are recorded in the git history only.
   padding every padded value holds. Before, an array written at the loop
   index got the body's values at the padded steps, which were valid only when
   the body was.
+
+## 0.1.271
+
+- `js_source` translates more of the Base a plain helper uses over a window
+  of a series, with native results and native errors:
+  - the comparison predicates `==(x)`, `!=(x)`, `<(x)`, `<=(x)`, `>(x)`,
+    `>=(x)` and `isequal(x)`, wherever a predicate is taken: `count`, `any`,
+    `all`, `filter`, a generator's condition, and `findfirst`/`findlast`;
+  - `findfirst(p, v)` and `findlast(p, v)` of a vector or a range, and of a
+    vector of `Bool`s, giving the position or `nothing`, and `isnothing`;
+    a predicate that does not return a `Bool` is refused by name;
+  - `sum(f, v)`, `maximum(f, v)` and `minimum(f, v)` of a vector or a range,
+    `f` a function, a closure or a predicate (`sum(abs2, x .- y)`,
+    `sum(isnan, x)`): a sum is pairwise as Julia's is, and an empty source
+    gives Julia's result (`sum(abs2, Float64[])` is `0.0`) or its
+    `MethodError`;
+  - `x[a:b]`, a checked copy of the window (`BoundsError` out of bounds);
+    `collect` of a range or a vector;
+  - `merge` of named tuples (`merge(nt, (; a))`), later fields winning, in
+    Julia's field order;
+  - `abs2` and `isequal` of numbers.
+
+## 0.1.270
+
+- `js_source` translates Julia's irrational constants (`π`, `ℯ`,
+  `MathConstants.γ`, and those of any package's `@irrational`, such as
+  `IrrationalConstants.log2π`) through Julia's own methods for them, with the
+  native values. Arithmetic rounds the constant to the float it promotes to
+  (`log(tail * π)` multiplies by `Float64(π)`); a comparison rounds it up or
+  down as Julia does, so `x < π` holds for `x == Float64(π)`, and `==` is
+  false; `ℯ^x` is `exp(x)` and `sin(π)` is `0.0`. A call of three or more
+  operands (`2 * π * r`) folds from the left, as Julia's method does. A
+  constant times or over a vector or matrix (`π * v`, `A / ℯ`) is the
+  broadcast Julia's method makes. A helper given `π` is specialized on it
+  rather than taking it as a parameter. Native execution is unchanged.
 
 ## 0.1.269
 

@@ -6,13 +6,16 @@
 #   `_js_array_call`  (`js_arrays.jl`):    literals and matrix reads
 #   `_js_iter_call`   (`js_iterators.jl`): generators, filters and their reductions
 #   `_js_linalg_call` (`js_linalg.jl`):    matrix arithmetic
+#   `_js_functions_call` (`js_functions.jl`): comparison predicates, searches,
+#                                           mapped reductions, windows, `merge`, `abs2`
 
-const _JS_FAMILIES = (_js_array_call, _js_iter_call, _js_linalg_call)
+const _JS_FAMILIES = (_js_array_call, _js_iter_call, _js_linalg_call, _js_functions_call)
 const _JS_FAMILY_FUNCTIONS = (
     Base.vect, getindex, size, length, axes, firstindex, lastindex, copy,
     collect, sum, maximum, minimum, count, any, all, isempty, argmin, argmax, findmin, findmax, filter,
     Base.Iterators.filter, Core.kwcall,
-    vec, transpose, adjoint, permutedims, *, /, +, -, prod, zeros, ones, fill)
+    vec, transpose, adjoint, permutedims, *, /, +, -, prod, zeros, ones, fill,
+    findfirst, findlast, isnothing, merge, abs2, _JS_FIX2_COMPARISONS...)
 
 for F in _JS_FAMILY_FUNCTIONS
     @eval function _js_function_call(ir::_JsIR, f::typeof($F), args, T)

@@ -12,7 +12,9 @@
 # while its magnitude stays below 2^53), `Bool` a boolean, a vector a JavaScript
 # array (any array-like on input), a tuple an array and a named tuple an object.
 # Indexing is checked and 1-based in the source, as in Julia. Sizes and numeric
-# inputs stay runtime arguments; nothing is specialized on a value.
+# inputs stay runtime arguments; nothing is specialized on a value. An
+# irrational constant written in the source (`π`) is known from its type: a
+# call with it translates Julia's method for it, which rounds it to a float.
 
 """
     JSEmissionError(message)
@@ -1346,6 +1348,7 @@ function _js_call!(ir::_JsIR, f, args::Vector{Any}, T)
         v, _ = _js_inline!(ir.fn, f, args, "value")
         return v
     end
+    !(f isa Core.Builtin) && any(_js_isirrational, args) && return _js_irrational_call!(ir, f, args)
     if f === Core.kwcall && length(args) >= 2 && args[2] isa _JsVal && args[2].static
         types = join((_js_type(a) isa Type ? _js_type(a) : typeof(_js_type(a)) for a in args[3:end]), ", ")
         _js_error(mod, "`", args[2].value, "` with argument types (", types, ") and keywords `",
@@ -1353,6 +1356,25 @@ function _js_call!(ir::_JsIR, f, args::Vector{Any}, T)
     end
     types = join((_js_type(a) isa Type ? _js_type(a) : typeof(_js_type(a)) for a in args), ", ")
     _js_error(mod, "`", f, "` with argument types (", types, ") has no JavaScript translation")
+end
+
+# An irrational constant (`π`, `ℯ`, `IrrationalConstants.log2π`) is a value
+# known while translating; its type is its value.
+_js_isirrational(a) = a isa _JsVal && a.static && a.value isa AbstractIrrational
+
+# A function of Julia's own with an irrational constant among its operands,
+# where the table has no entry: Julia's method for these operands, translated
+# from its typed code. Most promote the constant to the float it rounds to
+# (`tail * π` multiplies by `Float64(π)`); comparisons round it up or down
+# (`x < π` holds for `x == Float64(π)`), `==` is false, and some are exact
+# (`ℯ^x` is `exp(x)`, `sin(π)` is `0.0`), as natively.
+function _js_irrational_call!(ir::_JsIR, f, args::Vector{Any})
+    mod = ir.fn.mod
+    _js_flush!(ir)
+    push!(mod.stack, "`" * string(f) * "(" * join(("::" * string(_js_argtype(a)) for a in args), ", ") * ")`")
+    v, _ = _js_inline!(ir.fn, f, args, "value")
+    pop!(mod.stack)
+    v
 end
 
 # A constructor or function of Distributions.jl, or a call on one of its
@@ -1378,13 +1400,18 @@ _js_argtype(a::_JsVal) = a.static && !(a.value isa Union{Number,Nothing,String,S
     Core.Typeof(a.value) : (a.static ? typeof(a.value) : a.T)
 _js_argtype(a) = _js_type(a)
 
+# A value known while translating that a helper is specialized on instead of
+# taking it as a parameter: a function, a type, or an irrational constant such
+# as `π`, whose type is its value. Other numbers, strings and symbols are passed.
+_js_specialized(a) = a isa _JsVal && a.static &&
+    (!(a.value isa Union{Number,Nothing,String,Symbol}) || a.value isa AbstractIrrational)
+
 # A plain Julia function: its typed code becomes a JavaScript function, once
 # per argument types (and static arguments such as functions or types).
 function _js_helper_call!(ir::_JsIR, f, args::Vector{Any}, T)
     mod = ir.fn.mod
     argtypes = Any[_js_argtype(a) for a in args]
-    statics = Tuple(a isa _JsVal && a.static && !(a.value isa Union{Number,Nothing,String,Symbol}) ?
-                    a.value : nothing for a in args)
+    statics = Tuple(_js_specialized(a) ? a.value : nothing for a in args)
     key = (f, Tuple(argtypes), statics)
     name, RT = get(mod.helpers, key, ("", nothing))
     if isempty(name)
@@ -1392,7 +1419,7 @@ function _js_helper_call!(ir::_JsIR, f, args::Vector{Any}, T)
     end
     rargs = String[]
     for a in args
-        a isa _JsVal && a.static && !(a.value isa Union{Number,Nothing,String,Symbol}) && continue
+        _js_specialized(a) && continue
         push!(rargs, _js_runtime(mod, a).code)
     end
     pure = all(a -> _js_type(a) <: Union{Number,Bool}, args)
@@ -1412,7 +1439,7 @@ function _js_helper!(mod::_JsModule, f, args, argtypes, key)
     nfixed = m.isva ? nargs - 2 : nargs - 1
     for k in 1:nfixed
         a = args[k]
-        if a isa _JsVal && a.static && !(a.value isa Union{Number,Nothing,String,Symbol})
+        if _js_specialized(a)
             ir.slots[k+1] = a
         else
             p = _js_unique!(fn.taken, ci.slotnames[k+1])
@@ -1424,7 +1451,7 @@ function _js_helper!(mod::_JsModule, f, args, argtypes, key)
         items = Any[]
         for k in nfixed+1:length(args)
             a = args[k]
-            if a isa _JsVal && a.static && !(a.value isa Union{Number,Nothing,String,Symbol})
+            if _js_specialized(a)
                 push!(items, a)
             else
                 p = _js_unique!(fn.taken, string(ci.slotnames[nargs]) * "_" * string(k - nfixed))
@@ -1765,9 +1792,18 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
         return _js_fcall(ir, "Number.isInteger", args, Bool)
     elseif f === copysign && length(args) == 2 && all(_js_isfloat, args)
         return _js_fcall(ir, _js_use!(mod, :_rk_copysign), args, T)
-    elseif f === promote && !isempty(args) && all(_js_isnumber, args)
+    elseif f === promote && !isempty(args) && all(a -> _js_isnumber(a) || _js_isirrational(a), args)
+        # an irrational constant becomes the number it rounds to, as `convert` makes it
         PT = promote_type(map(_js_type, args)...)
-        return _JsTuple(Any[_js_convert(ir, PT, a) for a in args], T)
+        return _JsTuple(Any[_js_isirrational(a) ? _js_static(convert(PT, a.value)) : _js_convert(ir, PT, a)
+                            for a in args], T)
+    elseif f === Base.afoldl && length(args) >= 2 && args[1] isa _JsVal && args[1].static
+        # `2 * π * r` is `*(2, π, r)`, whose method folds the operator from the left.
+        op, y = args[1].value, args[2]
+        for b in args[3:end]
+            y = _js_call!(ir, op, Any[y, b], _js_return_type(op, Any[_js_argtype(y), _js_argtype(b)]))
+        end
+        return y
     elseif f === oftype && length(args) == 2 && _js_isnumber(args[1]) && args[2] isa _JsVal &&
            (_js_isnumber(args[2]) || (args[2].static && args[2].value isa Real))
         # `oftype(x, loghalf)`: an irrational constant becomes the number it rounds to.
@@ -1891,6 +1927,10 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
         return _js_rt(_js_code(mod, r, _JS_ATOM) * (f === first ? ".start" : ".stop"), Int64)
     elseif f === Base.Broadcast.broadcasted || f === _native_broadcasted
         return _js_broadcasted(ir, f, args, T)
+    elseif f === Base.broadcast_preserving_zero_d && length(args) >= 2
+        # Julia's method for a number and an array, `π * v`, `A * π` or `v / ℯ`,
+        # is this broadcast; JavaScript has no zero-dimensional arrays to preserve.
+        return _js_call!(ir, Base.Broadcast.materialize, Any[_js_broadcasted(ir, f, args, Nothing)], T)
     elseif (f === Base.Broadcast.materialize || f === _native_broadcast_materialize) &&
            length(args) == 1 && args[1] isa _JsBroadcast
         return _js_materialize!(ir, args[1], T)
@@ -2062,6 +2102,11 @@ end
 function _js_function_call(ir::_JsIR, f::Type, args, T)
     if f in (Float64, Int64) && length(args) == 1 && _js_isnumber(args[1])
         return _js_convert(ir, f, args[1])
+    elseif f in (Float64, Float32) && length(args) in (1, 2) && _js_isirrational(args[1]) &&
+           (length(args) == 1 || (args[2] isa _JsVal && args[2].static && args[2].value isa RoundingMode))
+        # An irrational constant rounded to a float (`Float64(x, RoundUp)` in
+        # Julia's comparisons with it): the same float for every input.
+        return _js_static(f((a.value for a in args)...))
     elseif f === Base.OneTo && length(args) == 1 && _js_isint(args[1])
         return _js_rt(_js_use!(ir.fn.mod, :_rk_range) * "(1, " * _js_runtime(ir.fn.mod, args[1]).code * ")", T)
     elseif f === Base.Generator && length(args) == 2 && (_js_isvector(args[2]) || _js_isrange(args[2]))
