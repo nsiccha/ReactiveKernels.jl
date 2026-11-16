@@ -1248,11 +1248,11 @@ end
     @test !occursin(r"jnp\.asarray\(s(?:_\d+)?, ", tupled)
     named = string(jax_source(jax_named_loop; have = (:w,), want = :t))
     @test occursin("jnp.asarray(s[1], dtype=jnp.int64)", named)
-    # Past a row's length each element keeps its value (`jnp.where` of a
-    # tuple would stack it into an array).
+    # Past a row's length a step keeps the tuple carry as it is (a lazy
+    # branch; `jnp.where` of a tuple would stack it into an array).
     rows = string(jax_source(jax_tuple_rows; have = (:a, :R), want = :total))
-    @test occursin(r"\(\(jnp\.where\(t <= (\w+), (\w+)\[0\], (\w+)\[0\]\), jnp\.where\(t <= \1, \2\[1\], \3\[1\]\)\),\)",
-                   rows)
+    @test occursin("jax.lax.cond(kept, step_body, lambda c: c, carry)", rows)
+    @test !occursin("jnp.where(t <= ", rows)
     @test occursin("jax.lax.while_loop(", string(jax_source(jax_tuple_while; have = (:x,), want = :t)))
     plain = string(jax_source(jax_plain; have = (:w, :x), want = :s))
     @test occursin("w ** 2", plain)

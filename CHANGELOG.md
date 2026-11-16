@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.272
+## 0.1.273
 
 - `js_source` translates the quantiles of RK's distribution laws:
   `standard_student_t`, `student_t`, `normal`, `lognormal`, `exponential`
@@ -40,6 +40,23 @@ are recorded in the git history only.
   - `findfirst` of a predicate over a tuple, with `something`;
   - `iszero` and `LazyString` exception messages;
   - splatting a tuple computed at run time.
+
+## 0.1.272
+
+- `jax_source`: a `for` loop to a padded row's length (`for t in 1:length(r)`
+  over a ragged row in a plate cell, or `eachindex(r)`) runs no body past the
+  row's end. It used to run the body at every step up to the padded width and
+  select the carry with `jnp.where`, so a body that is not finite at a step
+  Julia never runs (`log(length(r) - t + 1)`, say) gave the right value but
+  `jax.grad` NaN. Each step is now a lazy branch, as a counted `while` to a
+  padded length has been since 0.1.263 (`jax.lax.cond` per step; under
+  `jax.vmap` the untaken arm's reads go through `stop_gradient`).
+  CONTRIBUTING.md, "Lazy branches".
+- After such a loop, and after a counted `while` to a padded length, an array
+  padded by that length repeats its last valid entry in its padding, the
+  padding every padded value holds. Before, an array written at the loop
+  index got the body's values at the padded steps, which were valid only when
+  the body was.
 
 ## 0.1.271
 
