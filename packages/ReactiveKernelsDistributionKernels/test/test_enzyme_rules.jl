@@ -5,7 +5,7 @@
 # The shape that aborts Enzyme on SpecialFunctions' bodies
 # (benchmark/repro_enzyme_lgamma_branch.jl) therefore differentiates, with no
 # hand-written rule and no rule on a function this package does not own.
-using DifferentiationInterface: AutoEnzyme, gradient
+using DifferentiationInterface: AutoEnzyme, derivative, gradient
 import Enzyme
 using ReactiveKernels
 using ReactiveKernels: derivative_cut, prepare, prepare_ad, ad_gradient
@@ -102,7 +102,7 @@ _logrising_dref(a, m) = Float64(digamma(big(a) + m) - digamma(big(a)))
     f(a) = _DKS.logrising(a, 17) + 2 * _DKS.logrising(a * a, 5)
     expected = _logrising_dref(1.3, 17) + 4 * 1.3 * _logrising_dref(1.69, 5)
     @test gradient(f, backend, 1.3) ≈ expected rtol = 1e-13
-    @test gradient(f, AutoEnzyme(; mode = Enzyme.Forward), 1.3) ≈ expected rtol = 1e-13
+    @test derivative(f, AutoEnzyme(; mode = Enzyme.Forward), 1.3) ≈ expected rtol = 1e-13
     @test gradient(a -> a > 0 ? _DKS.logrising(a, 200) : -Inf, backend, 2.5) ≈
         _logrising_dref(2.5, 200) rtol = 1e-12
 end

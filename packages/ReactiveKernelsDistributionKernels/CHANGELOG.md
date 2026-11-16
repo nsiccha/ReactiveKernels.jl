@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.13
+
+- `beta_binomial.logpdf`, including `BetaBinomial2` responses, uses log rising
+  factorials for up to 64 trials when positive shapes sum to at most 2^30.
+  The value and shape partials share product recurrences, avoiding digamma
+  calls in the small-count reverse pass. Larger counts and shapes retain
+  the existing log-beta calculation. Requires ReactiveKernels 0.1.280.
+
 ## 0.1.12
 
 - `rk_ordinal_stopping_logtail(t, eta, d, effects, row, k, link, upper)` is

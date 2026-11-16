@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.280
+
+- Add the internal log rising-factorial numerical graph used by distribution
+  kernels. Small integer offsets evaluate chunked products and their shape
+  partial together; other offsets use the optional SpecialFunctions extension.
+  The ordinary derivative adapters come from that one graph, and the product
+  loops retain their runtime count.
+
 ## 0.1.278
 
 - `jax_source`: host `prepare_data` translates more ordinary data-only Julia,
