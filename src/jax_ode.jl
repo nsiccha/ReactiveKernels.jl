@@ -13,6 +13,12 @@
 # diffrax's own `max_steps` is a static bound on attempted steps that sizes
 # no buffer here (`checkpoints` does, so a gradient's memory does not grow
 # with it): it is the largest int32, as the native solve sets no such bound.
+# The solve also fails (status 3) where the step size falls below 16 ulps of
+# the latest time, or a step starts from a non-finite state or leaves a
+# non-finite step size, as the native solve stops as `DtLessThanMin` or
+# `Unstable`. diffrax would otherwise reject every later step until its
+# `max_steps`: a finite-time blow-up keeps proposing a step of a few ulps,
+# and its PID controller keeps a NaN step size.
 # `_rk_ode_solve` returns the times-by-states outputs and a status: 0 solved,
 # 1 invalid inputs, 2 a per-output budget exceeded, 3 the solver failed. Only
 # the first `n` output times are requested; later entries (a padded row's)
@@ -59,6 +65,11 @@ class _RKOutputBudget(diffrax.AbstractAdaptiveStepSizeController):
         count = jnp.where(keep, count + 1, count)
         result = diffrax.RESULTS.where(count > self.limit, diffrax.RESULTS.max_steps_reached,
                                        result)
+        # A non-finite state, or the step size a non-finite error estimate
+        # leaves (it stays NaN, so every later step is rejected), fails the
+        # solve, as the native solve stops as `Unstable`.
+        unstable = ~jnp.all(jnp.isfinite(y0)) | ~jnp.isfinite(next_t1 - next_t0)
+        result = diffrax.RESULTS.where(unstable, diffrax.RESULTS.nonfinite, result)
         return keep, next_t0, next_t1, jump, (state, count, now), result
 
 
@@ -86,11 +97,15 @@ def _rk_ode_solve(solver, rhs, y0, t0, ts, n, reltol, abstol, maxsteps, args):
     ok = valid & (n > 0)
     last = jnp.where(ok, last, t0 + 1)
     ts = jnp.where(requested & ok, ts, last)
+    # A step this short no longer advances time controllably: diffrax steps
+    # to rounded times, and a few ulps of t are as short as a step gets.
+    dtmin = jax.lax.stop_gradient(16 * jnp.finfo(dtype).eps * jnp.maximum(jnp.abs(t0), jnp.abs(last)))
     sol = diffrax.diffeqsolve(
         diffrax.ODETerm(rhs), solver, t0, last, None, y0, args=args,
         saveat=diffrax.SaveAt(ts=ts),
         stepsize_controller=_RKOutputBudget(
-            diffrax.PIDController(rtol=jnp.where(ok, reltol, 1.0), atol=jnp.where(ok, abstol, 1.0)),
+            diffrax.PIDController(rtol=jnp.where(ok, reltol, 1.0), atol=jnp.where(ok, abstol, 1.0),
+                                  dtmin=dtmin, force_dtmin=False),
             ts, jnp.where(ok, maxsteps, cap)),
         max_steps=cap, adjoint=diffrax.RecursiveCheckpointAdjoint(checkpoints=64), throw=False)
     status = jnp.where(sol.result == diffrax.RESULTS.successful, 0,
