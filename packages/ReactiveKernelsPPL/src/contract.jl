@@ -2520,7 +2520,7 @@ function _size_absent_responses!(plan::StructuralPlan, columns::AbstractDict)
             # A joint response's outcomes and a Multinomial's counts are
             # columns of the observation rows.
             columns[nm] = cells === nothing ? _absent_like(nm, eltype(old), dims) :
-                _absent_cells(nm, Array{eltype(old),length(first(cells))}, cells)
+                _absent_cells(nm, Array{eltype(old),_absent_cell_rank(cells)}, cells)
         end
     end
     # A caller-owned law broadcasts over its own arguments, so only a dotted
@@ -2530,10 +2530,12 @@ function _size_absent_responses!(plan::StructuralPlan, columns::AbstractDict)
         nm in absent || continue
         cells = _absent_cell_shapes(plan, columns, nm)
         cells === nothing && continue
-        columns[nm] = _absent_cells(nm, Array{eltype(columns[nm]),length(first(cells))}, cells)
+        columns[nm] = _absent_cells(nm, Array{eltype(columns[nm]),_absent_cell_rank(cells)}, cells)
     end
     return columns
 end
+
+_absent_cell_rank(cells) = isempty(cells) ? fieldcount(eltype(cells)) : length(first(cells))
 
 # The rank of the arrays a dotted cell's response held per index in the
 # binding being rebound, or `nothing` when it held none there.
@@ -2571,6 +2573,12 @@ function _absent_cell_shapes(plan::StructuralPlan, columns, response::Symbol)
     all(c -> length(columns[c]) == n, operands) || _fail(response, "the arrays " *
         "per index of $(join(operands, ", ")) have different counts, so the " *
         "absent response $response has no one number of cells")
+    # With no cells, their array types still determine the broadcast rank.
+    # Preserve it in the shape type rather than reading a nonexistent cell.
+    if n == 0
+        N = maximum(c -> ndims(eltype(columns[c])), operands)
+        return NTuple{N,Int}[]
+    end
     return [map(length, foldl((s, c) -> Base.Broadcast.broadcast_shape(s,
         axes(columns[c][i])), operands; init = ())) for i in 1:n]
 end

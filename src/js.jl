@@ -522,9 +522,9 @@ function _rk_ode_rk45(f, y0, t0, ts, rt, at, mx) {
   return out;
 }""", [:JuliaError, :_rk_dopri]),
     :_rk_cumprod => ("""
-function _rk_cumprod(x) { const r = x.slice(); for (let i = 1; i < r.length; i++) r[i] = r[i - 1] * r[i]; return r; }""", Symbol[]),
+function _rk_cumprod(x, start = 0, end = x.length) { const r = x.slice(start, end); for (let i = 1; i < r.length; i++) r[i] = r[i - 1] * r[i]; return r; }""", Symbol[]),
     :_rk_cumsum => ("""
-function _rk_cumsum(x) { const r = x.slice(); for (let i = 1; i < r.length; i++) r[i] = r[i - 1] + r[i]; return r; }""", Symbol[]),
+function _rk_cumsum(x, start = 0, end = x.length) { const r = x.slice(start, end); for (let i = 1; i < r.length; i++) r[i] = r[i - 1] + r[i]; return r; }""", Symbol[]),
     # `start:step:stop` as Julia builds it: `stop` becomes the last element reached.
     :_rk_steprange => ("""
 function _rk_steprange(start, step, stop) {
@@ -660,12 +660,26 @@ _js_tuple_length(v::_JsVal) = v.static ? length(v.value) : fieldcount(v.T)
 # at run time: a number, a `Bool`, a vector or matrix of them, or a tuple of
 # such values (`domain = ((lo1, hi1), (lo2, hi2))`, a tuple of axis vectors).
 _js_runtime_type(T) = T isa DataType && isconcretetype(T) &&
-    (T <: Union{_JsNumber,Bool} || _js_isvector_type(T) || (T <: Matrix && eltype(T) <: _JsMatrixElement) ||
+    (T <: Union{_JsNumber,Bool} || _js_isvector_type(T) || _js_ismatrix_type(T) ||
      (T <: Tuple && !(T <: NamedTuple) && all(_js_runtime_type, fieldtypes(T))))
 _js_uniform_tuple(S, T) = S <: Tuple && !(S <: NamedTuple) && isconcretetype(S) && fieldcount(S) > 0 &&
     _js_runtime_type(T) && all(==(T), fieldtypes(S))
 # A nonempty tuple whose elements all have the number type `T`.
 _js_number_tuple(S, T) = T <: _JsNumber && _js_uniform_tuple(S, T)
+
+# A preceding plate can produce concrete records of runtime values. Reading
+# those records in another plate uses the same array and field operations;
+# numerical array helpers and external input validation keep their own types.
+_js_plate_element(T) = _js_runtime_type(T) ||
+    (T isa DataType && isconcretetype(T) && T <: Union{Tuple,NamedTuple} &&
+     all(_js_plate_element, fieldtypes(T)))
+_js_vector_view(v) = v isa _JsStruct && v.T === view && length(v.fields) == 2
+_js_gather_view(v) = v isa _JsStruct && v.T === _readonly_gather
+_js_plate_vector(v) = _js_isvector(v) || _js_vector_view(v) || _js_gather_view(v) ||
+    (_js_type(v) <: Vector && _js_plate_element(eltype(_js_type(v))))
+_js_plate_length(v) = _js_isrange(v) ? _js_range_length(v) :
+    _js_vector_view(v) ? _js_range_length(v.fields[2]) :
+    _js_gather_view(v) ? v.fields[2].code * ".length" : v.code * ".length"
 
 # A range is read through its first element, last element and length. A range
 # known while translating (`for _ in 1:60` in a helper) is read as literals; a
@@ -1563,6 +1577,18 @@ _js_specialized(a) = a isa _JsVal && a.static &&
 function _js_helper_call!(ir::_JsIR, f, args::Vector{Any}, T)
     mod = ir.fn.mod
     argtypes = Any[_js_argtype(a) for a in args]
+    if any(a -> _js_vector_view(a) || _js_gather_view(a) || _js_isslice(a), args)
+        # A view carries its parent and indices as translated values. Keep that
+        # representation through the call; an ordinary SubArray parameter would
+        # lose it. Inlining this call still retains the helper's runtime loops.
+        context = "`" * string(f) * "(" * join(("::" * string(S) for S in argtypes), ", ") * ")`"
+        context in mod.stack && _js_error(mod, "recursive helper with a view argument: ", context)
+        push!(mod.stack, context)
+        _js_flush!(ir)
+        value, _ = _js_inline!(ir.fn, f, args, "value")
+        pop!(mod.stack)
+        return value
+    end
     statics = Tuple(_js_specialized(a) ? a.value : nothing for a in args)
     key = (f, Tuple(argtypes), statics)
     name, RT = get(mod.helpers, key, ("", nothing))
@@ -2252,10 +2278,19 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
                       prec = _JS_OR)
     elseif f === iszero && length(args) == 1 && _js_isnumber(args[1])
         return _js_rt(_js_code(mod, args[1], _JS_EQ + 1) * " === 0", Bool; prec = _JS_EQ)
-    elseif f in (cumprod, cumsum) && length(args) == 1 && _js_istuple(args[1]) &&
-           _js_number_tuple(_js_type(args[1]), eltype(_js_type(args[1]))) && T == _js_type(args[1])
-        # Running products or sums of a tuple, left to right as Julia accumulates them.
+    elseif f in (cumprod, cumsum) && length(args) == 1 &&
+           ((T == _js_type(args[1]) &&
+             ((_js_istuple(args[1]) && _js_number_tuple(T, eltype(T))) ||
+              (_js_isflatvector(args[1]) && eltype(T) <: _JsNumber))) ||
+            (_js_vector_view(args[1]) && T === Vector{eltype(_js_type(args[1]))} && eltype(T) <: _JsNumber))
+        # Running products or sums preserve the first value, including -0.0.
         helper = _js_use!(mod, f === cumprod ? :_rk_cumprod : :_rk_cumsum)
+        if _js_vector_view(args[1])
+            x, r = args[1].fields
+            start = "(" * _js_range_start(r) * " - 1)"
+            return _js_rt(helper * "(" * _js_runtime(mod, x).code * ", " * start *
+                          ", " * start * " + " * _js_range_length(r) * ")", T; pure = false)
+        end
         return _js_rt(helper * "(" * _js_runtime(mod, args[1]).code * ")", T)
     elseif f === ntuple && length(args) == 2 && args[2] isa _JsVal && args[2].static && args[2].value isa Val &&
            T <: Tuple && isconcretetype(T)
@@ -2553,7 +2588,9 @@ function _js_plan_body!(fn::_JsFn, p::Plan, values::Dict{ValueId,Any})
     function run_checks!()
         for c in copy(checks)
             all(a -> !(a isa Value) || haskey(values, canon_id(p.graph, a.id)), c.args) || continue
-            args = Any[a isa Value ? values[canon_id(p.graph, a.id)] : _js_static(a) for a in c.args]
+            args = Any[a isa Value ? values[canon_id(p.graph, a.id)] :
+                       _js_bound(mod, a, "check_arg_" * string(i))
+                       for (i, a) in enumerate(c.args)]
             v = _js_call!(kir, c.f, args, Nothing)
             _js_flush!(kir)
             # A check translated as a function (a package's named check, such
@@ -2661,9 +2698,17 @@ function _js_constant(mod::_JsModule, x::Union{Vector,BitVector,Matrix}, prefix,
 end
 
 # A value bound at preparation (`prepare(...; bound)`, an RKPPL binding's
-# data): a number or Bool is known while translating, so it folds as a
-# literal. A vector or matrix of them is a frozen module constant.
-_js_bound(mod::_JsModule, x::Union{Float64,Int64,Bool}, hint) = _js_static(x)
+# data): numerical values stay in module storage, like the arrays. They are
+# runtime operands of the executable body, not specialization parameters.
+function _js_bound(mod::_JsModule, x::Union{Float64,Int64,Bool,UnitRange{Int64},Base.OneTo{Int64}}, hint)
+    name = _js_module_name!(mod, "_rk_bound_", hint)
+    code = _js_runtime(mod, _js_static(x)).code
+    x isa AbstractRange && (code = "Object.freeze(" * code * ")")
+    push!(mod.defs, "const " * name * " = " * code * ";")
+    _js_rt(name, typeof(x); ref = true)
+end
+_js_bound(mod::_JsModule, x::Union{Tuple,NamedTuple}, hint) =
+    _JsTuple(Any[_js_bound(mod, v, string(hint, "_", k)) for (k, v) in pairs(x)], typeof(x))
 _js_bound(mod::_JsModule, x::Union{Vector,BitVector,Matrix}, hint) =
     _js_isvector_type(typeof(x)) || (x isa Matrix && eltype(x) <: _JsMatrixElement) ?
     _js_constant(mod, x, "_rk_bound_", hint; frozen = true) : _js_static(x)
@@ -2713,7 +2758,7 @@ function _js_plate!(fn::_JsFn, op::_AuthoredPlateOp{K,A}, inputs, hint) where {K
     mod = fn.mod
     body = op.kernel.plan
     length(body.want) == 1 || _js_error(mod, "a plate whose cell computes several values has no JavaScript translation yet")
-    mapped = Bool[!(i in A) && (_js_isvector(v) || _js_isrange(v)) for (i, v) in enumerate(inputs)]
+    mapped = Bool[!(i in A) && (_js_plate_vector(v) || _js_isrange(v)) for (i, v) in enumerate(inputs)]
     for (i, v) in enumerate(inputs)
         !(i in A) && !mapped[i] && !(_js_type(v) <: Union{Number,Bool}) &&
             _js_error(mod, "a plate over a `", _js_type(v), "` has no JavaScript translation (vectors and ranges are)")
@@ -2722,8 +2767,7 @@ function _js_plate!(fn::_JsFn, op::_AuthoredPlateOp{K,A}, inputs, hint) where {K
     kir = _js_ir(fn, only(Base.code_lowered(_js_noop, Tuple{})), 0)
     args = Any[!mapped[i] ? inputs[i] : _js_isrange(inputs[i]) ? _js_range!(kir, inputs[i], "x") :
                _js_simple!(kir, inputs[i], "x") for i in eachindex(inputs)]
-    lengths = unique([_js_isrange(a) ? _js_range_length(a) : a.code * ".length"
-                      for (i, a) in enumerate(args) if mapped[i]])
+    lengths = unique([_js_plate_length(a) for (i, a) in enumerate(args) if mapped[i]])
     single = length(lengths) == 1
     n = _js_local!(fn, "n")
     _js_line!(fn, "const " * n * " = " * (single ? lengths[1] :
@@ -2738,8 +2782,20 @@ function _js_plate!(fn::_JsFn, op::_AuthoredPlateOp{K,A}, inputs, hint) where {K
         cell[canon_id(body.graph, v.id)] = if !mapped[k]
             T = _js_type(a)
             a isa _JsVal && T <: Base.RefValue && a.static ? _js_static(a.value[]) : a
-        elseif _js_isrange(a)
-            _js_rt("(" * _js_range_start(a) * " + " * i * ")", Int64; prec = _JS_ATOM)
+        elseif _js_gather_view(a)
+            index = single ? i : "(" * _js_plate_length(a) * " === 1 ? 0 : " * i * ")"
+            _js_call!(kir, getindex, Any[a, _js_rt("(" * index * " + 1)", Int64)], eltype(_js_type(a)))
+        elseif _js_isrange(a) || _js_vector_view(a)
+            index = single ? i : "(" * _js_plate_length(a) * " === 1 ? 0 : " * i * ")"
+            if _js_isrange(a)
+                _js_rt("(" * _js_range_start(a) * " + " * index * ")", Int64; prec = _JS_ATOM)
+            else
+                # The view's creation checked its window. Read its parent at
+                # the cell position, retaining aliases without copying data.
+                x, r = a.fields
+                _js_rt(x.code * "[" * _js_range_start(r) * " - 1 + " * index * "]",
+                    eltype(_js_type(a)))
+            end
         else
             name = _js_local!(fn, v.name)
             el = single ? a.code * "[" * i * "]" : _js_use!(mod, :_rk_bcat) * "(" * a.code * ", " * i * ")"
@@ -2860,7 +2916,8 @@ ordinary kernel recipes, broadcasts (fused, with Julia's length rules),
 functions with Julia's domain errors, checked 1-based indexing (of a matrix:
 `m[i, j]`, `m[:, j]`, `m[i, :]`, `size`, `axes`), vector literals and
 matrix literals of numbers (`[a b; c d]`), `sum`/`prod`/`maximum`/`minimum`,
-ranges, comprehensions and `map` over vectors, tuples and named tuples
+ranges, comprehensions and `map` over vectors; `cumsum`/`cumprod` of numeric
+vectors, contiguous vector views or tuples; tuples and named tuples
 (objects) built, read and destructured, `all`/`any`/`count` of a tuple,
 keyword calls, and `rk_ode_rk45_tol`, integrated by the vendored `@reside-ic/dopri`
 Dormand–Prince 5(4) method with the native bridge's arguments, step budget
@@ -2872,8 +2929,15 @@ matrices; `sum`/`prod`/`maximum`/`minimum` of a matrix, whole or with
 `zeros`/`ones`/`fill(x, m, n)`, `Matrix{T}(undef, m, n)` and writes
 `m[i, j] = x`, `m[:, j] = v`, `m[i, :] = v`; `diag`; slices `view(m, :, j)`
 and `view(m, i, :)` read in place; and broadcasts over matrices, columns and
-rows with Julia's shape rules. Plain Julia helpers are translated from their
+rows with Julia's shape rules; `m[indices, j]` gathers a column's indexed rows.
+`reshape(vector, rows, cols)`, including a vector view, shares
+storage with the parent. Its dimensions must be nonnegative: Julia can
+construct a `ReshapedArray` view with negative axes, which JavaScript's
+array representation cannot hold and explicitly refuses.
+Plain Julia helpers are translated from their
 typed code, branches, early returns and loops included, without annotation;
+helpers taking views retain the view's parent and index expressions by inlining
+the call, including its loops (recursive calls with views are refused).
 Julia's own functions translate only through RK's table. A construct without
 a translation (a C call, `fma`, `\` and factorizations, indexing a transposed
 matrix, a scan with `history`, `rk_ode_bdf_tol`) raises
