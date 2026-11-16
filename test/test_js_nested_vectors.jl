@@ -95,8 +95,39 @@ end
     return y
 end
 
+@kernel named_record_groups(xs, scale) = begin
+    records = plate(xs, scale) do row, a
+        values = a .* row
+        (; values, summary = (; total = sum(values)))
+    end
+    rows = plate(records) do record
+        record.values
+    end
+    totals = plate(records) do record
+        record.summary.total
+    end
+    y = (; rows, totals)
+    return y
+end
+
+@kernel tuple_record_groups(xs, scale) = begin
+    records = plate(xs, scale) do row, a
+        values = a .* row
+        (values, sum(values))
+    end
+    rows = plate(records) do record
+        record[1]
+    end
+    totals = plate(records) do record
+        record[2]
+    end
+    y = (; rows, totals)
+    return y
+end
+
 agree(x::Real, y::Real) = isequal(x, y) || isapprox(x, y; rtol = 1e-12, atol = 1e-14)
 agree(x::AbstractArray, y::AbstractArray) = size(x) == size(y) && all(agree.(x, y))
+agree(x::NamedTuple, y::NamedTuple) = keys(x) == keys(y) && all(agree.(values(x), values(y)))
 
 function check(native, source, name, cases)
     for vectors in (:array, :float64array)
@@ -177,6 +208,26 @@ end
             bodies = [replace(s, r"(?m)^const _rk_bound_.*\n\n" => "") for s in emitted]
             @test all(==(first(bodies)), bodies)
             @test count("for (let ", first(bodies)) >= 2
+        end
+    end
+
+    @testset "plates read earlier tuple and named-tuple cells" begin
+        groups = (VV(), [Float64[], [1.0, 2.0]], [collect(1.0:i) for i in 1:23])
+        for spec in (named_record_groups, tuple_record_groups)
+            native = prepare(spec; have = (:xs, :scale), want = :y)
+            source = ReactiveKernels.js_source(spec; have = (:xs, :scale), want = :y,
+                types = (; xs = VV, scale = Float64), name = :records)
+            node && check(native, source, :records, [(xs, a) for xs in groups for a in (0.5, -2.0)])
+            sources = String[]
+            for xs in groups
+                bound = prepare(spec; have = (:xs, :scale), want = :y, bound = (; xs))
+                emitted = ReactiveKernels.js_source(bound; types = (; scale = Float64), name = :bound)
+                push!(sources, emitted)
+                node && check(bound, emitted, :bound, [(0.5,), (-2.0,)])
+            end
+            bodies = [replace(s, r"(?m)^const _rk_bound_.*\n\n" => "") for s in sources]
+            @test all(==(first(bodies)), bodies)
+            @test count("for (let ", first(bodies)) >= 3
         end
     end
 

@@ -644,6 +644,15 @@ _js_uniform_tuple(S, T) = S <: Tuple && !(S <: NamedTuple) && isconcretetype(S) 
 # A nonempty tuple whose elements all have the number type `T`.
 _js_number_tuple(S, T) = T <: _JsNumber && _js_uniform_tuple(S, T)
 
+# A preceding plate can produce concrete records of runtime values. Reading
+# those records in another plate uses the same array and field operations;
+# numerical array helpers and external input validation keep their own types.
+_js_plate_element(T) = _js_runtime_type(T) ||
+    (T isa DataType && isconcretetype(T) && T <: Union{Tuple,NamedTuple} &&
+     all(_js_plate_element, fieldtypes(T)))
+_js_plate_vector(v) = _js_isvector(v) ||
+    (_js_type(v) <: Vector && _js_plate_element(eltype(_js_type(v))))
+
 # A range is read through its first element, last element and length. A range
 # known while translating (`for _ in 1:60` in a helper) is read as literals; a
 # runtime one is a `{ start, stop }` object, bound to a name by `_js_range!`.
@@ -2682,7 +2691,7 @@ function _js_plate!(fn::_JsFn, op::_AuthoredPlateOp{K,A}, inputs, hint) where {K
     mod = fn.mod
     body = op.kernel.plan
     length(body.want) == 1 || _js_error(mod, "a plate whose cell computes several values has no JavaScript translation yet")
-    mapped = Bool[!(i in A) && (_js_isvector(v) || _js_isrange(v)) for (i, v) in enumerate(inputs)]
+    mapped = Bool[!(i in A) && (_js_plate_vector(v) || _js_isrange(v)) for (i, v) in enumerate(inputs)]
     for (i, v) in enumerate(inputs)
         !(i in A) && !mapped[i] && !(_js_type(v) <: Union{Number,Bool}) &&
             _js_error(mod, "a plate over a `", _js_type(v), "` has no JavaScript translation (vectors and ranges are)")

@@ -55,8 +55,8 @@ SparseArrays = "1"
 Treebars = "0.1.5"
 WarmupHMC = "0.2.21, 0.3"
 PrecompileTools = "1.2"
-# Nested observation parameters need the ragged-vector JavaScript emitter.
-ReactiveKernels = "0.1.282"
+# Nested observation parameters project fields from records produced by a plate.
+ReactiveKernels = "0.1.287"
 ReactiveKernelsDistributionKernels = "0.1.12"
 SpecialFunctions = "2"
 StatsFuns = "1, 2"

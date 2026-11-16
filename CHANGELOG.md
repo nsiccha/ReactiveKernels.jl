@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.287
+
+- `js_source` lets an authored plate read concrete tuples and named tuples
+  produced by an earlier plate, including records containing ragged vectors.
+  Field projections retain runtime iteration and the producer's shared work.
+
 ## 0.1.286
 
 - JAX host preparation translates `findall(vector)`,
