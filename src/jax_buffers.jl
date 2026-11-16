@@ -162,3 +162,19 @@ function _jax_check_slot_shapes(ctx)
             _jax_error("a nested-vector allocation without an authored row shape", _jax_where(ctx))
     end
 end
+
+# A logical empty buffer has no cells, even if other groups need physical
+# storage. Masking its output after evaluating a cell can poison a shared
+# argument's gradient (for example, a * log(0)). Guard the cell itself.
+# Abstract shape evaluation performs no numerical cell work, and closing
+# over its arguments keeps prepared StaticInts static during that trace.
+function _jax_slots_active_cell(ctx, cell, params)
+    name = _jax_fresh(ctx, :active_rows_cell)
+    shape = _jax_fresh(ctx, :cell_shape)
+    call = cell * "(" * join(params, ", ") * ")"
+    _jax_emit!(ctx, "def " * name * "(" * join(params, ", ") * "):")
+    _jax_emit!(ctx, "    " * shape * " = jax.eval_shape(lambda: " * call * ")")
+    _jax_emit!(ctx, "    return jax.lax.cond(" * last(params) * ", lambda: " * call *
+        ", lambda: jax.tree_util.tree_map(lambda s: jnp.zeros(s.shape, s.dtype), " * shape * "))")
+    name
+end

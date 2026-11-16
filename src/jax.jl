@@ -2899,9 +2899,43 @@ function _jax_expr(ctx::_JaxContext, ::Val{:call}, ex)
         x = _jax_expr(ctx, positional[1])
         return _jax_row_alias(f, [x], _jax_index(ctx, x, positional[2:end]))
     end
+    if ctx.host === nothing && f === ntuple && length(positional) == 2 && isempty(kwargs) &&
+       positional[1] isa Expr && positional[1].head === :->
+        return _jax_source_ntuple(ctx, positional...)
+    end
     values = _PyVal[_jax_expr(ctx, a) for a in positional]
     kw = Pair{Symbol,_PyVal}[k => _jax_expr(ctx, v) for (k, v) in kwargs]
     _jax_call(ctx, f, values, kw)
+end
+
+# A literal/type-level tuple arity is structural, unlike a data-derived
+# collection length. Record its fields in order, with runtime captures and
+# lazy branches inside each field. The lambda has its own local frame.
+function _jax_source_ntuple(ctx, lambda, count)
+    arity = _jax_expr(ctx, count).T
+    arity isa Type && arity <: Val && arity.parameters[1] isa Integer &&
+        arity.parameters[1] >= 0 ||
+        _jax_error("a source `ntuple` needs an authored `Val` arity", _jax_where(ctx))
+    param = lambda.args[1]
+    param isa Expr && param.head === :tuple && length(param.args) == 1 && (param = only(param.args))
+    param isa Expr && param.head === :(::) && (param = param.args[1])
+    param isa Symbol || _jax_error("an `ntuple` lambda needs one named argument", _jax_where(ctx))
+    body = _traceable_tail_body(lambda.args[2], :ntuple, "jax_source")
+    assigned, written = _host_targets(Any[body])
+    any(s -> s !== param && haskey(ctx.locals, s), union(assigned, written)) &&
+        _jax_error("an `ntuple` lambda mutating its caller needs reference writeback", _jax_where(ctx))
+    saved = ctx.locals
+    fields = _PyVal[]
+    try
+        for i in 1:arity.parameters[1]
+            ctx.locals = copy(saved)
+            ctx.locals[param] = _jax_literal(i)
+            push!(fields, _jax_expr(ctx, body))
+        end
+    finally
+        ctx.locals = saved
+    end
+    _jax_call_positional(ctx, tuple, fields)
 end
 
 # A local called as a function: a function value without captures (an
@@ -3896,6 +3930,11 @@ for (f, name, neutral) in ((prod, "jnp.prod", "1.0"), (maximum, "jnp.max", "-jnp
     @eval function _jax_function_call(ctx::_JaxContext, ::typeof($f), args::Vector{_PyVal})
         length(args) == 1 || _jax_error("this `", $f, "` call", _jax_where(ctx))
         x = args[1]
+        if $f !== prod && _jax_integer_data(x.T) && x.origin isa _JaxCellData
+            o = x.origin
+            throw(_CellHostNeeded(o.plate, o.recipe, JAXEmissionError(
+                "an integer reduction needs prepared entry bounds" * _jax_where(ctx))))
+        end
         v = isempty(x.extent) ? _jax_result($f, args, $name * "(" * _jax_collection_code(x) * ")") :
             _PyVal($name * "(" * _jax_padded_reduced(ctx, $f, x,
                 eltype(x.T) <: Integer && $f !== prod ?
@@ -6602,6 +6641,9 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
                                                                 origins = cell_origins,
                                                                 fields = cell_fields,
                                                                 active_cells = masked)
+    if masked && any(v -> v.origin isa _JaxDenseRows, inputs[padded])
+        cell = _jax_slots_active_cell(ctx, cell, cell_params)
+    end
     # A check cannot be run on padding unless its valid cells are known.
     # Pure cells without checks retain their existing translation.
     any(padded) && !masked && _JAX_EFFECTS[] != effects_before &&

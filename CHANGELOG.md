@@ -29,7 +29,10 @@ are recorded in the git history only.
   their bodies across changing data sizes. Unsupported row alias mutations,
   helper argument mutation, and direct public buffer outputs are diagnosed.
 - Device loops can read homogeneous numerical tuples at computed integer
-  indices, including fixed `ntuple` bases behind an early-return guard.
+  indices, including source `ntuple` lambdas with an authored `Val` arity
+  behind an early-return guard. Empty padded buffer cells are guarded before
+  evaluation, preserving ordinary gradients of shared arguments; integer
+  reductions of cell data request prepared bounds for their allocations.
 
 ## 0.1.280
 

@@ -120,7 +120,7 @@ print(jax_source(decayed; have = (:x, :rate), want = :value))
 
 Body-level early returns, including `condition || return fallback(...)`, keep the continuation in the falling-through branch. The native method retains its original control flow. A return inside a loop remains unsupported. In device code, `continue` skips the remaining iteration statements, `for` binds one name over one range, and `break` remains unsupported. Host `prepare_data` also supports `break`. A provider's source is read only by `jax_source`; native execution runs the method itself.
 
-A fixed tuple of numbers of one type supports computed integer reads, such as indexing an `ntuple` basis inside a loop. The device read checks bounds and uses a numerical array view of that tuple; the loop remains a runtime loop.
+A source `ntuple(j -> expression, Val(N))` records the authored, fixed number of fields with runtime captures. A fixed tuple of numbers of one type supports computed integer reads, such as indexing that basis inside a loop. The device read checks bounds and uses a numerical array view of the tuple; the data-dependent loop remains a runtime loop.
 
 A device helper can allocate `Vector{Vector{Float64}}(undef, k)`, fill its slots with fixed-width numerical rows, and use `isassigned(rows, i)` to skip earlier assignments. A size such as `isempty(ids) ? 0 : maximum(ids)` uses bounds computed from prepared integer data, including ragged cells. Allocation and iteration remain runtime array operations; emitted source does not grow with the data. Assignment state travels with the numerical storage through loops and branches. Missing references and invalid indices raise when read; `isassigned` returns false for either.
 
