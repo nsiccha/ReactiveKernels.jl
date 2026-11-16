@@ -289,11 +289,15 @@ end
         @test_throws ReactiveKernels.ODESolveFailure native(u, fails...)
         if _JAX_ODE_PYTHON
             query = x -> native(x, solves...)
-            got = rk_jax_evaluate(source, "density", (u, solves...); grad = true)
+            got = rk_jax_evaluate(source, "density", (u, solves...); grad = :joint)
             @test got.value ≈ query(u) rtol = 1e-6
+            @test got.joint_value == got.value
             @test got.grad ≈ gradient(query, backend, u) rtol = 1e-4
             @test rk_jax_evaluate(source, "value", (u, solves...)).value ≈ got.value
-            @test rk_jax_evaluate(source, "density", (u, fails...)).value == -Inf
+            # -inf also from jax.value_and_grad, as a sampler evaluates the
+            # point: an error lost under differentiation would read finite.
+            failed = rk_jax_evaluate(source, "density", (u, fails...); grad = :joint)
+            @test failed.value == -Inf && failed.joint_value == -Inf
             @test_throws r"exceeded maxsteps between requested outputs|\) failed" rk_jax_evaluate(
                 source, "value", (u, fails...))
         else
