@@ -214,13 +214,14 @@ end
     @testset "plates read earlier tuple and named-tuple cells" begin
         groups = (VV(), [Float64[], [1.0, 2.0]], [collect(1.0:i) for i in 1:23])
         for spec in (named_record_groups, tuple_record_groups)
-            native = prepare(spec; have = (:xs, :scale), want = :y)
-            source = ReactiveKernels.js_source(spec; have = (:xs, :scale), want = :y,
+            want = (; rows = :rows, totals = :totals)
+            native = prepare(spec; have = (:xs, :scale), want)
+            source = ReactiveKernels.js_source(spec; have = (:xs, :scale), want,
                 types = (; xs = VV, scale = Float64), name = :records)
             node && check(native, source, :records, [(xs, a) for xs in groups for a in (0.5, -2.0)])
             sources = String[]
             for xs in groups
-                bound = prepare(spec; have = (:xs, :scale), want = :y, bound = (; xs))
+                bound = prepare(spec; have = (:xs, :scale), want, bound = (; xs))
                 emitted = ReactiveKernels.js_source(bound; types = (; scale = Float64), name = :bound)
                 push!(sources, emitted)
                 node && check(bound, emitted, :bound, [(0.5,), (-2.0,)])

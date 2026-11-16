@@ -27,6 +27,8 @@ are recorded in the git history only.
   The public query and `workflow_wants(:observations)` select the same graph
   for native evaluation, ordinary derivatives and emitted JavaScript.
   Requires ReactiveKernels 0.1.287 for nested JavaScript outputs.
+- Rebinding a dotted observation to empty per-index data can leave its response
+  absent; the binding retains the cell rank from the data's array type.
 
 ## 0.1.204
 
