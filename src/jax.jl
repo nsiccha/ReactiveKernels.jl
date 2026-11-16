@@ -877,6 +877,11 @@ end
 function _jax_effect(ctx::_JaxContext, ex)
     ex isa Expr && ex.head === :block && return _jax_statements(ctx, ex.args; value = false)
     ex isa Expr && ex.head in (:if, :elseif) && return _jax_if(ctx, ex, false)
+    if ctx.host === nothing && ex isa Expr && ex.head in (:&&, :||)
+        a, b = ex.args
+        return _jax_if(ctx, ex.head === :&& ? Expr(:if, a, b, nothing) :
+                                              Expr(:if, a, nothing, b), false)
+    end
     _jax_statement(ctx, ex)
 end
 
@@ -923,6 +928,9 @@ function _jax_destructure!(ctx::_JaxContext, lhs, v::_PyVal)
     if lhs isa Expr && lhs.head === :ref && lhs.args[1] isa Symbol && haskey(ctx.locals, lhs.args[1])
         # `A[i] = v`: a functional update rebinding `A`.
         target = ctx.locals[lhs.args[1]]
+        _jax_slots(target) && return _jax_slots_write!(ctx, lhs, target, v)
+        target.origin isa _JaxRowShape && target.origin.stored &&
+            _jax_error("mutation through a row shared with a nested-vector buffer", _jax_where(ctx))
         indexed = _jax_index(ctx, target, lhs.args[2:end]; target = true)
         position = indexed.code[ncodeunits(target.code)+1:end]
         name = _jax_fresh(ctx, lhs.args[1])
@@ -1029,7 +1037,8 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(Base.vect), values::Vecto
     T = isempty(values) ? Float64 : promote_type((_jax_eltype(v.T) for v in values)...)
     isempty(values) && ctx.host !== nothing && return _host_list(ctx, Vector{T})
     isempty(values) && return _PyVal("jnp.zeros((0,), dtype=" * _jax_dtype(T) * ")", Vector{T})
-    _PyVal("jnp.stack([" * join((v.code for v in values), ", ") * "])", Vector{T})
+    v = _PyVal("jnp.stack([" * join((v.code for v in values), ", ") * "])", Vector{T})
+    all(v -> _jax_is_scalar(v.T), values) ? _jax_row_shape(v, (length(values),)) : v
 end
 
 # `x[i...]`, or a typed array literal `T[a, b]`.
@@ -1076,6 +1085,7 @@ end
 # Index `x` with Julia indices `indices` (source expressions). An assignment
 # `target` reads the position only, so its gather carries no extent.
 function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
+    _jax_slots(x) && return _jax_slots_index(ctx, x, indices)
     if !target && x.origin isa _JaxHistoryLayout
         read = _jax_history_read!(ctx, x, indices)
         read === nothing || return read
@@ -1153,7 +1163,7 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
     end
     E = eltype(x.T)
     T = kept == 0 ? E : Array{E,kept}
-    if _jax_ragged(x.T)
+    if _jax_ragged(x.T) && !_jax_outer_rows(x)
         isempty(x.extent) && _jax_error("a ragged array without its lengths", _jax_where(ctx))
         # One group's row and length, or several groups' rows and lengths.
         return _PyVal(_py_atom(x.code) * "[" * join(parts, ", ") * "]", T, false,
@@ -1321,7 +1331,7 @@ function _host_index_value(ctx::_JaxContext, v::_PyVal)
 end
 # The length of `x`'s dimension `dim`; a host value may be a Python list.
 _jax_dim_code(ctx::_JaxContext, x::_PyVal, dim::Int) = ctx.host === nothing ?
-    _py_atom(x.code) * ".shape[" * string(dim - 1) * "]" :
+    (_jax_slots(x) ? _jax_slot_mask(x) : _py_atom(x.code)) * ".shape[" * string(dim - 1) * "]" :
     dim == 1 ? "len(" * x.code * ")" : "np.shape(" * x.code * ")[" * string(dim - 1) * "]"
 _jax_mentions(ex, s::Symbol) = ex === s ||
     (ex isa Expr && !(ex.head === :ref) && any(a -> _jax_mentions(a, s), ex.args))
@@ -1738,11 +1748,14 @@ end
 # error, so a differentiated program writes the loop as a `for` over a range.
 function _jax_expr(ctx::_JaxContext, ::Val{:while}, ex)
     ctx.host === nothing || return _host_while(ctx, ex)
-    counted = _jax_counted_while(ctx, ex)
+    # A continue may skip the counter update, so that loop is not counted.
+    body = _jax_continue_body(ex.args[2])
+    counted = body === ex.args[2] ? _jax_counted_while(ctx, ex) : nothing
     counted === nothing || return _jax_counted_for(ctx, counted...)
-    condition_ex, body = ex.args
+    condition_ex = ex.args[1]
     assigned = Set{Symbol}()
     _jax_assigned_names!(assigned, body)
+    _jax_slot_aliases!(ctx, assigned)
     carried = sort!([n for n in assigned if haskey(ctx.locals, n)])
     isempty(carried) && _jax_error("a `while` loop that assigns no outer local", _jax_where(ctx))
     initial = [_jax_carry_value(ctx, ctx.locals[n]) for n in carried]
@@ -1760,7 +1773,7 @@ function _jax_expr(ctx::_JaxContext, ::Val{:while}, ex)
             names = [_jax_identifier(inner.used, n) for n in carried]
             _jax_emit!(ctx, "(" * join(names, ", ") * (length(names) == 1 ? ",)" : ")") * " = " * carry)
             for (n, name, v) in zip(carried, names, initial)
-                ctx.locals[n] = _PyVal(name, v.T)
+                ctx.locals[n] = _jax_slots(v) ? _PyVal(name, v.T, false, v.extent, v.limit, v.padded, v.origin) : _PyVal(name, v.T)
             end
             build()
         finally
@@ -1781,7 +1794,9 @@ function _jax_expr(ctx::_JaxContext, ::Val{:while}, ex)
     result = _jax_fresh(ctx, :loop_carry)
     _jax_emit!(ctx, result * " = jax.lax.while_loop(" * cond_f * ", " * body_f * ", " * carry_code * ")")
     for (k, (n, v)) in enumerate(zip(carried, initial))
-        ctx.locals[n] = _PyVal(result * "[" * string(k - 1) * "]", v.T)
+        code = result * "[" * string(k - 1) * "]"
+        ctx.locals[n] = _jax_slots(v) ?
+            _PyVal(code, v.T, false, v.extent, v.limit, v.padded, v.origin) : _PyVal(code, v.T)
     end
     _PyVal("None", Nothing, true)
 end
@@ -1849,6 +1864,7 @@ end
 # none): the padding a padded value holds (`_PyVal`'s `extent`). An array
 # whose padded axes are not known is returned as it is.
 function _jax_repeat_last_valid(ctx::_JaxContext, x::_PyVal)
+    _jax_slots(x) && return _jax_slots_repeat(ctx, x)
     axes = _jax_vector_like(x.T) && !(x.T <: AbstractVector) ? 0 : _jax_padded_axes(x)
     axes == 0 && return x
     final = _jax_bind!(ctx, :last_valid, _PyVal("jnp.maximum(" * x.extent * " - 1, 0)", Int))
@@ -1876,6 +1892,7 @@ end
 function _jax_expr(ctx::_JaxContext, ::Val{:for}, ex)
     ctx.host === nothing || return _host_for(ctx, ex)
     binding, body = ex.args
+    body = _jax_continue_body(body)
     binding isa Expr && binding.head === :(=) && binding.args[1] isa Symbol ||
         _jax_error("the loop binding `", binding, "` has no JAX translation", _jax_where(ctx))
     var = binding.args[1]
@@ -1885,6 +1902,7 @@ function _jax_expr(ctx::_JaxContext, ::Val{:for}, ex)
     isempty(steps) || return _jax_stepped_for(ctx, var, body, lo, hi, steps)
     assigned = Set{Symbol}()
     _jax_assigned_names!(assigned, body)
+    _jax_slot_aliases!(ctx, assigned)
     carried = sort!([n for n in assigned if haskey(ctx.locals, n) && n !== var])
     initial = [_jax_carry_value(ctx, ctx.locals[n]) for n in carried]
     fname = _jax_fresh(ctx, :loop_body)
@@ -1901,7 +1919,7 @@ function _jax_expr(ctx::_JaxContext, ::Val{:for}, ex)
         isempty(names) || _jax_emit!(ctx, "(" * join(names, ", ") * (length(names) == 1 ? ",)" : ")") *
                                          " = " * carry)
         for (n, name, v) in zip(carried, names, initial)
-            ctx.locals[n] = _PyVal(name, v.T, false, v.extent, v.limit, v.padded)
+            ctx.locals[n] = _PyVal(name, v.T, false, v.extent, v.limit, v.padded, _jax_carried_origin(v))
         end
         ctx.locals[var] = _jax_range_index(index, lo, hi)
         statements = body isa Expr && body.head === :block ? body.args : Any[body]
@@ -1924,9 +1942,27 @@ function _jax_expr(ctx::_JaxContext, ::Val{:for}, ex)
                             ", " * fname * ", " * init * ")", init, nonempty)
     for (k, (n, v)) in enumerate(zip(carried, initial))
         ctx.locals[n] = _PyVal(result * "[" * string(k - 1) * "]", v.T, false, v.extent, v.limit,
-                               v.padded)
+                               v.padded, _jax_carried_origin(v))
     end
     _PyVal("None", Nothing, true)
+end
+
+# A continue ends only this loop's iteration. Normalize its remaining
+# statements into the falling-through branch, using the same continuation
+# transformation as body-level returns. Nested loops normalize themselves.
+function _jax_continue_body(body)
+    changed = Ref(false)
+    function replace_jump(ex)
+        ex isa Expr || return ex
+        ex.head in (:for, :while, :->, :function, :quote, :inert) && return ex
+        if ex.head === :continue
+            changed[] = true
+            return Expr(:return, nothing)
+        end
+        Expr(ex.head, map(replace_jump, ex.args)...)
+    end
+    normalized = replace_jump(body)
+    changed[] ? _traceable_tail_body(normalized, :iteration, "jax_source") : body
 end
 
 # A `for` over a range whose ends are data, `lo:hi`, taking a static number
@@ -1941,6 +1977,7 @@ function _jax_stepped_for(ctx::_JaxContext, var::Symbol, body, lo::_PyVal, hi::_
                           steps::AbstractString)
     assigned = Set{Symbol}()
     _jax_assigned_names!(assigned, body)
+    _jax_slot_aliases!(ctx, assigned)
     carried = sort!([n for n in assigned if haskey(ctx.locals, n) && n !== var])
     initial = [_jax_carry_value(ctx, ctx.locals[n]) for n in carried]
     # The steps that are Julia's: `k <= last - first`.
@@ -1968,7 +2005,7 @@ function _jax_stepped_for(ctx::_JaxContext, var::Symbol, body, lo::_PyVal, hi::_
         isempty(names) || _jax_emit!(ctx, "(" * join(names, ", ") * (length(names) == 1 ? ",)" : ")") *
                                          " = " * run_carry)
         for (n, name, v) in zip(carried, names, initial)
-            ctx.locals[n] = _PyVal(name, v.T, false, v.extent, v.limit, v.padded)
+            ctx.locals[n] = _PyVal(name, v.T, false, v.extent, v.limit, v.padded, _jax_carried_origin(v))
         end
         index = _jax_fresh(ctx, var)
         _jax_emit!(ctx, index * " = jnp.minimum(" * _py_infix("+", [lo.code, step]) * ", " *
@@ -1999,7 +2036,7 @@ function _jax_stepped_for(ctx::_JaxContext, var::Symbol, body, lo::_PyVal, hi::_
                             init * ")", init, nonempty)
     for (k, (n, v)) in enumerate(zip(carried, initial))
         ctx.locals[n] = _PyVal(result * "[" * string(k - 1) * "]", v.T, false, v.extent, v.limit,
-                               v.padded)
+                               v.padded, _jax_carried_origin(v))
     end
     _PyVal("None", Nothing, true)
 end
@@ -2085,7 +2122,8 @@ function _jax_range_ends(ctx::_JaxContext, iter)
         else
             _jax_rank(x.T) == 1 || _jax_error("a loop over the indices of a `", x.T, "`",
                                               _jax_where(ctx))
-            hi = isempty(x.extent) ? _PyVal(_py_atom(x.code) * ".shape[0]", Int, true) :
+            hi = _jax_outer_rows(x) ? _jax_function_call(ctx, length, [x]) :
+                isempty(x.extent) ? _PyVal(_py_atom(x.code) * ".shape[0]", Int, true) :
                 _PyVal(x.extent, Int, false, "", _py_atom(x.code) * ".shape[0]")
         end
     else
@@ -2214,6 +2252,7 @@ function _jax_if(ctx::_JaxContext, ex, value::Bool)
     # its value followed by those locals, and the branch rebinds them.
     assigned = Set{Symbol}()
     foreach(a -> _jax_assigned_names!(assigned, a), ex.args[2:end])
+    _jax_slot_aliases!(ctx, assigned)
     carried = sort!([n for n in assigned if haskey(ctx.locals, n)])
     isempty(carried) && return _jax_conditional(ctx, condition,
         () -> translate(ex.args[2]), () -> translate(otherwise))
@@ -2245,7 +2284,7 @@ function _jax_if(ctx::_JaxContext, ex, value::Bool)
         T = _jax_is_tuple(result.T) && result.T <: Tuple && _jax_is_scalar(fieldtype(result.T, k + 1)) ?
             fieldtype(result.T, k + 1) : b.T
         ctx.locals[n] = _PyVal(_py_atom(result.code) * "[" * string(k) * "]", T, false, b.extent,
-                               b.limit, b.padded)
+                               b.limit, b.padded, _jax_carried_origin(b))
     end
     _PyVal(_py_atom(result.code) * "[0]", result.T isa Type && result.T <: Tuple ? fieldtype(result.T, 1) : Any)
 end
@@ -2307,7 +2346,8 @@ function _jax_conditional(ctx::_JaxContext, condition::_PyVal, then_build, else_
     T = A === Union{} ? B : B === Union{} ? A :
         _jax_branch_type(_jax_typeof(then_built.value), _jax_typeof(else_built.value))
     # A Python conditional returns the taken arm's value as Julia does.
-    condition.static && return _jax_static_branch!(ctx, condition, then_built, else_built, T)
+    bounded(v) = _jax_branch_bound(ctx, v, then_built.value, else_built.value)
+    condition.static && return bounded(_jax_static_branch!(ctx, condition, then_built, else_built, T))
     # A `jax.lax.cond`'s arms return the branch's type (`_jax_branch_value`).
     # An arm that throws (`scale >= 0 ? scale : throw(...)`) has no value: it
     # is its check, masked by its condition, and the branch is the other arm.
@@ -2322,13 +2362,24 @@ function _jax_conditional(ctx::_JaxContext, condition::_PyVal, then_build, else_
         return _jax_bind!(ctx, :value, _PyVal(value, T))
     end
     selected = _jax_selection(ctx, condition, then_built, else_built, T)
-    selected === nothing || return selected
+    selected === nothing || return bounded(selected)
     then_arm = _jax_emit_arm!(ctx, then_built, T)
     else_arm = _jax_emit_arm!(ctx, else_built, T)
     branch = _PyVal("jax.lax.cond(" * condition.code * ", " * _jax_typed_arm(then_arm, T) * ", " *
                     _jax_typed_arm(else_arm, T) * ")", T)
     # An arm with a runtime check runs even when the branch value is unused.
-    _JAX_EFFECTS[] == effects ? branch : _jax_bind!(ctx, :branch, branch)
+    bounded(_JAX_EFFECTS[] == effects ? branch : _jax_bind!(ctx, :branch, branch))
+end
+
+function _jax_branch_bound(ctx, v, a, b)
+    v.static && return v
+    v.T isa Type && v.T <: Integer || return v
+    upper(x) = x.static ? x.code : !isempty(x.limit) ? x.limit :
+        x.origin isa _JaxOrigin ? _jax_entry_bound(ctx, x.origin, true) : nothing
+    lo, hi = upper(a), upper(b)
+    lo === nothing || hi === nothing ? v :
+        _PyVal(v.code, v.T, false, v.extent, lo == hi ? lo : "max(" * lo * ", " * hi * ")",
+               v.padded, v.origin, v.field_extents)
 end
 # A static arm's value, a Python literal (`return 1.0`) or a NumPy scalar, is
 # float64 under 64-bit mode, and `jax.lax.cond` refuses arms of different
@@ -3832,9 +3883,22 @@ for (f, name, neutral) in ((prod, "jnp.prod", "1.0"), (maximum, "jnp.max", "-jnp
     @eval function _jax_function_call(ctx::_JaxContext, ::typeof($f), args::Vector{_PyVal})
         length(args) == 1 || _jax_error("this `", $f, "` call", _jax_where(ctx))
         x = args[1]
-        isempty(x.extent) || return _PyVal($name * "(" * _jax_padded_reduced(ctx, $f, x, $neutral) *
-                                           ")", eltype(x.T))
-        _jax_result($f, args, $name * "(" * _jax_collection_code(x) * ")")
+        v = isempty(x.extent) ? _jax_result($f, args, $name * "(" * _jax_collection_code(x) * ")") :
+            _PyVal($name * "(" * _jax_padded_reduced(ctx, $f, x,
+                eltype(x.T) <: Integer && $f !== prod ?
+                    string($f === maximum ? typemin(eltype(x.T)) : typemax(eltype(x.T))) : $neutral) *
+                ")", eltype(x.T))
+        # A reduction of prepared integer entries is bounded by the same
+        # dataset's extremes, including when x is one row of ragged data.
+        if $f !== prod && v.T isa Type && v.T <: Integer && x.origin isa _JaxOrigin
+            n = _jax_function_call(ctx, length, [x])
+            _jax_call(ctx, _runtime_check, [_jax_call(ctx, >, [n, _jax_literal(0)]),
+                _PyVal(repr("reducing over an empty collection is not allowed"), ArgumentError)])
+            neutral = string($f === maximum ? typemin(v.T) : typemax(v.T))
+            code = $name * "(" * _jax_padded_reduced(ctx, $f, x, neutral) * ", initial=" * neutral * ")"
+            v = _PyVal(code, v.T, v.static, "", _jax_entry_bound(ctx, x.origin, true))
+        end
+        v
     end
 end
 # `div(a, b)` of integers truncates toward zero, as Julia's does (lowered
@@ -4105,6 +4169,9 @@ end
 function _jax_function_call(ctx::_JaxContext, ::typeof(length), args::Vector{_PyVal})
     x = only(args)
     ctx.host === nothing || return _host_length(ctx, x)
+    _jax_outer_rows(x) && return isempty(x.extent) ?
+        _PyVal((_jax_slots(x) ? _jax_slot_mask(x) : _py_atom(x.code)) * ".shape[0]", Int, true) :
+        _PyVal(x.extent, Int, false, "", (_jax_slots(x) ? _jax_slot_mask(x) : _py_atom(x.code)) * ".shape[0]")
     _jax_columns(x.T) && return _jax_function_call(ctx, length, [_jax_column(x, 1)])
     isempty(x.extent) || _jax_ragged(x.T) ||
         return _PyVal(x.extent, Int, false, "", _py_atom(x.code) * ".shape[0]")
@@ -4117,6 +4184,13 @@ end
 # is data has no static shape entry.
 function _jax_function_call(ctx::_JaxContext, ::typeof(size), args::Vector{_PyVal})
     x = args[1]
+    if _jax_outer_rows(x)
+        n = _jax_function_call(ctx, length, [x])
+        length(args) == 1 && return _PyVal("(" * n.code * ",)", Tuple{Int}, n.static)
+        args[2].code == "1" && return n
+        args[2].static && return _PyVal("1", Int, true)
+        _jax_error("a nested-vector size with a computed dimension", _jax_where(ctx))
+    end
     ctx.host === nothing && !isempty(x.extent) && _jax_is_array(x.T) && !_jax_ragged(x.T) &&
         return _jax_padded_size(ctx, x, args[2:end])
     shape = ctx.host === nothing ? _py_atom(args[1].code) * ".shape" : "np.shape(" * args[1].code * ")"
@@ -4395,7 +4469,10 @@ for (f, name) in ((ones, "jnp.ones"), (zeros, "jnp.zeros"))
             return _PyVal($name * "(" * padded[1] * ", dtype=" * _jax_dtype(E) * ")", Vector{E},
                           false, padded[2])
         shape, N = _jax_dims(ctx, $f, args)
-        _PyVal($name * "(" * shape * ", dtype=" * _jax_dtype(E) * ")", Array{E,N})
+        v = _PyVal($name * "(" * shape * ", dtype=" * _jax_dtype(E) * ")", Array{E,N})
+        dims = _jax_dimension_values(args)
+        all(d -> d.static && occursin(r"^[0-9]+$", d.code), dims) ?
+            _jax_row_shape(v, Tuple(parse(Int, d.code) for d in dims)) : v
     end
 end
 function _jax_function_call(ctx::_JaxContext, ::typeof(fill), args::Vector{_PyVal})
@@ -4605,7 +4682,7 @@ end
 # storage spans the padded width. Scans and reductions must mask that tail.
 function _jax_axis(ctx::_JaxContext, x::_PyVal, dim::Int)
     extent = ""
-    if ctx.host === nothing && !isempty(x.extent) && !_jax_ragged(x.T)
+    if ctx.host === nothing && !isempty(x.extent) && (!_jax_ragged(x.T) || _jax_outer_rows(x))
         size = _jax_padded_size(ctx, x, [_PyVal(string(dim), Int, true)])
         isempty(size.limit) || (extent = size.code)
     end
@@ -4682,6 +4759,9 @@ _jax_value(ctx::_JaxContext, ::UndefInitializer, hint) = _PyVal("<undef>", Undef
 function _jax_allocation_size(ctx::_JaxContext, n::_PyVal)
     _jax_known(ctx, n) && return (n.code, "")
     isempty(n.limit) || return (n.limit, n.code)
+    n.origin isa _JaxOrigin && return (_jax_entry_bound(ctx, n.origin, true), n.code)
+    n.origin isa _JaxCellData && throw(_CellHostNeeded(n.origin.plate, n.origin.recipe,
+        JAXEmissionError("a data-only allocation size needs a bound from `prepare_data`" * _jax_where(ctx))))
     _jax_error("an array whose length depends on data has no JAX translation",
                _jax_where(ctx))
 end
@@ -4749,6 +4829,7 @@ function _jax_call_positional(ctx::_JaxContext, T::Type, args::Vector{_PyVal})
         dims = _jax_dimension_values(args[2:end])
         E = eltype(T)
         E isa TypeVar && (E = Float64)
+        E <: AbstractArray && return _jax_slots_allocate(ctx, T, dims)
         dtype = _jax_dtype(E)
         padded = _jax_vector_dims(ctx, T, dims)
         padded === nothing ||
@@ -6268,12 +6349,15 @@ _jax_captures(f) = nothing
 function _jax_source_expr(ctx::_JaxContext, source, names, inputs, mod::Module, captures)
     saved = (ctx.locals, ctx.source_module, ctx.captures, ctx.host)
     ctx.locals = Dict{Symbol,_PyVal}(zip(names, inputs))
+    _jax_slots_inputs!(ctx, inputs)
     ctx.source_module = mod
     ctx.captures = captures
     # On the host a source is a frame of its own: its locals take fresh names.
     ctx.host === nothing || (ctx.host = _HostState())
     try
-        return _jax_expr(ctx, source)
+        v = _jax_expr(ctx, source)
+        _jax_check_slot_shapes(ctx)
+        return v
     finally
         ctx.locals, ctx.source_module, ctx.captures, ctx.host = saved
     end
@@ -6412,6 +6496,7 @@ const _JAX_CELL_POSITIONS = Ref(0)
 function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
                      op::_AuthoredPlateOp{K,A}, inputs) where {K,A}
     ctx.host === nothing || return _host_plate(ctx, recipe, op, inputs)
+    inputs = [_jax_slots_rows(ctx, v) for v in inputs]
     body = op.kernel.plan
     # A tuple of numbers is a plate axis too; it is mapped as a stacked array.
     inputs = [!(i in A) && _jax_numeric_tuple(v.T) ?
@@ -6429,7 +6514,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     R = only(ranks)
     # Arguments whose cell value is padded: a ragged array's rows, and the
     # padded entries of an array of tuples (a shared cell plate's values).
-    ragged = Bool[!isempty(v.extent) && (_jax_ragged(v.T) || (_jax_is_array(v.T) &&
+    ragged = Bool[!isempty(v.extent) && ((!_jax_outer_rows(v) && _jax_ragged(v.T)) || (_jax_is_array(v.T) &&
                   eltype(v.T) <: Tuple) || !mapped[i]) && !(mapped[i] && eltype(v.T) <: Number)
                   for (i, v) in enumerate(inputs)]
     any(ragged[i] && mapped[i] for i in eachindex(inputs)) && R != 1 &&
@@ -7908,6 +7993,8 @@ end
 # A returned named tuple is a `dict` keyed by its field names.
 function _jax_returned(ctx::_JaxContext, v::_PyVal; arrays::Bool = false)
     v.T === Union{} && return v # an unconditional diagnostic has no returned fields
+    arrays && _jax_slots(v) && _jax_error("a reference-element buffer as a public JAX output; ",
+        "consume its rows inside the program", _jax_where(ctx))
     _jax_translation_only(v) && _jax_error("returning a callable or reference as a module output ",
                                           "has no JAX translation", _jax_where(ctx))
     if arrays && v.T isa Type &&

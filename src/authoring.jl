@@ -3403,8 +3403,8 @@ recorded source reads as the tuple of the trailing arguments, as the method
 does), `where` clauses, and a return-type annotation.  A docstring before `@traceable` documents the
 method, as it does a plain definition.  A `@traceable` method of a function
 from Base, Core or ReactiveKernels is rejected, and so are keyword arguments
-and a `return` before the end of the body (write that branch as an
-expression): a source-reading compiler translates the body as one expression.
+and a `return` inside a loop. Body-level early returns are recorded as lazy
+conditional expressions; the ordinary method keeps its authored control flow.
 """
 macro traceable(def)
     _traceable_definition(def, __module__)
@@ -3447,10 +3447,10 @@ function _traceable_definition(def, mod::Module)
         parameter isa Expr && parameter.head in (:<:, :>:) && (parameter = parameter.args[1])
         parameter isa Symbol && push!(names, parameter)
     end
-    _traceable_tail_body(body, signature)        # rejects an early `return`
+    sourcebody = _traceable_tail_body(body, signature)
     native = Expr(def.head, def.args[1], _kernel_native_body(body, mod, names))
     ignored = _kernel_ignored_traceable_methods(callee, formals, wheres, body, mod, names)
-    source = _traceable_source_method(callee, formals, wheres, body, mod)
+    source = _traceable_source_method(callee, formals, wheres, sourcebody, mod)
     esc(Expr(:block, _documentable(native), ignored..., source..., callee))
 end
 
@@ -3620,22 +3620,56 @@ function _traceable_source_method(callee, formals, wheres, body, mod)
                                    Expr(:tuple, statics...), vararg))]
 end
 
-# The body with its tail-position `return`s replaced by their values, as a
-# source-reading compiler translates it.  Any other `return` is rejected;
-# `owner` names what recorded the body in that error.
+# Record a method as one expression. A body-level return ends that path;
+# its continuation belongs only in the branches that fall through. This is
+# independent of data values and leaves loops intact. Returns crossing a
+# loop or another unsupported scope are still rejected by `_traceable_no_return`.
 function _traceable_tail_body(ex, signature, owner = "@traceable")
     if ex isa Expr && ex.head === :return
         return _traceable_no_return(isempty(ex.args) ? nothing : only(ex.args), signature, owner)
     elseif ex isa Expr && ex.head === :block
         position = findlast(arg -> !(arg isa LineNumberNode), ex.args)
         position === nothing && return ex
-        args = Any[i == position ? _traceable_tail_body(arg, signature, owner) :
-                   _traceable_no_return(arg, signature, owner)
-                   for (i, arg) in enumerate(ex.args)]
+        args = Any[]
+        for (i, arg) in enumerate(ex.args)
+            if i == position
+                push!(args, _traceable_tail_body(arg, signature, owner))
+            elseif _traceable_has_return(arg)
+                push!(args, _traceable_return_continuation(arg, ex.args[i+1:end], signature, owner))
+                return Expr(:block, args...)
+            else
+                push!(args, arg)
+            end
+        end
         return Expr(:block, args...)
     elseif ex isa Expr && ex.head in (:if, :elseif)
         return Expr(ex.head, _traceable_no_return(ex.args[1], signature, owner),
             (_traceable_tail_body(arg, signature, owner) for arg in ex.args[2:end])...)
+    elseif ex isa Expr && ex.head in (:&&, :||) && _traceable_has_return(ex)
+        return _traceable_return_continuation(ex, Any[], signature, owner)
+    end
+    _traceable_no_return(ex, signature, owner)
+end
+
+function _traceable_has_return(ex)
+    ex isa Expr || return false
+    ex.head in (:->, :function, :quote, :inert) && return false
+    ex.head === :return || any(_traceable_has_return, ex.args)
+end
+
+function _traceable_return_continuation(ex, tail, signature, owner)
+    ex.head === :return && return _traceable_tail_body(ex, signature, owner)
+    ex.head === :block && return _traceable_tail_body(Expr(:block, ex.args..., tail...), signature, owner)
+    if ex.head in (:&&, :||)
+        condition, arm = ex.args
+        ex = ex.head === :&& ? Expr(:if, condition, arm, false) :
+                              Expr(:if, condition, true, arm)
+    end
+    if ex.head in (:if, :elseif)
+        condition = _traceable_no_return(ex.args[1], signature, owner)
+        arms = length(ex.args) == 3 ? ex.args[2:3] : Any[ex.args[2], nothing]
+        return Expr(ex.head, condition,
+            (_traceable_tail_body(Expr(:block, arm, tail...), signature, owner) for arm in arms)...)
     end
     _traceable_no_return(ex, signature, owner)
 end
@@ -3661,12 +3695,13 @@ an [`@traceable`](@ref) body: a `for` loop becomes `jax.lax.fori_loop`, an
 `if` becomes `jax.lax.cond`, `A[i] = v` becomes `A.at[i].set(v)`, and
 `prepare_data` runs the body as host Python with Python loops and branches.
 
-The body is one expression whose value is the method's result. A `return` at
-its end is allowed; a `return` before the end throws an `ArgumentError` here,
-so write that branch as an expression (`condition ? a : b`). Code that runs
+The body is one expression whose value is the method's result. Body-level
+early returns become lazy conditional expressions; returns inside loops
+remain unsupported. Code that runs
 inside the JAX functions takes the subset an `@traceable` body takes there:
-no `break` or `continue`, and a `for` binds one name over one range.
-`prepare_data` takes both. Static parameters of the method (`where T`) are not bound: the body
+no `break`, and a `for` binds one name over one range. A `continue` keeps
+the current carry and skips the rest of that iteration. `prepare_data`
+also supports `break`. Static parameters of the method (`where T`) are not bound: the body
 reads its arguments and the globals of `mod`.
 
 Native execution, `prepare` and the compiled paths never read the source: the

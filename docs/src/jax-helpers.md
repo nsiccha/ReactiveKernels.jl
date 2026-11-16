@@ -118,4 +118,8 @@ end
 print(jax_source(decayed; have = (:x, :rate), want = :value))
 ```
 
-The body follows the rules of an `@traceable` body: a `return` only at its end, and in the JAX functions no `break` or `continue` and a `for` over one range. `prepare_data` runs the body as host Python, which takes both. A provider's source is read only by `jax_source`; native execution runs the method itself.
+Body-level early returns, including `condition || return fallback(...)`, keep the continuation in the falling-through branch. The native method retains its original control flow. A return inside a loop remains unsupported. In device code, `continue` skips the remaining iteration statements, `for` binds one name over one range, and `break` remains unsupported. Host `prepare_data` also supports `break`. A provider's source is read only by `jax_source`; native execution runs the method itself.
+
+A device helper can allocate `Vector{Vector{Float64}}(undef, k)`, fill its slots with fixed-width numerical rows, and use `isassigned(rows, i)` to skip earlier assignments. A size such as `isempty(ids) ? 0 : maximum(ids)` uses bounds computed from prepared integer data, including ragged cells. Allocation and iteration remain runtime array operations; emitted source does not grow with the data. Assignment state travels with the numerical storage through loops and branches. Missing references and invalid indices raise when read; `isassigned` returns false for either.
+
+This nested-buffer representation accepts fresh rows with an authored fixed shape, such as `[a, b, c]` or `zeros(3)`. Different row shapes require a ragged representation, and mutation through stored row aliases or a helper's buffer argument requires reference writeback; these cases raise `JAXEmissionError`. Buffers are consumed inside the program by indexing or plates; direct public buffer outputs are not supported yet.

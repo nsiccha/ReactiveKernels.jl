@@ -1,0 +1,167 @@
+using ReactiveKernels, Test, Enzyme
+include(joinpath(@__DIR__, "jax_python.jl"))
+
+@traceable function jax_group_rows(a::Float64, labels::Vector{Int}, rates::Vector{Float64})
+    k = isempty(labels) ? 0 : maximum(labels)
+    rows = Vector{Vector{Float64}}(undef, k)
+    for i in eachindex(labels)
+        t = labels[i]
+        isassigned(rows, t) && continue
+        rate = exp(rates[i])
+        rows[t] = [a, rate, 1 + a * rate]
+    end
+    for t in 1:k
+        isassigned(rows, t) || (rows[t] = zeros(3))
+    end
+    rows
+end
+
+@traceable function jax_rows_total(rows::Vector{Vector{Float64}})
+    total = 0.0
+    for t in eachindex(rows)
+        total += sum(abs2, rows[t])
+    end
+    total
+end
+
+@kernel jax_slots_graph(a::Float64, labels::Vector{Int}, rates::Vector{Float64}) = begin
+    rows = jax_group_rows(a, labels, rates)
+    score = jax_rows_total(rows)
+    parts = plate(rows) do row
+        sum(abs2, row)
+    end
+    mapped = sum(parts)
+    return (score, mapped)
+end
+
+@kernel jax_slots_ragged(a::Float64, labelsets::Vector{Vector{Int}}, ratesets::Vector{Vector{Float64}}) = begin
+    parts = plate(labelsets, ratesets) do labels, rates
+        rows = jax_group_rows(a, labels, rates)
+        jax_rows_total(rows)
+    end
+    score = sum(parts)
+    return score
+end
+
+@traceable function jax_partial_rows(a::Float64, i::Int, guarded::Bool)
+    rows = Vector{Vector{Float64}}(undef, 2)
+    alias = rows
+    if a > 0
+        alias[1] = [a, a * a]
+    else
+        rows[1] = [-a, a * a]
+    end
+    guarded && !isassigned(rows, i) && return 0.0
+    sum(rows[i])
+end
+@kernel jax_partial_graph(a::Float64, i::Int, guarded::Bool) = begin
+    score = jax_partial_rows(a, i, guarded)
+    return score
+end
+
+jax_slot_loss(a, labels, rates) = jax_rows_total(jax_group_rows(a, labels, rates))
+
+@testset "nested-vector buffers with runtime assignment state" begin
+    src = jax_source(jax_slots_graph; have=(:a, :labels, :rates), data=(:labels,),
+        functions=(score=:score, mapped=:mapped))
+    ragged = jax_source(jax_slots_ragged; have=(:a, :labelsets, :ratesets), data=(:labelsets,), functions=(score=:score,))
+    partial = jax_source(jax_partial_graph; have=(:a, :i, :guarded), functions=(score=:score,))
+    @test occursin("jax.lax.fori_loop", string(src))
+    @test occursin("jax.lax.cond", string(src))
+    @test string(jax_source(jax_slots_graph; have=(:a, :labels, :rates),
+        data=(labels=[1, 2],), functions=(score=:score, mapped=:mapped))) ==
+        string(jax_source(jax_slots_graph; have=(:a, :labels, :rates),
+        data=(labels=[1, 9, 1, 4],), functions=(score=:score, mapped=:mapped)))
+    cases = [Int[], [1], [3, 1, 3], [7, 2, 7, 2], repeat([4, 1, 4], 23)]
+    a = 0.4
+    expected = Float64[]
+    gradients = Float64[]
+    rate_gradients = Vector{Float64}[]
+    native = prepare(jax_slots_graph; have=(:a, :labels, :rates), want=(:score, :mapped))
+    for labels in cases
+        rates = collect(range(-0.2, step=0.02, length=length(labels)))
+        v = jax_rows_total(jax_group_rows(a, labels, rates))
+        push!(expected, v)
+        drates = zeros(length(rates))
+        da = Enzyme.autodiff(Enzyme.Reverse, jax_slot_loss, Enzyme.Active,
+            Enzyme.Active(a), Enzyme.Const(labels), Enzyme.Duplicated(rates, drates))[1][1]
+        push!(gradients, da)
+        push!(rate_gradients, drates)
+        @test da ≈ only(rk_fd_gradient(x -> jax_slot_loss(x[1], labels, rates), [a]))
+        @test all(isapprox.(native(a, labels, rates), (v, v)))
+    end
+    @test jax_partial_rows(a, 1, true) ≈ a + a*a
+    @test jax_partial_rows(a, 2, true) == 0.0
+    @test_throws UndefRefError jax_partial_rows(a, 2, false)
+    @test_throws BoundsError jax_partial_rows(a, 3, false)
+    if rk_jax_available()
+        mktempdir() do dir
+            write(joinpath(dir, "slots.py"), src)
+            write(joinpath(dir, "ragged.py"), ragged)
+            write(joinpath(dir, "partial.py"), partial)
+            # Keep the generated file for diagnosing a failing Python run.
+            get(ENV, "RK_SLOT_SOURCE", "") == "" || write(ENV["RK_SLOT_SOURCE"], src)
+            code = "cases = " * _rk_py(cases) * "\nexpected = " * _rk_py(expected) *
+                "\ngradients = " * _rk_py(gradients) * "\nrate_gradients = " * _rk_py(rate_gradients) * "\n" * raw"""
+import jax
+import numpy as np
+import slots, ragged, partial
+for labels, value, gradient, drates in zip(cases, expected, gradients, rate_gradients):
+    labels = np.asarray(labels, dtype=np.int64)
+    rates = -0.2 + 0.02*np.arange(labels.size)
+    prepared = slots.prepare_data(labels=labels)
+    for f in (slots.score, slots.mapped):
+        np.testing.assert_allclose(jax.jit(f)(0.4, rates, **prepared), value, rtol=1e-10)
+        np.testing.assert_allclose(jax.jit(jax.grad(f))(0.4, rates, **prepared), gradient, rtol=1e-8)
+        np.testing.assert_allclose(jax.jit(jax.grad(f, argnums=1))(0.4, rates, **prepared), drates, rtol=1e-8, atol=1e-12)
+labelsets = [np.asarray(x, dtype=np.int64) for x in cases]
+ratesets = [-0.2 + 0.02*np.arange(len(x)) for x in cases]
+prepared = ragged.prepare_data(labelsets=labelsets)
+np.testing.assert_allclose(jax.jit(ragged.score)(0.4, ratesets, **prepared), sum(expected), rtol=1e-10)
+np.testing.assert_allclose(jax.jit(jax.grad(ragged.score))(0.4, ratesets, **prepared), sum(gradients), rtol=1e-8)
+for a in (-0.4, 0.4):
+    np.testing.assert_allclose(jax.jit(partial.score)(a, 1, False), abs(a)+a*a)
+    for i in (-1, 0, 2, 3):
+        np.testing.assert_allclose(jax.jit(partial.score)(a, i, True), 0.)
+        np.testing.assert_allclose(jax.jit(jax.grad(partial.score))(a, i, True), 0.)
+for i, error in ((2, 'UndefRefError'), (3, 'BoundsError')):
+    try:
+        jax.jit(partial.score)(0.4, i, False).block_until_ready()
+    except Exception as exc:
+        assert error in str(exc), str(exc)
+    else:
+        raise AssertionError('missing '+error)
+prepared = slots.prepare_data(labels=np.array([1, 1]))
+for f in (slots.score, slots.mapped):
+    np.testing.assert_allclose(jax.jit(jax.grad(f, argnums=1))(0.4, np.array([0.1, np.nan]), **prepared)[1], 0.)
+def loops(tree):
+    tree = getattr(tree, 'jaxpr', tree)
+    count = 0
+    for eqn in tree.eqns:
+        count += eqn.primitive.name in ('scan', 'while')
+        for v in eqn.params.values():
+            for child in v if isinstance(v, (tuple, list)) else (v,):
+                if hasattr(child, 'jaxpr') or hasattr(child, 'eqns'):
+                    count += loops(child)
+    return count
+counts = []
+for n in (3, 70):
+    prepared = slots.prepare_data(labels=np.arange(1,n+1))
+    counts.append(loops(jax.make_jaxpr(slots.score)(0.4, np.zeros(n), **prepared)))
+assert counts[0] == counts[1] and counts[0] >= 3, counts
+print('retained loop regions at lengths 3 and 70:', counts)
+print('slot buffers: empty, duplicate, sparse and growing labels passed')
+"""
+            write(joinpath(dir, "check.py"), code)
+            if haskey(ENV, "RK_SLOT_DIR")
+                mkpath(ENV["RK_SLOT_DIR"])
+                for name in ("slots.py", "ragged.py", "partial.py", "check.py")
+                    cp(joinpath(dir, name), joinpath(ENV["RK_SLOT_DIR"], name); force=true)
+                end
+            end
+            @test success(pipeline(`$RK_JAX_PYTHON $(joinpath(dir, "check.py"))`; stdout=stdout, stderr=stderr))
+        end
+    else
+        @test_skip false
+    end
+end
