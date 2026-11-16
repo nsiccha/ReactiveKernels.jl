@@ -16,6 +16,23 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.274
+
+- `js_source` emits a `const` global array the code reads: a vector, or a
+  matrix as an array of row arrays, of `Float64`, `Int64` or `Bool` becomes a
+  module-level array (`const _rk_const_LEVELS = [50.0, 100.0];`) holding its
+  value at emission, emitted once, which the module reads and writes as the
+  kernel does the global. A broadcast over one (`scale .* LEVELS`, `2 .* LEVELS`,
+  `x .+ GRID`) loops over it with Julia's length rules. Such a broadcast used
+  to recurse until a bare `StackOverflowError`, and any other run-time use
+  was refused with "pass it as a kernel input"; an array without a JavaScript
+  value (a `Vector{String}`) is still refused by name, now also inside a
+  broadcast. `jax_source` already emits these arrays as literals.
+- A matrix bound at preparation is a frozen module constant of frozen rows,
+  as a bound vector is; a run-time use of one was refused.
+- A broadcast known while translating inside another (`x .+ (2 .* 3)`) is
+  fused like any other; it was refused as having a non-concrete element type.
+
 ## 0.1.273
 
 - `js_source` translates the quantiles of RK's distribution laws:
