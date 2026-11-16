@@ -21,6 +21,8 @@ are recorded in the git history only.
 - `js_source` lets an authored plate read concrete tuples and named tuples
   produced by an earlier plate, including records containing ragged vectors.
   Field projections retain runtime iteration and the producer's shared work.
+- Plates read vector views directly from their parent and broadcast singleton
+  views and ranges alongside other inputs, including empty inputs.
 
 ## 0.1.286
 

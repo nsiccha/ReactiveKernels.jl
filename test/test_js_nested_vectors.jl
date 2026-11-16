@@ -129,6 +129,22 @@ agree(x::Real, y::Real) = isequal(x, y) || isapprox(x, y; rtol = 1e-12, atol = 1
 agree(x::AbstractArray, y::AbstractArray) = size(x) == size(y) && all(agree.(x, y))
 agree(x::NamedTuple, y::NamedTuple) = keys(x) == keys(y) && all(agree.(values(x), values(y)))
 
+@kernel plate_view(xs, lo, hi, offsets) = begin
+    window = view(xs, lo:hi)
+    y = plate(window, offsets) do value, offset
+        value + offset
+    end
+    return y
+end
+
+@kernel plate_view_range(xs, lo, hi, rlo, rhi) = begin
+    window = view(xs, lo:hi)
+    y = plate(window, rlo:rhi) do value, offset
+        value + offset
+    end
+    return y
+end
+
 function check(native, source, name, cases)
     for vectors in (:array, :float64array)
         for (args, outcome) in zip(cases, ReactiveKernels.js_run(source, name, cases; vectors))
@@ -230,6 +246,41 @@ end
             @test all(==(first(bodies)), bodies)
             @test count("for (let ", first(bodies)) >= 3
         end
+    end
+
+    @testset "plates read vector views and broadcast singleton ranges" begin
+        native = prepare(plate_view; have = (:xs, :lo, :hi, :offsets), want = :y)
+        types = (; xs = V, lo = Int64, hi = Int64, offsets = V)
+        source = ReactiveKernels.js_source(native; types, name = :window)
+        cases = [(Float64[], 1, 0, Float64[]), (Float64[], 1, 0, [10.0]),
+            ([1.0, 2.0, 3.0], 2, 3, [10.0]), ([1.0, 2.0, 3.0], 2, 2, [10.0, 20.0, 30.0]),
+            (collect(1.0:23.0), 2, 23, ones(22))]
+        node && check(native, source, :window, cases)
+        ranged = prepare(plate_view_range; have = (:xs, :lo, :hi, :rlo, :rhi), want = :y)
+        rangesource = ReactiveKernels.js_source(ranged;
+            types = (; xs = V, lo = Int64, hi = Int64, rlo = Int64, rhi = Int64), name = :ranges)
+        node && check(ranged, rangesource, :ranges,
+            [(Float64[], 1, 0, 1, 0), ([1.0, 2.0, 3.0], 1, 3, 9, 9),
+             ([1.0, 2.0, 3.0], 2, 2, 1, 23)])
+        if node
+            bad = [([1.0, 2.0, 3.0], 0, 2, [10.0]),
+                ([1.0, 2.0, 3.0], 2, 4, [10.0]),
+                ([1.0, 2.0, 3.0], 2, 3, [10.0, 20.0, 30.0])]
+            errors = [BoundsError, BoundsError, DimensionMismatch]
+            for (args, error) in zip(bad, errors)
+                @test_throws error native(args...)
+            end
+            for vectors in (:array, :float64array)
+                @test [o.error for o in ReactiveKernels.js_run(source, :window, bad; vectors)] == string.(nameof.(errors))
+            end
+        end
+        sources = [ReactiveKernels.js_source(
+            prepare(plate_view; have = (:xs, :lo, :hi, :offsets), want = :y, bound = (; xs)),
+            types = (; lo = Int64, hi = Int64, offsets = V), name = :window)
+            for xs in (Float64[], [1.0, 2.0, 3.0], collect(1.0:23.0))]
+        bodies = [replace(s, r"(?m)^const _rk_bound_.*\n\n" => "") for s in sources]
+        @test all(==(first(bodies)), bodies)
+        @test count("for (let ", first(bodies)) >= 1
     end
 
     if node

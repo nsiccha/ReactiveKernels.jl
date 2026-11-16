@@ -650,8 +650,11 @@ _js_number_tuple(S, T) = T <: _JsNumber && _js_uniform_tuple(S, T)
 _js_plate_element(T) = _js_runtime_type(T) ||
     (T isa DataType && isconcretetype(T) && T <: Union{Tuple,NamedTuple} &&
      all(_js_plate_element, fieldtypes(T)))
-_js_plate_vector(v) = _js_isvector(v) ||
+_js_vector_view(v) = v isa _JsStruct && v.T === view
+_js_plate_vector(v) = _js_isvector(v) || _js_vector_view(v) ||
     (_js_type(v) <: Vector && _js_plate_element(eltype(_js_type(v))))
+_js_plate_length(v) = _js_isrange(v) ? _js_range_length(v) :
+    _js_vector_view(v) ? _js_range_length(v.fields[2]) : v.code * ".length"
 
 # A range is read through its first element, last element and length. A range
 # known while translating (`for _ in 1:60` in a helper) is read as literals; a
@@ -2700,8 +2703,7 @@ function _js_plate!(fn::_JsFn, op::_AuthoredPlateOp{K,A}, inputs, hint) where {K
     kir = _js_ir(fn, only(Base.code_lowered(_js_noop, Tuple{})), 0)
     args = Any[!mapped[i] ? inputs[i] : _js_isrange(inputs[i]) ? _js_range!(kir, inputs[i], "x") :
                _js_simple!(kir, inputs[i], "x") for i in eachindex(inputs)]
-    lengths = unique([_js_isrange(a) ? _js_range_length(a) : a.code * ".length"
-                      for (i, a) in enumerate(args) if mapped[i]])
+    lengths = unique([_js_plate_length(a) for (i, a) in enumerate(args) if mapped[i]])
     single = length(lengths) == 1
     n = _js_local!(fn, "n")
     _js_line!(fn, "const " * n * " = " * (single ? lengths[1] :
@@ -2716,8 +2718,17 @@ function _js_plate!(fn::_JsFn, op::_AuthoredPlateOp{K,A}, inputs, hint) where {K
         cell[canon_id(body.graph, v.id)] = if !mapped[k]
             T = _js_type(a)
             a isa _JsVal && T <: Base.RefValue && a.static ? _js_static(a.value[]) : a
-        elseif _js_isrange(a)
-            _js_rt("(" * _js_range_start(a) * " + " * i * ")", Int64; prec = _JS_ATOM)
+        elseif _js_isrange(a) || _js_vector_view(a)
+            index = single ? i : "(" * _js_plate_length(a) * " === 1 ? 0 : " * i * ")"
+            if _js_isrange(a)
+                _js_rt("(" * _js_range_start(a) * " + " * index * ")", Int64; prec = _JS_ATOM)
+            else
+                # The view's creation checked its window. Read its parent at
+                # the cell position, retaining aliases without copying data.
+                x, r = a.fields
+                _js_rt(x.code * "[" * _js_range_start(r) * " - 1 + " * index * "]",
+                    eltype(_js_type(a)))
+            end
         else
             name = _js_local!(fn, v.name)
             el = single ? a.code * "[" * i * "]" : _js_use!(mod, :_rk_bcat) * "(" * a.code * ", " * i * ")"
