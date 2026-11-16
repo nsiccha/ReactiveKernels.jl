@@ -70,6 +70,17 @@ end
     return result
 end
 
+"""
+    lower_truncated_lognormal(location, scale, lower)
+
+Mean and variance of `lognormal(location, scale)` restricted to `x ≥ lower`:
+the moments of
+`Distributions.truncated(Distributions.LogNormal(location, scale); lower)`,
+computed stably far into the tail. A `lower` that is not positive leaves the
+law untruncated.
+
+Endpoints: `mean()`, `var()`.
+"""
 @kernel lower_truncated_lognormal(location::Float64, scale::Float64, lower::Float64) = begin
     checked_scale::Float64 = scale >= 0 ? scale : throw(DomainError(scale, "scale must be nonnegative"))
     mean()::Float64 = if !(lower > 0)
@@ -93,6 +104,17 @@ end
     end
 end
 
+"""
+    upper_truncated_lognormal(location, scale, upper)
+
+Mean and variance of `lognormal(location, scale)` restricted to `x ≤ upper`:
+the moments of
+`Distributions.truncated(Distributions.LogNormal(location, scale); upper)`,
+computed stably far into the tail. An infinite `upper` leaves the law
+untruncated; one that is not positive gives `NaN`.
+
+Endpoints: `mean()`, `var()`.
+"""
 @kernel upper_truncated_lognormal(location::Float64, scale::Float64, upper::Float64) = begin
     checked_scale::Float64 = scale >= 0 ? scale : throw(DomainError(scale, "scale must be nonnegative"))
     mean()::Float64 = if !(upper > 0)

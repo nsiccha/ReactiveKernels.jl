@@ -28,6 +28,17 @@ end
 
 # Shared parameter arithmetic is deliberately in the object graph. Numerical
 # tail helpers receive its normalization instead of recomputing it per value.
+"""
+    gumbel(location, scale)
+
+Gumbel (maximum extreme value) law with location `location` and scale
+`scale > 0`: the same law as `Distributions.Gumbel(location, scale)`.
+
+Named bindings: `log_scale`, the logarithm of `scale`, in place of `scale`.
+
+Endpoints: `logpdf(x)`, `cdf(x)`, `ccdf(x)`, `logcdf(x)`, `logccdf(x)`,
+`quantile(p)`, and `standardized(x)`, which is `(x - location) / scale`.
+"""
 @kernel gumbel(location::Float64, scale::Float64) = begin
     log_scale::Float64 = log(scale)
     standardized(x::Float64)::Float64 = (x - location) / scale
@@ -48,6 +59,17 @@ end
     quantile(p::Float64)::Float64 = location - scale * log(-log(p))
 end
 
+"""
+    rayleigh(scale)
+
+Rayleigh law of `x ≥ 0` with scale `scale > 0`: the same law as
+`Distributions.Rayleigh(scale)`.
+
+Named bindings: `log_scale`, the logarithm of `scale`, in place of `scale`.
+
+Endpoints: `logpdf(x)`, `cdf(x)`, `ccdf(x)`, `logcdf(x)`, `logccdf(x)`,
+`quantile(p)`.
+"""
 @kernel rayleigh(scale::Float64) = begin
     log_scale::Float64 = log(scale)
     logpdf(x::Float64)::Float64 =
@@ -59,6 +81,15 @@ end
     quantile(p::Float64)::Float64 = scale * sqrt(-2log1p(-p))
 end
 
+"""
+    chi_squared(nu)
+
+Chi-squared law with `nu > 0` degrees of freedom, the gamma law with shape
+`nu / 2` and rate `1 / 2`: the same law as `Distributions.Chisq(nu)`.
+
+Endpoints: `logpdf(x)`, `cdf(x)`, `ccdf(x)`, `logcdf(x)`, `logccdf(x)`,
+`quantile(p)`.
+"""
 @kernel chi_squared(nu::Float64) = begin
     shape::Float64 = nu / 2
     rate::Float64 = 0.5
@@ -70,6 +101,15 @@ end
     quantile(p::Float64)::Float64 = gamma(shape, rate).quantile(p)
 end
 
+"""
+    chi(nu)
+
+Chi law with `nu > 0` degrees of freedom, the law of the square root of a
+chi-squared variable: the same law as `Distributions.Chi(nu)`.
+
+Endpoints: `logpdf(x)`, `cdf(x)`, `ccdf(x)`, `logcdf(x)`, `logccdf(x)`,
+`quantile(p)`.
+"""
 @kernel chi(nu::Float64) = begin
     shape::Float64 = nu / 2
     log_gamma_shape::Float64 = loggamma(shape)
@@ -87,6 +127,14 @@ end
     quantile(p::Float64)::Float64 = sqrt(chi_squared(nu).quantile(p))
 end
 
+"""
+    inverse_gaussian(mu, lambda)
+
+Inverse Gaussian law of `x > 0` with mean `mu > 0` and shape `lambda > 0`:
+the same law as `Distributions.InverseGaussian(mu, lambda)`.
+
+Endpoints: `logpdf(x)`, `cdf(x)`, `ccdf(x)`, `logcdf(x)`, `logccdf(x)`.
+"""
 @kernel inverse_gaussian(mu::Float64, lambda::Float64) = begin
     log_normalizer::Float64 = 0.5 * (log(lambda) - log(2pi))
     logpdf(x::Float64)::Float64 =
@@ -142,6 +190,15 @@ end
     ccdf(x::Float64)::Float64 = exp(logccdf(x))
 end
 
+"""
+    beta_prime(alpha, beta)
+
+Beta prime law of `x > 0` with shapes `alpha > 0` and `beta > 0`, the law of
+`y / (1 - y)` for `y` beta-distributed with those shapes: the same law as
+`Distributions.BetaPrime(alpha, beta)`.
+
+Endpoints: `logpdf(x)`, `cdf(x)`, `ccdf(x)`, `logcdf(x)`, `logccdf(x)`.
+"""
 @kernel beta_prime(alpha::Float64, beta::Float64) = begin
     log_scale::Float64 = 0.0
     logpdf(x::Float64)::Float64 = _scaled_beta_prime(alpha, beta, log_scale).logpdf(x)
@@ -151,6 +208,14 @@ end
     ccdf(x::Float64)::Float64 = exp(logccdf(x))
 end
 
+"""
+    f_dist(nu1, nu2)
+
+F law with numerator degrees of freedom `nu1 > 0` and denominator degrees of
+freedom `nu2 > 0`: the same law as `Distributions.FDist(nu1, nu2)`.
+
+Endpoints: `logpdf(x)`, `cdf(x)`, `ccdf(x)`, `logcdf(x)`, `logccdf(x)`.
+"""
 @kernel f_dist(nu1::Float64, nu2::Float64) = begin
     alpha::Float64 = nu1 / 2
     beta::Float64 = nu2 / 2
