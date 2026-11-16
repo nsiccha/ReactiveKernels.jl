@@ -16,6 +16,32 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.268
+
+- `js_source` emits prepared kernels, bound data included. The new
+  `js_source(kernel; types, name)` takes a kernel as `prepare` returns it
+  (a flat, tuple or shaped WANT), such as one prepared with
+  `prepare(spec; have, want, bound)` or an RKPPL query from `prepare_query`:
+  its module's function takes the kernel's remaining HAVE values and returns
+  what the kernel returns. `types` defaults to the kernel's exemplar types.
+  A recipe of another kernel may call such a kernel too
+  (`probability = QUERY(unconstrained)`); the call becomes a module-level
+  function translated from the kernel's plan, once per kernel and argument
+  types, as `jax_source` translates one. In both, bound numbers are literals
+  and bound vectors of `Float64`, `Int64` or `Bool` are frozen module
+  constants, emitted once. Before, `js_source(kernel)` had no method, and a
+  recipe calling a prepared kernel failed (up to 0.1.263 with "the
+  expression `$(Expr(:static_parameter, 4))` as an operand has no
+  JavaScript translation").
+- A kernel's input checks (`input_check!`, such as ReactiveKernelsPPL's
+  packed-length check of `unconstrained`) run at the entry of a `js_source`
+  module's function, raising the native exception. Before, every module
+  skipped them: a packed point of another length returned values where the
+  native kernel raises `ContractValidationError`.
+- `js_source` translates `vcat` of vectors and numbers of the result's
+  element type (RKPPL's `vcat([e])` coefficients) and `*` of strings (the
+  message a check builds). Native execution is unchanged.
+
 ## 0.1.267
 
 - `ReactiveKernels.js_source` translates `rk_ode_rk45_tol`. The emitted module
