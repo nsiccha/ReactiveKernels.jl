@@ -166,6 +166,12 @@ struct _JaxAggregate
     T::Type
     fields::Vector{_PyVal}
 end
+# Field names are structural values, even after a Python local or helper
+# renames their expression. This metadata never stores numerical values.
+struct _JaxSymbols
+    value::Union{Symbol,Tuple{Vararg{Symbol}}}
+end
+_jax_symbols(v::_PyVal) = v.origin isa _JaxSymbols ? v.origin : nothing
 # A record's field metadata is structural, unlike the lengths carried beside
 # its numerical leaves. An array of records also has its own mapped extent:
 # padding on that axis must not be confused with padding inside a field.
@@ -669,7 +675,7 @@ _jax_literal(x::Irrational{:ℯ}) = _PyVal("jnp.e", Float64, true)
 _jax_literal(x::Irrational) = _jax_literal(Float64(x))
 _jax_literal(::Nothing) = _PyVal("None", Nothing, true)
 _jax_literal(x::AbstractString) = _PyVal(repr(String(x)), String, true)
-_jax_literal(x::Symbol) = _PyVal(repr(String(x)), Symbol, true)
+_jax_literal(x::Symbol) = _PyVal(repr(String(x)), Symbol, true, "", "", 0, _JaxSymbols(x))
 
 function _jax_literal(x::AbstractArray{<:Real})
     T = eltype(x)
@@ -695,6 +701,8 @@ function _jax_literal(x::Tuple)
     _PyVal("(" * join((p.code for p in parts), ", ") * (length(x) == 1 ? ",)" : ")"), typeof(x),
            all(p -> p.static, parts))
 end
+_jax_literal(x::Tuple{Vararg{Symbol}}) =
+    _PyVal(_jax_tuple_code(_jax_literal.(x)), typeof(x), true, "", "", 0, _JaxSymbols(x))
 _jax_literal(x::NamedTuple) = (t = _jax_literal(Tuple(x)); _PyVal(t.code, typeof(x), t.static))
 _jax_literal(x) = _jax_error("no JAX literal for a value of type `", typeof(x), "`")
 
@@ -1083,12 +1091,15 @@ _jax_tuple_code(values) = "(" * join((v.code for v in values), ", ") *
 
 function _jax_record_value(values, T)
     values = _PyVal[values...]
+    T <: Tuple{Vararg{Symbol}} && all(v -> _jax_symbols(v) !== nothing, values) &&
+        return _jax_literal(Tuple(v.origin.value for v in values))
     _PyVal(_jax_tuple_code(values), T, all(v -> v.static, values),
            _jax_tuple_extent(values), _jax_tuple_limit(values), _jax_tuple_fields(values),
            _JaxRecordLayout(values, "", 0), Tuple(v.extent for v in values))
 end
 
 function _jax_record_field(x::_PyVal, k::Integer)
+    _jax_symbols(x) === nothing || return _jax_literal(x.origin.value[k])
     T = fieldtype(x.T, k)
     code = _py_atom(x.code) * "[" * string(k - 1) * "]"
     extent = _jax_field_extent(x, k, T)
@@ -6069,7 +6080,8 @@ function _jax_named_function!(ctx, f, names, inputs, source_module, emit, origin
 end
 
 _jax_contextual_value(v::_PyVal) =
-    (v.origin !== nothing && !_jax_row_metadata(v)) || _jax_contextual_type(v.T)
+    (v.origin !== nothing && _jax_symbols(v) === nothing && !_jax_row_metadata(v)) ||
+    _jax_contextual_type(v.T)
 _jax_contextual_type(T) = false
 _jax_contextual_type(T::_JaxAggregate) = any(_jax_contextual_value, T.fields)
 _jax_contextual_type(T::_JaxCallable) = T.f isa _JaxClosure && any(_jax_contextual_value, T.f.captures)
@@ -6078,7 +6090,7 @@ _jax_contextual_type(T::_JaxCallable) = T.f isa _JaxClosure && any(_jax_contextu
 # boundary too. Return their numerical leaves explicitly, rather than losing
 # the proof or retaining a name local to the helper's body.
 _jax_plain_function_result(v::_PyVal) = isempty(v.extent) && isempty(v.limit) &&
-    (v.origin === nothing || _jax_row_metadata(v))
+    (v.origin === nothing || _jax_symbols(v) !== nothing || _jax_row_metadata(v))
 function _jax_function_result(ctx, v)
     _jax_plain_function_result(v) && return v.code, v, nothing
     parts = String[]
@@ -6553,7 +6565,23 @@ end
 function _jax_static_symbol(ctx::_JaxContext, v::_PyVal)
     v.T === Symbol || _jax_error("`", v.code, "` is not a symbol known while emitting",
                                  _jax_where(ctx))
-    Symbol(startswith(v.code, ':') ? v.code[2:end] : Meta.parse(v.code)::String)
+    _jax_symbols(v) === nothing || return v.origin.value::Symbol
+    startswith(v.code, ':') && return Symbol(v.code[2:end])
+    parsed = Meta.parse(v.code; raise = false)
+    parsed isa String && return Symbol(parsed)
+    _jax_error("`", v.code, "` is not a symbol known while emitting", _jax_where(ctx))
+end
+# NamedTuple keys depend only on its field schema, never on its values or
+# the lengths of array fields. Other collections retain their normal path.
+function _jax_call_positional(ctx::_JaxContext, ::typeof(keys), args::Vector{_PyVal})
+    if length(args) == 1
+        T = only(args).T
+        if T isa Type && T <: NamedTuple
+            names = Base.unwrap_unionall(T).parameters[1]
+            names isa Tuple && return _jax_literal(names)
+        end
+    end
+    _jax_function_call(ctx, keys, args)
 end
 # A module's global, read while emitting as lowered code reads it: functions,
 # types and modules pass as themselves, data as values (`_jax_global_value`).
@@ -6662,6 +6690,7 @@ end
 # or a Boolean/integer literal.
 function _jax_static_parameter(ctx::_JaxContext, a::_PyVal)
     a.T isa _JaxCallable && return a.T.f
+    _jax_symbols(a) === nothing || return a.origin.value
     a.T isa Type && a.T <: Function && Base.issingletontype(a.T) && return a.T.instance
     a.T === Symbol && return _jax_static_symbol(ctx, a)
     a.T === Bool && a.static && a.code in ("True", "False") && return a.code == "True"
@@ -7819,11 +7848,12 @@ function _jax_module_source(plans, types, constants, docstring::String; data = n
     # either, with the reason, by (plate, cell recipe).
     cells = Dict{Int,Set{Int}}()
     cell_reasons = Dict{Tuple{Int,Int},JAXEmissionError}()
+    host_constants = Set{Int}()
     while true
         try
             return _jax_module_text(plans, types, constants, docstring,
                                     (data, excluded, defs, untranslated, keep, reasons,
-                                     promoted, cells, cell_reasons, definitions_module);
+                                     promoted, cells, cell_reasons, definitions_module, host_constants);
                                     function_docs, source_regions, rejecting)
         catch e
             if e isa _HostUnsupportedDefinition && !haskey(untranslated, e.name)
@@ -7833,6 +7863,9 @@ function _jax_module_source(plans, types, constants, docstring::String; data = n
                 reasons[e.recipe] = e.error
             elseif e isa _JaxPromote && !(e.recipe in promoted)
                 push!(promoted, e.recipe)
+            elseif e isa _ConstantHostNeeded
+                e.recipe in host_constants && throw(e.error)
+                push!(host_constants, e.recipe)
             elseif e isa _KeepUnavailable
                 more = setdiff(_jax_upstream_recipes(plans, e.name, excluded, defined), promoted)
                 if isempty(more)
@@ -7928,14 +7961,14 @@ function _jax_module_text(plans, types, constants, docstring::String, prepare;
         _jax_functions!(mod, bodies, functions, plans, types; function_docs, rejecting)
     else
         data, excluded, defs, untranslated, keep, reasons, promoted, cells, cell_reasons,
-            mod.definitions_module = prepare
+            mod.definitions_module, host_constants = prepare
         merge!(mod.host_reasons, reasons)
         merge!(mod.cell_reasons, cell_reasons)
         mod.host_graph = first(plans).second[1].graph
         defs === nothing || union!(mod.host_definitions, (first(d) for d in defs))
         meta = _jax_prepared_functions!(mod, bodies, functions, plans, types, data, excluded,
                                         defs, untranslated; keep, function_docs, promoted, cells,
-                                        rejecting)
+                                        rejecting, host_constants)
         constants = merge(constants, meta)
     end
     constant_lines = String[]
@@ -7990,7 +8023,7 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
                                   excluded, defs = nothing,
                                   untranslated = Dict{Symbol,JAXEmissionError}(); keep = (),
                                   function_docs = NamedTuple(), promoted = Set{Int}(),
-                                  cells = Dict{Int,Set{Int}}(), rejecting = ())
+                                  cells = Dict{Int,Set{Int}}(), rejecting = (), host_constants = Set{Int}())
     ports = data isa NamedTuple ? Set(keys(data)) : Set(data)
     # A promoted recipe's values (`_JaxPromote`) are data inputs of every
     # function, which its definitions give: the recipe is not run.
@@ -8011,7 +8044,7 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
                  for (fname, (p, w)) in plans]
         ports = union(ports, (v.name for v in values))
     end
-    split = _jax_prepare_split(plans, ports, excluded; keep, cells)
+    split = _jax_prepare_split(plans, ports, excluded; keep, cells, host_constants)
     p1 = first(plans).second[1]
     # Raw data enters host code, so its types need not be concrete (a column
     # with missing values); the functions' inputs must be.
@@ -8126,6 +8159,8 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
                         keyword_from = length(remaining_names))
     catch e
         e isa JAXEmissionError || rethrow()
+        failure = _jax_constant_failure(mod, plans, excluded, e)
+        failure === nothing || throw(failure)
         # A plate cell's data-only recipe the functions cannot compute:
         # `prepare_data` computes it for every cell instead.
         for (_, (rp, _)) in split.residuals
