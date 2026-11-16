@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.281
+## 0.1.282
 
 - `js_source` translates nested vectors of numbers and Booleans, including
   ragged and empty groups: literals, inputs, bound data, indexing, iteration,
@@ -25,6 +25,18 @@ are recorded in the git history only.
   Prepared kernels can consume those vectors inside another kernel.
   `js_run` preserves the nested
   output types and applies its typed-array mode to numeric leaves.
+
+## 0.1.281
+
+- `js_source` translates nested tuple literals and tuple `length`, including
+  calls in validation helpers. It also translates `fill!` of numerical and
+  Bool vectors with supported element conversions, preserving aliases and
+  converting the fill value once even when the destination is empty. The
+  destination length remains a runtime value. Reads of reassigned locals
+  retain their values, including the temporary reused by keyword sorters.
+  These operations let BRM's
+  type-stable fixed-domain HSGP basis emit with scalar or per-axis mode counts
+  and retain its input checks.
 
 ## 0.1.280
 
