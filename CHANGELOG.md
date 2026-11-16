@@ -16,6 +16,27 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.276
+
+- `js_source` translates arithmetic on `Bool`s as Julia does it, with native
+  values and types: a `Bool` operand of `+`, `-`, `*`, `/`, `^`, `min`/`max`,
+  a comparison or another function of Julia's own, next to `Float64`s,
+  `Int64`s or other `Bool`s, runs Julia's method for those operands,
+  translated from its typed code. `(a .> x) .+ (b .> x)` gives `Int`s,
+  `w .* (v .> x)` gives `Float64`s, `true * true` stays a `Bool`, and the
+  zeros keep their signs: `false * -Inf` is `-0.0` and `false + -0.0` is
+  `-0.0`, as natively. `Int(b)`, `Float64(b)`, `float(b)`, `convert`,
+  `promote`, `zero`, `one` and `oneunit` take a `Bool` (`0` or `1`). `sum` of a
+  `Bool` vector counts its `true`s, and `+`, `-`, `*` and `/` of `Bool`
+  vectors translate like those of number vectors. Before, each was refused
+  with "`+` with argument types (Bool, Bool) has no JavaScript translation".
+- `js_source` reads the `BitVector` of a comparison broadcast (`x .> c`) like
+  a `Vector{Bool}`: `sum(x .> c)`, `count(x .> c)`, `any`/`all` of it and
+  `w .* (x .> c)` translate, with Julia's types (`Int` from `sum`). A
+  `BitMatrix` is still refused.
+- `float` of an `Int` is a `Float64` while translating, as natively. It used
+  to keep the `Int` type, so a later `^` or `div` could take the integer path.
+
 ## 0.1.275
 
 - `js_source` emits a `const` global array the code reads: a vector, or a

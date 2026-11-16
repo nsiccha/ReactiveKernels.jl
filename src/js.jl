@@ -612,7 +612,9 @@ _js_isnumber(v) = _js_type(v) <: _JsNumber
 _js_isfloat(v) = _js_type(v) === Float64
 _js_isint(v) = _js_type(v) === Int64
 _js_isbool(v) = _js_type(v) === Bool
-_js_isvector(v) = _js_type(v) <: Vector && eltype(_js_type(v)) <: Union{_JsNumber,Bool}
+# A comparison broadcast (`x .> c`) is a `BitVector` natively: an array of
+# Booleans here, read like a `Vector{Bool}`.
+_js_isvector(v) = (_js_type(v) <: Vector && eltype(_js_type(v)) <: Union{_JsNumber,Bool}) || _js_type(v) === BitVector
 _js_isrange(v) = _js_type(v) in (UnitRange{Int64}, Base.OneTo{Int64})
 # A stepped range (`n:-1:1`): iterated, measured and read at its ends only.
 _js_isstep(v) = _js_type(v) === StepRange{Int64,Int64}
@@ -1438,6 +1440,7 @@ function _js_call!(ir::_JsIR, f, args::Vector{Any}, T)
         return v
     end
     !(f isa Core.Builtin) && any(_js_isirrational, args) && return _js_irrational_call!(ir, f, args)
+    !(f isa Core.Builtin) && _js_bool_operands(args) && return _js_bool_call!(ir, f, args)
     if f === Core.kwcall && length(args) >= 2 && args[2] isa _JsVal && args[2].static
         types = join((_js_type(a) isa Type ? _js_type(a) : typeof(_js_type(a)) for a in args[3:end]), ", ")
         _js_error(mod, "`", args[2].value, "` with argument types (", types, ") and keywords `",
@@ -1461,6 +1464,27 @@ function _js_irrational_call!(ir::_JsIR, f, args::Vector{Any})
     mod = ir.fn.mod
     _js_flush!(ir)
     push!(mod.stack, "`" * string(f) * "(" * join(("::" * string(_js_argtype(a)) for a in args), ", ") * ")`")
+    v, _ = _js_inline!(ir.fn, f, args, "value")
+    pop!(mod.stack)
+    v
+end
+
+# A `Bool` is a number in Julia: `true + true == 2`, `0.2 * true == 0.2`. A
+# function of Julia's own with a `Bool` among numeric operands, where the table
+# has no entry, is Julia's method for these operands, translated from its typed
+# code. Those methods convert the `Bool` to `0` or `1` (`Int(x) + Int(y)`) or
+# choose between the other operand and its zero (`false * y` is `0.0` even for
+# an infinite or `NaN` `y`, and `false + -0.0` stays `-0.0`), as natively.
+_js_bool_operands(args) = any(_js_isbool, args) && all(a -> _js_isnumber(a) || _js_isbool(a), args)
+
+function _js_bool_call!(ir::_JsIR, f, args::Vector{Any})
+    mod = ir.fn.mod
+    where = "`" * string(f) * "(" * join(("::" * string(_js_argtype(a)) for a in args), ", ") * ")`"
+    # a method that calls itself for the same operands has no translation
+    where in mod.stack && _js_error(mod, "`", f, "` with argument types (",
+                                    join((_js_argtype(a) for a in args), ", "), ") has no JavaScript translation")
+    _js_flush!(ir)
+    push!(mod.stack, where)
     v, _ = _js_inline!(ir.fn, f, args, "value")
     pop!(mod.stack)
     v
@@ -1823,16 +1847,17 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
             code *= " " * op * " " * _js_code(mod, a, prec + 1)
         end
         return _js_rt(code, T; prec)
-    elseif f in (+, -) && length(args) == 2 && all(_js_isvector, args) && all(a -> eltype(_js_type(a)) <: _JsNumber, args)
+    elseif f in (+, -) && length(args) == 2 && all(_js_isvector, args)
         x, y = _js_simple!(ir, args[1], "x"), _js_simple!(ir, args[2], "y")
         _js_flush!(ir)
         _js_line!(ir.fn, _js_use!(mod, :_rk_samelen) * "(" * x.code * ", " * y.code * ");")
         return _js_materialize!(ir, _JsBroadcast(f, Any[x, y], Nothing), T)
-    elseif f === (-) && length(args) == 1 && _js_isvector(args[1]) && eltype(_js_type(args[1])) <: _JsNumber
+    elseif f === (-) && length(args) == 1 && _js_isvector(args[1])
         return _js_materialize!(ir, _JsBroadcast(f, Any[args[1]], Nothing), T)
-    elseif f === (*) && length(args) == 2 && count(_js_isvector, args) == 1 && count(_js_isnumber, args) == 1
+    elseif f === (*) && length(args) == 2 && count(_js_isvector, args) == 1 &&
+           count(a -> _js_isnumber(a) || _js_isbool(a), args) == 1
         return _js_materialize!(ir, _JsBroadcast(f, Any[args...], Nothing), T)
-    elseif f === (/) && length(args) == 2 && _js_isvector(args[1]) && _js_isnumber(args[2])
+    elseif f === (/) && length(args) == 2 && _js_isvector(args[1]) && (_js_isnumber(args[2]) || _js_isbool(args[2]))
         return _js_materialize!(ir, _JsBroadcast(f, Any[args...], Nothing), T)
     elseif f === (-) && nums && length(args) == 2
         return _js_infix(ir, "-", _JS_ADD, args[1], args[2], T)
@@ -1885,6 +1910,13 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
         return _js_fcall(ir, _js_use!(mod, :_rk_div), args, T)
     elseif f in (rem, %) && length(args) == 2 && all(_js_isint, args)
         return _js_fcall(ir, _js_use!(mod, :_rk_rem), args, T)
+    elseif f === rem && length(args) == 2 && args[2] isa _JsVal && args[2].static && args[2].value === Int64 &&
+           (_js_isint(args[1]) || _js_isbool(args[1]))
+        # `x % Int64`, as Julia's integer arithmetic converts its operands
+        return _js_convert(ir, Int64, args[1])
+    elseif f === Base.not_sametype && length(args) == 2 && _js_type(args[1]) !== _js_type(args[2])
+        # promotion changed an operand's type, so there is no promotion error
+        return _js_static(nothing)
     elseif f in (rem, %) && length(args) == 2 && all(_js_isfloat, args)
         return _js_infix(ir, "%", _JS_MUL, args[1], args[2], T)
     elseif f === Base.mod && length(args) == 2 && all(_js_isint, args)
@@ -1901,14 +1933,16 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
                       _js_code(mod, hi, _JS_COND) * " : " * _js_code(mod, x, _JS_REL + 1) * " < " *
                       _js_code(mod, lo, _JS_REL + 1) * " ? " * _js_code(mod, lo, _JS_COND) * " : " *
                       _js_code(mod, x, _JS_COND), T; prec = _JS_COND)
-    elseif f in (float, identity, real) && length(args) == 1 && _js_isnumber(args[1])
+    elseif f === float && length(args) == 1 && (_js_isnumber(args[1]) || _js_isbool(args[1]))
+        return _js_convert(ir, Float64, args[1])
+    elseif f in (identity, real) && length(args) == 1 && (_js_isnumber(args[1]) || _js_isbool(args[1]))
         return args[1]
     elseif f === isinteger && length(args) == 1 && _js_isnumber(args[1])
         _js_isint(args[1]) && return _js_static(true)
         return _js_fcall(ir, "Number.isInteger", args, Bool)
     elseif f === copysign && length(args) == 2 && all(_js_isfloat, args)
         return _js_fcall(ir, _js_use!(mod, :_rk_copysign), args, T)
-    elseif f === promote && !isempty(args) && all(a -> _js_isnumber(a) || _js_isirrational(a), args)
+    elseif f === promote && !isempty(args) && all(a -> _js_isnumber(a) || _js_isbool(a) || _js_isirrational(a), args)
         # an irrational constant becomes the number it rounds to, as `convert` makes it
         PT = promote_type(map(_js_type, args)...)
         return _JsTuple(Any[_js_isirrational(a) ? _js_static(convert(PT, a.value)) : _js_convert(ir, PT, a)
@@ -1974,10 +2008,10 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
         # Destructuring `(a, b) = t`: the element and the next position.
         item = _js_function_call(ir, Core.getfield, Any[args[1], args[2]], fieldtype(T, 1))
         return _JsTuple(Any[item, _js_static(args[2].value + 1)], T)
-    elseif f in (zero, one) && length(args) == 1 && _js_isnumber(args[1])
+    elseif f in (zero, one, oneunit) && length(args) == 1 && (_js_isnumber(args[1]) || _js_isbool(args[1]))
         return _js_static(f(_js_type(args[1])))
     elseif f === convert && length(args) == 2 && args[1] isa _JsVal && args[1].static &&
-           _js_isnumber(args[2])
+           (_js_isnumber(args[2]) || _js_isbool(args[2]))
         return _js_convert(ir, args[1].value, args[2])
     elseif f === length && length(args) == 1 && _js_isvector(args[1])
         return _js_rt(_js_code(mod, args[1], _JS_ATOM) * ".length", Int64)
@@ -2019,6 +2053,9 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
         return _js_fcall(ir, _js_use!(mod, :_rk_set), args, T; pure = false)
     elseif f === sum && length(args) == 1 && _js_isvector(args[1]) && eltype(_js_type(args[1])) <: _JsNumber
         return _js_fcall(ir, _js_use!(mod, :_rk_sum), args, T)
+    elseif f === sum && length(args) == 1 && _js_isvector(args[1]) && eltype(_js_type(args[1])) === Bool
+        # a sum of Booleans is a count
+        return _js_rt(_js_use!(mod, :_rk_sum) * "(" * _js_runtime(mod, args[1]).code * ") + 0", T; prec = _JS_ADD)
     elseif f in (maximum, minimum) && length(args) == 1 && _js_isvector(args[1])
         # The error Julia throws for an empty collection, as this Julia throws it.
         empty = try
@@ -2312,6 +2349,11 @@ end
 function _js_convert(ir, T, v)
     S = _js_type(v)
     S === T && return v
+    if S === Bool && T in (Float64, Int64)
+        # `0` or `1`, as `Int(x)` and `Float64(x)` give it
+        v isa _JsVal && v.static && return _js_static(T(v.value))
+        return _js_rt(_js_code(ir.fn.mod, v, _JS_COND + 1) * " ? 1 : 0", T; prec = _JS_COND)
+    end
     T === Float64 && S <: _JsNumber && return _js_rt(v.code, Float64; prec = v.prec, ref = v.ref, pure = v.pure)
     T === Int64 && S === Float64 && return _js_fcall(ir, _js_use!(ir.fn.mod, :_rk_int), Any[v], Int64)
     _js_error(ir.fn.mod, "converting a `", S, "` to `", T, "` has no JavaScript translation")
@@ -2324,7 +2366,7 @@ function _js_function_call(ir::_JsIR, f::Type, args, T)
         return _js_rt("\"\" + " * join((_js_code(ir.fn.mod, a, _JS_ADD + 1) for a in args), " + "), LazyString;
                       prec = _JS_ADD)
     end
-    if f in (Float64, Int64) && length(args) == 1 && _js_isnumber(args[1])
+    if f in (Float64, Int64) && length(args) == 1 && (_js_isnumber(args[1]) || _js_isbool(args[1]))
         return _js_convert(ir, f, args[1])
     elseif f in (Float64, Float32) && length(args) in (1, 2) && _js_isirrational(args[1]) &&
            (length(args) == 1 || (args[2] isa _JsVal && args[2].static && args[2].value isa RoundingMode))

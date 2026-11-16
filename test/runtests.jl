@@ -182,6 +182,7 @@ const _MATRIX_CORE_TESTS = (
     "test_js_iterators.jl",
     "test_js_functions.jl",
     "test_js_tuples_matrices.jl",
+    "test_js_bool_arithmetic.jl",
     "test_js_prepared.jl",
     "test_shaped_want.jl",
     "test_rk_repository_module.jl",
