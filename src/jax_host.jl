@@ -718,6 +718,10 @@ function _host_iterable_value(ctx::_JaxContext, x::_PyVal)
     _jax_python_value(ctx, x)
     T = x.T
     T isa Type && T <: Base.Iterators.Zip && return x.code, eltype(T)
+    if T isa Type && T <: Iterators.ProductIterator
+        helper = _jax_helper!(ctx, "_rk_product_rows", _HOST_PRODUCT_ROWS)
+        return helper * "(" * x.code * ")", eltype(T)
+    end
     T isa Type && T <: AbstractDict && return x.code * ".items()", Tuple{Base.keytype(T),Base.valtype(T)}
     T isa Type && T <: Tuple && return x.code, promote_type(fieldtypes(T)...)
     T isa Type && T <: AbstractArray && ndims(T) > 1 &&
@@ -960,6 +964,43 @@ function _host_collected(code::AbstractString, @nospecialize(E), rank::Int = 1)
     _PyVal("np.asarray(" * code * ", dtype=" * _host_dtype(E) * ")", Array{E,rank}, true)
 end
 
+# Product axes stay runtime sequences. Python's product advances its last
+# axis first; reverse both the axes and each row to retain Julia's order.
+const _HOST_PRODUCT_ROWS = """
+def _rk_product_rows(axes):
+    import itertools
+    return (row[::-1] for row in itertools.product(
+        *(np.ravel(a, order="F") for a in axes[::-1])))
+"""
+
+const _HOST_COLLECT_PRODUCT = """
+def _rk_collect_product(axes):
+    shape = tuple(n for a in axes for n in np.shape(a))
+    result = np.empty(shape, dtype=object, order="F")
+    flat = result.reshape(-1, order="F")
+    for i, row in enumerate(_rk_product_rows(axes)):
+        flat[i] = row
+    return result
+"""
+
+function _jax_function_call(ctx::_JaxContext, ::typeof(Iterators.product), args::Vector{_PyVal})
+    ctx.host === nothing &&
+        _jax_error("`Iterators.product` needs host data preparation", _jax_where(ctx))
+    # NumPy flattening preserves numerical array axes (including ranges).
+    # Structured elements would be flattened into their fields instead.
+    all(a -> _jax_is_array(a.T) && eltype(a.T) <: Number, args) ||
+        _jax_error("`Iterators.product` with axes other than numerical arrays or ranges has no host translation",
+                   _jax_where(ctx))
+    _PyVal(_jax_tuple_code(args), _jax_return_type(Iterators.product, Any[a.T for a in args]), true)
+end
+
+function _host_collect_product(ctx::_JaxContext, x::_PyVal)
+    rows = _jax_helper!(ctx, "_rk_product_rows", _HOST_PRODUCT_ROWS)
+    text = replace(_HOST_COLLECT_PRODUCT, "_rk_product_rows(" => rows * "(")
+    helper = _jax_helper!(ctx, "_rk_collect_product", text)
+    _PyVal(helper * "(" * x.code * ")", _jax_return_type(collect, Any[x.T]), true)
+end
+
 # A comprehension; with `T`, a typed one (`T[f(x) for x in xs]`), whose
 # elements are converted to `T` as Julia's `convert` does.
 function _host_comprehension(ctx::_JaxContext, gen::Expr, T = nothing)
@@ -1190,6 +1231,8 @@ end
 
 function _host_length(ctx::_JaxContext, x::_PyVal)
     T = x.T
+    T isa Type && T <: Iterators.ProductIterator &&
+        return _PyVal("int(np.prod([np.size(a) for a in " * x.code * "], dtype=np.int64))", Int, true)
     T isa Type && T <: Tuple && return _PyVal(string(fieldcount(T)), Int, true)
     T isa Type && T <: AbstractArray && ndims(T) > 1 && !_host_listed(ctx, x.code) &&
         return _PyVal("np.size(" * x.code * ")", Int, true)
@@ -1717,9 +1760,10 @@ end
 # caller passes a value it owns (`_host_mutable_argument!`). The helper's body
 # is translated once, and again with the parameters it had to copy owned.
 function _host_function_call(ctx::_JaxContext, f, names::Vector{Symbol}, body, mod::Module,
-                             args::Vector{_PyVal}, inputs::Vector{_PyVal} = args)
+                             args::Vector{_PyVal}, inputs::Vector{_PyVal} = args;
+                             kw = Pair{Symbol,_PyVal}[])
     types = Any[_jax_argument_type(a) for a in args]
-    key = (:host_traceable, objectid(f), Tuple(a.T for a in args))
+    key = (:host_traceable, objectid(f), Tuple(names), Tuple(a.T for a in inputs))
     frame() = begin
         scope = _JaxScope()
         params, passed = String[], _PyVal[]
@@ -1763,7 +1807,12 @@ function _host_function_call(ctx::_JaxContext, f, names::Vector{Symbol}, body, m
         append!(lines, scope.lines)
         v.T === Union{} || push!(lines, "    return " * v.code)
         push!(ctx.mod.helpers, _host_helper_text(ctx, join(lines, "\n")))
-        inferred = _jax_return_type(f, types)
+        inferred = if isempty(kw)
+            _jax_return_type(f, types)
+        else
+            KT = NamedTuple{Tuple(first.(kw)),Tuple{(_jax_argument_type(a) for (_, a) in kw)...}}
+            _jax_return_type(Core.kwcall, Any[KT, typeof(f), types...])
+        end
         T = inferred isa Type && inferred !== Union{} && isconcretetype(inferred) ? inferred :
             foldl(_host_join, inner.host.returns; init = v.T)
         ctx.mod.helper_names[(:host_traceable_type, name)] = T
@@ -1910,21 +1959,24 @@ def _rk_pad_rows(rows, dtype, rank=1):
     return padded, lengths, flat
 """
 
-# A vector of tuples (or of named numbers) crosses to the functions as the
-# tuple of its columns (`_jax_columns`), the device form. Host code holds it
-# either way: a scan's stacked outputs as columns, a comprehension as a list
-# of row tuples.
+# An array of numeric tuples or a vector of named numbers crosses to the
+# functions as the tuple of its columns (`_jax_columns`), the device form.
+# Host code keeps a scan's stacked outputs as columns, a comprehension as a
+# list of row tuples, and a collected product as an object array of tuples.
 const _JAX_COLUMNS_NP = """
 def _rk_columns_np(value, dtypes):
-    # A vector of tuples as the functions take it: the tuple of its columns,
+    # An array of tuples as the functions take it: the tuple of its columns,
     # one NumPy array per field, from its columns or from a list of its rows.
     n = len(dtypes)
+    if isinstance(value, np.ndarray) and value.dtype == object:
+        return tuple(np.asarray([r[k] for r in value.ravel(order="F")], dtype=d)
+                     .reshape(value.shape, order="F") for k, d in enumerate(dtypes))
     if isinstance(value, tuple) and len(value) == n and \\
             not any(isinstance(c, (tuple, list)) for c in value):
         return tuple(np.asarray(c, dtype=d) for c, d in zip(value, dtypes))
     if isinstance(value, list) and all(isinstance(r, tuple) and len(r) == n for r in value):
         return tuple(np.asarray([r[k] for r in value], dtype=d) for k, d in enumerate(dtypes))
-    raise TypeError("a vector of %d-tuples is the tuple of its columns or a list of its rows, not %r"
+    raise TypeError("an array of %d-tuples is the tuple of its columns or an array/list of its rows, not %r"
                     % (n, type(value).__name__))
 """
 # The NumPy dtype of a column: a number field's, or a vector field's entries.

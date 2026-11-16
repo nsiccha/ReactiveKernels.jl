@@ -44,6 +44,13 @@ plates. Ragged cells can vary along their first axis; trailing dimensions
 must agree because the representation carries one extent per cell.
 For raw empty matrix lists, call `pad_ragged([], rank=2)`.
 
+Plate cells can return numerical tuples or named records, including nested
+records and numeric array fields. Later plates can read those fields directly,
+such as `r.prior + sum(r.pointwise.y)`. The emitted representation stacks each
+leaf along the mapped axes and keeps ragged field lengths separate from the
+record array's valid extent. Cartesian axes retain Julia's order, and empty
+axes skip the cell body. These operations use ordinary JAX reverse differentiation.
+
 ## Julia evaluation
 
 The Julia callable evaluates the same authored mathematical expression. Its output establishes the reference value for a consumer testing the emitted module.
@@ -54,6 +61,16 @@ prepared(3.0, 2.0)
 ```
 
 A PPL model can emit its sampler boundary through `jax_source(built, bound)`. The generated module includes data preparation and coordinate metadata. A top-level plate's cell recipe that reads only the plate's data and that the JAX functions cannot compute runs in `prepare_data` as a loop over the cells, and the plate reads its values as inputs of its own, one per cell. A branch in a top-level plate's cell whose condition reads only the plate's data, such as a censored row's `y <= lower`, also inside an arm of a parameter's support guard, is decided in `prepare_data`: for each pattern of such decisions it returns the cells that take it (`<value>_lanes_<k>`, 0-based) and the order that restores the plate (`<value>_lane_order`), and the functions run one plate per pattern over its cells. Each cell then evaluates only the arms it takes, as the Julia program does, instead of both arms of a batched `jax.lax.cond`. The patterns follow the cell's source, each with its plate even when no cell takes it, so one module serves every dataset. A data-only definition that calls a program-level `@kernel` with positional arguments, as Julia runs it (`prepare(spec)(args...)`), is computed in `prepare_data` by a host function of that kernel's plan. Inspect its untranslated-data declarations before treating it as a standalone raw-data pipeline; a definition without a host translation remains a required prepared input. A cell's vector argument arrives padded to the longest row, and an array it is broadcast into is padded along the same axes: `size`, reductions, also over `dims`, and `vec` read only the row's entries. Padded lengths and sizes retain bounds through `+`, `-` and `*`, including `(1 + length(parameters)) * length(row)`. Capacities follow input shapes during JAX tracing; emitted source serves different sizes. Ranges and arrays of equal valid lengths pad alike. Past its stop, a range to such a length repeats the stop, as padding repeats a row's last entry. `diff(x)` of a padded row has one valid entry fewer, and its padding repeats the last valid difference; a row with no difference (empty or one entry) has none to repeat. Two rows of a cell broadcast together (a feature row and its standard errors, `(x .- centres) ./ sqrt.(scales .^ 2 .+ s .^ 2)`) pad their result by Julia's broadcast length, the rows' common length or the other row's where one has length one; lengths Julia refuses to broadcast (`DimensionMismatch`) are not checked. Rows padding different axes by different lengths (`x .* s'`) are refused. `reduce(hcat, cells)` of vectors or matrices keeps Julia's columns; like `stack`, it raises at run time unless every column fills the padded width (Julia's `DimensionMismatch`). A response whose element type admits `missing` is passed to `prepare_data` as the caller has it, with `None` for a missing entry; the module computes its presence mask, so one module serves every absence pattern.
+
+Data-only `Iterators.product` over numerical ranges or arrays runs in
+`prepare_data`, including host loops and `collect`. For example,
+`states = collect(Iterators.product(0:n, 0:m))` can supply a plate's states:
+the support lengths remain runtime data, and the first axis advances
+fastest, as in Julia. Collected products preserve empty axes and their
+multidimensional shape. A collected product of homogeneous numerical
+tuples crosses to JAX as one array per tuple field with that same shape;
+compiled plates and indexing read those fields together. Increasing the
+support lengths changes the arrays, not the emitted bodies.
 
 `prepare_data` takes the data by the names the model reads them, also a name Python reserves or the module's code uses (`class`, `lambda`, `id`). No parameter can have such a name, so `prepare_data` takes it through `**data`: call it by name, `prepare_data(**raw)`. The dict it returns, the functions' `**prepared` and the metadata (`DATA`, `INPUTS`, `PREPARED`, `UNTRANSLATED`) use the same names. A name that is no Python identifier (a submodel's `r.g`) is spelled `r_g` there, and `UNTRANSLATED` keys it as the binding does.
 

@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.287
+## 0.1.292
 
 - `js_source` lets an authored plate read concrete tuples and named tuples
   produced by an earlier plate, including records containing ragged vectors.
@@ -31,6 +31,56 @@ are recorded in the git history only.
   accept view arguments while preserving their loops and lazy reads.
 - Bound numbers, ranges and numeric tuple/named-tuple fields stay in module data
   storage, including input-check arguments, instead of specializing function bodies.
+
+## 0.1.291
+
+- `@traceable` and `TraceableSource` accept body-level early returns, including
+  guards before loops. Recorded source preserves their lazy continuations;
+  native methods keep their authored control flow. Loop-crossing returns remain
+  unsupported.
+- JAX source supports `continue`, short-circuit conditional writes, and internal
+  nested-vector buffers with fixed-width numerical rows and `isassigned` state.
+  Prepared integer-data bounds size allocations such as
+  `isempty(ids) ? 0 : maximum(ids)`, including inside ragged cells. Loops retain
+  their bodies across changing data sizes. Unsupported row alias mutations,
+  helper argument mutation, and direct public buffer outputs are diagnosed.
+- Device loops can read homogeneous numerical tuples at computed integer
+  indices, including source `ntuple` lambdas with an authored `Val` arity
+  behind an early-return guard. Empty padded buffer cells are guarded before
+  evaluation, preserving ordinary gradients of shared arguments; integer
+  reductions of cell data request prepared bounds for their allocations.
+
+## 0.1.290
+
+- `jax_source` supports plate cells returning numerical tuples and named
+  records with nested records and array fields over multiple mapped axes.
+  Subsequent plates retain field lengths and the record array's own padding;
+  empty axes skip cell execution. Mapping and ordinary JAX reverse differentiation
+  keep bounded bodies as data sizes grow.
+
+## 0.1.289
+
+- `js_source` preserves Julia's `Float64` spelling in `string` and string
+  interpolation, including error messages: integral floats retain `.0`,
+  signed zero and infinities retain their Julia spelling, and scientific
+  notation uses Julia's exponent thresholds. Integer counts stay integers.
+
+## 0.1.288
+
+- `jax_source` prepares Cartesian products of data-bound numerical ranges
+  and arrays with runtime host iteration. Collected products retain Julia's
+  shape, first-axis-fastest order and empty axes. Homogeneous numerical
+  tuple arrays cross to JAX as one array per field with the same shape,
+  for compiled plates, indexing and reductions; source bodies do not grow
+  with supports.
+
+## 0.1.287
+
+- Accept keyword arguments in `@traceable` methods and translate their calls
+  in JAX functions and host data preparation. Required and typed keywords,
+  dependent defaults, shorthand calls and nested helpers retain Julia's
+  semantics. Keyword values remain runtime helper arguments.
+- Preserve `on_error = :ignore` through captured helper calls with keywords.
 
 ## 0.1.286
 

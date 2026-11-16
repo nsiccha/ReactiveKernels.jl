@@ -3402,9 +3402,10 @@ argument (`args...`, `args::T...`, `args::Vararg{T,N}`, whose name the
 recorded source reads as the tuple of the trailing arguments, as the method
 does), `where` clauses, and a return-type annotation.  A docstring before `@traceable` documents the
 method, as it does a plain definition.  A `@traceable` method of a function
-from Base, Core or ReactiveKernels is rejected, and so are keyword arguments
-and a `return` before the end of the body (write that branch as an
-expression): a source-reading compiler translates the body as one expression.
+from Base, Core or ReactiveKernels is rejected, as is a `return` inside a loop.
+Body-level early returns are recorded as lazy
+conditional expressions; the ordinary method keeps its authored control flow.
+Keyword arguments keep Julia's defaults, required arguments and type checks.
 """
 macro traceable(def)
     _traceable_definition(def, __module__)
@@ -3434,11 +3435,15 @@ function _traceable_definition(def, mod::Module)
             "define a helper function of your own."))
     end
     formals = signature.args[2:end]
-    any(arg -> arg isa Expr && arg.head === :parameters, formals) && throw(ArgumentError(
-        "@traceable does not support keyword arguments in `$(signature)`; " *
-        "pass them positionally."))
     names = Set{Symbol}()
     for formal in formals
+        if formal isa Expr && formal.head === :parameters
+            for keyword in formal.args
+                keyword isa Expr && keyword.head === :kw && (keyword = keyword.args[1])
+                _lhs_symbols!(names, keyword)
+            end
+            continue
+        end
         formal isa Expr && formal.head === :kw && (formal = formal.args[1])
         formal isa Expr && formal.head === :... && (formal = formal.args[1])
         _lhs_symbols!(names, formal)
@@ -3447,10 +3452,10 @@ function _traceable_definition(def, mod::Module)
         parameter isa Expr && parameter.head in (:<:, :>:) && (parameter = parameter.args[1])
         parameter isa Symbol && push!(names, parameter)
     end
-    _traceable_tail_body(body, signature)        # rejects an early `return`
+    sourcebody = _traceable_tail_body(body, signature)
     native = Expr(def.head, def.args[1], _kernel_native_body(body, mod, names))
     ignored = _kernel_ignored_traceable_methods(callee, formals, wheres, body, mod, names)
-    source = _traceable_source_method(callee, formals, wheres, body, mod)
+    source = _traceable_source_method(callee, formals, wheres, sourcebody, mod)
     esc(Expr(:block, _documentable(native), ignored..., source..., callee))
 end
 
@@ -3513,6 +3518,10 @@ function without a `@traceable` method.
 """
 _traceable_source(@nospecialize(args...)) = nothing
 
+# Separate from positional source: source readers that do not bind keywords
+# continue to execute the ordinary Julia call instead of reading free locals.
+_traceable_keyword_source(@nospecialize(args...)) = nothing
+
 """
     _traceable_arguments(source, args, group) -> Vector or nothing
 
@@ -3562,9 +3571,32 @@ end
 # A method of `_traceable_source` over the argument TYPES, with the method's own
 # formals as type bounds, so dispatch selects the source of the method that
 # values of those types call. A trailing Vararg formal bounds each trailing
-# argument type by its element type, and its count by the formal's. Defaulted
-# and destructured formals record no source.
-function _traceable_source_method(callee, formals, wheres, body, mod)
+# argument type by its element type, and its count by the formal's. Keyword
+# methods also record their default-positional forwarding methods. Other
+# defaulted and destructured formals record no source.
+function _traceable_source_method(callee, formals, wheres, body, mod;
+                                  registry = :_traceable_source, keywords = nothing,
+                                  defaults = ())
+    keyword_index = findfirst(a -> a isa Expr && a.head === :parameters, formals)
+    if keyword_index !== nothing
+        keywords = formals[keyword_index].args
+        positional = Any[a for (i, a) in enumerate(formals) if i != keyword_index]
+        return _traceable_source_method(callee, positional, wheres, body, mod;
+                                        registry = :_traceable_keyword_source, keywords)
+    end
+    if keywords !== nothing
+        first_default = findfirst(a -> a isa Expr && a.head === :kw, formals)
+        if first_default !== nothing
+            plain = Any[a isa Expr && a.head === :kw ? a.args[1] : a for a in formals]
+            records = _traceable_source_method(callee, plain, wheres, body, mod; registry, keywords)
+            fixed = length(formals) - (_traceable_vararg(last(formals), length(formals)) !== nothing)
+            for count in first_default-1:fixed-1
+                append!(records, _traceable_source_method(callee, plain[1:count], wheres, body, mod;
+                    registry, keywords, defaults = Tuple(formals[count+1:fixed])))
+            end
+            return records
+        end
+    end
     params = Any[]
     names = Symbol[]
     bounds = Any[]
@@ -3596,16 +3628,21 @@ function _traceable_source_method(callee, formals, wheres, body, mod)
         push!(names, formal.args[1])
         push!(bounds, formal.args[2])
     end
-    signature = Expr(:call, GlobalRef(@__MODULE__, :_traceable_source),
+    signature = Expr(:call, GlobalRef(@__MODULE__, registry),
                      Expr(:(::), Expr(:curly, :Type, Expr(:call, GlobalRef(Core, :typeof), callee))),
                      params...)
     # The method's own signature type, built once where it is defined: inside
     # the source method its `where` names are bound to the matched types.
     method_type = Expr(:curly, GlobalRef(Core, :Tuple),
                        Expr(:call, GlobalRef(Core, :typeof), callee), bounds...)
+    keyword_type = Expr(:curly, GlobalRef(Core, :Tuple),
+                       Expr(:call, GlobalRef(Core, :typeof), GlobalRef(Core, :kwcall)),
+                       GlobalRef(Core, :NamedTuple),
+                       Expr(:call, GlobalRef(Core, :typeof), callee), bounds...)
     for layer in reverse(wheres)
         signature = Expr(:where, signature, layer...)
         method_type = Expr(:where, method_type, layer...)
+        keyword_type = Expr(:where, keyword_type, layer...)
     end
     held = gensym(:traceable_signature)
     statics = Any[]
@@ -3615,27 +3652,63 @@ function _traceable_source_method(callee, formals, wheres, body, mod)
         push!(statics, Expr(:(=), parameter,
                             Expr(:if, Expr(:isdefined, parameter), parameter, nothing)))
     end
-    Any[Expr(:const, Expr(:(=), held, method_type)),
-        Expr(:(=), signature, Expr(:tuple, QuoteNode(Tuple(names)), QuoteNode(body), mod, held,
-                                   Expr(:tuple, statics...), vararg))]
+    record = Expr(:tuple, QuoteNode(Tuple(names)), QuoteNode(body), mod, held,
+                  Expr(:tuple, statics...), vararg)
+    keywords === nothing || append!(record.args,
+        (QuoteNode(Tuple(keywords)), keyword_type, QuoteNode(defaults)))
+    Any[Expr(:const, Expr(:(=), held, method_type)), Expr(:(=), signature, record)]
 end
 
-# The body with its tail-position `return`s replaced by their values, as a
-# source-reading compiler translates it.  Any other `return` is rejected;
-# `owner` names what recorded the body in that error.
+# Record a method as one expression. A body-level return ends that path;
+# its continuation belongs only in the branches that fall through. This is
+# independent of data values and leaves loops intact. Returns crossing a
+# loop or another unsupported scope are still rejected by `_traceable_no_return`.
 function _traceable_tail_body(ex, signature, owner = "@traceable")
     if ex isa Expr && ex.head === :return
         return _traceable_no_return(isempty(ex.args) ? nothing : only(ex.args), signature, owner)
     elseif ex isa Expr && ex.head === :block
         position = findlast(arg -> !(arg isa LineNumberNode), ex.args)
         position === nothing && return ex
-        args = Any[i == position ? _traceable_tail_body(arg, signature, owner) :
-                   _traceable_no_return(arg, signature, owner)
-                   for (i, arg) in enumerate(ex.args)]
+        args = Any[]
+        for (i, arg) in enumerate(ex.args)
+            if i == position
+                push!(args, _traceable_tail_body(arg, signature, owner))
+            elseif _traceable_has_return(arg)
+                push!(args, _traceable_return_continuation(arg, ex.args[i+1:end], signature, owner))
+                return Expr(:block, args...)
+            else
+                push!(args, arg)
+            end
+        end
         return Expr(:block, args...)
     elseif ex isa Expr && ex.head in (:if, :elseif)
         return Expr(ex.head, _traceable_no_return(ex.args[1], signature, owner),
             (_traceable_tail_body(arg, signature, owner) for arg in ex.args[2:end])...)
+    elseif ex isa Expr && ex.head in (:&&, :||) && _traceable_has_return(ex)
+        return _traceable_return_continuation(ex, Any[], signature, owner)
+    end
+    _traceable_no_return(ex, signature, owner)
+end
+
+function _traceable_has_return(ex)
+    ex isa Expr || return false
+    ex.head in (:->, :function, :quote, :inert) && return false
+    ex.head === :return || any(_traceable_has_return, ex.args)
+end
+
+function _traceable_return_continuation(ex, tail, signature, owner)
+    ex.head === :return && return _traceable_tail_body(ex, signature, owner)
+    ex.head === :block && return _traceable_tail_body(Expr(:block, ex.args..., tail...), signature, owner)
+    if ex.head in (:&&, :||)
+        condition, arm = ex.args
+        ex = ex.head === :&& ? Expr(:if, condition, arm, false) :
+                              Expr(:if, condition, true, arm)
+    end
+    if ex.head in (:if, :elseif)
+        condition = _traceable_no_return(ex.args[1], signature, owner)
+        arms = length(ex.args) == 3 ? ex.args[2:3] : Any[ex.args[2], nothing]
+        return Expr(ex.head, condition,
+            (_traceable_tail_body(Expr(:block, arm, tail...), signature, owner) for arm in arms)...)
     end
     _traceable_no_return(ex, signature, owner)
 end
@@ -3644,8 +3717,8 @@ function _traceable_no_return(ex, signature, owner = "@traceable")
     ex isa Expr || return ex
     ex.head in (:->, :function, :quote, :inert) && return ex
     ex.head === :return && throw(ArgumentError(
-        "$owner does not support a `return` before the end of `$(signature)`; " *
-        "write the branch as an expression (`condition ? a : b`)."))
+        "$owner cannot normalize this nested `return` in `$(signature)`; " *
+        "body-level early returns are supported, but returns crossing loops or other expression scopes are not."))
     foreach(arg -> _traceable_no_return(arg, signature, owner), ex.args)
     ex
 end
@@ -3661,12 +3734,13 @@ an [`@traceable`](@ref) body: a `for` loop becomes `jax.lax.fori_loop`, an
 `if` becomes `jax.lax.cond`, `A[i] = v` becomes `A.at[i].set(v)`, and
 `prepare_data` runs the body as host Python with Python loops and branches.
 
-The body is one expression whose value is the method's result. A `return` at
-its end is allowed; a `return` before the end throws an `ArgumentError` here,
-so write that branch as an expression (`condition ? a : b`). Code that runs
+The body is one expression whose value is the method's result. Body-level
+early returns become lazy conditional expressions; returns inside loops
+remain unsupported. Code that runs
 inside the JAX functions takes the subset an `@traceable` body takes there:
-no `break` or `continue`, and a `for` binds one name over one range.
-`prepare_data` takes both. Static parameters of the method (`where T`) are not bound: the body
+no `break`, and a `for` binds one name over one range. A `continue` keeps
+the current carry and skips the rest of that iteration. `prepare_data`
+also supports `break`. Static parameters of the method (`where T`) are not bound: the body
 reads its arguments and the globals of `mod`.
 
 Native execution, `prepare` and the compiled paths never read the source: the

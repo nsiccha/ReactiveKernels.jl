@@ -65,6 +65,13 @@ values they compute.
 
 A helper translates from recorded source when available: `@traceable` records it, and a trailing Vararg argument (`args...`, `args::Vararg{T,N}`) reads as the tuple of the trailing arguments, as the method receives them, and `sum(f, t; init)` folds such a tuple over its fixed length; `for` becomes `jax.lax.fori_loop`, `if` becomes `jax.lax.cond`, and `A[i] = v` becomes `A.at[i].set(v)`. A `jax.lax.cond` arm that is one expression is a `lambda`, and a branch between two values already bound or literal (`s == 0 && x == m ? 1.0 : s`) is `jnp.where`, whose value and derivative are the conditional's; an arm that computes anything stays lazy. A condition decided while tracing (a shape or literal test) is Python's own `if`, so a guard `n == k || throw(...)` reads `if not (n == k): raise ValueError(...)`. Plain lowered helpers support straight-line code and terminal forward branches, including size guards. They can create immutable closures and fold fixed argument lists with `Base.afoldl`. Broadcasting `Ref(x)` passes `x` whole to each call. Captures remain runtime inputs; host `prepare_data` uses the same translation.
 
+`@traceable` methods also accept named keywords, including required and typed
+keywords. Calls such as `weighted(xs; scale)` bind by name. Omitted defaults
+are evaluated in the helper's module, in declaration order, and may read
+positional arguments and earlier keywords. Supplied keywords skip their
+defaults. Keyword values and data-derived sizes remain runtime arguments in
+both host preparation and JAX functions.
+
 A captured `NamedTuple` of data can be read whole, for example passed to a
 helper (`metadata = (; weights = w, indices = idx)` captured by a kernel that
 calls `weighted(x, metadata)`). It is the Python tuple of its fields, as a
@@ -118,4 +125,10 @@ end
 print(jax_source(decayed; have = (:x, :rate), want = :value))
 ```
 
-The body follows the rules of an `@traceable` body: a `return` only at its end, and in the JAX functions no `break` or `continue` and a `for` over one range. `prepare_data` runs the body as host Python, which takes both. A provider's source is read only by `jax_source`; native execution runs the method itself.
+Body-level early returns, including `condition || return fallback(...)`, keep the continuation in the falling-through branch. The native method retains its original control flow. A return inside a loop remains unsupported. In device code, `continue` skips the remaining iteration statements, `for` binds one name over one range, and `break` remains unsupported. Host `prepare_data` also supports `break`. A provider's source is read only by `jax_source`; native execution runs the method itself.
+
+A source `ntuple(j -> expression, Val(N))` records the authored, fixed number of fields with runtime captures. A fixed tuple of numbers of one type supports computed integer reads, such as indexing that basis inside a loop. The device read checks bounds and uses a numerical array view of the tuple; the data-dependent loop remains a runtime loop.
+
+A device helper can allocate `Vector{Vector{Float64}}(undef, k)`, fill its slots with fixed-width numerical rows, and use `isassigned(rows, i)` to skip earlier assignments. A size such as `isempty(ids) ? 0 : maximum(ids)` uses bounds computed from prepared integer data, including ragged cells. Allocation and iteration remain runtime array operations; emitted source does not grow with the data. Assignment state travels with the numerical storage through loops and branches. Missing references and invalid indices raise when read; `isassigned` returns false for either.
+
+This nested-buffer representation accepts fresh rows with an authored fixed shape, such as `[a, b, c]` or `zeros(3)`. Different row shapes require a ragged representation, and mutation through stored row aliases or a helper's buffer or row argument requires reference writeback; these cases raise `JAXEmissionError`. Buffers are consumed inside the program by indexing or plates; direct public buffer outputs are not supported yet.

@@ -56,7 +56,7 @@ Treebars = "0.1.5"
 WarmupHMC = "0.2.21, 0.3"
 PrecompileTools = "1.2"
 # Nested observation parameters project fields from records produced by a plate.
-ReactiveKernels = "0.1.287"
+ReactiveKernels = "0.1.292"
 ReactiveKernelsDistributionKernels = "0.1.12"
 SpecialFunctions = "2"
 StatsFuns = "1, 2"
