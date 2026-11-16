@@ -5,7 +5,7 @@
 # The shape that aborts Enzyme on SpecialFunctions' bodies
 # (benchmark/repro_enzyme_lgamma_branch.jl) therefore differentiates, with no
 # hand-written rule and no rule on a function this package does not own.
-using DifferentiationInterface: AutoEnzyme, gradient
+using DifferentiationInterface: AutoEnzyme, derivative, gradient
 import Enzyme
 using ReactiveKernels
 using ReactiveKernels: derivative_cut, prepare, prepare_ad, ad_gradient
@@ -62,4 +62,47 @@ const _DKS = ReactiveKernelsDistributionKernels.DistributionKernelSources
     @test gradient(density, backend, p) ≈ expected
     prepared = prepare_ad(prior, backend, 2.0, 2.0, p; active = :x)
     @test ad_gradient(prepared, 2.0, 2.0, p) ≈ 1.0 / p - 1.0 / (1 - p)
+end
+
+# `logrising(a, m) = loggamma(a + m) - loggamma(a)`, the log rising factorial.
+# Whole small counts take the product path (value and `d/da` from one pass),
+# every other input the loggamma/digamma difference; BigFloat is the oracle.
+_logrising_ref(a, m) = Float64(SpecialFunctions.loggamma(big(a) + m) -
+                               SpecialFunctions.loggamma(big(a)))
+_logrising_dref(a, m) = Float64(digamma(big(a) + m) - digamma(big(a)))
+
+@testset "logrising: one graph, product path and gamma-difference path" begin
+    @test _DKS.logrising isa ScalarDerivativeRule
+    @test _DKS.logrising_graph isa KernelSpec
+    for a in (1e-8, 0.05, 0.7, 3.25, 41.0, 2.5e6, 1e9, 3e9, 1e12),
+            m in (0, 1, 2, 5, 31, 32, 33, 64, 65, 400)
+        value, slope = derivative_cut(_DKS.logrising, (true, false), a, m)
+        @test value == _DKS.logrising(a, m)
+        if m <= 64 && a <= 2.0^30
+            @test value ≈ _logrising_ref(a, m) rtol = 1e-14 atol = 1e-14
+            @test slope ≈ _logrising_dref(a, m) rtol = 1e-13
+        else
+            # The gamma difference, exactly (with its cancellation at large a).
+            @test value == SpecialFunctions.loggamma(a + m) - SpecialFunctions.loggamma(a)
+            @test slope == digamma(a + m) - digamma(a)
+        end
+    end
+    # A Float64 count, a fractional count, and the count's own partial.
+    @test _DKS.logrising(2.5, 3.0) ≈ _logrising_ref(2.5, 3) rtol = 1e-15
+    @test _DKS.logrising(2.5, 3.5) ≈ Float64(SpecialFunctions.loggamma(big(6.0)) -
+        SpecialFunctions.loggamma(big(2.5))) rtol = 1e-14
+    value, da, dm = derivative_cut(_DKS.logrising, (true, true), 2.5, 3.0)
+    @test (value, da) == derivative_cut(_DKS.logrising, (true, false), 2.5, 3.0)
+    @test dm == digamma(5.5)
+    # m = 0 is exactly zero, also at a shape the product path refuses.
+    @test _DKS.logrising(4.0, 0) == 0.0
+    @test derivative_cut(_DKS.logrising, (true, false), 3e9, 0) == (0.0, 0.0)
+
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    f(a) = _DKS.logrising(a, 17) + 2 * _DKS.logrising(a * a, 5)
+    expected = _logrising_dref(1.3, 17) + 4 * 1.3 * _logrising_dref(1.69, 5)
+    @test gradient(f, backend, 1.3) ≈ expected rtol = 1e-13
+    @test derivative(f, AutoEnzyme(; mode = Enzyme.Forward), 1.3) ≈ expected rtol = 1e-13
+    @test gradient(a -> a > 0 ? _DKS.logrising(a, 200) : -Inf, backend, 2.5) ≈
+        _logrising_dref(2.5, 200) rtol = 1e-12
 end
