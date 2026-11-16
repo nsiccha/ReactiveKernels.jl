@@ -2916,6 +2916,17 @@ _jax_is_indexing(f) = f === getindex || f === view || f === Base.maybeview
 _jax_call(ctx::_JaxContext, f, args::Vector{_PyVal}) = _jax_call(ctx, f, args, Pair{Symbol,_PyVal}[])
 
 function _jax_call(ctx::_JaxContext, f, args::Vector{_PyVal}, kw)
+    if any(_jax_slots, args) && !(f in (isassigned, length, size, eachindex, axes, lastindex,
+                                      identity, getindex, view, Base.maybeview))
+        # Numerical-array mappings cannot consume the storage/bitmap pair.
+        # Translate the Julia helper instead, so its individual reads retain
+        # assignment checks, or report the unsupported operation at emission.
+        isempty(kw) || _jax_error("keyword calls on a reference-element buffer", _jax_where(ctx))
+        return _jax_traceable_or_lowered(ctx, f, args)
+    end
+    _jax_call_keywords(ctx, f, args, kw)
+end
+function _jax_call_keywords(ctx::_JaxContext, f, args::Vector{_PyVal}, kw)
     isempty(kw) || _jax_error("keyword arguments to `", f, "` have no JAX translation",
                               _jax_where(ctx))
     _jax_call_positional(ctx, f, args)
@@ -2926,7 +2937,7 @@ end
 # keeps it, of length one, as Julia does.
 const _JAX_AXIS_REDUCTIONS = Dict{Any,String}(sum => "sum", prod => "prod",
                                               maximum => "max", minimum => "min")
-function _jax_call(ctx::_JaxContext,
+function _jax_call_keywords(ctx::_JaxContext,
                    f::Union{typeof(sum),typeof(prod),typeof(maximum),typeof(minimum)},
                    args::Vector{_PyVal}, kw)
     isempty(kw) && return _jax_call_positional(ctx, f, args)
@@ -2977,7 +2988,7 @@ function _jax_padded_dims_reduction(ctx::_JaxContext, f, x::_PyVal, k::Int)
 end
 
 # `dropdims(x; dims = d)`: `x` without its axis `d`, of length one.
-function _jax_call(ctx::_JaxContext, ::typeof(dropdims), args::Vector{_PyVal}, kw)
+function _jax_call_keywords(ctx::_JaxContext, ::typeof(dropdims), args::Vector{_PyVal}, kw)
     x = only(args)
     length(kw) == 1 && first(only(kw)) === :dims ||
         _jax_error("`dropdims` without one `dims` keyword", _jax_where(ctx))
@@ -2992,7 +3003,7 @@ end
 
 # `cumsum(x; dims = d)`: the running sum along axis `d`, a static integer, as
 # the axis reductions above take it.
-function _jax_call(ctx::_JaxContext, ::typeof(cumsum), args::Vector{_PyVal}, kw)
+function _jax_call_keywords(ctx::_JaxContext, ::typeof(cumsum), args::Vector{_PyVal}, kw)
     isempty(kw) && return _jax_call_positional(ctx, cumsum, args)
     first.(kw) == [:dims] || _jax_error("keyword arguments ", join(first.(kw), ", "),
         " to `cumsum` have no JAX translation", _jax_where(ctx))
@@ -3007,7 +3018,7 @@ end
 # `diff(x; dims = d)` along a literal axis `d`: a vector's differences
 # (`_jax_function_call(::typeof(diff))`, which Base's `diff(x)` calls), or an
 # unpadded array's along that axis.
-function _jax_call(ctx::_JaxContext, ::typeof(diff), args::Vector{_PyVal}, kw)
+function _jax_call_keywords(ctx::_JaxContext, ::typeof(diff), args::Vector{_PyVal}, kw)
     isempty(kw) && return _jax_call_positional(ctx, diff, args)
     first.(kw) == [:dims] || _jax_error("keyword arguments ", join(first.(kw), ", "),
         " to `diff` have no JAX translation", _jax_where(ctx))
@@ -3024,7 +3035,7 @@ end
 # `stack(rows; dims)` of a vector of equal-length vectors, held as the 2-D
 # array of its rows: a matrix with those rows (`dims = 1`) or columns. On the
 # host a plate of vectors is a list of arrays, which `np.stack` joins.
-function _jax_call(ctx::_JaxContext, ::typeof(stack), args::Vector{_PyVal}, kw)
+function _jax_call_keywords(ctx::_JaxContext, ::typeof(stack), args::Vector{_PyVal}, kw)
     x = only(args)
     T = x.T
     T isa Type && T <: AbstractVector && eltype(T) <: AbstractVector{<:Number} ||
@@ -4497,7 +4508,7 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(repeat), args::Vector{_Py
     _jax_is_array(args[1].T) || return _jax_traceable_or_lowered(ctx, repeat, args)
     _jax_repeat(ctx, args[1], nothing, args[2:end])
 end
-function _jax_call(ctx::_JaxContext, ::typeof(repeat), args::Vector{_PyVal}, kw)
+function _jax_call_keywords(ctx::_JaxContext, ::typeof(repeat), args::Vector{_PyVal}, kw)
     isempty(kw) && return _jax_call_positional(ctx, repeat, args)
     names = first.(kw)
     length(args) == 1 && _jax_is_array(args[1].T) && allunique(names) &&
@@ -4576,6 +4587,7 @@ end
 # Index with already translated index values (an integer, an integer array
 # or a `Bool` mask).
 function _jax_index_values(ctx::_JaxContext, x::_PyVal, indices::Vector{_PyVal})
+    _jax_slots(x) && return _jax_slots_index(ctx, x, indices)
     _jax_is_array(x.T) && length(indices) == ndims(x.T) ||
         _jax_error("a gather from `", x.T, "`", _jax_where(ctx))
     parts = String[]

@@ -53,7 +53,14 @@ end
 function _jax_slot_position(ctx, x, indices; checked=true)
     length(indices) == 1 || _jax_error("a nested vector needs one integer index", _jax_where(ctx))
     proxy = _PyVal(_jax_slot_mask(x), Vector{Bool}, false, x.extent)
-    part, keeps, i = _jax_index_part(ctx, proxy, 1, only(indices))
+    index = only(indices)
+    if index isa _PyVal
+        index.T isa Type && index.T <: Integer && index.T !== Bool ||
+            _jax_error("a nested vector needs one integer index", _jax_where(ctx))
+        part, keeps, i = _jax_minus_one(index), 0, index
+    else
+        part, keeps, i = _jax_index_part(ctx, proxy, 1, index)
+    end
     keeps == 0 && i !== nothing || _jax_error("slicing a reference-element buffer", _jax_where(ctx))
     n = isempty(x.extent) ? _jax_slot_mask(x) * ".shape[0]" : x.extent
     valid = "((" * i.code * " >= 1) & (" * i.code * " <= " * n * "))"

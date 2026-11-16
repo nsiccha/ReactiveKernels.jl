@@ -1,4 +1,4 @@
-using ReactiveKernels, Test
+using ReactiveKernels, Test, Enzyme
 include(joinpath(@__DIR__, "jax_python.jl"))
 
 @traceable function jax_guarded_recurrence(x::Float64, weights::Vector{Float64})
@@ -47,6 +47,9 @@ end
     native = prepare(jax_return_graph; have=(:x, :weights), want=(:guarded, :nested))
     for x in (-2.0, -0.75, -0.25, 0.0, 0.5, 2.0)
         @test native(x, weights) == (jax_guarded_recurrence(x, weights), jax_nested_guard(x))
+        da = Enzyme.autodiff(Enzyme.Reverse, jax_guarded_recurrence, Enzyme.Active,
+            Enzyme.Active(x), Enzyme.Const(weights))[1][1]
+        @test da ≈ (x > 0 ? inv(x) + sum(weights) : -2.0)
     end
     if rk_jax_available()
         mktempdir() do dir

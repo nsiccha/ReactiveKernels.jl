@@ -61,6 +61,43 @@ end
 
 jax_slot_loss(a, labels, rates) = jax_rows_total(jax_group_rows(a, labels, rates))
 
+@traceable function jax_stored_row_mutation(a::Float64)
+    rows = Vector{Vector{Float64}}(undef, 1)
+    row = [a, a]
+    rows[1] = row
+    row[1] = 2a
+    sum(rows[1])
+end
+@traceable function jax_write_borrowed(rows::Vector{Vector{Float64}}, a::Float64)
+    rows[1] = [a, a]
+    sum(rows[1])
+end
+@traceable function jax_borrowed_mutation(a::Float64)
+    rows = Vector{Vector{Float64}}(undef, 1)
+    rows[1] = [a, a]
+    jax_write_borrowed(rows, a)
+end
+@traceable function jax_mismatched_rows(a::Float64)
+    rows = Vector{Vector{Float64}}(undef, 2)
+    rows[1] = [a]
+    rows[2] = [a, a]
+    sum(rows[1])
+end
+@traceable function jax_reduce_slots(a::Float64)
+    rows = Vector{Vector{Float64}}(undef, 2)
+    rows[1] = [a, a]
+    sum(sum(rows))
+end
+for (name, helper) in ((:jax_row_alias_graph, :jax_stored_row_mutation),
+                       (:jax_borrowed_graph, :jax_borrowed_mutation),
+                       (:jax_shapes_graph, :jax_mismatched_rows),
+                       (:jax_reduce_graph, :jax_reduce_slots))
+    @eval @kernel $name(a::Float64) = begin
+        score = $helper(a)
+        return score
+    end
+end
+
 @testset "nested-vector buffers with runtime assignment state" begin
     src = jax_source(jax_slots_graph; have=(:a, :labels, :rates), data=(:labels,),
         functions=(score=:score, mapped=:mapped))
@@ -94,6 +131,9 @@ jax_slot_loss(a, labels, rates) = jax_rows_total(jax_group_rows(a, labels, rates
     @test jax_partial_rows(a, 2, true) == 0.0
     @test_throws UndefRefError jax_partial_rows(a, 2, false)
     @test_throws BoundsError jax_partial_rows(a, 3, false)
+    for graph in (jax_row_alias_graph, jax_borrowed_graph, jax_shapes_graph, jax_reduce_graph)
+        @test_throws JAXEmissionError jax_source(graph; have=(:a,), functions=(score=:score,))
+    end
     if rk_jax_available()
         mktempdir() do dir
             write(joinpath(dir, "slots.py"), src)
@@ -117,8 +157,17 @@ for labels, value, gradient, drates in zip(cases, expected, gradients, rate_grad
 labelsets = [np.asarray(x, dtype=np.int64) for x in cases]
 ratesets = [-0.2 + 0.02*np.arange(len(x)) for x in cases]
 prepared = ragged.prepare_data(labelsets=labelsets)
+ratesets, prepared['ratesets_lengths'], prepared['ratesets_flat'] = ragged._rk_pad_rows(ratesets, np.float64)
 np.testing.assert_allclose(jax.jit(ragged.score)(0.4, ratesets, **prepared), sum(expected), rtol=1e-10)
 np.testing.assert_allclose(jax.jit(jax.grad(ragged.score))(0.4, ratesets, **prepared), sum(gradients), rtol=1e-8)
+actual = jax.jit(jax.grad(ragged.score, argnums=1))(0.4, ratesets, **prepared)
+for row, expected_row in zip(actual, rate_gradients):
+    np.testing.assert_allclose(row[:len(expected_row)], expected_row, rtol=1e-8, atol=1e-12)
+    np.testing.assert_allclose(row[len(expected_row):], 0., atol=1e-12)
+prepared = ragged.prepare_data(labelsets=[np.array([], dtype=np.int64)] * 3)
+rates, prepared['ratesets_lengths'], prepared['ratesets_flat'] = ragged._rk_pad_rows([np.array([])] * 3, np.float64)
+np.testing.assert_allclose(jax.jit(ragged.score)(0.4, rates, **prepared), 0.)
+np.testing.assert_allclose(jax.jit(jax.grad(ragged.score))(0.4, rates, **prepared), 0.)
 for a in (-0.4, 0.4):
     np.testing.assert_allclose(jax.jit(partial.score)(a, 1, False), abs(a)+a*a)
     for i in (-1, 0, 2, 3):
@@ -147,8 +196,9 @@ def loops(tree):
 counts = []
 for n in (3, 70):
     prepared = slots.prepare_data(labels=np.arange(1,n+1))
-    counts.append(loops(jax.make_jaxpr(slots.score)(0.4, np.zeros(n), **prepared)))
-assert counts[0] == counts[1] and counts[0] >= 3, counts
+    counts.append([loops(jax.make_jaxpr(f)(0.4, np.zeros(n), **prepared))
+                   for f in (slots.score, jax.grad(slots.score))])
+assert counts[0] == counts[1] and min(counts[0]) >= 3, counts
 print('retained loop regions at lengths 3 and 70:', counts)
 print('slot buffers: empty, duplicate, sparse and growing labels passed')
 """
