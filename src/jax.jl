@@ -132,6 +132,22 @@ _jax_lower_end(v::_PyVal, origin) = v
 _jax_upper_end(v::_PyVal, origin) = v
 _jax_lower_end(v::_PyVal, origin::_JaxBetween) = _jax_lower_end(origin.lo)
 _jax_upper_end(v::_PyVal, origin::_JaxBetween) = _jax_upper_end(origin.hi)
+# Bounds known while tracing, including a padded length's interval. These
+# are Python shape expressions, never the dimensions of an emission exemplar.
+function _jax_static_integer_bounds(v::_PyVal)
+    v.T isa Type && v.T <: Integer || return nothing
+    v.static && return (v.code, v.code)
+    if v.origin isa _JaxBetween
+        lo, hi = _jax_lower_end(v), _jax_upper_end(v)
+        lo.static && hi.static && return (lo.code, hi.code)
+    end
+    nothing
+end
+function _jax_integer_interval(v::_PyVal, lo::String, hi::String)
+    origin = _JaxBetween(_PyVal(lo, Int, true), _PyVal(hi, Int, true))
+    limit = !isempty(v.limit) ? v.limit : "max(" * hi * ", 0)"
+    _PyVal(v.code, v.T, v.static, v.extent, limit, v.padded, origin, v.field_extents)
+end
 # A range element's index value `index`, between `lo` and `hi`.
 _jax_range_index(index::AbstractString, lo::_PyVal, hi::_PyVal) =
     _PyVal(index, Int, false, "", "", 0, _JaxBetween(lo, hi))
@@ -1858,6 +1874,10 @@ function _jax_repeat_last_valid(ctx::_JaxContext, x::_PyVal)
         edge = "jax.lax.dynamic_index_in_dim(" * y.code * ", " * final.code * ", " *
                string(k - 1) * ", keepdims=True)"
         filled = "jnp.where(" * _jax_padded_mask(y, 1 << (k - 1)) * ", " * y.code * ", " * edge * ")"
+        # A shape-derived capacity can be zero. There is no edge to read
+        # then; select at Python trace time before building the indexed read.
+        filled = "(" * y.code * " if " * y.code * ".shape[" * string(k - 1) *
+                 "] == 0 else " * filled * ")"
         x = _jax_bind!(ctx, :padded, _PyVal(filled, x.T, false, x.extent, x.limit, x.padded,
                                               x.origin, x.field_extents))
     end
@@ -3067,7 +3087,18 @@ function _host_float_value(code::AbstractString, @nospecialize(T))
     T === E ? dtype * "(" * code * ")" : "np.asarray(" * code * ", dtype=" * dtype * ")"
 end
 function _jax_stages(code::AbstractString, args::Vector{_PyVal})
-    operation = foldl((c, a) -> isempty(a.code) ? c : replace(c, a.code => ""), args; init = code)
+    # Ignore complete operands, whose static status is already known (a
+    # shape can contain a staged array expression). Substring removal would
+    # erase `n` from `jnp.isfinite(n)` too and hide the staging operation.
+    # Match longer operands first, outside identifiers and string literals.
+    operation = replace(code, _PY_STRING => "\"\"")
+    operands = sort!(unique!([replace(a.code, _PY_STRING => "\"\"") for a in args]);
+                     by = ncodeunits, rev = true)
+    for operand in operands
+        isempty(operand) && continue
+        pattern = Regex("(?<![.\\w])\\Q" * replace(operand, "\\E" => "\\E\\\\E\\Q") * "\\E(?!\\w)")
+        operation = replace(operation, pattern => " ")
+    end
     occursin(r"\b(?:jnp|jsp|jax)\.(?!(?:pi|e|inf|nan)\b)", operation)
 end
 _jax_args(args) = join((a.code for a in args), ", ")
@@ -3506,6 +3537,13 @@ end
 function _jax_shifted_integer_limit(f, args::Vector{_PyVal}, v::_PyVal)
     isempty(v.limit) && !v.static || return v
     all(a -> a.T isa Type && a.T <: Integer, args) || return v
+    interval = _jax_arithmetic_interval(f, args)
+    bounded = _jax_one_sided_integer_limit(f, args, v)
+    interval === nothing ? bounded : _jax_integer_interval(bounded, interval...)
+end
+# Retain a simpler existing bound when one side suffices (literal positive
+# scaling or a shift), alongside any two-sided proof used by later arithmetic.
+function _jax_one_sided_integer_limit(f, args::Vector{_PyVal}, v::_PyVal)
     f === (*) && return _jax_scaled_integer_limit(args, v)
     # `-j` is `-1 * j`.
     f === (-) && length(args) == 1 && return _jax_scaled_integer_limit([_jax_literal(-1), args[1]], v)
@@ -3533,6 +3571,32 @@ function _jax_shifted_integer_limit(f, args::Vector{_PyVal}, v::_PyVal)
         return v
     end
     _PyVal(v.code, v.T, v.static, v.extent, limit, v.padded, v.origin, v.field_extents)
+end
+# Propagate both ends when they are available. A static multiplier need not
+# be a literal and can have either sign: Python selects the extrema while
+# tracing. Keeping the lower bound also handles `-length(row)` and shifts
+# before a later multiplication, without assuming a size expression positive.
+function _jax_arithmetic_interval(f, args::Vector{_PyVal})
+    f in (+, -, *) || return nothing
+    bounds = map(_jax_static_integer_bounds, args)
+    any(isnothing, bounds) && return nothing
+    op = _jax_static_integer_op
+    if f === (-) && length(bounds) == 1
+        lo, hi = only(bounds)
+        return (op("*", "-1", hi), op("*", "-1", lo))
+    end
+    length(bounds) >= 2 || return nothing
+    foldl(bounds) do a, b
+        if f === (+)
+            (op("+", a[1], b[1]), op("+", a[2], b[2]))
+        elseif f === (-)
+            (op("-", a[1], b[2]), op("-", a[2], b[1]))
+        else
+            products = unique([op("*", x, y) for x in a for y in b])
+            length(products) == 1 ? (only(products), only(products)) :
+                ("min(" * join(products, ", ") * ")", "max(" * join(products, ", ") * ")")
+        end
+    end
 end
 # `k * j` of static integers `k` and one integer `j` with a static bound
 # keeps a bound: an entry of the prepared data keeps its origin, scaled
@@ -4107,7 +4171,9 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(length), args::Vector{_Py
     ctx.host === nothing || return _host_length(ctx, x)
     _jax_columns(x.T) && return _jax_function_call(ctx, length, [_jax_column(x, 1)])
     isempty(x.extent) || _jax_ragged(x.T) ||
-        return _PyVal(x.extent, Int, false, "", _py_atom(x.code) * ".shape[0]")
+        return _jax_integer_interval(
+            _PyVal(x.extent, Int, false, "", _py_atom(x.code) * ".shape[0]"),
+            "0", _py_atom(x.code) * ".shape[0]")
     _jax_ragged(x.T) && return _PyVal(_py_atom(x.code) * ".shape[0]", Int, true)
     x.T isa Type && x.T <: Tuple && return _PyVal(string(fieldcount(x.T)), Int, true)
     _PyVal(_py_atom(x.code) * ".size", Int, true)
@@ -4156,7 +4222,7 @@ function _jax_padded_size(ctx::_JaxContext, x::_PyVal, dims::Vector{_PyVal})
         adjoint && k == 1 && return _PyVal("1", Int, true)
         stored = _py_atom(x.code) * ".shape[" * string(adjoint ? 0 : k - 1) * "]"
         axes & (1 << (k - 1)) == 0 && return _PyVal(stored, Int, true)
-        _PyVal(x.extent, Int, false, "", stored)
+        _jax_integer_interval(_PyVal(x.extent, Int, false, "", stored), "0", stored)
     end
     if isempty(dims)
         parts = _PyVal[entry(k) for k in 1:R]

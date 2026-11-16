@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.283
+## 0.1.286
 
 - JAX host preparation translates `findall(vector)`,
   `findall(predicate, vector)` and `Dict(zip(keys, values))`, including
@@ -27,6 +27,32 @@ are recorded in the git history only.
   These operations retain runtime loops,
   including for empty inputs, and can supply standalone `prepare_data`
   definitions without Julia-computed intermediate values.
+
+## 0.1.285
+
+- `jax_source` keeps predicates and arithmetic over prepared integers static
+  when argument names overlap backend names, such as `isfinite(n)`. Those
+  calls use the existing NumPy translation instead of leaving a traced JAX
+  value in a Python conditional. Lazy guards and ordinary gradients are
+  preserved, including when prepared data are passed to a jitted function.
+
+## 0.1.284
+
+- Add the internal log rising-factorial numerical graph used by distribution
+  kernels. Small integer offsets evaluate chunked products and their shape
+  partial together; other offsets use the optional SpecialFunctions extension.
+  The ordinary derivative adapters come from that one graph, and the product
+  loops retain their runtime count.
+
+## 0.1.283
+
+- `jax_source` preserves padded length bounds through integer addition,
+  subtraction and multiplication by input-shape expressions. A helper can
+  allocate at `(1 + length(parameters)) * length(row)` when `row` is ragged;
+  its capacity comes from the input shapes during JAX tracing. Signed
+  arithmetic tracks both interval endpoints, and loops retain their runtime
+  structure. One emitted module continues to accept different input sizes.
+  Zero-capacity buffers skip the last-entry read when padding a loop result.
 
 ## 0.1.282
 

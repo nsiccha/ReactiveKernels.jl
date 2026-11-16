@@ -732,6 +732,13 @@ include("test_zero_inflated_binomial_logit_zi.jl")
             (10, 10, 2.0, 5.0), (7, 12, 0.5, 0.5), (1, 4, 8.0, 3.0))
         @test bb(y, n, a, b) ≈ logpdf(BetaBinomial(n, a, b), y)
     end
+    # Both arms of the trial-count split: log rising factorials up to 64
+    # trials, the two logbeta calls above.
+    for (y, n, a, b) in ((30, 64, 2.0, 5.0), (64, 64, 0.3, 7.0), (0, 64, 40.0, 0.2),
+            (30, 65, 2.0, 5.0), (65, 65, 0.3, 7.0), (40, 100, 2.0, 5.0),
+            (900, 1500, 1e-3, 3e3))
+        @test bb(y, n, a, b) ≈ logpdf(BetaBinomial(n, a, b), y) rtol = 1e-12
+    end
     # Out-of-support observations are -Inf, never NaN.
     @test bb(-1, 10, 2.0, 5.0) == -Inf
     @test bb(11, 10, 2.0, 5.0) == -Inf
@@ -767,3 +774,6 @@ include("test_lognormal_docs_source.jl")
 include("test_dirichlet_multinomial.jl")
 include("test_js_source.jl")
 include("test_law_docs.jl")
+
+include("test_beta_binomial_logrising.jl")
+include("test_beta_binomial_jax.jl")
