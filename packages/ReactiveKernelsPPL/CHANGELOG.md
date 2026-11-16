@@ -16,6 +16,25 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.207
+
+- `prepare_gibbs` derives exact finite conditionals for explicit scalar
+  integer blocks and a continuous conditional over the real coordinates.
+  Each conditional omits whole emitted density terms independent of its
+  block. `initialize_gibbs`, `gibbs_step!` and `gibbs_draws` combine exact
+  integer draws with a WarmupHMC NUTS transition. RNGs stay outside the model
+  graph, and saved draws own their storage.
+- Without `stepsize`, `initialize_gibbs` adapts the NUTS kernel during
+  `warmup` sweeps (default 1000) with WarmupHMC's continuously adapting
+  kernel, which follows the continuous conditional as the integers change,
+  then fixes it for every later sweep. `stepsize` (and `metric`) supply a
+  fixed kernel instead.
+- Joint integer blocks are configurable through `blocks`; their support
+  product remains a runtime plate. Nested author namespaces and purely
+  discrete models are supported. Integer arrays and already marginalized
+  integer models are not implemented by this initial driver. Discarding
+  sweeps does not adapt the kernel.
+
 ## 0.1.206
 
 - Finite integer declarations (`Binomial`, `Bernoulli`, `Categorical`,

@@ -89,6 +89,58 @@ has no single value at the remaining `u`. Query it on the conditional model
 with explicit integer state. Independent named values remain available;
 joint predictive and discrete-latent queries recover their conditional laws.
 
+For explicit scalar integer parameters, `prepare_gibbs` derives one finite
+conditional per declaration and one continuous conditional over all real
+coordinates. The driver draws the integers exactly, then takes one
+WarmupHMC NUTS transition on the real coordinates. Load `WarmupHMC`,
+`LogDensityProblems` and `Random` to enable the driver.
+
+```@example integer
+using WarmupHMC, LogDensityProblems, Enzyme, DifferentiationInterface
+
+problem = prepare_gibbs(count_built, count_plan, u; discrete,
+    backend = AutoEnzyme(; mode = Enzyme.Reverse))
+state = initialize_gibbs(Xoshiro(42), problem, u; discrete)
+draws = gibbs_draws(state, 1_000)
+draws.parameters.p
+draws.parameters.k
+```
+
+`initialize_gibbs` adapts the NUTS kernel during `warmup` sweeps (1000 by
+default). Each warm-up sweep draws the integers exactly and then moves the
+real coordinates with WarmupHMC's continuously adapting kernel, which follows
+the continuous conditional as the integers change. The chain then continues
+from the last warm-up state with that kernel fixed, so every saved sweep is an
+ordinary Markov chain transition. `state.warmup` reports the warm-up sweeps,
+their divergences and gradient evaluations. To supply the kernel instead,
+pass `stepsize` and optionally `metric`, a scale `L` with covariance `L*L'`;
+then no warm-up runs. `discard` only omits sweeps. `gibbs_step!(state)`
+advances one sweep and returns its divergence flag. Save multiple chains and check R-hat, bulk and tail ESS, and divergences
+before interpreting posterior summaries.
+
+Each conditional omits whole emitted density terms that do not read its
+block. For the RAG model, the integer conditional omits `p`'s prior, while
+the continuous conditional omits the honest-claims factor. These conditional
+log densities differ from the full joint by block-constant terms. The driver
+checks that the initial state has finite full joint density.
+
+The default visits scalar integers separately in declaration order. For
+strongly coupled or deterministically linked integers, use a joint block,
+for example `blocks = ((:k, :z),)`. Every free integer must appear exactly
+once. A nested name is written `Symbol("child.k")`; the state still uses
+nested named tuples. A joint block enumerates the Cartesian product, so
+its cost grows with the product of support sizes. Single-site updates can
+be unable to move between valid states when integers are deterministically
+linked; joint updates can move them together.
+
+The chain owns its position, integer values and RNG streams. Integer values
+are stored as `Int`, including when the starting value has a narrower type.
+Saved positions and constrained draws remain unchanged by later steps.
+Prepare a separate problem for each concurrent chain. Purely discrete
+models use the same driver without an AD backend, metric or step size.
+The initial Gibbs interface does not yet update integer arrays or models
+with already marginalized integers.
+
 JAX execution is verified for all four families, including ordinary
 gradients, changed data sizes, integer-dependent observation trials, and
 Categorical matrices with empty axes. Pass named integer dictionaries beside
