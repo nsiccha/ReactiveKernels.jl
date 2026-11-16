@@ -16,6 +16,33 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.274
+
+- `jax_source` takes `rejecting`, the names of module functions that answer
+  `-inf` where a numerical method cannot produce a value at a valid input
+  (natively a `ReactiveKernels.NumericalFailure`), as a log density outside
+  the model's support does. An ODE solve's exceeded per-output budget and
+  failed solve are such failures. The module emits them as
+  `jax.experimental.checkify` checks, which leave every plate cell's `vmap`,
+  scan step, branch and loop as values, and evaluates its functions through
+  `checkify`: those `rejecting` names return `-inf` for the whole evaluation,
+  also under `jax.jit`, `jax.grad` and `jax.vmap`, and the others raise, as
+  before, with the same message. Invalid ODE inputs and every other runtime
+  check still raise. A module without such a failure is unchanged.
+- Such a module needs a JAX whose `checkify` has `checkify.Error.has_error` and
+  differentiates a `custom_vjp` (every diffrax solve) after a check. No JAX
+  release has either: jax 0.12.0.1 gives a wrong or failing gradient there
+  (`benchmark/repro_jax_checkify_custom_vjp_control_flow.py`). Branch
+  `jax-v0.12.0.1-checkify` of `https://github.com/nsiccha/jax` carries both;
+  without them, the module refuses to import with an `ImportError` naming it.
+- A JAX ODE solve fails where its step size falls below 16 ulps of the latest
+  time, or where it steps from a non-finite state or its error estimate is
+  not finite, as the native solve stops as `DtLessThanMin` or `Unstable`.
+  Before, a finite-time blow-up (`dy/dt = k y²`) rejected steps until
+  diffrax's limit of 2³¹ − 1 steps, about 220 s an evaluation, and only then
+  failed; it now fails at once. Values and gradients where the solve
+  succeeds are unchanged.
+
 ## 0.1.273
 
 - `js_source` translates the quantiles of RK's distribution laws:

@@ -16,6 +16,18 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.204
+
+- A `jax_source` module's density functions (`log_density`, `log_prior`,
+  `log_likelihood` and `log_jacobian`) answer `-inf` where a numerical method
+  cannot evaluate the model, such as an ODE solve that fails or exceeds its
+  step budget, also from a plate cell, a scan step or a branch, as the native
+  sampler targets answer `-Inf` (0.1.195): a NumPyro or BlackJAX sampler then
+  rejects the point instead of aborting. Their gradient there is unspecified.
+  `constrain` raises there, and every other runtime check still raises. Needs
+  ReactiveKernels 0.1.274, and for a model with an ODE solve the JAX it names
+  (its `jax_source` docstring).
+
 ## 0.1.203
 
 - `marginalize(model, :x; predictive, filtered)` names values of the Kalman

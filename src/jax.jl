@@ -2435,10 +2435,57 @@ function _jax_call_positional(ctx::_JaxContext, ::typeof(_runtime_check), args::
     _jax_masked_check(ctx, valid, message)
     _PyVal("None", Nothing, true)
 end
+# A numerical method that cannot produce a value at a valid input
+# (`ReactiveKernels.NumericalFailure`, e.g. a failed ODE solve) is a
+# `checkify` check, which JAX carries out of every `vmap`, `scan`, `cond` and
+# loop as a value. The module's functions then answer `-inf` there (those
+# named in `jax_source`'s `rejecting`) or raise, as the native program throws
+# (`_JAX_CHECKIFIED`).
+const _JAX_REJECT = """
+from jax.experimental import checkify
+
+
+def _rk_reject(valid, message):
+    # A numerical method failed at a valid input (ReactiveKernels'
+    # NumericalFailure): a density function answers -inf, another raises.
+    checkify.check(valid, message)
+"""
+# The module functions of a module that has a `_rk_reject`, around the
+# function computing their value.
+const _JAX_CHECKIFIED = """
+if not hasattr(checkify.Error, "has_error"):
+    # A JAX release's checkify differentiates a custom_vjp (every diffrax
+    # solve) wrongly or not at all after a check, and has no has_error.
+    raise ImportError(
+        "this module runs its functions through jax.experimental.checkify, so it needs "
+        "a JAX whose checkify has Error.has_error and differentiates a custom_vjp after "
+        "a check; no JAX release has either yet (branch jax-v0.12.0.1-checkify of "
+        "https://github.com/nsiccha/jax has both)")
+
+
+def _rk_rejecting(f, *args, **kwargs):
+    # f's value, or -inf where a numerical method failed. checkify traces a
+    # closure, so static arguments (an entry's name) stay Python values.
+    error, value = checkify.checkify(lambda: f(*args, **kwargs))()
+    return jnp.where(error.has_error(), -jnp.inf, value)
+
+
+def _rk_raising(f, *args, **kwargs):
+    # f's value; raises where a numerical method failed, naming it.
+    error, value = checkify.checkify(lambda: f(*args, **kwargs))()
+    def throw(e):
+        e.throw()
+    jax.debug.callback(throw, error)
+    return value
+"""
+_jax_rejects(mod) = haskey(mod.helper_names, (:helper, "_rk_reject"))
+
 # A check of `valid` (`nothing`: a throw, which no value passes) where the
 # code runs: it holds where any data-dependent condition the code runs under
-# is false.
-function _jax_masked_check(ctx::_JaxContext, valid::Union{Nothing,_PyVal}, message::AbstractString)
+# is false. `reject = true` makes it a numerical failure (`_JAX_REJECT`)
+# instead of an error.
+function _jax_masked_check(ctx::_JaxContext, valid::Union{Nothing,_PyVal}, message::AbstractString;
+                           reject::Bool = false)
     guards = String[]
     for (scope, guard) in _JAX_GUARDS
         _jax_scope_within(ctx.scope, scope) || _jax_error(
@@ -2457,7 +2504,8 @@ function _jax_masked_check(ctx::_JaxContext, valid::Union{Nothing,_PyVal}, messa
     else
         taken === nothing ? valid.code : "jnp.logical_or(" * valid.code * ", " * _jax_not(taken) * ")"
     end
-    name = _jax_helper!(ctx, "_rk_check", _JAX_CHECK)
+    name = reject ? _jax_helper!(ctx, "_rk_reject", _JAX_REJECT) :
+        _jax_helper!(ctx, "_rk_check", _JAX_CHECK)
     _jax_emit!(ctx, name * "(" * held * ", " * message * ")")
     _JAX_EFFECTS[] += 1
     nothing
@@ -3162,11 +3210,14 @@ end
 # Define the module-level helper `name` (Python source `text`) once.
 function _jax_helper!(ctx::_JaxContext, name::AbstractString, text::AbstractString)
     ctx.host === nothing || return _host_helper!(ctx, name, text)
+    _jax_module_helper!(ctx.mod, name, text)
+end
+function _jax_module_helper!(mod, name::AbstractString, text::AbstractString)
     key = (:helper, name)
-    haskey(ctx.mod.helper_names, key) && return name
-    ctx.mod.helper_names[key] = name
-    push!(ctx.mod.used, name)
-    push!(ctx.mod.helpers, rstrip(text))
+    haskey(mod.helper_names, key) && return name
+    mod.helper_names[key] = name
+    push!(mod.used, name)
+    push!(mod.helpers, rstrip(text))
     name
 end
 
@@ -6777,7 +6828,7 @@ _jax_needs_x64(mod::_JaxModule) =
     jax_source(spec::KernelSpec; have, want, types = nothing, name = :kernel,
                float_type = Float64) -> JAXSource
     jax_source(spec::KernelSpec; have, functions, types = nothing, constants = (;),
-               doc = nothing, float_type = Float64) -> JAXSource
+               doc = nothing, float_type = Float64, rejecting = ()) -> JAXSource
     jax_source(p::Plan; types = nothing, name = :kernel, doc = nothing,
                float_type = Float64) -> JAXSource
 
@@ -6793,6 +6844,23 @@ dictionaries of these).
 `function_docs`, a `NamedTuple` of function name => text, gives functions
 their docstrings; the others state what they compute. Module functions
 annotate their parameters (`ArrayLike`) and results.
+
+Where a numerical method cannot produce a value at a valid input (natively a
+`ReactiveKernels.NumericalFailure`: an ODE solve that exceeds its per-output
+budget or fails), a module function raises, as the native program throws,
+except that the functions `rejecting` names (function names of `functions`,
+each with one WANT value) answer `-inf`, as a log density outside the model's
+support does. The failure is a
+`jax.experimental.checkify` check, which JAX carries out of every `vmap`,
+`scan`, `cond` and loop, so a plate cell's or scan step's failure rejects the
+whole evaluation, under `jax.jit`, `jax.grad` and `jax.vmap` too; a gradient
+there is unspecified. Only a module that can fail so wraps its functions in
+`checkify`. Such a module needs a JAX whose `checkify` has
+`checkify.Error.has_error` and differentiates a `custom_vjp` (every diffrax
+solve) after a check. No JAX release has either yet: jax 0.12.0.1 gives a
+wrong or failing gradient there (`benchmark/repro_jax_checkify_custom_vjp_control_flow.py`).
+Branch `jax-v0.12.0.1-checkify` of `https://github.com/nsiccha/jax` carries
+both; without them, the module refuses to import.
 
 The module docstring starts with the generated line `Generated by
 ReactiveKernels.jax_source; do not edit.` `doc` adds the author's description
@@ -6848,7 +6916,8 @@ function jax_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
                     name = :kernel, constants = NamedTuple(), doc = nothing, data = nothing,
                     definitions = nothing, definitions_module::Module = Main, keep = (),
                     function_docs = NamedTuple(), float_type = Float64,
-                    source_regions = _JaxSourceRegion[], module_docstring = nothing)
+                    source_regions = _JaxSourceRegion[], module_docstring = nothing,
+                    rejecting = ())
     docstring = _jax_module_docstring(doc, module_docstring)
     functions === nothing && want === nothing && (want = _KERNEL_DEFAULT_BOUNDARY)
     if functions === nothing
@@ -6858,11 +6927,18 @@ function jax_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
     end
     functions isa NamedTuple && !isempty(functions) || throw(ArgumentError(
         "jax_source: `functions` must be a nonempty NamedTuple of function name => WANT"))
+    rejecting = Tuple(Symbol.(rejecting))
+    for fname in rejecting
+        haskey(functions, fname) || throw(ArgumentError(
+            "jax_source: `rejecting` names `$fname`, which is not one of `functions`"))
+        functions[fname] isa Symbol || throw(ArgumentError(
+            "jax_source: `rejecting` names `$fname`, whose WANT is not one value"))
+    end
     plans = [fname => (plan(spec; have, want = _jax_want_names(w)), w)
              for (fname, w) in pairs(functions)]
     _jax_with_float_type(float_type) do
         _jax_module_source(plans, types, constants, docstring; data, definitions,
-                           definitions_module, keep, function_docs, source_regions)
+                           definitions_module, keep, function_docs, source_regions, rejecting)
     end
 end
 
@@ -6926,14 +7002,14 @@ _jax_want_names(w) = throw(ArgumentError(
 function _jax_module_source(plans, types, constants, docstring::String; data = nothing,
                             definitions = nothing, definitions_module::Module = Main,
                             keep = (), function_docs = NamedTuple(),
-                            source_regions = _JaxSourceRegion[])
+                            source_regions = _JaxSourceRegion[], rejecting = ())
     if data === nothing
         definitions === nothing || isempty(definitions) || throw(ArgumentError(
             "jax_source: `definitions` compute data values, so they need `data`"))
         isempty(keep) || throw(ArgumentError(
             "jax_source: `keep` names values of `prepare_data`, so it needs `data`"))
         return _jax_module_text(plans, types, constants, docstring, nothing;
-                                function_docs, source_regions)
+                                function_docs, source_regions, rejecting)
     end
     data isa NamedTuple || data isa Tuple && all(d -> d isa Symbol, data) ||
         throw(ArgumentError("jax_source: `data` is a tuple of HAVE names or a NamedTuple " *
@@ -6986,7 +7062,7 @@ function _jax_module_source(plans, types, constants, docstring::String; data = n
             return _jax_module_text(plans, types, constants, docstring,
                                     (data, excluded, defs, untranslated, keep, reasons,
                                      promoted, cells, cell_reasons, definitions_module);
-                                    function_docs, source_regions)
+                                    function_docs, source_regions, rejecting)
         catch e
             if e isa _HostUnsupportedDefinition && !haskey(untranslated, e.name)
                 untranslated[e.name] = e.error
@@ -7079,14 +7155,15 @@ import scipy.special as ssp
 """
 
 function _jax_module_text(plans, types, constants, docstring::String, prepare;
-                          function_docs = NamedTuple(), source_regions = _JaxSourceRegion[])
+                          function_docs = NamedTuple(), source_regions = _JaxSourceRegion[],
+                          rejecting = ())
     mod = _JaxModule()
     append!(mod.regions, source_regions)
     union!(mod.used, ("jax", "jnp", "jsp", "np", "ssp", "scipy"))
     bodies = String[]
     functions = JAXFunction[]
     if prepare === nothing
-        _jax_functions!(mod, bodies, functions, plans, types; function_docs)
+        _jax_functions!(mod, bodies, functions, plans, types; function_docs, rejecting)
     else
         data, excluded, defs, untranslated, keep, reasons, promoted, cells, cell_reasons,
             mod.definitions_module = prepare
@@ -7095,7 +7172,8 @@ function _jax_module_text(plans, types, constants, docstring::String, prepare;
         mod.host_graph = first(plans).second[1].graph
         defs === nothing || union!(mod.host_definitions, (first(d) for d in defs))
         meta = _jax_prepared_functions!(mod, bodies, functions, plans, types, data, excluded,
-                                        defs, untranslated; keep, function_docs, promoted, cells)
+                                        defs, untranslated; keep, function_docs, promoted, cells,
+                                        rejecting)
         constants = merge(constants, meta)
     end
     constant_lines = String[]
@@ -7149,7 +7227,7 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
                                   excluded, defs = nothing,
                                   untranslated = Dict{Symbol,JAXEmissionError}(); keep = (),
                                   function_docs = NamedTuple(), promoted = Set{Int}(),
-                                  cells = Dict{Int,Set{Int}}())
+                                  cells = Dict{Int,Set{Int}}(), rejecting = ())
     ports = data isa NamedTuple ? Set(keys(data)) : Set(data)
     # A promoted recipe's values (`_JaxPromote`) are data inputs of every
     # function, which its definitions give: the recipe is not run.
@@ -7281,7 +7359,7 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
     end
     try
         _jax_functions!(mod, bodies, functions, split.residuals, Tuple(all_types);
-                        names = all_names, function_docs,
+                        names = all_names, function_docs, rejecting,
                         keyword_from = length(remaining_names))
     catch e
         e isa JAXEmissionError || rethrow()
@@ -7332,10 +7410,43 @@ function _jax_compatible_plans(a::Plan, b::Plan)
         for (id, r) in a.producer)
 end
 
+# A module function, emitted once every function's value is: in a module that
+# has a numerical failure (`_rk_reject`), its value is `checkify`'s of the
+# function `target` computing it, `-inf` where the failure happens for a
+# function `rejecting` names (`_rk_rejecting`), else raising there
+# (`_rk_raising`). `lines` is the function's own text (`def` line, docstring,
+# body) and `target` empty, or `lines` is its `def` line and docstring and
+# `target(args...)` its value.
+struct _JaxEntry
+    fname::Symbol
+    lines::Vector{String}
+    target::String
+    args::Vector{String}
+end
+function _jax_entry_text(mod, e::_JaxEntry, rejecting)
+    if !_jax_rejects(mod)
+        isempty(e.target) && return join(e.lines, "\n")
+        return join([e.lines[1:2]; "    return " * e.target * "(" * join(e.args, ", ") * ")"], "\n")
+    end
+    _jax_module_helper!(mod, "_rk_rejecting", _JAX_CHECKIFIED)
+    lines, target = e.lines, e.target
+    body = String[]
+    if isempty(target)
+        # The function's own text becomes the private function computing its
+        # value, without the docstring the module function keeps.
+        name = match(r"^def ([A-Za-z_][A-Za-z0-9_]*)\(", lines[1])[1]
+        target = _jax_private_identifier(mod.used, name)
+        body = [join(["def " * target * chopprefix(lines[1], "def " * name); lines[3:end]], "\n"), "", ""]
+    end
+    via = e.fname in rejecting ? "_rk_rejecting" : "_rk_raising"
+    join([body; lines[1:2]; "    return " * via * "(" * join([target; e.args], ", ") * ")"], "\n")
+end
+
 function _jax_functions!(mod, bodies, functions, plans, types;
                          names = nothing, keyword_from = nothing,
-                         function_docs = NamedTuple())
+                         function_docs = NamedTuple(), rejecting = ())
     public_names = Dict(fname => _jax_identifier(mod.used, fname) for (fname, _) in plans)
+    blocks = Union{String,_JaxEntry}[]
     groups = Vector{eltype(plans)}[]
     for entry in plans
         index = findfirst(group -> all(_jax_compatible_plans(entry.second[1], e.second[1])
@@ -7349,7 +7460,10 @@ function _jax_functions!(mod, bodies, functions, plans, types;
             lines, f = _jax_function!(mod, fname, p, types, w; names, keyword_from,
                 name_override = public_names[fname],
                                       doc = get(function_docs, fname, nothing))
-            push!(bodies, join(lines, "\n"))
+            shown = keyword_from === nothing ? f.inputs : f.inputs[1:keyword_from]
+            args = String[first(io) for io in shown]
+            keyword_from === nothing || push!(args, "**prepared")
+            push!(blocks, _JaxEntry(fname, lines, "", args))
             emitted[fname] = f
             continue
         end
@@ -7406,7 +7520,7 @@ function _jax_functions!(mod, bodies, functions, plans, types;
         lines, shared = _jax_function!(mod, :_model, p, types, first(group).second[2];
             names, keyword_from, emit, selector,
             doc = "Shared model computation. The generated entry wrappers select a static output.")
-        push!(bodies, join(lines, "\n"))
+        push!(blocks, join(lines, "\n"))
         shown = keyword_from === nothing ? shared.inputs : shared.inputs[1:keyword_from]
         signature = [pn * ": " * _jax_annotation(T) for (pn, T) in shown]
         args = String[first(io) for io in shown]
@@ -7419,12 +7533,14 @@ function _jax_functions!(mod, bodies, functions, plans, types;
             name = public_names[fname]
             wrapper = ["def " * name * "(" * join(signature, ", ") * ") -> " *
                        _jax_return_annotation(w, wants) * ":",
-                _jax_docstring(something(get(function_docs, fname, nothing), _jax_default_doc(w)), "    "),
-                "    return " * shared.name * "(" * join([repr(String(fname)); args], ", ") * ")"]
-            push!(bodies, join(wrapper, "\n"))
+                _jax_docstring(something(get(function_docs, fname, nothing), _jax_default_doc(w)), "    ")]
+            push!(blocks, _JaxEntry(fname, wrapper, shared.name, [repr(String(fname)); args]))
             emitted[fname] = JAXFunction(name, copy(shared.inputs),
                 [String(v.name) => x.T for (v, x) in zip(q.want, wants)])
         end
+    end
+    for b in blocks
+        push!(bodies, b isa String ? b : _jax_entry_text(mod, b, rejecting))
     end
     append!(functions, (emitted[fname] for (fname, _) in plans))
 end

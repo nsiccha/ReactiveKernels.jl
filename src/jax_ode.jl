@@ -159,10 +159,14 @@ function _jax_ode_call(ctx::_JaxContext, f, args::Vector{_PyVal})
                join([_jax_ode_solver(f), fun, y0.code, t0.code, ts.code, n, rt.code, at.code,
                      mx.code, _jax_tuple_code(passed)], ", ") * ")")
     label = string(name, " (", _jax_ode_solver(f)[9:end-2], ")")
+    # Invalid inputs raise, as natively (`ArgumentError`); an exceeded budget
+    # or a failed solve is a numerical failure (`ODESolveFailure` natively),
+    # where a density function answers -inf.
     for (code, message) in ((1, " has an invalid initial state, output times, tolerances or maxsteps"),
                             (2, " exceeded maxsteps between requested outputs"),
                             (3, " failed"))
-        _jax_masked_check(ctx, _PyVal(status * " != " * string(code), Bool), repr(label * message))
+        _jax_masked_check(ctx, _PyVal(status * " != " * string(code), Bool), repr(label * message);
+                          reject = code != 1)
     end
     _PyVal(solution, Matrix{Float64}, false, ts.extent, "", isempty(ts.extent) ? 0 : 1)
 end
