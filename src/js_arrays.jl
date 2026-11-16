@@ -16,6 +16,17 @@ _js_ismatrix(v) = (T = _js_type(v); T isa Type && T <: Matrix && eltype(T) <: _J
 _js_iscolon(v) = v isa _JsVal && v.static && v.value isa Colon
 _js_static_int(v) = v isa _JsVal && v.static && v.value isa Integer ? Int(v.value) : nothing
 
+# `fill!` converts once, including for an empty destination, and returns the
+# same buffer. JavaScript's array/typed-array fill retains aliases and takes
+# its extent from the destination at run time.
+function _js_function_call(ir::_JsIR, ::typeof(fill!), args, T)
+    length(args) == 2 && _js_isvector(args[1]) &&
+        (_js_isnumber(args[2]) || _js_isbool(args[2])) || return nothing
+    out = _js_simple!(ir, args[1], "out")
+    value = _js_convert(ir, eltype(_js_type(out)), args[2])
+    _js_rt(out.code * ".fill(" * _js_runtime(ir.fn.mod, value).code * ")", _js_type(out); pure = false)
+end
+
 # The runtime helpers (`_rk_matrix`, `_rk_ncols`, `_rk_at2`, `_rk_col`,
 # `_rk_row`, `_rk_mcopy`) are entries of `_JS_RUNTIME` in `js.jl`; those that
 # write into a matrix are here. A write converts the value to the matrix's
@@ -74,6 +85,9 @@ end
 # or `1` in a numeric array.
 function _js_literal_element(mod, a, E)
     S = _js_type(a)
+    if _js_isvector_type(E)
+        return S === E ? _js_runtime(mod, a).code : nothing
+    end
     if E === Bool
         S === Bool || return nothing
         return _js_runtime(mod, a).code
@@ -85,7 +99,7 @@ function _js_literal_element(mod, a, E)
 end
 
 function _js_array_literal(ir, items, T)
-    T isa Type && T <: Vector && eltype(T) <: _JsMatrixElement || return nothing
+    T isa Type && T <: Vector && _js_isvector_type(T) || return nothing
     mod = ir.fn.mod
     codes = String[]
     for a in items

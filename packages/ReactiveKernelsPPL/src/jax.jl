@@ -25,6 +25,13 @@ parameters, then the prepared data. Its functions:
   parameter's constrained value (an empty parameter has none), plus each value
   named in `values` (a definition such as `:mu`).
 
+Where a numerical method cannot evaluate the model (a
+`ReactiveKernels.NumericalFailure` natively, such as an ODE solve that fails
+or exceeds its step budget), the density functions answer `-inf`, as the
+native sampler targets answer `-Inf`, also from a plate cell, a scan step or a
+branch, under `jax.jit`, `jax.grad` and `jax.vmap`; their gradient there is
+unspecified. `constrain` raises there. Any other runtime check still raises.
+
 Module constants describe the inputs: `DIMENSION` (the length of
 `unconstrained`), `PARAMETERS` (each parameter's 0-based `start`/`stop` in
 `unconstrained`, its transform and dimensions), `INPUTS` (the parameter names
@@ -141,10 +148,13 @@ function _jax_module_of(built, plan; values, doc, float_type)
     src = _absent_refusal(plan, built.spec, have, :posterior) do
         # The definitions' callees resolve as `bind_data` resolves them
         # (`_eval_callee`): in the generated scope, whatever the caller imported.
+        # The density functions answer -inf where a numerical method fails,
+        # as the native sampler targets answer -Inf; `constrain` raises.
         jax_source(built.spec; have, functions, types, constants, module_docstring = module_doc, data,
                    definitions, definitions_module = PPLGeneratedModels,
                    keep = Tuple(sizes), function_docs, float_type,
-                   source_regions = _jax_submodel_regions(built, plan))
+                   source_regions = _jax_submodel_regions(built, plan),
+                   rejecting = (:log_density, :log_prior, :log_likelihood, :log_jacobian))
     end
     _jax_with_layout(src, built.layout)
 end

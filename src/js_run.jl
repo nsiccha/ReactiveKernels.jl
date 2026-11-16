@@ -80,12 +80,17 @@ if (typeof m[entry] !== "function") {
   process.exit(0);
 }
 const inputs = Array.isArray(m.INPUTS) ? m.INPUTS : [];
+function inputVector(a, type) {
+  if (vectors !== "float64array" || !Array.isArray(a)) return a;
+  if (/^Vector\{(Float64|Int64)\}$/.test(type)) return Float64Array.from(a);
+  if (type.startsWith("Vector{") && type.endsWith("}"))
+    return a.map((x) => inputVector(x, type.slice(7, -1)));
+  if (/^Matrix\{(Float64|Int64)\}$/.test(type))
+    return Object.assign(a.map((r) => Float64Array.from(r)), a.length === 0 ? { cols: a.cols } : {});
+  return a;
+}
 const results = cases.map((raw) => {
-  const args = raw.map(decode).map((a, i) =>
-    vectors === "float64array" && Array.isArray(a) && /^Vector\{(Float64|Int64)\}$/.test(inputs[i]?.type ?? "") ?
-      Float64Array.from(a) :
-    vectors === "float64array" && Array.isArray(a) && /^Matrix\{(Float64|Int64)\}$/.test(inputs[i]?.type ?? "") ?
-      Object.assign(a.map((r) => Float64Array.from(r)), a.length === 0 ? { cols: a.cols } : {}) : a);
+  const args = raw.map(decode).map((a, i) => inputVector(a, inputs[i]?.type ?? ""));
   const before = JSON.stringify(encode(args));
   let r;
   try {
@@ -125,10 +130,10 @@ Call the function `entry` of the JavaScript module `source` (the text
 one Node.js process, and return one [`JSOutcome`](@ref ReactiveKernels.JSOutcome)
 per case, in order. Prototype; not exported.
 
-Arguments are `Float64`, `Int64` and `Bool` values and vectors of them, also
+Arguments are `Float64`, `Int64` and `Bool` values and nested vectors of them, also
 nonfinite numbers and `-0.0`; they are copied, so the caller's arrays are never
 changed. `vectors = :float64array` passes `Vector{Float64}` and
-`Vector{Int64}` inputs as `Float64Array`s instead of arrays. A call that
+`Vector{Int64}` inputs (including nested leaves) as `Float64Array`s. A call that
 throws inside the module is reported in its outcome; `js_run` throws a
 [`JSRunError`](@ref ReactiveKernels.JSRunError) only when the run itself
 fails: no Node.js, a module that does not import, a missing `entry`, a crash
@@ -205,7 +210,14 @@ end
 const _JS_RUN_TYPES = Dict{String,Any}(string(T) => T for T in
     (Float64, Int64, Bool, Vector{Float64}, Vector{Int64}, Vector{Bool},
      Matrix{Float64}, Matrix{Int64}, Matrix{Bool}, BitVector, BitMatrix))
-_js_run_type(name) = get(_JS_RUN_TYPES, name, nothing)
+function _js_run_type(name)
+    T = get(_JS_RUN_TYPES, name, nothing)
+    T === nothing || return T
+    # Parse only the supported nested-vector grammar, never evaluate module text.
+    startswith(name, "Vector{") && endswith(name, "}") || return nothing
+    E = _js_run_type(name[8:end-1])
+    E === nothing || !_js_isvector_type(E) ? nothing : Vector{E}
+end
 
 function _js_run_outcome(r::Dict, types, returns)
     mutated = get(r, "mutated", false) === true

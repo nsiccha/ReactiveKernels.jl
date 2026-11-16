@@ -16,13 +16,90 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.280
+## 0.1.284
 
 - Add the internal log rising-factorial numerical graph used by distribution
   kernels. Small integer offsets evaluate chunked products and their shape
   partial together; other offsets use the optional SpecialFunctions extension.
   The ordinary derivative adapters come from that one graph, and the product
   loops retain their runtime count.
+
+## 0.1.283
+
+- `jax_source` preserves padded length bounds through integer addition,
+  subtraction and multiplication by input-shape expressions. A helper can
+  allocate at `(1 + length(parameters)) * length(row)` when `row` is ragged;
+  its capacity comes from the input shapes during JAX tracing. Signed
+  arithmetic tracks both interval endpoints, and loops retain their runtime
+  structure. One emitted module continues to accept different input sizes.
+  Zero-capacity buffers skip the last-entry read when padding a loop result.
+
+## 0.1.282
+
+- `js_source` translates nested vectors of numbers and Booleans, including
+  ragged and empty groups: literals, inputs, bound data, indexing, iteration,
+  comprehensions and plate cells retain their nesting. `vec` preserves the
+  vector and `reduce(vcat, rows)` concatenates one level with runtime loops.
+  Prepared kernels can consume those vectors inside another kernel.
+  `js_run` preserves the nested
+  output types and applies its typed-array mode to numeric leaves.
+
+## 0.1.281
+
+- `js_source` translates nested tuple literals and tuple `length`, including
+  calls in validation helpers. It also translates `fill!` of numerical and
+  Bool vectors with supported element conversions, preserving aliases and
+  converting the fill value once even when the destination is empty. The
+  destination length remains a runtime value. Reads of reassigned locals
+  retain their values, including the temporary reused by keyword sorters.
+  These operations let BRM's
+  type-stable fixed-domain HSGP basis emit with scalar or per-axis mode counts
+  and retain its input checks.
+
+## 0.1.280
+
+- `jax_source`: the cells of a plate whose cells fill their stored rows (an
+  earlier plate's vectors or matrices of one fixed shape, such as one 3×3
+  propagator per step length) reach a later plate that maps them as dense
+  arrays, without lengths, so `size` and `length` of one cell are static there.
+  Before, each cell carried its stored size as a padded length, and a helper
+  that checked a typed argument's dimension (StanBlocks' `@juliacompat`
+  `matrix[3, 3]` check, `size(x, i)` with `i` the helper's argument) raised
+  `JAXEmissionError: size of a padded value along a computed dimension`.
+- `jax_source`: `size(x, d)` of a padded value (a ragged row in its cell) along
+  a dimension `d` that is static while JAX traces, such as a helper's integer
+  argument, is the row's length along its padded axis and the stored size
+  along another, as for a literal dimension. It raised the same error before.
+
+## 0.1.279
+
+- `jax_source` takes `rejecting`, the names of module functions that answer
+  `-inf` where a numerical method cannot produce a value at a valid input
+  (natively a `ReactiveKernels.NumericalFailure`), as a log density outside
+  the model's support does. An ODE solve's exceeded per-output budget and
+  failed solve are such failures. The module emits them as
+  `jax.experimental.checkify` checks, which leave every plate cell's `vmap`,
+  scan step, branch and loop as values, and evaluates its functions through
+  `checkify`: those `rejecting` names return `-inf` for the whole evaluation,
+  also under `jax.jit`, `jax.grad` and `jax.vmap`, and the others raise, as
+  before, with the same message. Invalid ODE inputs and every other runtime
+  check still raise. The module's other runtime checks are then `checkify`
+  checks too, so the first failure in program order decides, as natively: a
+  check on a failed solve's state (a solve continuing from it) neither raises
+  nor hides the failure. A module without such a failure is unchanged.
+- Such a module needs a JAX whose `checkify` has `checkify.Error.has_error` and
+  differentiates a `custom_vjp` (every diffrax solve) after a check. No JAX
+  release has either: jax 0.12.0.1 gives a wrong or failing gradient there
+  (`benchmark/repro_jax_checkify_custom_vjp_control_flow.py`). Branch
+  `jax-v0.12.0.1-checkify` of `https://github.com/nsiccha/jax` carries both;
+  without them, the module refuses to import with an `ImportError` naming it.
+- A JAX ODE solve fails where its step size falls below 16 ulps of the latest
+  time, or where it steps from a non-finite state or its error estimate is
+  not finite, as the native solve stops as `DtLessThanMin` or `Unstable`.
+  Before, a finite-time blow-up (`dy/dt = k y²`) rejected steps until
+  diffrax's limit of 2³¹ − 1 steps, about 220 s an evaluation, and only then
+  failed; it now fails at once. Values and gradients where the solve
+  succeeds are unchanged.
 
 ## 0.1.278
 

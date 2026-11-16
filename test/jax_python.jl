@@ -99,6 +99,10 @@ def jl(x):
 out = "(value = " + jl(value)
 if sys.argv[4] == "grad":
     out += ", grad = " + jl(jax.jit(jax.grad(call))(first))
+elif sys.argv[4] == "joint":
+    # Value and gradient from one jax.value_and_grad, as a sampler takes them.
+    joint_value, joint_grad = jax.jit(jax.value_and_grad(call))(first)
+    out += ", joint_value = " + jl(joint_value) + ", grad = " + jl(joint_grad)
 print(out + ",)")
 """
 
@@ -107,12 +111,17 @@ print(out + ",)")
 
 Call function `name` of the emitted module `src` on `args`, jitted over its
 first argument with the others closed over, as a sampler calls it; with
-`grad = true` also return `jax.grad` with respect to the first argument.
+`grad = true` also return `jax.grad` with respect to the first argument, and
+with `grad = :joint` also `joint_value` and `grad` from one
+`jax.value_and_grad`, as a sampler evaluates both.
 With `prepare = true` the other arguments are the raw data, which the
 module's `prepare_data` turns into the function's inputs; `prepare =
 :arguments` also passes those to the jitted function as traced arguments.
 """
-function rk_jax_evaluate(src::JAXSource, name, args; grad::Bool = false, prepare = false)
+function rk_jax_evaluate(src::JAXSource, name, args; grad::Union{Bool,Symbol} = false,
+                         prepare = false)
+    grad isa Symbol && grad !== :joint && throw(ArgumentError("grad is a Bool or :joint"))
+    mode = grad === :joint ? "joint" : grad ? "grad" : "value"
     dir = mktempdir()
     module_path = joinpath(dir, "rk_module.py")
     write(module_path, src)
@@ -122,7 +131,7 @@ function rk_jax_evaluate(src::JAXSource, name, args; grad::Bool = false, prepare
     driver = joinpath(dir, "driver.py")
     write(driver, _RK_JAX_DRIVER)
     errors = joinpath(dir, "stderr.txt")
-    cmd = `$RK_JAX_PYTHON $driver $module_path $args_path $(String(name)) $(grad ? "grad" : "value") $(prepare === :arguments ? "arguments" : prepare === false ? "plain" : "prepare")`
+    cmd = `$RK_JAX_PYTHON $driver $module_path $args_path $(String(name)) $mode $(prepare === :arguments ? "arguments" : prepare === false ? "plain" : "prepare")`
     output = try
         read(pipeline(cmd; stderr = errors), String)
     catch e

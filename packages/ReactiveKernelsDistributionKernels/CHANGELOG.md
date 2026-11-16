@@ -6,7 +6,7 @@
   factorials for up to 64 trials when positive shapes sum to at most 2^30.
   The value and shape partials share product recurrences, avoiding digamma
   calls in the small-count reverse pass. Larger counts and shapes retain
-  the existing log-beta calculation. Requires ReactiveKernels 0.1.280.
+  the existing log-beta calculation. Requires ReactiveKernels 0.1.284.
 
 ## 0.1.12
 
