@@ -16,6 +16,16 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.283
+
+- `jax_source` preserves padded length bounds through integer addition,
+  subtraction and multiplication by input-shape expressions. A helper can
+  allocate at `(1 + length(parameters)) * length(row)` when `row` is ragged;
+  its capacity comes from the input shapes during JAX tracing. Signed
+  arithmetic tracks both interval endpoints, and loops retain their runtime
+  structure. One emitted module continues to accept different input sizes.
+  Zero-capacity buffers skip the last-entry read when padding a loop result.
+
 ## 0.1.282
 
 - `js_source` translates nested vectors of numbers and Booleans, including
