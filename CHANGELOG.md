@@ -16,6 +16,27 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.271
+
+- `js_source` translates more of the Base a plain helper uses over a window
+  of a series, with native results and native errors:
+  - the comparison predicates `==(x)`, `!=(x)`, `<(x)`, `<=(x)`, `>(x)`,
+    `>=(x)` and `isequal(x)`, wherever a predicate is taken: `count`, `any`,
+    `all`, `filter`, a generator's condition, and `findfirst`/`findlast`;
+  - `findfirst(p, v)` and `findlast(p, v)` of a vector or a range, and of a
+    vector of `Bool`s, giving the position or `nothing`, and `isnothing`;
+    a predicate that does not return a `Bool` is refused by name;
+  - `sum(f, v)`, `maximum(f, v)` and `minimum(f, v)` of a vector or a range,
+    `f` a function, a closure or a predicate (`sum(abs2, x .- y)`,
+    `sum(isnan, x)`): a sum is pairwise as Julia's is, and an empty source
+    gives Julia's result (`sum(abs2, Float64[])` is `0.0`) or its
+    `MethodError`;
+  - `x[a:b]`, a checked copy of the window (`BoundsError` out of bounds);
+    `collect` of a range or a vector;
+  - `merge` of named tuples (`merge(nt, (; a))`), later fields winning, in
+    Julia's field order;
+  - `abs2` and `isequal` of numbers.
+
 ## 0.1.270
 
 - `js_source` translates Julia's irrational constants (`π`, `ℯ`,
