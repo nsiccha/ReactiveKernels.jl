@@ -14,6 +14,12 @@ function _jax_prefix(ctx, x, indices)
     if _jax_known(ctx, hi)
         return _PyVal(_py_atom(x.code) * "[:max(" * hi.code * ", 0)]", x.T, x.static)
     end
+    # A known bound can be narrower than the original row (`1:(n - 1)`).
+    # Keep the ordinary range capacity so adjacent shifted slices agree.
+    if !isempty(hi.limit)
+        range = _jax_call(ctx, Colon(), [_jax_literal(1), hi])
+        return _jax_index_values(ctx, x, [range])
+    end
     count = _jax_bind!(ctx, :prefix_length, _PyVal("jnp.maximum(" * hi.code * ", 0)", Int))
     _jax_repeat_last_valid(ctx, _PyVal(x.code, x.T, false, count.code, "", 1))
 end
