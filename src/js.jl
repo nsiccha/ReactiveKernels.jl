@@ -868,7 +868,8 @@ function _js_fold(fv, args)
     f = fv.value
     vals = Any[a.value for a in args]
     ok = if f === getproperty || f === getfield || f === Core.getfield
-        !ismutable(vals[1])
+        # a constant of a module (`Iterators.filter` in a helper), as a global reads
+        !ismutable(vals[1]) || (vals[1] isa Module && vals[2] isa Symbol && isconst(vals[1], vals[2]))
     elseif f isa Core.Builtin || f isa Type
         f in (Core.tuple, Core.apply_type, typeof, fieldtype, nfields, (===), isa, Core.sizeof)
     else

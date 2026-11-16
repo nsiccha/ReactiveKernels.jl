@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.266
+## 0.1.267
 
 - `ReactiveKernels.js_source` translates `rk_ode_rk45_tol`. The emitted module
   integrates with the Dormand–Prince 5(4) method of the vendored
@@ -44,6 +44,22 @@ are recorded in the git history only.
   `vectors = :float64array`.
 - `js_source` translates vector literals, `[a, b]` and `Float64[a, b]`, with
   Julia's promotions.
+
+## 0.1.266
+
+- `js_source` translates lazy iterators over a vector or a range: a
+  comprehension with a condition (`[f(x) for x in v if p(x)]`), a generator
+  over a filter or over another generator, and `Iterators.filter`, consumed by
+  `collect`, `sum`, `maximum` and `minimum` (each also with `init`), `count`,
+  `any`, `all` and `isempty`. Each is one loop that calls the functions in
+  Julia's order. A reduction folds from the first element (or `init`) as
+  Julia reduces an iterator, so a generator's `sum` is Julia's to the last
+  bit, and an empty iterator gives Julia's result or its error. `argmin`,
+  `argmax`, `findmin` and `findmax` of a vector (Julia's order: the first
+  `NaN`, then `-0.0` before `0.0`) and `filter` of a vector translate too, and
+  a helper may read a module's constant, such as `Iterators.filter`. Before,
+  these raised `JSEmissionError` (`Base.Iterators.Filter … has no JavaScript
+  translation`).
 
 ## 0.1.265
 
