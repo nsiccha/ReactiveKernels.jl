@@ -562,6 +562,52 @@ end
     y = sum(A; dims = 3)
     return y
 end
+# `const` global arrays the code reads are module-level arrays holding their
+# values (snag js-source-stack-1e1692d1: a broadcast over one recursed until
+# the stack overflowed, and a run-time use of one was refused).
+const JS_LEVELS = [50.0, 100.0, 200.0, 300.0, 400.0]
+const JS_COUNTS = [1, -2, 3]
+const JS_FLAGS = [true, false, true]
+const JS_GRID = [1.0 2.0; 3.0 4.0; 5.0 6.0]
+const JS_NOROWS = zeros(0, 2)
+const JS_BUFFER = zeros(3)
+const JS_WORDS = ["a", "b"]
+function js_share_above(line, v)
+    n = 0
+    for i in eachindex(v)
+        v[i] > line && (n += 1)
+    end
+    n / length(v)
+end
+function js_fill_buffer(x)
+    JS_BUFFER .= x
+    sum(JS_BUFFER)
+end
+@kernel js_constants(scale, x, i, line) = begin
+    dose = JS_LEVELS
+    scaled = scale .* JS_LEVELS
+    shifted = x .+ JS_LEVELS
+    times = scale * JS_LEVELS
+    picked = JS_LEVELS[i]
+    total = scale * sum(JS_LEVELS)
+    counts = 2 .* JS_COUNTS
+    signs = ifelse.(JS_FLAGS, scale, -scale)
+    grid = scale .* JS_GRID
+    projected = JS_GRID * [scale, 1.0]
+    norows = JS_NOROWS .+ scale
+    share = js_share_above(line, JS_LEVELS)
+    nested = scale .* (JS_LEVELS .+ 1.0)
+    fused = x .+ (2 .* 3)
+    return scaled
+end
+@kernel js_buffered(x) = begin
+    t = js_fill_buffer(x)
+    return t
+end
+@kernel js_words(scale) = begin
+    y = scale .* length.(JS_WORDS)
+    return y
+end
 
 const V = Vector{Float64}
 const M = Matrix{Float64}
@@ -702,6 +748,14 @@ const CASES = [
       (Float64[], 1.0, 0), ([2.0, 3.0], 0.25, -7), ([1.0, -2.0], 3.0, 1)]),
     (:js_irr_matrix, js_irr_matrix, (:A,), (:p, :s, :r), (; A = M),
      [([1.0 -2.0 0.5; 3.0 NaN -Inf],), (reshape([7.5], 1, 1),), (zeros(0, 3),), (zeros(2, 0),)]),
+    # a length-two `x` against five levels is a DimensionMismatch, a sixth level a BoundsError
+    (:js_constants, js_constants, (:scale, :x, :i, :line),
+     (:dose, :scaled, :shifted, :times, :picked, :total, :counts, :signs, :grid, :projected, :norows, :share,
+      :nested, :fused),
+     (; scale = Float64, x = V, i = Int, line = Float64),
+     [(100.0, [1.0, 2.0, 3.0, 4.0, 5.0], 2, 150.0), (-0.5, [1.0], 5, 1e3), (2.0, [1.0, 2.0], 1, 0.0),
+      (2.0, [1.0], 6, 0.0)]),
+    (:js_buffered, js_buffered, (:x,), :t, (; x = V), [([1.0, 2.0, 3.0],), ([4.0],), ([1.0, 2.0],)]),
 ]
 
 agree(a::Real, b::Real) = (isnan(a) && isnan(b)) || isapprox(a, b; rtol = 1e-12, atol = 1e-15)
@@ -861,6 +915,30 @@ agree(a, b) = false
         end
         @test e isa ReactiveKernels.JSEmissionError
         @test occursin("dims = 1", e.message) && occursin("(dims = 3,)", e.message)
+    end
+
+    @testset "a const global array is a module-level array" begin
+        source = ReactiveKernels.js_source(js_constants; have = (:scale, :x, :i, :line),
+                                           want = (:dose, :scaled, :grid, :norows, :share),
+                                           types = (; scale = Float64, x = V, i = Int, line = Float64))
+        # emitted once each, named after the global, its values exact
+        @test count("const _rk_const_JS_LEVELS = [50.0, 100.0, 200.0, 300.0, 400.0];", source) == 1
+        @test count("_rk_const_JS_LEVELS = ", source) == 1
+        @test occursin("const _rk_const_JS_GRID = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];", source)
+        @test occursin("const _rk_const_JS_NOROWS = Object.assign([], { cols: 2 });", source)
+        # the broadcast is one loop over the constant
+        @test occursin("_rk_const_JS_LEVELS.length", source)
+        # a global the code writes stays writable, as natively
+        buffered = ReactiveKernels.js_source(js_buffered; have = (:x,), want = :t, types = (; x = V))
+        @test occursin("const _rk_const_JS_BUFFER = [", buffered) && !occursin("Object.freeze", buffered)
+        # an array without a JavaScript value is refused by name
+        e = try
+            ReactiveKernels.js_source(js_words; have = (:scale,), want = :y, types = (; scale = Float64))
+        catch err
+            err
+        end
+        @test e isa ReactiveKernels.JSEmissionError
+        @test occursin("`Vector{String}` is needed at run time", e.message) && occursin("JS_WORDS", e.message)
     end
 
     @testset "matrix arithmetic reads rows in place" begin
