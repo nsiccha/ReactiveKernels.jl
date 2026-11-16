@@ -16,13 +16,20 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.289
+## 0.1.290
 
 - `jax_source` supports plate cells returning numerical tuples and named
   records with nested records and array fields over multiple mapped axes.
   Subsequent plates retain field lengths and the record array's own padding;
   empty axes skip cell execution. Mapping and ordinary JAX reverse differentiation
   keep bounded bodies as data sizes grow.
+
+## 0.1.289
+
+- `js_source` preserves Julia's `Float64` spelling in `string` and string
+  interpolation, including error messages: integral floats retain `.0`,
+  signed zero and infinities retain their Julia spelling, and scientific
+  notation uses Julia's exponent thresholds. Integer counts stay integers.
 
 ## 0.1.288
 

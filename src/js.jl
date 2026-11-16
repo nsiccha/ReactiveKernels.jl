@@ -232,6 +232,29 @@ export class JuliaError extends Error {
     if (value !== undefined) this.value = value;
   }
 }""", Symbol[]),
+    :_rk_float_string => (raw"""
+function _rk_float_string(x) {
+  if (Number.isNaN(x)) return "NaN";
+  if (!Number.isFinite(x)) return x < 0 ? "-Inf" : "Inf";
+  if (x === 0) return Object.is(x, -0) ? "-0.0" : "0.0";
+  const sign = x < 0 ? "-" : "";
+  // Reuse the engine's shortest round-trip digits. Only their presentation
+  // differs from Julia Float64: decimal point, exponent threshold and sign.
+  const parts = Math.abs(x).toString().split("e");
+  const dot = parts[0].indexOf(".");
+  let point = (dot < 0 ? parts[0].length : dot) + Number(parts[1] || 0);
+  let digits = parts[0].replace(".", "");
+  const leading = digits.match(/^0*/)[0].length;
+  point -= leading;
+  digits = digits.slice(leading).replace(/0+$/, "");
+  if (point > -4 && point <= 6) {
+    if (point <= 0) return sign + "0." + "0".repeat(-point) + digits;
+    if (point >= digits.length)
+      return sign + digits + "0".repeat(point - digits.length) + ".0";
+    return sign + digits.slice(0, point) + "." + digits.slice(point);
+  }
+  return sign + digits[0] + "." + (digits.slice(1) || "0") + "e" + (point - 1);
+}""", Symbol[]),
     :_rk_at => ("""
 function _rk_at(x, i) {
   if (!(Number.isInteger(i) && i >= 1 && i <= x.length))
@@ -2253,7 +2276,15 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
         # An array, computed here: its elements are locals of this block.
         return _js_rt("[" * join(items, ", ") * "]", T; pure = false)
     elseif f === string && all(a -> a isa _JsVal, args)
-        return _js_rt("\"\" + " * join((_js_code(mod, a, _JS_ADD + 1) for a in args), " + "), String;
+        # JavaScript numbers erase the distinction between Int64 and Float64.
+        # Select the float formatter while the Julia argument type is known.
+        pieces = ["\"\""]
+        for a in args
+            code = _js_isfloat(a) ? _js_use!(mod, :_rk_float_string) * "(" * _js_runtime(mod, a).code * ")" :
+                   _js_code(mod, a, _JS_ADD + 1)
+            push!(pieces, code)
+        end
+        return _js_rt(join(pieces, " + "), String;
                       prec = _JS_ADD)
     elseif f === _native_exp && length(args) == 1 && _js_isnumber(args[1])
         return _js_call!(ir, exp, Any[args[1]], T)

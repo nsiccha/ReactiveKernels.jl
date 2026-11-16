@@ -9,8 +9,77 @@ module TestJSTuplesMatrices
 using ReactiveKernels
 using LinearAlgebra: diag
 using Test
+using Random: Xoshiro
 
 const NODE = ReactiveKernels._js_default_node() !== nothing
+
+# Formatting is observable source behavior, including when validation reads
+# floats from runtime arrays. Counts retain their integer spelling.
+function js_float_message(x, n, flag)
+    flag || return x
+    throw(ArgumentError("axis $n: value=$x; integer=$(Float64(n)); flag=$flag"))
+end
+function js_vector_message(v, flag)
+    flag || return sum(v)
+    message = "values:"
+    for i in eachindex(v)
+        message = string(message, " ", i, "=", v[i])
+    end
+    throw(ArgumentError(message))
+end
+@kernel js_formatted_message(x, n, flag) = begin
+    result = js_float_message(x, n, flag)
+    return result
+end
+@kernel js_formatted_vector(v, flag) = begin
+    result = js_vector_message(v, flag)
+    return result
+end
+
+@testset "JavaScript Float64 interpolation preserves Julia spelling" begin
+    values = [0.0, -0.0, -1.0, 2.0, -2.5, Inf, -Inf, NaN,
+              nextfloat(0.0), floatmin(Float64), floatmax(Float64),
+              1e-7, 1e-6, 1e-5, 1e-4, 1e5, 1e6, 1e20, 1e21,
+              1.0000000000000001e18, 2.0^53, prevfloat(1e6), nextfloat(1e-4)]
+    append!(values, reinterpret(Float64, rand(Xoshiro(731), UInt64, 2048)))
+    cases = [(x, i, true) for (i, x) in enumerate(values)]
+    append!(cases, [(x, 1, false) for x in (-1.0, NaN, Inf, -0.0)])
+    source = ReactiveKernels.js_source(js_formatted_message; have = (:x, :n, :flag), want = :result,
+        types = (; x = Float64, n = Int, flag = Bool), name = :formatted)
+    @test occursin("function _rk_float_string", source)
+    if NODE
+        for (c, r) in zip(cases, ReactiveKernels.js_run(source, :formatted, cases))
+            @test !r.inputs_mutated
+            if c[3]
+                expected = try js_float_message(c...) catch e; e end
+                @test r.julia_error && r.error == "ArgumentError"
+                @test r.message == expected.msg
+            else
+                @test r.error === nothing
+                @test isequal(r.value, c[1])
+            end
+        end
+        vector_source = ReactiveKernels.js_source(js_formatted_vector; have = (:v, :flag), want = :result,
+            types = (; v = Vector{Float64}, flag = Bool), name = :formatted_vector)
+        @test occursin("while (", vector_source)
+        vector_cases = [(values[1:n], flag) for n in (0, 1, 23, length(values)) for flag in (true, false)]
+        for vectors in (:array, :float64array)
+            for (c, r) in zip(vector_cases, ReactiveKernels.js_run(vector_source, :formatted_vector, vector_cases; vectors))
+                @test !r.inputs_mutated
+                if c[2]
+                    expected = try js_vector_message(c...) catch e; e end
+                    @test r.julia_error && r.error == "ArgumentError"
+                    @test r.message == expected.msg
+                else
+                    @test r.error === nothing
+                    @test isequal(r.value, sum(c[1]))
+                end
+            end
+        end
+    else
+        @test_skip "no node on the PATH"
+    end
+end
 
 # Predicates over a tuple call the function on each element with that
 # element's own type, and `all`/`any` stop at the first element that decides
