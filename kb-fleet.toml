@@ -1,0 +1,4 @@
+[[landing_check]]
+name = "docs lint"
+run = ["julia", "--startup-file=no", "-e", "include(\"docs/pages.jl\"); include(\"docs/lint.jl\"); lint_docs(SITE_PAGES)"]
+timeout_s = 120
