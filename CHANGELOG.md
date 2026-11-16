@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.289
+
+- `jax_source` supports plate cells returning numerical tuples and named
+  records with nested records and array fields over multiple mapped axes.
+  Subsequent plates retain field lengths and the record array's own padding;
+  empty axes skip cell execution. Mapping and ordinary JAX reverse differentiation
+  keep bounded bodies as data sizes grow.
+
 ## 0.1.288
 
 - `jax_source` prepares Cartesian products of data-bound numerical ranges

@@ -44,6 +44,13 @@ plates. Ragged cells can vary along their first axis; trailing dimensions
 must agree because the representation carries one extent per cell.
 For raw empty matrix lists, call `pad_ragged([], rank=2)`.
 
+Plate cells can return numerical tuples or named records, including nested
+records and numeric array fields. Later plates can read those fields directly,
+such as `r.prior + sum(r.pointwise.y)`. The emitted representation stacks each
+leaf along the mapped axes and keeps ragged field lengths separate from the
+record array's valid extent. Cartesian axes retain Julia's order, and empty
+axes skip the cell body. These operations use ordinary JAX reverse differentiation.
+
 ## Julia evaluation
 
 The Julia callable evaluates the same authored mathematical expression. Its output establishes the reference value for a consumer testing the emitted module.
