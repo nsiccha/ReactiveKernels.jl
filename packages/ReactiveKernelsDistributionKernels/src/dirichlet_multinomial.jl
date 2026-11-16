@@ -22,6 +22,16 @@ end
     return coefficient + shared + sum(cells)
 end
 
+"""
+    dirichlet_multinomial(n, alpha)
+
+Dirichlet-multinomial law of a vector of counts summing to `n > 0`, with
+positive concentrations `alpha`: the same law as
+`Distributions.DirichletMultinomial(n, alpha)`. Counts that do not sum to `n`
+have log density `-Inf`.
+
+Endpoints: `logpdf(observed)`.
+"""
 @kernel dirichlet_multinomial(n::Int, alpha) = begin
     concentrations = _dm_concentrations(alpha)
     alpha_sum::Float64 = sum(abs, concentrations)
