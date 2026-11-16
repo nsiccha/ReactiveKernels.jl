@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.285
+
+- Accept keyword arguments in `@traceable` methods and translate their calls
+  in JAX functions and host data preparation. Required and typed keywords,
+  dependent defaults, shorthand calls and nested helpers retain Julia's
+  semantics. Keyword values remain runtime helper arguments.
+- Preserve `on_error = :ignore` through captured helper calls with keywords.
+
 ## 0.1.284
 
 - Add the internal log rising-factorial numerical graph used by distribution

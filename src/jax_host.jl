@@ -1729,9 +1729,10 @@ end
 # caller passes a value it owns (`_host_mutable_argument!`). The helper's body
 # is translated once, and again with the parameters it had to copy owned.
 function _host_function_call(ctx::_JaxContext, f, names::Vector{Symbol}, body, mod::Module,
-                             args::Vector{_PyVal}, inputs::Vector{_PyVal} = args)
+                             args::Vector{_PyVal}, inputs::Vector{_PyVal} = args;
+                             kw = Pair{Symbol,_PyVal}[])
     types = Any[_jax_argument_type(a) for a in args]
-    key = (:host_traceable, objectid(f), Tuple(a.T for a in args))
+    key = (:host_traceable, objectid(f), Tuple(names), Tuple(a.T for a in inputs))
     frame() = begin
         scope = _JaxScope()
         params, passed = String[], _PyVal[]
@@ -1775,7 +1776,12 @@ function _host_function_call(ctx::_JaxContext, f, names::Vector{Symbol}, body, m
         append!(lines, scope.lines)
         v.T === Union{} || push!(lines, "    return " * v.code)
         push!(ctx.mod.helpers, _host_helper_text(ctx, join(lines, "\n")))
-        inferred = _jax_return_type(f, types)
+        inferred = if isempty(kw)
+            _jax_return_type(f, types)
+        else
+            KT = NamedTuple{Tuple(first.(kw)),Tuple{(_jax_argument_type(a) for (_, a) in kw)...}}
+            _jax_return_type(Core.kwcall, Any[KT, typeof(f), types...])
+        end
         T = inferred isa Type && inferred !== Union{} && isconcretetype(inferred) ? inferred :
             foldl(_host_join, inner.host.returns; init = v.T)
         ctx.mod.helper_names[(:host_traceable_type, name)] = T

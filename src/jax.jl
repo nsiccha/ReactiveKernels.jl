@@ -726,7 +726,21 @@ function _jax_resolve(ctx::_JaxContext, ex)
         return getproperty(owner, ex.args[2].value)
     end
     if ex isa Expr && ex.head === :curly
-        return _jax_resolve(ctx, ex.args[1]){map(a -> _jax_type_argument(ctx, a), ex.args[2:end])...}
+        variables = TypeVar[]
+        parameters = Any[]
+        for a in ex.args[2:end]
+            if a isa Expr && a.head in (:<:, :>:) && length(a.args) == 1
+                bound = _jax_type_argument(ctx, only(a.args))
+                variable = a.head === :<: ? TypeVar(gensym(:T), Union{}, bound) :
+                    TypeVar(gensym(:T), bound, Any)
+                push!(variables, variable)
+                push!(parameters, variable)
+            else
+                push!(parameters, _jax_type_argument(ctx, a))
+            end
+        end
+        T = _jax_resolve(ctx, ex.args[1]){parameters...}
+        return foldr(UnionAll, variables; init = T)
     end
     # A value spliced into generated source (a module, a function, a type).
     ex isa Expr || return ex
@@ -2836,6 +2850,7 @@ function _jax_expr(ctx::_JaxContext, ::Val{:call}, ex)
         if a isa Expr && a.head === :parameters
             for p in a.args
                 p isa Expr && p.head === :kw ? push!(kwargs, p.args[1] => p.args[2]) :
+                    p isa Symbol ? push!(kwargs, p => p) :
                     _jax_error("the keyword argument `", p, "`", _jax_where(ctx))
             end
         elseif a isa Expr && a.head === :kw
@@ -2885,8 +2900,11 @@ _jax_is_indexing(f) = f === getindex || f === view || f === Base.maybeview
 _jax_call(ctx::_JaxContext, f, args::Vector{_PyVal}) = _jax_call(ctx, f, args, Pair{Symbol,_PyVal}[])
 
 function _jax_call(ctx::_JaxContext, f, args::Vector{_PyVal}, kw)
-    isempty(kw) || _jax_error("keyword arguments to `", f, "` have no JAX translation",
-                              _jax_where(ctx))
+    if !isempty(kw)
+        value = _jax_traceable_call(ctx, f, args, kw)
+        value === nothing || return value
+        _jax_error("keyword arguments to `", f, "` have no JAX translation", _jax_where(ctx))
+    end
     _jax_call_positional(ctx, f, args)
 end
 # `sum(x; init)` and `prod(x; init)`: the reduction combined with `init`,
@@ -4723,10 +4741,11 @@ _jax_call_positional(ctx::_JaxContext, ::typeof(promote_type), args::Vector{_PyV
 function _jax_call_positional(ctx::_JaxContext, f::Union{typeof(one),typeof(zero)},
                               args::Vector{_PyVal})
     x = only(args)
-    T = x.T isa _JaxCallable ? x.T.f : x.T
-    T isa Type && T <: Number && !(x.T isa _JaxCallable) && !x.static &&
+    type_value = _jax_type_of_value(x)
+    T = type_value === nothing ? x.T : type_value
+    T isa Type && T <: Number && type_value === nothing && !x.static &&
         return _jax_result(f, args, (f === one ? "jnp.ones_like(" : "jnp.zeros_like(") * x.code * ")")
-    _jax_is_array(T) && !(x.T isa _JaxCallable) && return _jax_function_call(ctx, f, args)
+    _jax_is_array(T) && type_value === nothing && return _jax_function_call(ctx, f, args)
     T isa Type && T <: Number || _jax_error("`", f, "` of `", T, "`", _jax_where(ctx))
     _jax_literal(f(T))
 end
@@ -5286,23 +5305,39 @@ end
 # A `@traceable` helper, or a method whose source a registered provider
 # supplies: its authored body over the arguments, as the compiled
 # path reads it. Its locals are scoped to the call.
-function _jax_traceable_call(ctx::_JaxContext, f, args::Vector{_PyVal})
-    source = _jax_traceable_body(ctx, f, args)
+function _jax_traceable_call(ctx::_JaxContext, f, args::Vector{_PyVal}, kw = Pair{Symbol,_PyVal}[])
+    source = _jax_traceable_body(ctx, f, args, kw)
     source === nothing && return nothing
     names, body, mod, inputs = source
     ctx.host === nothing ||
-        return _host_function_call(ctx, f, names, body, mod, args, inputs)
+        return _host_function_call(ctx, f, names, body, mod, args, inputs; kw)
     _jax_authored_function_call(ctx, f, names, body, mod, inputs)
 end
 
 # `f`'s recorded or provided source over `args`: `(names, body, module,
 # inputs)`, or `nothing`.
-function _jax_traceable_body(ctx::_JaxContext, f, args::Vector{_PyVal})
+function _jax_traceable_body(ctx::_JaxContext, f, args::Vector{_PyVal}, kw = Pair{Symbol,_PyVal}[])
     # A function passed as an argument dispatches on its own type (a stable
     # rewrite's `_rk_log_of(exp, x)` selects its `::typeof(exp)` method).
     types = Any[_jax_argument_type(a) for a in args]
     all(T -> T isa Type, types) || return nothing
-    source = _traceable_source(typeof(f), types...)
+    source = _traceable_keyword_source(typeof(f), types...)
+    if source !== nothing
+        # A more specific unrecorded method must keep its own body. Julia's
+        # keyword sorter may select a different method than a positional call.
+        calltypes, expected = if isempty(kw)
+            (Tuple{typeof(f),types...}, source[4])
+        else
+            KT = NamedTuple{Tuple(first.(kw)),Tuple{(_jax_argument_type(a) for (_, a) in kw)...}}
+            (Tuple{typeof(Core.kwcall),KT,typeof(f),types...}, source[8])
+        end
+        called = try which(calltypes) catch; nothing end
+        (called === nothing || called.sig != expected) && (source = nothing)
+    end
+    if source === nothing
+        isempty(kw) || return nothing
+        source = _traceable_source(typeof(f), types...)
+    end
     # A method a package generates: its source from a registered provider.
     source === nothing && (source = _provided_source(f, types))
     source === nothing && return nothing
@@ -5311,7 +5346,90 @@ function _jax_traceable_body(ctx::_JaxContext, f, args::Vector{_PyVal})
     # A Vararg source's last formal is the tuple of the trailing arguments.
     inputs = _traceable_arguments(source, args, rest -> _jax_call_positional(ctx, tuple, rest))
     inputs === nothing && return nothing
-    collect(Symbol, names), body, mod, inputs
+    names = collect(Symbol, names)
+    length(source) >= 9 && !isempty(source[9]) &&
+        return _jax_default_forward(f, source, names, inputs, kw)
+    length(source) >= 7 && _jax_bind_keywords!(ctx, f, source, names, inputs, kw)
+    names, body, mod, inputs
+end
+
+# Julia's optional-positional wrappers fill the omitted arguments and call the
+# function again. Redispatch before binding keyword defaults: the filled-in
+# types can select a more specific method with a different body or defaults.
+function _jax_default_forward(f, source, names, inputs, kw)
+    positional = Any[names...]
+    body = Expr(:block)
+    for declaration in source[9]
+        formal = declaration.args[1]
+        name = formal isa Symbol ? formal : formal.args[1]
+        expression = _jax_static_parameters(declaration.args[2], source[5])
+        push!(body.args, Expr(:(=), name, expression))
+        push!(positional, name)
+    end
+    parameters = Expr(:parameters)
+    for (key, value) in kw
+        name = Symbol("_kw_", key)
+        while name in names || name in positional
+            name = Symbol(name, "_")
+        end
+        push!(names, name)
+        push!(inputs, value)
+        push!(parameters.args, Expr(:kw, key, name))
+    end
+    call = isempty(kw) ? Expr(:call, QuoteNode(f), positional...) :
+        Expr(:call, QuoteNode(f), parameters, positional...)
+    push!(body.args, call)
+    names, body, source[3], inputs
+end
+
+# Bind defaults in the method's lexical scope, left to right, and only when
+# omitted. All bound values remain arguments of the emitted helper, including
+# runtime array extents and keyword values that differ between calls.
+function _jax_bind_keywords!(ctx, f, source, names, inputs, kw)
+    saved = (ctx.locals, ctx.source_module, ctx.captures)
+    ctx.locals = Dict{Symbol,_PyVal}(zip(names, inputs))
+    ctx.source_module = source[3]
+    ctx.captures = nothing
+    remaining = Dict(kw)
+    try
+        for declaration in source[7]
+            defaulted = declaration isa Expr && declaration.head === :kw
+            formal = defaulted ? declaration.args[1] : declaration
+            typed = formal isa Expr && formal.head === :(::)
+            name = typed ? formal.args[1] : formal
+            name isa Symbol || _jax_error("the keyword declaration `", declaration,
+                                           "` of `", f, "`", _jax_where(ctx))
+            value = if haskey(remaining, name)
+                pop!(remaining, name)
+            elseif defaulted
+                expression = _jax_static_parameters(declaration.args[2], source[5])
+                _jax_expr(ctx, expression)
+            else
+                _jax_error("required keyword `", name, "` is missing from `", f, "`", _jax_where(ctx))
+            end
+            if typed
+                annotation = _jax_static_parameters(formal.args[2], source[5])
+                T = _jax_type_argument(ctx, annotation)
+                S = _jax_argument_type(value)
+                T isa Type && S isa Type && S <: T ||
+                    _jax_error("keyword `", name, "` of `", f, "` must have type ",
+                               annotation, "; got ", S, _jax_where(ctx))
+            end
+            # Singleton functions and type values are passed structurally by
+            # the helper emitter, never assigned from their display strings.
+            callable = value.T isa Type && value.T <: Function && Base.issingletontype(value.T)
+            value = _jax_atom(value) || callable || _jax_type_of_value(value) !== nothing ?
+                value : _jax_bind!(ctx, name, value)
+            ctx.locals[name] = value
+            push!(names, name)
+            push!(inputs, value)
+        end
+        isempty(remaining) || _jax_error("unknown keywords to `", f, "`: ",
+                                         join(keys(remaining), ", "), _jax_where(ctx))
+    finally
+        ctx.locals, ctx.source_module, ctx.captures = saved
+    end
+    nothing
 end
 
 # Whether a call of `f` reaches the default translation (recorded source or
@@ -5495,7 +5613,7 @@ function _jax_named_function!(ctx, f, names, inputs, source_module, emit, origin
     # loop/scan. Keep those helpers lexically nested so the scan can still
     # resolve its access placeholders and prove a bounded history carry.
     contextual = any(_jax_contextual_value, inputs)
-    key = (:authored_function, objectid(f),
+    key = (:authored_function, objectid(f), Tuple(names),
            Tuple((a.T, a.static, !isempty(a.extent), !isempty(a.limit), a.padded, a.origin,
                   Tuple(!isempty(e) for e in a.field_extents),
                   Tuple(_jax_flat_kind(ctx, e) for e in (a.extent, a.field_extents...)))
