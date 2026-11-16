@@ -16,6 +16,20 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.270
+
+- `js_source` translates Julia's irrational constants (`π`, `ℯ`,
+  `MathConstants.γ`, and those of any package's `@irrational`, such as
+  `IrrationalConstants.log2π`) through Julia's own methods for them, with the
+  native values. Arithmetic rounds the constant to the float it promotes to
+  (`log(tail * π)` multiplies by `Float64(π)`); a comparison rounds it up or
+  down as Julia does, so `x < π` holds for `x == Float64(π)`, and `==` is
+  false; `ℯ^x` is `exp(x)` and `sin(π)` is `0.0`. A call of three or more
+  operands (`2 * π * r`) folds from the left, as Julia's method does. A
+  constant times or over a vector or matrix (`π * v`, `A / ℯ`) is the
+  broadcast Julia's method makes. A helper given `π` is specialized on it
+  rather than taking it as a parameter. Native execution is unchanged.
+
 ## 0.1.269
 
 - `js_source` translates matrix arithmetic on its row-array matrices: `*` of
