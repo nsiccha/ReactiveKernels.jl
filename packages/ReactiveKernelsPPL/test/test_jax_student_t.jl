@@ -101,13 +101,20 @@ end
     priors = (; location_prior=0.0, location_scale=2.0, scale_prior=1.0,
               df_shape=2.0, df_scale=2.0)
     # Both observations at their thresholds; then one above its threshold
-    # between two at theirs, so both arms of the censoring branch run.
+    # between two at theirs, so both arms of the censoring branch run; then
+    # rows without a limit (`-Inf`) beside censored ones.
     for (threshold, y) in (([-0.5, 0.25], [-0.5, 0.25]),
-                           ([-0.5, 0.25, 0.0], [-0.5, 1.3, 0.0]))
+                           ([-0.5, 0.25, 0.0], [-0.5, 1.3, 0.0]),
+                           ([-0.5, -Inf, 0.0, -Inf, -Inf], [-0.5, 1.3, 0.0, 0.2, -2.0]))
         plan = _JAX_STUDENT_THRESHOLD(; priors..., threshold) | (; y)
         built = build_kernel(plan)
         source = jax_source(built, plan)
         @test occursin("UNTRANSLATED = {}", string(source))
+        # The censoring test reads data alone: `prepare_data` partitions the
+        # rows (RK 0.1.268), so no batched `jax.lax.cond` decides it and the
+        # tail's fraction runs only on the censored rows.
+        @test occursin("_lane_order", string(source))
+        @test !occursin(r"jax\.lax\.cond\([^,]*threshold", string(source))
         rk_jax_available() || (@test_skip false; continue)
         data = merge(priors, (; threshold, y))
         inputs = first.(only(f for f in source.functions if f.name == "prepare_data").inputs)

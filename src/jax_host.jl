@@ -1693,11 +1693,14 @@ end
 function _jax_cell_data!(mod::_JaxModule, split, rp::Plan)
     prepared = Set{ValueId}(canon_id(rp.graph, v.id) for v in split.constants)
     for plate in rp.recipes
-        plate.op isa _AuthoredPlateOp || continue
-        cell = plate.op.kernel.plan
-        length(cell.have) == length(plate.inputs) || continue
-        bound = Set{ValueId}(canon_id(cell.graph, cell.have[i].id) for i in eachindex(plate.inputs)
-                             if canon_id(rp.graph, plate.inputs[i].id) in prepared)
+        # A partitioned plate's cell reads the original plate's inputs, gathered.
+        inputs = plate.op isa _JaxLanePlate ? plate.op.recipe.inputs : plate.inputs
+        op = plate.op isa _JaxLanePlate ? plate.op.plate : plate.op
+        op isa _AuthoredPlateOp || continue
+        cell = op.kernel.plan
+        length(cell.have) == length(inputs) || continue
+        bound = Set{ValueId}(canon_id(cell.graph, cell.have[i].id) for i in eachindex(inputs)
+                             if canon_id(rp.graph, inputs[i].id) in prepared)
         pre, _, _ = _partial_split(cell, bound)
         union!(mod.cell_data, ((plate.id, r.id) for r in pre))
     end
@@ -1715,8 +1718,11 @@ function _jax_cell_failure(mod::_JaxModule, split, rp::Plan, e::JAXEmissionError
     # recipe still identifies this residual plan's plate exactly.
     same_plan = outer === rp || (outer.graph === rp.graph &&
                                 any(r -> r.id == plate.id, rp.recipes))
-    same_plan && plate.op isa _AuthoredPlateOp && cell === plate.op.kernel.plan ||
+    # A partitioned plate (`jax_lanes.jl`) emits its original cell per pattern.
+    plate_op = plate.op isa _JaxLanePlate ? plate.op.plate : plate.op
+    same_plan && plate_op isa _AuthoredPlateOp && cell === plate_op.kernel.plan ||
         return nothing
+    plate.op isa _JaxLanePlate && (plate = plate.op.recipe)
     length(cell.have) == length(plate.inputs) || return nothing
     g = rp.graph
     prepared = Set{ValueId}(canon_id(g, v.id) for v in split.constants)
@@ -1752,6 +1758,7 @@ function _jax_prepare_split(plans, data_ports, excluded::Set{Int} = Set{Int}(); 
     # The plates whose cells `prepare_data` computes in part (`cells`), split
     # once for every function that has them.
     rewrites = Dict{Int,Any}()
+    lane_rewrites = Dict{Int,Any}()
     hosted = Dict{ValueId,Value}()
     for (fname, (p, w)) in plans
         bound = Value[v for v in p.have if v.name in data_ports]
@@ -1789,6 +1796,22 @@ function _jax_prepare_split(plans, data_ports, excluded::Set{Int} = Set{Int}(); 
             haskey(cells, r.id) && r.op isa _AuthoredPlateOp || continue
             _jax_cell_prefix_id(r.id) in excluded && continue
             rewrite = get!(() -> _jax_cell_split(g, r, dependent, cells[r.id]), rewrites, r.id)
+            rewrite === nothing && continue
+            pre = [pre; rewrite.prefix]
+            residual[k] = rewrite.plate
+            for v in rewrite.prefix.outputs
+                push!(dependent, canon_id(g, v.id))
+                hosted[v.id] = v
+            end
+        end
+        # A plate whose cell branches on data alone: `prepare_data` computes
+        # which cells take which arms, and the functions run each pattern's
+        # plate over its cells (`jax_lanes.jl`). Without a host translation
+        # of the conditions the plate stays whole.
+        for (k, r) in enumerate(residual)
+            r.op isa _AuthoredPlateOp || continue
+            _jax_lane_prefix_id(r.id) in excluded && continue
+            rewrite = get!(() -> _jax_lane_partition(g, r, dependent), lane_rewrites, r.id)
             rewrite === nothing && continue
             pre = [pre; rewrite.prefix]
             residual[k] = rewrite.plate

@@ -16,6 +16,25 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.268
+
+- `ReactiveKernels.jax_source` with `data` partitions a top-level plate by the
+  branches of its cell whose condition reads only the plate's data (a
+  censored row's `y <= lower`), also when they sit inside an arm of a
+  parameter-dependent branch (RKPPL's support guard). `prepare_data` returns,
+  for each pattern of those decisions, the 0-based positions of the cells that
+  take it (`<value>_lanes_<k>`) and the order that restores the plate
+  (`<value>_lane_order`); the functions run one `jax.vmap` per pattern over its
+  cells, each translated with the pattern's conditions decided, so a cell
+  evaluates only the arms it takes. Before, the plate was one `jax.vmap` whose
+  batched `jax.lax.cond` evaluated both arms on every cell: a censored
+  Student-t response ran its incomplete-beta continued fraction on every row,
+  not only on the censored ones. The patterns follow the cell's source (every
+  pattern has its plate, also when no cell takes it), so the module text does
+  not depend on the data. Values and gradients are unchanged. A plate with
+  more than eight patterns, a mapped argument that is not a vector of numbers,
+  or a value that is not a vector of numbers stays one `jax.vmap`.
+
 ## 0.1.267
 
 - `ReactiveKernels.js_source` translates `rk_ode_rk45_tol`. The emitted module
