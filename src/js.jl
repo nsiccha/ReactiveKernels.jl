@@ -164,8 +164,17 @@ function _js_runtime(mod::_JsModule, v::_JsVal)
         # the runtime range, as `a:b` builds it.
         return _js_rt(_js_use!(mod, :_rk_range) * "(" * _js_number(first(x)) * ", " * _js_number(last(x)) * ")",
                       typeof(x); ref = false)
+    elseif x isa StepRange{Int64,Int64}
+        return _js_rt(_js_use!(mod, :_rk_steprange) * "(" * _js_number(first(x)) * ", " * _js_number(step(x)) *
+                      ", " * _js_number(last(x)) * ")", typeof(x); ref = false)
     elseif x isa Exception
         return _js_rt(_js_exception(mod, x), typeof(x); pure = true)
+    elseif x isa Union{Vector,Matrix} && eltype(x) <: _JsMatrixElement
+        # An array known while translating (a `const` global the code reads):
+        # a module-level array holding its value at emission, which the module
+        # reads and writes as the kernel does the global.
+        hint = get(mod.helpers, (:global, objectid(x)), ("constant", nothing))[1]
+        return _js_constant(mod, x, "_rk_const_", hint; frozen = false)
     end
     _js_error(mod, "the value `", repr(x; context = :limit => true), "` of type `", typeof(x),
               "` is needed at run time and has no JavaScript translation; pass it as a kernel input")
@@ -486,6 +495,21 @@ function _rk_ode_rk45(f, y0, t0, ts, rt, at, mx) {
   }
   return out;
 }""", [:JuliaError, :_rk_dopri]),
+    :_rk_cumprod => ("""
+function _rk_cumprod(x) { const r = x.slice(); for (let i = 1; i < r.length; i++) r[i] = r[i - 1] * r[i]; return r; }""", Symbol[]),
+    :_rk_cumsum => ("""
+function _rk_cumsum(x) { const r = x.slice(); for (let i = 1; i < r.length; i++) r[i] = r[i - 1] + r[i]; return r; }""", Symbol[]),
+    # `start:step:stop` as Julia builds it: `stop` becomes the last element reached.
+    :_rk_steprange => ("""
+function _rk_steprange(start, step, stop) {
+  if (step === 0) throw new JuliaError("ArgumentError", "step cannot be zero");
+  let last = stop;
+  if (stop !== start) {
+    if ((step > 0) !== (stop > start)) last = start - step;
+    else { const remain = Math.abs(stop - start) % Math.abs(step); last = stop > start ? stop - remain : stop + remain; }
+  }
+  return { start, step, stop: last };
+}""", [:JuliaError]),
     :_rk_number => ("""
 function _rk_number(name, x, integer) {
   if (typeof x !== "number" || (integer && !Number.isInteger(x)))
@@ -516,6 +540,33 @@ function _rk_isodd(x) { return Number.isInteger(x) && Math.abs(x) <= 90071992547
     :_rk_stdlib_gammaln => _js_vendored(:gammaln),
     # `rk_ode_rk45_tol`'s integrator, `@reside-ic/dopri` (`js_ode.jl`)
     :_rk_dopri => _js_vendored(:dopri),
+    :_rk_stdlib_betainc => _js_vendored(:betainc),
+    :_rk_stdlib_betaincinv => _js_vendored(:betaincinv),
+    # SpecialFunctions' incomplete beta function and its inverse, with Julia's
+    # argument checks and special cases. Each tail comes from its own
+    # evaluation, so the smaller one keeps its precision.
+    :_rk_beta_inc => ("""
+function _rk_beta_inc(a, b, x, y) {
+  if (a < 0 || b < 0) _rk_domain("beta_inc", [a, b], "a or b is negative");
+  if (a === 0 && b === 0) _rk_domain("beta_inc", [a, b], "a and b are 0.0");
+  if (x < 0 || x > 1) _rk_domain("beta_inc", x, "x < 0 or x > 1");
+  if (y < 0 || y > 1) _rk_domain("beta_inc", y, "y < 0 or y > 1");
+  if (Math.abs(x + y - 1) > 3 * 2.220446049250313e-16) _rk_domain("beta_inc", [x, y], "x + y != 1.0");
+  if (Number.isNaN(x) || Number.isNaN(y) || Number.isNaN(a) || Number.isNaN(b)) return [NaN, NaN];
+  if (x === 0) return [0, 1];
+  if (y === 0 || a === 0) return [1, 0];
+  if (b === 0) return [0, 1];
+  return x <= 0.5 ? [_rk_stdlib_betainc(x, a, b, true, false), _rk_stdlib_betainc(x, a, b, true, true)]
+                  : [_rk_stdlib_betainc(y, b, a, true, true), _rk_stdlib_betainc(y, b, a, true, false)];
+}""", [:_rk_stdlib_betainc, :_rk_domain]),
+    :_rk_beta_inc_inv => ("""
+function _rk_beta_inc_inv(a, b, p, q) {
+  if (p > 0.5) { const z = _rk_beta_inc_inv(b, a, q, p); return [z[1], z[0]]; }
+  if (p === 0) return [0, 1];
+  if (p < 0) _rk_domain("log", p, "it must be nonnegative");
+  const x = _rk_stdlib_betaincinv(p, a, b, false);
+  return [x, 1 - x];
+}""", [:_rk_stdlib_betaincinv, :_rk_domain]),
     # `copysign` reads the sign of a NaN as positive: JavaScript keeps no sign of a NaN.
     :_rk_copysign => ("""
 function _rk_copysign(x, y) { return y < 0 || Object.is(y, -0) ? -Math.abs(x) : Math.abs(x); }""", Symbol[]),
@@ -555,18 +606,31 @@ _js_use!(mod::_JsModule, s::Symbol) = (push!(mod.runtime, s); String(s))
 # --- supported Julia types -----------------------------------------------------------
 
 const _JsNumber = Union{Float64,Int64}
+# an element of a vector or matrix the module holds (`js_arrays.jl`)
+const _JsMatrixElement = Union{Float64,Int64,Bool}
 _js_isnumber(v) = _js_type(v) <: _JsNumber
 _js_isfloat(v) = _js_type(v) === Float64
 _js_isint(v) = _js_type(v) === Int64
 _js_isbool(v) = _js_type(v) === Bool
-_js_isvector(v) = _js_type(v) <: Vector && eltype(_js_type(v)) <: Union{_JsNumber,Bool}
+# A comparison broadcast (`x .> c`) is a `BitVector` natively: an array of
+# Booleans here, read like a `Vector{Bool}`.
+_js_isvector(v) = (_js_type(v) <: Vector && eltype(_js_type(v)) <: Union{_JsNumber,Bool}) || _js_type(v) === BitVector
 _js_isrange(v) = _js_type(v) in (UnitRange{Int64}, Base.OneTo{Int64})
+# A stepped range (`n:-1:1`): iterated, measured and read at its ends only.
+_js_isstep(v) = _js_type(v) === StepRange{Int64,Int64}
 _js_istuple(v) = v isa _JsTuple || (v isa _JsVal && (v.static ? v.value isa Tuple : v.T <: Tuple))
 _js_tuple_length(v::_JsTuple) = length(v.items)
 _js_tuple_length(v::_JsVal) = v.static ? length(v.value) : fieldcount(v.T)
+# A nonempty tuple whose elements all have the type `T`, a value a module holds
+# at run time: a number, a `Bool`, a vector or matrix of them, or a tuple of
+# such values (`domain = ((lo1, hi1), (lo2, hi2))`, a tuple of axis vectors).
+_js_runtime_type(T) = T isa DataType && isconcretetype(T) &&
+    (T <: Union{_JsNumber,Bool} || (T <: Union{Vector,Matrix} && eltype(T) <: Union{_JsNumber,Bool}) ||
+     (T <: Tuple && !(T <: NamedTuple) && all(_js_runtime_type, fieldtypes(T))))
+_js_uniform_tuple(S, T) = S <: Tuple && !(S <: NamedTuple) && isconcretetype(S) && fieldcount(S) > 0 &&
+    _js_runtime_type(T) && all(==(T), fieldtypes(S))
 # A nonempty tuple whose elements all have the number type `T`.
-_js_number_tuple(S, T) = S <: Tuple && !(S <: NamedTuple) && isconcretetype(S) && fieldcount(S) > 0 &&
-    T <: _JsNumber && all(==(T), fieldtypes(S))
+_js_number_tuple(S, T) = T <: _JsNumber && _js_uniform_tuple(S, T)
 
 # A range is read through its first element, last element and length. A range
 # known while translating (`for _ in 1:60` in a helper) is read as literals; a
@@ -672,7 +736,10 @@ function _js_operand(ir::_JsIR, x)
         isdefined(x.mod, x.name) || _js_error(mod, "`", x, "` is not defined")
         isconst(x.mod, x.name) ||
             _js_error(mod, "the global `", x, "` is not constant; pass its value as a kernel input")
-        return _js_static(getglobal(x.mod, x.name))
+        v = getglobal(x.mod, x.name)
+        # an array names the module constant it may become (`_js_runtime`)
+        v isa Array && get!(mod.helpers, (:global, objectid(v)), (string(x.name), v))
+        return _js_static(v)
     elseif x isa QuoteNode
         return _js_static(x.value)
     elseif x isa Expr && x.head === :static_parameter
@@ -791,6 +858,30 @@ function _js_assign_slot!(ir::_JsIR, n, v)
             v = _js_rt(name, v.T; ref = true)
         end
         ir.slots[n] = v
+    elseif v isa _JsStruct && all(f -> f isa _JsVal, v.fields)
+        # A closure assigned on every pass of a loop (`all(x -> lo <= x <= hi, v)`
+        # inside `for j in 1:d`) stays a value known while translating, called
+        # where it is read. Julia's closure holds the values it captured when it
+        # was built, so each runtime capture is copied there, into a local of
+        # this slot that every block sees (`<slot>$<field>`: `$` is in no
+        # translated Julia name).
+        _js_flush!(ir)
+        fields = Any[]
+        for (k, f) in enumerate(v.fields)
+            if f.static
+                push!(fields, f)
+                continue
+            end
+            copy = name * "\$" * string(k)
+            if !(copy in ir.fn.taken)
+                push!(ir.fn.taken, copy)
+                insert!(ir.fn.lines, ir.decl_at + 1, "  "^ir.decl_indent * "let " * copy * ";")
+                ir.decl_at += 1
+            end
+            _js_line!(ir.fn, copy * " = " * _js_runtime(ir.fn.mod, f).code * ";")
+            push!(fields, _js_rt(copy, f.T; ref = true))
+        end
+        ir.slots[n] = _JsStruct(v.T, fields, v.RT)
     else
         r = _js_runtime(ir.fn.mod, v)
         _js_flush!(ir)
@@ -805,10 +896,10 @@ function _js_expr!(ir::_JsIR, i, ex, T)
     if ex.head === :call
         fv = _js_operand(ir, ex.args[1])
         args = Any[_js_operand(ir, a) for a in ex.args[2:end]]
-        if T isa Core.Const && _js_foldable(fv, args)
+        if T isa Core.Const && _js_foldable(fv, args) && !_js_lazy_broadcast(fv, args)
             return _js_static(T.val)
         end
-        folded = _js_fold(fv, args)
+        folded = _js_lazy_broadcast(fv, args) ? nothing : _js_fold(fv, args)
         folded === nothing || return folded
         RT = Core.Compiler.widenconst(T)
         fv isa _JsVal && fv.static ||
@@ -1349,6 +1440,7 @@ function _js_call!(ir::_JsIR, f, args::Vector{Any}, T)
         return v
     end
     !(f isa Core.Builtin) && any(_js_isirrational, args) && return _js_irrational_call!(ir, f, args)
+    !(f isa Core.Builtin) && _js_bool_operands(args) && return _js_bool_call!(ir, f, args)
     if f === Core.kwcall && length(args) >= 2 && args[2] isa _JsVal && args[2].static
         types = join((_js_type(a) isa Type ? _js_type(a) : typeof(_js_type(a)) for a in args[3:end]), ", ")
         _js_error(mod, "`", args[2].value, "` with argument types (", types, ") and keywords `",
@@ -1372,6 +1464,27 @@ function _js_irrational_call!(ir::_JsIR, f, args::Vector{Any})
     mod = ir.fn.mod
     _js_flush!(ir)
     push!(mod.stack, "`" * string(f) * "(" * join(("::" * string(_js_argtype(a)) for a in args), ", ") * ")`")
+    v, _ = _js_inline!(ir.fn, f, args, "value")
+    pop!(mod.stack)
+    v
+end
+
+# A `Bool` is a number in Julia: `true + true == 2`, `0.2 * true == 0.2`. A
+# function of Julia's own with a `Bool` among numeric operands, where the table
+# has no entry, is Julia's method for these operands, translated from its typed
+# code. Those methods convert the `Bool` to `0` or `1` (`Int(x) + Int(y)`) or
+# choose between the other operand and its zero (`false * y` is `0.0` even for
+# an infinite or `NaN` `y`, and `false + -0.0` stays `-0.0`), as natively.
+_js_bool_operands(args) = any(_js_isbool, args) && all(a -> _js_isnumber(a) || _js_isbool(a), args)
+
+function _js_bool_call!(ir::_JsIR, f, args::Vector{Any})
+    mod = ir.fn.mod
+    where = "`" * string(f) * "(" * join(("::" * string(_js_argtype(a)) for a in args), ", ") * ")`"
+    # a method that calls itself for the same operands has no translation
+    where in mod.stack && _js_error(mod, "`", f, "` with argument types (",
+                                    join((_js_argtype(a) for a in args), ", "), ") has no JavaScript translation")
+    _js_flush!(ir)
+    push!(mod.stack, where)
     v, _ = _js_inline!(ir.fn, f, args, "value")
     pop!(mod.stack)
     v
@@ -1535,6 +1648,31 @@ function _js_broadcasted(ir, f, args, T)
     _JsBroadcast(fv.value, Any[args[2:end]...], T)
 end
 
+# An array known while translating (a `const` global), not a range.
+_js_static_array(x) = x isa AbstractArray && !(x isa AbstractRange)
+_js_holds_array(x) = _js_static_array(x) || (x isa Base.RefValue && _js_holds_array(x[])) ||
+    (x isa Base.Broadcast.Broadcasted && any(_js_holds_array, x.args))
+# A broadcast over such an array stays a broadcast while translating, to be
+# read from the module constant the array becomes; one over numbers and
+# ranges alone folds (`(1:3) .+ 1` is the range `2:4`).
+_js_lazy_broadcast(fv, args) =
+    fv isa _JsVal && fv.static && (fv.value === Base.Broadcast.broadcasted || fv.value === _native_broadcasted) &&
+    any(a -> a isa _JsVal && a.static && _js_holds_array(a.value), args)
+
+# A broadcast's operands that are arrays known while translating are read like
+# runtime arrays, from the module constants they become (`_js_runtime`, which
+# refuses an array it cannot emit), and a broadcast known while translating
+# (`2 .* 3` inside `x .+ 2 .* 3`) is fused like any other; numbers, ranges
+# and `Ref`s stay as they are.
+function _js_bcvalues(mod::_JsModule, v)
+    v isa _JsBroadcast && return _JsBroadcast(v.f, Any[_js_bcvalues(mod, a) for a in v.args], v.T)
+    v isa _JsVal && v.static || return v
+    x = v.value
+    x isa Base.Broadcast.Broadcasted &&
+        return _js_bcvalues(mod, _JsBroadcast(x.f, Any[_js_static(a) for a in x.args], Nothing))
+    _js_static_array(x) ? _js_runtime(mod, v) : v
+end
+
 function _js_leaves!(leaves, v)
     if v isa _JsBroadcast
         foreach(a -> _js_leaves!(leaves, a), v.args)
@@ -1546,6 +1684,8 @@ end
 
 function _js_materialize!(ir::_JsIR, bc::_JsBroadcast, T; dest = nothing)
     mod = ir.fn.mod
+    bc = _js_bcvalues(mod, bc)
+    dest === nothing && _js_bc2d(bc) && return _js_materialize2!(ir, bc, T)
     leaves = _js_leaves!(Any[], bc)
     for l in leaves
         t = _js_type(l)
@@ -1707,16 +1847,17 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
             code *= " " * op * " " * _js_code(mod, a, prec + 1)
         end
         return _js_rt(code, T; prec)
-    elseif f in (+, -) && length(args) == 2 && all(_js_isvector, args) && all(a -> eltype(_js_type(a)) <: _JsNumber, args)
+    elseif f in (+, -) && length(args) == 2 && all(_js_isvector, args)
         x, y = _js_simple!(ir, args[1], "x"), _js_simple!(ir, args[2], "y")
         _js_flush!(ir)
         _js_line!(ir.fn, _js_use!(mod, :_rk_samelen) * "(" * x.code * ", " * y.code * ");")
         return _js_materialize!(ir, _JsBroadcast(f, Any[x, y], Nothing), T)
-    elseif f === (-) && length(args) == 1 && _js_isvector(args[1]) && eltype(_js_type(args[1])) <: _JsNumber
+    elseif f === (-) && length(args) == 1 && _js_isvector(args[1])
         return _js_materialize!(ir, _JsBroadcast(f, Any[args[1]], Nothing), T)
-    elseif f === (*) && length(args) == 2 && count(_js_isvector, args) == 1 && count(_js_isnumber, args) == 1
+    elseif f === (*) && length(args) == 2 && count(_js_isvector, args) == 1 &&
+           count(a -> _js_isnumber(a) || _js_isbool(a), args) == 1
         return _js_materialize!(ir, _JsBroadcast(f, Any[args...], Nothing), T)
-    elseif f === (/) && length(args) == 2 && _js_isvector(args[1]) && _js_isnumber(args[2])
+    elseif f === (/) && length(args) == 2 && _js_isvector(args[1]) && (_js_isnumber(args[2]) || _js_isbool(args[2]))
         return _js_materialize!(ir, _JsBroadcast(f, Any[args...], Nothing), T)
     elseif f === (-) && nums && length(args) == 2
         return _js_infix(ir, "-", _JS_ADD, args[1], args[2], T)
@@ -1769,6 +1910,13 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
         return _js_fcall(ir, _js_use!(mod, :_rk_div), args, T)
     elseif f in (rem, %) && length(args) == 2 && all(_js_isint, args)
         return _js_fcall(ir, _js_use!(mod, :_rk_rem), args, T)
+    elseif f === rem && length(args) == 2 && args[2] isa _JsVal && args[2].static && args[2].value === Int64 &&
+           (_js_isint(args[1]) || _js_isbool(args[1]))
+        # `x % Int64`, as Julia's integer arithmetic converts its operands
+        return _js_convert(ir, Int64, args[1])
+    elseif f === Base.not_sametype && length(args) == 2 && _js_type(args[1]) !== _js_type(args[2])
+        # promotion changed an operand's type, so there is no promotion error
+        return _js_static(nothing)
     elseif f in (rem, %) && length(args) == 2 && all(_js_isfloat, args)
         return _js_infix(ir, "%", _JS_MUL, args[1], args[2], T)
     elseif f === Base.mod && length(args) == 2 && all(_js_isint, args)
@@ -1785,14 +1933,16 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
                       _js_code(mod, hi, _JS_COND) * " : " * _js_code(mod, x, _JS_REL + 1) * " < " *
                       _js_code(mod, lo, _JS_REL + 1) * " ? " * _js_code(mod, lo, _JS_COND) * " : " *
                       _js_code(mod, x, _JS_COND), T; prec = _JS_COND)
-    elseif f in (float, identity, real) && length(args) == 1 && _js_isnumber(args[1])
+    elseif f === float && length(args) == 1 && (_js_isnumber(args[1]) || _js_isbool(args[1]))
+        return _js_convert(ir, Float64, args[1])
+    elseif f in (identity, real) && length(args) == 1 && (_js_isnumber(args[1]) || _js_isbool(args[1]))
         return args[1]
     elseif f === isinteger && length(args) == 1 && _js_isnumber(args[1])
         _js_isint(args[1]) && return _js_static(true)
         return _js_fcall(ir, "Number.isInteger", args, Bool)
     elseif f === copysign && length(args) == 2 && all(_js_isfloat, args)
         return _js_fcall(ir, _js_use!(mod, :_rk_copysign), args, T)
-    elseif f === promote && !isempty(args) && all(a -> _js_isnumber(a) || _js_isirrational(a), args)
+    elseif f === promote && !isempty(args) && all(a -> _js_isnumber(a) || _js_isbool(a) || _js_isirrational(a), args)
         # an irrational constant becomes the number it rounds to, as `convert` makes it
         PT = promote_type(map(_js_type, args)...)
         return _JsTuple(Any[_js_isirrational(a) ? _js_static(convert(PT, a.value)) : _js_convert(ir, PT, a)
@@ -1815,8 +1965,8 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
         # operation table of an RK derivative rule: a field read.
         return _js_function_call(ir, Core.getfield, args, T)
     elseif f === getindex && length(args) == 2 && _js_istuple(args[1]) && _js_isint(args[2]) &&
-           _js_number_tuple(_js_type(args[1]), T)
-        # A tuple of numbers read at a position computed at run time: as an array.
+           _js_uniform_tuple(_js_type(args[1]), T)
+        # A tuple of values of one type read at a position computed at run time: as an array.
         return _js_fcall(ir, _js_use!(mod, :_rk_at), Any[_js_runtime(mod, args[1]), args[2]], T)
     elseif f === evalpoly && length(args) == 2 && _js_isnumber(args[1]) && _js_istuple(args[2]) &&
            _js_tuple_length(args[2]) > 0 && !(_js_type(args[2]) <: NamedTuple)
@@ -1832,6 +1982,19 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
             acc = _js_call!(ir, muladd, Any[x, acc, c], T)
         end
         return acc
+    elseif f === map && length(args) == 2 && args[1] isa _JsVal && args[1].static && _js_istuple(args[2]) &&
+           !(_js_type(args[2]) <: NamedTuple) && T <: Tuple && isconcretetype(T)
+        # `map(float, (a, b, x))`: a tuple of the function's values, element by element.
+        S = _js_type(args[2])
+        items = Any[_js_call!(ir, args[1].value,
+                              Any[_js_function_call(ir, Core.getfield, Any[args[2], _js_static(k)], fieldtype(S, k))],
+                              fieldtype(T, k)) for k in 1:_js_tuple_length(args[2])]
+        return _JsTuple(items, T)
+    elseif f === minmax && length(args) == 2 && nums
+        x, y = _js_simple!(ir, args[1], "x"), _js_simple!(ir, args[2], "y")
+        lo = _js_runtime(mod, _js_call!(ir, min, Any[x, y], fieldtype(T, 1))).code
+        hi = _js_runtime(mod, _js_call!(ir, max, Any[x, y], fieldtype(T, 2))).code
+        return _js_rt("[" * lo * ", " * hi * "]", T; pure = false)
     elseif f in (first, last) && length(args) == 1 && _js_istuple(args[1]) && _js_tuple_length(args[1]) > 0
         k = f === first ? 1 : _js_tuple_length(args[1])
         return _js_function_call(ir, Core.getfield, Any[args[1], _js_static(k)], T)
@@ -1845,10 +2008,10 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
         # Destructuring `(a, b) = t`: the element and the next position.
         item = _js_function_call(ir, Core.getfield, Any[args[1], args[2]], fieldtype(T, 1))
         return _JsTuple(Any[item, _js_static(args[2].value + 1)], T)
-    elseif f in (zero, one) && length(args) == 1 && _js_isnumber(args[1])
+    elseif f in (zero, one, oneunit) && length(args) == 1 && (_js_isnumber(args[1]) || _js_isbool(args[1]))
         return _js_static(f(_js_type(args[1])))
     elseif f === convert && length(args) == 2 && args[1] isa _JsVal && args[1].static &&
-           _js_isnumber(args[2])
+           (_js_isnumber(args[2]) || _js_isbool(args[2]))
         return _js_convert(ir, args[1].value, args[2])
     elseif f === length && length(args) == 1 && _js_isvector(args[1])
         return _js_rt(_js_code(mod, args[1], _JS_ATOM) * ".length", Int64)
@@ -1890,6 +2053,9 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
         return _js_fcall(ir, _js_use!(mod, :_rk_set), args, T; pure = false)
     elseif f === sum && length(args) == 1 && _js_isvector(args[1]) && eltype(_js_type(args[1])) <: _JsNumber
         return _js_fcall(ir, _js_use!(mod, :_rk_sum), args, T)
+    elseif f === sum && length(args) == 1 && _js_isvector(args[1]) && eltype(_js_type(args[1])) === Bool
+        # a sum of Booleans is a count
+        return _js_rt(_js_use!(mod, :_rk_sum) * "(" * _js_runtime(mod, args[1]).code * ") + 0", T; prec = _JS_ADD)
     elseif f in (maximum, minimum) && length(args) == 1 && _js_isvector(args[1])
         # The error Julia throws for an empty collection, as this Julia throws it.
         empty = try
@@ -1911,6 +2077,40 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
         return _js_static(1)
     elseif f === (:) && length(args) == 2 && all(_js_isint, args)
         return _js_fcall(ir, _js_use!(mod, :_rk_range), args, UnitRange{Int64})
+    elseif f === (:) && length(args) == 3 && all(_js_isint, args)
+        if all(a -> a isa _JsVal && a.static, args)
+            r = try
+                (:)((a.value for a in args)...)
+            catch
+                nothing
+            end
+            r === nothing || return _js_static(r)
+        end
+        return _js_fcall(ir, _js_use!(mod, :_rk_steprange), args, StepRange{Int64,Int64})
+    elseif f === iterate && length(args) in (1, 2) && _js_isstep(args[1])
+        r = _js_range!(ir, args[1], "r")
+        if length(args) == 1
+            r.static && return _js_static(iterate(r.value))
+            return _js_rt("(" * r.code * ".start !== " * r.code * ".stop && (" * r.code * ".step > 0) !== (" *
+                          r.code * ".stop > " * r.code * ".start)) ? null : [" * r.code * ".start, " * r.code *
+                          ".start]", T; prec = _JS_COND)
+        end
+        s = _js_simple!(ir, args[2], "s")
+        stop, stp = r.static ? (_js_number(last(r.value)), _js_number(step(r.value))) :
+            (r.code * ".stop", r.code * ".step")
+        return _js_rt(s.code * " === " * stop * " ? null : [" * s.code * " + " * stp * ", " * s.code * " + " * stp *
+                      "]", T; prec = _JS_COND)
+    elseif f in (first, last, step, length, isempty) && length(args) == 1 && _js_isstep(args[1])
+        r = _js_range!(ir, args[1], "r")
+        r.static && return _js_static(f(r.value))
+        f === first && return _js_rt(r.code * ".start", Int64)
+        f === last && return _js_rt(r.code * ".stop", Int64)
+        f === step && return _js_rt(r.code * ".step", Int64)
+        empty = "(" * r.code * ".start !== " * r.code * ".stop && (" * r.code * ".step > 0) !== (" * r.code *
+                ".stop > " * r.code * ".start))"
+        f === isempty && return _js_rt(empty, Bool; prec = _JS_ATOM)
+        return _js_rt(empty * " ? 0 : (" * r.code * ".stop - " * r.code * ".start) / " * r.code * ".step + 1",
+                      Int64; prec = _JS_COND)
     elseif f === iterate && length(args) in (1, 2) && _js_isrange(args[1])
         r = _js_range!(ir, args[1])
         if length(args) == 1
@@ -1979,6 +2179,52 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
     elseif f === (*) && length(args) >= 2 && all(a -> a isa _JsVal && _js_type(a) <: AbstractString, args)
         # string concatenation, as an error message builds it
         return _js_rt(join((_js_code(mod, a, _JS_ADD + 1) for a in args), " + "), String; prec = _JS_ADD)
+    elseif f === findfirst && length(args) == 2 && args[1] isa _JsVal && args[1].static && _js_istuple(args[2]) &&
+           !(_js_type(args[2]) <: NamedTuple) && T == Union{Nothing,Int64}
+        # The first position of a tuple whose element satisfies a predicate known
+        # while translating (`findfirst(<(1e-3), ts)`), or `null` for `nothing`.
+        pred = args[1].value
+        S = _js_type(args[2])
+        test(v) = pred isa Base.Fix2 ? _js_call!(ir, pred.f, Any[v, _js_static(pred.x)], Bool) :
+                  pred isa Base.Fix1 ? _js_call!(ir, pred.f, Any[_js_static(pred.x), v], Bool) :
+                  _js_call!(ir, pred, Any[v], Bool)
+        code = "null"
+        for k in _js_tuple_length(args[2]):-1:1
+            v = _js_simple!(ir, _js_function_call(ir, Core.getfield, Any[args[2], _js_static(k)], fieldtype(S, k)), "e")
+            c = test(v)
+            _js_isbool(c) || return nothing
+            code = _js_code(mod, c, _JS_COND + 1) * " ? " * string(k) * " : " * code
+        end
+        return _js_rt("(" * code * ")", T)
+    elseif f === something && length(args) == 2 && Nothing <: _js_type(args[1]) && _js_isnumber(args[2]) &&
+           T === _js_type(args[2])
+        return _js_rt(_js_code(mod, args[1], _JS_OR + 1) * " ?? " * _js_code(mod, args[2], _JS_OR + 1), T;
+                      prec = _JS_OR)
+    elseif f === iszero && length(args) == 1 && _js_isnumber(args[1])
+        return _js_rt(_js_code(mod, args[1], _JS_EQ + 1) * " === 0", Bool; prec = _JS_EQ)
+    elseif f in (cumprod, cumsum) && length(args) == 1 && _js_istuple(args[1]) &&
+           _js_number_tuple(_js_type(args[1]), eltype(_js_type(args[1]))) && T == _js_type(args[1])
+        # Running products or sums of a tuple, left to right as Julia accumulates them.
+        helper = _js_use!(mod, f === cumprod ? :_rk_cumprod : :_rk_cumsum)
+        return _js_rt(helper * "(" * _js_runtime(mod, args[1]).code * ")", T)
+    elseif f === ntuple && length(args) == 2 && args[2] isa _JsVal && args[2].static && args[2].value isa Val &&
+           T <: Tuple && isconcretetype(T)
+        # `ntuple(k -> c[k] * x, Val(21))`: the function at each position, a
+        # tuple known in length while translating.
+        n = typeof(args[2].value).parameters[1]
+        n isa Int && n == fieldcount(T) || return nothing
+        items = String[]
+        for k in 1:n
+            if args[1] isa _JsStruct
+                _js_flush!(ir)
+                push!(items, _js_runtime(mod, first(_js_inline!(ir.fn, args[1], Any[_js_static(k)], "e"))).code)
+            else
+                args[1] isa _JsVal && args[1].static || return nothing
+                push!(items, _js_runtime(mod, _js_call!(ir, args[1].value, Any[_js_static(k)], fieldtype(T, k))).code)
+            end
+        end
+        # An array, computed here: its elements are locals of this block.
+        return _js_rt("[" * join(items, ", ") * "]", T; pure = false)
     elseif f === string && all(a -> a isa _JsVal, args)
         return _js_rt("\"\" + " * join((_js_code(mod, a, _JS_ADD + 1) for a in args), " + "), String;
                       prec = _JS_ADD)
@@ -2078,10 +2324,20 @@ function _js_function_call(ir::_JsIR, f::Core.Builtin, args, T)
         return _js_rt("throw " * _js_runtime(mod, args[1]).code, Union{}; pure = false)
     elseif f === Core._apply_iterate && length(args) >= 2 && args[1] isa _JsVal && args[1].static &&
            args[1].value === iterate && args[2] isa _JsVal && args[2].static &&
-           all(a -> a isa _JsTuple || (a isa _JsVal && a.static && a.value isa Tuple), args[3:end])
+           all(a -> a isa _JsTuple || (a isa _JsVal && a.static && a.value isa Tuple) ||
+                    (a isa _JsVal && !a.static && a.T <: Tuple && !(a.T <: NamedTuple) && isconcretetype(a.T)), args[3:end])
         items = Any[]
         for a in args[3:end]
-            a isa _JsTuple ? append!(items, a.items) : append!(items, (_js_static(x) for x in a.value))
+            if a isa _JsTuple
+                append!(items, a.items)
+            elseif a.static
+                append!(items, (_js_static(x) for x in a.value))
+            else
+                # a tuple computed at run time: its elements, read from one name
+                t = _js_simple!(ir, a, "t")
+                append!(items, (_js_rt(t.code * "[" * string(k - 1) * "]", fieldtype(a.T, k); ref = true)
+                                for k in 1:fieldcount(a.T)))
+            end
         end
         return _js_call!(ir, args[2].value, items, T)
     elseif f === Core.apply_type && all(a -> a isa _JsVal && a.static, args)
@@ -2093,6 +2349,11 @@ end
 function _js_convert(ir, T, v)
     S = _js_type(v)
     S === T && return v
+    if S === Bool && T in (Float64, Int64)
+        # `0` or `1`, as `Int(x)` and `Float64(x)` give it
+        v isa _JsVal && v.static && return _js_static(T(v.value))
+        return _js_rt(_js_code(ir.fn.mod, v, _JS_COND + 1) * " ? 1 : 0", T; prec = _JS_COND)
+    end
     T === Float64 && S <: _JsNumber && return _js_rt(v.code, Float64; prec = v.prec, ref = v.ref, pure = v.pure)
     T === Int64 && S === Float64 && return _js_fcall(ir, _js_use!(ir.fn.mod, :_rk_int), Any[v], Int64)
     _js_error(ir.fn.mod, "converting a `", S, "` to `", T, "` has no JavaScript translation")
@@ -2100,7 +2361,12 @@ end
 
 # Number constructors (`Float64(x)`, `Int(x)`) are calls of the type.
 function _js_function_call(ir::_JsIR, f::Type, args, T)
-    if f in (Float64, Int64) && length(args) == 1 && _js_isnumber(args[1])
+    if f === LazyString && all(a -> a isa _JsVal, args)
+        # An exception message built lazily: a string, as `string` builds one.
+        return _js_rt("\"\" + " * join((_js_code(ir.fn.mod, a, _JS_ADD + 1) for a in args), " + "), LazyString;
+                      prec = _JS_ADD)
+    end
+    if f in (Float64, Int64) && length(args) == 1 && (_js_isnumber(args[1]) || _js_isbool(args[1]))
         return _js_convert(ir, f, args[1])
     elseif f in (Float64, Float32) && length(args) in (1, 2) && _js_isirrational(args[1]) &&
            (length(args) == 1 || (args[2] isa _JsVal && args[2].static && args[2].value isa RoundingMode))
@@ -2116,6 +2382,11 @@ function _js_function_call(ir::_JsIR, f::Type, args, T)
         # `Vector{T}(undef, n)`: the values are unspecified, as in Julia.
         return _js_rt("new Array(" * _js_runtime(ir.fn.mod, args[2]).code * ").fill(" *
                       (f === Vector{Bool} ? "false" : "0") * ")", f; pure = false)
+    elseif f in (Matrix{Float64}, Matrix{Int64}, Matrix{Bool}) && length(args) == 3 && args[1] isa _JsVal &&
+           args[1].static && args[1].value === undef && _js_isint(args[2]) && _js_isint(args[3])
+        # `Matrix{T}(undef, m, n)`: a row-array matrix whose values are unspecified, as in Julia.
+        return _js_fcall(ir, _js_use!(ir.fn.mod, :_rk_mfill),
+                         Any[_js_static(f === Matrix{Bool} ? false : 0), args[2], args[3]], f; pure = false)
     elseif f <: NamedTuple && length(args) <= 1 && T isa DataType && T <: NamedTuple && isconcretetype(T)
         # `(; a, b)` and the keywords of `f(x; a, b)`: `NamedTuple{names}(tuple)`.
         items = isempty(args) ? Any[] : _js_tuple_items(ir, args[1])
@@ -2298,23 +2569,34 @@ function _js_module_name!(mod::_JsModule, prefix, hint)
     name
 end
 
-# A value bound at preparation (`prepare(...; bound)`, an RKPPL binding's
-# data): a number or Bool is known while translating, so it folds as a
-# literal. A vector of them is a frozen module constant, emitted once per
-# array; its numbers are exact (`Float64` literals round-trip, an `Int64`
-# beyond 2^53 is refused).
-_js_bound(mod::_JsModule, x::Union{Float64,Int64,Bool}, hint) = _js_static(x)
-function _js_bound(mod::_JsModule, x::Vector{T}, hint) where {T<:Union{Float64,Int64,Bool}}
-    key = (:bound, objectid(x))
+# An array known while translating as a module-level constant `prefix * hint`,
+# emitted once per array: a vector is an array, a matrix an array of row
+# arrays (one without rows keeps its column count as `cols`), as values cross
+# the module's boundary. Its numbers are exact (`Float64` literals round-trip,
+# an `Int64` beyond 2^53 is refused). `frozen` freezes it and its rows.
+function _js_constant(mod::_JsModule, x::Union{Vector{T},Matrix{T}}, prefix, hint;
+                      frozen::Bool) where {T<:_JsMatrixElement}
+    key = (Symbol(prefix), objectid(x))
     name, _ = get(mod.helpers, key, ("", nothing))
     if isempty(name)
-        name = _js_module_name!(mod, "_rk_bound_", hint)
-        items = join((_js_runtime(mod, _js_static(e)).code for e in x), ", ")
-        push!(mod.defs, "const " * name * " = Object.freeze([" * items * "]);")
+        name = _js_module_name!(mod, prefix, hint)
+        wrap(code) = frozen ? "Object.freeze(" * code * ")" : code
+        items(xs) = "[" * join((_js_runtime(mod, _js_static(e)).code for e in xs), ", ") * "]"
+        code = x isa Vector ? wrap(items(x)) :
+            size(x, 1) == 0 ? wrap("Object.assign([], { cols: " * string(size(x, 2)) * " })") :
+            wrap("[" * join((wrap(items(r)) for r in eachrow(x)), ", ") * "]")
+        push!(mod.defs, "const " * name * " = " * code * ";")
         mod.helpers[key] = (name, x)  # the array stays alive, so its id stays unique
     end
     _js_rt(name, typeof(x); ref = true)
 end
+
+# A value bound at preparation (`prepare(...; bound)`, an RKPPL binding's
+# data): a number or Bool is known while translating, so it folds as a
+# literal. A vector or matrix of them is a frozen module constant.
+_js_bound(mod::_JsModule, x::Union{Float64,Int64,Bool}, hint) = _js_static(x)
+_js_bound(mod::_JsModule, x::Union{Vector{T},Matrix{T}}, hint) where {T<:_JsMatrixElement} =
+    _js_constant(mod, x, "_rk_bound_", hint; frozen = true)
 # Another bound value stays known while translating: a call reads its fields
 # or folds it, and a run-time use of it raises as for any other such value.
 _js_bound(mod::_JsModule, x, hint) = _js_static(x)
@@ -2497,21 +2779,28 @@ Values are `Float64` and `Int64` numbers (an `Int64` exact while it stays
 below 2^53 in magnitude), `Bool`s, vectors of them, and matrices of them as
 arrays of row arrays (`m[i][j]` is Julia's `m[i+1, j+1]`; a matrix without
 rows keeps its column count as `cols`, `Object.assign([], { cols: 3 })` for
-`zeros(0, 3)`); sizes and numeric inputs stay runtime arguments. Translated:
+`zeros(0, 3)`); sizes and numeric inputs stay runtime arguments. A `const`
+global array of them that the code reads (`const LEVELS = [50.0, 100.0]`)
+becomes a module-level array (`_rk_const_LEVELS`) holding its value at
+emission, which the module reads and writes as the kernel does the global.
+Translated:
 ordinary kernel recipes, broadcasts (fused, with Julia's length rules),
 `plate` and `scan` as loops, arithmetic and comparisons, `Base.Math`
 functions with Julia's domain errors, checked 1-based indexing (of a matrix:
-`m[i, j]`, `m[:, j]`, `m[i, :]`, `size`, `axes`), vector literals,
-`sum`/`prod`/`maximum`/`minimum`, ranges, comprehensions and `map` over vectors,
-tuples and named tuples (objects) built, read and destructured, keyword
-calls, and `rk_ode_rk45_tol`, integrated by the vendored `@reside-ic/dopri`
+`m[i, j]`, `m[:, j]`, `m[i, :]`, `size`, `axes`), vector literals and
+matrix literals of numbers (`[a b; c d]`), `sum`/`prod`/`maximum`/`minimum`,
+ranges, comprehensions and `map` over vectors, tuples and named tuples
+(objects) built, read and destructured, `all`/`any`/`count` of a tuple,
+keyword calls, and `rk_ode_rk45_tol`, integrated by the vendored `@reside-ic/dopri`
 Dormand–Prince 5(4) method with the native bridge's arguments, step budget
 and `ODESolveFailure`s (values agree with native to the solvers' accuracy).
 Matrix arithmetic: `*` of matrices, vectors, scalars and the transposes
 `m'`/`transpose(m)`/`v'` (a chain `A * B * v` included); `+`/`-` of
 matrices; `sum`/`prod`/`maximum`/`minimum` of a matrix, whole or with
 `dims = 1` or `2`; `vec` (a fresh vector in column order); `permutedims`;
-`zeros`/`ones`/`fill(x, m, n)`; and broadcasts over matrices, columns and
+`zeros`/`ones`/`fill(x, m, n)`, `Matrix{T}(undef, m, n)` and writes
+`m[i, j] = x`, `m[:, j] = v`, `m[i, :] = v`; `diag`; slices `view(m, :, j)`
+and `view(m, i, :)` read in place; and broadcasts over matrices, columns and
 rows with Julia's shape rules. Plain Julia helpers are translated from their
 typed code, branches, early returns and loops included, without annotation;
 Julia's own functions translate only through RK's table. A construct without
@@ -2568,11 +2857,11 @@ The module of a prepared kernel as [`prepare`](@ref) returns it (a flat or
 shaped WANT), such as a native model's prepared query: its function takes the
 kernel's HAVE values in order and returns what the kernel returns. Data bound
 at preparation (`prepare(spec; have, want, bound)`, the data of an RKPPL
-binding) are part of the module, numbers as literals and vectors as frozen
-module constants, so the module computes what the kernel computes. `types`
-defaults to the exemplar types the kernel was prepared with, if any. A recipe
-of another kernel may call such a kernel too; its function is then translated
-from the kernel's plan the same way.
+binding) are part of the module, numbers as literals and vectors and
+matrices as frozen module constants, so the module computes what the kernel
+computes. `types` defaults to the exemplar types the kernel was prepared
+with, if any. A recipe of another kernel may call such a kernel too; its
+function is then translated from the kernel's plan the same way.
 """
 function js_source(k::PreparedKernel; types = nothing, name = :kernel)
     S = _exact_signature(k)

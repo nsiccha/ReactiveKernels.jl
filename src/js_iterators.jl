@@ -221,6 +221,72 @@ function _js_count_iter!(ir::_JsIR, op, it)
     _js_rt(r, Bool; ref = true)
 end
 
+# `count`, `any` or `all` of a tuple (`all(>=(1), rows)`, `any(a -> length(a) != n,
+# axes)`), or of a tuple of `Bool`s without a function: Julia calls the
+# function on each element in turn, with that element's own type, and `any` and
+# `all` stop at the first element that decides them. A result known while
+# translating decides here; the elements after it are not translated, as Julia
+# does not call the function on them.
+function _js_tuple_count!(ir::_JsIR, op, f, t)
+    mod = ir.fn.mod
+    S = _js_type(t)
+    decide = op === any
+    r, label, open = "", "", false
+    c = op === count ? 0 : nothing
+    for k in 1:_js_tuple_length(t)
+        e = _js_function_call(ir, Core.getfield, Any[t, _js_static(k)], fieldtype(S, k))
+        e === nothing && return nothing
+        v = if f === nothing
+            e
+        else
+            RT = _js_return_type(_js_stagefn(f), Any[_js_argtype(e)])
+            RT === Bool || _js_error(mod, "`", op, "` of a `", S, "`: the function `",
+                                     f isa _JsStruct ? f.T : _js_stagefn(f), "` returns a `", RT,
+                                     "` for element ", k, " (a `", _js_argtype(e), "`); it must return a `Bool`")
+            g = _js_stagefn(f)
+            folded = g isa _JsStruct ? nothing : _js_fold(_js_static(g), Any[e])
+            folded === nothing ? _js_call!(ir, g, Any[e], Bool) : folded
+        end
+        _js_type(v) === Bool || _js_error(mod, "`", op, "` of a `", S, "`: element ", k, " is a `",
+                                          _js_type(v), "`; its elements must be `Bool`s")
+        if op === count
+            if v isa _JsVal && v.static
+                c isa Int ? (c += v.value) : (v.value && _js_line!(ir.fn, c * "++;"))
+                continue
+            end
+            if c isa Int
+                n0 = c
+                _js_flush!(ir)
+                c = _js_local!(ir.fn, "c")
+                _js_line!(ir.fn, "let " * c * " = " * string(n0) * ";")
+            end
+            _js_line!(ir.fn, "if (" * _js_runtime(mod, v).code * ") " * c * "++;")
+            continue
+        end
+        if v isa _JsVal && v.static
+            v.value === decide || continue
+            open || return _js_static(decide)
+            _js_line!(ir.fn, r * " = " * string(decide) * ";")
+            break
+        end
+        if !open
+            _js_flush!(ir)
+            r, label = _js_local!(ir.fn, "r"), _js_local!(ir.fn, "L")
+            _js_line!(ir.fn, "let " * r * " = " * string(!decide) * ";")
+            _js_line!(ir.fn, label * ": {")
+            ir.fn.indent += 1
+            open = true
+        end
+        _js_line!(ir.fn, "if (" * (decide ? _js_runtime(mod, v).code : _js_not(mod, v).code) * ") { " *
+                         r * " = " * string(decide) * "; break " * label * "; }")
+    end
+    op === count && return c isa Int ? _js_static(c) : _js_rt(c, Int64; ref = true)
+    open || return _js_static(!decide)
+    ir.fn.indent -= 1
+    _js_line!(ir.fn, "}")
+    _js_rt(r, Bool; ref = true)
+end
+
 # `isempty` of a vector, a range or an iterator. A generator's function is not
 # called: only its source and the filters before it decide.
 function _js_isempty!(ir::_JsIR, it)
@@ -273,6 +339,8 @@ function _js_iter_call(ir::_JsIR, f, args, T)
     elseif f in (sum, maximum, minimum) && n == 1 && (_js_isiterstruct(args[1]) || _js_isiterstatic(args[1]) ||
                                                       _js_isrange(args[1])) && _js_iterchain(args[1]) !== nothing
         return _js_reduce_iter!(ir, f, args[1], T)
+    elseif f in (count, any, all) && n in (1, 2) && _js_istuple(args[n]) && !(_js_type(args[n]) <: NamedTuple)
+        return _js_tuple_count!(ir, f, n == 1 ? nothing : args[1], args[n])
     elseif f in (count, any, all) && n in (1, 2) && _js_iterchain(args[n]) !== nothing
         it = n == 1 ? args[1] : _JsStruct(Base.Generator, Any[args[1], args[2]], Nothing)
         return _js_count_iter!(ir, f, it)

@@ -25,6 +25,15 @@ const WEIGHTED_SHAPED = prepare(js_weighted; have = (:x, :scale, :weights),
 const WEIGHTED_EXEMPLAR = prepare(js_weighted; have = (:x, :scale, :weights), want = :total,
                                   bound = BOUND, exemplars = ([1.0, 2.0, 3.0],))
 
+# A bound matrix is a frozen module constant of frozen rows (snag
+# js-source-stack-1e1692d1), as a bound vector is.
+@kernel js_projected(x, basis) = begin
+    y = basis * x
+    return y
+end
+const BASIS = [1.0 0.5; -2.0 0.25; 0.0 3.0]
+const PROJECTED = prepare(js_projected; have = (:x, :basis), want = :y, bound = (; basis = BASIS))
+
 # A recipe calling the prepared kernel, twice with the same argument types.
 @kernel js_calls_prepared(x, shift) = begin
     y = WEIGHTED(x)
@@ -91,6 +100,17 @@ end
         @test occursin("export const INPUTS = [{ name: \"x\", type: \"Vector{Float64}\" }];", source)
         if NODE
             check_against(WEIGHTED, source, :weighted, CASES)
+        else
+            @test_skip "no node on the PATH"
+        end
+    end
+
+    @testset "a bound matrix is a frozen module constant" begin
+        source = ReactiveKernels.js_source(PROJECTED; types = (; x = V), name = :projected)
+        @test occursin("const _rk_bound_basis = Object.freeze([Object.freeze([1.0, 0.5]), " *
+                       "Object.freeze([-2.0, 0.25]), Object.freeze([0.0, 3.0])]);", source)
+        if NODE
+            check_against(PROJECTED, source, :projected, [([1.0, 2.0],), ([1.0],), (Float64[],)])
         else
             @test_skip "no node on the PATH"
         end

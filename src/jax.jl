@@ -1367,7 +1367,8 @@ _jax_expr(ctx::_JaxContext, ::Val{:&&}, ex) = _jax_short_circuit(ctx, ex, false)
 _jax_expr(ctx::_JaxContext, ::Val{:||}, ex) = _jax_short_circuit(ctx, ex, true)
 function _jax_short_circuit(ctx::_JaxContext, ex, is_or::Bool)
     ctx.host === nothing || return _host_short_circuit(ctx, ex, is_or)
-    a = _jax_expr(ctx, ex.args[1])
+    a = _jax_lane_decision(ctx, ex)
+    a === nothing && (a = _jax_expr(ctx, ex.args[1]))
     if a.static
         rest = () -> _jax_expr(ctx, ex.args[2])
         decided = () -> _jax_literal(is_or)
@@ -2199,10 +2200,12 @@ _jax_expr(ctx::_JaxContext, ::Val{:if}, ex) = _jax_if(ctx, ex, true)
 
 # An `if`; with `value = false` its arms' values are discarded.
 function _jax_if(ctx::_JaxContext, ex, value::Bool)
+    # A condition a partitioned plate decides for its cells (`jax_lanes.jl`).
+    decided = _jax_lane_decision(ctx, ex)
     ex.head === :elseif && (ex = Expr(:if, ex.args[1] isa Expr && ex.args[1].head === :block ?
                                       ex.args[1].args[end] : ex.args[1], ex.args[2:end]...))
     ctx.host === nothing || return _host_if(ctx, ex, value)
-    condition = _jax_expr(ctx, ex.args[1])
+    condition = decided === nothing ? _jax_expr(ctx, ex.args[1]) : decided
     otherwise = length(ex.args) >= 3 ? ex.args[3] : nothing
     translate(body) = value ? _jax_expr(ctx, body) :
         (_jax_effect(ctx, body); _PyVal("None", Nothing))
@@ -6132,6 +6135,8 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe, op::_KernelSourc
     f isa _KernelBranch && return _jax_split_outputs(ctx, recipe,
         _jax_branch(ctx, p, recipe, f, inputs))
     _has_source(recipe) || _jax_error("a source operation without its source", _jax_where(ctx))
+    # A partitioned plate's decided branches take their arm before rewriting.
+    recipe = _jax_lane_pruned(recipe)
     stable = _jax_stable_rewrite(ctx, p, recipe, inputs)
     # A recipe's whole source is bound to its one output's name.
     target = length(recipe.outputs) == 1 ? (out = only(recipe.outputs);
@@ -6188,7 +6193,9 @@ function _jax_branch(ctx::_JaxContext, p::Plan, recipe::Recipe, b::_KernelBranch
     # The branch's source closes over the values its record captured (a
     # distribution's `prepared standardized` child, say).
     captures = _jax_captures(b.call)
-    condition = _jax_source_expr(ctx, source.args[1], names, inputs, mod, captures)
+    condition = _jax_lane_decision(ctx, source)
+    condition === nothing &&
+        (condition = _jax_source_expr(ctx, source.args[1], names, inputs, mod, captures))
     # Each arm input is the branch's input of its name, for the stable rewrites.
     links = Dict{Symbol,Any}(n => (p, v) for (n, v) in zip(names, recipe.inputs)
                              if count(==(n), names) == 1)
@@ -6204,6 +6211,8 @@ end
 # the branch.
 function _jax_arm_expr(ctx::_JaxContext, p::Plan, recipe::Recipe, ex, names, inputs, mod,
                        captures)
+    # A partitioned plate's decided branches take their arm before rewriting.
+    ex = _jax_lane_prune(ex)
     stable = _simplify() && ex isa Expr && length(names) == length(recipe.inputs) ?
         _jax_stable_rewrite(ctx, p, _jax_stable_view(ex, names, mod), recipe.inputs, inputs;
                             alone = true) : nothing
