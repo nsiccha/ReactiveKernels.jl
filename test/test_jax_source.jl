@@ -1307,15 +1307,8 @@ end
 end
 
 @testset "jax_source: refused constructs" begin
-    # refused: a loop whose trip count is data has no static bound, and JAX
-    # arrays and loops need static shapes (docs/src/jax.md, "Limits").
-    @test_throws JAXEmissionError jax_source(jax_data_count; have = (:x, :n), want = :s)
-    err = try
-        jax_source(jax_data_count; have = (:x, :n), want = :s)
-    catch e
-        e
-    end
-    @test occursin("trip count depends on data", sprint(showerror, err))
+    # Runtime-count loops are covered by test_jax_helper_values.jl. Array
+    # outputs still need representable capacities, as the range below checks.
     # refused: Julia itself rejects two `:` dimensions (`DimensionMismatch`).
     @test_throws DimensionMismatch prepare(jax_two_colons; have = (:x,), want = :total)([1.0, 2.0])
     @test_throws "more than one `Colon`" jax_source(jax_two_colons; have = (:x,), want = :total)
@@ -2529,7 +2522,7 @@ end
     end
     return total
 end
-# A data-only method with a `break`, which only `prepare_data` translates.
+# A method with a `break`, translated on both device and host.
 @jax_test_generate function jax_test_first_at(x::AbstractVector, target::Real)
     found = 0
     for i in eachindex(x)
@@ -2579,9 +2572,9 @@ register_source_provider!(jax_test_provider)
         @test occursin("jax.lax.cond(", text)
         @test occursin(".at[", text)
         @test !occursin(r"^\s*for "m, text)
-        # In the JAX functions a `break` is refused; `prepare_data` runs it
-        # as host Python.
-        @test_throws "`break` has no JAX translation" jax_source(jax_generated_prep;
+        # A provider's break uses the same device loop exit as @traceable;
+        # prepare_data retains the host Python break.
+        device = jax_source(jax_generated_prep;
             have = (:theta, :x), want = :total)
         prep = jax_source(jax_generated_prep; have = (:theta, :x), want = :total, data = (; x))
         @test [f.name for f in prep.functions] == ["prepare_data", "kernel"]
@@ -2609,6 +2602,11 @@ register_source_provider!(jax_test_provider)
                 @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), x3), [dt])) rtol = 1e-6
             end
             native = prepare(jax_generated_prep; have = (:theta, :x), want = :total)
+            for values in (x, Float64[], [0.2, 0.7])
+                got = rk_jax_evaluate(device, "kernel", (0.7, values); grad=true)
+                @test got.value ≈ native(0.7, values) rtol=1e-12
+                @test got.grad ≈ jax_test_first_at(values, 1.0)
+            end
             @test rk_jax_evaluate(prep, "kernel", (0.7, x); prepare = true).value ≈
                   native(0.7, x) rtol = 1e-12
         end

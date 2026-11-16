@@ -919,6 +919,17 @@ end # module
 
 const _DRR = DerivativeRuleRegionGraphs
 
+# Source plans are build-time metadata. The tables passed to compiled native
+# regions must still be plain values, and calls must not allocate for plans.
+_rule_execution_isbits(x) = isbits(x)
+_rule_execution_isbits(x::Tuple) = all(_rule_execution_isbits, x)
+_rule_execution_isbits(r::ReactiveKernels._RuleRegion) =
+    isbits((r.f, r.constants, r.callables))
+function _rule_call_allocations(f, ts, q)
+    f(ts, q)
+    @allocated f(ts, q)
+end
+
 @testset "vector derivative rule: plates and scans in the graph" begin
     decay = _DRR.decay_primitive
     recurrence = derivative_rule(_DRR.recurrence_rule; primal = :y, covector = :y_bar,
@@ -939,9 +950,19 @@ const _DRR = DerivativeRuleRegionGraphs
         @test stage_reverse(rule, Val(mask), residuals, ȳ) ==
             reverse_cut(rule, Val(mask), ts, q, ȳ)
     end
-    # The cut's table keeps only the slots its native body reads, so the rule
-    # stays isbits with a plate or a scan.
-    @test isbits(decay) && isbits(recurrence)
+    # A region retains its authored plan for source emission. Only the native
+    # execution tables need to be isbits; source metadata is never an operand.
+    for (rule, graph) in ((decay, _DRR.decay_rule), (recurrence, _DRR.recurrence_rule))
+        @test _rule_execution_isbits((rule.primal_ops, rule.forward_ops,
+            rule.reverse_ops, rule.staged_ops, rule.lane))
+        compiled = prepare(graph; have=(:ts, :q), want=:y)
+        for n in (0, 7, 129)
+            times = collect(range(0.0, 5.0; length=n))
+            @test @inferred(rule(times, q)) == compiled(times, q)
+            @test _rule_call_allocations(rule, times, q) <=
+                _rule_call_allocations(compiled, times, q)
+        end
+    end
     # Enzyme stages through the generated adapter.
     w = [1.0, -0.5, 0.25, 2.0, 0.0, -1.0, 0.5]
     y = decay(ts, q)

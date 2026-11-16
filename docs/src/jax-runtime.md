@@ -37,8 +37,25 @@ from the rule's mathematical graph. It selects the primal and named partials
 for the active arguments, then applies the scalar chain rule. An inactive
 argument's partial is not contracted with a numeric zero. Calls share their
 generated helpers, including a joint recipe that serves several activity
-patterns. Host data preparation uses the primal cut. General `derivative_rule`
-calls currently emit their primal cut for ordinary JAX differentiation.
+patterns. Host data preparation uses the primal cut.
+
+General `derivative_rule` calls generate adapters from the authored forward
+branch and activity-selected staged reverse branches. Ordinary `jax.grad` and
+`jax.value_and_grad` compute the joint primal and residuals once, then contract
+the selected reverse cut. JAX does not differentiate the primal's convergence
+loop in place of the supplied derivative. Forward mode uses the authored
+forward branch; a missing branch or differentiation of a declared data-only
+input raises. Batching maps whole calls and retains each lane's lazy branches.
+These adapters use `jax.experimental.hijax.HiPrim` and are tested with JAX
+0.12.0.1. Only modules containing a general rule import that API.
+
+Ragged array ports carry their logical lengths through primal, forward and
+reverse cuts. Lengths have zero tangent; padded cotangents do not contribute
+to upstream gradients. Runtime checks inside a rule execute only for active
+calls, including rules reached through a lazy branch or an empty plate.
+Rules containing array regions retain their source plans as build-time
+metadata. Native invocation reads only the compiled body and its concrete
+execution tables.
 
 The incomplete-beta continued fraction used by distribution tails supplies
 its value and shape/argument partials through such a shared graph. A first
