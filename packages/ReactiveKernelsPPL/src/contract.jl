@@ -1148,7 +1148,24 @@ struct StructuralPlan
     data_values::Union{Nothing,_BindingData}
     # Authored prose and provenance, excluded from numerical analysis/cache keys.
     documentation::Vector{RKPPLDocumentation}
+    # Finite integer declarations integrated out by the generated graph.
+    marginalized_integers::Vector{Symbol}
 end
+
+StructuralPlan(responses, predictors, population_priors, parameters,
+    assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+    scans, vector_parameters, matrices, array_parameters, submodel_scopes,
+    conditioned, indexed_observations, external_observations,
+    cell_broadcasts, named_values, factors, cell_priors, frozen::FrozenValues,
+    cell_latents::Dict{Symbol,Tuple{Symbol,Symbol}},
+    cell_geometries::Dict{Symbol,CellGeometry}, data_values::Union{Nothing,_BindingData},
+    documentation::Vector{RKPPLDocumentation}) =
+    StructuralPlan(responses, predictors, population_priors, parameters,
+        assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+        scans, vector_parameters, matrices, array_parameters, submodel_scopes,
+        conditioned, indexed_observations, external_observations,
+        cell_broadcasts, named_values, factors, cell_priors, frozen, cell_latents,
+        cell_geometries, data_values, documentation, Symbol[])
 
 # Plans authored before retained docstrings carry no documentation.
 StructuralPlan(responses, predictors, population_priors, parameters,
@@ -1516,6 +1533,10 @@ const ADMITTED_TRIPLES = Tuple((family, link, predictor_link)
 """Positional arity per sampled family (Distributions.jl order; `:student_t`
 is `(nu, mu, sigma)` in Stan order, matching the response spelling)."""
 const SAMPLED_ARITY = Dict{Symbol,Int}(
+    :binomial => 2,
+    :bernoulli => 1,
+    :categorical => 1,
+    :discrete_uniform => 2,
     :normal => 2,
     :cauchy => 2,
     :exponential => 1,
@@ -1534,6 +1555,10 @@ const SAMPLED_ARITY = Dict{Symbol,Int}(
 """Inferred unconstrained support per sampled family (`:flat` = real;
 `:uniform` bounds come from its literal args)."""
 const SAMPLED_SUPPORT = Dict{Symbol,Symbol}(
+    :binomial => :integer,
+    :bernoulli => :integer,
+    :categorical => :integer,
+    :discrete_uniform => :integer,
     :normal => :real,
     :cauchy => :real,
     :flat => :real,
@@ -1676,6 +1701,7 @@ function validate_structure(plan::StructuralPlan)
         _validate_external_parameter(plan, observation; observation=true)
     end
     _validate_vector_parameters(plan)
+    _validate_integer_supports(plan)
     _validate_topo_order(plan)
     _validate_matrices(plan)
     _validate_predictors(plan)
@@ -1833,7 +1859,7 @@ const _MULTI_AXIS_SLOTS = (:responses, :predictors, :population_priors,
     :matrices,
     :array_parameters, :indexed_observations, :external_observations,
     :cell_broadcasts, :named_values, :factors, :cell_priors, :frozen,
-    :cell_latents, :cell_geometries, :data_values, :documentation)
+    :cell_latents, :cell_geometries, :data_values, :documentation, :marginalized_integers)
 
 # Observation-shaped values and their data dependencies. Parameters sized
 # by levels or coefficient width are shared values, so their priors do not
@@ -2411,7 +2437,7 @@ _is_absent_raw_source(plan::StructuralPlan, k::Symbol, v) = v isa _Absent &&
 function _absent_conditioned_value(plan::StructuralPlan, name::Symbol)
     for p in plan.parameters
         p.name === name || continue
-        return _absent_like(name, p.family in (:binomial, :poisson, :bernoulli) ?
+        return _absent_like(name, p.family in (:binomial, :poisson, :bernoulli, :categorical, :discrete_uniform) ?
             Int : Float64, ())
     end
     # Array declarations take their declared extents once data are bound.
@@ -3685,19 +3711,16 @@ function _collect_opaque_refs!(refs, ex, plan, label, bound::Bool)
     return nothing
 end
 
-# A gather (`cum[c]`) indexes by row-varying integer DATA. A parameter, a
-# per-cell latent, a vector parameter, or a definition reading one is a
-# value, never an index (`c[x_true]` would index by a real number at run
-# time). Bound, a raw index column must hold integers.
+# Gathers may read data or integer parameters as indices. Derived expressions
+# over them retain Julia's runtime index checks; real parameters are not indices.
 function _check_gather_index(ex::Expr, plan::StructuralPlan, label,
         bound::Bool)
     idx = ex.args[2]
     names = _all_name_set(plan)
     for s in _expr_value_symbols(idx)
-        _reads_data_only(plan, s, names, Set{Symbol}()) || _fail(label,
-            "gather `$(repr(ex))` indexes by $s, which is not data — a " *
-            "gather index is an integer data column (`v[c]`); a " *
-            "parameter or latent is a value, never an index")
+        _reads_integer_index(plan, s, names, Set{Symbol}()) || _fail(label,
+            "gather `$(repr(ex))` indexes by $s, which reads a real-valued " *
+            "parameter; indices must be integers")
     end
     bound && idx isa Symbol && _data_check(plan) do plan
         # Bound or computed at binding, an index holding one array per entry
@@ -3713,6 +3736,22 @@ function _check_gather_index(ex::Expr, plan::StructuralPlan, label,
         end
     end
     return nothing
+end
+
+function _reads_integer_index(plan::StructuralPlan, s::Symbol, names, active::Set{Symbol})
+    s in names || return true
+    s in active && return false
+    any(p -> p.name === s && _integer_parameter(p),
+        (plan.parameters..., plan.array_parameters..., plan.plate_parameters...)) && return true
+    i = findfirst(d -> d.name === s, plan.derived)
+    j = findfirst(a -> a.name === s, plan.assignments)
+    defn = i !== nothing ? plan.derived[i].expr :
+        j !== nothing ? plan.assignments[j].expr : nothing
+    defn === nothing && return false
+    push!(active, s)
+    ok = all(t -> _reads_integer_index(plan, t, names, active), _expr_value_symbols(defn))
+    delete!(active, s)
+    return ok
 end
 
 # `s` names data alone: a raw column (any name the plan does not define),
@@ -4213,7 +4252,11 @@ function _validate_parameters(plan::StructuralPlan)
             )
             _is_matrix_value(v, plan) && _fail(p.label,
                 "arg $k references matrix value $v; $(p.family) takes scalar arguments")
-            (v in names || (observed_binomial && (!isbound(plan) || haskey(plan.columns,v)))) ||
+            # Categorical consumes a whole probability vector, including a
+            # sampled simplex, a derived vector or a bound data column.
+            categorical_value = p.family === :categorical &&
+                (v in _all_name_set(plan) || !isbound(plan) || haskey(plan.columns, v))
+            (v in names || categorical_value || (observed_binomial && (!isbound(plan) || haskey(plan.columns,v)))) ||
                 _fail(p.label, "arg $k references unknown name $v")
         end
         _validate_uniform_args(p.label, p.family, p.args)
@@ -4284,6 +4327,13 @@ end
 function _validate_support_override(label, family::Symbol,
         ov::SupportOverride, args::NamedTuple)
     ov === nothing && return nothing
+    # Continuous interval mass uses F(hi)-F(lo). Integer truncation includes
+    # the lower lattice point and needs F(floor(hi))-F(ceil(lo)-1); do not
+    # silently apply the continuous normalizer to the new integer families.
+    if get(SAMPLED_SUPPORT, family, nothing) === :integer &&
+            !(ov isa Tuple && ov[1] === :restricted)
+        _fail(label, "normalized truncation of an integer parameter is not implemented yet")
+    end
     if _has_interval_bounds(ov)
         ov[1] === :truncated && family === :flat &&
             _fail(label, "truncation requires a proper univariate distribution")
@@ -4297,7 +4347,9 @@ function _validate_support_override(label, family::Symbol,
                 _fail(label, "truncation bounds must be values or declared names")
         end
         if ov[2] isa Real && ov[3] isa Real
-            ov[2] < ov[3] || _fail(label, "truncation needs lower < upper")
+            valid = get(SAMPLED_SUPPORT, family, nothing) === :integer ?
+                ov[2] <= ov[3] : ov[2] < ov[3]
+            valid || _fail(label, "truncation bounds are out of order")
         end
         return nothing
     end
@@ -4666,10 +4718,13 @@ function topological_order(plan::StructuralPlan)
         refs = Set{Symbol}()
         for v in (values(p.args)..., _support_args(p.support_override)...)
             for ref in _value_symbols(v)
-                (ref in names || p.family === :external || (p.family === :binomial && p.name in plan.conditioned &&
+                categorical_value = p.family === :categorical &&
+                    (ref in allnames || !isbound(plan) || haskey(plan.columns, ref))
+                (ref in names || categorical_value || p.family === :external || (p.family === :binomial && p.name in plan.conditioned &&
                     (!isbound(plan) || haskey(plan.columns,ref)))) ||
                     _fail(p.label, "bound or arg references unknown name $ref")
-                ref in names && push!(refs, ref)
+                (ref in names || (p.family === :categorical && ref in allnames)) &&
+                    push!(refs, ref)
             end
         end
         depend!(p.name, refs)
@@ -9351,9 +9406,12 @@ function _validate_conditioned_values(plan::StructuralPlan)
         plan.columns[_conditioned_input(p.name)] isa Number ||
             _fail(:condition, "$(p.name) is scalar; broadcast an observation vector with `.~`")
         if p.family === :binomial
-            n = _layout_bound(plan,p.args.arg1)
-            n isa Real && isfinite(n) && isinteger(n) && n >= 0 || _fail(p.label,
-                "Binomial trials must be a nonnegative integer, got $(repr(n))")
+            if all(s -> _reads_data_only(plan, s, _all_name_set(plan), Set{Symbol}()),
+                    _expr_value_symbols(p.args.arg1))
+                n = _layout_bound(plan, p.args.arg1)
+                n isa Real && isfinite(n) && isinteger(n) && n >= 0 || _fail(p.label,
+                    "Binomial trials must be a nonnegative integer, got $(repr(n))")
+            end
             probability = p.args.arg2
             if probability isa Number || haskey(plan.columns,probability)
                 value = probability isa Number ? probability : plan.columns[probability]

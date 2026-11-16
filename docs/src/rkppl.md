@@ -47,6 +47,9 @@ contributions = pointwise(u).y
 (; contributions, sum=sum(contributions), likelihood=likelihood(u))
 ```
 
+See [finite integer parameters](integer-parameters.md) for conditional queries,
+exact marginalization and joint posterior recovery.
+
 ## Observation parameters
 
 `:observations` reads named numeric distribution parameters from the model

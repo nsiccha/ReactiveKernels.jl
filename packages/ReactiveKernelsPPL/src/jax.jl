@@ -25,6 +25,12 @@ parameters, then the prepared data. Its functions:
   parameter's constrained value (an empty parameter has none), plus each value
   named in `values` (a definition such as `:mu`).
 
+With explicit integer parameters, each function takes their named state
+between `unconstrained` and the data: `log_density(u, {"k": 2}, **prepared)`.
+Nested parameters use nested dictionaries. Integer arrays retain their
+declared shape; these values occupy no continuous coordinates. Differentiate
+with respect to `u`, keeping the integer state fixed.
+
 Where a numerical method cannot evaluate the model (a
 `ReactiveKernels.NumericalFailure` natively, such as an ODE solve that fails
 or exceeds its step budget), the density functions answer `-inf`, as the
@@ -39,10 +45,10 @@ in order), `DATA` (each `prepare_data` parameter's dtype and rank) and
 `UNTRANSLATED` (each data-only definition `prepare_data` takes as an input
 instead of computing it, with the reason; `{}` when none).
 
-`float_type = Float32` emits the module in float32 (`ReactiveKernels.jax_source`'s
-`float_type`): `unconstrained`, the data and every value are `float32`, and
-the module does not turn on JAX's 64-bit mode. The default `Float64` module
-is its reference.
+`float_type = Float32` emits floating-point values in float32
+(`ReactiveKernels.jax_source`'s `float_type`), and the module does not turn on
+JAX's 64-bit mode. Integer state and index data retain integer dtypes. The
+default `Float64` module is its reference.
 
 The module docstring starts with the generated line naming
 `ReactiveKernelsPPL.jax_source`, then `Data:` (the names `prepare_data` takes)
@@ -67,10 +73,17 @@ function _jax_module_of(built, plan; values, doc, float_type)
     isbound(plan) || throw(ContractValidationError(
         "[jax] jax_source requires a bound plan (bind_data first)"))
     _check_built_program(built, plan)
+    _refuse_integer_conditional_values(plan, built.spec, values)
     have = _query_have(plan)
     data = _query_bound(plan)
     types = merge((; unconstrained = Vector{Float64}),
                   NamedTuple{keys(data)}(map(typeof, Tuple(data))))
+    integers = filter(e -> e.kind === :integer, built.layout.entries)
+    if !isempty(integers)
+        tree = _scope_namedtuple(Any[(get(built.layout.name_paths, e.name, (e.name,)),
+            isempty(e.dims) ? Int : Array{Int,length(e.dims)}) for e in integers])
+        types = merge(types, (; _ppl_discrete = _integer_namedtuple_type(tree)))
+    end
     # Every parameter the program has a value of, also an empty one whose size
     # reads data (`b[axes(X, 2)]` with no columns), so one module serves every
     # binding; a structurally empty one (the thresholds of a two-category
@@ -134,8 +147,12 @@ function _jax_module_of(built, plan; values, doc, float_type)
         doc,
         "Data: " * join(string.(_jax_data_name.(k for k in keys(data) if !(k in defined))), ", ") * ".",
         model_docs)
+    call = isempty(integers) ? "f(u, **prepared)" : "f(u, discrete, **prepared)"
     over = " at `unconstrained`, the packed unconstrained parameters (length " *
-        "`dimension(prepared)`), for the data `prepare_data` returned: `f(u, **prepared)`."
+        "`dimension(prepared)`), for the data `prepare_data` returned: `" * call * "`." *
+        (isempty(integers) ? "" :
+         " The `discrete` argument is a nested dictionary of integer parameter values; " *
+         "array values retain their declared shapes. Differentiate with respect to `u`.")
     function_docs = (
         log_density = "The log density a sampler targets" * over *
             "\n\nThe sum of `log_prior`, `log_likelihood` and `log_jacobian`.",
@@ -157,6 +174,51 @@ function _jax_module_of(built, plan; values, doc, float_type)
                    rejecting = (:log_density, :log_prior, :log_likelihood, :log_jacobian))
     end
     _jax_with_layout(src, built.layout)
+end
+
+_integer_namedtuple_type(T::Type) = T
+_integer_namedtuple_type(fields::NamedTuple) =
+    NamedTuple{keys(fields),Tuple{map(_integer_namedtuple_type, Tuple(fields))...}}
+
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_integer_value), args::Vector{ReactiveKernels._PyVal})
+    values, name, dims = args
+    path = if name.T === Symbol
+        (ReactiveKernels._jax_static_symbol(ctx, name),)
+    else
+        literal = Meta.parse(name.code)
+        name.static && Meta.isexpr(literal, :tuple) && all(x -> x isa String, literal.args) ||
+            ReactiveKernels._jax_error("integer parameter paths must be structural names")
+        Tuple(Symbol.(literal.args))
+    end
+    value = values
+    for key in path
+        i = findfirst(==(key), fieldnames(value.T))
+        i === nothing && ReactiveKernels._jax_error("missing integer parameter field ", key)
+        # Public Python state may use named dictionaries. Also retain RK's
+        # tuple representation for a state frozen into a prepared graph.
+        positional = ReactiveKernels._jax_call(ctx, getproperty,
+            [value, ReactiveKernels._jax_literal(key)])
+        code = "(" * value.code * "[" * repr(String(key)) * "] if isinstance(" *
+            value.code * ", dict) else " * positional.code * ")"
+        value = ReactiveKernels._jax_bind!(ctx, :integer_value,
+            ReactiveKernels._PyVal(code, fieldtype(value.T, i), value.static))
+    end
+    dtype = "jnp.asarray(" * value.code * ").dtype"
+    ReactiveKernels._jax_emit!(ctx, "if not (jnp.issubdtype(" * dtype *
+        ", jnp.integer) or jnp.issubdtype(" * dtype *
+        ", jnp.bool_)): raise TypeError('integer parameters require an integer dtype')")
+    if ReactiveKernels._jax_is_array(value.T)
+        shape = ReactiveKernels._jax_call(ctx, size, [value])
+        same = ReactiveKernels._jax_call(ctx, ==, [shape, dims])
+        message = ReactiveKernels._PyVal(repr("integer parameter has a different shape than its declaration"),
+            ArgumentError)
+        ReactiveKernels._jax_call(ctx, ReactiveKernels._runtime_check, [same, message])
+    else
+        ReactiveKernels._jax_emit!(ctx, "if jnp.ndim(" * value.code *
+            ") != 0: raise ValueError('scalar integer parameters require a scalar')")
+    end
+    return value
 end
 
 # Authored scope provenance, translated to RK's generic region boundary. The

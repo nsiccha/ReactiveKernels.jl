@@ -16,6 +16,29 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.206
+
+- Finite integer declarations (`Binomial`, `Bernoulli`, `Categorical`,
+  `DiscreteUniform`, scalar or array) occupy named runtime state beside the
+  continuous vector. Queries take `q(u, discrete)`; sampler and derivative
+  preparation take `discrete` as a keyword. Constrained draws preserve their
+  integer types. Binomial trials, DiscreteUniform endpoints and restriction
+  bounds read data; Categorical probabilities may read a sampled simplex.
+  Cached cell, factor, partition, slice, window and SMC queries retain a
+  private copy of the integer state used to prepare their row plans.
+- `marginalize(model, :name, ...)` sums out scalar finite integer parameters
+  in runtime loops. The density and ordinary derivatives use the exact
+  joint sum, and `prepare_discrete_latents` / `discrete_latent_draws` recover
+  their joint posterior under `parameters`. Marginal pointwise terms are
+  sequential predictive log probabilities, including ragged observations.
+  Predictive draws and observation-latent recovery use one shared integer
+  state. Integer arrays remain explicit; normalized integer truncation and
+  marginal density-factor catalogues are not implemented.
+- Explicit integer state and finite marginalization execute in JAX: the
+  density, ordinary gradients, recovered joint integer probabilities and
+  sequential pointwise terms, with the support summed in a runtime loop. A
+  pointwise field holding nested arrays still raises `JAXEmissionError`.
+
 ## 0.1.205
 
 - `prepare_query(built, plan, :observations)` exposes named numeric parameters

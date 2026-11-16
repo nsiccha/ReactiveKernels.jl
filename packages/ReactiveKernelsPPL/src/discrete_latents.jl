@@ -125,9 +125,14 @@ end
 """
     prepare_discrete_latents(built, plan) -> DiscreteLatentQuery
 
-Prepare the posteriors of the discrete latents the observations of `plan`
-sum out, on the graph `built` (`build_kernel` of a binding of the same
-program). The query returns a `NamedTuple` keyed by observation name:
+Prepare the posteriors of the discrete latents `plan` sums out, on the graph
+`built` (`build_kernel` of a binding of the same program). The query returns
+a `NamedTuple`:
+
+- for integer declarations eliminated by `marginalize`, `parameters` holds
+  `values`, a named tuple of integer state columns, and `probabilities`, their
+  joint posterior weights. Both have one axis per eliminated declaration.
+  Nested submodel names stay nested inside `values`;
 
 - for a whole-event hidden Markov observation (`y ~ LogDensity(law, …)` with
   one of `DistributionKernelSources`' hidden Markov laws), the law's state
@@ -137,6 +142,12 @@ program). The query returns a `NamedTuple` keyed by observation name:
 - for a plain finite-mixture response (`y .~ MixtureModel(…)`),
   `probabilities[i, k]`, the probability that observation `i` (in the
   response's column-major order) came from component `k`.
+
+When integer parameters are eliminated beside observation latents, those
+latents' conditional records are under `_conditional`, stacked on a trailing
+joint-state axis. `discrete_latent_draws` chooses the integer state once and
+then draws every observation latent from its record for that same state.
+Such joint draws separate the two namespaces as `parameters` and `observations`.
 
 At posterior draws of the parameters these are the latents' conditional
 posteriors; [`discrete_latent_draws`](@ref) draws the latents themselves, so
@@ -158,6 +169,8 @@ function prepare_discrete_latents(built, plan::StructuralPlan; on_error = nothin
 end
 
 (q::DiscreteLatentQuery)(u::AbstractVector) = Base.invokelatest(q.kernel, u)
+(q::DiscreteLatentQuery)(u::AbstractVector, discrete::NamedTuple) =
+    Base.invokelatest(q.kernel, u, discrete)
 
 """
     discrete_latents_node(built) -> Symbol
@@ -190,17 +203,38 @@ response's components (`Vector{Int}`, one per observation, drawn
 independently). `value` is the value of [`discrete_latents_node`](@ref) in
 any cut; `position = k` selects draw `k` of a vectorized cut. Only `rng`
 supplies randomness, in key order, so a seeded `rng` reproduces the draws.
+Eliminated integer parameters are drawn jointly and returned under
+`parameters`, with their author names and nested submodel namespaces.
 """
 discrete_latent_draws(q::DiscreteLatentQuery, u::AbstractVector, rng) =
     discrete_latent_draws(q(u), rng)
+discrete_latent_draws(q::DiscreteLatentQuery, u::AbstractVector,
+        discrete::NamedTuple, rng) = discrete_latent_draws(q(u, discrete), rng)
 function discrete_latent_draws(value::NamedTuple, rng; position = nothing)
     value = position === nothing ? value : _at_position(value, position)
+    if hasproperty(value, :_conditional) && hasproperty(value, :parameters) &&
+            hasproperty(value.parameters, :values)
+        index = _integer_draw_index(rng, value.parameters.probabilities)
+        parameters = _integer_state_at(value.parameters.values, index)
+        conditional = discrete_latent_draws(_at_position(value._conditional, index), rng)
+        return (; parameters, observations = conditional)
+    end
     return map(posterior -> _latent_draw(rng, posterior), value)
 end
 
-_latent_draw(rng, posterior::NamedTuple) = hasproperty(posterior, :log_filtered) ?
-    DistributionKernelSources.draw_hmm_states(rng, posterior) :
-    _membership_draws(rng, posterior.probabilities)
+function _latent_draw(rng, posterior::NamedTuple)
+    if hasproperty(posterior, :log_filtered)
+        return DistributionKernelSources.draw_hmm_states(rng, posterior)
+    elseif hasproperty(posterior, :values)
+        weights = vec(posterior.probabilities)
+        index = _integer_draw_index(rng, weights)
+        return _integer_state_at(posterior.values, index)
+    end
+    return _membership_draws(rng, posterior.probabilities)
+end
+
+_integer_state_at(columns::NamedTuple, index) = map(c -> _integer_state_at(c, index), columns)
+_integer_state_at(column::AbstractArray, index) = column[index]
 
 function _membership_draws(rng, probabilities::AbstractMatrix)
     out = Vector{Int}(undef, size(probabilities, 1))

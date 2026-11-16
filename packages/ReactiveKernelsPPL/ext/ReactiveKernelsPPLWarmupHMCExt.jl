@@ -5,7 +5,8 @@ import WarmupHMC as WH
 import LogDensityProblems as LDP
 
 function PPL.adaptive_centering_problem(built, plan::PPL.StructuralPlan, problem, backend;
-        cells::NamedTuple = (;), u0 = nothing, on_error = nothing)
+        cells::NamedTuple = (;), u0 = nothing, on_error = nothing, discrete = nothing)
+    plan = PPL._fixed_integer_query(plan, PPL.assign_layout(plan), discrete)
     prepared = PPL._centering_cells(built, plan, cells; u0, on_error)
     LDP.dimension(problem) == prepared.dimension || throw(DimensionMismatch(
         "problem dimension $(LDP.dimension(problem)) ≠ model dimension $(prepared.dimension)"))

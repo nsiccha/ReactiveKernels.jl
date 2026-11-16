@@ -107,7 +107,8 @@ _query_columns(plan::StructuralPlan) =
     sort!([k for (k, v) in plan.columns if _supplied(v)])
 
 _query_have(plan::StructuralPlan) =
-    (:unconstrained, _query_columns(plan)..., _frozen_graph_names(plan)...)
+    Tuple(unique((:unconstrained, (_has_integer_parameters(plan) ? (:_ppl_discrete,) : ())...,
+        _query_columns(plan)..., _frozen_graph_names(plan)...)))
 
 function _query_bound(plan::StructuralPlan)
     names = _query_columns(plan)
@@ -312,6 +313,7 @@ function _prepare_wants(built, plan::StructuralPlan, want;
     isbound(plan) || throw(ContractValidationError(
         "[query] prepare_query requires a bound plan (bind_data first)"))
     _check_built_program(built, plan)
+    _refuse_integer_conditional_values(plan, built.spec, want)
     inputs isa Symbol && (inputs = (inputs,))
     isempty(inputs) || return _prepare_wants_inputs(built, plan, want, inputs;
         on_error, exemplars)
@@ -325,6 +327,23 @@ function _prepare_wants(built, plan::StructuralPlan, want;
     end
 end
 
+# Elimination moves dependent definitions into the state loop. These no
+# longer have one value at the remaining coordinates. Diagnose only known
+# values absent from the resulting graph; independent values stay queryable.
+function _refuse_integer_conditional_values(plan, spec, want)
+    isempty(plan.marginalized_integers) && return nothing
+    names = want isa Tuple ? want : (want,)
+    known = _all_name_set(plan)
+    missing = filter(n -> !haskey(spec.ports, n) &&
+        (n in known || n === :_ppl_observations), names)
+    isempty(missing) && return nothing
+    throw(ContractValidationError("[query] " * _quoted_names(missing) *
+        " depends on an eliminated integer and has no single value at `u`. " *
+        "Query it on the conditional model with explicit integer state; " *
+        "use `prepare_discrete_latents` for the eliminated states' joint posterior " *
+        "or `prepare_predictive` for joint predictive draws."))
+end
+
 # A build serves every binding of its program, and each binding packs and names
 # its own coordinates: a query reads this binding's layout, never the one the
 # build was made with. The same positions and labels keep the build itself.
@@ -336,7 +355,7 @@ function _binding_build(built, plan::StructuralPlan)
 end
 _same_layout(a::LayoutTable, b::LayoutTable) = a.total == b.total &&
     length(a.entries) == length(b.entries) &&
-    all(x.name === y.name && x.offset == y.offset && x.size == y.size &&
+    all(x.name === y.name && x.offset == y.offset && x.size == y.size && x.dims == y.dims &&
         isequal(x.labels, y.labels) for (x, y) in zip(a.entries, b.entries)) &&
     isequal(a.axis_labels, b.axis_labels)
 
@@ -489,13 +508,14 @@ the value is `-Inf` and the gradient is filled with `NaN`, as Stan rejects a
 proposal whose ODE solve fails. Every other exception propagates. The query
 evaluates the next point as usual afterwards.
 """
-mutable struct SamplerQuery{K,P,L}
+mutable struct SamplerQuery{K,P,L,D}
     const kernel::K
     const ad::P
     const layout::L
+    discrete::D
     value::Float64
 end
-SamplerQuery(kernel, ad, layout) = SamplerQuery(kernel, ad, layout, NaN)
+SamplerQuery(kernel, ad, layout, discrete = nothing) = SamplerQuery(kernel, ad, layout, discrete, NaN)
 
 # Per-evaluation calls cross the world-age barrier with references only.
 # `Base.invokelatest` passes each argument as a boxed reference, so a prepared
@@ -603,7 +623,8 @@ the gradient took 1.4 to 3 times the ordinary one.
 """
 function prepare_sampler(built, plan::StructuralPlan, u0::AbstractVector{<:Real};
         backend, on_error = nothing, retain::Tuple = (), warm::Bool = false,
-        native_forward_batch::Bool = false, nonallocating::Union{Bool,Symbol} = :auto)
+        native_forward_batch::Bool = false, nonallocating::Union{Bool,Symbol} = :auto,
+        discrete = nothing)
     choice = nonallocating
     nonallocating = _sampler_nonallocating(choice, backend, retain,
                                            native_forward_batch)
@@ -612,7 +633,8 @@ function prepare_sampler(built, plan::StructuralPlan, u0::AbstractVector{<:Real}
     length(u0) == layout.total || throw(ContractValidationError(
         "[query] exemplar length $(length(u0)) ≠ layout total $(layout.total)"))
     u = Vector{Float64}(u0)
-    exemplar = (u,)
+    discrete = _query_integer_state(plan, layout, discrete)
+    exemplar = (u, _discrete_args(discrete)...)
     kern = ReactiveKernels._kernel_latest_prepared(
         prepare_query(built, plan, :sampler; on_error, exemplars = exemplar))
     gradient_kernel, wants = if isempty(retain)
@@ -632,19 +654,19 @@ function prepare_sampler(built, plan::StructuralPlan, u0::AbstractVector{<:Real}
     # A factored sampled covariance differentiates the ordinary program.
     ordinary_gradient = nonallocating && isempty(wants) && _factors_covariance(kern)
     if nonallocating
-        density_kernel = Base.invokelatest(ReactiveKernels.prepare_nonallocating, kern, u)
+        density_kernel = Base.invokelatest(ReactiveKernels.prepare_nonallocating, kern, exemplar...)
         ordinary_gradient || (gradient_kernel = isempty(wants) ? density_kernel :
-            Base.invokelatest(ReactiveKernels.prepare_nonallocating, gradient_kernel, u))
+            Base.invokelatest(ReactiveKernels.prepare_nonallocating, gradient_kernel, exemplar...))
         kern = density_kernel
     end
     # The non-allocating `prepare_ad` method takes no forward-batching keyword.
     forward = nonallocating && !ordinary_gradient ? (;) :
-        (; native_forward_batch = native_forward_batch &&
+        (; native_forward_batch = native_forward_batch && discrete === nothing &&
         isempty(wants) && ReactiveKernels._native_forward_batch_eligible(
             backend, gradient_kernel, u))
     prep = Base.invokelatest(prepare_ad, gradient_kernel, backend,
-        u; active = :unconstrained, retain = wants, warm, forward...)
-    return SamplerQuery(kern, prep, layout)
+        exemplar...; active = :unconstrained, retain = wants, warm, forward...)
+    return SamplerQuery(kern, prep, layout, discrete)
 end
 
 # `nonallocating = :auto` (decision `0nxki1e`): the non-allocating sampler
@@ -705,7 +727,7 @@ function (q::SamplerQuery)(u::Vector{Float64})
     end
 end
 (q::SamplerQuery)(u::AbstractVector{<:Real}) = q(Vector{Float64}(u))
-_sampler_density(q::SamplerQuery, u) = q.kernel(u)
+_sampler_density(q::SamplerQuery, u) = q.kernel(u, _discrete_args(q.discrete)...)
 
 """
     sampler_value_and_gradient!(q::SamplerQuery, g::AbstractVector, u)
@@ -729,7 +751,7 @@ function sampler_value_and_gradient!(q::SamplerQuery, g::AbstractVector, u::Vect
 end
 sampler_value_and_gradient!(q::SamplerQuery, g::AbstractVector, u::AbstractVector) =
     sampler_value_and_gradient!(q, g, Vector{Float64}(u))
-_sampler_gradient!(q::SamplerQuery, g, u) = first(ad_value_and_gradient!(q.ad, g, u))
+_sampler_gradient!(q::SamplerQuery, g, u) = first(ad_value_and_gradient!(q.ad, g, u, _discrete_args(q.discrete)...))
 
 """
     sampler_value_gradient_and_retained!(q::SamplerQuery, g::AbstractVector, u)
@@ -749,7 +771,7 @@ function sampler_value_gradient_and_retained!(q::SamplerQuery, g::AbstractVector
     v = u isa Vector{Float64} ? u : Vector{Float64}(u)
     return Base.invokelatest(_sampler_retained!, q, g, v)
 end
-_sampler_retained!(q::SamplerQuery, g, u) = ad_value_gradient_and_retained!(q.ad, g, u)
+_sampler_retained!(q::SamplerQuery, g, u) = ad_value_gradient_and_retained!(q.ad, g, u, _discrete_args(q.discrete)...)
 
 """
     QueryAD
@@ -766,10 +788,12 @@ their other value/in-place forms. Each call carries the `Base.invokelatest` barr
 the query's build-time code needs, so they are safe from compiled callers.
 Not thread-safe (one per caller).
 """
-mutable struct QueryAD{P,L}
+mutable struct QueryAD{P,L,D}
     const prepared::P
     const layout::L
+    discrete::D
 end
+QueryAD(prepared, layout) = QueryAD(prepared, layout, nothing)
 
 """
     prepare_query_ad(prepare_operator, built, plan, preset, backend, exemplars...;
@@ -803,7 +827,7 @@ backend's packages must be loaded in the calling session.
 """
 function prepare_query_ad(prepare_operator, built, plan::StructuralPlan,
         preset::Union{Symbol,Tuple{Vararg{Symbol}}}, backend, exemplars...;
-        on_error = nothing)
+        on_error = nothing, discrete = nothing)
     built = _binding_build(built, plan)
     layout = built.layout::LayoutTable
     isempty(exemplars) && throw(ContractValidationError(
@@ -813,10 +837,12 @@ function prepare_query_ad(prepare_operator, built, plan::StructuralPlan,
         throw(ContractValidationError(
             "[query] the last exemplar must be an unconstrained vector of length " *
             "$(layout.total); got $(summary(u0))"))
+    discrete = _query_integer_state(plan, layout, discrete)
     kernel = prepare_query(built, plan, preset; on_error)
     prepared = Base.invokelatest(prepare_operator, kernel, backend,
-        Base.front(exemplars)..., Vector{Float64}(u0); active = :unconstrained)
-    return QueryAD(prepared, layout)
+        Base.front(exemplars)..., Vector{Float64}(u0), _discrete_args(discrete)...;
+        active = :unconstrained)
+    return QueryAD(prepared, layout, discrete)
 end
 
 for verb in (:ad_gradient, :ad_value_and_gradient, :ad_value_and_gradient!,
@@ -829,7 +855,7 @@ for verb in (:ad_gradient, :ad_value_and_gradient, :ad_value_and_gradient!,
         Base.invokelatest(_query_ad_call, ReactiveKernels.$verb, q, args...)
 end
 _query_ad_call(verb::F, q::QueryAD, args::Vararg{Any,N}) where {F,N} =
-    verb(q.prepared, args...)
+    verb(q.prepared, args..., _discrete_args(q.discrete)...)
 
 """
     CellQuery
@@ -964,8 +990,10 @@ footprint for every capture. Inspect the supports of the actual model before
 assuming a fixed per-cell width.
 """
 function prepare_cell_query(built, plan::StructuralPlan, observations;
-        on_error = nothing, locality = nothing, partitioned = (), u0 = nothing)
+        on_error = nothing, locality = nothing, partitioned = (), u0 = nothing,
+        discrete = nothing)
     built = _binding_build(built, plan)
+    plan = _fixed_integer_query(plan, built.layout, discrete)
     isbound(plan) || throw(ContractValidationError(
         "[query] prepare_cell_query requires a bound plan (bind_data first)"))
     _check_built_program(built, plan)
@@ -1106,12 +1134,13 @@ as for [`prepare_sampler`](@ref). `locality` is passed to
 [`prepare_cell_query`](@ref).
 """
 function prepare_cell_sampler(built, plan::StructuralPlan, observations,
-        u0::AbstractVector{<:Real}; backend, on_error = nothing, locality = nothing)
+        u0::AbstractVector{<:Real}; backend, on_error = nothing, locality = nothing,
+        discrete = nothing)
     built = _binding_build(built, plan)
     layout = built.layout::LayoutTable
     length(u0) == layout.total || throw(ContractValidationError(
         "[query] exemplar length $(length(u0)) ≠ layout total $(layout.total)"))
-    q = prepare_cell_query(built, plan, observations; on_error, locality)
+    q = prepare_cell_query(built, plan, observations; on_error, locality, discrete)
     ad = Base.invokelatest(prepare_ad, q.kernel, backend, Vector{Float64}(u0), 1;
         active = :unconstrained)
     return CellSampler(q.kernel, ad, layout, q.observations)
@@ -1332,8 +1361,9 @@ coordinate, mapping each to its position in the selection.
 """
 function prepare_compact_cell_sampler(built, plan::StructuralPlan, observations,
         base0::AbstractVector{Float64}, indices0::AbstractVector{Int};
-        backend, on_error = nothing, locality = nothing)
+        backend, on_error = nothing, locality = nothing, discrete = nothing)
     built = _binding_build(built, plan)
+    plan = _fixed_integer_query(plan, built.layout, discrete)
     c = _prepare_compact_cell(:prepare_compact_cell_sampler, built, plan, observations,
         base0, indices0; on_error, locality)
     ad = Base.invokelatest(prepare_ad, c.kernel, backend, base0, c.active0, c.slots, 1;
@@ -1472,8 +1502,9 @@ reuse the fixed point without checking all shared coordinates per cell.
 """
 function prepare_compact_cell_ad(prepare_operator, built, plan::StructuralPlan, observations,
         base0::AbstractVector{Float64}, indices0::AbstractVector{Int}, backend, exemplars...;
-        on_error = nothing, locality = nothing, partitioned = ())
+        on_error = nothing, locality = nothing, partitioned = (), discrete = nothing)
     built = _binding_build(built, plan)
+    plan = _fixed_integer_query(plan, built.layout, discrete)
     isempty(_query_partition_rule(plan, built.layout, partitioned, nothing)) ||
         return _prepare_shared_compact_ad(prepare_operator, built, plan, observations,
             base0, indices0, backend, exemplars...; on_error, locality, partitioned)
@@ -1525,10 +1556,13 @@ function _stack_restored_draws(values)
         # One array per index (a dotted cell latent): stacked per index.
         return [_stack_restored_draws([draw[k] for draw in values]) for k in eachindex(value)]
     elseif value isa AbstractVector
-        return hcat([Vector{Float64}(draw) for draw in values]...)
+        T = eltype(value) <: Integer ? eltype(value) : Float64
+        return hcat([Vector{T}(draw) for draw in values]...)
     elseif value isa AbstractArray
-        return [Array{Float64,ndims(value)}(draw) for draw in values]
+        T = eltype(value) <: Integer ? eltype(value) : Float64
+        return [Array{T,ndims(value)}(draw) for draw in values]
     end
+    value isa Integer && return [draw for draw in values]
     return Float64[draw for draw in values]
 end
 
@@ -1539,6 +1573,11 @@ _empty_restored_draws(value::AbstractVector) = eltype(value) <: Number ?
     zeros(Float64, length(value), 0) : map(_empty_restored_draws, value)
 _empty_restored_draws(value::AbstractArray) = Array{Float64,ndims(value)}[]
 _empty_restored_draws(::Real) = Float64[]
+_empty_restored_draws(::T) where {T<:Integer} = T[]
+_empty_restored_draws(value::AbstractVector{T}) where {T<:Integer} =
+    zeros(T, length(value), 0)
+_empty_restored_draws(value::AbstractArray{T}) where {T<:Integer} =
+    Array{T,ndims(value)}[]
 
 """
     restore_draws(layout::LayoutTable, U::AbstractMatrix{<:Real}) -> NamedTuple
@@ -1550,18 +1589,24 @@ Scalar leaves become length-`draws` vectors, vector leaves become
 Empty draws retain those keys and leaf shapes. Each column is constrained
 independently through `constrain`, so transforms stay single-sourced.
 """
-function restore_draws(layout::LayoutTable, U::AbstractMatrix{<:Real})
+function restore_draws(layout::LayoutTable, U::AbstractMatrix{<:Real}; discrete = nothing)
     size(U, 1) == layout.total || throw(ContractValidationError(
         "[query] draws rows $(size(U, 1)) ≠ layout total $(layout.total)"))
     n = size(U, 2)
+    discrete isa AbstractVector && length(discrete) != n &&
+        throw(DimensionMismatch("one integer state is required per draw"))
     if n == 0
         # The host transform supplies keys/shapes without evaluating a
         # density. It also handles split coefficient blocks and derived
         # matrix draws exactly as the nonempty path does.
-        return _empty_restored_draws(constrain(layout, zeros(layout.total)))
+        integers = discrete isa NamedTuple ? discrete :
+            _scoped_draw_values(layout, [e.name => (isempty(e.dims) ? 0 : zeros(Int, e.dims...))
+                for e in layout.entries if e.kind === :integer])
+        return _empty_restored_draws(constrain(layout, zeros(layout.total), integers))
     end
     nts = map(1:n) do j
-        constrain(layout, view(U, :, j))
+        integers = discrete === nothing ? (;) : discrete isa NamedTuple ? discrete : discrete[j]
+        constrain(layout, view(U, :, j), integers)
     end
     return _stack_restored_draws(nts)
 end
@@ -1932,8 +1977,10 @@ This does not prepare AD. For individual cell supports, use the
 label per cell would retain a partition plan for every cell.
 """
 function prepare_partition(built, plan::StructuralPlan, observations; by,
-        locality = :error, on_error = nothing, partitioned = (), u0 = nothing)
+        locality = :error, on_error = nothing, partitioned = (), u0 = nothing,
+        discrete = nothing)
     built = _binding_build(built, plan)
+    plan = _fixed_integer_query(plan, built.layout, discrete)
     isbound(plan) || throw(ContractValidationError(
         "[query] prepare_partition requires a bound plan (bind_data first)"))
     _check_built_program(built, plan)
@@ -2262,8 +2309,9 @@ time costs one whole pullback per unit;
 """
 function prepare_partition_sampler(built, plan::StructuralPlan, observations,
         u0::AbstractVector{<:Real}; by, backend, compact::Bool = true, partitioned = (),
-        locality = :error, on_error = nothing)
+        locality = :error, on_error = nothing, discrete = nothing)
     built = _binding_build(built, plan)
+    plan = _fixed_integer_query(plan, built.layout, discrete)
     layout = built.layout::LayoutTable
     length(u0) == layout.total || throw(ContractValidationError(
         "[query] exemplar length $(length(u0)) ≠ layout total $(layout.total)"))

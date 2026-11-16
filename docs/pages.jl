@@ -7,6 +7,7 @@ const SITE_PAGES = [
         "Sequential recurrences" => "scan.md",
         "Prepared differentiation" => "automatic-differentiation.md",
         "Probabilistic graphs" => "rkppl.md",
+        "Finite integer parameters" => "integer-parameters.md",
         "Reusable buffers" => "nonallocating.md",
         "Graph inspection" => "visualization.md",
         "JAX source" => "jax.md",
