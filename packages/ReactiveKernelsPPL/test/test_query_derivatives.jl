@@ -326,18 +326,14 @@ end
     # Other queries never evaluate the observation arguments.
     @test Base.invokelatest(prepare_query(built, bound, :sampler), u) isa Float64
     # The printed program, including its `:observations` statement for a
-    # response without location/scale arguments, parses back as plain source
+    # response beyond location/scale families, parses back as plain source
     # (no `$(...)` interpolation of an unprintable value), so `kernel_expr`
     # replays through `@kernel` (`test_external_sampling.jl`).
     has_interpolation(x) = x isa Expr && (x.head === :$ || any(has_interpolation, x.args))
     @test !has_interpolation(Meta.parse(string(kernel_expr(bound, built.layout))))
-    # Not built yet: Bernoulli responses expose no observation arguments.
-    @test_broken try
-        Base.invokelatest(prepare_query(built, bound, :observations), u) isa NamedTuple
-    catch error
-        error isa ContractValidationError || rethrow()
-        false
-    end
+    obs = Base.invokelatest(prepare_query(built, bound, :observations), u)
+    @test obs.y.logit ≈ u[1] .+ u[2] .* data[:x]
+    @test obs.y.probability ≈ 1 ./ (1 .+ exp.(-obs.y.logit))
 end
 
 # Third-order directional derivatives `∇(vᵀ H v)` of the sampler preset over

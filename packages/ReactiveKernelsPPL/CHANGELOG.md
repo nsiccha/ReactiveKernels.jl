@@ -16,6 +16,18 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.205
+
+- `prepare_query(built, plan, :observations)` exposes named numeric parameters
+  from additional observation distribution graphs. Bernoulli/BernoulliLogit
+  return `probability` and `logit`; Exponential returns `scale`. Count and
+  positive-valued laws use the same extraction mechanism. Existing
+  Normal/Student t/LogNormal `location` and `scale` fields are unchanged.
+  Shared scalars, ranged observations and ragged cells retain their shapes.
+  The public query and `workflow_wants(:observations)` select the same graph
+  for native evaluation, ordinary derivatives and emitted JavaScript.
+  Requires ReactiveKernels 0.1.282 for nested JavaScript outputs.
+
 ## 0.1.204
 
 - A `jax_source` module's density functions (`log_density`, `log_prior`,

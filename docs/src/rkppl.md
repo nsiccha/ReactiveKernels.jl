@@ -47,6 +47,30 @@ contributions = pointwise(u).y
 (; contributions, sum=sum(contributions), likelihood=likelihood(u))
 ```
 
+## Observation parameters
+
+`:observations` reads named numeric distribution parameters from the model
+graph, preserving shared scalars and observation order:
+
+```@example ppl
+outcomes = @rkppl begin
+    a ~ Normal(0, 1)
+    b ~ Normal(0, 1)
+    @plate for i in eachindex(x)
+        event[i] ~ BernoulliLogit(a + b * x[i])
+        time[i] ~ Exponential(exp(a + b * x[i]))
+    end
+end
+observed = outcomes(; x) | (; event = Bool[0, 1, 1], time = [0.5, 1.0, 2.0])
+outcome_kernel = build_kernel(observed)
+coordinates = unconstrain(outcome_kernel.layout, (; a = 0.2, b = 0.4))
+parameters = prepare_query(outcome_kernel, observed, :observations)
+parameters(coordinates)
+```
+
+Use `prepare_query_ad` for derivatives or `ReactiveKernels.js_source` for
+JavaScript. [`WORKFLOW_WANTS`](@ref) lists the fields and coverage.
+
 ## Inspection
 
 A model view combines the generated program with graph inspection. It is derived from the built model and its binding, so it describes the program used by the queries above.
