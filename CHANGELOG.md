@@ -16,6 +16,24 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.290
+
+- `@traceable` and `TraceableSource` accept body-level early returns, including
+  guards before loops. Recorded source preserves their lazy continuations;
+  native methods keep their authored control flow. Loop-crossing returns remain
+  unsupported.
+- JAX source supports `continue`, short-circuit conditional writes, and internal
+  nested-vector buffers with fixed-width numerical rows and `isassigned` state.
+  Prepared integer-data bounds size allocations such as
+  `isempty(ids) ? 0 : maximum(ids)`, including inside ragged cells. Loops retain
+  their bodies across changing data sizes. Unsupported row alias mutations,
+  helper argument mutation, and direct public buffer outputs are diagnosed.
+- Device loops can read homogeneous numerical tuples at computed integer
+  indices, including source `ntuple` lambdas with an authored `Val` arity
+  behind an early-return guard. Empty padded buffer cells are guarded before
+  evaluation, preserving ordinary gradients of shared arguments; integer
+  reductions of cell data request prepared bounds for their allocations.
+
 ## 0.1.289
 
 - `js_source` preserves Julia's `Float64` spelling in `string` and string

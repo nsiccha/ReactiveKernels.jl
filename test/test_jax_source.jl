@@ -2624,21 +2624,21 @@ register_source_provider!(jax_test_provider)
     end
     # Native execution never reads the source.
     @test prepare(jax_generated; have, want = :y)(0.6, x) ≈ jax_test_propagator(0.6, x)
-    # `TraceableSource` takes a body as `@traceable` does: a `return` at its
-    # end is its value, one before the end is refused.
+    # `TraceableSource` records body-level returns as lazy expressions.
     s = TraceableSource([:x, :n], quote
         y = x * n
         return y
     end, @__MODULE__)
     @test s.argument_names === (:x, :n) && s.mod === @__MODULE__
     @test !occursin("return", string(s.body))
-    @test_throws "TraceableSource does not support a `return` before the end" TraceableSource((:x,),
+    guarded_source = TraceableSource((:x,),
         quote
             if x > 0
                 return x
             end
             -x
         end, @__MODULE__)
+    @test !ReactiveKernels._traceable_has_return(guarded_source.body)
     @test_throws "as `Symbol`s" TraceableSource(("x",), :x, @__MODULE__)
     @test_throws "the argument name `x` twice" TraceableSource((:x, :x), :x, @__MODULE__)
 end

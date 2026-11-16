@@ -152,6 +152,8 @@ const _MATRIX_CORE_TESTS = (
     "test_jax_shared_softplus.jl",
     "test_jax_join.jl",
     "test_jax_allocations.jl",
+    "test_jax_early_returns.jl",
+    "test_jax_slot_buffers.jl",
     "test_jax_keep.jl",
     "test_jax_empty_plate.jl",
     "test_jax_lane_partition.jl",
