@@ -879,7 +879,8 @@ _jax_expr(ctx::_JaxContext, ::Val{:continue}, ex) = ctx.host === nothing ?
 # `@views` read the same entries as indexing does (a NumPy basic slice is a
 # view, as Julia's is; a JAX array is never written in place).
 const _JAX_TRANSPARENT_MACROS = (Symbol("@inbounds"), Symbol("@fastmath"), Symbol("@inline"),
-                                 Symbol("@noinline"), Symbol("@view"), Symbol("@views"))
+                                 Symbol("@noinline"), Symbol("@view"), Symbol("@views"),
+                                 Symbol("@simd"))
 function _jax_expr(ctx::_JaxContext, ::Val{:macrocall}, ex)
     name = ex.args[1]
     name isa GlobalRef && (name = name.name)
@@ -1394,6 +1395,22 @@ end
 # check masked by the left (`_jax_call_positional(ctx, throw, ...)`).
 _jax_expr(ctx::_JaxContext, ::Val{:&&}, ex) = _jax_short_circuit(ctx, ex, false)
 _jax_expr(ctx::_JaxContext, ::Val{:||}, ex) = _jax_short_circuit(ctx, ex, true)
+
+# Shared operands in a comparison chain are evaluated once. Later operands
+# belong to the taken continuation, including their checks and accesses.
+function _jax_expr(ctx::_JaxContext, ::Val{:comparison}, ex)
+    function compare(left, i)
+        right = _jax_expr(ctx, ex.args[i + 1])
+        last = i + 1 == length(ex.args)
+        last || (right = _jax_bind!(ctx, :compared, right))
+        condition = _jax_call(ctx, _jax_resolve(ctx, ex.args[i]), [left, right])
+        last && return condition
+        _jax_conditional(ctx, condition, () -> compare(right, i + 2),
+                         () -> _jax_literal(false))
+    end
+    compare(_jax_expr(ctx, ex.args[1]), 2)
+end
+
 function _jax_short_circuit(ctx::_JaxContext, ex, is_or::Bool)
     ctx.host === nothing || return _host_short_circuit(ctx, ex, is_or)
     a = _jax_lane_decision(ctx, ex)
@@ -3404,6 +3421,18 @@ a broadcast, elementwise to arrays, so its code must act elementwise. A
 package adds one for its own function with a method of this function.
 """
 _jax_elementwise_call(ctx::_JaxContext, f, args::Vector{_PyVal}) = nothing
+
+for (predicate, comparison) in ((isodd, (!=)), (iseven, (==)))
+    @eval function _jax_elementwise_call(ctx::_JaxContext, ::typeof($predicate),
+                                         args::Vector{_PyVal})
+        length(args) == 1 || return nothing
+        x = only(args)
+        T = _jax_eltype(x.T)
+        T isa Type && T <: Integer || return nothing
+        remainder = _jax_call(ctx, mod, [x, _jax_literal(2)])
+        _jax_call(ctx, $comparison, [remainder, _jax_literal(0)])
+    end
+end
 
 # `x * y + z` as the source spelling translates. Julia's `muladd` may or may
 # not fuse, so this is its translation, and XLA may fuse it in turn; integer
@@ -5913,10 +5942,26 @@ function _jax_lowered_call_body(ctx::_JaxContext, f, args::Vector{_PyVal}, types
     end
     length(infos) == 1 || return nothing
     ci = only(infos)
-    any(enumerate(ci.code)) do (i, st)
-        st isa Core.GotoNode || (st isa Core.GotoIfNot && st.dest <= i) ||
-            (st isa Expr && st.head in (:enter, :leave, :pop_exception))
-    end &&
+    # Inspect only reachable instructions: lowering can leave a jump after
+    # a return. Forward jumps are ordinary acyclic joins; each returning
+    # region follows them without unrolling a data-dependent loop.
+    pending, visited = [1], Set{Int}()
+    cyclic_or_exceptional = false
+    while !isempty(pending)
+        i = pop!(pending)
+        i in visited && continue
+        1 <= i <= length(ci.code) || continue
+        push!(visited, i)
+        st = ci.code[i]
+        if st isa Core.GotoNode || st isa Core.GotoIfNot
+            dest = Int(st isa Core.GotoNode ? st.label : st.dest)
+            cyclic_or_exceptional |= dest <= i
+            push!(pending, dest)
+        end
+        cyclic_or_exceptional |= st isa Expr && st.head in (:enter, :leave, :pop_exception)
+        st isa Core.ReturnNode || st isa Core.GotoNode || push!(pending, i + 1)
+    end
+    cyclic_or_exceptional &&
         _jax_error("the function `", f, "` has loops or branches, so its lowered code is ",
                    "not translated", _jax_where(ctx), ". Define it with `@traceable` (its ",
                    "authored body is translated), author it as a kernel, or give it a ",
@@ -5984,13 +6029,16 @@ function _jax_lowered_call_body(ctx::_JaxContext, f, args::Vector{_PyVal}, types
         x isa Number ? _jax_literal(x) :
         _jax_global_value(ctx, x, :constant)
     function region(start)
-        for i in start:length(ci.code)
+        i = start
+        while i <= length(ci.code)
             st = ci.code[i]
             if st isa Core.ReturnNode
                 return isdefined(st, :val) ? value(st.val) : _PyVal("None", Union{}, true)
+            elseif st isa Core.GotoNode
+                i = Int(st.label)
+                continue
             elseif st isa Core.GotoIfNot
-                # A terminal branch (for example a shape guard) has no loop or
-                # control-flow join. Translate each returning region under the
+                # Translate each returning region under the
                 # ordinary source conditional, including its lazy error effects.
                 condition = value(st.cond)
                 saved_ssa, saved_slots = copy(ssa), copy(slots)
@@ -6023,6 +6071,7 @@ function _jax_lowered_call_body(ctx::_JaxContext, f, args::Vector{_PyVal}, types
             else
                 ssa[i] = value(st)
             end
+            i += 1
         end
         _jax_error("the lowered code of `", f, "` does not return", _jax_where(ctx))
     end
@@ -6258,11 +6307,12 @@ function _jax_call_positional(ctx::_JaxContext, ::typeof(Core.apply_type), args:
 end
 # A type parameter known while emitting: a type, function or module, a symbol
 # (`Val{:name}`), a tuple of symbols (a keyword call's `NamedTuple{(:a, :b)}`)
-# or an integer literal.
+# or a Boolean/integer literal.
 function _jax_static_parameter(ctx::_JaxContext, a::_PyVal)
     a.T isa _JaxCallable && return a.T.f
     a.T isa Type && a.T <: Function && Base.issingletontype(a.T) && return a.T.instance
     a.T === Symbol && return _jax_static_symbol(ctx, a)
+    a.T === Bool && a.static && a.code in ("True", "False") && return a.code == "True"
     if a.static && a.T isa Type && a.T <: Tuple{Vararg{Symbol}}
         ex = Meta.parse(a.code)
         ex isa Expr && ex.head === :tuple && all(x -> x isa String, ex.args) &&
