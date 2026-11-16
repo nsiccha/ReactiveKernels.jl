@@ -28,7 +28,7 @@ mutable struct _HostState
     lists::Set{String}   # names holding Python lists (`push!` targets)
     in_function::Bool    # a function body, where `return` is a statement
     depth::Int           # nesting in conditionals and loops
-    returns::Vector{Any} # the types an explicit `return` returns
+    returns::Vector{Any} # the translated values an explicit `return` returns
     growing::Set{Symbol} # locals a loop or conditional grows (`push!`): every
                          # binding of one is a list, so each pass appends to one
     maybe::Set{String}   # names that hold a list on some paths only (after a
@@ -232,7 +232,7 @@ function _host_bind!(ctx::_JaxContext, lhs::Symbol, v::_PyVal)
     deep = _host_fresh_elements(v.code) || v.code in h.deep
     deep ? push!(h.deep, name) : delete!(h.deep, name)
     deep || _host_fresh(v.code) || v.code in h.safe ? push!(h.safe, name) : delete!(h.safe, name)
-    ctx.locals[lhs] = _PyVal(name, v.T, true)
+    ctx.locals[lhs] = _PyVal(name, v.T, true, "", "", 0, _jax_symbols(v))
     nothing
 end
 
@@ -495,7 +495,7 @@ function _host_return(ctx::_JaxContext, ex)
                    "host translation", _jax_where(ctx))
     ctx.host.in_function || return v
     v.T === Union{} || _jax_emit!(ctx, "return " * v.code)
-    push!(ctx.host.returns, v.T)
+    push!(ctx.host.returns, v)
     _PyVal("None", Union{}, true)
 end
 _host_jump(ctx::_JaxContext, keyword) = (_jax_emit!(ctx, keyword); _PyVal("None", Union{}, true))
@@ -1732,7 +1732,7 @@ function _host_function_input!(scope, params, passed, hint, v::_PyVal, T)
     name = _jax_identifier(scope.used, hint)
     push!(params, name)
     push!(passed, v)
-    _PyVal(name, T, true)
+    _PyVal(name, T, true, "", "", 0, _jax_symbols(v))
 end
 function _host_function_input!(scope, params, passed, hint, v::_PyVal, T::_JaxCallable)
     T.f isa _HostLambda && !isempty(T.f.captures) &&
@@ -1763,7 +1763,8 @@ function _host_function_call(ctx::_JaxContext, f, names::Vector{Symbol}, body, m
                              args::Vector{_PyVal}, inputs::Vector{_PyVal} = args;
                              kw = Pair{Symbol,_PyVal}[])
     types = Any[_jax_argument_type(a) for a in args]
-    key = (:host_traceable, objectid(f), Tuple(names), Tuple(a.T for a in inputs))
+    key = (:host_traceable, objectid(f), Tuple(names),
+           Tuple((a.T, _jax_symbols(a)) for a in inputs))
     frame() = begin
         scope = _JaxScope()
         params, passed = String[], _PyVal[]
@@ -1814,15 +1815,21 @@ function _host_function_call(ctx::_JaxContext, f, names::Vector{Symbol}, body, m
             _jax_return_type(Core.kwcall, Any[KT, typeof(f), types...])
         end
         T = inferred isa Type && inferred !== Union{} && isconcretetype(inferred) ? inferred :
-            foldl(_host_join, inner.host.returns; init = v.T)
+            foldl((T, value) -> _host_join(T, value.T), inner.host.returns; init = v.T)
         ctx.mod.helper_names[(:host_traceable_type, name)] = T
+        returned = v.T === Union{} ? inner.host.returns : [inner.host.returns; v]
+        symbols = isempty(returned) ? nothing : _jax_symbols(first(returned))
+        all(value -> _jax_symbols(value) == symbols, returned) || (symbols = nothing)
+        ctx.mod.helper_names[(:host_traceable_symbols, name)] = symbols
         ctx.mod.helper_names[(:host_traceable_owned, name)] = owned
     end
     T = ctx.mod.helper_names[(:host_traceable_type, name)]
     owned = ctx.mod.helper_names[(:host_traceable_owned, name)]::Dict{String,Symbol}
     passed = [haskey(owned, p) ? _host_mutable_argument!(ctx, f, a, owned[p]) : a
               for (p, a) in zip(params, passed)]
-    _jax_bind!(ctx, :value, _PyVal(name * "(" * _jax_args(passed) * ")", T, true))
+    symbols = ctx.mod.helper_names[(:host_traceable_symbols, name)]
+    _jax_bind!(ctx, :value, _PyVal(name * "(" * _jax_args(passed) * ")", T, true,
+                                 "", "", 0, symbols))
 end
 
 # The caller's side of a helper that writes argument `v` in place (`kind`:
