@@ -345,7 +345,8 @@ end
             native = prepare(jax_ode_reject_blowup; have = (:u, :y0s, :ts), want = :total)
             @test batch[1:2] ≈ [native([u], [0.2, 0.3, 0.25], [0.5, 1.0, 2.0]) for u in (-2.0, 0.0)] rtol = 1e-6
             @test batch[3:4] == [-Inf, -Inf]
-            @test batch == one
+            # Batched and one-point programs may round differently.
+            @test all(isapprox.(batch, one; rtol = 1e-12))
         end
         # Per-chain gradients under `jax.vmap`, as a sampler takes them, of a
         # model whose solve sits in a scan step: those of one point at a time.

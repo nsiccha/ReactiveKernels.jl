@@ -2444,11 +2444,33 @@ end
 const _JAX_REJECT = """
 from jax.experimental import checkify
 
+# The messages of the module's numerical failures (`_rk_reject`), as checkify
+# records them.
+_RK_REJECTIONS = set()
+
+
+def _rk_checkify_message(message):
+    # checkify formats a check's message with str.format: braces stay literal.
+    return message.replace("{", "{{").replace("}", "}}")
+
 
 def _rk_reject(valid, message):
     # A numerical method failed at a valid input (ReactiveKernels'
     # NumericalFailure): a density function answers -inf, another raises.
+    message = _rk_checkify_message(message)
+    _RK_REJECTIONS.add(message)
     checkify.check(valid, message)
+"""
+# `_rk_check` in a module that has a `_rk_reject`: every runtime check is then
+# a checkify check, so checkify keeps the first failure in program order, as
+# the native program stops at its first throw. A check reading a failed
+# solve's state (a solve continuing from it) then neither raises nor hides the
+# failure.
+const _JAX_CHECK_CHECKIFIED = """
+def _rk_check(valid, message):
+    # ReactiveKernels._runtime_check: raises when the program runs on values
+    # that fail the check, unless a numerical failure came first.
+    checkify.check(valid, _rk_checkify_message(message))
 """
 # The module functions of a module that has a `_rk_reject`, around the
 # function computing their value.
@@ -2463,15 +2485,28 @@ if not hasattr(checkify.Error, "has_error"):
         "https://github.com/nsiccha/jax has both)")
 
 
+def _rk_raise_unless_rejected(error):
+    # Raises the first failed check (of each mapped lane), unless it is a
+    # numerical failure, where the value is -inf.
+    first = error.get_exception()
+    if first is None:
+        return
+    for e in getattr(first, "error_mapping", {(): first}).values():
+        if getattr(e, "fmt_string", None) not in _RK_REJECTIONS:
+            raise e
+
+
 def _rk_rejecting(f, *args, **kwargs):
-    # f's value, or -inf where a numerical method failed. checkify traces a
-    # closure, so static arguments (an entry's name) stay Python values.
+    # f's value, or -inf where a numerical method failed first; another
+    # failed check raises. checkify traces a closure, so static arguments (an
+    # entry's name) stay Python values.
     error, value = checkify.checkify(lambda: f(*args, **kwargs))()
+    jax.debug.callback(_rk_raise_unless_rejected, error)
     return jnp.where(error.has_error(), -jnp.inf, value)
 
 
 def _rk_raising(f, *args, **kwargs):
-    # f's value; raises where a numerical method failed, naming it.
+    # f's value; raises the first failed check, a numerical failure too.
     error, value = checkify.checkify(lambda: f(*args, **kwargs))()
     def throw(e):
         e.throw()
@@ -6855,7 +6890,10 @@ support does. The failure is a
 `scan`, `cond` and loop, so a plate cell's or scan step's failure rejects the
 whole evaluation, under `jax.jit`, `jax.grad` and `jax.vmap` too; a gradient
 there is unspecified. Only a module that can fail so wraps its functions in
-`checkify`. Such a module needs a JAX whose `checkify` has
+`checkify`, and its other runtime checks are `checkify` checks too: the first
+failure in program order decides, as the native program stops at its first
+throw, so a check on a failed solve's state (a solve continuing from it)
+neither raises nor hides the failure. Such a module needs a JAX whose `checkify` has
 `checkify.Error.has_error` and differentiates a `custom_vjp` (every diffrax
 solve) after a check. No JAX release has either yet: jax 0.12.0.1 gives a
 wrong or failing gradient there (`benchmark/repro_jax_checkify_custom_vjp_control_flow.py`).
@@ -7197,6 +7235,7 @@ function _jax_module_text(plans, types, constants, docstring::String, prepare;
     end
     push!(lines, header)
     isempty(constant_lines) || (push!(lines, ""); append!(lines, constant_lines))
+    _jax_rejects(mod) && replace!(mod.helpers, rstrip(_JAX_CHECK) => rstrip(_JAX_CHECK_CHECKIFIED))
     for block in [mod.helpers; bodies]
         push!(lines, "")
         push!(lines, "")

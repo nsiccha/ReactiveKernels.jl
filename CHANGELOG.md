@@ -28,7 +28,10 @@ are recorded in the git history only.
   `checkify`: those `rejecting` names return `-inf` for the whole evaluation,
   also under `jax.jit`, `jax.grad` and `jax.vmap`, and the others raise, as
   before, with the same message. Invalid ODE inputs and every other runtime
-  check still raise. A module without such a failure is unchanged.
+  check still raise. The module's other runtime checks are then `checkify`
+  checks too, so the first failure in program order decides, as natively: a
+  check on a failed solve's state (a solve continuing from it) neither raises
+  nor hides the failure. A module without such a failure is unchanged.
 - Such a module needs a JAX whose `checkify` has `checkify.Error.has_error` and
   differentiates a `custom_vjp` (every diffrax solve) after a check. No JAX
   release has either: jax 0.12.0.1 gives a wrong or failing gradient there
