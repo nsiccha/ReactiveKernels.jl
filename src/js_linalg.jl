@@ -1,6 +1,6 @@
 # Matrix arithmetic in `js_source` modules, on the row-array matrices of
 # `js_arrays.jl`: products (`*` of matrices, vectors and their transposes),
-# whole and per-dimension reductions, `vec`, transposes, matrix fills, and
+# whole and per-dimension reductions, `vec`, `diag`, transposes, matrix fills, and
 # broadcasts over matrices with Julia's shape rules.
 #
 # A lazy `transpose`/`adjoint` of a real matrix is its transpose's rows, made
@@ -114,6 +114,12 @@ function _rk_pairprod(x, first, last) {
   const mid = first + Math.floor((last - first) / 2);
   return _rk_pairprod(x, first, mid) * _rk_pairprod(x, mid + 1, last);
 }""", Symbol[]),
+    :_rk_diag => ("""
+function _rk_diag(m) {
+  const n = Math.min(m.length, _rk_ncols(m)), out = new Array(n);
+  for (let i = 0; i < n; i++) out[i] = m[i][i];
+  return out;
+}""", [:_rk_ncols]),
     :_rk_mfill => ("""
 function _rk_mfill(x, rows, cols) {
   if (!(rows >= 0 && cols >= 0)) throw new JuliaError("ArgumentError", "invalid Array dimensions");
@@ -195,6 +201,9 @@ function _js_linalg_call(ir, f, args, T)
         return _js_kwcall(ir, args, T)
     elseif f === vec && n == 1 && _js_matlike(args[1])
         return fresh(:_rk_vec, args)
+    elseif f === LinearAlgebra.diag && n == 1 && _js_matlike(args[1])
+        # the main diagonal, a fresh vector
+        return fresh(:_rk_diag, args)
     elseif f in (transpose, adjoint, permutedims) && n == 1 && _js_matlike(args[1])
         return fresh(:_rk_transpose, args)
     elseif f in (transpose, adjoint) && n == 1 && (_js_isvector(args[1]) || _js_rowlike(args[1]))
@@ -311,6 +320,7 @@ _js_bc2d(bc) = any(_js_bc2d_leaf, _js_leaves!(Any[], bc))
 # given, is written in place).
 function _js_materialize2!(ir::_JsIR, bc::_JsBroadcast, T; dest = nothing)
     mod = ir.fn.mod
+    bc = _js_bcvalues(mod, bc)
     leaves = _js_leaves!(Any[], bc)
     for l in leaves
         t = _js_type(l)

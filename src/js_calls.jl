@@ -3,7 +3,7 @@
 # families translate (`sum` of a generator and of a matrix) has this one method,
 # which asks each family in turn and then the general table (`js.jl`).
 #
-#   `_js_array_call`  (`js_arrays.jl`):    literals and matrix reads
+#   `_js_array_call`  (`js_arrays.jl`):    vector and matrix literals, matrix reads
 #   `_js_iter_call`   (`js_iterators.jl`): generators, filters and their reductions
 #   `_js_linalg_call` (`js_linalg.jl`):    matrix arithmetic
 #   `_js_functions_call` (`js_functions.jl`): comparison predicates, searches,
@@ -12,9 +12,10 @@
 const _JS_FAMILIES = (_js_array_call, _js_iter_call, _js_linalg_call, _js_functions_call)
 const _JS_FAMILY_FUNCTIONS = (
     Base.vect, getindex, size, length, axes, firstindex, lastindex, copy,
+    hvcat, hcat, Base.typed_hvcat, Base.typed_hcat, _native_hvcat, _native_hcat, setindex!,
     collect, sum, maximum, minimum, count, any, all, isempty, argmin, argmax, findmin, findmax, filter,
     Base.Iterators.filter, Core.kwcall,
-    vec, transpose, adjoint, permutedims, *, /, +, -, prod, zeros, ones, fill,
+    vec, LinearAlgebra.diag, transpose, adjoint, permutedims, *, /, +, -, prod, zeros, ones, fill,
     findfirst, findlast, isnothing, merge, abs2, _JS_FIX2_COMPARISONS...)
 
 for F in _JS_FAMILY_FUNCTIONS

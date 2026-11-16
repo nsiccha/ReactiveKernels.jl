@@ -25,7 +25,7 @@ are recorded in the git history only.
   sampler targets answer `-Inf` (0.1.195): a NumPyro or BlackJAX sampler then
   rejects the point instead of aborting. Their gradient there is unspecified.
   `constrain` raises there, and every other runtime check still raises. Needs
-  ReactiveKernels 0.1.274, and for a model with an ODE solve the JAX it names
+  ReactiveKernels 0.1.279, and for a model with an ODE solve the JAX it names
   (its `jax_source` docstring).
 
 ## 0.1.203

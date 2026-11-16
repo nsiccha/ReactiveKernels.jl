@@ -78,6 +78,8 @@ call passes that one name; a record of numbers stays a static literal and
 can size an allocation. A field that is a function or a type raises
 `JAXEmissionError`.
 
+A host helper that writes its argument in place (`rv[k] = x`, `push!(rv, x)`, `sort!(rv)`, or a helper it calls doing so) writes the caller's vector, as Julia's does, whether or not the caller reads the helper's result (RK 0.1.278). The caller passes its own local: a copy of an input or a module constant first, and a list when the helper grows it. A slice or another expression in that position raises `JAXEmissionError`, because Julia's `x[r]` is a copy and `view(x, r)` is not, and the two have one NumPy spelling.
+
 A method that a package generates, such as one its macro writes into the caller's module, cannot carry `@traceable`. The generating package keeps the method's source as a `TraceableSource` (argument names, body, and the module whose globals the body reads) and hands it over through a provider. It registers the provider with `register_source_provider!`, once, from the `__init__` of the package extension that loads with ReactiveKernels. The emitter asks the provider for a call that has no other translation and no `@traceable` source, with the function and the `Tuple` type of the argument types. The provider answers `nothing` or the source of the method those arguments call natively.
 
 The example below stands in for such a package. Its macro defines the method and keeps its source.
