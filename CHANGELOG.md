@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.281
+## 0.1.290
 
 - `@traceable` and `TraceableSource` accept body-level early returns, including
   guards before loops. Recorded source preserves their lazy continuations;
@@ -33,6 +33,90 @@ are recorded in the git history only.
   behind an early-return guard. Empty padded buffer cells are guarded before
   evaluation, preserving ordinary gradients of shared arguments; integer
   reductions of cell data request prepared bounds for their allocations.
+
+## 0.1.289
+
+- `js_source` preserves Julia's `Float64` spelling in `string` and string
+  interpolation, including error messages: integral floats retain `.0`,
+  signed zero and infinities retain their Julia spelling, and scientific
+  notation uses Julia's exponent thresholds. Integer counts stay integers.
+
+## 0.1.288
+
+- `jax_source` prepares Cartesian products of data-bound numerical ranges
+  and arrays with runtime host iteration. Collected products retain Julia's
+  shape, first-axis-fastest order and empty axes. Homogeneous numerical
+  tuple arrays cross to JAX as one array per field with the same shape,
+  for compiled plates, indexing and reductions; source bodies do not grow
+  with supports.
+
+## 0.1.287
+
+- Accept keyword arguments in `@traceable` methods and translate their calls
+  in JAX functions and host data preparation. Required and typed keywords,
+  dependent defaults, shorthand calls and nested helpers retain Julia's
+  semantics. Keyword values remain runtime helper arguments.
+- Preserve `on_error = :ignore` through captured helper calls with keywords.
+
+## 0.1.286
+
+- JAX host preparation translates `findall(vector)`,
+  `findall(predicate, vector)` and `Dict(zip(keys, values))`, including
+  `eachindex` values and dictionary lookups inside data-only plates.
+  Searches return one-based positions, zip remains reusable and stops at its
+  shortest input (its zero-argument form remains infinite). Dictionaries
+  preserve duplicate-key replacement and Julia's `isequal` key semantics.
+  These operations retain runtime loops,
+  including for empty inputs, and can supply standalone `prepare_data`
+  definitions without Julia-computed intermediate values.
+
+## 0.1.285
+
+- `jax_source` keeps predicates and arithmetic over prepared integers static
+  when argument names overlap backend names, such as `isfinite(n)`. Those
+  calls use the existing NumPy translation instead of leaving a traced JAX
+  value in a Python conditional. Lazy guards and ordinary gradients are
+  preserved, including when prepared data are passed to a jitted function.
+
+## 0.1.284
+
+- Add the internal log rising-factorial numerical graph used by distribution
+  kernels. Small integer offsets evaluate chunked products and their shape
+  partial together; other offsets use the optional SpecialFunctions extension.
+  The ordinary derivative adapters come from that one graph, and the product
+  loops retain their runtime count.
+
+## 0.1.283
+
+- `jax_source` preserves padded length bounds through integer addition,
+  subtraction and multiplication by input-shape expressions. A helper can
+  allocate at `(1 + length(parameters)) * length(row)` when `row` is ragged;
+  its capacity comes from the input shapes during JAX tracing. Signed
+  arithmetic tracks both interval endpoints, and loops retain their runtime
+  structure. One emitted module continues to accept different input sizes.
+  Zero-capacity buffers skip the last-entry read when padding a loop result.
+
+## 0.1.282
+
+- `js_source` translates nested vectors of numbers and Booleans, including
+  ragged and empty groups: literals, inputs, bound data, indexing, iteration,
+  comprehensions and plate cells retain their nesting. `vec` preserves the
+  vector and `reduce(vcat, rows)` concatenates one level with runtime loops.
+  Prepared kernels can consume those vectors inside another kernel.
+  `js_run` preserves the nested
+  output types and applies its typed-array mode to numeric leaves.
+
+## 0.1.281
+
+- `js_source` translates nested tuple literals and tuple `length`, including
+  calls in validation helpers. It also translates `fill!` of numerical and
+  Bool vectors with supported element conversions, preserving aliases and
+  converting the fill value once even when the destination is empty. The
+  destination length remains a runtime value. Reads of reassigned locals
+  retain their values, including the temporary reused by keyword sorters.
+  These operations let BRM's
+  type-stable fixed-domain HSGP basis emit with scalar or per-axis mode counts
+  and retain its input checks.
 
 ## 0.1.280
 

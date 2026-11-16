@@ -156,7 +156,9 @@ function _js_runtime(mod::_JsModule, v::_JsVal)
         return _js_rt("null", Nothing; ref = true)
     elseif x isa Union{String,Symbol}
         return _js_rt(_js_string_literal(x), typeof(x); ref = true)
-    elseif x isa Tuple && all(e -> e isa Union{Number,Nothing,String,Symbol}, x)
+    elseif x isa Tuple
+        # Nested tuples use the same representation as runtime tuple values;
+        # each leaf still goes through its ordinary translation/checks.
         items = [_js_runtime(mod, _js_static(e)).code for e in x]
         return _js_rt("[" * join(items, ", ") * "]", typeof(x); ref = false)
     elseif _js_isrange(v)
@@ -169,7 +171,7 @@ function _js_runtime(mod::_JsModule, v::_JsVal)
                       ", " * _js_number(last(x)) * ")", typeof(x); ref = false)
     elseif x isa Exception
         return _js_rt(_js_exception(mod, x), typeof(x); pure = true)
-    elseif x isa Union{Vector,Matrix} && eltype(x) <: _JsMatrixElement
+    elseif _js_isvector_type(typeof(x)) || (x isa Matrix && eltype(x) <: _JsMatrixElement)
         # An array known while translating (a `const` global the code reads):
         # a module-level array holding its value at emission, which the module
         # reads and writes as the kernel does the global.
@@ -230,10 +232,34 @@ export class JuliaError extends Error {
     if (value !== undefined) this.value = value;
   }
 }""", Symbol[]),
+    :_rk_float_string => (raw"""
+function _rk_float_string(x) {
+  if (Number.isNaN(x)) return "NaN";
+  if (!Number.isFinite(x)) return x < 0 ? "-Inf" : "Inf";
+  if (x === 0) return Object.is(x, -0) ? "-0.0" : "0.0";
+  const sign = x < 0 ? "-" : "";
+  // Reuse the engine's shortest round-trip digits. Only their presentation
+  // differs from Julia Float64: decimal point, exponent threshold and sign.
+  const parts = Math.abs(x).toString().split("e");
+  const dot = parts[0].indexOf(".");
+  let point = (dot < 0 ? parts[0].length : dot) + Number(parts[1] || 0);
+  let digits = parts[0].replace(".", "");
+  const leading = digits.match(/^0*/)[0].length;
+  point -= leading;
+  digits = digits.slice(leading).replace(/0+$/, "");
+  if (point > -4 && point <= 6) {
+    if (point <= 0) return sign + "0." + "0".repeat(-point) + digits;
+    if (point >= digits.length)
+      return sign + digits + "0".repeat(point - digits.length) + ".0";
+    return sign + digits.slice(0, point) + "." + digits.slice(point);
+  }
+  return sign + digits[0] + "." + (digits.slice(1) || "0") + "e" + (point - 1);
+}""", Symbol[]),
     :_rk_at => ("""
 function _rk_at(x, i) {
   if (!(Number.isInteger(i) && i >= 1 && i <= x.length))
     throw new JuliaError("BoundsError", "attempt to access " + x.length + "-element array at index [" + i + "]");
+  if (x[i - 1] === undefined) throw new JuliaError("UndefRefError", "access to undefined reference");
   return x[i - 1];
 }""", [:JuliaError]),
     :_rk_set => ("""
@@ -521,12 +547,15 @@ function _rk_boolean(name, x) {
     throw new JuliaError("ArgumentError", "the input `" + name + "` must be a boolean; got " + x);
 }""", [:JuliaError]),
     :_rk_vector => ("""
-function _rk_vector(name, x, element) {
+function _rk_vector(name, x, element, integer = false, depth = 1) {
   if (!(Array.isArray(x) || ArrayBuffer.isView(x)))
     throw new JuliaError("ArgumentError", "the input `" + name + "` must be an array; got " + x);
-  for (let i = 0; i < x.length; i++)
-    if (typeof x[i] !== element || (element === "number" && arguments[3] && !Number.isInteger(x[i])))
+  for (let i = 0; i < x.length; i++) {
+    if (depth > 1) {
+      _rk_vector(name + "[" + (i + 1) + "]", x[i], element, integer, depth - 1);
+    } else if (typeof x[i] !== element || (element === "number" && integer && !Number.isInteger(x[i])))
       throw new JuliaError("ArgumentError", "the input `" + name + "` must hold " + element + "s; entry " + (i + 1) + " is " + x[i]);
+  }
 }""", [:JuliaError]),
     # As Julia's `iseven`/`isodd` of a float: every integer above `maxintfloat` (2^53) is even.
     :_rk_iseven => ("""
@@ -614,7 +643,13 @@ _js_isint(v) = _js_type(v) === Int64
 _js_isbool(v) = _js_type(v) === Bool
 # A comparison broadcast (`x .> c`) is a `BitVector` natively: an array of
 # Booleans here, read like a `Vector{Bool}`.
-_js_isvector(v) = (_js_type(v) <: Vector && eltype(_js_type(v)) <: Union{_JsNumber,Bool}) || _js_type(v) === BitVector
+_js_isvector_type(::Any) = false
+_js_isvector_type(::Type{BitVector}) = true
+_js_isvector_type(::Type{Vector{E}}) where {E} = E in (Float64, Int64, Bool) || _js_isvector_type(E)
+_js_isvector(v) = _js_isvector_type(_js_type(v))
+# Numerical array helpers operate on scalar elements; indexing and iteration
+# also accept nested vectors, whose entries remain arrays (possibly ragged).
+_js_isflatvector(v) = _js_isvector(v) && eltype(_js_type(v)) <: _JsMatrixElement
 _js_isrange(v) = _js_type(v) in (UnitRange{Int64}, Base.OneTo{Int64})
 # A stepped range (`n:-1:1`): iterated, measured and read at its ends only.
 _js_isstep(v) = _js_type(v) === StepRange{Int64,Int64}
@@ -625,7 +660,7 @@ _js_tuple_length(v::_JsVal) = v.static ? length(v.value) : fieldcount(v.T)
 # at run time: a number, a `Bool`, a vector or matrix of them, or a tuple of
 # such values (`domain = ((lo1, hi1), (lo2, hi2))`, a tuple of axis vectors).
 _js_runtime_type(T) = T isa DataType && isconcretetype(T) &&
-    (T <: Union{_JsNumber,Bool} || (T <: Union{Vector,Matrix} && eltype(T) <: Union{_JsNumber,Bool}) ||
+    (T <: Union{_JsNumber,Bool} || _js_isvector_type(T) || (T <: Matrix && eltype(T) <: _JsMatrixElement) ||
      (T <: Tuple && !(T <: NamedTuple) && all(_js_runtime_type, fieldtypes(T))))
 _js_uniform_tuple(S, T) = S <: Tuple && !(S <: NamedTuple) && isconcretetype(S) && fieldcount(S) > 0 &&
     _js_runtime_type(T) && all(==(T), fieldtypes(S))
@@ -813,7 +848,10 @@ function _js_statement!(ir::_JsIR, i, st)
 end
 
 function _js_define_ssa!(ir::_JsIR, i, v, T)
-    if v isa _JsVal && !v.static && !v.ref
+    # An SSA value is a snapshot, including when its expression is just a
+    # read of a reassigned local. Keyword sorters reuse such a local for
+    # several arguments; retaining its name would read the last argument.
+    if v isa _JsVal && !v.static && (!v.ref || v.code in ir.slot_names)
         if T === Union{}
             _js_flush!(ir)
             _js_line!(ir.fn, v.code * ";")
@@ -845,7 +883,8 @@ function _js_assign_slot!(ir::_JsIR, n, v)
         # Assigned once: alias a value that is safe to read again, else bind it.
         # In code of several blocks, only a value every block sees is aliased
         # (a JavaScript `const` lives in its block); another is declared on top.
-        if v isa _JsVal && !v.static && (!v.ref || (ir.multiblock && !(v.code in ir.stable)))
+        if v isa _JsVal && !v.static &&
+           (!v.ref || v.code in ir.slot_names || (ir.multiblock && !(v.code in ir.stable)))
             _js_flush!(ir)
             if ir.multiblock
                 name = _js_hoist!(ir, ir.ci.slotnames[n])
@@ -1821,8 +1860,9 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
         return _js_function_call(ir, Core.getfield, args, T)
     elseif f === similar && length(args) == 1 && _js_isvector(args[1]) && T === _js_type(args[1])
         # The new vector's values are unspecified, as in Julia.
-        return _js_rt("new Array(" * _js_code(mod, args[1], _JS_ATOM) * ".length).fill(" *
-                      (eltype(T) === Bool ? "false" : "0") * ")", T; pure = false)
+        return _js_rt("new Array(" * _js_code(mod, args[1], _JS_ATOM) * ".length)" *
+                      (_js_isflatvector(args[1]) ? ".fill(" * (eltype(T) === Bool ? "false" : "0") * ")" : ""),
+                      T; pure = false)
     elseif f === Base.literal_pow && length(args) == 3 && _js_isnumber(args[2]) && args[3] isa _JsVal &&
        args[3].static && args[3].value isa Val
         p = typeof(args[3].value).parameters[1]
@@ -2013,7 +2053,8 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
     elseif f === convert && length(args) == 2 && args[1] isa _JsVal && args[1].static &&
            (_js_isnumber(args[2]) || _js_isbool(args[2]))
         return _js_convert(ir, args[1].value, args[2])
-    elseif f === length && length(args) == 1 && _js_isvector(args[1])
+    elseif f === length && length(args) == 1 &&
+           (_js_isvector(args[1]) || (_js_istuple(args[1]) && !(_js_type(args[1]) <: NamedTuple)))
         return _js_rt(_js_code(mod, args[1], _JS_ATOM) * ".length", Int64)
     elseif f === length && length(args) == 1 && _js_isrange(args[1])
         r = _js_range!(ir, args[1])
@@ -2050,13 +2091,14 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
                          _js_range_length(r) * " + \"-element view at index [\" + " * i.code * " + \"]\");")
         return _js_rt(x.code * "[" * _js_range_start(r) * " + " * _js_code(mod, i, _JS_ADD + 1) * " - 2]", T)
     elseif f === setindex! && length(args) == 3 && _js_isvector(args[1]) && _js_isint(args[3])
+        _js_isflatvector(args[1]) || _js_type(args[2]) === eltype(_js_type(args[1])) || return nothing
         return _js_fcall(ir, _js_use!(mod, :_rk_set), args, T; pure = false)
     elseif f === sum && length(args) == 1 && _js_isvector(args[1]) && eltype(_js_type(args[1])) <: _JsNumber
         return _js_fcall(ir, _js_use!(mod, :_rk_sum), args, T)
     elseif f === sum && length(args) == 1 && _js_isvector(args[1]) && eltype(_js_type(args[1])) === Bool
         # a sum of Booleans is a count
         return _js_rt(_js_use!(mod, :_rk_sum) * "(" * _js_runtime(mod, args[1]).code * ") + 0", T; prec = _JS_ADD)
-    elseif f in (maximum, minimum) && length(args) == 1 && _js_isvector(args[1])
+    elseif f in (maximum, minimum) && length(args) == 1 && _js_isflatvector(args[1])
         # The error Julia throws for an empty collection, as this Julia throws it.
         empty = try
             f(eltype(_js_type(args[1]))[])
@@ -2087,6 +2129,13 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
             r === nothing || return _js_static(r)
         end
         return _js_fcall(ir, _js_use!(mod, :_rk_steprange), args, StepRange{Int64,Int64})
+    elseif f === iterate && length(args) in (1, 2) && _js_isvector(args[1]) &&
+           (length(args) == 1 || _js_isint(args[2]))
+        x = _js_simple!(ir, args[1], "x")
+        s = length(args) == 1 ? _js_static(1) : _js_simple!(ir, args[2], "s")
+        index = _js_runtime(mod, s).code
+        return _js_rt(index * " > " * x.code * ".length ? null : [" * _js_use!(mod, :_rk_at) *
+                      "(" * x.code * ", " * index * "), " * index * " + 1]", T; prec = _JS_COND)
     elseif f === iterate && length(args) in (1, 2) && _js_isstep(args[1])
         r = _js_range!(ir, args[1], "r")
         if length(args) == 1
@@ -2159,7 +2208,8 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
     elseif f === map && length(args) == 2 && (_js_isvector(args[2]) || _js_isrange(args[2]))
         return _js_materialize!(ir, _JsBroadcast(args[1] isa _JsVal ? args[1].value : args[1],
                                                  Any[args[2]], Nothing), T)
-    elseif f === push! && length(args) == 2 && _js_isvector(args[1]) && _js_isnumber(args[2])
+    elseif f === push! && length(args) == 2 && _js_isvector(args[1]) &&
+           (_js_isflatvector(args[1]) ? _js_isnumber(args[2]) : _js_type(args[2]) === eltype(_js_type(args[1])))
         x = _js_simple!(ir, args[1], "x")
         _js_flush!(ir)
         _js_line!(ir.fn, x.code * ".push(" * _js_runtime(mod, args[2]).code * ");")
@@ -2171,10 +2221,10 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
         parts = join((_js_runtime(mod, a).code for a in args), " + ")
         return _js_rt("throw new JuliaError(\"ErrorException\", " *
                       (isempty(args) ? "\"\"" : "\"\" + " * parts) * ")", Union{}; pure = false)
-    elseif f in (vcat, _native_vcat) && T isa Type && T <: Vector && eltype(T) <: Union{_JsNumber,Bool} &&
+    elseif f in (vcat, _native_vcat) && T isa Type && T <: Vector && _js_isvector_type(T) &&
            !isempty(args) && all(a -> _js_type(a) === eltype(T) || _js_type(a) === T, args)
         # a vector concatenated from vectors and numbers of its element type: a new array
-        items = (_js_isvector(a) ? "..." * _js_code(mod, a, _JS_UNARY) : _js_runtime(mod, a).code for a in args)
+        items = (_js_type(a) === T ? "..." * _js_code(mod, a, _JS_UNARY) : _js_runtime(mod, a).code for a in args)
         return _js_rt("[" * join(items, ", ") * "]", T; pure = false)
     elseif f === (*) && length(args) >= 2 && all(a -> a isa _JsVal && _js_type(a) <: AbstractString, args)
         # string concatenation, as an error message builds it
@@ -2226,7 +2276,15 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
         # An array, computed here: its elements are locals of this block.
         return _js_rt("[" * join(items, ", ") * "]", T; pure = false)
     elseif f === string && all(a -> a isa _JsVal, args)
-        return _js_rt("\"\" + " * join((_js_code(mod, a, _JS_ADD + 1) for a in args), " + "), String;
+        # JavaScript numbers erase the distinction between Int64 and Float64.
+        # Select the float formatter while the Julia argument type is known.
+        pieces = ["\"\""]
+        for a in args
+            code = _js_isfloat(a) ? _js_use!(mod, :_rk_float_string) * "(" * _js_runtime(mod, a).code * ")" :
+                   _js_code(mod, a, _JS_ADD + 1)
+            push!(pieces, code)
+        end
+        return _js_rt(join(pieces, " + "), String;
                       prec = _JS_ADD)
     elseif f === _native_exp && length(args) == 1 && _js_isnumber(args[1])
         return _js_call!(ir, exp, Any[args[1]], T)
@@ -2377,11 +2435,16 @@ function _js_function_call(ir::_JsIR, f::Type, args, T)
         return _js_rt(_js_use!(ir.fn.mod, :_rk_range) * "(1, " * _js_runtime(ir.fn.mod, args[1]).code * ")", T)
     elseif f === Base.Generator && length(args) == 2 && (_js_isvector(args[2]) || _js_isrange(args[2]))
         return _JsStruct(f, Any[args...], T)
-    elseif f in (Vector{Float64}, Vector{Int64}, Vector{Bool}) && length(args) == 2 && args[1] isa _JsVal &&
+    elseif f <: Vector && _js_isvector_type(f) && length(args) == 2 && args[1] isa _JsVal &&
            args[1].static && args[1].value === undef && _js_isint(args[2])
         # `Vector{T}(undef, n)`: the values are unspecified, as in Julia.
-        return _js_rt("new Array(" * _js_runtime(ir.fn.mod, args[2]).code * ").fill(" *
-                      (f === Vector{Bool} ? "false" : "0") * ")", f; pure = false)
+        n = _js_simple!(ir, args[2], "n")
+        _js_flush!(ir)
+        _js_use!(ir.fn.mod, :JuliaError)
+        _js_line!(ir.fn, "if (" * n.code * " < 0) throw new JuliaError(\"ArgumentError\", \"invalid Array dimensions\");")
+        return _js_rt("new Array(" * n.code * ")" *
+                      (eltype(f) <: _JsMatrixElement ? ".fill(" * (eltype(f) === Bool ? "false" : "0") * ")" : ""),
+                      f; pure = false)
     elseif f in (Matrix{Float64}, Matrix{Int64}, Matrix{Bool}) && length(args) == 3 && args[1] isa _JsVal &&
            args[1].static && args[1].value === undef && _js_isint(args[2]) && _js_isint(args[3])
         # `Matrix{T}(undef, m, n)`: a row-array matrix whose values are unspecified, as in Julia.
@@ -2422,12 +2485,16 @@ function _js_input_check(mod::_JsModule, name, T)
         "_rk_number(" * _js_string_literal(name) * ", " * name * ", true);", :_rk_number
     elseif T === Bool
         "_rk_boolean(" * _js_string_literal(name) * ", " * name * ");", :_rk_boolean
-    elseif T <: Vector && eltype(T) in (Float64, Int64, Bool)
-        el = eltype(T) === Bool ? "boolean" : "number"
+    elseif _js_isvector_type(T)
+        E, depth = eltype(T), 1
+        while _js_isvector_type(E)
+            E, depth = eltype(E), depth + 1
+        end
+        el = E === Bool ? "boolean" : "number"
         "_rk_vector(" * _js_string_literal(name) * ", " * name * ", \"" * el * "\"" *
-            (eltype(T) === Int64 ? ", true" : "") * ");", :_rk_vector
+            (depth > 1 ? ", " * string(E === Int64) * ", " * string(depth) : E === Int64 ? ", true" : "") * ");", :_rk_vector
     else
-        throw(JSEmissionError("the input `$name` has type `$T`; JavaScript inputs are Float64, Int64, Bool or vectors of them"))
+        throw(JSEmissionError("the input `$name` has type `$T`; JavaScript inputs are Float64, Int64, Bool or nested vectors of them"))
     end
 end
 
@@ -2574,15 +2641,17 @@ end
 # arrays (one without rows keeps its column count as `cols`), as values cross
 # the module's boundary. Its numbers are exact (`Float64` literals round-trip,
 # an `Int64` beyond 2^53 is refused). `frozen` freezes it and its rows.
-function _js_constant(mod::_JsModule, x::Union{Vector{T},Matrix{T}}, prefix, hint;
-                      frozen::Bool) where {T<:_JsMatrixElement}
+function _js_constant(mod::_JsModule, x::Union{Vector,BitVector,Matrix}, prefix, hint;
+                      frozen::Bool)
     key = (Symbol(prefix), objectid(x))
     name, _ = get(mod.helpers, key, ("", nothing))
     if isempty(name)
         name = _js_module_name!(mod, prefix, hint)
         wrap(code) = frozen ? "Object.freeze(" * code * ")" : code
-        items(xs) = "[" * join((_js_runtime(mod, _js_static(e)).code for e in xs), ", ") * "]"
-        code = x isa Vector ? wrap(items(x)) :
+        element(e) = e isa AbstractVector ? _js_constant(mod, e, prefix, string(hint, "_item"); frozen).code :
+                                            _js_runtime(mod, _js_static(e)).code
+        items(xs) = "[" * join((element(e) for e in xs), ", ") * "]"
+        code = x isa AbstractVector ? wrap(items(x)) :
             size(x, 1) == 0 ? wrap("Object.assign([], { cols: " * string(size(x, 2)) * " })") :
             wrap("[" * join((wrap(items(r)) for r in eachrow(x)), ", ") * "]")
         push!(mod.defs, "const " * name * " = " * code * ";")
@@ -2595,8 +2664,9 @@ end
 # data): a number or Bool is known while translating, so it folds as a
 # literal. A vector or matrix of them is a frozen module constant.
 _js_bound(mod::_JsModule, x::Union{Float64,Int64,Bool}, hint) = _js_static(x)
-_js_bound(mod::_JsModule, x::Union{Vector{T},Matrix{T}}, hint) where {T<:_JsMatrixElement} =
-    _js_constant(mod, x, "_rk_bound_", hint; frozen = true)
+_js_bound(mod::_JsModule, x::Union{Vector,BitVector,Matrix}, hint) =
+    _js_isvector_type(typeof(x)) || (x isa Matrix && eltype(x) <: _JsMatrixElement) ?
+    _js_constant(mod, x, "_rk_bound_", hint; frozen = true) : _js_static(x)
 # Another bound value stays known while translating: a call reads its fields
 # or folds it, and a run-time use of it raises as for any other such value.
 _js_bound(mod::_JsModule, x, hint) = _js_static(x)
@@ -2776,7 +2846,8 @@ exception type (`DomainError`, `BoundsError`, `DimensionMismatch`, …).
 `types` gives each HAVE value's type, by name, where its port has none.
 
 Values are `Float64` and `Int64` numbers (an `Int64` exact while it stays
-below 2^53 in magnitude), `Bool`s, vectors of them, and matrices of them as
+below 2^53 in magnitude), `Bool`s, nested vectors of them (including empty
+and ragged groups), and matrices of scalar numbers or Booleans as
 arrays of row arrays (`m[i][j]` is Julia's `m[i+1, j+1]`; a matrix without
 rows keeps its column count as `cols`, `Object.assign([], { cols: 3 })` for
 `zeros(0, 3)`); sizes and numeric inputs stay runtime arguments. A `const`

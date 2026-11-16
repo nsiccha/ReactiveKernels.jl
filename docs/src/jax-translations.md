@@ -1,10 +1,12 @@
 # JAX translations
 
-This guide continues [JAX source](jax.md): the Julia functions that host preparation translates, and how a package maps its own callables.
+Companion to [JAX source](jax.md): host preparation and package mappings.
 
 ## Host preparation
 
-Host preparation translates `findfirst(predicate, vector)`, including captured predicates such as `isequal(label)`, `Base.Fix1` and `Base.Fix2`. It searches in order, stops at the first match, and returns a one-based index or `nothing`. A positional kernel can therefore compute group indices with `plate(values) do value; Int(findfirst(isequal(value), levels)); end` inside the emitted module. Label values and the lengths of both vectors remain runtime inputs.
+Host `findfirst(predicate, vector)` returns the first matching one-based index or `nothing`. Captured predicates (`isequal(label)`, `Base.Fix1`, `Base.Fix2`) work in positional kernels too: `plate(values) do value; Int(findfirst(isequal(value), levels)); end`. Labels and vector lengths remain runtime inputs.
+
+RK 0.1.286 adds `findall(vector)`/`findall(predicate, vector)`: every matching one-based position, possibly empty. Predicates run in order and return `Bool`. `Dict(zip(keys, values))`, including `eachindex(rows)` values, supports indexing, `get` and `haskey` in host plates. Zip is reusable and stops at its shortest input. Repeated keys keep their last value; equality follows `isequal` (NaNs, signed zero). These operations also translate in data-only `definitions`.
 
 Host preparation also orders vectors of numbers or strings as Julia's `isless` does (-0.0 before 0.0, every NaN last): `sort`, `unique` (and `sort!`, `unique!` of a list built with `push!`), `searchsortedfirst` and `searchsortedlast` (one-based), and `sortperm(v)`, whose one-based positions keep equal values in ascending position. `invperm(p)` of a vector of integers is the inverse permutation and raises `ArgumentError: argument is not a permutation` as Julia does. A data-only definition such as `pos = invperm(vcat(rows_a, rows_b))` therefore runs in `prepare_data`. Keyword orders (`rev`, `by`, `lt`) have no translation. In the JAX functions these calls have none either: a recipe that also reads a parameter (`theta[sortperm(rows)]`) raises `JAXEmissionError` naming the function, so give the permutation a definition of its own that reads data alone.
 

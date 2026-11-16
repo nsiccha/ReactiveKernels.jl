@@ -3402,9 +3402,10 @@ argument (`args...`, `args::T...`, `args::Vararg{T,N}`, whose name the
 recorded source reads as the tuple of the trailing arguments, as the method
 does), `where` clauses, and a return-type annotation.  A docstring before `@traceable` documents the
 method, as it does a plain definition.  A `@traceable` method of a function
-from Base, Core or ReactiveKernels is rejected, and so are keyword arguments
-and a `return` inside a loop. Body-level early returns are recorded as lazy
+from Base, Core or ReactiveKernels is rejected, as is a `return` inside a loop.
+Body-level early returns are recorded as lazy
 conditional expressions; the ordinary method keeps its authored control flow.
+Keyword arguments keep Julia's defaults, required arguments and type checks.
 """
 macro traceable(def)
     _traceable_definition(def, __module__)
@@ -3434,11 +3435,15 @@ function _traceable_definition(def, mod::Module)
             "define a helper function of your own."))
     end
     formals = signature.args[2:end]
-    any(arg -> arg isa Expr && arg.head === :parameters, formals) && throw(ArgumentError(
-        "@traceable does not support keyword arguments in `$(signature)`; " *
-        "pass them positionally."))
     names = Set{Symbol}()
     for formal in formals
+        if formal isa Expr && formal.head === :parameters
+            for keyword in formal.args
+                keyword isa Expr && keyword.head === :kw && (keyword = keyword.args[1])
+                _lhs_symbols!(names, keyword)
+            end
+            continue
+        end
         formal isa Expr && formal.head === :kw && (formal = formal.args[1])
         formal isa Expr && formal.head === :... && (formal = formal.args[1])
         _lhs_symbols!(names, formal)
@@ -3513,6 +3518,10 @@ function without a `@traceable` method.
 """
 _traceable_source(@nospecialize(args...)) = nothing
 
+# Separate from positional source: source readers that do not bind keywords
+# continue to execute the ordinary Julia call instead of reading free locals.
+_traceable_keyword_source(@nospecialize(args...)) = nothing
+
 """
     _traceable_arguments(source, args, group) -> Vector or nothing
 
@@ -3562,9 +3571,32 @@ end
 # A method of `_traceable_source` over the argument TYPES, with the method's own
 # formals as type bounds, so dispatch selects the source of the method that
 # values of those types call. A trailing Vararg formal bounds each trailing
-# argument type by its element type, and its count by the formal's. Defaulted
-# and destructured formals record no source.
-function _traceable_source_method(callee, formals, wheres, body, mod)
+# argument type by its element type, and its count by the formal's. Keyword
+# methods also record their default-positional forwarding methods. Other
+# defaulted and destructured formals record no source.
+function _traceable_source_method(callee, formals, wheres, body, mod;
+                                  registry = :_traceable_source, keywords = nothing,
+                                  defaults = ())
+    keyword_index = findfirst(a -> a isa Expr && a.head === :parameters, formals)
+    if keyword_index !== nothing
+        keywords = formals[keyword_index].args
+        positional = Any[a for (i, a) in enumerate(formals) if i != keyword_index]
+        return _traceable_source_method(callee, positional, wheres, body, mod;
+                                        registry = :_traceable_keyword_source, keywords)
+    end
+    if keywords !== nothing
+        first_default = findfirst(a -> a isa Expr && a.head === :kw, formals)
+        if first_default !== nothing
+            plain = Any[a isa Expr && a.head === :kw ? a.args[1] : a for a in formals]
+            records = _traceable_source_method(callee, plain, wheres, body, mod; registry, keywords)
+            fixed = length(formals) - (_traceable_vararg(last(formals), length(formals)) !== nothing)
+            for count in first_default-1:fixed-1
+                append!(records, _traceable_source_method(callee, plain[1:count], wheres, body, mod;
+                    registry, keywords, defaults = Tuple(formals[count+1:fixed])))
+            end
+            return records
+        end
+    end
     params = Any[]
     names = Symbol[]
     bounds = Any[]
@@ -3596,16 +3628,21 @@ function _traceable_source_method(callee, formals, wheres, body, mod)
         push!(names, formal.args[1])
         push!(bounds, formal.args[2])
     end
-    signature = Expr(:call, GlobalRef(@__MODULE__, :_traceable_source),
+    signature = Expr(:call, GlobalRef(@__MODULE__, registry),
                      Expr(:(::), Expr(:curly, :Type, Expr(:call, GlobalRef(Core, :typeof), callee))),
                      params...)
     # The method's own signature type, built once where it is defined: inside
     # the source method its `where` names are bound to the matched types.
     method_type = Expr(:curly, GlobalRef(Core, :Tuple),
                        Expr(:call, GlobalRef(Core, :typeof), callee), bounds...)
+    keyword_type = Expr(:curly, GlobalRef(Core, :Tuple),
+                       Expr(:call, GlobalRef(Core, :typeof), GlobalRef(Core, :kwcall)),
+                       GlobalRef(Core, :NamedTuple),
+                       Expr(:call, GlobalRef(Core, :typeof), callee), bounds...)
     for layer in reverse(wheres)
         signature = Expr(:where, signature, layer...)
         method_type = Expr(:where, method_type, layer...)
+        keyword_type = Expr(:where, keyword_type, layer...)
     end
     held = gensym(:traceable_signature)
     statics = Any[]
@@ -3615,9 +3652,11 @@ function _traceable_source_method(callee, formals, wheres, body, mod)
         push!(statics, Expr(:(=), parameter,
                             Expr(:if, Expr(:isdefined, parameter), parameter, nothing)))
     end
-    Any[Expr(:const, Expr(:(=), held, method_type)),
-        Expr(:(=), signature, Expr(:tuple, QuoteNode(Tuple(names)), QuoteNode(body), mod, held,
-                                   Expr(:tuple, statics...), vararg))]
+    record = Expr(:tuple, QuoteNode(Tuple(names)), QuoteNode(body), mod, held,
+                  Expr(:tuple, statics...), vararg)
+    keywords === nothing || append!(record.args,
+        (QuoteNode(Tuple(keywords)), keyword_type, QuoteNode(defaults)))
+    Any[Expr(:const, Expr(:(=), held, method_type)), Expr(:(=), signature, record)]
 end
 
 # Record a method as one expression. A body-level return ends that path;
