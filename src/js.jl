@@ -611,9 +611,16 @@ _js_isstep(v) = _js_type(v) === StepRange{Int64,Int64}
 _js_istuple(v) = v isa _JsTuple || (v isa _JsVal && (v.static ? v.value isa Tuple : v.T <: Tuple))
 _js_tuple_length(v::_JsTuple) = length(v.items)
 _js_tuple_length(v::_JsVal) = v.static ? length(v.value) : fieldcount(v.T)
+# A nonempty tuple whose elements all have the type `T`, a value a module holds
+# at run time: a number, a `Bool`, a vector or matrix of them, or a tuple of
+# such values (`domain = ((lo1, hi1), (lo2, hi2))`, a tuple of axis vectors).
+_js_runtime_type(T) = T isa DataType && isconcretetype(T) &&
+    (T <: Union{_JsNumber,Bool} || (T <: Union{Vector,Matrix} && eltype(T) <: Union{_JsNumber,Bool}) ||
+     (T <: Tuple && !(T <: NamedTuple) && all(_js_runtime_type, fieldtypes(T))))
+_js_uniform_tuple(S, T) = S <: Tuple && !(S <: NamedTuple) && isconcretetype(S) && fieldcount(S) > 0 &&
+    _js_runtime_type(T) && all(==(T), fieldtypes(S))
 # A nonempty tuple whose elements all have the number type `T`.
-_js_number_tuple(S, T) = S <: Tuple && !(S <: NamedTuple) && isconcretetype(S) && fieldcount(S) > 0 &&
-    T <: _JsNumber && all(==(T), fieldtypes(S))
+_js_number_tuple(S, T) = T <: _JsNumber && _js_uniform_tuple(S, T)
 
 # A range is read through its first element, last element and length. A range
 # known while translating (`for _ in 1:60` in a helper) is read as literals; a
@@ -838,6 +845,30 @@ function _js_assign_slot!(ir::_JsIR, n, v)
             v = _js_rt(name, v.T; ref = true)
         end
         ir.slots[n] = v
+    elseif v isa _JsStruct && all(f -> f isa _JsVal, v.fields)
+        # A closure assigned on every pass of a loop (`all(x -> lo <= x <= hi, v)`
+        # inside `for j in 1:d`) stays a value known while translating, called
+        # where it is read. Julia's closure holds the values it captured when it
+        # was built, so each runtime capture is copied there, into a local of
+        # this slot that every block sees (`<slot>$<field>`: `$` is in no
+        # translated Julia name).
+        _js_flush!(ir)
+        fields = Any[]
+        for (k, f) in enumerate(v.fields)
+            if f.static
+                push!(fields, f)
+                continue
+            end
+            copy = name * "\$" * string(k)
+            if !(copy in ir.fn.taken)
+                push!(ir.fn.taken, copy)
+                insert!(ir.fn.lines, ir.decl_at + 1, "  "^ir.decl_indent * "let " * copy * ";")
+                ir.decl_at += 1
+            end
+            _js_line!(ir.fn, copy * " = " * _js_runtime(ir.fn.mod, f).code * ";")
+            push!(fields, _js_rt(copy, f.T; ref = true))
+        end
+        ir.slots[n] = _JsStruct(v.T, fields, v.RT)
     else
         r = _js_runtime(ir.fn.mod, v)
         _js_flush!(ir)
@@ -1862,8 +1893,8 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
         # operation table of an RK derivative rule: a field read.
         return _js_function_call(ir, Core.getfield, args, T)
     elseif f === getindex && length(args) == 2 && _js_istuple(args[1]) && _js_isint(args[2]) &&
-           _js_number_tuple(_js_type(args[1]), T)
-        # A tuple of numbers read at a position computed at run time: as an array.
+           _js_uniform_tuple(_js_type(args[1]), T)
+        # A tuple of values of one type read at a position computed at run time: as an array.
         return _js_fcall(ir, _js_use!(mod, :_rk_at), Any[_js_runtime(mod, args[1]), args[2]], T)
     elseif f === evalpoly && length(args) == 2 && _js_isnumber(args[1]) && _js_istuple(args[2]) &&
            _js_tuple_length(args[2]) > 0 && !(_js_type(args[2]) <: NamedTuple)
@@ -2271,6 +2302,11 @@ function _js_function_call(ir::_JsIR, f::Type, args, T)
         # `Vector{T}(undef, n)`: the values are unspecified, as in Julia.
         return _js_rt("new Array(" * _js_runtime(ir.fn.mod, args[2]).code * ").fill(" *
                       (f === Vector{Bool} ? "false" : "0") * ")", f; pure = false)
+    elseif f in (Matrix{Float64}, Matrix{Int64}, Matrix{Bool}) && length(args) == 3 && args[1] isa _JsVal &&
+           args[1].static && args[1].value === undef && _js_isint(args[2]) && _js_isint(args[3])
+        # `Matrix{T}(undef, m, n)`: a row-array matrix whose values are unspecified, as in Julia.
+        return _js_fcall(ir, _js_use!(ir.fn.mod, :_rk_mfill),
+                         Any[_js_static(f === Matrix{Bool} ? false : 0), args[2], args[3]], f; pure = false)
     elseif f <: NamedTuple && length(args) <= 1 && T isa DataType && T <: NamedTuple && isconcretetype(T)
         # `(; a, b)` and the keywords of `f(x; a, b)`: `NamedTuple{names}(tuple)`.
         items = isempty(args) ? Any[] : _js_tuple_items(ir, args[1])
@@ -2656,17 +2692,20 @@ rows keeps its column count as `cols`, `Object.assign([], { cols: 3 })` for
 ordinary kernel recipes, broadcasts (fused, with Julia's length rules),
 `plate` and `scan` as loops, arithmetic and comparisons, `Base.Math`
 functions with Julia's domain errors, checked 1-based indexing (of a matrix:
-`m[i, j]`, `m[:, j]`, `m[i, :]`, `size`, `axes`), vector literals,
-`sum`/`prod`/`maximum`/`minimum`, ranges, comprehensions and `map` over vectors,
-tuples and named tuples (objects) built, read and destructured, keyword
-calls, and `rk_ode_rk45_tol`, integrated by the vendored `@reside-ic/dopri`
+`m[i, j]`, `m[:, j]`, `m[i, :]`, `size`, `axes`), vector literals and
+matrix literals of numbers (`[a b; c d]`), `sum`/`prod`/`maximum`/`minimum`,
+ranges, comprehensions and `map` over vectors, tuples and named tuples
+(objects) built, read and destructured, `all`/`any`/`count` of a tuple,
+keyword calls, and `rk_ode_rk45_tol`, integrated by the vendored `@reside-ic/dopri`
 Dormand–Prince 5(4) method with the native bridge's arguments, step budget
 and `ODESolveFailure`s (values agree with native to the solvers' accuracy).
 Matrix arithmetic: `*` of matrices, vectors, scalars and the transposes
 `m'`/`transpose(m)`/`v'` (a chain `A * B * v` included); `+`/`-` of
 matrices; `sum`/`prod`/`maximum`/`minimum` of a matrix, whole or with
 `dims = 1` or `2`; `vec` (a fresh vector in column order); `permutedims`;
-`zeros`/`ones`/`fill(x, m, n)`; and broadcasts over matrices, columns and
+`zeros`/`ones`/`fill(x, m, n)`, `Matrix{T}(undef, m, n)` and writes
+`m[i, j] = x`, `m[:, j] = v`, `m[i, :] = v`; `diag`; slices `view(m, :, j)`
+and `view(m, i, :)` read in place; and broadcasts over matrices, columns and
 rows with Julia's shape rules. Plain Julia helpers are translated from their
 typed code, branches, early returns and loops included, without annotation;
 Julia's own functions translate only through RK's table. A construct without
