@@ -50,6 +50,11 @@ such as `r.prior + sum(r.pointwise.y)`. The emitted representation stacks each
 leaf along the mapped axes and keeps ragged field lengths separate from the
 record array's valid extent. Cartesian axes retain Julia's order, and empty
 axes skip the cell body. These operations use ordinary JAX reverse differentiation.
+Empty records written as `NamedTuple()`, `NamedTuple{()}(())` or `(;)` have the
+same representation, including in nested results and kernels with no inputs.
+Public named-record results use Python dictionaries, so an empty record is `{}`.
+Record-valued plates can keep empty fields beside numerical leaves, including
+in ragged cells. A plate of records with no numerical leaves remains unsupported.
 
 ## Julia evaluation
 

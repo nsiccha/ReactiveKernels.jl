@@ -170,6 +170,7 @@ const _MATRIX_CORE_TESTS = (
     "test_jax_host_collections.jl",
     "test_jax_products.jl",
     "test_jax_record_plates.jl",
+    "test_jax_empty_records.jl",
     "test_jax_fma.jl",
     "test_jax_float_type.jl",
     "test_jax_outputs.jl",

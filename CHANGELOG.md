@@ -16,6 +16,18 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.293
+
+- `jax_source` translates empty `NamedTuple()` constructors in prepared
+  recipes and helper bodies, including kernels with no inputs and nested
+  numerical records. Empty records retain the same representation as `(;)`.
+  Literal field-name tuples in type parameters also support the typed
+  constructor spelling `NamedTuple{()}(())`.
+- Numerical record plates retain empty fields and derive their mapped axes
+  from the first stored numerical leaf, including when empty fields come first.
+- Prepared type-constructor recipes use the existing JAX constructor
+  translations, including numeric conversions.
+
 ## 0.1.292
 
 - `js_source` lets an authored plate read concrete tuples and named tuples

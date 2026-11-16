@@ -761,6 +761,9 @@ _jax_has_local(ctx::_JaxContext, s::Symbol) = haskey(ctx.locals, s)
 function _jax_type_argument(ctx::_JaxContext, a)
     a isa Symbol && haskey(ctx.locals, a) && return _jax_callable(ctx.locals[a])
     a isa Integer && return a
+    # Literal tuples name record fields, including `NamedTuple{()}`.
+    a isa Expr && a.head === :tuple &&
+        return Tuple(_jax_type_argument(ctx, x) for x in a.args)
     # A type computed by a call (`Dict{eltype(v),Int}`).
     a isa Expr && a.head === :call && return _jax_callable(_jax_expr(ctx, a))
     _jax_resolve(ctx, a)
@@ -1086,16 +1089,23 @@ function _jax_record_field(x::_PyVal, k::Integer)
     _PyVal(code, T, x.static, extent, "", field.padded, field.origin)
 end
 
-_jax_numeric_record(T) = _jax_is_tuple(T) && fieldcount(T) > 0 &&
+_jax_numeric_record(T) = _jax_is_tuple(T) &&
     all(F -> F <: Number || F <: AbstractArray{<:Number} || _jax_numeric_record(F), fieldtypes(T))
+
+# Empty fields carry no array leaf. Find a stored field over the fixed schema.
+function _jax_record_leaf(code, T)
+    _jax_is_tuple(T) || return (code, T)
+    for k in 1:fieldcount(T)
+        leaf = _jax_record_leaf(_py_atom(code) * "[" * string(k - 1) * "]", fieldtype(T, k))
+        leaf === nothing || return leaf
+    end
+    nothing
+end
 
 # The array's mapped axes, independent of any per-field lengths tree.
 function _jax_record_axis(v::_PyVal)
     v.origin isa _JaxRecordLayout && _jax_is_array(v.T) || return v
-    code, E = v.code, eltype(v.T)
-    while _jax_is_tuple(E)
-        code, E = _py_atom(code) * "[0]", fieldtype(E, 1)
-    end
+    code, E = _jax_record_leaf(v.code, eltype(v.T))
     # Shape/mask users need only the mapped dimensions, even when the first
     # leaf is itself an array. No cell or array element is read here.
     E <: AbstractArray && (code = "jnp.empty(" * code * ".shape[:" * string(ndims(v.T)) * "])")
@@ -4996,6 +5006,9 @@ end
 
 # A Julia type called as a function: a conversion.
 function _jax_call_positional(ctx::_JaxContext, T::Type, args::Vector{_PyVal})
+    # The standard empty constructor uses the literal record representation.
+    isempty(args) && T === NamedTuple &&
+        return _jax_record_value(_PyVal[], typeof(NamedTuple()))
     isempty(args) && Base.issingletontype(T) && return _PyVal("None", T)
     if (T === Ref || T === Base.RefValue) && length(args) == 1
         x = _jax_bind!(ctx, :referenced, only(args))
@@ -6622,6 +6635,11 @@ end
 _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe, op, inputs) =
     _jax_error("the operation `", typeof(op), "` has no JAX translation", _jax_where(ctx))
 
+# Recipe registration wraps type constructors to retain their concrete identity.
+# Use the same constructor translation as a call inside authored source.
+_jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe, op::_TypeOperation, inputs) =
+    _jax_split_outputs(ctx, recipe, _jax_call(ctx, _type_operation_type(op), inputs))
+
 # A bare function identity (`+`, `sum`, `log`): its call on the inputs.
 function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe, op::Function, inputs)
     # A call whose operands' definitions compose with it (`log(v)` of
@@ -6952,7 +6970,8 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     for shape in shapes[2:end]
         empty *= " and " * shape * " == " * first(shapes)
     end
-    if _jax_numeric_record(E)
+    # A stored leaf carries the mapped shape; empty fields beside it need none.
+    if _jax_numeric_record(E) && _jax_record_leaf(want.code, E) !== nothing
         empty_value = _jax_empty_record(want, first(shapes))
         only(with_length) && (empty_value = "(" * empty_value * ", " *
             _jax_empty_record(want, first(shapes); lengths = true) * ")")
@@ -7015,13 +7034,11 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
 end
 # The stored array whose leading axes are a mapped plate argument's: the
 # argument itself, or, for a vector of tuples (a Python tuple of stacked
-# arrays, one per field), its first field's.
+# arrays, one per field), its first nonempty field's.
 function _jax_mapped_array(v::_PyVal)
-    code, E = v.code, _jax_is_array(v.T) ? eltype(v.T) : Any
-    while _jax_is_tuple(E) && fieldcount(E) > 0
-        code, E = _py_atom(code) * "[0]", fieldtype(E, 1)
-    end
-    code
+    E = _jax_is_array(v.T) ? eltype(v.T) : Any
+    leaf = _jax_record_leaf(v.code, E)
+    leaf === nothing ? v.code : first(leaf)
 end
 
 # Empty mapped axes retain their dimensions without tracing a cell that may
