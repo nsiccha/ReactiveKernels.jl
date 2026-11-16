@@ -156,7 +156,9 @@ function _js_runtime(mod::_JsModule, v::_JsVal)
         return _js_rt("null", Nothing; ref = true)
     elseif x isa Union{String,Symbol}
         return _js_rt(_js_string_literal(x), typeof(x); ref = true)
-    elseif x isa Tuple && all(e -> e isa Union{Number,Nothing,String,Symbol}, x)
+    elseif x isa Tuple
+        # Nested tuples use the same representation as runtime tuple values;
+        # each leaf still goes through its ordinary translation/checks.
         items = [_js_runtime(mod, _js_static(e)).code for e in x]
         return _js_rt("[" * join(items, ", ") * "]", typeof(x); ref = false)
     elseif _js_isrange(v)
@@ -813,7 +815,10 @@ function _js_statement!(ir::_JsIR, i, st)
 end
 
 function _js_define_ssa!(ir::_JsIR, i, v, T)
-    if v isa _JsVal && !v.static && !v.ref
+    # An SSA value is a snapshot, including when its expression is just a
+    # read of a reassigned local. Keyword sorters reuse such a local for
+    # several arguments; retaining its name would read the last argument.
+    if v isa _JsVal && !v.static && (!v.ref || v.code in ir.slot_names)
         if T === Union{}
             _js_flush!(ir)
             _js_line!(ir.fn, v.code * ";")
@@ -845,7 +850,8 @@ function _js_assign_slot!(ir::_JsIR, n, v)
         # Assigned once: alias a value that is safe to read again, else bind it.
         # In code of several blocks, only a value every block sees is aliased
         # (a JavaScript `const` lives in its block); another is declared on top.
-        if v isa _JsVal && !v.static && (!v.ref || (ir.multiblock && !(v.code in ir.stable)))
+        if v isa _JsVal && !v.static &&
+           (!v.ref || v.code in ir.slot_names || (ir.multiblock && !(v.code in ir.stable)))
             _js_flush!(ir)
             if ir.multiblock
                 name = _js_hoist!(ir, ir.ci.slotnames[n])
@@ -2013,7 +2019,8 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
     elseif f === convert && length(args) == 2 && args[1] isa _JsVal && args[1].static &&
            (_js_isnumber(args[2]) || _js_isbool(args[2]))
         return _js_convert(ir, args[1].value, args[2])
-    elseif f === length && length(args) == 1 && _js_isvector(args[1])
+    elseif f === length && length(args) == 1 &&
+           (_js_isvector(args[1]) || (_js_istuple(args[1]) && !(_js_type(args[1]) <: NamedTuple)))
         return _js_rt(_js_code(mod, args[1], _JS_ATOM) * ".length", Int64)
     elseif f === length && length(args) == 1 && _js_isrange(args[1])
         r = _js_range!(ir, args[1])
