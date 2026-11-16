@@ -139,5 +139,48 @@ end
         err = _jax_full_cells_attempt(() -> rk_jax_evaluate(three, :kernel, (0.7, ragged)))
         @test err isa ErrorException
         @test occursin("dimension mismatch", sprint(showerror, err))
+
+        # CONTRIBUTING.md: the same emitted program handles changed data
+        # lengths, ragged and empty domains, with ordinary reverse AD.
+        for steps in ([[0.2, 0.4], Float64[], [0.6]],
+                      [fill(0.2, 17), [0.4]], Vector{Float64}[])
+            for (src, native, args) in ((direct, native_direct, (B, steps)),
+                                        (shared, native_shared, (ks, B, steps)))
+                r = rk_jax_evaluate(src, :kernel, (0.7, args...); grad = true)
+                @test r.value ≈ native(0.7, args...) rtol = 1e-12 atol = 1e-12
+                @test r.grad ≈ fd(a -> native(a, args...), 0.7) rtol = 1e-7 atol = 1e-9
+            end
+        end
+        # Inspect the trace too: the nested plate bodies stay batched as
+        # both the row count and padded capacity grow. The count is a
+        # diagnostic for this fixture, not a general optimizer requirement.
+        @test occursin("jax.vmap", string(shared))
+        mktempdir() do dir
+            module_path = joinpath(dir, "full_cells.py")
+            write(module_path, shared)
+            driver = joinpath(dir, "structure.py")
+            write(driver, raw"""
+import importlib.util, sys
+import jax, jax.numpy as jnp
+s = importlib.util.spec_from_file_location('full_cells', sys.argv[1])
+m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
+def regions(jaxpr):
+    jaxpr = getattr(jaxpr, 'jaxpr', jaxpr)
+    count = len(jaxpr.eqns)
+    for eq in jaxpr.eqns:
+        for v in eq.params.values():
+            for child in v if isinstance(v, (tuple, list)) else (v,):
+                if hasattr(child, 'jaxpr') or hasattr(child, 'eqns'):
+                    count += regions(child)
+    return count
+for f in (m.kernel, jax.grad(m.kernel)):
+    counts = [regions(jax.make_jaxpr(f)(0.7, jnp.ones(2), jnp.eye(3),
+                  jnp.ones((n, width)), jnp.full(n, width)))
+              for n, width in ((2, 3), (7, 19), (23, 53))]
+    assert counts[0] > 0 and max(counts) <= 2 * min(counts), counts
+    print('full-cell trace equation counts:', counts)
+""")
+            @test success(`$RK_JAX_PYTHON $driver $module_path`)
+        end
     end
 end
