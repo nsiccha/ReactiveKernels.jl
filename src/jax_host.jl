@@ -702,6 +702,7 @@ function _host_iterable(ctx::_JaxContext, iter)
             x, E = _host_iterable(ctx, args[1])
             return "enumerate(" * x * ", 1)", Tuple{Int,E}
         elseif f === zip
+            isempty(args) && return "iter(lambda: (), None)", Tuple{}
             parts = [_host_iterable(ctx, a) for a in args]
             return "zip(" * join(first.(parts), ", ") * ")", Tuple{last.(parts)...}
         elseif f === reverse && length(args) == 1
@@ -710,8 +711,13 @@ function _host_iterable(ctx::_JaxContext, iter)
         end
     end
     x = _host_raw(ctx, iter)
+    _host_iterable_value(ctx, x)
+end
+
+function _host_iterable_value(ctx::_JaxContext, x::_PyVal)
     _jax_python_value(ctx, x)
     T = x.T
+    T isa Type && T <: Base.Iterators.Zip && return x.code, eltype(T)
     T isa Type && T <: AbstractDict && return x.code * ".items()", Tuple{Base.keytype(T),Base.valtype(T)}
     T isa Type && T <: Tuple && return x.code, promote_type(fieldtypes(T)...)
     T isa Type && T <: AbstractArray && ndims(T) > 1 &&
@@ -1226,6 +1232,7 @@ end
 # A Julia type called as a constructor; `nothing` where JAX's translation serves.
 function _host_construct(ctx::_JaxContext, T::Type, args::Vector{_PyVal})
     T <: AbstractDict && isempty(args) && return _PyVal("{}", T isa UnionAll ? Dict{Any,Any} : T, true)
+    T <: Dict && length(args) == 1 && return _host_dict(ctx, T, only(args))
     if T <: AbstractSet && length(args) <= 1
         isempty(args) && return _PyVal("set()", T isa UnionAll ? Set{Any} : T, true)
         x = only(args)
@@ -1549,26 +1556,7 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(findfirst), args::Vector{
        !(args[2].T isa Type && args[2].T <: AbstractVector)
         return _jax_traceable_or_lowered(ctx, findfirst, args)
     end
-    predicate = _jax_function_of(args[1])
-    values = args[2]
-    result = _jax_fresh(ctx, :found)
-    index = _jax_fresh(ctx, :position)
-    element = _jax_fresh(ctx, :element)
-    _jax_emit!(ctx, result * " = None")
-    _jax_emit!(ctx, "for " * index * ", " * element * " in enumerate(" * values.code * ", 1):")
-    ctx.scope.indent += 1
-    try
-        test = _jax_bind!(ctx, :matched,
-                         _jax_call(ctx, predicate, [_PyVal(element, eltype(values.T), true)]))
-        _jax_emit!(ctx, "if not isinstance(" * test.code * ", (bool, np.bool_)):")
-        _jax_emit!(ctx, "    raise TypeError(\"findfirst predicate must return Bool\")")
-        _jax_emit!(ctx, "if " * test.code * ":")
-        _jax_emit!(ctx, "    " * result * " = " * index)
-        _jax_emit!(ctx, "    break")
-    finally
-        ctx.scope.indent -= 1
-    end
-    _PyVal(result, Union{Nothing,Int}, true)
+    _host_find(ctx, findfirst, _jax_function_of(args[1]), args[2])
 end
 function _jax_call_positional(ctx::_JaxContext, ::typeof(ismissing), args::Vector{_PyVal})
     ctx.host === nothing && return _jax_function_call(ctx, ismissing, args)
