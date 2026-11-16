@@ -1,7 +1,7 @@
 # Opt-in source policy, not exception catching. Only macro-captured source
 # participates; ordinary Julia methods stay opaque and keep their behavior.
 
-@inline _ignored_throw_call(f, args::Vararg{Any,N}) where {N} = f(args...)
+@inline _ignored_throw_call(f, args::Vararg{Any,N}; kwargs...) where {N} = f(args...; kwargs...)
 
 # These are explicit captured checks, so the existing opt-in policy strips
 # them as it strips a captured throw. Ordinary preparation retains them.
@@ -85,11 +85,7 @@ function _kernel_ignore_throw_source(ex, mod, names; statement = false)
         callee = Expr(:call, GlobalRef(@__MODULE__, :_IgnoredThrowFunction), ex.args[1])
         return Expr(:., callee, _kernel_ignore_throw_source(ex.args[2], mod, names))
     elseif ex.head === :call && !isempty(ex.args)
-        # Calls carrying keyword syntax keep their ordinary callable. The
-        # transparent @traceable contract itself is positional-only.
         args = Any[_kernel_ignore_throw_source(arg, mod, names) for arg in ex.args[2:end]]
-        any(arg -> arg isa Expr && arg.head in (:parameters, :kw), args) &&
-            return Expr(:call, ex.args[1], args...)
         callee = ex.args[1]
         callee isa Symbol && _is_broadcast_operator(callee) &&
             return Expr(:call, callee, args...)
@@ -98,7 +94,10 @@ function _kernel_ignore_throw_source(ex, mod, names; statement = false)
         if _kernel_base_or_core_callee(callee, mod)
             return Expr(:call, callee, args...)
         end
-        return Expr(:call, GlobalRef(@__MODULE__, :_ignored_throw_call), ex.args[1], args...)
+        params = Any[a for a in args if a isa Expr && a.head === :parameters]
+        rest = Any[a for a in args if !(a isa Expr && a.head === :parameters)]
+        return Expr(:call, GlobalRef(@__MODULE__, :_ignored_throw_call), params...,
+                    ex.args[1], rest...)
     end
     Expr(ex.head, (_kernel_ignore_throw_source(arg, mod, names) for arg in ex.args)...)
 end
@@ -106,8 +105,10 @@ end
 function _kernel_ignored_traceable_methods(callee, formals, wheres, body, mod, names)
     ignored = _kernel_ignore_throw_source(body, mod, names)
     native = _kernel_native_body(ignored, mod, names)
-    signature = Expr(:call, GlobalRef(@__MODULE__, :_ignored_throw_call),
-        Expr(:(::), Expr(:call, GlobalRef(Core, :typeof), callee)), formals...)
+    params = Any[a for a in formals if a isa Expr && a.head === :parameters]
+    rest = Any[a for a in formals if !(a isa Expr && a.head === :parameters)]
+    signature = Expr(:call, GlobalRef(@__MODULE__, :_ignored_throw_call), params...,
+        Expr(:(::), Expr(:call, GlobalRef(Core, :typeof), callee)), rest...)
     for layer in reverse(wheres)
         signature = Expr(:where, signature, layer...)
     end
