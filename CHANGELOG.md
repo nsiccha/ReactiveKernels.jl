@@ -16,13 +16,33 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.285
+## 0.1.287
 
 - Accept keyword arguments in `@traceable` methods and translate their calls
   in JAX functions and host data preparation. Required and typed keywords,
   dependent defaults, shorthand calls and nested helpers retain Julia's
   semantics. Keyword values remain runtime helper arguments.
 - Preserve `on_error = :ignore` through captured helper calls with keywords.
+
+## 0.1.286
+
+- JAX host preparation translates `findall(vector)`,
+  `findall(predicate, vector)` and `Dict(zip(keys, values))`, including
+  `eachindex` values and dictionary lookups inside data-only plates.
+  Searches return one-based positions, zip remains reusable and stops at its
+  shortest input (its zero-argument form remains infinite). Dictionaries
+  preserve duplicate-key replacement and Julia's `isequal` key semantics.
+  These operations retain runtime loops,
+  including for empty inputs, and can supply standalone `prepare_data`
+  definitions without Julia-computed intermediate values.
+
+## 0.1.285
+
+- `jax_source` keeps predicates and arithmetic over prepared integers static
+  when argument names overlap backend names, such as `isfinite(n)`. Those
+  calls use the existing NumPy translation instead of leaving a traced JAX
+  value in a Python conditional. Lazy guards and ordinary gradients are
+  preserved, including when prepared data are passed to a jitted function.
 
 ## 0.1.284
 
