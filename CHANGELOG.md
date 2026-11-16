@@ -16,6 +16,41 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.274
+
+- `js_source` translates predicates over tuples, matrix literals, matrices
+  built element by element and matrix slices, with native results and native
+  errors:
+  - `all(f, t)`, `any(f, t)` and `count(f, t)` of a tuple, and `all(t)`,
+    `any(t)`, `count(t)` of a tuple of `Bool`s: `f` is called on each
+    element with that element's own type, and `all`/`any` stop at the first
+    element that decides them, as Julia does (`all(a -> length(a) == n,
+    axes)`, `all(>=(1), rows)`); a function that may return something other
+    than a `Bool` is refused by name;
+  - matrix literals of numbers: `[a b; c d]`, `[a b]` and `Float64[a b; c d]`,
+    in a plain helper (`hvcat`, `hcat`, `typed_hvcat`, `typed_hcat`) and in a
+    kernel's recipe (RK's `_native_hvcat` and `_native_hcat`), in Julia's
+    element type; a layout `hvcat` rejects raises Julia's error where the
+    literal is;
+  - `Matrix{T}(undef, m, n)` for `Float64`, `Int64` and `Bool`, and writes
+    `m[i, j] = x`, `m[:, j] = v`, `m[i, :] = v`, converting to the element
+    type and checking positions and lengths as Julia does;
+  - `diag(m)`, and `extrema(v)` of a vector;
+  - matrix slices `view(m, :, j)` and `view(m, i, :)`, checked where they
+    are made: an element read and `length` read the matrix, and a function
+    of the whole slice (`extrema`, `sum`, `minimum`, `maximum`, `collect`, …)
+    reads it as it is when it is read; a write through a slice is refused;
+  - a tuple of values of one type (pairs of bounds, axis vectors) read at a
+    position computed at run time, where only tuples of numbers were;
+  - a closure built on every pass of a loop (`all(v -> lo <= v <= hi,
+    axes[j])` inside `for j in 1:d`), holding the values it captured on
+    that pass.
+
+  So the LKJ density of a Cholesky factor written as a matrix literal
+  (`lkj_corr_cholesky(eta).logpdf([1.0 0.0; r sqrt(1 - r^2)])`) emits, and a
+  type-stable Hilbert-space GP basis written with these operations emits and
+  matches native (snag `js-source-all-pr-b15faf4f`).
+
 ## 0.1.273
 
 - `js_source` translates the quantiles of RK's distribution laws:
