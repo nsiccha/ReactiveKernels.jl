@@ -5749,7 +5749,9 @@ function _jax_named_function!(ctx, f, names, inputs, source_module, emit, origin
     end
     name, v, bounds, _, flat, identity = cached
     lengths = Dict{String,String}()
-    contextual || foreach((a, b) -> _jax_argument_extents!(lengths, a, b), arguments, inputs)
+    # Lexically nested helpers capture these same expressions rather than
+    # passing them, but identity field reads still retain their caller lengths.
+    foreach((a, b) -> _jax_argument_extents!(lengths, a, b), arguments, inputs)
     (name, v, bounds, passed, flat, identity, lengths)
 end
 

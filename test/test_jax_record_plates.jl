@@ -174,12 +174,14 @@ end
     return value
 end
 
+jax_record_right_field(record) = record.pointwise.b
+
 @kernel jax_record_independent(x::Float64, left::Vector{Vector{Float64}}, right::Vector{Vector{Float64}}) = begin
     records = plate(left, right, x) do a, b, s
         (; pointwise = (; a = a .* s, b = b .+ s), prior = s^2)
     end
     terms = plate(records) do r
-        sum(r.pointwise.a) + sum(r.pointwise.b) + r.prior
+        sum(r.pointwise.a) + sum(jax_record_right_field(r)) + r.prior
     end
     value = sum(terms)
     return value
