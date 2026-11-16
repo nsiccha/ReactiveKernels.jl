@@ -53,6 +53,19 @@ end
 end
 ReactiveKernels.input_check!(js_checked, :x, js_check_three, :x)
 
+function js_check_size(x, n)
+    length(x) == n || throw(DimensionMismatch("packed size"))
+    nothing
+end
+@kernel js_bound_window(x, n, window, settings) = begin
+    selected = view(x, window)
+    y = plate(selected) do value
+        settings.gain * value + settings.offset
+    end
+    return y
+end
+ReactiveKernels.input_check!(js_bound_window, :x, js_check_size, :x, :n)
+
 # Vector literals and concatenation (RKPPL's affine coefficients are `vcat([e])`).
 @kernel js_literals(x, a, b) = begin
     v = vcat([a, b], x, a)
@@ -94,9 +107,9 @@ end
     @testset "a prepared kernel's module holds its bound data" begin
         source = ReactiveKernels.js_source(WEIGHTED; types = (; x = V), name = :weighted)
         @test occursin("export function weighted(x)", source)
-        # the bound vector is a frozen module constant; the bound number a literal
+        # Bound arrays and numbers are data stored outside the executable body.
         @test occursin("const _rk_bound_weights = Object.freeze([0.5, -1.0, 3.0]);", source)
-        @test occursin("2.0", source) && !occursin("scale", source)
+        @test occursin("const _rk_bound_scale = 2.0;", source)
         @test occursin("export const INPUTS = [{ name: \"x\", type: \"Vector{Float64}\" }];", source)
         if NODE
             check_against(WEIGHTED, source, :weighted, CASES)
@@ -171,6 +184,28 @@ end
         else
             @test_skip "no node on the PATH"
         end
+    end
+
+    @testset "bound sizes, ranges and record numbers stay in data storage" begin
+        sources = String[]
+        for (n, window, gain, offset) in ((0, 1:0, 0.5, -1.0), (3, 1:3, 2.0, 0.1), (17, 2:16, -0.5, 7.0))
+            native = prepare(js_bound_window; have = (:x, :n, :window, :settings), want = :y,
+                bound = (; n, window, settings = (; gain, offset)))
+            source = ReactiveKernels.js_source(native; types = (; x = V), name = :windowed)
+            push!(sources, source)
+            NODE && check_against(native, source, :windowed, [(collect(1.0:n),), (ones(n + 1),)])
+        end
+        bodies = [replace(source, r"(?m)^const _rk_bound_.*\n\n" => "") for source in sources]
+        # Fresh kernel closure arguments have fresh names, independent of data.
+        # Compare their executable structure up to that alpha-renaming only.
+        bodies = map(bodies) do body
+            names = Dict{String,String}()
+            replace(body, r"\bargument_\d+\b" => name -> get!(names, name) do
+                "argument_local_$(length(names))"
+            end)
+        end
+        @test all(==(first(bodies)), bodies)
+        @test count("for (let ", first(bodies)) >= 1
     end
 end
 

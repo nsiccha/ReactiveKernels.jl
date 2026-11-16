@@ -27,6 +27,10 @@ are recorded in the git history only.
   nonnegative runtime dimensions, so hierarchical latent matrices can be emitted too.
 - Numeric-vector and vector-view `cumsum` and `cumprod` use cumulative loops.
 - Matrix columns support a vector of row indices with checked runtime gathering.
+- Borrowed graph gathers retain their parent through plates; ordinary helpers
+  accept view arguments while preserving their loops and lazy reads.
+- Bound numbers, ranges and numeric tuple/named-tuple fields stay in module data
+  storage, including input-check arguments, instead of specializing function bodies.
 
 ## 0.1.286
 

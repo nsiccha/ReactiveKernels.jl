@@ -651,10 +651,12 @@ _js_plate_element(T) = _js_runtime_type(T) ||
     (T isa DataType && isconcretetype(T) && T <: Union{Tuple,NamedTuple} &&
      all(_js_plate_element, fieldtypes(T)))
 _js_vector_view(v) = v isa _JsStruct && v.T === view && length(v.fields) == 2
-_js_plate_vector(v) = _js_isvector(v) || _js_vector_view(v) ||
+_js_gather_view(v) = v isa _JsStruct && v.T === _readonly_gather
+_js_plate_vector(v) = _js_isvector(v) || _js_vector_view(v) || _js_gather_view(v) ||
     (_js_type(v) <: Vector && _js_plate_element(eltype(_js_type(v))))
 _js_plate_length(v) = _js_isrange(v) ? _js_range_length(v) :
-    _js_vector_view(v) ? _js_range_length(v.fields[2]) : v.code * ".length"
+    _js_vector_view(v) ? _js_range_length(v.fields[2]) :
+    _js_gather_view(v) ? v.fields[2].code * ".length" : v.code * ".length"
 
 # A range is read through its first element, last element and length. A range
 # known while translating (`for _ in 1:60` in a helper) is read as literals; a
@@ -1552,6 +1554,18 @@ _js_specialized(a) = a isa _JsVal && a.static &&
 function _js_helper_call!(ir::_JsIR, f, args::Vector{Any}, T)
     mod = ir.fn.mod
     argtypes = Any[_js_argtype(a) for a in args]
+    if any(a -> _js_vector_view(a) || _js_gather_view(a) || _js_isslice(a), args)
+        # A view carries its parent and indices as translated values. Keep that
+        # representation through the call; an ordinary SubArray parameter would
+        # lose it. Inlining this call still retains the helper's runtime loops.
+        context = "`" * string(f) * "(" * join(("::" * string(S) for S in argtypes), ", ") * ")`"
+        context in mod.stack && _js_error(mod, "recursive helper with a view argument: ", context)
+        push!(mod.stack, context)
+        _js_flush!(ir)
+        value, _ = _js_inline!(ir.fn, f, args, "value")
+        pop!(mod.stack)
+        return value
+    end
     statics = Tuple(_js_specialized(a) ? a.value : nothing for a in args)
     key = (f, Tuple(argtypes), statics)
     name, RT = get(mod.helpers, key, ("", nothing))
@@ -2543,7 +2557,9 @@ function _js_plan_body!(fn::_JsFn, p::Plan, values::Dict{ValueId,Any})
     function run_checks!()
         for c in copy(checks)
             all(a -> !(a isa Value) || haskey(values, canon_id(p.graph, a.id)), c.args) || continue
-            args = Any[a isa Value ? values[canon_id(p.graph, a.id)] : _js_static(a) for a in c.args]
+            args = Any[a isa Value ? values[canon_id(p.graph, a.id)] :
+                       _js_bound(mod, a, "check_arg_" * string(i))
+                       for (i, a) in enumerate(c.args)]
             v = _js_call!(kir, c.f, args, Nothing)
             _js_flush!(kir)
             # A check translated as a function (a package's named check, such
@@ -2651,9 +2667,17 @@ function _js_constant(mod::_JsModule, x::Union{Vector,BitVector,Matrix}, prefix,
 end
 
 # A value bound at preparation (`prepare(...; bound)`, an RKPPL binding's
-# data): a number or Bool is known while translating, so it folds as a
-# literal. A vector or matrix of them is a frozen module constant.
-_js_bound(mod::_JsModule, x::Union{Float64,Int64,Bool}, hint) = _js_static(x)
+# data): numerical values stay in module storage, like the arrays. They are
+# runtime operands of the executable body, not specialization parameters.
+function _js_bound(mod::_JsModule, x::Union{Float64,Int64,Bool,UnitRange{Int64},Base.OneTo{Int64}}, hint)
+    name = _js_module_name!(mod, "_rk_bound_", hint)
+    code = _js_runtime(mod, _js_static(x)).code
+    x isa AbstractRange && (code = "Object.freeze(" * code * ")")
+    push!(mod.defs, "const " * name * " = " * code * ";")
+    _js_rt(name, typeof(x); ref = true)
+end
+_js_bound(mod::_JsModule, x::Union{Tuple,NamedTuple}, hint) =
+    _JsTuple(Any[_js_bound(mod, v, string(hint, "_", k)) for (k, v) in pairs(x)], typeof(x))
 _js_bound(mod::_JsModule, x::Union{Vector,BitVector,Matrix}, hint) =
     _js_isvector_type(typeof(x)) || (x isa Matrix && eltype(x) <: _JsMatrixElement) ?
     _js_constant(mod, x, "_rk_bound_", hint; frozen = true) : _js_static(x)
@@ -2727,6 +2751,9 @@ function _js_plate!(fn::_JsFn, op::_AuthoredPlateOp{K,A}, inputs, hint) where {K
         cell[canon_id(body.graph, v.id)] = if !mapped[k]
             T = _js_type(a)
             a isa _JsVal && T <: Base.RefValue && a.static ? _js_static(a.value[]) : a
+        elseif _js_gather_view(a)
+            index = single ? i : "(" * _js_plate_length(a) * " === 1 ? 0 : " * i * ")"
+            _js_call!(kir, getindex, Any[a, _js_rt("(" * index * " + 1)", Int64)], eltype(_js_type(a)))
         elseif _js_isrange(a) || _js_vector_view(a)
             index = single ? i : "(" * _js_plate_length(a) * " === 1 ? 0 : " * i * ")"
             if _js_isrange(a)
@@ -2878,6 +2905,8 @@ construct a `ReshapedArray` view with negative axes, which JavaScript's
 array representation cannot hold and explicitly refuses.
 Plain Julia helpers are translated from their
 typed code, branches, early returns and loops included, without annotation;
+helpers taking views retain the view's parent and index expressions by inlining
+the call, including its loops (recursive calls with views are refused).
 Julia's own functions translate only through RK's table. A construct without
 a translation (a C call, `fma`, `\` and factorizations, indexing a transposed
 matrix, a scan with `history`, `rk_ode_bdf_tol`) raises

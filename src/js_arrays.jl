@@ -81,6 +81,14 @@ function _rk_mslice(m, i, j) {
     throw new JuliaError("BoundsError", "attempt to access " + m.length + "×" + cols + " array at index [" +
       (i === null ? ":" : i) + ", " + (j === null ? ":" : j) + "]");
 }""", [:JuliaError, :_rk_ncols]),
+    :_rk_checkindices => ("""
+function _rk_checkindices(indices, length) {
+  for (let k = 0; k < indices.length; k++) {
+    const i = indices[k];
+    if (!(Number.isInteger(i) && i >= 1 && i <= length))
+      throw new JuliaError("BoundsError", "attempt to access " + length + "-element view at index [" + i + "]");
+  }
+}""", [:JuliaError]),
     :_rk_gathercol => ("""
 function _rk_gathercol(m, indices, j) {
   _rk_mslice(m, null, j);
@@ -271,8 +279,32 @@ function _js_function_call(ir::_JsIR, ::typeof(reshape), args, T)
         Any[x, start, count, args[2], args[3]], T; pure = false)
 end
 
+function _js_function_call(ir::_JsIR, ::typeof(_readonly_gather), args, T)
+    length(args) == 2 || return nothing
+    parent, indices = args
+    (_js_isflatvector(parent) || _js_vector_view(parent) || _js_isslice(parent)) || return nothing
+    _js_isint(indices) && return _js_call!(ir, getindex, args, T)
+    _js_type(indices) === Vector{Int64} || return nothing
+    parent, indices = _js_simple!(ir, parent, "parent"), _js_simple!(ir, indices, "indices")
+    len = _js_call!(ir, length, Any[parent], Int64)
+    _js_flush!(ir)
+    _js_line!(ir.fn, _js_use!(ir.fn.mod, :_rk_checkindices) * "(" * indices.code * ", " *
+                      _js_runtime(ir.fn.mod, len).code * ");")
+    _JsStruct(_readonly_gather, Any[parent, indices], T)
+end
+
 function _js_array_call(ir, f, args, T)
     mod = ir.fn.mod
+    if !isempty(args) && _js_gather_view(args[1])
+        parent, indices = args[1].fields
+        if f === getindex && length(args) == 2 && _js_isint(args[2])
+            index = _js_fcall(ir, _js_use!(mod, :_rk_at), Any[indices, args[2]], Int64)
+            return _js_call!(ir, getindex, Any[parent, index], T)
+        elseif f in (length, lastindex) && length(args) == 1
+            return _js_rt(indices.code * ".length", Int64)
+        end
+        return nothing
+    end
     if f === Base.vect
         return _js_array_literal(ir, args, T)
     elseif f === getindex && !isempty(args) && args[1] isa _JsVal && args[1].static && args[1].value isa Type
