@@ -16,6 +16,16 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.282
+
+- `js_source` translates nested vectors of numbers and Booleans, including
+  ragged and empty groups: literals, inputs, bound data, indexing, iteration,
+  comprehensions and plate cells retain their nesting. `vec` preserves the
+  vector and `reduce(vcat, rows)` concatenates one level with runtime loops.
+  Prepared kernels can consume those vectors inside another kernel.
+  `js_run` preserves the nested
+  output types and applies its typed-array mode to numeric leaves.
+
 ## 0.1.281
 
 - `js_source` translates nested tuple literals and tuple `length`, including

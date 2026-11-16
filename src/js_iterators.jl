@@ -132,9 +132,9 @@ end
 function _js_collect_iter!(ir::_JsIR, it, T)
     mod = ir.fn.mod
     _js_itereltype(mod, _js_iterchain(it)...)
-    T isa DataType && T <: Vector && eltype(T) in (Float64, Int64, Bool) ||
+    T isa DataType && T <: Vector && _js_isvector_type(T) ||
         _js_error(mod, "collecting an iterator into a `", T,
-                  "` has no JavaScript translation (vectors of Float64, Int64 or Bool are translated)")
+                  "` has no JavaScript translation (nested vectors of Float64, Int64 or Bool are translated)")
     _js_flush!(ir)
     out = _js_local!(ir.fn, "out")
     _js_line!(ir.fn, "const " * out * " = [];")
@@ -328,7 +328,35 @@ function _js_findext!(ir::_JsIR, f, x, T)
     _js_rt(code * "[1]", Int64)
 end
 
+# Concatenate one vector level with runtime loops, retaining nested references.
+function _js_reduce_vcat!(ir, value, T)
+    mod = ir.fn.mod
+    x = _js_simple!(ir, value, "rows")
+    empty = _js_julia_error(reduce, vcat, _js_type(value)())
+    _js_flush!(ir)
+    _js_line!(ir.fn, "if (" * x.code * ".length === 0) throw " * _js_exception(mod, empty) * ";")
+    out, row, i, j = (_js_local!(ir.fn, name) for name in ("out", "row", "i", "j"))
+    at = _js_use!(mod, :_rk_at)
+    _js_line!(ir.fn, "const " * out * " = [];")
+    _js_line!(ir.fn, "for (let " * i * " = 0; " * i * " < " * x.code * ".length; " * i * "++) {")
+    ir.fn.indent += 1
+    _js_line!(ir.fn, "const " * row * " = " * at * "(" * x.code * ", " * i * " + 1);")
+    _js_line!(ir.fn, "for (let " * j * " = 0; " * j * " < " * row * ".length; " * j * "++) {")
+    ir.fn.indent += 1
+    _js_line!(ir.fn, out * ".push(" * at * "(" * row * ", " * j * " + 1));")
+    ir.fn.indent -= 1
+    _js_line!(ir.fn, "}")
+    ir.fn.indent -= 1
+    _js_line!(ir.fn, "}")
+    return _js_rt(out, T; pure = false)
+end
+
 function _js_iter_call(ir::_JsIR, f, args, T)
+    if f === reduce && length(args) == 2 && args[1] isa _JsVal && args[1].static &&
+       args[1].value === vcat && _js_isvector(args[2]) &&
+       _js_isvector_type(eltype(_js_type(args[2]))) && T === eltype(_js_type(args[2]))
+        return _js_reduce_vcat!(ir, args[2], T)
+    end
     mod = ir.fn.mod
     n = length(args)
     if f === collect && n == 1 && _js_iterchain(args[1]) !== nothing
@@ -346,7 +374,7 @@ function _js_iter_call(ir::_JsIR, f, args, T)
         return _js_count_iter!(ir, f, it)
     elseif f === isempty && n == 1 && _js_iterchain(args[1]) !== nothing
         return _js_isempty!(ir, args[1])
-    elseif f in (argmin, argmax, findmin, findmax) && n == 1 && _js_isloopsource(args[1]) && _js_isvector(args[1])
+    elseif f in (argmin, argmax, findmin, findmax) && n == 1 && _js_isloopsource(args[1]) && _js_isflatvector(args[1])
         return _js_findext!(ir, f, args[1], T)
     elseif f === filter && n == 2 && _js_isloopsource(args[2]) && _js_isvector(args[2])
         return _js_collect_iter!(ir, _JsStruct(Base.Iterators.Filter, Any[args[1], args[2]], Nothing), T)
