@@ -1931,6 +1931,14 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
         parts = join((_js_runtime(mod, a).code for a in args), " + ")
         return _js_rt("throw new JuliaError(\"ErrorException\", " *
                       (isempty(args) ? "\"\"" : "\"\" + " * parts) * ")", Union{}; pure = false)
+    elseif f in (vcat, _native_vcat) && T isa Type && T <: Vector && eltype(T) <: Union{_JsNumber,Bool} &&
+           !isempty(args) && all(a -> _js_type(a) === eltype(T) || _js_type(a) === T, args)
+        # a vector concatenated from vectors and numbers of its element type: a new array
+        items = (_js_isvector(a) ? "..." * _js_code(mod, a, _JS_UNARY) : _js_runtime(mod, a).code for a in args)
+        return _js_rt("[" * join(items, ", ") * "]", T; pure = false)
+    elseif f === (*) && length(args) >= 2 && all(a -> a isa _JsVal && _js_type(a) <: AbstractString, args)
+        # string concatenation, as an error message builds it
+        return _js_rt(join((_js_code(mod, a, _JS_ADD + 1) for a in args), " + "), String; prec = _JS_ADD)
     elseif f === string && all(a -> a isa _JsVal, args)
         return _js_rt("\"\" + " * join((_js_code(mod, a, _JS_ADD + 1) for a in args), " + "), String;
                       prec = _JS_ADD)
@@ -2120,23 +2128,28 @@ function _js_shape(w::NamedTuple, out)
     "{ " * join(fields, ", ") * " }"
 end
 
-# The kernel function of a plan.
-function _js_plan_function!(mod::_JsModule, fname::String, p::Plan, argtypes, shape)
+# The kernel function of a plan. An exported one checks its inputs; an inner
+# one (a prepared kernel a recipe calls) is called with translated values.
+function _js_plan_function!(mod::_JsModule, fname::String, p::Plan, argtypes, shape;
+                            exported::Bool = true)
     fn = _JsFn(mod)
     values = Dict{ValueId,Any}()
     params = String[]
     for (v, T) in zip(p.have, argtypes)
         name = _js_local!(fn, v.name)
         push!(params, name)
-        check, helper = _js_input_check(mod, name, T)
-        push!(mod.runtime, helper)
-        _js_line!(fn, check)
+        if exported
+            check, helper = _js_input_check(mod, name, T)
+            push!(mod.runtime, helper)
+            _js_line!(fn, check)
+        end
         values[canon_id(p.graph, v.id)] = _js_rt(name, T; ref = true)
     end
     wants = _js_plan_body!(fn, p, values)
     out = Dict(v.name => _js_runtime(mod, w).code for (v, w) in zip(p.want, wants))
     _js_line!(fn, "return " * _js_shape(shape, out) * ";")
-    code = "export function " * fname * "(" * join(params, ", ") * ") {\n" * join(fn.lines, "\n") * "\n}"
+    code = (exported ? "export function " : "function ") * fname * "(" * join(params, ", ") * ") {\n" *
+           join(fn.lines, "\n") * "\n}"
     code, Any[_js_value_type(w) for w in wants]
 end
 
@@ -2158,8 +2171,12 @@ function _js_plan_body!(fn::_JsFn, p::Plan, values::Dict{ValueId,Any})
         for c in copy(checks)
             all(a -> !(a isa Value) || haskey(values, canon_id(p.graph, a.id)), c.args) || continue
             args = Any[a isa Value ? values[canon_id(p.graph, a.id)] : _js_static(a) for a in c.args]
-            _js_call!(kir, c.f, args, Nothing)
+            v = _js_call!(kir, c.f, args, Nothing)
             _js_flush!(kir)
+            # A check translated as a function (a package's named check, such
+            # as RKPPL's packed-length check) is a call to run here; an
+            # inlined one has already emitted its code.
+            v isa _JsVal && !v.static && !v.ref && _js_line!(fn, v.code * ";")
             deleteat!(checks, findfirst(x -> x === c, checks))
         end
     end
@@ -2173,7 +2190,10 @@ function _js_plan_body!(fn::_JsFn, p::Plan, values::Dict{ValueId,Any})
         hint = length(recipe.outputs) == 1 ? string(only(recipe.outputs).name) : "outputs"
         start = length(fn.lines)
         before = copy(fn.taken)
-        result, RT = if op isa _KernelSourceOp
+        result, RT = if op isa _BoundConstant
+            # bound data: known while translating, emitted where read at run time
+            _js_bound(mod, op.value, hint), typeof(op.value)
+        elseif op isa _KernelSourceOp
             _js_inline!(fn, getfield(op, :f), inputs, hint)
         elseif op isa _AuthoredPlateOp
             _js_plate!(fn, op, inputs, hint)
@@ -2219,6 +2239,75 @@ end
 
 # The type a sub-plan's value has, for a WANT value of a cell or step.
 _js_value_type(v) = v isa _JsVal ? (v.static ? typeof(v.value) : v.T) : _js_type(v)
+
+# A module-level name `prefix * hint`, unique in the module. Function locals
+# never start with `_`, so they cannot shadow it.
+function _js_module_name!(mod::_JsModule, prefix, hint)
+    base = prefix * _js_identifier(hint)
+    name, k = base, 1
+    while name in mod.taken
+        k += 1
+        name = base * "_" * string(k)
+    end
+    push!(mod.taken, name)
+    name
+end
+
+# A value bound at preparation (`prepare(...; bound)`, an RKPPL binding's
+# data): a number or Bool is known while translating, so it folds as a
+# literal. A vector of them is a frozen module constant, emitted once per
+# array; its numbers are exact (`Float64` literals round-trip, an `Int64`
+# beyond 2^53 is refused).
+_js_bound(mod::_JsModule, x::Union{Float64,Int64,Bool}, hint) = _js_static(x)
+function _js_bound(mod::_JsModule, x::Vector{T}, hint) where {T<:Union{Float64,Int64,Bool}}
+    key = (:bound, objectid(x))
+    name, _ = get(mod.helpers, key, ("", nothing))
+    if isempty(name)
+        name = _js_module_name!(mod, "_rk_bound_", hint)
+        items = join((_js_runtime(mod, _js_static(e)).code for e in x), ", ")
+        push!(mod.defs, "const " * name * " = Object.freeze([" * items * "]);")
+        mod.helpers[key] = (name, x)  # the array stays alive, so its id stays unique
+    end
+    _js_rt(name, typeof(x); ref = true)
+end
+# Another bound value stays known while translating: a call reads its fields
+# or folds it, and a run-time use of it raises as for any other such value.
+_js_bound(mod::_JsModule, x, hint) = _js_static(x)
+
+# A prepared kernel called as a function (a native model's prepared query
+# that a recipe calls, such as an RKPPL `prepare_query`): a module-level
+# function translated from the kernel's plan, its bound data included, once
+# per kernel and argument types, as `jax_source` translates one. Its result is
+# the kernel's: the value of a single WANT, else a tuple of them.
+function _js_function_call(ir::_JsIR, k::PreparedKernel, args, T)
+    mod = ir.fn.mod
+    p = k.plan
+    length(p.have) == length(args) ||
+        _js_error(mod, "a prepared kernel of ", length(p.have), " inputs called with ", length(args))
+    argtypes = Any[_js_argtype(a) for a in args]
+    for (v, A) in zip(p.have, argtypes)
+        A isa Type && A <: valtype(v) || _js_error(mod, "a prepared kernel's input `", v.name,
+            "` (a `", valtype(v), "`) given a `", A, "`")
+    end
+    key = (:prepared, objectid(k), Tuple(argtypes))
+    name, RT = get(mod.helpers, key, ("", nothing))
+    if isempty(name)
+        hint = length(p.want) == 1 ? only(p.want).name : :kernel
+        name = _js_module_name!(mod, "_rk_prepared_", hint)
+        shape = length(p.want) == 1 ? only(p.want).name : Tuple(v.name for v in p.want)
+        push!(mod.stack, "prepared kernel `" * string(hint) * "`")
+        code, out_types = _js_plan_function!(mod, name, p, argtypes, shape; exported = false)
+        pop!(mod.stack)
+        push!(mod.defs, code)
+        RT = length(out_types) == 1 ? only(out_types) : Tuple{out_types...}
+        mod.helpers[key] = (name, RT)
+        # the kernel stays alive, so its id stays unique
+        mod.helpers[(:prepared_kernel, objectid(k))] = ("", k)
+    end
+    rargs = String[_js_runtime(mod, a).code for a in args]
+    _js_flush!(ir)
+    _js_rt(name * "(" * join(rargs, ", ") * ")", RT; pure = false)
+end
 
 # An authored plate: a loop over its cells, each running the cell plan. A
 # mapped argument is read at the cell's position (one of length 1 at every
@@ -2426,6 +2515,42 @@ function js_source(p::Plan; types = nothing, name = :kernel,
     println(io, "export const RETURNS = ", _js_returns(shape), ";")
     String(take!(io))
 end
+
+"""
+    js_source(kernel; types = nothing, name = :kernel) -> String
+
+The module of a prepared kernel as [`prepare`](@ref) returns it (a flat or
+shaped WANT), such as a native model's prepared query: its function takes the
+kernel's HAVE values in order and returns what the kernel returns. Data bound
+at preparation (`prepare(spec; have, want, bound)`, the data of an RKPPL
+binding) are part of the module, numbers as literals and vectors as frozen
+module constants, so the module computes what the kernel computes. `types`
+defaults to the exemplar types the kernel was prepared with, if any. A recipe
+of another kernel may call such a kernel too; its function is then translated
+from the kernel's plan the same way.
+"""
+function js_source(k::PreparedKernel; types = nothing, name = :kernel)
+    S = _exact_signature(k)
+    types === nothing && S !== Nothing && (types = Tuple(fieldtypes(S)))
+    js_source(k.plan; types, name)
+end
+
+function js_source(k::_ShapedKernel{S}; types = nothing, name = :kernel) where {S}
+    target = k.target
+    target isa PreparedKernel || throw(ArgumentError(
+        "js_source: this kernel fills keyword arguments or defaults of its signature; " *
+        "prepare it with an explicit `have` to emit it"))
+    p = target.plan
+    shape = _js_want_names(S, p)
+    T = _exact_signature(target)
+    types === nothing && T !== Nothing && (types = Tuple(fieldtypes(T)))
+    js_source(p; types, name, shape)
+end
+
+# A shaped kernel's shape (positions in its flat WANT) as names of that WANT.
+_js_want_names(position::Int, p::Plan) = p.want[position].name
+_js_want_names(shape::Tuple, p::Plan) = map(x -> _js_want_names(x, p), shape)
+_js_want_names(shape::NamedTuple, p::Plan) = map(x -> _js_want_names(x, p), shape)
 
 function _js_have_types(p::Plan, types)
     names = [v.name for v in p.have]
