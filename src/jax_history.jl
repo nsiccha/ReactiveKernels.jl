@@ -58,16 +58,6 @@ function _jax_history_arithmetic(op, a, b)
     _py_infix(op, [a, b])
 end
 
-function _jax_history_static_bounds(v::_PyVal)
-    v.T isa Type && v.T <: Integer || return nothing
-    v.static && return (v.code, v.code)
-    if v.origin isa _JaxBetween
-        lo, hi = _jax_lower_end(v), _jax_upper_end(v)
-        lo.static && hi.static && return (lo.code, hi.code)
-    end
-    nothing
-end
-
 function _jax_history_index_result(f, args, result)
     result.T isa Type && result.T <: Integer || return result
     length(args) == 2 || return result
@@ -77,7 +67,7 @@ function _jax_history_index_result(f, args, result)
     end
     h = a.origin
     h isa _JaxHistoryIndex || return result
-    bounds = _jax_history_static_bounds(b)
+    bounds = _jax_static_integer_bounds(b)
     bounds === nothing && return result
     lo, hi = bounds
     op = _jax_history_arithmetic
