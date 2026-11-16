@@ -34,6 +34,10 @@ const logbeta = scalar_derivative_rule(
     logbeta_graph; primal = :y, partials = (a = :dy_da, b = :dy_db),
     name = :logbeta)
 
+# General numerical machinery and its derivative graph live in RK proper.
+using ReactiveKernels: _rk_logrising as logrising, _rk_logrising_graph as logrising_graph,
+    _LOGRISING_PRODUCT_MAX, _LOGRISING_SHAPE_MAX
+
 include("gamma_logtails.jl")
 
 # General symmetric-eigendecomposition primitives live in RK proper.
@@ -1056,9 +1060,16 @@ end
 # Shapes are Stan-native; mean-precision callers precompute
 # `alpha = mu*kappa`, `beta = (1-mu)*kappa` at the boundary (the Beta
 # precedent). No cdf/quantile (discrete inversion); only `logpdf` is
-# exposed (the NB2 precedent).
+# exposed (the NB2 precedent). Up to _LOGRISING_PRODUCT_MAX trials the two
+# lbeta terms are written as log rising factorials,
+# logbeta(k + α, n - k + β) - logbeta(α, β) =
+# log(α)_k + log(β)_(n-k) - log(α + β)_n, whose `logrising` products give
+# the partials from the same pass with no digamma. More trials or shapes
+# outside the product range keep the two logbeta calls, preserving the large-
+# shape accuracy and avoiding three gamma differences for large counts.
 const BETA_BINOMIAL_KERNEL_SOURCE = raw"""
-using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma, logbeta
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma, logbeta, logrising,
+    _LOGRISING_PRODUCT_MAX, _LOGRISING_SHAPE_MAX
 
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: rk_beta_binomial_cdf, rk_beta_binomial_ccdf
 
@@ -1067,8 +1078,12 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: rk_beta_bino
         (observed >= 0) & (observed <= n) ?
             (loggamma(n + 1.0) - loggamma(observed + 1.0) -
              loggamma(n - observed + 1.0) +
-             logbeta(observed + alpha, n - observed + beta) -
-             logbeta(alpha, beta)) :
+             ((n <= _LOGRISING_PRODUCT_MAX) & (alpha > 0) & (beta > 0) &
+              (alpha + beta <= _LOGRISING_SHAPE_MAX) ?
+                (logrising(alpha, observed) + logrising(beta, n - observed) -
+                 logrising(alpha + beta, n)) :
+                (logbeta(observed + alpha, n - observed + beta) -
+                 logbeta(alpha, beta)))) :
             -Inf
     cdf(observed::Int)::Float64 = rk_beta_binomial_cdf(n, alpha, beta, observed)
     ccdf(observed::Int)::Float64 = rk_beta_binomial_ccdf(n, alpha, beta, observed)
