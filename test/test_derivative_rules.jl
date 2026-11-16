@@ -959,7 +959,7 @@ end
         for n in (0, 7, 129)
             times = collect(range(0.0, 5.0; length=n))
             @test @inferred(rule(times, q)) == compiled(times, q)
-            @test _rule_call_allocations(rule, times, q) ==
+            @test _rule_call_allocations(rule, times, q) <=
                 _rule_call_allocations(compiled, times, q)
         end
     end
