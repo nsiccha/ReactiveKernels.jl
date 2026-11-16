@@ -929,8 +929,9 @@ function _jax_destructure!(ctx::_JaxContext, lhs, v::_PyVal)
         # `A[i] = v`: a functional update rebinding `A`.
         target = ctx.locals[lhs.args[1]]
         _jax_slots(target) && return _jax_slots_write!(ctx, lhs, target, v)
-        (target.origin isa _JaxRowView || target.origin isa _JaxRowShape && target.origin.stored) &&
-            _jax_error("mutation through a row shared with a nested-vector buffer", _jax_where(ctx))
+        (target.origin isa _JaxRowView || target.origin isa _JaxRowShape &&
+            (target.origin.stored || _jax_borrowed_buffer(ctx, target))) &&
+            _jax_error("mutation through a row alias or helper argument needs reference writeback", _jax_where(ctx))
         indexed = _jax_index(ctx, target, lhs.args[2:end]; target = true)
         position = indexed.code[ncodeunits(target.code)+1:end]
         name = _jax_fresh(ctx, lhs.args[1])

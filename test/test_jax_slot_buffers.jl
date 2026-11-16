@@ -108,6 +108,17 @@ end
     rows[1] = [a, a]
     jax_write_borrowed(rows, a)
 end
+@traceable function jax_write_row_argument(row::Vector{Float64}, a::Float64)
+    row[1] = 2a
+    nothing
+end
+@traceable function jax_borrowed_row_mutation(a::Float64)
+    row = [a, a]
+    jax_write_row_argument(row, a)
+    rows = Vector{Vector{Float64}}(undef, 1)
+    rows[1] = row
+    sum(rows[1])
+end
 @traceable function jax_mismatched_rows(a::Float64)
     rows = Vector{Vector{Float64}}(undef, 2)
     rows[1] = [a]
@@ -123,6 +134,7 @@ for (name, helper) in ((:jax_row_alias_graph, :jax_stored_row_mutation),
                        (:jax_row_while_alias_graph, :jax_stored_row_while_mutation),
                        (:jax_row_view_graph, :jax_stored_row_view_mutation),
                        (:jax_borrowed_graph, :jax_borrowed_mutation),
+                       (:jax_borrowed_row_graph, :jax_borrowed_row_mutation),
                        (:jax_shapes_graph, :jax_mismatched_rows),
                        (:jax_reduce_graph, :jax_reduce_slots))
     @eval @kernel $name(a::Float64) = begin
@@ -166,7 +178,7 @@ end
     @test_throws UndefRefError jax_partial_rows(a, 2, false)
     @test_throws BoundsError jax_partial_rows(a, 3, false)
     for graph in (jax_row_alias_graph, jax_row_while_alias_graph, jax_row_view_graph, jax_borrowed_graph,
-                  jax_shapes_graph, jax_reduce_graph)
+                  jax_borrowed_row_graph, jax_shapes_graph, jax_reduce_graph)
         @test_throws JAXEmissionError jax_source(graph; have=(:a,), functions=(score=:score,))
     end
     if rk_jax_available()

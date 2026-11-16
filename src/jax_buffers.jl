@@ -86,10 +86,13 @@ function _jax_slots_index(ctx, x, indices)
                     _JaxRowShape(shape, true))
 end
 
-function _jax_slots_write!(ctx, lhs, target, row)
+function _jax_borrowed_buffer(ctx, target)
     frames = get(ctx.mod.helper_names, :borrowed_slot_frames, nothing)
     borrowed = frames === nothing ? () : get(frames, ctx.locals, ())
-    any(layout -> layout === target.origin, borrowed) &&
+    any(layout -> layout === target.origin, borrowed)
+end
+function _jax_slots_write!(ctx, lhs, target, row)
+    _jax_borrowed_buffer(ctx, target) &&
         _jax_error("a device helper mutating a reference-element buffer argument needs caller writeback",
                    _jax_where(ctx))
     _jax_slot_shape!(ctx, target, row)
@@ -104,7 +107,7 @@ function _jax_slots_write!(ctx, lhs, target, row)
 end
 
 function _jax_slots_inputs!(ctx, inputs)
-    layouts = [v.origin for v in inputs if _jax_slots(v)]
+    layouts = [v.origin for v in inputs if _jax_slots(v) || _jax_row_metadata(v)]
     isempty(layouts) && return
     frames = get!(IdDict{Any,Any}, ctx.mod.helper_names, :borrowed_slot_frames)
     frames[ctx.locals] = layouts
