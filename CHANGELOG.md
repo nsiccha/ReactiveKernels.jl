@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.282
+## 0.1.283
 
 - `jax_source` preserves padded length bounds through integer addition,
   subtraction and multiplication by input-shape expressions. A helper can
@@ -25,6 +25,16 @@ are recorded in the git history only.
   arithmetic tracks both interval endpoints, and loops retain their runtime
   structure. One emitted module continues to accept different input sizes.
   Zero-capacity buffers skip the last-entry read when padding a loop result.
+
+## 0.1.282
+
+- `js_source` translates nested vectors of numbers and Booleans, including
+  ragged and empty groups: literals, inputs, bound data, indexing, iteration,
+  comprehensions and plate cells retain their nesting. `vec` preserves the
+  vector and `reduce(vcat, rows)` concatenates one level with runtime loops.
+  Prepared kernels can consume those vectors inside another kernel.
+  `js_run` preserves the nested
+  output types and applies its typed-array mode to numeric leaves.
 
 ## 0.1.281
 

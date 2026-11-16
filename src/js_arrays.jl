@@ -85,6 +85,9 @@ end
 # or `1` in a numeric array.
 function _js_literal_element(mod, a, E)
     S = _js_type(a)
+    if _js_isvector_type(E)
+        return S === E ? _js_runtime(mod, a).code : nothing
+    end
     if E === Bool
         S === Bool || return nothing
         return _js_runtime(mod, a).code
@@ -96,7 +99,7 @@ function _js_literal_element(mod, a, E)
 end
 
 function _js_array_literal(ir, items, T)
-    T isa Type && T <: Vector && eltype(T) <: _JsMatrixElement || return nothing
+    T isa Type && T <: Vector && _js_isvector_type(T) || return nothing
     mod = ir.fn.mod
     codes = String[]
     for a in items
