@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.302
+
+- JAX source translates device `for` loops, generators and comprehensions
+  over a vector's elements, over `enumerate` (one-based positions) and over
+  `zip` of vectors (to the shortest), with destructured targets. Each is the
+  runtime loop over the positions, so emitted source does not grow with the
+  data and `jax.grad` differentiates it; a padded row's elements take lazy
+  steps to its length. Loop targets stay the loop's own.
+
 ## 0.1.301
 
 - `jax_source` host preparation collects and sorts tuple records without

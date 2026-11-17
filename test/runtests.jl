@@ -193,6 +193,7 @@ const _MATRIX_CORE_TESTS = (
     "test_jax_source_control.jl",
     "test_jax_helper_values.jl",
     "test_jax_loop_exits.jl",
+    "test_jax_collection_loops.jl",
     "test_jax_optional.jl",
     "test_jax_polynomial.jl",
     "test_jax_derivative_rules.jl",
