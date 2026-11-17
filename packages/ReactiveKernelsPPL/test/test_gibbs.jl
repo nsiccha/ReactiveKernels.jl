@@ -264,4 +264,78 @@ inventory(program::ReactiveKernels._PlateProgram) = inventory(program.ast)
     @test inventories[end].functions <= inventories[2].functions+2
     println("GIBBS NATIVE BODY INVENTORY ",inventories)
 end
+@testset "integer arrays: elementwise blocks draw every element exactly" begin
+    y = [-2.1, -1.9, 2.0, 2.2, 1.8]
+    model = @rkppl begin
+        mu[1:3] .~ Normal.(0, 5)
+        z[axes(y, 1)] .~ Categorical(p)
+        y .~ Normal.(mu[z], 1.0)
+    end
+    p, mu = [0.2, 0.3, 0.5], [-2.0, 0.5, 2.0]
+    plan = model(; p) | (; y)
+    built = build_kernel(plan)
+    d = (; z = [1, 1, 1, 1, 1])
+    u = unconstrain(built.layout, (; mu, z = d.z))
+    problem = prepare_gibbs(built, plan, u; discrete=d, backend=BACKEND)
+    block = only(problem.integers)
+    @test block isa PPL.GibbsArrayBlock && block.elementwise
+    support = collect(block.support(u, d))
+    @test support == 1:3
+    # Every element's exact conditional, from one evaluation per support value.
+    L = reduce(hcat, [block.cells(u, d, s) for s in support])
+    for i in eachindex(y)
+        exact = [p[k] * pdf(Normal(mu[k], 1.0), y[i]) for k in 1:3]
+        @test PPL._gibbs_weights(L[i, :]) ≈ exact ./ sum(exact) rtol=1e-12
+    end
+    # A one-coordinate model whose posterior of `m` is known by quadrature.
+    model2 = @rkppl begin
+        m ~ Normal(0, 3)
+        z[axes(y, 1)] .~ Bernoulli(0.3)
+        y .~ Normal.(m .+ delta .* z, 1.0)
+    end
+    delta = 2.5
+    plan2 = model2(; delta) | (; y)
+    built2 = build_kernel(plan2)
+    d2 = (; z = zeros(Int, 5))
+    problem2 = prepare_gibbs(built2, plan2, [0.0]; discrete=d2, backend=BACKEND)
+    @test only(problem2.integers).elementwise
+    grid = range(-8, 8; length=8001)
+    post = [pdf(Normal(0, 3), m) * prod(0.7 * pdf(Normal(m, 1), yi) +
+        0.3 * pdf(Normal(m + delta, 1), yi) for yi in y) for m in grid]
+    post ./= sum(post)
+    ms = Float64[]
+    for seed in 1:4
+        state = initialize_gibbs(Xoshiro(seed), problem2, [0.0]; discrete=d2, warmup=300)
+        draws = gibbs_draws(state, 3000)
+        @test all(z -> all(in(0:1), z.z), draws.discrete)
+        append!(ms, draws.parameters.m)
+    end
+    @test abs(sum(ms) / length(ms) - sum(post .* grid)) < 5 * batch_mcse(ms)
+    @test_throws ArgumentError prepare_gibbs(built2, plan2, [0.0]; discrete=d2,
+        backend=BACKEND, blocks=((:z,),))
+end
+
+@testset "integer arrays: coupled elements use exact single-site updates" begin
+    model = @rkppl begin
+        z[axes(y, 1)] .~ Bernoulli(0.4)
+        y .~ Normal.(2.0 .* z, 1.0)
+        s = sum(z)
+        t ~ Normal(s, 0.7)
+    end
+    y, t = [0.3, 1.9, 1.2, -0.4], 2.6
+    plan = model() | (; y, t)
+    built = build_kernel(plan)
+    d = (; z = [0, 0, 0, 0])
+    problem = prepare_gibbs(built, plan, Float64[]; discrete=d)
+    @test !only(problem.integers).elementwise   # `sum(z)` reads every element
+    states = vec([collect(c) for c in Iterators.product(0:1, 0:1, 0:1, 0:1)])
+    lw = [sum(log(zi == 1 ? 0.4 : 0.6) for zi in s) + sum(logpdf.(Normal.(2.0 .* s, 1.0), y)) +
+        logpdf(Normal(sum(s), 0.7), t) for s in states]
+    exact = exp.(lw .- maximum(lw))
+    exact ./= sum(exact)
+    draws = gibbs_draws(initialize_gibbs(Xoshiro(3), problem, Float64[]; discrete=d), 40000)
+    frequency = [count(x -> x.z == s, draws.discrete) / 40000 for s in states]
+    @test maximum(abs.(frequency .- exact)) < 0.02
+end
+
 end
