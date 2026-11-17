@@ -28,6 +28,14 @@ function chain1(f, x0, n; w, p, seed)
     return xs, reported, calls[]
 end
 
+@testset "coordinate updates are exported" begin
+    for name in (:prepare_coordinate_conditional, :CoordinateConditional, :coordinate_state,
+            :CoordinateState, :coordinate_logdensity, :set_coordinate!, :refresh_products!,
+            :coordinate_slice_step!, :coordinate_slice_sweep!)
+        @test Base.isexported(ReactiveKernelsPPL, name)
+    end
+end
+
 @testset "slice transition leaves one-dimensional targets invariant" begin
     normal(z) = -0.5z^2
     xs, reported, calls = chain1(normal, 0.0, 100_000; w=10.0, p=20, seed=1)
