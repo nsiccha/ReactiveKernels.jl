@@ -4858,6 +4858,7 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(vec), args::Vector{_PyVal
         parts = [_jax_function_call(ctx, vec, [_jax_column(x, k)]) for k in 1:fieldcount(E)]
         return _PyVal(_jax_tuple_code(parts), Vector{E})
     end
+    ctx.host === nothing && _jax_is_tuple(E) && return _jax_records_vec(ctx, x)
     isempty(x.extent) && return _PyVal("jnp.ravel(" * x.code * ", order=\"F\")", Vector{E})
     # An adjoint vector is stored as its vector, padded alike.
     _jax_adjoint_vector(x.T) && return _PyVal(x.code, Vector{E}, false, x.extent)
@@ -4877,6 +4878,56 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(vec), args::Vector{_PyVal
                     "jnp.logical_not(" * valid * "), stable=True)]")
     _PyVal("jnp.where(jnp.arange(" * entries * ".shape[0]) < " * count * ", " * entries * ", " *
            entries * "[" * count * " - 1])", Vector{E}, false, count)
+end
+# An array of records (tuples or named tuples) is stored as the tuple of its
+# fields' arrays, the array's axes leading each (a plate's records over a
+# matrix, `_JaxRecordLayout`), as a vector of records is with its one axis.
+# Its `vec` is the vector of those records: each field's leading axes merged
+# in Julia's column-major order, the records' field lengths alike, and the
+# record structure kept. A padded array's valid records come first, in that
+# order, the number of them its axis extent and the last of them repeated
+# as the padding, as `vec` of a padded numerical array orders its entries.
+const _JAX_VEC_RECORDS = """
+def _rk_vec_records(records, rank, order=None):
+    # An array of records, the tuple of its fields' arrays with the array's
+    # `rank` axes first, as its vector: each field's leading axes merged in
+    # Julia's column-major order, then its records taken in `order`.
+    def flat(a):
+        a = jnp.reshape(a, (int(np.prod(a.shape[:rank])),) + a.shape[rank:], order="F")
+        return a if order is None else a[order]
+    return jax.tree_util.tree_map(flat, records)
+"""
+function _jax_records_vec(ctx::_JaxContext, x::_PyVal)
+    R = _jax_rank(x.T)
+    helper = _jax_helper!(ctx, "_rk_vec_records", _JAX_VEC_RECORDS)
+    layout = x.origin isa _JaxRecordLayout ? x.origin : nothing
+    order = count = ""
+    if layout !== nothing && !isempty(layout.axis_extent)
+        axis = _jax_bind!(ctx, :axis, _jax_record_axis(x))
+        mask = _jax_padded_mask(axis)
+        mask === nothing && _jax_error("`vec` of a padded `", x.T,
+            "` whose padded axes are not known", _jax_where(ctx))
+        valid = _jax_fresh(ctx, :valid)
+        _jax_emit!(ctx, valid * " = jnp.ravel(jnp.broadcast_to(" * mask * ", " * axis.code *
+                        ".shape), order=\"F\")")
+        count = _jax_fresh(ctx, :count)
+        _jax_emit!(ctx, count * " = jnp.sum(" * valid * ")")
+        order = _jax_fresh(ctx, :order)
+        _jax_emit!(ctx, order * " = jnp.argsort(jnp.logical_not(" * valid * "), stable=True)")
+        _jax_emit!(ctx, order * " = " * order * "[jnp.minimum(jnp.arange(" * order * ".shape[0]), " *
+                        count * " - 1)]")
+    end
+    flat(code) = helper * "(" * code * ", " * string(R) * (isempty(order) ? "" : ", " * order) * ")"
+    values = _jax_fresh(ctx, :records)
+    _jax_emit!(ctx, values * " = " * flat(x.code))
+    lengths = ""
+    if !isempty(x.extent)
+        lengths = _jax_fresh(ctx, :record_lengths)
+        _jax_emit!(ctx, lengths * " = " * flat(x.extent))
+    end
+    origin = layout === nothing ? nothing :
+        _JaxRecordLayout(layout.fields, count, isempty(count) ? 0 : 1)
+    _PyVal(values, Vector{eltype(x.T)}, false, lengths, "", _jax_padded_fields(x), origin)
 end
 # Julia reshapes in column-major order. A `Colon` dimension (`reshape(v, 1, :)`)
 # is the remaining length, NumPy's `-1`. The dimensions may be one tuple

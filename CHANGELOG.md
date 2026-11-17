@@ -16,6 +16,19 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.305
+
+- JAX source translates `vec` of a matrix (or any array of rank two or
+  more) of records in device code, such as a plate's records over
+  `collect(Iterators.product(a, b))`: the result is the vector of those
+  records in Julia's column-major order, each field (nested fields too)
+  flattened alike, so `map(vec(records)) do r; r.field end` reads it as it
+  reads a vector of records. Records keep their fields' lengths, and a
+  padded array's valid records come first, as `vec` of a padded numerical
+  array orders its entries. Before, the module raveled the tuple of field
+  arrays and failed in Python with `TypeError: ravel requires ndarray or
+  scalar arguments`.
+
 ## 0.1.304
 
 - A device JAX helper's write to its array argument now also reaches the
