@@ -92,3 +92,58 @@ end
         @test_skip false
     end
 end
+
+# The diagonal of an LKJ factor is a fixed-shape allocation, so its value
+# keeps that shape as translation metadata. The lower factor is assembled
+# outside the submodel that computes the diagonal, so the caller reads a
+# submodel output that carries such metadata.
+@rkppl jax_correlated_effect(eta, n) = begin
+    L ~ LKJCholesky(3, eta)
+    z[1:n, 1:3] .~ Normal.(0, 1)
+    return z * transpose(L)
+end
+
+const jax_correlated_model = @rkppl begin
+    b ~ jax_correlated_effect(eta, n)
+    y .~ Normal.(b[:, 1] .+ b[:, 2] .- b[:, 3], noise)
+end
+
+@testset "a submodel's fixed-shape output is read from its result" begin
+    texts = String[]
+    for n in (0, 4, 9)
+        raw = (; n, eta = 2.0, noise = 0.7, y = collect(range(-0.4, 0.5; length = n)))
+        plan = jax_correlated_model(; Base.structdiff(raw, (; y = raw.y))...) | (; raw.y)
+        built = build_kernel(plan)
+        src = jax_source(built, plan)
+        push!(texts, src.text)
+        # The factor assembly sits between the submodel's density part and
+        # its returned value, which stay one function each.
+        @test count(r"(?m)^def jax_correlated_effect\w*\(", src.text) == 2
+        # Every array the caller's factor assembly reads is an entry of the
+        # submodel's result, never a name local to the submodel's body.
+        calls = [m.match for m in eachmatch(r"(?m)^\s+\w+ = _ppl_lkj_lower\(.*$", src.text)]
+        @test length(calls) == 1
+        @test occursin(r"_ppl_lkj_lower\((\w+)\[\"\w+\"\], \1\[\"\w+\"\], 3, 3\)", only(calls))
+        if rk_jax_available()
+            names = first.(only(f for f in src.functions if f.name == "prepare_data").inputs)
+            args = Tuple(getproperty(raw, Symbol(name)) for name in names)
+            u = collect(range(-0.3, 0.4; length = built.layout.total))
+            for (entry, workflow) in ((:log_density, :sampler), (:log_prior, :prior),
+                                      (:log_likelihood, :likelihood), (:log_jacobian, :log_jacobian))
+                native = prepare_query(built, plan, workflow)
+                got = rk_jax_evaluate(src, entry, (u, args...); grad = true, prepare = :arguments)
+                @test got.value ≈ native(u) atol = 1e-11
+                finite_difference = [(native(u + 1e-5 .* (1:length(u) .== i)) -
+                                      native(u - 1e-5 .* (1:length(u) .== i))) / 2e-5
+                                     for i in eachindex(u)]
+                @test got.grad ≈ finite_difference rtol = 2e-6 atol = 1e-7
+            end
+        else
+            @test_skip false
+        end
+    end
+    # A longer grouping axis keeps the same executable bodies.
+    structure(text) = [count(pattern, text) for pattern in
+        (r"(?m)^\s*def ", "jax.vmap(", "jax.lax.cond(", "jax.lax.fori_loop(")]
+    @test structure(texts[1]) == structure(texts[2]) == structure(texts[3])
+end

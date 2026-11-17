@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.300
+## 0.1.302
 
 - JAX source translates device `for` loops, generators and comprehensions
   over a vector's elements, over `enumerate` (one-based positions) and over
@@ -24,6 +24,30 @@ are recorded in the git history only.
   runtime loop over the positions, so emitted source does not grow with the
   data and `jax.grad` differentiates it; a padded row's elements take lazy
   steps to its length. Loop targets stay the loop's own.
+
+## 0.1.301
+
+- `jax_source` host preparation collects and sorts tuple records without
+  coercing their fields, including `issorted`, `by` field projections,
+  dictionary generators and broadcast lookups. Local named helpers preserve
+  writes to captured collections. `all` and `any` with a predicate stop at
+  the first deciding element; numerical array equality preserves shape and
+  exact integer comparisons. Host loops and generated JAX bodies remain
+  bounded as input lengths change. The guides describe host preparation on
+  its own page, `docs/src/jax-host.md`.
+- `jax_source` reads a submodel's fixed-shape output (an `LKJCholesky`
+  factor's diagonal, since 0.1.291) from the submodel's result. The caller
+  named a local of the submodel's body instead, a Python `NameError`.
+
+## 0.1.300
+
+- `js_source` translates one element of a range: `r[i]`, `r[begin]` and
+  `r[end]` (so `lastindex(r)`) for `a:b`, `a:s:b` and a vector's index range
+  (`eachindex(x)`, `axes(x, 1)`). The element is computed from the range's
+  ends, without building the window it selects, and a position outside the
+  range is Julia's `BoundsError` with Julia's message. Before, each of these
+  raised `JSEmissionError`, and a helper had to slice first (`x[r][1]`), which
+  copies the window and also checks its far end.
 
 ## 0.1.299
 

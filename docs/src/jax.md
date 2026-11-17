@@ -97,7 +97,8 @@ Translation errors identify an unsupported operation instead of substituting a d
 ## Further JAX guides
 
 - [JAX helpers and submodels](jax-helpers.md): shared submodel functions, and helpers with loops and branches.
-- [JAX translations](jax-translations.md): Julia functions in host preparation, and package-defined translations.
+- [JAX host preparation](jax-host.md): data-only Julia in `prepare_data`.
+- [JAX translations](jax-translations.md): package-defined translations.
 - [JAX runtime and derivatives](jax-runtime.md): accelerator runtime checks, derivative rules, stable rewrites and ODE solves.
 
 The [Eight-schools example](eight-schools.md) explains the model and coordinate boundary that a PPL export must preserve.
