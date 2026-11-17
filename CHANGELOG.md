@@ -16,6 +16,31 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.299
+
+- `jax_source`: a `map` do-block whose elements are numerical arrays of one
+  shape (a plate record's vector field, `map(records) do r; r.nested.y end`)
+  is a vector of dense rows. `first`, `last`, indexing, `similar`, `eachindex`
+  and loops read each row as the array it is. Before, a helper reading such a
+  row raised `JAXEmissionError: a ragged array without its lengths`.
+- `jax_source`: a `map` do-block over entries with lengths of their own (rows
+  of a ragged vector, records whose fields are padded rows) maps each entry
+  with its lengths and returns the lengths of padded results beside them.
+  Before, a `map` over a ragged vector of vectors computed on the device read
+  each row's padding as entries, so a reduction of the mapped values returned
+  a wrong value; records with padded fields failed in Python.
+- `jax_source` translates `for x in xs` over a vector's entries in device code
+  as the loop over `eachindex(xs)` that reads `xs[k]` into `x`. The loop
+  variable is local to the loop, as Julia's is.
+- `jax_source` translates `similar(A)`, `similar(A, T)` and `similar(A, [T,]
+  dims...)` of numerical arrays, `sum` of a vector of dense rows (Julia's `+` of
+  the entries, refusing an empty collection as Julia does), and generators
+  over dense rows. `sum` of a vector of rows with lengths of their own raises
+  a `JAXEmissionError` instead of failing in Python.
+- `jax_source`: `eachindex` of a ragged vector of vectors, or of a vector of
+  records with padded fields, ranges over its entries. Before, a loop over it
+  used the rows' lengths as its count and failed in Python.
+
 ## 0.1.298
 
 - `js_source` reads, indexes and iterates a vector of records that a recipe
