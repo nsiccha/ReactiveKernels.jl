@@ -25,6 +25,7 @@ using Random
 import DifferentiationInterface
 import EnzymeCore
 import Preferences
+import Profile
 import DiffRules
 using PrecompileTools: @setup_workload, @compile_workload
 RuntimeGeneratedFunctions.init(@__MODULE__)
@@ -70,6 +71,7 @@ include("indexed_invariants.jl")
 include("error_policy.jl")
 include("ad.jl")
 include("ad_accumulation.jl")
+include("ad_cost.jl")
 include("plate_reverse.jl")
 include("derivative_rules.jl")
 include("kernel_stateful.jl")
@@ -119,6 +121,7 @@ export PreparedADOperator, PreparedADPushforward, PreparedADHVP, PreparedADThird
 export value, value!, add!, plan, prepare, prepare_nonallocating, plate, scan, @plate, @scan
 export partial_evaluation
 export prepare_ad, ad_gradient, ad_value_and_gradient, ad_value_and_gradient!
+export ad_cost_profile, ADCostProfile, ADCostPart
 export PreparedADAccumulator, prepare_ad_accumulator, ad_accumulator_storage, ad_accumulate!
 export ad_value_gradient_and_retained, ad_value_gradient_and_retained!,
     ad_retains_primal_sweep

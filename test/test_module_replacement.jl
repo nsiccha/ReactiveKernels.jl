@@ -33,8 +33,10 @@ function define_replaced(source)
     Base.invokelatest(getglobal, ModuleReplacementHost, :Replaced)
 end
 
-# A compiled program's body as RuntimeGeneratedFunctions holds it.
-generated_body(f) = ReactiveKernels.RuntimeGeneratedFunctions.get_expression(f).args[2]
+# A compiled program's body as RuntimeGeneratedFunctions holds it, without the
+# statement scopes `_compile` adds for profiles (`_source_markers`).
+generated_body(f) = ReactiveKernels._strip_source_markers(
+    ReactiveKernels.RuntimeGeneratedFunctions.get_expression(f)).args[2]
 
 @testset "a replaced module's kernels run their own module's code" begin
     RK = ReactiveKernels

@@ -16,6 +16,17 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.212
+
+- Added `ReactiveKernels.ad_cost_profile(q::SamplerQuery, u; seconds,
+  threshold, allocations)`: where the posterior value `q(u)` and its gradient
+  `sampler_value_and_gradient!` spend their time at `u`, split by the
+  statements of the prepared sampler (authored names, `_ppl_lik_<response>`,
+  `_ppl_prior_<name>`, `log_jacobian`, and a plate cell's statements as
+  `plate_<name>`), for the ordinary and the non-allocating sampler. BRM's
+  `rk_logdensity_problem` holds its sampler as `problem.query`. Requires
+  ReactiveKernels 0.1.309.
+
 ## 0.1.211
 
 - A number bound to a data name is one position, as in Julia. Called with

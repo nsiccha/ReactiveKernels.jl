@@ -754,6 +754,27 @@ sampler_value_and_gradient!(q::SamplerQuery, g::AbstractVector, u::AbstractVecto
 _sampler_gradient!(q::SamplerQuery, g, u) = first(ad_value_and_gradient!(q.ad, g, u, _discrete_args(q.discrete)...))
 
 """
+    ReactiveKernels.ad_cost_profile(q::SamplerQuery, u; seconds = 1.0, threshold = nothing, allocations = true)
+
+Where the posterior value `q(u)` and its gradient
+`sampler_value_and_gradient!(q, g, u)` spend their time at `u`, split by the
+statements of the prepared program: the authored names (`mu`), the
+likelihood and prior terms (`_ppl_lik_y`, `_ppl_prior_z`), `log_jacobian`, and
+a plate cell's statements as `plate_<name>`. `ReactiveKernels.ad_cost_profile`
+documents the measurement, `threshold` and the result.
+"""
+function ReactiveKernels.ad_cost_profile(q::SamplerQuery, u::AbstractVector{<:Real};
+                                         kwargs...)
+    position = Vector{Float64}(u)
+    length(position) == q.layout.total || throw(ArgumentError(
+        "ad_cost_profile: the position has $(length(position)) entries; the " *
+        "sampler's layout has $(q.layout.total)"))
+    gradient = similar(position)
+    ReactiveKernels.ad_cost_profile(() -> q(position),
+        () -> sampler_value_and_gradient!(q, gradient, position); kwargs...)
+end
+
+"""
     sampler_value_gradient_and_retained!(q::SamplerQuery, g::AbstractVector, u)
 
 Posterior value and gradient at unconstrained `u` as

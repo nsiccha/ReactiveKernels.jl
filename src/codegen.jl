@@ -7871,9 +7871,10 @@ function _distinguish_module_generations(ast::Expr)
 end
 
 # The expression of the compiled program `f` as it was lowered, without the
-# statement `_distinguish_module_generations` added.
+# statement `_distinguish_module_generations` added and without the statement
+# scopes `_compile` added (`_source_markers`, ad_cost.jl).
 function _program_expression(@nospecialize(f))
-    ex = RuntimeGeneratedFunctions.get_expression(f)
+    ex = _strip_source_markers(RuntimeGeneratedFunctions.get_expression(f))
     ex isa Expr && length(ex.args) == 2 || return ex
     body = ex.args[2]
     body isa Expr && body.head === :block && length(body.args) == 2 &&
@@ -7891,6 +7892,9 @@ function _compile(ast::Expr, context::Module, native_context::GlobalRef)
     ast = _compile_plate_programs(_lift_comprehensions(ast), context, native_context)
     ast = _distinguish_module_generations(
         _canonical_embedded(_canonical_locals(_canonical_globals(ast))))
+    # Statement scopes for profiles (`_source_markers`, ad_cost.jl): debug
+    # information only, so the compiled code is unchanged.
+    ast = _source_markers(ast)
     f = RuntimeGeneratedFunction(context, context, ast)
     image = _image_program(f)
     image === nothing || return image
