@@ -1,7 +1,7 @@
 name = "ReactiveKernels"
 uuid = "78e9f072-d36b-4c73-b7a3-751b0eb26cf9"
 authors = ["Nikolas Siccha <nikolassiccha@gmail.com>"]
-version = "0.1.308"
+version = "0.1.309"
 
 [deps]
 DiffRules = "b552c78f-8df3-52c6-915a-8e097449b14b"
@@ -13,6 +13,7 @@ LogExpFunctions = "2ab3a3ac-af41-5b50-aa03-7779005ae688"
 OutputSignatures = "86cfaae4-1704-4c69-ba62-d919d81ae5f8"
 PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
 Preferences = "21216c6a-2e73-6563-6e65-726566657250"
+Profile = "9abbd945-dff8-562f-b5e8-e1ebf5ef1b79"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 RuntimeGeneratedFunctions = "7e49a35a-f44a-4d26-94aa-eba1b4ca6b47"
 
@@ -61,6 +62,7 @@ OrdinaryDiffEqBDF = "2.4"
 OrdinaryDiffEqLowOrderRK = "2.2"
 PrecompileTools = "1.2"
 Preferences = "1"
+Profile = "1"
 RuntimeGeneratedFunctions = "0.5"
 # Core does not use SciMLBase; current BDF and sensitivity weakdeps require 3.x.
 SciMLBase = "2.150, 3.46"

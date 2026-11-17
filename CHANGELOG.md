@@ -16,6 +16,35 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.309
+
+- Added `ad_cost_profile(value, value_and_gradient; seconds, threshold,
+  allocations)` and `ad_cost_profile(prepared::PreparedADKernel, args...)`:
+  where a prepared program's value and native gradient spend their time,
+  split by the program's statements. It times warm calls of both and, unless
+  `threshold` is given and the gradient ÷ value ratio does not exceed it, runs
+  each under Julia's sampling profiler and `Profile.Allocs`, attributing every
+  sample of the calling thread to the statement it ran. The result, an
+  `ADCostProfile` of `ADCostPart`s, lists each statement's value and gradient
+  time per call, their ratio, its samples and its Julia heap bytes; the parts
+  add up to the whole. Statements are named after the assigned value (`mu`,
+  `plate_<name>` for a plate cell's statement); `(other statements)`,
+  `(outside generated code)` and `(garbage collection)` hold the rest.
+- Every program RK compiles now runs each statement that assigns a value in a
+  source scope named after it (`Expr(:meta, :push_loc, Symbol("rk:<name>"))`,
+  the lowered form of a macro expansion), which is what lets a profile of the
+  fused native Enzyme gradient name the statement each reverse-pass sample ran.
+  Scopes are debug information only: values, gradients and warm times are
+  unchanged (measured on a Linux fleet host, Julia 1.10.12, Enzyme dogfood with
+  libEnzyme `5639cd2f`: an RKPPL Student-t model with a scan, bit-identical
+  values and gradients, warm gradient 63.98 against 65.95 µs and 67.33 against
+  67.76 µs in two alternating processes, and no change in preparation or
+  first-gradient compile time). `code_expr` and every reader of a compiled
+  program's source see it without the scopes. Stack traces of an error inside
+  a prepared program now name the statement as a `macro expansion` frame in
+  file `rk:<name>`.
+- New dependency: the `Profile` standard library.
+
 ## 0.1.308
 
 - Fixed: with `branch_arms = :all`, a plate cell with several lazy branches

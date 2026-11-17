@@ -43,6 +43,10 @@ value, returned = ad_value_and_gradient!(ad, buffer, q, data, scale)
 
 A prepared pullback handles an output cotangent for scalar, array or selected multiple outputs. Pushforwards and Hessian-vector products have separate preparation APIs. Their supported active structures and backend requirements are stated in the [differentiation reference](api.md); choose the operator needed rather than constructing a dense Jacobian unnecessarily.
 
+## Where the gradient's time goes
+
+`ad_cost_profile(ad, q, data, scale)` times warm calls of the prepared program and of its gradient, then splits both by the program's statements under Julia's sampling profiler. Every program ReactiveKernels compiles runs each assigning statement in a source scope named after the value it assigns, and native Enzyme keeps those scopes in the reverse pass, so the parts add up to the measured gradient. Each part reports its value time, gradient time, their ratio and its Julia heap bytes. With `threshold = 4.0` it profiles only a program whose gradient costs more than four times its value. The [differentiation reference](api.md) documents the result.
+
 Derivative rules for an owned mathematical primitive belong to one [derivative graph](manual-derivative-rules.md). The native primal and the derivative use that graph's selected computations.
 
 The [Eight-schools example](eight-schools.md) explains the density and coordinate boundary that a sampler differentiates.

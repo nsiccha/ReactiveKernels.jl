@@ -304,6 +304,7 @@ const _PPL_TEST_FILES = (
     "test_value_metadata.jl",
     "test_native_forward_batch_ad.jl",
     "test_sampler_retained.jl",
+    "test_ad_cost_profile.jl",
     "test_shared_value_closures.jl",
     "test_inline_call_values.jl",
     "test_inline_scalar_reads.jl",
