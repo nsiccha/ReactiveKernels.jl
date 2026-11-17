@@ -1740,18 +1740,18 @@ Base.@nospecializeinfer function _partition_plate_recipe(
     n === nothing && singleton_axis && !unknown_axis && (n = 1)
     n === nothing && return nothing
 
-    # The first branch recipe whose condition reads bound data only.
-    target = nothing
+    # The branch recipes whose condition reads bound data only, in cell order;
+    # the first is partitioned.
+    targets = Tuple{Recipe,Vector{ValueId}}[]
     for r in inner.recipes
         r.op isa _KernelSourceOp && getfield(r.op, :f) isa _KernelBranch || continue
         CI = (typeof(getfield(r.op, :f))::DataType).parameters[1]
         ports = [canon_id(inner.graph, r.inputs[i].id) for i in CI]
         all(cid -> haskey(bound, cid), ports) || continue
-        target = (r, ports)
-        break
+        push!(targets, (r, ports))
     end
-    target === nothing && return nothing
-    branch_recipe, cond_ports = target
+    isempty(targets) && return nothing
+    branch_recipe, cond_ports = first(targets)
     native = getfield(branch_recipe.op, :f)
     # Every arm becomes a plate, also one that no lane takes, and a domain of
     # no lanes splits into two such plates without evaluating its condition:
@@ -1771,6 +1771,17 @@ Base.@nospecializeinfer function _partition_plate_recipe(
     !lane_condition && !_partition_branch_has_bound_work(branch_recipe, inner, bound) &&
         return nothing
     n == 0 && lane_condition && !all_arms && return nothing
+    # An arm plate keeps every other recipe of the cell, so a second branch
+    # the lanes decide splits each arm plate again. With `branch_arms = :all`
+    # an arm no lane takes is kept too, so k such sibling branches gave 2^k
+    # plates whatever the data (snag `one-compiled-nat-bd7c7031`: a law with a
+    # few dozen flag branches never finished preparing). One plate keeps them
+    # all as conditionals its loop decides per lane, which grows with the
+    # branches, not their combinations; a lone branch with its nested arms is
+    # still partitioned, one plate per leaf arm.
+    all_arms && lane_condition &&
+        count(t -> any(cid -> bound[cid] isa AbstractArray, last(t)), targets) > 1 &&
+        return nothing
     arms = if n == 0 && lane_condition
         [(:then, Int[]), (:else, Int[])]
     else

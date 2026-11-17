@@ -16,6 +16,23 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.308
+
+- Fixed: with `branch_arms = :all`, a plate cell with several lazy branches
+  side by side whose conditions read bound data was split into one plate per
+  combination of their arms, 2^k plates for k branches, also for combinations
+  no lane can take. A law with a few dozen flag branches never finished
+  preparing. Such a cell is now one plate whose loop decides each
+  branch per lane: its program grows with the branches, and one program still
+  serves every binding. A lone branch, with any branches nested in its arms,
+  is still one plate per leaf arm, as before, and `:taken` is unchanged.
+  Values and gradients are unchanged. Measured on a Linux fleet host
+  (Julia 1.10.12): 24 independent branches prepare in 1.2 s as one plate;
+  with 2 or 3 independent branches, density is faster at every size (3 branches
+  over 2000 rows: 15.75 → 13.39 µs), gradients over 200 rows or more 5–11%
+  slower (17.57 → 18.54 µs) and over 10 rows faster (0.16 → 0.10 µs), and
+  the first gradient compiles in 0.2–0.4 s instead of 0.9–1.9 s.
+
 ## 0.1.307
 
 - **Fix:** a rebuild of one program reuses the code compiled for the first

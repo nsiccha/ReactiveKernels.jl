@@ -1641,7 +1641,10 @@ tuples `CI`/`TI`/`EI`; a nested branch arm is itself a `_KernelBranch` over
 every argument. Plate partial evaluation reads them: a condition whose ports
 are all bound data is evaluated per lane at preparation, and the plate splits
 into one plate per taken arm, or with `branch_arms = :all` into one plate per
-arm, over no lanes for an arm no lane takes (`_partition_plate_recipe`).
+arm, over no lanes for an arm no lane takes (`_partition_plate_recipe`). Under
+`:all`, a cell with two or more such branches side by side stays one plate
+whose loop decides each per lane, so its program grows with the branches, not
+with the combinations of their arms.
 
 In a plate cell, a leaf arm may also carry its own graph, `then_spec` /
 `else_spec`: a `KernelSpec` over the arm's ports (by name) whose one output is
