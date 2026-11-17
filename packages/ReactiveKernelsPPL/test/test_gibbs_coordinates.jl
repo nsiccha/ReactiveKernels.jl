@@ -16,6 +16,16 @@ const TWO = @rkppl begin
     b[axes(Z, 2)] .~ Normal.(0, 3.0)
     y .~ Bernoulli.(logistic.(X * a .+ Z * b))
 end
+const HIERARCHICAL = @rkppl begin
+    beta[axes(X, 2)] .~ Normal.(0, tau)
+    tau ~ Exponential(1.0)
+    y .~ Bernoulli.(logistic.(X * beta))
+end
+const POSITIVE = @rkppl begin
+    beta[axes(X, 2)] .~ Exponential.(tau)
+    tau ~ Exponential(1.0)
+    y .~ Bernoulli.(logistic.(X * beta))
+end
 const PLAIN = @rkppl begin
     m ~ Normal(0, 3)
     s ~ Exponential(1.0)
@@ -57,15 +67,20 @@ end
     plan = LOGISTIC(; X, sigma=10.0) | (; y)
     problem = PPL.prepare_coordinate_conditional(build_kernel(plan), plan, zeros(6))
     @test length(problem.products) == 1
+    # One block for the coefficient vector; its prior is read one cell at a time.
+    @test [(block.range, length(block.cells)) for block in problem.blocks] == [(1:6, 1)]
     u0 = 0.3 .* randn(rng, 6)
     start = copy(u0)
     state = PPL.coordinate_state(problem, u0)
-    # Closed form at the start: every term of this model reads a coordinate.
+    # Closed forms at the start. A coefficient's conditional keeps the
+    # likelihood and its own prior cell; the other cells are constant in it.
     eta = X * u0
-    reference = sum(@. -0.5 * (u0 / 10.0)^2 - log(10.0) - 0.5 * log(2pi)) +
-        sum(@. y * eta - log1p(exp(eta)))
-    @test PPL.coordinate_logdensity(state, 3, u0[3]) ≈ reference
-    @test problem.joint(u0) ≈ reference
+    cells = @. -0.5 * (u0 / 10.0)^2 - log(10.0) - 0.5 * log(2pi)
+    loglikelihood = sum(@. y * eta - log1p(exp(eta)))
+    @test problem.joint(u0) ≈ loglikelihood + sum(cells)
+    for k in (1, 3, 6)
+        @test PPL.coordinate_logdensity(state, k, u0[k]) ≈ loglikelihood + cells[k]
+    end
     result = exercise!(rng, state; sweeps=20, trials=3, scale=2.0)
     @test result.moves > 20
     @test result.worst < 1e-9
@@ -103,6 +118,7 @@ end
     plan = SCALED(; X) | (; y=yn)
     problem = PPL.prepare_coordinate_conditional(build_kernel(plan), plan, zeros(5))
     @test length(problem.products) == 1
+    @test [(block.range, length(block.cells)) for block in problem.blocks] == [(2:5, 1)]
     state = PPL.coordinate_state(problem, [0.1, -0.2, 0.3, 0.0, 0.2])
     result = exercise!(rng, state; sweeps=15, trials=3)
     @test result.moves > 10 && result.worst < 1e-9
@@ -112,10 +128,37 @@ end
     plan2 = TWO(; X, Z) | (; y=yb)
     problem2 = PPL.prepare_coordinate_conditional(build_kernel(plan2), plan2, zeros(7))
     @test length(problem2.products) == 2
+    @test [(block.range, length(block.cells)) for block in problem2.blocks] == [(1:4, 1), (5:7, 1)]
     state2 = PPL.coordinate_state(problem2, 0.2 .* randn(rng, 7))
     result2 = exercise!(rng, state2; sweeps=15, trials=3)
     @test result2.moves > 10 && result2.worst < 1e-9
     @test PPL.refresh_products!(state2) < 1e-10
+end
+
+@testset "a moved coefficient reads its own prior and Jacobian cells" begin
+    rng = Xoshiro(11)
+    X = randn(rng, 30, 5)
+    y = Int.(rand(rng, 30) .< 0.5)
+    # A scale shared by the vector's prior: the scale's own coordinate reads
+    # every term, a coefficient reads its likelihood and one prior cell.
+    plan = HIERARCHICAL(; X) | (; y)
+    problem = PPL.prepare_coordinate_conditional(build_kernel(plan), plan, zeros(6))
+    @test length(problem.products) == 1
+    @test [(block.range, length(block.cells)) for block in problem.blocks] == [(2:6, 1)]
+    state = PPL.coordinate_state(problem, 0.3 .* randn(rng, 6))
+    result = exercise!(rng, state; sweeps=15, trials=3)
+    @test result.moves > 10 && result.worst < 1e-9
+    @test PPL.refresh_products!(state) < 1e-10
+
+    # A constrained vector: its product is recomputed, and both its prior and
+    # its Jacobian are read at the moved cell.
+    plan2 = POSITIVE(; X) | (; y)
+    problem2 = PPL.prepare_coordinate_conditional(build_kernel(plan2), plan2, zeros(6))
+    @test isempty(problem2.products)
+    @test [(block.range, length(block.cells)) for block in problem2.blocks] == [(2:6, 2)]
+    state2 = PPL.coordinate_state(problem2, 0.3 .* randn(rng, 6))
+    result2 = exercise!(rng, state2; sweeps=15, trials=3)
+    @test result2.moves > 10 && result2.worst < 1e-9
 end
 
 @testset "a program without a product needs no cache" begin
@@ -123,6 +166,7 @@ end
     plan = PLAIN(;) | (; y=[0.3, -0.1, 0.8, 0.4])
     problem = PPL.prepare_coordinate_conditional(build_kernel(plan), plan, zeros(2))
     @test isempty(problem.products)
+    @test problem.blocks === ()
     state = PPL.coordinate_state(problem, [0.2, -0.3])
     @test state.products === ()
     result = exercise!(rng, state; sweeps=10, trials=3)
@@ -139,7 +183,8 @@ end
         X = randn(rng, n, d)
         plan = LOGISTIC(; X, sigma=1.5) | (; y=Int.(rand(rng, n) .< 0.5))
         problem = PPL.prepare_coordinate_conditional(build_kernel(plan), plan, zeros(d))
-        push!(sizes, inventory(code_expr(problem.conditional)))
+        push!(sizes, inventory(code_expr(problem.conditional)) +
+            inventory(code_expr(only(problem.blocks).kernel)))
         state = PPL.coordinate_state(problem, 0.1 .* randn(rng, d))
         @test exercise!(rng, state; sweeps=1, trials=2).worst < 1e-9
     end
