@@ -1295,6 +1295,10 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
         # An element reads each field's value; a slice, each field's column.
         element = all(k -> parts[k].T == fieldtype(E, k), 1:fieldcount(E))
         number = findfirst(k -> fieldtype(E, k) <: Number, 1:fieldcount(E))
+        # One record of a vector whose fields have their own lengths keeps them.
+        element && _jax_field_lengths(x) &&
+            return _PyVal(_jax_tuple_code(parts), E, false, _jax_tuple_extent(parts), "",
+                          _jax_tuple_fields(parts))
         return _PyVal(_jax_tuple_code(parts), element ? E : Array{E,ndims(first(parts).T)}, false,
                       element || number === nothing ? "" : parts[number].extent)
     end
@@ -8144,9 +8148,21 @@ _jax_stacked_namedtuple(@nospecialize(T)) = T isa Type && T <: NamedTuple &&
 # column is the dense array of its rows, one per element.
 _jax_columns(@nospecialize(T)) = T isa Type && T <: AbstractArray &&
     (T <: AbstractVector && _jax_stacked_namedtuple(eltype(T)) || _jax_numeric_tuple(eltype(T)))
+# A vector of records some of whose fields are vectors. Prepared by
+# `prepare_data`, each vector field's column is padded as a ragged value is
+# and the record carries the tuple of those fields' lengths (`None` for a
+# number field), as a plate's record values do.
+_jax_record_lengths(@nospecialize(T)) = _jax_columns(T) && T <: AbstractVector &&
+    any(F -> F <: AbstractVector, fieldtypes(eltype(T)))
+# Whether `x`'s fields carry their own lengths in its extent.
+_jax_field_lengths(x::_PyVal) = _jax_columns(x.T) && _jax_padded_fields(x) != 0
 function _jax_column(x::_PyVal, k::Integer)
     F = fieldtype(eltype(x.T), k)
     code = _py_atom(x.code) * "[" * string(k - 1) * "]"
+    # A vector field whose rows have their own lengths: a padded row per
+    # element, with that field's lengths.
+    _jax_field_lengths(x) && return _PyVal(code, Array{F,ndims(x.T)}, x.static,
+                                          _jax_field_extent(x, k, F))
     # A vector field's rows all have the stacked width.
     _PyVal(code, Array{F,ndims(x.T)}, x.static, F <: Number ? x.extent :
            "jnp.full((" * code * ".shape[0],), " * code * ".shape[1])")
@@ -9306,7 +9322,17 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
             continue
         end
         extent = flat = ""
-        if _jax_ragged(T)
+        record_lengths = names !== nothing && _jax_record_lengths(T)
+        if record_lengths
+            # A prepared vector of records whose vector fields are padded
+            # (`prepare_data`'s `_rk_record_columns_np`): the tuple of those
+            # fields' lengths.
+            extent_key = key * "_lengths"
+            extent = keyed ? _jax_param_name(scope.used, extent_key; stable = false) :
+                (push!(scope.used, extent_key); extent_key)
+            push!(params, extent); push!(inputs, extent_key => Tuple)
+            push!(input_locals, extent)
+        elseif _jax_ragged(T)
             extent_key = names === nothing ? "" : key * "_lengths"
             extent = names === nothing ? _jax_identifier(scope.used, Symbol(v.name, :_lengths)) :
                 keyed ? _jax_param_name(scope.used, extent_key; stable = false) :
@@ -9333,7 +9359,9 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
             T isa Type && T <: AbstractArray && _jax_integer_data(T)
         # Its origin names the array by its key in the prepared data, which
         # `prepare_data` reads to compute the bound.
-        scope.values[canon_id(p.graph, v.id)] = _PyVal(param, T, static, extent, "", 0,
+        fields = record_lengths ? foldl((m, (j, F)) -> F <: AbstractVector ? m | 1 << (j - 1) : m,
+                                        enumerate(fieldtypes(eltype(T))); init = 0) : 0
+        scope.values[canon_id(p.graph, v.id)] = _PyVal(param, T, static, extent, "", fields,
             prepared ? _JaxOrigin(key, nothing, "0") : nothing)
         # Callers may pass NumPy arrays; JAX indexes only its own arrays by a
         # traced index.
@@ -9350,6 +9378,8 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
             helper = _jax_helper!(ctx, "_rk_columns", _JAX_COLUMNS)
             dtypes = join((_jax_column_dtype(F) * ", " for F in fieldtypes(eltype(T))))
             _jax_emit!(ctx, param * " = " * helper * "(" * param * ", (" * dtypes * "))")
+            record_lengths && _jax_emit!(ctx, extent * " = tuple(None if n is None else " *
+                                              "jnp.asarray(n) for n in " * extent * ")")
         elseif T isa Type && T <: AbstractFloat && !isempty(_jax_input_dtype(T))
             _jax_emit!(ctx, param * " = jnp.asarray(" * param * _jax_input_dtype(T) * ")")
         end

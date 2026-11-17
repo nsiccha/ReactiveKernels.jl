@@ -209,3 +209,64 @@ end
         end
     end
 end
+
+# A prepared vector of records whose fields are vectors of a different length
+# in each record, as a model's per-subject design: a data-only plate computes
+# them in `prepare_data`, and a later plate maps them with the parameters.
+# Each vector field crosses padded with its own lengths.
+@traceable function jax_columns_design(times, kinds)
+    early = times[kinds .== 1]
+    late = times[kinds .== 2]
+    (; early, late, count = length(early), steps = diff(vcat(0.0, late)))
+end
+@kernel jax_columns_records(a::Float64, times::Vector{Vector{Float64}},
+                            kinds::Vector{Vector{Int}}) = begin
+    designs = plate(times, kinds) do t, k
+        jax_columns_design(t, k)
+    end
+    cells = plate(designs, Ref(a)) do d, a
+        sum(exp.(-a .* d.early)) + d.count * a + sum(a .* d.steps .^ 2) + length(d.late)
+    end
+    total = sum(cells)
+    return total
+end
+function jax_columns_records_native(a, times, kinds)
+    total = 0.0
+    for (t, k) in zip(times, kinds)
+        d = jax_columns_design(t, k)
+        total += sum(exp.(-a .* d.early)) + d.count * a + sum(a .* d.steps .^ 2) + length(d.late)
+    end
+    total
+end
+
+@testset "jax_source: prepared records whose vector fields differ in length" begin
+    times = [[0.5, 1.0, 1.5, 3.0], [2.0], [0.1, 0.2, 0.3, 0.7, 0.9], Float64[]]
+    kinds = [[1, 2, 2, 1], [2], [1, 1, 2, 1, 2], Int[]]
+    have = (:a, :times, :kinds)
+    src = jax_source(jax_columns_records; have, want = :total, data = (; times, kinds))
+    # `prepare_data` pads each vector field and returns their lengths.
+    @test occursin("_rk_record_columns_np(", src.text)
+    @test occursin("\"designs_lengths\"", src.text)
+    native = prepare(jax_columns_records; have, want = :total)
+    datasets = ((times, kinds), ([[1.0, 2.0, 3.0]], [[2, 2, 2]]), ([[4.0]], [[1]]),
+                (Vector{Float64}[], Vector{Int}[]),
+                ([collect(0.1:0.1:4.0), [0.3]], [repeat([1, 2], 20), [2]]))
+    for data in datasets
+        # Row counts and field lengths are data: they never specialize the source.
+        @test src.text == jax_source(jax_columns_records; have, want = :total,
+                                     data = (; times = data[1], kinds = data[2])).text
+        value = native(0.7, data...)
+        @test value ≈ jax_columns_records_native(0.7, data...)
+        derivative = Enzyme.autodiff(Enzyme.Reverse, jax_columns_records_native, Enzyme.Active,
+            Enzyme.Active(0.7), map(Enzyme.Const, data)...)[1][1]
+        if rk_jax_available()
+            for preparation in (true, :arguments)
+                r = rk_jax_evaluate(src, :kernel, (0.7, data...); grad = true, prepare = preparation)
+                @test r.value ≈ value rtol = 1e-12 atol = 1e-12
+                @test r.grad ≈ derivative rtol = 1e-12 atol = 1e-12
+            end
+        else
+            @test_skip false
+        end
+    end
+end
