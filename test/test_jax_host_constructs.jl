@@ -122,10 +122,23 @@ end
     end
     a + 2b
 end
+# An optional pair of lists, asked with `isnothing` and `!== nothing`.
+@traceable jhc_maybe_lists(x) =
+    length(x) > 2 ? (x[2:end], Int[findfirst(==(v), x) for v in x]) : nothing
+@traceable function jhc_union_forms(x)
+    m = jhc_maybe_lists(x)
+    tail, positions = if isnothing(m)
+        x, Int[length(x) - i for i in eachindex(x)]
+    else
+        m
+    end
+    present = m !== nothing ? 100.0 : 0.0
+    sum(tail) + 2 * sum(positions) + present
+end
 
 for f in (:jhc_span, :jhc_first_positions, :jhc_as_floats, :jhc_grow, :jhc_first_zero,
           :jhc_order, :jhc_distinct, :jhc_views, :jhc_mutations, :jhc_pairs, :jhc_branch_list,
-          :jhc_union_branch)
+          :jhc_union_branch, :jhc_union_forms)
     @eval @kernel $(Symbol(f, :_kernel))(theta::Float64, x::Vector{Float64}) = begin
         s = $f(x)
         total = theta * s
@@ -228,6 +241,7 @@ end
     end
     @testset "a Union{Nothing, Tuple} result" begin
         jhc_parity(jhc_union_branch_kernel, [xs, ([1.0],)])
+        jhc_parity(jhc_union_forms_kernel, [([3.0, 0.5, 1.0, 2.0],), ([1.0],), (Float64[],)])
     end
 end
 

@@ -54,7 +54,13 @@ function _jax_call_positional(ctx::_JaxContext, ::typeof(isnothing), args::Vecto
     x.T === Nothing && return _jax_literal(true)
     if _jax_optional_payload(x.T) === nothing
         x.T isa Type && typeintersect(x.T, Nothing) === Union{} && return _jax_literal(false)
-        return _jax_traceable_or_lowered(ctx, isnothing, args)
+        # Any other optional (a tuple or an array that may be `nothing`) has no
+        # (present, value) pair. One the host or the trace knows is an ordinary
+        # Python value, `None` exactly when it is `nothing`. The lowered code of
+        # `isnothing` is `x === nothing`, which asks this method again.
+        _jax_known(ctx, x) || _jax_error("`isnothing` or `=== nothing` of a `", x.T,
+            "` that depends on data: only an optional number has a JAX value", _jax_where(ctx))
+        return _PyVal("(" * x.code * " is None)", Bool, true)
     end
     ctx.host === nothing ? _PyVal("jnp.logical_not(" * _py_atom(x.code) * "[0])", Bool) :
         _PyVal("(" * x.code * " is None)", Bool, true)
