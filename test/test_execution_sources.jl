@@ -395,6 +395,43 @@ end
     @test [branch(x, 2.0) for x in (2.0, 3.0)] ≈ [2.0, 3.0] .* log(2.0)
 end
 
+@testset "an embedded branch leaves its arm graphs out" begin
+    # An ordinary branch whose arms are calls carries arm graphs
+    # (`then_spec`/`else_spec`, `_kernel_expand`). A body that splices the
+    # branch's source operation (a censored location-scale observation's lazy
+    # arm, say) embeds an execution copy of it. The graphs hold mutable tables
+    # and their build's value ids: copied, they reached state, the operation was
+    # embedded as it is, and every build of one program compiled that body again
+    # (snag `rk-0-1-206-every-58bdc046`).
+    definition = :(model(x::Float64, scale::Float64) = begin
+        z::Float64 = scale == 0 ? inv(scale) : sqrt(x) / scale
+        return z
+    end)
+    ops = map(1:2) do _
+        mod = Module(gensym(:ExecutionSource))
+        Core.eval(mod, :(using ReactiveKernels))
+        spec = RK._kernel_eval_definition(mod, deepcopy(definition))
+        only(r.op for r in spec.graph.recipes
+             if r.op isa RK._KernelSourceOp && r.op.f isa RK._KernelBranch)
+    end
+    @test all(op -> op.f.then_spec !== nothing && op.f.else_spec !== nothing, ops)
+    copies = map(ops) do op
+        c = RK._ExecutionCopier()
+        copied = RK._execution_copy(c, op)
+        @test !c.stateful
+        copied
+    end
+    @test all(c -> c.f.then_spec === nothing && c.f.else_spec === nothing, copies)
+    # Lowering reads the original operation, which keeps its graphs.
+    @test all(op -> op.f.then_spec !== nothing, ops)
+    # One body id for both builds, and the copy runs as the original does.
+    id(x) = RK.RuntimeGeneratedFunctions.expr_to_id(Expr(:call, QuoteNode(x)))
+    @test id(copies[1]) == id(copies[2])
+    for args in ((4.0, 2.0), (4.0, 0.0), (0.0, 4.0))
+        @test isequal(copies[1](args...), ops[1](args...))
+    end
+end
+
 @testset "runtime source conversion preserves lexical captures" begin
     function make(offset)
         @kernel captured(x::Float64) = begin

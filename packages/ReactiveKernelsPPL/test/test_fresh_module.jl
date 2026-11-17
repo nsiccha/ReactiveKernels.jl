@@ -518,4 +518,34 @@ end
     @test small == source(bound(2, 5))
     @test small == source(bound(3, 7))
 end
+
+# A censored observation's lazy arms splice the location-scale kernel's source
+# operations, whose ordinary branches (`scale == 0 && x == location ?
+# inv(scale) : standardized(x)`) carry arm graphs. Embedded with those graphs,
+# the operations named their build, so every fresh lowering of one program
+# compiled its readers again (snag `rk-0-1-206-every-58bdc046`).
+@testset "a censored observation reads through one type across fresh lowerings" begin
+    ast = quote
+        sigma ~ Exponential(1)
+        a ~ Normal(0, 1)
+        z[levels(subject)] .~ Normal.(0, 1)
+        eta = a .+ z[subject]
+        @plate for i in eachindex(y)
+            y[i] .~ censored.(Normal.(eta[i] .* x[i], sigma), lloq[i], Inf)
+        end
+    end
+    data = (; subject = ["s1", "s2", "s3"], x = [[1.0, 2.0], [0.5], [1.0, 1.5, 2.0]],
+            y = [[0.3, 1.2], [0.0], [0.9, 0.1, 0.05]],
+            lloq = [[0.0, 0.0], [0.0], [0.0, 0.0, 0.05]])
+    builds = map(1:2) do _
+        mod = Module(gensym(:FreshLowering))
+        Core.eval(mod, :(using ReactiveKernelsPPL, Distributions))
+        bound = bind_data(lower_rkppl(deepcopy(ast), data; conditioned = (:y,), mod), data)
+        built = build_kernel(bound)
+        (; built, query = prepare_query(built, bound, :pointwise))
+    end
+    @test typeof(builds[1].query) === typeof(builds[2].query)
+    u = collect(range(-0.3, 0.4; length = builds[1].built.layout.total))
+    @test isequal(Base.invokelatest(builds[1].query, u), Base.invokelatest(builds[2].query, u))
+end
 end
