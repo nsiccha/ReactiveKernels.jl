@@ -382,3 +382,139 @@ function refresh_products!(state::CoordinateState)
     state.products = fresh
     return drift
 end
+
+# Slice updates of one coordinate, after Neal (2003), "Slice sampling", Annals
+# of Statistics 31(3): stepping out by doubling (Fig. 4), then shrinkage
+# (Fig. 5) with the acceptance test that keeps doubling reversible (Fig. 6).
+# `f` is a log density of the coordinate up to a constant; a point whose value
+# is not above the slice level, NaN included, lies outside the slice.
+
+# An Exponential(1) draw from `rand` alone: `1 - rand(rng)` lies in (0, 1].
+_slice_exponential(rng) = -log1p(-rand(rng))
+
+"""
+    _slice_doubling(rng, f, x0, fx0, w, p) -> (x1, evaluations)
+
+One slice update from `x0`, where `fx0 == f(x0)` is finite: an interval of
+width `w` placed at random around `x0`, doubled at most `p` times while either
+end is in the slice, then shrunk towards `x0` until an acceptable point is
+drawn. `evaluations` counts the calls of `f` this update made.
+"""
+function _slice_doubling(rng, f, x0::Float64, fx0::Float64, w::Float64, p::Int)
+    level = fx0 - _slice_exponential(rng)
+    left = x0 - w * rand(rng)
+    right = left + w
+    fleft, fright = Float64(f(left)), Float64(f(right))
+    evaluations = 2
+    doublings = p
+    while doublings > 0 && (level < fleft || level < fright)
+        if rand(rng) < 0.5
+            left -= right - left
+            fleft = Float64(f(left))
+        else
+            right += right - left
+            fright = Float64(f(right))
+        end
+        evaluations += 1
+        doublings -= 1
+    end
+    lo, hi = left, right
+    while true
+        x1 = lo + rand(rng) * (hi - lo)
+        fx1 = Float64(f(x1))
+        evaluations += 1
+        if level < fx1
+            accepted, extra = _slice_acceptable(f, x0, x1, level, w, left, right, fleft, fright)
+            evaluations += extra
+            accepted && return x1, evaluations
+        end
+        x1 < x0 ? (lo = x1) : (hi = x1)
+    end
+end
+
+# Fig. 6: `x1` is acceptable unless some halving of the doubled interval that
+# separates `x0` from `x1` has both ends outside the slice, in which case the
+# doubling could not have reached the interval from `x1`. Midpoints are
+# evaluated only once such a separation has occurred.
+function _slice_acceptable(f, x0, x1, level, w, left, right, fleft, fright)
+    evaluations = 0
+    separated = false
+    known_left = known_right = true
+    while right - left > 1.1 * w
+        middle = (left + right) / 2
+        separated |= (x0 < middle) != (x1 < middle)
+        if x1 < middle
+            right, known_right = middle, false
+        else
+            left, known_left = middle, false
+        end
+        if separated
+            known_left || (fleft = Float64(f(left)); known_left = true; evaluations += 1)
+            known_right || (fright = Float64(f(right)); known_right = true; evaluations += 1)
+            !(level < fleft) && !(level < fright) && return false, evaluations
+        end
+    end
+    return true, evaluations
+end
+
+_slice_width(w::Real, k) = Float64(w)
+_slice_width(w::AbstractVector, k) = Float64(w[k])
+
+function _check_slice_settings(width, max_doublings)
+    widths = width isa AbstractVector ? width : (width,)
+    all(w -> w isa Real && isfinite(w) && w > 0, widths) || throw(ArgumentError(
+        "slice widths must be positive and finite"))
+    max_doublings >= 0 || throw(ArgumentError("max_doublings must be nonnegative"))
+    return nothing
+end
+
+"""
+    coordinate_slice_step!(rng, state, k; width=10.0, max_doublings=20)
+
+Update coordinate `k` of a [`coordinate_state`](@ref) by one slice-sampling
+transition of its conditional (Neal 2003: stepping out by doubling, shrinkage
+and the acceptance test for doubled intervals), then move it with
+[`set_coordinate!`](@ref). The transition leaves the conditional of `k`, and
+so the joint law, invariant. `width` is the initial interval width and
+`max_doublings` bounds the stepping out; the defaults are those of the slice
+sampler in Pigeons.jl.
+
+`rng` is any random number generator accepted by `rand`. Returns the number of
+conditional density evaluations, including the one at the current value.
+"""
+function coordinate_slice_step!(rng, state::CoordinateState, k::Integer;
+        width::Real=10.0, max_doublings::Integer=20)
+    _check_slice_settings(width, max_doublings)
+    return _coordinate_slice_step!(rng, state, Int(k), Float64(width), Int(max_doublings))
+end
+
+function _coordinate_slice_step!(rng, state::CoordinateState, k::Int, w::Float64, p::Int)
+    checkbounds(state.position, k)
+    x0 = state.position[k]
+    f = z -> coordinate_logdensity(state, k, z)
+    fx0 = Float64(f(x0))
+    isfinite(fx0) || throw(ArgumentError(
+        "coordinate $k has a non-finite conditional log density at the current point"))
+    x1, evaluations = _slice_doubling(rng, f, x0, fx0, w, p)
+    set_coordinate!(state, k, x1)
+    return evaluations + 1
+end
+
+"""
+    coordinate_slice_sweep!(rng, state; width=10.0, max_doublings=20)
+
+One [`coordinate_slice_step!`](@ref) of every packed coordinate, in order.
+`width` is one width for all coordinates or a vector with one per coordinate.
+Returns the number of conditional density evaluations.
+"""
+function coordinate_slice_sweep!(rng, state::CoordinateState;
+        width::Union{Real,AbstractVector{<:Real}}=10.0, max_doublings::Integer=20)
+    _check_slice_settings(width, max_doublings)
+    width isa AbstractVector && length(width) != length(state.position) && throw(DimensionMismatch(
+        "one slice width per coordinate is needed"))
+    evaluations = 0
+    for k in eachindex(state.position)
+        evaluations += _coordinate_slice_step!(rng, state, k, _slice_width(width, k), Int(max_doublings))
+    end
+    return evaluations
+end
