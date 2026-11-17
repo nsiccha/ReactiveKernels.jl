@@ -90,6 +90,33 @@ function window_scan_native(a, values, firsts, seconds)
     total
 end
 
+# A window between ends known while tracing, of rows padded to different
+# lengths. `p` is the length of a mapped dense cell (an earlier plate's
+# vector cells of one length), so the range stays in the cell, as a model's
+# `x[(p + 1):(p + q)]` with `p`, `q` the lengths of fixed grids does: a slice
+# of static length, checked against each row's own length.
+@kernel fixed_window(a::Float64, rows::Vector{Vector{Float64}}) = begin
+    grids = plate(rows, Ref(a)) do x, a
+        [a, 2 * a]
+    end
+    totals = plate(rows, grids, Ref(a)) do x, g, a
+        p = length(g)
+        head = exp.(a .* x[1:p])
+        tail = exp.(a .* x[(p + 1):(p + 2)])
+        sum(head .* g) + 2 * sum(tail) + sum(x[(p + 1):p])
+    end
+    total = sum(totals)
+end
+function fixed_window_native(a, rows)
+    total = 0.0
+    for x in rows
+        g = [a, 2 * a]
+        p = length(g)
+        total += sum(exp.(a .* x[1:p]) .* g) + 2 * sum(exp.(a .* x[(p + 1):(p + 2)]))
+    end
+    total
+end
+
 # A window whose ends are unrelated integers: nothing bounds its length but
 # the vector itself.
 @kernel free_window(a::Float64, x::Vector{Float64}, lo::Int, hi::Int) = begin
@@ -143,6 +170,25 @@ free_window_native(a, x, lo, hi) = sum(exp.(a .* x[lo:hi]))
             @test got.grad ≈ derivative rtol = 1e-12 atol = 1e-12
         end
     end
+
+    fixed = jax_source(fixed_window; have = (:a, :rows), want = :total)
+    # The window is sliced in the cell, not gathered by a hoisted range.
+    @test occursin("_rk_check(", fixed.text) && occursin("range exceeds array bounds", fixed.text)
+    for rows in ([row(4), row(6), row(5)], [row(4)], [row(40), row(13)], Vector{Float64}[])
+        value = prepare(fixed_window; have = (:a, :rows), want = :total)(0.3, rows)
+        @test value ≈ fixed_window_native(0.3, rows)
+        derivative = Enzyme.autodiff(Enzyme.Reverse, fixed_window_native, Enzyme.Active,
+            Enzyme.Active(0.3), Enzyme.Const(rows))[1][1]
+        if rk_jax_available()
+            got = rk_jax_evaluate(fixed, :kernel, (0.3, rows); grad = true)
+            @test got.value ≈ value rtol = 1e-12 atol = 1e-12
+            @test got.grad ≈ derivative rtol = 1e-12 atol = 1e-12
+        end
+    end
+    # A row shorter than the window is Julia's `BoundsError`.
+    @test_throws BoundsError fixed_window_native(0.3, [row(4), row(3)])
+    rk_jax_available() && @test_throws "range exceeds array bounds" rk_jax_evaluate(
+        fixed, :kernel, (0.3, [row(4), row(3)]))
 
     free = jax_source(free_window; have = (:a, :x, :lo, :hi), want = :total)
     x = row(7)

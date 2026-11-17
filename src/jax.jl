@@ -1428,6 +1428,20 @@ function _jax_index_part(ctx::_JaxContext, x::_PyVal, dim::Int, index; target::B
                 i = _jax_window(ctx, x, lo, hi)
                 return (_py_infix("-", [i.code, "1"]), 1, i)
             end
+        elseif !target && ctx.host === nothing && !isempty(x.extent) &&
+               x.T isa Type && x.T <: AbstractVector{<:Number}
+            # Ends known while tracing, read from a padded vector: a slice of
+            # its static length. Within the vector's length it holds valid
+            # entries alone, and Julia refuses any other, so the slice is not
+            # padded: its positions are the static range's.
+            n = _jax_call(ctx, length, [x])
+            _jax_call(ctx, _runtime_check,
+                [_PyVal("jnp.logical_or(" * hi.code * " < " * lo.code * ", jnp.logical_and(" *
+                        lo.code * " >= 1, " * hi.code * " <= " * n.code * "))", Bool),
+                 _PyVal(repr("BoundsError: range exceeds array bounds"), BoundsError)])
+            return (_jax_minus_one(lo) * ":" * hi.code, 1,
+                    _PyVal("jnp.arange(" * lo.code * ", " * _jax_plus_one(hi) * ")",
+                           UnitRange{Int}, true))
         end
         return (_jax_minus_one(lo) * ":" * hi.code, 1, nothing)
     end
