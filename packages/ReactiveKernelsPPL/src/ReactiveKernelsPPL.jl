@@ -112,6 +112,7 @@ export prepare_predictive, PredictiveQuery, PredictiveLaws, predictive_laws, pre
 export prepare_discrete_latents, DiscreteLatentQuery, discrete_latents_node,
     discrete_latent_draws
 export restore_draws
+export prepare_gibbs, GibbsProblem, initialize_gibbs, gibbs_step!, gibbs_draws
 export prepare_smc, smc, initialize_smc, update_smc, smc_step, smc_checkpoint, resume_smc,
     rescore_smc_checkpoint
 export SMCReference, SMCOptions, SMCNonfiniteError, SMCDegeneracyError, rejuvenate_smc, pool_smc
@@ -175,6 +176,7 @@ include("cell_latent.jl")
 include("observed_scan.jl")
 include("marginalize.jl")
 include("marginalize_discrete.jl")
+include("gibbs.jl")
 include("marginalize_vector.jl")
 include("merged_observations.jl")
 include("chains.jl")

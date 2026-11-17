@@ -1,7 +1,7 @@
 name = "ReactiveKernelsPPL"
 uuid = "e266ea2a-6817-46cd-8bec-6238f0035f44"
 authors = ["Nikolas Siccha <nikolassiccha@gmail.com>"]
-version = "0.1.206"
+version = "0.1.207"
 
 [deps]
 Compat = "34da2185-b29b-5c13-b0c7-acf172513d20"
@@ -33,6 +33,7 @@ ReactiveKernelsPPLSMCExt = ["LogDensityProblems", "Random", "SequentialMonteCarl
 ReactiveKernelsPPLFilterExt = ["Distributions", "Random", "SequentialMonteCarlo"]
 ReactiveKernelsPPLLogDensityProblemsExt = "LogDensityProblems"
 ReactiveKernelsPPLWarmupHMCExt = ["WarmupHMC", "LogDensityProblems"]
+ReactiveKernelsPPLGibbsExt = ["WarmupHMC", "LogDensityProblems", "Random"]
 
 [sources]
 MutatingFunctions = {url = "https://github.com/nsiccha/MutatingFunctions.jl.git", rev = "02eb981b9770e767f47a7fda287fcbfb9531d587"}
@@ -82,6 +83,7 @@ SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 StatsFuns = "4c63d2b9-4356-54db-8cca-17b64c39e42c"
 TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+WarmupHMC = "60658175-6863-4866-a322-ab51a11c0cfe"
 
 [targets]
-test = ["CategoricalArrays", "DifferentiationInterface", "Distributions", "Enzyme", "InteractiveUtils", "LogDensityProblems", "Profile", "Random", "SHA", "Serialization", "SparseArrays", "StatsFuns", "Test", "TOML"]
+test = ["CategoricalArrays", "DifferentiationInterface", "Distributions", "Enzyme", "InteractiveUtils", "LogDensityProblems", "Profile", "Random", "SHA", "Serialization", "SparseArrays", "StatsFuns", "Test", "TOML", "WarmupHMC"]

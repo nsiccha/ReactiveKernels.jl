@@ -16,6 +16,7 @@ const _PPL_TEST_FILES = (
     "test_integer_parameters.jl",
     "test_integer_outputs.jl",
     "test_integer_structure.jl",
+    "test_gibbs.jl",
     "test_parameter_metadata.jl",
     "test_host_transform_numbers.jl",
     "test_preprocessing.jl",
