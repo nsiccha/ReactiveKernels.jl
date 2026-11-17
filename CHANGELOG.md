@@ -16,6 +16,16 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.300
+
+- `js_source` translates one element of a range: `r[i]`, `r[begin]` and
+  `r[end]` (so `lastindex(r)`) for `a:b`, `a:s:b` and a vector's index range
+  (`eachindex(x)`, `axes(x, 1)`). The element is computed from the range's
+  ends, without building the window it selects, and a position outside the
+  range is Julia's `BoundsError` with Julia's message. Before, each of these
+  raised `JSEmissionError`, and a helper had to slice first (`x[r][1]`), which
+  copies the window and also checks its far end.
+
 ## 0.1.299
 
 - `jax_source`: a `map` do-block whose elements are numerical arrays of one

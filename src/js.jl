@@ -536,6 +536,21 @@ function _rk_steprange(start, step, stop) {
   }
   return { start, step, stop: last };
 }""", [:JuliaError]),
+    # `r[i]`: Julia's bounds check, then the element. `type` is the range's
+    # Julia type, which the error names.
+    :_rk_range_at => ("""
+function _rk_range_at(start, stop, i, type) {
+  if (!(Number.isInteger(i) && i >= 1 && i <= stop - start + 1))
+    throw new JuliaError("BoundsError", "attempt to access " + (stop - start + 1) + "-element " + type + " at index [" + i + "]");
+  return start + i - 1;
+}""", [:JuliaError]),
+    :_rk_steprange_at => ("""
+function _rk_steprange_at(r, i, type) {
+  const n = r.start !== r.stop && (r.step > 0) !== (r.stop > r.start) ? 0 : (r.stop - r.start) / r.step + 1;
+  if (!(Number.isInteger(i) && i >= 1 && i <= n))
+    throw new JuliaError("BoundsError", "attempt to access " + n + "-element " + type + " at index [" + i + "]");
+  return r.start + (i - 1) * r.step;
+}""", [:JuliaError]),
     :_rk_number => ("""
 function _rk_number(name, x, integer) {
   if (typeof x !== "number" || (integer && !Number.isInteger(x)))
@@ -651,7 +666,8 @@ _js_isvector(v) = _js_isvector_type(_js_type(v))
 # also accept nested vectors, whose entries remain arrays (possibly ragged).
 _js_isflatvector(v) = _js_isvector(v) && eltype(_js_type(v)) <: _JsMatrixElement
 _js_isrange(v) = _js_type(v) in (UnitRange{Int64}, Base.OneTo{Int64})
-# A stepped range (`n:-1:1`): iterated, measured and read at its ends only.
+# A stepped range (`n:-1:1`): iterated, measured and read at its ends or at a
+# position (`r[i]`).
 _js_isstep(v) = _js_type(v) === StepRange{Int64,Int64}
 _js_istuple(v) = v isa _JsTuple || (v isa _JsVal && (v.static ? v.value isa Tuple : v.T <: Tuple))
 _js_tuple_length(v::_JsTuple) = length(v.items)
@@ -2220,6 +2236,27 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
         r = args[1]
         r isa _JsVal && r.static && return _js_static(f(r.value))
         return _js_rt(_js_code(mod, r, _JS_ATOM) * (f === first ? ".start" : ".stop"), Int64)
+    elseif f === getindex && length(args) == 2 && (_js_isrange(args[1]) || _js_isstep(args[1])) &&
+           _js_isint(args[2])
+        # `r[i]`: the element at a position, after Julia's bounds check. A
+        # range and a position both known while translating give the number.
+        r, i = args[1], args[2]
+        if r isa _JsVal && r.static && i isa _JsVal && i.static
+            element = try
+                _js_static(r.value[i.value])
+            catch
+                nothing
+            end
+            element === nothing || return element
+        end
+        type = _js_static(string(_js_type(r)))
+        _js_isstep(r) && return _js_fcall(ir, _js_use!(mod, :_rk_steprange_at), Any[r, i, type], Int64)
+        r = _js_range!(ir, r)
+        return _js_rt(_js_use!(mod, :_rk_range_at) * "(" * _js_range_start(r) * ", " * _js_range_stop(r) * ", " *
+                      _js_runtime(mod, i).code * ", " * _js_runtime(mod, type).code * ")", Int64)
+    elseif f === lastindex && length(args) == 1 && (_js_isrange(args[1]) || _js_isstep(args[1]))
+        # `r[end]`: a range's last position is its length.
+        return _js_call!(ir, length, Any[args[1]], Int64)
     elseif f === Base.Broadcast.broadcasted || f === _native_broadcasted
         return _js_broadcasted(ir, f, args, T)
     elseif f === Base.broadcast_preserving_zero_d && length(args) >= 2
@@ -2953,6 +2990,8 @@ matrices; `sum`/`prod`/`maximum`/`minimum` of a matrix, whole or with
 `m[i, j] = x`, `m[:, j] = v`, `m[i, :] = v`; `diag`; slices `view(m, :, j)`
 and `view(m, i, :)` read in place; and broadcasts over matrices, columns and
 rows with Julia's shape rules; `m[indices, j]` gathers a column's indexed rows.
+A range (`a:b`, `a:s:b`, `eachindex(x)`) is read at a position (`r[i]`,
+`r[begin]`, `r[end]`) with Julia's bounds check.
 `reshape(vector, rows, cols)`, including a vector view, shares
 storage with the parent. Its dimensions must be nonnegative: Julia can
 construct a `ReshapedArray` view with negative axes, which JavaScript's
