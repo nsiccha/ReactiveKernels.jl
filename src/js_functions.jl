@@ -25,7 +25,7 @@
 
 const _JS_FIX2_COMPARISONS = (==, !=, <, <=, >, >=, isequal)
 
-_js_findsource(v) = (_js_isvector(v) && !(v isa _JsVal && v.static)) || _js_isrange(v)
+_js_findsource(v) = (_js_isanyvector(v) && !(v isa _JsVal && v.static)) || _js_isrange(v)
 _js_elementtype(v) = _js_isrange(v) ? Int64 : eltype(_js_type(v))
 _js_callable_name(g) = g isa _JsStruct ? g.T : g
 
@@ -156,7 +156,7 @@ function _js_functions_call(ir::_JsIR, f, args, T)
     elseif f in (sum, maximum, minimum) && n == 2 && _js_findsource(args[2]) &&
            (args[1] isa _JsStruct || (args[1] isa _JsVal && args[1].static && args[1].value isa Base.Callable))
         return _js_mapreduce!(ir, f, _js_stagefn(args[1]), args[2], T)
-    elseif f === getindex && n == 2 && _js_isvector(args[1]) && !(args[1] isa _JsVal && args[1].static) &&
+    elseif f === getindex && n == 2 && _js_isanyvector(args[1]) && !(args[1] isa _JsVal && args[1].static) &&
            _js_isrange(args[2]) && T === _js_type(args[1])
         # `x[a:b]`: a new vector holding the window, its bounds checked first
         x, r = _js_simple!(ir, args[1], "x"), _js_range!(ir, args[2])
@@ -170,7 +170,7 @@ function _js_functions_call(ir::_JsIR, f, args, T)
         start = _js_range_start(r)
         return _js_rt("Array.from({ length: " * _js_range_length(r) * " }, (_, i) => " *
                       (start == "0" ? "i" : start * " + i") * ")", T; pure = false)
-    elseif f === collect && n == 1 && _js_isvector(args[1]) && T === _js_type(args[1])
+    elseif f === collect && n == 1 && _js_isanyvector(args[1]) && T === _js_type(args[1])
         return _js_rt(_js_code(mod, args[1], _JS_ATOM) * ".slice()", T; pure = false)
     elseif f === merge && n >= 1 && all(a -> _js_concrete_namedtuple(_js_type(a)), args) &&
            _js_concrete_namedtuple(T)
