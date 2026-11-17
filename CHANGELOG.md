@@ -16,6 +16,25 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.304
+
+- A device JAX helper's write to its array argument now also reaches the
+  caller from inside a `for` or `while` loop, an `if` arm, or the right side
+  of a `&&` or `||`, where the construct does not itself assign that local
+  (`for i in eachindex(t); result[i] = step!(cells, weights); end`): the
+  construct carries the local, as it carries one it assigns. A loop or
+  branch carries each outer local its body passes to a function whose
+  `@traceable` source may write that argument, by index or through a
+  helper it calls. Before, these calls raised `JAXEmissionError`.
+- **Fix:** the right side of a `&&` or `||` whose value is used ran
+  unconditionally in JAX when it rebound a local, by an index write or a
+  helper's write to its array argument (`t = x > 0 && step!(w, x) > 0`), so
+  the module wrote `w` where Julia skips the right side, a different value
+  and gradient. It now runs only where Julia's does.
+- A write the emitter cannot see before translating the loop or branch (a
+  helper called through a name bound inside its body, a provider's source)
+  still raises `JAXEmissionError`.
+
 ## 0.1.303
 
 - JAX source translates a splatted tuple or named tuple in a tuple literal

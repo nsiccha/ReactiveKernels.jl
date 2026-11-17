@@ -351,6 +351,8 @@ const _JAX_RESERVED = Set{String}(split("""
 # stable rewrites find that value's definition (`_jax_stable_definition`).
 # `flat_positions` maps a ragged value's lengths expression to the flat
 # positions of the prepared input it has them from (`_jax_flat_positions`).
+# `carried` names the outer locals a branch arm's body leaves through its
+# branch (`_jax_if`), which a helper's writeback may rebind there.
 mutable struct _JaxScope
     lines::Vector{String}
     indent::Int
@@ -361,12 +363,14 @@ mutable struct _JaxScope
     hints::Dict{ValueId,Symbol}
     named_hints::Dict{Symbol,Symbol}
     flat_positions::Dict{String,String}
+    carried::Set{Symbol}
 end
 _JaxScope(parent::Union{Nothing,_JaxScope} = nothing) =
     _JaxScope(String[], 1, parent === nothing ? Set{String}() : copy(parent.used),
               Dict{ValueId,_PyVal}(), parent, Dict{ValueId,Any}(), Dict{ValueId,Symbol}(),
               parent === nothing ? Dict{Symbol,Symbol}() : parent.named_hints,
-              parent === nothing ? Dict{String,String}() : copy(parent.flat_positions))
+              parent === nothing ? Dict{String,String}() : copy(parent.flat_positions),
+              Set{Symbol}())
 # The `flat_positions` entry of the lengths of cells that each fill their stored
 # rows: a plate's cells returning vectors whose length the cell's own expression
 # fixes (`vcat(a, b)` of scalars), or matrices of a fixed shape. Every stored
@@ -1539,6 +1543,15 @@ end
 function _jax_short_circuit(ctx::_JaxContext, ex, is_or::Bool)
     ctx.host === nothing || return _host_short_circuit(ctx, ex, is_or)
     a = _jax_lane_decision(ctx, ex)
+    # A right side that rebinds an outer local (an assignment, or a helper's
+    # writeback, `_jax_carried_names!`) runs only where Julia's does: it is
+    # the `if` it means, whose branch carries the local out, as a statement
+    # `a && b` is (`_jax_effect`).
+    if any(n -> haskey(ctx.locals, n), _jax_carried_names!(ctx, Set{Symbol}(), ex.args[2]))
+        condition = a === nothing ? ex.args[1] : a.code == "True"
+        return _jax_if(ctx, is_or ? Expr(:if, condition, true, ex.args[2]) :
+                                    Expr(:if, condition, ex.args[2], false), true)
+    end
     a === nothing && (a = _jax_expr(ctx, ex.args[1]))
     if a.static
         rest = () -> _jax_expr(ctx, ex.args[2])
@@ -2008,8 +2021,7 @@ function _jax_expr(ctx::_JaxContext, ::Val{:while}, ex)
     exited = _jax_break_loop(ctx, ex)
     exited === nothing || return exited
     condition_ex = ex.args[1]
-    assigned = Set{Symbol}()
-    _jax_assigned_names!(assigned, body)
+    assigned = _jax_carried_names!(ctx, Set{Symbol}(), body)
     _jax_slot_aliases!(ctx, assigned)
     carried = sort!([n for n in assigned if haskey(ctx.locals, n)])
     isempty(carried) && _jax_error("a `while` loop that assigns no outer local", _jax_where(ctx))
@@ -2084,7 +2096,7 @@ function _jax_counted_while(ctx::_JaxContext, ex)
     step = statements[last]
     step == :($i = $i + 1) || step == :($i += 1) || return nothing
     assigned = Set{Symbol}()
-    foreach(st -> _jax_assigned_names!(assigned, st), statements[1:last-1])
+    foreach(st -> _jax_carried_names!(ctx, assigned, st), statements[1:last-1])
     i in assigned && return nothing
     # A body that changes the limit is not counted: the `while` reads it at
     # every step, a range only once.
@@ -2114,7 +2126,7 @@ end
 # the padding every padded value holds (`_jax_repeat_last_valid`).
 function _jax_padded_for(ctx::_JaxContext, var, body, lo::_PyVal, hi::_PyVal)
     targets = _jax_loop_targets(var)
-    carried = [n for n in _jax_assigned_names!(Set{Symbol}(), body)
+    carried = [n for n in _jax_carried_names!(ctx, Set{Symbol}(), body)
                if !(n in targets) && haskey(ctx.locals, n)]
     result = _jax_stepped_for(ctx, var, body, lo, hi, _jax_trip_bound(ctx, lo, hi))
     for n in carried
@@ -2180,8 +2192,7 @@ function _jax_range_for(ctx::_JaxContext, var, body, lo::_PyVal, hi::_PyVal)
     _jax_padded_stop(lo, hi) && return _jax_padded_for(ctx, var, body, lo, hi)
     lo, hi, _, steps = _jax_loop_range(ctx, lo, hi; dynamic = true)
     isempty(steps) || return _jax_stepped_for(ctx, var, body, lo, hi, steps)
-    assigned = Set{Symbol}()
-    _jax_assigned_names!(assigned, body)
+    assigned = _jax_carried_names!(ctx, Set{Symbol}(), body)
     _jax_slot_aliases!(ctx, assigned)
     targets = _jax_loop_targets(var)
     carried = sort!([n for n in assigned if haskey(ctx.locals, n) && !(n in targets)])
@@ -2394,8 +2405,7 @@ end
 # inputs through `stop_gradient`, so a non-finite value there reaches neither.
 function _jax_stepped_for(ctx::_JaxContext, var, body, lo::_PyVal, hi::_PyVal,
                           steps::AbstractString)
-    assigned = Set{Symbol}()
-    _jax_assigned_names!(assigned, body)
+    assigned = _jax_carried_names!(ctx, Set{Symbol}(), body)
     _jax_slot_aliases!(ctx, assigned)
     targets = _jax_loop_targets(var)
     carried = sort!([n for n in assigned if haskey(ctx.locals, n) && !(n in targets)])
@@ -2509,6 +2519,115 @@ function _jax_assigned_target!(names::Set{Symbol}, target)
     target isa Expr && target.head === :tuple &&
         foreach(t -> _jax_assigned_target!(names, t), _jax_target_parts(target))
     names
+end
+
+# The locals a loop body or branch arm `ex` rebinds, which leave the construct
+# through its carry: those it assigns (`_jax_assigned_names!`), and each local
+# it passes to a helper that may write that argument in place, which the
+# call's writeback rebinds (`_jax_writeback!`). A helper is read whatever
+# argument types select it (`_jax_may_write`), so the set may name a local
+# that a call leaves unchanged; carrying that local keeps its value.
+function _jax_carried_names!(ctx::_JaxContext, names::Set{Symbol}, ex)
+    _jax_assigned_names!(names, ex)
+    _jax_argument_writes!(names, ex, s -> haskey(ctx.locals, s),
+                          head -> _jax_call_callee(ctx, head), Dict{Tuple{Any,Int},Bool}())
+end
+# Adds to `names` each name `candidate` accepts that `ex` passes as a
+# positional argument to a call that may write that argument in place
+# (`_jax_may_write`); `callee` resolves a call's head, `nothing` when it is
+# not known before translation. An anonymous function's body keeps its own,
+# as for `_jax_assigned_names!`, and a splatted call's positions are not its
+# expressions'.
+function _jax_argument_writes!(names::Set{Symbol}, ex, candidate, callee, memo)
+    ex isa Expr || return names
+    ex.head in (:quote, :inert, :->, :function) && return names
+    if ex.head === :call && !any(a -> a isa Expr && a.head === :..., ex.args)
+        positional = Any[a for a in ex.args[2:end]
+                         if !(a isa Expr && a.head in (:parameters, :kw))]
+        written = [k for (k, a) in enumerate(positional)
+                   if a isa Symbol && !(a in names) && candidate(a)]
+        f = isempty(written) ? nothing : callee(ex.args[1])
+        if f !== nothing
+            for k in written
+                _jax_may_write(f, k, memo) && push!(names, positional[k])
+            end
+        end
+    end
+    foreach(a -> _jax_argument_writes!(names, a, candidate, callee, memo), ex.args)
+    names
+end
+# The function a call's head names before translation: a local's singleton
+# function value, a capture, or a global of the source's module.
+function _jax_call_callee(ctx::_JaxContext, head)
+    if head isa Symbol && _jax_has_local(ctx, head)
+        T = ctx.locals[head].T
+        return T isa _JaxCallable ? T.f :
+            T isa Type && T <: Function && Base.issingletontype(T) ? T.instance : nothing
+    end
+    head isa Symbol && ctx.captures isa NamedTuple && haskey(ctx.captures, head) &&
+        return getfield(ctx.captures, head)
+    _jax_static_callee(ctx.source_module, head, ())
+end
+# The global a call's head names in module `mod`: `nothing` for a name in
+# `shadowed` (a local of the source) or one the module does not define.
+function _jax_static_callee(mod::Module, head, shadowed)
+    head isa QuoteNode && return head.value
+    head isa GlobalRef && return isdefined(head.mod, head.name) ? getglobal(head.mod, head.name) : nothing
+    head isa Symbol && return head in shadowed || !isdefined(mod, head) ? nothing : getglobal(mod, head)
+    if head isa Expr && head.head === :. && length(head.args) == 2 && head.args[2] isa QuoteNode
+        owner = _jax_static_callee(mod, head.args[1], shadowed)
+        name = head.args[2].value
+        owner isa Module && name isa Symbol && isdefined(owner, name) && return getglobal(owner, name)
+    end
+    nothing
+end
+# Whether a recorded source of `f` (`_jax_recorded_sources`) may write its
+# `k`th positional argument in place: by index (`w[i] = v`, `w[i] += v`), or
+# by passing it on to a callee that may. `memo` holds each `(typeof(f), k)`
+# decided, `false` while deciding it (a recursive call adds no write).
+function _jax_may_write(f, k::Int, memo::Dict{Tuple{Any,Int},Bool})
+    key = (typeof(f), k)
+    haskey(memo, key) && return memo[key]
+    memo[key] = false
+    written = any(_jax_recorded_sources(f)) do record
+        names, body, mod = record[1], record[2], record[3]
+        vararg = record[6] === true
+        trailing = vararg && k >= length(names)
+        trailing || k <= length(names) - vararg || return false
+        formal = names[trailing ? end : k]
+        rebound, inplace = Set{Symbol}(), Set{Symbol}()
+        _jax_write_targets!(rebound, inplace, body)
+        formal in inplace && return true
+        # The trailing arguments' tuple is passed on only as a whole.
+        trailing && return false
+        shadowed = union(Set{Symbol}(names), rebound)
+        formal in _jax_argument_writes!(Set{Symbol}(), body, ==(formal),
+                                        head -> _jax_static_callee(mod, head, shadowed), memo)
+    end
+    memo[key] = written
+end
+# Each recorded `@traceable` source of `f` (`_traceable_source`, and
+# `_traceable_keyword_source` for a method with keywords), whatever argument
+# types select it. Only a record's constant part (its formal names, body and
+# module) is read, so each registry method is called with `Union{}` for every
+# argument type it matches.
+function _jax_recorded_sources(f)
+    f isa Type && return ()
+    records = Tuple[]
+    for registry in (_traceable_source, _traceable_keyword_source)
+        for m in methods(registry, Tuple{Type{typeof(f)},Vararg{Any}})
+            signature = Base.unwrap_unionall(m.sig)
+            length(signature.parameters) >= 2 && signature.parameters[2] == Type{typeof(f)} ||
+                continue
+            last = signature.parameters[end]
+            fixed = length(signature.parameters) - 2 - Base.isvarargtype(last)
+            count = Base.isvarargtype(last) && isdefined(last, :N) && last.N isa Int ? last.N : 0
+            record = Base.invoke(registry, Base.tuple_type_tail(m.sig), typeof(f),
+                                 ntuple(_ -> Union{}, fixed + count)...)
+            record isa Tuple && length(record) >= 6 && push!(records, record)
+        end
+    end
+    records
 end
 # `(; a, b)`, a target that binds each name to the field of that name.
 _jax_property_destructuring(lhs) = lhs isa Expr && lhs.head === :tuple && length(lhs.args) == 1 &&
@@ -2683,13 +2802,18 @@ function _jax_if(ctx::_JaxContext, ex, value::Bool)
     # Outer locals an arm assigns leave the branch with it: each arm returns
     # its value followed by those locals, and the branch rebinds them.
     assigned = Set{Symbol}()
-    foreach(a -> _jax_assigned_names!(assigned, a), ex.args[2:end])
+    foreach(a -> _jax_carried_names!(ctx, assigned, a), ex.args[2:end])
     _jax_slot_aliases!(ctx, assigned)
     carried = sort!([n for n in assigned if haskey(ctx.locals, n)])
     isempty(carried) && return _jax_conditional(ctx, condition,
         () -> translate(ex.args[2]), () -> translate(otherwise))
     before = Dict(n => ctx.locals[n] for n in carried)
+    outer = ctx.scope
     arm(body) = () -> begin
+        # An arm translated in its own scope (`_jax_arm_function`) leaves the
+        # carried locals through the branch, a helper's writeback included
+        # (`_jax_writeback_reaches`).
+        ctx.scope === outer || union!(ctx.scope.carried, carried)
         v = translate(body)
         # An arm that throws carries nothing out: the branch is the other arm.
         v.T === Union{} && return v
@@ -6423,10 +6547,12 @@ function _jax_writeback!(ctx::_JaxContext, f, param, argument, final::_PyVal)
                        "receives; later reads of `", s, "` would not see the write in JAX. Pass a ",
                        "local copy (`copy(", s, ")`) instead", _jax_where(ctx))
         l = ctx.locals[s]
-        _jax_writeback_reaches(ctx, frame, l) ||
+        _jax_writeback_reaches(ctx, frame, s, l) ||
             _jax_error("the helper `", f, "` writes its argument `", s, "` in place inside a ",
-                       "loop or branch that does not assign `", s, "`; its caller writeback has ",
-                       "no JAX translation there", _jax_where(ctx))
+                       "loop or branch that does not carry `", s, "`: neither assigns it nor ",
+                       "names a function before translation whose `@traceable` source writes it ",
+                       "(`_jax_carried_names!`); its caller writeback has no JAX translation ",
+                       "there", _jax_where(ctx))
         name = _jax_fresh(ctx, s)
         _jax_emit!(ctx, name * " = " * final.code)
         ctx.locals[s] = _PyVal(name, l.T, false, l.extent, l.limit, l.padded, nothing,
@@ -6443,13 +6569,16 @@ function _jax_writeback!(ctx::_JaxContext, f, param, argument, final::_PyVal)
                "translation takes a local name or a new array (`copy(x)`) there, as Julia ",
                "writes the caller's value, which another expression may share", _jax_where(ctx))
 end
-# A rebinding inside a loop body or branch arm reaches the code after it only
-# through that construct's carry: the local's value must be bound in the
-# current scope (a carried name, or one bound there), not an enclosing one.
-function _jax_writeback_reaches(ctx::_JaxContext, frame, l::_PyVal)
+# A rebinding of `s` (now `l`) inside a loop body or branch arm reaches the
+# code after it only through that construct's carry (`_jax_carried_names!`):
+# the local's value must be bound in the current scope (a loop's carried
+# name, or one bound there), not an enclosing one, or the scope is a branch
+# arm that carries `s` out (`_JaxScope`'s `carried`).
+function _jax_writeback_reaches(ctx::_JaxContext, frame, s::Symbol, l::_PyVal)
     frame !== nothing && ctx.scope === frame.scope && return true
     parent = ctx.scope.parent
     parent === nothing && return true
+    s in ctx.scope.carried && return true
     m = match(r"^[A-Za-z_][A-Za-z0-9_]*", l.code)
     m !== nothing && !(m.match in parent.used)
 end

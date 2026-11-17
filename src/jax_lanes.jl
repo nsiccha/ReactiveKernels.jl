@@ -188,13 +188,17 @@ function _jax_lane_points!(points, r::Recipe, cg::Graph, port_of::Dict{ValueId,I
     ports = Int[get(port_of, canon_id(cg, v.id), 0) for v in r.inputs]
     data = Set{Symbol}(n for (n, p) in zip(names, ports) if p in data_ports)
     isempty(data) && return points
-    # A name an arm reassigns is not the input it names everywhere.
-    assigned = Set{Symbol}()
-    _jax_assigned_names!(assigned, r.source)
-    setdiff!(data, assigned)
     mod = _jax_source_module(r.op)
     captures = _jax_source_captures(r.op)
     allnames = Set{Symbol}(names)
+    # A name an arm reassigns, or passes to a helper that may write it in
+    # place (`_jax_argument_writes!`), is not the input it names everywhere.
+    assigned = _jax_assigned_names!(Set{Symbol}(), r.source)
+    local_names = union(allnames, assigned)
+    _jax_argument_writes!(assigned, r.source, in(data),
+                          head -> _jax_static_callee(mod, head, local_names),
+                          Dict{Tuple{Any,Int},Bool}())
+    setdiff!(data, assigned)
     f = getfield(r.op, :f)
     plan_arms = f isa _KernelBranch ? (f.then_spec isa Plan, f.else_spec isa Plan) : (false, false)
     function visit(ex, top::Bool)
