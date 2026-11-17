@@ -432,10 +432,12 @@ Compose model programs over shared submodel blocks (StanBlocks `Base.merge`
 analogue). Each form returns a NEW model; the base (AST and fixed dict) is
 unchanged.
 
-Statement splice: `override` is one `~` / `.~` / `name = ...` statement or a
-`quote ... end` block of them. An override whose bare LHS names a base
-top-level statement replaces it in place; a fresh LHS appends (completing an
-incomplete base). A submodel use-site is a statement, so merge rewrites which
+Statement splice: `override` is one `~` / `.~` / `name = ...` statement, a
+top-level `@plate` / `@scan` block, or a `quote ... end` block of them. An
+override whose LHS names a base top-level statement replaces it in place; a
+statement whose LHS names no base statement appends (completing or extending
+the base), bare or sized alike (`z[1:N] .~ Normal.(0, 1)`). A `@plate` /
+`@scan` block always appends. A submodel use-site is a statement, so merge rewrites which
 shared block a program calls (`y ~ stream_a(...)` to `y ~ stream_b(...)`)
 without forking the shared def. Multi-part calls fold left, so fix-vs-splice
 conflicts resolve to the LATER part (write the fix last).
@@ -450,11 +452,13 @@ Sized left-hand sides match their complete declaration, including its axes.
 A bare name replaces the whole declaration. Scoped names use author paths
 (`z.w.tau`); keyword pins use `var"z.w.tau" = value`. `merge(submodel, …)`
 derives a reusable variant, including replacements and pins in nested calls.
-Partial array writes, duplicate matches, and unknown pins fail explicitly.
+Partial array writes, duplicate matches, and unknown pins fail explicitly;
+an indexed assignment (`c[1] = 2`) writes an element and never declares one.
 Joint responses match their whole vector left-hand side; pins must supply
 every member. Members cannot be rewritten separately;
-`@plate` / `@scan` cells are invisible to the top-level matcher, so a
-colliding append fails at lowering through the single-assignment gate.
+`@plate` / `@scan` cells are invisible to the top-level matcher, so an
+appended block or statement that binds a name the other already binds fails
+at lowering through the single-assignment gate, as in a hand-written model.
 """
 function Base.merge(m::RKPPLModel, override::Expr)
     out = Any[a for a in m.ast.args]
@@ -462,6 +466,8 @@ function Base.merge(m::RKPPLModel, override::Expr)
     rewrites = copy(m.rewrites)
     fixed = copy(m.fixed)
     for raw in _merge_override_stmts(override)
+        # A top-level block binds its own names; lowering owns its gates.
+        _is_block_macro(raw) && (push!(out, raw); continue)
         idx, dups, blocked = _merge_base_index(out)
         st = _merge_unwrap_override(raw)
         lhs = _merge_override_lhs(st)
@@ -492,7 +498,12 @@ function Base.merge(m::RKPPLModel, override::Expr)
             _merge_check_lhs(lhs, _stmt_lhs(_merge_unwrap_override(out[idx[nm]])))
             out[idx[nm]] = raw
         else
-            lhs isa Symbol || _sfail("merge indexed override `$lhs` matches no declaration")
+            # A fresh sized or indexed `~` / `.~` declares `nm`, as it would
+            # hand-written; an indexed assignment would only write an element.
+            (lhs isa Symbol || _is_sample(st) || _is_broadcast_sample(st)) ||
+                _sfail("merge override `$lhs = …` writes an element of `$nm`, " *
+                       "which no statement declares; declare `$nm` with `~` / " *
+                       "`.~`, or define it whole (`$nm = …`)")
             push!(out, raw)
         end
         delete!(fixed, nm)

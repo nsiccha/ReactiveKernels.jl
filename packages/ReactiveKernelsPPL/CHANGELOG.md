@@ -16,6 +16,19 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.208
+
+- `merge(model, override)` appends any statement whose left-hand side names
+  nothing in the model, whatever its shape: a fresh sized or indexed
+  declaration (`z[1:N] .~ Normal.(0, 1)`, `b[1:K] ~ MvNormal(…)`,
+  `eachrow(B[a, b]) .~ …`) and a top-level `@plate` / `@scan` block, which
+  0.1.207 refused with `merge indexed override … matches no declaration` and
+  `merge override … is not a splicing statement`. The merged model lowers
+  exactly as the hand-written one with the statement appended; a name the
+  appended block shares with another statement fails at lowering through the
+  single-assignment gate. An indexed assignment to an undeclared name
+  (`c[1] = 2`) still fails, now naming the element write.
+
 ## 0.1.207
 
 - `prepare_gibbs` derives exact finite conditionals for explicit scalar
