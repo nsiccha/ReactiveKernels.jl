@@ -2088,6 +2088,22 @@ function _jax_expr(ctx::_JaxContext, ::Val{:typed_comprehension}, ex)
            v.static, v.extent, v.limit, v.padded)
 end
 
+# A loop's carried value `k` after the loop. An array padded past its
+# length (a data-sized allocation the loop fills, under any name for that
+# length) leaves the loop with its padding repeating its last valid entry
+# (`_jax_repeat_last_valid`), as a padded input's does. An entry past the
+# length is not Julia's, so values are unchanged; but an allocation's zeros
+# there would meet functions with no finite derivative at zero (`sqrt`,
+# `log`), and a masked reduction's zero cotangent times that derivative is
+# NaN in a reverse-mode gradient.
+function _jax_loop_carried(ctx::_JaxContext, result::AbstractString, k::Int, v::_PyVal)
+    carried = _PyVal(result * "[" * string(k - 1) * "]", v.T, false, v.extent, v.limit,
+                     v.padded, _jax_carried_origin(v))
+    ctx.host === nothing && _jax_is_array(v.T) && !_jax_ragged(v.T) && !isempty(v.extent) ||
+        return carried
+    _jax_repeat_last_valid(ctx, carried)
+end
+
 # A `while` loop: `jax.lax.while_loop` over the outer locals the body assigns.
 # JAX differentiates it forward only; `jax.grad` through it raises JAX's own
 # error, so a differentiated program writes the loop as a `for` over a range.
@@ -2200,21 +2216,11 @@ end
 # limit: lazy branches that do not run the body past `hi` (CONTRIBUTING.md,
 # "Lazy branches"), so a value the body would compute at a step Julia never
 # runs reaches neither the result nor `jax.grad`. Those steps keep the whole
-# carry, so an array padded by `hi` keeps its entries past `hi` as they
+# carry, so a padded array keeps its entries past its length as they
 # entered; afterwards each such slot repeats the array's last valid entry,
-# the padding every padded value holds (`_jax_repeat_last_valid`).
-function _jax_padded_for(ctx::_JaxContext, var, body, lo::_PyVal, hi::_PyVal)
-    targets = _jax_loop_targets(var)
-    carried = [n for n in _jax_carried_names!(ctx, Set{Symbol}(), body)
-               if !(n in targets) && haskey(ctx.locals, n)]
-    result = _jax_stepped_for(ctx, var, body, lo, hi, _jax_trip_bound(ctx, lo, hi))
-    for n in carried
-        v = ctx.locals[n]
-        _jax_is_array(v.T) && v.extent == hi.code || continue
-        ctx.locals[n] = _jax_repeat_last_valid(ctx, v)
-    end
-    result
-end
+# the padding every padded value holds (`_jax_loop_carried`).
+_jax_padded_for(ctx::_JaxContext, var, body, lo::_PyVal, hi::_PyVal) =
+    _jax_stepped_for(ctx, var, body, lo, hi, _jax_trip_bound(ctx, lo, hi))
 # `x`, a padded array, with each slot past its extent along its padded axes
 # holding the last valid entry along that axis (the first, when there is
 # none): the padding a padded value holds (`_PyVal`'s `extent`). An array
@@ -2312,8 +2318,7 @@ function _jax_range_for(ctx::_JaxContext, var, body, lo::_PyVal, hi::_PyVal)
     _jax_emit_unless_empty!(ctx, result, "jax.lax.fori_loop(" * lo.code * ", " * _jax_plus_one(hi) *
                             ", " * fname * ", " * init * ")", init, nonempty)
     for (k, (n, v)) in enumerate(zip(carried, initial))
-        ctx.locals[n] = _PyVal(result * "[" * string(k - 1) * "]", v.T, false, v.extent, v.limit,
-                               v.padded, _jax_carried_origin(v))
+        ctx.locals[n] = _jax_loop_carried(ctx, result, k, v)
     end
     _PyVal("None", Nothing, true)
 end
@@ -2548,8 +2553,7 @@ function _jax_stepped_for(ctx::_JaxContext, var, body, lo::_PyVal, hi::_PyVal,
     _jax_emit_unless_empty!(ctx, result, "jax.lax.fori_loop(0, " * steps * ", " * fname * ", " *
                             init * ")", init, nonempty)
     for (k, (n, v)) in enumerate(zip(carried, initial))
-        ctx.locals[n] = _PyVal(result * "[" * string(k - 1) * "]", v.T, false, v.extent, v.limit,
-                               v.padded, _jax_carried_origin(v))
+        ctx.locals[n] = _jax_loop_carried(ctx, result, k, v)
     end
     _PyVal("None", Nothing, true)
 end
