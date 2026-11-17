@@ -62,6 +62,18 @@ end
     end
     return total + value
 end
+# A loop over the rows that exits early.
+@traceable function mapped_row_break(records)
+    rows = map(vec(records)) do record
+        record.nested.y
+    end
+    total = 0.0
+    for value in rows
+        total > 1.0 && break
+        total += sum(value)
+    end
+    return total
+end
 # Per-record sums of a padded field: each record keeps its own length.
 @traceable function mapped_field_sums(records)
     totals = map(vec(records)) do record
@@ -98,7 +110,8 @@ end
 end
 
 for (name, helper) in ((:jax_mapped_nested, :mapped_nested), (:jax_mapped_direct, :mapped_direct),
-                       (:jax_mapped_row_reads, :mapped_row_reads), (:jax_mapped_row_loop, :mapped_row_loop))
+                       (:jax_mapped_row_reads, :mapped_row_reads), (:jax_mapped_row_loop, :mapped_row_loop),
+                       (:jax_mapped_row_break, :mapped_row_break))
     @eval @kernel $name(x::Float64, indices::Vector{Int}, y::Vector{Float64}) = begin
         records = plate(indices, x, Ref(y)) do i, s, ys
             (; nested = (; y = ys .* (s + i)))
@@ -167,6 +180,7 @@ end
     nonempty = [([1, 2, 3], [0.2, 0.7]), ([4, 1], [0.3, -0.1, 1.5, 2.0]), ([2, 2], [0.5])]
     jax_mapped_parity(jax_mapped_row_reads, (:x, :indices, :y), nonempty)
     jax_mapped_parity(jax_mapped_row_loop, (:x, :indices, :y), [nonempty; ([1, 2], Float64[])])
+    jax_mapped_parity(jax_mapped_row_break, (:x, :indices, :y), [nonempty; ([1, 2], Float64[])])
     jax_mapped_parity(jax_mapped_cell_sum, (:x, :indices, :y), nonempty)
     # Rows of one length per dataset, padded as ragged data.
     jax_mapped_parity(jax_mapped_padded_nested, (:x, :rows),
