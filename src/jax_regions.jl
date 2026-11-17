@@ -340,10 +340,23 @@ function _jax_region_call!(ctx, p, unit, demand, labels, selector, available, mo
         # a plain result is the dictionary entry itself, and keeps the shape
         # or symbol metadata a fixed-shape allocation or static tuple carries.
         ctx.scope.values[id] = if _jax_plain_function_result(value)
-            _PyVal(code, value.T, value.static, "", "", value.padded, value.origin)
+            _jax_record_from_dict(ctx,
+                _PyVal(code, value.T, value.static, "", "", value.padded, value.origin))
         else
             _jax_function_return!(ctx, value, flat, code)
         end
         available[id] = output_demand[key]
     end
+end
+
+# A region returns a named tuple as a `dict` keyed by its field names, the
+# public form (`_jax_returned`). Inside the module a named tuple is the tuple
+# of its fields, read by position (`_jax_record_field`), so the caller reads
+# the returned `dict` back into that tuple.
+function _jax_record_from_dict(ctx, v::_PyVal)
+    v.T isa Type && v.T <: NamedTuple && fieldcount(v.T) > 0 || return v
+    bound = _jax_bind!(ctx, :record, v)
+    _PyVal("(" * join((_py_atom(bound.code) * "[" * repr(string(n)) * "]" for n in fieldnames(v.T)),
+                      ", ") * (fieldcount(v.T) == 1 ? ",)" : ")"),
+           v.T, v.static, "", "", v.padded, v.origin)
 end
