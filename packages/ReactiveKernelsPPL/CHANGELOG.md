@@ -16,6 +16,19 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.208
+
+- `jax_source(built, plan; values)` accepts a parameter in `values`
+  (`values = (:mu,)`, or a submodel parameter by its dotted name
+  `Symbol("e.spread")`): `constrain` returns it once, as the parameter. It
+  also accepts a submodel call (`e` in `e ~ shared(1.0, N)`): `constrain`
+  returns the call's value under `return` in the namespace that holds the
+  call's parameters, `constrain(u, **prepared)["e"]["return"]`, at any depth
+  (`["outer"]["inner"]["return"]`). `return` is a keyword, so no authored
+  name takes that key. A call whose namespace holds nothing else keeps its
+  own key. Both crashed before with `ArgumentError: tuple must be non-empty`
+  (snag `rkppl-jax-source-4f06381a`).
+
 ## 0.1.207
 
 - `prepare_gibbs` derives exact finite conditionals for explicit scalar

@@ -23,7 +23,10 @@ parameters, then the prepared data. Its functions:
 - `log_prior`, `log_likelihood` and `log_jacobian`: its parts;
 - `constrain(unconstrained, data...)`: a `dict` of every declared
   parameter's constrained value (an empty parameter has none), plus each value
-  named in `values` (a definition such as `:mu`).
+  named in `values` (a definition such as `:mu`; a parameter named there is
+  returned once). A submodel's values are nested under its name, as native
+  `constrain(layout, u)` nests them, and the value of a submodel call `e` whose
+  name holds other values is under `return` there: `constrain(u, **p)["e"]["return"]`.
 
 With explicit integer parameters, each function takes their named state
 between `unconstrained` and the data: `log_density(u, {"k": 2}, **prepared)`.
@@ -90,11 +93,14 @@ function _jax_module_of(built, plan; values, doc, float_type)
     # ordinal response) has no value in the program.
     parameters = [entry.name for entry in built.layout.entries
                   if entry.size > 0 || haskey(built.spec.ports, entry.name)]
-    returned = Symbol[parameters; collect(Symbol, values)]
+    # A name in `values` that is a parameter (`:mu`, `Symbol("lv.sigma")`)
+    # is returned once, as the parameter.
+    returned = unique!(Symbol[parameters; collect(Symbol, values)])
     # `constrain` returns what native `constrain(layout, u)` does: a value in
-    # a submodel's scope (`lv.sigma`) nested under the submodel (`lv`).
-    paths = [get(built.layout.name_paths, name, (name,)) for name in returned]
-    constrained = _jax_nested_want(paths, returned)
+    # a submodel's scope (`lv.sigma`) nested under the submodel (`lv`), and
+    # the call's own value under `return` there (`_jax_value_paths`).
+    paths = _jax_value_paths([get(built.layout.name_paths, name, (name,)) for name in returned])
+    constrained = _scope_namedtuple(Any[(p, n) for (p, n) in zip(paths, returned)])
     functions = (log_density = workflow_wants(:sampler),
                  log_prior = workflow_wants(:prior),
                  log_likelihood = workflow_wants(:likelihood),
@@ -135,7 +141,9 @@ function _jax_module_of(built, plan; values, doc, float_type)
     # The model's own docstrings (`rkppl_documentation`), by author path.
     authored = rkppl_documentation(plan)
     documented(path) = join((d.markdown for d in authored if d.path == path), "\n")
-    entry(path) = (text = documented(path); "- `" * join(String.(path), ".") * "`" *
+    # A call's value under `return` is documented by the call's statement.
+    entry(path) = (text = documented(last(path) === :return ? path[1:end-1] : path);
+                   "- `" * join(String.(path), ".") * "`" *
                    (isempty(text) ? "" : ": " * replace(strip(text), "\n" => "\n  ")))
     model_docs = isempty(authored) ? "" : "Model documentation:\n\n" *
         join(("- `" * join(String.(d.path), ".") * "`: " * replace(strip(d.markdown), "\n" => "\n  ")
@@ -160,7 +168,8 @@ function _jax_module_of(built, plan; values, doc, float_type)
         log_likelihood = "The log likelihood of the observations" * over,
         log_jacobian = "The log Jacobian of the constraining transforms" * over,
         constrain = "The constrained value of each parameter, and of each requested value," *
-            over * " Returns a dict, a submodel's values nested under its name:\n\n" *
+            over * " Returns a dict, a submodel's values nested under its name (a " *
+            "submodel call's own value under `return` there):\n\n" *
             join(map(entry, paths), "\n"))
     src = _absent_refusal(plan, built.spec, have, :posterior) do
         # The definitions' callees resolve as `bind_data` resolves them
@@ -279,21 +288,14 @@ function _jax_submodel_regions(built, plan)
     regions
 end
 
-# A nested `NamedTuple` of the program's `names`, keyed by their author
-# `paths` (`(:lv, :sigma)` under `lv`), in first-appearance order.
-function _jax_nested_want(paths, names)
-    keys_ = Symbol[]
-    groups = Dict{Symbol,Vector{Int}}()
-    for (i, p) in enumerate(paths)
-        haskey(groups, first(p)) || (push!(keys_, first(p)); groups[first(p)] = Int[])
-        push!(groups[first(p)], i)
-    end
-    vals = map(keys_) do k
-        idx = groups[k]
-        length(idx) == 1 && length(paths[only(idx)]) == 1 ? names[only(idx)] :
-            _jax_nested_want([paths[i][2:end] for i in idx], names[idx])
-    end
-    NamedTuple{Tuple(keys_)}(Tuple(vals))
+# The author paths of `constrain`'s values, nested as native `constrain`
+# nests them (`_scope_namedtuple`). A submodel call's value (`e` in
+# `e ~ shared(…)`) whose path also holds other values (its parameters
+# `e.spread`, `e.z`) goes under `return` in that namespace: `return` is a
+# keyword, so no authored local, parameter or call takes that key. A call
+# whose namespace holds nothing else keeps its own key.
+_jax_value_paths(paths) = map(paths) do p
+    any(q -> length(q) > length(p) && q[1:length(p)] == p, paths) ? (p..., :return) : p
 end
 
 # The names of the data values a layout reads its positions and axis lengths
