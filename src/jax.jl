@@ -5274,10 +5274,13 @@ function _jax_flat_positions(ctx::_JaxContext, extent::AbstractString)
     length(unique(found)) == 1 ? only(unique(found)) : nothing
 end
 # A ragged value whose cells fill their stored rows (`_JAX_FULL_ROWS`): its
-# lengths are its stored sizes, so it is the dense array of its cells.
+# lengths are its stored sizes, so it is the dense array of its cells. A
+# plate cell that receives it whole selects one cell with an index
+# (`units[k]`), as it does a row of any dense rows.
 _jax_full_rows(ctx::_JaxContext, v::_PyVal) = !isempty(v.extent) && _jax_ragged(v.T) &&
     isempty(v.field_extents) && _jax_flat_positions(ctx, v.extent) == _JAX_FULL_ROWS
-_jax_without_lengths(v::_PyVal) = _PyVal(v.code, v.T, v.static, "", "", 0, v.origin)
+_jax_without_lengths(v::_PyVal) = _PyVal(v.code, v.T, v.static, "", "", 0,
+    v.origin === nothing ? _JaxDenseRows() : v.origin)
 # What a flattening of a value with lengths `extent` reads, for keying a helper
 # translated over it: nothing known, full rows, or a prepared input's positions.
 function _jax_flat_kind(ctx::_JaxContext, extent::AbstractString)
