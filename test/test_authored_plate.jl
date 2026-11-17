@@ -2552,8 +2552,16 @@ end
     # Loud refusals.
     define(ex) = ReactiveKernels._traceable_definition(ex, H)
     @test_throws ArgumentError define(:(sum(x::Lattice) = 0))
-    @test_throws ArgumentError define(:(g(x; k = 1) = x))
-    @test_throws ArgumentError define(:(g(x) = (x > 0 && return 1; 2)))
+    # Keywords (0.1.287) and body-level early returns (0.1.291) define a
+    # method; a `return` inside a loop is still refused, as the docstring says.
+    @test define(:(g(x; k = 1) = x)) isa Expr
+    @test define(:(g(x) = (x > 0 && return 1; 2))) isa Expr
+    @test_throws ArgumentError define(:(function g(x)
+        for i in 1:3
+            i > x && return i
+        end
+        0
+    end))
     @test_throws ArgumentError define(:(g(x)))
     @test_throws ArgumentError define(:((x -> x)(y) = y))
 end

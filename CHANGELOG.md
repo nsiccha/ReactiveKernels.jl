@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.305
+## 0.1.306
 
 - JAX source translates `vec` and `reshape` of a matrix (or any array of
   rank two or more) of records in device code, such as a plate's records
@@ -29,6 +29,17 @@ are recorded in the git history only.
   of it raises `JAXEmissionError`, as for a padded numerical array. Before,
   the module raveled or reshaped the tuple of field arrays and failed in
   Python (`TypeError: ravel requires ndarray or scalar arguments`).
+
+## 0.1.305
+
+- `@traceable` takes `@inline` and `@noinline` on either side of it
+  (`@traceable @inline f(x) = ...`, `@inline @traceable f(x) = ...`). The
+  method keeps the hint and the recorded source omits it; before, the first
+  spelling was refused at definition and `jax_source` refused the second.
+- Fixed in JAX source since 0.1.296: `x === nothing`, `x !== nothing` and
+  `isnothing(x)` of a data-only value that is `nothing` or a tuple or array
+  were refused (`the function isnothing calls itself`). Host preparation
+  compares such a value with Python's `is None` again.
 
 ## 0.1.304
 

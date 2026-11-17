@@ -50,4 +50,64 @@ print("dynamic loop bounds passed")
         @test success(`$RK_JAX_PYTHON $(joinpath(dir, "check.py"))`)
     end
 end
+
+# The same loop under each spelling of an inlining hint, and without one.
+@traceable function unhinted_series(x, trips)
+    total = 0.0
+    for i in 1:trips
+        total = total * x + i
+    end
+    total
+end
+@traceable @inline function inline_after_series(x, trips)
+    total = 0.0
+    for i in 1:trips
+        total = total * x + i
+    end
+    total
+end
+@inline @traceable function inline_before_series(x, trips)
+    total = 0.0
+    for i in 1:trips
+        total = total * x + i
+    end
+    total
+end
+@traceable @noinline noinline_double(x) = 2x
+@traceable Base.@inline base_inline_double(x) = 2x
+@kernel hinted_helpers(x::Float64, trips::Int) = begin
+    after = inline_after_series(x, trips)
+    before = inline_before_series(x, trips)
+    doubled = noinline_double(x) + base_inline_double(x)
+    return after, before, doubled
+end
+
+@testset "inlining hints on traceable helpers" begin
+    hint(f) = Base.uncompressed_ast(only(methods(f))).inlining
+    @test hint(unhinted_series) == 0x00
+    @test hint(inline_after_series) == hint(inline_before_series) == hint(base_inline_double) == 0x01
+    @test hint(noinline_double) == 0x02
+    # The recorded source states the value alone: the hint is not part of it.
+    recorded(f) = Base.remove_linenums!(deepcopy(
+        ReactiveKernels._traceable_source(typeof(f), Float64, Int)[2]))
+    @test recorded(inline_after_series) == recorded(inline_before_series) == recorded(unhinted_series)
+    functions = (after=:after, before=:before, doubled=:doubled)
+    src = jax_source(hinted_helpers; have=(:x, :trips), functions)
+    for x in (0.3, -1.2), trips in (0, 1, 5)
+        expected = unhinted_series(x, trips)
+        @test inline_after_series(x, trips) == inline_before_series(x, trips) == expected
+        derivative = Enzyme.autodiff(Enzyme.Reverse, inline_after_series, Enzyme.Active,
+            Enzyme.Active(x), Enzyme.Const(trips))[1][1]
+        if rk_jax_available()
+            for name in (:after, :before)
+                got = rk_jax_evaluate(src, name, (x, trips); grad=true)
+                @test got.value ≈ expected
+                @test got.grad ≈ derivative atol=1e-12
+            end
+            got = rk_jax_evaluate(src, :doubled, (x, trips); grad=true)
+            @test got.value ≈ 4x
+            @test got.grad ≈ 4.0
+        end
+    end
+end
 end

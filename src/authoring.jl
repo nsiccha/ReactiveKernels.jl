@@ -3401,7 +3401,10 @@ Supported: positional arguments with optional defaults, a trailing Vararg
 argument (`args...`, `args::T...`, `args::Vararg{T,N}`, whose name the
 recorded source reads as the tuple of the trailing arguments, as the method
 does), `where` clauses, and a return-type annotation.  A docstring before `@traceable` documents the
-method, as it does a plain definition.  A `@traceable` method of a function
+method, as it does a plain definition.  An `@inline` or `@noinline` on the
+definition, written before or after `@traceable`, gives the method that hint
+as it does a plain definition; the recorded source is the same without it.
+A `@traceable` method of a function
 from Base, Core or ReactiveKernels is rejected, as is a `return` inside a loop.
 Body-level early returns are recorded as lazy
 conditional expressions; the ordinary method keeps its authored control flow.
@@ -3411,8 +3414,40 @@ macro traceable(def)
     _traceable_definition(def, __module__)
 end
 
+const _TRACEABLE_HINTS = (
+    (Symbol("@inline"), :inline), (:(Base.var"@inline"), :inline),
+    (GlobalRef(Base, Symbol("@inline")), :inline),
+    (Symbol("@noinline"), :noinline), (:(Base.var"@noinline"), :noinline),
+    (GlobalRef(Base, Symbol("@noinline")), :noinline))
+
+# `@traceable @inline f(args...) = body`: the hint of a leading `@inline` or
+# `@noinline` goes into the method's body, where Julia's own macro writes it,
+# so either order of the two macros defines the same method.
+function _traceable_hinted_definition(def)
+    hints = Symbol[]
+    inner = def
+    while inner isa Expr && inner.head === :macrocall
+        position = findfirst(hint -> first(hint) == inner.args[1], _TRACEABLE_HINTS)
+        position === nothing && break
+        pushfirst!(hints, last(_TRACEABLE_HINTS[position]))
+        inner = inner.args[end]
+    end
+    isempty(hints) && return def
+    inner isa Expr && inner.head in (:(=), :function) && length(inner.args) == 2 || return def
+    body = inner.args[2]
+    statements = body isa Expr && body.head === :block ? body.args : Any[body]
+    Expr(inner.head, inner.args[1],
+         Expr(:block, (Expr(:meta, hint) for hint in hints)..., statements...))
+end
+
+# The body a source reader translates: the method's value. A compiler hint
+# (`Expr(:meta, :inline)`) is the native method's and states no value.
+_traceable_without_hints(body) = body isa Expr && body.head === :block ?
+    Expr(:block, (arg for arg in body.args if !(arg isa Expr && arg.head === :meta))...) : body
+
 function _traceable_definition(def, mod::Module)
     usage = "`@traceable f(args...) = body` or `@traceable function f(args...) ... end`"
+    def = _traceable_hinted_definition(def)
     def isa Expr && def.head in (:(=), :function) && length(def.args) == 2 ||
         throw(ArgumentError("@traceable expects a method definition, $usage; got `$(def)`."))
     signature, body = def.args
@@ -3452,7 +3487,7 @@ function _traceable_definition(def, mod::Module)
         parameter isa Expr && parameter.head in (:<:, :>:) && (parameter = parameter.args[1])
         parameter isa Symbol && push!(names, parameter)
     end
-    sourcebody = _traceable_tail_body(body, signature)
+    sourcebody = _traceable_tail_body(_traceable_without_hints(body), signature)
     native = Expr(def.head, def.args[1], _kernel_native_body(body, mod, names))
     ignored = _kernel_ignored_traceable_methods(callee, formals, wheres, body, mod, names)
     source = _traceable_source_method(callee, formals, wheres, sourcebody, mod)
