@@ -163,6 +163,7 @@ const _MATRIX_CORE_TESTS = (
     "test_jax_elementwise.jl",
     "test_jax_captured_records.jl",
     "test_jax_tuple_writes.jl",
+    "test_jax_argument_writes.jl",
     "test_jax_type_checks.jl",
     "test_jax_zero_predicates.jl",
     "test_jax_host_arguments.jl",
