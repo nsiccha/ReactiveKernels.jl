@@ -48,9 +48,9 @@ Plate cells can return numerical tuples or named records, including nested
 records and numeric array fields. Later plates can read those fields directly,
 such as `r.prior + sum(r.pointwise.y)`. The emitted representation stacks each
 leaf along the mapped axes and keeps ragged field lengths separate from the
-record array's valid extent. Cartesian axes retain Julia's order, also when
-`vec` flattens a record matrix (valid records first), and empty axes skip the
-cell body. These operations use ordinary JAX reverse differentiation.
+record array's valid extent. Cartesian axes retain Julia's order, also through
+`vec`/`reshape` of a record matrix (`vec`: valid records first), and empty
+axes skip the cell body. These operations use ordinary JAX reverse differentiation.
 Empty records written as `NamedTuple()`, `NamedTuple{()}(())` or `(;)` have the
 same representation, including in nested results and kernels with no inputs.
 Public named-record results use Python dictionaries, so an empty record is `{}`.

@@ -4882,25 +4882,51 @@ end
 # An array of records (tuples or named tuples) is stored as the tuple of its
 # fields' arrays, the array's axes leading each (a plate's records over a
 # matrix, `_JaxRecordLayout`), as a vector of records is with its one axis.
-# Its `vec` is the vector of those records: each field's leading axes merged
-# in Julia's column-major order, the records' field lengths alike, and the
-# record structure kept. A padded array's valid records come first, in that
-# order, the number of them its axis extent and the last of them repeated
-# as the padding, as `vec` of a padded numerical array orders its entries.
-const _JAX_VEC_RECORDS = """
-def _rk_vec_records(records, rank, order=None):
+# `vec` and `reshape` of it reshape those leading axes of every field in
+# Julia's column-major order, the records' field lengths alike, and keep the
+# record structure. A padded array's `vec` takes its valid records first, in
+# that order, the number of them its axis extent and the last of them
+# repeated as the padding, as `vec` of a padded numerical array orders its
+# entries.
+const _JAX_RESHAPE_RECORDS = """
+def _rk_reshape_records(records, rank, shape, order=None):
     # An array of records, the tuple of its fields' arrays with the array's
-    # `rank` axes first, as its vector: each field's leading axes merged in
-    # Julia's column-major order, then its records taken in `order`.
-    def flat(a):
-        a = jnp.reshape(a, (int(np.prod(a.shape[:rank])),) + a.shape[rank:], order="F")
+    # `rank` axes first, reshaped to `shape` (`None`: the remaining length)
+    # in Julia's column-major order, each field's own axes kept; a vector's
+    # records are then taken in `order`.
+    def reshape(a):
+        n = int(np.prod(a.shape[:rank]))
+        known = int(np.prod([d for d in shape if d is not None]))
+        if None in shape and known == 0:
+            raise ValueError("DimensionMismatch: array size %d must be divisible by the product of the new dimensions %r" % (n, shape))
+        dims = tuple(n // known if d is None else d for d in shape)
+        a = jnp.reshape(a, dims + a.shape[rank:], order="F")
         return a if order is None else a[order]
-    return jax.tree_util.tree_map(flat, records)
+    return jax.tree_util.tree_map(reshape, records)
 """
+# `x` reshaped to the Python shape `shape` (`None` for a `Colon`), a device
+# array of records; `order` takes a vector's records in that order.
+function _jax_reshape_records!(ctx::_JaxContext, x::_PyVal, shape::AbstractString, N::Int;
+                               order::AbstractString = "", count::AbstractString = "")
+    helper = _jax_helper!(ctx, "_rk_reshape_records", _JAX_RESHAPE_RECORDS)
+    call(code) = helper * "(" * code * ", " * string(_jax_rank(x.T)) * ", " * shape *
+                 (isempty(order) ? "" : ", " * order) * ")"
+    values = _jax_fresh(ctx, :records)
+    _jax_emit!(ctx, values * " = " * call(x.code))
+    lengths = ""
+    if !isempty(x.extent)
+        lengths = _jax_fresh(ctx, :record_lengths)
+        _jax_emit!(ctx, lengths * " = " * call(x.extent))
+    end
+    origin = x.origin isa _JaxRecordLayout ?
+        _JaxRecordLayout(x.origin.fields, count, isempty(count) ? 0 : 1) : nothing
+    _PyVal(values, Array{eltype(x.T),N}, false, lengths, "", _jax_padded_fields(x), origin)
+end
 function _jax_records_vec(ctx::_JaxContext, x::_PyVal)
-    R = _jax_rank(x.T)
-    helper = _jax_helper!(ctx, "_rk_vec_records", _JAX_VEC_RECORDS)
     layout = x.origin isa _JaxRecordLayout ? x.origin : nothing
+    # Without a record layout an extent's axes are not known.
+    layout === nothing && !isempty(x.extent) &&
+        _jax_error("`vec` of a padded `", x.T, "` whose padded axes are not known", _jax_where(ctx))
     order = count = ""
     if layout !== nothing && !isempty(layout.axis_extent)
         axis = _jax_bind!(ctx, :axis, _jax_record_axis(x))
@@ -4917,24 +4943,18 @@ function _jax_records_vec(ctx::_JaxContext, x::_PyVal)
         _jax_emit!(ctx, order * " = " * order * "[jnp.minimum(jnp.arange(" * order * ".shape[0]), " *
                         count * " - 1)]")
     end
-    flat(code) = helper * "(" * code * ", " * string(R) * (isempty(order) ? "" : ", " * order) * ")"
-    values = _jax_fresh(ctx, :records)
-    _jax_emit!(ctx, values * " = " * flat(x.code))
-    lengths = ""
-    if !isempty(x.extent)
-        lengths = _jax_fresh(ctx, :record_lengths)
-        _jax_emit!(ctx, lengths * " = " * flat(x.extent))
-    end
-    origin = layout === nothing ? nothing :
-        _JaxRecordLayout(layout.fields, count, isempty(count) ? 0 : 1)
-    _PyVal(values, Vector{eltype(x.T)}, false, lengths, "", _jax_padded_fields(x), origin)
+    _jax_reshape_records!(ctx, x, "(None,)", 1; order, count)
 end
 # Julia reshapes in column-major order. A `Colon` dimension (`reshape(v, 1, :)`)
 # is the remaining length, NumPy's `-1`. The dimensions may be one tuple
 # (`reshape(v, size(w))`, `reshape(v, (1, :))`).
 function _jax_function_call(ctx::_JaxContext, ::typeof(reshape), args::Vector{_PyVal})
     x, dims = args[1], args[2:end]
-    isempty(x.extent) || _jax_error("`reshape` of a padded (ragged) value", _jax_where(ctx))
+    # Records with a record layout keep their fields' lengths
+    # (`_jax_reshape_records!`); only their own axis may not be padded.
+    records = ctx.host === nothing && _jax_is_array(x.T) && _jax_is_tuple(eltype(x.T))
+    (records && x.origin isa _JaxRecordLayout ? isempty(x.origin.axis_extent) : isempty(x.extent)) ||
+        _jax_error("`reshape` of a padded (ragged) value", _jax_where(ctx))
     packed = length(dims) == 1 && dims[1].T isa Type && dims[1].T <: Tuple
     types = packed ? (isconcretetype(dims[1].T) ? fieldtypes(dims[1].T) : nothing) :
         Tuple(_jax_is_colon(d) ? Colon : d.T for d in dims)
@@ -4945,6 +4965,11 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(reshape), args::Vector{_P
     count(T -> T === Colon, types) <= 1 ||
         _jax_error("`reshape` with more than one `Colon` dimension (Julia raises a ",
                    "`DimensionMismatch`)", _jax_where(ctx))
+    if records
+        shape = packed ? dims[1].code : "(" * join((_jax_is_colon(d) ? "None" : d.code for d in dims), ", ") *
+                                        (length(dims) == 1 ? ",)" : ")")
+        return _jax_reshape_records!(ctx, x, shape, length(types))
+    end
     # A tuple holds `:` as `None` (`_jax_value`).
     shape = !packed ? "(" * join((_jax_is_colon(d) ? "-1" : d.code for d in dims), ", ") *
                      (length(dims) == 1 ? ",)" : ")") :
