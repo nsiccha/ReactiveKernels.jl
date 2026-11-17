@@ -939,6 +939,21 @@ const _JAX_UPDATING = Dict{Symbol,Symbol}(:+= => :+, :-= => :-, :*= => :*, :/= =
     :&= => :&, :|= => :|, :⊻= => :⊻,
                                            :^= => :^)
 
+# The value an array of element type `E` stores: `convert(E, v)`, as Julia's
+# `setindex!` stores it, entry by entry for an array value (a row or slice).
+# For a number `convert(E, v)` is `E(v)`, so the store is `E.(v)`'s
+# translation. JAX's `.at[i].set(v)` of a value of another dtype leaves that
+# cast to the scatter, which performs it with a FutureWarning and will refuse
+# it in a later release, so a value whose dtype is not the array's is
+# converted here.
+function _jax_stored(ctx::_JaxContext, @nospecialize(E), v::_PyVal)
+    S = _jax_eltype(v.T)
+    E isa Type && S isa Type && isconcretetype(E) && isconcretetype(S) &&
+        E <: _JaxBranchReal && S <: _JaxBranchReal && _jax_dtype(E) != _jax_dtype(S) ||
+        return v
+    _jax_broadcast(ctx, E, [v])
+end
+
 function _jax_statement(ctx::_JaxContext, ex)
     if ex isa Expr && ex.head === :(=) && length(ex.args) == 2
         return _jax_assign!(ctx, ex.args[1], ex.args[2])
@@ -986,7 +1001,8 @@ function _jax_destructure!(ctx::_JaxContext, lhs, v::_PyVal)
         indexed = _jax_index(ctx, target, lhs.args[2:end]; target = true)
         position = indexed.code[ncodeunits(target.code)+1:end]
         name = _jax_fresh(ctx, lhs.args[1])
-        _jax_emit!(ctx, name * " = " * _py_atom(target.code) * ".at" * position * ".set(" * v.code * ")")
+        stored = _jax_stored(ctx, _jax_eltype(target.T), v)
+        _jax_emit!(ctx, name * " = " * _py_atom(target.code) * ".at" * position * ".set(" * stored.code * ")")
         ctx.locals[lhs.args[1]] = _PyVal(name, target.T, false, target.extent, target.limit,
                                          target.padded)
         return
