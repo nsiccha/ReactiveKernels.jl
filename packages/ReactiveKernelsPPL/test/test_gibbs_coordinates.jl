@@ -161,6 +161,20 @@ end
     @test result2.moves > 10 && result2.worst < 1e-9
 end
 
+@testset "a coefficient trial does not materialize the product" begin
+    rng = Xoshiro(3)
+    n = 4000
+    X = randn(rng, n, 3)
+    plan = LOGISTIC(; X, sigma=2.0) | (; y=Int.(rand(rng, n) .< 0.5))
+    problem = PPL.prepare_coordinate_conditional(build_kernel(plan), plan, zeros(3))
+    state = PPL.coordinate_state(problem, [0.1, -0.2, 0.05])
+    trial(state) = PPL.coordinate_logdensity(state, 2, 0.3)
+    trial(state)
+    # The shifted product feeds the likelihood without a vector of its own.
+    @test (@allocated trial(state)) < 8n
+    @test exercise!(rng, state; sweeps=2, trials=2).worst < 1e-8
+end
+
 @testset "a program without a product needs no cache" begin
     rng = Xoshiro(9)
     plan = PLAIN(;) | (; y=[0.3, -0.1, 0.8, 0.4])

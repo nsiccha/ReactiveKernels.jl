@@ -225,7 +225,8 @@ function prepare_coordinate_conditional(built, plan::StructuralPlan, u0::Abstrac
                 end
                 summed === nothing ? push!(rest, term) : push!(cells, summed)
             end
-            push!(blocks, (; span, cells, rest, partial=Symbol(:_ppl_cg_partial_, i)))
+            push!(blocks, (; span, bounds=entry.first, cells, rest,
+                partial=Symbol(:_ppl_cg_partial_, i)))
         end
     end
 
@@ -245,7 +246,6 @@ function prepare_coordinate_conditional(built, plan::StructuralPlan, u0::Abstrac
     push!(signature.args, :(_ppl_cg_index::Int), :(_ppl_cg_previous::Float64))
     body = Expr(:block, derived...,
         :(_ppl_cg_density::Float64 = $(_sum_terms(selected))),
-        (:($(block.partial)::Float64 = $(_sum_terms(block.rest))) for block in blocks)...,
         (isempty(nodes) ? () : (:(_ppl_cg_products = $products),))...,
         :(return _ppl_cg_density))
     spec = _eval_kernel_def(Expr(:(=), signature, body))
@@ -260,7 +260,24 @@ function prepare_coordinate_conditional(built, plan::StructuralPlan, u0::Abstrac
         (cut(:_ppl_cg_products), whole(:_ppl_cg_products))
 
     prepared = map(blocks) do block
-        cellspec, names, indices = spec, Symbol[], Symbol[]
+        # Inside a block the moved coordinate always lies in the block's own
+        # vector: its products take the column update without a branch, so
+        # the update composes with its reader, and every other product is
+        # the cached value itself.
+        own = copy(statements)
+        for (node, port) in zip(nodes, ports)
+            m = :(_ppl_cg_index - ($(node.first) - 1))
+            own[node.position] = (node.first, node.last) == block.bounds ?
+                :($(node.name)::Vector{Float64} = $port .+
+                    ($(node.vector)[$m] - _ppl_cg_previous) .*
+                    Base.view($(node.matrix), Base.Colon(), $m)) :
+                :($(node.name)::Vector{Float64} = $port)
+        end
+        blockspec = _eval_kernel_def(Expr(:(=), signature, Expr(:block, own...,
+            :($(block.partial)::Float64 = $(_sum_terms(block.rest))),
+            :(return $(block.partial)))))
+        _register_packed_check!(blockspec, layout)
+        cellspec, names, indices = blockspec, Symbol[], Symbol[]
         for (c, summed) in enumerate(block.cells)
             push!(names, Symbol(block.partial, :_cell_, c))
             push!(indices, Symbol(block.partial, :_index_, c))
