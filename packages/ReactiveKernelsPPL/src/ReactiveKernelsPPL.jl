@@ -113,6 +113,9 @@ export prepare_discrete_latents, DiscreteLatentQuery, discrete_latents_node,
     discrete_latent_draws
 export restore_draws
 export prepare_gibbs, GibbsProblem, initialize_gibbs, gibbs_step!, gibbs_draws
+export prepare_coordinate_conditional, CoordinateConditional, coordinate_state, CoordinateState,
+    coordinate_logdensity, set_coordinate!, refresh_products!, coordinate_slice_step!,
+    coordinate_slice_sweep!
 export prepare_smc, smc, initialize_smc, update_smc, smc_step, smc_checkpoint, resume_smc,
     rescore_smc_checkpoint
 export SMCReference, SMCOptions, SMCNonfiniteError, SMCDegeneracyError, rejuvenate_smc, pool_smc
@@ -177,6 +180,7 @@ include("observed_scan.jl")
 include("marginalize.jl")
 include("marginalize_discrete.jl")
 include("gibbs.jl")
+include("gibbs_coordinates.jl")
 include("marginalize_vector.jl")
 include("merged_observations.jl")
 include("chains.jl")
