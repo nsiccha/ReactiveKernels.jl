@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.297
+## 0.1.301
 
 - `jax_source` host preparation collects and sorts tuple records without
   coercing their fields, including `issorted`, `by` field projections,
@@ -30,6 +30,64 @@ are recorded in the git history only.
   factor's diagonal, since 0.1.291) from the submodel's result. The caller
   named a local of the submodel's body instead, a Python `NameError`.
 
+## 0.1.300
+
+- `js_source` translates one element of a range: `r[i]`, `r[begin]` and
+  `r[end]` (so `lastindex(r)`) for `a:b`, `a:s:b` and a vector's index range
+  (`eachindex(x)`, `axes(x, 1)`). The element is computed from the range's
+  ends, without building the window it selects, and a position outside the
+  range is Julia's `BoundsError` with Julia's message. Before, each of these
+  raised `JSEmissionError`, and a helper had to slice first (`x[r][1]`), which
+  copies the window and also checks its far end.
+
+## 0.1.299
+
+- `jax_source`: a `map` do-block whose elements are numerical arrays of one
+  shape (a plate record's vector field, `map(records) do r; r.nested.y end`)
+  is a vector of dense rows. `first`, `last`, indexing, `similar`, `eachindex`
+  and loops read each row as the array it is. Before, a helper reading such a
+  row raised `JAXEmissionError: a ragged array without its lengths`.
+- `jax_source`: a `map` do-block over entries with lengths of their own (rows
+  of a ragged vector, records whose fields are padded rows) maps each entry
+  with its lengths and returns the lengths of padded results beside them.
+  Before, a `map` over a ragged vector of vectors computed on the device read
+  each row's padding as entries, so a reduction of the mapped values returned
+  a wrong value; records with padded fields failed in Python.
+- `jax_source` translates `for x in xs` over a vector's entries in device code
+  as the loop over `eachindex(xs)` that reads `xs[k]` into `x`. The loop
+  variable is local to the loop, as Julia's is.
+- `jax_source` translates `similar(A)`, `similar(A, T)` and `similar(A, [T,]
+  dims...)` of numerical arrays, `sum` of a vector of dense rows (Julia's `+` of
+  the entries, refusing an empty collection as Julia does), and generators
+  over dense rows. `sum` of a vector of rows with lengths of their own raises
+  a `JAXEmissionError` instead of failing in Python.
+- `jax_source`: `eachindex` of a ragged vector of vectors, or of a vector of
+  records with padded fields, ranges over its entries. Before, a loop over it
+  used the rows' lengths as its count and failed in Python.
+
+## 0.1.298
+
+- `js_source` reads, indexes and iterates a vector of records that a recipe
+  or helper builds, such as `[k(d) for d in dose]` where a prepared kernel `k`
+  returns a named tuple, or a helper returns a tuple or named tuple: `length`,
+  `eachindex`, `x[i]`, `x[indices]`, `x[a:b]`, `@view x[a:b]`, `for`,
+  comprehensions and generators with their filters and reductions, `count`,
+  `any`, `all`, `isempty`, `filter`, `map`, `findfirst`,
+  `sum(f, x)`, broadcasts, `copy`, `collect`, `push!` and `x[i] = r`. Field
+  projections such as `[r.a for r in records]` and `getproperty.(records, :a)`
+  give vectors of that field's type. These vectors remain internal values:
+  `types=` inputs and constants keep the vector types listed in the guide.
+
+## 0.1.297
+
+- `jax_source` converts a value stored into an array (`A[i] = v`, `A[i, :] = row`,
+  `A[i] += v`, and a row stored into a vector of vectors) to the array's
+  element type, as Julia's `setindex!` does: a `Float64` value stored into a
+  `Float32` array is rounded to float32 in the emitted code. JAX's
+  `.at[i].set(v)` performed that cast implicitly, with a FutureWarning
+  ("scatter inputs have incompatible types") that a later JAX release turns
+  into an error. Stores whose value already has the array's dtype are
+  unchanged.
 
 ## 0.1.296
 

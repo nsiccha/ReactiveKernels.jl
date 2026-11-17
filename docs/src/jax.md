@@ -55,6 +55,7 @@ same representation, including in nested results and kernels with no inputs.
 Public named-record results use Python dictionaries, so an empty record is `{}`.
 Record-valued plates can keep empty fields beside numerical leaves, including
 in ragged cells. A plate of records with no numerical leaves remains unsupported.
+A helper's `map` keeps each entry's shape and lengths: mapping records to a numerical field (`map(records) do r; r.nested.y end`) gives dense rows that indexing, `first`, `last`, `similar`, loops and `sum` read as arrays, and ragged entries keep their lengths.
 
 ## Julia evaluation
 

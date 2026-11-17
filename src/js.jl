@@ -536,6 +536,21 @@ function _rk_steprange(start, step, stop) {
   }
   return { start, step, stop: last };
 }""", [:JuliaError]),
+    # `r[i]`: Julia's bounds check, then the element. `type` is the range's
+    # Julia type, which the error names.
+    :_rk_range_at => ("""
+function _rk_range_at(start, stop, i, type) {
+  if (!(Number.isInteger(i) && i >= 1 && i <= stop - start + 1))
+    throw new JuliaError("BoundsError", "attempt to access " + (stop - start + 1) + "-element " + type + " at index [" + i + "]");
+  return start + i - 1;
+}""", [:JuliaError]),
+    :_rk_steprange_at => ("""
+function _rk_steprange_at(r, i, type) {
+  const n = r.start !== r.stop && (r.step > 0) !== (r.stop > r.start) ? 0 : (r.stop - r.start) / r.step + 1;
+  if (!(Number.isInteger(i) && i >= 1 && i <= n))
+    throw new JuliaError("BoundsError", "attempt to access " + n + "-element " + type + " at index [" + i + "]");
+  return r.start + (i - 1) * r.step;
+}""", [:JuliaError]),
     :_rk_number => ("""
 function _rk_number(name, x, integer) {
   if (typeof x !== "number" || (integer && !Number.isInteger(x)))
@@ -651,7 +666,8 @@ _js_isvector(v) = _js_isvector_type(_js_type(v))
 # also accept nested vectors, whose entries remain arrays (possibly ragged).
 _js_isflatvector(v) = _js_isvector(v) && eltype(_js_type(v)) <: _JsMatrixElement
 _js_isrange(v) = _js_type(v) in (UnitRange{Int64}, Base.OneTo{Int64})
-# A stepped range (`n:-1:1`): iterated, measured and read at its ends only.
+# A stepped range (`n:-1:1`): iterated, measured and read at its ends or at a
+# position (`r[i]`).
 _js_isstep(v) = _js_type(v) === StepRange{Int64,Int64}
 _js_istuple(v) = v isa _JsTuple || (v isa _JsVal && (v.static ? v.value isa Tuple : v.T <: Tuple))
 _js_tuple_length(v::_JsTuple) = length(v.items)
@@ -667,16 +683,22 @@ _js_uniform_tuple(S, T) = S <: Tuple && !(S <: NamedTuple) && isconcretetype(S) 
 # A nonempty tuple whose elements all have the number type `T`.
 _js_number_tuple(S, T) = T <: _JsNumber && _js_uniform_tuple(S, T)
 
-# A preceding plate can produce concrete records of runtime values. Reading
-# those records in another plate uses the same array and field operations;
-# numerical array helpers and external input validation keep their own types.
+# A preceding plate, or a comprehension of a function returning a tuple or a
+# named tuple (`[k(d) for d in dose]` with a prepared kernel `k` whose WANT is
+# `(; a, b)`), can produce concrete records of runtime values: an array of the
+# records' values. Such a vector (`_js_isanyvector`) is read, indexed and
+# iterated with the same array and field operations as the vectors above
+# (`length`, `x[i]`, `for`, generators, filters and their reductions,
+# broadcasts, `map`, `findfirst`, copies, `push!`); numerical array helpers,
+# constants and external input validation keep `_js_isvector`'s types.
 _js_plate_element(T) = _js_runtime_type(T) ||
     (T isa DataType && isconcretetype(T) && T <: Union{Tuple,NamedTuple} &&
      all(_js_plate_element, fieldtypes(T)))
+_js_isanyvector_type(T) = _js_isvector_type(T) || (T isa DataType && T <: Vector && _js_plate_element(eltype(T)))
+_js_isanyvector(v) = _js_isanyvector_type(_js_type(v))
 _js_vector_view(v) = v isa _JsStruct && v.T === view && length(v.fields) == 2
 _js_gather_view(v) = v isa _JsStruct && v.T === _readonly_gather
-_js_plate_vector(v) = _js_isvector(v) || _js_vector_view(v) || _js_gather_view(v) ||
-    (_js_type(v) <: Vector && _js_plate_element(eltype(_js_type(v))))
+_js_plate_vector(v) = _js_isanyvector(v) || _js_vector_view(v) || _js_gather_view(v)
 _js_plate_length(v) = _js_isrange(v) ? _js_range_length(v) :
     _js_vector_view(v) ? _js_range_length(v.fields[2]) :
     _js_gather_view(v) ? v.fields[2].code * ".length" : v.code * ".length"
@@ -1754,11 +1776,11 @@ function _js_materialize!(ir::_JsIR, bc::_JsBroadcast, T; dest = nothing)
     leaves = _js_leaves!(Any[], bc)
     for l in leaves
         t = _js_type(l)
-        (l isa _JsVal && (l.static || t <: Union{Number,Bool} || _js_isvector(l) || _js_isrange(l) ||
+        (l isa _JsVal && (l.static || t <: Union{Number,Bool} || _js_isanyvector(l) || _js_isrange(l) ||
                           t <: Base.RefValue)) ||
             _js_error(mod, "a broadcast over a `", t, "` has no JavaScript translation (scalars, vectors and ranges are supported)")
     end
-    arrays = filter(l -> l isa _JsVal && ((!l.static && _js_isvector(l)) || _js_isrange(l)), leaves)
+    arrays = filter(l -> l isa _JsVal && ((!l.static && _js_isanyvector(l)) || _js_isrange(l)), leaves)
     if isempty(arrays) && dest === nothing
         return _js_element!(ir, bc, Dict{Any,String}(), "")
     end
@@ -1799,7 +1821,7 @@ end
 function _js_element!(ir::_JsIR, v, elements, i)
     if v isa _JsBroadcast
         args = Any[_js_element!(ir, a, elements, i) for a in v.args]
-        ET = _js_return_type(v.f, Any[_js_argtype(a) for a in args])
+        ET = _js_bc_eltype(v.f, args)
         isconcretetype(ET) || _js_error(ir.fn.mod, "the broadcast element type of `", v.f,
                                         "` is not concrete (", ET, ")")
         return _js_call!(ir, v.f, args, ET)
@@ -1813,6 +1835,20 @@ function _js_element!(ir::_JsIR, v, elements, i)
         return _js_static(v.value[])
     end
     v
+end
+
+# The element type of a broadcast call. A field read by a name or position
+# written in the source (`getproperty.(records, :a)`) has that field's type,
+# as Julia's constant propagation finds natively; the call's types alone give
+# the union of every field's type.
+function _js_bc_eltype(f, args)
+    if f in (getproperty, getfield) && length(args) == 2 && args[2] isa _JsVal && args[2].static
+        S, key = _js_argtype(args[1]), args[2].value
+        S isa DataType && isconcretetype(S) && S <: Union{Tuple,NamedTuple} &&
+            ((key isa Symbol && S <: NamedTuple && hasfield(S, key)) || (key isa Int && 1 <= key <= fieldcount(S))) &&
+            return fieldtype(S, key)
+    end
+    _js_return_type(f, Any[_js_argtype(a) for a in args])
 end
 
 # --- the call table ---------------------------------------------------------------------------------
@@ -2080,21 +2116,21 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
            (_js_isnumber(args[2]) || _js_isbool(args[2]))
         return _js_convert(ir, args[1].value, args[2])
     elseif f === length && length(args) == 1 &&
-           (_js_isvector(args[1]) || (_js_istuple(args[1]) && !(_js_type(args[1]) <: NamedTuple)))
+           (_js_isanyvector(args[1]) || (_js_istuple(args[1]) && !(_js_type(args[1]) <: NamedTuple)))
         return _js_rt(_js_code(mod, args[1], _JS_ATOM) * ".length", Int64)
     elseif f === length && length(args) == 1 && _js_isrange(args[1])
         r = _js_range!(ir, args[1])
         r.static && return _js_static(length(r.value))
         return _js_rt(r.code * ".stop - " * r.code * ".start + 1", Int64; prec = _JS_ADD)
-    elseif f === size && length(args) == 2 && _js_isvector(args[1]) && _js_isint(args[2])
+    elseif f === size && length(args) == 2 && _js_isanyvector(args[1]) && _js_isint(args[2])
         d = args[2]
         d isa _JsVal && d.static && d.value == 1 && return _js_call!(ir, length, Any[args[1]], Int64)
-    elseif f === getindex && length(args) == 2 && _js_isvector(args[1]) && _js_isint(args[2])
+    elseif f === getindex && length(args) == 2 && _js_isanyvector(args[1]) && _js_isint(args[2])
         return _js_fcall(ir, _js_use!(mod, :_rk_at), args, T)
-    elseif f === getindex && length(args) == 2 && _js_isvector(args[1]) && _js_type(args[2]) === Vector{Int64}
+    elseif f === getindex && length(args) == 2 && _js_isanyvector(args[1]) && _js_type(args[2]) === Vector{Int64}
         # `x[index]` for a vector of indices: a new vector, every index checked first.
         return _js_fcall(ir, _js_use!(mod, :_rk_gather), args, T; pure = false)
-    elseif f === view && length(args) == 2 && _js_isvector(args[1]) && _js_isrange(args[2])
+    elseif f === view && length(args) == 2 && _js_isanyvector(args[1]) && _js_isrange(args[2])
         # `@view x[a:b]`, read where it is used (`sum`, `length`, `getindex`).
         x, r = _js_simple!(ir, args[1], "x"), _js_range!(ir, args[2])
         _js_flush!(ir)
@@ -2116,7 +2152,7 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
                          _js_use!(mod, :JuliaError) * "(\"BoundsError\",\"attempt to access \" + " *
                          _js_range_length(r) * " + \"-element view at index [\" + " * i.code * " + \"]\");")
         return _js_rt(x.code * "[" * _js_range_start(r) * " + " * _js_code(mod, i, _JS_ADD + 1) * " - 2]", T)
-    elseif f === setindex! && length(args) == 3 && _js_isvector(args[1]) && _js_isint(args[3])
+    elseif f === setindex! && length(args) == 3 && _js_isanyvector(args[1]) && _js_isint(args[3])
         _js_isflatvector(args[1]) || _js_type(args[2]) === eltype(_js_type(args[1])) || return nothing
         return _js_fcall(ir, _js_use!(mod, :_rk_set), args, T; pure = false)
     elseif f === sum && length(args) == 1 && _js_isvector(args[1]) && eltype(_js_type(args[1])) <: _JsNumber
@@ -2134,14 +2170,14 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
         return _js_rt(_js_use!(mod, :_rk_extremum) * "(" * (f === maximum ? "Math.max" : "Math.min") *
                       ", " * _js_runtime(mod, args[1]).code * ", () => " *
                       _js_runtime(mod, _js_static(empty)).code * ")", T)
-    elseif f in (eachindex, LinearIndices) && length(args) == 1 && _js_isvector(args[1])
+    elseif f in (eachindex, LinearIndices) && length(args) == 1 && _js_isanyvector(args[1])
         return _js_rt(_js_use!(mod, :_rk_range) * "(1, " * _js_code(mod, args[1], _JS_ATOM) * ".length)", T)
-    elseif f === axes && length(args) == 2 && _js_isvector(args[1]) && args[2] isa _JsVal &&
+    elseif f === axes && length(args) == 2 && _js_isanyvector(args[1]) && args[2] isa _JsVal &&
            args[2].static && args[2].value == 1
         return _js_rt(_js_use!(mod, :_rk_range) * "(1, " * _js_code(mod, args[1], _JS_ATOM) * ".length)", T)
-    elseif f === lastindex && length(args) == 1 && _js_isvector(args[1])
+    elseif f === lastindex && length(args) == 1 && _js_isanyvector(args[1])
         return _js_rt(_js_code(mod, args[1], _JS_ATOM) * ".length", Int64)
-    elseif f === firstindex && length(args) == 1 && _js_isvector(args[1])
+    elseif f === firstindex && length(args) == 1 && _js_isanyvector(args[1])
         return _js_static(1)
     elseif f === (:) && length(args) == 2 && all(_js_isint, args)
         return _js_fcall(ir, _js_use!(mod, :_rk_range), args, UnitRange{Int64})
@@ -2155,7 +2191,7 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
             r === nothing || return _js_static(r)
         end
         return _js_fcall(ir, _js_use!(mod, :_rk_steprange), args, StepRange{Int64,Int64})
-    elseif f === iterate && length(args) in (1, 2) && _js_isvector(args[1]) &&
+    elseif f === iterate && length(args) in (1, 2) && _js_isanyvector(args[1]) &&
            (length(args) == 1 || _js_isint(args[2]))
         x = _js_simple!(ir, args[1], "x")
         s = length(args) == 1 ? _js_static(1) : _js_simple!(ir, args[2], "s")
@@ -2200,6 +2236,27 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
         r = args[1]
         r isa _JsVal && r.static && return _js_static(f(r.value))
         return _js_rt(_js_code(mod, r, _JS_ATOM) * (f === first ? ".start" : ".stop"), Int64)
+    elseif f === getindex && length(args) == 2 && (_js_isrange(args[1]) || _js_isstep(args[1])) &&
+           _js_isint(args[2])
+        # `r[i]`: the element at a position, after Julia's bounds check. A
+        # range and a position both known while translating give the number.
+        r, i = args[1], args[2]
+        if r isa _JsVal && r.static && i isa _JsVal && i.static
+            element = try
+                _js_static(r.value[i.value])
+            catch
+                nothing
+            end
+            element === nothing || return element
+        end
+        type = _js_static(string(_js_type(r)))
+        _js_isstep(r) && return _js_fcall(ir, _js_use!(mod, :_rk_steprange_at), Any[r, i, type], Int64)
+        r = _js_range!(ir, r)
+        return _js_rt(_js_use!(mod, :_rk_range_at) * "(" * _js_range_start(r) * ", " * _js_range_stop(r) * ", " *
+                      _js_runtime(mod, i).code * ", " * _js_runtime(mod, type).code * ")", Int64)
+    elseif f === lastindex && length(args) == 1 && (_js_isrange(args[1]) || _js_isstep(args[1]))
+        # `r[end]`: a range's last position is its length.
+        return _js_call!(ir, length, Any[args[1]], Int64)
     elseif f === Base.Broadcast.broadcasted || f === _native_broadcasted
         return _js_broadcasted(ir, f, args, T)
     elseif f === Base.broadcast_preserving_zero_d && length(args) >= 2
@@ -2220,7 +2277,7 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
     elseif f === fill && length(args) == 2 && _js_isnumber(args[1]) && _js_isint(args[2])
         return _js_rt("new Array(" * _js_runtime(mod, args[2]).code * ").fill(" *
                       _js_runtime(mod, args[1]).code * ")", T; pure = false)
-    elseif f === copy && length(args) == 1 && _js_isvector(args[1])
+    elseif f === copy && length(args) == 1 && _js_isanyvector(args[1])
         return _js_rt(_js_code(mod, args[1], _JS_ATOM) * ".slice()", T; pure = false)
     elseif f === collect && length(args) == 1 && args[1] isa _JsStruct && args[1].T === Base.Generator
         g = args[1]
@@ -2231,10 +2288,10 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
         # `[f(k) for k in 1:5]` with nothing captured: a generator known while translating
         g = args[1].value
         return _js_materialize!(ir, _JsBroadcast(g.f, Any[_js_static(g.iter)], Nothing), T)
-    elseif f === map && length(args) == 2 && (_js_isvector(args[2]) || _js_isrange(args[2]))
+    elseif f === map && length(args) == 2 && (_js_isanyvector(args[2]) || _js_isrange(args[2]))
         return _js_materialize!(ir, _JsBroadcast(args[1] isa _JsVal ? args[1].value : args[1],
                                                  Any[args[2]], Nothing), T)
-    elseif f === push! && length(args) == 2 && _js_isvector(args[1]) &&
+    elseif f === push! && length(args) == 2 && _js_isanyvector(args[1]) &&
            (_js_isflatvector(args[1]) ? _js_isnumber(args[2]) : _js_type(args[2]) === eltype(_js_type(args[1])))
         x = _js_simple!(ir, args[1], "x")
         _js_flush!(ir)
@@ -2468,7 +2525,7 @@ function _js_function_call(ir::_JsIR, f::Type, args, T)
         return _js_static(f((a.value for a in args)...))
     elseif f === Base.OneTo && length(args) == 1 && _js_isint(args[1])
         return _js_rt(_js_use!(ir.fn.mod, :_rk_range) * "(1, " * _js_runtime(ir.fn.mod, args[1]).code * ")", T)
-    elseif f === Base.Generator && length(args) == 2 && (_js_isvector(args[2]) || _js_isrange(args[2]))
+    elseif f === Base.Generator && length(args) == 2 && (_js_isanyvector(args[2]) || _js_isrange(args[2]))
         return _JsStruct(f, Any[args...], T)
     elseif f <: Vector && _js_isvector_type(f) && length(args) == 2 && args[1] isa _JsVal &&
            args[1].static && args[1].value === undef && _js_isint(args[2])
@@ -2916,7 +2973,10 @@ ordinary kernel recipes, broadcasts (fused, with Julia's length rules),
 functions with Julia's domain errors, checked 1-based indexing (of a matrix:
 `m[i, j]`, `m[:, j]`, `m[i, :]`, `size`, `axes`), vector literals and
 matrix literals of numbers (`[a b; c d]`), `sum`/`prod`/`maximum`/`minimum`,
-ranges, comprehensions and `map` over vectors; `cumsum`/`cumprod` of numeric
+ranges, comprehensions and `map` over vectors, including a vector of tuples or
+named tuples that a recipe builds (`[k(d) for d in dose]` with a prepared
+kernel `k` whose WANT is `(; a, b)`), read, indexed, iterated and projected
+(`[r.a for r in records]`) like other vectors but never an input; `cumsum`/`cumprod` of numeric
 vectors, contiguous vector views or tuples; tuples and named tuples
 (objects) built, read and destructured, `all`/`any`/`count` of a tuple,
 keyword calls, and `rk_ode_rk45_tol`, integrated by the vendored `@reside-ic/dopri`
@@ -2930,6 +2990,8 @@ matrices; `sum`/`prod`/`maximum`/`minimum` of a matrix, whole or with
 `m[i, j] = x`, `m[:, j] = v`, `m[i, :] = v`; `diag`; slices `view(m, :, j)`
 and `view(m, i, :)` read in place; and broadcasts over matrices, columns and
 rows with Julia's shape rules; `m[indices, j]` gathers a column's indexed rows.
+A range (`a:b`, `a:s:b`, `eachindex(x)`) is read at a position (`r[i]`,
+`r[begin]`, `r[end]`) with Julia's bounds check.
 `reshape(vector, rows, cols)`, including a vector view, shares
 storage with the parent. Its dimensions must be nonnegative: Julia can
 construct a `ReshapedArray` view with negative axes, which JavaScript's

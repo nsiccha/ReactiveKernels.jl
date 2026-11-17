@@ -98,7 +98,9 @@ function _jax_slots_write!(ctx, lhs, target, row)
     _jax_slot_shape!(ctx, target, row)
     part, _ = _jax_slot_position(ctx, target, lhs.args[2:end])
     name = _jax_fresh(ctx, lhs.args[1])
-    _jax_emit!(ctx, name * " = (" * _jax_slot_data(target) * ".at[" * part * "].set(" * row.code *
+    # The row converted to the buffer's element type, as `convert` stores it.
+    stored = _jax_stored(ctx, eltype(eltype(target.T)), row)
+    _jax_emit!(ctx, name * " = (" * _jax_slot_data(target) * ".at[" * part * "].set(" * stored.code *
                     "), " * _jax_slot_mask(target) * ".at[" * part * "].set(True))")
     for (key, v) in ctx.locals
         v.origin === target.origin || continue

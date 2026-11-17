@@ -41,7 +41,7 @@ function _rk_findmax(x, empty) {
 
 _js_isiterstruct(v) = v isa _JsStruct && (v.T === Base.Generator || v.T === Base.Iterators.Filter)
 _js_isiterstatic(v) = v isa _JsVal && v.static && v.value isa Union{Base.Generator,Base.Iterators.Filter}
-_js_isloopsource(v) = v isa _JsVal && ((!v.static && _js_isvector(v)) || _js_isrange(v))
+_js_isloopsource(v) = v isa _JsVal && ((!v.static && _js_isanyvector(v)) || _js_isrange(v))
 _js_isiterable(v) = _js_isiterstruct(v) || _js_isiterstatic(v) || _js_isloopsource(v)
 _js_stagefn(f) = f isa _JsVal && f.static ? f.value : f
 
@@ -132,9 +132,9 @@ end
 function _js_collect_iter!(ir::_JsIR, it, T)
     mod = ir.fn.mod
     _js_itereltype(mod, _js_iterchain(it)...)
-    T isa DataType && T <: Vector && _js_isvector_type(T) ||
-        _js_error(mod, "collecting an iterator into a `", T,
-                  "` has no JavaScript translation (nested vectors of Float64, Int64 or Bool are translated)")
+    T isa DataType && T <: Vector && _js_isanyvector_type(T) ||
+        _js_error(mod, "collecting an iterator into a `", T, "` has no JavaScript translation (vectors of ",
+                  "Float64, Int64, Bool, vectors or matrices of them, and tuples or named tuples of those are translated)")
     _js_flush!(ir)
     out = _js_local!(ir.fn, "out")
     _js_line!(ir.fn, "const " * out * " = [];")
@@ -291,7 +291,7 @@ end
 # called: only its source and the filters before it decide.
 function _js_isempty!(ir::_JsIR, it)
     mod = ir.fn.mod
-    if _js_isloopsource(it) && _js_isvector(it)
+    if _js_isloopsource(it) && _js_isanyvector(it)
         return _js_rt(_js_code(mod, it, _JS_ATOM) * ".length === 0", Bool; prec = _JS_EQ)
     elseif _js_isrange(it)
         r = _js_range!(ir, it)
@@ -376,7 +376,7 @@ function _js_iter_call(ir::_JsIR, f, args, T)
         return _js_isempty!(ir, args[1])
     elseif f in (argmin, argmax, findmin, findmax) && n == 1 && _js_isloopsource(args[1]) && _js_isflatvector(args[1])
         return _js_findext!(ir, f, args[1], T)
-    elseif f === filter && n == 2 && _js_isloopsource(args[2]) && _js_isvector(args[2])
+    elseif f === filter && n == 2 && _js_isloopsource(args[2]) && _js_isanyvector(args[2])
         return _js_collect_iter!(ir, _JsStruct(Base.Iterators.Filter, Any[args[1], args[2]], Nothing), T)
     elseif f === Base.Iterators.filter && n == 2 && _js_iterchain(args[2]) !== nothing
         return _JsStruct(Base.Iterators.Filter, Any[args...], T)

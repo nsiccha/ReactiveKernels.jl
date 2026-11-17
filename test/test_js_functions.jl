@@ -3,8 +3,9 @@ module TestJSFunctions
 # `js_source` of the Base idioms plain helpers use over a window of a series:
 # comparison predicates (`==(x)`, `>=(x)`, …) given to the functions that take
 # one, `findfirst`/`findlast`, `sum`/`maximum`/`minimum` with a function,
-# `x[a:b]`, `collect`, and `merge` of named tuples. Each module is checked in
-# Node against the native kernel, errors included.
+# `x[a:b]`, `collect`, one element of a range (`r[i]`, `r[end]`), and `merge`
+# of named tuples. Each module is checked in Node against the native kernel,
+# errors included.
 
 using ReactiveKernels
 using Test
@@ -122,6 +123,48 @@ js_window_sum(x, from, to) = sum(x[from:to])
     return window
 end
 
+# One element of a range: at a position computed at run time, the first, the
+# last and the one before it. The range is a recipe's value that a helper
+# returns, a helper's own `a:b` or `a:s:b`, a vector's index range, a range
+# written out in a helper, and a range bound at preparation.
+js_bounds(a, b) = a:b
+js_before_last(a, b) = (a:b)[end - 1]
+@kernel js_fn_range_elements(x, a, b, i) = begin
+    span = js_bounds(a, b)
+    head = x[span[1]]
+    at = span[i]
+    ends = span[begin] + span[end]
+    before_last = js_before_last(a, b)
+    return head
+end
+
+js_step_at(a, s, b, i) = (a:s:b)[i]
+js_step_last(a, s, b) = (a:s:b)[end]
+@kernel js_fn_step_elements(a, s, b, i) = begin
+    at = js_step_at(a, s, b, i)
+    last_one = js_step_last(a, s, b)
+    return at
+end
+
+js_index_at(x, i) = eachindex(x)[i]
+js_axis_last(x) = axes(x, 1)[end]
+js_fixed_at(i) = (3:9)[i]
+js_fixed_step_at(i) = (10:-3:1)[i]
+js_fixed_second() = (3:9)[2]
+@kernel js_fn_index_elements(x, i) = begin
+    index = js_index_at(x, i)
+    axis_last = js_axis_last(x)
+    fixed = js_fixed_at(i)
+    fixed_step = js_fixed_step_at(i)
+    second = js_fixed_second()
+    return index
+end
+
+@kernel js_fn_bound_element(x, window, i) = begin
+    picked = x[window[i]] + window[end]
+    return picked
+end
+
 # A predicate that is not a `Bool`.
 js_truthy_search(x) = findfirst(v -> v, x)
 @kernel js_fn_truthy(x) = begin
@@ -155,6 +198,26 @@ const CASES = [
      (; x = V, from = Int, to = Int),
      [(SERIES, 2, 4), (SERIES, 3, 2), (SERIES, 6, 6), (SERIES, 5, 9),   # 5:9 is out of bounds
       ([1.0], 1, 1)]),                                                   # x[1:2] is out of bounds
+    (:js_fn_range_elements, js_fn_range_elements, (:x, :a, :b, :i), (:head, :at, :ends, :before_last),
+     (; x = V, a = Int, b = Int, i = Int),
+     [(SERIES, 3, 6, 2), (SERIES, 3, 6, 4),
+      (SERIES, 5, 9, 5),    # 5:9 runs past the series, and only its elements are read
+      (SERIES, 3, 6, 5), (SERIES, 3, 6, 0),   # a position outside the range
+      (SERIES, 4, 3, 1),    # an empty range has no first element
+      (SERIES, 2, 2, 1),    # nor a one-element range an element before its last
+      (SERIES, 7, 9, 1), (SERIES, -1, 2, 2)]),   # the range's first element is outside the series
+    (:js_fn_step_elements, js_fn_step_elements, (:a, :s, :b, :i), (:at, :last_one),
+     (; a = Int, s = Int, b = Int, i = Int),
+     [(1, 2, 10, 5), (10, -3, 1, 4), (4, 3, 4, 1), (-7, 5, 9, 2),
+      (1, 2, 10, 6), (10, -3, 1, 5), (10, -3, 1, 0),   # a position outside the range
+      (5, 2, 1, 1), (1, -1, 5, 1),                      # empty ranges
+      (1, 0, 5, 1)]),                                   # a zero step: Julia's ArgumentError
+    (:js_fn_index_elements, js_fn_index_elements, (:x, :i), (:index, :axis_last, :fixed, :fixed_step, :second),
+     (; x = V, i = Int),
+     [(SERIES, 4), ([1.0], 1),
+      (SERIES, 7),      # outside the series' index range
+      (SERIES, 5),      # 10:-3:1 has four elements
+      (Float64[], 1)]),
 ]
 
 agree(a::Real, b::Real) = (isnan(a) && isnan(b)) ||
@@ -214,6 +277,72 @@ end
         lookup = body(source, "js_lookup")
         @test count("for (let", lookup) == 1 && occursin("break ", lookup)
         @test !occursin("Fix2", source)
+    end
+
+    @testset "a position outside a range is native's BoundsError, message included" begin
+        range_have, range_types = (:x, :a, :b, :i), (; x = V, a = Int, b = Int, i = Int)
+        for (k, have, want, types, case) in (
+            (js_fn_range_elements, range_have, :at, range_types, (SERIES, 3, 6, 5)),
+            (js_fn_range_elements, range_have, :head, range_types, (SERIES, 4, 3, 1)),
+            (js_fn_step_elements, (:a, :s, :b, :i), :at, (; a = Int, s = Int, b = Int, i = Int), (10, -3, 1, 5)),
+            (js_fn_index_elements, (:x, :i), :index, (; x = V, i = Int), (SERIES, 7)))
+            source = ReactiveKernels.js_source(k; have, want, types, name = :element)
+            if !NODE
+                @test_skip "no node on the PATH"
+                continue
+            end
+            native = prepare(k; have, want)
+            expected = try
+                native(case...)
+            catch e
+                e
+            end
+            @test expected isa BoundsError
+            r = only(ReactiveKernels.js_run(source, :element, [case]))
+            @test r.julia_error && r.error == "BoundsError"
+            @test "BoundsError: " * r.message == sprint(showerror, expected)
+        end
+    end
+
+    @testset "a range element is computed from the range's ends" begin
+        source = ReactiveKernels.js_source(js_fn_range_elements; have = (:x, :a, :b, :i),
+                                           want = (:head, :at, :ends, :before_last),
+                                           types = (; x = V, a = Int, b = Int, i = Int))
+        # no window of the series is checked or copied, and no array is built
+        @test !occursin("_rk_window(", source) && !occursin(".slice(", source) && !occursin("Array.from(", source)
+        source = ReactiveKernels.js_source(js_fn_index_elements; have = (:x, :i), want = (:fixed, :second),
+                                           types = (; x = V, i = Int))
+        # a range written out in a helper is read as its two numbers, and its
+        # element at a position written out is that number
+        @test occursin("_rk_range_at(3, 9, ", body(source, "js_fixed_at"))
+        @test !occursin("_rk_range(", source)
+        @test occursin("return 4;", body(source, "js_fixed_second"))
+    end
+
+    @testset "a bound range read at a position stays module data" begin
+        sources = String[]
+        for window in (2:5, 11:40)
+            native = prepare(js_fn_bound_element; have = (:x, :window, :i), want = :picked, bound = (; window))
+            source = ReactiveKernels.js_source(native; types = (; x = V, i = Int), name = :picked)
+            push!(sources, source)
+            NODE || continue
+            cases = [(collect(1.0:45.0), 1), (collect(1.0:45.0), 4), (collect(1.0:45.0), 31), (SERIES, 2)]
+            for (c, r) in zip(cases, ReactiveKernels.js_run(source, :picked, cases))
+                expected = try
+                    native(c...)
+                catch e
+                    e
+                end
+                if expected isa Exception
+                    @test r.julia_error && r.error == string(nameof(typeof(expected)))
+                else
+                    @test r.error === nothing && agree(expected, r.value)
+                end
+            end
+        end
+        bodies = [replace(source, r"(?m)^const _rk_bound_.*\n" => "") for source in sources]
+        @test all(==(first(bodies)), bodies)
+        @test occursin("_rk_bound_window.start", first(bodies))
     end
 
     @testset "a predicate that is not a Bool is named" begin

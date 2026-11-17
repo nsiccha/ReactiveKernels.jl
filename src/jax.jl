@@ -939,6 +939,21 @@ const _JAX_UPDATING = Dict{Symbol,Symbol}(:+= => :+, :-= => :-, :*= => :*, :/= =
     :&= => :&, :|= => :|, :⊻= => :⊻,
                                            :^= => :^)
 
+# The value an array of element type `E` stores: `convert(E, v)`, as Julia's
+# `setindex!` stores it, entry by entry for an array value (a row or slice).
+# For a number `convert(E, v)` is `E(v)`, so the store is `E.(v)`'s
+# translation. JAX's `.at[i].set(v)` of a value of another dtype leaves that
+# cast to the scatter, which performs it with a FutureWarning and will refuse
+# it in a later release, so a value whose dtype is not the array's is
+# converted here.
+function _jax_stored(ctx::_JaxContext, @nospecialize(E), v::_PyVal)
+    S = _jax_eltype(v.T)
+    E isa Type && S isa Type && isconcretetype(E) && isconcretetype(S) &&
+        E <: _JaxBranchReal && S <: _JaxBranchReal && _jax_dtype(E) != _jax_dtype(S) ||
+        return v
+    _jax_broadcast(ctx, E, [v])
+end
+
 function _jax_statement(ctx::_JaxContext, ex)
     if ex isa Expr && ex.head === :(=) && length(ex.args) == 2
         return _jax_assign!(ctx, ex.args[1], ex.args[2])
@@ -988,7 +1003,8 @@ function _jax_destructure!(ctx::_JaxContext, lhs, v::_PyVal)
         indexed = _jax_index(ctx, target, lhs.args[2:end]; target = true)
         position = indexed.code[ncodeunits(target.code)+1:end]
         name = _jax_fresh(ctx, lhs.args[1])
-        _jax_emit!(ctx, name * " = " * _py_atom(target.code) * ".at" * position * ".set(" * v.code * ")")
+        stored = _jax_stored(ctx, _jax_eltype(target.T), v)
+        _jax_emit!(ctx, name * " = " * _py_atom(target.code) * ".at" * position * ".set(" * stored.code * ")")
         ctx.locals[lhs.args[1]] = _PyVal(name, target.T, false, target.extent, target.limit,
                                          target.padded)
         return
@@ -1521,6 +1537,20 @@ function _jax_short_circuit(ctx::_JaxContext, ex, is_or::Bool)
     _PyVal((is_or ? "jnp.logical_or(" : "jnp.logical_and(") * a.code * ", " * b.code * ")", Bool)
 end
 
+# The padding of a mapped collection's own axis (its entries past a valid
+# count), apart from lengths inside its entries: a ragged row vector's
+# lengths and a record vector's field lengths belong to each entry.
+function _jax_entry_axis_extent(c::_PyVal)
+    c.origin isa _JaxRecordLayout && _jax_is_array(c.T) && return c.origin.axis_extent
+    _jax_entry_lengths(c) && return ""
+    c.extent
+end
+# Whether a collection's `extent` holds lengths inside each entry: one row
+# length per entry of a ragged vector of vectors, or a lengths tree per
+# record of a vector of records with padded fields.
+_jax_entry_lengths(c::_PyVal) = !isempty(c.extent) && _jax_is_array(c.T) &&
+    ((_jax_ragged(c.T) && !_jax_outer_rows(c)) || _jax_is_tuple(eltype(c.T)))
+
 # `map(xs...) do args... body end`: the body as a function of one element of
 # each collection, vectorized over them (padded collections stay padded).
 function _jax_expr(ctx::_JaxContext, ::Val{:do}, ex)
@@ -1530,7 +1560,8 @@ function _jax_expr(ctx::_JaxContext, ::Val{:do}, ex)
         _jax_error("the do-block `", ex, "` has no JAX translation", _jax_where(ctx))
     f = _jax_resolve(ctx, call.args[1])
     f === map || _jax_error("a do-block on `", f, "` has no JAX translation", _jax_where(ctx))
-    collections = [_jax_expr(ctx, a) for a in call.args[2:end]]
+    # A buffer of rows maps its assigned rows (`_jax_slots_rows` checks them).
+    collections = [_jax_slots_rows(ctx, _jax_expr(ctx, a)) for a in call.args[2:end]]
     all(c -> _jax_rank(c.T) == 1, collections) ||
         _jax_error("`map` over collections that are not vectors", _jax_where(ctx))
     params = lambda.args[1]
@@ -1538,7 +1569,25 @@ function _jax_expr(ctx::_JaxContext, ::Val{:do}, ex)
     length(names) == length(collections) ||
         _jax_error("a do-block with ", length(names), " arguments over ", length(collections),
                    " collections", _jax_where(ctx))
-    elements = [_PyVal(_jax_fresh(ctx, n), eltype(c.T)) for (n, c) in zip(names, collections)]
+    # An entry that carries lengths (a ragged row, a record with padded
+    # fields) keeps them: they are mapped beside the collection, as a plate
+    # maps a ragged argument with its lengths.
+    with_lengths = Bool[_jax_entry_lengths(c) for c in collections]
+    elements = _PyVal[]
+    params_code = String[]
+    args_code = String[]
+    for (n, c, w) in zip(names, collections, with_lengths)
+        element = _jax_fresh(ctx, n)
+        push!(params_code, element); push!(args_code, c.code)
+        if w
+            lengths = _jax_fresh(ctx, Symbol(n, :_lengths))
+            push!(params_code, lengths); push!(args_code, c.extent)
+            padded = _jax_ragged(c.T) ? 1 : _jax_padded_fields(c)
+            push!(elements, _PyVal(element, eltype(c.T), false, lengths, "", padded))
+        else
+            push!(elements, _PyVal(element, eltype(c.T)))
+        end
+    end
     hint = _jax_element_hint(ctx, ex)
     outer = ctx.scope
     inner = _JaxScope(outer)
@@ -1554,9 +1603,49 @@ function _jax_expr(ctx::_JaxContext, ::Val{:do}, ex)
         ctx.scope = outer
         empty!(ctx.locals); merge!(ctx.locals, saved)
     end
-    f = _jax_element_callable!(ctx, inner, hint, [e.code for e in elements], result.code)
-    _PyVal("jax.vmap(" * f * ")(" * _jax_args(collections) * ")", Vector{_jax_typeof(result)},
-           false, _jax_extent(collections))
+    E = _jax_typeof(result)
+    T = Vector{E}
+    axis = ""
+    for c in collections
+        a = _jax_entry_axis_extent(c)
+        isempty(a) && continue
+        isempty(axis) || axis == a ||
+            _jax_error("`map` over collections padded to different lengths", _jax_where(ctx))
+        axis = a
+    end
+    # An element with lengths of its own (a padded row of a ragged entry, a
+    # record with such a field) returns them beside its value: the mapped
+    # values are ragged rows, or records whose fields keep their lengths.
+    if !isempty(result.extent)
+        row = _jax_is_array(E) && E <: AbstractVector && eltype(E) <: Number
+        row || _jax_tuple_valued(E) && _jax_is_tuple(E) ||
+            _jax_error("`map` whose elements are padded `", E, "` values", _jax_where(ctx))
+        isempty(axis) ||
+            _jax_error("`map` over a padded collection whose elements have lengths of their own",
+                       _jax_where(ctx))
+        fn = _jax_element_callable!(ctx, inner, hint, params_code,
+                                    "(" * result.code * ", " * result.extent * ")")
+        values = _jax_fresh(ctx, row ? :rows : :records)
+        lengths = _jax_fresh(ctx, row ? :row_lengths : :record_lengths)
+        _jax_emit!(ctx, values * ", " * lengths * " = jax.vmap(" * fn * ")(" *
+                        join(args_code, ", ") * ")")
+        row && return _PyVal(values, T, false, lengths)
+        layout = result.origin isa _JaxRecordLayout ?
+            _JaxRecordLayout([_jax_record_field(result, k) for k in 1:fieldcount(E)], "", 0) : nothing
+        return _PyVal(values, T, false, lengths, "", _jax_padded_fields(result), layout)
+    end
+    fn = _jax_element_callable!(ctx, inner, hint, params_code, result.code)
+    v = _PyVal("jax.vmap(" * fn * ")(" * join(args_code, ", ") * ")", T, false, axis)
+    # Numerical arrays of one stored shape (every mapped element has the
+    # shape of the others under `vmap`) stack into rows without padding: a
+    # row read is the dense array it is, as an earlier plate's full rows are.
+    _jax_ragged(T) && eltype(E) <: Number && return _jax_with_origin(v, _JaxDenseRows())
+    # Records keep a padded collection's count on their own axis, apart from
+    # any lengths of their fields.
+    _jax_is_tuple(E) && !isempty(axis) &&
+        return _PyVal(v.code, T, false, "", "", 0,
+                      _JaxRecordLayout([_jax_record_field(result, k) for k in 1:fieldcount(E)], axis, 1))
+    v
 end
 
 # Generators and comprehensions: the element expression as a function of the
@@ -1648,7 +1737,10 @@ _jax_is_range_form(ctx::_JaxContext, iter) =
 # a padded vector masks its padding as a filter does.
 function _jax_collection_values(ctx::_JaxContext, body, var::Symbol, iter, condition, hint)
     xs = _jax_expr(ctx, iter)
-    _jax_rank(xs.T) == 1 && !_jax_ragged(xs.T) ||
+    # Dense rows (`_jax_dense_rows`) map one array per element.
+    rows = _jax_dense_rows(ctx, xs)
+    rows === nothing || (xs = rows)
+    _jax_rank(xs.T) == 1 && (!_jax_ragged(xs.T) || rows !== nothing) ||
         _jax_error("a generator over a `", xs.T, "`", _jax_where(ctx))
     element = _jax_fresh(ctx, var)
     outer = ctx.scope
@@ -2015,6 +2107,35 @@ function _jax_repeat_last_valid(ctx::_JaxContext, x::_PyVal)
     x
 end
 
+# A `for` over a vector's entries, `for x in xs`: the loop over its indices
+# whose body first reads entry `k` into `x`, as Julia's iteration of an array
+# visits its entries in index order. The loop variable is local to the loop,
+# as Julia's is: an outer binding of the same name is neither carried nor
+# changed.
+function _jax_collection_for(ctx::_JaxContext, ex)
+    binding, body = ex.args
+    binding isa Expr && binding.head === :(=) && binding.args[1] isa Symbol || return nothing
+    iter = binding.args[2]
+    _jax_is_range_form(ctx, iter) && return nothing
+    xs = _jax_expr(ctx, iter)
+    _jax_rank(xs.T) == 1 ||
+        _jax_error("a loop over the entries of a `", xs.T, "`", _jax_where(ctx))
+    var = binding.args[1]
+    collection = gensym(:collection)
+    index = gensym(var)
+    outer = get(ctx.locals, var, nothing)
+    ctx.locals[collection] = _jax_bind!(ctx, :collection, xs)
+    delete!(ctx.locals, var)
+    loop = Expr(:for, Expr(:(=), index, Expr(:call, GlobalRef(Base, :eachindex), collection)),
+                Expr(:block, Expr(:(=), var, Expr(:ref, collection, index)), body))
+    try
+        _jax_expr(ctx, loop)
+    finally
+        delete!(ctx.locals, collection)
+        outer === nothing ? delete!(ctx.locals, var) : (ctx.locals[var] = outer)
+    end
+end
+
 # Loops. A `for` over a range is `jax.lax.fori_loop` over a function of the
 # index and the carry, the outer locals the body assigns (an indexed write
 # assigns its array). The range's bounds are static, so the loop lowers to a
@@ -2029,6 +2150,8 @@ function _jax_expr(ctx::_JaxContext, ::Val{:for}, ex)
     exited = _jax_break_loop(ctx, ex)
     exited === nothing || return exited
     binding, body = ex.args
+    loop = _jax_collection_for(ctx, ex)
+    loop === nothing || return loop
     body = _jax_continue_body(body)
     binding isa Expr && binding.head === :(=) && binding.args[1] isa Symbol ||
         _jax_error("the loop binding `", binding, "` has no JAX translation", _jax_where(ctx))
@@ -2289,7 +2412,10 @@ function _jax_range_ends(ctx::_JaxContext, iter)
         else
             _jax_rank(x.T) == 1 || _jax_error("a loop over the indices of a `", x.T, "`",
                                               _jax_where(ctx))
-            hi = _jax_outer_rows(x) ? _jax_function_call(ctx, length, [x]) :
+            # Lengths inside the entries (a ragged vector's rows, a record
+            # vector's fields) do not pad the vector itself.
+            hi = _jax_outer_rows(x) || _jax_entry_lengths(x) || x.origin isa _JaxRecordLayout ?
+                _jax_function_call(ctx, length, [x]) :
                 isempty(x.extent) ? _PyVal(_py_atom(x.code) * ".shape[0]", Int, true) :
                 _PyVal(x.extent, Int, false, "", _py_atom(x.code) * ".shape[0]")
         end
@@ -4155,7 +4281,41 @@ end
 _jax_collection_code(x::_PyVal; float::Bool = false) =
     something(_jax_tuple_array_code(x; float), x.code)
 
+# A vector of numerical arrays stored as dense rows, one array per entry of
+# the leading axis: a `map` or a buffer's assigned rows (`_JaxDenseRows`),
+# or an earlier plate's cells that fill their stored rows; `nothing` for
+# rows with lengths of their own.
+function _jax_dense_rows(ctx::_JaxContext, v::_PyVal)
+    _jax_ragged(v.T) || return nothing
+    _jax_slots(v) && return _jax_slots_rows(ctx, v)
+    v.origin isa _JaxDenseRows && return v
+    _jax_full_rows(ctx, v) && return _jax_with_origin(_jax_without_lengths(v), _JaxDenseRows())
+    nothing
+end
+# `sum` of a vector of arrays, Julia's `+` of its entries: the sum along the
+# leading axis of their dense rows, over the valid entries of a padded
+# vector. Julia refuses an empty collection without `init`, and so does the
+# module, at run time when the number of entries is data.
+function _jax_rows_sum(ctx::_JaxContext, x::_PyVal)
+    rows = _jax_dense_rows(ctx, x)
+    rows === nothing &&
+        _jax_error("`sum` of a vector of arrays whose entries have lengths of their own",
+                   _jax_where(ctx))
+    n = _jax_function_call(ctx, length, [rows])
+    _jax_call(ctx, _runtime_check, [_jax_call(ctx, >, [n, _jax_literal(0)]),
+        _PyVal(repr("ArgumentError: reducing over an empty collection is not allowed"),
+               ArgumentError)])
+    E = eltype(rows.T)
+    code = rows.code
+    if !isempty(rows.extent)
+        r = ndims(E)
+        code = "jnp.where(" * _jax_mask(rows) * "[:" * ", None"^r * "], " * code * ", 0)"
+    end
+    _PyVal("jnp.sum(" * code * ", axis=0)", Array{eltype(E),ndims(E)})
+end
 function _jax_function_call(ctx::_JaxContext, ::typeof(sum), args::Vector{_PyVal})
+    length(args) == 1 && _jax_rank(args[1].T) == 1 && _jax_ragged(args[1].T) &&
+        return _jax_rows_sum(ctx, args[1])
     # Fixed structural lag windows reduce a numeric tuple, of mixed element
     # types too. Tuples of arrays have different Julia sum semantics.
     stacked = length(args) == 1 ? _jax_tuple_array_code(args[1]) : nothing
@@ -4857,6 +5017,24 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(fill), args::Vector{_PyVa
     shape, N = _jax_dims(ctx, fill, dims)
     _PyVal("jnp.full(" * shape * ", " * x.code * ", dtype=" * _jax_dtype(E) * ")", Array{E,N})
 end
+# `similar(A)` and `similar(A, T)`: a new numerical array of `A`'s shape, with
+# its padding (a padded row's length), of `A`'s element type or `T`. Julia
+# leaves the entries undefined, so a program reads only entries it writes
+# first; zeros are such an allocation. With dimensions, `similar(A, [T,]
+# dims...)` is the allocation `zeros(T, dims...)` is.
+function _jax_function_call(ctx::_JaxContext, ::typeof(similar), args::Vector{_PyVal})
+    x = args[1]
+    ctx.host === nothing && x.T isa Type && x.T <: Union{Array,AbstractRange} && !_jax_ragged(x.T) &&
+        !_jax_columns(x.T) && eltype(x.T) <: Number || return _jax_traceable_or_lowered(ctx, similar, args)
+    rest = args[2:end]
+    E = isempty(rest) ? nothing : _jax_type_of_value(rest[1])
+    E === nothing ? (E = eltype(x.T)) : (rest = rest[2:end])
+    E isa Type && E <: Number || return _jax_traceable_or_lowered(ctx, similar, args)
+    isempty(rest) ||
+        return _jax_function_call(ctx, zeros, [_PyVal("<type>", _JaxCallable(E)); rest])
+    _PyVal("jnp.zeros_like(" * x.code * ", dtype=" * _jax_dtype(E) * ")",
+           Array{E,ndims(x.T)}, false, x.extent, x.limit, x.padded)
+end
 # `repeat(A, counts...)` is Julia's `repeat(A; outer = counts)`: `A` tiled
 # `counts[d]` times along axis `d`, as `jnp.tile` does. `inner` first repeats
 # each entry along each axis, as `jnp.repeat` does. The result has as many
@@ -4978,8 +5156,9 @@ function _jax_index_values(ctx::_JaxContext, x::_PyVal, indices::Vector{_PyVal})
     E = eltype(x.T)
     code = _py_atom(x.code) * "[" * join(parts, ", ") * "]"
     T = kept == 0 ? E : Array{E,kept}
-    # Rows of a ragged value keep their lengths, as `x[i]` does (`_jax_index`).
-    if _jax_ragged(x.T)
+    # Rows of a ragged value keep their lengths, as `x[i]` does (`_jax_index`);
+    # dense rows are the arrays they store.
+    if _jax_ragged(x.T) && !_jax_outer_rows(x)
         isempty(x.extent) && _jax_error("a ragged array without its lengths", _jax_where(ctx))
         return _PyVal(code, T, false, x.extent * "[" * join(parts, ", ") * "]", "", kept == 0 ? 1 : 0)
     end
@@ -6704,7 +6883,7 @@ for (f, position) in ((first, 1), (last, 0))
             k = $position == 1 ? 1 : fieldcount(x.T)
             return _jax_tuple_element(ctx, x, _PyVal(string(k), Int, true))
         end
-        _jax_is_array(x.T) && ndims(x.T) == 1 && !_jax_ragged(x.T) ||
+        _jax_is_array(x.T) && ndims(x.T) == 1 && (!_jax_ragged(x.T) || x.origin isa _JaxDenseRows) ||
             return _jax_traceable_or_lowered(ctx, $f, args)
         # A padded vector's last entry is the one at its length.
         isempty(x.extent) || $position == 1 ||
