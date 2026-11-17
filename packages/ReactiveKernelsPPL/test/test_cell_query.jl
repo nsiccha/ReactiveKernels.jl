@@ -610,10 +610,18 @@ end
     @test generate > 100 * hit
     @test (@allocated ReactiveKernelsPPL._check_built_program(built, rebound)) < 10_000
 
-    # A binding of another program (one group fewer, so `Z` has other sizes) is
-    # refused on every preparation, before and after the first one.
+    # One group fewer is the same program: level counts may change under one
+    # build (rkppl-use §14, "Rebinding"), and the binding's own layout sizes
+    # `Z`. Its queries through this build equal those through its own build.
     fewer = map(x -> x isa AbstractVector ? x[1:4] : x, data)
-    other = bind_data(plan, fewer)
+    smaller = bind_data(plan, fewer)
+    alone = build_kernel(smaller)
+    v = collect(range(-0.4, 0.5; length = alone.layout.total))
+    @test [prepare_cell_query(built, smaller, :y)(v, i) for i in eachindex(fewer.y)] ==
+        [prepare_cell_query(alone, smaller, :y)(v, i) for i in eachindex(fewer.y)]
+    # A binding of another program (single-precision `w`, another data type)
+    # is refused on every preparation, before and after the first one.
+    other = bind_data(plan, merge(data, (; w = Float32.(data.w))))
     for _ in 1:2
         @test_throws ContractValidationError prepare_cell_query(built, other, :y)
         @test_throws ContractValidationError prepare_query(built, other, :pointwise)

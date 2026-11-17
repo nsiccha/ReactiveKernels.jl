@@ -2336,9 +2336,16 @@ _is_array_value_ref(ex::Expr, data, detmap, memo, active, env) =
 # shape and the axis an enclosing broadcast inherits both read this one
 # rule, so naming a gather never changes its shape: `rg = b[g, 1]` and
 # `(b[g, 1] .+ b[h, 1]) ./ 2` are per observation alike.
-_array_ref_shape(ex::Expr, data, detmap, memo, active, env) =
-    _ref_shape(ex, i -> (i isa Symbol && i in data) ||
+# An index that is itself a model-level array (an integer array parameter,
+# `mu[z]`) gives the read that index's shape, as Julia indexing does.
+function _array_ref_shape(ex::Expr, data, detmap, memo, active, env)
+    shape = _ref_shape(ex, i -> (i isa Symbol && i in data) ||
         _obs_axis(i, data, detmap, memo, active, env))
+    shape === :scalar && any(i -> i isa Symbol &&
+        _shape_of(i, data, detmap, memo, active, env) === :array, ex.args[2:end]) &&
+        return :array
+    return shape
+end
 
 # Reads of an array (`z[g]` per observation, `phi[1]` scalar, `L[:, 1]`
 # array); every other ref keeps the slice-1 scalar shape. Predictor
@@ -13056,6 +13063,8 @@ function _lower_lkj_stack(lhs, dims::Vector{Any}, rhs)
         Any[K, K, dims[3]], nothing, lhs)
 end
 
+const _VECTOR_PARAMETER_FAMILIES = (:Categorical,)
+
 # `z[axes...] .~ Fam.(args...)`: the elementwise prior is the scalar
 # statement `Fam(args...)` applied per element (Distributions.jl
 # broadcast), so it lowers through the scalar parameter parser (family,
@@ -13069,7 +13078,10 @@ function _lower_array_parameter(lhs, dims::Vector{Any}, rhs, coefuse, ctx,
         "`B * $lhs` through a data matrix)")
     call = _undot_distribution(lhs, rhs)
     if Meta.isexpr(rhs, :call)
-        for a in call.args[2:end]
+        for (j, a) in enumerate(call.args[2:end])
+            # A family whose parameter is itself a vector (`Categorical(w)`'s
+            # probabilities) shares that whole vector across the elements.
+            j == 1 && call.args[1] in _VECTOR_PARAMETER_FAMILIES && continue
             _canon_shape(a, ctx) === :scalar || _sfail("array $lhs: " *
                 "a shared scalar distribution constructor requires scalar " *
                 "arguments; use `$(call.args[1]).(...)` to broadcast arguments")
