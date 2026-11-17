@@ -16,6 +16,29 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.303
+
+- JAX source translates a splatted tuple or named tuple in a tuple literal
+  or a call (`(a, rest(...)...)`, `tuple(a, rest...)`, `f(t...)`), in
+  `@traceable` source as in plain lowered helpers: it passes the tuple's
+  fields, whose count is its type's. A helper that recurses over a record's
+  field names and splats each step's result (`NamedTuple{names}(...)` of
+  per-field values) therefore emits, unrolled over the names, never over
+  data. Splatting a vector, whose length is data, still raises
+  `JAXEmissionError`.
+- A device JAX function whose helper writes an array argument in place
+  (`w[i] += x`, also through a helper it calls) now writes the caller's
+  array, as Julia's does: the function returns each written array after its
+  value, and the caller rebinds the local it passed, so later reads (another
+  helper's, or a sequential update across calls) see the write. Before, the
+  write was dropped silently and the emitted module computed a different
+  value. Writes before a helper's own `w = copy(w)` reach the caller, later
+  ones the copy. A write the caller cannot rebind (inside a loop or branch
+  that does not assign that local, to a value another kernel statement
+  reads, to an expression other than a local name or a new array, or to an
+  argument the helper also rebinds inside a loop, branch or `let`) raises
+  `JAXEmissionError`.
+
 ## 0.1.302
 
 - JAX source translates device `for` loops, generators and comprehensions
