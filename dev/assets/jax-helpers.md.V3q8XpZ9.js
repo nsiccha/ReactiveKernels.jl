@@ -302,7 +302,7 @@ import{_ as e,o as a,c as i,a6 as n}from"./chunks/framework.BUF_B7sW.js";const u
 <span class="line"></span>
 <span class="line"></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">def constrain(unconstrained: ArrayLike, **prepared: ArrayLike) -&gt; dict:</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    &quot;&quot;&quot;The constrained value of each parameter, and of each requested value, at \`unconstrained\`, the packed unconstrained parameters (length \`dimension(prepared)\`), for the data \`prepare_data\` returned: \`f(u, **prepared)\`. Returns a dict, a submodel&#39;s values nested under its name:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    &quot;&quot;&quot;The constrained value of each parameter, and of each requested value, at \`unconstrained\`, the packed unconstrained parameters (length \`dimension(prepared)\`), for the data \`prepare_data\` returned: \`f(u, **prepared)\`. Returns a dict, a submodel&#39;s values nested under its name (a submodel call&#39;s own value under \`return\` there):</span></span>
 <span class="line"></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    - \`a.mean\`: Mean of the effect.</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    - \`a.spread\`: Spread of the members around the mean.</span></span>
