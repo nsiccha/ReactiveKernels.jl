@@ -352,11 +352,11 @@ end
 # A region returns a named tuple as a `dict` keyed by its field names, the
 # public form (`_jax_returned`). Inside the module a named tuple is the tuple
 # of its fields, read by position (`_jax_record_field`), so the caller reads
-# the returned `dict` back into that tuple.
+# the returned `dict` back into that tuple. The reads stay where the value is
+# used: an entry that does not demand the output has no such key.
 function _jax_record_from_dict(ctx, v::_PyVal)
     v.T isa Type && v.T <: NamedTuple && fieldcount(v.T) > 0 || return v
-    bound = _jax_bind!(ctx, :record, v)
-    _PyVal("(" * join((_py_atom(bound.code) * "[" * repr(string(n)) * "]" for n in fieldnames(v.T)),
+    _PyVal("(" * join((_py_atom(v.code) * "[" * repr(string(n)) * "]" for n in fieldnames(v.T)),
                       ", ") * (fieldcount(v.T) == 1 ? ",)" : ")"),
            v.T, v.static, "", "", v.padded, v.origin)
 end
