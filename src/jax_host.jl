@@ -175,7 +175,9 @@ _host_emit_lines!(ctx::_JaxContext, lines, extra::Int = 0) =
 # --- locals ---------------------------------------------------------------------------
 
 # A local read as a value: a list is read as an array.
-_host_read(ctx::_JaxContext, v::_PyVal) = ctx.host !== nothing && _host_listed(ctx, v.code) ?
+_host_tuple_vector(T) = T isa Type && T <: AbstractVector && eltype(T) <: Tuple
+_host_read(ctx::_JaxContext, v::_PyVal) = ctx.host !== nothing &&
+    (v.code == "[]" || _host_listed(ctx, v.code)) && !_host_tuple_vector(v.T) ?
     _PyVal("np.asarray(" * v.code * ", dtype=" * _host_dtype(_jax_eltype(v.T)) * ")", v.T, true) : v
 # A local read in place (appended to, indexed, measured, iterated).
 _host_raw(ctx::_JaxContext, ex) = ex isa Symbol && haskey(ctx.locals, ex) ? ctx.locals[ex] :
@@ -193,8 +195,10 @@ end
 
 # An allocation: its array may be written in place.
 const _HOST_ALLOCATIONS = ("jnp.zeros(", "jnp.ones(", "jnp.full(", "np.zeros(", "np.ones(",
-                           "np.full(", "np.empty(", "list(")
-_host_fresh(code::AbstractString) = code in ("[]", "{}", "set()") || endswith(code, ".copy()") ||
+                           "np.full(", "np.empty(", "list(", "sorted(", "_RKDict(")
+_host_fresh(code::AbstractString) = code in ("[]", "{}", "set()") ||
+    endswith(code, ".copy()") || endswith(code, ".tolist()") ||
+    startswith(code, "[") && endswith(code, "]") ||
     any(p -> startswith(code, p) && _host_one_call(code), _HOST_ALLOCATIONS)
 # A list of allocations (`[np.zeros(n) for k in ...]`): each element is a
 # fresh array (a list, a dictionary), so its elements may be written in place.
@@ -218,7 +222,7 @@ function _host_bind!(ctx::_JaxContext, lhs::Symbol, v::_PyVal)
     _jax_translation_only(v) && (ctx.locals[lhs] = v; return)
     v.T === Union{} && return
     h = ctx.host
-    listed = v.code == "[]" || v.code in h.lists
+    listed = v.code == "[]" || v.code in h.lists || _host_tuple_vector(v.T)
     # A local a loop grows stays a list whatever it is bound to: a fresh one.
     lhs in h.growing && !listed && _jax_is_array(v.T) &&
         (v = _PyVal("list(" * v.code * ")", v.T, true); listed = true)
@@ -337,6 +341,7 @@ function _host_targets(exs)
     walk(ex) = begin
         ex isa Expr || return
         ex.head in (:quote, :inert, :->, :function) && return
+        Meta.isexpr(ex, :(=), 2) && Meta.isexpr(ex.args[1], :call) && return
         if (ex.head === :(=) || haskey(_JAX_UPDATING, ex.head)) && length(ex.args) == 2
             target = ex.args[1]
             target isa Expr && target.head === :(::) && (target = target.args[1])
@@ -367,6 +372,7 @@ function _host_grown(exs)
     walk(ex) = begin
         ex isa Expr || return
         ex.head in (:quote, :inert, :->, :function) && return
+        Meta.isexpr(ex, :(=), 2) && Meta.isexpr(ex.args[1], :call) && return
         if ex.head === :call && ex.args[1] in _HOST_GROWING && length(ex.args) >= 3
             s = root(ex.args[2])
             s === nothing || push!(grown, s)
@@ -518,7 +524,8 @@ function _host_arm!(ctx::_JaxContext, build, result::AbstractString)
     T
 end
 
-_host_join(A, B) = A === Union{} ? B : B === Union{} ? A : promote_type(_jax_typeof_T(A), _jax_typeof_T(B))
+_host_join(A, B) = A === B ? A : A === Union{} ? B : B === Union{} ? A :
+    promote_type(_jax_typeof_T(A), _jax_typeof_T(B))
 _jax_typeof_T(@nospecialize(T)) = T isa Type ? T : Any
 
 # An `if` (`value`: its value is used).
@@ -1171,7 +1178,26 @@ end
 
 # Calls that read a collection in place; `nothing` for any other.
 function _host_call(ctx::_JaxContext, f, positional, kwargs)
+    if f in (sort, sort!, sortperm) && length(positional) == 1 && first.(kwargs) == [:by]
+        return _host_sort_by(ctx, f, positional[1], _jax_expr(ctx, last(only(kwargs))))
+    end
     isempty(kwargs) || return nothing
+    if length(positional) == 1 && (f === collect || f isa Type && (f <: AbstractDict || f <: AbstractSet))
+        ex = only(positional)
+        if ex isa Expr && ex.head === :generator
+            body = ex.args[1]
+            if f isa Type && f <: AbstractDict && body isa Expr && body.head === :call && body.args[1] === :(=>)
+                ex = Expr(:generator, Expr(:tuple, body.args[2:end]...), ex.args[2:end]...)
+            end
+            element, clauses, E, _ = _host_generator(ctx, ex)
+            v = _host_collected("[" * element * " " * clauses * "]", E)
+            return f === collect ? v : _host_construct(ctx, f, [v])
+        elseif f === collect && ex isa Expr && ex.head === :call &&
+               ex.args[1] in (:keys, :values, :pairs)
+            iterable, E = _host_iterable(ctx, ex)
+            return _host_collected("list(" * iterable * ")", E)
+        end
+    end
     (f === sort! || f === unique!) && length(positional) == 1 &&
         return _host_rewrite!(ctx, f, positional[1])
     listed = _host_list_read(ctx, f, positional)
@@ -1248,7 +1274,7 @@ function _host_index(ctx::_JaxContext, x::_PyVal, indices)
         key = _jax_expr(ctx, indices[1])
         return _PyVal(_py_atom(x.code) * "[" * key.code * "]", Base.valtype(T), true)
     end
-    _host_listed(ctx, x.code) || _jax_ragged(T) || return nothing
+    _host_listed(ctx, x.code) || _jax_ragged(T) || _host_tuple_vector(T) || return nothing
     length(indices) == 1 || _jax_error("indexing a list with ", length(indices), " indices",
                                        _jax_where(ctx))
     E = _jax_eltype(T)
@@ -1274,7 +1300,10 @@ end
 
 # A Julia type called as a constructor; `nothing` where JAX's translation serves.
 function _host_construct(ctx::_JaxContext, T::Type, args::Vector{_PyVal})
-    T <: AbstractDict && isempty(args) && return _PyVal("{}", T isa UnionAll ? Dict{Any,Any} : T, true)
+    if T <: Dict && isempty(args)
+        name = _jax_module_helper!(ctx.mod, "_RKDict", _HOST_DICT)
+        return _PyVal(name * "()", T isa UnionAll ? Dict{Any,Any} : T, true)
+    end
     T <: Dict && length(args) == 1 && return _host_dict(ctx, T, only(args))
     if T <: AbstractSet && length(args) <= 1
         isempty(args) && return _PyVal("set()", T isa UnionAll ? Set{Any} : T, true)
@@ -1291,6 +1320,7 @@ function _host_construct(ctx::_JaxContext, T::Type, args::Vector{_PyVal})
         E = eltype(T)
         E isa TypeVar && (E = Float64)
         shape, N = _jax_dims(ctx, T, dims)
+        N == 1 && E <: Tuple && return _PyVal("np.empty(" * shape * ", dtype=object).tolist()", Vector{E}, true)
         return _PyVal("np.zeros(" * shape * ", dtype=" * _host_dtype(E) * ")", Array{E,N}, true)
     end
     length(args) == 1 && !_jax_is_array(args[1].T) || return nothing
@@ -1379,6 +1409,8 @@ def _rk_isless_key_np(a):
     # One value's place in Julia's isless order: every NaN last, missing
     # (None) after it, -0.0 before 0.0, equal places for values isequal
     # treats as equal.
+    if isinstance(a, tuple):
+        return tuple(map(_rk_isless_key_np, a))
     if a is None:
         return (2, 0.0, 0)
     if isinstance(a, (float, np.floating)):
@@ -1425,10 +1457,12 @@ end
 # which order as Julia's `isless` does.
 function _host_ordered_eltype(ctx::_JaxContext, f, @nospecialize(T))
     E = T isa Type && T <: AbstractVector ? eltype(T) : nothing
-    E isa Type && (E <: Real || E <: AbstractString) && return E
-    _jax_error("`", f, "` of a `", T, "` has no host translation (vectors of numbers or ",
-               "strings order on the host)", _jax_where(ctx))
+    E isa Type && _host_orderable(E) && return E
+    _jax_error("`", f, "` of a `", T, "` has no host translation (vectors of numbers, ",
+               "strings or concrete tuples of them order on the host)", _jax_where(ctx))
 end
+_host_orderable(T) = T <: Real || T <: AbstractString ||
+    T <: Tuple && isconcretetype(T) && all(_host_orderable, fieldtypes(T))
 
 # `sort(v)`, `unique(v)` and `sortperm(v)` in Julia's default order (no
 # keywords); `sortperm` returns the positions, `Int`s.
@@ -1437,6 +1471,7 @@ function _host_order_call(ctx::_JaxContext, f, which::Symbol, args::Vector{_PyVa
         _jax_error("`", f, "` with ", length(args), " arguments has no host translation",
                    _jax_where(ctx))
     E = _host_ordered_eltype(ctx, f, args[1].T)
+    E <: Tuple && return _host_tuple_order(ctx, which, args[1])
     _PyVal(_host_order_helper!(ctx, which) * "(" * args[1].code * ")",
            which === :sortperm ? Vector{Int} : Vector{E}, true)
 end
@@ -1474,7 +1509,8 @@ function _jax_call_positional(ctx::_JaxContext, ::typeof(issorted), args::Vector
     length(args) == 1 ||
         _jax_error("`issorted` with ", length(args), " arguments has no host translation",
                    _jax_where(ctx))
-    _host_ordered_eltype(ctx, issorted, args[1].T)
+    E = _host_ordered_eltype(ctx, issorted, args[1].T)
+    E <: Tuple && return _host_tuple_issorted(ctx, args[1])
     _PyVal(_host_order_helper!(ctx, :issorted) * "(" * args[1].code * ")", Bool, true)
 end
 # `isless(a, b)` of two scalars: Julia's total order, -0.0 before 0.0 and
@@ -1571,6 +1607,10 @@ end
 function _host_rewrite!(ctx::_JaxContext, f, ex)
     s, c = _host_target(ctx, ex)
     E = _host_ordered_eltype(ctx, f, c.T)
+    if E <: Tuple
+        value = _host_tuple_order(ctx, f === sort! ? :sort : :unique, c)
+        return _host_rewrite_value!(ctx, s, c, value)
+    end
     helper = _host_order_helper!(ctx, f === sort! ? :sort : :unique)
     s === nothing && return _PyVal(helper * "(" * _host_read(ctx, c).code * ")", Vector{E}, true)
     if c.code in ctx.host.lists
@@ -1738,6 +1778,9 @@ function _host_function_input!(scope, params, passed, hint, v::_PyVal, T::_JaxCa
     T.f isa _HostLambda && !isempty(T.f.captures) &&
         _jax_error("an anonymous function that reads the locals ", join(T.f.captures, ", "),
                    " of the code that makes it, passed to a helper, has no host translation")
+    T.f isa _HostLocalFunction && !isempty(T.f.captures) &&
+        _jax_error("a local named function with captures, passed to another helper, ",
+                   "has no host translation")
     T.f isa _JaxClosure || return v
     captures = [_host_function_input!(scope, params, passed, Symbol(hint, :_, i), a)
                 for (i, a) in enumerate(T.f.captures)]
@@ -2448,7 +2491,19 @@ def _rk_keyword_inputs(data, names):
 function _host_input!(ctx::_JaxContext, code::AbstractString, @nospecialize(T))
     _jax_ragged(T) && return "[np.asarray(a, dtype=" * _host_dtype(eltype(eltype(T))) *
         ") for a in " * code * "]"
+    if _host_tuple_vector(T)
+        E = eltype(T)
+        helper, _ = _host_nested_function!(ctx, :record, [:row], [E], () ->
+            _PyVal(_host_input!(ctx, ctx.locals[:row].code, E), E, true))
+        row = _jax_fresh(ctx, :row)
+        return "[" * helper * "(" * row * ") for " * row * " in " * code * "]"
+    end
     _jax_is_array(T) && return "np.asarray(" * code * ", dtype=" * _host_dtype(eltype(T)) * ")"
+    if T isa Type && T <: Tuple && isconcretetype(T)
+        parts = [_host_input!(ctx, _py_atom(code) * "[" * string(k - 1) * "]", fieldtype(T, k))
+                 for k in 1:fieldcount(T)]
+        return "(" * join(parts, ", ") * (length(parts) == 1 ? ",)" : ")")
+    end
     T isa Type && T <: NamedTuple && isconcretetype(T) || return code
     mod = ctx.mod
     if !haskey(mod.helper_names, (:helper, "_rk_fields"))

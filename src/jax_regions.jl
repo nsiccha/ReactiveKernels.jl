@@ -336,8 +336,11 @@ function _jax_region_call!(ctx, p, unit, demand, labels, selector, available, mo
     for (v, key, value, flat) in zip(want, keys, results, flat_results)
         id = canon_id(g, v.id)
         code = result.code * "[" * repr(key) * "]"
-        ctx.scope.values[id] = if isempty(value.extent) && isempty(value.limit) && value.origin === nothing
-            _PyVal(code, value.T, value.static, "", "", value.padded)
+        # The same test `_jax_function_result` applied to the returned value:
+        # a plain result is the dictionary entry itself, and keeps the shape
+        # or symbol metadata a fixed-shape allocation or static tuple carries.
+        ctx.scope.values[id] = if _jax_plain_function_result(value)
+            _PyVal(code, value.T, value.static, "", "", value.padded, value.origin)
         else
             _jax_function_return!(ctx, value, flat, code)
         end
