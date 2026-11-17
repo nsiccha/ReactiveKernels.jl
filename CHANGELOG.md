@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.306
+## 0.1.307
 
 - **Fix:** a rebuild of one program reuses the code compiled for the first
   build again when the program holds a lazy branch whose arms are calls, such
@@ -32,6 +32,20 @@ are recorded in the git history only.
   preparing re-keyed the shared branch's graphs. The embedded branch now
   leaves its graphs out; lowering still reads them from the plan. Values are
   unchanged.
+
+## 0.1.306
+
+- JAX source translates `vec` and `reshape` of a matrix (or any array of
+  rank two or more) of records in device code, such as a plate's records
+  over `collect(Iterators.product(a, b))`: `vec` is the vector of those
+  records in Julia's column-major order, each field (nested fields too)
+  flattened alike, so `map(vec(records)) do r; r.field end` reads it as it
+  reads a vector of records, and `reshape` keeps that linear order. Records
+  keep their fields' lengths. A padded array's `vec` takes its valid records
+  first, as `vec` of a padded numerical array orders its entries; `reshape`
+  of it raises `JAXEmissionError`, as for a padded numerical array. Before,
+  the module raveled or reshaped the tuple of field arrays and failed in
+  Python (`TypeError: ravel requires ndarray or scalar arguments`).
 
 ## 0.1.305
 
