@@ -40,4 +40,6 @@ Tutorials.generated(run)
 
 A prepared object with mutable caches is for direct use by one caller at a time. Give concurrent callers their own prepared objects. For differentiation, use the prepared AD APIs that manage the derivative storage contract; do not assume that wrapping an arbitrary mutating callable preserves its primal state for reverse evaluation.
 
+A prepared reverse gradient reuses its buffers' derivative storage across calls. For Enzyme differentiation through a matrix product's buffer, use the `blas_overwritten_output` repair (dogfood `cb2b2b1e` or later). Registered Enzyme keeps a non-finite adjoint in that storage, so after one call whose gradient is not finite, later gradients from the same preparation can also be `NaN`. The non-allocating acceptance suite checks that a gradient after such a call equals the first one bit for bit.
+
 The [bound-regression example](bound-regression.md) shows how to separate data-dependent work before deciding whether a repeated computation also needs reusable buffers.

@@ -470,3 +470,36 @@ end
     @test_throws ArgumentError prepare_sampler(built, plan, u;
         backend = NA_SAMPLER_BACKEND, nonallocating = :always)
 end
+
+# A point whose gradient is not finite leaves later gradients unchanged (snag
+# `rkppl-samplerque-d71bddde`). At `beta = 1e308` the product `X * beta`
+# overflows, so the reverse pass seeds a non-finite adjoint into the
+# product's reused buffer, and Enzyme's reverse BLAS rules must clear that
+# buffer's shadow for the next call. That is the Enzyme dogfood repair
+# `blas_overwritten_output`; registered Enzyme's outcome depends on the
+# OpenBLAS build (`test_nonallocating_nonfinite_ad.jl`), so it is asserted
+# only with the repair.
+@testset "a non-finite sampler gradient leaves later gradients unchanged" begin
+    plan = first(_na_sampler_cases())[2]
+    built = build_kernel(plan)
+    n = built.layout.total
+    u = [0.1 * sin(k) for k in 1:n]
+    beta = only(e for e in built.layout.entries if e.name === :beta)
+    bad = copy(u)
+    bad[beta.offset:(beta.offset + beta.size - 1)] .= 1e308
+    q = prepare_sampler(built, plan, u; backend = NA_SAMPLER_BACKEND)
+    @test q.kernel isa NonAllocatingKernel
+    g = zeros(n)
+    results = map((u, bad, u)) do point
+        value, _ = sampler_value_and_gradient!(q, g, point)
+        (value, copy(g))
+    end
+    @test isfinite(results[1][1]) && all(isfinite, results[1][2])
+    @test !isfinite(results[2][1])
+    @test !all(isfinite, results[2][2])
+    if isdefined(Enzyme, :has_dogfood_repair) &&
+       Enzyme.has_dogfood_repair(:blas_overwritten_output)
+        @test results[3][1] === results[1][1]
+        @test all(map(===, results[3][2], results[1][2]))
+    end
+end
