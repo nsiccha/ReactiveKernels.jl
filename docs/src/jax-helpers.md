@@ -78,8 +78,7 @@ calls `weighted(x, metadata)`). It is the Python tuple of its fields, as a
 named-tuple HAVE crosses, and the helper's field reads (`metadata.weights[1]`)
 index it by position. Each array field is a typed module constant named after
 the record and the field (`METADATA_WEIGHTS = jnp.asarray(..., dtype=jnp.float64)`),
-with Julia's shape and element type, so a matrix or a rank-3 integer array
-keeps its axes and one-based reads. A record holding an array is itself a
+with Julia's shape, element type and one-based reads. A record holding an array is itself a
 module constant (`METADATA = (METADATA_WEIGHTS, METADATA_INDICES)`), so a
 call passes that one name; a record of numbers stays a static literal and
 can size an allocation. A field that is a function or a type raises
@@ -92,7 +91,7 @@ in the record's declared order, in host preparation and JAX functions. The
 record's numerical fields and array lengths remain runtime values; this does
 not specialize a module to the data used when emitting it.
 
-A host helper that writes its argument in place (`rv[k] = x`, `push!(rv, x)`, `sort!(rv)`, or a helper it calls doing so) writes the caller's vector, as Julia's does, whether or not the caller reads the helper's result (RK 0.1.278). The caller passes its own local: a copy of an input or a module constant first, and a list when the helper grows it. A slice or another expression in that position raises `JAXEmissionError`, because Julia's `x[r]` is a copy and `view(x, r)` is not, and the two have one NumPy spelling.
+A helper writing its argument in place (`rv[k] = x`, or via a helper it calls; host also `push!`, `sort!`) writes the caller's array, as in Julia, read or not. The host (RK 0.1.278) passes the caller's own local, copying an input or module constant, a list when grown; a slice or other expression raises `JAXEmissionError` (`x[r]` copies, `view(x, r)` does not; NumPy spells both alike). A device function (RK 0.1.303) also returns written arrays for the caller to rebind; a write it cannot rebind (in a loop or branch not assigning the local, or to another statement's value) raises `JAXEmissionError`.
 
 A method that a package generates, such as one its macro writes into the caller's module, cannot carry `@traceable`. The generating package keeps the method's source as a `TraceableSource` (argument names, body, and the module whose globals the body reads) and hands it over through a provider. It registers the provider with `register_source_provider!`, once, from the `__init__` of the package extension that loads with ReactiveKernels. The emitter asks the provider for a call that has no other translation and no `@traceable` source, with the function and the `Tuple` type of the argument types. The provider answers `nothing` or the source of the method those arguments call natively.
 
@@ -146,7 +145,7 @@ several axes may share that logical extent. Independently padded dimensions
 remain unsupported. Array lengths and loop bodies are never copied from a
 sample dataset into emitted source.
 
-A source `ntuple(j -> expression, Val(N))` records the authored, fixed number of fields with runtime captures. A fixed tuple of numbers of one type supports computed integer reads, such as indexing that basis inside a loop. The device read checks bounds and uses a numerical array view of the tuple; the data-dependent loop remains a runtime loop.
+A source `ntuple(j -> expression, Val(N))` records its authored field count, with runtime captures; a splatted tuple (`(a, rest(...)...)`, `f(t...)`) passes its fields, so recursion over a record's names unrolls over them. A homogeneous numerical tuple supports computed integer reads, such as in a loop, through a bounds-checked array view; the loop stays a runtime loop.
 
 A device helper can allocate `Vector{Vector{Float64}}(undef, k)`, fill its slots with fixed-width numerical rows, and use `isassigned(rows, i)` to skip earlier assignments. A size such as `isempty(ids) ? 0 : maximum(ids)` uses bounds computed from prepared integer data, including ragged cells. Allocation and iteration remain runtime array operations; emitted source does not grow with the data. Assignment state travels with the numerical storage through loops and branches. Missing references and invalid indices raise when read; `isassigned` returns false for either.
 

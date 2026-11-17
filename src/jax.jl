@@ -988,6 +988,7 @@ function _jax_destructure!(ctx::_JaxContext, lhs, v::_PyVal)
     if lhs isa Symbol
         # A type or callable value exists only while translating.
         _jax_translation_only(v) && (ctx.locals[lhs] = v; return)
+        _jax_rebinding!(ctx, lhs)
         name = _jax_fresh(ctx, lhs)
         _jax_emit!(ctx, name * " = " * v.code)
         ctx.locals[lhs] = _PyVal(name, v.T, v.static, v.extent, v.limit, v.padded, v.origin, v.field_extents)
@@ -1050,6 +1051,8 @@ function _jax_expr(ctx::_JaxContext, ::Val{:let}, ex)
     ctx.host === nothing || return _host_let(ctx, ex)
     bindings, body = ex.args
     saved = copy(ctx.locals)
+    frame = _jax_frame()
+    frame === nothing || (frame.lets += 1)
     try
         list = bindings isa Expr && bindings.head === :block ? bindings.args : Any[bindings]
         for binding in list
@@ -1064,6 +1067,7 @@ function _jax_expr(ctx::_JaxContext, ::Val{:let}, ex)
         # expression as any other: its caller names it or reads it once.
         return _jax_expr(ctx, body)
     finally
+        frame === nothing || (frame.lets -= 1)
         empty!(ctx.locals)
         merge!(ctx.locals, saved)
     end
@@ -1081,8 +1085,28 @@ function _jax_expr(ctx::_JaxContext, ::Val{:tuple}, ex)
         values = [_jax_expr(ctx, a isa Symbol ? a : a.args[2]) for a in params]
         return _jax_record_value(values, NamedTuple{names,Tuple{(v.T for v in values)...}})
     end
-    values = _PyVal[_jax_expr(ctx, a) for a in ex.args]
-    _jax_call_positional(ctx, tuple, values)
+    _jax_call_positional(ctx, tuple, _jax_positional_values(ctx, ex.args))
+end
+# Positional arguments (of a call or a tuple literal) as values: a splat
+# `rest...` passes the elements of `rest`, as `_jax_splat_elements` reads them.
+function _jax_positional_values(ctx::_JaxContext, args)
+    values = _PyVal[]
+    for a in args
+        a isa Expr && a.head === :... && length(a.args) == 1 ?
+            append!(values, _jax_splat_elements(ctx, _jax_expr(ctx, a.args[1]))) :
+            push!(values, _jax_expr(ctx, a))
+    end
+    values
+end
+# The elements a splat passes: the fields of a tuple or named tuple, whose
+# count is its type's (a record's fields, a helper's result over a tuple of
+# field names), so splatting is fixed structure, never data-sized iteration.
+# A collection whose length is data (a vector) has no fixed count to pass.
+function _jax_splat_elements(ctx::_JaxContext, v::_PyVal)
+    v.T isa _JaxAggregate && v.T.T <: Union{Tuple,NamedTuple} && return copy(v.T.fields)
+    v.T isa Type && v.T <: Union{Tuple,NamedTuple} && _jax_is_tuple(v.T) ||
+        _jax_error("splatting a `", v.T, "` has no JAX translation", _jax_where(ctx))
+    _PyVal[_jax_tuple_element(ctx, v, _PyVal(string(k), Int, true)) for k in 1:fieldcount(v.T)]
 end
 # The extents of a tuple's padded elements, as a Python tuple (`None` for an
 # element that is not padded), or "" when none is; and which elements are
@@ -3308,7 +3332,7 @@ function _jax_expr(ctx::_JaxContext, ::Val{:call}, ex)
     if head isa Symbol && !_jax_has_local(ctx, head) && startswith(String(head), ".") &&
        length(String(head)) > 1
         f = _jax_resolve(ctx, Symbol(String(head)[2:end]))
-        return _jax_broadcast(ctx, f, [_jax_expr(ctx, a) for a in positional])
+        return _jax_broadcast(ctx, f, _jax_positional_values(ctx, positional))
     end
     f = head isa Symbol && _jax_has_local(ctx, head) ? _jax_local_callable(ctx, head) :
         _jax_resolve(ctx, head)
@@ -3331,9 +3355,11 @@ function _jax_expr(ctx::_JaxContext, ::Val{:call}, ex)
        positional[1] isa Expr && positional[1].head === :->
         return _jax_source_ntuple(ctx, positional...)
     end
-    values = _PyVal[_jax_expr(ctx, a) for a in positional]
+    values = _jax_positional_values(ctx, positional)
     kw = Pair{Symbol,_PyVal}[k => _jax_expr(ctx, v) for (k, v) in kwargs]
-    _jax_call(ctx, f, values, kw)
+    _jax_with_call_arguments(ctx, f, positional) do
+        _jax_call(ctx, f, values, kw)
+    end
 end
 
 # A literal/type-level tuple arity is structural, unlike a data-derived
@@ -6176,7 +6202,8 @@ function _jax_vectorized_named_function!(ctx::_JaxContext, f, types)
     source = _jax_traceable_body(inner, f, args)
     if source !== nothing
         names, body, mod, inputs = source
-        emit(c, arguments) = _jax_source_expr(c, body, names, arguments, mod, nothing)
+        emit(c, arguments) = _jax_source_expr(c, body, names, arguments, mod, nothing;
+                                              function_body = true)
         defined = _jax_named_function!(inner, f, names, inputs, mod, emit,
                                        "from its authored source")
     elseif !_jax_internal_function(f) &&
@@ -6205,7 +6232,8 @@ end
 # extra extent/bound arguments are the same runtime representation used by
 # plates; none is a value baked into the module from a particular dataset.
 function _jax_authored_function_call(ctx, f, names, body, source_module, inputs)
-    emit(inner, arguments) = _jax_source_expr(inner, body, names, arguments, source_module, nothing)
+    emit(inner, arguments) = _jax_source_expr(inner, body, names, arguments, source_module, nothing;
+                                              function_body = true)
     inline() = _jax_source_expr(ctx, body, names, inputs, source_module, nothing)
     _jax_named_function_call(ctx, f, names, inputs, source_module, emit, inline,
                              "from its authored source")
@@ -6252,21 +6280,204 @@ _jax_internal_module(m::Module) = _julia_own_module(m) || _rk_repository_module(
 # authored name already marks it private (`_scaled`).
 _jax_private_function(f) = startswith(String(nameof_or(f)), "_") || _jax_internal_function(f)
 
+# Julia passes arrays by reference: a helper that writes its array argument in
+# place (`w[i] += x`, also through a helper it calls) writes its caller's
+# array, which the caller reads afterwards (a sequential update shared across
+# calls). A JAX array is a value, so the helper's function returns each array
+# argument it wrote after its value (`_jax_written_parameters`), and the caller
+# rebinds the local it passed to the written value (`_jax_writeback!`), as
+# host preparation writes the caller's array itself (`_host_function_call`).
+#
+# A device source is translated in a frame: its scope, its input names,
+# whether it is a function's body, its source, its locals (final, for a
+# function's body), the locals a callee wrote back in it, and for each array
+# argument the body rebinds by name (`w = copy(w)`) its value just before
+# (`detached`), or, rebound inside a loop, branch or `let` (`ambiguous`),
+# nothing: which writes reach the caller then depends on the path taken.
+mutable struct _JaxFrame
+    scope::_JaxScope
+    names::Vector{Symbol}
+    function_body::Bool
+    source::Any
+    locals::Dict{Symbol,_PyVal}
+    written::Set{Symbol}
+    detached::Dict{Symbol,_PyVal}
+    ambiguous::Set{Symbol}
+    lets::Int
+end
+_JaxFrame(scope, names, function_body, source, locals) =
+    _JaxFrame(scope, names, function_body, source, locals, Set{Symbol}(),
+              Dict{Symbol,_PyVal}(), Set{Symbol}(), 0)
+_jax_frame() = (frames = _jax_frames(); isempty(frames) ? nothing : last(frames))
+# A function body's argument rebound by name: Julia's writes until here
+# reached the caller's array, and later ones reach the new value.
+function _jax_rebinding!(ctx::_JaxContext, s::Symbol)
+    frame = _jax_frame()
+    frame !== nothing && frame.function_body && ctx.locals === frame.locals &&
+        s in frame.names && haskey(ctx.locals, s) || return
+    (haskey(frame.detached, s) || s in frame.ambiguous) && return
+    ctx.scope === frame.scope && frame.lets == 0 ?
+        (frame.detached[s] = ctx.locals[s]) : push!(frame.ambiguous, s)
+    nothing
+end
+const _JAX_FRAMES_KEY = :reactivekernels_jax_frames
+const _JAX_LAST_BODY_KEY = :reactivekernels_jax_last_body
+const _JAX_CALL_ARGUMENTS_KEY = :reactivekernels_jax_call_arguments
+_jax_frames() = get!(() -> _JaxFrame[], task_local_storage(), _JAX_FRAMES_KEY)::Vector{_JaxFrame}
+# The last function body translated (set by its frame), returned and replaced.
+function _jax_last_body!(frame)
+    previous = get(task_local_storage(), _JAX_LAST_BODY_KEY, nothing)
+    task_local_storage(_JAX_LAST_BODY_KEY, frame)
+    previous
+end
+# An authored call's argument expressions, for the named function the call
+# reaches (`_jax_take_call_arguments!`): which local a written argument is.
+# A splatted call's positions are not its expressions' (`nothing`).
+function _jax_with_call_arguments(f, ctx::_JaxContext, callee, arguments)
+    stack = get!(() -> Any[], task_local_storage(), _JAX_CALL_ARGUMENTS_KEY)::Vector{Any}
+    splat = any(a -> a isa Expr && a.head === :..., arguments)
+    push!(stack, (callee, ctx.locals, splat ? nothing : Any[arguments...]))
+    try
+        f()
+    finally
+        pop!(stack)
+    end
+end
+function _jax_take_call_arguments!(ctx::_JaxContext, f)
+    stack = get(task_local_storage(), _JAX_CALL_ARGUMENTS_KEY, nothing)
+    (stack === nothing || isempty(stack)) && return nothing
+    callee, locals, arguments = last(stack)
+    callee === f && locals === ctx.locals || return nothing
+    stack[end] = (nothing, nothing, arguments)
+    arguments
+end
+
+# The names a source rebinds (`x = v`, `x += v`, loop and `let` targets) and
+# those it writes by index (`x[i] = v`, `x[i] += v`), as `_jax_destructure!`
+# translates each; an anonymous function's body keeps its own.
+function _jax_write_targets!(rebound::Set{Symbol}, inplace::Set{Symbol}, ex)
+    ex isa Expr || return
+    ex.head in (:quote, :inert, :->, :function) && return
+    (ex.head === :(=) || haskey(_JAX_UPDATING, ex.head)) && length(ex.args) == 2 &&
+        _jax_write_target!(rebound, inplace, ex.args[1])
+    foreach(a -> _jax_write_targets!(rebound, inplace, a), ex.args)
+end
+function _jax_write_target!(rebound, inplace, target)
+    target isa Expr && target.head === :(::) && (target = target.args[1])
+    if target isa Symbol
+        push!(rebound, target)
+    elseif target isa Expr && target.head === :ref
+        while target isa Expr && target.head === :ref
+            target = target.args[1]
+        end
+        target isa Symbol && push!(inplace, target)
+    elseif target isa Expr && target.head === :tuple
+        foreach(t -> _jax_write_target!(rebound, inplace, t), _jax_target_parts(target))
+    end
+end
+
+# The array arguments a function's body (`frame`) wrote in place, by index or
+# through a helper it called, as `position => value`: the caller's array as
+# the body left it, or as it was when the body rebound the name.
+function _jax_written_parameters(f, names, arguments, frame::_JaxFrame)
+    rebound, inplace = Set{Symbol}(), Set{Symbol}()
+    _jax_write_targets!(rebound, inplace, frame.source)
+    written = Pair{Int,_PyVal}[]
+    for (k, (n, a)) in enumerate(zip(names, arguments))
+        _jax_is_array(a.T) && !_jax_slots(a) && haskey(frame.locals, n) || continue
+        if n in frame.ambiguous
+            (n in inplace || n in frame.written) &&
+                _jax_error("the helper `", f, "` writes its array argument `", n, "` and ",
+                           "rebinds it inside a loop, branch or `let`, so which writes reach ",
+                           "its caller depends on the path taken; its caller writeback has no ",
+                           "JAX translation (rebind it once, before any write: `", n, " = copy(",
+                           n, ")`)")
+            continue
+        end
+        value = get(frame.detached, n, frame.locals[n])
+        value.code == a.code || push!(written, k => value)
+    end
+    written
+end
+
+# An argument expression whose value is a new array (`copy(x)`, `zeros(n)`,
+# `x[r]`, `x .* y`): a write to it reaches no other value.
+_jax_fresh_argument(ex) = ex isa Expr && (
+    ex.head in (:ref, :comprehension, :vect, :vcat, :hcat, :.) ||
+    ex.head === :call && (ex.args[1] in (:copy, :deepcopy, :similar, :zeros, :ones, :fill,
+                                         :collect, :vcat, :hcat) ||
+                          ex.args[1] isa Symbol && startswith(String(ex.args[1]), ".")))
+
+# The caller's side of a helper that wrote array argument `param` (passed as
+# the authored expression `argument`; `nothing` when unknown): the local it
+# names takes the written value `final`, as Julia's caller reads its array.
+function _jax_writeback!(ctx::_JaxContext, f, param, argument, final::_PyVal)
+    frame = _jax_frame()
+    if argument isa Symbol && haskey(ctx.locals, argument)
+        s = argument
+        # An input of a computation that is not a function (a kernel
+        # recipe, a spliced body, a branch arm) is shared with the
+        # computations that read it later, which a rebound name is not.
+        frame !== nothing && !frame.function_body && s in frame.names &&
+            _jax_error("the helper `", f, "` writes `", s, "` in place, a value this computation ",
+                       "receives; later reads of `", s, "` would not see the write in JAX. Pass a ",
+                       "local copy (`copy(", s, ")`) instead", _jax_where(ctx))
+        l = ctx.locals[s]
+        _jax_writeback_reaches(ctx, frame, l) ||
+            _jax_error("the helper `", f, "` writes its argument `", s, "` in place inside a ",
+                       "loop or branch that does not assign `", s, "`; its caller writeback has ",
+                       "no JAX translation there", _jax_where(ctx))
+        name = _jax_fresh(ctx, s)
+        _jax_emit!(ctx, name * " = " * final.code)
+        ctx.locals[s] = _PyVal(name, l.T, false, l.extent, l.limit, l.padded, nothing,
+                               l.field_extents)
+        frame === nothing || push!(frame.written, s)
+        return
+    end
+    _jax_fresh_argument(argument) && return
+    argument === nothing && _jax_error("the helper `", f, "` writes its argument `", param,
+        "` in place, and this call (a kernel statement, or lowered code) has no local its JAX ",
+        "translation can rebind; write a local array (`w = copy(...)`) inside a `@traceable` ",
+        "helper and call the writing helper there", _jax_where(ctx))
+    _jax_error("the helper `", f, "` writes its argument `", param, "` in place; its JAX ",
+               "translation takes a local name or a new array (`copy(x)`) there, as Julia ",
+               "writes the caller's value, which another expression may share", _jax_where(ctx))
+end
+# A rebinding inside a loop body or branch arm reaches the code after it only
+# through that construct's carry: the local's value must be bound in the
+# current scope (a carried name, or one bound there), not an enclosing one.
+function _jax_writeback_reaches(ctx::_JaxContext, frame, l::_PyVal)
+    frame !== nothing && ctx.scope === frame.scope && return true
+    parent = ctx.scope.parent
+    parent === nothing && return true
+    m = match(r"^[A-Za-z_][A-Za-z0-9_]*", l.code)
+    m !== nothing && !(m.match in parent.used)
+end
+
 # The value of `f` over `inputs` through its named function, defining that
 # function on its first use (`emit` translates the body in the function's
 # scope); `inline()` translates it in place when its value exists only during
 # translation (a type, a closure).
 function _jax_named_function_call(ctx, f, names, inputs, source_module, emit, inline, origin)
+    arguments = _jax_take_call_arguments!(ctx, f)
     defined = _jax_named_function!(ctx, f, names, inputs, source_module, emit, origin)
     defined === nothing && return inline()
-    name, v, bounds, passed, flat, identity, lengths = defined
+    name, v, bounds, passed, flat, identity, lengths, written = defined
     call = name * "(" * join([passed; bounds], ", ") * ")"
-    if _jax_plain_function_result(v)
-        return _jax_bind!(ctx, name, _PyVal(call, v.T, v.static, "", "", v.padded, v.origin))
+    result = if _jax_plain_function_result(v)
+        _jax_bind!(ctx, name, _PyVal(call, v.T, v.static, "", "", v.padded, v.origin))
+    else
+        returned = _jax_bind!(ctx, name, _PyVal(call, Any))
+        _jax_identity_return(_jax_function_return!(ctx, v, flat, returned.code), identity, lengths,
+                             returned.code)
     end
-    result = _jax_bind!(ctx, name, _PyVal(call, Any))
-    _jax_identity_return(_jax_function_return!(ctx, v, flat, result.code), identity, lengths,
-                         result.code)
+    isempty(written) && return result
+    # The value, then each array argument the function wrote (`_jax_writeback!`).
+    for (j, k) in enumerate(written)
+        argument = arguments === nothing || k > length(arguments) ? nothing : arguments[k]
+        _jax_writeback!(ctx, f, names[k], argument, _jax_record_field(result, j + 1))
+    end
+    _jax_record_field(result, 1)
 end
 
 # A returned length that is one of the function's own length arguments (the
@@ -6320,9 +6531,11 @@ function _jax_identity_return(v, identity, lengths, returned)
 end
 
 # `f`'s named function for arguments like `inputs`: `(name, value, bounds,
-# passed, flat, identity, lengths)`, the call's arguments being `passed` then
-# `bounds` (`identity` and `lengths` for `_jax_identity_return`), or `nothing`
-# when the value exists only during translation.
+# passed, flat, identity, lengths, written)`, the call's arguments being
+# `passed` then `bounds` (`identity` and `lengths` for `_jax_identity_return`),
+# or `nothing` when the value exists only during translation. A function that
+# writes array arguments in place returns the tuple of its value and those
+# arguments' final values, in the order of their positions `written`.
 function _jax_named_function!(ctx, f, names, inputs, source_module, emit, origin)
     # Integer provenance and history access proofs refer to the surrounding
     # loop/scan. Keep those helpers lexically nested so the scan can still
@@ -6346,6 +6559,7 @@ function _jax_named_function!(ctx, f, names, inputs, source_module, emit, origin
                             Dict{Symbol,_PyVal}(), nothing)
         inner.traced_branches = ctx.traced_branches
         before = _JAX_EFFECTS[]
+        _jax_last_body!(nothing)
         v = if contextual
             emit(inner, arguments)
         else
@@ -6353,10 +6567,15 @@ function _jax_named_function!(ctx, f, names, inputs, source_module, emit, origin
                 emit(inner, arguments)
             end
         end
+        body = _jax_last_body!(nothing)
         effects = _JAX_EFFECTS[] - before
         # Types and callable closures belong to translation. Their captured
         # runtime leaves still need the caller's lexical names.
         (_jax_translation_only(v) || _jax_type_of_value(v) !== nothing) && return nothing
+        writes = body === nothing || body.scope !== scope ? Pair{Int,_PyVal}[] :
+            _jax_written_parameters(f, names, arguments, body)
+        written = first.(writes)
+        isempty(writes) || (v = _jax_call_positional(inner, tuple, _PyVal[v; last.(writes)]))
         name = _jax_named_function(ctx, nameof_or(f); private = _jax_private_function(f))
         text = join(scope.lines, "\n") * "\n" * v.code * "\n" * v.extent * "\n" * v.limit
         bounds = contextual ? String[] : [bn for (bn, _, _) in _jax_prepared_bounds(ctx.mod)
@@ -6383,19 +6602,19 @@ function _jax_named_function!(ctx, f, names, inputs, source_module, emit, origin
         else
             push!(ctx.mod.helpers, join(lines, "\n"))
         end
-        cached = (name, result, bounds, effects, flat, identity)
+        cached = (name, result, bounds, effects, flat, identity, written)
         ctx.mod.helper_names[key] = cached
     else
         # A reused check still prevents its caller's branch from being
         # discarded, even though this call emits no new helper definition.
         _JAX_EFFECTS[] += cached[4]
     end
-    name, v, bounds, _, flat, identity = cached
+    name, v, bounds, _, flat, identity, written = cached
     lengths = Dict{String,String}()
     # Lexically nested helpers capture these same expressions rather than
     # passing them, but identity field reads still retain their caller lengths.
     foreach((a, b) -> _jax_argument_extents!(lengths, a, b), arguments, inputs)
-    (name, v, bounds, passed, flat, identity, lengths)
+    (name, v, bounds, passed, flat, identity, lengths, written)
 end
 
 _jax_contextual_value(v::_PyVal) =
@@ -6801,7 +7020,8 @@ end
 # splatted collection is a tuple of known length, a Vararg method's trailing
 # arguments (`splats`), a tuple the lowered code built (`fields`: its elements
 # pass as they were given, so a function among them stays a function) or a
-# tuple value, and its elements are `g`'s arguments.
+# tuple or named tuple value (`_jax_splat_elements`), and its elements are
+# `g`'s arguments.
 function _jax_lowered_splat(ctx::_JaxContext, args, value, splats,
                             fields = Dict{Int,Vector{_PyVal}}())
     _jax_function_of(value(args[1])) === iterate ||
@@ -6819,16 +7039,7 @@ function _jax_lowered_splat(ctx::_JaxContext, args, value, splats,
             append!(elements, fields[x.id])
             continue
         end
-        v = value(x)
-        if v.T isa _JaxAggregate && v.T.T <: Tuple
-            append!(elements, v.T.fields)
-            continue
-        end
-        v.T isa Type && v.T <: Tuple && _jax_is_tuple(v.T) ||
-            _jax_error("splatting a `", v.T, "` has no JAX translation", _jax_where(ctx))
-        for k in 1:fieldcount(v.T)
-            push!(elements, _jax_tuple_element(ctx, v, _PyVal(string(k), Int, true)))
-        end
+        append!(elements, _jax_splat_elements(ctx, value(x)))
     end
     _jax_call(ctx, g, elements)
 end
@@ -7220,19 +7431,29 @@ _jax_captures(f::Union{_KernelSplit,_KernelReduction}) = _jax_captures(f.call)
 _jax_captures(f) = nothing
 
 # Translate `source` with `names[i]` bound to `inputs[i]`.
-function _jax_source_expr(ctx::_JaxContext, source, names, inputs, mod::Module, captures)
+function _jax_source_expr(ctx::_JaxContext, source, names, inputs, mod::Module, captures;
+                          function_body::Bool = false)
     saved = (ctx.locals, ctx.source_module, ctx.captures, ctx.host)
     ctx.locals = Dict{Symbol,_PyVal}(zip(names, inputs))
     _jax_slots_inputs!(ctx, inputs)
     ctx.source_module = mod
     ctx.captures = captures
+    # A device source is a frame: its caller writebacks are recorded on it.
+    frame = ctx.host === nothing ?
+        _JaxFrame(ctx.scope, Symbol[names...], function_body, source, ctx.locals) : nothing
     # On the host a source is a frame of its own: its locals take fresh names.
     ctx.host === nothing || (ctx.host = _HostState())
+    frame === nothing || push!(_jax_frames(), frame)
     try
         v = _jax_expr(ctx, source)
         _jax_check_slot_shapes(ctx)
+        if frame !== nothing && function_body
+            frame.locals = ctx.locals
+            _jax_last_body!(frame)
+        end
         return v
     finally
+        frame === nothing || pop!(_jax_frames())
         ctx.locals, ctx.source_module, ctx.captures, ctx.host = saved
     end
 end
