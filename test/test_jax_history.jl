@@ -192,4 +192,134 @@ end
         end
     end
 end
+
+# A history scan over each ragged row of a plate. The rows are padded to the
+# longest; a step past a row's own length is not one of Julia's and must not
+# run: `log(d * a)` of an empty row's padding has no finite derivative.
+@kernel ragged_feedback(a::Float64, rows::Vector{Vector{Float64}}) = begin
+    totals = plate(rows, Ref(a)) do row, a
+        ys = scan(row, eachindex(row), Ref(a); init = 0, history = 0.0) do carry, d, j, a, earlier
+            c = sum((earlier[i] * a^(j - i) for i in 1:j-1); init = 0.0)
+            (carry, log(d * a) * exp(-0.1 * c))
+        end
+        sum(ys)
+    end
+    total = sum(totals)
+end
+
+@kernel ragged_lagged(a::Float64, rows::Vector{Vector{Float64}}) = begin
+    totals = plate(rows, Ref(a)) do row, a
+        ys = scan(row, eachindex(row), Ref(a); init = 0.0, history = 2.0) do carry, d, j, a, earlier
+            previous = j > 1 ? earlier[j - 1] : 0.0
+            (carry + d, a * previous + log(d * a) + carry)
+        end
+        sum(ys)
+    end
+    total = sum(totals)
+end
+
+@kernel ragged_seeded(a::Float64, rows::Vector{Vector{Float64}}, seeds::Vector{Float64}) = begin
+    totals = plate(rows, Ref(a), Ref(seeds)) do row, a, seeds
+        ys = scan(row, eachindex(row), Ref(a); init = 0.0, history = seeds) do carry, d, j, a, earlier
+            (carry, a * earlier[j] + log(d * a))
+        end
+        sum(ys)
+    end
+    total = sum(totals)
+end
+
+@testset "JAX history scans over ragged plate rows skip the steps past each row" begin
+    ragged = [[0.5, 1.5, 2.5], Float64[], [1.2], [0.7, 0.9, 1.1, 2.0, 0.3]]
+    datasets = (ragged, [Float64[], Float64[]], [[0.8, 0.6]], Vector{Float64}[],
+                [collect(range(0.3, 2.0; length = 23)), [1.0], Float64[]])
+    seeds = [0.5, -0.25]
+    cases = ((ragged_feedback, (:a, :rows), ()),
+             (ragged_lagged, (:a, :rows), ()),
+             (ragged_seeded, (:a, :rows, :seeds), (seeds,)),
+             (ragged_seeded, (:a, :rows, :seeds), (Float64[],)))
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    a = 0.4
+    for (kernel, have, shared) in cases
+        native = prepare(kernel; have, want = :total)
+        src = jax_source(kernel; have, want = :total)
+        names = Base.tail(have)
+        prepared = jax_source(kernel; have, want = :total,
+                              data = NamedTuple{names}((ragged, shared...)))
+        # The full layout serves the generator over all earlier entries; a
+        # bounded lag keeps its rolling carry.
+        @test occursin("compact_history = False", src.text) == (kernel === ragged_feedback)
+        # Each row's steps stay one scan whose skipped steps are a lazy branch.
+        @test count("jax.lax.scan(", src.text) == 1
+        @test occursin("jax.lax.cond(live", src.text)
+        for rows in datasets
+            # Row counts and lengths are data: they never specialize the source.
+            @test prepared.text == jax_source(kernel; have, want = :total,
+                data = NamedTuple{names}((rows, shared...))).text
+            value = native(a, rows, shared...)
+            gradient = ad_gradient(kernel, backend, a, rows, shared...; active = :a, want = :total)
+            @test isfinite(value) && isfinite(gradient)
+            if rk_jax_available()
+                result = rk_jax_evaluate(src, :kernel, (a, rows, shared...); grad = true)
+                @test result.value ≈ value rtol = 1e-12 atol = 1e-12
+                @test result.grad ≈ gradient rtol = 1e-12 atol = 1e-12
+                for mode in (true, :arguments)
+                    result = rk_jax_evaluate(prepared, :kernel, (a, rows, shared...);
+                                             grad = true, prepare = mode)
+                    @test result.value ≈ value rtol = 1e-12 atol = 1e-12
+                    @test result.grad ≈ gradient rtol = 1e-12 atol = 1e-12
+                end
+            else
+                @test_skip "RK_JAX_PYTHON not set"
+            end
+        end
+    end
+    if rk_jax_available()
+        seeded = jax_source(ragged_seeded; have = (:seeds, :a, :rows), want = :total)
+        result = rk_jax_evaluate(seeded, :kernel, (seeds, a, ragged); grad = true)
+        @test result.grad ≈ ad_gradient(ragged_seeded, backend, a, ragged, seeds;
+                                       active = :seeds, want = :total) rtol = 1e-12
+        # Longer rows and more rows trace the same program: one scan, the same
+        # number of equations, in the value and in its reverse derivative.
+        src = jax_source(ragged_feedback; have = (:a, :rows), want = :total,
+                         data = (; rows = ragged))
+        mktempdir() do dir
+            path = joinpath(dir, "ragged_feedback.py")
+            write(path, src)
+            program = """
+                import importlib.util
+                import jax, numpy as np
+                spec = importlib.util.spec_from_file_location('ragged_feedback', $(_rk_py(path)))
+                m = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(m)
+                def count(graph, name=None):
+                    graph = getattr(graph, 'jaxpr', graph)
+                    total = 0
+                    for e in graph.eqns:
+                        total += name is None or e.primitive.name == name
+                        for parameter in e.params.values():
+                            children = parameter if isinstance(parameter, (tuple, list)) else (parameter,)
+                            for child in children:
+                                if hasattr(child, 'jaxpr') or hasattr(child, 'eqns'):
+                                    total += count(child, name)
+                    return total
+                shapes = []
+                # From 9 to 300 entries a row and from 5 to 40 rows. (A widest row
+                # of two entries traces four fewer reverse equations: JAX
+                # simplifies the one-entry sum over the earlier entries.)
+                for rows in ([[0.4] * 9, [1.0], [], [2.0], [0.3, 0.2]],
+                             [list(np.linspace(0.3, 2.0, 70)), [1.0], [], [0.4] * 9, [2.0]],
+                             [list(np.linspace(0.3, 2.0, 300))] + [[1.0, 2.0]] * 39):
+                    prepared = m.prepare_data(rows=[np.asarray(r, dtype=np.float64) for r in rows])
+                    f = lambda a: m.kernel(a, **prepared)
+                    primal = jax.make_jaxpr(f)($a).jaxpr
+                    reverse = jax.make_jaxpr(jax.grad(f))($a).jaxpr
+                    shapes.append((count(primal, 'scan'), count(primal),
+                                   count(reverse, 'scan'), count(reverse)))
+                print('ragged history trace (scans, equations; primal then reverse):', shapes)
+                assert shapes[0][0] == 1 and len(set(shapes)) == 1, shapes
+                """
+            @test success(pipeline(`$RK_JAX_PYTHON -c $program`; stdout, stderr))
+        end
+    end
+end
 end

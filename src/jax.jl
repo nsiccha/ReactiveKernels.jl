@@ -8202,9 +8202,17 @@ function _jax_history_scan(ctx::_JaxContext, recipe::Recipe,
     iterated = [i for i in 2:length(args) if !(i in A)]
     shared = [i for i in 2:length(args) if i in A]
     isempty(iterated) && _jax_error("a history scan without a sequence", _jax_where(ctx))
-    any(i -> !isempty(args[i].extent), iterated) &&
-        _jax_error("a history scan over a padded sequence has no JAX translation yet",
-                   _jax_where(ctx))
+    # A sequence padded past a data-dependent length (a ragged row in a plate
+    # cell) is scanned to its static capacity. A step past the length is not
+    # one of Julia's: a lazy branch skips its body and keeps the carry and the
+    # history, so its reads of padding reach neither a value nor a derivative
+    # (CONTRIBUTING.md, "Lazy branches"; a padded loop's steps,
+    # `_jax_stepped_for`, are skipped the same way).
+    padded_inputs = [i for i in iterated if !isempty(args[i].extent)]
+    extent = isempty(padded_inputs) ? "" : args[first(padded_inputs)].extent
+    isempty(extent) || isempty(history.extent) ||
+        _jax_error("a history scan over a padded sequence whose `history` is padded too ",
+                   "has no JAX translation yet", _jax_where(ctx))
     HT = history.T
     E = HT isa Type && HT <: Number ? HT :
         HT isa Type && HT <: AbstractVector{<:Number} ? eltype(HT) :
@@ -8242,12 +8250,25 @@ function _jax_history_scan(ctx::_JaxContext, recipe::Recipe,
     end
     inner.values[canon_id(body.graph, have[end].id)] =
         _jax_with_origin(_PyVal(history_token, Vector{E}), layout)
+    # The step's body: the step itself, or for a padded sequence the function
+    # its lazy branch runs while the step is within the length.
+    live = isempty(extent) ? "" : _jax_identifier(inner.used, :live)
+    run_name = isempty(extent) ? "" : _jax_identifier(inner.used, :step_body)
     recipe_saved = ctx.recipe
     ctx.scope = inner
+    run = inner
     wants = try
         _jax_emit!(ctx, carry * ", " * earlier * " = " * state)
         _jax_emit!(ctx, join(unpack, ", ") * (length(unpack) == 1 ? "," : "") * " = " * xs)
-        _jax_plan!(ctx, body)
+        if isempty(extent)
+            _jax_plan!(ctx, body)
+        else
+            _jax_emit!(ctx, live * " = " * _py_infix("<", [position, extent]))
+            run = _JaxScope(inner)
+            run.indent = inner.indent + 1
+            ctx.scope = run
+            _jax_with_guard(() -> _jax_plan!(ctx, body), run, live)
+        end
         [_jax_lookup(ctx, body.graph, v) for v in body.want]
     finally
         ctx.scope = outer
@@ -8255,16 +8276,27 @@ function _jax_history_scan(ctx::_JaxContext, recipe::Recipe,
     end
     _jax_typeof(wants[2]) <: Number || _jax_error("a history scan whose step outputs `",
         _jax_typeof(wants[2]), "` has no JAX translation yet", _jax_where(ctx))
-    storage = _jax_history_layout!(ctx, layout, inner, wants, steps, history, dtype)
+    storage = _jax_history_layout!(ctx, layout, run, wants, steps, history, dtype)
     wants = storage.wants
     push!(outer.lines, "    "^outer.indent * "def " * step * "(" * state * ", " * xs * "):")
     append!(outer.lines, inner.lines)
-    output = _jax_identifier(inner.used, :output)
-    push!(outer.lines, "    "^inner.indent * output * " = jnp.asarray(" * wants[2].code * ", dtype=" * dtype * ")")
+    output = _jax_identifier(run.used, :output)
     at = _py_infix("+", [offset, position])
     at = "((" * at * ") % " * storage.width * " if " * storage.use_compact * " else " * at * ")"
-    push!(outer.lines, "    "^inner.indent * "return (" * wants[1].code * ", " * earlier *
-          ".at[" * at * "].set(" * output * ")), " * output)
+    written = "(" * wants[1].code * ", " * earlier * ".at[" * at * "].set(" * output * ")), " * output
+    if isempty(extent)
+        push!(outer.lines, "    "^inner.indent * output * " = jnp.asarray(" * wants[2].code * ", dtype=" * dtype * ")")
+        push!(outer.lines, "    "^inner.indent * "return " * written)
+    else
+        push!(outer.lines, "    "^inner.indent * "def " * run_name * "():")
+        append!(outer.lines, run.lines)
+        push!(outer.lines, "    "^run.indent * output * " = jnp.asarray(" * wants[2].code * ", dtype=" * dtype * ")")
+        push!(outer.lines, "    "^run.indent * "return " * written)
+        # A skipped step's output is padding, which the result's extent masks.
+        push!(outer.lines, "    "^inner.indent * "return jax.lax.cond(" * live * ", " * run_name *
+              ", lambda: ((" * carry * ", " * earlier * "), jnp.asarray(" * layout.fill *
+              ", dtype=" * dtype * ")))")
+    end
     seqs = String[[args[i].code for i in iterated]; "jnp.arange(" * steps * ")"]
     result = _jax_fresh(ctx, :scan_result)
     full = _jax_fresh(ctx, :history_result)
@@ -8276,7 +8308,10 @@ function _jax_history_scan(ctx::_JaxContext, recipe::Recipe,
     compact_result = HT <: Number ? outputs :
         "jnp.concatenate([jnp.asarray(" * history.code * ", dtype=" * dtype * "), " * outputs * "])"
     _jax_emit!(ctx, result * " = " * compact_result * " if " * storage.use_compact * " else " * full)
-    [_PyVal(result, Vector{E})]
+    # The result is padded as its sequence is: its length is the sequence's,
+    # after the leading entries of a vector `history`.
+    [_PyVal(result, Vector{E}, false,
+            isempty(extent) ? "" : HT <: Number ? extent : _py_infix("+", [offset, extent]))]
 end
 
 # --- module -------------------------------------------------------------------------
