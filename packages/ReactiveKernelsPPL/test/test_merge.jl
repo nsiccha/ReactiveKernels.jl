@@ -122,6 +122,94 @@ end
     @test _plans_equal(got, _merge_lower(hand))
 end
 
+# A statement that declares a fresh name appends whatever its shape, exactly as
+# the hand-written model would carry it (snag rkppl-merge-cann-31516008).
+@testset "merge appends fresh sized declarations and blocks" begin
+    base = @rkppl begin
+        mu ~ Normal(0, 1)
+        y .~ Normal.(mu, 1)
+    end
+    before = deepcopy(base.ast)
+    _lower_y(m) = lower_rkppl(m.ast, (:y,); mod = @__MODULE__, conditioned = (:y,))
+    Y = [0.3, -0.8, 1.1, 0.2]
+    # A fresh sized vector, alone and with a definition reading it.
+    sized = Base.merge(base, :(z[1:3] .~ Normal.(0, 1)))
+    @test _plans_equal(_lower_y(sized), _lower_y(@rkppl begin
+        mu ~ Normal(0, 1)
+        y .~ Normal.(mu, 1)
+        z[1:3] .~ Normal.(0, 1)
+    end))
+    used = Base.merge(base, quote
+        z[1:3] .~ Normal.(0, 1)
+        y .~ Normal.(mu .+ sum(z), 1)
+    end)
+    hand_used = @rkppl begin
+        mu ~ Normal(0, 1)
+        y .~ Normal.(mu .+ sum(z), 1)
+        z[1:3] .~ Normal.(0, 1)
+    end
+    @test _plans_equal(_lower_y(used), _lower_y(hand_used))
+    bu, bh = used() | (; y = Y), hand_used() | (; y = Y)
+    u = [0.1, -0.2, 0.4, 0.3]
+    @test _query(build_kernel(bu).spec, bu, :posterior, u) ==
+        _query(build_kernel(bh).spec, bh, :posterior, u)
+    # A fresh indexed `~` and a fresh slice declaration append the same way.
+    for decl in (:(b[1:2] ~ MvNormal([0.0, 0.0], [1.0 0.0; 0.0 1.0])),
+                 :(eachrow(B[1:2, 1:2]) .~ MvNormal(zeros(2), [1.0 0.0; 0.0 1.0])))
+        @test Base.merge(base, decl).ast.args[end] == decl
+    end
+    # A top-level `@scan` appends; its carried array is a model value.
+    scanned = Base.merge(base, quote
+        @scan begin
+            h[1] ~ Normal(0, 1)
+            for t in 2:3
+                h[t] ~ Normal(0.5 * h[t - 1], 1)
+            end
+        end
+        y .~ Normal.(mu .+ h[3], 1)
+    end)
+    hand_scanned = @rkppl begin
+        mu ~ Normal(0, 1)
+        y .~ Normal.(mu .+ h[3], 1)
+        @scan begin
+            h[1] ~ Normal(0, 1)
+            for t in 2:3
+                h[t] ~ Normal(0.5 * h[t - 1], 1)
+            end
+        end
+    end
+    @test _plans_equal(_lower_y(scanned), _lower_y(hand_scanned))
+    bs, bhs = scanned() | (; y = Y), hand_scanned() | (; y = Y)
+    @test _query(build_kernel(bs).spec, bs, :posterior, u) ==
+        _query(build_kernel(bhs).spec, bhs, :posterior, u)
+    # A top-level `@plate` appends too.
+    plated = Base.merge(base, quote
+        @plate for i in eachindex(y)
+            e[i] ~ Normal(0, 1)
+        end
+    end)
+    @test plated.ast.args[end].args[1] === Symbol("@plate")
+    @test _plans_equal(_lower_y(plated), _lower_y(@rkppl begin
+        mu ~ Normal(0, 1)
+        y .~ Normal.(mu, 1)
+        @plate for i in eachindex(y)
+            e[i] ~ Normal(0, 1)
+        end
+    end))
+    # The base is unchanged.
+    @test base.ast == before
+    # refused: an indexed assignment writes an element of an undeclared name (merge docstring; single assignment, §9).
+    @test_throws SurfaceLoweringError Base.merge(base, :(c[1] = 2))
+    # refused: an appended block rebinding a base name fails at lowering, as hand-written (single assignment, §9).
+    clash = Base.merge(base, :(@scan begin
+        mu[1] ~ Normal(0, 1)
+        for t in 2:3
+            mu[t] ~ Normal(mu[t - 1], 1)
+        end
+    end))
+    @test_throws SurfaceLoweringError _lower_y(clash)
+end
+
 @testset "merge NamedTuple fix transparency" begin
     n = 6
     fixed = Base.merge(merge_base, (; s = fill(2.0, n)))

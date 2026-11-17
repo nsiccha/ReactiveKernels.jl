@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.208
+## 0.1.210
 
 - `jax_source(built, plan; values)` accepts a parameter in `values`
   (`values = (:mu,)`, or a submodel parameter by its dotted name
@@ -28,6 +28,38 @@ are recorded in the git history only.
   name takes that key. A call whose namespace holds nothing else keeps its
   own key. Both crashed before with `ArgumentError: tuple must be non-empty`
   (snag `rkppl-jax-source-4f06381a`).
+
+## 0.1.209
+
+- `merge(model, override)` appends any statement whose left-hand side names
+  nothing in the model, whatever its shape: a fresh sized or indexed
+  declaration (`z[1:N] .~ Normal.(0, 1)`, `b[1:K] ~ MvNormal(…)`,
+  `eachrow(B[a, b]) .~ …`) and a top-level `@plate` / `@scan` block, which
+  0.1.207 refused with `merge indexed override … matches no declaration` and
+  `merge override … is not a splicing statement`. The merged model lowers
+  exactly as the hand-written one with the statement appended; a name the
+  appended block shares with another statement fails at lowering through the
+  single-assignment gate. An indexed assignment to an undeclared name
+  (`c[1] = 2`) still fails, now naming the element write.
+
+## 0.1.208
+
+- `prepare_coordinate_conditional` prepares the conditional log density of
+  one packed coordinate given the others. Each emitted product `A * w` of a
+  matrix constant in the coordinates and a contiguous parameter vector is
+  cached, so a trial value costs one column of `A`. A coordinate of such a
+  vector evaluates only the terms that read it, and a sum over the vector's
+  cells, such as its prior or Jacobian, at the moved cell alone.
+  `coordinate_state`, `coordinate_logdensity`, `set_coordinate!` and
+  `refresh_products!` hold and move a point with its cached products.
+- `coordinate_slice_step!` and `coordinate_slice_sweep!` update coordinates
+  by slice sampling their conditionals: stepping out by doubling, shrinkage
+  and the acceptance test for doubled intervals (Neal 2003), with initial
+  width 10 and at most 20 doublings by default.
+- Not covered: free integer parameters are refused, products over
+  transformed vectors are recomputed in full, and the fused
+  `BernoulliLogitGLM` spelling hides its product from the cache. Native
+  execution only.
 
 ## 0.1.207
 
