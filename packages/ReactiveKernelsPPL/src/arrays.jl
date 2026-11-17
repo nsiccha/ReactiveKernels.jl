@@ -874,14 +874,14 @@ function _vector_literal_metadata(ex, entries, throw_conflicts::Bool)
         axes = (Base.OneTo(length(entries)),))
 end
 
-# `A[...]` reads literal positions or `:` (one per axis), or gathers per
-# observation (`a[g]`, `A[g, :]`, `A[:, g]`): the bound index column holds one
-# position per row, whatever its values (a level gather reads labels), and a
-# single index is linear.
+# `A[...]` reads positions (literal, or a bound number's) or `:` (one per
+# axis), or gathers per observation (`a[g]`, `A[g, :]`, `A[:, g]`): the bound
+# index column holds one position per row, whatever its values (a level
+# gather reads labels), and a single index is linear.
 function _ref_metadata(plan::StructuralPlan, ex::Expr, meta, throw_conflicts::Bool)
     base = meta(ex.args[1])
     idx = ex.args[2:end]
-    if all(_is_position, idx)
+    if all(i -> _is_index_position(plan, i), idx)
         _OS.value_rank(base) === length(idx) || return _OS.ValueInfo()
         return _metadata_result(_OS.infer_call(getindex,
             _OS.ValueInfo[base; map(_position_metadata, idx)]), ex, throw_conflicts)
@@ -1029,11 +1029,11 @@ _is_position(i) = _is_scalar_position(i) || i === :(:)
 
 # A per-observation index: a column name (data or derived), including a
 # definition computed from data only (`i = positions(g)`), which binding
-# evaluates into a column.
+# evaluates into a column. A bound number is a position instead.
 _is_row_index(plan::StructuralPlan, i) =
     i isa Symbol && i !== :(:) && !_is_endpoint(i) &&
     _structural(plan, (:is_row_index, i); columns = :none) do
-        !_is_array_param(plan, i) &&
+        !_is_array_param(plan, i) && !_is_value_position(plan, i) &&
             (!(i in _union_name_set(plan)) || _is_data_only_assignment(plan, i))
     end
 _is_data_only_assignment(plan::StructuralPlan, i::Symbol) =
@@ -1045,20 +1045,99 @@ _is_data_only_assignment(plan::StructuralPlan, i::Symbol) =
 _model_level_gather(plan::StructuralPlan, g) = g isa Symbol &&
     _reads_data_only(plan, g, _all_name_set(plan), Set{Symbol}())
 
+# A number bound to a data name is one position, as in Julia: called with
+# `T = 3`, `h[T]` and `z[T]` read one element, never one per observation.
+# Lowering defines such a name as `T = _bound_value(_rkppl_value_T)`
+# (`_scalar_value_definitions`). Integer arithmetic of bound numbers,
+# literals and endpoints is the position it evaluates to (`h[T - 1]`,
+# `z[end - T]`), and so is a definition of one (`k = T - 1`; `z[k]`), so
+# naming a position never changes what it reads. Binding checks the value
+# (`_value_position_check`), as it checks a literal position.
+_is_value_position(plan::StructuralPlan, i) =
+    !_is_scalar_position(i) && (i isa Symbol || Meta.isexpr(i, :call)) &&
+    _structural(plan, (:is_value_position, i); columns = :none) do
+        _is_position_term(plan, i, Set{Symbol}())
+    end
+
+function _is_position_term(plan::StructuralPlan, i, seen::Set{Symbol})
+    (i isa Int || _is_endpoint(i)) && return true
+    if i isa Symbol
+        i in seen && return false
+        defs = filter(a -> a.name === i, plan.assignments)
+        isempty(defs) && return false
+        push!(seen, i)
+        r = all(defs) do a
+            _is_bound_value_call(a.expr) ? !_is_bound_array_value_call(a.expr) :
+                (a.expr isa Int || Meta.isexpr(a.expr, :call)) &&
+                    _is_position_term(plan, a.expr, seen)
+        end
+        delete!(seen, i)
+        return r
+    end
+    return Meta.isexpr(i, :call) && length(i.args) >= 2 &&
+        i.args[1] in _ENDPOINT_OPS &&
+        all(a -> _is_position_term(plan, a, seen), i.args[2:end])
+end
+
+# An index of one element: a literal position or a bound number's.
+_is_one_position(plan::StructuralPlan, i) =
+    _is_scalar_position(i) || _is_value_position(plan, i)
+# One element or a whole axis.
+_is_index_position(plan::StructuralPlan, i) =
+    _is_position(i) || _is_value_position(plan, i)
+
+# The value of a position at bind, on an axis `first:last`: `missing` when a
+# bound number it reads is not bound here, `nothing` when one is not an
+# integer.
+function _position_value(plan::StructuralPlan, i, first::Int, last::Int)
+    i isa Int && return i
+    _is_endpoint(i) && return _endpoint_value(i, first, last)
+    if i isa Symbol
+        d = nothing
+        for a in plan.assignments
+            a.name === i && (d = a; break)
+        end
+        if _is_bound_value_call(d.expr)
+            input = d.expr.args[2]
+            _holds_bound_value(plan, plan.columns, input) || return missing
+            v = _bound_value(plan, plan.columns, input)
+            return v isa Integer && !(v isa Bool) ? Int(v) : nothing
+        end
+        return _position_value(plan, d.expr, first, last)
+    end
+    args = Any[_position_value(plan, a, first, last) for a in i.args[2:end]]
+    any(ismissing, args) && return missing
+    any(isnothing, args) && return nothing
+    return getfield(Base, i.args[1])(args...)
+end
+
+# Binding checks a bound number's position as Julia indexing would: an
+# integer, inside the axis `1:last` it reads.
+function _value_position_check(plan::StructuralPlan, label, ex, i, last::Int)
+    _is_value_position(plan, i) || return true
+    v = _position_value(plan, i, 1, last)
+    ismissing(v) && return true
+    v === nothing && _fail(label, "`$(repr(ex))` reads the position " *
+        "$(repr(i)), which must be an integer")
+    1 <= v <= last || _fail(label, "`$(repr(ex))` is out of bounds: " *
+        "$(repr(i)) is $v, outside 1:$last")
+    return true
+end
+
 # Index forms of `A[...]` over an array parameter `A`:
-# `:scalar` (every index a literal Int), `:slice` (literal Ints and `:`),
-# `:gather` (one index a data column — one value per observation,
-# the rest literal positions or `:`), or `:invalid`.
+# `:scalar` (every index one position: a literal Int or a bound number's),
+# `:slice` (positions and `:`), `:gather` (one index a data column — one
+# value per observation, the rest positions or `:`), or `:invalid`.
 _gather_index_axis(plan::StructuralPlan, ex::Expr) =
     findfirst(i -> _is_row_index(plan, i), ex.args[2:end])
 
 function _array_index_kind(plan::StructuralPlan, ex::Expr)
     idx = ex.args[2:end]
     isempty(idx) && return :invalid
-    all(_is_scalar_position, idx) && return :scalar
-    all(_is_position, idx) && return :slice
+    all(i -> _is_one_position(plan, i), idx) && return :scalar
+    all(i -> _is_index_position(plan, i), idx) && return :slice
     count(i -> _is_row_index(plan, i), idx) == 1 &&
-        all(i -> _is_position(i) || _is_row_index(plan, i), idx) &&
+        all(i -> _is_index_position(plan, i) || _is_row_index(plan, i), idx) &&
         return :gather
     return :invalid
 end
@@ -1070,15 +1149,15 @@ function _collect_array_ref!(refs, ex::Expr, plan::StructuralPlan, label,
     base = ex.args[1]
     if _is_array_assignment(plan, base)
         idx = ex.args[2:end]
-        if !isempty(idx) && all(_is_position, idx)
+        if !isempty(idx) && all(i -> _is_index_position(plan, i), idx)
             push!(refs, base)
             return true
         end
         _array_index_kind(plan, ex) === :gather || _fail(label,
-            "`$(repr(ex))` reads the array value $base by literal " *
-            "positions or `:` (`$base[1]`, `$base[:, 1]`) or, in a " *
-            "per-observation expression, by one data column " *
-            "(`$base[g]`, `$base[g, 1]`)")
+            "`$(repr(ex))` reads the array value $base by positions or " *
+            "`:` (`$base[1]`, `$base[:, 1]`, `$base[N]` with a number `N` " *
+            "bound as data) or, in a per-observation expression, by one " *
+            "data column (`$base[g]`, `$base[g, 1]`)")
         g = ex.args[1 + _gather_index_axis(plan, ex)]
         allow_gather || _model_level_gather(plan, g) || _fail(label,
             "`$(repr(ex))` gathers per observation — write it in a vector " *
@@ -1112,9 +1191,9 @@ function _collect_array_ref!(refs, ex::Expr, plan::StructuralPlan, label,
     p = _array_param(plan, base)
     kind = _array_index_kind(plan, ex)
     kind === :invalid && _fail(label, "indexing `$(repr(ex))` reads array " *
-        "$(base) by literal positions (`$(base)[1]`, `$(base)[2, 1]`, " *
-        "`$(base)[:, 1]`) or, in a per-observation expression, by one " *
-        "data column (`$(base)[g]`)")
+        "$(base) by positions (`$(base)[1]`, `$(base)[2, 1]`, " *
+        "`$(base)[:, 1]`, `$(base)[N - 1]` with a number `N` bound as data) " *
+        "or, in a per-observation expression, by one data column (`$(base)[g]`)")
     kind === :gather && !allow_gather &&
         !_model_level_gather(plan, ex.args[1 + _gather_index_axis(plan, ex)]) &&
         _fail(label, "`$(repr(ex))` gathers per observation — write it in " *
@@ -1137,14 +1216,14 @@ function _collect_array_ref!(refs, ex::Expr, plan::StructuralPlan, label,
         _data_check(plan) do plan
             dims = _array_dims(plan, p)
             idx = ex.args[2:end]
-            inbounds(i, d) = !_is_scalar_position(i) ||
-                1 <= _endpoint_value(i, 1, d) <= d
+            inbounds(i, d) = _value_position_check(plan, label, ex, i, d) &&
+                (!_is_scalar_position(i) || 1 <= _endpoint_value(i, 1, d) <= d)
             if length(idx) == length(dims)
                 for (i, d) in zip(idx, dims)
                     inbounds(i, d) || _fail(label, "`$(repr(ex))` is out of " *
                         "bounds: $(base) has size $(repr(Tuple(dims)))")
                 end
-            elseif !(length(idx) == 1 && _is_scalar_position(idx[1]) &&
+            elseif !(length(idx) == 1 && _is_one_position(plan, idx[1]) &&
                     inbounds(idx[1], prod(dims)))
                 _fail(label, "`$(repr(ex))` indexes $(length(idx)) axes of the " *
                     "$(length(dims))-axis array $(base)")
@@ -1193,6 +1272,17 @@ function _gather_index_column(plan::StructuralPlan, name::Symbol, label,
         g::Symbol)
     haskey(plan.columns, g) || _fail(label, "array $name is read by " *
         "`$name[$g]`, but $g is not a bound column")
+    # A number reads one position only where lowering saw it as one
+    # (`_is_value_position`): a plan lowered from data names alone cannot.
+    plan.columns[g] isa Number && _fail(label, "`$name[$g]` reads $name " *
+        "per observation of $g, but $g is the number $(repr(plan.columns[g])). " *
+        (any(a -> a.name === g, plan.assignments) ?
+            "A computed index reads one position when it is integer " *
+            "arithmetic of literals, `end` and numbers bound as data " *
+            "(`k = N - 1`)" :
+            "This plan was lowered from data names alone. Lower it from the " *
+            "values (the model call or `lower_rkppl(ast, data)`), so " *
+            "`$name[$g]` reads one position"))
     return _vector_column(plan.columns, g, label, "gather index")
 end
 

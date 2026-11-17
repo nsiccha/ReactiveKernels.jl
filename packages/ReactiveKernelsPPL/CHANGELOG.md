@@ -16,6 +16,22 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.211
+
+- A number bound to a data name is one position, as in Julia. Called with
+  `T = 3` (the model call or `lower_rkppl(ast, data)`), `h[T]` reads one
+  element of a scan state and `z[N]` or `B[N, 2]` one element of a declared
+  array, in a broadcast location, a named definition and a plate cell alike,
+  as the literal `h[3]` does. Before, `y .~ Normal.(mu .+ h[T], 1)` failed
+  with `array_info requires rank ≥ 1` and `y .~ Normal.(mu .+ z[N], 1)` with
+  `gather index N must be a vector column`. Integer arithmetic of bound
+  numbers, literals and endpoints is the position it evaluates to
+  (`h[T - 1]`, `z[end - K + 1]`), and so is a definition of one
+  (`k = T - 1`). Binding refuses a value outside the array or one that is
+  not an integer, and a new value rebinds without lowering again. A plan
+  lowered from data names alone still reads `z[K]` per observation; binding
+  a number to `K` now says to lower from the values.
+
 ## 0.1.210
 
 - `jax_source(built, plan; values)` accepts a parameter in `values`

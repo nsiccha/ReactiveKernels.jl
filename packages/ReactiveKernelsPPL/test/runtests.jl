@@ -287,6 +287,7 @@ const _PPL_TEST_FILES = (
     "test_plate_column_compositions.jl",
     "test_plate_cell_once.jl",
     "test_index_endpoints.jl",
+    "test_value_positions.jl",
     "test_base_value_names.jl",
     "test_lazy_branch_values.jl",
     "test_reduction_calls.jl",
