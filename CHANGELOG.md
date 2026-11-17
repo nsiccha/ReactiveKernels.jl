@@ -16,6 +16,17 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.297
+
+- `jax_source` converts a value stored into an array (`A[i] = v`, `A[i, :] = row`,
+  `A[i] += v`, and a row stored into a vector of vectors) to the array's
+  element type, as Julia's `setindex!` does: a `Float64` value stored into a
+  `Float32` array is rounded to float32 in the emitted code. JAX's
+  `.at[i].set(v)` performed that cast implicitly, with a FutureWarning
+  ("scatter inputs have incompatible types") that a later JAX release turns
+  into an error. Stores whose value already has the array's dtype are
+  unchanged.
+
 ## 0.1.296
 
 - JAX source translates nearest-loop `break`, convergence `while` loops,
