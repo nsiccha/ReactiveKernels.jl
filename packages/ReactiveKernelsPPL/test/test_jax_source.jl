@@ -1335,6 +1335,73 @@ end
     end
 end
 
+# `values` may name a parameter, which `constrain` returns once, and a
+# submodel call, whose own value sits under `return` in the namespace that
+# holds its parameters, at any depth; a call whose namespace holds nothing
+# else keeps its own key (snag rkppl-jax-source-4f06381a: these crashed with
+# `ArgumentError: tuple must be non-empty`).
+@rkppl jax_ppl_outer_effect(K) = begin
+    inner ~ jax_ppl_group_effects(K)
+    shift ~ Normal(0, 1)
+    return inner .+ shift
+end
+@rkppl jax_ppl_scaled(x, c) = begin
+    w = c .* x
+    return w
+end
+@testset "jax_source(built, plan): values naming parameters and submodel calls" begin
+    plain = (@rkppl(begin
+        mu ~ Normal(0, 1)
+        y .~ Normal.(mu, 0.5)
+    end))() | (; y = [0.3, -0.2, 0.1])
+    effect = (@rkppl(begin
+        mu ~ Normal(0, 1)
+        b ~ jax_ppl_group_effects(K)
+        o ~ jax_ppl_outer_effect(K)
+        s ~ jax_ppl_scaled(x, 2.0)
+        y .~ Normal.(mu .+ b .+ o .+ s, 0.5)
+    end))(; K = 4, x = [0.1, 0.2, 0.3, 0.4]) | (; y = [0.3, -0.2, 0.1, 1.0])
+    cases = ((plain, (:mu,)),
+             (effect, (:mu, :b, Symbol("b.tau"), :o, Symbol("o.inner"), :s)))
+    for (plan, values) in cases
+        built = build_kernel(plan)
+        src = jax_source(built, plan; values)
+        text = string(src)
+        plan === effect || continue
+        constrain_doc = split(split(text, "def constrain(")[2], "\"\"\"")[2]
+        for key in ("b.return", "b.tau", "o.return", "o.inner.return", "o.inner.tau", "s")
+            @test occursin("- `" * key * "`", constrain_doc)
+        end
+        @test !occursin("- `s.return`", constrain_doc)
+    end
+    if !rk_jax_available()
+        @test_skip "RK_JAX_PYTHON not set"
+    else
+        for (plan, values) in cases
+            built = build_kernel(plan)
+            src = jax_source(built, plan; values)
+            u = 0.1 .* collect(1:built.layout.total)
+            r = rk_jax_evaluate(src, "constrain", (u, jax_raw_data(plan, src)...); prepare = true).value
+            native = prepare_query(built, plan, values)(u)
+            native = NamedTuple{values}(length(values) == 1 ? (native,) : native)
+            @test r["mu"] ≈ native.mu
+            plan === effect || (@test collect(keys(r)) == ["mu"]; continue)
+            layout = ReactiveKernelsPPL.constrain(built.layout, u)
+            @test sort(collect(keys(r))) == ["b", "mu", "o", "s"]
+            @test sort(collect(keys(r["b"]))) == ["return", "tau", "z"]
+            @test r["b"]["return"] ≈ native.b
+            @test r["b"]["tau"] ≈ native[Symbol("b.tau")] ≈ layout.b.tau
+            @test r["b"]["z"] ≈ layout.b.z
+            @test sort(collect(keys(r["o"]))) == ["inner", "return", "shift"]
+            @test r["o"]["return"] ≈ native.o
+            @test r["o"]["inner"]["return"] ≈ native[Symbol("o.inner")]
+            @test r["o"]["inner"]["tau"] ≈ layout.o.inner.tau
+            @test r["o"]["shift"] ≈ layout.o.shift
+            @test r["s"] ≈ native.s ≈ 2.0 .* [0.1, 0.2, 0.3, 0.4]
+        end
+    end
+end
+
 # A per-index value of a ragged plate comes back from `constrain` padded,
 # with its lengths beside it, so a caller can strip the padding.
 @testset "jax_source(built, plan): ragged values in constrain" begin
