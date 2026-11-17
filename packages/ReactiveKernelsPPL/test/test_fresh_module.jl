@@ -548,4 +548,46 @@ end
     u = collect(range(-0.3, 0.4; length = builds[1].built.layout.total))
     @test isequal(Base.invokelatest(builds[1].query, u), Base.invokelatest(builds[2].query, u))
 end
+
+# The same through a law kernel every build shares, which calls a child kernel
+# whose branch reads the observation: preparing any build (the same one again
+# included) re-keyed the shared branch's arm graphs, which its readers embedded
+# (co-report on snag `rk-0-1-206-every-58bdc046`).
+module SharedBranchKernels
+using ReactiveKernels
+const STRIP = ReactiveKernels.@kernel strip_logdensity(y, eta) = begin
+    value = y > 0 ? -log(1 + exp(-eta)) : -log(1 + exp(eta))
+    return value
+end
+const COMPONENT = ReactiveKernels.@kernel component_logdensity(y, eta, w) = begin
+    first_strip = STRIP(y, eta)
+    second_strip = w > 0 ? STRIP(y, eta + w) : 0.0
+    total = first_strip + second_strip
+    return total
+end
+end
+
+@testset "a shared law kernel's branches read through one type across preparations" begin
+    ast = quote
+        a ~ Normal(0, 1)
+        z[levels(g)] .~ Normal.(0, 1)
+        eta = a .+ z[g]
+        @plate for i in eachindex(y)
+            y[i] ~ LogDensity(COMPONENT, eta[i], w[i])
+        end
+    end
+    data = (; g = ["s1", "s2", "s1", "s3", "s2"], y = [1.0, 0.0, 1.0, 0.0, 1.0],
+            w = [0.5, 0.0, 1.0, 0.0, 0.2])
+    builds = map(1:2) do _
+        mod = Module(gensym(:FreshLowering))
+        Core.eval(mod, :(using ReactiveKernelsPPL, Distributions))
+        Core.eval(mod, :(const COMPONENT = $(SharedBranchKernels.COMPONENT)))
+        bound = bind_data(lower_rkppl(deepcopy(ast), data; conditioned = (:y,), mod), data)
+        (; built = build_kernel(bound), bound)
+    end
+    query(b) = prepare_query(b.built, b.bound, :pointwise)
+    first_query = query(builds[1])
+    @test typeof(query(builds[2])) === typeof(first_query)
+    @test typeof(query(builds[1])) === typeof(first_query)
+end
 end

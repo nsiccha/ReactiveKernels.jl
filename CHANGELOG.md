@@ -26,9 +26,12 @@ are recorded in the git history only.
   embedded the branch kept them, with the value ids of the build that made
   them. So every rebuild compiled its readers and their derivatives again:
   for BRM's `brm_nlme_model` of one specification built a second time in a
-  process, about 40 s of preparation and 120 s of `check_protocol`. The
-  embedded branch now leaves its graphs out; lowering still reads them from
-  the plan. Values are unchanged.
+  process, about 40 s of preparation and 120 s of `check_protocol`. A law
+  kernel that every build shares, whose child kernel's branch reads the
+  observation, compiled again at every preparation, of the same build too:
+  preparing re-keyed the shared branch's graphs. The embedded branch now
+  leaves its graphs out; lowering still reads them from the plan. Values are
+  unchanged.
 
 ## 0.1.305
 
