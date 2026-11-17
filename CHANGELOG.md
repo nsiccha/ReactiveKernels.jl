@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.297
+## 0.1.299
 
 - `jax_source`: a `map` do-block whose elements are numerical arrays of one
   shape (a plate record's vector field, `map(records) do r; r.nested.y end`)
@@ -40,6 +40,30 @@ are recorded in the git history only.
 - `jax_source`: `eachindex` of a ragged vector of vectors, or of a vector of
   records with padded fields, ranges over its entries. Before, a loop over it
   used the rows' lengths as its count and failed in Python.
+
+## 0.1.298
+
+- `js_source` reads, indexes and iterates a vector of records that a recipe
+  or helper builds, such as `[k(d) for d in dose]` where a prepared kernel `k`
+  returns a named tuple, or a helper returns a tuple or named tuple: `length`,
+  `eachindex`, `x[i]`, `x[indices]`, `x[a:b]`, `@view x[a:b]`, `for`,
+  comprehensions and generators with their filters and reductions, `count`,
+  `any`, `all`, `isempty`, `filter`, `map`, `findfirst`,
+  `sum(f, x)`, broadcasts, `copy`, `collect`, `push!` and `x[i] = r`. Field
+  projections such as `[r.a for r in records]` and `getproperty.(records, :a)`
+  give vectors of that field's type. These vectors remain internal values:
+  `types=` inputs and constants keep the vector types listed in the guide.
+
+## 0.1.297
+
+- `jax_source` converts a value stored into an array (`A[i] = v`, `A[i, :] = row`,
+  `A[i] += v`, and a row stored into a vector of vectors) to the array's
+  element type, as Julia's `setindex!` does: a `Float64` value stored into a
+  `Float32` array is rounded to float32 in the emitted code. JAX's
+  `.at[i].set(v)` performed that cast implicitly, with a FutureWarning
+  ("scatter inputs have incompatible types") that a later JAX release turns
+  into an error. Stores whose value already has the array's dtype are
+  unchanged.
 
 ## 0.1.296
 
