@@ -108,6 +108,36 @@ end
     total::Float64 = sum(pointwise) + 0.0 * extra
 end
 
+# Three sibling branches the lanes decide, each with a counted `log` arm that
+# is invalid (DomainError) on the lanes that do not take it.
+@kernel sibling_guards(x::Vector{Float64}, a::Vector{Float64}, b::Vector{Float64},
+                       c::Vector{Float64}) = begin
+    pointwise = plate(x, a, b, c) do xi, ai, bi, ci
+        p = ai > 0 ? counted_log(xi) : xi - 1.0
+        q = bi > 0 ? 2.0 * xi : counted_log(-xi)
+        r = ci > 0 ? counted_log(xi * xi) : 0.0
+        cell::Float64 = p + q + r
+        cell
+    end
+    total::Float64 = sum(pointwise)
+end
+
+# Twelve sibling branches the lanes decide, one flag column each: every arm
+# combination as its own plate would be 4096 plates.
+let flags = [Symbol(:f, j) for j in 1:12], lanes = [Symbol(:g, j) for j in 1:12]
+    terms = [:($(Symbol(:t, j)) = $(lanes[j]) > 0 ? log1p(xi * xi + $j) : $j * xi)
+             for j in 1:12]
+    @eval @kernel twelve_siblings(x::Vector{Float64},
+            $([:($f::Vector{Float64}) for f in flags]...)) = begin
+        pointwise = plate(x, $(flags...)) do xi, $(lanes...)
+            $(terms...)
+            cell::Float64 = +($([Symbol(:t, j) for j in 1:12]...))
+            cell
+        end
+        total::Float64 = sum(pointwise)
+    end
+end
+
 # A guarded location over a bound index domain, read from captured live
 # scalars, with a constant fallback arm, then gathered by a guarded density
 # plate. Its extra consumer preserves the intermediate boundary. The `sqrt`
