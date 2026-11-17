@@ -16,6 +16,17 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.304
+
+- `@traceable` takes `@inline` and `@noinline` on either side of it
+  (`@traceable @inline f(x) = ...`, `@inline @traceable f(x) = ...`). The
+  method keeps the hint and the recorded source omits it; before, the first
+  spelling was refused at definition and `jax_source` refused the second.
+- Fixed in JAX source since 0.1.296: `x === nothing`, `x !== nothing` and
+  `isnothing(x)` of a data-only value that is `nothing` or a tuple or array
+  were refused (`the function isnothing calls itself`). Host preparation
+  compares such a value with Python's `is None` again.
+
 ## 0.1.303
 
 - JAX source translates a splatted tuple or named tuple in a tuple literal
