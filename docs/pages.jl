@@ -8,6 +8,7 @@ const SITE_PAGES = [
         "Prepared differentiation" => "automatic-differentiation.md",
         "Probabilistic graphs" => "rkppl.md",
         "Finite integer parameters" => "integer-parameters.md",
+        "Coordinate updates" => "coordinate-updates.md",
         "Reusable buffers" => "nonallocating.md",
         "Graph inspection" => "visualization.md",
         "JAX source" => "jax.md",
