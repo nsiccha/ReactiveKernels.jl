@@ -116,6 +116,17 @@ end
     return result
 end
 
+# Rows in lexicographic order need not be ordered field by field.
+@traceable function jhrec_sorted_rows(labels, values)
+    rows = collect(zip(labels, values))
+    (issorted(rows) ? 1.0 : 0.0) + (issorted(sort(rows)) ? 2.0 : 0.0)
+end
+@kernel jhrec_sorted_model(theta::Float64, labels::Vector{Int}, values::Vector{Float64}) = begin
+    coefficient = jhrec_sorted_rows(labels, values)
+    result = theta * coefficient
+    return result
+end
+
 @traceable function jhrec_nested(labels, values)
     result = 0.0
     for i in eachindex(values)
@@ -300,6 +311,11 @@ end
     @test jhrec_parity(jhrec_nested_model, first(ragged)) == jhrec_parity(jhrec_nested_model, last(ragged))
     @test jhrec_parity(jhrec_raw_model, (; input = [(2, 4.0), (1, 2.0), (2, 4.0)])) ==
           jhrec_parity(jhrec_raw_model, (; input = Tuple{Int,Float64}[]))
+    for data in ((; labels = [1, 2], values = [5.0, 1.0]), (; labels = [2, 1], values = [1.0, 5.0]),
+                 (; labels = [1, 1], values = [-0.0, 0.0]), (; labels = [1, 1], values = [0.0, -0.0]),
+                 (; labels = [1, 1], values = [NaN, 1.0]), (; labels = Int[], values = Float64[]))
+        jhrec_parity(jhrec_sorted_model, data)
+    end
     for data in ((; left=[2^53 + 1], right=[Float64(2^53)]),
                  (; left=[1], right=[1.0]), (; left=Int[], right=Float64[]),
                  (; left=[1], right=Float64[]), (; left=[0], right=[NaN]))

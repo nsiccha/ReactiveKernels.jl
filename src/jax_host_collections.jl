@@ -202,6 +202,18 @@ def _rk_tuple_unique(x):
     result
 end
 
+# `issorted` of tuple rows: no row is `isless` than the row before it. The
+# array helper would compare the rows' fields column by column.
+function _host_tuple_issorted(ctx::_JaxContext, x::_PyVal)
+    _host_order_helper!(ctx, :isless)
+    helper = _jax_helper!(ctx, "_rk_tuple_issorted", """
+def _rk_tuple_issorted(x):
+    keys = [_rk_isless_key_np(row) for row in x]
+    return all(a <= b for a, b in zip(keys, keys[1:]))
+""")
+    _PyVal(helper * "(" * x.code * ")", Bool, true)
+end
+
 # NumPy otherwise interprets the fields of each tuple as a second broadcast
 # axis. Box each complete row, without converting its individual fields.
 function _host_broadcast_operand(ctx::_JaxContext, x::_PyVal)

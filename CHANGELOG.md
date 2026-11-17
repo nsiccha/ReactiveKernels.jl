@@ -19,11 +19,13 @@ are recorded in the git history only.
 ## 0.1.297
 
 - `jax_source` host preparation collects and sorts tuple records without
-  coercing their fields, including `by` field projections, dictionary generators and
-  broadcast lookups. Local named helpers preserve writes to captured
-  collections. Chained comparisons and predicate reductions short-circuit;
-  numerical array equality preserves shape and exact integer comparisons.
-  Host loops and generated JAX bodies remain bounded as input lengths change.
+  coercing their fields, including `issorted`, `by` field projections,
+  dictionary generators and broadcast lookups. Local named helpers preserve
+  writes to captured collections. `all` and `any` with a predicate stop at
+  the first deciding element; numerical array equality preserves shape and
+  exact integer comparisons. Host loops and generated JAX bodies remain
+  bounded as input lengths change. The guides describe host preparation on
+  its own page, `docs/src/jax-host.md`.
 - `jax_source` reads a submodel's fixed-shape output (an `LKJCholesky`
   factor's diagonal, since 0.1.291) from the submodel's result. The caller
   named a local of the submodel's body instead, a Python `NameError`.

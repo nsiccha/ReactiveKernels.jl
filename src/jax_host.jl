@@ -1509,7 +1509,8 @@ function _jax_call_positional(ctx::_JaxContext, ::typeof(issorted), args::Vector
     length(args) == 1 ||
         _jax_error("`issorted` with ", length(args), " arguments has no host translation",
                    _jax_where(ctx))
-    _host_ordered_eltype(ctx, issorted, args[1].T)
+    E = _host_ordered_eltype(ctx, issorted, args[1].T)
+    E <: Tuple && return _host_tuple_issorted(ctx, args[1])
     _PyVal(_host_order_helper!(ctx, :issorted) * "(" * args[1].code * ")", Bool, true)
 end
 # `isless(a, b)` of two scalars: Julia's total order, -0.0 before 0.0 and
