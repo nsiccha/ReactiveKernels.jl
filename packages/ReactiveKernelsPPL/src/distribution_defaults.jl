@@ -2,6 +2,9 @@
 # lowering path. These expand fixed call syntax, never data-dependent work.
 _distribution_args(head::Symbol, args) = _distribution_args(Val(head), args)
 _distribution_args(::Val, args) = args
+_distribution_args(::Val{:Bernoulli}, args) = isempty(args) ? Any[0.5] : args
+_distribution_args(::Val{:Binomial}, args) =
+    _trailing_distribution_defaults(args, (1, 0.5))
 
 function _trailing_distribution_defaults(args, defaults)
     length(args) >= length(defaults) && return args

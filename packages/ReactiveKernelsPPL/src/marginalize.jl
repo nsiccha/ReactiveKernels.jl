@@ -22,11 +22,21 @@ const _MARGINAL_ROLES = (:mean, :var, :coef, :shift, :innovation_var)
 """
     marginalize(model, names::Symbol...; predictive = (;), filtered = (;)) -> model
 
-Integrate the latent `@scan` arrays `names` out of `model` exactly, as a Kalman
-filter. `model` is an `RKPPLModel` or a binding of one (`model(; inputs...)`);
+Integrate finite integer parameters or linear-Gaussian latent `@scan` arrays
+`names` out of `model` exactly. `model` is an `RKPPLModel` or a binding of one (`model(; inputs...)`);
 the result composes with `|` and `condition` as the model does. The model
 source keeps the recurrence as written.
 
+Scalar `Binomial`, `Bernoulli`, `Categorical` and `DiscreteUniform` parameters
+are summed over their finite supports with log-sum-exp. Binomial trials and
+DiscreteUniform bounds come from data. The integer state occupies no real
+coordinates; the generated program iterates over its support at runtime.
+[`prepare_discrete_latents`](@ref) returns the joint state probabilities and
+named state columns under `parameters`, and [`discrete_latent_draws`](@ref)
+recovers a joint draw with a caller-supplied RNG. Several declarations can
+be eliminated together, including submodel locals named by their author paths.
+
+A linear-Gaussian recurrence is lowered as a Kalman filter.
 A marginalized array `x` qualifies when
 
 - its `@scan` carries `x` alone, seeded once: `x[1] ~ Normal(m0, s0)` or
@@ -1492,8 +1502,8 @@ end
 prepare_marginalized_latents(built, m::_PlanSource; kwargs...) =
     prepare_marginalized_latents(built, _bound_plan(m); kwargs...)
 
-function (q::MarginalizedLatentQuery)(u::AbstractVector)
-    values = Base.invokelatest(q.query, u)
+function (q::MarginalizedLatentQuery)(u::AbstractVector, discrete::Vararg{NamedTuple})
+    values = Base.invokelatest(q.query, u, discrete...)
     k = length(_MARGINAL_ROLES)
     entries = Any[NamedTuple{_MARGINAL_ROLES}(Tuple(values[(i - 1) * k + r] for r in 1:k))
         for i in eachindex(q.names)]
@@ -1523,6 +1533,8 @@ posterior of the model as written.
 """
 marginalized_latent_draws(q::MarginalizedLatentQuery, u::AbstractVector, rng) =
     marginalized_latent_draws(q(u), rng)
+marginalized_latent_draws(q::MarginalizedLatentQuery, u::AbstractVector,
+    discrete::NamedTuple, rng) = marginalized_latent_draws(q(u, discrete), rng)
 function marginalized_latent_draws(filtered::NamedTuple, rng)
     out = Pair{Symbol,Any}[]
     for (x, f) in pairs(filtered)

@@ -125,6 +125,7 @@ _bound_summary(b) = string(b)
 function _entry_transform(family::Symbol, override::BoundOverride,
         args::NamedTuple; elementwise::NTuple{2,Bool} = (false, false))
     support = support_of(family, override)
+    support === :integer && return (:identity, NaN, NaN)
     if support === :truncated
         lo, hi = override[2], override[3]
         natural = SAMPLED_SUPPORT[family]
@@ -535,6 +536,12 @@ function assign_layout(plan::StructuralPlan)
     end
     for p in plan.parameters
         p.name in plan.conditioned && continue
+        p.name in plan.marginalized_integers && continue
+        if _integer_parameter(p)
+            push!(entries, LayoutEntry(:integer, nothing, p.name, Symbol[],
+                offset, 0, :identity))
+            continue
+        end
         if p.family === :external
             entry = _external_layout_entry(plan, p, offset, Int[])
             push!(entries, entry)
@@ -551,6 +558,11 @@ function assign_layout(plan::StructuralPlan)
     end
     for p in plan.plate_parameters
         p.name in plan.conditioned && continue
+        if _integer_parameter(p)
+            push!(entries, LayoutEntry(:integer, nothing, p.name, Symbol[],
+                offset, 0, :identity, NaN, NaN, [_plate_rows(plan, p)]))
+            continue
+        end
         if p.family === :external
             size = _plate_rows(plan, p)
             labels = [Symbol(p.name, ".", i) for i in 1:size]
@@ -1381,7 +1393,7 @@ function _bound_entry_order(layout::LayoutTable)
 end
 
 """
-    constrain(layout, unconstrained) -> NamedTuple
+    constrain(layout, unconstrained[, discrete]) -> NamedTuple
 
 Host-side constrain of the packed vector. Parameters keep their author
 names; submodel locals are nested (`nt.z.b`, `nt.z.w.b`). Scalar, vector,
@@ -1391,12 +1403,16 @@ locals and return values are read in the model rather than included in this
 draw container. The generator emits the equivalent transforms inside the
 mathematical graph.
 
+Integer parameters come from the named `discrete` state, retaining their
+integer types. Array values are copied into the result, so later updates to
+the state do not change a saved constrained draw.
+
 Concurrent calls may share a completed layout when its inputs and bound values
 remain read-only. Built-in transforms synchronize their lazy endpoint caches;
 caller-owned geometry and functions evaluated in bounds must themselves allow
 concurrent calls. Each call constructs its own result containers.
 """
-function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
+function constrain(layout::LayoutTable, u::AbstractVector{<:Real}, discrete::NamedTuple = (;))
     length(u) == layout.total ||
         throw(ContractValidationError("[layout] unconstrained length $(length(u)) ≠ $(layout.total)"))
     pairs = Pair{Symbol,Any}[]
@@ -1409,7 +1425,10 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
         haskey(layout.cell_geometries, entry.name) && continue
         e = _resolved_entry(layout, entry, values)
         seg = u[e.offset:(e.offset + e.size - 1)]
-        if e.kind === :external_plate
+        if e.kind === :integer
+            v = _integer_value(discrete, get(layout.name_paths, e.name, (e.name,)), Tuple(e.dims))
+            push!(pairs, e.name => (v isa AbstractArray ? copy(v) : v))
+        elseif e.kind === :external_plate
             args = _external_host_args(layout, e, values)
             v = _external_host_cells(e, :constrain, seg, args; _external_host_kwargs(layout, e, values)...)
             push!(pairs, e.name => v)
@@ -1480,7 +1499,9 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
     seen_coef = Set{Symbol}()
     for entry in layout.entries
         e = _resolved_entry(layout, entry, nt)
-        if haskey(layout.cell_geometries, e.name)
+        if e.kind === :integer
+            _integer_value(nt, e.name, Tuple(e.dims))
+        elseif haskey(layout.cell_geometries, e.name)
             haskey(nt, e.name) || throw(ContractValidationError("[layout] missing parameter $(e.name)"))
             u[e.offset:(e.offset + e.size - 1)] .= _cell_geometry_unconstrain(layout,
                 e.name, nt[e.name], nt)
@@ -1623,13 +1644,13 @@ Host-side total log-Jacobian, using the same source-coordinate formulas as
 the in-graph terms (positive: `u`; unit:
 `-log1pexp(-u) - log1pexp(u)`).
 """
-function logjac(layout::LayoutTable, u::AbstractVector{<:Real})
+function logjac(layout::LayoutTable, u::AbstractVector{<:Real}, discrete::NamedTuple = (;))
     length(u) == layout.total ||
         throw(ContractValidationError("[layout] unconstrained length $(length(u)) ≠ $(layout.total)"))
     T = _host_eltype(u)
     total = zero(T)
     values = any(_dynamic_bounds, layout.entries) || !isempty(layout.cell_geometries) ?
-        _flat_draw_values(layout, constrain(layout, u)) : NamedTuple()
+        _flat_draw_values(layout, constrain(layout, u, discrete)) : NamedTuple()
     for entry in layout.entries
         e = _resolved_entry(layout, entry, values)
         if haskey(layout.cell_geometries, e.name)
@@ -2102,6 +2123,19 @@ function _entry_reads!(reads, plan, tests, e::LayoutEntry, at, scan, bound_reads
         LayoutEntry(e.kind, e.predictor, e.name, e.labels, e.offset, e.size, e.transform,
             e.lo, e.hi, e.dims, blocks, e.sampling, positions, axes, bound_reads,
             e.elementwise)
+    if e.kind === :integer
+        p = findfirst(p -> p.name === e.name, plan.plate_parameters)
+        dims = isempty(e.dims) ? Any[] : p === nothing ?
+            _array_packed_reads(plan, tests, e) :
+            Any[_plate_rows_read(plan, tests, plan.plate_parameters[p], only(e.dims))]
+        axes = Any[_named_read!(reads, Symbol(:_ppl_axis, d, :_, e.name), a)
+            for (d, a) in enumerate(dims)]
+        # Even an empty packed block has runtime positions when a preceding
+        # continuous block has data-sized extent (JAX layout metadata reads it).
+        at isa Int && return with(nothing, axes), at
+        start, stop, _ = _block_reads!(reads, e.name, at, 0)
+        return with((start, stop), axes), at
+    end
     if !_reads_positions(e)
         return with(nothing), _read_add(at, e.size)
     end
@@ -2237,8 +2271,16 @@ In-graph constrain edge(s) for one layout entry. Coefficient/scan slices read a
 sampled entry (`:exp`/`:logistic`) splices the bijector's `constrain` endpoint,
 which the planner inlines.
 """
-function transform_statements(e::LayoutEntry)
+function transform_statements(e::LayoutEntry; path = (e.name,))
     e = _program_entry(e)
+    if e.kind === :integer
+        statements = Expr[:($(e.name) =
+            $(GlobalRef(@__MODULE__, :_integer_value))(_ppl_discrete,
+                $(QuoteNode(path)), $(Expr(:tuple, something(e.axes, e.dims)...))))]
+        length(e.dims) > 1 && push!(statements,
+            :($(_array_flat_name(e.name, length(e.dims))) = vec($(e.name))))
+        return statements
+    end
     e.kind === :external_plate && return Expr[
         :($(e.name) = $(_external_cells_expr(e, :constrain))),
         :($(_plate_logjac_name(e.name)) = $(_external_cells_expr(e, :logjac)))]

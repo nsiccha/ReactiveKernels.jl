@@ -99,8 +99,9 @@ terms a factor selection whose rows are data, prepared on the set's first use.
 """
 function prepare_slices(built, plan::StructuralPlan, observations,
         u0::AbstractVector{<:Real}; by, backend, partitioned = (), locality = :error,
-        on_error = nothing)
+        on_error = nothing, discrete = nothing)
     built = _binding_build(built, plan)
+    plan = _fixed_integer_query(plan, built.layout, discrete)
     layout = built.layout::LayoutTable
     exemplar = Vector{Float64}(u0)
     likelihood = prepare_partition_sampler(built, plan, observations, exemplar; by, backend,

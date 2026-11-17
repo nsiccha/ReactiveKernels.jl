@@ -79,6 +79,7 @@ function _parameter_shape(layout, e, ncoordinates)
 end
 
 _parameter_shape(::Val{:sampled}, e, n) = ()
+_parameter_shape(::Val{:integer}, e, n) = Tuple(e.dims)
 _parameter_shape(::Val{:coefficient}, e, n) = (n,)
 _parameter_shape(::Val{:plate}, e, n) = (n,)
 _parameter_shape(::Val{:external_plate}, e, n) = (n,)

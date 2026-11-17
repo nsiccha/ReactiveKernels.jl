@@ -99,7 +99,7 @@ Use [`joined_point`](@ref) to pack the window points and
 """
 function prepare_joined_windows(built, plans::AbstractVector{<:StructuralPlan},
         u0s::AbstractVector{<:AbstractVector{<:Real}}; boundary, backend, locals = (),
-        on_error = nothing)
+        on_error = nothing, discrete = nothing)
     K = length(plans)
     K >= 1 || throw(ContractValidationError("[windows] at least one window is needed"))
     length(u0s) == K || throw(ContractValidationError(
@@ -107,6 +107,9 @@ function prepare_joined_windows(built, plans::AbstractVector{<:StructuralPlan},
     pairs = _window_boundary(boundary)
     local_names = Set{Symbol}(Symbol[Symbol(n) for n in locals])
     builds = [_binding_build(built, plan) for plan in plans]
+    states = discrete isa AbstractVector ? discrete : fill(discrete, K)
+    length(states) == K || throw(DimensionMismatch("one integer state per window is required"))
+    plans = [_fixed_integer_query(plans[k], builds[k].layout, states[k]) for k in 1:K]
     layouts = LayoutTable[b.layout for b in builds]
     exemplars = Vector{Float64}[Vector{Float64}(u) for u in u0s]
     for k in 1:K

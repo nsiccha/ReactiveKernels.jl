@@ -120,10 +120,12 @@ function PPL.carry_smc(target::AbstractSMCTarget, reference::SMCReference;
 end
 
 function PPL.prepare_smc(built, binding::StructuralPlan, u0::AbstractVector;
-        backend, model_id::AbstractString, binding_id::AbstractString, kwargs...)
+        backend, model_id::AbstractString, binding_id::AbstractString,
+        discrete = nothing, kwargs...)
     isempty(model_id) && throw(ArgumentError("model_id must name the model and coordinate frame"))
     isempty(binding_id) && throw(ArgumentError("binding_id must name the exact bound data"))
     hasproperty(built, :program) || throw(ArgumentError("prepare_smc needs a build_kernel result"))
+    binding = PPL._fixed_integer_query(binding, PPL.assign_layout(binding), discrete)
     query = prepare_sampler(built, binding, u0; backend, kwargs...)
     signature = deepcopy((; model_id=String(model_id), binding_id=String(binding_id),
         program=built.program, layout=_layout(query.layout)))
@@ -167,7 +169,8 @@ end
 
 function PPL.prepare_smc_window(built, binding::StructuralPlan, u0::AbstractVector;
         previous::SMCCarriedReference, backend, model_id::AbstractString,
-        binding_id::AbstractString, warm::Bool=false, coordinates=:all)
+        binding_id::AbstractString, warm::Bool=false, coordinates=:all, discrete=nothing)
+    binding = PPL._fixed_integer_query(binding, PPL.assign_layout(binding), discrete)
     coordinates === :auto && return _prepare_smc_selective(built, binding, u0;
         previous, backend, model_id, binding_id, warm)
     coordinates === :all || throw(ArgumentError("coordinates must be :all or :auto"))

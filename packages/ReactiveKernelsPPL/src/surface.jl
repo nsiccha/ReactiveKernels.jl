@@ -735,6 +735,8 @@ function _lower_model_latest(m::RKPPLModel, supplied; conditioned = keys(m.condi
     # A recurrence a submodel holds is named by its author path (`z.x`) and
     # lowers under the local's private identifier.
     marginalized = Symbol[_marginalized_identifier(x, ctx) for x in m.marginalized]
+    integer_marginals = _integer_marginal_names(ast, marginalized)
+    marginalized = setdiff(marginalized, integer_marginals)
     # Filter values a `marginalize` call names (`predictive`, `filtered`).
     marginal_requests = _marginal_value_requests(m.marginal_values, ctx, used, values)
     _marginalized_lengths!(values, data, expanded.ast, marginalized)
@@ -758,7 +760,7 @@ function _lower_model_latest(m::RKPPLModel, supplied; conditioned = keys(m.condi
     for name in _conditioned_inputs(plan)
         values[_conditioned_input(name)] = pop!(values, name)
     end
-    return _with(plan; documentation), values
+    return _with(plan; documentation, marginalized_integers = integer_marginals), values
 end
 
 lower_rkppl(m::RKPPLModel, data::NamedTuple; conditioned=keys(m.conditioned)) = first(_lower_model(m, data; conditioned))
@@ -12876,6 +12878,8 @@ _axis_extent(d) = _is_bound_extent_dim(d) ? d :
         Expr(:call, :length, d.args[2]) : nothing
 
 const _PARAM_FAMILIES = Dict{Symbol,Symbol}(
+    :Binomial => :binomial, :Bernoulli => :bernoulli,
+    :Categorical => :categorical, :DiscreteUniform => :discrete_uniform,
     :Normal => :normal, :Cauchy => :cauchy,
     :Exponential => :exponential, :Gamma => :gamma,
     :LogNormal => :lognormal, :Beta => :beta,
@@ -13485,7 +13489,7 @@ function _lower_parameter(lhs, rhs, coefuse, matrices)
         fam -> _sfail("parameter $lhs: unknown distribution `$(repr(fam))` " *
             "(admitted: Normal, Cauchy, Exponential, Gamma, LogNormal, " *
             "Beta, InverseGamma, StudentT, TDist, Laplace, Logistic, Uniform, Weibull, " *
-            "HalfNormal, HalfCauchy, Flat, " *
+            "HalfNormal, HalfCauchy, Flat, Binomial, Bernoulli, Categorical, DiscreteUniform, " *
             "Dirichlet, LKJCholesky, truncated, restricted). If `$fam` is " *
             "meant as a submodel, define it with " *
             "`@rkppl $fam(args...) = begin ... end` and " *

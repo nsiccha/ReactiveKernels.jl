@@ -5,6 +5,9 @@ import ReactiveKernelsPPL
 import ReactiveKernelsDistributionKernels: DistributionKernelSources
 using LogExpFunctions: logistic
 
+ReactiveKernelsPPL._predictive_mixture(components::AbstractVector, weights::AbstractVector) =
+    Distributions.MixtureModel(components, weights ./ sum(weights))
+
 # Distribution objects use their ordinary public logpdf. Parameter geometry
 # is a separate capability; it is never inferred by evaluating active args.
 ReactiveKernelsPPL.sampling_logdensity(d::Distributions.Distribution, value) =

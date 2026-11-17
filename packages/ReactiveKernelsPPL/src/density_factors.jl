@@ -179,6 +179,9 @@ _DensityCoordinates(start, step, width, stride = 1) =
     _DensityCoordinates(start, step, width, stride, nothing)
 
 function _density_coordinates(e::LayoutEntry, count, plan)
+    # A discrete event owns named integer state, never a slot in the packed
+    # real coordinates, including when the declaration has several events.
+    e.kind === :integer && return _DensityCoordinates(e.offset, 0, 0)
     count <= 1 && return _DensityCoordinates(e.offset, 0, e.size)
     if e.kind === :array
         p = only(p for p in plan.array_parameters if p.name === e.name)
@@ -319,8 +322,17 @@ with [`factor_support`](@ref), and evaluate them with [`prepare_query`](@ref)
 or [`prepare_query_ad`](@ref). Catalogue and query preparation may inspect the
 whole model; repeated selected evaluation uses precomputed row plans.
 """
-function density_factors(built, plan::StructuralPlan)
+function density_factors(built, plan::StructuralPlan; discrete = nothing)
+    # Summing a latent can couple authored prior sites. The catalogue below
+    # records conditional sites before elimination; exposing those as factors
+    # of the marginal would evaluate a different density. Until the catalogue
+    # represents integrated joint events, refuse that unsupported operation.
+    isempty(plan.marginalized_integers) || throw(ContractValidationError(
+        "[query] density_factors does not yet catalogue joint prior events " *
+        "after finite integer marginalization; use the marginalized :prior " *
+        "query for the complete integrated prior"))
     built = _binding_build(built, plan)
+    plan = _fixed_integer_query(plan, built.layout, discrete)
     _check_built_program(built, plan)
     sites = _DensitySite[]
     def = Base.invokelatest(_kernel_expr_latest, plan, built.layout; density_sites = sites)
@@ -456,6 +468,9 @@ function _check_factor_selection(built, plan, selection)
     select_factors(c, selection.factors)
     _check_factor_binding(built, plan, c)
 end
+
+_factor_integer_plan(built, plan, catalogue) = _fixed_integer_query(plan, built.layout,
+    get(catalogue.plan.frozen.values, :_ppl_discrete, nothing))
 
 function _check_factor_binding(built, plan, c)
     _check_built_program(built, plan)
@@ -669,6 +684,7 @@ end
 "Prepare the sum of selected authored density events, callable with a packed point."
 function prepare_query(built, plan::StructuralPlan, selection::FactorSelection;
         on_error = nothing, locality = :error, u0 = nothing)
+    plan = _factor_integer_plan(built, plan, selection.catalogue)
     exemplar = _factor_exemplar(selection.catalogue, u0)
     q = _density_selection_spec(built, plan, selection; locality, on_error, u0 = exemplar)
     Base.invokelatest(_prepare_cached, plan, q.spec; have = q.have, want = q.want, bound = q.bound, on_error)
@@ -733,6 +749,7 @@ function prepare_query_ad(prepare_operator, built, plan::StructuralPlan,
         selection::FactorSelection, backend, exemplars...; on_error = nothing,
         locality = :error, coordinates = nothing)
     built = _binding_build(built, plan)
+    plan = _factor_integer_plan(built, plan, selection.catalogue)
     isempty(exemplars) && throw(ArgumentError("prepare_query_ad needs a packed exemplar"))
     _check_factor_selection(built, plan, selection)
     u0 = _query_exemplar(built.layout, last(exemplars))
@@ -769,6 +786,7 @@ function prepare_query_ad(prepare_operator, built, plan::StructuralPlan,
         return coordinates === nothing ? QueryAD[] : FactorQueryAD[]
     end
     c = first(selections).catalogue
+    plan = _factor_integer_plan(built, plan, c)
     _check_factor_binding(built, plan, c)
     for selection in selections
         selection.catalogue === c || throw(ArgumentError(

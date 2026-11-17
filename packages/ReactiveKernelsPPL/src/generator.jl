@@ -68,7 +68,8 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     end
     def = _elide_named_location_aliases(plan, def)
     def = _pointwise_arithmetic_plates(plan, def)
-    return _name_plate_cells(def, _location_value_aliases(plan, def))
+    def = _name_plate_cells(def, _location_value_aliases(plan, def))
+    return isempty(plan.marginalized_integers) ? def : _integer_marginal_program(plan, def)
 end
 
 function _kernel_expr_latest(plan::StructuralPlan, layout::LayoutTable;
@@ -85,7 +86,7 @@ function _kernel_expr_latest(plan::StructuralPlan, layout::LayoutTable;
     priors = _prior_statements(free, layout; gathers, context = plan, density_sites)
     transforms = Expr[layout.reads...]
     for e in layout.entries
-        append!(transforms, transform_statements(e))
+        append!(transforms, transform_statements(e; path = get(layout.name_paths, e.name, (e.name,))))
     end
     coefs = _coef_reassembly_statements(plan, layout)
     conditioned = _conditioned_value_statements(plan)
@@ -102,6 +103,7 @@ function _kernel_expr_latest(plan::StructuralPlan, layout::LayoutTable;
     append!(stmts, values)
     args = Expr[:(unconstrained::AbstractVector{Float64});
         [_data_arg(colname, col) for (colname, col) in _ordered_columns(plan)]]
+    _has_integer_parameters(plan) && insert!(args, 2, :(_ppl_discrete::NamedTuple))
     append!(stmts, _named_value_statements(plan,
         Expr[args..., transforms..., coefs..., conditioned..., values...]))
     append!(stmts, likelihoods)
@@ -2128,8 +2130,9 @@ function _assigned_names(st)
     return name === nothing ? Symbol[] : Symbol[name]
 end
 
-# Value names a generated statement reads: call heads and keyword names are
-# skipped. A plate cell or scan step reads the enclosing names it closes
+# Value names a generated statement reads: named call heads and keyword names
+# are skipped, but a constructed callable's arguments are reads too. A plate
+# cell or scan step reads the enclosing names it closes
 # over (`_closure_reads`).
 # `out` is always a `Set{Symbol}`; typed, so its `union!` below is not Base's
 # generic vector path that a package adding `lastindex` invalidates.
@@ -2142,6 +2145,7 @@ function _statement_value_reads!(out::Set{Symbol}, ex::Expr)
     elseif ex.head === :(=) && length(ex.args) == 2 && _assigned_name(ex) !== nothing
         _statement_value_reads!(out, ex.args[2])
     elseif ex.head === :call && !isempty(ex.args)
+        ex.args[1] isa Expr && _statement_value_reads!(out, ex.args[1])
         foreach(a -> _statement_value_reads!(out, a), ex.args[2:end])
     elseif ex.head === :. && length(ex.args) == 2
         ex.args[2] isa QuoteNode && _statement_value_reads!(out, ex.args[1])
@@ -5280,7 +5284,9 @@ function _vector_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
     end
     inputs = Any[name]
     tv = _dovar(1)
-    argvals = Any[_thread_ref!(inputs, v) for v in values(args)]
+    # A Categorical law reads its whole probability vector in each cell.
+    argvals = family === :categorical ? Any[values(args)...] :
+        Any[_thread_ref!(inputs, v) for v in values(args)]
     float64_args = Set{Symbol}(t for (v, t) in zip(values(args), argvals)
         if v isa Symbol && v in float64_inputs)
     cell = _family_logpdf_expr(family, argvals, tv; float64_variate, float64_args)
@@ -5293,7 +5299,7 @@ function _vector_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
     corr = _support_correction(family, threaded_support, argvals; pre, stem = name,
         open_bounds)
     corr === nothing || (cell = :($cell + $corr))
-    if conditioned
+    if conditioned || get(SAMPLED_SUPPORT, family, nothing) === :integer
         cell = _conditioned_support_guard(tv, threaded_support,
             isempty(pre) ? cell : Expr(:block, pre..., cell))
         empty!(pre)
@@ -5347,7 +5353,7 @@ _float64_inputs(plan::StructuralPlan, values) = Set{Symbol}(v for v in values
     if v isa Symbol && _reads_float64(plan, v))
 _reads_float64(plan::StructuralPlan, x::Symbol) =
     (x ∉ plan.conditioned &&
-        any(p -> p.name === x && p.family !== :external, plan.parameters)) ||
+        any(p -> p.name === x && p.family !== :external && !_integer_parameter(p), plan.parameters)) ||
     _value_type(get(plan.columns, x, nothing)) <: Union{Float64,AbstractArray{Float64}}
 _gamma_rate(v) = :(1 / $v)
 _gamma_rate(v::Union{Bool,Base.BitInteger,Base.IEEEFloat}) = 1 / v
@@ -5371,7 +5377,16 @@ end
 function _family_logpdf_expr(family::Symbol, a, x; float64_variate::Bool = false,
         float64_args = ())
     family === :flat && return :(0.0)
+    family === :bernoulli && return _family_logpdf_expr(:binomial,
+        Any[1, only(a)], x; float64_variate, float64_args)
+    family === :categorical && return :(
+        $(GlobalRef(DistributionKernelSources, :_categorical_distribution))($(only(a))).logpdf($x))
+    family === :discrete_uniform && return :(
+        isfinite($x) && isinteger($x) && isinteger($(a[1])) && isinteger($(a[2])) &&
+        $(a[1]) <= $x && $x <= $(a[2]) ?
+            -log(Float64($(a[2]) - $(a[1]) + 1)) : -Inf)
     family === :binomial && return :((isfinite($x) && floor($x) == $x &&
+        isfinite($(a[1])) && isinteger($(a[1])) && $(a[1]) >= 0 &&
         isfinite($(a[2])) && 0 <= $(a[2]) && $(a[2]) <= 1) ?
         binomial(Int($(a[1])), $(a[2] in float64_args ? a[2] : _float64_port(a[2]))).logpdf(Int($x)) : -Inf)
     return _prior_endpoint_expr(family, a, :logpdf, x; float64_variate, float64_args)
@@ -5447,10 +5462,11 @@ function _sampled_prior_expr(p::SampledParameter; pre::Vector{Expr} = Expr[], co
     end
     base = _family_logpdf_expr(p.family, argvals, p.name; float64_variate = !conditioned,
         float64_args)
-    local_pre = conditioned ? Expr[] : pre
+    guarded = conditioned || _integer_parameter(p)
+    local_pre = guarded ? Expr[] : pre
     corr = _support_correction(p.family, p.support_override, argvals; pre = local_pre, stem = p.name)
     rhs = corr === nothing ? base : :($base + $corr)
-    return conditioned ? _conditioned_support_guard(p.name, p.support_override,
+    return guarded ? _conditioned_support_guard(p.name, p.support_override,
         isempty(local_pre) ? rhs : Expr(:block, local_pre..., rhs)) : rhs
 end
 

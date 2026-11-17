@@ -376,8 +376,15 @@ function _validate_array_parameters_data(plan::StructuralPlan)
         end
         for (k, a) in pairs(p.args)
             n = _array_arg_size(plan, a)
-            n === nothing || n == Tuple(dims) || _fail(p.label,
-                _array_arg_mismatch(p.name, k, Tuple(dims), n))
+            if p.family === :categorical
+                # One categorical variate is scalar, but every event reads
+                # the whole shared probability vector, not one probability.
+                n === nothing || length(n) == 1 || _fail(p.label,
+                    "array $(p.name): Categorical needs a probability vector, got size $n")
+            else
+                n === nothing || n == Tuple(dims) || _fail(p.label,
+                    _array_arg_mismatch(p.name, k, Tuple(dims), n))
+            end
         end
     end
     return nothing
@@ -1486,7 +1493,10 @@ function _array_layout_entries!(entries::Vector{LayoutEntry},
     for p in plan.array_parameters
         p.name in plan.conditioned && continue
         dims = _array_dims(plan, p)
-        if p.family === :external
+        if _integer_parameter(p)
+            push!(entries, LayoutEntry(:integer, nothing, p.name, Symbol[],
+                offset, 0, :identity, NaN, NaN, dims))
+        elseif p.family === :external
             entry = _external_layout_entry(plan, p, offset, dims)
             push!(entries, entry)
             offset += entry.size
@@ -2203,8 +2213,8 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
         cells = length(dims) == 2
         for (i, (k, a)) in enumerate(pairs(p.args))
             push!(arg_names, k)
-            if a isa Real || a isa Symbol && !(cells &&
-                    _value_axes(context, a; data_axes = true) != Any[])
+            if a isa Real || a isa Symbol && (p.family === :categorical || !(cells &&
+                    _value_axes(context, a; data_axes = true) != Any[]))
                 push!(arg_values, a)
                 continue
             end
@@ -2220,7 +2230,7 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
             else
                 _array_gather_rewrite(a, context, needed)
             end
-            cells && (val = :(_array_prior_cells($val,
+            cells && p.family !== :categorical && (val = :(_array_prior_cells($val,
                 $(_array_cells_dims(layout, p)))))
             push!(stmts, :($local_name = $val))
             push!(arg_values, local_name)

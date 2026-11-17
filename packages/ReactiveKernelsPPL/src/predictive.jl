@@ -424,6 +424,10 @@ The law of every observation, keyed like `:pointwise`: a lazy
 response is one observation, as in `:pointwise`), and a vector of them for a
 response holding one array per `@plate` index.
 
+After finite integer marginalization, these are each entry's marginal
+mixture laws. Use `predictive_draws` for a joint draw: it chooses one integer
+state for all entries before drawing their conditional observations.
+
 `value` is the value of [`predictive_node`](@ref) in any cut, and `targets`
 is [`predictive_targets`](@ref) of the design that cut evaluates. A cut
 vectorized over draws returns the value stacked on its trailing axis:
@@ -431,15 +435,77 @@ vectorized over draws returns the value stacked on its trailing axis:
 `predictive_laws(q, u)`.
 """
 function predictive_laws(value::NamedTuple, targets::NamedTuple; position = nothing)
+    value = position === nothing ? value : _at_position(value, position)
+    if _integer_predictive(value)
+        mixture = value._integer_mixture
+        _check_integer_probabilities(mixture.probabilities)
+        # Marginal laws describe individual entries. predictive_draws samples
+        # a shared state first, retaining their joint dependence.
+        active = findall(>(0), mixture.probabilities)
+        components = [predictive_laws(_at_position(mixture.conditional, i), targets)
+            for i in active]
+        weights = mixture.probabilities[active]
+        return map(keys(targets)) do name
+            _integer_response_laws([component[name] for component in components], weights)
+        end |> fields -> NamedTuple{keys(targets)}(fields)
+    end
     names = keys(targets)
     keys(value) == names || throw(ArgumentError("[query] the predictive value " *
         "holds the laws of $(keys(value)), the targets $(names): pass the targets " *
         "of the design the value's cut evaluates"))
-    value = position === nothing ? value : _at_position(value, position)
     return NamedTuple{names}(map(k -> _response_laws(value[k], targets[k]), names))
+end
+
+_integer_predictive(value::NamedTuple) = keys(value) == (:_integer_mixture,) &&
+    hasproperty(value._integer_mixture, :conditional) &&
+    hasproperty(value._integer_mixture, :probabilities)
+
+struct IntegerPredictiveLaws{N,C,W} <: AbstractArray{Any,N}
+    components::C
+    weights::W
+end
+function _integer_response_laws(components::AbstractVector{<:PredictiveLaws}, weights)
+    first_law = first(components)
+    all(c -> size(c) == size(first_law), components) || throw(DimensionMismatch(
+        "[query] integer states give different predictive response shapes"))
+    return IntegerPredictiveLaws{ndims(first_law),typeof(components),typeof(weights)}(
+        components, weights)
+end
+function _integer_response_laws(components::AbstractVector{<:AbstractVector}, weights)
+    return [_integer_response_laws([c[i] for c in components], weights)
+        for i in eachindex(first(components))]
+end
+Base.size(L::IntegerPredictiveLaws) = size(first(L.components))
+Base.IndexStyle(::Type{<:IntegerPredictiveLaws}) = IndexCartesian()
+function Base.getindex(L::IntegerPredictiveLaws{N}, I::Vararg{Int,N}) where {N}
+    @boundscheck checkbounds(L, I...)
+    return _predictive_mixture([component[I...] for component in L.components], L.weights)
+end
+_predictive_mixture(components, weights) = throw(ArgumentError(
+    "predictive laws need `using Distributions`"))
+
+function _check_integer_probabilities(weights)
+    all(p -> isfinite(p) && p >= 0, weights) && sum(weights) > 0 ||
+        throw(ArgumentError("[query] the integer posterior is undefined"))
+    return nothing
+end
+function _integer_draw_index(rng, weights)
+    _check_integer_probabilities(weights)
+    return only(_membership_draws(rng, reshape(vec(weights), 1, :)))
+end
+function _predictive_draw_laws(value, targets, rng; position = nothing)
+    value = position === nothing ? value : _at_position(value, position)
+    if _integer_predictive(value)
+        mixture = value._integer_mixture
+        index = _integer_draw_index(rng, mixture.probabilities)
+        value = _at_position(mixture.conditional, index)
+    end
+    return predictive_laws(value, targets)
 end
 predictive_laws(q::PredictiveQuery, u::AbstractVector) =
     predictive_laws(Base.invokelatest(q.kernel, u), q.targets)
+predictive_laws(q::PredictiveQuery, u::AbstractVector, discrete::NamedTuple) =
+    predictive_laws(Base.invokelatest(q.kernel, u, discrete), q.targets)
 
 # Draw `k` of a vectorized cut's value: every leaf at position `k` of its
 # trailing axis.
@@ -498,9 +564,11 @@ draws, and passing a copy of one RNG at every posterior draw reuses one
 stream.
 """
 predictive_draws(value::NamedTuple, targets::NamedTuple, rng; position = nothing) =
-    _draws(rng, predictive_laws(value, targets; position), targets)
+    _draws(rng, _predictive_draw_laws(value, targets, rng; position), targets)
 (q::PredictiveQuery)(u::AbstractVector, rng) =
-    _draws(rng, predictive_laws(q, u), q.targets)
+    predictive_draws(Base.invokelatest(q.kernel, u), q.targets, rng)
+(q::PredictiveQuery)(u::AbstractVector, discrete::NamedTuple, rng) =
+    predictive_draws(Base.invokelatest(q.kernel, u, discrete), q.targets, rng)
 
 _draws(rng, laws::NamedTuple, targets::NamedTuple) =
     NamedTuple{keys(laws)}(map(k -> _draw(rng, laws[k], targets[k].eltype), keys(laws)))
@@ -519,9 +587,12 @@ Draw every observation into `out` (a result of [`predictive_draws`](@ref) or
 """
 predictive_draws!(out::NamedTuple, value::NamedTuple, targets::NamedTuple, rng;
         position = nothing) =
-    _draws!(rng, out, predictive_laws(value, targets; position))
+    _draws!(rng, out, _predictive_draw_laws(value, targets, rng; position))
 predictive_draws!(out::NamedTuple, q::PredictiveQuery, u::AbstractVector, rng) =
-    _draws!(rng, out, predictive_laws(q, u))
+    predictive_draws!(out, Base.invokelatest(q.kernel, u), q.targets, rng)
+predictive_draws!(out::NamedTuple, q::PredictiveQuery, u::AbstractVector,
+        discrete::NamedTuple, rng) =
+    predictive_draws!(out, Base.invokelatest(q.kernel, u, discrete), q.targets, rng)
 
 function _draws!(rng, out::NamedTuple, laws::NamedTuple)
     for k in keys(laws)

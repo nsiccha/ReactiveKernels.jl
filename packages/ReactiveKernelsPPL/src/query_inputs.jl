@@ -32,6 +32,7 @@ end
 
 struct _InputQuery{K}
     kernel::K
+    discrete::Bool
     inputs::Vector{Symbol}
     # The binding's value of each input: its type and size are the program's.
     templates::Vector{Any}
@@ -41,19 +42,23 @@ end
 function Base.show(io::IO, q::_InputQuery)
     print(io, "prepared query with runtime inputs (",
         join(string.(q.inputs), ", "), "): call it as q(u, ",
+        q.discrete ? "discrete, " : "",
         join(string.(q.inputs), ", "), ")")
 end
 
 function (q::_InputQuery)(u, args::Vararg{Any,N}) where {N}
-    N == length(q.inputs) || throw(ArgumentError("[query] this query takes " *
-        "the parameter vector and $(length(q.inputs)) runtime input" *
+    expected = length(q.inputs) + q.discrete
+    N == expected || throw(ArgumentError("[query] this query takes " *
+        "the parameter vector" * (q.discrete ? ", named integer state" : "") *
+        " and $(length(q.inputs)) runtime input" *
         (length(q.inputs) == 1 ? "" : "s") * " (" * _quoted_names(q.inputs) *
         "), got $N"))
-    for i in 1:N
-        _same_shape(q.templates[i], args[i]) || _input_mismatch(q.inputs[i],
-            q.templates[i], args[i])
+    data = q.discrete ? Base.tail(args) : args
+    for i in eachindex(q.inputs)
+        _same_shape(q.templates[i], data[i]) || _input_mismatch(q.inputs[i],
+            q.templates[i], data[i])
     end
-    return q.kernel(u, args..., _derived_values(q.derived, args)...)
+    return q.kernel(u, args..., _derived_values(q.derived, data)...)
 end
 
 _quoted_names(names) = join(("`$n`" for n in names), ", ", " and ")
@@ -309,8 +314,9 @@ function _prepare_wants_inputs(built, plan::StructuralPlan, want, inputs;
     derived = Base.invokelatest(_derived_inputs, built, plan, Any[x for x in inputs])
     inputs = Symbol[x for x in inputs]
     runtime = (derived.ports..., derived.passed...)
-    have = (:unconstrained, runtime...,
-        (n for n in _query_have(plan)[2:end] if !(n in runtime))...)
+    state = _has_integer_parameters(plan) ? (:_ppl_discrete,) : ()
+    have = (:unconstrained, state..., runtime...,
+        (n for n in _query_have(plan)[2:end] if !(n in runtime) && !(n in state))...)
     full = _query_bound(plan)
     names = Tuple(k for k in keys(full) if !(k in runtime))
     bound = NamedTuple{names}(Tuple(full[k] for k in names))
@@ -321,6 +327,7 @@ function _prepare_wants_inputs(built, plan::StructuralPlan, want, inputs;
         Base.invokelatest(_prepare_cached, plan, built.spec; have,
             want, bound, on_error, exemplars = examples)
     end
-    return _InputQuery(kernel, inputs,
+    return _InputQuery(kernel, _has_integer_parameters(plan) &&
+        !haskey(plan.frozen.values, :_ppl_discrete), inputs,
         Any[plan.columns[p] for p in derived.ports], derived)
 end
