@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.306
+## 0.1.308
 
 - Fixed: with `branch_arms = :all`, a plate cell with several lazy branches
   side by side whose conditions read bound data was split into one plate per
@@ -32,6 +32,37 @@ are recorded in the git history only.
   over 2000 rows: 15.75 → 13.39 µs), gradients over 200 rows or more 5–11%
   slower (17.57 → 18.54 µs) and over 10 rows faster (0.16 → 0.10 µs), and
   the first gradient compiles in 0.2–0.4 s instead of 0.9–1.9 s.
+
+## 0.1.307
+
+- **Fix:** a rebuild of one program reuses the code compiled for the first
+  build again when the program holds a lazy branch whose arms are calls, such
+  as a censored location-scale observation (`censored(Normal(...); lower =
+  ...)`, whose arms run the distribution's endpoints). Since `b78ce392`
+  (0.1.206) an ordinary branch carries its arms' graphs, and a body that
+  embedded the branch kept them, with the value ids of the build that made
+  them. So every rebuild compiled its readers and their derivatives again:
+  for BRM's `brm_nlme_model` of one specification built a second time in a
+  process, about 40 s of preparation and 120 s of `check_protocol`. A law
+  kernel that every build shares, whose child kernel's branch reads the
+  observation, compiled again at every preparation, of the same build too:
+  preparing re-keyed the shared branch's graphs. The embedded branch now
+  leaves its graphs out; lowering still reads them from the plan. Values are
+  unchanged.
+
+## 0.1.306
+
+- JAX source translates `vec` and `reshape` of a matrix (or any array of
+  rank two or more) of records in device code, such as a plate's records
+  over `collect(Iterators.product(a, b))`: `vec` is the vector of those
+  records in Julia's column-major order, each field (nested fields too)
+  flattened alike, so `map(vec(records)) do r; r.field end` reads it as it
+  reads a vector of records, and `reshape` keeps that linear order. Records
+  keep their fields' lengths. A padded array's `vec` takes its valid records
+  first, as `vec` of a padded numerical array orders its entries; `reshape`
+  of it raises `JAXEmissionError`, as for a padded numerical array. Before,
+  the module raveled or reshaped the tuple of field arrays and failed in
+  Python (`TypeError: ravel requires ndarray or scalar arguments`).
 
 ## 0.1.305
 
