@@ -448,6 +448,73 @@ end
     end
 end
 
+# With `branch_arms = :all`, an arm plate keeps every other recipe of its cell,
+# so splitting a cell by k sibling branches the lanes decide gave 2^k plates,
+# also for arm combinations no lane can take (snag `one-compiled-nat-bd7c7031`:
+# a law with a few dozen flag branches never finished preparing). Such a cell
+# is one plate whose loop decides each branch per lane; a lone branch and its
+# nested arms are still partitioned (above). `:taken` is unchanged.
+@testset "sibling branches the lanes decide: one plate under branch_arms = :all" begin
+    C = BranchPartition
+    RK = ReactiveKernels
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    plates(p) = filter(r -> r.op isa RK._AuthoredPlateOp, p.recipes)
+    has_branch(p) = any(r -> r.op isa RK._KernelSourceOp &&
+                             r.op.f isa RK._KernelBranch, p.recipes)
+    have = (:x, :a, :b, :c)
+    # `log(x)` needs x > 0 where a > 0, `log(-x)` needs x < 0 where b <= 0,
+    # `log(x^2)` needs x != 0 where c > 0.
+    cell(x, a, b, c) = (a > 0 ? log(x) : x - 1.0) + (b > 0 ? 2.0 * x : log(-x)) +
+                       (c > 0 ? log(x * x) : 0.0)
+    slope(x, a, b, c) = (a > 0 ? inv(x) : 1.0) + (b > 0 ? 2.0 : inv(x)) +
+                        (c > 0 ? 2.0 / x : 0.0)
+    logs(a, b, c) = count(>(0), a) + count(<=(0), b) + count(>(0), c)
+    x = [0.5, -1.5, 2.0, -0.25, 1.25]
+    flags = [1.0, -1.0, 1.0, -1.0, 1.0]
+    cases = (; mixed = (x, flags, flags, [1.0, 1.0, -1.0, 1.0, -1.0]),
+             then = (abs.(x), ones(5), ones(5), ones(5)),
+             other = (-abs.(x), -ones(5), -ones(5), -ones(5)),
+             empty = (Float64[], Float64[], Float64[], Float64[]))
+    prepared = Dict(name => prepare(C.sibling_guards; have, want = :total,
+                                    bound = (; a, b, c), branch_arms = :all)
+                    for (name, (_, a, b, c)) in pairs(cases))
+    @test allequal(typeof.(collect(values(prepared))))
+    for (name, (xs, a, b, c)) in pairs(cases)
+        k = prepared[name]
+        @test length(plates(k.plan)) == 1
+        @test has_branch(plate_body(only(plates(k.plan))))
+        # Only the taken arm is evaluated, on its own lanes.
+        C.arm_calls[] = 0
+        @test k(xs) ≈ sum(cell.(xs, a, b, c); init = 0.0)
+        @test C.arm_calls[] == logs(a, b, c)
+        isempty(xs) && continue
+        value, gradient = RK.ad_value_and_gradient!(
+            prepare_ad(k, backend, xs; active = :x), similar(xs), xs)
+        @test value ≈ sum(cell.(xs, a, b, c))
+        @test gradient ≈ slope.(xs, a, b, c)
+    end
+    # By default each pattern of taken arms is still its own plate.
+    let (xs, a, b, c) = cases.mixed
+        taken = prepare(C.sibling_guards; have, want = :total, bound = (; a, b, c))
+        @test length(plates(taken.plan)) == length(unique(zip(a, b, c)))
+        @test taken(xs) ≈ sum(cell.(xs, a, b, c))
+    end
+
+    # Twelve siblings: one plate, where every arm combination was 4096.
+    n = 64
+    fs = [Float64.(isodd.((0:n-1) .>> (j - 1))) for j in 1:12]
+    xs = collect(range(0.1, 2.0; length = n))
+    names = Tuple(Symbol(:f, j) for j in 1:12)
+    bound = NamedTuple{names}(Tuple(fs))
+    k = prepare(C.twelve_siblings; have = (:x, names...), want = :total, bound,
+                branch_arms = :all)
+    @test length(plates(k.plan)) == 1
+    @test typeof(k) == typeof(prepare(C.twelve_siblings; have = (:x, names...),
+        want = :total, bound = NamedTuple{names}(Tuple(reverse.(fs))), branch_arms = :all))
+    @test k(xs) ≈ sum(sum(fs[j][i] > 0 ? log1p(xs[i]^2 + j) : j * xs[i] for j in 1:12)
+                      for i in 1:n)
+end
+
 # A constructed endpoint under a lazy branch arm lowers in its arm: each taken
 # arm carries its own endpoint evaluation, the arm stays lazy (an endpoint
 # that is invalid off-arm never evaluates there), and the inlined math keeps

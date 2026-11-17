@@ -8071,6 +8071,23 @@ Base.@nospecializeinfer function _execution_copy_object(c::_ExecutionCopier,
                     _execution_copy(c, getfield(op, :call_identity)), nothing)
 end
 
+# A lazy branch keeps its condition and arms. Its arm graphs (`then_spec`,
+# `else_spec`) are lowering metadata: lowering reads them from the original
+# operation in the plan, and no call reads them. A graph holds mutable tables
+# and the value ids its build allocated, so copying one would reach state, and
+# the whole embedded value, build names included, would be kept as it is. An
+# ordinary branch in a scalar kernel carries arm graphs (`_kernel_expand`), so a
+# censored location-scale observation's arm compiled once per build of one
+# program (snag `rk-0-1-206-every-58bdc046`). The copy leaves the graphs out.
+Base.@nospecializeinfer function _execution_copy_object(c::_ExecutionCopier,
+                                                        @nospecialize(b::_KernelBranch))
+    parts = Any[_execution_copy(c, getfield(b, f))
+                for f in (:call, :condition, :then_arm, :else_arm)]
+    getfield(b, :then_spec) === nothing && getfield(b, :else_spec) === nothing &&
+        all(i -> parts[i] === getfield(b, i), 1:4) && return b
+    _kernel_new_instance(typeof(b), (parts..., nothing, nothing))
+end
+
 # `ast` with each object it embeds replaced by its execution copy, unless the
 # copy reached state.
 function _canonical_embedded(ast::Expr)
