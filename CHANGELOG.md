@@ -32,9 +32,11 @@ are recorded in the git history only.
   value, and the caller rebinds the local it passed, so later reads (another
   helper's, or a sequential update across calls) see the write. Before, the
   write was dropped silently and the emitted module computed a different
-  value. A write the caller cannot rebind (inside a loop or branch that does
-  not assign that local, to a value another kernel statement reads, or to an
-  expression other than a local name or a new array) raises
+  value. Writes before a helper's own `w = copy(w)` reach the caller, later
+  ones the copy. A write the caller cannot rebind (inside a loop or branch
+  that does not assign that local, to a value another kernel statement
+  reads, to an expression other than a local name or a new array, or to an
+  argument the helper also rebinds inside a loop, branch or `let`) raises
   `JAXEmissionError`.
 
 ## 0.1.302
