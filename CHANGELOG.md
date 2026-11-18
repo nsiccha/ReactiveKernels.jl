@@ -16,6 +16,22 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.315
+
+- A summed plate nested in another plate's cell, such as the positions of a
+  whole-event law, runs once per distinct row of its bind-time caches per
+  lane of the enclosing plates, weighted by its row count, as a top-level
+  summed plate over repeated bound rows does since 0.1.184. A cached row index
+  into an array that is the same in every row (a `fill`, an `hcat` of fills,
+  numbers and bound columns with equal rows) does not tell positions apart,
+  so a species' all-zero sites of `hcat(fill(theta, n), never)` occupancy
+  operands are one cell. Values agree with the plate's sum to rounding; no
+  exception moves. `simplify = false` keeps every position.
+- `size(x, d)` and `length(x)` of a live array built in a plate cell by
+  `fill` with bind-time dimensions, or by `hcat`/`[a b]` of such arrays,
+  numbers and bind-time arrays (through a check returning it), are bind-time
+  values, so the work they feed is cached at binding.
+
 ## 0.1.314
 
 - With Enzyme's dogfood repair `derivative_report_reachability` (dogfood

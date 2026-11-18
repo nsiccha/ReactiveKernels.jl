@@ -1037,6 +1037,8 @@ function _partial_nested_shared_recipe(g, r, dataonly, outer_types, refused)
     readable = _dict_from(Dict{Int,Any}, (q.id => source for (q, source) in
         zip(original.recipes, op.kernel.lowered_recipes)))
     inner = _partial_split_recipes(original, bound, excluded, readable)
+    inner = _partial_shape_recipes(inner, bound, excluded, readable,
+        _partial_shape_types(inner, r, op, types, outer_types, g))
     union!(excluded, (q.id for q in inner.recipes if (prefix_key..., q.id) in refused))
     nested_refused = Set(key[3] for key in refused
         if length(key) == 3 && key[1:2] == node_key)
@@ -1110,6 +1112,8 @@ Base.@nospecializeinfer function _partial_plate_analysis(
     while true
     readable, excluded = copy(original_readable), copy(original_excluded)
     inner = _partial_split_recipes(original, bound, excluded, readable)
+    inner = _partial_shape_recipes(inner, bound, excluded, readable,
+        _partial_shape_types(inner, recipe, op, bound_types))
     inner, nested_speculative = _partial_nested_shared_recipes(inner, bound,
         bound_types, excluded, readable, refused)
     inner, speculative = _partial_speculate_recipes(inner, bound, excluded, readable,
@@ -2037,6 +2041,19 @@ function _partial_inner_plates(p::Plan, known, rewrites, one_object::Set{ValueId
         if specialized !== nothing
             changed = true
             push!(signature, specialized.key)
+            # A summed plate nested in the cell runs once per distinct row of
+            # its caches (`nested_duplicate_cells.jl`).
+            if specialized.recipe !== nothing
+                nested = _nested_cell_group_recipe(copied, specialized.recipe, known,
+                    specialized.cache_values, specialized.cache_data,
+                    keyed ? rewrites : nothing)
+                if nested !== nothing
+                    push!(signature, nested.key)
+                    specialized = (; specialized..., recipe = nested.recipe,
+                                   cache_values = nested.cache_values,
+                                   cache_data = nested.cache_data)
+                end
+            end
             for (value, data) in zip(specialized.cache_values, specialized.cache_data)
                 push!(recipes, Recipe(fresh(), (), (value,), _BoundConstant(data),
                                       0.0, nothing, false))
