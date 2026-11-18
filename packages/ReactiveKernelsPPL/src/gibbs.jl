@@ -424,10 +424,11 @@ function _draw_array_block(block::GibbsArrayBlock, rng, position, values, suppor
     if block.elementwise
         candidates, logweights = _gibbs_elementwise_logweights(block, position,
             values, support)
+        # One uniform per element, in element order, as a draw per element.
+        indices = _membership_draws(rng, _gibbs_probabilities!(logweights))
         draw = similar(current, Int)
         for i in 1:n
-            weights = _gibbs_weights(view(logweights, i, :))
-            draw[i] = candidates[_integer_draw_index(rng, weights)]
+            draw[i] = candidates[indices[i]]
         end
         return _gibbs_set(values, block.path, draw)
     end
@@ -479,6 +480,33 @@ end
 _gibbs_state(state::NamedTuple) = map(_gibbs_state, state)
 _gibbs_state(value::Integer) = Int(value)
 _gibbs_state(value) = deepcopy(value)
+# Row `i` of `logweights` (elements × values) becomes element `i`'s
+# probabilities, in place: the values `_gibbs_weights` gives that row, without
+# allocating per element.
+function _gibbs_probabilities!(logweights::AbstractMatrix{Float64})
+    for i in axes(logweights, 1)
+        top = -Inf
+        for j in axes(logweights, 2)
+            w = logweights[i, j]
+            isfinite(w) || w == -Inf || throw(ArgumentError(
+                "Gibbs conditional contains NaN or positive infinity"))
+            top = max(top, w)
+        end
+        isfinite(top) || throw(ArgumentError(
+            "Gibbs conditional has zero probability at every state"))
+        total = 0.0
+        for j in axes(logweights, 2)
+            w = exp(logweights[i, j] - top)
+            logweights[i, j] = w
+            total += w
+        end
+        for j in axes(logweights, 2)
+            logweights[i, j] /= total
+        end
+    end
+    return logweights
+end
+
 function _gibbs_weights(logweights)
     isempty(logweights) && throw(ArgumentError("Gibbs block has empty support"))
     all(w -> isfinite(w) || w == -Inf, logweights) || throw(ArgumentError(

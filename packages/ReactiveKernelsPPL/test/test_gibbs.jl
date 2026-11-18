@@ -287,6 +287,18 @@ end
         exact = [p[k] * pdf(Normal(mu[k], 1.0), y[i]) for k in 1:3]
         @test PPL._gibbs_weights(L[i, :]) ≈ exact ./ sum(exact) rtol=1e-12
     end
+    # All elements are drawn in one pass: each row's probabilities equal
+    # `_gibbs_weights`, and the draw takes one uniform per element in order,
+    # as drawing each element on its own does.
+    P = PPL._gibbs_probabilities!(copy(L))
+    @test all(i -> P[i, :] ≈ PPL._gibbs_weights(L[i, :]), eachindex(y))
+    batch = PPL._draw_array_block(block, Xoshiro(11), u, d).z
+    reference = let rng = Xoshiro(11)
+        [support[PPL._integer_draw_index(rng, PPL._gibbs_weights(L[i, :]))] for i in eachindex(y)]
+    end
+    @test batch == reference
+    @test_throws ArgumentError PPL._gibbs_probabilities!([0.0 NaN])
+    @test_throws ArgumentError PPL._gibbs_probabilities!([-Inf -Inf])
     # A one-coordinate model whose posterior of `m` is known by quadrature.
     model2 = @rkppl begin
         m ~ Normal(0, 3)

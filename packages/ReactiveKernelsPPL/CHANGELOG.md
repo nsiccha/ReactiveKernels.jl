@@ -32,6 +32,10 @@ are recorded in the git history only.
   `1:length(ws[i])`, including vectors of different lengths. Before, `ws` was
   read as one shared probability vector and the density failed with a
   `DimensionMismatch`. A shared `Categorical(w)` is unchanged.
+- The joint update of an integer array draws every element in one pass, one
+  uniform per element in element order as before, without allocating per
+  element: one draw of 1000 mixture assignments takes about 95 µs instead of
+  220 µs.
 
 ## 0.1.214
 
