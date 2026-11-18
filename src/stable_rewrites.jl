@@ -838,21 +838,25 @@ end
 # Recognize only RK's own cell loops. Their domain is CartesianIndices over
 # prepared axes, so checking emptiness adds no user iterator calls. SIMD's
 # generated control flow is scaffolding, whereas branches in the cell body
-# remain semantic boundaries for lifting.
+# remain semantic boundaries for lifting. A reduction grouped by index runs
+# and the flat loop it keeps (`_index_run_arms`) are one plate: each arm runs
+# the same cells over the same axes, so one prelude before their conditional
+# serves both, and a run loop is never a barrier inside its own plate (snag
+# radon-slope-valu-0c41c09b).
 function _rw_plate_loop(ex::Expr)
+    arms = _index_run_arms(ex)
+    if arms !== nothing
+        axes, index, grouped, flat = arms
+        replace = rewritten -> Expr(:if, ex.args[1],
+            _rw_with_cell(ex.args[2], index, rewritten[1]),
+            _rw_with_cell(ex.args[3], index, rewritten[2]))
+        return (; axes, index, bodies = Any[grouped, flat], replace)
+    end
     simd = _index_run_simd_plate(ex)
     if simd !== nothing
         axes, index, body = simd
-        replace = rewritten -> _index_run_replace(ex) do node
-            node.head === :block || return node
-            statements = Any[a for a in node.args if !(a isa LineNumberNode)]
-            isempty(statements) && return node
-            first_statement = first(statements)
-            _rw_assignment(first_statement) !== nothing &&
-                first_statement.args[1] === index || return node
-            Expr(:block, first_statement, rewritten.args...)
-        end
-        return (; axes, index, body, replace)
+        replace = rewritten -> _rw_with_cell(ex, index, only(rewritten))
+        return (; axes, index, bodies = Any[body], replace)
     end
     ex.head === :for && length(ex.args) == 2 || return nothing
     binding = ex.args[1]
@@ -861,8 +865,22 @@ function _rw_plate_loop(ex::Expr)
     _index_run_call(domain, GlobalRef(@__MODULE__, :_plate_cells), 1) || return nothing
     indices = domain.args[2]
     _index_run_call(indices, GlobalRef(Base, :CartesianIndices), 1) || return nothing
-    (; axes = indices.args[2], index = binding.args[1], body = ex.args[2],
-       replace = rewritten -> Expr(:for, binding, rewritten))
+    (; axes = indices.args[2], index = binding.args[1], bodies = Any[ex.args[2]],
+       replace = rewritten -> Expr(:for, binding, only(rewritten)))
+end
+
+# `ex` with the statements after its cell's `index = …` replaced by those of
+# `rewritten`.
+function _rw_with_cell(ex::Expr, index::Symbol, rewritten::Expr)
+    _index_run_replace(ex) do node
+        node.head === :block || return node
+        statements = Any[a for a in node.args if !(a isa LineNumberNode)]
+        isempty(statements) && return node
+        first_statement = first(statements)
+        _rw_assignment(first_statement) !== nothing &&
+            first_statement.args[1] === index || return node
+        Expr(:block, first_statement, rewritten.args...)
+    end
 end
 
 # The assignment counts a plate cell's statements see: a name the cell assigns
@@ -903,9 +921,12 @@ function _rw_plate_expr(ex, plate, ctx, env)
     # The extracted cell body starts after SIMD's index assignment. Keep the
     # index readable by existing cell-read rewrites, but never loop-invariant.
     inner[plate.index] = nothing
-    cell = _RwContext(ctx.recipes, _rw_cell_counts(plate.body, ctx.counts), ctx.params,
-                      ctx.reads, ctx.hoisted, ctx.loops, ctx.parts)
-    rewritten = _rw_expr(plate.body, cell, inner)
+    # Every arm's cells share the loop's one prelude.
+    rewritten = Any[_rw_expr(body,
+                             _RwContext(ctx.recipes, _rw_cell_counts(body, ctx.counts),
+                                        ctx.params, ctx.reads, ctx.hoisted, ctx.loops,
+                                        ctx.parts),
+                             copy(inner)) for body in plate.bodies]
     pop!(ctx.loops)
     result = plate.replace(rewritten)
     isempty(loop.prelude) && return result

@@ -16,6 +16,18 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.315
+
+- A summed plate whose cells the compiler sums by contiguous index runs (a
+  gathered operand such as RKPPL's `beta[county_idx]` over grouped data) reads
+  the same once-per-call reciprocal scale `exp(-u)` as its flat loop. Before,
+  only the flat loop read it, and the run-grouped loop, the one that runs on
+  such data, computed `exp(-u)` in every cell. A Normal likelihood whose
+  location keeps a shared term beside a gathered slope, such as
+  `alpha .+ beta[county_idx] .* x`, divides by its scale in every cell, so
+  its density cost more than its own gradient. Values and derivatives are
+  unchanged: both forms compute `y * exp(-u)`.
+
 ## 0.1.314
 
 - With Enzyme's dogfood repair `derivative_report_reachability` (dogfood
