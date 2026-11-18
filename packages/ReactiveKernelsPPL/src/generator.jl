@@ -2177,6 +2177,14 @@ end
 # Locals a body assigns, outside its nested cells.
 function _assigned_names!(out::Set{Symbol}, ex)
     ex isa Expr && ex.head !== :(->) || return out
+    if ex.head === :tuple
+        # `(y = value,)` names a field of a NamedTuple; it assigns no local,
+        # so the body still reads an enclosing `y`.
+        for a in ex.args
+            _assigned_names!(out, Meta.isexpr(a, :(=), 2) ? a.args[2] : a)
+        end
+        return out
+    end
     name = _assigned_name(ex)
     name === nothing || push!(out, name)
     if Meta.isexpr(ex, :(=), 2) && Meta.isexpr(ex.args[1], :tuple)

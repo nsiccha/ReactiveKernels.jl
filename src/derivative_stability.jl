@@ -50,12 +50,16 @@ ran, with ReactiveKernels' reading of their findings.
 
 `unstable` and `allocations` leave out calls only reached on a path that ends
 in an error (`throw_only`), and calls an expansion of Julia's logging macros
-writes, which the primal check exempts too. `unstable` also leaves out calls in
-code the derivative runs without differentiating it (`sweep === :primal`):
-that is primal code, whose dispatch the primal check covers, and Enzyme marks
-`throw_only` per function, so it does not mark the code of a function that is
-only called on an error path, such as the one building an error message.
-Every other call that leaves the compiled code
+writes, which the primal check exempts too. Calls in code the derivative runs
+without differentiating it (`sweep === :primal`) count in `unstable` where the
+loaded Enzyme has the dogfood repair `derivative_report_reachability`, which
+marks the code of a function only called on an error path, such as one
+building an error message, `throw_only` (Enzyme snag
+`derivative-repor-8d7dfce1`), unless they sit in Julia's own functions (Base,
+Core, the standard libraries), whose bodies the primal check treats as leaves
+too. Without that repair `unstable` leaves undifferentiated code to the primal
+check, since error-only code would read as returning. Every other call that
+leaves the compiled code
 (`:runtime_call`: BLAS, Julia's runtime, separately compiled Julia code) is
 in `derivatives` only.
 """
@@ -82,12 +86,38 @@ _derivative_logging(finding) = any(finding.frames) do frame
     any(source -> file == chopprefix(String(source), "./"), _LOGGING_SOURCES)
 end
 
+# Whether the loaded Enzyme marks the code of a function only called on an
+# error path `throw_only` (repair `derivative_report_reachability`), so that
+# `unstable` can count code the derivative runs without differentiating it.
+# Set by the Enzyme extension when it loads.
+const _DERIVATIVE_REPORT_REACHABILITY = Ref(false)
+
+# Whether a frame of debug info is in Julia's own code (Base, Core and the
+# standard libraries), whose bodies the primal check treats as leaves: debug
+# info names Base's files `./x.jl` and the standard libraries by their install
+# path.
+function _julia_own_frame(frame)
+    file = String(frame.file)
+    startswith(file, "./") || startswith(file, Sys.STDLIB) ||
+        occursin("/share/julia/base/", file) || occursin("/share/julia/stdlib/", file)
+end
+
+# Whether a finding counts as unstable: code the derivative differentiates
+# always does; code it runs undifferentiated does where Enzyme marks error-only
+# code (`derivative_report_reachability`), except inside Julia's own functions,
+# which the primal check exempts too (their logging machinery included).
+_derivative_unstable_sweep(finding, primal::Bool) =
+    finding.sweep !== :primal ||
+    primal && (isempty(finding.frames) || !_julia_own_frame(first(finding.frames)))
+
 function ADDerivativeReport(value, derivatives)
+    primal = _DERIVATIVE_REPORT_REACHABILITY[]
     unstable = Pair{Any,Any}[]
     allocations = Pair{Any,Any}[]
     for derivative in derivatives, finding in _reported_findings(derivative)
         (finding.throw_only || _derivative_logging(finding)) && continue
-        finding.kind in _DERIVATIVE_UNSTABLE_KINDS && finding.sweep !== :primal &&
+        finding.kind in _DERIVATIVE_UNSTABLE_KINDS &&
+            _derivative_unstable_sweep(finding, primal) &&
             push!(unstable, derivative => finding)
         finding.kind in _DERIVATIVE_ALLOCATION_KINDS &&
             push!(allocations, derivative => finding)

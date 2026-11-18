@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.218
+## 0.1.219
 
 - With WarmupHMC 0.3.11 or later, a Markov chain from `markov_chains` runs its
   frame kernel once per map, inverse or log density, and at most twice per
@@ -33,6 +33,20 @@ are recorded in the git history only.
   8.3 MiB in the same run. A hand-built `MarkovChain` reading the coordinates
   directly takes 0.19, 0.37 and 0.95 ms, so the chain now costs 1.7–1.8 times
   it at every size.
+
+## 0.1.218
+
+- `prepare_gibbs` accepts a model whose other integers are marginalized
+  (`marginalize(model, :a)`). Each remaining integer is updated from its
+  collapsed conditional, which sums over the marginalized integers, and the
+  continuous step targets the density with them summed out. Before, it was
+  refused with `prepare_gibbs currently requires explicit integer
+  parameters`. A model whose integers are all marginalized is refused with
+  NUTS as the remedy.
+- Fixed the dependency analysis of a cell body that builds a NamedTuple
+  field named after an enclosing value (`pointwise = (y = …,)`): the body's
+  read of that value was lost, so a query selecting statements by their
+  reads could omit it.
 
 ## 0.1.217
 
