@@ -1163,6 +1163,8 @@ _jax_tuple_fields(values) =
     foldl((m, (k, v)) -> isempty(v.extent) ? m : m | 1 << (k - 1), enumerate(values); init = 0)
 _jax_tuple_valued(@nospecialize(T)) = _jax_is_tuple(T) ||
     T isa Type && T <: AbstractArray && _jax_is_tuple(eltype(T))
+# A tuple whose fields are all numbers: none of them has a length.
+_jax_number_fields(@nospecialize(T)) = _jax_is_tuple(T) && all(F -> F <: Number, fieldtypes(T))
 # The fields of a tuple (or of a vector of tuples' entries) that have a
 # length in its extent, as a bitmask; zero when none was recorded, in which
 # case every field with an array type is taken to have one.
@@ -7916,8 +7918,12 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     R = only(ranks)
     # Arguments whose cell value is padded: a ragged array's rows, and the
     # padded entries of an array of tuples (a shared cell plate's values).
+    # Entries whose fields are all numbers have no lengths of their own, so
+    # the extent of an array of them (a padded scan's stacked step outputs)
+    # pads the array itself: the plate maps it as a padded group vector.
     ragged = Bool[!isempty(v.extent) && ((!_jax_outer_rows(v) && _jax_ragged(v.T)) || (_jax_is_array(v.T) &&
-                  _jax_is_tuple(eltype(v.T))) || !mapped[i]) && !(mapped[i] && eltype(v.T) <: Number)
+                  _jax_is_tuple(eltype(v.T)) && !_jax_number_fields(eltype(v.T))) || !mapped[i]) &&
+                  !(mapped[i] && eltype(v.T) <: Number)
                   for (i, v) in enumerate(inputs)]
     any(ragged[i] && mapped[i] && !_jax_tuple_valued(inputs[i].T) for i in eachindex(inputs)) && R != 1 &&
         _jax_error("a ragged plate of rank ", R, _jax_where(ctx))

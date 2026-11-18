@@ -837,10 +837,12 @@ end
 # a cell's block through the table, padded rows of packed positions, as a
 # gather that reductions mask by the row's length.
 #
-# On the host a vector of dimension tuples is a tuple of integer columns, one
-# per dimension, as the functions index it (`ReactiveKernels._jax_columns`);
-# with no dimensions (a number at every index) it is a `cells × 0` array. An
-# axes tuple is a tuple of `range(1, n + 1)` (`ReactiveKernels._host_axes`).
+# On the host a vector of dimension tuples is a list of its rows, one tuple of
+# integers per index, as host code indexes a vector of numeric tuples; the
+# functions take it as the tuple of its columns (`ReactiveKernels._jax_columns`,
+# which `prepare_data`'s `_rk_columns_np` builds from the rows). With no
+# dimensions (a number at every index) it is a `cells × 0` array. An axes
+# tuple is a tuple of `range(1, n + 1)` (`ReactiveKernels._host_axes`).
 
 _jax_cell_dims_rank(ctx, @nospecialize(D), what) =
     D isa Type && D <: Tuple && isconcretetype(D) && all(T -> T === Int, fieldtypes(D)) ?
@@ -860,7 +862,7 @@ function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
                            NTuple{fieldcount(a.T),Int}, true)
 end
 
-# Every index's dimensions, as columns.
+# Every index's dimensions, as rows.
 function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
         ::typeof(_ppl_cell_latent_shapes), args::Vector{ReactiveKernels._PyVal})
     ctx.host === nothing &&
@@ -871,8 +873,7 @@ function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
     N = _jax_cell_dims_rank(ctx, ReactiveKernels._jax_eltype(cells.T),
                             "a cell latent whose indices hold arrays")
     code = N == 0 ? "np.zeros((len(" * cells.code * "), 0), dtype=np.int64)" :
-        "tuple(np.asarray([int(d[k]) for d in " * cells.code * "], dtype=np.int64) " *
-        "for k in range(" * string(N) * "))"
+        "[tuple(int(n) for n in d) for d in " * cells.code * "]"
     ReactiveKernels._jax_bind!(ctx, :dims, ReactiveKernels._PyVal(code, Vector{NTuple{N,Int}}, true))
 end
 
@@ -884,8 +885,8 @@ function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
     dims = only(args)
     N = _jax_cell_dims_rank(ctx, ReactiveKernels._jax_eltype(dims.T), "the offsets of cells")
     code = N == 0 ? "np.arange(len(" * dims.code * ") + 1, dtype=np.int64)" :
-        "np.concatenate([np.zeros(1, dtype=np.int64), np.cumsum(np.prod(np.stack(" *
-        dims.code * "), axis=0, dtype=np.int64))])"
+        "np.concatenate([np.zeros(1, dtype=np.int64), np.cumsum(np.asarray(" *
+        "[int(np.prod(d, dtype=np.int64)) for d in " * dims.code * "], dtype=np.int64))])"
     ReactiveKernels._jax_bind!(ctx, :offsets, ReactiveKernels._PyVal(code, Vector{Int}, true))
 end
 
@@ -909,7 +910,8 @@ function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
     dims, pos = args
     N = _jax_cell_dims_rank(ctx, ReactiveKernels._jax_eltype(dims.T), "the axes of cells")
     k = ReactiveKernels._jax_minus_one(pos)
-    code = "tuple(range(1, int(c[" * k * "]) + 1) for c in " * (N == 0 ? "()" : dims.code) * ")"
+    code = N == 0 ? "()" :
+        "tuple(range(1, int(n) + 1) for n in " * ReactiveKernels._py_atom(dims.code) * "[" * k * "])"
     ReactiveKernels._PyVal(code, NTuple{N,Base.OneTo{Int}}, true)
 end
 
