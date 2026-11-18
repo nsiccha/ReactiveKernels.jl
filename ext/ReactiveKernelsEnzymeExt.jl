@@ -605,10 +605,25 @@ _structured_gradient_inplace() =
     isdefined(Enzyme, :has_dogfood_repair) &&
     Enzyme.has_dogfood_repair(:structured_gradient_inplace)
 
-# Both answers depend on the loaded Enzyme's Julia source alone.
+# The report of the derivatives native Enzyme compiles and runs
+# (`ReactiveKernels.ad_derivative_report`, and the derivative check of every
+# native-Enzyme `prepare_ad*`): Enzyme's dogfood repair `derivative_report`,
+# which is in its Julia source.
+_derivative_report_available() =
+    isdefined(Enzyme, :derivative_report) && isdefined(Enzyme, :has_dogfood_repair) &&
+    Enzyme.has_dogfood_repair(:derivative_report)
+
+function _enzyme_derivative_report(f)
+    report = Enzyme.derivative_report(f)
+    ReactiveKernels.ADDerivativeReport(report.value, report.derivatives)
+end
+
+# Every answer depends on the loaded Enzyme's Julia source alone.
 function __init__()
     _STRUCTURED_GRADIENT_INPLACE[] = _structured_gradient_inplace()
     ReactiveKernels._PR_INDEX_RUN_REFUSAL[] = _index_run_refusal()
+    ReactiveKernels._DERIVATIVE_REPORTER[] =
+        _derivative_report_available() ? _enzyme_derivative_report : missing
     nothing
 end
 
