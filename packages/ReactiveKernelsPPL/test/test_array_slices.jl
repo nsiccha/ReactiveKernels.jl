@@ -156,6 +156,30 @@ end
     @test all(j -> sum(r.nt.P[:, j]) ≈ 1, 1:3)
 end
 
+# Both outputs contribute to the derivative: summing a simplex itself would
+# give a constant and leave only the log-Jacobian to check.
+function _sl_transform_objective(o, u)
+    p = ReactiveKernelsPPL._simplex_slices_constrain(o, u)
+    return sum(abs2, p) + ReactiveKernelsPPL._simplex_slices_logjac(o, u)
+end
+
+@testset "array slices: reverse differentiation of simplex transforms" begin
+    u = reshape(_av_point(6), 2, 3)
+    for o in (ReactiveKernelsPPL._SliceRows(), ReactiveKernelsPPL._SliceCols())
+        f = x -> _sl_transform_objective(o, x)
+        reverse = () -> only(Enzyme.gradient(Enzyme.Reverse, f, u))
+        g = if isdefined(Enzyme, :has_dogfood_repair) && Enzyme.has_dogfood_repair(:derivative_report)
+            report = ReactiveKernels.ad_derivative_report(reverse)
+            @test !isempty(report.derivatives)
+            @test isempty(report.unstable)
+            report.value
+        else
+            reverse()
+        end
+        @test g ≈ _findiff_grad(f, u) rtol = 1e-5 atol = 1e-7
+    end
+end
+
 @testset "array slices: Dirichlet with parameter concentrations" begin
     _sl_check(:(begin
         s ~ Exponential(1)

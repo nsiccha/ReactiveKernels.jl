@@ -16,6 +16,13 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.225
+
+- Row-wise Dirichlet parameters now use the same column scan as column-wise
+  parameters for their stick-breaking transform and log-Jacobian. Native
+  reverse-mode differentiation of the scan passes the strict type-stability
+  check. Each simplex keeps its declared row or column orientation.
+
 ## 0.1.224
 
 - `filter_step` no longer deep-copies each particle's carried state or calls
