@@ -37,6 +37,47 @@ end
     end
 end
 
+# A record a region returns is read by field name in the caller and in a
+# plate cell, as an effectiveness submodel's value is in a dose model.
+@kernel jax_returned_record(a::Float64, xs::Vector{Float64}) = begin
+    rec = (; scale = 2 * a, offset = a + 1.0, weights = [a, 3 * a])
+    cells = plate(xs, Ref(rec)) do x, r
+        r.scale * x + r.offset + sum(r.weights) * x^2
+    end
+    total = sum(cells) + rec.offset * rec.weights[2]
+    count = a * length(xs)
+    return total, count
+end
+jax_returned_record_native(a, xs) =
+    sum(2a * x + (a + 1.0) + 4a * x^2 for x in xs; init = 0.0) + (a + 1.0) * 3a
+
+@testset "a record a region returns is read by its field names" begin
+    region = ReactiveKernels._JaxSourceRegion(:record_group, [:a], [:rec],
+        Dict(:rec => :value), "A record returned by an authored region.")
+    for regions in (ReactiveKernels._JaxSourceRegion[], [region])
+        # Two entries: `count` does not demand the record, so the region it
+        # calls returns no `value` and the entry must read none of its keys.
+        src = jax_source(jax_returned_record; have = (:a, :xs),
+                         functions = (kernel = :total, count = :count), source_regions = regions)
+        @test !occursin(r"(?m)^\s*\w+ = \w+\[\"value\"\]\s*$", src.text)
+        # With the region, its function returns the record by field name.
+        isempty(regions) || @test occursin("\"scale\": ", src.text)
+        if rk_jax_available()
+            for xs in ([0.5, -1.0, 2.0], Float64[], [3.0])
+                result = rk_jax_evaluate(src, :kernel, (0.7, xs); grad = true)
+                @test result.value ≈ jax_returned_record_native(0.7, xs) rtol = 1e-12 atol = 1e-12
+                expected = sum(2x + 1.0 + 4x^2 for x in xs; init = 0.0) + 3 * (2 * 0.7 + 1.0)
+                @test result.grad ≈ expected rtol = 1e-12 atol = 1e-12
+                counted = rk_jax_evaluate(src, :count, (0.7, xs); grad = true)
+                @test counted.value ≈ 0.7 * length(xs) rtol = 1e-12
+                @test counted.grad ≈ length(xs) rtol = 1e-12
+            end
+        else
+            @test_skip false
+        end
+    end
+end
+
 @kernel jax_returned_bound(x::Vector{Float64}, stops::Vector{Int}) = begin
     total = begin
         acc = 0.0

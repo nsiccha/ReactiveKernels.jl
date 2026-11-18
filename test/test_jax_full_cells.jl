@@ -67,6 +67,23 @@ end
     total = sum(totals)
     return total
 end
+# Vector cells made in one plate and selected by an index in a later one:
+# they cross that plate as a shared argument, and `units[k]` is one cell.
+@kernel jax_full_cells_selected(a::Float64, rates::Vector{Float64}, lags::Vector{Float64},
+                                picks::Vector{Vector{Int}}) = begin
+    totals = plate(picks, Ref(rates), Ref(lags)) do pick, rates, lags
+        units = plate(rates, Ref(lags)) do rate, lags
+            exp.(-a * rate .* lags)
+        end
+        values = plate(pick, Ref(units)) do k, units
+            row = units[k]
+            sum(row) + row[1] * length(units) + row[end]
+        end
+        sum(values)
+    end
+    total = sum(totals)
+    return total
+end
 # A padded row checked along a helper-argument dimension: its length.
 @traceable jax_full_cells_mean(x, n) = (jax_full_cells_dim(x, 1, n); sum(x) / size(x, 1))
 @kernel jax_full_cells_rows(a::Float64, xs::Vector{Vector{Float64}}) = begin
@@ -150,6 +167,20 @@ end
                 @test r.value ≈ native(0.7, args...) rtol = 1e-12 atol = 1e-12
                 @test r.grad ≈ fd(a -> native(a, args...), 0.7) rtol = 1e-7 atol = 1e-9
             end
+        end
+        # Shared vector cells selected by index, over ragged and empty picks,
+        # one to many cells and one to many lags.
+        selected = jax_source(jax_full_cells_selected; have = (:a, :rates, :lags, :picks),
+                              want = :total)
+        native_selected = prepare(jax_full_cells_selected)
+        for (rates, lags, picks) in (([0.3, 0.9], [0.5, 1.0, 2.0], [[1, 2, 2], Int[], [2]]),
+                                     ([0.4], [0.25], [[1]]),
+                                     (collect(0.1:0.1:1.3), collect(0.0:0.5:9.0),
+                                      [collect(1:13), [7], Int[], [13, 1]]),
+                                     ([0.3, 0.9], [0.5, 1.0], Vector{Int}[]))
+            r = rk_jax_evaluate(selected, :kernel, (0.7, rates, lags, picks); grad = true)
+            @test r.value ≈ native_selected(0.7, rates, lags, picks) rtol = 1e-12 atol = 1e-12
+            @test r.grad ≈ fd(a -> native_selected(a, rates, lags, picks), 0.7) rtol = 1e-7 atol = 1e-9
         end
         # Inspect the trace too: the nested plate bodies stay batched as
         # both the row count and padded capacity grow. The count is a
