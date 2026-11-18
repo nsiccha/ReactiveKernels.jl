@@ -414,6 +414,24 @@ end
         @test PPL._gibbs_weights(L2[i, :]) ≈ exact ./ sum(exact) rtol=1e-12
     end
 
+    # A restriction read per element intersects each element's own support.
+    nr, lor, hir, yr = [4, 5, 3], [1, 0, 2], [3, 2, 3], [2.2, 0.4, 2.9]
+    modelr = @rkppl begin
+        k[axes(n, 1)] .~ restricted.(Binomial.(n, 0.4), lo, hi)
+        y .~ Normal.(k, 0.6)
+    end
+    planr = modelr(; n = nr, lo = lor, hi = hir) | (; y = yr)
+    builtr = build_kernel(planr)
+    dr = (; k = [2, 1, 2])
+    blockr = only(prepare_gibbs(builtr, planr, Float64[]; discrete=dr).integers)
+    @test blockr.support(Float64[], dr) == [1:3, 0:2, 2:3]
+    candidatesr, Lr = PPL._gibbs_elementwise_logweights(blockr, Float64[], dr)
+    for i in eachindex(nr)
+        exact = [lor[i] <= s <= hir[i] ? pdf(Binomial(nr[i], 0.4), s) *
+            pdf(Normal(s, 0.6), yr[i]) : 0.0 for s in candidatesr]
+        @test PPL._gibbs_weights(Lr[i, :]) ≈ exact ./ sum(exact) rtol=1e-12
+    end
+
     # The loop spelling reads its trials per cell, as the array does.
     model3 = @rkppl begin
         @plate for i in eachindex(y)
