@@ -352,15 +352,16 @@ end
 
 # The exact sweep of single-site updates over every joint state: element `i`
 # moves by its conditional, the others stay.
-function _gibbs_sweep_matrix(block, states)
+function _gibbs_sweep_matrix(block, states; name = :k)
+    state(x) = NamedTuple{(name,)}((x,))
     T = Matrix{Float64}(I, length(states), length(states))
-    support = PPL._gibbs_block_supports(block, Float64[], (; k = states[1]))
+    support = PPL._gibbs_block_supports(block, Float64[], state(states[1]))
     for i in eachindex(states[1])
         own = PPL._gibbs_element_support(support, i)
         K = zeros(length(states), length(states))
         for (a, old) in enumerate(states)
             w = PPL._gibbs_weights(PPL._gibbs_site_logweights!(zeros(length(own)),
-                block, Float64[], (; k = old), copy(old), i, own))
+                block, Float64[], state(old), copy(old), i, own))
             for (j, s) in enumerate(own)
                 new = copy(old); new[i] = s
                 K[a, findfirst(==(new), states)] += w[j]
@@ -518,6 +519,90 @@ end
     draws6 = gibbs_draws(initialize_gibbs(Xoshiro(4), problem6, Float64[]; discrete=d6), 500)
     @test all(x -> size(x.k) == (2, 2) && all(0 .<= x.k .<= N), draws6.discrete)
     @test any(x -> x.k[1, 2] == 3, draws6.discrete)
+end
+
+
+@testset "collapsed integers: Gibbs beside marginalized integers" begin
+    # A cell body naming a NamedTuple field after an enclosing value still
+    # reads that value: marginalized programs build `pointwise = (y = …,)`.
+    reads = PPL._statement_value_reads!(Set{Symbol}(),
+        :(plate(s) do i; pointwise = (y = y[i] + w,); pointwise end))
+    @test :y in reads && :w in reads && :pointwise ∉ reads
+    # `a` is summed out; `k`'s conditional is p(k | p, y) ∝ Σₐ p(k, a, y | p).
+    n, y = 4, 2.6
+    model = @rkppl begin
+        p ~ Beta(2, 2)
+        a ~ Bernoulli(0.3)
+        k ~ Binomial(n, p)
+        y ~ Normal(k + 2a, 1)
+    end
+    plan = marginalize(model(; n), :a) | (; y)
+    built = build_kernel(plan)
+    d = (; k = 1)
+    u = unconstrain(built.layout, (; p = 0.45, k = 1))
+    problem = prepare_gibbs(built, plan, u; discrete=d, backend=BACKEND)
+    @test [b.names for b in problem.integers] == [(:k,)]
+    conditional = only(problem.integers).kernel(u, d)
+    exact = [pdf(Binomial(n, 0.45), k) * (0.7 * pdf(Normal(k, 1), y) +
+        0.3 * pdf(Normal(k + 2, 1), y)) for k in 0:n]
+    @test PPL._gibbs_weights(conditional.logweights) ≈ exact ./ sum(exact) rtol=1e-12
+    @test problem.joint(u, d) ≈ logpdf(Beta(2, 2), 0.45) + logpdf(Binomial(n, 0.45), 1) +
+        log(0.7 * pdf(Normal(1, 1), y) + 0.3 * pdf(Normal(3, 1), y)) + log(0.45 * 0.55)
+    draws = gibbs_draws(initialize_gibbs(Xoshiro(1), problem, u; discrete=d, warmup=200), 300)
+    @test all(x -> x.k in 0:n, draws.discrete)
+
+    # Two explicit scalars beside a marginalized one: the sweep leaves the
+    # collapsed joint law invariant.
+    model2 = @rkppl begin
+        a ~ Bernoulli(0.4)
+        k ~ Bernoulli(0.3 + 0.4a)
+        z ~ Bernoulli(0.2 + 0.5k)
+        y ~ Normal(k + z + a, 1)
+    end
+    plan2 = marginalize(model2(), :a) | (; y = 1.3)
+    built2 = build_kernel(plan2)
+    problem2 = prepare_gibbs(built2, plan2, Float64[]; discrete=(; k=0, z=0))
+    states = [(; k, z) for k in 0:1 for z in 0:1]
+    joint = [sum((a == 1 ? 0.4 : 0.6) * pdf(Bernoulli(0.3 + 0.4a), s.k) *
+        pdf(Bernoulli(0.2 + 0.5s.k), s.z) * pdf(Normal(s.k + s.z + a, 1), 1.3) for a in 0:1)
+        for s in states]
+    joint ./= sum(joint)
+    @test PPL._gibbs_weights([problem2.joint(Float64[], s) for s in states]) ≈ joint rtol=1e-12
+    T = zeros(4, 4)
+    for (i, old) in enumerate(states), (j, new) in enumerate(states)
+        first_block = problem2.integers[1].kernel(Float64[], old)
+        second_block = problem2.integers[2].kernel(Float64[], (; k=new.k, z=old.z))
+        T[i, j] = PPL._gibbs_weights(first_block.logweights)[new.k+1] *
+            PPL._gibbs_weights(second_block.logweights)[new.z+1]
+    end
+    @test transpose(T) * joint ≈ joint rtol=1e-12
+
+    # An explicit integer array beside a marginalized scalar: its terms are
+    # sums over the marginalized states, so elements update one by one.
+    y3 = [0.2, 2.9, 1.1]
+    model3 = @rkppl begin
+        a ~ Bernoulli(0.5)
+        z[axes(y, 1)] .~ Bernoulli(0.4)
+        y .~ Normal.(z .+ 2a, 1)
+    end
+    plan3 = marginalize(model3(), :a) | (; y = y3)
+    built3 = build_kernel(plan3)
+    block3 = only(prepare_gibbs(built3, plan3, Float64[]; discrete=(; z=[0, 0, 0])).integers)
+    @test !block3.elementwise
+    states3 = vec([collect(c) for c in Iterators.product(0:1, 0:1, 0:1)])
+    joint3 = [sum(0.5 * prod(pdf.(Bernoulli(0.4), s)) * prod(pdf.(Normal.(s .+ 2a, 1), y3))
+        for a in 0:1) for s in states3]
+    joint3 ./= sum(joint3)
+    T3 = _gibbs_sweep_matrix(block3, states3; name = :z)
+    @test transpose(T3) * joint3 ≈ joint3 rtol=1e-12
+
+    # Nothing left to update: the remedy is NUTS on the real coordinates.
+    plan4 = marginalize(@rkppl(begin
+        a ~ Bernoulli(0.3)
+        y ~ Normal(2a, 1)
+    end)(), :a) | (; y = 0.5)
+    err = try prepare_gibbs(build_kernel(plan4), plan4, Float64[]; discrete=nothing); nothing catch e; e end
+    @test err isa ArgumentError && occursin("NUTS", sprint(showerror, err))
 end
 
 end

@@ -138,8 +138,30 @@ are stored as `Int`, including when the starting value has a narrower type.
 Saved positions and constrained draws remain unchanged by later steps.
 Prepare a separate problem for each concurrent chain. Purely discrete
 models use the same driver without an AD backend, metric or step size.
-The Gibbs interface does not yet update models with already marginalized
-integers.
+
+Some integers can be summed out while the others are updated: on
+`marginalize(model, :a)`, `prepare_gibbs` updates every remaining integer from
+its collapsed conditional, which sums over `a`, and the continuous step
+targets the density with `a` summed out. A model whose integers are all
+marginalized has nothing left to update; sample its real coordinates with
+NUTS instead.
+
+```@example integer
+collapsed = @rkppl begin
+    a ~ Bernoulli(0.3)
+    j ~ Binomial(4, 0.45)
+    y ~ Normal(j + 2a, 1)
+end
+collapsed_plan = marginalize(collapsed(), :a) | (; y = 2.6)
+collapsed_built = build_kernel(collapsed_plan)
+collapsed_problem = prepare_gibbs(collapsed_built, collapsed_plan, Float64[];
+    discrete = (; j = 0))
+weights = only(collapsed_problem.integers).kernel(Float64[], (; j = 0)).logweights
+exact = [pdf(Binomial(4, 0.45), j) *
+    (0.7 * pdf(Normal(j, 1), 2.6) + 0.3 * pdf(Normal(j + 2, 1), 2.6)) for j in 0:4]
+exp.(vec(weights) .- maximum(weights)) ./ sum(exp.(vec(weights) .- maximum(weights))) ≈
+    exact ./ sum(exact)
+```
 
 An integer parameter indexes an array as Julia does, so a mixture assigns one
 component per observation:
