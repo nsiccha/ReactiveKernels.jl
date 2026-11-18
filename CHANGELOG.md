@@ -16,6 +16,29 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.310
+
+- JAX source scans a padded sequence with `history` (a dose list per ragged
+  row of a plate): a step past the row's length runs no body and keeps the
+  carry and history, so its reads of padding reach neither a value nor a
+  derivative. The result carries the row's length. Before, it was refused.
+- A later plate selects one cell of an earlier plate's vector cells by index
+  (`units[k]`). Before, it was refused as "a ragged array without its
+  lengths".
+- A vector slice between ends that are data (`x[(p + 1):(p + q)]`) or that the
+  trace knows, read from a padded vector, translates, with Julia's
+  `BoundsError` for a nonempty range outside the vector. Padded rows of one
+  length stored with different widths broadcast and scan together.
+- `prepare_data` passes a vector of records whose vector fields differ in
+  length per record with those fields padded and `<name>_lengths`, the tuple
+  of their lengths (`None` for a number field). Before, NumPy refused it.
+- Fixed: a record a source region returns is read by its field names in the
+  caller, and only in the entries that use it (`KeyError`).
+- Fixed: NaN reverse-mode gradients, with correct values, when a data-sized
+  allocation filled by a loop reached a function with no finite derivative at
+  zero (`sqrt`, `log`) through a masked reduction. Every padded array a loop
+  carries now leaves it repeating its last valid entry.
+
 ## 0.1.309
 
 - Added `ad_cost_profile(value, value_and_gradient; seconds, threshold,
