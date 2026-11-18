@@ -86,6 +86,12 @@ filter carries the window `a[t - j]`, `j < p`, of every array, and the draws
 return each array under its name. A vector state observed otherwise or in a
 `@plate` cell is refused.
 
+A step's innovation scale may be 0 (`s * sqrt(1 - r * r)` at `r = 1`, the
+state carried over unchanged): the filter is exact there, and native
+gradients are finite. In emitted JAX (`jax_source`) a scale that reaches 0
+through `sqrt` has a NaN gradient, because JAX's derivative of `sqrt` at 0
+is infinite.
+
 A recurrence a submodel holds is named by its author path:
 `marginalize(model, Symbol("z.x"))` for the array `x` of `z ~ sm(…)` (a
 nested call: `Symbol("z.w.x")`). It integrates out as its top-level spelling
