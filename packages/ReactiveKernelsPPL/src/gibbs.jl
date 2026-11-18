@@ -23,8 +23,12 @@ block. Terms constant in that block are omitted; the resulting conditional
 log density need not equal the full joint log density. Finite supports remain
 runtime plate axes. A joint block enumerates their Cartesian product.
 
-This initial driver supports explicit scalar integer declarations. Integer
-arrays and models with already marginalized integers are not yet supported.
+Integer arrays, declared (`z[axes(y, 1)] .~ Categorical(w)`) or written as
+`@plate` loop cells, are updated exactly as their own blocks after the scalar
+ones (`GibbsArrayBlock`). An array's elements may each have their own support,
+when a support bound is read per element (`Binomial.(n, p)` with a vector
+`n`). Models with already marginalized integers are not yet supported.
+
 Continuous derivatives use the supplied ordinary AD backend. No backend is
 needed for a model with zero continuous coordinates. Prepare one problem per
 concurrent chain: its continuous query owns mutable derivative buffers.
@@ -144,14 +148,21 @@ exactly: for each support value `s`, one evaluation of those cells with every
 element set to `s` gives each element's log weight for `s`. Otherwise the
 elements are drawn one after another from their exact conditionals, each
 evaluating the terms that read the array.
+
+The elements share one support, or each has its own when a support bound is
+read per element (`Binomial.(n, p)` with a vector `n`). Then the elementwise
+update evaluates each value of the union of the supports once: an element
+outside its own support at that value keeps an in-support value in the
+evaluation, and its weight for the value is zero.
 """
 struct GibbsArrayBlock{C,S}
     name::Symbol
     path::Tuple
     elementwise::Bool
-    cells::C       # (u, discrete, s) -> per-element log weights (elementwise),
-                   # or (u, discrete) -> the summed terms (one site at a time)
-    support::S     # (u, discrete) -> the support all elements share
+    cells::C       # (u, discrete) -> per-element log weights at that integer
+                   # state (elementwise), or the summed terms (one site at a time)
+    support::S     # (u, discrete) -> one shared range, or an array of ranges,
+                   # one per element
 end
 
 # Names whose value reads the integer array `root` elementwise: entry `i` reads
@@ -276,26 +287,18 @@ function _gibbs_array_block(plan, p, def, statements, terms, layout, exemplar, o
     support = _integer_support_expr(p)
     bound, have = _query_bound(plan), _query_have(plan)
     if separable
-        # Every element takes the value `s` at once; each cell then holds its
-        # own element's log weight for `s`.
-        program = copy(statements)
-        program[at] = Expr(:(=), statements[at].args[1], Expr(:call,
-            GlobalRef(@__MODULE__, :_gibbs_fill), statements[at].args[2], :_ppl_gibbs_value))
-        body = Expr(:block, program...,
+        # Each cell holds its own element's log weight at the integer state it
+        # is given; the draw gives every element one support value at a time.
+        body = Expr(:block, statements...,
             :(_ppl_gibbs_cells = $(GlobalRef(@__MODULE__, :_gibbs_cell_sum))($(plates...))),
             :(_ppl_gibbs_support = $support),
             :(return _ppl_gibbs_cells))
-        signature = copy(def.args[1])
-        push!(signature.args, :(_ppl_gibbs_value::Int))
-        spec = _eval_kernel_def(Expr(:(=), signature, body))
+        spec = _eval_kernel_def(Expr(:(=), def.args[1], body))
         _register_packed_check!(spec, layout)
-        vectorized(want) = Base.invokelatest(_prepare_cached, plan, spec;
-            have=(have..., :_ppl_gibbs_value), want, bound,
-            exemplars=(exemplar..., 1), on_error)
-        cells = vectorized(:_ppl_gibbs_cells)
-        supported = vectorized(:_ppl_gibbs_support)
-        return GibbsArrayBlock(p.name, path, true, cells,
-            (u, d) -> supported(u, d, 1))
+        vectorized(want) = Base.invokelatest(_prepare_cached, plan, spec; have, want,
+            bound, exemplars=exemplar, on_error)
+        return GibbsArrayBlock(p.name, path, true, vectorized(:_ppl_gibbs_cells),
+            vectorized(:_ppl_gibbs_support))
     end
     body = Expr(:block, statements...,
         :(_ppl_gibbs_density::Float64 = $(_sum_terms(selected))),
@@ -309,7 +312,6 @@ function _gibbs_array_block(plan, p, def, statements, terms, layout, exemplar, o
         site(:_ppl_gibbs_support))
 end
 
-@traceable _gibbs_fill(value::AbstractArray, s::Int) = fill(s, size(value))
 @traceable function _gibbs_cell_sum(first, rest...)
     total = collect(Float64, vec(first))
     for cells in rest
@@ -323,37 +325,120 @@ end
 _gibbs_lookup(state::NamedTuple, path::Tuple) = isempty(Base.tail(path)) ?
     state[first(path)] : _gibbs_lookup(state[first(path)], Base.tail(path))
 
-# One exact draw of every element of an integer array block.
-function _draw_array_block(block::GibbsArrayBlock, rng, position, values)
-    current = _gibbs_lookup(values, block.path)
-    support = collect(Int, Base.invokelatest(block.support, position, values))
+# Each element's support: one shared range, or the element's own range when a
+# support bound is read per element.
+function _gibbs_element_supports(block::GibbsArrayBlock, support, n)
+    if support isa AbstractArray{<:AbstractRange}
+        length(support) == n || throw(DimensionMismatch("Gibbs integer array " *
+            "$(block.name): $(length(support)) supports for $n elements"))
+        supports = vec(support)
+        i = findfirst(isempty, supports)
+        i === nothing || throw(ArgumentError(
+            "Gibbs block $(block.name) has empty support at element $i"))
+        return supports
+    end
     isempty(support) && throw(ArgumentError("Gibbs block $(block.name) has empty support"))
+    return support isa AbstractRange{Int} ? support : collect(Int, support)
+end
+_gibbs_element_support(support::AbstractVector{Int}, i) = support
+_gibbs_element_support(supports::AbstractVector{<:AbstractRange}, i) = supports[i]
+# The values the elementwise update evaluates: the shared support, or every
+# value some element's own support holds.
+_gibbs_values(support::AbstractVector{Int}) = support
+_gibbs_values(supports::AbstractVector{<:AbstractRange}) = sort!(unique!(
+    collect(Int, Iterators.flatten(supports))))
+
+# The block's per-element supports at the current state.
+function _gibbs_block_supports(block::GibbsArrayBlock, position, values)
+    n = length(_gibbs_lookup(values, block.path))
+    return _gibbs_element_supports(block,
+        Base.invokelatest(block.support, position, values), n)
+end
+
+# Every element's exact conditional log weights when the elements are
+# conditionally independent: `(candidates, L)` with `L[i, j]` element `i`'s log
+# weight for `candidates[j]`, −Inf outside the element's own support. Each
+# candidate costs one evaluation of the block's cells.
+_gibbs_elementwise_logweights(block::GibbsArrayBlock, position, values) =
+    _gibbs_elementwise_logweights(block, position, values,
+        _gibbs_block_supports(block, position, values))
+function _gibbs_elementwise_logweights(block::GibbsArrayBlock, position, values, support)
+    current = _gibbs_lookup(values, block.path)
+    n = length(current)
+    candidates = _gibbs_values(support)
+    logweights = Matrix{Float64}(undef, n, length(candidates))
+    state = similar(current, Int)
+    for (j, s) in enumerate(candidates)
+        _gibbs_candidate_state!(state, support, s)
+        cells = Base.invokelatest(block.cells, position,
+            _gibbs_set(values, block.path, state))
+        length(cells) == n || throw(ArgumentError("Gibbs integer array " *
+            "$(block.name): $(length(cells)) density cells for $n elements"))
+        _gibbs_store_cells!(logweights, j, cells, support, s)
+    end
+    return candidates, logweights
+end
+# Every element at `s`; with own supports, an element outside its own keeps an
+# in-support value, so no read sees an excluded state.
+_gibbs_candidate_state!(state, ::AbstractVector{Int}, s) = fill!(state, s)
+function _gibbs_candidate_state!(state, supports::AbstractVector{<:AbstractRange}, s)
+    for i in eachindex(state, supports)
+        state[i] = s in supports[i] ? s : first(supports[i])
+    end
+    return state
+end
+# Column `j` of the log weights from one evaluation's cells; an element whose
+# own support excludes `s` has weight zero there.
+function _gibbs_store_cells!(logweights, j, cells, ::AbstractVector{Int}, s)
+    logweights[:, j] .= vec(cells)
+    return logweights
+end
+function _gibbs_store_cells!(logweights, j, cells::AbstractArray,
+        supports::AbstractVector{<:AbstractRange}, s)
+    for (i, c) in zip(eachindex(supports), vec(cells))
+        logweights[i, j] = s in supports[i] ? c : -Inf
+    end
+    return logweights
+end
+
+# Element `i`'s exact conditional log weights over its own support `own`,
+# the other elements fixed at their values in `draw` (which ends at `own`'s
+# last value).
+function _gibbs_site_logweights!(logweights, block::GibbsArrayBlock, position,
+        values, draw, i, own)
+    for (j, s) in enumerate(own)
+        draw[i] = s
+        logweights[j] = Base.invokelatest(block.cells, position,
+            _gibbs_set(values, block.path, draw))
+    end
+    return logweights
+end
+
+# One exact draw of every element of an integer array block.
+_draw_array_block(block::GibbsArrayBlock, rng, position, values) =
+    _draw_array_block(block, rng, position, values,
+        _gibbs_block_supports(block, position, values))
+function _draw_array_block(block::GibbsArrayBlock, rng, position, values, support)
+    current = _gibbs_lookup(values, block.path)
     n = length(current)
     if block.elementwise
-        logweights = Matrix{Float64}(undef, n, length(support))
-        for (j, s) in enumerate(support)
-            cells = Base.invokelatest(block.cells, position, values, s)
-            length(cells) == n || throw(ArgumentError("Gibbs integer array " *
-                "$(block.name): $(length(cells)) density cells for $n elements"))
-            logweights[:, j] .= cells
-        end
+        candidates, logweights = _gibbs_elementwise_logweights(block, position,
+            values, support)
         draw = similar(current, Int)
         for i in 1:n
             weights = _gibbs_weights(view(logweights, i, :))
-            draw[i] = support[_integer_draw_index(rng, weights)]
+            draw[i] = candidates[_integer_draw_index(rng, weights)]
         end
         return _gibbs_set(values, block.path, draw)
     end
-    draw = collect(Int, current)
-    draw = reshape(draw, size(current))
-    logweights = Vector{Float64}(undef, length(support))
+    draw = reshape(collect(Int, current), size(current))
+    buffer = Vector{Float64}(undef,
+        maximum(i -> length(_gibbs_element_support(support, i)), 1:n))
     for i in 1:n
-        for (j, s) in enumerate(support)
-            draw[i] = s
-            logweights[j] = Base.invokelatest(block.cells, position,
-                _gibbs_set(values, block.path, draw))
-        end
-        draw[i] = support[_integer_draw_index(rng, _gibbs_weights(logweights))]
+        own = _gibbs_element_support(support, i)
+        logweights = _gibbs_site_logweights!(view(buffer, 1:length(own)), block,
+            position, values, draw, i, own)
+        draw[i] = own[_integer_draw_index(rng, _gibbs_weights(logweights))]
     end
     return _gibbs_set(values, block.path, draw)
 end

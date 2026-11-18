@@ -282,7 +282,7 @@ end
     support = collect(block.support(u, d))
     @test support == 1:3
     # Every element's exact conditional, from one evaluation per support value.
-    L = reduce(hcat, [block.cells(u, d, s) for s in support])
+    L = reduce(hcat, [block.cells(u, (; z = fill(s, length(y)))) for s in support])
     for i in eachindex(y)
         exact = [p[k] * pdf(Normal(mu[k], 1.0), y[i]) for k in 1:3]
         @test PPL._gibbs_weights(L[i, :]) ≈ exact ./ sum(exact) rtol=1e-12
@@ -336,6 +336,158 @@ end
     draws = gibbs_draws(initialize_gibbs(Xoshiro(3), problem, Float64[]; discrete=d), 40000)
     frequency = [count(x -> x.z == s, draws.discrete) / 40000 for s in states]
     @test maximum(abs.(frequency .- exact)) < 0.02
+end
+
+# The exact sweep of single-site updates over every joint state: element `i`
+# moves by its conditional, the others stay.
+function _gibbs_sweep_matrix(block, states)
+    T = Matrix{Float64}(I, length(states), length(states))
+    support = PPL._gibbs_block_supports(block, Float64[], (; k = states[1]))
+    for i in eachindex(states[1])
+        own = PPL._gibbs_element_support(support, i)
+        K = zeros(length(states), length(states))
+        for (a, old) in enumerate(states)
+            w = PPL._gibbs_weights(PPL._gibbs_site_logweights!(zeros(length(own)),
+                block, Float64[], (; k = old), copy(old), i, own))
+            for (j, s) in enumerate(own)
+                new = copy(old); new[i] = s
+                K[a, findfirst(==(new), states)] += w[j]
+            end
+        end
+        T = T * K
+    end
+    return T
+end
+
+@testset "integer arrays: each element may have its own support" begin
+    # Elementwise: Binomial trials and DiscreteUniform bounds read per element.
+    n, p, y = [2, 5, 1], 0.35, [1.2, 3.9, 0.1]
+    model = @rkppl begin
+        k[axes(n, 1)] .~ Binomial.(n, p)
+        y .~ Normal.(k, 0.7)
+    end
+    plan = model(; n, p) | (; y)
+    built = build_kernel(plan)
+    d = (; k = [0, 0, 0])
+    problem = prepare_gibbs(built, plan, Float64[]; discrete=d)
+    block = only(problem.integers)
+    @test block.elementwise
+    @test block.support(Float64[], d) == [0:2, 0:5, 0:1]
+    candidates, L = PPL._gibbs_elementwise_logweights(block, Float64[], d)
+    @test candidates == 0:5               # each value evaluated once, for every element
+    for i in eachindex(n)
+        exact = [s <= n[i] ? pdf(Binomial(n[i], p), s) * pdf(Normal(s, 0.7), y[i]) : 0.0
+            for s in candidates]
+        @test PPL._gibbs_weights(L[i, :]) ≈ exact ./ sum(exact) rtol=1e-12
+    end
+    chain = initialize_gibbs(Xoshiro(2), problem, Float64[]; discrete=d)
+    draws = gibbs_draws(chain, 2000)
+    @test all(x -> all(x.k .<= n) && all(>=(0), x.k), draws.discrete)
+    @test any(x -> x.k[2] >= 3, draws.discrete)  # beyond the other elements' supports
+
+    # Disjoint ranges: only values some element can take are evaluated.
+    lo, hi, y2 = [0, 5, 2], [1, 6, 3], [0.8, 5.6, 2.2]
+    model2 = @rkppl begin
+        k[axes(lo, 1)] .~ DiscreteUniform.(lo, hi)
+        y .~ Normal.(k, 0.5)
+    end
+    plan2 = model2(; lo, hi) | (; y = y2)
+    built2 = build_kernel(plan2)
+    d2 = (; k = copy(lo))
+    block2 = only(prepare_gibbs(built2, plan2, Float64[]; discrete=d2).integers)
+    candidates2, L2 = PPL._gibbs_elementwise_logweights(block2, Float64[], d2)
+    @test candidates2 == [0, 1, 2, 3, 5, 6]
+    for i in eachindex(lo)
+        exact = [lo[i] <= s <= hi[i] ? pdf(Normal(s, 0.5), y2[i]) : 0.0 for s in candidates2]
+        @test PPL._gibbs_weights(L2[i, :]) ≈ exact ./ sum(exact) rtol=1e-12
+    end
+
+    # The loop spelling reads its trials per cell, as the array does.
+    model3 = @rkppl begin
+        @plate for i in eachindex(y)
+            k[i] ~ Binomial(n[i], p)
+            y[i] ~ Normal(k[i], 0.7)
+        end
+    end
+    plan3 = model3(; n, p) | (; y)
+    built3 = build_kernel(plan3)
+    problem3 = prepare_gibbs(built3, plan3, Float64[]; discrete=d)
+    @test only(problem3.integers).elementwise
+    a = gibbs_draws(initialize_gibbs(Xoshiro(7), problem, Float64[]; discrete=d), 200)
+    b = gibbs_draws(initialize_gibbs(Xoshiro(7), problem3, Float64[]; discrete=d), 200)
+    @test [x.k for x in a.discrete] == [x.k for x in b.discrete]
+
+    # Coupled elements: single-site updates over each element's own support
+    # leave the exact joint law invariant.
+    model4 = @rkppl begin
+        k[axes(n, 1)] .~ Binomial.(n, p)
+        s = sum(k)
+        t ~ Normal(s, 0.8)
+    end
+    n4, t = [1, 2, 1], 2.3
+    plan4 = model4(; n = n4, p) | (; t)
+    built4 = build_kernel(plan4)
+    d4 = (; k = [0, 0, 0])
+    block4 = only(prepare_gibbs(built4, plan4, Float64[]; discrete=d4).integers)
+    @test !block4.elementwise
+    states = vec([collect(c) for c in Iterators.product(0:1, 0:2, 0:1)])
+    joint = [prod(pdf.(Binomial.(n4, p), s)) * pdf(Normal(sum(s), 0.8), t) for s in states]
+    joint ./= sum(joint)
+    T = _gibbs_sweep_matrix(block4, states)
+    @test vec(sum(T; dims=2)) ≈ ones(length(states))
+    @test transpose(T) * joint ≈ joint rtol=1e-12
+
+    # `Categorical.(ws)` over data holding one probability vector per element
+    # reads element `i`'s law from `ws[i]`, as in Julia.
+    ws, y5, mu = [[0.5, 0.5], [0.2, 0.3, 0.5], [1.0]], [0.1, 2.0, -1.0], [-1.0, 0.3, 1.2]
+    model5 = @rkppl begin
+        mu[1:3] .~ Normal.(0, 5)
+        z[axes(y, 1)] .~ Categorical.(ws)
+        y .~ Normal.(mu[z], 1.0)
+    end
+    plan5 = model5(; ws) | (; y = y5)
+    built5 = build_kernel(plan5)
+    q5 = prepare_query(built5, plan5, :sampler)
+    for z in ([1, 3, 1], [2, 2, 1])
+        u5 = unconstrain(built5.layout, (; mu, z))
+        @test q5(u5, (; z)) ≈ sum(logpdf.(Normal(0, 5), mu)) +
+            sum(log(ws[i][z[i]]) for i in 1:3) + sum(logpdf.(Normal.(mu[z], 1.0), y5))
+    end
+    d5 = (; z = [1, 1, 1])
+    u5 = unconstrain(built5.layout, (; mu, z = d5.z))
+    sampler5 = prepare_sampler(built5, plan5, u5; backend=BACKEND, discrete=d5)
+    g5 = zeros(3)
+    sampler_value_and_gradient!(sampler5, g5, u5)
+    @test g5 ≈ [(q5(u5 .+ 1e-6 .* (1:3 .== j), d5) - q5(u5 .- 1e-6 .* (1:3 .== j), d5)) / 2e-6
+        for j in 1:3] rtol=1e-6
+    block5 = only(prepare_gibbs(built5, plan5, u5; discrete=d5, backend=BACKEND).integers)
+    @test block5.elementwise
+    @test block5.support(u5, d5) == [1:2, 1:3, 1:1]
+    candidates5, L5 = PPL._gibbs_elementwise_logweights(block5, u5, d5)
+    for i in 1:3
+        exact = [k <= length(ws[i]) ? ws[i][k] * pdf(Normal(mu[k], 1.0), y5[i]) : 0.0
+            for k in candidates5]
+        @test PPL._gibbs_weights(L5[i, :]) ≈ exact ./ sum(exact) rtol=1e-12
+    end
+    err = try build_kernel(model5(; ws = ws[1:2]) | (; y = y5)); nothing catch e; e end
+    @test err isa PPL.ContractValidationError
+    @test occursin("3 elements but its prior arg1 has 2", sprint(showerror, err))
+
+    # A two-axis array keeps each element's own support in its shape.
+    N = [1 3; 2 0]
+    model6 = @rkppl begin
+        k[1:2, 1:2] .~ Binomial.(N, 0.5)
+        y .~ Normal.(vec(k), 1.0)
+    end
+    plan6 = model6(; N) | (; y = [0.4, 1.5, 2.2, 0.0])
+    built6 = build_kernel(plan6)
+    d6 = (; k = zeros(Int, 2, 2))
+    problem6 = prepare_gibbs(built6, plan6, Float64[]; discrete=d6)
+    block6 = only(problem6.integers)
+    @test block6.support(Float64[], d6) == reshape([0:1, 0:2, 0:3, 0:0], 2, 2)
+    draws6 = gibbs_draws(initialize_gibbs(Xoshiro(4), problem6, Float64[]; discrete=d6), 500)
+    @test all(x -> size(x.k) == (2, 2) && all(0 .<= x.k .<= N), draws6.discrete)
+    @test any(x -> x.k[1, 2] == 3, draws6.discrete)
 end
 
 end
