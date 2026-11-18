@@ -28,8 +28,9 @@ without editing the model's text, before binding:
     end)
 
 A definition that only cells read leaves the sampler's program and the
-`jax_source` module unchanged, so it costs the density and its gradient
-nothing. Named values' numerical work and derivatives stay in the graph, and
+`jax_source` module unchanged, so it adds nothing to the model's own density
+and gradient; the reparametrized problem evaluates it with the map, as below.
+Named values' numerical work and derivatives stay in the graph, and
 their arrays are only read. One joint kernel
 computes all selected endpoints, sharing their common graph work across cells
 and both affine roles. WarmupHMC 0.2.21
@@ -68,9 +69,17 @@ Recurrences marked with [`markov_chains`](@ref) get their WarmupHMC
 coefficients, drift and step size may not read a cell's latent, and no cell's
 location or log-scale may read a chain's states.
 
+Each chain has a frame kernel of its own, which computes its per-state
+coefficients, drift and log step SDs in one pass, linear in the chain's
+length. WarmupHMC reads a chain's four accessors (log step SD, coefficient,
+drift and initial location) one at a time, so a map, inverse or gradient
+evaluates the frame kernel four times once warm-up has moved the chain off
+the model as written; at its starting controls it is not evaluated.
+
 Construction evaluates each named value once to check its shape, using `u0`
-(default zeros) as a model-coordinate exemplar. The joint execution kernel
-is independent of the number of latent coordinates.
+(default zeros) as a model-coordinate exemplar. The code of the joint kernel
+and of a chain's frame kernel does not grow with the number of latent
+coordinates.
 """
 function adaptive_centering_problem end
 
@@ -115,9 +124,17 @@ _centering_values(value::Real) = Float64[value]
 _centering_values(value::Array{Float64}) = vec(value)
 _centering_values(value::AbstractArray{<:Real}) = collect(Float64, vec(value))
 # A recurrence per `@plate` index records one vector per index; its chain reads
-# them concatenated in plate order.
-_centering_values(value::AbstractVector{<:AbstractVector{<:Real}}) =
-    Float64[v for entry in value for v in entry]
+# them concatenated in plate order. The output is sized before it is written:
+# a comprehension over a nested generator has no length, so it grows by
+# `push!`, and reverse AD then records every reallocation.
+function _centering_values(value::AbstractVector{<:AbstractVector{<:Real}})
+    out = Vector{Float64}(undef, sum(length, value; init = 0))
+    k = 0
+    for entry in value, v in entry
+        out[k += 1] = v
+    end
+    out
+end
 _centering_frame(values...) =
     _CenteringFrame(map(_centering_values, values))
 
@@ -250,9 +267,9 @@ function _centering_cells(built, plan::StructuralPlan, cells::NamedTuple;
     sort!(records; by = cell -> (cell.stage, cell.offset))
     kernel = isempty(kernel_names) ? nothing :
         _centering_kernel(built, plan, Tuple(kernel_names); on_error)
-    chains, chain_kernel = _centering_chains(built, plan, layout, entries, exemplar,
+    chains = _centering_chains(built, plan, layout, entries, exemplar,
         selected, selected_ids, cells; on_error)
-    (; kernel, records, chains, chain_kernel, dimension = layout.total)
+    (; kernel, records, chains, dimension = layout.total)
 end
 
 # The recurrences `markov_chains` marked, sorted by name: those whose
@@ -272,15 +289,17 @@ function _centering_chain_names(spec)
 end
 
 # One record per marked recurrence: its states in time order (each `@plate`
-# index's in plate order) and the kernel families of its coefficient, drift
-# and log step SD. The frame reads only coordinates no chain or cell
-# transforms, and no cell's endpoint reads a chain's states.
+# index's in plate order) and its own frame kernel, whose families 1 to 3 are
+# its coefficient, drift and log step SD. A kernel per chain computes only that
+# chain's frame, so K chains cost the sum of their frames, not K times it.
+# The frame reads only coordinates no chain or cell transforms, and no cell's
+# endpoint reads a chain's states.
 function _centering_chains(built, plan, layout, entries, exemplar, selected,
         selected_ids, cells; on_error)
     RK = ReactiveKernels
     graph = built.spec.graph
     names = _centering_chain_names(built.spec)
-    isempty(names) && return NamedTuple[], nothing
+    isempty(names) && return NamedTuple[]
     records = NamedTuple[]
     frame_names = Symbol[]
     state_entries = Symbol[]
@@ -324,10 +343,8 @@ function _centering_chains(built, plan, layout, entries, exemplar, selected,
                 "holds the states of Markov chain `$x`; a chain's states take no cell"))
         end
         append!(state_entries, used)
-        start = length(frame_names)
         append!(frame_names, frames)
-        push!(records, (; name = x, states, coef = start + 1, drift = start + 2,
-            log_scale = start + 3))
+        push!(records, (; name = x, states, frames))
     end
     # Accessors read the source vector. A chain's frame reading transformed
     # coordinates, or a cell's endpoint reading a chain's states, would read
@@ -350,8 +367,9 @@ function _centering_chains(built, plan, layout, entries, exemplar, selected,
                     "may not read a chain's states"))
         end
     end
-    kernel = _centering_kernel(built, plan, Tuple(frame_names); on_error)
-    records, kernel
+    [(; record.name, record.states, coef = 1, drift = 2, log_scale = 3,
+        kernel = _centering_kernel(built, plan, record.frames; on_error))
+        for record in records]
 end
 
 # A cell reading no selected latent is on level 1; a cell reading cells of

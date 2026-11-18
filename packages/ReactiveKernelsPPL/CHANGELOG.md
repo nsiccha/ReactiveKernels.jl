@@ -16,6 +16,24 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.217
+
+- A Markov chain from `markov_chains` costs its reparametrized gradient a pass
+  linear in its length, where it grew faster. The frame of a recurrence per
+  `@plate` index (each index's coefficients, drift and log step SDs) is now
+  concatenated into a vector sized before it is written. Before, it grew
+  element by element, and Enzyme's reverse pass recorded every reallocation.
+  On a per-group walk moved off the model as written (`phi = c = 0.5`), one
+  gradient of the `adaptive_centering_problem` takes 0.46 ms and 1.7 MiB at
+  3 × 623 states and 2.2 ms at 12 × 790, down from 5.9 ms and 9.8 MiB and
+  35 ms; a hand-built `MarkovChain` reading the coordinates directly takes
+  0.21 ms and 0.23 MiB, and 0.60 ms.
+- Each marked chain has a frame kernel of its own, so K chains cost the sum of
+  their frames per map instead of K times it.
+- WarmupHMC reads a chain's four accessors one at a time, so a map or gradient
+  still evaluates the chain's frame four times; `?adaptive_centering_problem`
+  now says so.
+
 ## 0.1.216
 
 - `jax_source(built, plan)` translates in Julia's latest world, as
