@@ -194,7 +194,7 @@ end
         :(_ppl_int_q::Float64 = log(q + 2.0) - log(3.0 - q)),
     ]
     @test jacobian_term(ientry) ==
-        :(log(5.0) - log1pexp(-unconstrained[3]) - log1pexp(unconstrained[3]))
+        :(log(5.0) + (-abs(unconstrained[3]) - 2 * log1pexp(-abs(unconstrained[3]))))
     # A literal zero bound contributes nothing to an edge: a zero lower end
     # drops out of the interval, a zero floor is `exp(u)` itself, a zero
     # ceiling negates, and a unit width has no `log(1.0)` term.
@@ -205,14 +205,14 @@ end
         :(_ppl_int_q::Float64 = log(q) - log(0.5 - q)),
     ]
     @test jacobian_term(zentry) ==
-        :(log(0.5) - log1pexp(-unconstrained[3]) - log1pexp(unconstrained[3]))
+        :(log(0.5) + (-abs(unconstrained[3]) - 2 * log1pexp(-abs(unconstrained[3]))))
     uentry01 = LayoutEntry(:sampled, nothing, :q, [:q], 3, 1, :interval, -1.0, 0.0)
     @test transform_statements(uentry01)[2:3] == Expr[
         :(q::Float64 = rk_affine_logistic(-1.0, 0.0, _ppl_int_q)),
         :(_ppl_int_q::Float64 = log(q + 1.0) - log(-q)),
     ]
     @test jacobian_term(uentry01) ==
-        :(0.0 - log1pexp(-unconstrained[3]) - log1pexp(unconstrained[3]))
+        :(0.0 + (-abs(unconstrained[3]) - 2 * log1pexp(-abs(unconstrained[3]))))
     fentry = LayoutEntry(:sampled, nothing, :s, [:s], 2, 1, :floored, 0.0, NaN)
     @test transform_statements(fentry) == Expr[
         :(_ppl_fl_s::Float64 = unconstrained[2]),
@@ -231,8 +231,8 @@ end
         :(_ppl_int_d::AbstractVector{Float64} = log.(d) .- log.(0.5 .- d)),
     ]
     @test jacobian_term(pentry) ==
-        :(sum(log(0.5) .- log1pexp.(-view(unconstrained, 1:2)) .-
-            log1pexp.(view(unconstrained, 1:2))))
+        :(sum(log(0.5) .+ (.-abs.(view(unconstrained, 1:2)) .-
+            2 .* log1pexp.(.-abs.(view(unconstrained, 1:2))))))
     # A sampled bound stays as authored.
     dentry = LayoutEntry(:sampled, nothing, :w, [:w], 2, 1, :interval, 0.0, :w_hi)
     @test transform_statements(dentry)[2:3] == Expr[
@@ -240,7 +240,7 @@ end
         :(_ppl_int_w::Float64 = log(w) - log(w_hi - w)),
     ]
     @test jacobian_term(dentry) ==
-        :(log(w_hi) - log1pexp(-unconstrained[2]) - log1pexp(unconstrained[2]))
+        :(log(w_hi) + (-abs(unconstrained[2]) - 2 * log1pexp(-abs(unconstrained[2]))))
     # Upper transform: parameterized ceiling ⇒ hand-rolled forward/inverse
     # edges; the Jacobian is the bare unconstrained coordinate (Stan kernel).
     centry = LayoutEntry(:sampled, nothing, :c, [:c], 4, 1, :upper, NaN, bhi)

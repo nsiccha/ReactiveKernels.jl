@@ -72,6 +72,17 @@ end
     @test RK._sample_label([frame("jl_gc_collect", "gc.c"), frame("f", "x.jl")]) ==
         "(garbage collection)"
     @test RK._sample_label([frame("f", "x.jl")]) == "(outside generated code)"
+    # A program compiled for a recipe (a rule's `q = exp(-abs(x))`) runs in
+    # the statement that calls the rule: its program scope defers to it.
+    @test RK._sample_label([frame("exp", "special/exp.jl"),
+                            frame("macro expansion", "./rk:(other statements)"),
+                            frame("rule", "derivative_rules.jl"),
+                            frame("macro expansion", "./rk:plate_value"),
+                            frame("macro expansion", "./rk:(other statements)")]) == "plate_value"
+    # With no statement around it, a program scope still takes the sample.
+    @test RK._sample_label([frame("exp", "special/exp.jl"),
+                            frame("macro expansion", "./rk:(other statements)"),
+                            frame("f", "x.jl")]) == "(other statements)"
 end
 
 @testset "samples spent managing memory, collecting and in called functions" begin
@@ -206,4 +217,39 @@ end
     @test isempty(gated.parts)
     @test occursin("not profiled", sprint(show, MIME"text/plain"(), gated))
     @test_throws ArgumentError ad_cost_profile(ad, theta, x, y; seconds = 0)
+end
+
+# A scalar rule whose recipes are expressions: RK compiles each recipe's
+# expression into its own program, with its own program scope.
+@kernel cost_profiled_softplus_graph(x::Float64) = begin
+    q::Float64 = exp(-abs(x))
+    value::Float64 = max(x, 0.0) + log1p(q)
+    partial::Float64 = ifelse(x >= 0, 1.0, q) / (1 + q)
+    return value, partial
+end
+const cost_profiled_softplus = scalar_derivative_rule(cost_profiled_softplus_graph;
+    primal = :value, partials = (x = :partial,), name = :cost_profiled_softplus)
+
+@testset "ad_cost_profile books a rule's recipe programs on the statement calling it" begin
+    spec = @kernel cost_profiled_rule(theta, x) = begin
+        eta = theta[1] .* x
+        @plate for i in eachindex(eta)
+            term[i] = 0.0 - cost_profiled_softplus(eta[i])
+        end
+        total = sum(term)
+    end
+    x = [sin(0.37i) for i in 1:20_000]
+    theta = [1.5]
+    k = prepare(spec; have = (:theta, :x), want = :total)
+    ad = prepare_ad(k, AutoEnzyme(; mode = Enzyme.Reverse), theta, x; active = :theta)
+    p = ad_cost_profile(ad, theta, x; seconds = 0.5)
+    @test p.profiled
+    @test sum(part.primal_seconds for part in p.parts) ≈ p.primal_seconds
+    # The rule's exp and log1p, in its recipes' own programs, are the plate
+    # statement's time, not `(other statements)`.
+    other = filter(part -> part.name == "(other statements)", p.parts)
+    @test sum(part.primal_seconds for part in other; init = 0.0) < 0.3 * p.primal_seconds
+    top = argmax(part -> part.primal_seconds, p.parts)
+    @test startswith(top.name, "plate")
+    @test top.primal_seconds > 0.5 * p.primal_seconds
 end

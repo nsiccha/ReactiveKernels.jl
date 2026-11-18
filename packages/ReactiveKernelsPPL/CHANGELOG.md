@@ -16,6 +16,73 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.222
+
+- `marginalize(model, :z)` sums out an integer array: a declaration
+  `z[axes(y, 1)] .~ Categorical(w)` (or `Binomial.(n, p)`, `Bernoulli`,
+  `DiscreteUniform`, restricted) or the integers of a `@plate` loop,
+  `z[i] ~ Categorical(w)`. When every density term that reads `z` sums cells
+  that each read it only at their own element (the condition under which
+  `prepare_gibbs` draws all elements at once), the density holds
+  `Σ_i logsumexp_s (log p(z_i = s) + log p(y_i | z_i = s))`, computed with
+  one evaluation of those cells per support value, so its cost is linear in
+  the number of elements and in the support size. The guide's mixture
+  spelling now matches the components written out as
+  `MixtureModel.(vcat.(…), Ref(w))` in density and Enzyme gradient. Elements
+  may have their own supports, scalars may be summed out beside the array,
+  and a submodel's array is named by its author path (`Symbol("c.z")`).
+  `:pointwise` holds each element's predictive factors (sequential in field
+  order when several responses read it). `prepare_discrete_latents` returns
+  each element's posterior under `parameters.elements.z` (`values`, and
+  `probabilities` with one row per element; given each joint state of
+  summed-out scalars on a trailing axis), and `discrete_latent_draws` returns
+  the drawn array as `parameters.z`. A term coupling elements (`sum(z)`, a
+  recurrence) is refused with an `ArgumentError` naming it. `jax_source` and
+  `prepare_predictive` refuse such a model by name for now (native only).
+  Before, every integer array was refused with a misleading `@scan` error.
+
+## 0.1.221
+
+- The log-Jacobian of every logistic-based transform (unit, interval, and an
+  element bounded on both sides) is `log(hi - lo) - abs(u) - 2 *
+  log1pexp(-abs(u))`, where it was `log(hi - lo) - log1pexp(-u) -
+  log1pexp(u)`. The two are equal. The new form, which Stan and Wren use, needs
+  one `log1pexp` per coordinate instead of two, in the log density and in its
+  gradient, and is within 0.42 ulp of a 256-bit oracle (1.2 ulp before).
+  Generated programs (`kernel_expr`) show the new expression.
+- On the PosteriorDB UKDrivers port (a level `@scan` of 192 interval-bounded
+  states; Julia 1.13.1, registered Enzyme 0.13.221, one CPU of a loaded host)
+  the prepared sampler's log density takes 2.3 µs and its gradient 6.6–6.9 µs,
+  down from 3.8 µs and 12.5–13.1 µs, with ReactiveKernels 0.1.318's
+  affine-logistic slopes. The log density at the benchmark point is
+  unchanged to the bit, and the gradient agrees to 4e-14 relative (snag
+  `ukdrivers-log1pe-1df47969`).
+
+## 0.1.220
+
+- A coordinate of a vector parameter in `prepare_coordinate_conditional` now
+  reads a likelihood plate only at the rows that read that element, so its
+  cost no longer grows with the number of elements:
+  - a plate with one cell per element, as
+    `@plate for j in eachindex(y); y[j] .~ Normal.(theta[j], 1); end` writes it,
+    is read at the moved element's cell, as the vector's prior already was;
+  - a plate reading the vector through a bound integer index vector, as
+    `y .~ Normal.(theta[g], 1)` does, is read only at the rows whose index is
+    the moved element's, through RK's `plate_partition`. An element no row
+    reads has none.
+- The rows of each element and their bookkeeping are computed once per
+  element when the conditional is prepared, which takes memory linear in the
+  data. Values are unchanged; a plate the conditional cannot read this way is
+  still evaluated whole, as before.
+- Measured (one thread, single-site random-walk MH, two conditional
+  evaluations per step, J groups of 10 rows, median per step at J = 10, 100
+  and 1,000 on a loaded host): the `theta[g]` spelling took 0.20, 0.48 and
+  3.97 µs and now takes 0.28, 0.29 and 0.40 µs (288 bytes per step); the
+  per-group `@plate` spelling took 0.30, 1.78 and 17.1 µs and now takes 0.18,
+  0.18 and 0.20 µs (no allocation).
+- `CoordinateBlock` (internal) names the plates read at the moved element's
+  rows: `cells` (one cell per element) and `parts` (gathered).
+
 ## 0.1.219
 
 - With WarmupHMC 0.3.11 or later, a Markov chain from `markov_chains` runs its

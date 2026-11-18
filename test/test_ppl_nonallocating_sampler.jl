@@ -66,7 +66,7 @@ _na_affine = @rkppl begin
 end
 
 # An interval-bounded coefficient vector: its log-Jacobian broadcasts over the
-# negated unconstrained values, `log1pexp.(-u)`.
+# negated absolute unconstrained values, `log1pexp.(.-abs.(u))`.
 _na_bounded = @rkppl begin
     alpha ~ Normal(0, 10)
     beta[axes(X, 2)] .~ Uniform.(-5, 5)

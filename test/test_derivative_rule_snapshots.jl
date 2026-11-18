@@ -1,5 +1,6 @@
 module DerivativeRuleSnapshotTests
 using ReactiveKernels, Test
+using InteractiveUtils: code_llvm
 using ReactiveKernels: stage_primal, stage_residuals
 import Enzyme
 
@@ -136,13 +137,10 @@ end
     saved = @inferred r((1,), (nested,), 1.0, (false,false))
     @test saved[1] !== nested
     @test only(saved[1]) !== a
-    # Audit the owned specialization directly as well as its caller. A Base
-    # boundary must not hide nonconcrete code introduced by this prototype.
-    env = ext._DerivativeResidualEnvironment(tape, (1,-1,-1),
-        (false,false), true)
-    findings = ReactiveKernels._level_code_findings(:all, Base.deepcopy_internal,
-        (typeof(env), IdDict{Any,Any}))
-    println("OWNED_SNAPSHOT_HOOK_AUDIT ", findings)
+    # Audit the generated snapshot directly as well as its caller.
+    findings = ReactiveKernels._level_code_findings(:all, ext._snapshot_residuals,
+        (Tuple{Int,Int,Int}, typeof(tape), Tuple{Bool,Bool}, Val{true}))
+    println("OWNED_SNAPSHOT_AUDIT ", findings)
     @test isempty(findings)
     record = Record(a)
     for value in (view(a,:), (a,), (;data=a), record,
@@ -214,6 +212,59 @@ end
     @test isempty(ReactiveKernels._level_code_findings(:all, retain,
         (Tuple{Int,Int}, Tuple{Vector{Float64},Vector{Float64}},
          Vector{Float64}, Tuple{Bool,Bool})))
+end
+
+# The snapshot is concretely typed code (snag `rkppl-ark-dogfoo-72035cd9`).
+# Base's `deepcopy(@nospecialize x)` compiled to a boxed call, a `jl_invoke`
+# in the derivative Enzyme compiles where it emits the rule into it, which the
+# check of that derivative refuses at `type_stability_level = :all`, also on a
+# path the program never takes. Mutable containers keep `deepcopy`, whose memo
+# follows their identity. (Whether Enzyme emits a rule into the derivative or
+# calls it natively depends on Julia's inlining of the rule, so these tests
+# read the compiled code itself; RKPPL's `test_glm_object_values.jl` checks a
+# derivative the report sees.)
+function retention_llvm(f, types)
+    io = IOBuffer()
+    code_llvm(io, f, types; debuginfo = :none)
+    String(take!(io))
+end
+function no_dispatch(code)
+    !occursin("deepcopy", code) && !occursin("jl_invoke", code) &&
+        !occursin("jl_apply_generic", code)
+end
+
+@testset "residual snapshots compile without deepcopy" begin
+    ext = Base.get_extension(ReactiveKernels, :ReactiveKernelsEnzymeExt)
+    retain = ext._retain_residuals
+    a, b = [1.0, 2.0], [3.0, 4.0, 5.0]
+    # Flat with a borrowed and a copied input; nested containers; a mutable
+    # result other than a dense array.
+    for (tape, sources, primal, flags, borrow) in (
+            ((a, b, 1.5), (1, 2, -1), 0.0, (false, false, true), true),
+            ((a, view(a, :), (b,)), (1, -1, -1), 0.0, (false, false), false),
+            (((; data = a), Record(b)), (-1, -1), view(b, :), (false,), false))
+        types = Tuple{typeof(sources), typeof(tape), typeof(primal), typeof(flags)}
+        @test no_dispatch(retention_llvm(retain, types))
+        @test no_dispatch(retention_llvm(ext._snapshot_residuals,
+            Tuple{typeof(tape), typeof(sources), typeof(flags), Val{borrow}}))
+        @test only(Base.return_types(retain, types)) === typeof(tape)
+    end
+    # Residuals the rule's graph does not infer (a type as its callable's
+    # field, as `Record` in the first testset) reach the snapshot through a
+    # run-time call. Retention keeps their inferred type, which Enzyme's reverse
+    # needs: it compiles the reverse for the tape type inferred here, and
+    # `stage_reverse` of residuals of unknown length infers as throwing.
+    for (tape, sources) in ((Tuple{Any}, Tuple{Int}), (Tuple{Any,Float64}, Tuple{Int,Int}))
+        for (primal, flags) in ((Float64, Tuple{Bool,Bool}), (SubArray, Tuple{Bool}))
+            @test only(Base.return_types(retain, Tuple{sources, tape, primal, flags})) <: tape
+        end
+    end
+    # Positive control: a mutable container keeps Base's `deepcopy`.
+    tape = (MutableRecord(a), b)
+    @test occursin("deepcopy", retention_llvm(ext._snapshot_residuals,
+        Tuple{typeof(tape), Tuple{Int,Int}, Tuple{Bool}, Val{false}}))
+    saved = retain((-1, -1), tape, 0.0, (false,))
+    @test saved[1] !== tape[1] && saved[1].data == a && saved[1].data !== a
 end
 
 module BorrowedMutationChecks

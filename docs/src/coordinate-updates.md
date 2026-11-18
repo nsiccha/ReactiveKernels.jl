@@ -72,8 +72,15 @@ coordinate. A sweep typically costs a few evaluations per coordinate.
   coordinates read whole, as an unconstrained vector parameter is, and `A` does
   not depend on any coordinate.
 - A coordinate of such a vector evaluates only the terms that read the vector.
-  A term summing a plate over the vector's cells, such as its prior or its
-  Jacobian, is read at the moved coordinate's cell alone.
+  A term summing a plate over the vector's cells is read at the moved
+  coordinate's cell alone: the vector's prior, its Jacobian, or a likelihood
+  with one plate cell per element, as in
+  `@plate for j in eachindex(y); y[j] .~ Normal.(theta[j], 1); end`.
+- A term summing a plate that reads the vector through a bound index vector,
+  as `y .~ Normal.(theta[g], 1)` does with group labels `g`, is read only at
+  the rows whose index is the moved coordinate's. A group with no rows reads
+  none. So a coordinate of a group-level vector costs about its own group's
+  rows, whatever the number of groups.
 - Every other coordinate, a shared scale for example, evaluates all terms that
   read any coordinate.
 

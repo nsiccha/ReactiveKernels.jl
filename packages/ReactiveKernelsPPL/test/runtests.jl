@@ -21,6 +21,7 @@ const _PPL_TEST_FILES = (
     "test_gibbs.jl",
     "test_gibbs_coordinates.jl",
     "test_gibbs_slice.jl",
+    "test_integer_array_marginal.jl",
     "test_parameter_metadata.jl",
     "test_host_transform_numbers.jl",
     "test_preprocessing.jl",

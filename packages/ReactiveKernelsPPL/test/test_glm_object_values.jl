@@ -482,3 +482,34 @@ end
     built = _gv_check(plan, (; g, y), nt -> sum(logpdf.(Normal.(nt.z[g], nt.sigma), y)))
     @test !occursin("normal_id_glm_lpdf", sprint(print, kernel_expr(plan, built.layout)))
 end
+
+# The NormalIDGLM rule retains a flat residual tuple. Its derivative passes the
+# check of the compiled derivative at `type_stability = :error` (snag
+# `rkppl-ark-dogfoo-72035cd9`: RK's residual snapshot reached Base's `deepcopy`
+# through a boxed call, refused although this program never takes that path).
+# The check reads Enzyme's dogfood repair `derivative_report`.
+const _GV_DERIVATIVE_REPORT = isdefined(Enzyme, :derivative_report) &&
+    isdefined(Enzyme, :has_dogfood_repair) && Enzyme.has_dogfood_repair(:derivative_report)
+_GV_DERIVATIVE_REPORT && @testset "an AR(K) NormalIDGLM passes the derivative check" begin
+    n = 7
+    lags, y = _gv_X(n), _gv_y(n)
+    m = @rkppl begin
+        alpha ~ Normal(0, 10)
+        beta[axes(lags, 2)] .~ Normal.(0, 10)
+        sigma ~ HalfCauchy(2.5)
+        y ~ NormalIDGLM(lags, alpha, beta, sigma)
+    end
+    plan = m(; lags) | (; y)
+    built = build_kernel(plan)
+    u = _gv_u(built)
+    for nonallocating in (:auto, false)
+        q = ReactiveKernels._with_type_stability(:error, :all) do
+            prepare_sampler(built, plan, u; backend = _GV_BACKEND, nonallocating)
+        end
+        @test isempty(ReactiveKernels.ad_derivative_report(q.ad, u).unstable)
+        g = similar(u)
+        value, _ = sampler_value_and_gradient!(q, g, u)
+        @test value ≈ q(u)
+        @test g ≈ _gv_fd(v -> q(v), u) rtol = 1e-5 atol = 1e-6
+    end
+end

@@ -35,6 +35,17 @@ end
     @test derivative_cut(f,(true,),-Inf)==(0.0,0.0)
     @test derivative_cut(f,(true,),Inf)==(Inf,1.0)
     @test all(isnan,derivative_cut(f,(true,),NaN))
+    @test isnan(f(NaN)) && f(Inf)==Inf && f(-Inf)==0.0
+
+    # The primal call plans the one value-only recipe, whose tail shortcuts
+    # (`x` above 34, `exp(x)` below -37) return the joint recipe's bits.
+    @test length(typeof(f).parameters[4][2])==1
+    @test f(40.0)===40.0 && f(-40.0)===exp(-40.0)
+    for x in (34.0,prevfloat(34.0),nextfloat(34.0),-37.0,prevfloat(-37.0),
+            nextfloat(-37.0),-745.2,-746.0,1e300,-1e300,
+            range(-800.0,800.0;length=40_001)...)
+        @test f(x)===derivative_cut(f,(true,),x)[1]
+    end
 
     backend=AutoEnzyme(;mode=Enzyme.Reverse)
     for nonallocating in (false,true), enabled in (false,true)

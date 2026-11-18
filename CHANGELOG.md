@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.317
+## 0.1.320
 
 - A compiled reactive state invalidates per element where it can. With an
   index, `touch!(state, x, index)` and `mutate!(f, state, x, index)` say that
@@ -51,6 +51,46 @@ are recorded in the git history only.
     3.3–3.5 s cold and 1.0 s for a second program, as on 0.1.316; the first
     move that names elements prepares the one-cell kernel (about 4 s cold,
     1 s warm).
+## 0.1.319
+
+- A derivative rule that retains arrays for its reverse pass (a
+  `derivative_rule`, and RK's own rules such as the one behind RKPPL's
+  `NormalIDGLM`) no longer makes the check of the derivative native Enzyme
+  compiles refuse the gradient under `type_stability = :error` at
+  `type_stability_level = :all`. Retention snapshots those arrays with
+  concretely typed code instead of Base's `deepcopy`, whose
+  `@nospecialize` argument compiled to a boxed `jl_invoke` that the check
+  counts as run-time dispatch, even where a program never takes that path
+  (snag `rkppl-ark-dogfoo-72035cd9`: an AR(K) regression through
+  `NormalIDGLM`). What is retained, borrowed or copied is unchanged.
+  Residuals that hold a mutable container other than a dense array of bits
+  values (a mutable struct, an array of arrays) still take `deepcopy`, which
+  the check reports where Enzyme compiles the rule into the derivative.
+
+## 0.1.318
+
+- `rk_affine_logistic`'s derivative rule computes both sigmoid slopes, σ(u)
+  and σ(-u), from one `exp(-abs(u))`. It evaluated `exp(-log1pexp(-u))` and
+  `exp(-log1pexp(u))`, two `log1pexp` and two `exp` in every gradient call.
+  The primal is unchanged. Both slopes are within 1.1 ulp of a 256-bit oracle
+  (up to 6 ulp before), and a tail slope such as σ(-40) stays representable.
+  Together with ReactiveKernelsPPL 0.1.221 this halves the gradient of an
+  interval-bounded `@scan` (snag `ukdrivers-log1pe-1df47969`; numbers in that
+  package's changelog).
+
+## 0.1.317
+
+- A primal-only `rk_log1pexp(x)` (a value without a derivative, such as a
+  Bernoulli-logit density's value) skips work in both tails: it returns `x`
+  for `x >= 34` without an `exp`, and `exp(x)` for `x < -37` without a
+  `log1p`. The values are the same Float64 bits as before. A derivative still
+  runs the joint value/partial recipe, unchanged. Logits far from zero, as at
+  a sampler's random initial points, made the value pay one `exp` and one
+  `log1p` per row where `LogExpFunctions.log1pexp` pays at most one `exp`.
+- `ad_cost_profile` counts the time of a program RK compiled for a recipe's
+  expression, such as a scalar derivative rule's `exp(-abs(x))`, towards the
+  statement that calls the rule. Before, it counted it as `(other statements)`,
+  which hid a rule's cost from the statement that called it.
 
 ## 0.1.316
 
