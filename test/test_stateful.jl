@@ -594,3 +594,189 @@ end
     mutate!(v -> (v[1] = 1.5), scan_state, statevalue(scan_program, _reactive_native_scan.xs))
     @test get!(scan_state, lasth) == 4.5
 end
+
+# Element-level invalidation (decision `0opsm1w`): `touch!`/`mutate!` at an
+# index rerun only the cells of a plate that read the changed elements, and a
+# `sum` over the plate takes their difference. A cell counts its evaluations.
+const _CELL_EVALUATIONS = Ref(0)
+_counted_cell(t) = (_CELL_EVALUATIONS[] += 1; t)
+# Reading the cell's own `yj` keeps the call in the cell loop: a call that
+# reads only shared values is hoisted out of it and runs once per plate.
+_counted_cell(t, yj) = (_CELL_EVALUATIONS[] += 1; t)
+
+@kernel _reactive_cells_hier(theta::Vector{Float64}, y::Vector{Vector{Float64}},
+                             mu::Float64, tau::Float64) = begin
+    dens::Vector{Float64} = plate(theta, y) do t, yj
+        s::Float64 = _counted_cell(t)
+        v::Float64 = -0.5 * ((s - mu) / tau)^2 - log(tau) -
+            0.5 * sum(x -> abs2(x - s), yj)
+        v
+    end
+    total::Float64 = sum(dens)
+    return total
+end
+
+# A plate that reads theta whole (captured, so shared by every cell); its
+# cells read `y` at their own position.
+@kernel _reactive_cells_shared(theta::Vector{Float64}, y::Vector{Vector{Float64}},
+                               mu::Float64, tau::Float64) = begin
+    dens::Vector{Float64} = plate(y) do yj
+        s::Float64 = _counted_cell(theta[1], yj)
+        v::Float64 = -0.5 * ((s - mu) / tau)^2 - 0.5 * sum(x -> abs2(x - s), yj)
+        v
+    end
+    total::Float64 = sum(dens)
+    return total
+end
+
+function _cells_reference(theta, y, mu, tau)
+    dens = [-0.5 * ((theta[j] - mu) / tau)^2 - log(tau) -
+            0.5 * sum(x -> abs2(x - theta[j]), y[j]) for j in eachindex(theta)]
+    dens, sum(dens)
+end
+
+function _cells_move_allocations(state, th, totalh, j, v)
+    mutate!(t -> (t[j] = v), state, th, j)
+    get!(state, totalh)
+    @allocated begin
+        mutate!(t -> (t[j] = v + 1), state, th, j)
+        get!(state, totalh)
+    end
+end
+
+@testset "compiled reactive state: element-level invalidation of plate cells" begin
+    spec = _reactive_cells_hier
+    have = (:theta, :y, :mu, :tau)
+    program = prepare_reactive(spec; have, want = (:dens, :total))
+    @test length(program.cells) == 1
+    whole = prepare(spec; have, want = :dens)
+    J = 40
+    y = [collect(range(-1.0, 1.0; length = 5)) .+ 0.1j for j in 1:J]
+    theta = [0.1j for j in 1:J]
+    mu, tau = 0.3, 1.4
+    state = program(copy(theta), y, mu, tau)
+    th, muh = statevalue(program, spec.theta), statevalue(program, spec.mu)
+    densh, totalh = statevalue(program, spec.dens), statevalue(program, spec.total)
+    _CELL_EVALUATIONS[] = 0
+    @test get!(state, totalh) ≈ last(_cells_reference(theta, y, mu, tau))
+    @test _CELL_EVALUATIONS[] == J
+
+    # One changed element reruns its one cell; the total reruns none.
+    for (step, j) in enumerate((3, 17, 3, 40, 1))
+        v = 0.25 * step - 0.5
+        _CELL_EVALUATIONS[] = 0
+        mutate!(t -> (t[j] = v), state, th, j)
+        theta[j] = v
+        @test get!(state, totalh) ≈ last(_cells_reference(theta, y, mu, tau)) rtol = 1e-14
+        @test _CELL_EVALUATIONS[] == 1
+    end
+    # The plate equals a whole recomputation bit for bit.
+    @test get!(state, densh) == whole(theta, y, mu, tau)
+    # A changed shared value reruns every cell.
+    _CELL_EVALUATIONS[] = 0
+    mu = 0.7
+    set!(state, muh, mu)
+    @test get!(state, totalh) ≈ last(_cells_reference(theta, y, mu, tau))
+    @test _CELL_EVALUATIONS[] == J
+    # Several elements at once, a CartesianIndex, and `touch!` after an
+    # in-place write.
+    _CELL_EVALUATIONS[] = 0
+    mutate!(t -> (t[[2, 5, 9]] .= (1.0, 2.0, 3.0)), state, th, [2, 5, 9])
+    theta[[2, 5, 9]] .= (1.0, 2.0, 3.0)
+    get!(state, th)[CartesianIndex(11)] = -1.0
+    touch!(state, th, CartesianIndex(11))
+    theta[11] = -1.0
+    @test get!(state, totalh) ≈ last(_cells_reference(theta, y, mu, tau)) rtol = 1e-14
+    @test _CELL_EVALUATIONS[] == 4
+    # Without an index every cell reruns, as before.
+    _CELL_EVALUATIONS[] = 0
+    touch!(state, th)
+    get!(state, totalh)
+    @test _CELL_EVALUATIONS[] == J
+
+    # The index is checked before the mutation runs.
+    @test_throws BoundsError mutate!(t -> (t[1] = 99.0), state, th, J + 1)
+    @test get!(state, th)[1] == theta[1]
+    @test_throws ArgumentError touch!(state, muh, 1)
+
+    # A plate value handed out is not overwritten by a later cell change.
+    handed = get!(state, densh)
+    before = copy(handed)
+    mutate!(t -> (t[4] = 5.0), state, th, 4)
+    theta[4] = 5.0
+    @test handed == before
+    @test get!(state, densh) == whole(theta, y, mu, tau)
+
+    # A value installed by `assign!` recomputes from its recipe on a change.
+    ReactiveKernels.assign!(state, totalh, 123.0)
+    @test get!(state, totalh) == 123.0
+    mutate!(t -> (t[6] = 0.5), state, th, 6)
+    theta[6] = 0.5
+    @test get!(state, totalh) ≈ last(_cells_reference(theta, y, mu, tau)) rtol = 1e-14
+    # A frozen plate stays as frozen.
+    freeze!(state, densh)
+    frozen_value = copy(get!(state, densh))
+    mutate!(t -> (t[7] = 0.5), state, th, 7)
+    theta[7] = 0.5
+    @test get!(state, densh) == frozen_value
+    unfreeze!(state, densh)
+    @test get!(state, totalh) ≈ last(_cells_reference(theta, y, mu, tau)) rtol = 1e-14
+
+    # Copies continue independently.
+    other = copy(state)
+    mutate!(t -> (t[8] = -2.0), other, th, 8)
+    @test get!(state, totalh) ≈ last(_cells_reference(theta, y, mu, tau)) rtol = 1e-14
+    moved = copy(theta); moved[8] = -2.0
+    @test get!(other, totalh) ≈ last(_cells_reference(moved, y, mu, tau)) rtol = 1e-14
+    copyto!(state, other)
+    theta = moved
+    mutate!(t -> (t[9] = 1.5), state, th, 9)
+    theta[9] = 1.5
+    @test get!(state, totalh) ≈ last(_cells_reference(theta, y, mu, tau)) rtol = 1e-14
+
+    # Many moves: the compensated total stays within rounding of a whole sum,
+    # and is summed whole again once as many cells changed as the plate has.
+    fresh = program(copy(theta), y, mu, tau)
+    get!(fresh, totalh)
+    updates = fresh.cellstate.updates
+    total_slot = ReactiveKernels._slot_index(totalh)
+    counts = Int[]
+    for step in 1:(3J)
+        j = mod1(7step, J)
+        v = sin(step)
+        _CELL_EVALUATIONS[] = 0
+        mutate!(t -> (t[j] = v), fresh, th, j)
+        theta[j] = v
+        @test _CELL_EVALUATIONS[] == 1
+        @test get!(fresh, totalh) ≈ sum(whole(theta, y, mu, tau)) rtol = 1e-14
+        push!(counts, updates[total_slot])
+    end
+    @test all(<=(J), counts)
+    @test count(==(0), counts) == 2
+    @test get!(fresh, densh) == whole(theta, y, mu, tau)
+
+    # A move with typed ports allocates nothing.
+    @test _cells_move_allocations(fresh, th, totalh, 12, 0.25) == 0
+
+    # A plate reading the array whole reruns every cell when one element
+    # changes; its per-cell argument `y` still takes element-level changes.
+    shared = prepare_reactive(_reactive_cells_shared; have, want = (:total,))
+    sstate = shared(copy(theta), copy(y), mu, tau)
+    stheta = statevalue(shared, _reactive_cells_shared.theta)
+    sy = statevalue(shared, _reactive_cells_shared.y)
+    stotal = statevalue(shared, _reactive_cells_shared.total)
+    swhole = prepare(_reactive_cells_shared; have, want = :total)
+    get!(sstate, stotal)
+    _CELL_EVALUATIONS[] = 0
+    mutate!(t -> (t[1] = 0.0), sstate, stheta, 1)
+    theta[1] = 0.0
+    value = get!(sstate, stotal)
+    @test _CELL_EVALUATIONS[] == J
+    @test value == swhole(theta, y, mu, tau)
+    _CELL_EVALUATIONS[] = 0
+    moved_y = copy(y); moved_y[5] = [0.5]
+    mutate!(ys -> (ys[5] = [0.5]), sstate, sy, 5)
+    value = get!(sstate, stotal)
+    @test _CELL_EVALUATIONS[] == 1
+    @test value ≈ swhole(theta, moved_y, mu, tau) rtol = 1e-14
+end
