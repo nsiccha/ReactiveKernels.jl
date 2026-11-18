@@ -51,6 +51,11 @@ hidden(x) = (SCALE[] * x)::Float64
     return total
 end
 
+@kernel quadratic(q::Vector{Float64}, scale::Float64) = begin
+    total::Float64 = scale * sum(abs2, q) / 2
+    return total
+end
+
 const n = 16
 const x = collect(range(-1, 1; length = n))
 const y = 0.3 .+ 0.7 .* x .+ 0.1 .* sin.(1:n)
@@ -163,12 +168,15 @@ end
     pullback = @test_logs min_level = quiet prepare_ad_pullback(plate_location, backend,
         1.0, args...; want = :total, active = :a, type_stability = :error)
     @test !isempty(ad_derivative_report(pullback, 1.0, args...).derivatives)
+    # Forward over Reverse: the inner derivative is part of the outer one's code.
     second = SecondOrder(AutoEnzyme(; mode = Enzyme.Forward), backend)
-    hvp = @test_logs min_level = quiet prepare_ad_hvp(plate_location, second, (1.0,),
-        args...; want = :total, active = :a, type_stability = :error)
-    report = ad_derivative_report(hvp, (1.0,), args...)
+    q, tangents = [0.3, -1.2, 2.0], ([1.0, 0.5, -0.25],)
+    hvp = @test_logs min_level = quiet prepare_ad_hvp(quadratic, second, tangents,
+        q, 1.7; want = :total, active = :q, type_stability = :error)
+    report = ad_derivative_report(hvp, tangents, q, 1.7)
     @test !isempty(report.derivatives)
     @test isempty(report.unstable)
+    @test only(ad_hvp(hvp, tangents, q, 1.7)) ≈ 1.7 .* only(tangents)
 end
 
 end # HOOK

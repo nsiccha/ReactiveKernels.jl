@@ -50,8 +50,12 @@ ran, with ReactiveKernels' reading of their findings.
 
 `unstable` and `allocations` leave out calls only reached on a path that ends
 in an error (`throw_only`), and calls an expansion of Julia's logging macros
-writes, which the primal check exempts too. Every other call that leaves the
-compiled code
+writes, which the primal check exempts too. `unstable` also leaves out calls in
+code the derivative runs without differentiating it (`sweep === :primal`):
+that is primal code, whose dispatch the primal check covers, and Enzyme marks
+`throw_only` per function, so it does not mark the code of a function that is
+only called on an error path, such as the one building an error message.
+Every other call that leaves the compiled code
 (`:runtime_call`: BLAS, Julia's runtime, separately compiled Julia code) is
 in `derivatives` only.
 """
@@ -71,7 +75,11 @@ _reported_findings(derivative) = something(derivative.findings, ())
 # which dispatches at run time by design and runs only for a record a logger
 # accepts. The primal audit exempts it (`_code_logging`), and so does this one.
 _derivative_logging(finding) = any(finding.frames) do frame
-    frame.func === Symbol("macro expansion") && frame.file in _LOGGING_SOURCES
+    frame.func === Symbol("macro expansion") || return false
+    # Debug info names Base's file `./logging.jl` where its methods say
+    # `logging.jl`.
+    file = chopprefix(String(frame.file), "./")
+    any(source -> file == chopprefix(String(source), "./"), _LOGGING_SOURCES)
 end
 
 function ADDerivativeReport(value, derivatives)
@@ -79,7 +87,8 @@ function ADDerivativeReport(value, derivatives)
     allocations = Pair{Any,Any}[]
     for derivative in derivatives, finding in _reported_findings(derivative)
         (finding.throw_only || _derivative_logging(finding)) && continue
-        finding.kind in _DERIVATIVE_UNSTABLE_KINDS && push!(unstable, derivative => finding)
+        finding.kind in _DERIVATIVE_UNSTABLE_KINDS && finding.sweep !== :primal &&
+            push!(unstable, derivative => finding)
         finding.kind in _DERIVATIVE_ALLOCATION_KINDS &&
             push!(allocations, derivative => finding)
     end

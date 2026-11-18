@@ -2519,8 +2519,10 @@ evaluates the prepared operator once at a copy of the exemplar, compiling it
 as `warm = true` does, and reads Enzyme's report of the derivatives that
 evaluation ran ([`ad_derivative_report`](@ref)). A call the derivative
 dispatches at run time, a call Enzyme differentiates at run time, and a boxed
-value, on a path that returns, are findings of `type_stability`: warned once
-per process, or refused with `type_stability = :error`. `:rk` and `:values`
+value, on a path that returns in the code Enzyme differentiates, are findings
+of `type_stability`: warned once per process, or refused with
+`type_stability = :error`. Code the derivative runs without differentiating it
+is primal code, which the check of the program's own code covers. `:rk` and `:values`
 check the primal only. The derivative's allocations, on Julia's heap or native
 (Enzyme's tape, which `@allocated` does not count), follow `ad_allocations`:
 `:ignore`, the default, only lists them in [`ad_derivative_report`](@ref);

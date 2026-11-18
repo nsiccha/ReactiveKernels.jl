@@ -325,6 +325,19 @@ function report(name, found)
     false
 end
 
+# With Enzyme's dogfood repair `derivative_report`, preparation at the default
+# `type_stability_level = :all` also checks the derivative native Enzyme
+# compiles (snag `rk-ad-pass-type-b179e693`), and the corpus holds it to the
+# same standard: no run-time dispatch on a path that returns.
+const DERIVATIVE_REPORT = isdefined(Enzyme, :derivative_report) &&
+    isdefined(Enzyme, :has_dogfood_repair) && Enzyme.has_dogfood_repair(:derivative_report)
+# Cases whose gradient call native inference types concretely but whose
+# derivative dispatches at run time: Enzyme's own inference of the program,
+# not RK's lowering (Enzyme snag `derivative-dispa-e5e3434f`).
+const DERIVATIVE_GAPS = DERIVATIVE_REPORT ? ("scan child in a lazy arm",) : ()
+const derivative_unstable_warning = (:warn,
+    r"the reverse-mode derivative native Enzyme compiles for the prepared program is not type stable")
+
 @testset "prepared programs are concretely typed" begin
     backend = AutoEnzyme(; mode = Enzyme.Reverse)
     recurse = rk_or_generated(Corpus)
@@ -335,10 +348,18 @@ end
                 @test any(op -> op isa ReactiveKernels._LaneAssemble, kernel.callables)
             @test report("$name (native body)",
                          findings(kernel, map(Core.Typeof, args); recurse))
-            prepared = @test_logs min_level = Base.CoreLogging.Warn prepare_ad(
-                kernel, backend, args...; active)
+            prepared = name in DERIVATIVE_GAPS ?
+                @test_logs(derivative_unstable_warning,
+                           prepare_ad(kernel, backend, args...; active)) :
+                @test_logs(min_level = Base.CoreLogging.Warn,
+                           prepare_ad(kernel, backend, args...; active))
             @test report("$name (gradient call)",
                          ad_call_findings(prepared, args...; recurse))
+            if DERIVATIVE_REPORT
+                unstable = ad_derivative_report(prepared, args...).unstable
+                name in DERIVATIVE_GAPS ? (@test_broken isempty(unstable)) :
+                    @test report("$name (derivative)", unstable)
+            end
         end
     end
 end
