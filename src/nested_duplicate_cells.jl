@@ -160,6 +160,7 @@ function _nested_rows_constant_expr(p::Plan, x, names, mod, argument, lane, ctx,
     x.head === :call || return false
     f = _bound_shape_callee(first(x.args), mod)
     f === fill && return true
+    _bound_shape_scalar_expr(x, names, mod, ctx) && return true
     f === identity && length(x.args) == 2 &&
         return _nested_rows_constant_expr(p, x.args[2], names, mod, argument, lane, ctx,
                                           depth + 1)
@@ -534,6 +535,8 @@ Base.@nospecializeinfer function _nested_cell_group_path(
         total_rows += n
         total_groups += length(first(groups[p]))
     end
+    # No cells, or rows that barely repeat: the plate keeps its own loop.
+    total_rows > 0 || return nothing
     total_groups * _CELL_GROUP_MINIMUM_MULTIPLICITY <= total_rows || return nothing
 
     # The rewrite follows from the plate structure and the key, never from the

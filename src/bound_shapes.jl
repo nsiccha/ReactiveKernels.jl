@@ -196,10 +196,59 @@ function _bound_shape_type(ctx, v::Value, depth = 0)
             err isa InterruptException && rethrow()
             Any
         end
+    if !(T isa Type && isconcretetype(T))
+        # A generated source operation may not infer through its closure; its
+        # readable source over the same input types can.
+        parsed = _bound_shape_source(r)
+        if parsed !== nothing
+            ctx.types[cid] = Any    # no cycle through this value
+            S = _bound_shape_expr_type(parsed.source, parsed.names, parsed.mod, ctx, depth + 1)
+            S isa Type && S !== Union{} && isconcretetype(S) && (T = S)
+        end
+    end
     ctx.types[cid] = T
     T
 end
 _bound_shape_number(ctx, v::Value) = (T = _bound_shape_type(ctx, v); T isa Type && T <: Number)
+
+# The type of expression `x` of a recipe's source over `names`: a name's, a
+# number written in the source, or a call's inferred over its arguments'
+# types (`Any` when unknown).
+function _bound_shape_expr_type(x, names, mod, ctx, depth = 0)
+    depth > 16 && return Any
+    x = _bound_shape_unblock(x)
+    x isa Symbol && haskey(names, x) && return _bound_shape_type(ctx, names[x])
+    x isa Number && return typeof(x)
+    if x isa Symbol
+        c = _bound_shape_callee(x, mod)
+        return c isa Number ? typeof(c) : Any
+    end
+    x isa Expr && x.head in (:call, :ref) || return Any
+    f = x.head === :ref ? getindex : _bound_shape_callee(first(x.args), mod)
+    f isa Function || return Any
+    args = x.head === :ref ? x.args : x.args[2:end]
+    x.head === :ref && any(a -> a isa Symbol && a in (:end, :begin) ||
+                           a isa Expr && _cell_array_has(a, Set((:end, :begin))), args) &&
+        return Any
+    any(a -> a isa Expr && a.head in (:parameters, :kw, :...), args) && return Any
+    types = Any[_bound_shape_expr_type(a, names, mod, ctx, depth + 1) for a in args]
+    any(T -> T === Any, types) && return Any
+    # An entry of an array at integer indices is of its element type, whatever
+    # concrete array it is (inference gives up on an abstract array type).
+    x.head === :ref && first(types) isa Type && first(types) <: AbstractArray &&
+        all(T -> T isa Type && T <: Integer, types[2:end]) &&
+        return eltype(first(types))
+    try
+        Base.promote_op(f, types...)
+    catch err
+        err isa InterruptException && rethrow()
+        Any
+    end
+end
+function _bound_shape_scalar_expr(x, names, mod, ctx)
+    T = _bound_shape_expr_type(x, names, mod, ctx)
+    T isa Type && T !== Union{} && T <: Number
+end
 
 # The shape tree (over values) of value `v`, or `nothing`. A bind-time value
 # has its own shape; a live one the shape recorded for it.
@@ -258,6 +307,8 @@ function _bound_shape_expr(g::Graph, x, names, mod, shapes, dataonly, ctx, depth
     f = _bound_shape_callee(first(x.args), mod)
     args = x.args[2:end]
     any(a -> a isa Expr && a.head in (:parameters, :kw, :...), args) && return nothing
+    # A number computed from numbers (`-psi`) is a 1x1 block.
+    f === fill || _bound_shape_scalar_expr(x, names, mod, ctx) && return (:scalar,)
     if f === identity && length(args) == 1
         return _bound_shape_expr(g, only(args), names, mod, shapes, dataonly, ctx, depth + 1)
     elseif f === fill && length(args) >= 2
