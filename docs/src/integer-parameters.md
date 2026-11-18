@@ -138,8 +138,46 @@ are stored as `Int`, including when the starting value has a narrower type.
 Saved positions and constrained draws remain unchanged by later steps.
 Prepare a separate problem for each concurrent chain. Purely discrete
 models use the same driver without an AD backend, metric or step size.
-The initial Gibbs interface does not yet update integer arrays or models
-with already marginalized integers.
+The Gibbs interface does not yet update models with already marginalized
+integers.
+
+An integer parameter indexes an array as Julia does, so a mixture assigns one
+component per observation:
+
+```@example integer
+mixture = @rkppl begin
+    w ~ Dirichlet(ones(K))
+    mu[1:K] .~ Normal.(0, 5)
+    z[axes(y, 1)] .~ Categorical(w)
+    y .~ Normal.(mu[z], 1.0)
+end
+mixture_y = [-2.1, -1.9, 2.0, 2.2, 1.8]
+mixture_plan = mixture(; K = 2) | (; y = mixture_y)
+mixture_built = build_kernel(mixture_plan)
+mixture_z = [1, 1, 2, 2, 2]
+mixture_u = unconstrain(mixture_built.layout,
+    (; w = [0.5, 0.5], mu = [-2.0, 2.0], z = mixture_z))
+mixture_problem = prepare_gibbs(mixture_built, mixture_plan, mixture_u;
+    discrete = (; z = mixture_z), backend = AutoEnzyme(; mode = Enzyme.Reverse))
+mixture_state = initialize_gibbs(Xoshiro(1), mixture_problem, mixture_u;
+    discrete = (; z = mixture_z), warmup = 200)
+mixture_draws = gibbs_draws(mixture_state, 500)
+sum(sort(mixture_draws.parameters.mu; dims = 1); dims = 2) ./ 500
+```
+
+The two components are exchangeable, so the chain may swap their labels; the
+summary sorts each draw's means, which is label invariant.
+
+Each declared integer array is a block of its own, after the scalar blocks.
+Here every density term that reads `z` sums cells that read only their own
+element, so the elements are conditionally independent: one evaluation of
+those cells per support value gives every element's log weight, and all
+elements are drawn together. A term that couples elements, such as one reading
+`sum(z)`, makes the driver draw the elements one after another, each from its
+exact conditional. All elements must share one support. The array spelling is
+required for now: integer `@plate` cells and data arrays indexed by an integer
+are not yet supported. Julia checks integer indices when the program runs, so
+an index outside the indexed array raises a `BoundsError`.
 
 JAX execution is verified for all four families, including ordinary
 gradients, changed data sizes, integer-dependent observation trials, and

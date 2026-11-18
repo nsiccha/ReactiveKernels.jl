@@ -16,6 +16,21 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.214
+
+- An integer parameter indexes an array as in Julia: a scalar one reads one
+  entry (`mu[k]`), an integer array one entry per element (`mu[z]`), in
+  locations and named definitions. Julia checks the bounds when the program
+  runs; indexing a level axis by an integer is refused at binding. An integer
+  array's `Categorical` prior may share a whole probability vector, including
+  a sampled simplex: `z[axes(y, 1)] .~ Categorical(w)`.
+- `prepare_gibbs` updates declared integer arrays, each as its own block after
+  the scalar blocks. When every density term reading the array sums plate
+  cells that read only their own element, all elements are drawn together
+  from one evaluation per support value; otherwise each element is drawn in
+  turn from its exact conditional. All elements share one support. Integer
+  `@plate` cells, and data arrays indexed by an integer, are not supported yet.
+
 ## 0.1.213
 
 - `marginalize` integrates out a vector state in which one array reads
