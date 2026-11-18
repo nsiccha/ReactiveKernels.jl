@@ -43,9 +43,25 @@ end
     return sum(totals)
 end
 
+# A summed plate over a gathered operand whose index has long runs is grouped
+# by run (`index_runs.jl`) beside the flat loop it keeps. The `log1p` keeps
+# the division in the cell (`summed_plate_factors.jl` takes nothing out).
+@kernel grouped_divisor(u::Float64, q::Vector{Float64}, idx::Vector{Int},
+                        x::Vector{Float64}) = begin
+    s = exp(u)
+    gathered = ReactiveKernels._readonly_gather(q, idx)
+    cells = plate(gathered, x) do a, xi
+        log1p(((xi - a) / s)^2)
+    end
+    total = sum(cells)
+    return total
+end
+
 function inventory(ast)
     heads = Dict{Symbol,Int}()
     scales = Int[]
+    # Divisions that compute their exponential where they stand.
+    unscaled = Ref(0)
     function visit(ex, depth)
         ex isa RK._PlateProgram && return visit(ex.ast, depth)
         ex isa Expr || return
@@ -54,10 +70,12 @@ function inventory(ast)
         if ex.head === :call && first(ex.args) == GlobalRef(RK, :_rk_div_by_scale)
             push!(scales, depth)
         end
+        ex.head === :call && first(ex.args) == GlobalRef(RK, :_rk_div_by_of) &&
+            length(ex.args) == 4 && (unscaled[] += 1)
         foreach(a -> visit(a, depth + (ex.head in (:for, :while))), ex.args)
     end
     visit(ast, 0)
-    (; heads, scales)
+    (; heads, scales, unscaled = unscaled[])
 end
 
 @testset "one reciprocal exponential per evaluation, including bound data" begin
@@ -137,6 +155,66 @@ end
     literal = prepare(shared_divisor; simplify = false)
     @test isempty(inventory(code_expr(literal)).scales)
     @test k(0.3, x) ≈ literal(0.3, x)
+end
+
+function grouped_oracle(u, q, idx, x)
+    z = (x .- q[idx]) .* exp(-u)
+    dq = zero(q)
+    for i in eachindex(idx)
+        dq[idx[i]] -= 2z[i] / (1 + z[i]^2) * exp(-u)
+    end
+    sum(log1p.(z .^ 2)), sum(-2z .^ 2 ./ (1 .+ z .^ 2)), dq
+end
+
+# Snag radon-slope-valu-0c41c09b: the run-grouped arm computed `exp(-u)` in
+# every cell while the flat arm read the hoisted scale, so a varying-slope
+# Normal model's density cost more than its own gradient.
+@testset "a run-grouped reduction reads its plate's one scale" begin
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    cache = PreparationCache()
+    q = [0.1, -0.4, 0.3]
+    shapes = Dict{Bool,Vector{Any}}(true => [], false => [])
+    # Mean runs of 8 and more group (`_INDEX_RUN_MINIMUM_MEAN_LENGTH`), with
+    # unequal runs and a group that reappears; shorter, empty and one-cell
+    # data keep the flat loop.
+    for idx in (repeat([1, 2, 3], inner = 8), repeat([1, 2, 3], inner = 64),
+                [fill(2, 17); fill(1, 8); fill(3, 9); fill(1, 13)],
+                repeat([3, 1], inner = 256), Int[], [2], repeat([1, 2, 3], inner = 2))
+        x = [sin(i / 3) / 2 for i in eachindex(idx)]
+        k = prepare!(cache, grouped_divisor; bound = (; idx, x))
+        grouped = occursin("run_partial", string(k.ast))
+        @test grouped == (length(idx) >= 24)
+        push!(shapes[grouped], inventory(code_expr(k)).heads)
+        candidates = Base.get_extension(RK, :ReactiveKernelsMutatingFunctionsExt) === nothing ?
+            (k,) : (k, prepare_nonallocating(k, 0.3, q))
+        # At u = 800 the reciprocal underflows to zero: value and derivatives
+        # are finite zeros. At u = -800 it overflows, which an empty plate
+        # never reads: its derivative stays zero.
+        us = isempty(idx) ? (-800.0, 0.3) : (-2.0, 0.3, 3.0, 800.0)
+        for candidate in candidates
+            report = inventory(code_expr(candidate))
+            # Scales run before every loop (one per copy of the plate: its
+            # direct and broadcast reads), and no cell computes its own.
+            @test !isempty(report.scales) && all(iszero, report.scales)
+            @test report.unscaled == 0
+            by_u = prepare_ad(candidate, backend, 0.3, q; active = :u)
+            by_q = prepare_ad(candidate, backend, 0.3, q; active = :q)
+            for u in us, qv in (q, [-0.8, 0.6, 1.2])
+                value, du, dq = grouped_oracle(u, qv, idx, x)
+                @test candidate(u, qv) ≈ value rtol = 1e-12 atol = 1e-14
+                v, g = ad_value_and_gradient(by_u, u, qv)
+                @test v ≈ value rtol = 1e-12 atol = 1e-14
+                @test g ≈ du rtol = 1e-12 atol = 1e-14
+                v, g = ad_value_and_gradient(by_q, u, qv)
+                @test v ≈ value rtol = 1e-12 atol = 1e-14
+                @test g ≈ dq rtol = 1e-11 atol = 1e-14
+            end
+        end
+    end
+    # More data of one schedule replicates no body or control region.
+    for head in (:for, :while, :if)
+        @test all(s -> get(s, head, 0) == get(first(shapes[true]), head, 0), shapes[true])
+    end
 end
 
 @testset "unsupported operand types keep their original dispatch" begin

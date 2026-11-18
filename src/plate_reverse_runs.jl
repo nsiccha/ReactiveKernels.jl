@@ -21,17 +21,8 @@ end
 function _pr_index_run_arm(ex)
     Meta.isexpr(ex, :if, 3) || return nothing
     run = ex.args[2]
-    Meta.isexpr(run, :for, 2) || return nothing
-    binding = run.args[1]
-    Meta.isexpr(binding, :(=), 2) || return nothing
-    range = binding.args[2]
-    Meta.isexpr(range, :call, 2) && _pr_index_run_names(range.args[1]) === :eachindex ||
-        return nothing
-    field = range.args[2]
-    Meta.isexpr(field, :call, 3) && _pr_index_run_names(field.args[1]) === :getfield &&
-        field.args[3] === 1 || return nothing
-    metadata = field.args[2]
-    metadata isa Symbol || return nothing
+    metadata = _index_run_loop_metadata(run)
+    metadata === nothing && return nothing
     flat = _index_run_simd_plate(ex.args[3])
     flat === nothing && return nothing
     axes, _, cell = flat

@@ -199,6 +199,48 @@ function _index_run_simd_plate(ex)
     (domain.args[2],index,cellbody)
 end
 
+# The run loop `_lower_index_runs_native` emits, `for run =
+# eachindex(getfield(metadata, 1))`: the name of its metadata, or `nothing`.
+function _index_run_loop_metadata(ex)
+    Meta.isexpr(ex,:for,2) || return nothing
+    binding=ex.args[1]
+    Meta.isexpr(binding,:(=),2) || return nothing
+    range=binding.args[2]
+    Meta.isexpr(range,:call,2) && _pr_index_run_names(range.args[1])===:eachindex ||
+        return nothing
+    field=range.args[2]
+    Meta.isexpr(field,:call,3) && _pr_index_run_names(field.args[1])===:getfield &&
+        field.args[3]===1 || return nothing
+    metadata=field.args[2]
+    metadata isa Symbol ? metadata : nothing
+end
+
+# A grouped reduction beside the flat loop it keeps (`_lower_index_runs_native`):
+# `if guard; <run loop>; else <flat @simd loop>; end`, the run loop reading each
+# run's cells in an inner `@simd` loop whose body begins with the flat loop's
+# `index = CartesianIndex(linear)`. Returns `(axes, index, grouped, flat)`, the
+# cell statements after that index in each arm, or `nothing`.
+function _index_run_arms(ex)
+    Meta.isexpr(ex,:if,3) && _index_run_loop_metadata(ex.args[2])!==nothing ||
+        return nothing
+    flat=_index_run_simd_plate(ex.args[3])
+    flat===nothing && return nothing
+    axes,index,flatcell=flat
+    grouped=Ref{Any}(nothing)
+    _index_run_visit(ex.args[2]) do b
+        grouped[]===nothing && b.head===:block || return
+        statements=Any[a for a in b.args if !(a isa LineNumberNode)]
+        isempty(statements) && return
+        first_statement=first(statements)
+        Meta.isexpr(first_statement,:(=),2) && first_statement.args[1]===index &&
+            Meta.isexpr(first_statement.args[2],:call,2) &&
+            _pr_is_ref(first_statement.args[2].args[1],Base,:CartesianIndex) || return
+        grouped[]=Expr(:block,statements[2:end]...)
+    end
+    grouped[]===nothing && return nothing
+    (axes,index,grouped[],flatcell)
+end
+
 # This local emitter transformation reads only compiler-owned operation identity
 # and generated data flow. It adds no operation slots.
 function _lower_index_runs_native(body::Expr,ops)
