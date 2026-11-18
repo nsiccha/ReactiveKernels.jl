@@ -25,6 +25,10 @@ are recorded in the git history only.
   runs the joint value/partial recipe, unchanged. Logits far from zero, as at
   a sampler's random initial points, made the value pay one `exp` and one
   `log1p` per row where `LogExpFunctions.log1pexp` pays at most one `exp`.
+- `ad_cost_profile` counts the time of a program RK compiled for a recipe's
+  expression, such as a scalar derivative rule's `exp(-abs(x))`, towards the
+  statement that calls the rule. Before, it counted it as `(other statements)`,
+  which hid a rule's cost from the statement that called it.
 
 ## 0.1.314
 
