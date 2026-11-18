@@ -16,6 +16,21 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.220
+
+- `filter_step` no longer deep-copies each particle's carried state or calls
+  the prepared transition once per particle through `invokelatest`. All
+  particles of an ensemble member advance in one call, each carry is copied
+  array by array, and a resampled parent's first child keeps the parent's
+  new state instead of a copy. SequentialMonteCarlo's buffers are reused
+  from step to step while the particle count stays the same. The random
+  draws and their order are unchanged, so a seeded filter gives exactly the
+  same clouds and `log_normalizer` as before.
+- On the AR(1) state-space model `x[t] ~ Normal(phi * x[t - 1], sx)`,
+  `y .~ Normal.(x, sy)` at 1,000 particles (one thread, loaded host), a step
+  takes 0.12–0.15 ms, where it took 3.8–4.4 ms in the same runs, and
+  allocates 0.16 MB instead of 1.65 MB.
+
 ## 0.1.219
 
 - With WarmupHMC 0.3.11 or later, a Markov chain from `markov_chains` runs its
