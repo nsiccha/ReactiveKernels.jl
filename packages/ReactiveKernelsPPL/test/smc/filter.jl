@@ -497,3 +497,57 @@ count_filter_step(x)=(filter_work[]+=1; x+1.0)
     single=initialize_filter(target;rng=Xoshiro(3),particles=1)
     @test filter_step(single,(;y=0.0)).predictive_logscore≈logpdf(Normal(),0.0)
 end
+
+# A two-lag window shifts in place each step: every particle's window then
+# holds the exact previous and current values of a deterministic AR(2).
+@testset "Two-lag window shifts in place" begin
+    model=@rkppl begin
+        @scan begin
+            h[1]=0.4
+            h[2]=-0.2
+            for t in 3:T
+                h[t]=0.5h[t-1]+0.3h[t-2]+x[t]
+            end
+        end
+        y .~ Normal.(h,0.5)
+    end
+    target=prepare_filter(model;model_id="two-lag",inputs=(:x,))
+    s=initialize_filter(target;rng=Xoshiro(3),particles=6)
+    x=[0.1t for t in 1:12]
+    y=[sin(t) for t in 1:12]
+    h=[0.4,-0.2]
+    score=0.0
+    for t in eachindex(y)
+        t > 2 && push!(h,0.5h[t-1]+0.3h[t-2]+x[t])
+        score+=logpdf(Normal(h[t],0.5),y[t])
+        s=filter_step(s,(;y=y[t]);inputs=(;x=x[t]))
+        @test all(==(h[t]),current(s,:h))
+        t > 1 && @test all(c -> c.h[1,1]==h[t-1],s.carries)
+        @test s.log_normalizer ≈ score
+    end
+    @test all(s.carries[i].h !== s.carries[j].h for i in 1:6 for j in 1:6 if i!=j)
+end
+
+# A step allocates one carry per resampled particle and O(particles)
+# bookkeeping, never a deep copy per particle. Snag rkppl-filter-ste-d805d6f9:
+# per-particle deep copies made a 1,000-particle AR(1) step allocate 1.6 MB
+# and cost about 50 times a hand-written kernel of the same step.
+filter_step_bytes(s,obs) = @allocated filter_step(s,obs)
+@testset "Filter step allocation is bounded per particle" begin
+    model=@rkppl begin
+        @scan begin
+            x[1] ~ Normal(0,1)
+            for t in 2:T
+                x[t] ~ Normal(0.9x[t-1],1)
+            end
+        end
+        y .~ Normal.(x,1)
+    end
+    target=prepare_filter(model;model_id="allocation-ar1")
+    s=initialize_filter(target;rng=Xoshiro(1),particles=1000)
+    for t in 1:3
+        s=filter_step(s,(;y=0.1t))
+    end
+    filter_step_bytes(s,(;y=0.5))
+    @test filter_step_bytes(s,(;y=0.5)) < 400*1000
+end
