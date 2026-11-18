@@ -27,7 +27,9 @@ Integer arrays, declared (`z[axes(y, 1)] .~ Categorical(w)`) or written as
 `@plate` loop cells, are updated exactly as their own blocks after the scalar
 ones (`GibbsArrayBlock`). An array's elements may each have their own support,
 when a support bound is read per element (`Binomial.(n, p)` with a vector
-`n`). Models with already marginalized integers are not yet supported.
+`n`). In a model whose other integers are marginalized
+(`marginalize(model, :a)`), the explicit integers are updated from their
+collapsed conditionals, the marginalized ones summed out exactly.
 
 Continuous derivatives use the supplied ordinary AD backend. No backend is
 needed for a model with zero continuous coordinates. Prepare one problem per
@@ -37,16 +39,20 @@ function prepare_gibbs(built, plan::StructuralPlan, u0::AbstractVector;
         discrete, backend=nothing, blocks=nothing, on_error=nothing)
     built = _binding_build(built, plan)
     _check_built_program(built, plan)
-    isempty(plan.marginalized_integers) || throw(ArgumentError(
-        "prepare_gibbs currently requires explicit integer parameters"))
     haskey(plan.frozen.values, :_ppl_discrete) && throw(ArgumentError(
         "prepare_gibbs needs mutable integer inputs, not a frozen integer query"))
     layout = built.layout
     u = Vector{Float64}(u0)
     length(u) == layout.total || throw(DimensionMismatch("Gibbs position has the wrong dimension"))
     _check_integer_parameters(layout, discrete)
-    all_ps = _integer_parameters(plan)
-    isempty(all_ps) && throw(ArgumentError("prepare_gibbs needs at least one integer parameter"))
+    # Marginalized integers are summed out inside the program's density terms
+    # (`marginalize`); every conditional reads those sums, so the remaining
+    # integers are updated from their collapsed conditionals.
+    all_ps = [p for p in _integer_parameters(plan) if p.name ∉ plan.marginalized_integers]
+    isempty(all_ps) && throw(ArgumentError("prepare_gibbs needs at least one " *
+        (isempty(plan.marginalized_integers) ? "integer parameter" :
+            "integer parameter that is not marginalized; sample a fully " *
+            "marginalized model with NUTS on its real coordinates")))
     ps = [p for p in all_ps if p isa SampledParameter]
     # A declared integer array and an integer `@plate` cell (`z[i] ~
     # Categorical(w)` in a loop) are both one array of integers.
@@ -72,6 +78,9 @@ function prepare_gibbs(built, plan::StructuralPlan, u0::AbstractVector;
     def = _elide_named_location_aliases(plan, def)
     def = _pointwise_arithmetic_plates(plan, def)
     def = _name_plate_cells(def, _location_value_aliases(plan, def))
+    # As `kernel_expr` does: marginalized integers are summed out of `prior`
+    # and `likelihood` by one runtime plate over their joint states.
+    isempty(plan.marginalized_integers) || (def = _integer_marginal_program(plan, def))
     statements = Expr[s for s in def.args[2].args if s isa Expr && s.head !== :return]
     terms = Any[]
     for name in (:prior, :likelihood, :log_jacobian)
