@@ -333,8 +333,12 @@ const DERIVATIVE_REPORT = isdefined(Enzyme, :derivative_report) &&
     isdefined(Enzyme, :has_dogfood_repair) && Enzyme.has_dogfood_repair(:derivative_report)
 # Cases whose gradient call native inference types concretely but whose
 # derivative dispatches at run time: Enzyme's own inference of the program,
-# not RK's lowering (Enzyme snag `derivative-dispa-e5e3434f`).
-const DERIVATIVE_GAPS = DERIVATIVE_REPORT ? ("scan child in a lazy arm",) : ()
+# not RK's lowering (Enzyme snag `derivative-dispa-e5e3434f`). Dogfood repairs
+# it from `bab1bb45` (repair `nested_callable_inference`); there the corpus
+# holds the case to the same standard as every other.
+const DERIVATIVE_GAPS =
+    DERIVATIVE_REPORT && !Enzyme.has_dogfood_repair(:nested_callable_inference) ?
+    ("scan child in a lazy arm",) : ()
 const derivative_unstable_warning = (:warn,
     r"the reverse-mode derivative native Enzyme compiles for the prepared program is not type stable")
 
