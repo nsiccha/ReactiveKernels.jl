@@ -5,7 +5,10 @@
 # program. Everything downstream of the product is the emitted program.
 #
 # A coordinate of a vector parameter also needs only the density terms that
-# read that vector, and of a sum over the vector's cells only its own cell.
+# read that vector. Of a sum over a plate that reads the vector it needs only
+# the cells that read the moved element: the element's own cell when the plate
+# runs over the vector's cells, and the rows holding the element's index when
+# the plate reads the vector through a gather by a bound index vector.
 
 "Prepared coordinate conditionals returned by [`prepare_coordinate_conditional`](@ref)."
 struct CoordinateConditional{L,J,C,U,R,B<:Tuple}
@@ -19,11 +22,13 @@ struct CoordinateConditional{L,J,C,U,R,B<:Tuple}
 end
 
 # The conditional of the coordinates in `range`: the terms that read them,
-# with each plate in `cells` read at the moved coordinate's cell only.
-struct CoordinateBlock{K,N}
+# with each plate in `cells` read at the moved coordinate's cell only, and each
+# plate in `parts` at the rows whose gathered index is the moved coordinate's.
+struct CoordinateBlock{K,C<:Tuple{Vararg{Symbol}},P<:Tuple{Vararg{Symbol}}}
     range::UnitRange{Int}
     kernel::K
-    cells::NTuple{N,Symbol}
+    cells::C
+    parts::P
 end
 
 _is_packed_view(f) = f === Base.view || f === :view || f == :(Base.view) ||
@@ -111,32 +116,148 @@ function _named_statement(statements, name)
     return at === nothing ? nothing : statements[at]
 end
 
-# The plate summed by `term`, when a coordinate of the block moves exactly one
-# of its cells: the plate runs over the block's cells, reads the block only
-# through operands aligned with it, and captures nothing that depends on it.
-function _coordinate_cell_plate(statements, term, roots, plates, dependent)
+# How a plate's operand reads a vector whose cells it runs over (see
+# `_coordinate_operand`); a gather reads it by the name of its key instead.
+struct _CoordinateCell end
+
+_is_named_callee(f, name::Symbol) = f === name ||
+    (f isa GlobalRef && f.name === name) ||
+    (Meta.isexpr(f, :., 2) && f.args[2] isa QuoteNode && f.args[2].value === name)
+
+# How the plate operand `x` reads the block whose vector values are `roots`:
+# `_CoordinateCell()` when its element `i` is the vector's element `i` (the
+# vector itself, a name for it, or `_ppl_rows` of it, which is the vector when
+# the plate has one row per element), `key` when its element `i` is the
+# vector's element `key[i]` (a gather by `key`, a port or statement in `named`
+# that no coordinate moves, outside `moving`), and `nothing` for any other
+# read. `seen` stops a cycle of names.
+function _coordinate_operand(statements, x, roots, moving, named, seen = Set{Symbol}())
+    if x isa Symbol
+        x in roots && return _CoordinateCell()
+        x in seen && return nothing
+        push!(seen, x)
+        st = _named_statement(statements, x)
+        return st === nothing ? nothing :
+            _coordinate_operand(statements, st.args[2], roots, moving, named, seen)
+    end
+    if Meta.isexpr(x, :call, 3) && _is_named_callee(x.args[1], :_ppl_rows) &&
+            !_gibbs_reads(x.args[3], moving)
+        # `_ppl_rows(v, n)` is `v` when `v` holds one Float64 per row, and
+        # broadcasts `v` otherwise. Preparation checks the plate's length, so
+        # a broadcast single element is no aligned operand.
+        return _coordinate_operand(statements, x.args[2], roots, moving, named, seen)
+    end
+    gather = Meta.isexpr(x, :ref, 2) ? (x.args[1], x.args[2]) :
+        Meta.isexpr(x, :call, 3) && _is_named_callee(x.args[1], :_readonly_gather) ?
+        (x.args[2], x.args[3]) : nothing
+    if gather !== nothing
+        source, key = gather
+        key isa Symbol && key in named && key ∉ moving || return nothing
+        return _coordinate_operand(statements, source, roots, moving, named, seen) isa
+            _CoordinateCell ? key : nothing
+    end
+    return nothing
+end
+
+# The plate summed by `term` and how a coordinate of the block reads it, when
+# that coordinate moves only some of its cells: the plate's operands that read
+# the block all read it the same way (see `_coordinate_operand`), and its cell
+# body reads nothing that depends on the block. Returns `(plate,
+# _CoordinateCell(), direct)` when the plate runs over the block's cells, so a
+# coordinate moves its own cell, `(plate, key, false)` when the plate reads the
+# block through a gather by `key`, so a coordinate moves the cells whose key
+# holds its index, and `nothing` otherwise. `direct` says every operand reading
+# the block is one of its vector values itself, which a cell reads as a number
+# at its row; any other read keeps row bookkeeping per call.
+function _coordinate_term_plate(statements, term, roots, plates, reached, moving, named)
     term isa Symbol || return nothing
     total = _named_statement(statements, term)
     total === nothing && return nothing
     rhs = total.args[2]
     Meta.isexpr(rhs, :call, 2) && rhs.args[1] === :sum && rhs.args[2] isa Symbol || return nothing
     summed = rhs.args[2]
-    summed in roots && return summed in plates ? summed : nothing
+    summed in roots && return summed in plates ? (summed, _CoordinateCell(), true) : nothing
     producer = _named_statement(statements, summed)
     producer === nothing && return nothing
     source = producer.args[2]
     _is_plate(source) || return nothing
-    aligned = false
+    read, direct = nothing, true
     for argument in source.args[1].args[2:end]
-        if argument isa Symbol && argument in roots
-            aligned = true
-        elseif _gibbs_reads(argument, dependent)
-            return nothing
-        end
+        _gibbs_reads(argument, reached) || continue
+        how = _coordinate_operand(statements, argument, roots, moving, named)
+        how === nothing && return nothing
+        read === nothing || read === how || return nothing
+        read = how
+        direct &= argument isa Symbol && argument in roots
     end
-    aligned && !_gibbs_reads(source.args[2], dependent) || return nothing
-    return summed
+    read !== nothing && !_gibbs_reads(source.args[2], reached) || return nothing
+    return (summed, read, direct)
 end
+
+"""
+    _coordinate_rows(key, n)
+
+The rows of each element of a vector of `n` elements that a gather by `key`
+reads, as a partition index (`plate_partition`'s key): row `i` belongs to
+element `key[i]`. Every element `1:n` has an entry, so an element that no row
+reads has an empty partition, which sums to zero. Computed from bound data,
+once per binding.
+"""
+function _coordinate_rows(key::AbstractVector{<:Integer}, n::Integer)
+    table = Dict{Int,Vector{Int}}(j => Int[] for j in 1:n)
+    for (row, j) in enumerate(key)
+        rows = get(table, Int(j), nothing)
+        rows === nothing && throw(BoundsError(1:n, j))
+        push!(rows, row)
+    end
+    return ReactiveKernels._PartitionIndex(table, length(key))
+end
+
+# The same partition index for a plate over the cells of a vector of `n`
+# elements: each element's rows are its own cell.
+_coordinate_cells(n::Integer) =
+    ReactiveKernels._PartitionIndex(Dict{Int,Vector{Int}}(j => [j] for j in 1:n), Int(n))
+
+# The length of a gather key, or -1 when it is no vector of integer indices
+# (a `Bool` vector is a mask, not indices). A preparation measures it to
+# check the key has one entry per cell.
+_coordinate_key_length(key::AbstractVector{<:Integer}) = length(key)
+_coordinate_key_length(key::AbstractVector{Bool}) = -1
+_coordinate_key_length(key) = -1
+
+# A block kernel with a partition plan port, called without it: the plan of
+# the element index (the last argument) is read from `plans`. Each plan holds
+# that element's rows of the partitioned plates and their bookkeeping
+# (`ReactiveKernels.partition_plan`), computed once at preparation from the
+# bound data, so a call does not rebuild them.
+struct _PlannedBlockKernel{K,T}
+    kernel::K
+    plans::Vector{T}
+end
+@inline (p::_PlannedBlockKernel)(args::Vararg{Any,N}) where {N} =
+    p.kernel(args..., p.plans[args[N]])
+ReactiveKernels.code_expr(p::_PlannedBlockKernel) = ReactiveKernels.code_expr(p.kernel)
+
+# The plan of each element of `span` for `kernel`, whose arguments are the
+# block's (`exemplars`: the point, the products, the coordinate and its previous
+# value), the element's index and the plan. A plan holds no value of the
+# coordinates, so the exemplar point serves every element.
+function _planned_block_kernel(kernel, span, exemplars)
+    prepared = ReactiveKernels._kernel_latest_prepared(kernel)
+    planner = Base.invokelatest(ReactiveKernels.partition_plan_kernel, prepared)
+    pool = ReactiveKernels._PartitionPlanPool()
+    leading = exemplars[1:(end - 2)]
+    plans = [ReactiveKernels._intern_partition_plan(pool, Base.invokelatest(planner,
+        leading..., first(span) + j - 1, last(exemplars), j, nothing)) for j in eachindex(span)]
+    types = unique!(Any[typeof(plan) for plan in plans])
+    length(types) == 1 || throw(ArgumentError(
+        "coordinate conditional: the partition plans have several types: $(join(types, ", "))"))
+    return _PlannedBlockKernel(kernel, Vector{only(types)}(plans))
+end
+
+# The length of a candidate plate, or -1 when it is no vector of cells.
+_coordinate_plate_length(cells::AbstractVector) = length(cells)
+_coordinate_plate_length(cells) = -1
 
 """
     prepare_coordinate_conditional(built, plan, u0)
@@ -153,8 +274,12 @@ constant differs between coordinates: compare values of one coordinate only.
   a cached value. A trial then costs one column of `A` instead of the whole
   product. Products over a transformed or reshaped vector are recomputed.
 - A coordinate of a vector parameter evaluates only the terms that read that
-  vector. A term that sums a plate over the vector's cells, such as its prior
-  or Jacobian, evaluates the moved coordinate's cell alone.
+  vector. A term that sums a plate over the vector's cells, such as its prior,
+  its Jacobian or an `@plate for j in eachindex(y)` likelihood reading
+  `theta[j]`, evaluates the moved coordinate's cell alone. A term that sums a
+  plate reading the vector through a bound index vector, as
+  `y .~ Normal.(theta[g], 1)` does, evaluates only the rows whose index is the
+  moved coordinate's (none when no row has it).
 - Every other coordinate evaluates all terms that read any coordinate.
 
 Use [`coordinate_state`](@ref) to hold a point with its cached products,
@@ -191,41 +316,67 @@ function prepare_coordinate_conditional(built, plan::StructuralPlan, u0::Abstrac
     products = Expr(:tuple, (node.name for node in nodes)...)
     bound = _query_bound(plan)
 
+    # The program's ports and values: the names a gather key may take.
+    named = Set{Symbol}(name for name in map(_assigned_name, statements) if name !== nothing)
+    for argument in def.args[1].args[2:end]
+        Meta.isexpr(argument, :(::)) && (argument = argument.args[1])
+        argument isa Symbol && push!(named, argument)
+    end
+    # Vector blocks: packed ranges no other read can reach. Each term that
+    # reads a block's vector is classified from the program; one preparation
+    # of the emitted program then measures, on this binding, the ranges, the
+    # length of each candidate plate and of each gather key. Anything
+    # unrecognized keeps every coordinate on the general conditional below.
+    found = [begin
+        roots = Set{Symbol}(entry.second)
+        reached = _gibbs_dependents(statements, roots)
+        [(term, _coordinate_term_plate(statements, term, roots, readers.plates, reached,
+            dependent, named)) for term in terms if _gibbs_reads(term, reached)]
+    end for entry in readers.ranges]
+    candidates = unique!([how for entries in found for (_, how) in entries if how !== nothing])
+    keys = unique!(Symbol[how[2] for how in candidates if how[2] isa Symbol])
+    measured = Expr(:tuple, (x for entry in readers.ranges for x in entry.first)...,
+        (:($(GlobalRef(@__MODULE__, :_coordinate_plate_length))($(first(how))))
+            for how in candidates)...,
+        (:($(GlobalRef(@__MODULE__, :_coordinate_key_length))($key)) for key in keys)...)
+
     # The emitted program with the values this preparation reads once: the
-    # cached products at a point, the packed ranges and candidate plates.
-    bounds = Expr(:tuple, (x for entry in readers.ranges for x in entry.first)...)
+    # cached products at a point, and the measurements above.
     whole_spec = _eval_kernel_def(Expr(:(=), def.args[1], Expr(:block, statements...,
         (isempty(nodes) ? () : (:(_ppl_cg_products = $products),))...,
-        (isempty(readers.ranges) ? () : (:(_ppl_cg_ranges = $bounds),))...,
+        (isempty(readers.ranges) ? () : (:(_ppl_cg_measured = $measured),))...,
         :(return posterior))))
     _register_packed_check!(whole_spec, layout)
     whole(want) = Base.invokelatest(_prepare_cached, plan, whole_spec;
         have=_query_have(plan), want, bound, exemplars=(u,), on_error)
 
-    # Vector blocks: packed ranges no other read can reach, measured on this
-    # binding. Anything unrecognized keeps every coordinate on the general
-    # conditional below.
     blocks = NamedTuple[]
     if readers.recognized && !isempty(readers.ranges)
-        limits = whole(:_ppl_cg_ranges)(u)
-        spans = [Int(limits[2i - 1]):Int(limits[2i]) for i in eachindex(readers.ranges)]
+        values = whole(:_ppl_cg_measured)(u)
+        r = 2length(readers.ranges)
+        spans = [Int(values[2i - 1]):Int(values[2i]) for i in eachindex(readers.ranges)]
+        plate_length = Dict(first(how) => Int(values[r + c]) for (c, how) in enumerate(candidates))
+        key_length = Dict(key => Int(values[r + length(candidates) + c])
+            for (c, key) in enumerate(keys))
         for (i, entry) in enumerate(readers.ranges)
             span = spans[i]
             isempty(span) && continue
             any(in(span), readers.positions) && continue
             all(j -> j == i || isempty(intersect(span, spans[j])), eachindex(spans)) || continue
-            roots = Set{Symbol}(entry.second)
-            reached = _gibbs_dependents(statements, roots)
-            cells, rest = Symbol[], Any[]
-            for term in filter(t -> _gibbs_reads(t, reached), terms)
-                summed = _coordinate_cell_plate(statements, term, roots, readers.plates, reached)
-                if summed !== nothing
-                    value = whole(summed)(u)
-                    value isa AbstractVector && length(value) == length(span) || (summed = nothing)
+            cells, direct, parts, rest = Symbol[], Symbol[], NamedTuple[], Any[]
+            for (term, how) in found[i]
+                summed, read, at_row = how === nothing ? (nothing, nothing, false) : how
+                if read isa _CoordinateCell && plate_length[summed] == length(span)
+                    push!(cells, summed)
+                    at_row && push!(direct, summed)
+                elseif read isa Symbol && plate_length[summed] >= 0 &&
+                        key_length[read] == plate_length[summed]
+                    push!(parts, (; term, plate=summed, key=read))
+                else
+                    push!(rest, term)
                 end
-                summed === nothing ? push!(rest, term) : push!(cells, summed)
             end
-            push!(blocks, (; span, bounds=entry.first, cells, rest,
+            push!(blocks, (; span, bounds=entry.first, cells, direct, parts, rest,
                 partial=Symbol(:_ppl_cg_partial_, i)))
         end
     end
@@ -273,21 +424,68 @@ function prepare_coordinate_conditional(built, plan::StructuralPlan, u0::Abstrac
                     Base.view($(node.matrix), Base.Colon(), $m)) :
                 :($(node.name)::Vector{Float64} = $port)
         end
-        blockspec = _eval_kernel_def(Expr(:(=), signature, Expr(:block, own...,
-            :($(block.partial)::Float64 = $(_sum_terms(block.rest))),
-            :(return $(block.partial)))))
-        _register_packed_check!(blockspec, layout)
-        cellspec, names, indices = blockspec, Symbol[], Symbol[]
-        for (c, summed) in enumerate(block.cells)
-            push!(names, Symbol(block.partial, :_cell_, c))
-            push!(indices, Symbol(block.partial, :_index_, c))
-            cellspec = ReactiveKernels.plate_cell(cellspec, summed;
-                index=last(indices), name=last(names))
+        lo, hi = block.bounds
+        n = :($hi - $lo + 1)
+        # The plates a coordinate reads at its own element's rows: a plate over
+        # the vector's cells at its own cell (each element owns its cell), a
+        # gathered plate at the rows its key gives the element.
+        aligned = [(; plate, rows=:($(GlobalRef(@__MODULE__, :_coordinate_cells))($n)))
+            for plate in block.cells if plate ∉ block.direct]
+        gathered = [(; part.plate, rows=:($(GlobalRef(@__MODULE__, :_coordinate_rows))(
+            $(part.key), $n))) for part in block.parts]
+        # `celled` plates are read as `plate_cell`s at the element's index (the
+        # plates reading the vector directly, which a cell reads as numbers at
+        # one row), the `members` as one partition labelled by that index,
+        # whose row bookkeeping per label is a plan computed once per label.
+        function build(celled, members, rest)
+            rows = [Symbol(block.partial, :_rows_, c) for c in eachindex(members)]
+            blockspec = _eval_kernel_def(Expr(:(=), signature, Expr(:block, own...,
+                (:($name = $(member.rows)) for (name, member) in zip(rows, members))...,
+                :($(block.partial)::Float64 = $(_sum_terms(rest))),
+                :(return $(block.partial)))))
+            _register_packed_check!(blockspec, layout)
+            # Every cell and the partition read the moved element's index in
+            # its vector, so a plate they share runs at that index once.
+            index = Symbol(block.partial, :_index)
+            cellspec, names = blockspec, Symbol[]
+            for (c, summed) in enumerate(celled)
+                push!(names, Symbol(block.partial, :_cell_, c))
+                cellspec = ReactiveKernels.plate_cell(cellspec, summed; index, name=last(names))
+            end
+            planned = ()
+            if !isempty(members)
+                push!(names, Symbol(block.partial, :_parts))
+                planned = (Symbol(block.partial, :_plan),)
+                cellspec = ReactiveKernels.plate_partition(cellspec,
+                    Tuple(member.plate for member in members);
+                    by=Dict(member.plate => rows[c] for (c, member) in enumerate(members)),
+                    index, name=last(names), locality=:error, plan=only(planned))
+            end
+            indexed = isempty(names) ? () : (index,)
+            kernel = Base.invokelatest(_prepare_cached, plan, cellspec;
+                have=(have..., indexed..., planned...), want=(block.partial, names...),
+                bound, exemplars=(exemplars..., (1 for _ in indexed)...,
+                    (nothing for _ in planned)...), on_error)
+            isempty(members) || (kernel = _planned_block_kernel(kernel, block.span, exemplars))
+            # The block names the plates read at the element's rows: its
+            # aligned plates, and the gathered ones read through the partition.
+            CoordinateBlock(block.span, kernel, Tuple(block.cells),
+                Tuple(member.plate for member in members if member.plate ∉ block.cells))
         end
-        kernel = Base.invokelatest(_prepare_cached, plan, cellspec;
-            have=(have..., indices...), want=(block.partial, names...), bound,
-            exemplars=(exemplars..., (1 for _ in indices)...), on_error)
-        CoordinateBlock(block.span, kernel, Tuple(block.cells))
+        # A partition that would compute a value it reads at rows whole costs
+        # as much as reading the term whole: read the aligned plates as cells
+        # instead, and failing that the gathered terms whole.
+        attempts = Any[(block.direct, [aligned; gathered], block.rest)]
+        isempty(aligned) || push!(attempts, (block.cells, gathered, block.rest))
+        isempty(gathered) || push!(attempts,
+            (block.cells, NamedTuple[], Any[block.rest; [part.term for part in block.parts]]))
+        for (a, attempt) in enumerate(attempts)
+            try
+                return build(attempt...)
+            catch err
+                err isa ReactiveKernels.PartitionLocalityError && a < length(attempts) || rethrow()
+            end
+        end
     end
     joint = prepare_query(built, plan, :sampler; exemplars=(u,), on_error)
     return CoordinateConditional(layout, joint, conditional, update, refresh,
@@ -323,9 +521,12 @@ end
     k in block.range && return _block_density(block, u, products, k, previous)
     return _coordinate_density(Base.tail(blocks), problem, u, products, k, previous)
 end
-_block_density(block::CoordinateBlock{K,N}, u, products, k, previous) where {K,N} =
-    sum(block.kernel(u, products..., k, previous,
-        ntuple(_ -> k - first(block.range) + 1, Val(N))...))
+# The kernel reads the moved element's index in the block's vector, unless the
+# block has neither cells nor partitions.
+_block_density(block::CoordinateBlock{K,Tuple{},Tuple{}}, u, products, k, previous) where {K} =
+    sum(block.kernel(u, products..., k, previous))
+_block_density(block::CoordinateBlock, u, products, k, previous) =
+    sum(block.kernel(u, products..., k, previous, k - first(block.range) + 1))
 
 """
     coordinate_logdensity(state, k, z)

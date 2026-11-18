@@ -16,6 +16,31 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.220
+
+- A coordinate of a vector parameter in `prepare_coordinate_conditional` now
+  reads a likelihood plate only at the rows that read that element, so its
+  cost no longer grows with the number of elements:
+  - a plate with one cell per element, as
+    `@plate for j in eachindex(y); y[j] .~ Normal.(theta[j], 1); end` writes it,
+    is read at the moved element's cell, as the vector's prior already was;
+  - a plate reading the vector through a bound integer index vector, as
+    `y .~ Normal.(theta[g], 1)` does, is read only at the rows whose index is
+    the moved element's, through RK's `plate_partition`. An element no row
+    reads has none.
+- The rows of each element and their bookkeeping are computed once per
+  element when the conditional is prepared, which takes memory linear in the
+  data. Values are unchanged; a plate the conditional cannot read this way is
+  still evaluated whole, as before.
+- Measured (one thread, single-site random-walk MH, two conditional
+  evaluations per step, J groups of 10 rows, median per step at J = 10, 100
+  and 1,000 on a loaded host): the `theta[g]` spelling took 0.20, 0.48 and
+  3.97 µs and now takes 0.28, 0.29 and 0.40 µs (288 bytes per step); the
+  per-group `@plate` spelling took 0.30, 1.78 and 17.1 µs and now takes 0.18,
+  0.18 and 0.20 µs (no allocation).
+- `CoordinateBlock` (internal) names the plates read at the moved element's
+  rows: `cells` (one cell per element) and `parts` (gathered).
+
 ## 0.1.219
 
 - With WarmupHMC 0.3.11 or later, a Markov chain from `markov_chains` runs its
