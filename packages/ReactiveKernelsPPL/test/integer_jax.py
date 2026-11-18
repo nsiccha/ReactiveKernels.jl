@@ -153,3 +153,21 @@ for shape in ((2, 3), (1, 0), (0, 3), (4, 6)):
 assert inventories[(4, 6)] < 2*inventories[(2, 3)], inventories
 print("Categorical matrix JAX: shape, empty axes, ordinary gradients and restoration passed;",
       "trace equation counts", inventories)
+
+m = model("observed")
+for n in (2, 5):
+    y_obs, k = np.linspace(1.0, 2.0, n), np.arange(n) % 2
+    data = m.prepare_data(p=0.4, y=y_obs)
+    u = np.array([0.3])
+    value = jax.jit(m.log_density)(u, {"k": k}, **data)
+    expected = (-0.5 * (0.3 ** 2 + np.log(2 * np.pi))
+                + np.sum(k * np.log(0.4) + (1 - k) * np.log(0.6))
+                - 0.5 * np.sum((y_obs - 0.3 - k) ** 2 + np.log(2 * np.pi)))
+    np.testing.assert_allclose(value, expected, rtol=1e-12)
+try:
+    m.log_density(np.array([0.3]), {"k": np.zeros((5, 1), dtype=int)}, **data)
+except (TypeError, ValueError):
+    pass
+else:
+    raise AssertionError("an integer state of another rank was accepted")
+print("Integer JAX: an observation-sized integer array serves every number of observations")

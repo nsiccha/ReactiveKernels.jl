@@ -327,6 +327,46 @@ end
         backend=BACKEND, blocks=((:z,),))
 end
 
+# An integer array sized by an observation (`z[axes(y, 1)]`) has an extent the
+# program may not read, since a design binding may lack `y`. Its programs keep
+# no binding size: one type serves every number of observations, so a new N
+# compiles nothing (the Gen-home-turf mixture recompiled about 12 s per N).
+# The host still checks the size wherever an integer state enters.
+@testset "integer arrays sized by an observation: one program for every size" begin
+    model = @rkppl begin
+        mu[1:3] .~ Normal.(0, 5)
+        z[axes(y, 1)] .~ Categorical(p)
+        y .~ Normal.(mu[z], 1.0)
+    end
+    p, mu = [0.2, 0.3, 0.5], [-2.0, 0.5, 2.0]
+    function prepared(N)
+        y = collect(range(-2.5, 2.5; length = N))
+        plan = model(; p) | (; y)
+        built = build_kernel(plan)
+        d = (; z = [mod1(i, 3) for i in 1:N])
+        u = unconstrain(built.layout, (; mu, z = d.z))
+        problem = prepare_gibbs(built, plan, u; discrete = d, backend = BACKEND)
+        (; problem, built, plan, u, d, y)
+    end
+    a, b = prepared(5), prepared(9)
+    @test typeof(a.problem.continuous) === typeof(b.problem.continuous)
+    @test typeof(a.problem.integers) === typeof(b.problem.integers)
+    @test typeof(a.problem.joint) === typeof(b.problem.joint)
+    # The same program evaluates each size's own conditional.
+    for (s, N) in ((a, 5), (b, 9))
+        block = only(s.problem.integers)
+        L = reduce(hcat, [block.cells(s.u, (; z = fill(k, N))) for k in 1:3])
+        @test size(L) == (N, 3)
+        for i in 1:N
+            exact = [p[k] * pdf(Normal(mu[k], 1.0), s.y[i]) for k in 1:3]
+            @test PPL._gibbs_weights(L[i, :]) ≈ exact ./ sum(exact) rtol = 1e-12
+        end
+    end
+    # A state of another size is refused by the host check.
+    @test_throws ArgumentError prepare_gibbs(a.built, a.plan, a.u;
+        discrete = (; z = ones(Int, 4)), backend = BACKEND)
+end
+
 @testset "integer arrays: coupled elements use exact single-site updates" begin
     model = @rkppl begin
         z[axes(y, 1)] .~ Bernoulli(0.4)

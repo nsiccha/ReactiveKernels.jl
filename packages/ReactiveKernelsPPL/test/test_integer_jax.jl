@@ -39,6 +39,13 @@ include(joinpath(pkgdir(ReactiveKernels), "test", "jax_python.jl"))
         k[axes(x,1),axes(x,2)] .~ Categorical(p .* 1)
         y .~ Normal.(mu .+ k,1)
     end
+    # Sized by the observation, which the program may not read: the module
+    # holds no binding size for `k` and checks its rank.
+    observed = @rkppl begin
+        mu ~ Normal(0, 1)
+        k[axes(y, 1)] .~ Bernoulli(p)
+        y .~ Normal.(mu .+ k, 1)
+    end
     mktempdir() do dir
         for (name, plan) in (("scalar", scalar() | (; y=[1.2, 2.1])),
                 ("arrays", arrays(; x=[0.1, 0.2], p=0.4) | (; y=[1.2, 2.1])),
@@ -46,7 +53,8 @@ include(joinpath(pkgdir(ReactiveKernels), "test", "jax_python.jl"))
                 ("uniform",uniform(;lo=2,hi=7) | (;y=[1.2,2.1])),
                 ("binomial",binomial(;n=5) | (;y=[1.2,2.1])),
                 ("rag",bind_data(rag(;n=10,h=8,a=2.0,b=3.0))),
-                ("matrix",matrix(;x=zeros(2,3),p=[0.2,0.3,0.5]) | (;y=fill(0.4,2,3))))
+                ("matrix",matrix(;x=zeros(2,3),p=[0.2,0.3,0.5]) | (;y=fill(0.4,2,3))),
+                ("observed", observed(; p=0.4) | (; y=[1.2, 2.1])))
             source = jax_source(build_kernel(plan), plan)
             @test occursin("def log_density", source.text)
             write(joinpath(dir, name * ".py"), source)

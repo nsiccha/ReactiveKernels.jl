@@ -16,6 +16,32 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.223
+
+- An integer array sized by an observation (`z[axes(y, 1)] .~ Categorical(w)`
+  with `y` observed) no longer puts the binding's size into its programs. The
+  program may not read that extent (a design binding may lack the
+  observation), so `_integer_value` had checked the integer state against the
+  binding's number, spliced as a literal: every data size generated other
+  programs, and `prepare_gibbs` with `initialize_gibbs` recompiled about 12 s
+  at each new number of observations (Gen-home-turf mixture, N = 100 then
+  1,000). Such an axis is now checked for its rank in the program; the size is
+  still checked against the binding wherever an integer state enters
+  (`prepare_gibbs`, query preparation, the Gibbs state), and an authored
+  literal extent (`z[1:3]`) is still checked in the program. One program
+  serves every N: `prepare_gibbs` at N = 1,000 after N = 100 took 0.53 s
+  instead of 4.1–4.5 s. In an emitted JAX module, such an integer array
+  raises `ValueError` for a state of another rank, and the module serves
+  every number of observations; its layout metadata reports the binding's
+  extent, as before.
+- Binding and `build_kernel` recompile less in a process that loads
+  Distributions after RKPPL. Eleven cached name-set analyses converted their
+  cached value through a declared `::Set{Symbol}`, which sizes a new set with
+  `IteratorSize` of an abstract type; DataStructures' `IteratorSize` for its
+  sorted containers then invalidated 1,014 RK/RKPPL method instances. They
+  now return the cached set by dispatch: 66 remain (census in the
+  Gen-home-turf benchmark's load order, Julia 1.10.12).
+
 ## 0.1.222
 
 - `marginalize(model, :z)` sums out an integer array: a declaration
