@@ -962,20 +962,24 @@ end
     @test LDP.logdensity(named.rp, x) == LDP.logdensity(named.problem, x)
 end
 
-# Snag rkppl-chain-acce-cc8a8c89: WarmupHMC reads a chain's four accessors one
-# at a time, so whatever one evaluation of its frame costs, a map pays four
-# times. A chain's frame kernel computes that chain's frame alone (with one
-# kernel for every chain, K chains cost K times their frames), and a per-cell
-# frame is concatenated into one sized vector, not grown under reverse AD.
+# Snag rkppl-chain-acce-cc8a8c89: whatever one evaluation of a chain's frame
+# costs, a map pays it once per evaluation (four on WarmupHMC before 0.3.11,
+# which reads the four accessors one at a time). A chain's frame kernel
+# computes that chain's frame alone (with one kernel for every chain, K chains
+# cost K times their frames), and a per-cell frame is concatenated into one
+# sized vector, not grown under reverse AD.
 @testset "a chain's accessors evaluate that chain's frame alone" begin
     ys = [chain_series([n]; seed = k)[1] for (k, n) in enumerate((4, 6, 3))]
     named = chain_setup(markov_chains(NAMED_WALKS(; T = 4, U = 6, V = 3), :w_frame, :η, :w) |
         (; y = ys[1], v = ys[2], r = ys[3]))
     x = 0.2 .* cos.(1:length(named.u)) .+ 0.1
     for chain in named.ir.chains
-        frame = chain.log_scale.kernel(x)
-        @test length(frame.values) == 3
-        @test all(length(v) == length(chain.states) for v in frame.values)
+        # Each role reads one family of the chain's own frame: one value per
+        # state, and the initial location is the first state's drift.
+        for role in (chain.log_scale, chain.coefficient, chain.drift)
+            @test length(role(x)) == length(chain.states)
+        end
+        @test chain.initial(x) == first(chain.drift(x))
     end
     # The cells' frames, one vector per cell (empty cells included), in order.
     cells = [collect(1.0:n) for n in (300, 1, 0, 700)]
@@ -985,6 +989,56 @@ end
     flat_bytes(v) = @allocated ReactiveKernelsPPL._centering_values(v)
     flat_bytes(cells)
     @test flat_bytes(cells) <= 8 * length(flat) + 256
+end
+
+# A chain's four accessors are `SharedAccessor`s of its frame kernel, which
+# WarmupHMC 0.3.11 evaluates once per chain for all of them (WarmupHMC snag
+# markovchain-acce-da401817); earlier WarmupHMC calls each accessor on its own.
+# Each chain's kernel is counted on its own, with every chain moved off the
+# model as written so that the maps read their accessors.
+@testset "a chain's frame kernel runs once per map, inverse and log density" begin
+    ys = [chain_series([n]; seed = k)[1] for (k, n) in enumerate((4, 6, 3))]
+    named = chain_setup(markov_chains(NAMED_WALKS(; T = 4, U = 6, V = 3), :w_frame, :η, :w) |
+        (; y = ys[1], v = ys[2], r = ys[3]))
+    p = ReactiveKernelsPPL._centering_cells(named.built, named.plan, (;);
+        u0 = nothing, on_error = nothing)
+    counted = [CountedKernel(record.kernel, Ref(0)) for record in p.chains]
+    observed = EXT._centering_reparametrization(p.kernel, p.records,
+        EXT._centering_chains([merge(record, (; kernel))
+            for (record, kernel) in zip(p.chains, counted)]))
+    rp = WarmupHMC.ReparametrizedProblem(observed, named.problem, BACKEND)
+    for ir in (observed, named.ir), chain in ir.chains
+        chain.phi .= 0.5
+        chain.c .= 0.5
+    end
+    x = 0.2 .* cos.(1:length(named.u)) .+ 0.1
+    calls() = [kernel.calls[] for kernel in counted]
+    reset!() = foreach(kernel -> kernel.calls[] = 0, counted)
+
+    # The counted map is the map: same values and gradients as the problem
+    # `adaptive_centering_problem` built, and the gradient is the density's.
+    value, gradient = LDP.logdensity_and_gradient(rp, x)
+    @test value == LDP.logdensity(named.rp, x)
+    @test gradient ≈ last(LDP.logdensity_and_gradient(named.rp, x)) rtol = 1e-12
+    @test gradient ≈ finite_gradient(q -> LDP.logdensity(named.rp, q), x) rtol = 1e-5 atol = 1e-7
+
+    if pkgversion(WarmupHMC) >= v"0.3.11"
+        reset!()
+        _, mapped = WarmupHMC.with_logabsdet_jacobian!(copy(x), observed, x)
+        @test calls() == [1, 1, 1]
+        reset!()
+        _, back = WarmupHMC.with_logabsdet_jacobian!(copy(mapped),
+            WarmupHMC.InverseFunctions.inverse(observed), mapped)
+        @test calls() == [1, 1, 1]
+        @test back ≈ x
+        reset!()
+        LDP.logdensity(rp, x)
+        @test calls() == [1, 1, 1]
+        # One value pass and one reverse pass at most.
+        reset!()
+        LDP.logdensity_and_gradient(rp, x)
+        @test all(n -> 1 <= n <= 2, calls())
+    end
 end
 
 # The shape of snag adaptive-centeri-230d5f0a: a log-normal effect

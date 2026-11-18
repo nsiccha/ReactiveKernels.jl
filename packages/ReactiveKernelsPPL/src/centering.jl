@@ -71,10 +71,13 @@ location or log-scale may read a chain's states.
 
 Each chain has a frame kernel of its own, which computes its per-state
 coefficients, drift and log step SDs in one pass, linear in the chain's
-length. WarmupHMC reads a chain's four accessors (log step SD, coefficient,
-drift and initial location) one at a time, so a map, inverse or gradient
-evaluates the frame kernel four times once warm-up has moved the chain off
-the model as written; at its starting controls it is not evaluated.
+length. A chain's four accessors (log step SD, coefficient, drift and initial
+location) are `SharedAccessor`s of that kernel. From WarmupHMC 0.3.11 they
+share one evaluation, so once warm-up has moved the chain off the model as
+written, a map or inverse runs the frame kernel once and a gradient runs it
+once forward and once in reverse. Earlier WarmupHMC reads each accessor on its
+own and runs the kernel four times. At the chain's starting controls the
+kernel is not evaluated.
 
 Construction evaluates each named value once to check its shape, using `u0`
 (default zeros) as a model-coordinate exemplar. The code of the joint kernel
@@ -91,19 +94,6 @@ struct _CenteringAccessor{K}
 end
 @inline (a::_CenteringAccessor)(x) = a.kernel[](x)
 
-# A Markov chain's per-state accessor: one family of the chains' frame kernel.
-# Its first entry is the first state's location (`_ChainInitial`).
-struct _ChainAccessor{K}
-    kernel::_CenteringAccessor{K}
-    family::Int
-end
-@inline (a::_ChainAccessor)(x) = a.kernel(x).values[a.family]
-struct _ChainInitial{K}
-    kernel::_CenteringAccessor{K}
-    family::Int
-end
-@inline (a::_ChainInitial)(x) = a.kernel(x).values[a.family][1]
-
 # Runtime family/element selectors keep heterogeneous endpoint shapes concrete
 # without concatenating or copying their arrays into a flat buffer.
 struct _CenteringFrame{N}
@@ -111,6 +101,9 @@ struct _CenteringFrame{N}
 end
 @inline Base.getindex(frame::_CenteringFrame, index::CartesianIndex{2}) =
     frame.values[index[1]][index[2]]
+# A whole family: a Markov chain's per-state coefficients, drift or log step
+# SDs, read by WarmupHMC as `SharedAccessor(frame kernel, family)`.
+@inline Base.getindex(frame::_CenteringFrame, family::Int) = frame.values[family]
 
 const _CENTERING_VALUE = :_ppl_centering_value
 

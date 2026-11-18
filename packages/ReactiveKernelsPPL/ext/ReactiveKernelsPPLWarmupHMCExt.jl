@@ -16,7 +16,9 @@ function PPL.adaptive_centering_problem(built, plan::PPL.StructuralPlan, problem
 end
 
 # One `MarkovChain` per recurrence `markov_chains` marked, each on its own
-# frame kernel.
+# frame kernel. Its accessors are `SharedAccessor`s of that kernel: WarmupHMC
+# 0.3.11+ evaluates the kernel once per chain for all four, and earlier
+# versions call each accessor on its own, as plain `f(x)[i]`.
 function _centering_chains(records)
     isempty(records) && return ()
     pkgversion(WH) >= v"0.3.1" && isdefined(WH, :MarkovChain) ||
@@ -26,10 +28,10 @@ function _centering_chains(records)
         for chain in records)
 end
 _centering_chain(chain, frame) = WH.MarkovChain(chain.states;
-    log_scale = PPL._ChainAccessor(frame, chain.log_scale),
-    coefficient = PPL._ChainAccessor(frame, chain.coef),
-    drift = PPL._ChainAccessor(frame, chain.drift),
-    initial = PPL._ChainInitial(frame, chain.drift))
+    log_scale = WH.SharedAccessor(frame, chain.log_scale),
+    coefficient = WH.SharedAccessor(frame, chain.coef),
+    drift = WH.SharedAccessor(frame, chain.drift),
+    initial = WH.SharedAccessor(frame, CartesianIndex(chain.drift, 1)))
 
 # Records arrive ordered by level. Each level reads the shared kernel at its own
 # stage, so WarmupHMC evaluates the kernel once per level, after the earlier

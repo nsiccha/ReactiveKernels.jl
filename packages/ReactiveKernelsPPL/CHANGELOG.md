@@ -16,6 +16,24 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.219
+
+- With WarmupHMC 0.3.11 or later, a Markov chain from `markov_chains` runs its
+  frame kernel once per map, inverse or log density, and at most twice per
+  gradient, where it ran four and eight times. Its four accessors (log step
+  SD, coefficient, drift and initial location) are now `SharedAccessor`s of
+  that kernel, which WarmupHMC 0.3.11 evaluates once for all of them. With
+  earlier WarmupHMC each accessor still runs the kernel on its own, as before,
+  so the compat floor is unchanged.
+- On a per-group walk moved off the model as written (`phi = c = 0.5`, one
+  thread, 30 paired rounds on a loaded host), one gradient of the
+  `adaptive_centering_problem` takes 0.34 ms and 0.56 MiB at 3 × 623 states,
+  0.68 ms and 1.1 MiB at 6 × 623 and 1.7 ms and 2.8 MiB at 12 × 790. Reading
+  the accessors separately took 0.82, 1.7 and 4.3 ms and 1.7, 3.3 and
+  8.3 MiB in the same run. A hand-built `MarkovChain` reading the coordinates
+  directly takes 0.19, 0.37 and 0.95 ms, so the chain now costs 1.7–1.8 times
+  it at every size.
+
 ## 0.1.218
 
 - `prepare_gibbs` accepts a model whose other integers are marginalized
