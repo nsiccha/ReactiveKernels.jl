@@ -16,6 +16,34 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.322
+
+- A summed plate nested in another plate's cell, such as the positions of a
+  whole-event law, runs once per distinct row of its bind-time caches per
+  lane of the enclosing plates, weighted by its row count, as a top-level
+  summed plate over repeated bound rows does since 0.1.184. A cached row index
+  into an array that is the same in every row (a `fill`, an `hcat` of fills,
+  numbers and bound columns with equal rows) does not tell positions apart,
+  so a species' all-zero sites of `hcat(fill(theta, n), never)` occupancy
+  operands are one cell. Values agree with the plate's sum to rounding; no
+  exception moves. `simplify = false` keeps every position.
+- `size(x, d)` and `length(x)` of a live array built in a plate cell by
+  `fill` with bind-time dimensions, or by `hcat`/`[a b]` of such arrays,
+  numbers and bind-time arrays (through a check returning it), are bind-time
+  values, so the work they feed is cached at binding.
+
+## 0.1.321
+
+- `jax_source`: a plate over a padded vector of tuples of numbers, such as
+  the stacked step outputs of a scan inside a plate cell whose length comes
+  from the data, maps that vector as a padded group vector: its cells are
+  masked by its length. Before, the plate passed that single length to every
+  cell as if each tuple had a length of its own, and `jax.vmap` raised
+  `ValueError: vmap was requested to map its argument along axis 0, which
+  implies that its rank should be at least 1, but is only 0` (RKPPL's
+  `group_random_walk` and marginalized `@plate` cell filters). Tuples with an
+  array or tuple field keep their per-entry lengths as before.
+
 ## 0.1.320
 
 - A compiled reactive state invalidates per element where it can. With an
