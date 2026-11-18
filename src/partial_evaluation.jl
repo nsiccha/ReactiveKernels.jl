@@ -2606,6 +2606,26 @@ end
 # A class's template before its first binding the inner-plate pass left alone.
 struct _UnbuiltTemplate end
 
+# The non-allocating program every binding of one bound template shares,
+# without that binding's constants (snag `rkppl-smc-with-d-80655b87`). A
+# rebound kernel's `prepare_nonallocating` places its own constants in their
+# slots of the first binding's step program instead of lowering and compiling
+# it again; each kernel owns a fresh copy of the unfilled step caches, which
+# its first call fills.
+struct _NonallocTemplate
+    f::Any
+    constants::_RebindTable # the constants table without the binding's values
+    callables::Tuple        # the step operations, the same for every binding
+    caches::Tuple           # the unfilled step caches; every kernel copies them
+    cache_apply::Any
+    inputs::Tuple
+    outputs::Tuple
+    ast::Expr
+    read::Vector{Int}       # the positions, among the plan's constants, of those it reads
+    count::Int              # the plan's number of constants
+    signature::Type         # the exemplar call signature (`Nothing` without exemplars)
+end
+
 struct _BoundEntry
     plan::Plan
     boundary::_PartialBoundary
@@ -2776,6 +2796,75 @@ function _bound_rebind(entry::_BoundEntry, template::_BoundTemplate,
     _executed_prepared_kernel(template.f, table, callables, template.inputs,
                               template.outputs, plan, template.ast, Tuple(lowered),
                               template.exact_signature, template.vectorizations)
+end
+
+# `prepare_nonallocating` of a prepared kernel. A kernel a bound template
+# produced (`k.rebinding`) shares its non-allocating program with the other
+# bindings of that template, per exemplar signature, passes and settings: the
+# first binding lowers and compiles it, and keeps it without its constants
+# when each constant its program reads fills exactly its own slot; later
+# bindings place their constants there. Any other kernel prepares afresh.
+function _prepare_nonallocating_rebinding(@nospecialize(k::PreparedKernel), p::Plan,
+                                          cache_apply; have_types = nothing,
+                                          exact_signature::Bool = false, passes = ())
+    vectorizations = getfield(k, :rebinding)
+    vectorizations isa _BoundVectorizations &&
+        all(pass -> Base.issingletontype(typeof(pass)), passes) ||
+        return _prepare_nonallocating(p, cache_apply; have_types, exact_signature, passes)
+    key = (:nonallocating, have_types, exact_signature, Tuple(_pass_key(q) for q in passes),
+           cache_apply, _simplify(), _bound_statistics(), _branch_arms(), _plan_mode(),
+           _type_stability(), _type_stability_level())
+    constants = _bound_constants(p)
+    template = @lock vectorizations.lock get(vectorizations.products, key, _UnbuiltTemplate())
+    template isa _NonallocTemplate && length(constants) == template.count &&
+        return _nonalloc_rebind(template, p, constants)
+    recipes = Ref{Any}(nothing)
+    kernel = _prepare_nonallocating(p, cache_apply; have_types, exact_signature, passes,
+                                    lowered_recipes = recipes)
+    if template isa _UnbuiltTemplate
+        built = _nonalloc_template(kernel, recipes[], constants)
+        @lock vectorizations.lock get!(vectorizations.products, key, built)
+    end
+    kernel
+end
+
+# The template of a binding's non-allocating kernel, or `nothing` when one of
+# the constants its program reads does not fill exactly its own slot of the
+# lowered recipes and constants table, or an unread constant's value is still
+# in the table: then every binding prepares afresh.
+function _nonalloc_template(@nospecialize(kernel::NonAllocatingKernel),
+                            @nospecialize(recipes::Tuple), constants::Vector{Recipe})
+    table = getfield(kernel, :constants)
+    read = Int[]
+    for (j, c) in enumerate(constants)
+        if any(x -> x === c, recipes)
+            push!(read, j)
+        else
+            value = c.op.value
+            any(x -> x === value, table) && return nothing
+        end
+    end
+    used = constants[read]
+    lowered = _rebind_table(recipes, used)
+    lowered === nothing && return nothing
+    fixed = Any[table...]
+    for (j, slot) in enumerate(lowered.slots)
+        fixed[slot] === used[j].op.value || return nothing
+        fixed[slot] = nothing
+    end
+    S = (typeof(kernel)::DataType).parameters[8]
+    _NonallocTemplate(getfield(kernel, :f), _RebindTable(fixed, lowered.slots),
+                      getfield(kernel, :callables), deepcopy(getfield(kernel, :caches)),
+                      getfield(kernel, :cache_apply), getfield(kernel, :inputs),
+                      getfield(kernel, :outputs), getfield(kernel, :ast), read,
+                      length(constants), S)
+end
+
+function _nonalloc_rebind(t::_NonallocTemplate, p::Plan, constants::Vector{Recipe})
+    values = Any[c.op.value for c in constants[t.read]]
+    table = Tuple(_rebound_table(t.constants, values))
+    NonAllocatingKernel{t.signature}(t.f, table, t.callables, deepcopy(t.caches),
+                                     t.cache_apply, t.inputs, t.outputs, p, t.ast)
 end
 
 # Normalize the public `bound` kwarg — one `Value => data` pair or an
