@@ -16,6 +16,20 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.223
+
+- `jax_source`: `prepare_data` computes a dotted `@plate` cell latent's
+  per-index dimensions as a list of rows again, the form host code indexes a
+  vector of numeric tuples in since ReactiveKernels 0.1.287. It had kept them
+  as a tuple of columns, so reading one index's dimensions read a column
+  instead: `prepare_data` raised `IndexError: tuple index out of range` or a
+  broadcast error such as `(6,)` against `(6,6,5,8,4,4)`, for BRM's ragged
+  per-cell steps among others. The functions still take the dimensions as
+  columns.
+- Requires ReactiveKernels 0.1.321, whose plates map a scan's padded tuple
+  outputs by their length, so the JAX module of a marginalized `@plate` cell
+  filter or a per-group random walk runs again.
+
 ## 0.1.222
 
 - `marginalize(model, :z)` sums out an integer array: a declaration

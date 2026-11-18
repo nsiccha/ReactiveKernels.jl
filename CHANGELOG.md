@@ -16,6 +16,18 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.321
+
+- `jax_source`: a plate over a padded vector of tuples of numbers, such as
+  the stacked step outputs of a scan inside a plate cell whose length comes
+  from the data, maps that vector as a padded group vector: its cells are
+  masked by its length. Before, the plate passed that single length to every
+  cell as if each tuple had a length of its own, and `jax.vmap` raised
+  `ValueError: vmap was requested to map its argument along axis 0, which
+  implies that its rank should be at least 1, but is only 0` (RKPPL's
+  `group_random_walk` and marginalized `@plate` cell filters). Tuples with an
+  array or tuple field keep their per-entry lengths as before.
+
 ## 0.1.320
 
 - A compiled reactive state invalidates per element where it can. With an
