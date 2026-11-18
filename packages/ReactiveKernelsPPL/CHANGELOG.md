@@ -16,6 +16,23 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.220
+
+- The log-Jacobian of every logistic-based transform (unit, interval, and an
+  element bounded on both sides) is `log(hi - lo) - abs(u) - 2 *
+  log1pexp(-abs(u))`, where it was `log(hi - lo) - log1pexp(-u) -
+  log1pexp(u)`. The two are equal. The new form, which Stan and Wren use, needs
+  one `log1pexp` per coordinate instead of two, in the log density and in its
+  gradient, and is within 0.42 ulp of a 256-bit oracle (1.2 ulp before).
+  Generated programs (`kernel_expr`) show the new expression.
+- On the PosteriorDB UKDrivers port (a level `@scan` of 192 interval-bounded
+  states; Julia 1.13.1, registered Enzyme 0.13.221, one CPU of a loaded host)
+  the prepared sampler's log density takes 2.3 µs and its gradient 6.6–6.9 µs,
+  down from 3.8 µs and 12.5–13.1 µs, with ReactiveKernels 0.1.315's
+  affine-logistic slopes. The log density at the benchmark point is
+  unchanged to the bit, and the gradient agrees to 4e-14 relative (snag
+  `ukdrivers-log1pe-1df47969`).
+
 ## 0.1.219
 
 - With WarmupHMC 0.3.11 or later, a Markov chain from `markov_chains` runs its

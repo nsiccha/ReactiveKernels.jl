@@ -23,11 +23,14 @@
     logjac(u::Float64)::Float64 = u
 end
 
+# The logistic log-slope log σ(u) + log σ(-u) is `-log1pexp(-u) - log1pexp(u)`,
+# written with the one `log1pexp(-|u|)` both terms share (`_logistic_logslope`
+# in layout.jl, which the generated programs and the host use).
 @kernel unit_bijector() = begin
     constrain(u::Float64)::Float64 = 1 / (1 + exp(-u))
     inv(constrain, x::Float64)::Float64 = log(x) - log1p(-x)
     unconstrain(x::Float64)::Float64 = inv(constrain, x)
-    logjac(u::Float64)::Float64 = -log1pexp(-u) - log1pexp(u)
+    logjac(u::Float64)::Float64 = -abs(u) - 2 * log1pexp(-abs(u))
 end
 
 """Transform symbol → bijector kernel object (constrained supports only)."""
@@ -89,7 +92,7 @@ end
     inv(constrain, x::Float64)::Float64 = log(x - lo) - log(hi - x)
     unconstrain(x::Float64)::Float64 = inv(constrain, x)
     logjac(u::Float64)::Float64 =
-        log(hi - lo) - log1pexp(-u) - log1pexp(u)
+        log(hi - lo) - abs(u) - 2 * log1pexp(-abs(u))
 end
 
 # Cache of prepared interval endpoints, keyed by (lo, hi, endpoint): the owner
