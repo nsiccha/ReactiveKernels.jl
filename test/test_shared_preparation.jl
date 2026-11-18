@@ -711,6 +711,49 @@ end
     @test data.value === nothing
 end
 
+# A binding prepared on exemplars, as RKPPL's sampler prepares one, takes the
+# graph's bound cache too, keyed on the exemplars' call signature: a later
+# binding of the same ports and signature runs only its data prefix and
+# shares the first binding's compiled residual (snag
+# rkppl-smc-with-d-80655b87: each such binding planned, lowered and compiled
+# afresh, about 85 ms of a three-coefficient regression's preparation).
+@testset "an exemplar-typed binding rebinds the graph's bound template" begin
+    F = BoundVectorizeFixture
+    have = (:q, :b, :amount, :subjects, :d)
+    want = (:lo, :hi, :pred)
+    designs = ((; subjects = collect(1:4), d = [0.5, 1.0, 1.5, 2.0]),
+               (; subjects = collect(1:6), d = collect(0.25:0.25:1.5)),
+               (; subjects = [4, 3, 2, 1], d = [2.0, 1.0, 3.0, 4.0]))
+    q = [-1.0, 0.0, 1.0]
+    b = collect(range(0.1, 2.0; length = 6))
+    amount = 0.7
+    unbound = prepare(F.graph; have, want)
+    exemplars = (q, b, amount)
+    kernels = map(designs) do design
+        kernel = prepare(F.graph; have, want, bound = design, exemplars)
+        @test kernel(q, b, amount) == unbound(q, b, amount, design.subjects, design.d)
+        kernel
+    end
+    @test all(k -> k.f === first(kernels).f, kernels)
+    @test all(k -> ReactiveKernels._exact_signature(k) ===
+                   Tuple{Vector{Float64},Vector{Float64},Float64}, kernels)
+    # The uncached preparation of the plan gives the same values.
+    p = ReactiveKernels.plan(F.graph; have, want)
+    port(name) = p.have[findfirst(v -> v.name === name, p.have)]
+    for design in designs
+        bound = (port(:subjects) => design.subjects, port(:d) => design.d)
+        @test prepare(p; bound, exemplars)(q, b, amount) ==
+              prepare(F.graph; have, want, bound = design, exemplars)(q, b, amount)
+    end
+    # Another exemplar signature is another entry, typed for its own exemplars.
+    other = prepare(F.graph; have, want, bound = designs[1], exemplars = (q, b, 1))
+    @test ReactiveKernels._exact_signature(other) ===
+          Tuple{Vector{Float64},Vector{Float64},Int}
+    @test other(q, b, 1) == unbound(q, b, 1, designs[1].subjects, designs[1].d)
+    @test prepare(F.graph; have, want, bound = designs[2], exemplars).f ===
+          first(kernels).f
+end
+
 module RewrittenPlateFixture
 using ReactiveKernels
 # The cell's `c` reads bound data only, so the inner-plate pass caches it per
