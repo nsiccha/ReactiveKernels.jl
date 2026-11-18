@@ -16,6 +16,23 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.311
+
+- `ad_cost_profile` now reports the time a program spends managing memory, so
+  a gradient whose excess over its value is allocation, freeing or garbage
+  collection is named as such instead of being booked on whichever statement
+  ran it. Each `ADCostPart` gains `primal_memory_seconds` and
+  `gradient_memory_seconds` (time allocating, freeing, zero-filling or
+  copying in Julia's runtime or the C library, including native Enzyme's
+  `malloc`/`free` of the reverse pass's tape) and `callees` (the functions,
+  neither Julia's nor RK's own, that the statement's time is spent in, such
+  as a model's helper). Every sample inside a garbage collection now counts
+  as `(garbage collection)`, not as the statement whose allocation started
+  the collection, which varied between runs and hosts. The display adds a
+  memory-management summary line and the columns `memory` and `mostly in`
+  (the largest callee, when it holds at least half of the part's gradient
+  time).
+
 ## 0.1.310
 
 - JAX source scans a padded sequence with `history` (a dose list per ragged
