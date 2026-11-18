@@ -44,10 +44,11 @@ function prepare_gibbs(built, plan::StructuralPlan, u0::AbstractVector;
     all_ps = _integer_parameters(plan)
     isempty(all_ps) && throw(ArgumentError("prepare_gibbs needs at least one integer parameter"))
     ps = [p for p in all_ps if p isa SampledParameter]
-    array_ps = [p for p in all_ps if p isa ArrayParameter]
+    # A declared integer array and an integer `@plate` cell (`z[i] ~
+    # Categorical(w)` in a loop) are both one array of integers.
+    array_ps = [p for p in all_ps if p isa ArrayParameter || p isa PlateParameter]
     length(ps) + length(array_ps) == length(all_ps) || throw(ArgumentError(
-        "prepare_gibbs updates scalar integers and declared integer arrays; " *
-        "integer `@plate` cells are not yet supported"))
+        "prepare_gibbs updates scalar integers and integer arrays"))
     layout.total == 0 || backend !== nothing || throw(ArgumentError(
         "prepare_gibbs requires an AD backend for its continuous block"))
     paths = [get(layout.name_paths, p.name, (p.name,)) for p in ps]
@@ -160,19 +161,24 @@ end
 # else that reads it.
 function _gibbs_elementwise(statements, root::Symbol, dependent)
     elementwise = Set{Symbol}([root])
+    positions = _gibbs_position_names(statements)
     for st in statements
         name = _assigned_name(st)
         (name === nothing || name === root || name ∉ dependent) && continue
-        _gibbs_elementwise_expr(st.args[2], elementwise, dependent) &&
+        _gibbs_elementwise_expr(st.args[2], elementwise, dependent, positions) &&
             push!(elementwise, name)
     end
     return elementwise
 end
-function _gibbs_elementwise_expr(ex, elementwise, dependent)
+# Names the program binds to every position of a vector, in order.
+_gibbs_position_names(statements) = Set{Symbol}(_assigned_name(st) for st in statements
+    if _assigned_name(st) !== nothing && _gibbs_all_positions(st.args[2]))
+function _gibbs_elementwise_expr(ex, elementwise, dependent, positions=Set{Symbol}())
     ex isa Symbol && return ex in elementwise
     ex isa Expr || return false
     free(a) = !_gibbs_reads(a, dependent)
-    item(a) = free(a) || _gibbs_elementwise_expr(a, elementwise, dependent)
+    item(a) = free(a) || _gibbs_elementwise_expr(a, elementwise, dependent, positions)
+    all_positions(a) = a isa Symbol ? a in positions : _gibbs_all_positions(a)
     if ex.head === :ref && length(ex.args) == 2
         return free(ex.args[1]) && ex.args[2] isa Symbol && ex.args[2] in elementwise
     elseif ex.head === :. && length(ex.args) == 2 && Meta.isexpr(ex.args[2], :tuple)
@@ -182,10 +188,48 @@ function _gibbs_elementwise_expr(ex, elementwise, dependent)
         return all(item, ex.args[2:end])
     elseif _gibbs_plate_parts(ex) !== nothing
         operands, captured = _gibbs_plate_parts(ex)
-        return isempty(intersect(captured, dependent)) && all(item, operands) &&
-            any(a -> !free(a), operands)
+        isempty(intersect(captured, dependent)) && all(item, operands) &&
+            any(a -> !free(a), operands) && return true
+        # A loop's cells over every position (`@plate for i in eachindex(y)`)
+        # reading the array only at their own position (`mu[z[i]]`): cell `i`
+        # holds element `i`.
+        params = ex.args[2].args[1]
+        param = params isa Symbol ? params :
+            (Meta.isexpr(params, :tuple, 1) ? params.args[1] : nothing)
+        return length(operands) == 1 && param isa Symbol &&
+            all_positions(operands[1]) &&
+            _gibbs_reads(ex.args[2].args[2], dependent) &&
+            _gibbs_reads_own(ex.args[2].args[2], param, elementwise, dependent)
+    elseif ex.head === :call && length(ex.args) == 3 &&
+            _gibbs_callee(ex.args[1], :_ppl_range_values)
+        # A response's selection of a location at every position, in order.
+        return item(ex.args[2]) && free(ex.args[3]) && all_positions(ex.args[3])
     end
     return false
+end
+
+_gibbs_callee(f, name::Symbol) = f === name || (f isa GlobalRef && f.name === name) ||
+    (Meta.isexpr(f, :., 2) && f.args[2] == QuoteNode(name))
+# Every position of a vector in order: `collect(eachindex(x))`,
+# `eachindex(x)` or `collect(axes(x, 1))`, as the plate and range desugars
+# spell a loop over all of `x`.
+function _gibbs_all_positions(ex)
+    Meta.isexpr(ex, :call) || return false
+    _gibbs_callee(ex.args[1], :collect) && length(ex.args) == 2 &&
+        return _gibbs_all_positions(ex.args[2])
+    _gibbs_callee(ex.args[1], :eachindex) && length(ex.args) == 2 && return true
+    return _gibbs_callee(ex.args[1], :axes) && length(ex.args) == 3 && ex.args[3] == 1
+end
+# The cell body reads names that depend on the array only as `a[param]`,
+# with `a` an elementwise value.
+function _gibbs_reads_own(ex, param, elementwise, dependent)
+    ex isa Symbol && return ex ∉ dependent
+    ex isa Expr || return true
+    if ex.head === :ref && length(ex.args) == 2 && ex.args[1] isa Symbol &&
+            ex.args[1] in dependent
+        return ex.args[1] in elementwise && ex.args[2] === param
+    end
+    return all(a -> _gibbs_reads_own(a, param, elementwise, dependent), ex.args)
 end
 
 # `(operands, captured)` of `plate(operands...) do cells...; body end`, or
@@ -214,7 +258,8 @@ function _gibbs_elementwise_plate(statements, term, elementwise, dependent)
     pst = _named_statement(statements, rhs.args[2])
     pst === nothing && return nothing
     _gibbs_plate_parts(pst.args[2]) === nothing && return nothing
-    _gibbs_elementwise_expr(pst.args[2], elementwise, dependent) || return nothing
+    _gibbs_elementwise_expr(pst.args[2], elementwise, dependent,
+        _gibbs_position_names(statements)) || return nothing
     return rhs.args[2]
 end
 

@@ -24,12 +24,20 @@ are recorded in the git history only.
   runs; indexing a level axis by an integer is refused at binding. An integer
   array's `Categorical` prior may share a whole probability vector, including
   a sampled simplex: `z[axes(y, 1)] .~ Categorical(w)`.
-- `prepare_gibbs` updates declared integer arrays, each as its own block after
-  the scalar blocks. When every density term reading the array sums plate
-  cells that read only their own element, all elements are drawn together
-  from one evaluation per support value; otherwise each element is drawn in
-  turn from its exact conditional. All elements share one support. Integer
-  `@plate` cells, and data arrays indexed by an integer, are not supported yet.
+- A data array is indexed by an integer parameter the same way:
+  `centers[z]` per element and `centers[k]` for a scalar.
+- An integer parameter may be written as a `@plate` loop cell: with
+  `z[i] ~ Categorical(w)` and `y[i] ~ Normal(mu[z[i]], 1.0)` in one cell, a
+  cell gathers through its own latent's value at `i`. The loop means the same
+  parameter as `z[axes(y, 1)] .~ Categorical(w)` with `mu[z]`: densities,
+  gradients and constrained values agree. A cell's `Categorical` reads its
+  probabilities as one whole vector, a sampled simplex or bound data.
+- `prepare_gibbs` updates integer arrays, declared or written as `@plate`
+  cells, each as its own block after the scalar blocks. When every density
+  term reading the array sums plate cells that read only their own element
+  (`mu[z[i]]` over every position of the loop), all elements are drawn
+  together from one evaluation per support value; otherwise each element is
+  drawn in turn from its exact conditional. All elements share one support.
 
 ## 0.1.213
 

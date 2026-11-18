@@ -174,10 +174,36 @@ element, so the elements are conditionally independent: one evaluation of
 those cells per support value gives every element's log weight, and all
 elements are drawn together. A term that couples elements, such as one reading
 `sum(z)`, makes the driver draw the elements one after another, each from its
-exact conditional. All elements must share one support. The array spelling is
-required for now: integer `@plate` cells and data arrays indexed by an integer
-are not yet supported. Julia checks integer indices when the program runs, so
-an index outside the indexed array raises a `BoundsError`.
+exact conditional. All elements must share one support. Julia checks integer
+indices when the program runs, so an index outside the indexed array raises a
+`BoundsError`.
+
+The same mixture can be written as a loop, one observation per cell. The
+loop's integers are the same parameter as the declared array: densities,
+gradients and Gibbs draws agree, and each cell reads only its own element, so
+all elements are still drawn together:
+
+```@example integer
+loop_mixture = @rkppl begin
+    w ~ Dirichlet(ones(K))
+    mu[1:K] .~ Normal.(0, 5)
+    @plate for i in eachindex(y)
+        z[i] ~ Categorical(w)
+        y[i] ~ Normal(mu[z[i]], 1.0)
+    end
+end
+loop_plan = loop_mixture(; K = 2) | (; y = mixture_y)
+loop_built = build_kernel(loop_plan)
+loop_u = unconstrain(loop_built.layout,
+    (; w = [0.5, 0.5], mu = [-2.0, 2.0], z = mixture_z))
+prepare_query(loop_built, loop_plan, :sampler)(loop_u, (; z = mixture_z)) ≈
+    prepare_query(mixture_built, mixture_plan, :sampler)(mixture_u, (; z = mixture_z))
+```
+
+A cell's `Categorical` reads its probabilities as one whole vector: a sampled
+simplex (`w`) or bound data. Data arrays are indexed by integers too, so
+known component centers read `y .~ Normal.(centers[z], s)`, and a scalar
+integer reads one entry (`centers[k]`).
 
 JAX execution is verified for all four families, including ordinary
 gradients, changed data sizes, integer-dependent observation trials, and

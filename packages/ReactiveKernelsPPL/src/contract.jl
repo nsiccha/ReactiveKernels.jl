@@ -1744,7 +1744,10 @@ function _validate_plate_parameters_data(plan::StructuralPlan)
         # attached); anything else is a genuine unknown name.
         for (k, v) in pairs(p.args)
             v isa Symbol || continue
-            (v in scalarnames || v in derivednames || haskey(plan.columns, v)) ||
+            # A Categorical cell reads a whole probability vector, which may
+            # be a sampled simplex or another model value.
+            (v in scalarnames || v in derivednames || haskey(plan.columns, v) ||
+                (p.family === :categorical && v in _all_name_set(plan))) ||
                 _fail(p.label, "arg $k references unknown name $v")
         end
         p.range === nothing && continue

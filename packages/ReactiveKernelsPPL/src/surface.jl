@@ -5025,9 +5025,15 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
             ex.args[2] === ivar && return ex.args[1]
         ex isa Expr ? Expr(ex.head, map(localread, ex.args)...) : ex
     end
-    # Gathers from data and declared arrays index at `i` or through an
-    # integer data column. Indexing into a per-index value or a cell local
+    # Gathers from data and declared arrays index at `i`, through an
+    # integer data column, or through this plate's own latent (`mu[z[i]]`
+    # after `z[i] ~ Categorical(w)`): its value at `i` is a runtime
+    # position, as in Julia. Indexing into a per-index value or a cell local
     # (`t[i][k[i]]`, `p[sel]`) is ordinary Julia inside the retained cell.
+    cell_latents = Set{Symbol}(c.args[2].args[1] for c in cells
+        if c isa Expr && _is_sample(c) && Meta.isexpr(c.args[2], :ref, 2) &&
+            c.args[2].args[1] isa Symbol && c.args[2].args[1] ∉ data &&
+            c.args[2].args[2] === ivar)
     function checkrefs(ex)
         ex isa Expr || return
         base = ex.head === :ref ? ex.args[1] : nothing
@@ -5036,7 +5042,8 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
             for index in ex.args[2:end]
                 index === ivar && continue
                 if Meta.isexpr(index, :ref, 2) && index.args[2] === ivar
-                    index.args[1] in data || _sfail("cell gather indexes through `$(index.args[1])`, which is not bound data")
+                    index.args[1] in data || index.args[1] in cell_latents ||
+                        _sfail("cell gather indexes through `$(index.args[1])`, which is not bound data")
                 elseif _expr_has_sym(index, ivar)
                     _cell_lhs_error(ex, ivar)
                 end
@@ -6157,6 +6164,10 @@ function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx,
         # not a shared scalar that can broadcast to every cell.
         bares = _cell_bares(obj, ivar, data)
         setdiff!(bares, plate_defs)
+        # A Categorical cell reads its probabilities as one whole vector
+        # shared by every cell (`z[i] ~ Categorical(p)`), as in Julia.
+        Meta.isexpr(obj, :call, 2) && obj.args[1] === :Categorical &&
+            obj.args[2] isa Symbol && delete!(bares, obj.args[2])
         push!(ctx, (col, line, bares))
         # A data or literal iterator is evaluated as written at binding. A
         # value's iterator (`eachindex(mu)` for a definition, a sampled
@@ -12235,6 +12246,12 @@ function _classify_ref(pname, core::Expr, sign::Int, ctx)
     idx isa Integer && return _extract_summand(pname, core, sign, ctx)
     base isa Symbol || _sfail("predictor $pname: factor base must be a " *
                               "bare coefficient vector, got $(repr(base))")
+    # Data read at a parameter's positions (`centers[z]`, `z` an integer
+    # parameter) is a value, as in Julia: the index decides the read when
+    # the program runs.
+    base in ctx.data && idx isa Symbol &&
+        (idx in ctx.value_arrays || idx in ctx.prior_names) &&
+        return _extract_summand(pname, core, sign, ctx)
     base in ctx.data && _sfail("predictor $pname: $base is data — " *
                                "precompute data-indexed columns")
     haskey(ctx.detmap, base) && _sfail("predictor $pname: $base is a " *
