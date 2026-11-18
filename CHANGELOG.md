@@ -16,6 +16,41 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.320
+
+- A compiled reactive state invalidates per element where it can. With an
+  index, `touch!(state, x, index)` and `mutate!(f, state, x, index)` say that
+  only those elements of the HAVE array `x` changed (an integer or
+  `CartesianIndex` of `x`, or a collection of them; checked before `f` runs).
+  An authored plate that reads `x` only at its own cell (an iterated argument,
+  with the plate's axes) then reruns just those cells, at once, through the
+  native kernel of one cell that `plate_cell` lowers, and a `Float64` `sum`
+  over the plate is updated by the cells' difference instead of summed again.
+  Every other dependent of `x` is invalidated as before. A single-site move of
+  `theta[j]` read through `sum(plate(theta, y) do ... end)` therefore costs
+  one cell, not one per element.
+  - The plate's values are bitwise those of a whole recomputation. The sum's
+    running total is compensated (Neumaier) and summed whole again once as
+    many cells have changed as the plate has, so it equals a fresh `sum` to
+    within rounding, not bitwise.
+  - A plate value already returned by `get!` is never overwritten (the next
+    change copies the buffer first). A frozen plate or sum stays frozen; a
+    value installed by `assign!` or `freeze!` recomputes from its recipe on
+    the next change; `copy` and `copyto!` carry the incremental state.
+  - Without an index, `touch!` and `mutate!` are unchanged. A plate's
+    one-cell kernel is prepared on the first change that names its elements,
+    so preparing a state costs what it did; a kernel that cannot be prepared
+    warns once and leaves its plate to recompute whole.
+  - Measured on a single-site MH move of `theta[j]` that reads the total
+    (the Gen-home-turf benchmark's hand-authored arm; gordito, Julia 1.10.12,
+    one CPU, host load about 45), median per move at J = 10 / 100 / 1,000 /
+    10,000: typed ports 0.50 / 1.45 / 9.8 / 87 µs without the index and
+    0.48 / 0.48 / 0.54 / 0.73 µs with it; untyped ports, as in the benchmark,
+    1.3 / 2.1 / 10.8 / 131 µs and 1.1 / 1.9 / 2.1 / 1.8 µs. The total after
+    20,000 moves is within 2e-16 of a fresh sum. Preparing the state took
+    3.3–3.5 s cold and 1.0 s for a second program, as on 0.1.316; the first
+    move that names elements prepares the one-cell kernel (about 4 s cold,
+    1 s warm).
 ## 0.1.319
 
 - A derivative rule that retains arrays for its reverse pass (a

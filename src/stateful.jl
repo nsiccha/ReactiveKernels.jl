@@ -62,7 +62,7 @@ A prepared, inspectable state program produced by [`prepare_reactive`](@ref).
 It contains a single selected `Plan`, an initialization kernel, compiled lazy
 getter kernels, and a precomputed dependency graph for invalidation.
 """
-struct ReactiveProgram{H,G,V,IN,OUT}
+struct ReactiveProgram{H,G,V,IN,OUT,C}
     token::Base.RefValue{Nothing}
     graph::Graph
     graph_version::Int
@@ -75,6 +75,37 @@ struct ReactiveProgram{H,G,V,IN,OUT}
     dependents::Vector{Vector{Int}}
     sources::BitVector
     plan::Plan
+    # The plates whose cells a change to some elements of a HAVE array reruns
+    # one by one (`_CellPlate`, stateful_cells.jl); `()` for none.
+    cells::C
+end
+
+# The per-instance state of element-level invalidation (stateful_cells.jl).
+# Every vector is indexed by slot and empty when the program has no cell
+# plates. `keep` and `marked` are scratch of one `touch!`; `override` marks a
+# slot whose value `assign!` or `freeze!` installed; `owned` holds the plate
+# buffer this instance copied and so may overwrite in place; `hi`, `comp`,
+# `last` and `updates` hold an incrementally updated sum's compensated total,
+# the value last written to its slot, and the cells changed since its last
+# full sum.
+struct _CellState
+    keep::BitVector
+    marked::BitVector
+    override::BitVector
+    owned::Vector{Any}
+    hi::Vector{Float64}
+    comp::Vector{Float64}
+    last::Vector{Float64}
+    updates::Vector{Int}
+    positions::Vector{Int}
+    olds::Vector{Float64}
+    news::Vector{Float64}
+end
+
+function _CellState(count::Int, cells::Bool)
+    n = cells ? count : 0
+    _CellState(falses(n), falses(n), falses(n), Vector{Any}(nothing, n),
+               zeros(n), zeros(n), zeros(n), zeros(Int, n), Int[], Float64[], Float64[])
 end
 
 """
@@ -90,6 +121,7 @@ mutable struct CompiledReactiveState{P,S}
     valid::BitVector
     frozen::BitVector
     stack::Vector{Int}
+    cellstate::_CellState
 end
 
 function _owned_output(plan::Plan, recipe::Recipe, id::ValueId)
@@ -388,6 +420,13 @@ The selected graph and runtime slot types are fixed. This is the efficient
 state-machine counterpart to the open-ended, dictionary-backed
 [`ReactiveState`](@ref).
 
+Invalidation is per value, and per element where the change names its
+elements: after `mutate!(f, state, x, index)` or `touch!(state, x, index)`, an
+authored plate that reads the HAVE array `x` only at its own cell reruns just
+the cells at `index`, at once, and a `sum` over it takes their difference (a
+compensated running total, summed whole again once as many cells have changed
+as the plate has). Everything else that reads `x` is invalidated as usual.
+
 Unless `simplify = false` (or the project preference `[ReactiveKernels]
 simplify = false`), each recipe computes the numerically fragile compositions
 in its own source in the stable form [`prepare`](@ref) computes
@@ -464,6 +503,7 @@ function _prepare_reactive_program(graph::Graph, have, want, cache_apply, is_mut
     dependents = _state_dependencies(selected, index)
     source_ids = Set(canon_id(graph, value.id) for value in selected.have)
     sources = BitVector(canon_id(graph, value.id) in source_ids for value in values)
+    cells = _reactive_cells(selected, index, sources, dependents)
     ReactiveProgram(
         token,
         graph,
@@ -477,6 +517,7 @@ function _prepare_reactive_program(graph::Graph, have, want, cache_apply, is_mut
         dependents,
         sources,
         selected,
+        cells,
     )
 end
 
@@ -545,6 +586,7 @@ function (program::ReactiveProgram)(args...; frozen = nothing)
         BitVector(index <= source_count for index in 1:count),
         falses(count),
         Vector{Int}(undef, count),
+        _CellState(count, !isempty(program.cells)),
     )
     if frozen !== nothing
         for (id, value) in frozen
@@ -608,6 +650,9 @@ end
 @inline function Base.get!(state::CompiledReactiveState,
                            handle::ReactiveValue{I,T}) where {I,T}
     _check_handle(state, handle)
+    # A plate's buffer handed to the caller is no longer the instance's alone:
+    # the next change of one of its cells copies it first (`_patch_cell!`).
+    _escape_cells!(state, state.program.cells, Val(I))
     getter = _tuple_slot(state.program.getters, Val(I))
     getter(state.slots, state.valid)::T
 end
@@ -615,9 +660,20 @@ end
 Base.get!(state::CompiledReactiveState, value::Value) =
     get!(state, statevalue(state, value))
 
-function _invalidate_dependents!(state::CompiledReactiveState, root::Int)
+_invalidate_dependents!(state::CompiledReactiveState, root::Int) =
+    _invalidate_dependents!(state, root, nothing)
+
+# `keep` (`touch!` at an index, stateful_cells.jl) names direct dependents of
+# `root` that the caller updates itself; only the edge from `root` is skipped,
+# so a kept value reached on another path is invalidated as usual.
+@inline _kept(::Nothing, child) = false
+@inline _kept(keep::BitVector, child) = keep[child]
+
+function _invalidate_dependents!(state::CompiledReactiveState, root::Int,
+                                 keep::Union{Nothing,BitVector})
     top = 0
     for child in state.program.dependents[root]
+        _kept(keep, child) && continue
         state.frozen[child] && continue
         state.valid[child] || continue
         state.valid[child] = false
@@ -638,7 +694,22 @@ function _invalidate_dependents!(state::CompiledReactiveState, root::Int)
     state
 end
 
-"""Mark an in-place mutation of a declared HAVE value and invalidate downstream slots."""
+"""
+    touch!(state, source)
+    touch!(state, source, index)
+
+Mark an in-place mutation of a declared HAVE value and invalidate downstream
+slots.
+
+With `index` (an integer or `CartesianIndex` of the array `source`, or a
+collection of them) only those elements changed. A plate that reads `source`
+only at its own cell (an iterated, not `Ref`-shared, argument with the plate's
+axes) then reruns just those cells, at once, and a `sum` over the plate is
+updated by their difference instead of recomputed; every other dependent is
+invalidated as usual. The index is a promise: an element changed but not named
+leaves its cells stale. An index outside `source` throws `BoundsError` before
+anything is invalidated.
+"""
 function touch!(state::CompiledReactiveState, handle::ReactiveValue{I}) where {I}
     _check_handle(state, handle)
     state.program.sources[I] || throw(ArgumentError(
@@ -651,14 +722,32 @@ end
 touch!(state::CompiledReactiveState, value::Value) =
     touch!(state, statevalue(state, value))
 
+function touch!(state::CompiledReactiveState, handle::ReactiveValue{I}, index) where {I}
+    _check_handle(state, handle)
+    state.program.sources[I] || throw(ArgumentError(
+        "touch! is restricted to the ReactiveProgram HAVE boundary; use freeze! for a derived cut point",
+    ))
+    positions = _cell_positions!(state, _tuple_slot(state.slots, Val(I))[], index)
+    _touch_cells!(state, handle, positions)
+end
+
+touch!(state::CompiledReactiveState, value::Value, index) =
+    touch!(state, statevalue(state, value), index)
+
 """
     mutate!(state, source) do value
         ...
     end
+    mutate!(f, state, source, index)
 
 Mutate the stored object for a declared HAVE `source`, then automatically mark
 it changed and invalidate its downstream slots. Invalidation also runs if the
 mutation throws, because the object may already have been modified.
+
+With `index`, `f` changes only those elements of the array `source`, and the
+state reruns only the plate cells that read them (see [`touch!`](@ref)):
+`mutate!(x -> (x[j] = v), state, theta, j)`. The index is checked before `f`
+runs.
 """
 function mutate!(f, state::CompiledReactiveState, handle::ReactiveValue)
     _check_handle(state, handle)
@@ -675,6 +764,23 @@ end
 
 mutate!(f, state::CompiledReactiveState, value::Value) =
     mutate!(f, state, statevalue(state, value))
+
+function mutate!(f, state::CompiledReactiveState, handle::ReactiveValue{I}, index) where {I}
+    _check_handle(state, handle)
+    state.program.sources[I] || throw(ArgumentError(
+        "mutate! is restricted to the ReactiveProgram HAVE boundary; use freeze! for a derived cut point",
+    ))
+    value = get!(state, handle)
+    positions = _cell_positions!(state, value, index)
+    try
+        f(value)
+    finally
+        _touch_cells!(state, handle, positions)
+    end
+end
+
+mutate!(f, state::CompiledReactiveState, value::Value, index) =
+    mutate!(f, state, statevalue(state, value), index)
 
 "Set a declared HAVE value and invalidate its downstream slots."
 function set!(state::CompiledReactiveState, handle::ReactiveValue{I}, value) where {I}
@@ -706,6 +812,7 @@ function assign!(state::CompiledReactiveState, handle::ReactiveValue{I,T}, value
         "assign! cannot override frozen slot $I; unfreeze! first"))
     _tuple_slot(state.slots, Val(I))[] = value
     state.valid[I] = true
+    _note_override!(state, I)
     _invalidate_dependents!(state, I)
     state
 end
@@ -726,6 +833,7 @@ function assign!(f, state::CompiledReactiveState, handle::ReactiveValue{I,T}) wh
         return f(value)
     finally
         state.valid[I] = true
+        _note_override!(state, I)
         _invalidate_dependents!(state, I)
     end
 end
@@ -751,6 +859,7 @@ function freeze!(state::CompiledReactiveState, handle::ReactiveValue{I}, value) 
     _tuple_slot(state.slots, Val(I))[] = value
     state.valid[I] = true
     state.frozen[I] = true
+    _note_override!(state, I)
     state
 end
 
@@ -848,6 +957,7 @@ function Base.copy(state::CompiledReactiveState)
         copy(state.valid),
         copy(state.frozen),
         similar(state.stack),
+        _copy_cellstate(state.cellstate),
     )
 end
 
@@ -862,6 +972,7 @@ function Base.copyto!(destination::CompiledReactiveState,
                  destination.valid, source.valid)
     copyto!(destination.valid, source.valid)
     copyto!(destination.frozen, source.frozen)
+    _copyto_cellstate!(destination.cellstate, source.cellstate)
     destination
 end
 
