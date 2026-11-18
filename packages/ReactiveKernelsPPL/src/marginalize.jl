@@ -36,6 +36,21 @@ named state columns under `parameters`, and [`discrete_latent_draws`](@ref)
 recovers a joint draw with a caller-supplied RNG. Several declarations can
 be eliminated together, including submodel locals named by their author paths.
 
+An integer array, declared (`z[axes(y, 1)] .~ Categorical(w)`) or written
+as the integers of a `@plate` loop (`z[i] ~ Categorical(w)`), is summed out
+element by element when every density term that reads it sums cells that
+each read it only at their own element (`y .~ Normal.(mu[z], s)`): the
+elements are then conditionally independent, and the density holds
+`Σ_i logsumexp_s (log p(z_i = s) + log p(y_i | z_i = s))`, in time linear in
+the number of elements and in the support size. Elements may each have their
+own support (`Binomial.(n, p)` with a vector `n`). A term coupling elements
+(one reading `sum(z)`, a recurrence over `z`) is refused: summing it out
+would enumerate every joint state. `:pointwise` then holds each element's
+predictive density given everything else (sequential in field order when
+several responses read the element), and `prepare_discrete_latents` returns
+each element's posterior under `parameters.elements`, drawn independently by
+`discrete_latent_draws`.
+
 A linear-Gaussian recurrence is lowered as a Kalman filter.
 A marginalized array `x` qualifies when
 

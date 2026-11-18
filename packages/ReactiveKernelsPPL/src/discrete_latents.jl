@@ -132,7 +132,13 @@ a `NamedTuple`:
 - for integer declarations eliminated by `marginalize`, `parameters` holds
   `values`, a named tuple of integer state columns, and `probabilities`, their
   joint posterior weights. Both have one axis per eliminated declaration.
-  Nested submodel names stay nested inside `values`;
+  Nested submodel names stay nested inside `values`. An integer array summed
+  out element by element has its record under `parameters.elements` (keyed by
+  its author path, `parameters.elements.z`): `values`, the support values, and
+  `probabilities`, the array's axes and then one over `values` (for a vector,
+  `probabilities[i, j]` is the probability that `z[i] == values[j]`). When
+  scalars are eliminated beside it, both carry a trailing axis over the
+  scalars' joint states;
 
 - for a whole-event hidden Markov observation (`y ~ LogDensity(law, …)` with
   one of `DistributionKernelSources`' hidden Markov laws), the law's state
@@ -214,8 +220,7 @@ function discrete_latent_draws(value::NamedTuple, rng; position = nothing)
     value = position === nothing ? value : _at_position(value, position)
     if hasproperty(value, :_conditional) && hasproperty(value, :parameters) &&
             hasproperty(value.parameters, :values)
-        index = _integer_draw_index(rng, value.parameters.probabilities)
-        parameters = _integer_state_at(value.parameters.values, index)
+        parameters, index = _integer_parameter_draws(rng, value.parameters)
         conditional = discrete_latent_draws(_at_position(value._conditional, index), rng)
         return (; parameters, observations = conditional)
     end
@@ -225,13 +230,45 @@ end
 function _latent_draw(rng, posterior::NamedTuple)
     if hasproperty(posterior, :log_filtered)
         return DistributionKernelSources.draw_hmm_states(rng, posterior)
-    elseif hasproperty(posterior, :values)
-        weights = vec(posterior.probabilities)
-        index = _integer_draw_index(rng, weights)
-        return _integer_state_at(posterior.values, index)
+    elseif hasproperty(posterior, :values) || hasproperty(posterior, :elements)
+        return first(_integer_parameter_draws(rng, posterior))
     end
     return _membership_draws(rng, posterior.probabilities)
 end
+
+# Marginalized integers: one joint state of the scalars, then every element
+# of each summed-out array from its own posterior given that state.
+function _integer_parameter_draws(rng, posterior::NamedTuple)
+    index = nothing
+    scalars = (;)
+    if hasproperty(posterior, :values)
+        index = _integer_draw_index(rng, vec(posterior.probabilities))
+        scalars = _integer_state_at(posterior.values, index)
+    end
+    hasproperty(posterior, :elements) || return scalars, index
+    return _merge_paths(scalars, _integer_element_draws(rng, posterior.elements, index)), index
+end
+
+_integer_element_draws(rng, records::NamedTuple, index) = hasproperty(records, :probabilities) ?
+    _integer_element_draw(rng, records, index) :
+    map(record -> _integer_element_draws(rng, record, index), records)
+# `values` holds the support values (a trailing joint-state axis when the
+# element posteriors depend on summed-out scalars); `probabilities` the
+# elements' posteriors, the values on its last axis before that state axis.
+function _integer_element_draw(rng, record::NamedTuple, index)
+    values, probabilities = record.values, record.probabilities
+    if ndims(values) == 2
+        values = selectdim(values, 2, index)
+        probabilities = selectdim(probabilities, ndims(probabilities), index)
+    end
+    shape = size(probabilities)[1:end-1]
+    choices = _membership_draws(rng, reshape(probabilities, :, size(probabilities, ndims(probabilities))))
+    return reshape([values[j] for j in choices], shape)
+end
+
+_merge_paths(a::NamedTuple, b::NamedTuple) = merge(a, NamedTuple{keys(b)}(map(keys(b)) do k
+    haskey(a, k) && a[k] isa NamedTuple && b[k] isa NamedTuple ? _merge_paths(a[k], b[k]) : b[k]
+end))
 
 _integer_state_at(columns::NamedTuple, index) = map(c -> _integer_state_at(c, index), columns)
 _integer_state_at(column::AbstractArray, index) = column[index]

@@ -178,13 +178,15 @@ end
 # `root` only at `i`. They are `root`, a gather `A[x]` from a value `A` that
 # does not read `root`, dotted broadcasts of such values with values that do
 # not read `root`, and plates over such operands whose cells capture nothing
-# else that reads it.
-function _gibbs_elementwise(statements, root::Symbol, dependent)
-    elementwise = Set{Symbol}([root])
+# else that reads it. `root` may also be several names holding the same
+# elements in the same order (an array and its column-major `vec`).
+function _gibbs_elementwise(statements, root, dependent)
+    roots = root isa Symbol ? (root,) : Tuple(root)
+    elementwise = Set{Symbol}(roots)
     positions = _gibbs_position_names(statements)
     for st in statements
         name = _assigned_name(st)
-        (name === nothing || name === root || name ∉ dependent) && continue
+        (name === nothing || name in roots || name ∉ dependent) && continue
         _gibbs_elementwise_expr(st.args[2], elementwise, dependent, positions) &&
             push!(elementwise, name)
     end

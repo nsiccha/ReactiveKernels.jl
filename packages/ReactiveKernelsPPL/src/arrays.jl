@@ -1620,6 +1620,7 @@ function _array_layout_entries!(entries::Vector{LayoutEntry},
         plan::StructuralPlan, offset::Int)
     for p in plan.array_parameters
         p.name in plan.conditioned && continue
+        p.name in plan.marginalized_integers && continue
         dims = _array_dims(plan, p)
         if _integer_parameter(p)
             push!(entries, LayoutEntry(:integer, nothing, p.name, Symbol[],

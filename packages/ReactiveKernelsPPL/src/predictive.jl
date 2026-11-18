@@ -274,6 +274,12 @@ generator. [`predictive_draws!`](@ref) fills existing response storage, and
 [`predictive_laws`](@ref) exposes the corresponding Distributions laws.
 """
 function prepare_predictive(built, plan::StructuralPlan; on_error = nothing)
+    arrays = _marginalized_integer_arrays(plan)
+    isempty(arrays) || throw(ContractValidationError("[query] " * _quoted_names(arrays) *
+        _integer_arrays_noun(arrays) * " summed out by `marginalize`; joint predictive draws " *
+        "over its elements are not implemented yet. Draw it with " *
+        "`discrete_latent_draws` and prepare the predictive query on the model " *
+        "with the array explicit, passing that draw as its integer state."))
     kernel = _prepare_wants(built, plan, predictive_node(built); on_error)
     return PredictiveQuery(kernel, predictive_targets(built, plan))
 end
