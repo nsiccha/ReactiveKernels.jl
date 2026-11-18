@@ -16,6 +16,20 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.217
+
+- `prepare_gibbs` accepts a model whose other integers are marginalized
+  (`marginalize(model, :a)`). Each remaining integer is updated from its
+  collapsed conditional, which sums over the marginalized integers, and the
+  continuous step targets the density with them summed out. Before, it was
+  refused with `prepare_gibbs currently requires explicit integer
+  parameters`. A model whose integers are all marginalized is refused with
+  NUTS as the remedy.
+- Fixed the dependency analysis of a cell body that builds a NamedTuple
+  field named after an enclosing value (`pointwise = (y = …,)`): the body's
+  read of that value was lost, so a query selecting statements by their
+  reads could omit it.
+
 ## 0.1.216
 
 - `jax_source(built, plan)` translates in Julia's latest world, as
