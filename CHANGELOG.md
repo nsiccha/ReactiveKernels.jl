@@ -23,9 +23,10 @@ are recorded in the git history only.
   and `ad_derivative_report`'s `unstable` also count run-time dispatch and
   boxes in code the derivative runs without differentiating it (Enzyme's
   `sweep = :primal`), since that repair marks error-only code such as error
-  message builders `throw_only`. Without it, that code stays left to the primal
-  check, as in 0.1.312. Programs whose cell windows union their rows
-  (`unique!` dispatches in `issorted`) now report that call.
+  message builders `throw_only`. Calls inside Julia's own functions there stay
+  exempt, as in the primal check, which treats their bodies as leaves (logging
+  machinery included). Without the repair, that code stays left to the primal
+  check, as in 0.1.312.
 
 ## 0.1.313
 

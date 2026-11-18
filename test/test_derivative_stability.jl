@@ -85,12 +85,15 @@ end
     # Enzyme's repair `derivative_report_reachability` marks the code of a
     # function only called on an error path `throw_only`; with it, `unstable`
     # also counts calls in code the derivative runs undifferentiated.
-    finding(sweep; throw_only = false) = (; kind = :dynamic_dispatch,
-        callee = "jl_invoke", in_function = "f", sweep,
-        frames = Base.StackTraces.StackFrame[], in_loop = false, throw_only,
-        bytes = nothing, count = 1)
+    frame(file) = Base.StackTraces.StackFrame(:f, Symbol(file), 1)
+    finding(sweep; throw_only = false, file = "/pkg/src/helper.jl") =
+        (; kind = :dynamic_dispatch, callee = "jl_invoke", in_function = "f", sweep,
+         frames = [frame(file)], in_loop = false, throw_only, bytes = nothing, count = 1)
+    # Julia's own functions stay exempt, as their bodies are in the primal check.
     derivative = (; func = Nothing, mode = :reverse, note = "",
-        findings = [finding(:primal), finding(:forward), finding(:primal; throw_only = true)])
+        findings = [finding(:primal), finding(:forward), finding(:primal; throw_only = true),
+                    finding(:primal; file = "./sort.jl"),
+                    finding(:primal; file = joinpath(Sys.STDLIB, "Logging", "src", "x.jl"))])
     flag = ReactiveKernels._DERIVATIVE_REPORT_REACHABILITY
     saved = flag[]
     try

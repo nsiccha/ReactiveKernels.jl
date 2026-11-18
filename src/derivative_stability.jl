@@ -55,8 +55,10 @@ without differentiating it (`sweep === :primal`) count in `unstable` where the
 loaded Enzyme has the dogfood repair `derivative_report_reachability`, which
 marks the code of a function only called on an error path, such as one
 building an error message, `throw_only` (Enzyme snag
-`derivative-repor-8d7dfce1`). Without that repair `unstable` leaves them to the
-primal check, since such code would read as returning. Every other call that
+`derivative-repor-8d7dfce1`), unless they sit in Julia's own functions (Base,
+Core, the standard libraries), whose bodies the primal check treats as leaves
+too. Without that repair `unstable` leaves undifferentiated code to the primal
+check, since error-only code would read as returning. Every other call that
 leaves the compiled code
 (`:runtime_call`: BLAS, Julia's runtime, separately compiled Julia code) is
 in `derivatives` only.
@@ -90,6 +92,24 @@ end
 # Set by the Enzyme extension when it loads.
 const _DERIVATIVE_REPORT_REACHABILITY = Ref(false)
 
+# Whether a frame of debug info is in Julia's own code (Base, Core and the
+# standard libraries), whose bodies the primal check treats as leaves: debug
+# info names Base's files `./x.jl` and the standard libraries by their install
+# path.
+function _julia_own_frame(frame)
+    file = String(frame.file)
+    startswith(file, "./") || startswith(file, Sys.STDLIB) ||
+        occursin("/share/julia/base/", file) || occursin("/share/julia/stdlib/", file)
+end
+
+# Whether a finding counts as unstable: code the derivative differentiates
+# always does; code it runs undifferentiated does where Enzyme marks error-only
+# code (`derivative_report_reachability`), except inside Julia's own functions,
+# which the primal check exempts too (their logging machinery included).
+_derivative_unstable_sweep(finding, primal::Bool) =
+    finding.sweep !== :primal ||
+    primal && (isempty(finding.frames) || !_julia_own_frame(first(finding.frames)))
+
 function ADDerivativeReport(value, derivatives)
     primal = _DERIVATIVE_REPORT_REACHABILITY[]
     unstable = Pair{Any,Any}[]
@@ -97,7 +117,7 @@ function ADDerivativeReport(value, derivatives)
     for derivative in derivatives, finding in _reported_findings(derivative)
         (finding.throw_only || _derivative_logging(finding)) && continue
         finding.kind in _DERIVATIVE_UNSTABLE_KINDS &&
-            (primal || finding.sweep !== :primal) &&
+            _derivative_unstable_sweep(finding, primal) &&
             push!(unstable, derivative => finding)
         finding.kind in _DERIVATIVE_ALLOCATION_KINDS &&
             push!(allocations, derivative => finding)
