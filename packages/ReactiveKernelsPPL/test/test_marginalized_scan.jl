@@ -685,10 +685,48 @@ cycle_prior(p) = logpdf(Uniform(-1, 1), p.phi1) + logpdf(Uniform(-0.5, 0.5), p.p
     logpdf(Exponential(1), p.sigma) + logpdf(Exponential(1), p.tau) +
     logpdf(Normal(0, 1), p.b) + logpdf(Exponential(1), p.noise)
 
+# One draw read by two rows (snag rkppl-marginaliz-a49e44e4): a process at
+# the start `x0` and the end `x1` of each row's interval, `x1` reading `x0`'s
+# draw of the same seed and step, every scale compound. Each row names its own
+# share of an innovation: `x0`'s innovation reaches `x1`'s row as `phi * …`.
+const SHARED = @rkppl begin
+    sd ~ Exponential(1)
+    range ~ LogNormal(0, 1)
+    noise ~ Exponential(1)
+    phi = exp(-1 / range)
+    beta = (1 - phi) * range / (1 + phi)
+    @scan begin
+        x0[1] ~ Normal(0, 2 * sd)
+        x1[1] ~ Normal(phi * x0[1], sd * sqrt(1 - phi * phi))
+        for t in 2:T
+            rho = exp(-gap[t] / range)
+            x0[t] ~ Normal(rho * x1[t - 1], sd * sqrt(1 - rho * rho))
+            x1[t] ~ Normal(phi * x0[t], sd * sqrt(1 - phi * phi))
+        end
+    end
+    y .~ Normal.(beta .* x0 .+ beta .* x1, noise)
+end
+shared_rec(c, T, gap) = z -> begin
+    phi = exp(-1 / c.range)
+    x0, x1 = zeros(T), zeros(T)
+    x0[1] = 2 * c.sd * z[1]
+    x1[1] = phi * x0[1] + c.sd * sqrt(1 - phi^2) * z[2]
+    for t in 2:T
+        rho = exp(-gap[t] / c.range)
+        x0[t] = rho * x1[t - 1] + c.sd * sqrt(1 - rho^2) * z[2t - 1]
+        x1[t] = phi * x0[t] + c.sd * sqrt(1 - phi^2) * z[2t]
+    end
+    vcat(x0, x1)
+end
+shared_beta(c) = (phi = exp(-1 / c.range); (1 - phi) * c.range / (1 + phi))
+shared_prior(c) = logpdf(Exponential(1), c.sd) + logpdf(LogNormal(0, 1), c.range) +
+    logpdf(Exponential(1), c.noise)
+
 function vector_cases(T; seed = 11)
     rng = Random.Xoshiro(seed)
     y = randn(rng, T)
     w = collect(range(0.1, 1; length = T))
+    gap = collect(range(0.5, 2; length = T))
     E = Matrix(1.0I, T, T)
     return (;
         trend = (plan = marginalize(TREND(; T), :level, :slope) | (; y), y, nz = 2T,
@@ -699,7 +737,10 @@ function vector_cases(T; seed = 11)
             keys = (:x,)),
         cycle = (plan = marginalize(CYCLE(; T, w), :c, :level, :v) | (; y), y, nz = 2T,
             rec = c -> cycle_rec(c, T), H = c -> [zeros(T, T) E Diagonal(c.b .* w)],
-            offset = c -> 0.0, prior = cycle_prior, keys = (:c, :level, :v)))
+            offset = c -> 0.0, prior = cycle_prior, keys = (:c, :level, :v)),
+        shared = (plan = marginalize(SHARED(; T, gap), :x0, :x1) | (; y), y, nz = 2T,
+            rec = c -> shared_rec(c, T, gap), H = c -> shared_beta(c) .* [E E],
+            offset = c -> 0.0, prior = shared_prior, keys = (:x0, :x1)))
 end
 
 @testset "a vector state integrates out as one filter" begin
@@ -1227,6 +1268,7 @@ end
         censored_observed = censored_observed_plan(censored_data(9)),
         gathered = gathered_plan(gathered_data(5, 8)),
         trend = vector_cases(6).trend.plan, ar2 = vector_cases(6).ar2.plan,
+        shared = vector_cases(6).shared.plan,
         submodel = submodel_plans(6).trend[1],
         cell_ar = marginalize(CELL_AR(; c.G, c.se, c.m0), :h) | (; c.y),
         observed = OBSERVED_AR() | (; y = [0.1, -0.3, 0.4, 0.2]))
