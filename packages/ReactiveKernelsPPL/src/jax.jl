@@ -84,6 +84,11 @@ function _jax_module_of(built, plan; values, doc, float_type)
         "[jax] jax_source requires a bound plan (bind_data first)"))
     _check_built_program(built, plan)
     _refuse_integer_conditional_values(plan, built.spec, values)
+    arrays = _marginalized_integer_arrays(plan)
+    isempty(arrays) || throw(ReactiveKernels.JAXEmissionError("[jax] " *
+        _quoted_names(arrays) * _integer_arrays_noun(arrays) * " summed out by `marginalize`; " *
+        "emitting that element-by-element sum in JAX is not implemented yet. " *
+        "Run it natively, or emit the model with the array explicit."))
     have = _query_have(plan)
     data = _query_bound(plan)
     types = merge((; unconstrained = Vector{Float64}),

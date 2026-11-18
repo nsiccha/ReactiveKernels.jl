@@ -16,6 +16,31 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.222
+
+- `marginalize(model, :z)` sums out an integer array: a declaration
+  `z[axes(y, 1)] .~ Categorical(w)` (or `Binomial.(n, p)`, `Bernoulli`,
+  `DiscreteUniform`, restricted) or the integers of a `@plate` loop,
+  `z[i] ~ Categorical(w)`. When every density term that reads `z` sums cells
+  that each read it only at their own element (the condition under which
+  `prepare_gibbs` draws all elements at once), the density holds
+  `Σ_i logsumexp_s (log p(z_i = s) + log p(y_i | z_i = s))`, computed with
+  one evaluation of those cells per support value, so its cost is linear in
+  the number of elements and in the support size. The guide's mixture
+  spelling now matches the components written out as
+  `MixtureModel.(vcat.(…), Ref(w))` in density and Enzyme gradient. Elements
+  may have their own supports, scalars may be summed out beside the array,
+  and a submodel's array is named by its author path (`Symbol("c.z")`).
+  `:pointwise` holds each element's predictive factors (sequential in field
+  order when several responses read it). `prepare_discrete_latents` returns
+  each element's posterior under `parameters.elements.z` (`values`, and
+  `probabilities` with one row per element; given each joint state of
+  summed-out scalars on a trailing axis), and `discrete_latent_draws` returns
+  the drawn array as `parameters.z`. A term coupling elements (`sum(z)`, a
+  recurrence) is refused with an `ArgumentError` naming it. `jax_source` and
+  `prepare_predictive` refuse such a model by name for now (native only).
+  Before, every integer array was refused with a misleading `@scan` error.
+
 ## 0.1.221
 
 - The log-Jacobian of every logistic-based transform (unit, interval, and an

@@ -64,8 +64,8 @@ place in ordinary Julia with the supplied RNG. Several marginalized
 declarations are recovered jointly. Marginal observations are dependent;
 their pointwise terms use sequential predictive probabilities in observation
 field and column-major order (including ragged cells), whose sum is the
-marginal log likelihood. Scalar integer declarations can be eliminated;
-integer arrays remain explicit runtime state.
+marginal log likelihood. An integer array is summed out element by element,
+as the mixture below shows.
 
 For supported observation laws, `prepare_predictive` on the marginalized
 model draws one joint integer state and then every response conditional on
@@ -254,6 +254,28 @@ A cell's `Categorical` reads its probabilities as one whole vector: a sampled
 simplex (`w`) or bound data. Data arrays are indexed by integers too, so
 known component centers read `y .~ Normal.(centers[z], s)`, and a scalar
 integer reads one entry (`centers[k]`).
+
+The assignments can instead be summed out, `marginalize(model, :z)`, when
+every density term that reads `z` sums cells that read only their own
+element, as in both spellings above. The density then holds each
+observation's log-sum-exp over the components, at a cost linear in the
+observations and the components, and equals the components written out as
+`MixtureModel.(…)` in value and gradient. Each element's posterior is under
+`parameters.elements`. A term that couples elements, such as one reading
+`sum(z)`, is refused: summing it out would enumerate every joint assignment.
+Predictive draws and JAX emission of such a model are not implemented yet.
+
+```@example integer
+summed_plan = marginalize(mixture(; K = 2), :z) | (; y = mixture_y)
+summed_built = build_kernel(summed_plan)
+summed_u = unconstrain(summed_built.layout, (; w = [0.5, 0.5], mu = [-2.0, 2.0]))
+assignments = prepare_discrete_latents(summed_built, summed_plan)
+law = MixtureModel(Normal.([-2.0, 2.0], 1.0), [0.5, 0.5])
+(; likelihood = prepare_query(summed_built, summed_plan, :likelihood)(summed_u),
+   written_out = sum(y -> logpdf(law, y), mixture_y),
+   probabilities = assignments(summed_u).parameters.elements.z.probabilities,
+   draw = discrete_latent_draws(assignments, summed_u, Xoshiro(1)).parameters.z)
+```
 
 JAX execution is verified for all four families, including ordinary
 gradients, changed data sizes, integer-dependent observation trials, and

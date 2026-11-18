@@ -558,6 +558,7 @@ function assign_layout(plan::StructuralPlan)
     end
     for p in plan.plate_parameters
         p.name in plan.conditioned && continue
+        p.name in plan.marginalized_integers && continue
         if _integer_parameter(p)
             push!(entries, LayoutEntry(:integer, nothing, p.name, Symbol[],
                 offset, 0, :identity, NaN, NaN, [_plate_rows(plan, p)]))
