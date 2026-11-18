@@ -270,8 +270,11 @@ Thrown by a preparation checked with `type_stability = :error` when the
 prepared program is not type stable at the checked `type_stability_level`.
 `messages` holds one message per finding, as the warning of the default
 `type_stability = :warn` words it: a value whose type the program does not
-infer concretely, or a method whose code holds non-concrete values or calls
-dispatched at run time.
+infer concretely, a method whose code holds non-concrete values or calls
+dispatched at run time, or, at `type_stability_level = :all` with native
+Enzyme, a derivative Enzyme compiles for the program whose code dispatches at
+run time, differentiates a call at run time, or boxes a value (see
+[`ad_derivative_report`](@ref)).
 """
 struct TypeInstabilityError <: Exception
     messages::Vector{String}
@@ -314,6 +317,16 @@ _type_stability_choices(::Val{:cell_locality}) = (:warn, :error, :ignore)
 #   call (`_inline_plate_programs`); a small censored model pays per call for
 #   its arms no lane takes.
 _type_stability_choices(::Val{:branch_arms}) = (:taken, :all)
+# - `ad_allocations`: what a native-Enzyme `prepare_ad*` does with allocations
+#   in the derivative Enzyme compiles for the prepared program (snag
+#   `rk-ad-pass-type-b179e693`, user decision
+#   `ReactiveKernels:snag.rk-ad-pass-type-b179e693/decisions/2026-11-17T22-00-23-356-1auv5ma`).
+#   `:ignore`, the default, only lists them in `ad_derivative_report`; `:warn`
+#   logs them once per process; `:error` refuses the preparation
+#   (`DerivativeAllocationError`). Remaining allocations are intermediate
+#   results, not errors (principle `zero-gradient-allocations`), so this is an
+#   opt-in for a consumer that asserts an allocation-free derivative.
+_type_stability_choices(::Val{:ad_allocations}) = (:ignore, :warn, :error)
 
 function _type_stability_choice(setting::Val{S}, value) where {S}
     choices = _type_stability_choices(setting)
@@ -329,7 +342,8 @@ end
 # `__init__` forgets values read while an image was generated.
 const _TYPE_STABILITY_PREFERENCES =
     (Ref{Union{Nothing,Symbol}}(nothing), Ref{Union{Nothing,Symbol}}(nothing),
-     Ref{Union{Nothing,Symbol}}(nothing), Ref{Union{Nothing,Symbol}}(nothing))
+     Ref{Union{Nothing,Symbol}}(nothing), Ref{Union{Nothing,Symbol}}(nothing),
+     Ref{Union{Nothing,Symbol}}(nothing))
 _type_stability_preference_cache(::Val{:type_stability}) = _TYPE_STABILITY_PREFERENCES[1]
 _type_stability_preference_cache(::Val{:type_stability_level}) =
     _TYPE_STABILITY_PREFERENCES[2]
@@ -338,6 +352,7 @@ _type_stability_preference_cache(::Val{:type_stability_level}) =
 _type_stability_preference_cache(::Val{:cell_locality}) = _TYPE_STABILITY_PREFERENCES[3]
 _cell_locality_preference() = _type_stability_preference(Val(:cell_locality))
 _type_stability_preference_cache(::Val{:branch_arms}) = _TYPE_STABILITY_PREFERENCES[4]
+_type_stability_preference_cache(::Val{:ad_allocations}) = _TYPE_STABILITY_PREFERENCES[5]
 
 function _type_stability_preference(setting::Val{S}) where {S}
     cache = _type_stability_preference_cache(setting)
@@ -356,6 +371,7 @@ end
 _type_stability_scope(::Val{:type_stability}) = :ReactiveKernels_type_stability
 _type_stability_scope(::Val{:type_stability_level}) = :ReactiveKernels_type_stability_level
 _type_stability_scope(::Val{:branch_arms}) = :ReactiveKernels_branch_arms
+_type_stability_scope(::Val{:ad_allocations}) = :ReactiveKernels_ad_allocations
 
 # A setting of the preparation in progress: the innermost enclosing keyword,
 # else the preference.
@@ -365,16 +381,20 @@ _type_stability_setting(setting::Val) = get(() -> _type_stability_preference(set
 _type_stability() = _type_stability_setting(Val(:type_stability))
 _type_stability_level() = _type_stability_setting(Val(:type_stability_level))
 _branch_arms() = _type_stability_setting(Val(:branch_arms))
+_ad_allocations() = _type_stability_setting(Val(:ad_allocations))
 _all_branch_arms() = _branch_arms() === :all
 # `f()` with every preparation inside it given `branch_arms`; `nothing` keeps
 # the enclosing setting.
 _with_branch_arms(f, value) = _with_type_stability_setting(f, Val(:branch_arms), value)
 
 # `f()` with every preparation inside it checked with the given settings;
-# `nothing` keeps the enclosing one.
-_with_type_stability(f, mode, level) =
+# `nothing` keeps the enclosing one. `allocations` is the `ad_allocations`
+# setting every `prepare_ad*` takes.
+_with_type_stability(f, mode, level, allocations = nothing) =
     _with_type_stability_setting(Val(:type_stability), mode) do
-        _with_type_stability_setting(f, Val(:type_stability_level), level)
+        _with_type_stability_setting(Val(:type_stability_level), level) do
+            _with_type_stability_setting(f, Val(:ad_allocations), allocations)
+        end
     end
 _with_type_stability_setting(f, ::Val, ::Nothing) = f()
 _with_type_stability_setting(f, setting::Val, value) =

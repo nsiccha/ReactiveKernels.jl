@@ -24,10 +24,14 @@ end
 @testset "prepare_ad warm compiles during preparation" begin
     q, scale = [0.3, -1.2, 2.0], 1.7
     exemplar = copy(q)
-    cold, cold_runs = evaluations(() ->
-        prepare_ad(warm_objective, BACKEND, q, scale; want = :total, active = :q))
+    # At `type_stability_level = :all`, the default, a native-Enzyme
+    # preparation with Enzyme's derivative report evaluates the gradient once
+    # to check its derivative (`test_derivative_stability.jl`), so these
+    # preparations are compared at `:rk`.
+    cold, cold_runs = evaluations(() -> prepare_ad(warm_objective, BACKEND, q, scale;
+        want = :total, active = :q, type_stability_level = :rk))
     warm, warm_runs = evaluations(() -> prepare_ad(warm_objective, BACKEND,
-        q, scale; want = :total, active = :q, warm = true))
+        q, scale; want = :total, active = :q, warm = true, type_stability_level = :rk))
     # `total` is untyped. Inference proves it a Number for the exemplar's
     # types, so a cold preparation evaluates nothing: a gradient-only caller
     # never compiles the primal (snag frozen-atlas-fir-2d4269a6).
