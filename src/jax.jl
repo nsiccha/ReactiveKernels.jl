@@ -904,6 +904,18 @@ function _jax_with_float_type(f, float_type)
     task_local_storage(f, _JAX_FLOAT_TYPE_KEY, float_type)
 end
 
+# A translation reads the program through reflection
+# (`Core.Compiler.return_type`, `hasmethod`, `which`, `methods`,
+# `code_lowered`) and through dispatch (the `_traceable_source` records,
+# `_jax_function_call` methods), and each sees only the methods of the world
+# it runs in. A program's helpers, `@traceable` records and kernels may be
+# newer than its caller's world, as when a driver builds a program and
+# translates it in one function call: a helper then read as a function with
+# no method (snag jax-source-world-4606dd56). So `jax_source` and `js_source`
+# translate in the latest world, as construction reads a fresh program from
+# any world, and their caller needs no `invokelatest`.
+_translate_in_latest_world(f, ::Type{T}) where {T} = Base.invokelatest(f)::T
+
 _jax_expr(ctx::_JaxContext, ::Val{H}, ex) where {H} =
     _jax_error("the construct `", H, "` (`", ex, "`) has no JAX translation yet",
                _jax_where(ctx))
@@ -8541,6 +8553,11 @@ dictionaries of these).
 their docstrings; the others state what they compute. Module functions
 annotate their parameters (`ArrayLike`) and results.
 
+`jax_source` reads the program in Julia's latest world, so it translates a
+program whose helpers, `@traceable` functions or kernels were defined after
+the calling function began, as when a function builds a program and
+translates it: the caller needs no `Base.invokelatest`.
+
 Where a numerical method cannot produce a value at a valid input (natively a
 `ReactiveKernels.NumericalFailure`: an ODE solve that exceeds its per-output
 budget or fails), a module function raises, as the native program throws,
@@ -8612,13 +8629,13 @@ authored reverse graph when one is available. Generators and slices still
 need a capacity bound for their output storage. A range known to be empty
 from shapes runs no JAX loop, so its body's empty-array reads are not traced.
 """
-function jax_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
-                    want = nothing, functions = nothing, types = nothing,
-                    name = :kernel, constants = NamedTuple(), doc = nothing, data = nothing,
-                    definitions = nothing, definitions_module::Module = Main, keep = (),
-                    function_docs = NamedTuple(), float_type = Float64,
-                    source_regions = _JaxSourceRegion[], module_docstring = nothing,
-                    rejecting = ())
+jax_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
+           want = nothing, functions = nothing, types = nothing,
+           name = :kernel, constants = NamedTuple(), doc = nothing, data = nothing,
+           definitions = nothing, definitions_module::Module = Main, keep = (),
+           function_docs = NamedTuple(), float_type = Float64,
+           source_regions = _JaxSourceRegion[], module_docstring = nothing,
+           rejecting = ()) = _translate_in_latest_world(JAXSource) do
     docstring = _jax_module_docstring(doc, module_docstring)
     functions === nothing && want === nothing && (want = _KERNEL_DEFAULT_BOUNDARY)
     if functions === nothing
@@ -8647,10 +8664,12 @@ jax_source(p::Plan; types = nothing, name = :kernel, constants = NamedTuple(),
            doc = nothing, data = nothing, definitions = nothing,
            definitions_module::Module = Main, keep = (), function_docs = NamedTuple(),
            float_type = Float64) =
-    _jax_with_float_type(float_type) do
-        _jax_module_source([Symbol(name) => (p, Tuple(v.name for v in p.want))],
-                           types, constants, _jax_module_docstring(doc, nothing);
-                           data, definitions, definitions_module, keep, function_docs)
+    _translate_in_latest_world(JAXSource) do
+        _jax_with_float_type(float_type) do
+            _jax_module_source([Symbol(name) => (p, Tuple(v.name for v in p.want))],
+                               types, constants, _jax_module_docstring(doc, nothing);
+                               data, definitions, definitions_module, keep, function_docs)
+        end
     end
 
 # The module docstring: the generated line naming the generator, the author's

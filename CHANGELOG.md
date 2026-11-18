@@ -16,6 +16,17 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.313
+
+- `jax_source` and `js_source` translate a program in Julia's latest world,
+  so a function that defines a program's helpers, `@traceable` functions or
+  kernels and then translates it gets the same module as a translation from
+  the top level, with no `Base.invokelatest` around the call. Before, a
+  helper defined after the calling function began read as a function with no
+  method: `jax_source` raised `JAXEmissionError` ("the function `f` has no
+  applicable Julia method for argument types (Float64)"), or listed a
+  data-only definition calling it in `UNTRANSLATED`.
+
 ## 0.1.312
 
 - A native-Enzyme gradient runs the derivative Enzyme compiles, not the

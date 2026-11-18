@@ -64,12 +64,19 @@ not to the model value, so the caller passes it.
 `plan` is any binding that generates the same program as `built`, as for
 [`prepare_query`](@ref); its values only type the inputs. Data arrays keep
 Julia's dimension order and integer index data stay 1-based. See
-`ReactiveKernels.jax_source` for the translation.
+`ReactiveKernels.jax_source` for the translation. Like it, this method reads
+the program in Julia's latest world: a function that builds a model and
+translates it needs no `Base.invokelatest`.
 """
 ReactiveKernels.jax_source(built::NamedTuple, plan::StructuralPlan; values = (), doc = nothing,
                            float_type = Float64) =
-    ReactiveKernels._jax_with_float_type(float_type) do
-        _jax_module_of(built, plan; values, doc, float_type)
+    # In the latest world, as `ReactiveKernels.jax_source` translates: a
+    # program built in the caller's own function call has methods its world
+    # does not see.
+    ReactiveKernels._translate_in_latest_world(ReactiveKernels.JAXSource) do
+        ReactiveKernels._jax_with_float_type(float_type) do
+            _jax_module_of(built, plan; values, doc, float_type)
+        end
     end
 function _jax_module_of(built, plan; values, doc, float_type)
     built = _binding_build(built, plan)
