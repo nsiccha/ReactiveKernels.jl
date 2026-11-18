@@ -16,6 +16,16 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.215
+
+- `jax_source(built, plan)` translates in Julia's latest world, as
+  `ReactiveKernels.jax_source` does from ReactiveKernels 0.1.312 on: a
+  function that builds a model calling its own functions and translates it
+  gets the module a translation from the top level gives, and its data-only
+  definitions are computed by `prepare_data` instead of staying in
+  `UNTRANSLATED` with "has no applicable Julia method". Requires
+  ReactiveKernels 0.1.312.
+
 ## 0.1.214
 
 - An integer parameter indexes an array as in Julia: a scalar one reads one

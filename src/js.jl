@@ -3000,6 +3000,8 @@ Plain Julia helpers are translated from their
 typed code, branches, early returns and loops included, without annotation;
 helpers taking views retain the view's parent and index expressions by inlining
 the call, including its loops (recursive calls with views are refused).
+Like `jax_source`, it reads the program in Julia's latest world, so a function
+may build a program and translate it without `Base.invokelatest`.
 Julia's own functions translate only through RK's table. A construct without
 a translation (a C call, `fma`, `\` and factorizations, indexing a transposed
 matrix, a scan with `history`, `rk_ode_bdf_tol`) raises
@@ -3013,8 +3015,12 @@ function js_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
     js_source(p; types, name, shape = want)
 end
 
-function js_source(p::Plan; types = nothing, name = :kernel,
-                   shape = length(p.want) == 1 ? only(p.want).name : Tuple(v.name for v in p.want))
+# Translated in the latest world, as `jax_source` is (`_translate_in_latest_world`).
+js_source(p::Plan; types = nothing, name = :kernel,
+          shape = length(p.want) == 1 ? only(p.want).name : Tuple(v.name for v in p.want)) =
+    _translate_in_latest_world(() -> _js_source(p, types, name, shape), String)
+
+function _js_source(p::Plan, types, name, shape)
     argtypes = _js_have_types(p, types)
     mod = _JsModule()
     _js_identifier(name) == string(name) ||
