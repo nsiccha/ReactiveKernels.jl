@@ -16,6 +16,22 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.213
+
+- `marginalize` integrates out a vector state in which one array reads
+  another's draw of the same seed or step when that draw's scale is an
+  expression, as in a process observed at the start and the end of each
+  interval: `x0[t] ~ Normal(rho * x1[t - 1], sd * sqrt(1 - rho * rho))`,
+  `x1[t] ~ Normal(phi * x0[t], sd * sqrt(1 - phi * phi))`. Before, it was
+  refused with `SurfaceLoweringError: @scan: the local
+  _rkppl_marginal_<array>__step_scale__<n> is defined twice in one step`,
+  or, for seeds (`x1[1] ~ Normal(phi * x0[1], s)` after
+  `x0[1] ~ Normal(0, 2 * sd)`), `single assignment:
+  _rkppl_marginal_<array>__seed_scale__<n> is defined twice at model level`.
+- `?marginalize` states that an innovation scale of 0 at a step is exact
+  with finite native gradients, and that in emitted JAX a scale reaching 0
+  through `sqrt` has a NaN gradient.
+
 ## 0.1.212
 
 - Added `ReactiveKernels.ad_cost_profile(q::SamplerQuery, u; seconds,

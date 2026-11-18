@@ -264,6 +264,20 @@ def _rk_broadcast_length(*lengths):
         n = jnp.where(n == 1, m, n)
     return n
 """
+const _JAX_SAME_WIDTH = """
+def _rk_same_width(rows, lengths):
+    # Padded rows whose stored widths differ: each is widened to the widest,
+    # its last valid entry repeated, as padding repeats it. Rows of one
+    # stored width are returned as they are.
+    width = max(row.shape[0] for row in rows)
+    def widen(row, n):
+        if row.shape[0] == width:
+            return row
+        if row.shape[0] == 0:
+            return jnp.zeros((width,), dtype=row.dtype)
+        return row[jnp.minimum(jnp.arange(width), jnp.maximum(n - 1, 0))]
+    return tuple(widen(row, n) for row, n in zip(rows, lengths))
+"""
 function _jax_common_extent(ctx, args::Vector{_PyVal})
     ctx.host === nothing || return args
     padded = [a for a in args if !isempty(a.extent)]
@@ -278,7 +292,22 @@ function _jax_common_extent(ctx, args::Vector{_PyVal})
     name = _jax_helper!(ctx, "_rk_broadcast_length", _JAX_BROADCAST_LENGTH)
     extent = name * "(" * join(parts, ", ") * ")"
     ctx.mod.helper_names[(:broadcast_length, extent)] = parts
-    [isempty(a.extent) ? a : _PyVal(a.code, a.T, a.static, extent, "", a.padded, a.origin, a.field_extents)
+    # Padded vectors may also be stored with different widths (a window of
+    # one row beside another row of its length): each is widened to the
+    # widest, as padding does, before JAX broadcasts their storage.
+    codes = Dict{String,String}()
+    if all(a -> a.T isa Type && a.T <: AbstractVector{<:Number}, padded)
+        rows = unique((a.code, a.extent) for a in padded)
+        widened = _jax_fresh(ctx, :rows)
+        _jax_emit!(ctx, widened * " = " * _jax_helper!(ctx, "_rk_same_width", _JAX_SAME_WIDTH) *
+            "((" * join((first(r) for r in rows), ", ") * ",), (" *
+            join((last(r) for r in rows), ", ") * ",))")
+        for (k, row) in enumerate(rows)
+            codes[first(row)] = widened * "[" * string(k - 1) * "]"
+        end
+    end
+    [isempty(a.extent) ? a : _PyVal(get(codes, a.code, a.code), a.T, a.static, extent, "",
+                                    a.padded, a.origin, a.field_extents)
      for a in args]
 end
 # The padded axes an elementwise function of `x` keeps: `x`'s, unless `x` is
@@ -1266,6 +1295,10 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
         # An element reads each field's value; a slice, each field's column.
         element = all(k -> parts[k].T == fieldtype(E, k), 1:fieldcount(E))
         number = findfirst(k -> fieldtype(E, k) <: Number, 1:fieldcount(E))
+        # One record of a vector whose fields have their own lengths keeps them.
+        element && _jax_field_lengths(x) &&
+            return _PyVal(_jax_tuple_code(parts), E, false, _jax_tuple_extent(parts), "",
+                          _jax_tuple_fields(parts))
         return _PyVal(_jax_tuple_code(parts), element ? E : Array{E,ndims(first(parts).T)}, false,
                       element || number === nothing ? "" : parts[number].extent)
     end
@@ -1387,10 +1420,32 @@ function _jax_index_part(ctx::_JaxContext, x::_PyVal, dim::Int, index; target::B
         # Ends that are data with a static number of elements (a stop with a
         # static limit, or ends `_jax_trip_bound` bounds): a gather by the
         # range's elements, padded (`_jax_call_positional(::Colon)`).
-        if !(_jax_known(ctx, lo) && _jax_known(ctx, hi)) &&
-           (_jax_known(ctx, lo) && !isempty(hi.limit) || _jax_trip_bound(ctx, lo, hi) !== nothing)
-            i = _jax_call_positional(ctx, Colon(), [lo, hi])
-            return (_py_infix("-", [i.code, "1"]), 1, i)
+        if !(_jax_known(ctx, lo) && _jax_known(ctx, hi))
+            if _jax_known(ctx, lo) && !isempty(hi.limit) || _jax_trip_bound(ctx, lo, hi) !== nothing
+                i = _jax_call_positional(ctx, Colon(), [lo, hi])
+                return (_py_infix("-", [i.code, "1"]), 1, i)
+            end
+            # Ends that are data without a bound of their own, read from a
+            # vector: the slice lies within the vector, whose stored size
+            # bounds it (`_jax_window`).
+            if !target && x.T isa Type && x.T <: AbstractVector{<:Number}
+                i = _jax_window(ctx, x, lo, hi)
+                return (_py_infix("-", [i.code, "1"]), 1, i)
+            end
+        elseif !target && ctx.host === nothing && !isempty(x.extent) &&
+               x.T isa Type && x.T <: AbstractVector{<:Number}
+            # Ends known while tracing, read from a padded vector: a slice of
+            # its static length. Within the vector's length it holds valid
+            # entries alone, and Julia refuses any other, so the slice is not
+            # padded: its positions are the static range's.
+            n = _jax_call(ctx, length, [x])
+            _jax_call(ctx, _runtime_check,
+                [_PyVal("jnp.logical_or(" * hi.code * " < " * lo.code * ", jnp.logical_and(" *
+                        lo.code * " >= 1, " * hi.code * " <= " * n.code * "))", Bool),
+                 _PyVal(repr("BoundsError: range exceeds array bounds"), BoundsError)])
+            return (_jax_minus_one(lo) * ":" * hi.code, 1,
+                    _PyVal("jnp.arange(" * lo.code * ", " * _jax_plus_one(hi) * ")",
+                           UnitRange{Int}, true))
         end
         return (_jax_minus_one(lo) * ":" * hi.code, 1, nothing)
     end
@@ -1414,6 +1469,30 @@ function _jax_index_part(ctx::_JaxContext, x::_PyVal, dim::Int, index; target::B
     end
     _jax_error("the index `", index, "` (of type `", i.T, "`) has no JAX translation",
                _jax_where(ctx))
+end
+
+# The positions of a slice `x[lo:hi]` of a vector whose ends are data. The
+# slice has at most the vector's stored size, a static number, so it is a
+# gather of that many positions from `lo`, the last one repeated past `hi`
+# (padding repeats the last valid entry), with the range's length as the
+# extent that reductions mask by. It is stored as wide as the vector; a
+# broadcast or a scan that combines it with a row of its length stored
+# narrower brings them to one width (`_jax_common_extent`,
+# `_jax_scan_width`). A prefix `x[1:n]` keeps the vector's own storage or
+# its range's (`_jax_prefix`). Julia checks a nonempty range's ends against
+# the vector; an empty range reads nothing.
+function _jax_window(ctx::_JaxContext, x::_PyVal, lo::_PyVal, hi::_PyVal)
+    lo = _jax_bind!(ctx, :slice_start, lo)
+    hi = _jax_bind!(ctx, :slice_stop, hi)
+    count = _jax_bind!(ctx, :slice_length, _PyVal("jnp.maximum(" *
+        _py_infix("+", [_py_infix("-", [hi.code, lo.code]), "1"]) * ", 0)", Int))
+    n = _jax_call(ctx, length, [x])
+    _jax_call(ctx, _runtime_check,
+        [_PyVal("jnp.logical_or(" * count.code * " == 0, jnp.logical_and(" * lo.code *
+                " >= 1, " * hi.code * " <= " * n.code * "))", Bool),
+         _PyVal(repr("BoundsError: range exceeds array bounds"), BoundsError)])
+    _PyVal("jnp.clip(" * lo.code * " + jnp.arange(" * _jax_dim_code(ctx, x, 1) * "), 1, " *
+           "jnp.maximum(" * hi.code * ", 1))", Vector{Int}, false, count.code)
 end
 
 _jax_bool_index_error(ctx::_JaxContext, index) =
@@ -2009,6 +2088,22 @@ function _jax_expr(ctx::_JaxContext, ::Val{:typed_comprehension}, ex)
            v.static, v.extent, v.limit, v.padded)
 end
 
+# A loop's carried value `k` after the loop. An array padded past its
+# length (a data-sized allocation the loop fills, under any name for that
+# length) leaves the loop with its padding repeating its last valid entry
+# (`_jax_repeat_last_valid`), as a padded input's does. An entry past the
+# length is not Julia's, so values are unchanged; but an allocation's zeros
+# there would meet functions with no finite derivative at zero (`sqrt`,
+# `log`), and a masked reduction's zero cotangent times that derivative is
+# NaN in a reverse-mode gradient.
+function _jax_loop_carried(ctx::_JaxContext, result::AbstractString, k::Int, v::_PyVal)
+    carried = _PyVal(result * "[" * string(k - 1) * "]", v.T, false, v.extent, v.limit,
+                     v.padded, _jax_carried_origin(v))
+    ctx.host === nothing && _jax_is_array(v.T) && !_jax_ragged(v.T) && !isempty(v.extent) ||
+        return carried
+    _jax_repeat_last_valid(ctx, carried)
+end
+
 # A `while` loop: `jax.lax.while_loop` over the outer locals the body assigns.
 # JAX differentiates it forward only; `jax.grad` through it raises JAX's own
 # error, so a differentiated program writes the loop as a `for` over a range.
@@ -2121,21 +2216,11 @@ end
 # limit: lazy branches that do not run the body past `hi` (CONTRIBUTING.md,
 # "Lazy branches"), so a value the body would compute at a step Julia never
 # runs reaches neither the result nor `jax.grad`. Those steps keep the whole
-# carry, so an array padded by `hi` keeps its entries past `hi` as they
+# carry, so a padded array keeps its entries past its length as they
 # entered; afterwards each such slot repeats the array's last valid entry,
-# the padding every padded value holds (`_jax_repeat_last_valid`).
-function _jax_padded_for(ctx::_JaxContext, var, body, lo::_PyVal, hi::_PyVal)
-    targets = _jax_loop_targets(var)
-    carried = [n for n in _jax_carried_names!(ctx, Set{Symbol}(), body)
-               if !(n in targets) && haskey(ctx.locals, n)]
-    result = _jax_stepped_for(ctx, var, body, lo, hi, _jax_trip_bound(ctx, lo, hi))
-    for n in carried
-        v = ctx.locals[n]
-        _jax_is_array(v.T) && v.extent == hi.code || continue
-        ctx.locals[n] = _jax_repeat_last_valid(ctx, v)
-    end
-    result
-end
+# the padding every padded value holds (`_jax_loop_carried`).
+_jax_padded_for(ctx::_JaxContext, var, body, lo::_PyVal, hi::_PyVal) =
+    _jax_stepped_for(ctx, var, body, lo, hi, _jax_trip_bound(ctx, lo, hi))
 # `x`, a padded array, with each slot past its extent along its padded axes
 # holding the last valid entry along that axis (the first, when there is
 # none): the padding a padded value holds (`_PyVal`'s `extent`). An array
@@ -2233,8 +2318,7 @@ function _jax_range_for(ctx::_JaxContext, var, body, lo::_PyVal, hi::_PyVal)
     _jax_emit_unless_empty!(ctx, result, "jax.lax.fori_loop(" * lo.code * ", " * _jax_plus_one(hi) *
                             ", " * fname * ", " * init * ")", init, nonempty)
     for (k, (n, v)) in enumerate(zip(carried, initial))
-        ctx.locals[n] = _PyVal(result * "[" * string(k - 1) * "]", v.T, false, v.extent, v.limit,
-                               v.padded, _jax_carried_origin(v))
+        ctx.locals[n] = _jax_loop_carried(ctx, result, k, v)
     end
     _PyVal("None", Nothing, true)
 end
@@ -2469,8 +2553,7 @@ function _jax_stepped_for(ctx::_JaxContext, var, body, lo::_PyVal, hi::_PyVal,
     _jax_emit_unless_empty!(ctx, result, "jax.lax.fori_loop(0, " * steps * ", " * fname * ", " *
                             init * ")", init, nonempty)
     for (k, (n, v)) in enumerate(zip(carried, initial))
-        ctx.locals[n] = _PyVal(result * "[" * string(k - 1) * "]", v.T, false, v.extent, v.limit,
-                               v.padded, _jax_carried_origin(v))
+        ctx.locals[n] = _jax_loop_carried(ctx, result, k, v)
     end
     _PyVal("None", Nothing, true)
 end
@@ -5274,10 +5357,13 @@ function _jax_flat_positions(ctx::_JaxContext, extent::AbstractString)
     length(unique(found)) == 1 ? only(unique(found)) : nothing
 end
 # A ragged value whose cells fill their stored rows (`_JAX_FULL_ROWS`): its
-# lengths are its stored sizes, so it is the dense array of its cells.
+# lengths are its stored sizes, so it is the dense array of its cells. A
+# plate cell that receives it whole selects one cell with an index
+# (`units[k]`), as it does a row of any dense rows.
 _jax_full_rows(ctx::_JaxContext, v::_PyVal) = !isempty(v.extent) && _jax_ragged(v.T) &&
     isempty(v.field_extents) && _jax_flat_positions(ctx, v.extent) == _JAX_FULL_ROWS
-_jax_without_lengths(v::_PyVal) = _PyVal(v.code, v.T, v.static, "", "", 0, v.origin)
+_jax_without_lengths(v::_PyVal) = _PyVal(v.code, v.T, v.static, "", "", 0,
+    v.origin === nothing ? _JaxDenseRows() : v.origin)
 # What a flattening of a value with lengths `extent` reads, for keying a helper
 # translated over it: nothing known, full rows, or a prepared input's positions.
 function _jax_flat_kind(ctx::_JaxContext, extent::AbstractString)
@@ -5775,8 +5861,12 @@ function _jax_broadcast(ctx::_JaxContext, f, args::Vector{_PyVal})
                       R == 0 ? f : Array{f,R}, false, x.extent, "", _jax_padded_like(x))
     end
     # The result's extent and padded axes: rows padded by different lengths
-    # along the same axes take Julia's broadcast length (`_jax_common_extent`).
+    # along the same axes take Julia's broadcast length (`_jax_common_extent`),
+    # and are read at one stored width.
     meta = _jax_common_extent(ctx, args)
+    values = [ref || m.code == a.code ? a :
+              _PyVal(m.code, a.T, a.static, a.extent, a.limit, a.padded, a.origin, a.field_extents)
+              for (a, m, ref) in zip(values, meta, referenced)]
     padded = map(values, referenced) do a, ref
         r = _jax_rank(a.T)
         !ref && 0 < r < R ? _PyVal(_py_atom(a.code) * "[" * join(fill("...", 1), "") *
@@ -8062,9 +8152,21 @@ _jax_stacked_namedtuple(@nospecialize(T)) = T isa Type && T <: NamedTuple &&
 # column is the dense array of its rows, one per element.
 _jax_columns(@nospecialize(T)) = T isa Type && T <: AbstractArray &&
     (T <: AbstractVector && _jax_stacked_namedtuple(eltype(T)) || _jax_numeric_tuple(eltype(T)))
+# A vector of records some of whose fields are vectors. Prepared by
+# `prepare_data`, each vector field's column is padded as a ragged value is
+# and the record carries the tuple of those fields' lengths (`None` for a
+# number field), as a plate's record values do.
+_jax_record_lengths(@nospecialize(T)) = _jax_columns(T) && T <: AbstractVector &&
+    any(F -> F <: AbstractVector, fieldtypes(eltype(T)))
+# Whether `x`'s fields carry their own lengths in its extent.
+_jax_field_lengths(x::_PyVal) = _jax_columns(x.T) && _jax_padded_fields(x) != 0
 function _jax_column(x::_PyVal, k::Integer)
     F = fieldtype(eltype(x.T), k)
     code = _py_atom(x.code) * "[" * string(k - 1) * "]"
+    # A vector field whose rows have their own lengths: a padded row per
+    # element, with that field's lengths.
+    _jax_field_lengths(x) && return _PyVal(code, Array{F,ndims(x.T)}, x.static,
+                                          _jax_field_extent(x, k, F))
     # A vector field's rows all have the stacked width.
     _PyVal(code, Array{F,ndims(x.T)}, x.static, F <: Number ? x.extent :
            "jnp.full((" * code * ".shape[0],), " * code * ".shape[1])")
@@ -8143,8 +8245,9 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     push!(outer.lines, "    "^outer.indent * "def " * step * "(" * carry * ", " * xs * "):")
     append!(outer.lines, inner.lines)
     push!(outer.lines, "    "^inner.indent * "return " * next_carry * ", " * wants[2].code)
-    seqs = String[inputs[i].code for i in iterated]
-    isempty(position) || push!(seqs, "jnp.arange(" * _py_atom(inputs[iterated[1]].code) * ".shape[0])")
+    width = _jax_scan_width(ctx, inputs, iterated)
+    seqs = String[_jax_scan_sequence(inputs[i], width) for i in iterated]
+    isempty(position) || push!(seqs, "jnp.arange(" * _py_atom(first(seqs)) * ".shape[0])")
     sequences = "(" * join(seqs, ", ") * (length(seqs) == 1 ? ",)" : ")")
     result = _jax_fresh(ctx, :scan_result)
     E = _jax_typeof(wants[2])
@@ -8158,7 +8261,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     if empty === nothing
         _jax_emit!(ctx, result * " = " * call)
     else
-        steps = _jax_mapped_array(inputs[first(iterated)]) * ".shape[0]"
+        steps = width === nothing ? _jax_mapped_array(inputs[first(iterated)]) * ".shape[0]" : width
         _jax_emit_unless_empty!(ctx, result, call, empty, _jax_nonempty("1", steps))
     end
     if I
@@ -8177,6 +8280,24 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     # of its columns, each padded alike.
     [_PyVal(result, Vector{E}, false, extent)]
 end
+
+# Padded sequences of one length may be stored with different widths (a
+# window of one row beside another row of its length). A scan runs them to
+# the narrowest, which holds every valid entry of each: its name, bound in
+# the module, or `nothing` when the sequences share their lengths or are not
+# all numerical vectors or ranges.
+function _jax_scan_width(ctx::_JaxContext, inputs, iterated)
+    extents = unique(inputs[i].extent for i in iterated if !isempty(inputs[i].extent))
+    length(extents) > 1 || return nothing
+    all(i -> inputs[i].T isa Type && (inputs[i].T <: AbstractVector{<:Number} ||
+                                      inputs[i].T <: AbstractUnitRange), iterated) || return nothing
+    width = _jax_fresh(ctx, :scan_width)
+    _jax_emit!(ctx, width * " = min(" *
+        join((_py_atom(inputs[i].code) * ".shape[0]" for i in iterated), ", ") * ")")
+    width
+end
+_jax_scan_sequence(v::_PyVal, width) =
+    width === nothing ? v.code : _py_atom(v.code) * "[:" * width * "]"
 
 # One element of a scan's sequence, as its step reads it. An index of
 # `eachindex(x)`/`axes(x, d)` (`Base.OneTo`) is at most the sequence's length,
@@ -8202,16 +8323,25 @@ function _jax_history_scan(ctx::_JaxContext, recipe::Recipe,
     iterated = [i for i in 2:length(args) if !(i in A)]
     shared = [i for i in 2:length(args) if i in A]
     isempty(iterated) && _jax_error("a history scan without a sequence", _jax_where(ctx))
-    any(i -> !isempty(args[i].extent), iterated) &&
-        _jax_error("a history scan over a padded sequence has no JAX translation yet",
-                   _jax_where(ctx))
+    # A sequence padded past a data-dependent length (a ragged row in a plate
+    # cell) is scanned to its static capacity. A step past the length is not
+    # one of Julia's: a lazy branch skips its body and keeps the carry and the
+    # history, so its reads of padding reach neither a value nor a derivative
+    # (CONTRIBUTING.md, "Lazy branches"; a padded loop's steps,
+    # `_jax_stepped_for`, are skipped the same way).
+    padded_inputs = [i for i in iterated if !isempty(args[i].extent)]
+    extent = isempty(padded_inputs) ? "" : args[first(padded_inputs)].extent
+    isempty(extent) || isempty(history.extent) ||
+        _jax_error("a history scan over a padded sequence whose `history` is padded too ",
+                   "has no JAX translation yet", _jax_where(ctx))
     HT = history.T
     E = HT isa Type && HT <: Number ? HT :
         HT isa Type && HT <: AbstractVector{<:Number} ? eltype(HT) :
         _jax_error("a scan `history` of type `", HT, "` has no JAX translation yet",
                    _jax_where(ctx))
     dtype = _jax_dtype(E)
-    steps = _py_atom(args[iterated[1]].code) * ".shape[0]"
+    width = _jax_scan_width(ctx, args, iterated)
+    steps = width === nothing ? _py_atom(args[iterated[1]].code) * ".shape[0]" : width
     offset = HT <: Number ? "0" : _py_atom(history.code) * ".shape[0]"
     step = _jax_fresh(ctx, _jax_body_hint(ctx, recipe, :step))
     state = _jax_fresh(ctx, :state)
@@ -8242,12 +8372,25 @@ function _jax_history_scan(ctx::_JaxContext, recipe::Recipe,
     end
     inner.values[canon_id(body.graph, have[end].id)] =
         _jax_with_origin(_PyVal(history_token, Vector{E}), layout)
+    # The step's body: the step itself, or for a padded sequence the function
+    # its lazy branch runs while the step is within the length.
+    live = isempty(extent) ? "" : _jax_identifier(inner.used, :live)
+    run_name = isempty(extent) ? "" : _jax_identifier(inner.used, :step_body)
     recipe_saved = ctx.recipe
     ctx.scope = inner
+    run = inner
     wants = try
         _jax_emit!(ctx, carry * ", " * earlier * " = " * state)
         _jax_emit!(ctx, join(unpack, ", ") * (length(unpack) == 1 ? "," : "") * " = " * xs)
-        _jax_plan!(ctx, body)
+        if isempty(extent)
+            _jax_plan!(ctx, body)
+        else
+            _jax_emit!(ctx, live * " = " * _py_infix("<", [position, extent]))
+            run = _JaxScope(inner)
+            run.indent = inner.indent + 1
+            ctx.scope = run
+            _jax_with_guard(() -> _jax_plan!(ctx, body), run, live)
+        end
         [_jax_lookup(ctx, body.graph, v) for v in body.want]
     finally
         ctx.scope = outer
@@ -8255,17 +8398,28 @@ function _jax_history_scan(ctx::_JaxContext, recipe::Recipe,
     end
     _jax_typeof(wants[2]) <: Number || _jax_error("a history scan whose step outputs `",
         _jax_typeof(wants[2]), "` has no JAX translation yet", _jax_where(ctx))
-    storage = _jax_history_layout!(ctx, layout, inner, wants, steps, history, dtype)
+    storage = _jax_history_layout!(ctx, layout, run, wants, steps, history, dtype)
     wants = storage.wants
     push!(outer.lines, "    "^outer.indent * "def " * step * "(" * state * ", " * xs * "):")
     append!(outer.lines, inner.lines)
-    output = _jax_identifier(inner.used, :output)
-    push!(outer.lines, "    "^inner.indent * output * " = jnp.asarray(" * wants[2].code * ", dtype=" * dtype * ")")
+    output = _jax_identifier(run.used, :output)
     at = _py_infix("+", [offset, position])
     at = "((" * at * ") % " * storage.width * " if " * storage.use_compact * " else " * at * ")"
-    push!(outer.lines, "    "^inner.indent * "return (" * wants[1].code * ", " * earlier *
-          ".at[" * at * "].set(" * output * ")), " * output)
-    seqs = String[[args[i].code for i in iterated]; "jnp.arange(" * steps * ")"]
+    written = "(" * wants[1].code * ", " * earlier * ".at[" * at * "].set(" * output * ")), " * output
+    if isempty(extent)
+        push!(outer.lines, "    "^inner.indent * output * " = jnp.asarray(" * wants[2].code * ", dtype=" * dtype * ")")
+        push!(outer.lines, "    "^inner.indent * "return " * written)
+    else
+        push!(outer.lines, "    "^inner.indent * "def " * run_name * "():")
+        append!(outer.lines, run.lines)
+        push!(outer.lines, "    "^run.indent * output * " = jnp.asarray(" * wants[2].code * ", dtype=" * dtype * ")")
+        push!(outer.lines, "    "^run.indent * "return " * written)
+        # A skipped step's output is padding, which the result's extent masks.
+        push!(outer.lines, "    "^inner.indent * "return jax.lax.cond(" * live * ", " * run_name *
+              ", lambda: ((" * carry * ", " * earlier * "), jnp.asarray(" * layout.fill *
+              ", dtype=" * dtype * ")))")
+    end
+    seqs = String[[_jax_scan_sequence(args[i], width) for i in iterated]; "jnp.arange(" * steps * ")"]
     result = _jax_fresh(ctx, :scan_result)
     full = _jax_fresh(ctx, :history_result)
     init = _jax_scan_init(ctx, args[1]).code
@@ -8276,7 +8430,10 @@ function _jax_history_scan(ctx::_JaxContext, recipe::Recipe,
     compact_result = HT <: Number ? outputs :
         "jnp.concatenate([jnp.asarray(" * history.code * ", dtype=" * dtype * "), " * outputs * "])"
     _jax_emit!(ctx, result * " = " * compact_result * " if " * storage.use_compact * " else " * full)
-    [_PyVal(result, Vector{E})]
+    # The result is padded as its sequence is: its length is the sequence's,
+    # after the leading entries of a vector `history`.
+    [_PyVal(result, Vector{E}, false,
+            isempty(extent) ? "" : HT <: Number ? extent : _py_infix("+", [offset, extent]))]
 end
 
 # --- module -------------------------------------------------------------------------
@@ -9169,7 +9326,17 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
             continue
         end
         extent = flat = ""
-        if _jax_ragged(T)
+        record_lengths = names !== nothing && _jax_record_lengths(T)
+        if record_lengths
+            # A prepared vector of records whose vector fields are padded
+            # (`prepare_data`'s `_rk_record_columns_np`): the tuple of those
+            # fields' lengths.
+            extent_key = key * "_lengths"
+            extent = keyed ? _jax_param_name(scope.used, extent_key; stable = false) :
+                (push!(scope.used, extent_key); extent_key)
+            push!(params, extent); push!(inputs, extent_key => Tuple)
+            push!(input_locals, extent)
+        elseif _jax_ragged(T)
             extent_key = names === nothing ? "" : key * "_lengths"
             extent = names === nothing ? _jax_identifier(scope.used, Symbol(v.name, :_lengths)) :
                 keyed ? _jax_param_name(scope.used, extent_key; stable = false) :
@@ -9196,7 +9363,9 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
             T isa Type && T <: AbstractArray && _jax_integer_data(T)
         # Its origin names the array by its key in the prepared data, which
         # `prepare_data` reads to compute the bound.
-        scope.values[canon_id(p.graph, v.id)] = _PyVal(param, T, static, extent, "", 0,
+        fields = record_lengths ? foldl((m, (j, F)) -> F <: AbstractVector ? m | 1 << (j - 1) : m,
+                                        enumerate(fieldtypes(eltype(T))); init = 0) : 0
+        scope.values[canon_id(p.graph, v.id)] = _PyVal(param, T, static, extent, "", fields,
             prepared ? _JaxOrigin(key, nothing, "0") : nothing)
         # Callers may pass NumPy arrays; JAX indexes only its own arrays by a
         # traced index.
@@ -9213,6 +9382,8 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
             helper = _jax_helper!(ctx, "_rk_columns", _JAX_COLUMNS)
             dtypes = join((_jax_column_dtype(F) * ", " for F in fieldtypes(eltype(T))))
             _jax_emit!(ctx, param * " = " * helper * "(" * param * ", (" * dtypes * "))")
+            record_lengths && _jax_emit!(ctx, extent * " = tuple(None if n is None else " *
+                                              "jnp.asarray(n) for n in " * extent * ")")
         elseif T isa Type && T <: AbstractFloat && !isempty(_jax_input_dtype(T))
             _jax_emit!(ctx, param * " = jnp.asarray(" * param * _jax_input_dtype(T) * ")")
         end

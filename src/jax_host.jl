@@ -2009,6 +2009,36 @@ def _rk_pad_rows(rows, dtype, rank=1):
     return padded, lengths, flat
 """
 
+# A vector of records with vector fields crosses as the tuple of its
+# columns, each vector field's column padded as a ragged value is, and the
+# tuple of those fields' lengths (`_jax_record_lengths`).
+const _JAX_RECORD_COLUMNS_NP = """
+def _rk_record_columns_np(value, dtypes, vectors):
+    # The columns of a vector of records, from its columns or its rows; a
+    # vector field's column is padded (`_rk_pad_rows`) and has its lengths,
+    # a number field's is an array and has none.
+    n = len(dtypes)
+    if isinstance(value, np.ndarray) and value.dtype == object:
+        columns = [[r[k] for r in value.ravel(order="F")] for k in range(n)]
+    elif isinstance(value, tuple) and len(value) == n:
+        columns = [list(c) if v else c for c, v in zip(value, vectors)]
+    elif isinstance(value, list) and all(isinstance(r, tuple) and len(r) == n for r in value):
+        columns = [[r[k] for r in value] for k in range(n)]
+    else:
+        raise TypeError("a vector of %d-field records is the tuple of its columns or a list of "
+                        "its rows, not %r" % (n, type(value).__name__))
+    stored, lengths = [], []
+    for column, dtype, vector in zip(columns, dtypes, vectors):
+        if vector:
+            padded, counts, _ = _rk_pad_rows(column, dtype, 1)
+            stored.append(padded)
+            lengths.append(counts)
+        else:
+            stored.append(np.asarray(column, dtype=dtype))
+            lengths.append(None)
+    return tuple(stored), tuple(lengths)
+"""
+
 # An array of numeric tuples or a vector of named numbers crosses to the
 # functions as the tuple of its columns (`_jax_columns`), the device form.
 # Host code keeps a scan's stacked outputs as columns, a comprehension as a
@@ -2641,6 +2671,25 @@ function _jax_prepare_function!(mod::_JaxModule, split, raw_types, names, types;
                 push!(mod.helpers, rstrip(_JAX_STATIC_INT))
             end
             push!(entries, "\"" * name * "\": StaticInt(" * v.code * ")")
+        elseif _jax_record_lengths(T)
+            # Vector fields of one length per record: padded columns and the
+            # tuple of their lengths (`_jax_record_lengths`).
+            for (helper, text) in (("_rk_pad_rows", _JAX_PAD_ROWS),
+                                   ("_rk_record_columns_np", _JAX_RECORD_COLUMNS_NP))
+                if !haskey(mod.helper_names, (:helper, helper))
+                    mod.helper_names[(:helper, helper)] = helper
+                    push!(mod.used, helper)
+                    push!(mod.helpers, rstrip(text))
+                end
+            end
+            F = fieldtypes(eltype(T))
+            dtypes = join((_host_column_dtype(f) * ", " for f in F))
+            vectors = join(((f <: AbstractVector ? "True" : "False") * ", " for f in F))
+            columns = _jax_fresh(ctx, Symbol(name, :_columns))
+            lengths = _jax_fresh(ctx, Symbol(name, :_lengths))
+            _jax_emit!(ctx, columns * ", " * lengths * " = _rk_record_columns_np(" * v.code *
+                            ", (" * dtypes * "), (" * vectors * "))")
+            push!(entries, "\"" * name * "\": " * columns, "\"" * name * "_lengths\": " * lengths)
         elseif _jax_columns(T)
             if !haskey(mod.helper_names, (:helper, "_rk_columns_np"))
                 mod.helper_names[(:helper, "_rk_columns_np")] = "_rk_columns_np"

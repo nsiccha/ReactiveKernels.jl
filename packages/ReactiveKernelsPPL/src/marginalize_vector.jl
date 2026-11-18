@@ -55,7 +55,10 @@ function _noise_cov(fi::_Affine, fk::_Affine)
 end
 
 # A compound noise scale is read in every covariance entry: `name!` replaces it
-# by a definition (top level for seeds, a step local for the loop).
+# by a definition (top level for seeds, a step local for the loop). One draw
+# enters every row that reads it: in `slope[t] ~ Normal(phi * level[t], s)`
+# `level[t]`'s innovation reaches `slope`'s row as `phi * <its scale>`, so a
+# name belongs to one row and one innovation, never to the innovation alone.
 function _name_noise_scales(f::_Affine, name!)
     coefs = Dict{Any,Any}()
     for (key, c) in f.coefs
@@ -94,8 +97,10 @@ function _vector_transition(spec::ScanSpec, arrays::Vector{Symbol})
             seeds[(st.target, st.index)] = form
         end
     end
-    seed_name!(n, c) = (nm = _vname(g, :seed_scale, n); push!(seed_defs, :($nm = $c)); nm)
-    window = [_name_noise_scales(seeds[(a, p - j)], seed_name!) for (a, j) in comps]
+    seed_name!(i) = (n, c) -> (nm = _vname(g, :seed_scale, i, n);
+        push!(seed_defs, :($nm = $c)); nm)
+    window = [_name_noise_scales(seeds[(a, p - j)], seed_name!(i))
+        for (i, (a, j)) in enumerate(comps)]
     m0 = Any[]
     for (i, f) in enumerate(window)
         c = f.constant
@@ -159,7 +164,8 @@ function _vector_transition(spec::ScanSpec, arrays::Vector{Symbol})
             push!(locals, Expr(:(=), st.target, st.expr))
         end
     end
-    step_name!(n, c) = (nm = _vname(g, :step_scale, n); push!(locals, :($nm = $c)); nm)
+    step_name!(i) = (n, c) -> (nm = _vname(g, :step_scale, i, n);
+        push!(locals, :($nm = $c)); nm)
     A = Dict{Tuple{Int,Int},Any}()
     shift = Any[nothing for _ in comps]
     rows = Dict{Int,_Affine}()
@@ -168,7 +174,7 @@ function _vector_transition(spec::ScanSpec, arrays::Vector{Symbol})
             A[(i, index[(a, j - 1)])] = 1
             continue
         end
-        f = _name_noise_scales(write[a], step_name!)
+        f = _name_noise_scales(write[a], step_name!(i))
         rows[i] = f
         shift[i] = f.constant
         for (key, c) in f.coefs

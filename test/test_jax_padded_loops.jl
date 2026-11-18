@@ -1,4 +1,4 @@
-using ReactiveKernels, Test
+using ReactiveKernels, Test, Enzyme
 
 isdefined(@__MODULE__, :rk_jax_available) || include(joinpath(@__DIR__, "jax_python.jl"))
 
@@ -180,6 +180,53 @@ end
             # Eager steps past the end gave NaN here (log of zero and below).
             @test all(isfinite, r.grad)
             @test r.grad ≈ rk_fd_gradient(u -> f(u, R), x) rtol = 1e-6 atol = 1e-6
+        end
+    end
+end
+
+# A data-sized allocation that a loop fills in a ragged cell, then read by a
+# function with no finite derivative at zero (snag jax-source-devic-93f7d839:
+# an observation scale `sqrt(a^2 + (loc * b)^2)` over per-observation scales
+# a model builds this way). Past the row's length the allocation is padding;
+# it leaves the loop repeating the last valid entry, as a padded input does,
+# so the masked sum's gradient stays finite.
+# The allocation comes from a helper, as a model's `@deffun` allocator does,
+# so its length is that helper's result, not the loop's stop.
+@traceable jax_padded_loops_alloc(n) = zeros(n)
+@traceable function jax_padded_loops_fill(row, a)
+    s = jax_padded_loops_alloc(length(row))
+    for i in eachindex(row)
+        s[i] = a * row[i]^2 + 0.5
+    end
+    s
+end
+@kernel jax_padded_loops_filled(a::Float64, rows::Vector{Vector{Float64}}) = begin
+    totals = plate(rows, Ref(a)) do row, a
+        s = jax_padded_loops_fill(row, a)
+        sum(sqrt.(s .* a))
+    end
+    total = sum(totals)
+    return total
+end
+jax_padded_loops_filled_native(a, rows) =
+    sum(sum(sqrt.(jax_padded_loops_fill(r, a) .* a); init = 0.0) for r in rows; init = 0.0)
+
+@testset "jax_source: a filled allocation's padding keeps gradients finite" begin
+    src = jax_source(jax_padded_loops_filled; have = (:a, :rows), want = :total)
+    native = prepare(jax_padded_loops_filled; have = (:a, :rows), want = :total)
+    for rows in ([[1.0, 2.0, 3.0], [0.5], [4.0, 1.5]], [[1.0], [2.0, 3.0, 4.0, 5.0, 6.0]],
+                 [collect(0.1:0.1:4.0), [0.3, 0.2]])
+        value = native(0.7, rows)
+        @test value ≈ jax_padded_loops_filled_native(0.7, rows)
+        derivative = Enzyme.autodiff(Enzyme.Reverse, jax_padded_loops_filled_native, Enzyme.Active,
+            Enzyme.Active(0.7), Enzyme.Const(rows))[1][1]
+        if rk_jax_available()
+            got = rk_jax_evaluate(src, :kernel, (0.7, rows); grad = true)
+            @test got.value ≈ value rtol = 1e-12
+            @test isfinite(got.grad)
+            @test got.grad ≈ derivative rtol = 1e-12
+        else
+            @test_skip false
         end
     end
 end
