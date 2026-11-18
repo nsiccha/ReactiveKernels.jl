@@ -81,6 +81,33 @@ end
         want = :total, active = :a, ad_allocations = :sometimes)
 end
 
+@testset "unstable: code run undifferentiated counts with Enzyme's reachability repair" begin
+    # Enzyme's repair `derivative_report_reachability` marks the code of a
+    # function only called on an error path `throw_only`; with it, `unstable`
+    # also counts calls in code the derivative runs undifferentiated.
+    frame(file) = Base.StackTraces.StackFrame(:f, Symbol(file), 1)
+    finding(sweep; throw_only = false, file = "/pkg/src/helper.jl") =
+        (; kind = :dynamic_dispatch, callee = "jl_invoke", in_function = "f", sweep,
+         frames = [frame(file)], in_loop = false, throw_only, bytes = nothing, count = 1)
+    # Julia's own functions stay exempt, as their bodies are in the primal check.
+    derivative = (; func = Nothing, mode = :reverse, note = "",
+        findings = [finding(:primal), finding(:forward), finding(:primal; throw_only = true),
+                    finding(:primal; file = "./sort.jl"),
+                    finding(:primal; file = joinpath(Sys.STDLIB, "Logging", "src", "x.jl"))])
+    flag = ReactiveKernels._DERIVATIVE_REPORT_REACHABILITY
+    saved = flag[]
+    try
+        flag[] = false
+        @test [last(p).sweep for p in ADDerivativeReport(nothing, [derivative]).unstable] ==
+            [:forward]
+        flag[] = true
+        @test [last(p).sweep for p in ADDerivativeReport(nothing, [derivative]).unstable] ==
+            [:primal, :forward]
+    finally
+        flag[] = saved
+    end
+end
+
 if !HOOK
     @testset "without Enzyme's derivative report the derivative is not checked" begin
         # Never refused, warned once where a check was asked for.
