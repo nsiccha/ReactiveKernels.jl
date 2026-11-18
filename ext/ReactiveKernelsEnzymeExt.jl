@@ -624,6 +624,9 @@ function __init__()
     ReactiveKernels._PR_INDEX_RUN_REFUSAL[] = _index_run_refusal()
     ReactiveKernels._DERIVATIVE_REPORTER[] =
         _derivative_report_available() ? _enzyme_derivative_report : missing
+    ReactiveKernels._DERIVATIVE_REPORT_REACHABILITY[] =
+        isdefined(Enzyme, :has_dogfood_repair) &&
+        Enzyme.has_dogfood_repair(:derivative_report_reachability)
     nothing
 end
 

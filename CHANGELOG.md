@@ -16,6 +16,17 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.314
+
+- With Enzyme's dogfood repair `derivative_report_reachability` (dogfood
+  `db46ba80` or later), the derivative check of `type_stability_level = :all`
+  and `ad_derivative_report`'s `unstable` also count run-time dispatch and
+  boxes in code the derivative runs without differentiating it (Enzyme's
+  `sweep = :primal`), since that repair marks error-only code such as error
+  message builders `throw_only`. Without it, that code stays left to the primal
+  check, as in 0.1.312. Programs whose cell windows union their rows
+  (`unique!` dispatches in `issorted`) now report that call.
+
 ## 0.1.313
 
 - `jax_source` and `js_source` translate a program in Julia's latest world,
