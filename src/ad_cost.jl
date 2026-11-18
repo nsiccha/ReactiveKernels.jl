@@ -179,13 +179,26 @@ parentheses group the other samples: `(other statements)` (code of an RK
 program between its assigning statements: loop control, branch conditions,
 calls whose result is not assigned), `(outside generated code)` (the AD
 driver, DifferentiationInterface, Enzyme's runtime and the caller) and
-`(garbage collection)`.
+`(garbage collection)` (every sample inside a collection, whichever statement
+allocated when it started).
 
 - `primal_seconds`, `gradient_seconds`: the part's estimated time per call,
   its share of the samples times the measured time per call.
 - `primal_samples`, `gradient_samples`: the samples the estimate rests on.
 - `primal_bytes`, `gradient_bytes`: Julia heap bytes it allocated per warm
   call (`NaN` when allocations were not profiled).
+- `primal_memory_seconds`, `gradient_memory_seconds`: the part of that time
+  spent allocating, freeing, zero-filling or copying memory in Julia's runtime
+  or the C library: Julia heap allocation, and in the gradient also the shadows
+  and the native `malloc`/`free` of the reverse pass's tape, which native
+  Enzyme books on the statement whose value it stores or on the loop it
+  stores it in.
+- `callees`: the functions the part's time is spent in, when the statement
+  calls a function that is neither Julia's nor RK's own (a model's helper, a
+  package function), each as `(; name, primal_seconds, gradient_seconds)`,
+  `name` being the function and its file, sorted by gradient time. The
+  outermost such call counts, so a helper that calls further helpers is named
+  itself.
 """
 struct ADCostPart
     name::String
@@ -195,6 +208,10 @@ struct ADCostPart
     gradient_samples::Int
     primal_bytes::Float64
     gradient_bytes::Float64
+    primal_memory_seconds::Float64
+    gradient_memory_seconds::Float64
+    callees::Vector{NamedTuple{(:name, :primal_seconds, :gradient_seconds),
+                               Tuple{String,Float64,Float64}}}
 end
 
 """
@@ -251,10 +268,22 @@ imprecise. Profiling clears Julia's profile buffer and restores the
 profiler's settings afterwards. Measure on a quiet thread: the samples of
 other threads are ignored, but their load slows the measured one.
 
+Time spent managing memory is reported beside the statements, because a
+gradient's excess over its value is often there rather than in arithmetic:
+each part's `memory` share is its time allocating, freeing, zero-filling or
+copying (Julia heap allocations and their shadows, and native Enzyme's tape,
+which it allocates with `malloc` and frees after the reverse pass), and every
+sample inside a garbage collection is counted as `(garbage collection)`
+instead of on the statement whose allocation happened to start it, which
+varies from run to run and host to host. The display's first lines give both
+shares for the whole value and gradient.
+
 Statements in a function Julia does not inline and RK did not compile (a
-package function a recipe calls) count towards the RK statement that calls it.
-Native Enzyme tapes are not Julia heap bytes; read them with
-`Enzyme.API.printperf!(true)` on the part this profile names.
+package function a recipe calls) count towards the RK statement that calls it,
+and that part's `callees` names the function (the display's `mostly in`
+column shows the largest). Native Enzyme tapes are not Julia heap bytes; their
+`malloc` time is in `memory`, and `Enzyme.API.printperf!(true)` on the part
+this profile names shows what is stored.
 """
 function ad_cost_profile(value, value_and_gradient; seconds::Real = 1.0,
                          threshold::Union{Nothing,Real} = nothing,
@@ -274,20 +303,33 @@ function ad_cost_profile(value, value_and_gradient; seconds::Real = 1.0,
         return ADCostProfile(primal, gradient, ratio, primal_bytes, gradient_bytes,
                              limit, false, 0, 0, ADCostPart[])
     end
-    primal_counts, primal_total = _marker_samples(value, seconds)
-    gradient_counts, gradient_total = _marker_samples(value_and_gradient, seconds)
+    primal_samples = _marker_samples(value, seconds)
+    gradient_samples = _marker_samples(value_and_gradient, seconds)
+    primal_total, gradient_total = primal_samples.total, gradient_samples.total
     primal_allocated = allocations ? _marker_allocations(value) : Dict{String,Float64}()
     gradient_allocated = allocations ? _marker_allocations(value_and_gradient) :
         Dict{String,Float64}()
-    names = union(keys(primal_counts), keys(gradient_counts),
+    names = union(keys(primal_samples.counts), keys(gradient_samples.counts),
                   keys(primal_allocated), keys(gradient_allocated))
-    share(counts, total, name) = total == 0 ? 0.0 : get(counts, name, 0) / total
+    share(counts, total, key) = total == 0 ? 0.0 : get(counts, key, 0) / total
     bytes(allocated, name) = allocations ? get(allocated, name, 0.0) : NaN
+    function callees(name)
+        called = union((callee for (label, callee) in keys(primal_samples.callees) if label == name),
+                       (callee for (label, callee) in keys(gradient_samples.callees) if label == name))
+        rows = [(; name = callee,
+                   primal_seconds = primal * share(primal_samples.callees, primal_total, (name, callee)),
+                   gradient_seconds = gradient * share(gradient_samples.callees, gradient_total, (name, callee)))
+                for callee in called]
+        sort!(rows; by = row -> (-row.gradient_seconds, -row.primal_seconds, row.name))
+    end
     parts = ADCostPart[ADCostPart(name,
-        primal * share(primal_counts, primal_total, name),
-        gradient * share(gradient_counts, gradient_total, name),
-        get(primal_counts, name, 0), get(gradient_counts, name, 0),
-        bytes(primal_allocated, name), bytes(gradient_allocated, name))
+        primal * share(primal_samples.counts, primal_total, name),
+        gradient * share(gradient_samples.counts, gradient_total, name),
+        get(primal_samples.counts, name, 0), get(gradient_samples.counts, name, 0),
+        bytes(primal_allocated, name), bytes(gradient_allocated, name),
+        primal * share(primal_samples.memory, primal_total, name),
+        gradient * share(gradient_samples.memory, gradient_total, name),
+        callees(name))
         for name in names]
     sort!(parts; by = part -> (-part.gradient_seconds, -part.primal_seconds, part.name))
     ADCostProfile(primal, gradient, ratio, primal_bytes, gradient_bytes, limit, true,
@@ -320,27 +362,98 @@ function _batch_seconds(f::F, n::Int) where {F}
 end
 _allocated_per_call(f::F) where {F} = (f(); @allocated f())
 
-# The label of a profile sample: its innermost RK statement marker, else a
-# category in parentheses.
-function _sample_label(frames)
-    collected = false
-    for frame in frames
-        file = String(frame.file)
-        startswith(file, "./") && (file = file[3:end])
-        startswith(file, _SOURCE_MARKER_PREFIX) &&
-            return file[(ncodeunits(_SOURCE_MARKER_PREFIX) + 1):end]
-        name = String(frame.func)
-        (startswith(name, "jl_gc_") || startswith(name, "gc_") ||
-         startswith(name, "ijl_gc_") || name == "GC.gc") && (collected = true)
+# The label of a profile sample: `(garbage collection)` for a sample inside a
+# collection, else its innermost RK statement marker, else
+# `(outside generated code)`. `frames` run from the innermost frame outwards.
+_sample_label(frames) = first(_sample_info(collect(frames)))
+
+# A sample's label, whether it was spent managing memory, and the function it
+# was spent in when its statement called one that is neither Julia's nor RK's
+# (`nothing` otherwise).
+function _sample_info(frames::AbstractVector)
+    any(_collection_frame, frames) && return ("(garbage collection)", false, nothing)
+    memory = _memory_sample(frames)
+    for (index, frame) in enumerate(frames)
+        label = _marker_label(frame)
+        label === nothing && continue
+        return (label, memory, _sample_callee(frames, index))
     end
-    collected ? "(garbage collection)" : "(outside generated code)"
+    ("(outside generated code)", memory, nothing)
 end
 
-# Samples of `f` run for `seconds` on this thread, counted by label.
+function _marker_label(frame)
+    file = String(frame.file)
+    startswith(file, "./") && (file = file[3:end])
+    startswith(file, _SOURCE_MARKER_PREFIX) || return nothing
+    file[(ncodeunits(_SOURCE_MARKER_PREFIX) + 1):end]
+end
+
+# Julia's collector: its entry points and the mark and sweep phases they run.
+function _collection_frame(frame)
+    name = String(frame.func)
+    name in ("_jl_gc_collect", "jl_gc_collect", "ijl_gc_collect", "gc") &&
+        (name != "gc" || endswith(String(frame.file), "gcutils.jl")) && return true
+    startswith(name, "gc_mark") || startswith(name, "gc_sweep")
+end
+
+# A sample is memory management when the native code it ran (the frames
+# before the first Julia frame) allocates, frees, zero-fills or copies: Julia's
+# allocator, or the C library's (`malloc`, `free` and their internals,
+# `memset`, `memcpy`), whose internal functions often have no symbol name.
+const _MEMORY_FUNCTION = r"^(i?jl_(gc_(pool_|big_|small_|managed_)?(alloc|malloc|realloc)|alloc_|malloc|realloc|calloc|free|array_grow|array_del)|_new_array|_new_genericmemory|gc_(alloc|add_page|page_data)|set_page_metadata|_?_?(libc_)?(malloc|calloc|realloc|free|memalign|posix_memalign|aligned_alloc)|_int_|tcache|mem(set|cpy|move)|__mem(set|cpy|move)|_platform_mem|bzero|__bzero|szone_|tiny_|small_|medium_|nanov2_|_malloc_|_free)"
+const _MEMORY_LIBRARY = r"(^|/)(libc\.so|libc-|libsystem_malloc|libsystem_platform)"
+function _memory_sample(frames)
+    for frame in frames
+        _native_frame(frame) || return false
+        name = String(frame.func)
+        occursin(_MEMORY_FUNCTION, name) && return true
+        isempty(name) && occursin(_MEMORY_LIBRARY, String(frame.file)) && return true
+    end
+    false
+end
+function _native_frame(frame)
+    frame.from_c && return true
+    file = String(frame.file)
+    endswith(file, ".c") || endswith(file, ".h") || endswith(file, ".cpp") ||
+        occursin(".so", file) || occursin(".dylib", file)
+end
+
+# The outermost function, inside the statement at `frames[marker]`, that is
+# neither Julia's (Base, Core, a standard library) nor RK's own source.
+function _sample_callee(frames, marker::Int)
+    for index in (marker - 1):-1:1
+        frame = frames[index]
+        _native_frame(frame) && continue
+        _marker_label(frame) === nothing || continue
+        name = String(frame.func)
+        (isempty(name) || name == "macro expansion") && continue
+        file = String(frame.file)
+        _language_file(file) && continue
+        return string(name, " (", basename(file), ")")
+    end
+    nothing
+end
+# RK's own source: the package and its extensions.
+const _RK_SOURCE = dirname(@__FILE__)
+const _RK_OWN_DIRECTORIES = (joinpath(_RK_SOURCE, ""), joinpath(dirname(_RK_SOURCE), "ext", ""))
+function _language_file(file)
+    # Base's files are recorded relative to its source directory (`./array.jl`),
+    # generated code as `none`.
+    isabspath(file) || return true
+    (occursin("/share/julia/base/", file) || occursin("/share/julia/stdlib/", file)) &&
+        return true
+    any(directory -> startswith(file, directory), _RK_OWN_DIRECTORIES)
+end
+
+# Samples of `f` run for `seconds` on this thread, counted by label (`counts`),
+# by label for those spent managing memory (`memory`) and by label and called
+# function (`callees`).
 function _marker_samples(f::F, seconds::Real) where {F}
     previous = Profile.init()
     thread = Threads.threadid()
     counts = Dict{String,Int}()
+    memory = Dict{String,Int}()
+    callees = Dict{Tuple{String,String},Int}()
     total = 0
     try
         # About 10^4 samples per second, with room for deep stacks.
@@ -360,16 +473,19 @@ function _marker_samples(f::F, seconds::Real) where {F}
             data[i - Profile.META_OFFSET_THREADID] == thread || continue
             # The sleep state is stored plus one: 1 running, 2 sleeping.
             data[i - Profile.META_OFFSET_SLEEPSTATE] == 1 || continue
-            label = _sample_label(Iterators.flatten(
-                get(frames, ip, Base.StackTraces.StackFrame[]) for ip in ips))
+            label, managing, callee = _sample_info(collect(Iterators.flatten(
+                get(frames, ip, Base.StackTraces.StackFrame[]) for ip in ips)))
             counts[label] = get(counts, label, 0) + 1
+            managing && (memory[label] = get(memory, label, 0) + 1)
+            callee === nothing ||
+                (callees[(label, callee)] = get(callees, (label, callee), 0) + 1)
             total += 1
         end
     finally
         Profile.clear()
         Profile.init(first(previous), last(previous))
     end
-    counts, total
+    (; counts, memory, callees, total)
 end
 
 # Julia heap bytes per warm call of `f`, by label, from three calls under
@@ -406,6 +522,22 @@ function _cost_bytes(bytes::Real)
     string(round(bytes / 1024^2; digits = 1), " MiB")
 end
 _cost_ratio(gradient, primal) = primal > 0 ? string(round(gradient / primal; digits = 2), "×") : "—"
+_cost_share(part, whole) = whole > 0 ? string(round(Int, 100 * part / whole), "%") : "—"
+# The function most of a part's gradient time is spent in, with its share.
+function _cost_callee(part::ADCostPart)
+    isempty(part.callees) && return ""
+    top = first(part.callees)
+    top.gradient_seconds > 0 || return ""
+    string(top.name, " ", _cost_share(top.gradient_seconds, part.gradient_seconds))
+end
+# A pass's share of time managing memory, then its share in garbage collection.
+function _cost_memory_summary(p::ADCostProfile, pass::Symbol)
+    total = getfield(p, Symbol(pass, :_seconds))
+    memory = sum(part -> getfield(part, Symbol(pass, :_memory_seconds)), p.parts; init = 0.0)
+    collection = sum(part -> part.name == "(garbage collection)" ?
+                     getfield(part, Symbol(pass, :_seconds)) : 0.0, p.parts; init = 0.0)
+    string(_cost_share(memory, total), " + garbage collection ", _cost_share(collection, total))
+end
 
 function Base.show(io::IO, ::MIME"text/plain", p::ADCostProfile)
     println(io, "ADCostProfile: gradient ", _cost_time(p.gradient_seconds), " = ",
@@ -417,6 +549,8 @@ function Base.show(io::IO, ::MIME"text/plain", p::ADCostProfile)
         return
     end
     println(io, "samples: ", p.gradient_samples, " gradient, ", p.primal_samples, " value")
+    println(io, "memory management: gradient ", _cost_memory_summary(p, :gradient),
+            "; value ", _cost_memory_summary(p, :primal))
     # Parts with no sample and no allocation in either pass are left out of
     # the table, and at most `_COST_ROWS` rows are shown; `p.parts` has all.
     shown = [part for part in p.parts if part.gradient_samples + part.primal_samples > 0 ||
@@ -424,11 +558,16 @@ function Base.show(io::IO, ::MIME"text/plain", p::ADCostProfile)
     hidden = length(p.parts) - min(length(shown), _COST_ROWS)
     rows = [(part.name, _cost_time(part.gradient_seconds), _cost_time(part.primal_seconds),
              _cost_ratio(part.gradient_seconds, part.primal_seconds),
-             string(part.gradient_samples), _cost_bytes(part.gradient_bytes))
+             _cost_share(part.gradient_memory_seconds, part.gradient_seconds),
+             string(part.gradient_samples), _cost_bytes(part.gradient_bytes),
+             _cost_callee(part))
             for part in first(shown, _COST_ROWS)]
-    header = ("part", "gradient", "value", "ratio", "samples", "gradient heap")
-    widths = [maximum(length, (header[k], (row[k] for row in rows)...); init = 0) for k in 1:6]
-    line(row) = join((k == 1 ? rpad(row[k], widths[k]) : lpad(row[k], widths[k]) for k in 1:6), "  ")
+    header = ("part", "gradient", "value", "ratio", "memory", "samples", "gradient heap",
+              "mostly in")
+    n = length(header)
+    widths = [maximum(length, (header[k], (row[k] for row in rows)...); init = 0) for k in 1:n]
+    line(row) = rstrip(join((k == 1 || k == n ? rpad(row[k], widths[k]) : lpad(row[k], widths[k])
+                             for k in 1:n), "  "))
     print(io, line(header))
     for row in rows
         print(io, '\n', line(row))

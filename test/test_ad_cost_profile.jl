@@ -74,6 +74,87 @@ end
     @test RK._sample_label([frame("f", "x.jl")]) == "(outside generated code)"
 end
 
+@testset "samples spent managing memory, collecting and in called functions" begin
+    RK = ReactiveKernels
+    frame(func, file; c = false) =
+        Base.StackTraces.StackFrame(Symbol(func), Symbol(file), 1, nothing, c, false, UInt64(0))
+    marker(name) = frame("macro expansion", "./rk:" * name)
+    # A collection counts as garbage collection even inside a statement: which
+    # statement's allocation starts one is not the statement's cost.
+    @test RK._sample_info([frame("gc_sweep_page", "gc.c"; c = true),
+                           frame("_jl_gc_collect", "gc.c"; c = true),
+                           frame("jl_gc_pool_alloc_inner", "gc.c"; c = true), marker("mu")]) ==
+        ("(garbage collection)", false, nothing)
+    # Allocation alone is not a collection; it is the statement's memory time.
+    @test RK._sample_info([frame("jl_gc_pool_alloc_inner", "gc.c"; c = true),
+                           frame("ijl_alloc_array_1d", "array.c"; c = true),
+                           frame("Array", "boot.jl"), marker("mu")]) == ("mu", true, nothing)
+    # The C library's allocator, named or (without its symbols) not.
+    @test RK._sample_info([frame("_int_malloc", "/lib/libc.so.6"; c = true),
+                           marker("(other statements)")]) == ("(other statements)", true, nothing)
+    @test RK._sample_info([frame("", "/lib/x86_64-linux-gnu/libc.so.6"; c = true),
+                           frame("", "/lib/x86_64-linux-gnu/libc.so.6"; c = true),
+                           marker("inbounds_value")]) == ("inbounds_value", true, nothing)
+    @test RK._sample_info([frame("__libc_free", "libc.so.6"; c = true), frame("f", "/x/f.jl")]) ==
+        ("(outside generated code)", true, nothing)
+    # A named C-library function that does not manage memory, and arithmetic,
+    # are not memory time.
+    @test RK._sample_info([frame("clock_gettime", "/lib/libc.so.6"; c = true), marker("mu")]) ==
+        ("mu", false, nothing)
+    @test RK._sample_info([frame("exp", "./special/exp.jl"), marker("mu")]) == ("mu", false, nothing)
+    # The statement's outermost call into a function neither Julia's nor RK's.
+    @test RK._sample_info([frame("fill!", "./array.jl"),
+                           frame("step_propagator", "/pkg/PK/src/pk.jl"),
+                           frame("jcall", "/pkg/Blocks/src/functions.jl"),
+                           frame("pk_propagator", "/pkg/PK/src/pk.jl"),
+                           marker("propagators"), marker("(other statements)")]) ==
+        ("propagators", false, "pk_propagator (pk.jl)")
+    # RK's own source and extensions are not callees; what they call is.
+    @test RK._sample_info([frame("model_helper", "/pkg/Model/src/model.jl"),
+                           frame("cache_fill!", joinpath(dirname(RK._RK_SOURCE), "ext",
+                                                         "ReactiveKernelsMutatingFunctionsExt.jl")),
+                           marker("step")]) == ("step", false, "model_helper (model.jl)")
+    @test RK._sample_info([frame("_native_mul", joinpath(RK._RK_SOURCE, "core.jl")),
+                           frame("gemm!", "/opt/julia/share/julia/stdlib/v1.10/LinearAlgebra/src/blas.jl"),
+                           marker("mu")]) == ("mu", false, nothing)
+end
+
+# A model helper that allocates, outside RK, so its part names it.
+cost_profile_helper(m) = (v = fill(m, 32); sum(abs2, v) / 32)
+
+@testset "ad_cost_profile names memory time and the helper a statement calls" begin
+    spec = @kernel cost_profiled_helper(theta, x) = begin
+        mu = theta[1] .+ theta[2] .* x
+        @plate for i in eachindex(mu)
+            term[i] = cost_profile_helper(mu[i])
+        end
+        total = sum(term)
+    end
+    x = [sin(0.37i) for i in 1:2_000]
+    theta = [0.1, 0.5]
+    k = prepare(spec; have = (:theta, :x), want = :total)
+    ad = prepare_ad(k, AutoEnzyme(; mode = Enzyme.Reverse), theta, x; active = :theta)
+    value, gradient = ad_value_and_gradient(ad, theta, x)
+    p = ad_cost_profile(ad, theta, x; seconds = 0.5)
+    @test p.profiled
+    @test sum(part.gradient_seconds for part in p.parts) ≈ p.gradient_seconds
+    @test all(part -> 0 <= part.gradient_memory_seconds <= part.gradient_seconds * (1 + 1e-12) &&
+                      0 <= part.primal_memory_seconds <= part.primal_seconds * (1 + 1e-12), p.parts)
+    # The statement that calls the helper names it as where its time goes.
+    calling = filter(part -> !isempty(part.callees) &&
+                             startswith(first(part.callees).name, "cost_profile_helper ("), p.parts)
+    @test !isempty(calling)
+    # Each cell allocates a vector, in the value and in the gradient.
+    @test sum(part.primal_memory_seconds for part in calling) > 0
+    @test sum(part.primal_memory_seconds for part in p.parts) > 0
+    shown = sprint(show, MIME"text/plain"(), p)
+    @test occursin("memory management: gradient", shown)
+    @test occursin("cost_profile_helper", shown)
+    collection = filter(part -> part.name == "(garbage collection)", p.parts)
+    @test all(part -> part.primal_memory_seconds == 0 && part.gradient_memory_seconds == 0, collection)
+    @test ad_value_and_gradient(ad, theta, x) == (value, gradient)
+end
+
 @testset "ad_cost_profile splits the gradient by statement" begin
     spec = @kernel cost_profiled(theta, x, y) = begin
         a = theta[1]
