@@ -26,6 +26,14 @@ _ref(x, indices...) = Expr(:ref, x, indices...)
 _call(f, args...) = Expr(:call, f, args...)
 _global(name) = GlobalRef(@__MODULE__, name)
 
+# A particle's carry is a named tuple of lag-window arrays, each allocated on
+# its own. Copying each array gives a new step the same independently owned
+# storage `deepcopy` gives, without building an identity dictionary per
+# particle; anything else still takes `deepcopy`.
+_copy_carry(carry::NamedTuple) = map(_copy_carry, carry)
+_copy_carry(a::Array{T}) where {T} = isbitstype(T) ? copy(a) : deepcopy(a)
+_copy_carry(x) = deepcopy(x)
+
 function _declaration_name(lhs)
     name = PPL._declared_value_name(lhs)
     name isa Symbol || _fail("cannot identify static declaration $lhs")
@@ -405,9 +413,15 @@ function _scan!(c, ex, group)
                 Expr(:(=), dest, lhs.args[1]))
         end
     end
+    # Shift each lag window by one slot in place, through views: slicing the
+    # old window would allocate a copy per particle and step. A one-slot
+    # window has nothing to shift.
+    window = GlobalRef(Base, :view)
+    shifts = [:( $window($(_field(:_filter_next,c.states[n][1])),1:$(depth-1),$(c.states[n][3])) .=
+            $window($(_field(:_filter_carry,c.states[n][1])),2:$depth,$(c.states[n][3])) )
+        for n in scan.states if depth > 1]
     return quote
-        $(Expr(:block, [:( $(_field(:_filter_next,c.states[n][1]))[1:$(depth-1),$(c.states[n][3])] .=
-            $(_field(:_filter_carry,c.states[n][1]))[2:$depth,$(c.states[n][3])]) for n in scan.states]...))
+        $(Expr(:block, shifts...))
         $(scan.loopvar) = _filter_time
         if _filter_time < $(scan.lo)
             $(branches...)
@@ -674,7 +688,7 @@ function _prepare_filter(model::RKPPLModel; model_id::AbstractString,
                  _filter_times, _filter_active) -> begin
         $(bindings...)
         _filter_time = _filter_global_time
-        _filter_next = $(GlobalRef(Base, :deepcopy))(_filter_carry)
+        _filter_next = $(_global(:_copy_carry))(_filter_carry)
         _filter_score = 0.0
         $body
         (_filter_next, Float64(_filter_score))
@@ -745,6 +759,22 @@ mutable struct FilterIndex
 end
 FilterIndex() = FilterIndex(0,0.0)
 
+# SequentialMonteCarlo's buffers for `n` particles and two iterations. `smc!`
+# overwrites every one of them before reading it, so the calling task keeps
+# its last buffer and reuses it while `n` is unchanged: a step then allocates
+# no engine particles. Each task holds at most one buffer, used by one
+# `_resample` at a time, since that call blocks until the engine finishes.
+const _ENGINE_BUFFER = :ReactiveKernelsPPLFilterExt_engine_buffer
+function _engine_buffer(n)
+    storage = task_local_storage()
+    io = get(storage, _ENGINE_BUFFER, nothing)
+    if !(io isa SMC.SMCIO{FilterIndex,Nothing}) || io.N != n
+        io = SMC.SMCIO{FilterIndex,Nothing}(n,2,1,false)
+        storage[_ENGINE_BUFFER] = io
+    end
+    return io::SMC.SMCIO{FilterIndex,Nothing}
+end
+
 # All engine arrays have length bounded by N or 2, regardless of stream time.
 # Static ensemble members retain separate conditional clouds, permitting a
 # state-only warm-up without multiplying already calibrated parameter masses.
@@ -768,7 +798,7 @@ function _resample(logweights, seed)
         nothing
     end
     model = SMC.SMCModel(mutation!, (t,p,s) -> p.logweight, 2, FilterIndex, Nothing)
-    output = SMC.SMCIO{FilterIndex,Nothing}(n,2,1,false)
+    output = _engine_buffer(n)
     task = @task begin
         Random.seed!(seed)
         SMC.smc!(model,output)
@@ -782,6 +812,47 @@ function _logsum(x)
     m = maximum(x)
     m == -Inf && _fail("all parameter members have zero predictive weight")
     return m + log(sum(v -> exp(v-m), x))
+end
+
+# One member's particles advance in one call. The prepared transition was
+# evaluated after this extension loaded, so the caller crosses the world-age
+# barrier once per member; inside, `advance` has its concrete type and every
+# particle's call, carry and score are inferred, with no per-particle dynamic
+# dispatch or boxed result. Particles draw from `rng` in index order, as before.
+function _advance_member!(predicted, scores, advance::F, rng, carries, offset, parameters,
+        data, inputs, observation, time, operations, group_times, active) where {F}
+    for j in eachindex(scores)
+        i = offset+j
+        carry, score = advance(rng, carries[i], parameters, data, inputs, observation, time,
+            operations, group_times, active)
+        all(a -> all(isfinite,a), carry) || _fail("non-finite recurrence state")
+        predicted[i] = carry
+        scores[j] = score
+    end
+    return nothing
+end
+
+# Every predicted carry is this step's own fresh storage. A parent's first
+# child takes it; each further child of that parent gets a copy, so every
+# particle still owns its carry while a step allocates one carry per child.
+function _assign_children!(carries, ancestors, predicted, parents, offset, taken)
+    fill!(taken, false)
+    for j in eachindex(parents)
+        i, p = offset+j, parents[j]
+        ancestors[i] = offset+p
+        carries[i] = taken[p] ? _copy_carry(predicted[offset+p]) : (taken[p] = true; predicted[offset+p])
+    end
+    return nothing
+end
+
+# Number of distinct values in `v`, all in 1:bound (ancestors and lineages).
+function _distinct(v, bound)
+    seen = falses(bound)
+    count = 0
+    for x in v
+        seen[x] || (seen[x] = true; count += 1)
+    end
+    return count
 end
 
 function _filter_step(state::FilterState, observation::NamedTuple;
@@ -810,18 +881,13 @@ function _filter_step(state::FilterState, observation::NamedTuple;
     ancestors = similar(state.ancestors)
     increments = Vector{Float64}(undef,k)
     esses = Vector{Float64}(undef,k)
+    scores = Vector{Float64}(undef,n)
+    taken = falses(n)
     for member in 1:k
         offset = (member-1)*n
-        scores = Vector{Float64}(undef,n)
-        for j in 1:n
-            i = offset+j
-            carry, score = Base.invokelatest(state.target.advance, rng, state.carries[i],
-                state.ensemble[member], state.target.data, inputs, observation, state.time+1,
-                state.target.operations,state.group_times,active)
-            all(a -> all(isfinite,a), carry) || _fail("non-finite recurrence state")
-            predicted[i] = carry
-            scores[j] = score
-        end
+        Base.invokelatest(_advance_member!, predicted, scores, state.target.advance, rng,
+            state.carries, offset, state.ensemble[member], state.target.data, inputs,
+            observation, state.time+1, state.target.operations, state.group_times, active)
         all(x -> isfinite(x) || x == -Inf,scores) || _fail("NaN or +Inf observation log weight")
         parents, increment, ess = if maximum(scores) == -Inf
             condition_state_only && state.parameter_mass[member] > 0 &&
@@ -831,11 +897,7 @@ function _filter_step(state::FilterState, observation::NamedTuple;
             _resample(scores,rand(rng,UInt64))
         end
         increments[member], esses[member] = increment, ess
-        for j in 1:n
-            i, parent = offset+j, offset+parents[j]
-            ancestors[i] = parent
-            carries[i] = deepcopy(predicted[parent])
-        end
+        _assign_children!(carries, ancestors, predicted, parents, offset, taken)
     end
     logmass = state.log_parameter_mass .+ increments
     zero_ok && all(==(-Inf),logmass) && return nothing
@@ -847,7 +909,7 @@ function _filter_step(state::FilterState, observation::NamedTuple;
     isfinite(total) || _fail("log normalizer overflow")
     lineage = state.lineage[ancestors]
     stage = FilterStage(state.time+1, score, sum(state.parameter_mass .* esses),
-        length(Set(ancestors)), length(Set(lineage)), inv(sum(abs2,mass)), condition_state_only)
+        _distinct(ancestors,n*k), _distinct(lineage,n*k), inv(sum(abs2,mass)), condition_state_only)
     history = [state.history; stage]
     length(history) > state.history_limit && deleteat!(history,1:length(history)-state.history_limit)
     times = deepcopy(state.group_times)
