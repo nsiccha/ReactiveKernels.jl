@@ -241,7 +241,10 @@ end
     for spec in (indexed_terms, indexed_positions, deep_indexed_terms)
         first_kernel = nothing
         for n in (2, 29, 0)
-            rows = [collect(0:(i % 7)) for i in 1:n]
+            # Distinct rows: repeated rows would run once per distinct row
+            # (`duplicate_cells.jl`, `nested_duplicate_cells.jl`), a program
+            # of its own, while these bindings share one.
+            rows = [collect(i:(i + i % 7)) for i in 1:n]
             events = spec === deep_indexed_terms ? [rows, [Int[]]] : rows
             saved = deepcopy(events)
             bound_calls[] = 0
@@ -293,7 +296,8 @@ end
 @testset "scalar kernel branch graphs survive nested composition" begin
     first_kernel = nothing
     for n in (2, 29, 0)
-        events = [collect(0:(i % 7)) for i in 1:n]
+        # Distinct rows, as in the testset above.
+        events = [collect(i:(i + i % 7)) for i in 1:n]
         flat = reduce(vcat, events; init=Int[])
         bound_calls[] = 0
         kernel = prepare(nested_composed_branches; bound=(;events),
@@ -378,7 +382,8 @@ end
     graph_recipes = copy(original.graph.recipes)
     first_kernel = nothing
     for n in (2, 29)
-        events = [collect(0:(i % 7)) for i in 1:n]
+        # Distinct rows, as in the testsets above.
+        events = [collect(i:(i + i % 7)) for i in 1:n]
         bound_calls[] = 0
         kernel = prepare(counted_score; bound=(; events), type_stability=:error)
         @test bound_calls[] == sum(length, events)
