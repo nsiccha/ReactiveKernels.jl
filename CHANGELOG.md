@@ -16,6 +16,20 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.315
+
+- A compiled reactive state (`prepare_reactive`, and the recipes
+  `prepare_reactive_nonallocating` does not reuse in place) runs an authored
+  plate, a `plate_cell` value and a scan with the loop `prepare` emits for that
+  recipe. Before, its getters called those operations' fallback methods, which
+  ran each cell through the scalar kernel's own call and typed the result at
+  run time: about 130 ns and 7 allocations per plate cell, and 3.6 µs and 74
+  allocations for one `plate_cell` read, where `prepare` takes nanoseconds and
+  allocates nothing. Values, invalidation, `freeze!` and `assign!` are
+  unchanged; with concretely typed ports a cell read after `set!` of its index
+  allocates nothing. Preparing the state now also prepares each such recipe,
+  which costs about what `prepare` costs to compile its loop.
+
 ## 0.1.314
 
 - With Enzyme's dogfood repair `derivative_report_reachability` (dogfood

@@ -507,3 +507,90 @@ end
     @test get!(st2, hd) == [99.0, 99.0]
     @test get!(st2, hd) === buf0            # reused the same buffer
 end
+
+# A plate, a plate cell and a scan in a compiled reactive state run the loop
+# `prepare` emits for them, not their operations' fallback calls, which ran
+# each cell through the scalar kernel's call and allocated per cell: one
+# `plate_cell` read cost 3.6 µs and 74 allocations against `prepare`'s 6 ns
+# (snag `compiledreactive-566bf27c`).
+@kernel _reactive_native_hier(theta::Vector{Float64}, y::Vector{Vector{Float64}},
+                              mu::Float64, tau::Float64, j::Int) = begin
+    dens::Vector{Float64} = plate(theta, y) do t, yj
+        v::Float64 = -0.5 * ((t - mu) / tau)^2 - log(tau) -
+            0.5 * sum(x -> abs2(x - t), yj)
+        v
+    end
+    total::Float64 = sum(dens)
+    return total
+end
+
+@kernel _reactive_native_scan(xs::Vector{Float64}) = begin
+    cumulative = scan(xs; init = 0.0) do carry, x
+        next = carry + x
+        (next, next)
+    end
+    last_value = cumulative[end]
+    return last_value
+end
+
+function _reactive_cell_read_allocations(state, index, cell)
+    set!(state, index, 2)
+    get!(state, cell)
+    @allocated begin
+        set!(state, index, 3)
+        get!(state, cell)
+    end
+end
+
+@testset "compiled reactive plates, cells and scans run prepare's native loop" begin
+    theta = [0.0, 1.0, -0.5, 0.4]
+    y = [[0.1, -0.4, 0.3], [1.2, 0.8, 1.1], [-0.5, -0.2, -0.9], [0.4, 0.6, 0.2]]
+    spec = plate_cell(_reactive_native_hier, :dens; index = :j)
+    have = (:theta, :y, :mu, :tau, :j)
+    program = prepare_reactive(spec; have, want = (:dens_cell, :total))
+    @test typeof(program) === typeof(prepare_reactive(spec; have, want = (:dens_cell, :total)))
+    # The plate and the cell each run a prepared one-recipe program.
+    ops = first(program.getters).callables
+    @test count(op -> op isa ReactiveKernels.PreparedKernel, ops) == 2
+    @test !any(op -> op isa ReactiveKernels._LoweredOnlyOp, ops)
+
+    dens_kernel = prepare(spec; have, want = :dens)
+    cell_kernel = prepare(spec; have, want = :dens_cell)
+    state = program(copy(theta), y, 0.2, 1.3, 1)
+    th, jh = statevalue(program, spec.theta), statevalue(program, spec.j)
+    densh = statevalue(program, spec.dens)
+    cellh, totalh = statevalue(program, spec.dens_cell), statevalue(program, spec.total)
+    for j in eachindex(theta)
+        set!(state, jh, j)
+        @test get!(state, cellh) == cell_kernel(theta, y, 0.2, 1.3, j)
+    end
+    @test get!(state, densh) == dens_kernel(theta, y, 0.2, 1.3, 1)
+    @test get!(state, totalh) == sum(dens_kernel(theta, y, 0.2, 1.3, 1))
+    @test_throws BoundsError (set!(state, jh, 5); get!(state, cellh))
+
+    # Invalidation and cut points are unchanged: the plate keeps its own slot.
+    set!(state, jh, 2)
+    mutate!(t -> (t[2] = 0.7), state, th)
+    moved = [0.0, 0.7, -0.5, 0.4]
+    @test get!(state, cellh) == cell_kernel(moved, y, 0.2, 1.3, 2)
+    @test get!(state, totalh) == sum(dens_kernel(moved, y, 0.2, 1.3, 1))
+    freeze!(state, densh)
+    mutate!(t -> (t[3] = 2.0), state, th)
+    @test get!(state, totalh) == sum(dens_kernel(moved, y, 0.2, 1.3, 1))
+    unfreeze!(state, densh)
+    moved[3] = 2.0
+    @test get!(state, totalh) == sum(dens_kernel(moved, y, 0.2, 1.3, 1))
+
+    # With typed ports, a cell read after `set!` of its index allocates nothing.
+    @test _reactive_cell_read_allocations(state, jh, cellh) == 0
+
+    scan_program = prepare_reactive(_reactive_native_scan)
+    @test any(op -> op isa ReactiveKernels.PreparedKernel,
+              first(scan_program.getters).callables)
+    xs = [0.5, 1.0, 2.0]
+    scan_state = scan_program(xs)
+    lasth = statevalue(scan_program, _reactive_native_scan.last_value)
+    @test get!(scan_state, lasth) == prepare(_reactive_native_scan)(xs)
+    mutate!(v -> (v[1] = 1.5), scan_state, statevalue(scan_program, _reactive_native_scan.xs))
+    @test get!(scan_state, lasth) == 4.5
+end
