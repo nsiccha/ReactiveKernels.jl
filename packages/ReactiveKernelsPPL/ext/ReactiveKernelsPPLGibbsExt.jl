@@ -17,12 +17,19 @@ end
 # One exact draw of every finite integer block given the position.
 function _draw_integers(problem, rng, position, values)
     for block in problem.integers
-        conditional = Base.invokelatest(block.kernel, position, values)
-        weights = PPL._gibbs_weights(conditional.logweights)
-        draw = conditional.states[PPL._integer_draw_index(rng, weights)]
-        for (path, value) in zip(block.paths, draw)
-            values = PPL._gibbs_set(values, path, value)
-        end
+        values = _draw_block(block, rng, position, values)
+    end
+    return values
+end
+
+_draw_block(block::PPL.GibbsArrayBlock, rng, position, values) =
+    PPL._draw_array_block(block, rng, position, values)
+function _draw_block(block, rng, position, values)
+    conditional = Base.invokelatest(block.kernel, position, values)
+    weights = PPL._gibbs_weights(conditional.logweights)
+    draw = conditional.states[PPL._integer_draw_index(rng, weights)]
+    for (path, value) in zip(block.paths, draw)
+        values = PPL._gibbs_set(values, path, value)
     end
     return values
 end

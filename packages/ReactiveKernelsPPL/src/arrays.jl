@@ -689,6 +689,13 @@ end
 _sampled_metadata(dims) = isempty(dims) ? _OS.scalar_info(Float64) :
     _OS.array_info(Float64, (_metadata_axis(d) for d in dims)...;
         container_type = AbstractArray{Float64,length(dims)})
+# An integer parameter's runtime state: an `Int`, or an `Int` array of its
+# declared dims, so reads it indexes (`mu[k]`, `mu[z]`) have known shapes.
+_integer_metadata(dims) = isempty(dims) ? _OS.scalar_info(Int) :
+    _OS.array_info(Int, (_metadata_axis(d) for d in dims)...;
+        container_type = AbstractArray{Int,length(dims)})
+_parameter_metadata(p, dims) =
+    _integer_parameter(p) ? _integer_metadata(dims) : _sampled_metadata(dims)
 
 # A call's result facts. A proved conflict has none; an unsupported call may
 # still know some (a broadcast's axes).
@@ -752,13 +759,13 @@ function _value_metadata(plan::StructuralPlan, ex, seen::Set{Symbol};
             return _OS.value_info(plan.columns[ex])
         if _is_array_param(plan, ex)
             p = _array_param(plan, ex)
-            (data_axes && isbound(plan)) || return _sampled_metadata(p.dims)
+            (data_axes && isbound(plan)) || return _parameter_metadata(p, p.dims)
             push!(seen, ex)
             r = p.family === :external ?
                 Any[_sampling_extent(plan, d, p.name) for d in p.dims] :
                 Any[_array_dim_size(plan, p, d; active = seen) for d in p.dims]
             delete!(seen, ex)
-            return _sampled_metadata(r)
+            return _parameter_metadata(p, r)
         end
         i = findfirst(v -> v.name === ex, plan.vector_parameters)
         if i !== nothing
@@ -775,7 +782,7 @@ function _value_metadata(plan::StructuralPlan, ex, seen::Set{Symbol};
                 push!(seen, ex)
                 n = _plate_rows(plan, plan.plate_parameters[i]; active = seen)
                 delete!(seen, ex)
-                return _sampled_metadata(Any[n])
+                return _parameter_metadata(plan.plate_parameters[i], Any[n])
             end
             i = findfirst(s -> ex in s.states, plan.scans)
             if i !== nothing
@@ -787,7 +794,8 @@ function _value_metadata(plan::StructuralPlan, ex, seen::Set{Symbol};
                 return _sampled_metadata(Any[_scan_length(plan, s)])
             end
         end
-        any(p -> p.name === ex, plan.parameters) && return _OS.scalar_info(Float64)
+        i = findfirst(p -> p.name === ex, plan.parameters)
+        i === nothing || return _parameter_metadata(plan.parameters[i], Any[])
         d = _find_definition(plan, ex; derived = data_axes || symbolic_data)
         d === nothing && return _OS.ValueInfo()
         push!(seen, ex)
@@ -881,10 +889,11 @@ end
 function _ref_metadata(plan::StructuralPlan, ex::Expr, meta, throw_conflicts::Bool)
     base = meta(ex.args[1])
     idx = ex.args[2:end]
-    if all(i -> _is_index_position(plan, i), idx)
+    if all(i -> _is_index_position(plan, i) || _is_integer_position(plan, i), idx)
         _OS.value_rank(base) === length(idx) || return _OS.ValueInfo()
+        position(i) = _is_integer_position(plan, i) ? meta(i) : _position_metadata(i)
         return _metadata_result(_OS.infer_call(getindex,
-            _OS.ValueInfo[base; map(_position_metadata, idx)]), ex, throw_conflicts)
+            _OS.ValueInfo[base; map(position, idx)]), ex, throw_conflicts)
     end
     _array_index_kind(plan, ex) === :gather || return _OS.ValueInfo()
     k = _gather_index_axis(plan, ex)
@@ -1033,9 +1042,19 @@ _is_position(i) = _is_scalar_position(i) || i === :(:)
 _is_row_index(plan::StructuralPlan, i) =
     i isa Symbol && i !== :(:) && !_is_endpoint(i) &&
     _structural(plan, (:is_row_index, i); columns = :none) do
-        !_is_array_param(plan, i) && !_is_value_position(plan, i) &&
+        _is_integer_column(plan, i) || !_is_array_param(plan, i) && !_is_value_position(plan, i) &&
             (!(i in _union_name_set(plan)) || _is_data_only_assignment(plan, i))
     end
+# An integer parameter is a runtime position, as in Julia: a scalar one reads
+# one entry (`mu[k]`), an integer array one entry per observation (`mu[z]`).
+# Its values are state, not data, so Julia checks their bounds when the
+# program runs; binding checks only that the indexed axis is positional.
+_integer_index_parameter(plan::StructuralPlan, i) = i isa Symbol &&
+    any(p -> p.name === i, _integer_parameters(plan))
+_is_integer_position(plan::StructuralPlan, i) =
+    _integer_index_parameter(plan, i) && !_is_array_param(plan, i)
+_is_integer_column(plan::StructuralPlan, i) =
+    _integer_index_parameter(plan, i) && _is_array_param(plan, i)
 _is_data_only_assignment(plan::StructuralPlan, i::Symbol) =
     any(a -> a.name === i, plan.assignments) &&
     _reads_data_only(plan, i, _all_name_set(plan), Set{Symbol}())
@@ -1043,7 +1062,8 @@ _is_data_only_assignment(plan::StructuralPlan, i::Symbol) =
 # indexing with a model-level result, so naming the definition never
 # changes its legality.
 _model_level_gather(plan::StructuralPlan, g) = g isa Symbol &&
-    _reads_data_only(plan, g, _all_name_set(plan), Set{Symbol}())
+    (_is_integer_column(plan, g) ||
+        _reads_data_only(plan, g, _all_name_set(plan), Set{Symbol}()))
 
 # A number bound to a data name is one position, as in Julia: called with
 # `T = 3`, `h[T]` and `z[T]` read one element, never one per observation.
@@ -1134,8 +1154,8 @@ _gather_index_axis(plan::StructuralPlan, ex::Expr) =
 function _array_index_kind(plan::StructuralPlan, ex::Expr)
     idx = ex.args[2:end]
     isempty(idx) && return :invalid
-    all(i -> _is_one_position(plan, i), idx) && return :scalar
-    all(i -> _is_index_position(plan, i), idx) && return :slice
+    all(i -> _is_one_position(plan, i) || _is_integer_position(plan, i), idx) && return :scalar
+    all(i -> _is_index_position(plan, i) || _is_integer_position(plan, i), idx) && return :slice
     count(i -> _is_row_index(plan, i), idx) == 1 &&
         all(i -> _is_index_position(plan, i) || _is_row_index(plan, i), idx) &&
         return :gather
@@ -1149,7 +1169,7 @@ function _collect_array_ref!(refs, ex::Expr, plan::StructuralPlan, label,
     base = ex.args[1]
     if _is_array_assignment(plan, base)
         idx = ex.args[2:end]
-        if !isempty(idx) && all(i -> _is_index_position(plan, i), idx)
+        if !isempty(idx) && all(i -> _is_index_position(plan, i) || _is_integer_position(plan, i), idx)
             push!(refs, base)
             return true
         end
@@ -1168,10 +1188,16 @@ function _collect_array_ref!(refs, ex::Expr, plan::StructuralPlan, label,
             "gathers from the $(length(axs))-axis array value $base with " *
             "$(length(idx)) indices. Give one index per axis or one " *
             "linear index")
-        _reads_data_only(plan, g, _all_name_set(plan), Set{Symbol}()) ||
+        _is_integer_column(plan, g) ||
+            _reads_data_only(plan, g, _all_name_set(plan), Set{Symbol}()) ||
             _fail(label, "`$(repr(ex))` gather index $g must be data")
         push!(refs, base)
-        if bound
+        if bound && _is_integer_column(plan, g)
+            d = _gather_axis(plan, ex)
+            d !== nothing && _is_levels_dim(d) && _fail(label, "`$(repr(ex))` " *
+                "indexes the level axis of $base by the integer parameter $g; " *
+                "declare that axis by position (`1:K`) to index it by an integer")
+        elseif bound
             d = _gather_axis(plan, ex)
             _data_check(plan) do plan
                 if d === nothing
@@ -1207,10 +1233,16 @@ function _collect_array_ref!(refs, ex::Expr, plan::StructuralPlan, label,
             "`$(repr(ex))` gathers from the LKJCholesky factor $(base)")
         axis = _gather_index_axis(plan, ex)
         g = ex.args[1 + axis]
-        _reads_data_only(plan, g, _all_name_set(plan), Set{Symbol}()) ||
-            _fail(label, "`$(repr(ex))` gather index $g must be data")
-        bound && _data_check(plan) do plan
-            _validate_gather_axis(plan, p.name, label, p.dims[axis], g)
+        if _is_integer_column(plan, g)
+            bound && _is_levels_dim(p.dims[axis]) && _fail(label, "`$(repr(ex))` " *
+                "indexes the level axis of $base by the integer parameter $g; " *
+                "declare that axis by position (`1:K`) to index it by an integer")
+        else
+            _reads_data_only(plan, g, _all_name_set(plan), Set{Symbol}()) ||
+                _fail(label, "`$(repr(ex))` gather index $g must be data")
+            bound && _data_check(plan) do plan
+                _validate_gather_axis(plan, p.name, label, p.dims[axis], g)
+            end
         end
     elseif bound
         _data_check(plan) do plan

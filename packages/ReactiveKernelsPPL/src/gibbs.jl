@@ -41,10 +41,14 @@ function prepare_gibbs(built, plan::StructuralPlan, u0::AbstractVector;
     u = Vector{Float64}(u0)
     length(u) == layout.total || throw(DimensionMismatch("Gibbs position has the wrong dimension"))
     _check_integer_parameters(layout, discrete)
-    ps = _integer_parameters(plan)
-    isempty(ps) && throw(ArgumentError("prepare_gibbs needs at least one integer parameter"))
-    all(p -> p isa SampledParameter, ps) || throw(ArgumentError(
-        "prepare_gibbs currently enumerates scalar integer declarations; integer arrays are not yet supported"))
+    all_ps = _integer_parameters(plan)
+    isempty(all_ps) && throw(ArgumentError("prepare_gibbs needs at least one integer parameter"))
+    ps = [p for p in all_ps if p isa SampledParameter]
+    # A declared integer array and an integer `@plate` cell (`z[i] ~
+    # Categorical(w)` in a loop) are both one array of integers.
+    array_ps = [p for p in all_ps if p isa ArrayParameter || p isa PlateParameter]
+    length(ps) + length(array_ps) == length(all_ps) || throw(ArgumentError(
+        "prepare_gibbs updates scalar integers and integer arrays"))
     layout.total == 0 || backend !== nothing || throw(ArgumentError(
         "prepare_gibbs requires an AD backend for its continuous block"))
     paths = [get(layout.name_paths, p.name, (p.name,)) for p in ps]
@@ -54,7 +58,8 @@ function prepare_gibbs(built, plan::StructuralPlan, u0::AbstractVector;
         throw(ArgumentError("blocks must contain nonempty tuples of integer parameter names"))
     selected = [name for group in groups for name in group]
     length(selected) == length(authored) && Set(selected) == Set(authored) ||
-        throw(ArgumentError("blocks must include each free integer exactly once: $(Tuple(authored))"))
+        throw(ArgumentError("blocks must include each free scalar integer exactly once: " *
+            "$(Tuple(authored)); integer arrays are updated as their own blocks"))
 
     # Record individual prior/Jacobian events, so independent scalar priors
     # are not grouped into a single aggregate before selecting conditionals.
@@ -123,8 +128,234 @@ function prepare_gibbs(built, plan::StructuralPlan, u0::AbstractVector;
             bound=_query_bound(plan), exemplars=exemplar, on_error)
         (; names=group, paths=Tuple(paths[indices]), kernel)
     end
+    arrays = map(p -> _gibbs_array_block(plan, p, def, statements, terms, layout,
+        exemplar, on_error), array_ps)
     joint = prepare_query(built, plan, :sampler; exemplars=exemplar, on_error)
-    return GibbsProblem(layout, continuous, integers, joint)
+    return GibbsProblem(layout, continuous, (integers..., arrays...), joint)
+end
+
+"""
+One declared integer array updated as a block of a Gibbs sweep.
+
+When every density term that reads the array is a sum over plate cells, each
+reading the array only at its own element, the elements are conditionally
+independent given everything else. All of them are then drawn together and
+exactly: for each support value `s`, one evaluation of those cells with every
+element set to `s` gives each element's log weight for `s`. Otherwise the
+elements are drawn one after another from their exact conditionals, each
+evaluating the terms that read the array.
+"""
+struct GibbsArrayBlock{C,S}
+    name::Symbol
+    path::Tuple
+    elementwise::Bool
+    cells::C       # (u, discrete, s) -> per-element log weights (elementwise),
+                   # or (u, discrete) -> the summed terms (one site at a time)
+    support::S     # (u, discrete) -> the support all elements share
+end
+
+# Names whose value reads the integer array `root` elementwise: entry `i` reads
+# `root` only at `i`. They are `root`, a gather `A[x]` from a value `A` that
+# does not read `root`, dotted broadcasts of such values with values that do
+# not read `root`, and plates over such operands whose cells capture nothing
+# else that reads it.
+function _gibbs_elementwise(statements, root::Symbol, dependent)
+    elementwise = Set{Symbol}([root])
+    positions = _gibbs_position_names(statements)
+    for st in statements
+        name = _assigned_name(st)
+        (name === nothing || name === root || name ∉ dependent) && continue
+        _gibbs_elementwise_expr(st.args[2], elementwise, dependent, positions) &&
+            push!(elementwise, name)
+    end
+    return elementwise
+end
+# Names the program binds to every position of a vector, in order.
+_gibbs_position_names(statements) = Set{Symbol}(_assigned_name(st) for st in statements
+    if _assigned_name(st) !== nothing && _gibbs_all_positions(st.args[2]))
+function _gibbs_elementwise_expr(ex, elementwise, dependent, positions=Set{Symbol}())
+    ex isa Symbol && return ex in elementwise
+    ex isa Expr || return false
+    free(a) = !_gibbs_reads(a, dependent)
+    item(a) = free(a) || _gibbs_elementwise_expr(a, elementwise, dependent, positions)
+    all_positions(a) = a isa Symbol ? a in positions : _gibbs_all_positions(a)
+    if ex.head === :ref && length(ex.args) == 2
+        return free(ex.args[1]) && ex.args[2] isa Symbol && ex.args[2] in elementwise
+    elseif ex.head === :. && length(ex.args) == 2 && Meta.isexpr(ex.args[2], :tuple)
+        return free(ex.args[1]) && all(item, ex.args[2].args)
+    elseif ex.head === :call && !isempty(ex.args) && ex.args[1] isa Symbol &&
+            startswith(string(ex.args[1]), ".")
+        return all(item, ex.args[2:end])
+    elseif _gibbs_plate_parts(ex) !== nothing
+        operands, captured = _gibbs_plate_parts(ex)
+        isempty(intersect(captured, dependent)) && all(item, operands) &&
+            any(a -> !free(a), operands) && return true
+        # A loop's cells over every position (`@plate for i in eachindex(y)`)
+        # reading the array only at their own position (`mu[z[i]]`): cell `i`
+        # holds element `i`.
+        params = ex.args[2].args[1]
+        param = params isa Symbol ? params :
+            (Meta.isexpr(params, :tuple, 1) ? params.args[1] : nothing)
+        return length(operands) == 1 && param isa Symbol &&
+            all_positions(operands[1]) &&
+            _gibbs_reads(ex.args[2].args[2], dependent) &&
+            _gibbs_reads_own(ex.args[2].args[2], param, elementwise, dependent)
+    elseif ex.head === :call && length(ex.args) == 3 &&
+            _gibbs_callee(ex.args[1], :_ppl_range_values)
+        # A response's selection of a location at every position, in order.
+        return item(ex.args[2]) && free(ex.args[3]) && all_positions(ex.args[3])
+    end
+    return false
+end
+
+_gibbs_callee(f, name::Symbol) = f === name || (f isa GlobalRef && f.name === name) ||
+    (Meta.isexpr(f, :., 2) && f.args[2] == QuoteNode(name))
+# Every position of a vector in order: `collect(eachindex(x))`,
+# `eachindex(x)` or `collect(axes(x, 1))`, as the plate and range desugars
+# spell a loop over all of `x`.
+function _gibbs_all_positions(ex)
+    Meta.isexpr(ex, :call) || return false
+    _gibbs_callee(ex.args[1], :collect) && length(ex.args) == 2 &&
+        return _gibbs_all_positions(ex.args[2])
+    _gibbs_callee(ex.args[1], :eachindex) && length(ex.args) == 2 && return true
+    return _gibbs_callee(ex.args[1], :axes) && length(ex.args) == 3 && ex.args[3] == 1
+end
+# The cell body reads names that depend on the array only as `a[param]`,
+# with `a` an elementwise value.
+function _gibbs_reads_own(ex, param, elementwise, dependent)
+    ex isa Symbol && return ex ∉ dependent
+    ex isa Expr || return true
+    if ex.head === :ref && length(ex.args) == 2 && ex.args[1] isa Symbol &&
+            ex.args[1] in dependent
+        return ex.args[1] in elementwise && ex.args[2] === param
+    end
+    return all(a -> _gibbs_reads_own(a, param, elementwise, dependent), ex.args)
+end
+
+# `(operands, captured)` of `plate(operands...) do cells...; body end`, or
+# `nothing` for any other expression (including keyword operands).
+function _gibbs_plate_parts(ex)
+    Meta.isexpr(ex, :do) && Meta.isexpr(ex.args[1], :call) &&
+        ex.args[1].args[1] === :plate && Meta.isexpr(ex.args[2], :->) || return nothing
+    operands = ex.args[1].args[2:end]
+    any(a -> a isa Expr && a.head in (:parameters, :kw), operands) && return nothing
+    params = ex.args[2].args[1]
+    params = params isa Symbol ? Symbol[params] : Symbol[a for a in params.args if a isa Symbol]
+    captured = setdiff(_statement_value_reads!(Set{Symbol}(), ex.args[2].args[2]), params)
+    return operands, captured
+end
+
+# The plate a density term sums when its cells read the array elementwise: the
+# term is `sum(P)`, `P` is a plate whose operands read the array only through
+# elementwise names, and whose cell body captures nothing that reads it.
+function _gibbs_elementwise_plate(statements, term, elementwise, dependent)
+    term isa Symbol || return nothing
+    st = _named_statement(statements, term)
+    st === nothing && return nothing
+    rhs = st.args[2]
+    Meta.isexpr(rhs, :call, 2) && rhs.args[1] === :sum && rhs.args[2] isa Symbol ||
+        return nothing
+    pst = _named_statement(statements, rhs.args[2])
+    pst === nothing && return nothing
+    _gibbs_plate_parts(pst.args[2]) === nothing && return nothing
+    _gibbs_elementwise_expr(pst.args[2], elementwise, dependent,
+        _gibbs_position_names(statements)) || return nothing
+    return rhs.args[2]
+end
+
+function _gibbs_array_block(plan, p, def, statements, terms, layout, exemplar, on_error)
+    path = get(layout.name_paths, p.name, (p.name,))
+    at = findfirst(st -> _assigned_name(st) === p.name, statements)
+    at === nothing && throw(ArgumentError(
+        "prepare_gibbs found no program value for the integer array $(p.name)"))
+    dependent = _gibbs_dependents(statements, (p.name,))
+    selected = filter(t -> _gibbs_reads(t, dependent), terms)
+    elementwise = _gibbs_elementwise(statements, p.name, dependent)
+    plates = [_gibbs_elementwise_plate(statements, t, elementwise, dependent) for t in selected]
+    separable = !isempty(plates) && all(!isnothing, plates)
+    support = _integer_support_expr(p)
+    bound, have = _query_bound(plan), _query_have(plan)
+    if separable
+        # Every element takes the value `s` at once; each cell then holds its
+        # own element's log weight for `s`.
+        program = copy(statements)
+        program[at] = Expr(:(=), statements[at].args[1], Expr(:call,
+            GlobalRef(@__MODULE__, :_gibbs_fill), statements[at].args[2], :_ppl_gibbs_value))
+        body = Expr(:block, program...,
+            :(_ppl_gibbs_cells = $(GlobalRef(@__MODULE__, :_gibbs_cell_sum))($(plates...))),
+            :(_ppl_gibbs_support = $support),
+            :(return _ppl_gibbs_cells))
+        signature = copy(def.args[1])
+        push!(signature.args, :(_ppl_gibbs_value::Int))
+        spec = _eval_kernel_def(Expr(:(=), signature, body))
+        _register_packed_check!(spec, layout)
+        vectorized(want) = Base.invokelatest(_prepare_cached, plan, spec;
+            have=(have..., :_ppl_gibbs_value), want, bound,
+            exemplars=(exemplar..., 1), on_error)
+        cells = vectorized(:_ppl_gibbs_cells)
+        supported = vectorized(:_ppl_gibbs_support)
+        return GibbsArrayBlock(p.name, path, true, cells,
+            (u, d) -> supported(u, d, 1))
+    end
+    body = Expr(:block, statements...,
+        :(_ppl_gibbs_density::Float64 = $(_sum_terms(selected))),
+        :(_ppl_gibbs_support = $support),
+        :(return _ppl_gibbs_density))
+    spec = _eval_kernel_def(Expr(:(=), def.args[1], body))
+    _register_packed_check!(spec, layout)
+    site(want) = Base.invokelatest(_prepare_cached, plan, spec; have, want, bound,
+        exemplars=exemplar, on_error)
+    return GibbsArrayBlock(p.name, path, false, site(:_ppl_gibbs_density),
+        site(:_ppl_gibbs_support))
+end
+
+@traceable _gibbs_fill(value::AbstractArray, s::Int) = fill(s, size(value))
+@traceable function _gibbs_cell_sum(first, rest...)
+    total = collect(Float64, vec(first))
+    for cells in rest
+        length(cells) == length(total) || throw(ArgumentError(
+            "Gibbs integer array: density cells of different lengths"))
+        total .+= vec(cells)
+    end
+    return total
+end
+
+_gibbs_lookup(state::NamedTuple, path::Tuple) = isempty(Base.tail(path)) ?
+    state[first(path)] : _gibbs_lookup(state[first(path)], Base.tail(path))
+
+# One exact draw of every element of an integer array block.
+function _draw_array_block(block::GibbsArrayBlock, rng, position, values)
+    current = _gibbs_lookup(values, block.path)
+    support = collect(Int, Base.invokelatest(block.support, position, values))
+    isempty(support) && throw(ArgumentError("Gibbs block $(block.name) has empty support"))
+    n = length(current)
+    if block.elementwise
+        logweights = Matrix{Float64}(undef, n, length(support))
+        for (j, s) in enumerate(support)
+            cells = Base.invokelatest(block.cells, position, values, s)
+            length(cells) == n || throw(ArgumentError("Gibbs integer array " *
+                "$(block.name): $(length(cells)) density cells for $n elements"))
+            logweights[:, j] .= cells
+        end
+        draw = similar(current, Int)
+        for i in 1:n
+            weights = _gibbs_weights(view(logweights, i, :))
+            draw[i] = support[_integer_draw_index(rng, weights)]
+        end
+        return _gibbs_set(values, block.path, draw)
+    end
+    draw = collect(Int, current)
+    draw = reshape(draw, size(current))
+    logweights = Vector{Float64}(undef, length(support))
+    for i in 1:n
+        for (j, s) in enumerate(support)
+            draw[i] = s
+            logweights[j] = Base.invokelatest(block.cells, position,
+                _gibbs_set(values, block.path, draw))
+        end
+        draw[i] = support[_integer_draw_index(rng, _gibbs_weights(logweights))]
+    end
+    return _gibbs_set(values, block.path, draw)
 end
 
 # Only split the addition tree the PPL emitter uses for density aggregates.

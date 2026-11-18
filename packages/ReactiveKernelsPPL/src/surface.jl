@@ -2336,9 +2336,16 @@ _is_array_value_ref(ex::Expr, data, detmap, memo, active, env) =
 # shape and the axis an enclosing broadcast inherits both read this one
 # rule, so naming a gather never changes its shape: `rg = b[g, 1]` and
 # `(b[g, 1] .+ b[h, 1]) ./ 2` are per observation alike.
-_array_ref_shape(ex::Expr, data, detmap, memo, active, env) =
-    _ref_shape(ex, i -> (i isa Symbol && i in data) ||
+# An index that is itself a model-level array (an integer array parameter,
+# `mu[z]`) gives the read that index's shape, as Julia indexing does.
+function _array_ref_shape(ex::Expr, data, detmap, memo, active, env)
+    shape = _ref_shape(ex, i -> (i isa Symbol && i in data) ||
         _obs_axis(i, data, detmap, memo, active, env))
+    shape === :scalar && any(i -> i isa Symbol &&
+        _shape_of(i, data, detmap, memo, active, env) === :array, ex.args[2:end]) &&
+        return :array
+    return shape
+end
 
 # Reads of an array (`z[g]` per observation, `phi[1]` scalar, `L[:, 1]`
 # array); every other ref keeps the slice-1 scalar shape. Predictor
@@ -5018,9 +5025,15 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
             ex.args[2] === ivar && return ex.args[1]
         ex isa Expr ? Expr(ex.head, map(localread, ex.args)...) : ex
     end
-    # Gathers from data and declared arrays index at `i` or through an
-    # integer data column. Indexing into a per-index value or a cell local
+    # Gathers from data and declared arrays index at `i`, through an
+    # integer data column, or through this plate's own latent (`mu[z[i]]`
+    # after `z[i] ~ Categorical(w)`): its value at `i` is a runtime
+    # position, as in Julia. Indexing into a per-index value or a cell local
     # (`t[i][k[i]]`, `p[sel]`) is ordinary Julia inside the retained cell.
+    cell_latents = Set{Symbol}(c.args[2].args[1] for c in cells
+        if c isa Expr && _is_sample(c) && Meta.isexpr(c.args[2], :ref, 2) &&
+            c.args[2].args[1] isa Symbol && c.args[2].args[1] ∉ data &&
+            c.args[2].args[2] === ivar)
     function checkrefs(ex)
         ex isa Expr || return
         base = ex.head === :ref ? ex.args[1] : nothing
@@ -5029,7 +5042,8 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
             for index in ex.args[2:end]
                 index === ivar && continue
                 if Meta.isexpr(index, :ref, 2) && index.args[2] === ivar
-                    index.args[1] in data || _sfail("cell gather indexes through `$(index.args[1])`, which is not bound data")
+                    index.args[1] in data || index.args[1] in cell_latents ||
+                        _sfail("cell gather indexes through `$(index.args[1])`, which is not bound data")
                 elseif _expr_has_sym(index, ivar)
                     _cell_lhs_error(ex, ivar)
                 end
@@ -6150,6 +6164,10 @@ function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx,
         # not a shared scalar that can broadcast to every cell.
         bares = _cell_bares(obj, ivar, data)
         setdiff!(bares, plate_defs)
+        # A Categorical cell reads its probabilities as one whole vector
+        # shared by every cell (`z[i] ~ Categorical(p)`), as in Julia.
+        Meta.isexpr(obj, :call, 2) && obj.args[1] === :Categorical &&
+            obj.args[2] isa Symbol && delete!(bares, obj.args[2])
         push!(ctx, (col, line, bares))
         # A data or literal iterator is evaluated as written at binding. A
         # value's iterator (`eachindex(mu)` for a definition, a sampled
@@ -12228,6 +12246,12 @@ function _classify_ref(pname, core::Expr, sign::Int, ctx)
     idx isa Integer && return _extract_summand(pname, core, sign, ctx)
     base isa Symbol || _sfail("predictor $pname: factor base must be a " *
                               "bare coefficient vector, got $(repr(base))")
+    # Data read at a parameter's positions (`centers[z]`, `z` an integer
+    # parameter) is a value, as in Julia: the index decides the read when
+    # the program runs.
+    base in ctx.data && idx isa Symbol &&
+        (idx in ctx.value_arrays || idx in ctx.prior_names) &&
+        return _extract_summand(pname, core, sign, ctx)
     base in ctx.data && _sfail("predictor $pname: $base is data — " *
                                "precompute data-indexed columns")
     haskey(ctx.detmap, base) && _sfail("predictor $pname: $base is a " *
@@ -13056,6 +13080,8 @@ function _lower_lkj_stack(lhs, dims::Vector{Any}, rhs)
         Any[K, K, dims[3]], nothing, lhs)
 end
 
+const _VECTOR_PARAMETER_FAMILIES = (:Categorical,)
+
 # `z[axes...] .~ Fam.(args...)`: the elementwise prior is the scalar
 # statement `Fam(args...)` applied per element (Distributions.jl
 # broadcast), so it lowers through the scalar parameter parser (family,
@@ -13069,7 +13095,10 @@ function _lower_array_parameter(lhs, dims::Vector{Any}, rhs, coefuse, ctx,
         "`B * $lhs` through a data matrix)")
     call = _undot_distribution(lhs, rhs)
     if Meta.isexpr(rhs, :call)
-        for a in call.args[2:end]
+        for (j, a) in enumerate(call.args[2:end])
+            # A family whose parameter is itself a vector (`Categorical(w)`'s
+            # probabilities) shares that whole vector across the elements.
+            j == 1 && call.args[1] in _VECTOR_PARAMETER_FAMILIES && continue
             _canon_shape(a, ctx) === :scalar || _sfail("array $lhs: " *
                 "a shared scalar distribution constructor requires scalar " *
                 "arguments; use `$(call.args[1]).(...)` to broadcast arguments")

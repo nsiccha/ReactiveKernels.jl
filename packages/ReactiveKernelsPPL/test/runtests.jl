@@ -16,6 +16,8 @@ const _PPL_TEST_FILES = (
     "test_integer_parameters.jl",
     "test_integer_outputs.jl",
     "test_integer_structure.jl",
+    "test_integer_gathers.jl",
+    "test_integer_plates.jl",
     "test_gibbs.jl",
     "test_gibbs_coordinates.jl",
     "test_gibbs_slice.jl",
