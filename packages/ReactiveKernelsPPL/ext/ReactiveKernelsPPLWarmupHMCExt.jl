@@ -11,23 +11,25 @@ function PPL.adaptive_centering_problem(built, plan::PPL.StructuralPlan, problem
     LDP.dimension(problem) == prepared.dimension || throw(DimensionMismatch(
         "problem dimension $(LDP.dimension(problem)) ≠ model dimension $(prepared.dimension)"))
     map = _centering_reparametrization(prepared.kernel, prepared.records,
-        _centering_chains(prepared.chain_kernel, prepared.chains))
+        _centering_chains(prepared.chains))
     WH.ReparametrizedProblem(map, problem, backend)
 end
 
-# One `MarkovChain` per recurrence `markov_chains` marked, on the frame kernel.
-function _centering_chains(kernel, records)
+# One `MarkovChain` per recurrence `markov_chains` marked, each on its own
+# frame kernel.
+function _centering_chains(records)
     isempty(records) && return ()
     pkgversion(WH) >= v"0.3.1" && isdefined(WH, :MarkovChain) ||
         throw(PPL.ContractValidationError("[centering] Markov chains (`markov_chains`) " *
             "need WarmupHMC 0.3.1 or later; this environment has WarmupHMC $(pkgversion(WH))"))
-    shared = PPL._CenteringAccessor(Ref(kernel))
-    Tuple(WH.MarkovChain(chain.states;
-        log_scale = PPL._ChainAccessor(shared, chain.log_scale),
-        coefficient = PPL._ChainAccessor(shared, chain.coef),
-        drift = PPL._ChainAccessor(shared, chain.drift),
-        initial = PPL._ChainInitial(shared, chain.drift)) for chain in records)
+    Tuple(_centering_chain(chain, PPL._CenteringAccessor(Ref(chain.kernel)))
+        for chain in records)
 end
+_centering_chain(chain, frame) = WH.MarkovChain(chain.states;
+    log_scale = PPL._ChainAccessor(frame, chain.log_scale),
+    coefficient = PPL._ChainAccessor(frame, chain.coef),
+    drift = PPL._ChainAccessor(frame, chain.drift),
+    initial = PPL._ChainInitial(frame, chain.drift))
 
 # Records arrive ordered by level. Each level reads the shared kernel at its own
 # stage, so WarmupHMC evaluates the kernel once per level, after the earlier

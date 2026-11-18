@@ -962,6 +962,31 @@ end
     @test LDP.logdensity(named.rp, x) == LDP.logdensity(named.problem, x)
 end
 
+# Snag rkppl-chain-acce-cc8a8c89: WarmupHMC reads a chain's four accessors one
+# at a time, so whatever one evaluation of its frame costs, a map pays four
+# times. A chain's frame kernel computes that chain's frame alone (with one
+# kernel for every chain, K chains cost K times their frames), and a per-cell
+# frame is concatenated into one sized vector, not grown under reverse AD.
+@testset "a chain's accessors evaluate that chain's frame alone" begin
+    ys = [chain_series([n]; seed = k)[1] for (k, n) in enumerate((4, 6, 3))]
+    named = chain_setup(markov_chains(NAMED_WALKS(; T = 4, U = 6, V = 3), :w_frame, :η, :w) |
+        (; y = ys[1], v = ys[2], r = ys[3]))
+    x = 0.2 .* cos.(1:length(named.u)) .+ 0.1
+    for chain in named.ir.chains
+        frame = chain.log_scale.kernel(x)
+        @test length(frame.values) == 3
+        @test all(length(v) == length(chain.states) for v in frame.values)
+    end
+    # The cells' frames, one vector per cell (empty cells included), in order.
+    cells = [collect(1.0:n) for n in (300, 1, 0, 700)]
+    flat = ReactiveKernelsPPL._centering_values(cells)
+    @test flat == reduce(vcat, cells)
+    @test ReactiveKernelsPPL._centering_values(Vector{Float64}[]) == Float64[]
+    flat_bytes(v) = @allocated ReactiveKernelsPPL._centering_values(v)
+    flat_bytes(cells)
+    @test flat_bytes(cells) <= 8 * length(flat) + 256
+end
+
 # The shape of snag adaptive-centeri-230d5f0a: a log-normal effect
 # `exp.(m .+ s .* z)` with a positive spread `s`, a second effect whose
 # natural centre is bound data plus the first, and a walk per index whose step
