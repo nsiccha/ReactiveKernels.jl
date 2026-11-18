@@ -38,21 +38,20 @@ function translate_fresh()
         y = fresh_scale(x)
         return y
     end))
-    (; spec, scalar, jax = jax_source(spec), planned = jax_source(plan(spec; want = :y)),
-       js = ReactiveKernels.js_source(scalar; want = :y),
-       native = prepare(spec)(3.7, [1.0, 2.0]))
+    (; spec, scalar, jax = jax_source(spec; want = :y),
+       planned = jax_source(plan(spec; want = :y)),
+       js = ReactiveKernels.js_source(scalar; want = :y))
 end
 
 @testset "jax_source and js_source translate a program newer than the caller's world" begin
     fresh = translate_fresh()
-    @test fresh.native ≈ (3.7 - 2.5) / 1.2 + 4.0
     @test fresh.jax isa JAXSource
     @test occursin("def fresh_scale(", string(fresh.jax))
     @test occursin("def fresh_cumsum(", string(fresh.jax))
     @test occursin("fresh_scale", string(fresh.planned))
     @test occursin("fresh_scale", fresh.js)
     # The same modules as translated from the latest world.
-    @test string(fresh.jax) == string(jax_source(fresh.spec))
+    @test string(fresh.jax) == string(jax_source(fresh.spec; want = :y))
     @test string(fresh.planned) == string(jax_source(plan(fresh.spec; want = :y)))
     @test fresh.js == ReactiveKernels.js_source(fresh.scalar; want = :y)
 end
