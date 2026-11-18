@@ -26,7 +26,11 @@ end
 # Only the support's endpoints determine enumeration. In particular the
 # Binomial probability is not a support dependency.
 function _integer_support_expr(p)
-    base = _integer_support_expr(Val(p.family), p.args)
+    # An integer array's Categorical may read one probability vector per
+    # element (`Categorical.(ws)`): its support is then one range per element.
+    base = p isa Union{ArrayParameter,PlateParameter} && p.family === :categorical ?
+        Expr(:call, GlobalRef(@__MODULE__, :_categorical_support), p.args.arg1) :
+        _integer_support_expr(Val(p.family), p.args)
     p.support_override === nothing && return base
     # Contract validation admits only unnormalized interval restrictions for
     # integer laws. Enumerate their intersection, so expressions that index by
@@ -54,6 +58,29 @@ end
     lower, upper = max(first(support), lo), min(last(support), hi)
     return lower > upper ? (1:0) : (ceil(Int, lower):floor(Int, upper))
 end
+
+_categorical_support(probabilities::AbstractVector{<:Real}) = 1:length(probabilities)
+_categorical_support(probabilities::AbstractArray{<:AbstractVector}) =
+    map(_categorical_support, probabilities)
+
+# An integer array whose support bound is read per element (`Binomial.(n, p)`
+# with a vector `n`, `DiscreteUniform.(lo, hi)`, a per-element restriction)
+# has one support per element: an array of ranges in the bound's shape, each
+# from the scalar rule above. Scalar bounds keep one shared range. Only the
+# native Gibbs driver enumerates array supports.
+_binomial_support(n::AbstractArray) = map(_binomial_support, n)
+_discrete_uniform_support(lo::AbstractArray, hi) = _discrete_uniform_support.(lo, hi)
+_discrete_uniform_support(lo, hi::AbstractArray) = _discrete_uniform_support.(lo, hi)
+_discrete_uniform_support(lo::AbstractArray, hi::AbstractArray) =
+    _discrete_uniform_support.(lo, hi)
+_restricted_integer_support(support::AbstractArray{<:AbstractRange}, lo, hi) =
+    _restricted_integer_support.(support, lo, hi)
+_restricted_integer_support(support::AbstractRange{<:Integer}, lo::AbstractArray, hi) =
+    _restricted_integer_support.(Ref(support), lo, hi)
+_restricted_integer_support(support::AbstractRange{<:Integer}, lo, hi::AbstractArray) =
+    _restricted_integer_support.(Ref(support), lo, hi)
+_restricted_integer_support(support::AbstractRange{<:Integer}, lo::AbstractArray, hi::AbstractArray) =
+    _restricted_integer_support.(Ref(support), lo, hi)
 
 # Cell/partition queries cache row ownership and shared prefixes. Their integer
 # state is fixed at preparation, just like index data: changing it can change

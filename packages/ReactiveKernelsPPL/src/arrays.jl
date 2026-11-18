@@ -376,7 +376,7 @@ function _validate_array_parameters_data(plan::StructuralPlan)
         end
         for (k, a) in pairs(p.args)
             n = _array_arg_size(plan, a)
-            if p.family === :categorical
+            if p.family === :categorical && !_categorical_per_element(plan, a)
                 # One categorical variate is scalar, but every event reads
                 # the whole shared probability vector, not one probability.
                 n === nothing || length(n) == 1 || _fail(p.label,
@@ -403,6 +403,12 @@ _array_arg_mismatch(name, k, dims::Tuple, n) = "array $name has size " *
 
 # Statically known size of a per-element prior argument (`nothing` = a
 # number, or only known at run time, where the prior checks it).
+# `Categorical.(ws)` over bound data holding one probability vector per
+# element reads, as in Julia, element `i`'s law from `ws[i]`; any other
+# Categorical argument is one probability vector every element shares.
+_categorical_per_element(plan::StructuralPlan, a) = a isa Symbol &&
+    get(plan.columns, a, nothing) isa AbstractArray{<:AbstractVector}
+
 function _array_arg_size(plan::StructuralPlan, a)
     _is_array_literal(a) && return _array_literal_size(a)
     a isa Symbol || return nothing
@@ -2333,9 +2339,12 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
         # A two-axis array reads a per-element argument in its packed
         # column-major order (`_array_prior_cells`); a number stays shared.
         cells = length(dims) == 2
+        per_element = p.family === :categorical &&
+            any(a -> _categorical_per_element(context, a), values(p.args))
+        shared_categorical = p.family === :categorical && !per_element
         for (i, (k, a)) in enumerate(pairs(p.args))
             push!(arg_names, k)
-            if a isa Real || a isa Symbol && (p.family === :categorical || !(cells &&
+            if a isa Real || a isa Symbol && (shared_categorical || !(cells &&
                     _value_axes(context, a; data_axes = true) != Any[]))
                 push!(arg_values, a)
                 continue
@@ -2352,7 +2361,7 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
             else
                 _array_gather_rewrite(a, context, needed)
             end
-            cells && p.family !== :categorical && (val = :(_array_prior_cells($val,
+            cells && !shared_categorical && (val = :(_array_prior_cells($val,
                 $(_array_cells_dims(layout, p)))))
             push!(stmts, :($local_name = $val))
             push!(arg_values, local_name)
@@ -2378,7 +2387,7 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
             NamedTuple{Tuple(arg_names)}(Tuple(arg_values)),
             support; conditioned = p.name in context.conditioned, open_bounds,
             float64_variate = p.name ∉ context.conditioned, label = p.name,
-            float64_inputs, cell_names)
+            float64_inputs, cell_names, shared_categorical)
         push!(pointwise, p.name => :(reshape($(Symbol(:_ppl_pw_prior_, p.name)), size($(p.name)))))
         _record_density!(density_sites, stmts, :prior, p.name, node;
             pointwise = Symbol(:_ppl_pw_prior_, p.name), count = prod(dims))
