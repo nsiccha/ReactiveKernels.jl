@@ -177,7 +177,9 @@ value (`mu`, `_ppl_lik_y_resp`, `plate_heavy` for the statement `heavy` of a
 plate cell); statements of one name are counted together. Names in
 parentheses group the other samples: `(other statements)` (code of an RK
 program between its assigning statements: loop control, branch conditions,
-calls whose result is not assigned), `(outside generated code)` (the AD
+calls whose result is not assigned; code of a program RK compiled for a
+recipe, such as a derivative rule's, counts towards the statement that calls
+it instead), `(outside generated code)` (the AD
 driver, DifferentiationInterface, Enzyme's runtime and the caller) and
 `(garbage collection)` (every sample inside a collection, whichever statement
 allocated when it started).
@@ -364,21 +366,31 @@ end
 _allocated_per_call(f::F) where {F} = (f(); @allocated f())
 
 # The label of a profile sample: `(garbage collection)` for a sample inside a
-# collection, else its innermost RK statement marker, else
-# `(outside generated code)`. `frames` run from the innermost frame outwards.
+# collection, else its innermost RK statement marker, else the innermost
+# program scope `(other statements)`, else `(outside generated code)`.
+# `frames` run from the innermost frame outwards.
 _sample_label(frames) = first(_sample_info(collect(frames)))
 
 # A sample's label, whether it was spent managing memory, and the function it
 # was spent in when its statement called one that is neither Julia's nor RK's
-# (`nothing` otherwise).
+# (`nothing` otherwise). A program's own scope `(other statements)` takes a
+# sample only when no statement encloses it: a program RK compiles for a
+# recipe's expression (a rule's `q = exp(-abs(x))`) runs inside the statement
+# that calls the rule, so its time is that statement's.
 function _sample_info(frames::AbstractVector)
     any(_collection_frame, frames) && return ("(garbage collection)", false, nothing)
     memory = _memory_sample(frames)
+    program = 0
     for (index, frame) in enumerate(frames)
         label = _marker_label(frame)
         label === nothing && continue
+        if label == _SOURCE_MARKER_PROGRAM
+            program == 0 && (program = index)
+            continue
+        end
         return (label, memory, _sample_callee(frames, index))
     end
+    program == 0 || return (_SOURCE_MARKER_PROGRAM, memory, _sample_callee(frames, program))
     ("(outside generated code)", memory, nothing)
 end
 
