@@ -29,7 +29,9 @@ are recorded in the git history only.
   as a model's helper). Every sample inside a garbage collection now counts
   as `(garbage collection)`, not as the statement whose allocation started
   the collection, which varied between runs and hosts. The display adds a
-  memory-management summary line and the columns `memory` and `mostly in`.
+  memory-management summary line and the columns `memory` and `mostly in`
+  (the largest callee, when it holds at least half of the part's gradient
+  time).
 
 ## 0.1.309
 

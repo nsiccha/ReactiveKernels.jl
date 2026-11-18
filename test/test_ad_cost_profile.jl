@@ -114,6 +114,12 @@ end
                            frame("cache_fill!", joinpath(dirname(RK._RK_SOURCE), "ext",
                                                          "ReactiveKernelsMutatingFunctionsExt.jl")),
                            marker("step")]) == ("step", false, "model_helper (model.jl)")
+    # The display names a callee only when it holds at least half of the part.
+    callee(name, g) = (; name, primal_seconds = 0.0, gradient_seconds = g)
+    part(callees) = RK.ADCostPart("p", 1.0, 1.0, 1, 1, 0.0, 0.0, 0.0, 0.0, callees)
+    @test RK._cost_callee(part([callee("f (f.jl)", 0.91)])) == "f (f.jl) 91%"
+    @test RK._cost_callee(part([callee("f (f.jl)", 0.02)])) == ""
+    @test RK._cost_callee(part(eltype(part([]).callees)[])) == ""
     @test RK._sample_info([frame("_native_mul", joinpath(RK._RK_SOURCE, "core.jl")),
                            frame("gemm!", "/opt/julia/share/julia/stdlib/v1.10/LinearAlgebra/src/blas.jl"),
                            marker("mu")]) == ("mu", false, nothing)

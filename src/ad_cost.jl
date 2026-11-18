@@ -281,7 +281,8 @@ shares for the whole value and gradient.
 Statements in a function Julia does not inline and RK did not compile (a
 package function a recipe calls) count towards the RK statement that calls it,
 and that part's `callees` names the function (the display's `mostly in`
-column shows the largest). Native Enzyme tapes are not Julia heap bytes; their
+column shows the largest when it holds at least half of the part's gradient
+time). Native Enzyme tapes are not Julia heap bytes; their
 `malloc` time is in `memory`, and `Enzyme.API.printperf!(true)` on the part
 this profile names shows what is stored.
 """
@@ -523,11 +524,12 @@ function _cost_bytes(bytes::Real)
 end
 _cost_ratio(gradient, primal) = primal > 0 ? string(round(gradient / primal; digits = 2), "×") : "—"
 _cost_share(part, whole) = whole > 0 ? string(round(Int, 100 * part / whole), "%") : "—"
-# The function most of a part's gradient time is spent in, with its share.
+# The function a part's gradient time is mostly spent in, with its share: shown
+# only when it holds at least half of that time (`callees` lists every one).
 function _cost_callee(part::ADCostPart)
     isempty(part.callees) && return ""
     top = first(part.callees)
-    top.gradient_seconds > 0 || return ""
+    top.gradient_seconds >= 0.5 * part.gradient_seconds > 0 || return ""
     string(top.name, " ", _cost_share(top.gradient_seconds, part.gradient_seconds))
 end
 # A pass's share of time managing memory, then its share in garbage collection.
