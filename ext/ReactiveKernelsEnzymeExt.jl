@@ -170,45 +170,84 @@ end
 # Graph provenance does not prove storage ownership. Preserve derivative
 # snapshots across caller mutation, borrowing only backend-proven stable input
 # arrays in flat environments when no mutable primal alias escapes.
-# Use Julia's documented deepcopy specialization hook on an owned wrapper. The
-# memo is shared across the flat environment, preserving repeated array
-# references. Nested containers retain the existing whole-tuple snapshot path.
-struct _DerivativeResidualEnvironment{R,S,F}
-    residuals::R
-    sources::S
-    overwritten::F
-    borrow_inputs::Bool
-end
-
-_flat_residual_value(value) = isbitstype(typeof(value)) ||
-    (value isa Array && isbitstype(eltype(value)))
+#
+# The snapshot is concretely typed code generated from the residuals' type, not
+# Base's `deepcopy`: `deepcopy(@nospecialize x)` compiles to a boxed `jl_invoke`
+# whose callee dispatches on an `IdDict` memo at run time, which the check of the
+# compiled derivative (`type_stability_level = :all`) refuses even on a path a
+# program never takes (snag `rkppl-ark-dogfoo-72035cd9`). The result is the one
+# `deepcopy` gives with the borrowed inputs seeded in its memo:
+# - the leaves are the dense bits arrays the residuals hold, directly or inside
+#   immutable containers (tuples, named tuples, views, immutable structs);
+# - a leaf is kept when it is, or is the same object as, a top-level residual
+#   whose input the backend proves unchanged through the reverse (`borrow`);
+# - every other leaf is copied once, and leaves holding the same array share
+#   the copy (an array and a view of it, say);
+# - containers holding a leaf are rebuilt around the copies, as `deepcopy`
+#   rebuilds them, without calling their constructors; bits values and
+#   containers without a leaf are kept.
+# Residuals that hold a mutable container other than a dense bits array (a
+# mutable struct, an array of arrays) or an abstractly typed field keep Base's
+# `deepcopy`, whose memo also follows cycles.
+_dense_bits_array(::Type{T}) where {T} = T <: Array && isbitstype(eltype(T))
+_flat_residual_value(value) = isbitstype(typeof(value)) || _dense_bits_array(typeof(value))
 _flat_residual_environment(residuals::Tuple) = all(_flat_residual_value, residuals)
 
-_seed_borrowed_residuals!(memo, ::Tuple{}, ::Tuple{}, flags) = nothing
-function _seed_borrowed_residuals!(memo, residuals::Tuple, sources::Tuple, flags)
-    value = first(residuals)
-    source = first(sources)
-    # A direct dense bits array has no reference-valued element. The backend
-    # flag must establish that its memory is unchanged through the reverse.
-    if value isa Array && isbitstype(eltype(value)) && source > 0 &&
-            !flags[source + 1]
-        # Keep Base's heterogeneous memo implementation at its Base boundary;
-        # the caller and the retained tuple positions stay concretely typed.
-        Base.@noinline setindex!(memo, value, value)
-    end
-    _seed_borrowed_residuals!(memo, Base.tail(residuals), Base.tail(sources), flags)
+# Whether residual `source` (an input's position; 0 for the primal output, -1
+# for an intermediate) is an input the backend proves unchanged through the
+# reverse (`flags` are Enzyme's `overwritten`, the callable first).
+@inline _residual_borrowable(source::Int, flags) = source > 0 && !flags[source + 1]
+
+# Generation-time helpers of `_snapshot_residuals`. `_snapshot_leaves!` appends
+# `path => type` for each leaf of a value of type `T` at field path `path`, and
+# returns `false` where the snapshot cannot be typed.
+function _snapshot_leaves!(leaves, ::Type{T}, path) where {T}
+    isbitstype(T) && return true
+    _dense_bits_array(T) && (push!(leaves, path => T); return true)
+    (isconcretetype(T) && isstructtype(T) && !ismutabletype(T)) || return false
+    all(i -> _snapshot_leaves!(leaves, fieldtype(T, i), (path..., i)), 1:fieldcount(T))
+end
+_snapshot_get(root, path) = foldl((ex, i) -> :(getfield($ex, $i)), path; init = root)
+# The snapshot of the value of type `T` at `path`, given each leaf's saved name.
+function _snapshot_rebuild(::Type{T}, path, saved) where {T}
+    haskey(saved, path) && return saved[path]
+    n = length(path)
+    any(leaf -> length(leaf) > n && leaf[1:n] == path, keys(saved)) ||
+        return _snapshot_get(:residuals, path)
+    fields = Any[_snapshot_rebuild(fieldtype(T, i), (path..., i), saved)
+                 for i in 1:fieldcount(T)]
+    T <: Tuple ? Expr(:tuple, fields...) : Expr(:new, T, fields...)
 end
 
-function Base.deepcopy_internal(env::_DerivativeResidualEnvironment{R}, memo::IdDict) where {R}
-    env.borrow_inputs && _seed_borrowed_residuals!(memo, env.residuals, env.sources,
-        env.overwritten)
-    # Preserve each structural tuple position's type. Base's tuple copier uses
-    # integer indexing and infers a tuple of unions for heterogeneous residuals.
-    retained = map(env.residuals) do value
-        isbitstype(typeof(value)) && return value
-        (Base.@noinline Base.deepcopy_internal(value, memo))::typeof(value)
+@generated function _snapshot_residuals(residuals::R, sources::NTuple{N,Int}, flags,
+        ::Val{borrow}) where {R<:Tuple,N,borrow}
+    leaves = Pair{Tuple,Type}[]
+    _snapshot_leaves!(leaves, R, ()) || return :(Base.@noinline deepcopy(residuals))
+    value(k) = Symbol(:leaf_, k)
+    keep(k) = Symbol(:keep_, k)
+    saved(k) = Symbol(:saved_, k)
+    body = Expr(:block)
+    for (k, (path, _)) in enumerate(leaves)
+        push!(body.args, :($(value(k)) = $(_snapshot_get(:residuals, path))))
+        # The flags describe the inputs, which are top-level residuals only.
+        push!(body.args, borrow && length(path) == 1 ?
+            :($(keep(k)) = _residual_borrowable(getfield(sources, $(path[1])), flags)) :
+            :($(keep(k)) = false))
     end
-    _DerivativeResidualEnvironment(retained, env.sources, env.overwritten, env.borrow_inputs)
+    for (k, (_, T)) in enumerate(leaves)
+        # Only a leaf of the same type can be the same array.
+        peers = [j for (j, (_, S)) in enumerate(leaves) if j != k && S === T]
+        kept = foldl((kept, j) -> :($kept || ($(keep(j)) && $(value(j)) === $(value(k)))),
+                     peers; init = keep(k))
+        fresh = :(copy($(value(k))))
+        for j in Iterators.reverse(filter(<(k), peers))
+            fresh = :($(value(j)) === $(value(k)) ? $(saved(j)) : $fresh)
+        end
+        push!(body.args, :($(saved(k)) = $kept ? $(value(k)) : $fresh))
+    end
+    names = Dict{Tuple,Symbol}(path => saved(k) for (k, (path, _)) in enumerate(leaves))
+    push!(body.args, _snapshot_rebuild(R, (), names))
+    body
 end
 
 # Dense bits arrays have contiguous payloads. Compare their occupied byte
@@ -226,8 +265,8 @@ end
 _protect_primal_aliases(::Tuple{}, ::Tuple{}, flags, primal) = flags
 function _protect_primal_aliases(residuals::Tuple, sources::Tuple, flags, primal)
     value, source = first(residuals), first(sources)
-    if value isa Array && isbitstype(eltype(value)) && source > 0 &&
-            !flags[source + 1] && _residual_storage_overlaps(value, primal)
+    if value isa Array && isbitstype(eltype(value)) &&
+            _residual_borrowable(source, flags) && _residual_storage_overlaps(value, primal)
         flags = Base.setindex(flags, true, source + 1)
     end
     _protect_primal_aliases(Base.tail(residuals), Base.tail(sources), flags, primal)
@@ -236,33 +275,34 @@ end
 _borrow_all_residuals(::Tuple{}, ::Tuple{}, flags) = true
 function _borrow_all_residuals(residuals::Tuple, sources::Tuple, flags)
     value, source = first(residuals), first(sources)
-    (isbitstype(typeof(value)) || (source > 0 && !flags[source + 1])) &&
+    (isbitstype(typeof(value)) || _residual_borrowable(source, flags)) &&
         _borrow_all_residuals(Base.tail(residuals), Base.tail(sources), flags)
 end
 
 @inline function _retain_residuals(sources::NTuple{R,Int}, residuals::NTuple{R,Any},
         primal, flags) where {R}
     isbitstype(typeof(residuals)) && return residuals
-    if !_flat_residual_environment(residuals)
-        return Base.@noinline deepcopy(residuals)
-    end
+    # Nested containers keep the conservative snapshot: every array is copied.
+    _flat_residual_environment(residuals) ||
+        return _snapshot_residuals(residuals, sources, flags, Val(false))::typeof(residuals)
     # A mutable result can expose input storage independently of its write
     # flag. For a dense bits-array result, protect only inputs whose storage
     # overlaps it; a fresh result need not force copies of readonly inputs.
-    # Other mutable result structures retain the complete snapshot path.
+    # Other mutable result structures copy every array.
     if !isbitstype(typeof(primal))
-        if primal isa Array && isbitstype(eltype(primal))
-            flags = _protect_primal_aliases(residuals, sources, flags, primal)
-        else
-            return Base.@noinline deepcopy(residuals)
-        end
+        primal isa Array && isbitstype(eltype(primal)) ||
+            return _snapshot_residuals(residuals, sources, flags, Val(false))::typeof(residuals)
+        flags = _protect_primal_aliases(residuals, sources, flags, primal)
     end
-    # Flat readonly inputs need neither a copy nor a deepcopy identity memo.
-    # Check after protecting storage exposed by the mutable primal result.
+    # Flat readonly inputs need no copy. Check after protecting storage exposed
+    # by the mutable primal result.
     _borrow_all_residuals(residuals, sources, flags) && return residuals
-    env = _DerivativeResidualEnvironment(residuals, sources, flags, true)
-    saved = Base.@noinline deepcopy(env)
-    saved.residuals
+    # A snapshot has its residuals' type. The assertions keep that type where
+    # a rule's residuals are not inferred, so the snapshot is a run-time call:
+    # Enzyme compiles the reverse for the tape type inferred here, and
+    # `stage_reverse` splats the residuals, which infers as throwing for a
+    # tuple of unknown length.
+    _snapshot_residuals(residuals, sources, flags, Val(true))::typeof(residuals)
 end
 
 function EnzymeRules.augmented_primal(
