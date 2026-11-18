@@ -16,6 +16,16 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.315
+
+- A primal-only `rk_log1pexp(x)` (a value without a derivative, such as a
+  Bernoulli-logit density's value) skips work in both tails: it returns `x`
+  for `x >= 34` without an `exp`, and `exp(x)` for `x < -37` without a
+  `log1p`. The values are the same Float64 bits as before. A derivative still
+  runs the joint value/partial recipe, unchanged. Logits far from zero, as at
+  a sampler's random initial points, made the value pay one `exp` and one
+  `log1p` per row where `LogExpFunctions.log1pexp` pays at most one `exp`.
+
 ## 0.1.314
 
 - With Enzyme's dogfood repair `derivative_report_reachability` (dogfood
