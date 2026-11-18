@@ -31,6 +31,23 @@ const PLAIN = @rkppl begin
     s ~ Exponential(1.0)
     y .~ Normal.(m, s)
 end
+# A hierarchical normal model in its two natural spellings: one flat response
+# read through a group index, and one plate cell per group.
+const GATHER = @rkppl begin
+    mu ~ Normal(0, 5)
+    tau ~ Exponential(5)
+    theta[1:J] .~ Normal.(mu, tau)
+    y .~ Normal.(theta[g], 1)
+end
+const GROUPED = @rkppl begin
+    mu ~ Normal(0, 5)
+    tau ~ Exponential(5)
+    theta[1:J] .~ Normal.(mu, tau)
+    @plate for j in eachindex(y)
+        y[j] .~ Normal.(theta[j], 1)
+    end
+end
+normal_logpdf(x, m, s) = -0.5 * abs2((x - m) / s) - log(s) - 0.5 * log(2pi)
 
 at(u, k, z) = (v = copy(u); v[k] = z; v)
 
@@ -206,6 +223,84 @@ end
     # Inventories may differ by folded constants, never by the data's extent.
     @test maximum(sizes) < 2minimum(sizes)
     @test sizes[3] <= sizes[2] + 8
+end
+
+# Groups of 3, 0, 5, 1, 4 and 2 rows in shuffled order: group 2 has none.
+function grouped_data(rng)
+    counts = [3, 0, 5, 1, 4, 2]
+    g = shuffle(rng, reduce(vcat, [fill(j, c) for (j, c) in enumerate(counts)]))
+    y = randn(rng, length(g)) .+ g
+    (; J=length(counts), g, y, groups=[y[g .== j] for j in eachindex(counts)])
+end
+
+# A state at `u` without the start check, for a binding whose joint density
+# is deliberately not finite (no products to cache in these models).
+unchecked_state(problem, u) = PPL.CoordinateState(problem, copy(u), ())
+
+@testset "a group coordinate reads only its own group's rows" begin
+    rng = Xoshiro(21)
+    d = grouped_data(rng)
+    u0 = [0.2, log(1.5), (0.3 .* randn(rng, d.J))...]
+    for (plan, parts) in ((GATHER(; J=d.J, g=d.g) | (; y=d.y), 1),
+                          (GROUPED(; J=d.J) | (; y=d.groups), 0))
+        problem = PPL.prepare_coordinate_conditional(build_kernel(plan), plan, u0)
+        # theta reads its prior at the moved cell and, in the gather spelling,
+        # its likelihood at the rows of the moved group; in the grouped
+        # spelling the likelihood plate is a second cell.
+        @test [(b.range, length(b.cells), length(b.parts)) for b in problem.blocks] ==
+            [(3:(d.J + 2), 2 - parts, parts)]
+        state = PPL.coordinate_state(problem, u0)
+        mu, tau = u0[1], exp(u0[2])
+        for j in 1:d.J, z in (-0.4, 1.3)
+            expected = normal_logpdf(z, mu, tau) +
+                sum(normal_logpdf(x, z, 1.0) for x in d.groups[j]; init=0.0)
+            @test PPL.coordinate_logdensity(state, j + 2, z) ≈ expected
+        end
+        result = exercise!(rng, state; sweeps=10, trials=3)
+        @test result.moves > 20 && result.worst < 1e-9
+    end
+
+    # A NaN observation in group 1 reaches only group 1's coordinate: every
+    # other group's coordinate never reads that row.
+    bad = copy(d.y); bad[findfirst(==(1), d.g)] = NaN
+    badgroups = [bad[d.g .== j] for j in 1:d.J]
+    for plan in (GATHER(; J=d.J, g=d.g) | (; y=bad), GROUPED(; J=d.J) | (; y=badgroups))
+        problem = PPL.prepare_coordinate_conditional(build_kernel(plan), plan, u0)
+        state = unchecked_state(problem, u0)
+        @test isnan(PPL.coordinate_logdensity(state, 3, 0.5))
+        @test all(j -> isfinite(PPL.coordinate_logdensity(state, j + 2, 0.5)), 2:d.J)
+    end
+end
+
+@testset "group rows from a gather index" begin
+    index = PPL._coordinate_rows([2, 1, 2, 4], 4)
+    @test index.table == Dict(1 => [2], 2 => [1, 3], 3 => Int[], 4 => [4])
+    @test index.cells == 4
+    @test_throws BoundsError PPL._coordinate_rows([1, 5], 4)
+    @test PPL._coordinate_key_length([3, 1]) == 2
+    # A Bool vector is a mask, not indices (RKPPL refuses one as a position
+    # index when it binds the data, so this guards hand-built programs only).
+    @test PPL._coordinate_key_length([true, true]) == -1
+end
+
+@testset "a group conditional does not grow with the number of groups" begin
+    inventory(ex) = ex isa Expr ? 1 + sum(inventory, ex.args; init=0) : 1
+    inventory(program::ReactiveKernels._PlateProgram) = inventory(program.ast)
+    for (name, model) in (("gather", GATHER), ("grouped", GROUPED))
+        sizes = Int[]
+        for J in (3, 30, 300)
+            rng = Xoshiro(J)
+            groups = [randn(rng, 4) for _ in 1:J]
+            plan = name == "gather" ?
+                model(; J, g=repeat(1:J; inner=4)) | (; y=reduce(vcat, groups)) :
+                model(; J) | (; y=groups)
+            problem = PPL.prepare_coordinate_conditional(build_kernel(plan), plan, zeros(J + 2))
+            push!(sizes, inventory(code_expr(only(problem.blocks).kernel)))
+        end
+        println("GROUP CONDITIONAL NODE INVENTORY $name ", sizes)
+        @test maximum(sizes) < 2minimum(sizes)
+        @test sizes[3] <= sizes[2] + 8
+    end
 end
 
 @testset "free integer parameters are not combined yet" begin
