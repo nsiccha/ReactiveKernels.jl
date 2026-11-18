@@ -291,16 +291,40 @@ function _reactive_stable_op(r::Recipe)
     _StableRecipeOp(compile(rewritten), constants, _native_table(rewritten, callables))
 end
 
-# The callables table of the getters: one operation per recipe, rewritten
-# unless `simplify = false` or the recipe's slot is reused in place (its
-# operation selects the in-place method, `_mutating_slots`).
+# A plate, a plate cell or a scan run as `prepare` runs it: a one-recipe plan
+# over the recipe's own inputs and output, prepared. Their call methods are
+# semantic fallbacks (`_LoweredOnlyOp`) that run each cell through the scalar
+# kernel's own call and type the buffer at run time: a plate cost about 130 ns
+# and 7 allocations per cell, one `plate_cell` read 3.6 µs and 74 allocations,
+# where `prepare`'s loop runs the cell in nanoseconds without allocating (snag
+# `compiledreactive-566bf27c`). The prepared recipe still reads and writes only
+# its own slots, so `freeze!`, `assign!` and invalidation are unchanged. The
+# reactive program runs no input checks, so neither does this plan; a recipe
+# reading one value twice, or with several outputs, keeps its call.
+function _reactive_native_op(plan::Plan, r::Recipe)
+    graph = plan.graph
+    length(r.outputs) == 1 || return r.op
+    allunique(canon_id(graph, v.id) for v in r.inputs) || return r.op
+    output = only(r.outputs)
+    one = Plan(graph, collect(Value, r.inputs), Value[output], Recipe[r],
+               Dict{ValueId,Recipe}(canon_id(graph, output.id) => r), r.cost,
+               Recipe[r], InputCheck[])
+    _prepare_plan(one)
+end
+
+# The callables table of the getters: one operation per recipe. A plate, a
+# plate cell or a scan runs as `prepare` lowers it (`_reactive_native_op`);
+# any other operation is rewritten unless `simplify = false`. A recipe whose
+# slot is reused in place keeps its operation, which selects the in-place
+# method (`_mutating_slots`).
 function _reactive_ops(plan::Plan, index, mutating_slots::Set{Int})
     graph = plan.graph
-    _simplify() || return Tuple(recipe.op for recipe in plan.recipes)
     Tuple(begin
         in_place = length(recipe.outputs) == 1 &&
             get(index, canon_id(graph, only(recipe.outputs).id), 0) in mutating_slots
-        in_place ? recipe.op : _reactive_stable_op(recipe)
+        in_place ? recipe.op :
+            recipe.op isa _LoweredOnlyOp ? _reactive_native_op(plan, recipe) :
+            _simplify() ? _reactive_stable_op(recipe) : recipe.op
     end for recipe in plan.recipes)
 end
 

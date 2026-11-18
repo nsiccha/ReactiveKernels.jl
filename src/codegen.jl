@@ -662,6 +662,12 @@ end
     :(_scan_loop(op.kernel, args[1], $iterated, $shared, Val($I)))
 end
 
+# The operations whose call method is a semantic fallback the lowering never
+# runs: `prepare` emits a plate, a plate cell or a scan as a native loop. Their
+# calls are neither inferred (`_recipe_inferred_output_types`) nor run by a
+# compiled reactive state (`_reactive_native_op`, stateful.jl).
+const _LoweredOnlyOp = Union{_AuthoredPlateOp,_AuthoredPlateCellOp,_AuthoredScanOp}
+
 function _lhs_symbols!(symbols::Set{Symbol}, lhs)
     lhs isa Symbol && return push!(symbols, lhs)
     lhs isa Expr || return symbols
@@ -6107,7 +6113,7 @@ end
 function _recipe_inferred_output_types(recipe::Recipe, inputs)
     T = if recipe.op isa _BoundConstant
         typeof(recipe.op.value)
-    elseif recipe.op isa Union{_AuthoredPlateOp,_AuthoredPlateCellOp,_AuthoredScanOp}
+    elseif recipe.op isa _LoweredOnlyOp
         Any
     elseif all(t -> t isa Type, inputs)
         _promote_op(recipe.op, inputs...)
