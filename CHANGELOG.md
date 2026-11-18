@@ -16,6 +16,22 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.319
+
+- A derivative rule that retains arrays for its reverse pass (a
+  `derivative_rule`, and RK's own rules such as the one behind RKPPL's
+  `NormalIDGLM`) no longer makes the check of the derivative native Enzyme
+  compiles refuse the gradient under `type_stability = :error` at
+  `type_stability_level = :all`. Retention snapshots those arrays with
+  concretely typed code instead of Base's `deepcopy`, whose
+  `@nospecialize` argument compiled to a boxed `jl_invoke` that the check
+  counts as run-time dispatch, even where a program never takes that path
+  (snag `rkppl-ark-dogfoo-72035cd9`: an AR(K) regression through
+  `NormalIDGLM`). What is retained, borrowed or copied is unchanged.
+  Residuals that hold a mutable container other than a dense array of bits
+  values (a mutable struct, an array of arrays) still take `deepcopy`, which
+  the check reports where Enzyme compiles the rule into the derivative.
+
 ## 0.1.318
 
 - `rk_affine_logistic`'s derivative rule computes both sigmoid slopes, σ(u)
