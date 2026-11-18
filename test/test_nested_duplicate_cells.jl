@@ -116,7 +116,7 @@ const A = [0.3 * sin(e) - 0.2 for e in eachindex(EVENTS)]
     events = deepcopy(EVENTS)
     never = [fill(-Inf, length(h)) for h in events]
     omega = 0.6
-    k = prepare(filled_model; bound = (; events, never, omega))
+    k = prepare(filled_model; bound = (; events, never, omega), type_stability = :error)
     @test grouped(k)
     counts = only(multiplicities(k))
     # No cache varies by component, so both components of an event share one
@@ -141,7 +141,7 @@ end
 @testset "nested duplicate cells: one row per event" begin
     events = deepcopy(EVENTS)
     omega = 0.35
-    k = prepare(row_model; bound = (; events, omega))
+    k = prepare(row_model; bound = (; events, omega), type_stability = :error)
     @test grouped(k)
     verify(k, A, events, omega)
 end
@@ -190,5 +190,14 @@ end
     a2 = [A[1:3]; 0.7; A[4:end]]
     verify(k2, a2, with_empty, 0.6)
     verify(k1, A, events, 0.6)
+    # Four times the events and positions: the same compiled program, whose
+    # loops run over the bound groups.
+    longer = [repeat(h, 2) for h in repeat(events, 2)]
+    k4 = prepare!(cache, filled_model;
+        bound = (events = longer, never = [fill(-Inf, length(h)) for h in longer],
+                 omega = 0.6))
+    @test grouped(k4)
+    @test k4.f === k1.f
+    verify(k4, repeat(A, 2), longer, 0.6)
 end
 end
