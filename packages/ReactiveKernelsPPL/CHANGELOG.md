@@ -16,15 +16,36 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.215
+## 0.1.216
 
 - `jax_source(built, plan)` translates in Julia's latest world, as
-  `ReactiveKernels.jax_source` does from ReactiveKernels 0.1.312 on: a
+  `ReactiveKernels.jax_source` does from ReactiveKernels 0.1.313 on: a
   function that builds a model calling its own functions and translates it
   gets the module a translation from the top level gives, and its data-only
   definitions are computed by `prepare_data` instead of staying in
   `UNTRANSLATED` with "has no applicable Julia method". Requires
-  ReactiveKernels 0.1.312.
+  ReactiveKernels 0.1.313.
+
+## 0.1.215
+
+- Each element of an integer array may have its own support when a support
+  bound is read per element: `Binomial.(n, p)` with a vector of trials `n`,
+  `DiscreteUniform.(lo, hi)` with vector endpoints, or a per-element
+  restriction. Before, `prepare_gibbs` refused such an array with
+  `ArgumentError: Binomial trials must be a nonnegative integer, got [2, 5, 3]`
+  (or the DiscreteUniform bounds error). Single-site updates enumerate each
+  element's own range. The joint update evaluates each value some element can
+  take once; an element whose own support excludes that value keeps an
+  in-support value in that evaluation and gets probability zero.
+- `z[axes(y, 1)] .~ Categorical.(ws)` over data holding one probability vector
+  per element reads element `i`'s law from `ws[i]`, as in Julia, with support
+  `1:length(ws[i])`, including vectors of different lengths. Before, `ws` was
+  read as one shared probability vector and the density failed with a
+  `DimensionMismatch`. A shared `Categorical(w)` is unchanged.
+- The joint update of an integer array draws every element in one pass, one
+  uniform per element in element order as before, without allocating per
+  element: one draw of 1000 mixture assignments takes about 95 µs instead of
+  220 µs.
 
 ## 0.1.214
 

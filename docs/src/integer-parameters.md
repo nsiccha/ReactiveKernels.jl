@@ -174,9 +174,37 @@ element, so the elements are conditionally independent: one evaluation of
 those cells per support value gives every element's log weight, and all
 elements are drawn together. A term that couples elements, such as one reading
 `sum(z)`, makes the driver draw the elements one after another, each from its
-exact conditional. All elements must share one support. Julia checks integer
-indices when the program runs, so an index outside the indexed array raises a
-`BoundsError`.
+exact conditional. Julia checks integer indices when the program runs, so an
+index outside the indexed array raises a `BoundsError`.
+
+Each element may have its own support when a bound is read per element:
+`Binomial.(n, p)` with a vector of trials `n`, `DiscreteUniform.(lo, hi)`
+with vector endpoints, or `Categorical.(ws)` over data that holds one
+probability vector per element, which reads element `i`'s law from `ws[i]`, as
+in Julia. Single-site updates enumerate each element's own range. The joint
+update evaluates each value that some element can take once; an element whose
+own support excludes that value keeps an in-support value in that evaluation
+and gets probability zero:
+
+```@example integer
+trials = [2, 5, 1]
+count_array = @rkppl begin
+    k[axes(trials, 1)] .~ Binomial.(trials, 0.35)
+    y .~ Normal.(k, 0.7)
+end
+counts_y = [1.2, 3.9, 0.1]
+counts_plan = count_array(; trials) | (; y = counts_y)
+counts_built = build_kernel(counts_plan)
+counts_problem = prepare_gibbs(counts_built, counts_plan, Float64[];
+    discrete = (; k = [0, 0, 0]))
+counts_draws = gibbs_draws(initialize_gibbs(Xoshiro(3), counts_problem,
+    Float64[]; discrete = (; k = [0, 0, 0])), 4_000)
+# The second element's exact conditional over its own 0:5.
+exact = [pdf(Binomial(5, 0.35), s) * pdf(Normal(s, 0.7), counts_y[2]) for s in 0:5]
+frequency = [count(d -> d.k[2] == s, counts_draws.discrete) for s in 0:5] ./ 4_000
+all(d -> all(0 .<= d.k .<= trials), counts_draws.discrete) &&
+    maximum(abs.(frequency .- exact ./ sum(exact))) < 0.03
+```
 
 The same mixture can be written as a loop, one observation per cell. The
 loop's integers are the same parameter as the declared array: densities,

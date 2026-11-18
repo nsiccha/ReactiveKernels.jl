@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.312
+## 0.1.313
 
 - `jax_source` and `js_source` translate a program in Julia's latest world,
   so a function that defines a program's helpers, `@traceable` functions or
@@ -26,6 +26,33 @@ are recorded in the git history only.
   method: `jax_source` raised `JAXEmissionError` ("the function `f` has no
   applicable Julia method for argument types (Float64)"), or listed a
   data-only definition calling it in `UNTRANSLATED`.
+
+## 0.1.312
+
+- A native-Enzyme gradient runs the derivative Enzyme compiles, not the
+  prepared program's own code, and the type-stability check now covers it. At
+  `type_stability_level = :all` (the default), every `prepare_ad*` with
+  `AutoEnzyme` (or a `SecondOrder` with an `AutoEnzyme` part, so also
+  `prepare_sampler` and `rk_logdensity_problem`) evaluates its operator once at
+  the exemplar, compiling it as `warm = true` does, and reads Enzyme's report
+  of the derivatives that evaluation ran. Calls the derivative dispatches at
+  run time, calls Enzyme differentiates at run time, and boxes, on paths that
+  return, are `type_stability` findings: warned once per process, or refused
+  with `TypeInstabilityError` under `type_stability = :error`. `:rk` and
+  `:values` still check the primal only.
+- New setting `ad_allocations = :ignore | :warn | :error`, a keyword of every
+  `prepare_ad*` and a preference of the same name, scoped like
+  `type_stability`: it warns about or refuses (`DerivativeAllocationError`)
+  allocations in that derivative, on Julia's heap or native (Enzyme's tape,
+  which `@allocated` does not count). The default, `:ignore`, only lists them.
+  A setting other than `:ignore` checks the derivative at every level.
+- New `ad_derivative_report(f)` and `ad_derivative_report(prepared, args...)`
+  return an `ADDerivativeReport`: every derivative Enzyme ran for the code, its
+  findings with source lines, and the unstable calls and allocations among them.
+- Reading the derivative needs Enzyme's dogfood repair `derivative_report`
+  (dogfood 83ff174a or later). With any other Enzyme nothing changes, except
+  that a preparation checked with `type_stability = :error` or with
+  `ad_allocations` warns once per process that the derivative is not checked.
 
 ## 0.1.311
 

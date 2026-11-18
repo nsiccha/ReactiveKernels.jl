@@ -70,6 +70,7 @@ include("cell_arrays.jl")
 include("indexed_invariants.jl")
 include("error_policy.jl")
 include("ad.jl")
+include("derivative_stability.jl")
 include("ad_accumulation.jl")
 include("ad_cost.jl")
 include("plate_reverse.jl")
@@ -113,7 +114,7 @@ include("js_functions.jl")
 include("js_calls.jl")
 
 export Value, Recipe, Graph, Plan, PreparedKernel, PreparedADKernel, PreparedADPullback, ReplicatedKernel, NonAllocatingKernel, PlanningError
-export TypeInstabilityError
+export TypeInstabilityError, DerivativeAllocationError
 export PartitionLocalityError, PartitionSeparabilityError, partition_locality, plate_partition,
     partition_footprint, partition_footprint_kernel, partition_separability,
     partition_plan, partition_plan_kernel
@@ -122,6 +123,7 @@ export value, value!, add!, plan, prepare, prepare_nonallocating, plate, scan, @
 export partial_evaluation
 export prepare_ad, ad_gradient, ad_value_and_gradient, ad_value_and_gradient!
 export ad_cost_profile, ADCostProfile, ADCostPart
+export ad_derivative_report, ADDerivativeReport
 export PreparedADAccumulator, prepare_ad_accumulator, ad_accumulator_storage, ad_accumulate!
 export ad_value_gradient_and_retained, ad_value_gradient_and_retained!,
     ad_retains_primal_sweep

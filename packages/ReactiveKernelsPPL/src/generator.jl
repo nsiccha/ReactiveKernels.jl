@@ -5267,7 +5267,8 @@ function _vector_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
         float64_variate::Bool = false, label::Symbol = name,
         float64_inputs = (), cell_names = Dict{Symbol,Symbol}(),
         node::Symbol = Symbol(:_ppl_prior_, label),
-        pw::Symbol = Symbol(:_ppl_pw_prior_, label), open_bounds::Bool = false)
+        pw::Symbol = Symbol(:_ppl_pw_prior_, label), open_bounds::Bool = false,
+        shared_categorical::Bool = family === :categorical)
     if family === :flat
         # An improper density contributes zero; evaluating a posterior does
         # not request a draw from the unnormalizable prior.
@@ -5284,8 +5285,9 @@ function _vector_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
     end
     inputs = Any[name]
     tv = _dovar(1)
-    # A Categorical law reads its whole probability vector in each cell.
-    argvals = family === :categorical ? Any[values(args)...] :
+    # A Categorical law reads its whole probability vector in each cell,
+    # unless each element has its own (`Categorical.(ws)`).
+    argvals = shared_categorical ? Any[values(args)...] :
         Any[_thread_ref!(inputs, v) for v in values(args)]
     float64_args = Set{Symbol}(t for (v, t) in zip(values(args), argvals)
         if v isa Symbol && v in float64_inputs)
