@@ -2600,6 +2600,7 @@ struct _BoundTemplate
     vectorizations::_BoundVectorizations
     read::Vector{Int}     # the positions, among the plan's constants, of those it reads
     count::Int            # the plan's number of constants
+    exact_signature::Type # the exemplar call signature (`Nothing` without exemplars)
 end
 
 # A class's template before its first binding the inner-plate pass left alone.
@@ -2712,9 +2713,10 @@ end
 # own operation-table slot. Returns the template (or `nothing`) and this
 # binding's kernel.
 function _bound_build(entry::_BoundEntry, @nospecialize(residual),
-                      @nospecialize(hoisted), @nospecialize(passes))
+                      @nospecialize(hoisted), @nospecialize(passes),
+                      @nospecialize(exemplars))
     plan = _bound_residual_plan(entry, residual, hoisted)
-    kernel = prepare(plan; passes = passes)
+    kernel = prepare(plan; passes = passes, exemplars)
     constants = _bound_constants(plan)
     read = _read_bound_constants(kernel, constants)
     read === nothing && return nothing, kernel
@@ -2732,7 +2734,8 @@ function _bound_build(entry::_BoundEntry, @nospecialize(residual),
     isempty(constants) && return kernel, kernel
     callables = Any[kernel.callables...]
     _BoundTemplate(kernel.f, table, callables, kernel.inputs, kernel.outputs, kernel.ast,
-                   lowered, vectorizations, read, length(constants)), kernel
+                   lowered, vectorizations, read, length(constants),
+                   _exact_signature(kernel)), kernel
 end
 
 # `kernel`, linked to the vectorizations its template's bindings share.
@@ -2747,31 +2750,32 @@ end
 # A later binding of a residual whose constants do not fill their own slots:
 # compilation on the cached plan and prefix.
 function _bound_rebind(entry::_BoundEntry, ::Nothing, @nospecialize(residual),
-                       @nospecialize(hoisted), @nospecialize(passes))
-    prepare(_bound_residual_plan(entry, residual, hoisted); passes = passes)
+                       @nospecialize(hoisted), @nospecialize(passes),
+                       @nospecialize(exemplars))
+    prepare(_bound_residual_plan(entry, residual, hoisted); passes = passes, exemplars)
 end
 
 # A residual that reads no hoisted value is one kernel for every binding.
 _bound_rebind(::_BoundEntry, @nospecialize(kernel::PreparedKernel), @nospecialize(residual),
-              @nospecialize(hoisted), @nospecialize(passes)) = kernel
+              @nospecialize(hoisted), @nospecialize(passes), @nospecialize(exemplars)) = kernel
 
 # A later binding of the same key: the same compiled callable over its own
 # constants.
 function _bound_rebind(entry::_BoundEntry, template::_BoundTemplate,
                        @nospecialize(residual), @nospecialize(hoisted),
-                       @nospecialize(passes))
+                       @nospecialize(passes), @nospecialize(exemplars))
     plan = _bound_residual_plan(entry, residual, hoisted)
     constants = _bound_constants(plan)
     # The key fixes the plan up to its constants; a different count would mean
     # it does not, and the ordinary preparation is the safe answer.
-    length(constants) == template.count || return prepare(plan; passes = passes)
+    length(constants) == template.count || return prepare(plan; passes = passes, exemplars)
     constants = constants[template.read]
     table = Tuple(_rebound_table(template.constants, Any[c.op.value for c in constants]))
     callables = _executable_callables(template.callables)
     lowered = _rebound_table(template.lowered, constants)
     _executed_prepared_kernel(template.f, table, callables, template.inputs,
                               template.outputs, plan, template.ast, Tuple(lowered),
-                              Nothing, template.vectorizations)
+                              template.exact_signature, template.vectorizations)
 end
 
 # Normalize the public `bound` kwarg — one `Value => data` pair or an

@@ -9779,9 +9779,9 @@ function prepare(g::Graph; have = (), want = (), passes = (), bound = (),
     _with_branch_arms(branch_arms) do
     _with_settings(simplify, bound_statistics) do
         _with_type_stability(type_stability, type_stability_level) do
-            exemplars === nothing && _reuses_bound_preparation(binding, passes) &&
+            _reuses_bound_preparation(binding, passes) &&
                 return _graph_bound_preparation(g, haves, wants, passes, binding, on_error;
-                    _data_cache)
+                    _data_cache, exemplars)
             p = plan(g; have = haves, want = wants)
             prepare(p; passes = passes, bound = binding, on_error = on_error, exemplars,
                 _data_cache)
