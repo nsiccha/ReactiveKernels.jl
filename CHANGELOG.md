@@ -16,6 +16,17 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.318
+
+- `rk_affine_logistic`'s derivative rule computes both sigmoid slopes, σ(u)
+  and σ(-u), from one `exp(-abs(u))`. It evaluated `exp(-log1pexp(-u))` and
+  `exp(-log1pexp(u))`, two `log1pexp` and two `exp` in every gradient call.
+  The primal is unchanged. Both slopes are within 1.1 ulp of a 256-bit oracle
+  (up to 6 ulp before), and a tail slope such as σ(-40) stays representable.
+  Together with ReactiveKernelsPPL 0.1.221 this halves the gradient of an
+  interval-bounded `@scan` (snag `ukdrivers-log1pe-1df47969`; numbers in that
+  package's changelog).
+
 ## 0.1.317
 
 - A primal-only `rk_log1pexp(x)` (a value without a derivative, such as a

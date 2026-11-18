@@ -1641,8 +1641,8 @@ _host_value_type(x) = Float64
     logjac(layout, unconstrained) -> Real
 
 Host-side total log-Jacobian, using the same source-coordinate formulas as
-the in-graph terms (positive: `u`; unit:
-`-log1pexp(-u) - log1pexp(u)`).
+the in-graph terms (positive: `u`; unit: the logistic log-slope
+`-abs(u) - 2 * log1pexp(-abs(u))`).
 """
 function logjac(layout::LayoutTable, u::AbstractVector{<:Real}, discrete::NamedTuple = (;))
     length(u) == layout.total ||
@@ -1738,7 +1738,7 @@ _logjac_value(transform::Symbol, u) =
 # Symbol-keyed parameterless bijector registry (like `:identity`, it lives
 # outside it): it maps ℝ → (lo, hi) through RK's affine-logistic rule
 # (`lo + (hi-lo)·σ(u)`). Its log-Jacobian reads the source coordinate:
-# `log(hi-lo) - log1pexp(-u) - log1pexp(u)`. `:floored` is likewise
+# `log(hi-lo)` plus the logistic log-slope (`_logistic_logslope`). `:floored` is likewise
 # parameterized (ℝ → (lo, ∞), `lo + exp(u)`, log-Jacobian `u`), as is
 # `:upper` (ℝ → (-∞, hi), `hi - exp(u)`, log-Jacobian `u`). Prior density
 # normalizers are emitted separately.
@@ -1749,6 +1749,23 @@ _logjac_value(transform::Symbol, u) =
 # both finite (interval), a finite lower bound (floored), a finite upper bound
 # (upper), or neither (identity). The program's cells branch the same way on
 # the same data (`_bounded_cell`).
+
+# The logistic log-slope log σ(u) + log σ(-u), the log-Jacobian of every
+# logistic-based transform (unit, interval, and a bounded element with two
+# finite bounds) apart from the width's `log(hi - lo)`. It is
+# `-log1pexp(-u) - log1pexp(u)`, written with the one `log1pexp(-|u|)` both
+# terms share (log1pexp(±u) = max(±u, 0) + log1pexp(-|u|)), as Stan and Wren
+# write it: exact in both tails, one `exp` and one `log1p` per coordinate in
+# the value and in the gradient instead of two of each (snag
+# `ukdrivers-log1pe-1df47969`). This is its single source: the host terms call
+# `_logistic_logslope`, every generated program splices
+# `_logistic_logslope_expr`, and the bijector kernels (bijectors.jl) spell the
+# same arithmetic.
+_logistic_logslope(u) = -abs(u) - 2 * log1pexp(-abs(u))
+_logistic_logslope_expr(u; dot::Bool = false) = dot ?
+    :(.-abs.($u) .- 2 .* log1pexp.(.-abs.($u))) :
+    :(-abs($u) - 2 * log1pexp(-abs($u)))
+
 _bounded_constrain(lo, hi, u) = isfinite(lo) ?
     (isfinite(hi) ? rk_affine_logistic(lo, hi, u) : lo + exp(u)) :
     (isfinite(hi) ? hi - exp(u) : u)
@@ -1756,7 +1773,7 @@ _bounded_unconstrain(lo, hi, x) = isfinite(lo) ?
     (isfinite(hi) ? log(x - lo) - log(hi - x) : log(x - lo)) :
     (isfinite(hi) ? log(hi - x) : x)
 _bounded_logjac(lo, hi, u) = isfinite(lo) ?
-    (isfinite(hi) ? log(oftype(u, hi - lo)) - log1pexp(-u) - log1pexp(u) : u) :
+    (isfinite(hi) ? log(oftype(u, hi - lo)) + _logistic_logslope(u) : u) :
     (isfinite(hi) ? u : zero(u))
 
 # `k` is the element's position in the entry's block, which selects its own
@@ -1786,7 +1803,7 @@ function _logjac_elt(e::LayoutEntry, u, k::Integer = 1)
     e.transform === :upper && return u
     # The width takes the coordinate's number type, so a wide input keeps
     # its precision; no rounded constrained value enters the logarithms.
-    return log(oftype(u, _bound_at(e.hi, k) - _bound_at(e.lo, k))) - log1pexp(-u) - log1pexp(u)
+    return log(oftype(u, _bound_at(e.hi, k) - _bound_at(e.lo, k))) + _logistic_logslope(u)
 end
 
 # The program's check of its packed point (snag `rk-prepared-cut-0e0b98ed`):
@@ -2245,9 +2262,9 @@ end
 
 # Interval edges ℝ → (lo, hi): the RK-owned affine-logistic constrain rule,
 # whose primal is `lo + (hi - lo) / (1 + exp(-u))`, its
-# inverse `log(x - lo) - log(hi - x)`, and the log-Jacobian
-# `log(hi - lo) - log1pexp(-u) - log1pexp(u)` (summed over the block when
-# `dot`).
+# inverse `log(x - lo) - log(hi - x)`, and the log-Jacobian `log(hi - lo)`
+# plus the logistic log-slope `_logistic_logslope_expr` (summed over the block
+# when `dot`).
 function _interval_constrain(lo, hi, u; dot::Bool = false)
     return dot ? :(rk_affine_logistic.($lo, $hi, $u)) :
         :(rk_affine_logistic($lo, $hi, $u))
@@ -2259,8 +2276,9 @@ function _interval_logjac(lo, hi, u; dot::Bool = false, elementwise::Bool = fals
     # A width per element is a vector of logarithms; a shared one is one.
     w = _bound_sub(hi, lo; dot = elementwise)
     logw = _literal_bound(w) && isone(w) ? 0.0 : elementwise ? :(log.($w)) : :(log($w))
-    dot || return :($logw - log1pexp(-$u) - log1pexp($u))
-    return :(sum($logw .- log1pexp.(-$u) .- log1pexp.($u)))
+    slope = _logistic_logslope_expr(u; dot)
+    dot || return :($logw + $slope)
+    return :(sum($logw .+ $slope))
 end
 
 """
@@ -2504,7 +2522,7 @@ function _bounded_cell(edge::Symbol, l, h, v)
         branch(finite(h), :(rk_affine_logistic($l, $h, $v)), :($l + exp($v))),
         branch(finite(h), :($h - exp($v)), v))
     edge === :logjac && return branch(finite(l),
-        branch(finite(h), :(log($h - $l) - log1pexp(-$v) - log1pexp($v)), v),
+        branch(finite(h), :(log($h - $l) + $(_logistic_logslope_expr(v))), v),
         branch(finite(h), v, 0.0))
     return branch(finite(l),
         branch(finite(h), :(log($v - $l) - log($h - $v)), :(log($v - $l))),
