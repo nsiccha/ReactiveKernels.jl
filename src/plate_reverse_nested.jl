@@ -4,9 +4,9 @@
 function _pr_additive_groups(body, totals, terminal, assignments)
     groups = IdDict{Expr,_PRAdditiveGroup}()
     intermediate = setdiff(totals, terminal)
-    isempty(intermediate) && return groups
-    reads = _rw_reads!(Dict{Symbol,Int}(), body)
     declared = Dict{Symbol,Any}()
+    isempty(intermediate) && return groups, declared
+    reads = _rw_reads!(Dict{Symbol,Int}(), body)
     _index_run_visit(body) do node
         node.head === :local || return
         for arg in node.args
@@ -69,24 +69,33 @@ function _pr_additive_groups(body, totals, terminal, assignments)
         push!(covered, inner)
     end
     covered == intermediate || _pr_fail("an intermediate plate total needs a propagated adjoint")
-    groups
+    groups, declared
 end
 
 @inline _pr_group_view(::Nothing, indices) = nothing
+@inline _pr_group_view(shadow::Vector{<:Vector}, row::Int) = shadow[row]
 @inline _pr_group_view(shadow, indices) = view(shadow, indices)
 @inline _pr_group_view(shadow::_PRMappedShadow, indices) =
     _PRMappedShadow(shadow.f, _pr_group_view(shadow.storage, indices))
 
+struct _PRGroupProjection{Declared}
+    parent::Int
+    rows::Int
+    grouped::Bool
+    batched::Bool
+end
+
 # A gathered group operand uses its own indices in both directions. A view
 # of the parent's cotangent storage scatters repeated positions on addition.
-function _pr_group_shadows!(reads, groups, params, active, prepared, mod, values)
+function _pr_group_shadows!(reads, groups, params, active, prepared, mod, values, declared)
     sources = Set{Symbol}()
     bindings = IdDict{Expr,Expr}()
-    projections = Tuple{Int,Int,Bool}[]
+    scatters = IdDict{Expr,Expr}()
+    projections = _PRGroupProjection[]
     for group in Base.values(groups), s in group.prefix
         Meta.isexpr(s, :(=), 2) || continue
         name, rhs = s.args
-        name in Base.values(prepared) && name in active || continue
+        name in active && rhs isa Expr || continue
         source = Meta.isexpr(rhs, :let, 2) ? _rw_peel_let(rhs, x -> x isa Symbol) : rhs
         isgather = Meta.isexpr(source, :call, 3) &&
             _pr_call_function(source.args[1], mod, values) === _cell_array_gather
@@ -94,6 +103,8 @@ function _pr_group_shadows!(reads, groups, params, active, prepared, mod, values
         parent, indices = source.args[end-1:end]
         parent isa Symbol && parent in params && indices isa Symbol && !(indices in active) ||
             _pr_fail("a group gather needs a parameter and data indices")
+        declaration = get(declared, name, Any)
+        declaration isa Type || _pr_fail("a group read has a dynamic type declaration")
         # Select the projection rule at dispatch for the actual source and
         # index types. A user-defined indexed operation can have a different
         # pullback even if it returns an ordinary vector.
@@ -111,20 +122,117 @@ function _pr_group_shadows!(reads, groups, params, active, prepared, mod, values
             rows = get(prepared, read.args[2], nothing)
             rows in params || _pr_fail("unknown group index operand")
         end
-        push!(projections, (findfirst(==(parent), params), findfirst(==(rows), params), rows !== indices))
+        batched = name in Base.values(prepared)
+        push!(projections, _PRGroupProjection{declaration}(findfirst(==(parent), params),
+            findfirst(==(rows), params), rows !== indices, batched))
         push!(sources, parent)
         reads[rhs] = nothing
-        bindings[s] = :($(Symbol(name, :_shadow)) = $(GlobalRef(@__MODULE__, :_pr_group_view))(
-            $(Symbol(parent, :_shadow)), $indices))
+        shadow = Symbol(parent, :_shadow)
+        if batched
+            bindings[s] = :($(Symbol(name, :_shadow)) =
+                $(GlobalRef(@__MODULE__, :_pr_group_view))($shadow, $indices))
+        else
+            # All hours in this group contributed to the same scalar.
+            scatters[rhs] = :($(GlobalRef(@__MODULE__, :_pr_shadow_add!))(
+                $shadow, $indices, $(_pr_bar(name))))
+        end
     end
-    sources, bindings, Tuple(unique(projections))
+    sources, bindings, scatters, Tuple(unique(projections))
 end
 
-function _pr_group_projections_cover(projections, types)
-    all(projections) do (parent, rows, grouped)
-        source = types[parent]
-        source <: Union{Vector,SubArray{<:Any,1,<:Vector}} || return false
-        indices = grouped ? eltype(types[rows]) : types[rows]
-        indices <: Union{Vector{Int},UnitRange{Int},Base.OneTo{Int}}
+_pr_group_projections_cover(projections, types) =
+    all(p -> _pr_group_projection_covers(p, types), projections)
+
+function _pr_group_projection_covers(p::_PRGroupProjection{D}, types) where {D}
+    source = types[p.parent]
+    source <: Union{Vector,SubArray{<:Any,1,<:Vector}} || return false
+    indices = p.grouped ? eltype(types[p.rows]) : types[p.rows]
+    # A typed assignment may convert the indexed result. An integer index
+    # returns the element. A vector of indices can return a vector or a view.
+    if D !== Any
+        result = indices === Int ? eltype(source) : AbstractVector{eltype(source)}
+        result <: D || return false
     end
+    if indices === Int
+        return p.batched ? source <: Vector{<:Vector{<:Union{Float32,Float64}}} :
+                           eltype(source) <: AbstractFloat
+    end
+    p.batched && indices <: Union{Vector{Int},UnitRange{Int},Base.OneTo{Int}}
+end
+
+# Expose the two leaves of a lazy scalar-plus-vector broadcast at the rule
+# boundary. The group still loads its entry once. Its ordinary scalar graph
+# now returns the shared cotangent and scatters the indexed cotangent.
+struct _PRGroupBroadcastRule{Positions,F,R} <: Function
+    original::F
+    expanded::R
+end
+
+const _PRScalarPlusVector = _CellBroadcast{T,1,B} where
+    {T<:Union{Float32,Float64},B<:Base.Broadcast.Broadcasted{
+        Base.Broadcast.DefaultArrayStyle{1},<:Any,typeof(+),Tuple{T,Vector{T}}}}
+
+@inline _pr_broadcast_type(::Val{T}) where {T} = T
+
+function _pr_expand_group_reads(ast, positions)
+    params = ast.args[1].args
+    shared = Dict(params[i] => gensym(:broadcast_scalar) for i in positions)
+    original_types = Dict(params[i] => gensym(:broadcast_type) for i in positions)
+    function expand(ex)
+        ex isa Symbol && haskey(shared, ex) && _pr_fail(
+            "a group broadcast has a use other than a scalar index")
+        ex isa Expr && ex.head !== :quote || return ex
+        if Meta.isexpr(ex, :call, 2) &&
+                ex.args[1] in (typeof, GlobalRef(Base, :typeof), GlobalRef(Core, :typeof)) &&
+                haskey(original_types, ex.args[2])
+            return Expr(:call, GlobalRef(@__MODULE__, :_pr_broadcast_type), original_types[ex.args[2]])
+        end
+        if ex.head === :block
+            stmts = Any[]
+            for stmt in ex.args
+                if Meta.isexpr(stmt, :(=), 2) && Meta.isexpr(stmt.args[2], :ref, 2)
+                    rhs = stmt.args[2]
+                    parent, index = rhs.args
+                    if haskey(shared, parent) && index isa Symbol
+                        entry = gensym(:group_entry)
+                        push!(stmts, :($entry = $parent[$index]),
+                              Expr(:(=), stmt.args[1], Expr(:call, GlobalRef(Base, :+), shared[parent], entry)))
+                        continue
+                    end
+                end
+                push!(stmts, expand(stmt))
+            end
+            return Expr(:block, stmts...)
+        end
+        Expr(ex.head, map(expand, ex.args)...)
+    end
+    scalars = [shared[params[i]] for i in positions]
+    types = [original_types[params[i]] for i in positions]
+    Expr(:function, Expr(:tuple, params..., types..., scalars...), expand(ast.args[2])), scalars
+end
+
+function _pr_group_broadcast_expr(positions, projections, types, dispatch)
+    slotted = !isempty(types) && types[end] === _PlateTapeSlot
+    count = length(types) - slotted
+    original = :($dispatch(rule.original, args))
+    all(i -> types[i] <: _PRScalarPlusVector, positions) || return original
+    for p in projections
+        p.parent in positions || continue
+        indices = p.grouped ? eltype(types[p.rows]) : types[p.rows]
+        !p.batched && indices === Int || return original
+    end
+    leaves = Any[:(getfield(args, $i)) for i in 1:count]
+    checks = Any[]
+    for i in positions
+        cells = leaves[i]
+        vector = :(getfield($cells.broadcast.args, 2))
+        push!(checks, :(axes($cells) == axes($vector)))
+        leaves[i] = vector
+        push!(leaves, :(Val(typeof($cells))))
+    end
+    append!(leaves, (:(getfield(getfield(args, $i).broadcast.args, 1)) for i in positions))
+    slotted && length(leaves) < _PLATE_CALL_MAX_ARGUMENTS &&
+        push!(leaves, :(getfield(args, $(count + 1))))
+    condition = foldl((a, b) -> :($a && $b), checks)
+    :($condition ? $dispatch(rule.expanded, ($(leaves...),)) : $original)
 end

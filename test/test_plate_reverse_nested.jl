@@ -32,10 +32,23 @@ Base.getindex(x::ScaledGather, i::Vector{Int}) = 2 .* x.data[i]
     # The same compiled caller can receive either array. Only the plain
     # projection can add the unscaled cell partials directly to its parent.
     primal = (source, groups) -> sum(source[only(groups)])
-    rule = RK._PlateSumRule{(),(1,),typeof(primal),typeof(identity),false,((1,2,true),)}(primal, identity)
+    projection = (RK._PRGroupProjection{Any}(1, 2, true, true),)
+    rule = RK._PlateSumRule{(),(1,),typeof(primal),typeof(identity),false,projection}(primal, identity)
     @test RK._pr_rule_target(rule, (x, indices)) isa RK._PlateSumRuleBody
     @test RK._pr_rule_target(rule, (projected, indices)) === primal
     @test rule(projected, indices) == primal(projected, indices)
+    types = (Vector{Float64}, Vector{Int})
+    @test RK._pr_group_projection_covers(RK._PRGroupProjection{Float64}(1, 2, true, false), types)
+    @test !RK._pr_group_projection_covers(RK._PRGroupProjection{Int}(1, 2, true, false), types)
+    # A slot and its indices can both be refilled between the two passes.
+    ext = Base.get_extension(RK, :ReactiveKernelsEnzymeExt)
+    shared = [1, 2]
+    values = ([[0.4]], [shared, shared])
+    tape = ext._pr_tape(Val((false, true, true)), values)
+    values[1][1][1] = 1.7
+    shared[1] = 2
+    @test tape == ([[0.4]], [[1, 2], [1, 2]])
+    @test tape[2][1] === tape[2][2]
 end
 
 @kernel weighted_groups(groups::Vector{Vector{Float64}}, weights::Vector{Float64},
@@ -72,6 +85,55 @@ end
     end
     result = sum(totals)
     return result
+end
+
+@kernel indexed_group_totals(rows::Vector{Vector{Float64}}, ids::Vector{Int},
+                             offsets::Vector{Float64}, scale::Float64) = begin
+    scaled = plate(rows) do xs
+        xs .* scale
+    end
+    totals = plate(ids) do i
+        xs = scaled[i]
+        offset = offsets[i]
+        terms = plate(xs) do x
+            sin(x + offset)
+        end
+        subtotal::Float64 = sum(terms)
+        subtotal
+    end
+    result = sum(totals)
+    return result
+end
+
+@testset "repeated scalar and ragged row lookups in a cached nested plate" begin
+    rows = [[0.4, -1.2], Float64[], [0.8]]
+    offsets = [0.12, -0.31, 0.7]
+    scale = -0.8
+    ids = [3, 1, 2, 1, 3]
+    for enabled in (false, true)
+        grad = with_plate_reverse(enabled) do
+            k = prepare_nonallocating(indexed_group_totals, rows, ids, offsets, scale)
+            if enabled
+                @test last(last(plate_reverse_report(k, (3, 4)))) == "rule"
+            end
+            prepare_ad(k, AutoEnzyme(; mode = Enzyme.Reverse), rows, ids, offsets, scale;
+                       active = (:offsets, :scale))
+        end
+        for order in (ids, [2, 2, 3], Int[])
+            want = ds = 0.0
+            db = zero(offsets)
+            for i in order, x in rows[i]
+                z = x * scale + offsets[i]
+                want += sin(z)
+                db[i] += cos(z)
+                ds += x * cos(z)
+            end
+            val, (doffsets, dscale) = ad_value_and_gradient(grad, rows, order, offsets, scale)
+            @test val ≈ want
+            @test doffsets ≈ db
+            @test dscale ≈ ds
+        end
+    end
 end
 
 function reference(groups, z, offsets, scale, weight)

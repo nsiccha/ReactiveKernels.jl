@@ -12,6 +12,10 @@ mutable struct _NestedPlateCache{K,R}
     result::R
 end
 
+# The step returns its owned result array. A following plate can use its
+# rank and element type even when the authored plate's fallback is opaque.
+ReactiveKernels._nested_plate_result_type(::Base.RefValue{_NestedPlateCache{K,R}}) where {K,R} = R
+
 function ReactiveKernels._nested_plate_cache(op::ReactiveKernels._AuthoredPlateOp{K,A},
         argtypes, ::Type{T}, N) where {K,A,T<:AbstractArray}
     isconcretetype(T) && N !== nothing || return nothing

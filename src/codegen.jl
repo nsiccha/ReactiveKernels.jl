@@ -6136,6 +6136,8 @@ end
 function _recipe_inferred_output_types(recipe::Recipe, inputs)
     T = if recipe.op isa _BoundConstant
         typeof(recipe.op.value)
+    elseif recipe.op isa _NonallocNestedPlate
+        _nested_plate_result_type(recipe.op.slot)
     elseif recipe.op isa _LoweredOnlyOp
         Any
     elseif all(t -> t isa Type, inputs)

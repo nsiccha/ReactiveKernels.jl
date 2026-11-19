@@ -1118,9 +1118,13 @@ end
 # else: the reverse pass reads every other operand from its annotation, so a
 # call whose operands stay intact keeps an empty tape and allocates none.
 @generated function _pr_tape(::Val{F}, values::Tuple) where {F}
-    Expr(:tuple, (F[i+1] && T <: AbstractArray ? :(copy(getfield(values, $i))) : :nothing
+    Expr(:tuple, (F[i+1] && T <: AbstractArray ? :(_pr_snapshot(getfield(values, $i))) : :nothing
                   for (i, T) in enumerate(values.parameters))...)
 end
+_pr_snapshot(x) = copy(x)
+# A producer can refill ragged values or index rows after the primal. Preserve
+# the entries and their sharing when the backend marks the operand overwritten.
+_pr_snapshot(x::Vector{<:Vector}) = deepcopy(x)
 # The operand values for the reverse pass: the tape's copy where it holds one.
 @generated function _pr_operands(tape::Tuple, args::Tuple)
     Expr(:tuple, (tape.parameters[i] === Nothing ? :(getfield(args, $i).val) :
