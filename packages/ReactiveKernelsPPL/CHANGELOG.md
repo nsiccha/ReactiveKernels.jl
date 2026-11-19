@@ -16,6 +16,12 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.231
+
+- `marginalize` carries a square root of the filtered covariance for a vector
+  Gaussian scan. This preserves small observation and process variances when
+  successive innovations differ by many orders of magnitude.
+
 ## 0.1.230
 
 - The package image prepares a coordinate conditional and a marginalized

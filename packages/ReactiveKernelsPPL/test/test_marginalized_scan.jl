@@ -722,6 +722,62 @@ shared_beta(c) = (phi = exp(-1 / c.range); (1 - phi) * c.range / (1 + phi))
 shared_prior(c) = logpdf(Exponential(1), c.sd) + logpdf(LogNormal(0, 1), c.range) +
     logpdf(Exponential(1), c.noise)
 
+# The observed state shares the other state's noise and has its own innovation.
+# Conditioning on it should retain the much smaller sources of uncertainty.
+const SCALED_PAIR = @rkppl begin
+    gain ~ Normal(0, 1)
+    @scan begin
+        x[1] ~ Normal(0, spread[1])
+        z[1] ~ Normal(gain * x[1], jitter[1])
+        for k in 2:N
+            x[k] ~ Normal(0.75 * x[k - 1] + 0.25 * z[k - 1], spread[k])
+            z[k] ~ Normal(gain * x[k], jitter[k])
+        end
+    end
+    y .~ Normal.(z, 0.3)
+end
+
+@testset "vector filter retains observation noise across widely separated scales" begin
+    spread = [1e18, 1e-15, 0.5, 1e12, 1e-12]
+    jitter = [1e-10, 0.1, 1e-9, 1e-15, 0.2]
+    y = [1.0, -0.4, 0.8, -0.9, 0.3]
+    N = length(y)
+    plan = marginalize(SCALED_PAIR(; N, spread, jitter), :x, :z;
+        predictive = (location = :loc, scale = :pred_sd)) | (; y)
+    built = build_kernel(plan)
+    function reference(gain)
+        # Build the dense joint observation law directly from independent
+        # innovations. Extra precision retains the measurement variance at 1e36.
+        x = zeros(BigFloat, N, 2N)
+        z = similar(x)
+        for k in 1:N
+            if k > 1
+                x[k, :] .= (3 .* x[k - 1, :] .+ z[k - 1, :]) ./ 4
+            end
+            x[k, 2k - 1] = spread[k]
+            z[k, :] .= gain .* x[k, :]
+            z[k, 2k] = jitter[k]
+        end
+        C = cholesky(Symmetric(z * z' + BigFloat(0.3)^2 * I)).L
+        sd = diag(C)
+        residual = C \ BigFloat.(y)
+        loc = y .- sd .* residual
+        ll = -sum(log, sd) - sum(abs2, residual) / 2 - N * log(2big(pi)) / 2
+        (; loc, sd, ll)
+    end
+    u = [0.8]
+    truth = reference(big(only(u)))
+    loc, sd = Base.invokelatest(prepare_query(built, plan, (:loc, :pred_sd)), u)
+    @test loc ≈ truth.loc rtol = 1e-12 atol = 1e-12
+    @test all(isapprox.(sd, truth.sd; rtol = 1e-12))
+    @test Base.invokelatest(prepare_query(built, plan, :likelihood), u) ≈ truth.ll rtol = 1e-12
+    sampler = prepare_sampler(built, plan, u; backend = DI.AutoEnzyme(; mode = Enzyme.Reverse))
+    _, grad = sampler_value_and_gradient!(sampler, similar(u), u)
+    h = big"1e-12"
+    dlik = (reference(big(only(u)) + h).ll - reference(big(only(u)) - h).ll) / (2h)
+    @test only(grad) ≈ dlik - only(u) rtol = 1e-8 atol = 1e-9
+end
+
 function vector_cases(T; seed = 11)
     rng = Random.Xoshiro(seed)
     y = randn(rng, T)
@@ -1244,6 +1300,66 @@ end
 
 include(joinpath(pkgdir(ReactiveKernels), "test", "jax_python.jl"))
 include("jax_ppl_data.jl")
+
+@testset "a zero loading retains its derivative in the vector filter" begin
+    model = @rkppl begin
+        a ~ Normal(0, 1)
+        @scan begin
+            x[1] = 0.0
+            z[1] = 0.0
+            for k in 2:N
+                e ~ Normal(0, 1)
+                f ~ Normal(0, 1)
+                x[k] = 0.5 * x[k - 1] + a * (e + f)
+                z[k] = 0.5 * z[k - 1] + e + 2 * f
+            end
+        end
+        y .~ Normal.(w .* (x .+ z), 0.3)
+    end
+    y = [0.1, 0.2, 0.3]
+    plan = marginalize(model(; N = 3, w = [0.0, 0.0, 1.0]), :x, :z) | (; y)
+    built = build_kernel(plan)
+    u = [0.0]
+    sampler = prepare_sampler(built, plan, u; backend = DI.AutoEnzyme(; mode = Enzyme.Reverse))
+    _, grad = sampler_value_and_gradient!(sampler, similar(u), u)
+    # Only the final observation reads the states. Its variance is
+    # (1 + 0.5^2) * ((a + 1)^2 + (a + 2)^2) + 0.3^2.
+    variance = 1.25 * 5 + 0.3^2
+    expected = (y[end]^2 / variance - 1) * 7.5 / (2 * variance)
+    @test only(grad) ≈ expected
+    if rk_jax_available()
+        src = jax_source(built, plan)
+        result = rk_jax_evaluate(src, "log_density", (u, jax_raw_data(plan, src)...);
+            grad = true, prepare = true)
+        @test only(result.grad) ≈ expected
+    else
+        @test_skip false
+    end
+end
+
+@testset "exact observation retains the derivative of a zero loading" begin
+    model = @rkppl begin
+        a ~ Normal(0, 1)
+        @scan begin
+            x[1] ~ Normal(0, 1)
+            z[1] ~ Normal(0, 1)
+            for t in 2:N
+                x[t] = x[t - 1]
+                z[t] = z[t - 1]
+            end
+        end
+        y .~ Normal.((base .+ a .* firstrow) .* x .+ firstrow .* z, noise)
+    end
+    y = [0.7, 0.4]
+    plan = marginalize(model(; N = 2, firstrow = [1.0, 0.0], base = [0.0, 1.0],
+        noise = [0.0, 1.0]), :x, :z) | (; y)
+    built = build_kernel(plan)
+    u = [0.0]
+    sampler = prepare_sampler(built, plan, u; backend = DI.AutoEnzyme(; mode = Enzyme.Reverse))
+    _, grad = sampler_value_and_gradient!(sampler, similar(u), u)
+    # cov(y) = [1+a^2 a; a 2]. At a=0 only its off-diagonal changes.
+    @test only(grad) ≈ prod(y) / 2
+end
 
 # An observed AR(1) series whose length is the response's own: the check
 # without a supplied length.
