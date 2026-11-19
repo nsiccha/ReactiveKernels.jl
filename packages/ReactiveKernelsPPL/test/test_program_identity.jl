@@ -162,5 +162,13 @@ end
             cell = prepare_cell_query(b, changed, :y)
             @test [cell([0.3], i) for i in 1:n] ≈ expected
         end
+
+        # Removing the mask port changes the generated program under the same
+        # model owner. The old build still serves its original masked binding.
+        full = model(; x = abs.(x)) | (; y = coalesce.(y, 0.0))
+        unmasked = build_kernel(full)
+        @test !ReactiveKernelsPPL._same_program(built.program, unmasked.program)
+        @test_throws ContractValidationError prepare_query(built, full, :pointwise)
+        @test Base.invokelatest(prepare_query(built, changed, :pointwise), [0.3]).y ≈ expected
     end
 end
