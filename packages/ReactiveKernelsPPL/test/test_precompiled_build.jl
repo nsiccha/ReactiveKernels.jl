@@ -176,10 +176,7 @@ using ReactiveKernels, ReactiveKernelsPPL, ReactiveKernelsDistributionKernels, T
             @test all(image_root, companion_roots(P.BUILT.spec))
             runtime = build_kernel(B.PLAN)
             @test !isempty(companion_roots(runtime.spec))
-            # Rebuilding after Enzyme loads can reuse a regression companion
-            # compiled in the sampler preparation extension.
-            sampler_image = Base.get_extension(ReactiveKernelsPPL, :ReactiveKernelsPPLEnzymePreparationExt)
-            @test all(r -> image_root(r) || r === sampler_image, companion_roots(runtime.spec))
+            @test all(image_root, companion_roots(runtime.spec))
             @test all(m -> image_root(Base.moduleroot(m)), source_modules(runtime.spec))
             @test prepare_query(runtime, B.PLAN, :sampler)([0.3, -0.2, 0.1]) ≈
                   density([0.3, -0.2, 0.1], x, y)
