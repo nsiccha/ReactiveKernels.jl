@@ -304,12 +304,12 @@ end
 # predictive location and variance of each observed entry, `moments(a)` the
 # filtered mean and variance of array `a`. `define(name, value)` writes one: a
 # top-level definition, or a per-index output in a `@plate` cell.
-function _marginal_value_defs(req, loc, var, moments; define = (n, v) -> Expr(:(=), n, v))
+function _marginal_value_defs(req, loc, var, moments; scale = :(sqrt.($var)),
+        define = (n, v) -> Expr(:(=), n, v))
     req === nothing && return Any[]
     defs = Any[]
     for (role, nm) in req.predictive
-        push!(defs, define(nm, role === :location ? loc : role === :variance ? var :
-            :(sqrt.($var))))
+        push!(defs, define(nm, role === :location ? loc : role === :variance ? var : scale))
     end
     for (a, role, nm) in req.filtered
         mean, v = moments(a)
