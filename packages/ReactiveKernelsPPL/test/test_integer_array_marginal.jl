@@ -86,6 +86,10 @@ end
     @test sum(record.probabilities; dims = 2) ≈ ones(3, 1)
     draws = [discrete_latent_draws(latents, Float64[], Xoshiro(s)).parameters.k for s in 1:100]
     @test all(d -> all(0 .<= d .<= trials), draws)
+    empty_plan = marginalize(model(; trials = Int[]), :k) | (; y = Float64[])
+    q = prepare_predictive(build_kernel(empty_plan), empty_plan)
+    @test size(predictive_laws(q, Float64[]).y) == (0,)
+    @test q(Float64[], Xoshiro(4)).y == Float64[]
 end
 
 @testset "a matrix of integers sums out entry by entry" begin

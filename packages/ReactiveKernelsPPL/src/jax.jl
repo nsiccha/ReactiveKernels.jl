@@ -196,6 +196,31 @@ _integer_namedtuple_type(T::Type) = T
 _integer_namedtuple_type(fields::NamedTuple) =
     NamedTuple{keys(fields),Tuple{map(_integer_namedtuple_type, Tuple(fields))...}}
 
+# Shape reads remain static while tracing. An empty element axis skips every
+# shared component, including components that would index an empty table.
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_integer_used_support), args::Vector{ReactiveKernels._PyVal})
+    s, sizes = args
+    code = "(" * ReactiveKernels._py_atom(s.code) * "[:0] if 0 in " * sizes.code *
+        " else " * s.code * ")"
+    return ReactiveKernels._PyVal(code, s.T, s.static)
+end
+
+# Julia broadcasts missing trailing axes. Preserve that order before the
+# matrix (or higher-rank array) becomes a column-major vector of elements.
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_integer_flat_operand), args::Vector{ReactiveKernels._PyVal})
+    v, dims = args
+    ReactiveKernels._jax_is_array(v.T) || return v
+    rank = fieldcount(dims.T)
+    api = ctx.host === nothing ? "jnp" : "np"
+    a = ReactiveKernels._jax_bind!(ctx, :operand, v).code
+    shape = api * ".shape(" * a * ") + (1,) * " * string(max(0, rank - ndims(v.T)))
+    code = api * ".ravel(" * api * ".broadcast_to(" * api * ".reshape(" * a * ", " *
+        shape * "), " * dims.code * "), order='F')"
+    return ReactiveKernels._PyVal(code, Vector{eltype(v.T)}, v.static)
+end
+
 # The array overload applies exactly the scalar support rule to each bound.
 # Use that rule's emitted host helper so invalid trials have the same check.
 function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,

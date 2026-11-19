@@ -121,7 +121,7 @@ def check_array(name):
     m = model(name)
     assert not m.UNTRANSLATED, m.UNTRANSLATED
     sizes = []
-    for n in (2, 13):
+    for n in ((2, 13) if name == "array_joint" else (2, 13, 0)):
         ref = {"np": np}
         exec((Path(sys.argv[1]) / f"{name}{n}_reference.py").read_text(), ref)
         data = m.prepare_data(**ref["raw"])
@@ -141,7 +141,7 @@ def check_array(name):
 
 
 checks = {"mixture": check_mixture, "joint": check_joint, "rag": check_rag}
-for array_model in ("array_guide", "array_counts", "array_joint"):
+for array_model in ("array_guide", "array_counts", "array_matrix", "array_joint"):
     checks[array_model] = lambda name=array_model: check_array(name)
 for name in sys.argv[2:] or checks:
     checks[name]()

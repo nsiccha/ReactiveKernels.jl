@@ -467,11 +467,12 @@ function _predictive_entries(value, targets; rng = nothing)
         p = record.probabilities
         nstates = size(p, ndims(p))
         weights = reshape(p, prod(size(p)[1:end-1]), nstates)
-        laws = [_response_laws(_at_position(record.conditional, j), targets[k])
-            for j in axes(weights, 2)]
         dims = targets[k].dims
         prod(dims) == size(weights, 1) || throw(DimensionMismatch(
             "[query] response `$k` and integer array `$name` have different element counts"))
+        0 in dims && return PredictiveLaws((; law = NamedTuple()), dims)
+        laws = [_response_laws(_at_position(record.conditional, j), targets[k])
+            for j in axes(weights, 2)]
         rng === nothing && return _integer_response_laws(laws, weights)
         indices = get!(choices, name) do
             _membership_draws(rng, weights)

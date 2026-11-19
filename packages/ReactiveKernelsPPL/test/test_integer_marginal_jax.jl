@@ -55,6 +55,11 @@ end
         z[axes(trials, 1)] .~ Binomial.(trials, p)
         y .~ Normal.(z, 0.7)
     end
+    matrix = @rkppl begin
+        p ~ Beta(2, 3)
+        z[axes(y, 1), axes(y, 2)] .~ Bernoulli(p)
+        y .~ Normal.(z, 1.0)
+    end
     joint = @rkppl begin
         p ~ Beta(2, 3)
         a ~ Bernoulli(p)
@@ -63,12 +68,15 @@ end
     end
     mktempdir() do dir
         for (name, model, eliminated) in (("array_guide", guide, (:z,)),
-                ("array_counts", counts, (:z,)), ("array_joint", joint, (:a, :z)))
+                ("array_counts", counts, (:z,)), ("array_matrix", matrix, (:z,)),
+                ("array_joint", joint, (:a, :z)))
             @testset "$name" begin
                 program = nothing
-                for n in (2, 13)
-                    y = collect(range(-0.2, 0.8; length = n))
-                    inputs = name == "array_guide" ? (; K = 3) :
+                for n in (name == "array_joint" ? (2, 13) : (2, 13, 0))
+                    y = name == "array_matrix" ?
+                        reshape(collect(range(-0.2, 0.8; length = 2n)), n, 2) :
+                        collect(range(-0.2, 0.8; length = n))
+                    inputs = name == "array_guide" ? (; K = n == 2 ? 3 : 5) :
                         name == "array_counts" ? (; trials = mod.(1:n, n)) : (;)
                     plan = marginalize(model(; inputs...), eliminated...) | (; y)
                     built = build_kernel(plan)
@@ -80,7 +88,7 @@ end
                     else
                         @test built.program == program
                     end
-                    u = fill(0.15, built.layout.total)
+                    u = [0.15 + 0.2 * (j - 1) for j in 1:built.layout.total]
                     density = prepare_query(built, plan, :sampler)
                     gradient = [(density(u .+ step) - density(u .- step)) / 2e-5
                         for step in (1e-5 .* ((1:length(u)) .== i) for i in eachindex(u))]
