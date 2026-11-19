@@ -6433,12 +6433,16 @@ function _lower_with_ops_collecting(p::Plan;
             # The enclosing plate can prove the rank of a group's observations
             # and gathers, just as a top-level exemplar can. Use it to select
             # the existing vector loop, including for a branch-free inner sum.
-            nested_ranks = cell_have_types !== nothing && _plate_reverse_enabled()
+            cell_window = cells !== nothing && r.id in cells.recipes
+            total_recipe = cell_window ? nothing : _authored_plate_total_recipe(p, r)
+            total_fold = total_recipe === nothing ? sum : _plate_total_consumer_fold(total_recipe)
+            nested_reverse = cell_have_types !== nothing && _plate_reverse_enabled()
+            nested_ranks = nested_reverse && total_recipe !== nothing && total_fold === sum
             if (type_hints === nothing || cell_have_types !== nothing) &&
                     (exemplar_types !== nothing || branch || nested_ranks)
                 inferred_plate_types === nothing &&
                     (inferred_plate_types = _plate_inferred_input_types(p;
-                        have_types = cell_have_types, infer_ranks = nested_ranks))
+                        have_types = cell_have_types, infer_ranks = nested_reverse))
                 if exemplar_types !== nothing
                     inferred_exemplar_types === nothing &&
                         (inferred_exemplar_types =
@@ -6452,7 +6456,7 @@ function _lower_with_ops_collecting(p::Plan;
                 "an authored plate recipe must have exactly one pointwise output"))
             pointwise = only(r.outputs)
             pointwise_id = canon_id(g, pointwise.id)
-            if cells !== nothing && r.id in cells.recipes
+            if cell_window
                 # Computed only at the rows its reading cells read
                 # (`_cell_window!`): reserve its table slots here, as for a
                 # strip member, and lower it at each of those rows.
@@ -6477,9 +6481,6 @@ function _lower_with_ops_collecting(p::Plan;
                 push!(assigned, pointwise_id)
                 continue
             end
-            total_recipe = _authored_plate_total_recipe(p, r)
-            total_fold = total_recipe === nothing ? sum :
-                _plate_total_consumer_fold(total_recipe)
             # Scan consumers and strip refills stream sums only; another fold
             # reads its materialized pointwise port there.
             if total_fold !== sum && (haskey(pending_scans, r.id) || r.id in strip_members)

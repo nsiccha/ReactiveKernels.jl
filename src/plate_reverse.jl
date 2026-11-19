@@ -2004,7 +2004,7 @@ function _pr_arm_initializers!(initializers, node)
 end
 
 """
-    _pr_program_reverse(ast, active_params, mod, values) -> (expr, scalar, batched, joint)
+    _pr_program_reverse(ast, active_params, mod, values) -> (expr, scalar, batched, joint, projections)
 
 The reverse of plate program `ast` (a `function (params...) body; result end`
 expression). `active_params` are the parameters that carry derivatives;
@@ -2012,7 +2012,8 @@ expression). `active_params` are the parameters that carry derivatives;
 reverse function's expression `(params..., ȳ, want, shadows...) -> (value,
 cotangents of the scalar active parameters...)`, the scalar active parameters
 in order, the batched (per-cell) active parameters, and whether a cell uses a
-joint value/partial cut. Shadows follow `want` in batched parameter order.
+joint value/partial cut, and the argument positions for group gather dispatch.
+Shadows follow `want` in batched parameter order.
 One pass over the cells computes the cotangents for seed ȳ, adding each
 batched operand's cotangent into its shadow.
 
@@ -2058,9 +2059,11 @@ function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict
     # each use that seed; counting totals alone would reject those programs.
     groups = _pr_additive_groups(body, totals, terminal_totals, assignments)
     prepared, broadcastables = _pr_prepared_operands(body, params)
-    cell_reads = _pr_direct_operands!(prepared, body, params, active_params,
-                                    broadcastables, mod, values)
     active = _pr_program_activity(body, active_params, mod, values)
+    # A group's gathered array can itself be active. Its direct reads must
+    # pass the same coordinate check as reads of a program argument.
+    cell_reads = _pr_direct_operands!(prepared, body, params, active,
+                                     broadcastables, mod, values)
     sources, group_shadows, projections = _pr_group_shadows!(cell_reads, groups, params, active,
                                                              prepared, mod, values)
     batched = Symbol[p for p in params if p in active_params &&
