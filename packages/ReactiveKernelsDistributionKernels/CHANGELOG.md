@@ -6,6 +6,8 @@
   `lognormalizer(observed)`. Their sum is the full log density. The
   normalizer depends only on the observed count and the kernel uses the
   log rising factorial for the shape-dependent term.
+- The prepared standard Normal log-CDF supports direct reverse
+  differentiation with registered Enzyme on Julia 1.10.
 
 ## 0.1.13
 

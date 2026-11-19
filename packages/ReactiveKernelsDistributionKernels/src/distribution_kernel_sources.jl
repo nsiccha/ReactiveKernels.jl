@@ -176,13 +176,24 @@ ReactiveKernels.@_record_source function _normal_logcdf(z)
 end
 
 # In the negative tail, logerfc(w) = log(erfcx(w)) - w². Its scaled
-# complement also gives φ(z)/Φ(z) when Φ rounds to zero.
+# complement also gives φ(z)/Φ(z) when Φ rounds to zero. Keep the lazy
+# scalar operations in the rule's table as singleton functions. Released
+# Enzyme on Julia 1.10 can differentiate the prepared log-CDF directly
+# when its callable carries only these operations.
+ReactiveKernels.@_record_source function _normal_scaled_tail(z, w)
+    return z < 0 ? SpecialFunctions.erfcx(w) : 0.0
+end
+ReactiveKernels.@_record_source function _normal_logcdf_from_tail(z, w, scaled)
+    return z < 0 ? log(scaled) - w^2 - log(2.0) : log1p(-0.5 * SpecialFunctions.erfc(-w))
+end
+ReactiveKernels.@_record_source function _normal_logcdf_slope(z, scaled, y)
+    return z < 0 ? sqrt(2 / π) / scaled : exp(-0.5 * z^2 - 0.5 * log(2π) - y)
+end
 @kernel _normal_logcdf_graph(z::Float64) = begin
     w = -z / sqrt(2.0)
-    scaled = z < 0 ? SpecialFunctions.erfcx(w) : 0.0
-    y::Float64 = z < 0 ? log(scaled) - w^2 - log(2.0) : log1p(-0.5 * SpecialFunctions.erfc(-w))
-    slope::Float64 = z < 0 ? sqrt(2 / π) / scaled :
-        exp(-0.5 * z^2 - 0.5 * log(2π) - y)
+    scaled = _normal_scaled_tail(z, w)
+    y::Float64 = _normal_logcdf_from_tail(z, w, scaled)
+    slope::Float64 = _normal_logcdf_slope(z, scaled, y)
     return y, slope
 end
 const _standard_normal_logcdf = scalar_derivative_rule(_normal_logcdf_graph;
