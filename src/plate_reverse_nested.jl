@@ -6,6 +6,14 @@ function _pr_additive_groups(body, totals, terminal, assignments)
     intermediate = setdiff(totals, terminal)
     isempty(intermediate) && return groups
     reads = _rw_reads!(Dict{Symbol,Int}(), body)
+    declared = Dict{Symbol,Any}()
+    _index_run_visit(body) do node
+        node.head === :local || return
+        for arg in node.args
+            Meta.isexpr(arg, :(::), 2) && arg.args[1] isa Symbol &&
+                (declared[arg.args[1]] = arg.args[2])
+        end
+    end
     covered = Set{Symbol}()
     _index_run_visit(body) do loop
         Meta.isexpr(loop, :for, 2) || return
@@ -25,7 +33,14 @@ function _pr_additive_groups(body, totals, terminal, assignments)
             s = xs[k]
             Meta.isexpr(s, :(=), 2) && s.args[1] === result && result isa Symbol &&
                 get(reads, result, 0) == 1 || return
-            result = s.args[2]
+            rhs = s.args[2]
+            if haskey(declared, result)
+                # Typed assignment can call convert. Only a raw value already
+                # asserted to that type is an identity on this path.
+                Meta.isexpr(rhs, :(::), 2) && rhs.args[2] === declared[result] || return
+                rhs = rhs.args[1]
+            end
+            result = rhs
             result isa Symbol || break
             k -= 1
         end

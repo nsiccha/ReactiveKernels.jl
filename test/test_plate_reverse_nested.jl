@@ -50,6 +50,30 @@ end
     return result
 end
 
+@kernel integer_totals(groups::Vector{Vector{Float64}}, scale::Float64) = begin
+    totals = plate(groups) do xs
+        cells = plate(xs) do x
+            scale * x
+        end
+        count::Int = sum(cells)
+        count
+    end
+    result = 1.0 * sum(totals)
+    return result
+end
+
+@kernel float_totals(groups::Vector{Vector{Float64}}, scale::Float64) = begin
+    totals = plate(groups) do xs
+        cells = plate(xs) do x
+            scale * x
+        end
+        subtotal::Float64 = sum(cells)
+        subtotal
+    end
+    result = sum(totals)
+    return result
+end
+
 function reference(groups, z, offsets, scale, weight)
     total = ds = 0.0
     dz, doff = zero(z), zero(offsets)
@@ -149,6 +173,24 @@ end
         @test v ≈ sum(weights .* sums)
         @test dw ≈ sums
         @test actual_ds ≈ ds
+    end
+end
+
+@testset "typed group totals preserve the assignment's conversion" begin
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    groups, scale = [[-1.0, 0.5], [2.0], Float64[]], 2.0
+    for (model, expected) in ((integer_totals, 0.0), (float_totals, 1.5)), flag in (false, true)
+        with_plate_reverse(flag) do
+            k = prepare(model)
+            if flag
+                reason = last(only(plate_reverse_report(k, 2)))
+                @test model === float_totals ? reason == "rule" : occursin("intermediate", reason)
+            end
+            ad = prepare_ad(k, backend, groups, scale; active = :scale)
+            v, ds = ad_value_and_gradient(ad, groups, scale)
+            @test v == 3.0
+            @test only(ds) == expected
+        end
     end
 end
 end

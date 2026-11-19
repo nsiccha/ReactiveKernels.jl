@@ -4028,6 +4028,16 @@ end
 Base.@nospecializeinfer _plate_cell_value_type(@nospecialize(T), atomic::Bool) =
     atomic || T <: Number ? T : T <: AbstractArray ? eltype(T) : Any
 
+# A sum of cells of one machine float type starts and stays in that type.
+# If its output local declares that same type, assignment needs no conversion.
+function _plate_identity_sum_type(op::_AuthoredPlateOp{K,A}, callvalues, declared) where {K,A}
+    declared in (Float16, Float32, Float64) || return nothing
+    _owns_array_regions(op.kernel.plan) && return nothing
+    types = Any[_plate_cell_value_type(valtype(v), i in A) for (i, v) in pairs(callvalues)]
+    all(_concrete_value_type, types) || return nothing
+    Base.promote_op(op.kernel, types...) === declared ? declared : nothing
+end
+
 # The types the cell ports of `inner` (a plate's cell plan) receive from the
 # plate's call values, keyed by their identities in the cell's scalar plan.
 # The ports themselves are declared untyped; a plate nested in the cell reads
@@ -6560,15 +6570,22 @@ function _lower_with_ops_collecting(p::Plan;
                         _readonly_value_types(p, exemplar_types))
                     batch = _plate_batch_plan(p, r, readonly_value_types)
                 end
+                sum_type = if nested_ranks && declare_types
+                    _plate_identity_sum_type(r.op, callvalues, valtype(only(total_recipe.outputs)))
+                end
+                raw_total = sum_type === nothing ? total_lhs : gensym(:group_sum)
                 _lower_authored_plate_native!(
                     plate_body, runtime_ops, runtime_recipes, r.op, callargs, callvalues,
-                    pointwise_lhs, total_lhs; recycled = recycled(pointwise_id),
+                    pointwise_lhs, raw_total; recycled = recycled(pointwise_id),
                     total_fold, program = own_program,
                     readonly_slices, batch,
                     element_type = plate_element_types ?
                         first(_declared_array_layout(valtype(pointwise))) : nothing,
                     input_type_hints = type_hints === nothing ? nothing :
                         Any[type_hints[canon_id(g, v.id)] for v in r.inputs])
+                # Keep the declaration for Julia's inference. The assertion
+                # also exposes the raw sum's proved type to its reverse.
+                sum_type === nothing || push!(plate_body.args, :($total_lhs = $raw_total::$sum_type))
                 # The program is the plate's cell work where the lowering marked
                 # it (`_lower_authored_plate_cells_native!`), so the setup runs in
                 # the body and an empty domain calls no program; otherwise the
