@@ -9,11 +9,16 @@
 # digamma(a + m); a count is data, so ordinary AD selects only the `a` cut.
 const _LOGRISING_PRODUCT_MAX = 64
 const _LOGRISING_SHAPE_MAX = 1073741824.0
+const _LOGRISING_FLOAT32_MAX = floatmax(Float32)
 
 @_record_source @inline function _logrising_product(a, m, partial::Bool)
-    # At most 16 factors below 256, or four below 2^30 + 64, keep both
-    # the product and its derivative representable in Float32 and Float64.
-    chunk = a + m <= 256 ? 16 : 4
+    # Float64 can hold 32 factors below 2^30 + 64. For Float32, use at
+    # most 16 factors below 256, or four across the full shape range.
+    chunk = if floatmax(float(a)) > _LOGRISING_FLOAT32_MAX
+        32
+    else
+        a + m <= 256 ? 16 : 4
+    end
     L = zero(a)
     D = zero(a)
     j = 0
