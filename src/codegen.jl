@@ -6069,13 +6069,13 @@ end
 # declared untyped, but the enclosing plate's operand types say what each cell
 # receives (`_nested_cell_have_types`).
 function _plate_inferred_input_types(p::Plan; exemplar_types = nothing,
-                                     have_types = nothing)
+                                     have_types = nothing, infer_ranks = exemplar_types !== nothing)
     g = p.graph
     target = Set(canon_id(g, v.id) for r in p.recipes
         if r.op isa _AuthoredPlateOp &&
-           (exemplar_types !== nothing ||
+           (infer_ranks ||
             any(q -> _plate_branch_operation(q.op), r.op.kernel.plan.recipes))
-        for v in r.inputs if exemplar_types !== nothing || valtype(v) === Any)
+        for v in r.inputs if infer_ranks || valtype(v) === Any)
     producer = Dict(canon_id(g, v.id) => r for r in p.recipes for v in r.outputs)
     needed = Set{Int}()
     while !isempty(target)
@@ -6430,11 +6430,15 @@ function _lower_with_ops_collecting(p::Plan;
             # number the cell received is decided once per nested call.
             branch = any(q -> _plate_branch_operation(q.op),
                          r.op.kernel.plan.recipes)
+            # The enclosing plate can prove the rank of a group's observations
+            # and gathers, just as a top-level exemplar can. Use it to select
+            # the existing vector loop, including for a branch-free inner sum.
+            nested_ranks = cell_have_types !== nothing && _plate_reverse_enabled()
             if (type_hints === nothing || cell_have_types !== nothing) &&
-                    (exemplar_types !== nothing || branch)
+                    (exemplar_types !== nothing || branch || nested_ranks)
                 inferred_plate_types === nothing &&
                     (inferred_plate_types = _plate_inferred_input_types(p;
-                        have_types = cell_have_types))
+                        have_types = cell_have_types, infer_ranks = nested_ranks))
                 if exemplar_types !== nothing
                     inferred_exemplar_types === nothing &&
                         (inferred_exemplar_types =
@@ -6442,7 +6446,7 @@ function _lower_with_ops_collecting(p::Plan;
                 end
                 scalars = something(inferred_exemplar_types, inferred_plate_types)
                 callvalues = _plate_inferred_values(g, r.inputs, scalars;
-                    rank_types = inferred_exemplar_types)
+                    rank_types = nested_ranks ? scalars : inferred_exemplar_types)
             end
             length(r.outputs) == 1 || throw(ArgumentError(
                 "an authored plate recipe must have exactly one pointwise output"))

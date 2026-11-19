@@ -420,7 +420,9 @@ end
 
 # An inlined source, `let <param> = <arg>, … ; <call> end`, as the call over the
 # arguments, when every argument is available here and the body is one call.
-function _rw_peel_let(ex::Expr, ctx::_RwContext, env)
+_rw_peel_let(ex::Expr, ctx::_RwContext, env) =
+    _rw_peel_let(ex, x -> _rw_available(x, ctx, env))
+function _rw_peel_let(ex::Expr, available)
     length(ex.args) == 2 || return nothing
     bindings, body = ex.args
     pairs = bindings isa Expr && bindings.head === :block ? bindings.args : Any[bindings]
@@ -429,8 +431,8 @@ function _rw_peel_let(ex::Expr, ctx::_RwContext, env)
         b isa LineNumberNode && continue
         b isa Expr && b.head === :(=) && length(b.args) == 2 && b.args[1] isa Symbol ||
             return nothing
-        _rw_available(b.args[2], ctx, env) || return nothing
-        subst[b.args[1]] = b.args[2]
+        available(b.args[2]) || return nothing
+        subst[b.args[1]] = _rw_substitute(b.args[2], subst)
     end
     statements = body isa Expr && body.head === :block ?
         Any[s for s in body.args if !(s isa LineNumberNode)] : Any[body]

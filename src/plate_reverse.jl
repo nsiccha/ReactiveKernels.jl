@@ -936,6 +936,12 @@ _pr_has_loop(ex) = ex isa Expr && ex.head !== :quote &&
 
 # ----------------------------------------------------------- the transform
 
+struct _PRAdditiveGroup
+    prefix::Vector{Any}
+    finish::Vector{Any}
+    index::Symbol
+    locals::Vector{Symbol}
+end
 
 mutable struct _PRProgramState
     mod::Module
@@ -951,6 +957,8 @@ mutable struct _PRProgramState
     reads::Dict{Symbol,Int}           # batched parameter => its reads in the program
     arm_initializers::Dict{Symbol,Vector{Pair{Symbol,Any}}}
     joint_cell_cut::Bool
+    groups::IdDict{Expr,_PRAdditiveGroup}
+    group_shadows::IdDict{Expr,Expr}
 end
 
 # How many reads of each batched parameter one call of the program can make,
@@ -1873,34 +1881,52 @@ end
 # Transform one block: its forward statements (cell loops fused, branch arms
 # transformed in place), then the reverse of its straight-line active
 # statements whose adjoints received a contribution.
-function _pr_program_block(stmts, st::_PRProgramState)
+function _pr_program_block(stmts, st::_PRProgramState; group_index = nothing)
     fwd = Any[]
     record = _PRStatement[]
     for s in stmts
         s isa LineNumberNode && continue
         loop = _pr_cell_loop(s)
-        if loop !== nothing
-            push!(fwd, _pr_fused_loop(loop..., st))
+        if haskey(st.groups, s)
+            group = st.groups[s]
+            inner = _pr_program_block(group.prefix, st; group_index = group.index)
+            # Group-local scalar adjoints sum over this group's cells only.
+            reset = Any[:($(_pr_bar(a)) = 0.0) for a in group.locals
+                        if a in st.outer && a in st.touched && !(a in st.totals)]
+            emit = Expr(:if, :(!($_PR_WANT_VALUE isa Val{false})), Expr(:block, group.finish...))
+            push!(fwd, Expr(:for, s.args[1], Expr(:block, reset..., inner..., emit)))
+        elseif loop !== nothing
+            fused = _pr_fused_loop(loop..., st)
+            # A group may have no cells. Even a newly hoisted scalar partial
+            # must only run when the original cell has an iteration.
+            push!(fwd, group_index === nothing ? fused :
+                :(if !isempty($(loop[1])); $fused; end))
         elseif Meta.isexpr(s, :if)
             arms = Any[s.args[1]]
             for arm in s.args[2:end]
                 push!(arms, Expr(:block, _pr_program_block(
-                    Meta.isexpr(arm, :block) ? arm.args : Any[arm], st)...))
+                    Meta.isexpr(arm, :block) ? arm.args : Any[arm], st; group_index)...))
             end
             push!(fwd, Expr(:if, arms...))
         elseif Meta.isexpr(s, :block)
-            append!(fwd, _pr_program_block(s.args, st))
+            append!(fwd, _pr_program_block(s.args, st; group_index))
         else
             _pr_has_loop(s) && !isdisjoint(_pr_reads!(Set{Symbol}(), s, st.mod, st.values), st.active) &&
                 _pr_fail("a loop over active values that is not a summed cell loop")
             push!(fwd, s)
+            haskey(st.group_shadows, s) && push!(fwd, st.group_shadows[s])
             for (lhs, rhs) in _pr_assignments!(Pair{Symbol,Any}[], s)
                 if rhs === false && haskey(st.arm_initializers, lhs)
                     push!(record, _PRStatement(lhs, rhs))
                     continue
                 end
                 lhs in st.active || continue
-                lhs in st.totals && continue
+                if lhs in st.totals
+                    group_index !== nothing && Meta.isexpr(rhs, :call) &&
+                        _pr_is_ref(rhs.args[1], @__MODULE__, :_plate_total_add) &&
+                        _pr_fail("nested total addition outside a supported cell loop")
+                    continue
+                end
                 if lhs === st.output
                     # `output = _plate_total_value(total)`: the total's adjoint
                     # is the seed, set before the body.
@@ -1912,15 +1938,15 @@ function _pr_program_block(stmts, st::_PRProgramState)
             end
         end
     end
-    append!(fwd, _pr_outer_reverse(record, st))
+    append!(fwd, _pr_outer_reverse(record, st, group_index))
 end
 
-function _pr_outer_reverse(record, st)
+function _pr_outer_reverse(record, st, group_index = nothing)
     rev = Any[]
     for s in Iterators.reverse(record)
         if s.rhs === false && haskey(st.arm_initializers, s.lhs)
             arm = [_PRStatement(lhs, rhs) for (lhs, rhs) in st.arm_initializers[s.lhs]]
-            sweep = _pr_outer_reverse(arm, st)
+            sweep = _pr_outer_reverse(arm, st, group_index)
             isempty(sweep) || push!(rev, Expr(:if, s.lhs, Expr(:block, sweep...)))
             continue
         end
@@ -1935,12 +1961,23 @@ function _pr_outer_reverse(record, st)
             cuts = Dict{Symbol,Tuple{Symbol,Expr}}()
             subrev = Any[]
             _pr_accumulate!(subrev, defined, r, _pr_bar(s.lhs); touched = st.touched)
-            _pr_reverse_exprs!(subrev, sub, active, defined; touched = st.touched, cuts)
+            leaf = call -> begin
+                group_index === nothing && return nothing
+                _pr_is_read(call, st) || return nothing
+                prepared, index = call.args
+                index === group_index || _pr_fail("group operand read at another index")
+                shadow = st.shadow[st.prepared[prepared]]
+                cot = :($(GlobalRef(@__MODULE__, :_pr_read_cotangent))($shadow, $(call.lhs), $(_pr_bar(call.lhs))))
+                :($(GlobalRef(@__MODULE__, :_pr_shadow_add!))($shadow, $index, $cot))
+            end
+            _pr_reverse_exprs!(subrev, sub, active, defined; leaf, touched = st.touched, cuts)
             append!(rev, _pr_forward_exprs(sub, cuts), subrev)
         end
     end
     rev
 end
+
+include("plate_reverse_nested.jl")
 
 # _native_plate_inline_arm declares its shared values outside the cells and
 # initializes them on the first visit to their arm. All visits contribute to
@@ -2019,13 +2056,15 @@ function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict
     # by later arithmetic. Seeding that partial with the output's seed would
     # be wrong. Distinct terminal totals in mutually exclusive branches may
     # each use that seed; counting totals alone would reject those programs.
-    issubset(totals, terminal_totals) ||
-        _pr_fail("an intermediate plate total needs a propagated adjoint")
+    groups = _pr_additive_groups(body, totals, terminal_totals, assignments)
     prepared, broadcastables = _pr_prepared_operands(body, params)
     cell_reads = _pr_direct_operands!(prepared, body, params, active_params,
                                     broadcastables, mod, values)
     active = _pr_program_activity(body, active_params, mod, values)
-    batched = Symbol[p for p in params if p in active_params && p in Base.values(prepared)]
+    sources, group_shadows, projections = _pr_group_shadows!(cell_reads, groups, params, active,
+                                                             prepared, mod, values)
+    batched = Symbol[p for p in params if p in active_params &&
+                     (p in Base.values(prepared) || p in sources)]
     scalar = Symbol[p for p in params if p in active_params && !(p in batched)]
     # A marker returns an operand alias, not detached metadata. Permit it
     # only when its result is read exclusively by derivative-inert queries.
@@ -2052,6 +2091,15 @@ function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict
     end
     seed = gensym(:ybar)
     shadow = Dict{Symbol,Symbol}(p => Symbol(p, :_shadow) for p in batched)
+    for assignment in keys(group_shadows)
+        p = assignment.args[1]
+        shadow[p] = Symbol(p, :_shadow)
+    end
+    if !isempty(groups)
+        for p in Base.values(prepared)
+            p in active && !haskey(shadow, p) && _pr_fail("no shadow for nested operand `$p`")
+        end
+    end
     # Values bound inside a cell are per cell: their adjoints restart in every
     # cell. Only values bound outside every cell loop accumulate across cells.
     cell_locals = Set{Symbol}()
@@ -2071,8 +2119,12 @@ function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict
         delete!(cell_locals, lhs)
     end
     outer = Set{Symbol}(a for a in active if !(a in cell_locals))
+    counts = _pr_read_counts(body, prepared, mod, values)
+    # Several groups may contribute to the same entry. Scaling a whole shadow
+    # after each group's loop would also rescale earlier groups' contributions.
+    isempty(groups) || empty!(counts)
     st = _PRProgramState(mod, values, active, prepared, shadow, totals, output,
-                         Set{Symbol}(), 0, outer, _pr_read_counts(body, prepared, mod, values), initializers, false)
+                         Set{Symbol}(), 0, outer, counts, initializers, false, groups, group_shadows)
     new_body = _pr_program_block(stmts, st)
     # Every outer adjoint starts at zero; every total's adjoint is the seed.
     init = Any[:($(_pr_bar(a)) = 0.0) for a in sort!(collect(outer)) if !(a in totals)]
@@ -2082,7 +2134,7 @@ function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict
         Expr(:tuple, params..., seed, _PR_WANT_VALUE, (shadow[p] for p in batched)...),
         Expr(:block, checks..., init..., seeds..., new_body...,
              Expr(:tuple, output, (_pr_bar(p) for p in scalar)...)))
-    _pr_index_run_schedule(fexpr, index_runs, prepared, shadow, params, batched), scalar, batched, st.joint_cell_cut
+    _pr_index_run_schedule(fexpr, index_runs, prepared, shadow, params, batched), scalar, batched, st.joint_cell_cut, projections
 end
 
 include("plate_reverse_runs.jl")
@@ -2117,10 +2169,11 @@ are the positions of the batched operands. The Enzyme extension runs it either
 in the augmented primal with a unit seed (scaling afterwards) or in the reverse
 pass with the seed; see `_pr_one_pass` there.
 """
-struct _PlateSumRule{S,B,P,R,Joint} <: Function
+struct _PlateSumRule{S,B,P,R,Joint,Projections} <: Function
     program::P
     reverse::R
 end
+_PlateSumRule{S,B,P,R,J}(p::P, r::R) where {S,B,P,R,J} = _PlateSumRule{S,B,P,R,J,()}(p, r)
 _PlateSumRule{S,B,P,R}(p::P, r::R) where {S,B,P,R} = _PlateSumRule{S,B,P,R,false}(p, r)
 
 # Pass the dense leaf itself across the AD rule boundary. Enzyme can then
@@ -2239,10 +2292,14 @@ end
 # The call itself, made in each branch: a target chosen by size and then called
 # would be a union of the two wrappers, boxed in the primal. A trailing tape
 # slot is not an operand of the program: only the one-pass call takes it on.
-function _pr_rule_expr(S, B, types, joint, dispatch)
+function _pr_rule_expr(S, B, types, joint, dispatch, projections)
     slotted = !isempty(types) && types[end] === _PlateTapeSlot
     count = length(types) - slotted
     operands = Any[:(getfield(args, $i)) for i in 1:count]
+    if !_pr_group_projections_cover(projections, types)
+        primal = :(getfield(rule, :program))
+        return dispatch === :_pr_rule_target ? primal : Expr(:call, primal, operands...)
+    end
     inputs = Tuple(b for b in B if types[b] <: _PRExpCells)
     if !isempty(inputs)
         shadows = Tuple(count + 2 + findfirst(==(i), B) for i in inputs)
@@ -2260,10 +2317,10 @@ function _pr_rule_expr(S, B, types, joint, dispatch)
         (target -> Expr(:call, target, operands..., :(getfield(args, $(count + 1))))) : call
     _pr_target_expr(S, B, types, joint, call, one_pass)
 end
-@generated _pr_rule_target(rule::_PlateSumRule{S,B,P,R,J}, args::Tuple) where {S,B,P,R,J} =
-    _pr_rule_expr(S, B, args.parameters, J, :_pr_rule_target)
-@generated _pr_rule_call(rule::_PlateSumRule{S,B,P,R,J}, args::Tuple) where {S,B,P,R,J} =
-    _pr_rule_expr(S, B, args.parameters, J, :_pr_rule_call)
+@generated _pr_rule_target(rule::_PlateSumRule{S,B,P,R,J,G}, args::Tuple) where {S,B,P,R,J,G} =
+    _pr_rule_expr(S, B, args.parameters, J, :_pr_rule_target, G)
+@generated _pr_rule_call(rule::_PlateSumRule{S,B,P,R,J,G}, args::Tuple) where {S,B,P,R,J,G} =
+    _pr_rule_expr(S, B, args.parameters, J, :_pr_rule_call, G)
 # One method per operand count, each operand's type a parameter of its own:
 # Julia does not otherwise specialize on a `Function` operand it only passes on
 # (the program's callables), and the call would dispatch dynamically
@@ -2418,7 +2475,7 @@ function _pr_rule_for(call::Expr, outer_active::Set{Symbol}, kernel,
     end
     isempty(active_params) && return nothing, "no active operand"
     try
-        rexpr, scalar, batched, joint = _pr_program_reverse(program.ast, active_params, @__MODULE__, values)
+        rexpr, scalar, batched, joint, projections = _pr_program_reverse(program.ast, active_params, @__MODULE__, values)
         # A batched operand's cotangent is added into its shadow cell by cell,
         # which a lazy cell array's shadow cannot take: the program keeps the
         # backend's reverse (snag generated-plate-56eaf6e3).
@@ -2435,7 +2492,7 @@ function _pr_rule_for(call::Expr, outer_active::Set{Symbol}, kernel,
         # dispatch dynamically and box every operand.
         primal = _PlateCall(compile(program.ast))
         rev = _PlateCall(compile(rexpr))
-        return _PlateSumRule{S,B,typeof(primal),typeof(rev),joint}(primal, rev), rexpr
+        return _PlateSumRule{S,B,typeof(primal),typeof(rev),joint,projections}(primal, rev), rexpr
     catch err
         err isa _PRIneligible || rethrow()
         return nothing, err.reason
