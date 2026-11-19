@@ -175,8 +175,21 @@ ReactiveKernels.@_record_source function _normal_logcdf(z)
     return result
 end
 
+# In the negative tail, logerfc(w) = log(erfcx(w)) - w². Its scaled
+# complement also gives φ(z)/Φ(z) when Φ rounds to zero.
+@kernel _normal_logcdf_graph(z::Float64) = begin
+    w = -z / sqrt(2.0)
+    scaled = z < 0 ? SpecialFunctions.erfcx(w) : 0.0
+    y::Float64 = z < 0 ? log(scaled) - w^2 - log(2.0) : log1p(-0.5 * SpecialFunctions.erfc(-w))
+    slope::Float64 = z < 0 ? sqrt(2 / π) / scaled :
+        exp(-0.5 * z^2 - 0.5 * log(2π) - y)
+    return y, slope
+end
+const _standard_normal_logcdf = scalar_derivative_rule(_normal_logcdf_graph;
+    primal = :y, partials = (z = :slope,), name = :standard_normal_logcdf)
+
 const LOCATION_SCALE_SOURCE = raw"""
-using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma, logbeta, rk_beta_inc, rk_student_tail, _normal_logcdf, _student_log_tail, _student_log_kernel
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma, logbeta, rk_beta_inc, rk_student_tail, _standard_normal_logcdf, _student_log_tail, _student_log_kernel
 using SpecialFunctions: erfc, erfcinv, beta_inc_inv
 using LogExpFunctions: log1pexp
 
@@ -184,8 +197,8 @@ using LogExpFunctions: log1pexp
     logpdf(z::Float64)::Float64 = -0.5 * log(2π) - 0.5 * z^2
     cdf(z::Float64)::Float64 = 0.5 * erfc(-z / sqrt(2))
     ccdf(z::Float64)::Float64 = 0.5 * erfc(z / sqrt(2))
-    logcdf(z::Float64)::Float64 = _normal_logcdf(z)
-    logccdf(z::Float64)::Float64 = _normal_logcdf(-z)
+    logcdf(z::Float64)::Float64 = _standard_normal_logcdf(z)
+    logccdf(z::Float64)::Float64 = _standard_normal_logcdf(-z)
     quantile(p::Float64)::Float64 = -sqrt(2) * erfcinv(2p)
 end
 
@@ -738,14 +751,70 @@ using LogExpFunctions: logaddexp, logsumexp
 end
 """
 
+# The upper and lower Poisson tails are opposite projections of one
+# incomplete gamma evaluation. Their rate partials are the boundary mass
+# with opposite signs. The real-valued cutoff enters through floor.
+ReactiveKernels.@_record_source function _poisson_tail_probability(observed, rate, upper)
+    tails = SpecialFunctions.gamma_inc(floor(observed) + 1.0, rate)
+    return Float64(upper ? first(tails) : last(tails))
+end
+
+# For large counts the three terms in k log(rate) - rate - log(k!) lose
+# precision near the mean. Write them as the Poisson deviance plus the
+# Stirling correction. The series for log(1+d) - d uses v = d/(2+d);
+# the near-mean branch has |v| < 1/7.
+ReactiveKernels.@_record_source function _poisson_boundary_mass(k, rate)
+    mass = 0.0
+    if k == 0
+        mass = exp(-rate)
+    elseif rate != Inf && isfinite(k)
+        if k < 16
+            mass = exp(k * log(rate) - rate - SpecialFunctions.loggamma(k + 1.0))
+        else
+            d = (rate - k) / k
+            dev = 0.0
+            if abs(d) < 0.25
+                v = d / (2.0 + d)
+                v2 = v * v
+                dev = -d * v
+                term = 2.0 * v * v2
+                n = 3
+                while abs(term) > eps(Float64) * abs(dev)
+                    dev += term / n
+                    term *= v2
+                    n += 2
+                end
+            else
+                dev = log(rate / k) - d
+            end
+            h = inv(k)
+            q = h * h
+            correction = h * (1/12 + q * (-1/360 + q * (1/1260 + q * (-1/1680 + q/1188))))
+            mass = exp(k * dev - correction) / (sqrt(2π) * sqrt(k))
+        end
+    end
+    return mass
+end
+
+@kernel _poisson_tail_graph(rate::Float64, observed::Real, upper::Bool) = begin
+    probability::Float64 = _poisson_tail_probability(observed, rate, upper)
+    mass::Float64 = _poisson_boundary_mass(Float64(floor(observed)), rate)
+    slope::Float64 = upper ? mass : -mass
+    d_observed::Float64 = 0.0
+    d_upper::Float64 = 0.0
+    return probability, slope, d_observed, d_upper
+end
+const _poisson_tail = scalar_derivative_rule(_poisson_tail_graph;
+    primal = :probability, partials = (rate = :slope, observed = :d_observed, upper = :d_upper),
+    name = :poisson_tail)
+
 # Discrete count family. `log_rate` is the canonical GLM/log-link HAVE route;
 # `rate` is the equivalent linear representation. Poisson has no closed-form
 # quantile (discrete inversion needs an iterative search, which is not a pure
 # straight-line endpoint), so only `logpdf` and `cdf` are exposed. `cdf` is the
 # regularized upper incomplete gamma Q(k+1, λ).
 const POISSON_KERNEL_SOURCE = raw"""
-using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma, _integer_observation
-using SpecialFunctions: gamma_inc
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma, _integer_observation, _poisson_tail
 
 @kernel poisson(rate::Float64) = begin
     log_rate::Float64 = log(rate)
@@ -785,11 +854,11 @@ using SpecialFunctions: gamma_inc
     # an integer. Handle infinite bounds before forming the gamma argument.
     cdf(observed::Real)::Float64 =
         observed >= 0 ? (observed == Inf ? 1.0 :
-            last(gamma_inc(floor(observed) + 1.0, rate))) :
+            _poisson_tail(rate, observed, false)) :
             (isnan(observed) ? NaN : 0.0)
     ccdf(observed::Real)::Float64 =
         observed >= 0 ? (observed == Inf ? 0.0 :
-            first(gamma_inc(floor(observed) + 1.0, rate))) :
+            _poisson_tail(rate, observed, true)) :
             (isnan(observed) ? NaN : 1.0)
 
 end

@@ -19,6 +19,31 @@ using Test
 # `loggamma` in `Main`, and the point of this file is the package's own one.
 const _DKS = ReactiveKernelsDistributionKernels.DistributionKernelSources
 
+@testset "Normal and Poisson tail cuts" begin
+    for z in (-40.0, -3.0, -nextfloat(0.0), 0.0, nextfloat(0.0), 2.0, 12.0)
+        value, slope = derivative_cut(_DKS._standard_normal_logcdf, (true,), z)
+        x = big(z)
+        probability = SpecialFunctions.erfc(-x / sqrt(big(2))) / 2
+        @test value == _DKS._normal_logcdf(z)
+        @test slope ≈ Float64(exp(-x^2 / 2) / (sqrt(2 * big(π)) * probability)) rtol = 2e-14
+    end
+    @test derivative_cut(_DKS._standard_normal_logcdf, (true,), -Inf) == (-Inf, Inf)
+    @test derivative_cut(_DKS._standard_normal_logcdf, (true,), Inf) == (0.0, 0.0)
+    for (rate, observed) in ((0.0, 0), (0.0, 4), (0.7, 3.9), (20.0, 2),
+                             (3.0, big"1.25"), (1e6, 1_000_000),
+                             (1e6 + 1000, 1_000_000)), upper in (false, true)
+        value, slope, dcutoff = derivative_cut(_DKS._poisson_tail,
+            (true, true, false), rate, observed, upper)
+        tails = SpecialFunctions.gamma_inc(floor(observed) + 1.0, rate)
+        k = big(floor(observed))
+        mass = k == 0 ? exp(-big(rate)) :
+            exp(k * log(big(rate)) - rate - SpecialFunctions.loggamma(k + 1))
+        @test value == Float64(upper ? first(tails) : last(tails))
+        @test slope ≈ Float64(upper ? mass : -mass) rtol = 2e-13
+        @test iszero(dcutoff)
+    end
+end
+
 @testset "loggamma / logbeta are rules generated from their graphs" begin
     @test Base.get_extension(ReactiveKernels, :ReactiveKernelsEnzymeExt) !== nothing
     @test Base.get_extension(

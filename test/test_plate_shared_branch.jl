@@ -236,6 +236,37 @@ function _program(k)
             r"var\"[^\"]*\"" => m -> get!(names, m, "v$(length(names) + 1)"))
 end
 
+@testset "cached preparation honors the plate reverse mode in either order" begin
+    y = [0.5, -1.0, 2.0]
+    mu = [0.1, 0.2, -0.3]
+    for binding in ((;), (; y))
+        args = isempty(binding) ? (y, mu, 1.3) : (mu, 1.3)
+        prepared(cache, enabled) = with_plate_reverse(enabled) do
+            prepare!(cache, _guarded_normal; have = (:y, :mu, :sigma),
+                     want = :total, bound = binding)
+        end
+        factored(k) = occursin("_plate_factor_usable", _program(k))
+        expected = Dict(on => factored(prepared(PreparationCache(), on)) for on in (false, true))
+        if isempty(binding)
+            # Positional calls keep a graph-owned cache for their default boundary.
+            for on in (true, false, true)
+                with_plate_reverse(on) do
+                    @test _guarded_normal(args...) ≈ _reference_normal(y, mu, 1.3)
+                    @test factored(ReactiveKernels._kernel_direct_callable(_guarded_normal)) == expected[on]
+                end
+            end
+        end
+        for order in ((false, true), (true, false))
+            cache = PreparationCache()
+            for on in order
+                k = prepared(cache, on)
+                @test factored(k) == expected[on]
+                @test k(args...) ≈ _reference_normal(y, mu, 1.3)
+            end
+        end
+    end
+end
+
 @testset "exemplar scalar evidence keeps embedded operation tables aligned" begin
     x = [1.0, 2.0, 3.0]
     k = prepare(_guarded_untyped; exemplars = (x, 2.0))
@@ -312,12 +343,16 @@ end
     @test pointwise(Float64[], Float64[], -1.0) == Float64[]
     @test pointwise(y, mu, 1.3) isa Vector{Float64}
 
-    # The taken arm's scale logarithm runs once, above the cell loop.
-    program = _program(k)
-    logcall = "(__callables__[$(findfirst(op -> op === log, k.callables))])("
-    @test occursin(logcall, program)
-    @test findfirst(logcall, program).start < findfirst("for ", program).start
-    @test count("condition", program) == 1
+    # Count the scale logarithm through the actual operation table. The
+    # extracted plate program receives that operation as a positional input.
+    counted = map(op -> op === log ? _counted_log : op, k.callables)
+    for (obs, loc, sigma, calls) in ((y, mu, 1.3, 1), (y, mu, -1.0, 0),
+                                     (Float64[], Float64[], 1.3, 0))
+        _ARM_CALLS[] = 0
+        @test k.f(k.constants, counted, obs, loc, sigma) == k(obs, loc, sigma)
+        @test _ARM_CALLS[] == calls
+    end
+    @test count("condition", _program(k)) == 1
     # The graph keeps the authored lazy branch; only the native loop changes.
     @test [(e.kind, e.depth) for e in recipe_inventory(k)
            if e.kind !== :ordinary] == [(:plate, 0)]
@@ -405,6 +440,18 @@ end
     value, gradient = ad_value_and_gradient(pb, x, 2.0)
     @test value ≈ 5.0 + 5.5log(2.0)
     @test gradient ≈ 5.5 / 2.0
+
+    with_plate_reverse() do
+        k = prepare(_endpoint_law_math_plate)
+        report = plate_reverse_report(k, 2)
+        @test !isempty(report) && all(r -> last(r) == "rule", report)
+        pb = prepare_ad(k, backend, x, 2.0; active = :scale)
+        for (cells, scale) in ((x, 2.0), (Float64[], -1.0), ([-1.0, -3.0], -1.0))
+            value, gradient = ad_value_and_gradient(pb, cells, scale)
+            @test value ≈ sum(xi -> xi > 0 ? xi * log(scale) : -xi, cells; init = 0.0)
+            @test gradient ≈ sum(xi -> xi > 0 ? xi / scale : 0.0, cells; init = 0.0)
+        end
+    end
 end
 
 @testset "bound data and native Reverse through a shared plate branch" begin

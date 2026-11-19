@@ -115,6 +115,9 @@ end
         parentindices(shadow)[1] === parentindices(value)[1]
 end
 @inline function _pr_run_disjoint(values::Tuple, shadows::Tuple)
+    # A mapped shadow accumulates in its broadcast input's storage.
+    # Ordinary cell order preserves those writes when another operand aliases it.
+    any(s -> s isa _PRMappedShadow, shadows) && return false
     all(s -> all(v -> !_pr_run_overlap(s, v), values), shadows) || return false
     # Tuple arity is the program's structural operand count, never data size.
     all(i -> all(j -> i == j || !_pr_run_shadow_overlap(shadows[i], shadows[j]),

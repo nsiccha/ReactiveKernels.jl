@@ -2847,7 +2847,7 @@ function _prepare_nonallocating_rebinding(@nospecialize(k::PreparedKernel), p::P
         all(pass -> Base.issingletontype(typeof(pass)), passes) ||
         return _prepare_nonallocating(p, cache_apply; have_types, exact_signature, passes)
     key = (:nonallocating, have_types, exact_signature, Tuple(_pass_key(q) for q in passes),
-           cache_apply, _simplify(), _bound_statistics(), _branch_arms(), _plan_mode(),
+           cache_apply, _simplify(), _bound_statistics(), _branch_arms(), _plan_mode(), _plate_reverse_enabled(),
            _type_stability(), _type_stability_level())
     constants = _bound_constants(p)
     template = @lock vectorizations.lock get(vectorizations.products, key, _UnbuiltTemplate())

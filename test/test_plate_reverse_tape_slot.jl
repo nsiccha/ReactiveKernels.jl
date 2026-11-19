@@ -119,10 +119,14 @@ end
     q = [.1, -.4, .3]
     prepared, idx, x = prepare_case(n, run, true)
     slot = only(tape_slots(prepared))
-    @test isempty(slot.tape)
+    # A derivative audit may have evaluated the exemplar during preparation.
+    # The first caller reuses any tape that evaluation returned.
+    initial_tape = slot.tape
+    @test isempty(initial_tape) || length(initial_tape) == length(q) + 2
     destination = (fill(71., 3), Ref(81.))
     check!(prepared, destination, q, 1.2, idx, x)
     tape = slot.tape
+    isempty(initial_tape) || @test tape === initial_tape
     # The gathered parent's buffer plus the generated rule's two scalar
     # operands: the initial plate total and the scale.
     @test length(tape) == length(q) + 2

@@ -3255,7 +3255,7 @@ end
 # and arm callables are the same branch parts used by plate partitioning;
 # emitting them here retains the authored lazy choice.
 function _native_plate_branch_expr(
-        branch::_KernelBranch{CI,TI,EI}, reference, args) where {CI,TI,EI}
+        branch::Union{_KernelBranch{CI,TI,EI},_KernelBranchCall{CI,TI,EI}}, reference, args) where {CI,TI,EI}
     condition = Expr(:call, :(getfield($reference, :condition)),
                      (args[i] for i in CI)...)
     arm_expr(arm, field, indices) = begin
@@ -4738,8 +4738,10 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
             first_coordinate, shares, output_axes; deferred)
     end
     if cells
-        append!(body.args, declarations)
-        execution = Expr(:block, invariants.args...)
+        # A lane arm's ready flag and cached values live for exactly this
+        # execution of the loop. Initialize them inside the extracted plate
+        # so its caller receives only values consumed after the loop.
+        execution = Expr(:block, declarations..., invariants.args...)
         # The batched tiles of a plate of products (plate_batching.jl), for
         # the plain cell loop only: a strip refill, lane slots, cell tables,
         # scheduled groups, branch arms, scan slices, shared calls, nested

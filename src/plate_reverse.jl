@@ -58,24 +58,27 @@ mutable struct _PRCtx
     mod::Module
     counter::Int
     values::Dict{Symbol,Any}   # program-local names whose values are known (callables)
+    prefix::Symbol
 end
+_PRCtx(mod::Module, counter::Int, values::Dict{Symbol,Any}) = _PRCtx(mod, counter, values, :_pr_)
 _PRCtx(mod::Module, counter::Int) = _PRCtx(mod, counter, Dict{Symbol,Any}())
-_pr_tmp!(ctx::_PRCtx, base = :t) = (ctx.counter += 1; Symbol("_pr_", base, ctx.counter))
+_pr_tmp!(ctx::_PRCtx, base = :t) = (ctx.counter += 1; Symbol(ctx.prefix, base, ctx.counter))
 
 # Resolve a call head to its function object and the reference the emitted
 # code calls. A head that does not resolve to a constant global is opaque.
 function _pr_resolve(head, mod::Module)
     if head isa Symbol
-        isdefined(mod, head) || _pr_fail("unresolved call `$head`")
+        isdefined(mod, head) && isconst(mod, head) || _pr_fail("unresolved call `$head`")
         return getglobal(mod, head), GlobalRef(mod, head)
     elseif head isa GlobalRef
-        isdefined(head.mod, head.name) || _pr_fail("unresolved call `$head`")
+        isdefined(head.mod, head.name) && isconst(head.mod, head.name) ||
+            _pr_fail("unresolved call `$head`")
         return getglobal(head.mod, head.name), head
     elseif Meta.isexpr(head, :., 2) && head.args[2] isa QuoteNode
         parent, _ = _pr_resolve(head.args[1], mod)
         parent isa Module || _pr_fail("call head `$head` is not a module member")
         name = head.args[2].value
-        isdefined(parent, name) || _pr_fail("unresolved call `$head`")
+        isdefined(parent, name) && isconst(parent, name) || _pr_fail("unresolved call `$head`")
         return getglobal(parent, name), GlobalRef(parent, name)
     elseif head isa Function || head isa Type
         return head, head
@@ -88,9 +91,8 @@ end
 # if the reverse sweep needs its derivative. Program-local callables resolve
 # through `ctx.values` when the caller knows their values.
 function _pr_resolve_lenient(head, ctx)
-    if head isa Symbol && haskey(ctx.values, head)
-        return ctx.values[head], head
-    end
+    value = _pr_known_value(head, ctx)
+    value === nothing || return something(value), head
     try
         return _pr_resolve(head, ctx.mod)
     catch err
@@ -100,6 +102,35 @@ function _pr_resolve_lenient(head, ctx)
     end
 end
 _pr_flatten_head(head, ctx) = head
+
+# Follow only immutable, literal field selections. The actual emitted call
+# still reads its receiver at runtime, including when a new binding is used.
+function _pr_known_value(ex, ctx)
+    ex isa QuoteNode && return Some(ex.value)
+    ex isa Symbol && haskey(ctx.values, ex) && return Some(ctx.values[ex])
+    ex isa GlobalRef && isdefined(ex.mod, ex.name) && isconst(ex.mod, ex.name) &&
+        return Some(getglobal(ex.mod, ex.name))
+    if Meta.isexpr(ex, :call, 3) && first(_pr_resolve_lenient(ex.args[1], ctx)) === Core.getfield
+        object = _pr_known_value(ex.args[2], ctx)
+        return _pr_known_field(object, ex.args[3])
+    elseif Meta.isexpr(ex, :ref, 2) && ex.args[2] isa Int
+        table = _pr_known_value(ex.args[1], ctx)
+        table !== nothing && something(table) isa Tuple &&
+            return _pr_known_field(table, ex.args[2])
+    end
+    nothing
+end
+
+function _pr_known_field(object, field)
+    object === nothing && return nothing
+    value = something(object)
+    (field isa Int || field isa QuoteNode && field.value isa Union{Symbol,Int}) || return nothing
+    field = field isa QuoteNode ? field.value : field
+    if !ismutabletype(typeof(value)) && isdefined(value, field)
+        return Some(getfield(value, field))
+    end
+    nothing
+end
 
 _pr_atom(x) = x isa Symbol || x isa Number || x isa QuoteNode || x isa GlobalRef ||
     x isa AbstractString || x isa Irrational
@@ -148,6 +179,11 @@ function _pr_flatten!(stmts::Vector{Any}, ex, ctx::_PRCtx)
         return nothing
     elseif Meta.isexpr(ex, :meta) || Meta.isexpr(ex, :inbounds) || Meta.isexpr(ex, :loopinfo)
         return nothing
+    elseif Meta.isexpr(ex, :ref, 2) && ex.args[2] isa Int
+        table = _pr_known_value(ex.args[1], ctx)
+        table !== nothing && something(table) isa Tuple ||
+            _pr_fail("unsupported indexed read `$ex`")
+        return _pr_flatten!(stmts, Expr(:call, GlobalRef(Core, :getfield), ex.args...), ctx)
     elseif Meta.isexpr(ex, :call)
         f, fref = _pr_resolve_lenient(ex.args[1], ctx)
         expanded = _pr_expand_stable_helper(f, ex.args[2:end], ctx)
@@ -158,13 +194,9 @@ function _pr_flatten!(stmts::Vector{Any}, ex, ctx::_PRCtx)
         # An immutable closure can carry an owned rule. Resolve its field for
         # call identity only; retain the runtime getfield and its aliases in
         # the emitted program. Mutable records may change after preparation.
-        if f === Core.getfield && length(args) == 2 &&
-                args[1] isa Symbol && haskey(ctx.values, args[1])
-            object = ctx.values[args[1]]
-            field = args[2] isa QuoteNode ? args[2].value : args[2]
-            if !ismutabletype(typeof(object)) && field isa Union{Symbol,Int} && isdefined(object, field)
-                ctx.values[lhs] = getfield(object, field)
-            end
+        if f === Core.getfield && length(args) == 2
+            value = _pr_known_field(_pr_known_value(args[1], ctx), args[2])
+            value === nothing || (ctx.values[lhs] = something(value))
         end
         return lhs
     elseif Meta.isexpr(ex, :if) && length(ex.args) in (2, 3)
@@ -299,8 +331,12 @@ function _pr_result_partials(f, y, args)
         return Any[p == 2 ? :(2 * $(args[1])) : :($p * $(args[1])^$(p - 1)), nothing]
     end
     f === Base.float && return Any[1.0]
-    # `convert(T, x)` to a float type (a stable form's `_rw_float`).
-    f === Base.convert && length(args) == 2 && return Any[nothing, 1.0]
+    # A Boolean predicate is inactive. Float conversions also arise from a
+    # stable form's `_rw_float` and carry the scalar partial unchanged.
+    if f === Base.convert && length(args) == 2
+        (args[1] === Bool || args[1] == GlobalRef(Core, :Bool)) && return Any[nothing, 0.0]
+        return Any[nothing, 1.0]
+    end
     if f === Base.:*
         # n-ary product: ∂/∂a_k = ∏_{j≠k} a_j
         return Any[length(args) == 2 ? args[3-k] :
@@ -374,12 +410,19 @@ end
 # value used solely by a predicate must still execute just its primal. The
 # forward sweep later emits this cut at the original (possibly lazy) call site.
 function _pr_call_partials(s::_PRCall, active, cuts; cellvars = nothing)
-    s.f isa ScalarDerivativeRule || return _pr_partials(s.f, s.lhs, s.args)
+    if !(s.f isa ScalarDerivativeRule)
+        p = _pr_partials(s.f, s.lhs, s.args)
+        p === nothing || return p
+    end
     flags = Tuple(a isa Symbol && a in active for a in s.args)
-    mask = _activity_mask(flags, 1)
+    call = if s.f isa ScalarDerivativeRule
+        Expr(:call, GlobalRef(@__MODULE__, :_derivative_cut_call),
+             s.fref, QuoteNode(Val(_activity_mask(flags, 1))), s.args...)
+    else
+        _pr_source_cut(s.f, s.fref, s.args, flags)
+    end
+    call === nothing && return nothing
     cut = gensym(:scalar_rule_cut)
-    call = Expr(:call, GlobalRef(@__MODULE__, :_derivative_cut_call),
-                s.fref, QuoteNode(Val(mask)), s.args...)
     cuts[s.lhs] = (cut, call)
     # A tuple holding cell partials varies with the cell too. Otherwise the
     # factored sweep would treat its fields as shared coefficients.
@@ -526,8 +569,9 @@ statements, the reverse sweep seeded with `result_bar` (a symbol the caller
 binds), the result atom, and the adjoint symbol of each active input that
 receives a contribution (inputs absent from `bars` have a zero adjoint).
 """
-function _pr_scalar_reverse(ex, active_inputs::Vector{Symbol}, mod::Module; seed::Symbol)
-    ctx = _PRCtx(mod, 0)
+function _pr_scalar_reverse(ex, active_inputs::Vector{Symbol}, mod::Module; seed::Symbol,
+                            values = Dict{Symbol,Any}(), prefix = :_pr_)
+    ctx = _PRCtx(mod, 0, values, prefix)
     stmts = Any[]
     result = _pr_flatten!(stmts, ex, ctx)
     active = _pr_activity!(Set{Symbol}(active_inputs), stmts)
@@ -542,6 +586,146 @@ function _pr_scalar_reverse(ex, active_inputs::Vector{Symbol}, mod::Module; seed
     forward = _pr_forward_exprs(stmts, cuts)
     bars = Dict{Symbol,Symbol}(a => _pr_bar(a) for a in active_inputs if _pr_bar(a) in defined)
     (; forward, reverse, result, bars)
+end
+
+# Source records and generated leaf arms already carry their executable
+# expression. Differentiate that expression once inside a scalar call, with
+# its own argument names and scope. Keep tables and captures as arguments:
+# two records with the same code may hold different bound data.
+_pr_source_cut(@nospecialize(f), ref, args, flags) = nothing
+_pr_field(ref, field) = Expr(:call, GlobalRef(Core, :getfield), ref, QuoteNode(field))
+Base.@nospecializeinfer _pr_source_cut(@nospecialize(f::_KernelSourceOp), ref, args, flags) =
+    _pr_source_cut(f.f, _pr_field(ref, :f), args, flags)
+Base.@nospecializeinfer _pr_source_cut(@nospecialize(f::Union{_KernelBranch,_KernelSplit}), ref, args, flags) =
+    _pr_source_cut(f.call, _pr_field(ref, :call), args, flags)
+
+Base.@nospecializeinfer function _pr_source_cut(@nospecialize(f::_KernelSource), ref, args, flags)
+    f.native === nothing || return nothing
+    program = _native_generated_function(f.companion)
+    _pr_program_cut(program, args, flags, ((f.captures, _pr_field(ref, :captures)),))
+end
+
+Base.@nospecializeinfer _pr_source_cut(@nospecialize(f::RuntimeGeneratedFunctions.RuntimeGeneratedFunction), ref, args, flags) =
+    _pr_program_cut(f, args, flags, ())
+
+Base.@nospecializeinfer function _pr_source_cut(@nospecialize(f::Union{_KernelBranchCall,_KernelSplitApply}), ref, args, flags)
+    record = gensym(:record)
+    params = [gensym(:arg) for _ in args]
+    body = if f isa _KernelBranchCall
+        _native_plate_branch_expr(f, record, params)
+    else
+        plan = typeof(f).parameters[1]
+        _split_apply_body(plan, _kernel_split_spec(f.split), _pr_field(record, :split),
+                          i -> params[i], identity)
+    end
+    ex = Expr(:->, Expr(:tuple, record, params...), body)
+    _pr_expression_cut(ex, @__MODULE__, args, flags, ((f, ref),))
+end
+
+Base.@nospecializeinfer function _pr_source_cut(@nospecialize(child::_KernelPreparedChild), ref, args, flags)
+    k = child.kernel
+    kernel_ref = _pr_field(ref, :kernel)
+    tables = ((k.constants, _pr_field(kernel_ref, :constants)),
+              (k.callables, _pr_field(kernel_ref, :callables)))
+    program = k.f isa _ArrayFunction ? k.f.native : k.f
+    _pr_program_cut(_native_generated_function(program), args, flags, tables)
+end
+
+# Only a final return is a value expression. An early return keeps the
+# original ordinary reverse (the scalar sweep has no nonlocal control flow).
+function _pr_tail_value(ex)
+    Meta.isexpr(ex, :return, 1) && return only(ex.args)
+    if Meta.isexpr(ex, :block)
+        xs = Any[x for x in ex.args if !(x isa LineNumberNode)]
+        isempty(xs) || (xs[end] = _pr_tail_value(xs[end]))
+        return Expr(:block, xs...)
+    end
+    ex
+end
+
+# Each branch exports its value, and each local in the scalar sweep has one
+# primal and adjoint. Keep let bindings distinct, preserve conversions, and
+# require a definition on the path where the local is read.
+function _pr_source_body(ex, bound, types, mod; binding = false)
+    ex isa Symbol && return get(() -> _pr_fail("unbound scalar source local `$ex`"), bound, ex)
+    ex isa Expr || return ex
+    ex.head in (:quote, :inert, :meta, :inbounds, :loopinfo) && return ex
+    if Meta.isexpr(ex, :(=), 2)
+        lhs, rhs = ex.args
+        value = _pr_source_body(rhs, bound, types, mod)
+        name = _pr_param_name(lhs)
+        name isa Symbol || _pr_fail("mutation in scalar source")
+        if binding
+            delete!(types, name)
+        elseif haskey(bound, name)
+            _pr_fail("reassignment to `$name` in scalar source")
+        end
+        Meta.isexpr(lhs, :(::), 2) && (types[name] = lhs.args[2])
+        if haskey(types, name)
+            T, _ = _pr_resolve(types[name], mod)
+            T in (Bool, Float16, Float32, Float64) || _pr_fail("scalar source converts to `$T`")
+            value = Expr(:call, GlobalRef(Base, :convert), GlobalRef(Core, nameof(T)), value)
+        end
+        target = bound[name] = gensym(:source_value)
+        return Expr(:(=), target, value)
+    elseif Meta.isexpr(ex, :let, 2)
+        locals, declared = copy(bound), copy(types)
+        header, body = ex.args
+        bindings = Meta.isexpr(header, :block) ? header.args : (header,)
+        values = Any[_pr_source_body(b, locals, declared, mod; binding = true) for b in bindings]
+        return Expr(:let, Expr(:block, values...), _pr_source_body(body, locals, declared, mod))
+    elseif ex.head in (:if, :&&, :||)
+        cond = _pr_source_body(ex.args[1], bound, types, mod)
+        return Expr(ex.head, cond,
+            (_pr_source_body(a, copy(bound), copy(types), mod) for a in ex.args[2:end])...)
+    elseif ex.head === :local
+        values = Any[]
+        for a in ex.args
+            if Meta.isexpr(a, :(=), 2)
+                push!(values, _pr_source_body(a, bound, types, mod))
+            else
+                name = _pr_param_name(a)
+                name isa Symbol || _pr_fail("unsupported declaration in scalar source: `$a`")
+                haskey(bound, name) && _pr_fail("redeclaration of scalar source local `$name`")
+                Meta.isexpr(a, :(::), 2) && (types[name] = a.args[2])
+            end
+        end
+        return Expr(:block, values...)
+    end
+    Expr(ex.head, Any[_pr_source_body(a, bound, types, mod) for a in ex.args]...)
+end
+
+Base.@nospecializeinfer function _pr_program_cut(@nospecialize(program), args, flags, @nospecialize(known))
+    program isa RuntimeGeneratedFunctions.RuntimeGeneratedFunction || return nothing
+    ex = _program_expression(program)
+    mod = parentmodule(typeof(program).parameters[3])
+    _pr_expression_cut(ex, mod, args, flags, known)
+end
+
+Base.@nospecializeinfer function _pr_expression_cut(ex, mod, args, flags, @nospecialize(known))
+    ex isa Expr && ex.head in (:->, :function) && Meta.isexpr(ex.args[1], :tuple) || return nothing
+    # Use Julia's lexical bindings: a let can shadow an argument, and a
+    # free name belongs to the program's defining module.
+    ex = macroexpand(mod, Expr(Symbol("hygienic-scope"), ex, mod))
+    params = ex.args[1].args
+    length(params) == length(known) + length(args) || return nothing
+    all(p -> _pr_param_name(p) isa Symbol, params) || return nothing
+    names = Symbol[_pr_param_name(p) for p in params]
+    body = _pr_tail_value(ex.args[2])
+    _inline_contains_return(body) && return nothing
+    body = _pr_source_body(body, Dict(n => n for n in names), Dict{Symbol,Any}(), mod)
+    values = Dict{Symbol,Any}(n => v for (n,(v,_)) in zip(names, known))
+    inputs = names[length(known)+1:end][collect(flags)]
+    seed = gensym(:seed)
+    sweep = _pr_scalar_reverse(body, inputs, mod; seed, values, prefix = gensym(:source))
+    result = Expr(:tuple, sweep.result, (get(sweep.bars, n, 0.0) for n in inputs)...)
+    code = Expr(:block, :($seed = 1.0), sweep.forward..., sweep.reverse..., result)
+    actuals = Any[(ref for (_, ref) in known)..., args...]
+    bindings = map(params, names, actuals) do p, name, value
+        rhs = p isa Symbol ? value : Expr(:(::), value, p.args[2])
+        Expr(:(=), name, rhs)
+    end
+    Expr(:let, Expr(:block, bindings...), code)
 end
 
 # =============================================== programs
@@ -765,6 +949,8 @@ mutable struct _PRProgramState
     counter::Int
     outer::Set{Symbol}                # active values bound outside every cell loop
     reads::Dict{Symbol,Int}           # batched parameter => its reads in the program
+    arm_initializers::Dict{Symbol,Vector{Pair{Symbol,Any}}}
+    joint_cell_cut::Bool
 end
 
 # How many reads of each batched parameter one call of the program can make,
@@ -1310,7 +1496,8 @@ function _pr_read_reverse!(out, fc::_PRFactored, adj, mutable, s, terms, topleve
     end
     if !isempty(terms)
         v = _pr_materialize!(plain, fc, terms)
-        push!(plain, :($(GlobalRef(@__MODULE__, :_pr_shadow_add!))($shadow, $(fc.linear), $v)))
+        cot = :($(GlobalRef(@__MODULE__, :_pr_read_cotangent))($shadow, $(s.lhs), $v))
+        push!(plain, :($(GlobalRef(@__MODULE__, :_pr_shadow_add!))($shadow, $(fc.linear), $cot)))
     end
     if !factorable
         append!(out, plain)
@@ -1420,9 +1607,9 @@ function _pr_direct_reads(stmts, st::_PRProgramState, linear::Symbol, found::Vec
     out, found
 end
 
-# Whether the generated sweep also computes the program's value: the name of
-# its `Val{true}` / `Val{false}` parameter. A sweep that only feeds cotangents
-# (the two-pass schedule) compiles the value away.
+# The sweep's layout parameter also controls the value reduction. Grouped
+# tapes factor it, logical tapes accumulate in cell order, and the two-pass
+# schedule compiles the reduction away.
 const _PR_WANT_VALUE = :_pr_want_value
 
 # The cell's value `result` as affine terms `(num, inv, var)` over the cell's
@@ -1478,7 +1665,8 @@ function _pr_value_accumulation(stmts, invariant, cellvars, result, total, add, 
     coef(num, inv) = isempty(inv) ? num :
         num == 1.0 ? Expr(:call, GlobalRef(Base, :*), inv...) :
         Expr(:call, GlobalRef(Base, :*), num, inv...)
-    pre = Any[]; inloop = Any[]; parts = Any[]; constant = Any[]
+    pre = Any[]; parts = Any[]; constant = Any[]
+    inloop = Any[:($_PR_WANT_VALUE isa Val{:logical} && ($total = $add($total, $result)))]
     for (num, inv, var) in _pr_value_terms(stmts, invariant, cellvars, result)
         if var === nothing
             push!(constant, coef(num, inv))
@@ -1594,6 +1782,7 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState)
             _pr_contribute!(reverse, fc, adj, mutable, result,
                             [_PRTerm(1.0, Any[_pr_bar(total)], nothing)], true)
             _pr_factored_sweep!(reverse, fc, inloop, adj, mutable, true, cuts)
+            st.joint_cell_cut |= !isempty(cuts)
             _pr_flush_counts!(fc)
             coefficients, flush = fc.pre, fc.post
             _pr_reverse_exprs!(after, hoisted, active, copy(defined); touched = st.touched, cuts)
@@ -1649,6 +1838,21 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState)
     Expr(:block, pre..., nest(1, ()))
 end
 
+# A lazy exp.(x) over one dense vector has exactly one writable input.
+# The cell already read the primal y, so its result-based partial composes
+# with the cell cotangent without rereading x or materializing exp.(x).
+const _PRExpCells = _CellBroadcast{T,1,B} where
+    {T<:Union{Float32,Float64},B<:Base.Broadcast.Broadcasted{<:Any,<:Any,typeof(exp),Tuple{Vector{T}}}}
+struct _PRMappedShadow{F,V}
+    f::F
+    storage::V
+end
+@inline _pr_read_cotangent(shadow, y, v) = v
+@generated function _pr_read_cotangent(::_PRMappedShadow{F}, y, v) where {F}
+    slope = only(_pr_result_partials(F.instance, :y, (:x,)))
+    :(v * $slope)
+end
+@inline _pr_shadow_add!(s::_PRMappedShadow, i, v) = _pr_shadow_add!(s.storage, i, v)
 @inline _pr_shadow_add!(::Nothing, i, v) = nothing
 @inline function _pr_shadow_add!(shadow::AbstractArray, i, v)
     # Batched operands are one-dimensional, but may broadcast a single entry
@@ -1691,6 +1895,10 @@ function _pr_program_block(stmts, st::_PRProgramState)
                 _pr_fail("a loop over active values that is not a summed cell loop")
             push!(fwd, s)
             for (lhs, rhs) in _pr_assignments!(Pair{Symbol,Any}[], s)
+                if rhs === false && haskey(st.arm_initializers, lhs)
+                    push!(record, _PRStatement(lhs, rhs))
+                    continue
+                end
                 lhs in st.active || continue
                 lhs in st.totals && continue
                 if lhs === st.output
@@ -1704,8 +1912,18 @@ function _pr_program_block(stmts, st::_PRProgramState)
             end
         end
     end
+    append!(fwd, _pr_outer_reverse(record, st))
+end
+
+function _pr_outer_reverse(record, st)
     rev = Any[]
     for s in Iterators.reverse(record)
+        if s.rhs === false && haskey(st.arm_initializers, s.lhs)
+            arm = [_PRStatement(lhs, rhs) for (lhs, rhs) in st.arm_initializers[s.lhs]]
+            sweep = _pr_outer_reverse(arm, st)
+            isempty(sweep) || push!(rev, Expr(:if, s.lhs, Expr(:block, sweep...)))
+            continue
+        end
         s.lhs in st.touched || continue
         ctx = _PRCtx(st.mod, st.counter, st.values)
         sub = Any[]
@@ -1715,33 +1933,59 @@ function _pr_program_block(stmts, st::_PRProgramState)
         defined = Set{Symbol}(_pr_bar(a) for a in st.outer if !(a in st.totals))
         if r isa Symbol && r in active && r !== s.lhs
             cuts = Dict{Symbol,Tuple{Symbol,Expr}}()
-            subrev = Any[:($(_pr_bar(r)) = $(_pr_bar(s.lhs)))]
-            push!(defined, _pr_bar(r))
+            subrev = Any[]
+            _pr_accumulate!(subrev, defined, r, _pr_bar(s.lhs); touched = st.touched)
             _pr_reverse_exprs!(subrev, sub, active, defined; touched = st.touched, cuts)
             append!(rev, _pr_forward_exprs(sub, cuts), subrev)
         end
     end
-    vcat(fwd, rev)
+    rev
+end
+
+# _native_plate_inline_arm declares its shared values outside the cells and
+# initializes them on the first visit to their arm. All visits contribute to
+# the same cotangents. Sweep those recipes once, only if that arm was taken.
+function _pr_arm_initializers!(initializers, node)
+    node isa Expr && node.head !== :quote || return
+    if Meta.isexpr(node, :if, 2)
+        cond, init = node.args
+        if _index_run_call(cond, GlobalRef(Base, :!), 1) && Meta.isexpr(init, :block)
+            ready = cond.args[2]
+            if ready isa Symbol && _gensym_base(ready) == "arm_ready" && !isempty(init.args) &&
+                    last(init.args) == Expr(:(=), ready, true)
+                entries = init.args[1:end-1]
+                all(e -> Meta.isexpr(e, :(=), 2) && e.args[1] isa Symbol, entries) ||
+                    _pr_fail("unsupported shared arm initializer")
+                body = Pair{Symbol,Any}[e.args[1] => e.args[2] for e in entries]
+                get!(initializers, ready, body) == body ||
+                    _pr_fail("different initializers for a shared arm")
+                return
+            end
+        end
+    end
+    foreach(a -> _pr_arm_initializers!(initializers, a), node.args)
 end
 
 """
-    _pr_program_reverse(ast, active_params, mod, values) -> (expr, scalar, batched)
+    _pr_program_reverse(ast, active_params, mod, values) -> (expr, scalar, batched, joint)
 
 The reverse of plate program `ast` (a `function (params...) body; result end`
 expression). `active_params` are the parameters that carry derivatives;
 `values` maps program-local callable parameters to their values. Returns the
 reverse function's expression `(params..., ȳ, want, shadows...) -> (value,
 cotangents of the scalar active parameters...)`, the scalar active parameters
-in order, and the batched (per-cell) active parameters, whose shadows follow
-`want` in order. One pass over the cells computes the cotangents for seed ȳ,
-adding each batched operand's cotangent into its shadow, and, when `want` is
-`Val(true)`, the program's value (otherwise the returned value is not it).
+in order, the batched (per-cell) active parameters, and whether a cell uses a
+joint value/partial cut. Shadows follow `want` in batched parameter order.
+One pass over the cells computes the cotangents for seed ȳ, adding each
+batched operand's cotangent into its shadow.
 
 Under `Val(true)` each shadow must be a zeroed buffer the caller owns: an
 `Array`, or a gathered operand's buffer, a view of owned storage through the
 operand's own index vector. The sweep may add unscaled partials into it and
 scale it in place after the loop, and the caller adds it into the operand's
-real shadow. Under `Val(false)` the cotangents add into the shadows as given.
+real shadow. Under `Val(:logical)` the sweep accumulates the cell values in
+their loop and writes cotangents to zeroed buffers indexed like the operands.
+Under `Val(false)` it only adds cotangents into the supplied shadows.
 """
 function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict{Symbol,Any})
     Meta.isexpr(ast, :function, 2) && Meta.isexpr(ast.args[1], :tuple) ||
@@ -1749,6 +1993,8 @@ function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict
     params = Symbol[p for p in ast.args[1].args]
     source, index_runs = _pr_index_run_source(ast)
     body = source.args[2]
+    initializers = Dict{Symbol,Vector{Pair{Symbol,Any}}}()
+    _pr_arm_initializers!(initializers, body)
     stmts = Any[a for a in body.args if !(a isa LineNumberNode)]
     output = stmts[end]
     output isa Symbol || _pr_fail("a plate program with several results")
@@ -1821,9 +2067,12 @@ function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict
         foreach(collect_cells, node.args)
     end
     collect_cells(body)
+    for entries in Base.values(initializers), (lhs, _) in entries
+        delete!(cell_locals, lhs)
+    end
     outer = Set{Symbol}(a for a in active if !(a in cell_locals))
     st = _PRProgramState(mod, values, active, prepared, shadow, totals, output,
-                         Set{Symbol}(), 0, outer, _pr_read_counts(body, prepared, mod, values))
+                         Set{Symbol}(), 0, outer, _pr_read_counts(body, prepared, mod, values), initializers, false)
     new_body = _pr_program_block(stmts, st)
     # Every outer adjoint starts at zero; every total's adjoint is the seed.
     init = Any[:($(_pr_bar(a)) = 0.0) for a in sort!(collect(outer)) if !(a in totals)]
@@ -1833,12 +2082,14 @@ function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict
         Expr(:tuple, params..., seed, _PR_WANT_VALUE, (shadow[p] for p in batched)...),
         Expr(:block, checks..., init..., seeds..., new_body...,
              Expr(:tuple, output, (_pr_bar(p) for p in scalar)...)))
-    _pr_index_run_schedule(fexpr, index_runs, prepared, shadow, params, batched), scalar, batched
+    _pr_index_run_schedule(fexpr, index_runs, prepared, shadow, params, batched), scalar, batched, st.joint_cell_cut
 end
 
 include("plate_reverse_runs.jl")
 
 _pr_check_shadow(::Nothing, x) = nothing
+_pr_check_shadow(s::_PRMappedShadow, x::_PRExpCells) =
+    _pr_check_shadow(s.storage, only(x.broadcast.args))
 # A tuple operand's cotangent accumulates in a vector the adapter provides.
 function _pr_check_shadow(shadow::AbstractVector, x::Tuple)
     length(shadow) == length(x) || throw(ArgumentError(
@@ -1866,29 +2117,61 @@ are the positions of the batched operands. The Enzyme extension runs it either
 in the augmented primal with a unit seed (scaling afterwards) or in the reverse
 pass with the seed; see `_pr_one_pass` there.
 """
-struct _PlateSumRule{S,B,P,R} <: Function
+struct _PlateSumRule{S,B,P,R,Joint} <: Function
     program::P
     reverse::R
 end
+_PlateSumRule{S,B,P,R}(p::P, r::R) where {S,B,P,R} = _PlateSumRule{S,B,P,R,false}(p, r)
+
+# Pass the dense leaf itself across the AD rule boundary. Enzyme can then
+# tape it when the caller overwrites it after the primal. The by-value
+# broadcast descriptor alone does not expose that write to its overwrite flag.
+# Keep the descriptor's style and axes so the original program sees the same
+# lazy array, including when its single input broadcasts over a larger axis.
+struct _PRExpProgram{Inputs,Shadows,F,A}
+    f::F
+    shapes::A
+end
+_pr_exp_program(::Val{I}, ::Val{J}, f::F, shapes::A) where {I,J,F,A} =
+    _PRExpProgram{I,J,F,A}(f, shapes)
+@inline function _pr_exp_operand(x::Vector{T}, shape) where {T}
+    bc = Base.Broadcast.Broadcasted(first(shape), exp, (x,), last(shape))
+    _CellBroadcast{T,1,typeof(bc)}(bc)
+end
+@inline _pr_exp_shadow(::Nothing) = nothing
+@inline _pr_exp_shadow(storage) = _PRMappedShadow(exp, storage)
+@generated function (p::_PRExpProgram{I,J})(args::Vararg{Any,N}) where {I,J,N}
+    operands = Any[:(getfield(args, $k)) for k in 1:N]
+    for (j, i) in enumerate(I)
+        operands[i] = :(_pr_exp_operand($(operands[i]), getfield(p.shapes, $j)))
+    end
+    for j in J
+        operands[j] = :(_pr_exp_shadow($(operands[j])))
+    end
+    Expr(:call, :(p.f), operands...)
+end
+@inline function _pr_exp_rule(rule::_PlateSumRule{S,B}, inputs, shadows, shapes) where {S,B}
+    p = _pr_exp_program(inputs, Val(()), rule.program, shapes)
+    r = _pr_exp_program(inputs, shadows, rule.reverse, shapes)
+    _PlateSumRule{S,B,typeof(p),typeof(r),true}(p, r)
+end
 
 # Attach the backend rule only after checking the operands' storage types.
-# A lazy cell array has no writable cell shadow. Let ordinary AD see its
-# program before custom-rule annotation construction creates shadow references.
+# For a lazy cell array the reverse must know how to write into its backing
+# storage. Otherwise ordinary AD sees the program before constructing shadows.
 struct _PlateSumRuleBody{S,B,R} <: Function
     rule::R
 end
-# The same call where the generated reverse takes one pass over the cells (the
-# Enzyme extension's `_pr_one_pass`): a gathered operand (`_pr_gather_value`),
-# at least `_PR_ONE_PASS_MIN_CELLS` cells, and the gathered operands' parents
-# (the one-pass buffers) shorter than the plate. It is chosen here, per call
-# from the operands' sizes, so that each target's rule has one tape type: a
-# call that takes two passes keeps the two-pass rule's empty tape. Deciding in
-# the rule instead cost every small plate with a gather its unused vector tape
-# (Seeds' identity gather `b[axes(n, 1)]`, 21 cells: 16 B and about 15 ns).
-struct _PlateSumRuleOnePass{S,B,R} <: Function
+# The augmented primal sweeps once. A grouped tape holds partials per parent
+# entry of an indirect view. A logical tape holds partials per operand entry,
+# including each entry of an active tuple. Select the layout at the call site
+# so the two-pass target keeps its empty tape on small arithmetic plates.
+struct _PlateSumRuleOnePass{S,B,R,Layout} <: Function
     rule::R
 end
-# Below this many cells one pass's tape allocation outweighs the pass it saves
+_pr_tape_layout(::_PlateSumRuleOnePass{S,B,R,L}) where {S,B,R,L} = Val(L)
+# For a gather that would allocate its tape, below this many cells the
+# allocation outweighs the pass it saves
 # (eight schools, 8 cells: 0.070 µs in two passes, 0.102–0.118 µs in one).
 const _PR_ONE_PASS_MIN_CELLS = 128
 # Whether an operand type is a gather one pass can factor through: a `Float64`
@@ -1929,39 +2212,58 @@ end
 
 # The target of a call with operands of types `types`, as an expression in
 # `rule` and `args` that `make` turns into the result (the target itself, or
-# its call): the program for a lazy cell array, else the two-pass body, or the
-# one-pass call (`one_pass`, which alone receives a tape slot) when a gathered
-# operand's sizes allow.
-function _pr_target_expr(S, B, types, make, one_pass = make)
-    any(b -> types[b] <: _CellArray, B) && return make(:(getfield(rule, :program)))
-    body = make(:(_PlateSumRuleBody{$S,$B,typeof(rule)}(rule)))
+# its call): the program for a remaining lazy cell array, else the two-pass body, or the
+# one-pass call when its operand sizes or reusable joint cut justify a tape.
+function _pr_target_expr(S, B, types, joint, make, one_pass = make)
+    any(b -> types[b] <: _CellArray, B) &&
+        return make(:(getfield(rule, :program)))
+    # A joint scalar cut already produced both the cell value and its
+    # partials. Reuse them within a prepared call. Tuples also use this
+    # schedule so their temporary cotangents live in the preparation's tape.
+    buffered = !isempty(types) && types[end] === _PlateTapeSlot &&
+               (joint || any(b -> types[b] <: Tuple{Vararg{Float64}}, B))
+    body = buffered ? one_pass(:(_PlateSumRuleOnePass{$S,$B,typeof(rule),:logical}(rule))) :
+                      make(:(_PlateSumRuleBody{$S,$B,typeof(rule)}(rule)))
     gathered = [b for b in B if _pr_gather_value(types[b])]
     isempty(gathered) && return body
     buffers = Expr(:call, :+, (:(length(parent(getfield(args, $b)))) for b in gathered)...)
     quote
         cells = length(getfield(args, $(first(gathered))))
-        if cells >= _PR_ONE_PASS_MIN_CELLS && $buffers < cells
-            $(one_pass(:(_PlateSumRuleOnePass{$S,$B,typeof(rule)}(rule))))
+        if ($buffered || cells >= _PR_ONE_PASS_MIN_CELLS) && $buffers < cells
+            $(one_pass(:(_PlateSumRuleOnePass{$S,$B,typeof(rule),true}(rule))))
         else
             $body
         end
     end
 end
-@generated _pr_rule_target(rule::_PlateSumRule{S,B}, args::Tuple) where {S,B} =
-    _pr_target_expr(S, B, args.parameters, identity)
 # The call itself, made in each branch: a target chosen by size and then called
 # would be a union of the two wrappers, boxed in the primal. A trailing tape
 # slot is not an operand of the program: only the one-pass call takes it on.
-@generated function _pr_rule_call(rule::_PlateSumRule{S,B}, args::Tuple) where {S,B}
-    types = args.parameters
+function _pr_rule_expr(S, B, types, joint, dispatch)
     slotted = !isempty(types) && types[end] === _PlateTapeSlot
     count = length(types) - slotted
     operands = Any[:(getfield(args, $i)) for i in 1:count]
+    inputs = Tuple(b for b in B if types[b] <: _PRExpCells)
+    if !isempty(inputs)
+        shadows = Tuple(count + 2 + findfirst(==(i), B) for i in inputs)
+        shapes = Expr(:tuple, (:((args[$i].broadcast.style, args[$i].broadcast.axes)) for i in inputs)...)
+        for i in inputs
+            operands[i] = :(only(getfield(args, $i).broadcast.args))
+        end
+        slotted && push!(operands, :(getfield(args, $(count + 1))))
+        return :($dispatch(_pr_exp_rule(rule, Val($inputs), Val($shadows), $shapes),
+                           ($(operands...),)))
+    end
+    dispatch === :_pr_rule_target && return _pr_target_expr(S, B, types, joint, identity)
     call = target -> Expr(:call, target, operands...)
     one_pass = slotted ?
         (target -> Expr(:call, target, operands..., :(getfield(args, $(count + 1))))) : call
-    _pr_target_expr(S, B, types, call, one_pass)
+    _pr_target_expr(S, B, types, joint, call, one_pass)
 end
+@generated _pr_rule_target(rule::_PlateSumRule{S,B,P,R,J}, args::Tuple) where {S,B,P,R,J} =
+    _pr_rule_expr(S, B, args.parameters, J, :_pr_rule_target)
+@generated _pr_rule_call(rule::_PlateSumRule{S,B,P,R,J}, args::Tuple) where {S,B,P,R,J} =
+    _pr_rule_expr(S, B, args.parameters, J, :_pr_rule_call)
 # One method per operand count, each operand's type a parameter of its own:
 # Julia does not otherwise specialize on a `Function` operand it only passes on
 # (the program's callables), and the call would dispatch dynamically
@@ -2116,7 +2418,7 @@ function _pr_rule_for(call::Expr, outer_active::Set{Symbol}, kernel,
     end
     isempty(active_params) && return nothing, "no active operand"
     try
-        rexpr, scalar, batched = _pr_program_reverse(program.ast, active_params, @__MODULE__, values)
+        rexpr, scalar, batched, joint = _pr_program_reverse(program.ast, active_params, @__MODULE__, values)
         # A batched operand's cotangent is added into its shadow cell by cell,
         # which a lazy cell array's shadow cannot take: the program keeps the
         # backend's reverse (snag generated-plate-56eaf6e3).
@@ -2133,7 +2435,7 @@ function _pr_rule_for(call::Expr, outer_active::Set{Symbol}, kernel,
         # dispatch dynamically and box every operand.
         primal = _PlateCall(compile(program.ast))
         rev = _PlateCall(compile(rexpr))
-        return _PlateSumRule{S,B,typeof(primal),typeof(rev)}(primal, rev), rexpr
+        return _PlateSumRule{S,B,typeof(primal),typeof(rev),joint}(primal, rev), rexpr
     catch err
         err isa _PRIneligible || rethrow()
         return nothing, err.reason

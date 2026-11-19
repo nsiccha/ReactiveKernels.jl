@@ -1759,20 +1759,22 @@ struct _KernelSplitApply{P,S}
     split::S
 end
 _KernelSplitApply(::Val{P}, split::S) where {P,S} = _KernelSplitApply{P,S}(split)
-@inline @generated function (apply::_KernelSplitApply{P,S})(args::Vararg{Any,N}) where {P,S,N}
-    ports, root, nodes = S.parameters[1]
+function _split_apply_body(plan, spec, split, arg, wrap)
+    ports, root, nodes = spec
     count = length(ports)
-    arg(i) = :(getfield(args, $i))
-    split = :(getfield(apply, :split))
-    function node(plan)
-        plan[1] === :value && return arg(count + plan[2])
-        k = plan[2]
-        plan[1] === :whole && return :(Base.@inline getfield(getfield($split, :wholes), $k)(
-            $(map(arg, nodes[k][1])...)))
-        :(Base.@inline getfield(getfield($split, :splits), $k)(
-            $(map(arg, nodes[k][2])...), $(map(node, plan[3])...)))
+    function node(part)
+        part[1] === :value && return arg(count + part[2])
+        k = part[2]
+        part[1] === :whole && return wrap(:(getfield(getfield($split, :wholes), $k)(
+            $(map(arg, nodes[k][1])...))))
+        wrap(:(getfield(getfield($split, :splits), $k)(
+            $(map(arg, nodes[k][2])...), $(map(node, part[3])...))))
     end
-    :(Base.@inline getfield($split, :root)($(map(arg, root[1])...), $(map(node, P)...)))
+    wrap(:(getfield($split, :root)($(map(arg, root[1])...), $(map(node, plan)...))))
+end
+@inline @generated function (apply::_KernelSplitApply{P,S})(args::Vararg{Any,N}) where {P,S,N}
+    _split_apply_body(P, S.parameters[1], :(getfield(apply, :split)),
+        i -> :(getfield(args, $i)), call -> :(Base.@inline $call))
 end
 Base.@nospecializeinfer _source_record(@nospecialize(apply::_KernelSplitApply)) =
     _source_record(getfield(apply, :split))
