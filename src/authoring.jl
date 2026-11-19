@@ -1889,6 +1889,11 @@ struct _KernelPreparedChild{K,L}
 end
 _KernelPreparedChild(name::Symbol, kernel::PreparedKernel) =
     _KernelPreparedChild(name, kernel, _lane_kernel(kernel.plan))
+# Preparing a child enters the planner. Keep the syntax walk independent of
+# its inference so loading e.g. SparseArrays cannot invalidate the walk via
+# the planner's array methods.
+_kernel_prepare_child(name, spec) = _KernelPreparedChild(name, prepare(spec))
+
 # The child stays its own compiled call. Its source operations infer concretely
 # inside the caller (`_source_call_recursion_well_founded`), and native Enzyme
 # reverse on Julia 1.10 fails on the caller once the child's body is inlined
@@ -1996,6 +2001,16 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                                       lift_scope::Union{Nothing,Symbol} = nothing,
                                       boundary_types = Dict{Symbol,Vector{Any}}())
     ex isa Expr || return ex, nothing
+    # Nested endpoints recurse with different scopes. Infer each walk on its
+    # own so Julia can retain its native code when building a package image.
+    return Base.inferencebarrier(_kernel_constructed_endpoint)(
+        ex, mod, locals, nested_specs, local_types, context, materialized,
+        cell_locals, straight, scoped, endpoint_cache, lift_scope, boundary_types)::Tuple{Any,Any}
+end
+
+function _kernel_constructed_endpoint(ex::Expr, mod, locals, nested_specs, local_types,
+                                      context, materialized, cell_locals, straight,
+                                      scoped, endpoint_cache, lift_scope, boundary_types)
     ex.head in (:quote, :inert) && return ex, nothing
     # A nested plate/scan owns a different scalar caller scope. Its authoring
     # pass rewrites the do-block after registering that region's formals and
@@ -2318,7 +2333,7 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
         rewritten_ex = lowering === :inline ?
             _kernel_inline_endpoint_call(
                 spec, name, Any[rewritten_ex.args[2:end]...], context) :
-            Expr(:call, QuoteNode(_KernelPreparedChild(name, prepare(spec))),
+            Expr(:call, QuoteNode(Base.inferencebarrier(_kernel_prepare_child)(name, spec)),
                  rewritten_ex.args[2:end]...)
     end
     inferred = if ex.head === :block
@@ -4724,8 +4739,8 @@ function _kernel_lift_plate_expressions(statements, mod)
     result = Any[]
     for statement in statements
         lifted = Any[]
-        function rewrite(ex, root = false)
-            ex isa Expr || return ex
+        rewrite(@nospecialize(ex), root = false) = ex
+        function rewrite(ex::Expr, root = false)
             if ex.head === :do && length(ex.args) == 2
                 call = ex.args[1]
                 if call isa Expr && call.head === :call &&

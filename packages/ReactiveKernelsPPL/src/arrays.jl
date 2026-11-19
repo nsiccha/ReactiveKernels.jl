@@ -618,6 +618,10 @@ end
 # call may produce an array without reading a declared one.
 function _mentions_array(ex, plan::StructuralPlan,
         seen::Set{Symbol} = Set{Symbol}(); opaque::Bool = false)
+    return Base.inferencebarrier(_mentions_array)(ex, plan, seen, opaque)::Bool
+end
+
+function _mentions_array(ex, plan::StructuralPlan, seen::Set{Symbol}, opaque::Bool)
     _is_bound_array_value_call(ex) && return true
     opaque && _contains_module_call(ex) && !_is_bound_value_call(ex) && return true
     if ex isa Symbol
@@ -746,6 +750,13 @@ _is_dotted_operator_call(ex) = Meta.isexpr(ex, :call) && !isempty(ex.args) &&
 
 function _value_metadata(plan::StructuralPlan, ex, seen::Set{Symbol};
         data_axes::Bool, symbolic_data::Bool = false, throw_conflicts::Bool = false)
+    # As with _canonical_expr, infer recursive expression analysis on its own.
+    return Base.inferencebarrier(_value_metadata)(
+        plan, ex, seen, data_axes, symbolic_data, throw_conflicts)::_OS.ValueInfo
+end
+
+function _value_metadata(plan::StructuralPlan, ex, seen::Set{Symbol},
+        data_axes::Bool, symbolic_data::Bool, throw_conflicts::Bool)
     ex isa Number && return _OS.known_info(ex)
     if _is_bound_value_call(ex)
         # A caller's value: bound data supplies its type and shape.

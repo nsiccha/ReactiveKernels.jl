@@ -2545,8 +2545,13 @@ _is_plain_comparison(fn::Symbol) =
 # left exactly as written for its own downstream check, never refused here.
 function _canonical_expr(ex, data, detmap, detshape, env, where;
         strict::Bool = true)
-    ex isa Symbol && return ex
     ex isa Expr || return ex
+    # Inferring this recursive walker through a caller can leave only its
+    # return type in the image. Give the walk its own inference root.
+    return Base.inferencebarrier(_canonical_expr)(ex, data, detmap, detshape, env, where, strict)
+end
+
+function _canonical_expr(ex::Expr, data, detmap, detshape, env, where, strict::Bool)
     if ex.head === :parameters
         strict || return ex
         _sfail("$where takes positional arguments only (no keywords)")

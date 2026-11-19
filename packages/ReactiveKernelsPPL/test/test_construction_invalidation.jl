@@ -134,3 +134,46 @@ end
         @test defined_first == control
     end
 end
+
+@testset "first construction reuses native syntax walkers" begin
+    fixture = raw"""
+        using ReactiveKernels, ReactiveKernelsPPL
+        @kernel column_average(x) = begin
+            return sum(x) / length(x)
+        end
+        @rkppl projected(X) = begin
+            weights[axes(X, 2)] .~ Normal.(0.0, 1.0)
+            return X * weights
+        end
+        body = quote
+            center = column_average(training)
+            design = hcat(ones(length(x)), x .- center)
+            mu ~ projected(design)
+            sigma ~ Exponential(1.0)
+            y .~ Normal.(mu, sigma)
+        end
+        data = (; x=[0.0, 1.0, 2.0], training=[2.0, 3.0], y=[2.0, 1.0, 4.0])
+        plan = lower_rkppl(body, keys(data); mod=Main, conditioned=(:y,))
+        @assert build_kernel(bind_data(plan, Dict(pairs(data)))).layout.total == 3
+        """
+    options = Base.JLOptions()
+    if options.code_coverage != 0 || options.use_pkgimages == 0 || options.use_compiled_modules == 0
+        @test_skip "requires native package images"
+    else
+        mktempdir() do dir
+            trace = joinpath(dir, "construction.trace")
+            run(`$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project())
+                 --trace-compile=$trace -e $fixture`)
+            statements = readlines(trace)
+            # The keyword bodies have compiler-generated names. Match their
+            # ordinary function argument and the syntax node's type instead.
+            for signature in ("typeof(ReactiveKernelsPPL._canonical_expr), Expr,",
+                              "typeof(ReactiveKernelsPPL._mentions_array), Symbol,",
+                              "typeof(ReactiveKernelsPPL._value_metadata), ReactiveKernelsPPL.StructuralPlan, Expr,",
+                              "typeof(ReactiveKernels._kernel_hygienic_catches), Float64,",
+                              "typeof(ReactiveKernels._kernel_constructed_endpoint), Expr, Module,")
+                @test isempty(filter(contains(signature), statements))
+            end
+        end
+    end
+end
