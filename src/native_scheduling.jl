@@ -9,9 +9,10 @@ an upper bound. Available threads and chunks cap each runtime call. Supply
 positive integers for these hints and choose values by measuring your
 workload.
 
-During package-image generation, a nonempty scheduled call also exercises the
-worker code on a single Julia thread. Two sample positions suffice even when
-they fit in one chunk. Set `workers=1` to exercise just the serial path.
+During package-image generation, a nonempty scheduled call precompiles the
+serial driver for its argument types and exercises the worker code even on a
+single Julia thread. Two sample positions suffice even when they fit in one
+chunk. Set `workers=1` to exercise just the serial path.
 
 For calls using several position workers, materialized data-only prefix plates
 also use the worker budget. Their cells share equal-input results within the
@@ -312,6 +313,21 @@ end
 _scheduled_first_range(job::UnitRange{Int}, chunk_size) =
     first(job):min(last(job), first(job) + chunk_size - 1)
 
+# The worker workload below bypasses the serial driver used by one-job reads.
+# With many input ports its splatted call to the generated function dispatches
+# at runtime, so compiling the driver alone can leave that callee out of the image.
+Base.@nospecializeinfer function _precompile_scheduled_serial(@nospecialize(serial),
+                                                               @nospecialize(args))
+    types = map(Core.Typeof, args)
+    precompile(serial, types)
+    tables = (typeof(serial.constants), typeof(serial.callables))
+    if serial isa BorrowedBatchedKernel
+        tables = (tables..., typeof(serial.caches))
+    end
+    precompile(serial.native, (tables..., types...))
+    nothing
+end
+
 function (k::_ScheduledBatchedKernel{Reuse,S,B,BT,PS,N})(args...) where {Reuse,S,B,BT,PS,N}
     length(args) == length(inputs(k)) || throw(MethodError(k, args))
     count = _replicated_validate_axes(args, Val(B), BT)
@@ -319,6 +335,7 @@ function (k::_ScheduledBatchedKernel{Reuse,S,B,BT,PS,N})(args...) where {Reuse,S
     jobs = min(budget, cld(count, k.schedule.chunk_size))
     if ccall(:jl_generating_output, Cint, ()) != 0 && count > 0 &&
             getfield(k.schedule, :workers) !== 1
+        _precompile_scheduled_serial(k.serial, args)
         # compilecache may have one physical thread and just one chunk of
         # samples. Run the production tasks on disjoint positions, using
         # call-local workers so an image-held reader keeps no virtual pool.

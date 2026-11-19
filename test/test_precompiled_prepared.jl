@@ -14,6 +14,7 @@ using ReactiveKernels, Test
             uuid = "3cab329d-6ec4-4c05-9ae4-533c6802a85a"
             version = "0.1.0"
             [deps]
+            PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
             ReactiveKernels = "78e9f072-d36b-4c73-b7a3-751b0eb26cf9"
             """)
         cp(fixture, joinpath(consumer, "src", "PrecompiledPreparedConsumer.jl"))
@@ -87,6 +88,43 @@ using ReactiveKernels, Test
                                     stdout = stdout, stderr = stderr))
         @test setup_ok
         setup_ok || return
+        # A small stage takes the serial path after load. A larger one uses
+        # workers. A new input type is a positive control for the trace.
+        if Base.JLOptions().use_pkgimages != 0 && Base.JLOptions().code_coverage == 0
+            staged = """
+                using PrecompiledPreparedConsumer
+                const C = PrecompiledPreparedConsumer
+                @assert C.WAS_PRECOMPILED
+                offsets = map(-, C.STAGED_OFFSETS)
+                for reuse in (true, false)
+                    reader = C.staged_reader(reuse)
+                    for n in (2, 6, 24)
+                        draws = collect(1.0:n)
+                        x = only(ARGS) == "dense" ? draws : view(draws, :)
+                        @assert reader(x, offsets...) == draws .+ sum(offsets)
+                    end
+                end
+                """
+            for layout in ("dense", "view")
+                trace = joinpath(env, "staged-$layout.jl")
+                @test success(pipeline(
+                    `$julia --startup-file=no --threads=4 --project=$env --trace-compile=$trace -e $staged $layout`;
+                    stdout = stdout, stderr = stderr))
+                entries = filter(readlines(trace)) do line
+                    calls = ("ReactiveKernels.BorrowedBatchedKernel{",
+                             "ReactiveKernels.GraphReplicatedKernel{",
+                             "RuntimeGeneratedFunctions.RuntimeGeneratedFunction{",
+                             "typeof(RuntimeGeneratedFunctions.generated_callfunc),")
+                    occursin("PrecompiledPreparedConsumer", line) &&
+                        any(call -> startswith(line, "precompile(Tuple{" * call), calls)
+                end
+                if layout == "dense"
+                    @test isempty(entries)
+                else
+                    @test !isempty(entries)
+                end
+            end
+        end
         probe = """
             using Test, ReactiveKernels, PrecompiledPreparedConsumer,
                   ImportedPreparedConsumer
