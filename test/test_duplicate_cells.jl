@@ -4,6 +4,7 @@ module DuplicateCellAcceptance
 using ReactiveKernels, Enzyme, DifferentiationInterface, Test
 using LogExpFunctions: log1pexp, logistic, logsumexp, logaddexp
 include("type_stability_audit.jl")
+include("prepared_structure.jl")
 using .TypeStabilityAudit: findings, ad_call_findings
 const RK = ReactiveKernels
 
@@ -302,21 +303,18 @@ end
 end
 
 @testset "duplicate cells: retained loops across data sizes" begin
-    inventories = Dict{Symbol,Int}[]
+    shapes = []
     for (distinct, copies) in ((4, 8), (40, 8), (400, 16))
         x = repeat(collect(range(-2, 2; length = distinct)), copies)
         y = repeat(isodd.(1:distinct), copies)
         k = prepare(logit_rows; bound = (; x, y))
         @test grouped(k)
         @test length(only(multiplicities(k))) == distinct
-        counts = Dict{Symbol,Int}()
-        RK._index_run_visit(k.ast) do ex
-            counts[ex.head] = get(counts, ex.head, 0) + 1
-        end
-        @test get(counts, :while, 0) > 0
-        push!(inventories, counts)
+        shape = prepared_structure(k.ast)
+        @test shape.depth > 0
+        push!(shapes, shape)
         verify(k, [0.3, -0.7], rows_oracle([0.3, -0.7], x, y))
     end
-    @test all(==(first(inventories)), inventories)
+    @test all(==(first(shapes)), shapes)
 end
 end

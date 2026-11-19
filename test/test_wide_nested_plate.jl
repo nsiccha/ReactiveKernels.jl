@@ -2,6 +2,7 @@ module WideNestedPlateTests
 using ReactiveKernels, DifferentiationInterface, Enzyme, Test
 include("fixtures/wide_nested_plates.jl")
 include("type_stability_audit.jl")
+include("prepared_structure.jl")
 
 @testset "Nested allocation type queries match the runtime allocation" begin
     RK = ReactiveKernels
@@ -46,16 +47,19 @@ end
         kernel = prepare(spec)
         rows = prepare(spec; want=:rows)
         ast = deepcopy(code_expr(kernel))
-        @test F.count_head(ast, :for) == 2
+        @test prepared_structure(ast).depth == 2
+        bound_shapes = []
         weights = [0.2, 0.7]
         # Both empty levels, ragged inner domains and changed lengths reuse
         # the authored loops. Ref(weights) must remain a whole shared array,
         # even when its length differs from every batched operand's length.
-        for lengths in (Int[], [0], [3, 0, 1], [17, 5, 0])
+        for lengths in (Int[], [0], [3, 0, 1], [17, 5, 0, 2, 1])
             groups = F.data(width, lengths)
             original = deepcopy((groups, weights))
             bound = prepare(spec; bound=(; groups, weights))
-            @test F.count_head(code_expr(bound), :for) <= 2
+            shape = prepared_structure(code_expr(bound))
+            @test shape.depth <= 2
+            any(>(0), lengths) && push!(bound_shapes, shape)
             for (reader, args) in ((kernel, (groups, 0.3, weights)),
                                    (bound, (0.3,)))
                 ad = prepare_ad(reader, backend, args...; active=:scale)
@@ -72,6 +76,7 @@ end
             @test (groups, weights) == original
             @test code_expr(kernel) == ast
         end
+        @test bound_shapes[1] == bound_shapes[2]
 
         groups = F.data(width, [3, 0, 1])
         args = (groups, 0.3, weights)

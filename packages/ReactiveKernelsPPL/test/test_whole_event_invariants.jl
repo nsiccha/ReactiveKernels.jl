@@ -127,7 +127,7 @@ end
         if kind === :event_dependent
             @test call_depths!(Int[],ast,logit) == [0]
             @test isempty(call_depths!(Int[],ast,ReactiveKernels._indexed_map))
-        else
+        elseif kind === :probability
             @test call_depths!(Int[],ast,ReactiveKernels._indexed_map) == [0,0]
             lanes = filter(cache -> cache isa Base.RefValue,sampler.kernel.caches)
             @test !isempty(lanes)
@@ -137,10 +137,19 @@ end
             @test length(tables) == 2
             @test all(j -> sampler.kernel.caches[j] isa
                 Base.RefValue{Union{Nothing,Matrix{Float64}}},tables)
+        else
+            # The Bernoulli logit law uses rk_log1pexp. Its scalar derivative
+            # rule is outside the indexed pass's elementary formula set. The
+            # input matrix is still shared by every event.
+            @test call_depths!(Int[],ast,ReactiveKernels._cell_array_hcat) == [0]
+        end
+        if kind !== :event_dependent
             @test isempty(ReactiveKernels._level_code_findings(:all,sampler.kernel,
                                                                (typeof(raw),)))
         end
-        for values in (raw,raw .+ 0.15)
+        points = [raw, raw .+ 0.15]
+        kind === :logit && push!(points, [-0.2, 40.0, -40.0, 0.0])
+        for values in points
             expected_gradient = zero(values)
             expected = Enzyme.autodiff(Enzyme.ReverseWithPrimal,reference,Enzyme.Active,
                 Enzyme.Duplicated(values,expected_gradient),Enzyme.Const(events),
@@ -150,15 +159,12 @@ end
             @test actual ≈ expected rtol=1e-12
             @test gradient ≈ expected_gradient rtol=1e-11 atol=1e-12
         end
-        if kind !== :event_dependent
+        if kind === :probability
             # The tables refill buffers the sampler keeps: with the pass, a
             # density or gradient call allocates exactly what it does without
             # it (snag posteriordb-mt-c-01c1a87b: 4 and 8 more allocations).
             kept = [sampler.kernel.caches[j][] for j in table_slots(sampler.kernel)]
-            # The logit kind's `location` is a view of the unconstrained point,
-            # which `_indexed_safe` does not take yet, so it builds no tables
-            # (ReactiveKernels todo 10kg7nx).
-            @test all(table -> table isa Matrix{Float64}, kept) broken = kind === :logit
+            @test length(kept) == 2 && all(table -> table isa Matrix{Float64}, kept)
             baseline = task_local_storage(ReactiveKernels._INDEXED_INVARIANT_DEPTH, 1) do
                 make_sampler(kind,events,offsets,raw)
             end

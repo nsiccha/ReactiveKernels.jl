@@ -40,6 +40,4 @@ function reference(groups, scale, weights)
      linear + 2scale * weights[2] * lanes)
 end
 
-count_head(ex, head) = ex isa Expr ? Int(ex.head === head) +
-    sum(x -> count_head(x, head), ex.args; init=0) : 0
 end

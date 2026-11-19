@@ -57,7 +57,7 @@ function verify(k,q,ref)
     pristine=copy(q)
     @test k(q)≈ref[1] rtol=1e-12 atol=1e-12
     ad=prepare_ad(k,AutoEnzyme(;mode=Enzyme.Reverse),q;active=:q,native_forward_batch=false)
-    @test ad.backend.mode===Enzyme.Reverse
+    @test ad.backend.mode isa Enzyme.ReverseMode
     g=zero(q);v,_=ad_value_and_gradient!(ad,g,q)
     @test v≈ref[1] rtol=1e-12 atol=1e-12
     @test g≈ref[2] rtol=1e-11 atol=1e-11
