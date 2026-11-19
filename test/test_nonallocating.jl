@@ -63,6 +63,42 @@ const SPEC = @kernel untyped_logs(x, w) = begin
 end
 end
 
+# A traced helper returning a tuple of arrays, destructured by another one,
+# whose pieces are a running sum along rows of a `hcat`, a column read with
+# `end`, and a broadcast: the shape of RKPPL's simplex-slice transforms.
+module TracedTupleFixture
+using ReactiveKernels
+@traceable function running_parts(U)
+    z = 1.0 ./ (1.0 .+ exp.(-U))
+    lr = cumsum(hcat(0.0 .* U[:, 1:1], log1p.(-z)); dims = 2)
+    return z, lr
+end
+@traceable function tail_terms(U)
+    z, lr = running_parts(U)
+    sum(lr[:, 1:(end - 1)] .+ log.(z)) + sum(lr[:, begin:begin])
+end
+@traceable function first_part(U)
+    z, _ = running_parts(U)
+    exp.(z)
+end
+const SPEC = @kernel tuple_steps(U::Matrix{Float64}) = begin
+    out::Float64 = tail_terms(U)
+    head::Matrix{Float64} = first_part(U)
+    total::Float64 = out + sum(head)
+end
+const ROWS = @kernel transposed(B::Matrix{Float64}, v::Vector{Float64}) = begin
+    T::Matrix{Float64} = permutedims(B)
+    H::Matrix{Float64} = hcat(v, 2.0 .* v, B[:, 1:1])
+    out::Float64 = sum(T .* T) + sum(H)
+end
+# A vector's `permutedims` is the vector itself as one row (Base reshapes
+# it, sharing its memory), so it must keep no buffer of its own.
+const ROW = @kernel row_of(v::Vector{Float64}) = begin
+    r::Matrix{Float64} = permutedims(v)
+    out::Float64 = sum(r .* r) + sum(r)
+end
+end
+
 # A traced helper whose trailing Vararg formal is the tuple of its arguments.
 module TracedVarargFixture
 using ReactiveKernels
@@ -424,6 +460,63 @@ end
         @test kernel_allocations(k, x, 0.7) == 0
     end
 
+    @testset "a traced helper's tuple result, running sums and end indices fill buffers" begin
+        # `z, lr = running_parts(U)` binds the fields of the helper's tuple
+        # result; the `hcat`, the running sum along rows, `lr[:, 1:(end - 1)]`
+        # and `lr[:, begin:begin]` each fill a buffer of their own. Before, the
+        # destructuring left the helper's whole call fresh on every
+        # evaluation.
+        spec = TracedTupleFixture.SPEC
+        ordinary = prepare(spec; have = (:U,), want = :total)
+        k = prepare_nonallocating(spec; have = (:U,), want = :total)
+        ops = called_ops(k)
+        @test !any(source_entry, ops)
+        @test any(op -> op isa ReactiveKernels._AccumulateStep, ops)
+        @test any(op -> op isa ReactiveKernels._ConcatenateStep{typeof(hcat)}, ops)
+        for U in ([0.3 * sin(i + 2j) for i in 1:6, j in 1:4],
+                  [0.2 * cos(i * j) for i in 1:3, j in 1:9])
+            @test k(U) == ordinary(U)
+        end
+        @test kernel_allocations(k, [0.3 * sin(i + 2j) for i in 1:6, j in 1:4]) == 0
+    end
+
+    @testset "permutedims and hcat fill buffers of their own" begin
+        spec = TracedTupleFixture.ROWS
+        ordinary = prepare(spec; have = (:B, :v), want = :out)
+        k = prepare_nonallocating(spec; have = (:B, :v), want = :out)
+        @test !any(source_entry, called_ops(k))
+        B, v = [sin(i - j) for i in 1:5, j in 1:3], [cos(i) for i in 1:5]
+        @test k(B, v) == ordinary(B, v)
+        @test k(2 .* B, -v) == ordinary(2 .* B, -v)
+        @test k(B, v) == ordinary(B, v)
+        @test kernel_allocations(k, B, v) == 0
+        # A vector's row shares the vector's memory: the kernel writes into
+        # no caller vector, and each call reads its own argument.
+        row = prepare(TracedTupleFixture.ROW; have = (:v,), want = :out)
+        k_row = prepare_nonallocating(TracedTupleFixture.ROW; have = (:v,), want = :out)
+        v1, v2 = copy(v), [sin(2i) for i in 1:5]
+        @test k_row(v1) == row(v)
+        @test k_row(v2) == row([sin(2i) for i in 1:5])
+        @test k_row(v1) == row(v)
+        @test v1 == v && v2 == [sin(2i) for i in 1:5]
+        # A destination of another shape, or one sharing memory with the
+        # argument, returns the call's own result.
+        @test MutatingFunctions.apply!!(zeros(2, 2), permutedims, B) == permutedims(B)
+        square = [1.0 2.0; 3.0 4.0]
+        @test MutatingFunctions.apply!!(square, permutedims, square) == [1.0 3.0; 2.0 4.0]
+        op = ReactiveKernels._ConcatenateStep(hcat)
+        @test MutatingFunctions.apply!!(zeros(5, 2), op, v, v) == hcat(v, v)
+        @test MutatingFunctions.apply!!(zeros(4, 2), op, v, v) == hcat(v, v)
+        @test_throws DimensionMismatch MutatingFunctions.apply!!(zeros(5, 2), op, v, v[1:4])
+        block = [1.0 2.0 3.0; 4.0 5.0 6.0]
+        dest = zeros(3, 3)
+        @test MutatingFunctions.apply!!(dest, op, transpose(block), v[1:3]) === dest
+        @test dest == hcat(transpose(block), v[1:3])
+        aliased = copy(square)
+        copied = MutatingFunctions.apply!!(aliased, op, transpose(aliased))
+        @test copied == transpose(square) && aliased == square
+    end
+
     @testset "a traced helper's Vararg formal is the tuple of its arguments" begin
         spec = TracedVarargFixture.SPEC
         ordinary = prepare(spec; have = (:x, :y, :w), want = :out)
@@ -565,21 +658,30 @@ end
         @test any(op -> op isa ReactiveKernels._RowReduceStep, called_ops(k_cs))
     end
 
-    @testset "non-reduction kwargs and port-valued dims keep the fallback" begin
+    @testset "running sums along a constant axis become destination steps" begin
+        # `cumsum`/`cumprod` with a literal `dims` fill a buffer of their own
+        # in the same order as the allocating call.
         cumsum_spec = @kernel cumsum_dims(m::Matrix{Float64}) = begin
             c::Matrix{Float64} = cumsum(m; dims = 2)
-            out::Float64 = sum(c)
+            p::Matrix{Float64} = cumprod(m; dims = 1)
+            out::Float64 = sum(c) + sum(p)
         end
+        ordinary = prepare(cumsum_spec; have = (:m,), want = :out)
+        k = prepare_nonallocating(cumsum_spec; have = (:m,), want = :out)
+        @test !any(source_entry, called_ops(k))
+        @test count(op -> op isa ReactiveKernels._AccumulateStep, called_ops(k)) == 2
+        for m in (randn(16, 3), randn(5, 7), randn(16, 3))
+            @test k(m) == ordinary(m)
+        end
+        @test kernel_allocations(k, randn(16, 3)) == 0
+    end
+
+    @testset "port-valued dims keep the fallback" begin
         dyn_spec = @kernel rowmax_dyn(m::Matrix{Float64}, d::Int) = begin
             r::Vector{Float64} = vec(maximum(m; dims = d))
             out::Float64 = sum(r)
         end
-        ordinary = prepare(cumsum_spec; have = (:m,), want = :out)
-        k = prepare_nonallocating(cumsum_spec; have = (:m,), want = :out)
         m = randn(16, 3)
-        @test k(m) == ordinary(m)
-        @test any(source_entry, called_ops(k))
-        @test !any(op -> op isa ReactiveKernels._RowReduceStep, called_ops(k))
 
         ordinary_dyn = prepare(dyn_spec; have = (:m, :d), want = :out)
         k_dyn = prepare_nonallocating(dyn_spec; have = (:m, :d), want = :out)

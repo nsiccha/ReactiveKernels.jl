@@ -39,9 +39,11 @@ _slice_length(::_SliceWhole, b) = length(b)
 # The slices as the rows of a matrix (one slice per row) — the layout the
 # vectorized densities below reduce over. Fresh for columns. One vector is a
 # 1×K row over its own storage: a reshaped view, which, unlike `reshape` of a
-# `Vector`, builds no array object.
-_slice_rows(::_SliceRows, B) = B
-_slice_rows(::_SliceCols, B) = permutedims(B)
+# `Vector`, builds no array object. The row and column methods are
+# `@traceable`, so a non-allocating kernel reads their source, as it reads
+# the densities that call them, and keeps a buffer for the transpose.
+@traceable _slice_rows(o::_SliceRows, B) = B
+@traceable _slice_rows(o::_SliceCols, B) = permutedims(B)
 _slice_rows(::_SliceWhole, b) = _row_of(b)
 _row_of(v::AbstractVector) = reshape(view(v, :), 1, length(v))
 
@@ -476,11 +478,13 @@ _ordered_slices_unconstrain(::_SliceCols, X) =
 # trailing column of the value are built from `U` (`0.0 .* U[:, 1:1]`),
 # never as a host array, so the transform is broadcasts and reductions
 # over `U` alone. `U` is finite, so the column is exactly zero. A one-entry simplex (K = 1, no coordinates) is
-# the constant 1.
-_slice_zero(::_SliceRows, U) = 0.0 .* U[:, 1:1]
-_slice_zero(::_SliceCols, U) = 0.0 .* U[1:1, :]
-_slice_hcat(::_SliceRows, a, b) = hcat(a, b)
-_slice_hcat(::_SliceCols, a, b) = vcat(a, b)
+# the constant 1. The orientation helpers are `@traceable` straight-line
+# sources: a non-allocating kernel reads them, as it reads the transforms,
+# and keeps one buffer per array they build (`non-allocating-automatically`).
+@traceable _slice_zero(o::_SliceRows, U) = 0.0 .* U[:, 1:1]
+@traceable _slice_zero(o::_SliceCols, U) = 0.0 .* U[1:1, :]
+@traceable _slice_hcat(o::_SliceRows, a, b) = hcat(a, b)
+@traceable _slice_hcat(o::_SliceCols, a, b) = vcat(a, b)
 _slice_dims(::_SliceRows) = 2
 _slice_dims(::_SliceCols) = 1
 _slice_width(o, U) = size(U, _slice_dims(o))
@@ -503,10 +507,10 @@ end
     z, l, lr = _simplex_slices_breaks(_SliceCols(), transpose(U))
     return transpose(z), transpose(l), transpose(lr)
 end
-_slice_ones(::_SliceRows, G) = ones(G, 1)
-_slice_ones(::_SliceCols, G) = ones(1, G)
-_simplex_lr_head(::_SliceRows, lr) = lr[:, 1:(end - 1)]
-_simplex_lr_head(::_SliceCols, lr) = lr[1:(end - 1), :]
+@traceable _slice_ones(o::_SliceRows, G) = ones(G, 1)
+@traceable _slice_ones(o::_SliceCols, G) = ones(1, G)
+@traceable _simplex_lr_head(o::_SliceRows, lr) = lr[:, 1:(end - 1)]
+@traceable _simplex_lr_head(o::_SliceCols, lr) = lr[1:(end - 1), :]
 
 # The slice width is a shape, so the one-entry branch is decided while JAX
 # traces, as it is decided natively.

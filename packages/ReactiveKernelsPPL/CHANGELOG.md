@@ -16,6 +16,16 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.227
+
+- Requires ReactiveKernels 0.1.323. A matrix of simplexes, one per row or
+  column (`eachcol(W[1:K, 1:G]) .~ Dirichlet(alpha)` and its `eachrow` form),
+  now constrains, takes its log Jacobian and evaluates its Dirichlet density
+  in buffers the non-allocating sampler owns. An LDA-shaped topic mixture
+  (K = 5 topics, 40 documents, 120 words, 3000 tokens) went from 128 KB to
+  400 bytes per log density call, and from 305 KB to 7.7 KB per gradient,
+  with bitwise-identical values and gradients.
+
 ## 0.1.226
 
 - Row-wise Dirichlet parameters now use the same column scan as column-wise

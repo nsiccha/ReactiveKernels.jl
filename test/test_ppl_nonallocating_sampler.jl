@@ -82,6 +82,23 @@ _na_simplex = @rkppl begin
     z .~ Categorical(w)
 end
 
+# Simplex slices: one stick-broken simplex per column or per row of a matrix
+# parameter, read by a categorical plate. Their transform and log-Jacobian
+# are RKPPL's `@traceable` slice sources, which the non-allocating kernel
+# decomposes into steps with buffers of their own.
+_na_simplex_columns = @rkppl begin
+    eachcol(W[1:K, 1:G]) .~ Dirichlet(alpha)
+    @plate for i in eachindex(z)
+        z[i] ~ Categorical(W[:, g[i]])
+    end
+end
+_na_simplex_rows = @rkppl begin
+    eachrow(P[1:G, 1:K]) .~ Dirichlet(fill(1.5, K))
+    @plate for i in eachindex(z)
+        z[i] ~ Categorical(P[g[i], :])
+    end
+end
+
 # An ordered vector: its transform is a prefix sum of exponentials.
 _na_ordered = @rkppl begin
     m ~ Ordered(Normal(0, 3), 2)
@@ -104,6 +121,7 @@ const _NA_Y = [0.5 + 0.8 * _NA_X[i, 1] - 0.3 * _NA_X[i, 2] + 0.2 * cos(1.3i) for
 const _NA_SERIES = [sin(0.3t) + 0.1 * cos(2.1t) for t in 1:80]
 const _NA_COUNTS = [round(Int, exp(0.3 + 0.5 * _NA_X[i, 1] - 0.2 * _NA_X[i, 2])) for i in 1:60]
 const _NA_LABELS = [1 + mod(3i + i ÷ 5, 4) for i in 1:40]
+const _NA_GROUPS = [1 + mod(i, 3) for i in 1:40]
 const _NA_T = [0.1i for i in 1:30]
 const _NA_V = [0.2 + 0.7 * _NA_T[i] + 0.3 * sin(1.7i) for i in 1:30]
 const _NA_POSITIONS = [0.37i + 0.2 * sin(i) for i in 1:9]
@@ -119,6 +137,10 @@ _na_sampler_cases() = (
         x3 = _NA_X[:, 3]) | (; n = _NA_COUNTS)),
     ("interval-bounded coefficients", _na_bounded(; X = _NA_X) | (; y = _NA_Y)),
     ("simplex", _na_simplex() | (; z = _NA_LABELS)),
+    ("simplex columns", _na_simplex_columns(; K = 4, G = 3, g = _NA_GROUPS,
+        alpha = [1.0, 2.0, 1.5, 0.7]) | (; z = _NA_LABELS)),
+    ("simplex rows", _na_simplex_rows(; K = 4, G = 3, g = _NA_GROUPS) |
+        (; z = _NA_LABELS)),
     ("ordered vector", _na_ordered(; t = _NA_T) | (; v = _NA_V)),
     ("Gaussian process", _na_process(; D = _NA_D, n = length(_NA_R)) | (; r = _NA_R)),
 )
@@ -260,10 +282,13 @@ end
     # the query's own call returns its value through a world-age barrier
     # (`SamplerQuery`), which boxes the number it returns. The simplex,
     # ordered and `MvNormal` destinations are RKPPL's own `apply!!` methods
-    # (`src/mutating.jl`).
+    # (`src/mutating.jl`); simplex slices decompose from their `@traceable`
+    # sources into RK's own steps (a running sum, `hcat`, `permutedims`).
     @test hasmethod(MutatingFunctions.apply!!, Tuple{Vector{Float64},
         typeof(ReactiveKernelsPPL._ordered_constrain_kernel), Vector{Float64}, Int, Int})
     for (label, plan) in _na_sampler_cases()
+        # Simplex slices: see "simplex slices reuse their buffers" below.
+        label in ("simplex columns", "simplex rows") && continue
         @testset "$label" begin
             built = build_kernel(plan)
             u = [0.1 * sin(k) for k in 1:built.layout.total]
@@ -282,6 +307,55 @@ end
             else
                 @test bytes == 0
             end
+        end
+    end
+end
+
+# Simplex slices whose likelihood reads entries, not slices: what the warmed
+# density and gradient allocate does not grow with the number of slices, so
+# the stick-breaking transform, its log-Jacobian and the Dirichlet density run
+# in buffers of their own (snag `posteriordb-port-e9e2c1d4`: before, each
+# allocated its arrays fresh on every call, in proportion to the number of
+# slices). The constant remainder is outside the slices: the packed
+# block's `reshape` (an array object per call on Julia 1.11+) and the row sum
+# of the shared concentration, a reshaped view.
+_na_slice_entries_columns = @rkppl begin
+    eachcol(W[1:K, 1:G]) .~ Dirichlet(alpha)
+    s ~ HalfNormal(1)
+    y .~ Normal.(W[1, g] .- W[2, g], s)
+end
+_na_slice_entries_rows = @rkppl begin
+    eachrow(P[1:G, 1:K]) .~ Dirichlet(fill(1.5, K))
+    s ~ HalfNormal(1)
+    y .~ Normal.(P[g, 1] .- P[g, 2], s)
+end
+
+@testset "simplex slices reuse their buffers" begin
+    y = [0.3 * sin(1.3i) for i in 1:40]
+    for (label, model) in (("columns", (G, g) -> _na_slice_entries_columns(; K = 4, G, g,
+                                alpha = [1.0, 2.0, 1.5, 0.7]) | (; y)),
+                           ("rows", (G, g) -> _na_slice_entries_rows(; K = 4, G, g) | (; y)))
+        @testset "$label" begin
+            bytes = map((3, 24)) do G
+                plan = model(G, [1 + mod(i, G) for i in 1:40])
+                built = build_kernel(plan)
+                u = [0.1 * sin(k) for k in 1:built.layout.total]
+                q = prepare_sampler(built, plan, u; backend = NA_SAMPLER_BACKEND,
+                    warm = true, nonallocating = true)
+                ordinary = prepare_sampler(built, plan, u; backend = NA_SAMPLER_BACKEND,
+                    warm = true, nonallocating = false)
+                g, go = zeros(length(u)), zeros(length(u))
+                @test sampler_value_and_gradient!(q, g, u)[1] ==
+                    sampler_value_and_gradient!(ordinary, go, u)[1]
+                @test g ≈ go rtol = 1e-12
+                (Base.invokelatest(_na_density_bytes, q.kernel, u),
+                 Base.invokelatest(_na_gradient_bytes, q, g, u),
+                 Base.invokelatest(_na_density_bytes, ordinary.kernel, u))
+            end
+            println("NONALLOCATING_ALLOC_BYTES\tsimplex slices $label (density, gradient, ordinary density) at G = 3, 24\t", bytes)
+            @test bytes[1][1] == bytes[2][1]
+            @test bytes[1][2] == bytes[2][2]
+            @test bytes[2][3] > 8 * bytes[2][1]
         end
     end
 end

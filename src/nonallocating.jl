@@ -21,10 +21,14 @@
 # - broadcast materializations (dotted calls, and array `getindex` with
 #   range/vector indices via `view`) become `_MaterializeStep` destination
 #   steps; the unary minus of an array operand joins the broadcast lazily;
-# - `vcat` becomes `_ConcatenateStep`, with vector literals of numbers
-#   (`vcat([a], [b], v)`) concatenated as their elements, and `zeros`/`ones` become
-#   `_FillConstructorStep`; `sum`/`prod`/`minimum`/`maximum` with a
-#   preparation-constant `dims` keyword become `_RowReduceStep`;
+# - `vcat` and `hcat` become `_ConcatenateStep`, with vector literals of
+#   numbers (`vcat([a], [b], v)`) concatenated as their elements, and
+#   `zeros`/`ones` become `_FillConstructorStep`; `sum`/`prod`/`minimum`/
+#   `maximum` with a preparation-constant `dims` keyword become
+#   `_RowReduceStep`, and `cumsum`/`cumprod` with one become `_AccumulateStep`;
+# - `end` and `begin` in an index read the indexed array's `lastindex` and
+#   `firstindex` along that axis, as Julia lowers them, and a tuple `(a, b)`
+#   holds its decomposed values;
 # - every other resolved call stays a generic per-step cache operation, so
 #   registered in-place coverage (e.g. `mul!`-backed `*`) applies per step.
 #
@@ -85,6 +89,17 @@ struct _RowReduceStep{F,D}
 end
 @inline (op::_RowReduceStep)(A) = op.f(A; dims = op.dims)
 
+"""
+Running sum or product along a preparation-constant axis (`cumsum`/`cumprod`
+with a literal `dims` keyword). Keep that axis in the type so the allocating
+path and its derivative specialize on the same axis as the authored call.
+"""
+struct _AccumulateStep{F,D}
+    f::F
+end
+_AccumulateStep(f::F, dims::Int) where {F} = _AccumulateStep{F,dims}(f)
+@inline (op::_AccumulateStep{F,D})(A) where {F,D} = op.f(A; dims = D)
+
 "One-dimensional gather (`x[idx]`); in-place layers may copy into a destination."
 struct _GatherStep end
 @inline (::_GatherStep)(x, idx...) = x[idx...]
@@ -125,7 +140,7 @@ end
 _nonalloc_fresh_step(op) = false
 _nonalloc_fresh_step(::Union{_MaterializeStep,_GatherStep,_MatMulStep,
                              _ConcatenateStep,_FillConstructorStep,
-                             _RowReduceStep}) = true
+                             _RowReduceStep,_AccumulateStep}) = true
 
 # Whether a step with operation `op`, inferred result type `T` and argument
 # types `argtypes` keeps a cache slot. The extension adds the method for its
@@ -338,7 +353,23 @@ function _decompose(ctx::_FusedDecomposition, node, allow_lazy_broadcast::Bool)
                                   allow_lazy_broadcast)
     (node.head === :if || node.head === :elseif) && 2 <= length(node.args) <= 3 &&
         return _decompose_branch(ctx, node)
+    node.head === :tuple && return _decompose_tuple(ctx, node)
     nothing
+end
+
+# A tuple `(a, b)` of plain values, as a straight-line helper returns several
+# results (`return z, l, lr`): its values decomposed in order, each evaluated
+# once where the tuple is built. Names, splats and keywords (`(; a)`,
+# `(a = 1,)`, `(a...,)`), or a value of an abstract type, are outside the
+# grammar.
+function _decompose_tuple(ctx::_FusedDecomposition, node::Expr)
+    any(a -> a isa Expr && a.head in (:(=), :..., :parameters, :kw), node.args) &&
+        return nothing
+    decomposed = _decompose_arguments(ctx, node.args, false)
+    decomposed === nothing && return nothing
+    args, types = decomposed
+    all(t -> t isa Type && isconcretetype(t), types) || return nothing
+    (Expr(:tuple, args...), Tuple{types...})
 end
 
 # `if c; a; else; b; end`, as an authored branch (`_KernelBranch`) spells it:
@@ -474,6 +505,21 @@ function _decompose_call_resolved(ctx::_FusedDecomposition, callee, f, fref,
                 kw.args[1] === :dims || return nothing
         end
     end
+    if kwargs !== nothing && (f === Base.cumsum || f === Base.cumprod) &&
+       length(positional) == 1
+        # A running sum or product along a constant axis fills its own buffer.
+        dimsval = _nonalloc_dims_const(only(kwargs))
+        dimsval === nothing && return nothing
+        axis = something(dimsval)
+        axis isa Int || return nothing
+        decomposed = _decompose_arguments(ctx, positional, false)
+        decomposed === nothing && return nothing
+        args, types = decomposed
+        length(types) == 1 && types[1] isa Type || return nothing
+        T = _static_dims_type(f, axis, only(types))
+        T isa DataType && isconcretetype(T) && T <: Array || return nothing
+        return (_emit_step!(ctx, _AccumulateStep(f, axis), T, args...), T)
+    end
     if kwargs !== nothing
         (f === Base.sum || f === Base.prod ||
          f === Base.minimum || f === Base.maximum) &&
@@ -487,7 +533,7 @@ function _decompose_call_resolved(ctx::_FusedDecomposition, callee, f, fref,
         args, types = decomposed
         length(types) == 1 && types[1] isa Type || return nothing
         D = something(dimsval)
-        T = _static_type(A -> f(A; dims = D), only(types))
+        T = _static_dims_type(f, D, only(types))
         T isa DataType && isconcretetype(T) && T <: AbstractArray ||
             return nothing
         return (_emit_step!(ctx, _RowReduceStep(f, D), T, args...), T)
@@ -523,7 +569,7 @@ function _decompose_call_resolved(ctx::_FusedDecomposition, callee, f, fref,
         return (Expr(:call, fref, args...), T)
     end
     T isa Type || return nothing
-    f === Base.vcat &&
+    (f === Base.vcat || f === Base.hcat) &&
         return (_emit_step!(ctx, _ConcatenateStep(f), T, args...), T)
     if (f === Base.zeros || f === Base.ones) && !isempty(types) &&
        all(t -> t isa Type && t <: Integer, types)
@@ -554,6 +600,11 @@ function _decompose_call_resolved(ctx::_FusedDecomposition, callee, f, fref,
     # which may alias an argument: run it inline, never as a cache step.
     (Expr(:call, fref, args...), T)
 end
+
+# The result type of `f(A; dims)` for an argument of type `A`, through a
+# function barrier: a closure over a local the caller assigns more than once
+# reads it from a box, which inference cannot see through.
+_static_dims_type(f, dims, A) = _static_type(x -> f(x; dims), A)
 
 # The authored body of the `@traceable` method that arguments of `types` call
 # (`_traceable_source`), decomposed with its formals bound to the decomposed
@@ -627,9 +678,10 @@ _nonalloc_returned(ex) = ex isa Expr && ex.head === :return &&
     length(ex.args) == 1 ? only(ex.args) : ex
 
 # One statement of a traced body, run where the helper's call runs it: an
-# assignment `x = value` or `a, b = x, y` binds its names to the decomposed
-# values, each evaluated once, and a call (an argument check, say) runs for
-# its effect. `false` for anything else, such as a loop or a branch.
+# assignment `x = value`, `a, b = x, y` or `a, b = f(x)` binds its names to
+# the decomposed values, each evaluated once, and a call (an argument check,
+# say) runs for its effect. `false` for anything else, such as a loop or a
+# branch.
 function _decompose_traced_statement!(ctx::_FusedDecomposition, st)
     st isa Expr || return false
     if st.head === :(=) && st.args[1] isa Symbol
@@ -649,6 +701,9 @@ function _decompose_traced_statement!(ctx::_FusedDecomposition, st)
             ctx.argmap[name], ctx.argtypes[name] = value
         end
         return true
+    elseif st.head === :(=) && st.args[1] isa Expr && st.args[1].head === :tuple &&
+           all(n -> n isa Symbol, st.args[1].args)
+        return _bind_traced_fields!(ctx, st.args[1].args, st.args[2])
     elseif st.head === :call
         d = _decompose(ctx, st, false)
         d === nothing && return false
@@ -662,6 +717,40 @@ function _bind_traced!(ctx::_FusedDecomposition, name::Symbol, value)
     d = _decompose(ctx, value, false)
     d === nothing && return false
     ctx.argmap[name], ctx.argtypes[name] = _traced_value!(ctx, d)
+    true
+end
+
+# `a, b = f(x)`: one value, a tuple of exactly as many fields as names, read
+# field by field, which is what destructuring a tuple reads. The value
+# decomposes as any other, so a helper whose tuple result has a registered
+# destination keeps its buffers (RKPPL's simplex-slice breaks). A name `_`
+# reads nothing. Any other value, such as one of an abstract type, is outside
+# the grammar.
+function _bind_traced_fields!(ctx::_FusedDecomposition, names, value)
+    d = _decompose(ctx, value, false)
+    d === nothing && return false
+    T = d[2]
+    T isa DataType && T <: Tuple && isconcretetype(T) &&
+        fieldcount(T) == length(names) || return false
+    if d[1] isa Expr && d[1].head === :tuple && length(d[1].args) == length(names)
+        # A tuple built right here (a traced helper's `return z, l, lr`): its
+        # values, each evaluated once in order, with no tuple in between.
+        values = [_traced_value!(ctx, (v, fieldtype(T, i)))
+                  for (i, v) in enumerate(d[1].args)]
+        for (name, value) in zip(names, values)
+            name === :_ && continue
+            ctx.argmap[name], ctx.argtypes[name] = value
+        end
+        return true
+    end
+    tuple, _ = _traced_value!(ctx, d)
+    for (i, name) in enumerate(names)
+        name === :_ && continue
+        field = gensym(:traced_field)
+        push!(ctx.stmts, Expr(:(=), field,
+            Expr(:call, GlobalRef(Core, :getfield), tuple, i)))
+        ctx.argmap[name], ctx.argtypes[name] = field, fieldtype(T, i)
+    end
     true
 end
 
@@ -808,7 +897,13 @@ end
 function _decompose_getindex(ctx::_FusedDecomposition, xraw, idxraws)
     dx = _decompose(ctx, xraw, false)
     dx === nothing && return nothing
-    decomposed = _decompose_arguments(ctx, idxraws, false)
+    decomposed = if any(raw -> _nonalloc_mentions(raw, :end) ||
+                               _nonalloc_mentions(raw, :begin), idxraws)
+        dx = _traced_value!(ctx, dx)
+        _decompose_end_indices(ctx, dx, idxraws)
+    else
+        _decompose_arguments(ctx, idxraws, false)
+    end
     decomposed === nothing && return nothing
     idxs, itypes = decomposed
     T = _static_type(Base.getindex, dx[2], itypes...)
@@ -826,6 +921,56 @@ function _decompose_getindex(ctx::_FusedDecomposition, xraw, idxraws)
     GT = _static_type(Base.getindex, dx[2], itypes...)
     GT isa Type || return nothing
     (_emit_step!(ctx, _GatherStep(), GT, dx[1], idxs...), GT)
+end
+
+# Whether an index expression reads `endpoint` (`end` or `begin`) of the
+# array it indexes. One inside a nested indexing expression belongs to that.
+_nonalloc_mentions(ex, endpoint::Symbol) = ex === endpoint ||
+    ex isa Expr && !(ex.head in (:ref, :quote, :inert)) &&
+    any(a -> _nonalloc_mentions(a, endpoint), ex.args)
+
+# The indices of `x[i, …]` when one reads `end` or `begin`: Julia lowers them
+# in index `d` of `n` to `lastindex(x, d)` and `firstindex(x, d)` (without `d`
+# for one index), as `_kernel_ref_endpoints` resolves them, so each index
+# that reads one does, with `x` evaluated once beforehand. A nested indexing
+# expression binds them again for its own indices.
+function _decompose_end_indices(ctx::_FusedDecomposition, (x, Tx), idxraws)
+    Tx isa Type || return nothing
+    n = length(idxraws)
+    endpoints = ((:end, :lastindex), (:begin, :firstindex))
+    outer = [haskey(ctx.argmap, e) ? (ctx.argmap[e], ctx.argtypes[e]) : nothing
+             for (e, _) in endpoints]
+    args = Any[]
+    types = Any[]
+    try
+        for (d, raw) in enumerate(idxraws)
+            for (endpoint, f) in endpoints
+                _nonalloc_mentions(raw, endpoint) || continue
+                call = n == 1 ? Expr(:call, GlobalRef(Base, f), x) :
+                    Expr(:call, GlobalRef(Base, f), x, d)
+                L = n == 1 ? _static_type(getglobal(Base, f), Tx) :
+                    _static_type(getglobal(Base, f), Tx, Int)
+                L isa Type && L <: Integer || return nothing
+                tmp = gensym(endpoint === :end ? :traced_end : :traced_begin)
+                push!(ctx.stmts, Expr(:(=), tmp, call))
+                ctx.argmap[endpoint], ctx.argtypes[endpoint] = tmp, L
+            end
+            index = _decompose(ctx, raw, false)
+            index === nothing && return nothing
+            push!(args, index[1])
+            push!(types, index[2])
+        end
+    finally
+        for ((endpoint, _), saved) in zip(endpoints, outer)
+            if saved === nothing
+                delete!(ctx.argmap, endpoint)
+                delete!(ctx.argtypes, endpoint)
+            else
+                ctx.argmap[endpoint], ctx.argtypes[endpoint] = saved
+            end
+        end
+    end
+    (args, types)
 end
 
 # A vector literal `[a, b, ...]` without splats, keywords or rows.
