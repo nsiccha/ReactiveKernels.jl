@@ -418,6 +418,19 @@ end
     @test ds ≈ sum(exp, x)
 end
 
+span_guard_bytes(cells, value, shadow, operands) =
+    @allocated RK._pr_span_possible(cells, value, shadow, operands)
+
+@testset "checking gathered parameter and tape slices uses zero warm bytes" begin
+    indices = repeat(1:16, 3)
+    cells = eachindex(indices)
+    value = Base.SubArray(view(ones(20), 5:20), (indices,))
+    shadow = Base.SubArray(view(zeros(17), 1:16), (indices,))
+    operands = (value, ones(length(cells)), zeros(length(cells)))
+    @test RK._pr_span_possible(cells, value, shadow, operands)
+    @test span_guard_bytes(cells, value, shadow, operands) == 0
+end
+
 @testset "grouped reverse checks the live gather span before addressing its parents" begin
     expr = first(RK._pr_program_reverse(direct_program(), [:x], RK, Dict{Symbol,Any}()))
     @test occursin("_pr_span_end", string(expr))

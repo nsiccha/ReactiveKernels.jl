@@ -1693,6 +1693,13 @@ end
 const _PRSpanParent = Union{Vector{Float64},SubArray{Float64,1,Vector{Float64},Tuple{UnitRange{Int}},true}}
 const _PRSpanGather = SubArray{Float64,1,<:_PRSpanParent,Tuple{Vector{Int}}}
 _pr_span_possible(cells, value, shadow, operands) = false
+@inline _pr_span_operands(::Tuple{}, cells, value, storage) = true
+@inline function _pr_span_operands(operands::Tuple, cells, value, storage)
+    x = first(operands)
+    (x === value || (x isa StridedVector{<:Union{Float32,Float64}} &&
+        axes(x) == (cells,) && !Base.mightalias(storage, x))) &&
+        _pr_span_operands(Base.tail(operands), cells, value, storage)
+end
 @inline function _pr_span_possible(cells::Base.OneTo{Int}, value::_PRSpanGather,
                                    shadow::_PRSpanGather, operands::Tuple)
     idx = only(parentindices(value))
@@ -1701,10 +1708,7 @@ _pr_span_possible(cells, value, shadow, operands) = false
         @inbounds(idx[2] == idx[1] + 1) && only(parentindices(shadow)) === idx &&
         axes(storage) == axes(parent(value)) &&
         !Base.mightalias(storage, parent(value)) && !Base.mightalias(storage, idx) &&
-        all(operands) do x
-            x === value || (x isa StridedVector{<:Union{Float32,Float64}} &&
-                axes(x) == (cells,) && !Base.mightalias(storage, x))
-        end
+        _pr_span_operands(operands, cells, value, storage)
 end
 
 # The candidate span ends at the bound of either the plate or the parent.
@@ -1716,11 +1720,11 @@ end
     count >= 7 && @inbounds(indices[lo + 1]) == start + 1 || return lo - 1
     offset = start - lo
     hi = lo + count
-    matches = true
+    different = 0
     @inbounds @simd for i in lo+2:hi
-        matches &= indices[i] == i + offset
+        different |= xor(indices[i], i + offset)
     end
-    matches ? hi : lo - 1
+    iszero(different) ? hi : lo - 1
 end
 
 function _pr_span_loop(linear, cells, value, shadow, operands, cellbody, prepared, original)
