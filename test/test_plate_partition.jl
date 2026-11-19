@@ -10,6 +10,24 @@ using ReactiveKernels, DifferentiationInterface, Enzyme, Test
 
 _pp_central(f, x; h = 1e-6) = (f(x + h) - f(x - h)) / (2h)
 
+_pp_operands(xs...) = xs
+
+@testset "wide partition statements forward their operands positionally" begin
+    statement = ReactiveKernels._partition_statement_call
+    # Exercise the first wide splat and both sides of the positional array
+    # wrapper's limit. The scalar statement always takes the direct branch.
+    limit = ReactiveKernels._PLATE_CALL_MAX_ARGUMENTS
+    for n in (32, 33, limit, limit + 1)
+        scalars = ntuple(identity, n)
+        mixed = ([1], Base.tail(scalars)...)
+        for operands in (scalars, mixed)
+            @test statement(_pp_operands, operands...) === operands
+            types = (typeof(_pp_operands), map(typeof, operands)...)
+            @test isempty(ReactiveKernels._code_findings(statement, types))
+        end
+    end
+end
+
 function _pp_window_sum(x, rows, indices, sorted)
     shape = (Base.OneTo(isempty(rows) ? 0 : maximum(rows)),)
     window = ReactiveKernels._CellWindow(x, rows, shape, sorted)

@@ -1478,9 +1478,13 @@ for count in 0:_PLATE_CALL_MAX_ARGUMENTS
 end
 @inline @generated function _partition_statement_call(f, args::Vararg{Any,N}) where {N}
     array = any(T -> T <: Union{AbstractArray,Base.Broadcast.Broadcasted}, args)
-    # Past the positional methods a call would need one argument tuple again.
-    (array && N <= _PLATE_CALL_MAX_ARGUMENTS) || return :(f(args...))
-    :(_partition_array_call(f, args...))
+    # A runtime splat leaves wide statements dynamically dispatched. Their
+    # arity is structural, so forward each operand directly in either call.
+    operands = [:(getfield(args, $i)) for i in 1:N]
+    if array && N <= _PLATE_CALL_MAX_ARGUMENTS
+        return :(_partition_array_call(f, $(operands...)))
+    end
+    :(f($(operands...)))
 end
 _partition_has_loop(@nospecialize(x)) =
     x isa Expr && (x.head in (:for, :while) || any(_partition_has_loop, x.args))
