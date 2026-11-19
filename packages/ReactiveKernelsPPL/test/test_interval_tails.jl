@@ -41,6 +41,15 @@ function _tail_query(expr, data, q; want=:sampler, conditioned=(:y,))
     return k, u
 end
 
+@testset "A narrow Normal interval at the median has finite pointwise mass" begin
+    expr = quote
+        m ~ Normal(0., 1.)
+        y .~ interval_censored.(Normal.(m, 1.), hi)
+    end
+    k, u = _tail_query(expr, (; y=[nextfloat(0.)], hi=[eps()/2]), (; m=0.); want=:pointwise)
+    @test isfinite(only(Base.invokelatest(k, u).y))
+end
+
 @testset "LogNormal and mixture intervals preserve Normal tail masses" begin
     m, s = 0.03, 0.5
     for mixture in (false, true)

@@ -18,6 +18,9 @@ are recorded in the git history only.
 
 ## 0.1.333
 
+- The log rising factorial and its shape derivative keep intermediate products
+  finite in Float32 for the supported small-count product calculation.
+
 - The generated reverse of a summed plate now includes the derivative of a
   shared value first computed inside a lazy branch, including when the
   prepared program introduces an alias for its scalar input before the loop.

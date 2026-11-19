@@ -99,6 +99,12 @@ _logrising_dref(a, m) = Float64(digamma(big(a) + m) - digamma(big(a)))
 @testset "logrising: one graph, product path and gamma-difference path" begin
     @test _DKS.logrising isa ScalarDerivativeRule
     @test _DKS.logrising_graph isa KernelSpec
+    for (a, m) in ((10f0, 32), (4f0, 64), (1f5, 9), (240f0, 16),
+            (240f0, 17), (2f0^30, 64))
+        value, slope = derivative_cut(_DKS.logrising, (true, false), a, m)
+        @test value ≈ _logrising_ref(a, m) rtol = 2e-6
+        @test slope ≈ _logrising_dref(a, m) rtol = 2e-6
+    end
     for a in (1e-8, 0.05, 0.7, 3.25, 41.0, 2.5e6, 1e9, 3e9, 1e12),
             m in (0, 1, 2, 5, 31, 32, 33, 64, 65, 400)
         value, slope = derivative_cut(_DKS.logrising, (true, false), a, m)
