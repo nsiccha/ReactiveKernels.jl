@@ -33,14 +33,7 @@ end
     return sum(cells)
 end
 
-function structure(ex)
-    ex isa Expr || return (0, 0)
-    result = (1, Int(ex.head in (:for, :while)))
-    for child in ex.args
-        result = result .+ structure(child)
-    end
-    result
-end
+include("prepared_structure.jl")
 
 @testset "nonescaping fills preserve shapes, indexing and ownership" begin
     RK = ReactiveKernels
@@ -85,7 +78,7 @@ end
 
 @testset "filled cells retain loops and ordinary Reverse" begin
     backend = AutoEnzyme(; mode=Enzyme.Reverse)
-    shapes = Tuple{Int,Int}[]
+    shapes = []
     for (n, m) in ((2, 3), (29, 5), (0, 3), (2, 0))
         k = prepare(filled_columns; bound=(; n, m), type_stability=:error)
         @test k(0.25) ≈ n * m * 0.25^2
@@ -93,10 +86,10 @@ end
         value, gradient = ad_value_and_gradient(ad, 0.25)
         @test value ≈ n * m * 0.25^2
         @test gradient ≈ 2n * m * 0.25
-        n > 0 && m > 0 && push!(shapes, structure(code_expr(k)))
+        n > 0 && m > 0 && push!(shapes, prepared_structure(code_expr(k)))
     end
     @test shapes[1] == shapes[2]
-    @test last(first(shapes)) >= 2
+    @test first(shapes).depth >= 2
     groups = [[0.2, -0.4], Float64[], [0.7], [1.0, 0.5, -0.3]]
     before = deepcopy(groups)
     k = prepare(filled_groups; bound=(; groups), type_stability=:error)

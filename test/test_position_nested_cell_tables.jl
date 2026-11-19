@@ -324,24 +324,15 @@ end
         end
         @test maximum(per_cell) < unit / 16
     end
-    for flag in (true, false)
-        r = copy(vectorize(stored_choice; batched = :theta, reuse = true))
+    # Exercise both arms when the branch is the stored cell itself and when
+    # the branch is the primal of a rule.
+    for spec in (stored_arm, stored_choice), flag in (true, false)
+        r = copy(vectorize(spec; batched = :theta, reuse = true))
         per_cell = map(((4, 4), (16, 4), (16, 16))) do (count, positions)
             theta, subjects = subjects_input(count, positions)
             bytes(r, theta, subjects, ts, flag) / (count * 3 * positions)
         end
         @test maximum(per_cell) < unit / 16
-    end
-    # A lazy branch with a shared condition lowers each arm into one shared
-    # buffer and keeps no table at any depth, so its stored arm arrays still
-    # allocate (todo 06nbgmo).
-    for flag in (true, false)
-        r = copy(vectorize(stored_arm; batched = :theta, reuse = true))
-        per_cell = map(((4, 4), (16, 4))) do (count, positions)
-            theta, subjects = subjects_input(count, positions)
-            bytes(r, theta, subjects, ts, flag) / (count * 3 * positions)
-        end
-        @test_broken maximum(per_cell) < unit / 16
     end
     r = copy(vectorize(stored_regions; batched = :theta, reuse = true))
     per_cell = map(((4, 4), (8, 8))) do (count, positions)

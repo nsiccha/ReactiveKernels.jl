@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.330
+
+- Strict cell queries on Julia 1.12 and 1.13 recognize captured
+  comprehensions and row-building loops, including helpers that read a
+  shared array and compute only the requested trajectory's rows.
+
 ## 0.1.329
 
 - Streaming a plate into `logsumexp` skips the first floating-point

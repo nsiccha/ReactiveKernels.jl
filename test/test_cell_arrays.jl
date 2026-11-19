@@ -1,16 +1,7 @@
 module CellArrayTests
 using Test, ReactiveKernels, DifferentiationInterface, Enzyme
 
-function native_structure(ex)
-    ex isa Expr || return (0, 0)
-    nodes, loops = 1, Int(ex.head in (:for, :while))
-    for arg in ex.args
-        child_nodes, child_loops = native_structure(arg)
-        nodes += child_nodes
-        loops += child_loops
-    end
-    (nodes, loops)
-end
+include("prepared_structure.jl")
 
 # Embedding must keep Julia's call boundary even when an argument is a
 # projection or another expression used repeatedly by the nested body.
@@ -247,8 +238,9 @@ gathered_rows_data(groups, n) = (rows = [collect(g:groups:n) for g in 1:groups],
         large = prepare!(cache, spec; bound=(; groups=[ones(5) for _ in 1:60]))
         # Changing both event count and cell width retains runtime loops
         # without growing the emitted body (fresh gensyms may differ).
-        @test native_structure(small.ast) == native_structure(large.ast)
-        @test last(native_structure(small.ast)) > 0
+        shape = prepared_structure(small.ast)
+        @test shape == prepared_structure(large.ast)
+        @test shape.depth > 0
     end
     @test groups == original
     # Queries still return owned dense authored intermediates.
