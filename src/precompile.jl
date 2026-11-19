@@ -10,7 +10,7 @@
     workload_definition = :(_precompile_workload(
             x::Vector{Float64}, a::Float64, b::Float64) = begin
         cells = plate(x, a, b) do value, intercept, slope
-            cell::Float64 = intercept + slope * log(value)
+            cell::Float64 = intercept + slope * log(value + 1.0)
             cell
         end
         prefix::Vector{Float64} = let
@@ -36,5 +36,27 @@
         workload_spec = _kernel_eval_definition(@__MODULE__, workload_definition)
         workload_kernel = Base.invokelatest(prepare, workload_spec)
         Base.invokelatest(workload_kernel, [1.0, 2.0], 0.5, 2.0)
+
+        symbols = Set{Symbol}
+        bindings = Dict{Symbol,Any}
+        # Construction also reaches these methods through runtime dispatch.
+        # In Julia 1.10 the workload alone retains their inferred code but
+        # can omit the standalone entry points.
+        for scope in (Nothing, Symbol)
+            types = (Expr, Module, symbols, bindings, bindings, String,
+                     Vector{Tuple{Symbol,Any,Any}}, symbols, Bool, symbols,
+                     IdDict{Any,Dict{Any,KernelSpec}}, scope, Dict{Symbol,Vector{Any}})
+            precompile(_kernel_constructed_endpoint, types) || error("no endpoint walk for $types")
+        end
+        for (f, types) in (
+                (_kernel_free_ports, (Symbol, symbols)),
+                (_kernel_hygienic_catches, (Float64, symbols)),
+                (_kernel_lift_invariant_operands!, (Vector{Any}, Symbol, symbols, symbols, Bool)),
+                (_kernel_selection, (KernelSpec, Vector{Symbol}, Vector{Symbol}, Symbol)),
+                (_lane_has_macro, (Expr,)),
+                (_local_symbols!, (symbols, Symbol)),
+                (_metadata_callable, (Symbol, Module, Tuple{})))
+            precompile(f, types) || error("no $f method for $types")
+        end
     end
 end

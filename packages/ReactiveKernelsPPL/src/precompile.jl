@@ -52,10 +52,45 @@ function _marginalized_workload()
     return nothing
 end
 
+function _precompile_lowering_calls()
+    # The workload exercises these syntax walkers, but Julia 1.10 keeps
+    # some calls as inferred IR only. Model construction also dispatches
+    # to them from untyped expression trees in a fresh process.
+    symbols = Set{Symbol}
+    definitions = Dict{Symbol,Any}
+    shapes = Dict{Symbol,Symbol}
+    for (f, types) in (
+            (_canonical_expr, (Expr, symbols, definitions, shapes, _ShapeEnv, String, Bool)),
+            (_mentions_array, (Symbol, StructuralPlan, symbols, Bool)),
+            (_value_metadata, (StructuralPlan, Expr, symbols, Bool, Bool, Bool)),
+            (VectorAssignmentSpec, (Symbol, Expr, Symbol)),
+            (_AbsentArray{Float64,1}, (Symbol, Tuple{Int})),
+            (_obs_axis, (Expr, symbols, definitions, shapes, symbols, _ShapeEnv)),
+            (_program_value_names!, (symbols, Symbol)),
+            (_resolve_module_calls, (Symbol, Module, symbols, String)),
+            (_shape_of, (Symbol, symbols, definitions, shapes, symbols)),
+            (_symbols_in, (Symbol,)),
+            (_value_symbols, (Symbol,)),
+            (_whole_name_reads!, (symbols, Symbol)))
+        precompile(f, types) || error("no $f method for $types")
+    end
+    # Take the lowering context's concrete NamedTuple type from the
+    # construction above, without duplicating its field list here.
+    for (f, types) in ((_composed_root, (Symbol, NamedTuple)),
+                       (_reads_array_value, (Symbol, NamedTuple, symbols)))
+        for instance in Base.specializations(which(f, types))
+            sig = instance.specTypes
+            isconcretetype(sig) && sig <: Tuple{typeof(f),types...} || continue
+            precompile(sig) || error("no lowering method for $sig")
+        end
+    end
+end
+
 @setup_workload begin
     @compile_workload begin
         built, plan = _construction_workload()
         prepare_coordinate_conditional(built, plan, zeros(built.layout.total))
         _marginalized_workload()
+        _precompile_lowering_calls()
     end
 end
