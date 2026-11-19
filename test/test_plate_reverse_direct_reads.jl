@@ -158,7 +158,7 @@ end
     @test err isa RK._PRIneligible
 end
 
-seeded_plate(program, x, seed) = seed * program(x)
+seeded_plate(program, x, seed, slots...) = seed * program(x, slots...)
 
 function lazy_plate(program, x, scale, seed, overwrite)
     # The active scalar and array require the ordinary backend fallback.
@@ -186,9 +186,9 @@ function (s::CountExpSweep)(args...)
     exp_sweeps[] += 1
     s.reverse(args...)
 end
-function exp_plate(program, x, overwrite)
+function exp_plate(program, x, overwrite, slots...)
     cells = RK._cell_array_broadcast(Base.broadcasted(exp, x))
-    value = program(cells)
+    value = program(cells, slots...)
     overwrite && fill!(x, 2.0)
     value
 end
@@ -199,16 +199,19 @@ end
     primal = RK.compile(ast)
     sweep = CountExpSweep(RK.compile(rexpr))
     rule = RK._PlateSumRule{(),(1,),typeof(primal),typeof(sweep)}(primal, sweep)
-    for overwrite in (false, true), n in (0, 1, 7)
+    slot = RK._PlateTapeSlot()
+    for slotted in (false, true), overwrite in (false, true), n in (0, 1, 7)
         x = [cos(i) for i in 1:n]
         y = exp.(x)
         dx = fill(0.3, n)
         exp_sweeps[] = 0
         _, value = Enzyme.autodiff(Enzyme.ReverseWithPrimal, exp_plate, Enzyme.Active,
-            Enzyme.Const(rule), Enzyme.Duplicated(x, dx), Enzyme.Const(overwrite))
+            Enzyme.Const(rule), Enzyme.Duplicated(x, dx), Enzyme.Const(overwrite),
+            (slotted ? (Enzyme.Const(slot),) : ())...)
         @test value ≈ sum(sin, y; init = 0.0)
         @test dx ≈ (overwrite ? 0.0 : 0.3) .+ y .* cos.(y)
         @test exp_sweeps[] == 1
+        slotted && @test length(slot.tape) == n
     end
 end
 
@@ -276,6 +279,11 @@ end
         end
         @test collect(gradients[1]) ≈ collect(expected)
         @test collect(gradients[2]) ≈ collect(gradients[1])
+        slot = RK._PlateTapeSlot()
+        taped = first(Enzyme.autodiff(Enzyme.Reverse, seeded_plate, Enzyme.Active,
+            Enzyme.Const(rule), Enzyme.Active(x), Enzyme.Const(seed), Enzyme.Const(slot)))[2]
+        @test collect(taped) ≈ collect(expected)
+        @test length(slot.tape) == n
         @test seeded_plate(rule, x, seed) ≈ seed * sum(sin, x; init = 0.0)
     end
     for n in (0, 1, 73, 7)

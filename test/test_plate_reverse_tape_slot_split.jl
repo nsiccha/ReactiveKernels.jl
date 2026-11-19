@@ -70,4 +70,50 @@ end
     @test dz[end] == dz2[end] == 0.0
     @test (z, z2, group) == original
 end
+
+@testset "logical cotangents survive replacement of the primal entries" begin
+    ast = split_program()
+    rexpr, _, _ = RK._pr_program_reverse(ast, [:x, :s], RK, Dict{Symbol,Any}())
+    primal, sweep = RK.compile(ast), RK.compile(rexpr)
+    rule = RK._PlateSumRule{(2,),(1,),typeof(primal),typeof(sweep),true}(primal, sweep)
+    slot = RK._PlateTapeSlot()
+    original = [0.2, -0.7, 1.0]
+    x, dx = copy(original), fill(0.1, length(original))
+    args = (Enzyme.Duplicated(x, dx), Enzyme.Active(1.5), Enzyme.Const(slot))
+    mode = Enzyme.ReverseSplitModified(Enzyme.ReverseSplitWithPrimal, Val((false, true, false, true)))
+    fwd, rev = Enzyme.autodiff_thunk(mode, Enzyme.Const{typeof(rule)},
+        Enzyme.Active{Float64}, typeof.(args)...)
+    tape, value, _ = fwd(Enzyme.Const(rule), args...)
+    empty!(x)
+    cot = only(rev(Enzyme.Const(rule), args..., -0.4, tape))
+    @test value ≈ 1.5sum(original)
+    @test dx ≈ fill(0.1 - 0.4 * 1.5, length(original))
+    @test cot[2] ≈ -0.4sum(original)
+    @test length(slot.tape) == length(original) + 1
+end
+
+@testset "a sparse gather tapes its entries and adds repeated gradients" begin
+    ast = split_program()
+    rexpr, _, _ = RK._pr_program_reverse(ast, [:x, :s], RK, Dict{Symbol,Any}())
+    primal, sweep = RK.compile(ast), RK.compile(rexpr)
+    rule = RK._PlateSumRule{(2,),(1,),typeof(primal),typeof(sweep),true}(primal, sweep)
+    slot = RK._PlateTapeSlot()
+    parent_values = collect(1.0:20.0)
+    idx = [12, 8, 12]
+    x = view(parent_values, idx)
+    dx = fill(0.5, length(parent_values))
+    args = (Enzyme.Duplicated(x, view(dx, idx)), Enzyme.Active(1.5), Enzyme.Const(slot))
+    mode = Enzyme.ReverseSplitModified(Enzyme.ReverseSplitWithPrimal, Val((false, false, false, true)))
+    fwd, rev = Enzyme.autodiff_thunk(mode, Enzyme.Const{typeof(rule)}, Enzyme.Active{Float64}, typeof.(args)...)
+    tape, value, _ = fwd(Enzyme.Const(rule), args...)
+    cot = only(rev(Enzyme.Const(rule), args..., -2.0, tape))
+    expected = fill(0.5, length(dx))
+    for i in idx
+        expected[i] -= 3.0
+    end
+    @test value == 1.5sum(x)
+    @test dx == expected
+    @test cot[2] == -2.0sum(x)
+    @test length(slot.tape) == length(idx) + 1
+end
 end

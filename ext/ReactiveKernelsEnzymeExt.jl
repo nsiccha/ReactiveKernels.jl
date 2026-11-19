@@ -914,19 +914,17 @@ end
 #
 # - Two passes (`_PlateSumRuleBody`): the augmented primal runs the program;
 #   the reverse pass runs the sweep with the seed straight into the shadows.
-# - One pass (`_PlateSumRuleOnePass`, which the primal picks for a gathered
-#   operand of enough cells and a shorter parent, when `_pr_one_pass` admits
-#   the annotations): the augmented primal runs the sweep with a unit seed, each
-#   gathered operand's cotangent going into a buffer of its parent's length (`z`
-#   for `z[g]`). The reverse pass makes no second pass over the cells; it
-#   scales by the seed. A one-pass call whose annotations `_pr_one_pass` does
-#   not admit takes two passes, as the body does.
+# - One pass (`_PlateSumRuleOnePass`): the augmented primal computes the value
+#   and unit-seed partials together. The reverse scales the buffered partials
+#   by its seed. Grouped tapes aggregate gathered gradients into their parents.
+#   Logical tapes retain one partial per operand entry, using storage leased
+#   from the preparation. Unsupported annotations take the two-pass route.
 #
 # A call whose activity the generated reverse does not take runs the program
 # and differentiates it with Enzyme's ordinary reverse instead.
 
 using ReactiveKernels: _PlateSumRuleBody, _PlateSumRuleOnePass, _pr_gather_value,
-    _pr_scalar_positions, _pr_batched_positions, _CellArray, _PlateTapeSlot,
+    _pr_scalar_positions, _pr_batched_positions, _pr_tape_layout, _CellArray, _PlateTapeSlot,
     _pr_take_tape!, _pr_return_tape!
 
 # A one-pass call made by a preparation that owns AD caches ends with its tape
@@ -977,8 +975,8 @@ function EnzymeRules.augmented_primal(
     AugmentedReturn(needs_primal(config) ? primal : nothing, nothing, tape)
 end
 
-# The one-pass tape is one `Vector{Float64}`: each gathered operand's buffer,
-# then the scalar operands' unit-seed cotangents. It is a heap array already,
+# The one-pass tape is one `Vector{Float64}` holding the batched operands'
+# buffers followed by the scalar operands' unit-seed cotangents. It is a heap array already,
 # so Enzyme keeps it without boxing a tape struct (a struct holding the buffers
 # cost each eight-schools plate a 64 B box). With a tape slot the vector is the
 # preparation's own, taken out of the slot here and put back by the reverse
@@ -992,11 +990,12 @@ function EnzymeRules.augmented_primal(
     values = _pr_values(args)
     r = rule.val.rule
     S, B = _pr_scalar_positions(r), _pr_batched_positions(r)
-    if !(RT <: Const) && _pr_covers(Val(S), Val(B), args) &&
-            _pr_one_pass(Val(S), Val(B), Val(overwritten(config)), args)
+    layout = _pr_tape_layout(rule.val)
+    if width(config) == 1 && !(RT <: Const) && _pr_covers(Val(S), Val(B), args) &&
+            _pr_one_pass(layout, Val(S), Val(B), Val(overwritten(config)), args)
         tape = _pr_take_tape!(_pr_slot(annotations),
-                              _pr_buffer_length(Val(B), args) + length(S))
-        swept = r.reverse(values..., 1.0, Val(true), _pr_tape_buffers(Val(B), args, tape)...)
+                              _pr_buffer_length(layout, Val(B), args) + length(S))
+        swept = r.reverse(values..., 1.0, layout, _pr_tape_buffers(layout, Val(B), args, tape)...)
         _pr_store_cotangents!(tape, Base.tail(swept))
         return AugmentedReturn(needs_primal(config) ? first(swept) : nothing, nothing, tape)
     end
@@ -1013,7 +1012,7 @@ end
 # other is constant, every active scalar is a `Float64`, and no array operand
 # may be overwritten before the reverse pass (which, in two passes, reads the
 # operands themselves).
-@generated function _pr_one_pass(::Val{S}, ::Val{B}, ::Val{O}, args::Tuple) where {S,B,O}
+@generated function _pr_one_pass(::Val{true}, ::Val{S}, ::Val{B}, ::Val{O}, args::Tuple) where {S,B,O}
     gathered = false
     for b in B
         T = args.parameters[b]
@@ -1032,27 +1031,43 @@ end
     :(true)
 end
 
-# The buffers' total length: each gathered operand's parent.
-@generated function _pr_buffer_length(::Val{B}, args::Tuple) where {B}
-    terms = Any[:(length(parent(getfield(args, $b).dval))) for b in B
-                if args.parameters[b] <: Union{Duplicated,DuplicatedNoNeed}]
+# A logical buffer has one partial per operand entry. Contents of dense
+# inputs may change after the sweep. An indirect view, however, needs its
+# index map again when the reverse scatters into the shadow.
+@generated function _pr_one_pass(::Val{:logical}, ::Val{S}, ::Val{B}, ::Val{O}, args::Tuple) where {S,B,O}
+    for b in B
+        T = args.parameters[b]
+        T <: Union{Const,Active{<:Tuple{Vararg{Float64}}}} && continue
+        T <: Union{Duplicated,DuplicatedNoNeed} || return :(false)
+        V = T.parameters[1]
+        V <: Vector{Float64} && continue
+        V <: SubArray{Float64,1,<:AbstractVector} && !O[b + 1] || return :(false)
+    end
+    all(s -> args.parameters[s] <: Union{Const,Active{Float64}}, S) ? :(true) : :(false)
+end
+
+_pr_buffer_size(::Val{true}, a) = length(parent(a.dval))
+_pr_buffer_size(::Val{:logical}, a::Active) = length(a.val)
+_pr_buffer_size(::Val{:logical}, a::Union{Duplicated,DuplicatedNoNeed}) = length(a.dval)
+@generated function _pr_buffer_length(layout::Val, ::Val{B}, args::Tuple) where {B}
+    terms = Any[:(_pr_buffer_size(layout, getfield(args, $b))) for b in B
+                if !(args.parameters[b] <: Const)]
     Expr(:call, :+, 0, terms...)
 end
-# Each gathered operand's buffer, a view of its slice of the tape through the
-# operand value's own index vector, so a sum over the buffer's parent lines up
-# with the operand's parent (`_pr_gather_dot`); `nothing` for a constant one.
-@generated function _pr_tape_buffers(::Val{B}, args::Tuple, tape::Vector{Float64}) where {B}
+# Each active batched operand gets a disjoint slice. A grouped buffer uses
+# the operand's own indices and retains its slice as its parent for
+# `_pr_gather_dot`. Logical buffers address their slices in cell order.
+@inline _pr_buffer_view(::Val{true}, a, slice) = Base.SubArray(slice, parentindices(a.val))
+@inline _pr_buffer_view(::Val{:logical}, a, slice) = slice
+@generated function _pr_tape_buffers(layout::Val, ::Val{B}, args::Tuple, tape::Vector{Float64}) where {B}
     body = Any[:(offset = 0)]
     names = Symbol[]
     for (j, b) in enumerate(B)
         name = Symbol(:buffer, j)
-        if args.parameters[b] <: Union{Duplicated,DuplicatedNoNeed}
-            push!(body, :(n = length(parent(getfield(args, $b).dval))))
-            # `Base.SubArray`, not `view`: a view of a view composes the
-            # indices into the whole tape, and the buffer's parent must be its
-            # own slice (as `_readonly_gather` keeps its parent).
-            push!(body, :($name = Base.SubArray(view(tape, offset+1:offset+n),
-                                                parentindices(getfield(args, $b).val))))
+        if !(args.parameters[b] <: Const)
+            push!(body, :(n = _pr_buffer_size(layout, getfield(args, $b))))
+            push!(body, :($name = _pr_buffer_view(layout, getfield(args, $b),
+                                                  view(tape, offset+1:offset+n))))
             push!(body, :(offset += n))
         else
             push!(body, :($name = nothing))
@@ -1072,16 +1087,19 @@ end
 @inline _pr_tape_cotangents(::Val{K}, tape::Vector{Float64}, ȳ) where {K} =
     ntuple(k -> ȳ * @inbounds(tape[length(tape) - K + k]), Val(K))
 
-# Each buffer scaled by the seed `ȳ` and added into its operand's shadow,
-# through the gathered view's parent.
-@generated function _pr_scaled_shadows(::Val{B}, args::Tuple, buffers::Tuple, ȳ) where {B}
-    Expr(:tuple, (:(_pr_scaled_shadow(getfield(args, $b), getfield(buffers, $j), ȳ))
+# Scale by the reverse seed and return active tuple gradients or add to array shadows.
+@generated function _pr_scaled_shadows(layout::Val, ::Val{B}, args::Tuple, buffers::Tuple, ȳ) where {B}
+    Expr(:tuple, (:(_pr_scaled_shadow(layout, getfield(args, $b), getfield(buffers, $j), ȳ))
                   for (j, b) in enumerate(B))...)
 end
-@inline _pr_scaled_shadow(arg, ::Nothing, ȳ) = nothing
-@inline function _pr_scaled_shadow(arg::Union{Duplicated,DuplicatedNoNeed}, buffer::SubArray, ȳ)
-    shadow = parent(arg.dval)
-    source = parent(buffer)
+@inline _pr_scaled_shadow(layout, arg, ::Nothing, ȳ) = nothing
+@inline _pr_scaled_shadow(::Val{:logical}, arg::Active{T}, buffer::SubArray, ȳ) where {T<:Tuple} =
+    ntuple(k -> ȳ * @inbounds(buffer[k]), Val(fieldcount(T)))
+@inline _pr_buffer_storage(::Val{true}, x) = parent(x)
+@inline _pr_buffer_storage(::Val{:logical}, x) = x
+@inline function _pr_scaled_shadow(layout::Val, arg::Union{Duplicated,DuplicatedNoNeed}, buffer::SubArray, ȳ)
+    shadow = _pr_buffer_storage(layout, arg.dval)
+    source = _pr_buffer_storage(layout, buffer)
     @inbounds for i in eachindex(shadow, source)
         shadow[i] += ȳ * source[i]
     end
@@ -1206,8 +1224,14 @@ end
 function EnzymeRules.reverse(
         config::RevConfig, rule::Const{<:Union{_PlateSumRuleBody,_PlateSumRuleOnePass}},
         dret, tape, annotations::Vararg{Annotation,N}) where {N}
-    cotangents = _pr_rule_reverse(config, rule.val.rule, dret, tape,
-                                  _pr_operand_args(annotations))
+    args = _pr_operand_args(annotations)
+    r = rule.val.rule
+    cotangents = if tape isa Vector{Float64}
+        _pr_vector_tape_reverse(_pr_tape_layout(rule.val), Val(_pr_scalar_positions(r)),
+                                Val(_pr_batched_positions(r)), dret, tape, args)
+    else
+        _pr_rule_reverse(config, r, dret, tape, args)
+    end
     # The seed's scaling is done: the vector goes back to its slot for the
     # next call. A two-pass or constant call of the site took none out.
     tape isa Vector{Float64} && _pr_return_tape!(_pr_slot(annotations), tape)
@@ -1220,7 +1244,6 @@ function _pr_rule_reverse(config::RevConfig, r::R, dret, tape,
     B = _pr_batched_positions(r)
     W = width(config)
     tape === nothing && return _pr_reverse_return(Val(()), args, ())
-    tape isa Vector{Float64} && return _pr_vector_tape_reverse(r, Val(S), Val(B), dret, tape, args)
     operands = _pr_operands(tape, args)
     covered = _pr_covers(Val(S), Val(B), args)
     if W == 1 && !covered
@@ -1253,13 +1276,12 @@ function _pr_rule_reverse(config::RevConfig, r::R, dret, tape,
     end
 end
 
-# The reverse pass of a call with a vector tape (width 1, by `_pr_one_pass`):
-# only the seed's scaling of what the augmented primal computed. `r::R`: Julia
-# does not otherwise specialize on a `Function` it only reads fields of.
-function _pr_vector_tape_reverse(r::R, ::Val{S}, ::Val{B}, dret, tape::Vector{Float64},
-                                 args::Tuple) where {R,S,B}
+# A vector tape holds unit-seed cotangents from the augmented primal. Only
+# the seed scaling and accumulation into the real shadows remain.
+function _pr_vector_tape_reverse(layout::Val, ::Val{S}, ::Val{B}, dret, tape::Vector{Float64},
+                                 args::Tuple) where {S,B}
     ȳ = dret isa Active ? dret.val : dret
-    shadows = _pr_scaled_shadows(Val(B), args, _pr_tape_buffers(Val(B), args, tape), ȳ)
+    shadows = _pr_scaled_shadows(layout, Val(B), args, _pr_tape_buffers(layout, Val(B), args, tape), ȳ)
     _pr_reverse_return(Val(S), args, _pr_tape_cotangents(Val(length(S)), tape, ȳ), Val(B), shadows)
 end
 

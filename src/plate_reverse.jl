@@ -950,6 +950,7 @@ mutable struct _PRProgramState
     outer::Set{Symbol}                # active values bound outside every cell loop
     reads::Dict{Symbol,Int}           # batched parameter => its reads in the program
     arm_initializers::Dict{Symbol,Vector{Pair{Symbol,Any}}}
+    joint_cell_cut::Bool
 end
 
 # How many reads of each batched parameter one call of the program can make,
@@ -1606,9 +1607,9 @@ function _pr_direct_reads(stmts, st::_PRProgramState, linear::Symbol, found::Vec
     out, found
 end
 
-# Whether the generated sweep also computes the program's value: the name of
-# its `Val{true}` / `Val{false}` parameter. A sweep that only feeds cotangents
-# (the two-pass schedule) compiles the value away.
+# The sweep's layout parameter also controls the value reduction. Grouped
+# tapes factor it, logical tapes accumulate in cell order, and the two-pass
+# schedule compiles the reduction away.
 const _PR_WANT_VALUE = :_pr_want_value
 
 # The cell's value `result` as affine terms `(num, inv, var)` over the cell's
@@ -1664,7 +1665,8 @@ function _pr_value_accumulation(stmts, invariant, cellvars, result, total, add, 
     coef(num, inv) = isempty(inv) ? num :
         num == 1.0 ? Expr(:call, GlobalRef(Base, :*), inv...) :
         Expr(:call, GlobalRef(Base, :*), num, inv...)
-    pre = Any[]; inloop = Any[]; parts = Any[]; constant = Any[]
+    pre = Any[]; parts = Any[]; constant = Any[]
+    inloop = Any[:($_PR_WANT_VALUE isa Val{:logical} && ($total = $add($total, $result)))]
     for (num, inv, var) in _pr_value_terms(stmts, invariant, cellvars, result)
         if var === nothing
             push!(constant, coef(num, inv))
@@ -1780,6 +1782,7 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState)
             _pr_contribute!(reverse, fc, adj, mutable, result,
                             [_PRTerm(1.0, Any[_pr_bar(total)], nothing)], true)
             _pr_factored_sweep!(reverse, fc, inloop, adj, mutable, true, cuts)
+            st.joint_cell_cut |= !isempty(cuts)
             _pr_flush_counts!(fc)
             coefficients, flush = fc.pre, fc.post
             _pr_reverse_exprs!(after, hoisted, active, copy(defined); touched = st.touched, cuts)
@@ -1964,23 +1967,25 @@ function _pr_arm_initializers!(initializers, node)
 end
 
 """
-    _pr_program_reverse(ast, active_params, mod, values) -> (expr, scalar, batched)
+    _pr_program_reverse(ast, active_params, mod, values) -> (expr, scalar, batched, joint)
 
 The reverse of plate program `ast` (a `function (params...) body; result end`
 expression). `active_params` are the parameters that carry derivatives;
 `values` maps program-local callable parameters to their values. Returns the
 reverse function's expression `(params..., ȳ, want, shadows...) -> (value,
 cotangents of the scalar active parameters...)`, the scalar active parameters
-in order, and the batched (per-cell) active parameters, whose shadows follow
-`want` in order. One pass over the cells computes the cotangents for seed ȳ,
-adding each batched operand's cotangent into its shadow, and, when `want` is
-`Val(true)`, the program's value (otherwise the returned value is not it).
+in order, the batched (per-cell) active parameters, and whether a cell uses a
+joint value/partial cut. Shadows follow `want` in batched parameter order.
+One pass over the cells computes the cotangents for seed ȳ, adding each
+batched operand's cotangent into its shadow.
 
 Under `Val(true)` each shadow must be a zeroed buffer the caller owns: an
 `Array`, or a gathered operand's buffer, a view of owned storage through the
 operand's own index vector. The sweep may add unscaled partials into it and
 scale it in place after the loop, and the caller adds it into the operand's
-real shadow. Under `Val(false)` the cotangents add into the shadows as given.
+real shadow. Under `Val(:logical)` the sweep accumulates the cell values in
+their loop and writes cotangents to zeroed buffers indexed like the operands.
+Under `Val(false)` it only adds cotangents into the supplied shadows.
 """
 function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict{Symbol,Any})
     Meta.isexpr(ast, :function, 2) && Meta.isexpr(ast.args[1], :tuple) ||
@@ -2067,7 +2072,7 @@ function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict
     end
     outer = Set{Symbol}(a for a in active if !(a in cell_locals))
     st = _PRProgramState(mod, values, active, prepared, shadow, totals, output,
-                         Set{Symbol}(), 0, outer, _pr_read_counts(body, prepared, mod, values), initializers)
+                         Set{Symbol}(), 0, outer, _pr_read_counts(body, prepared, mod, values), initializers, false)
     new_body = _pr_program_block(stmts, st)
     # Every outer adjoint starts at zero; every total's adjoint is the seed.
     init = Any[:($(_pr_bar(a)) = 0.0) for a in sort!(collect(outer)) if !(a in totals)]
@@ -2077,7 +2082,7 @@ function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict
         Expr(:tuple, params..., seed, _PR_WANT_VALUE, (shadow[p] for p in batched)...),
         Expr(:block, checks..., init..., seeds..., new_body...,
              Expr(:tuple, output, (_pr_bar(p) for p in scalar)...)))
-    _pr_index_run_schedule(fexpr, index_runs, prepared, shadow, params, batched), scalar, batched
+    _pr_index_run_schedule(fexpr, index_runs, prepared, shadow, params, batched), scalar, batched, st.joint_cell_cut
 end
 
 include("plate_reverse_runs.jl")
@@ -2112,10 +2117,11 @@ are the positions of the batched operands. The Enzyme extension runs it either
 in the augmented primal with a unit seed (scaling afterwards) or in the reverse
 pass with the seed; see `_pr_one_pass` there.
 """
-struct _PlateSumRule{S,B,P,R} <: Function
+struct _PlateSumRule{S,B,P,R,Joint} <: Function
     program::P
     reverse::R
 end
+_PlateSumRule{S,B,P,R}(p::P, r::R) where {S,B,P,R} = _PlateSumRule{S,B,P,R,false}(p, r)
 
 # Pass the dense leaf itself across the AD rule boundary. Enzyme can then
 # tape it when the caller overwrites it after the primal. The by-value
@@ -2147,7 +2153,7 @@ end
 @inline function _pr_exp_rule(rule::_PlateSumRule{S,B}, inputs, shadows, shapes) where {S,B}
     p = _pr_exp_program(inputs, Val(()), rule.program, shapes)
     r = _pr_exp_program(inputs, shadows, rule.reverse, shapes)
-    _PlateSumRule{S,B,typeof(p),typeof(r)}(p, r)
+    _PlateSumRule{S,B,typeof(p),typeof(r),true}(p, r)
 end
 
 # Attach the backend rule only after checking the operands' storage types.
@@ -2156,18 +2162,16 @@ end
 struct _PlateSumRuleBody{S,B,R} <: Function
     rule::R
 end
-# The same call where the generated reverse takes one pass over the cells (the
-# Enzyme extension's `_pr_one_pass`): a gathered operand (`_pr_gather_value`),
-# at least `_PR_ONE_PASS_MIN_CELLS` cells, and the gathered operands' parents
-# (the one-pass buffers) shorter than the plate. It is chosen here, per call
-# from the operands' sizes, so that each target's rule has one tape type: a
-# call that takes two passes keeps the two-pass rule's empty tape. Deciding in
-# the rule instead cost every small plate with a gather its unused vector tape
-# (Seeds' identity gather `b[axes(n, 1)]`, 21 cells: 16 B and about 15 ns).
-struct _PlateSumRuleOnePass{S,B,R} <: Function
+# The augmented primal sweeps once. A grouped tape holds partials per parent
+# entry of an indirect view. A logical tape holds partials per operand entry,
+# including each entry of an active tuple. Select the layout at the call site
+# so the two-pass target keeps its empty tape on small arithmetic plates.
+struct _PlateSumRuleOnePass{S,B,R,Layout} <: Function
     rule::R
 end
-# Below this many cells one pass's tape allocation outweighs the pass it saves
+_pr_tape_layout(::_PlateSumRuleOnePass{S,B,R,L}) where {S,B,R,L} = Val(L)
+# For a gather that would allocate its tape, below this many cells the
+# allocation outweighs the pass it saves
 # (eight schools, 8 cells: 0.070 µs in two passes, 0.102–0.118 µs in one).
 const _PR_ONE_PASS_MIN_CELLS = 128
 # Whether an operand type is a gather one pass can factor through: a `Float64`
@@ -2209,19 +2213,24 @@ end
 # The target of a call with operands of types `types`, as an expression in
 # `rule` and `args` that `make` turns into the result (the target itself, or
 # its call): the program for a remaining lazy cell array, else the two-pass body, or the
-# one-pass call (`one_pass`, which alone receives a tape slot) when a gathered
-# operand's sizes allow.
-function _pr_target_expr(S, B, types, make, one_pass = make)
+# one-pass call when its operand sizes or reusable joint cut justify a tape.
+function _pr_target_expr(S, B, types, joint, make, one_pass = make)
     any(b -> types[b] <: _CellArray, B) &&
         return make(:(getfield(rule, :program)))
-    body = make(:(_PlateSumRuleBody{$S,$B,typeof(rule)}(rule)))
+    # A joint scalar cut already produced both the cell value and its
+    # partials. Reuse them within a prepared call. Tuples also use this
+    # schedule so their temporary cotangents live in the preparation's tape.
+    buffered = !isempty(types) && types[end] === _PlateTapeSlot &&
+               (joint || any(b -> types[b] <: Tuple{Vararg{Float64}}, B))
+    body = buffered ? one_pass(:(_PlateSumRuleOnePass{$S,$B,typeof(rule),:logical}(rule))) :
+                      make(:(_PlateSumRuleBody{$S,$B,typeof(rule)}(rule)))
     gathered = [b for b in B if _pr_gather_value(types[b])]
     isempty(gathered) && return body
     buffers = Expr(:call, :+, (:(length(parent(getfield(args, $b)))) for b in gathered)...)
     quote
         cells = length(getfield(args, $(first(gathered))))
-        if cells >= _PR_ONE_PASS_MIN_CELLS && $buffers < cells
-            $(one_pass(:(_PlateSumRuleOnePass{$S,$B,typeof(rule)}(rule))))
+        if ($buffered || cells >= _PR_ONE_PASS_MIN_CELLS) && $buffers < cells
+            $(one_pass(:(_PlateSumRuleOnePass{$S,$B,typeof(rule),true}(rule))))
         else
             $body
         end
@@ -2230,7 +2239,7 @@ end
 # The call itself, made in each branch: a target chosen by size and then called
 # would be a union of the two wrappers, boxed in the primal. A trailing tape
 # slot is not an operand of the program: only the one-pass call takes it on.
-function _pr_rule_expr(S, B, types, dispatch)
+function _pr_rule_expr(S, B, types, joint, dispatch)
     slotted = !isempty(types) && types[end] === _PlateTapeSlot
     count = length(types) - slotted
     operands = Any[:(getfield(args, $i)) for i in 1:count]
@@ -2245,16 +2254,16 @@ function _pr_rule_expr(S, B, types, dispatch)
         return :($dispatch(_pr_exp_rule(rule, Val($inputs), Val($shadows), $shapes),
                            ($(operands...),)))
     end
-    dispatch === :_pr_rule_target && return _pr_target_expr(S, B, types, identity)
+    dispatch === :_pr_rule_target && return _pr_target_expr(S, B, types, joint, identity)
     call = target -> Expr(:call, target, operands...)
     one_pass = slotted ?
         (target -> Expr(:call, target, operands..., :(getfield(args, $(count + 1))))) : call
-    _pr_target_expr(S, B, types, call, one_pass)
+    _pr_target_expr(S, B, types, joint, call, one_pass)
 end
-@generated _pr_rule_target(rule::_PlateSumRule{S,B}, args::Tuple) where {S,B} =
-    _pr_rule_expr(S, B, args.parameters, :_pr_rule_target)
-@generated _pr_rule_call(rule::_PlateSumRule{S,B}, args::Tuple) where {S,B} =
-    _pr_rule_expr(S, B, args.parameters, :_pr_rule_call)
+@generated _pr_rule_target(rule::_PlateSumRule{S,B,P,R,J}, args::Tuple) where {S,B,P,R,J} =
+    _pr_rule_expr(S, B, args.parameters, J, :_pr_rule_target)
+@generated _pr_rule_call(rule::_PlateSumRule{S,B,P,R,J}, args::Tuple) where {S,B,P,R,J} =
+    _pr_rule_expr(S, B, args.parameters, J, :_pr_rule_call)
 # One method per operand count, each operand's type a parameter of its own:
 # Julia does not otherwise specialize on a `Function` operand it only passes on
 # (the program's callables), and the call would dispatch dynamically
@@ -2409,7 +2418,7 @@ function _pr_rule_for(call::Expr, outer_active::Set{Symbol}, kernel,
     end
     isempty(active_params) && return nothing, "no active operand"
     try
-        rexpr, scalar, batched = _pr_program_reverse(program.ast, active_params, @__MODULE__, values)
+        rexpr, scalar, batched, joint = _pr_program_reverse(program.ast, active_params, @__MODULE__, values)
         # A batched operand's cotangent is added into its shadow cell by cell,
         # which a lazy cell array's shadow cannot take: the program keeps the
         # backend's reverse (snag generated-plate-56eaf6e3).
@@ -2426,7 +2435,7 @@ function _pr_rule_for(call::Expr, outer_active::Set{Symbol}, kernel,
         # dispatch dynamically and box every operand.
         primal = _PlateCall(compile(program.ast))
         rev = _PlateCall(compile(rexpr))
-        return _PlateSumRule{S,B,typeof(primal),typeof(rev)}(primal, rev), rexpr
+        return _PlateSumRule{S,B,typeof(primal),typeof(rev),joint}(primal, rev), rexpr
     catch err
         err isa _PRIneligible || rethrow()
         return nothing, err.reason
