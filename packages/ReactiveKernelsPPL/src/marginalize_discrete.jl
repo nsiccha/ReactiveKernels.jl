@@ -261,6 +261,26 @@ function _integer_cell_expr(ex, dependent, elementwise, localvalue, operand)
         map(scalar, ex.args[2:end])...)
 end
 
+# Partition score assignments at the first read of an observation operand.
+# The shared table needs only columns the cell or its result actually reads.
+function _integer_component_columns(scores, total, params)
+    common, conditional = Expr[], Expr[]
+    varying = Set(params)
+    for st in scores
+        name = _assigned_name(st)
+        name === nothing && return (common, scores, Symbol[])
+        if _gibbs_reads(st.args[2], varying)
+            push!(varying, name)
+            push!(conditional, st)
+        else
+            push!(common, st)
+        end
+    end
+    used = _statement_value_reads!(Set{Symbol}(), Expr(:block, conditional..., total))
+    columns = [n for n in _assigned_name.(common) if n in used]
+    return common, conditional, columns
+end
+
 # Build only the selected cut. A density needs a scalar log-sum-exp per
 # element. Recovery also needs the vector of scores on that element.
 function _integer_score_plate(plan, added, table, x, roots, statements, prior, likelihood,
@@ -314,18 +334,7 @@ function _integer_score_plate(plan, added, table, x, roots, statements, prior, l
         # location) belongs to a component plate shared by every observation.
         # Give that table its own port. A component plate inside an element
         # cell would compose into its scoring plate and rerun for every row.
-        conditional, common = Expr[], Expr[]
-        varying = Set(params)
-        for st in scores
-            if _gibbs_reads(st.args[2], varying)
-                push!(varying, _assigned_name(st))
-                push!(conditional, st)
-            else
-                push!(common, st)
-            end
-        end
-        used = _statement_value_reads!(Set{Symbol}(), Expr(:block, conditional..., total))
-        outputs = [n for n in _assigned_name.(common) if n in used]
+        common, conditional, outputs = _integer_component_columns(scores, total, params)
         if !isempty(outputs) && !isempty(conditional)
             row = Symbol(:_ppl_component_, x)
             common_body = Expr(:block, common..., Expr(:tuple, outputs...))
@@ -378,11 +387,12 @@ function _integer_score_plate(plan, added, table, x, roots, statements, prior, l
     end
     # An operand whose axes are exactly the declaration's already sets the
     # domain, even when empty or length one. Drop the redundant shape lane.
-    if shared && any(lanes[2:end]) do a
-            data = a isa Symbol ? get(plan.columns, a, nothing) : nothing
-            data isa AbstractArray && ndims(data) == length(dims.args) &&
-                all(d -> dims.args[d] == _read_size(a, d), eachindex(dims.args))
-        end
+    function sets_domain(a)
+        data = a isa Symbol ? get(plan.columns, a, nothing) : nothing
+        return data isa AbstractArray && ndims(data) == length(dims.args) &&
+            all(d -> dims.args[d] == _read_size(a, d), eachindex(dims.args))
+    end
+    if shared && any(sets_domain, lanes[2:end])
         popfirst!(lanes)
         popfirst!(params)
     end
@@ -470,7 +480,8 @@ function _integer_array_marginal_program(plan, p, def)
     probabilities = Symbol(:_ppl_array_probabilities_, x)
     masses = [Symbol(:_ppl_array_mass_, x, :_, k) for k in 0:length(likelihoods)]
     shared = _integer_shared_support(plan, p)
-    added = Expr[:($support = $rhs),
+    checked = shared ? rhs : :($(GlobalRef(here, :_integer_checked_support))($rhs, $dims))
+    added = Expr[:($support = $checked),
         :($values = $(GlobalRef(here, :_integer_array_values))($support))]
     score(k; kwargs...) = _integer_score_plate(plan, added, Symbol(masses[k+1], :_components),
         x, roots, statements, plates[:prior], likelihoods[1:k], dependent, elementwise,
@@ -605,16 +616,25 @@ end
 _integer_array_values(support::AbstractRange{<:Integer}) = support
 _integer_array_values(supports::AbstractArray{<:AbstractRange}) = _gibbs_values(vec(supports))
 
+# Validate the per-element domain once, before iterating any candidates. If
+# every range is empty the union is empty and the nonempty model has zero mass.
+_integer_checked_support(support::AbstractRange, dims) = support
+function _integer_checked_support(supports::AbstractArray{<:AbstractRange}, dims)
+    length(supports) == prod(dims) || throw(DimensionMismatch("[query] an integer array " *
+        "of size $dims has $(length(supports)) element supports"))
+    i = findfirst(isempty, vec(supports))
+    if i !== nothing && any(!isempty, supports)
+        throw(ArgumentError("[query] element $i of a marginalized integer array has an empty support"))
+    end
+    return supports
+end
+
 # Every element at `value`; with own supports, an element outside its own
 # keeps an in-support value, so no read sees an excluded state.
 _integer_array_candidate(::AbstractRange{<:Integer}, value, dims) = fill(value, dims)
 function _integer_array_candidate(supports::AbstractArray{<:AbstractRange}, value, dims)
-    length(supports) == prod(dims) || throw(DimensionMismatch("[query] an integer array " *
-        "of size $dims has $(length(supports)) element supports"))
     state = Array{Int}(undef, dims)
     for (i, own) in enumerate(supports)
-        isempty(own) && throw(ArgumentError(
-            "[query] element $i of a marginalized integer array has an empty support"))
         state[i] = value in own ? value : first(own)
     end
     return state

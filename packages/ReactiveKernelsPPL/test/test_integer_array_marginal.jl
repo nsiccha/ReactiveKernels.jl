@@ -90,6 +90,11 @@ end
     q = prepare_predictive(build_kernel(empty_plan), empty_plan)
     @test size(predictive_laws(q, Float64[]).y) == (0,)
     @test q(Float64[], Xoshiro(4)).y == Float64[]
+    # A nonempty union cannot supply an in-support value for an empty row.
+    checked = ReactiveKernelsPPL._integer_checked_support
+    @test_throws ArgumentError checked([0:2, 1:0], (2,))
+    @test_throws DimensionMismatch checked([0:2, 0:1], (3,))
+    @test checked([1:0, 1:0], (2,)) == [1:0, 1:0]
 end
 
 @testset "a matrix of integers sums out entry by entry" begin

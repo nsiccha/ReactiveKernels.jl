@@ -269,6 +269,22 @@ function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
     return ReactiveKernels._PyVal(code, T, ctx.host !== nothing)
 end
 
+# The bound supports are host-side arrays of ranges in column-major order.
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_integer_checked_support), args::Vector{ReactiveKernels._PyVal})
+    support, dims = args
+    support.T <: AbstractRange && return support
+    ctx.host === nothing && ReactiveKernels._jax_error(
+        "per-element integer supports require host data preparation")
+    rows = ReactiveKernels._jax_bind!(ctx, :supports, support)
+    ReactiveKernels._jax_emit!(ctx, "if len(" * rows.code * ") != np.prod(" * dims.code *
+        "): raise ValueError('integer array dimensions and number of element supports differ')")
+    ReactiveKernels._jax_emit!(ctx, "if any(len(r) == 0 for r in " * rows.code *
+        ") and any(len(r) > 0 for r in " * rows.code *
+        "): raise ValueError('an element of a marginalized integer array has an empty support')")
+    return rows
+end
+
 # A shared support already is the candidate axis. For individual supports,
 # prepare their sorted union on the host, preserving holes between ranges.
 function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
