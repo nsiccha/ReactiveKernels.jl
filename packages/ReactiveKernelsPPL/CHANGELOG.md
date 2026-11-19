@@ -16,6 +16,10 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.235
+
+- Repeated sampler density calls reuse intermediate storage when unpacking array parameters, evaluating ordered slices and reducing categorical probability columns.
+
 ## 0.1.230
 
 - The package image prepares a coordinate conditional and a marginalized
