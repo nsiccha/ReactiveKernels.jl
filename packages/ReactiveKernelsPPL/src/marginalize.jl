@@ -87,7 +87,7 @@ Any other form is refused with a `SurfaceLoweringError` naming the
 statement. Each scalar coefficient may vary by step (irregular gaps
 `exp(-gap[t] / range)`, a reset `r = 0` where a new series starts).
 
-A top-level `@scan` carrying several arrays, or reading one at a lag above
+A `@scan` carrying several arrays, or reading one at a lag above
 1 (seeded at `x[1]`, …, `x[p]`, its loop from `p + 1`), has a vector state:
 name every array it carries, `marginalize(model, :level, :slope)`. Each seed
 is a Normal draw or a value affine in the seeds above it, and each step
@@ -98,8 +98,8 @@ above it in the same step and Normal innovations (a local linear trend
 arrays, `y .~ Normal.(offset .+ loading_a .* a .+ …, noise)`, an observation
 of bound data without missing entries whose location is affine in them. The
 filter carries the window `a[t - j]`, `j < p`, of every array, and the draws
-return each array under its name. A vector state observed otherwise or in a
-`@plate` cell is refused.
+return each array under its name. In a plate, each cell has its own window
+and observes its own vector `y[g]`.
 
 A step's innovation scale may be 0 (`s * sqrt(1 - r * r)` at `r = 1`, the
 state carried over unchanged): the filter is exact there, and native
@@ -665,6 +665,7 @@ _value_shape(v) = v isa Number ? :scalar :
 
 # The shape of one entry `v[g]` of a bound value read in a `@plate` cell.
 _entry_shape(v) = !(v isa AbstractVector) ? :unknown :
+    eltype(v) <: AbstractVector{<:Number} ? :vector :
     all(e -> e isa Number, v) ? :scalar :
     all(e -> _value_shape(e) === :vector, v) ? :vector : :unknown
 
@@ -967,35 +968,35 @@ function _marginalize_latents(ast::Expr, marginalized, values, observing,
     done = Set{Symbol}()
     for x in marginalized
         x in done && continue
-        # A top-level `@scan` with a vector state (several arrays, or a lag
-        # above one) integrates out as one group (marginalize_vector.jl).
-        group = _marginal_group(ast, x, marginalized)
-        req = _marginal_request_for(requests, group === nothing ? Symbol[x] : group)
-        if group === nothing
-            ast = _marginalize_latent(ast, x, values, observing, req)
-            push!(done, x)
+        k = findfirst(st -> _is_scan_of(st, x), ast.args)
+        if k === nothing
+            p = findfirst(st -> _marginal_cell_scan(st, x) !== nothing, ast.args)
+            if p === nothing
+                nested = any(st -> _plate_loop(st) !== nothing && _mentions_symbol(st, x), ast.args)
+                _marginal_fail(x, nested ?
+                    "its `@scan` is not a statement of a `@plate` cell (a recurrence in a " *
+                    "nested `@plate` is not marginalized yet)" :
+                    "no top-level `@scan` and no `@plate` cell `@scan` carries `$x`")
+            end
+            ast, members = _marginalize_cell_latent(ast, p, x, marginalized, values, observing, requests)
         else
-            ast = _marginalize_vector_latent(ast, group, values, observing, req)
-            union!(done, group)
+            spec = parse_scan_block(ast.args[k].args[end])
+            group = _vector_group(spec, x, marginalized)
+            members = something(group, Symbol[x])
+            req = _marginal_request_for(requests, members)
+            ast = if group === nothing
+                _marginalize_latent(ast, k, x, _gaussian_transition(spec, x), values, observing, req)
+            else
+                _marginalize_vector_latent(ast, k, _vector_transition(spec, group), values, observing, req)
+            end
         end
+        union!(done, members)
     end
     return ast
 end
 
-function _marginalize_latent(ast::Expr, x::Symbol, values, observing, req = nothing)
+function _marginalize_latent(ast, k, x, law, values, observing, req)
     stmts = ast.args
-    k = findfirst(st -> _is_scan_of(st, x), stmts)
-    if k === nothing
-        p = findfirst(st -> _is_plate_scan_of(st, x), stmts)
-        p === nothing || return _marginalize_cell_latent(ast, p, x, values, observing, req)
-        nested = any(st -> Meta.isexpr(st, :macrocall) && st.args[1] === Symbol("@plate") &&
-            _mentions_symbol(st, x), stmts)
-        _marginal_fail(x, nested ?
-            "its `@scan` is not a statement of a `@plate` cell (a recurrence in a " *
-            "nested `@plate` is not marginalized yet)" :
-            "no top-level `@scan` and no `@plate` cell `@scan` carries `$x`")
-    end
-    law = _gaussian_transition(parse_scan_block(stmts[k].args[end]), x)
     stmts, k = _inline_latent_definitions(stmts, k, x)
     j = _marginal_reader(x, stmts, k)
     y, loc, scale, form, idx = _marginal_observation(x, stmts[j], y -> y isa Symbol, "y")
@@ -1138,28 +1139,62 @@ end
 _marginal_cell_carried(x, role) = _marginal_name(x, Symbol(:cell_, role))
 _marginal_draw_carried(x, role) = _marginal_name(x, Symbol(:draw_, role))
 
-function _marginalize_cell_latent(ast::Expr, p, x::Symbol, values, observing, req = nothing)
-    stmts = ast.args
-    loop = _plate_loop(stmts[p])
+# A cell submodel writes a carried array as a column of trajectories,
+# `state[g][t]`. Distinguish that from an ordinary cell-local `state[t]`.
+function _marginal_cell_scan(st, x)
+    loop = _plate_loop(st)
+    loop === nothing && return nothing
+    ref = Expr(:ref, x, loop.args[1].args[1])
+    return findfirst(loop.args[2].args) do c
+        _is_cell_scan_block(c) && any(_observed_scan_setups(c.args[end])) do seed
+            lhs = _observed_scan_lhs(seed)
+            Meta.isexpr(lhs, :ref, 2) && lhs.args[1] in (x, ref)
+        end
+    end
+end
+
+function _marginalize_cell_latent(ast, p, x, marginalized, values, observing, requests)
+    st = ast.args[p]
+    loop = _plate_loop(st)
     head = loop.args[1]
     ivar = head.args[1]
-    cell = Any[c for c in loop.args[2].args if !(c isa LineNumberNode)]
-    k = findfirst(c -> _is_scan_of(c, x), cell)
+    cell = copy(loop.args[2].args)
+    k = _marginal_cell_scan(st, x)
+    others = Any[c for (i, c) in enumerate(ast.args) if i != p]
+    indexed = Set(lhs.args[1] for seed in _observed_scan_setups(cell[k].args[end])
+        for lhs in (_observed_scan_lhs(seed),) if Meta.isexpr(lhs, :ref, 2) &&
+        Meta.isexpr(lhs.args[1], :ref, 2) && lhs.args[1].args[2] === ivar)
+    for ref in indexed
+        name = ref.args[1]
+        name in observing && _marginal_fail(x, "`$name` is observed data, not a latent array")
+        any(c -> _mentions_symbol(c, name), others) && _marginal_fail(x,
+            "its carried array `$name` is read outside the plate")
+        # Other indices or the whole column cannot be integrated independently.
+        function localize(ex)
+            ex == ref && return name
+            ex === name && _marginal_fail(x, "its cell reads `$name` outside `$ref`")
+            return ex isa Expr ? Expr(ex.head, map(localize, ex.args)...) : ex
+        end
+        cell = map(localize, cell)
+    end
     spec, hi = _parse_marginal_scan(cell[k].args[end])
-    (length(spec.states) == 1 && spec.lo == 2) || _marginal_fail(x, "its `@scan` in a " *
-        "`@plate` cell has a vector state (several carried arrays or a lag above 1); " *
-        "a vector state in a `@plate` cell is not marginalized yet (at top level it is)")
-    law = _gaussian_transition(spec, x, hi)
-    others = Any[st for (i, st) in enumerate(stmts) if i != p]
-    cell, k = _inline_cell_latent_definitions(cell, k, x, ivar, others)
-    j = _marginal_reader(x, cell, k;
-        observation = "y[$ivar] .~ Normal.(offset .+ loading .* $x, noise)")
-    y, loc, scale, form, idx = _marginal_observation(x, cell[j],
-        y -> Meta.isexpr(y, :ref, 2) && y.args[1] isa Symbol && y.args[2] === ivar,
-        "y[$ivar]")
-    idx === nothing || _marginal_fail(x, "its observation `$y` reads `$x[$idx]`; " *
-        "gathered rows in a `@plate` cell are not marginalized yet (at top level " *
-        "each row observes the state at its step)")
+    group = _vector_group(spec, x, marginalized)
+    members = something(group, Symbol[x])
+    req = _marginal_request_for(requests, members)
+    for a in members
+        cell, k = _inline_cell_latent_definitions(cell, k, a, ivar, others)
+    end
+    response(y) = Meta.isexpr(y, :ref, 2) && y.args[1] isa Symbol && y.args[2] === ivar
+    if group === nothing
+        j = _marginal_reader(x, cell, k;
+            observation = "y[$ivar] .~ Normal.(offset .+ loading .* $x, noise)")
+        y, _, scale, form, idx = _marginal_observation(x, cell[j], response, "y[$ivar]")
+        idx === nothing || _marginal_fail(x, "its observation `$y` reads `$x[$idx]`; " *
+            "gathered rows in a `@plate` cell are not marginalized yet (at top level " *
+            "each row observes the state at its step)")
+    else
+        j, y, form, scale = _vector_reader(cell, k, group, response, "y[$ivar]")
+    end
     yname = y.args[1]
     yvalue = get(values, yname, nothing)
     yvalue isa AbstractVector && any(e -> e isa AbstractVector && Missing <: eltype(e), yvalue) &&
@@ -1180,32 +1215,27 @@ function _marginalize_cell_latent(ast::Expr, p, x::Symbol, values, observing, re
     drawn = Set{Symbol}(c.args[2] for c in cell
         if Meta.isexpr(c, :call, 3) && c.args[1] === :~ && c.args[2] isa Symbol)
     leaf = _cell_shape_leaf(_marginal_names(ast), values, ivar, defs, outputs, drawn)
-    t = law.loopvar
-    pieces = Any[]
-    seed, step = _marginal_pieces!(pieces, x, y, form, scale, leaf, t)
-    filter = _filter_scan(x, y, law, seed, step;
-        M = _marginal_cell_carried(x, :mean), V = _marginal_cell_carried(x, :var))
-    density_cell = Any[]
-    for (i, c) in enumerate(cell)
-        i == k && continue
-        if i == j
-            append!(density_cell, pieces)
-            push!(density_cell, filter)
-            continue
-        end
-        push!(density_cell, c)
+    if group === nothing
+        law = _gaussian_transition(spec, x, hi)
+        pieces = Any[]
+        seed, step = _marginal_pieces!(pieces, x, y, form, scale, leaf, law.loopvar)
+        filter = _filter_scan(x, y, law, seed, step;
+            M = _marginal_cell_carried(x, :mean), V = _marginal_cell_carried(x, :var))
+        replacement = Any[pieces..., filter]
+        side = Any[_cell_draws_plate(x, y, law, seed, step, head, cell, pieces, k, j, observing, req)]
+    else
+        law = _vector_transition(spec, group, hi)
+        replacement = _vector_filter_statements(law, y, form, scale, leaf, req; ivar)
+        side = Any[]
     end
-    draws = _cell_draws_plate(x, y, law, seed, step, head, cell, pieces, k, j, observing, req)
-    out = Any[]
-    for (i, st) in enumerate(stmts)
-        if i == p
-            push!(out, Expr(:macrocall, st.args[1], st.args[2],
-                Expr(:for, head, Expr(:block, density_cell...))), draws)
-        else
-            push!(out, st)
-        end
-    end
-    return Expr(:block, out...)
+    density_cell = copy(cell)
+    deleteat!(density_cell, k)
+    reader = k < j ? j - 1 : j
+    splice!(density_cell, reader:reader, replacement)
+    out = copy(ast.args)
+    splice!(out, p:p, Any[Expr(:macrocall, st.args[1:2]...,
+        Expr(:for, head, Expr(:block, density_cell...))), side...])
+    return Expr(:block, out...), members
 end
 
 # The cell form of `_inline_latent_definitions`: a cell definition reading
@@ -1457,10 +1487,10 @@ filtered means and variances and the transition the filter used;
 prepare one per thread.
 """
 # A vector state's group (marginalize_vector.jl): its key, its window's
-# components `(array, j)`, and its structural transition and noise entries
-# `(i, k)`.
+# components `(array, j)`, structural transition and noise entries
+# `(i, k)`, and whether these fields hold one series per plate index.
 const _MarginalGroup = Tuple{Symbol,Vector{Tuple{Symbol,Int}},Vector{Tuple{Int,Int}},
-    Vector{Tuple{Int,Int}}}
+    Vector{Tuple{Int,Int}},Bool}
 
 struct MarginalizedLatentQuery{Q}
     names::Vector{Symbol}
@@ -1502,9 +1532,10 @@ each field. A vector state is one entry keyed by its first array: its
 window's `components` (`(array, j)` for `array[t - j]`), its seed depth
 `lags`, and per step the window's filtered `mean` and `cov`, and the
 transition into it, `coef` and `shift` with noise covariance
-`innovation_cov` (entries up to `lags` hold seeds). A recurrence a submodel
-holds is keyed by its author path (`Symbol("z.x")`). At posterior draws of the parameters these determine each
-latent's exact conditional posterior; [`marginalized_latent_draws`](@ref)
+`innovation_cov` (entries up to `lags` hold seeds). In a plate the per-step
+fields are grouped by plate index. A recurrence a submodel holds is keyed by
+its author path (`Symbol("z.x")`). At posterior draws of the parameters these
+determine each latent's exact conditional posterior; [`marginalized_latent_draws`](@ref)
 samples it. A program with no marginalized recurrence is refused.
 """
 function prepare_marginalized_latents(built, plan::StructuralPlan; kwargs...)
@@ -1530,9 +1561,9 @@ function (q::MarginalizedLatentQuery)(u::AbstractVector, discrete::Vararg{NamedT
         for i in eachindex(q.names)]
     next = k * length(q.names)
     label(nm) = get(q.labels, nm, nm)
-    for (g, comps, A, Q) in q.groups
+    for (g, comps, A, Q, per_cell) in q.groups
         n = length(_vector_wants(g, comps, A, Q))
-        f = _vector_filtered(values[next+1:next+n], comps, A, Q)
+        f = _vector_filtered(values[next+1:next+n], comps, A, Q, per_cell)
         push!(entries, merge(f, (; components = map(((a, j),) -> (label(a), j), f.components))))
         next += n
     end

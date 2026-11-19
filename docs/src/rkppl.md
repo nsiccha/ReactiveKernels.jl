@@ -226,7 +226,7 @@ draws = marginalized_latent_draws(prepare_marginalized_latents(built_trend, smoo
 
 An AR(p) seeded at `x[1]`, …, `x[p]` integrates out the same way, as `marginalize(model, :x)`. A recurrence a submodel holds is named by its path, `marginalize(model, Symbol("z.x"))` for `x` of `z ~ sm(…)`, and its draws nest as `draws.z.x`.
 
-A recurrence in a `@plate` cell integrates out the same way, one filter per index, when the cell observes it through `y[g] .~ Normal.(offset .+ loading .* x, noise)` and the bound `y` holds one vector per index. The draws then hold one trajectory per index:
+A `@plate` filters each group's observation vector separately and returns one trajectory per group:
 
 ```@example marginal
 grouped = @rkppl begin
@@ -253,7 +253,9 @@ latents = prepare_marginalized_latents(built_cells, cells)
     x=marginalized_latent_draws(latents, u, Xoshiro(1)).x)
 ```
 
-Recurrences inside nested `@plate` cells, missing entries or gathered rows in a `@plate` cell's series, a vector state in a `@plate` cell or observed through missing entries, a defined vector or gathered rows, and observations that are not Normal are refused with an error naming the statement.
+For coupled arrays, `marginalize(model, :level, :slope; predictive = (location = :loc, scale = :pred_sd))` returns each group's predictive locations and scales in time order. Submodel paths work inside cells too.
+
+The filter requires Normal observations. Nested plates, missing entries or gathered rows in a cell, and vector states observed through missing entries, a defined vector or gathered rows are currently unsupported.
 
 ## Adaptive partial centering
 

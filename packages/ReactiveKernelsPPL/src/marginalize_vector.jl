@@ -66,7 +66,7 @@ function _name_noise_scales(f::_Affine, name!)
     return _Affine(f.constant, coefs)
 end
 
-function _vector_transition(spec::ScanSpec, arrays::Vector{Symbol})
+function _vector_transition(spec::ScanSpec, arrays::Vector{Symbol}, hi = spec.hi)
     g = first(arrays)
     fail(msg) = _marginal_fail(g, msg)
     p = spec.lo - 1
@@ -184,7 +184,7 @@ function _vector_transition(spec::ScanSpec, arrays::Vector{Symbol})
             A[(i, key[2])] = c
         end
     end
-    return _VectorTransition(g, arrays, p, t, spec.hi, comps, m0, seed_noise, seed_defs,
+    return _VectorTransition(g, arrays, p, t, hi, comps, m0, seed_noise, seed_defs,
         locals, A, shift, _noise_factor(rows, first_step_draw:nz[]))
 end
 
@@ -276,7 +276,6 @@ function _vector_filter_scan(law::_VectorTransition, y, offset, loading, scale, 
     M(i, at) = Expr(:ref, _vector_mean(law, i), at)
     V(i, k, at) = Expr(:ref, _vector_cov(law, i, k), at)
     L(i, k, at) = Expr(:ref, _vname(g, :root, i, k), at)
-    index = Dict(c => i for (i, c) in enumerate(law.comps))
 
     # Seeds have scalar definitions outside the scan; the same algebra in the
     # loop gets step locals. Name each expression once at its point of use.
@@ -296,34 +295,44 @@ function _vector_filter_scan(law::_VectorTransition, y, offset, loading, scale, 
         push!(writes, :($yt ~ Normal($loc, $sd)))
         residual = :($yt - $loc)
         root = joint[2:end, 2:(d + 1)]
-        for i in 1:d
+        seed_means = Any[]
+        for (i, (a, j)) in enumerate(law.comps)
             gain = _mdiv(joint[i + 1, 1], sd, false)
             mean = _madd(pm[i], _mmul(gain, residual, false), false)
-            push!(writes, Expr(:(=), M(i, at), _mfloat(something(mean, 0.0))))
+            value = _mfloat(something(mean, 0.0))
+            if at isa Int
+                # The next structural seed and any named output share this update.
+                value = save(value)
+                push!(seed_means, value)
+            end
+            push!(writes, Expr(:(=), M(i, at), value))
+            named = j == lag && a in filtered
+            named && push!(writes, Expr(:(=), Expr(:ref, _vector_filtered_mean(law, a), at),
+                at isa Int ? value : M(i, at)))
             for k in 1:d
                 push!(writes, Expr(:(=), L(i, k, at), _mfloat(something(root[i, k], 0.0))))
             end
             for k in i:d
                 cov = _factor_dot(view(root, i, :), view(root, k, :))
-                push!(writes, Expr(:(=), V(i, k, at), _mfloat(something(cov, 0.0))))
+                value = _mfloat(something(cov, 0.0))
+                named && i == k && at isa Int && (value = save(value))
+                push!(writes, Expr(:(=), V(i, k, at), value))
+                if named && i == k
+                    push!(writes, Expr(:(=), Expr(:ref, _vector_filtered_var(law, a), at),
+                        at isa Int ? value : V(i, i, at)))
+                end
             end
         end
         if predictive
             push!(writes, Expr(:(=), Expr(:ref, _vector_predictive(law, :location), at), loc),
                 Expr(:(=), Expr(:ref, _vector_predictive(law, :scale), at), sd))
         end
-        for a in filtered
-            i = index[(a, lag)]
-            push!(writes, Expr(:(=), Expr(:ref, _vector_filtered_mean(law, a), at), M(i, at)),
-                Expr(:(=), Expr(:ref, _vector_filtered_var(law, a), at), V(i, i, at)))
-        end
-        return root
+        return seed_means, root
     end
     setup = Any[]
-    factor = law.seed_noise
+    pm, factor = law.m0, law.seed_noise
     for k in 1:p
-        pm = k == 1 ? law.m0 : Any[M(i, k - 1) for i in 1:d]
-        factor = observe!(setup, defs, k, p - k, pm, factor)
+        pm, factor = observe!(setup, defs, k, p - k, pm, factor)
     end
     prev = Expr(:call, :-, t, 1)
     body = Any[law.locals...]
@@ -346,8 +355,8 @@ _vector_coef(law, i, k) = _vname(law.group, :a, i, k)
 _vector_shift(law, i) = _vname(law.group, :c, i)
 _vector_noise(law, i, k) = _vname(law.group, :q, i, k)
 
-function _vector_transition_scan(law::_VectorTransition)
-    t, p, d = law.loopvar, law.p, length(law.comps)
+function _vector_transition_entries(law)
+    d = length(law.comps)
     entries = Pair{Symbol,Any}[]
     for (i, k) in sort!(collect(keys(law.A)))
         push!(entries, _vector_coef(law, i, k) => law.A[(i, k)])
@@ -359,19 +368,19 @@ function _vector_transition_scan(law::_VectorTransition)
         q = _factor_dot(view(law.step_noise, i, :), view(law.step_noise, k, :))
         q === nothing || push!(entries, _vector_noise(law, i, k) => q)
     end
+    return entries
+end
+
+function _vector_transition_scan(law, entries)
+    t, p = law.loopvar, law.p
     setup = Any[Expr(:(=), Expr(:ref, n, s), 0.0) for s in 1:p for (n, _) in entries]
     body = Any[law.locals..., (Expr(:(=), Expr(:ref, n, t), _mfloat(v)) for (n, v) in entries)...]
     loop = Expr(:for, Expr(:(=), t, Expr(:call, :(:), p + 1, law.hi)), Expr(:block, body...))
     return _scan_macro(Expr(:block, setup..., loop))
 end
 
-# The arrays a top-level `@scan` carrying `x` integrates out together, or
-# `nothing` when it carries `x` alone at lag one (the scalar filter) or when
-# no top-level `@scan` carries `x` (a `@plate` cell's, or a refusal).
-function _marginal_group(ast::Expr, x::Symbol, marginalized)
-    k = findfirst(st -> _is_scan_of(st, x), ast.args)
-    k === nothing && return nothing
-    spec = parse_scan_block(ast.args[k].args[end])
+# A multi-array or multi-lag scan integrates out its entire state window.
+function _vector_group(spec, x, marginalized)
     (length(spec.states) == 1 && spec.lo == 2) && return nothing
     missing_names = setdiff(spec.states, marginalized)
     isempty(missing_names) || _marginal_fail(x, "its `@scan` also carries " *
@@ -385,31 +394,49 @@ function _marginal_group(ast::Expr, x::Symbol, marginalized)
     return spec.states
 end
 
-function _marginalize_vector_latent(ast::Expr, arrays::Vector{Symbol}, values, observing,
-        req = nothing)
-    g = first(arrays)
+function _marginalize_vector_latent(ast, k, law, values, observing, req)
+    g, arrays = law.group, law.arrays
     stmts = ast.args
-    k = findfirst(st -> _is_scan_of(st, g), stmts)
-    law = _vector_transition(parse_scan_block(stmts[k].args[end]), arrays)
     for a in arrays
         stmts, k = _inline_latent_definitions(stmts, k, a)
     end
-    readers = [j for (j, st) in enumerate(stmts)
-        if j != k && st isa Expr && any(a -> _mentions_symbol(st, a), arrays)]
-    spelled = "y .~ Normal.(offset .+ " * join(("loading_$a .* $a" for a in arrays), " .+ ") *
-        ", noise)"
-    length(readers) == 1 || _marginal_fail(g, "every read of " *
-        join(("`$a`" for a in arrays), ", ") * " must be the location of one Normal " *
-        "observation `$spelled`; " * (isempty(readers) ? "nothing reads them" :
-            "they are read by " * join(("`$(stmts[j])`" for j in readers), ", ")))
-    j = only(readers)
-    y, form, scale = _vector_observation(g, arrays, stmts[j], spelled)
+    j, y, form, scale = _vector_reader(stmts, k, arrays, y -> y isa Symbol, "y")
     (y in observing && get(values, y, nothing) isa AbstractVector) ||
         _marginal_fail(g, "its observation `$y` is not bound data; a vector state is " *
             "marginalized when observed through bound data (`| (; $y)`)")
     Missing <: eltype(values[y]) && _marginal_fail(g, "its observation `$y` admits " *
         "`missing` entries; a vector state is marginalized without them yet")
     leaf = _toplevel_shape_leaf(_marginal_names(ast), values)
+    filter = _vector_filter_statements(law, y, form, scale, leaf, req)
+    out = Any[]
+    for (i, st) in enumerate(stmts)
+        i == k && continue
+        if i == j
+            append!(out, filter)
+            continue
+        end
+        push!(out, st)
+    end
+    return Expr(:block, out...)
+end
+
+function _vector_reader(stmts, k, arrays, response, lhs)
+    g = first(arrays)
+    readers = [j for (j, st) in enumerate(stmts)
+        if j != k && st isa Expr && any(a -> _mentions_symbol(st, a), arrays)]
+    spelled = "$lhs .~ Normal.(offset .+ " * join(("loading_$a .* $a" for a in arrays), " .+ ") *
+        ", noise)"
+    length(readers) == 1 || _marginal_fail(g, "every read of " *
+        join(("`$a`" for a in arrays), ", ") * " must be the location of one Normal " *
+        "observation `$spelled`; " * (isempty(readers) ? "nothing reads them" :
+            "they are read by " * join(("`$(stmts[j])`" for j in readers), ", ")))
+    j = only(readers)
+    return j, _vector_observation(g, arrays, stmts[j], spelled, response)...
+end
+
+function _vector_filter_statements(law, y, form, scale, leaf, req; ivar = nothing)
+    define(n, v) = Expr(:(=), ivar === nothing ? n : Expr(:ref, n, ivar), v)
+    g, arrays = law.group, law.arrays
     defs = Any[law.seed_defs...]
     offset = _vector_piece!(defs, form.constant, :offset, g, y, leaf)
     loadings = Dict(a => _vector_piece!(defs, get(form.coefs, a, nothing),
@@ -418,30 +445,35 @@ function _marginalize_vector_latent(ast::Expr, arrays::Vector{Symbol}, values, o
     stored = req === nothing ? Symbol[] : unique(Symbol[a for (a, _, _) in req.filtered])
     filter = _vector_filter_scan(law, y, offset, (a, k) -> loadings[a](k), noise, defs;
         predictive = _stores_predictive(req), filtered = stored)
-    transition = _vector_transition_scan(law)
+    entries = _vector_transition_entries(law)
+    transition = _vector_transition_scan(law, entries)
     sd = _vector_predictive(law, :scale)
     named = _marginal_value_defs(req, _vector_predictive(law, :location), :($sd .* $sd),
-        a -> (_vector_filtered_mean(law, a), _vector_filtered_var(law, a)); scale = sd)
-    out = Any[]
-    for (i, st) in enumerate(stmts)
-        i == k && continue
-        if i == j
-            append!(out, defs)
-            push!(out, filter, transition, named...)
-            continue
+        a -> (_vector_filtered_mean(law, a), _vector_filtered_var(law, a)); scale = sd, define)
+    if ivar !== nothing
+        # Export each cell's filter and transition histories for backward sampling.
+        for name in Iterators.flatten((_vector_moment_names(law), first.(entries)))
+            push!(named, define(_vector_cell_output(name), name))
         end
-        push!(out, st)
     end
-    return Expr(:block, out...)
+    return Any[defs..., filter, transition, named...]
+end
+
+_vector_cell_output(n) = Symbol(n, "__cell")
+
+function _vector_moment_names(law)
+    d = length(law.comps)
+    return Symbol[(_vector_mean(law, i) for i in 1:d)...,
+        (_vector_cov(law, i, k) for i in 1:d for k in i:d)...]
 end
 
 # The Normal observation of a whole bound vector whose location is affine in
 # the group's arrays: its response, affine form and scale.
-function _vector_observation(g, arrays, obs, spelled)
+function _vector_observation(g, arrays, obs, spelled, response)
     wrong() = _marginal_fail(g, "it is read by `$obs`; the filter needs a Normal " *
         "observation of a whole observed vector, `$spelled`, with `offset`, the " *
         "loadings and `noise` not reading the carried arrays")
-    (Meta.isexpr(obs, :call, 3) && obs.args[1] === :.~ && obs.args[2] isa Symbol) || wrong()
+    (Meta.isexpr(obs, :call, 3) && obs.args[1] === :.~ && response(obs.args[2])) || wrong()
     y, rhs = obs.args[2], obs.args[3]
     (Meta.isexpr(rhs, :., 2) && rhs.args[1] === :Normal &&
         Meta.isexpr(rhs.args[2], :tuple) && length(rhs.args[2].args) in (1, 2)) || wrong()
@@ -490,16 +522,20 @@ using LinearAlgebra: pinv
 function _marginalized_groups(plan::StructuralPlan)
     groups = Dict{Symbol,Any}()
     order = Symbol[]
-    for sp in plan.scans, s in sp.states
+    names = Iterators.flatten(((s for sp in plan.scans for s in sp.states),
+        (d.name for d in plan.derived if endswith(String(d.name), "__cell"))))
+    for s in names
         str = String(s)
         startswith(str, _MARGINAL_PREFIX) || continue
         parts = split(str[length(_MARGINAL_PREFIX)+1:end], "__")
         length(parts) >= 3 || continue
+        per_cell = last(parts) == "cell"
+        per_cell && pop!(parts)
         g = Symbol(parts[1])
         entry = get!(groups, g) do
             push!(order, g)
             (; comps = Dict{Int,Tuple{Symbol,Int}}(), A = Tuple{Int,Int}[],
-                Q = Tuple{Int,Int}[])
+                Q = Tuple{Int,Int}[], per_cell)
         end
         if length(parts) == 5 && parts[5] == "m"
             entry.comps[parse(Int, parts[2])] = (Symbol(parts[3]), parse(Int, parts[4]))
@@ -510,18 +546,31 @@ function _marginalized_groups(plan::StructuralPlan)
         end
     end
     return _MarginalGroup[(g, [groups[g].comps[i] for i in 1:length(groups[g].comps)],
-        sort!(groups[g].A), sort!(groups[g].Q)) for g in order]
+        sort!(groups[g].A), sort!(groups[g].Q), groups[g].per_cell) for g in order]
 end
 
 # The query names of one group, in the order `_vector_filtered` reads them.
-function _vector_wants(g, comps, A, Q)
+function _vector_wants(g, comps, A, Q, per_cell = false)
     d = length(comps)
     law = (; group = g, comps)
-    return Symbol[(_vector_mean(law, i) for i in 1:d)...,
-        (_vector_cov(law, i, k) for i in 1:d for k in i:d)...,
+    wants = Symbol[_vector_moment_names(law)...,
         (_vector_coef(law, i, k) for (i, k) in A)...,
         (_vector_shift(law, i) for i in 1:d)...,
         (_vector_noise(law, i, k) for (i, k) in Q)...]
+    return per_cell ? _vector_cell_output.(wants) : wants
+end
+
+const _VECTOR_SERIES_FIELDS = (:mean, :cov, :coef, :shift, :innovation_cov)
+
+function _vector_filtered(values, comps, A, Q, per_cell)
+    per_cell || return _vector_filtered(values, comps, A, Q)
+    cells = [_vector_filtered(map(v -> v[i], values), comps, A, Q) for i in eachindex(first(values))]
+    # Preserve each history's rank for a plate with no cells.
+    column(k, ::Type{T}) where T = Vector{T}[getproperty(cell, k) for cell in cells]
+    return (; components = Tuple(comps), lags = maximum(last, comps) + 1,
+        mean = column(:mean, Vector{Float64}), cov = column(:cov, Matrix{Float64}),
+        coef = column(:coef, Matrix{Float64}), shift = column(:shift, Vector{Float64}),
+        innovation_cov = column(:innovation_cov, Matrix{Float64}))
 end
 
 # One group's filtered window: per step, its mean vector and covariance, and
@@ -554,6 +603,18 @@ end
 # (a deterministic seed, the window's shifted components) is conditioned on
 # through its pseudo-inverse.
 function _backward_sample_vector(rng, f)
+    if f.mean isa AbstractVector{<:AbstractVector{<:AbstractVector}}
+        arrays = unique(first.(f.components))
+        cells = map(eachindex(f.mean)) do i
+            series = (; (k => getproperty(f, k)[i] for k in _VECTOR_SERIES_FIELDS)...)
+            _backward_sample_window(rng, (; f.components, f.lags, series...))
+        end
+        return [a => Vector{Float64}[last(cell[j]) for cell in cells] for (j, a) in enumerate(arrays)]
+    end
+    return _backward_sample_window(rng, f)
+end
+
+function _backward_sample_window(rng, f)
     comps, p, T = f.components, f.lags, length(f.mean)
     d = length(comps)
     arrays = unique(first.(comps))
