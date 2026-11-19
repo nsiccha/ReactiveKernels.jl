@@ -2078,7 +2078,12 @@ function _hoist_data_gather_indices!(sample, det, data, taken; resolve = identit
         end
         return ex
     end
-    out = Pair{Symbol,Any}[nm => walk(rhs) for (nm, rhs) in det]
+    # Keep the append! destination concrete even when inference cannot see
+    # the shape of det. A typed comprehension fixes only the element type.
+    out = Pair{Symbol,Any}[]
+    for (nm, rhs) in det
+        push!(out, nm => walk(rhs))
+    end
     for (i, s) in enumerate(sample)
         rhs = walk(s.rhs)
         sample[i] = SampleStmt(s.lhs, rhs, s.broadcast, s.range, s.levels,
