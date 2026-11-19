@@ -162,7 +162,7 @@ Base.@nospecializeinfer _unbound_key(g::Graph, graph_key, have_sig::Vector{Value
                                      on_error) =
     (graph_key, g.version, have_sig, want_sig, Tuple(_pass_key(p) for p in passes),
      on_error, _type_stability(), _type_stability_level(), _plan_mode(), _simplify(),
-     _branch_arms())
+     _branch_arms(), _plate_reverse_enabled())
 
 # The unbound kernel of `g` for one boundary, prepared at the first lookup of
 # its key.
@@ -248,7 +248,7 @@ function _prepare_bound!(cache::PreparationCache, g::Graph, @nospecialize(have),
     key = (:bound, graph_key, g.version, _sig(g, have), _sig(g, want),
            _sig(g, ports), Tuple(_pass_key(p) for p in passes), on_error,
            _type_stability(), _type_stability_level(), _plan_mode(), _simplify(), _branch_arms(),
-           _bound_statistics(), _bound_exemplar_key(exemplars))
+           _bound_statistics(), _plate_reverse_enabled(), _bound_exemplar_key(exemplars))
     # The bound pre-pass reads the exemplars' types as the uncached
     # preparation's does (`_cell_group_numbers`); without exemplars it reads
     # none, not an enclosing preparation's.
@@ -319,21 +319,19 @@ for on_error in (Nothing, Symbol)
         error("no _prepare_bound_entry! method for a $on_error error policy")
 end
 # A cache hit compares its key with the stored one. Signatures are vectors, so
-# one key type serves every port count (here without passes). The last two
-# elements are `_simplify()` and `_branch_arms()`; a key type change here must
-# follow the key. A bound key ends in `_bound_statistics()` and the exemplar
-# signature (`nothing`, or a `Tuple` type). The unbound key
+# one key type serves every port count (here without passes). These tuple
+# types follow the settings in the keys above. The unbound key
 # with no graph identity is a positional `KernelSpec` call's: without it here,
 # a process's first repeated call compiled the comparison.
 for on_error in (Nothing, Symbol)
     S = Vector{ValueId}
     for graph_key in (Nothing, UInt64), exemplars in (Nothing, DataType)
-        K = Tuple{Symbol,graph_key,Int,S,S,S,Tuple{},on_error,Symbol,Symbol,Bool,Bool,Symbol,Bool,
+        K = Tuple{Symbol,graph_key,Int,S,S,S,Tuple{},on_error,Symbol,Symbol,Bool,Bool,Symbol,Bool,Bool,
                   exemplars}
         precompile(isequal, (K, K)) || error("no isequal method for bound key $K")
     end
     for graph_key in (Nothing, UInt64)
-        K = Tuple{graph_key,Int,S,S,Tuple{},on_error,Symbol,Symbol,Bool,Bool,Symbol}
+        K = Tuple{graph_key,Int,S,S,Tuple{},on_error,Symbol,Symbol,Bool,Bool,Symbol,Bool}
         precompile(isequal, (K, K)) || error("no isequal method for cache key $K")
     end
 end

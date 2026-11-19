@@ -236,6 +236,28 @@ function _program(k)
             r"var\"[^\"]*\"" => m -> get!(names, m, "v$(length(names) + 1)"))
 end
 
+@testset "cached preparation honors the plate reverse mode in either order" begin
+    y = [0.5, -1.0, 2.0]
+    mu = [0.1, 0.2, -0.3]
+    for binding in ((;), (; y))
+        args = isempty(binding) ? (y, mu, 1.3) : (mu, 1.3)
+        prepared(cache, enabled) = with_plate_reverse(enabled) do
+            prepare!(cache, _guarded_normal; have = (:y, :mu, :sigma),
+                     want = :total, bound = binding)
+        end
+        factored(k) = occursin("_plate_factor_usable", _program(k))
+        expected = Dict(on => factored(prepared(PreparationCache(), on)) for on in (false, true))
+        for order in ((false, true), (true, false))
+            cache = PreparationCache()
+            for on in order
+                k = prepared(cache, on)
+                @test factored(k) == expected[on]
+                @test k(args...) ≈ _reference_normal(y, mu, 1.3)
+            end
+        end
+    end
+end
+
 @testset "exemplar scalar evidence keeps embedded operation tables aligned" begin
     x = [1.0, 2.0, 3.0]
     k = prepare(_guarded_untyped; exemplars = (x, 2.0))
