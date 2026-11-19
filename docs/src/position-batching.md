@@ -64,3 +64,13 @@ The caller owns the stage values and refreshes them when the positions or schedu
 Batching requires pure recipes. Hidden mutation or state carried from one position to another changes the semantics and is rejected. Empty batches require enough declared output information to establish a layout without a first result.
 
 The [bound-regression example](bound-regression.md) develops the same input and output selection without a batch axis.
+
+## Warming scheduled reads in a package image
+
+Call the scheduled reader with representative inputs in the consuming package's
+precompile workload. For example, a read with two positions and
+`NativeScheduling(; chunk_size=8)` runs the shared prefix and gives one
+position to each of two worker tasks, even on a single-threaded image builder.
+After loading, ordinary calls use the runtime thread and chunk limits.
+An explicit `workers=1` warms the serial driver. Empty batches also follow
+the serial path.

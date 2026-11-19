@@ -43,6 +43,20 @@ const BORROWED = vectorize(borrowed_curve; batched=:position, reuse=true)
 const USED_BORROWED = copy(BORROWED)
 const BORROWED_WARMUP = USED_BORROWED([1.0, 2.0], [3.0, 4.0]; amount=2.0)
 
+@kernel scaled_curve(position::Float64, data::Vector{Float64}) = begin
+    weights = plate(data) do x
+        abs2(x)
+    end
+    result::Vector{Float64} = position .* weights
+end
+scheduled(schedule) = vectorize(scaled_curve; batched=:position, reuse=true, schedule)
+const SCHEDULED = scheduled(NativeScheduling(; chunk_size=2))
+const ONE_WORKER = scheduled(NativeScheduling(; chunk_size=2, workers=1))
+const SCHEDULED_WARMUP = SCHEDULED([2.0, 3.0], [4.0, 5.0])
+const SERIAL_WARMUP = ONE_WORKER([2.0, 3.0], [4.0, 5.0])
+const TWO_WORKERS = scheduled(NativeScheduling(; chunk_size=2, workers=2))
+const SINGLE_WARMUP = TWO_WORKERS([2.0], [4.0])
+
 @kernel pair_locations(x) = begin
     locations = Float64.(x)
     left = locations

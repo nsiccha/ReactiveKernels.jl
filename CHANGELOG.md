@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.326
+
+- Reading a nonempty batch with `NativeScheduling` in a package-image
+  workload warms the scheduled prefix and position workers even on a
+  single-threaded builder. An explicit `workers=1` warms the serial path.
+
 ## 0.1.325
 
 - `prepare_nonallocating` also buffers `hcat` (as it did `vcat`),

@@ -83,7 +83,7 @@ using ReactiveKernels, Test
             Pkg.precompile()
             """
         julia = Base.julia_cmd()
-        setup_ok = success(pipeline(`$julia --startup-file=no --project=$env -e $setup`;
+        setup_ok = success(pipeline(`$julia --startup-file=no --threads=1 --project=$env -e $setup`;
                                     stdout = stdout, stderr = stderr))
         @test setup_ok
         setup_ok || return
@@ -98,6 +98,33 @@ using ReactiveKernels, Test
             # A value one image refers to from the other keeps its identity.
             const RK = ReactiveKernels
             const D = ImportedPreparedConsumer
+            # In the one-thread image, two positions fill one ordinary chunk.
+            # Only a scheduled execution publishes into the scheduler's cache.
+            raw(r) = r isa RK._KernelSignatureCallable ? r.target : r
+            @test C.SCHEDULED_WARMUP == C.SERIAL_WARMUP == [32.0 48.0; 50.0 75.0]
+            @test only(raw(C.SCHEDULED).caches)[] === C.SCHEDULED_WARMUP
+            @test only(raw(C.ONE_WORKER).caches)[] === nothing
+            @test only(raw(C.TWO_WORKERS).caches)[] === C.SINGLE_WARMUP
+            @test C.SINGLE_WARMUP == fill(32.0, 1, 1)
+            @test length(raw(C.SCHEDULED).workers) == 1
+            @test raw(C.SCHEDULED).schedule.workers == Threads.nthreads()
+            @test raw(C.ONE_WORKER).schedule.workers == 1
+            @test all(slot -> slot[] === nothing, only(raw(C.SCHEDULED).workers).caches)
+            draws = collect(1.0:9)
+            data = [-2.0, 3.0, 4.0]
+            for reader in (copy(C.SCHEDULED), C.SCHEDULED,
+                           C.scheduled(NativeScheduling(; chunk_size=2)))
+                result = reader(draws, data)
+                @test result == abs2.(data) .* transpose(draws)
+                @test length(raw(reader).workers) == Threads.nthreads()
+                @test all(w -> any(slot -> slot[] !== nothing, w.caches) == (Threads.nthreads() > 1),
+                          raw(reader).workers)
+                @test reader(draws .+ 1, data) === result
+            end
+            @test C.ONE_WORKER(draws, data) == abs2.(data) .* transpose(draws)
+            @test only(raw(C.ONE_WORKER).caches)[] === nothing
+            @test C.TWO_WORKERS(draws, data) == abs2.(data) .* transpose(draws)
+            @test length(raw(C.TWO_WORKERS).workers) == min(2, Threads.nthreads())
             here = RK._VALUE_NAMESPACE[]
             consumer_namespace = first(inputs(C.trajectory)).id.namespace
             derived_namespace = D.TEMPLATE.x.id.namespace
@@ -239,9 +266,9 @@ using ReactiveKernels, Test
             println("PRECOMPILED_PREPARED_PASS")
             """
         # Two independent loads rule out a process-local body-cache recovery.
-        for _ in 1:2
+        for threads in (1, 4)
             @test success(pipeline(
-                `$julia --startup-file=no --check-bounds=yes --project=$env -e $probe`;
+                `$julia --startup-file=no --threads=$threads --check-bounds=yes --project=$env -e $probe`;
                 stdout = stdout, stderr = stderr))
         end
 
