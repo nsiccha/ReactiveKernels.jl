@@ -50,6 +50,24 @@ function gradient!(dx, f::F, x) where {F}
         Enzyme.Duplicated(x, dx))[2]
 end
 
+reverse_from_inputs(rule, inputs::Tuple, seed) = reverse_cut(rule, Val(1), inputs..., seed)
+
+@testset "Reverse cuts with unknown tuple length" begin
+    rule = make_rule(Record, 2)
+    x = [1.5, -2.0]
+    _, residuals = stage_primal(rule, Val(1), x)
+    for tape_type in (Any, Tuple)
+        @test only(Base.return_types(stage_reverse,
+            Tuple{typeof(rule), Val{1}, tape_type, Float64})) !== Union{}
+        @test only(Base.return_types(reverse_from_inputs,
+            Tuple{typeof(rule), tape_type, Float64})) !== Union{}
+    end
+    @test stage_reverse(rule, Val(1), residuals, 3.0) == (6 .* x,)
+    @test reverse_from_inputs(rule, (x,), 3.0) == (6 .* x,)
+    @test_throws ArgumentError stage_reverse(rule, Val(1), (), 3.0)
+    @test_throws ArgumentError reverse_from_inputs(rule, (x, x), 3.0)
+end
+
 function exp_joint(x)
     y = exp.(x)
     y, view(y, :)
@@ -251,9 +269,7 @@ end
     end
     # Residuals the rule's graph does not infer (a type as its callable's
     # field, as `Record` in the first testset) reach the snapshot through a
-    # run-time call. Retention keeps their inferred type, which Enzyme's reverse
-    # needs: it compiles the reverse for the tape type inferred here, and
-    # `stage_reverse` of residuals of unknown length infers as throwing.
+    # run-time call. Retention preserves the known tuple shape for the reverse.
     for (tape, sources) in ((Tuple{Any}, Tuple{Int}), (Tuple{Any,Float64}, Tuple{Int,Int}))
         for (primal, flags) in ((Float64, Tuple{Bool,Bool}), (SubArray, Tuple{Bool}))
             @test only(Base.return_types(retain, Tuple{sources, tape, primal, flags})) <: tape
