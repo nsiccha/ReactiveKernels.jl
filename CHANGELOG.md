@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.333
+
+- The generated reverse of a summed plate now includes the derivative of a
+  shared value first computed inside a lazy branch, including when the
+  prepared program introduces an alias for its scalar input before the loop.
+
 ## 0.1.332
 
 - A scheduled reader used in a package precompile workload retains its serial

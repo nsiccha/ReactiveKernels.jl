@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.14
+
+- `negative_binomial2` exposes `logkernel(observed)` and
+  `lognormalizer(observed)`. Their sum is the full log density. The
+  normalizer depends only on the observed count and the kernel uses the
+  log rising factorial for the shape-dependent term.
+
 ## 0.1.13
 
 - `beta_binomial.logpdf`, including `BetaBinomial2` responses, uses log rising
