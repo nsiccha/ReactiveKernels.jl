@@ -2,19 +2,27 @@ module PlateReverseSourceDispatchTests
 using ReactiveKernels, DifferentiationInterface, Enzyme, Test
 const RK = ReactiveKernels
 
+composed_term(x, scale) = log1p(x * scale)
+
 @traceable function traced_term(x::Real, scale::Real)
     if x > 0
-        return log1p(x * scale)
+        return composed_term(x, scale)
     else
         return sin(x * scale)
     end
 end
 traced_term(x::Float32, scale::Float64) = x + 2scale
 
+struct DispatchScope{M} end
+select_op(::DispatchScope, ::Val{:term}) = traced_term
+forward(tag, scope, xs...) = select_op(scope, tag)(xs...)
+
 supplied_term(x, scale) = traced_term(x, scale)
 function scalar_source(f, types)
     f === supplied_term && types === Tuple{Float64,Float64} || return nothing
-    TraceableSource((:x, :scale), :(traced_term(x, scale)), @__MODULE__)
+    scope = Expr(:call, Expr(:curly, GlobalRef(@__MODULE__, :DispatchScope), @__MODULE__))
+    tag = Expr(:call, Expr(:curly, Val, QuoteNode(:term)))
+    TraceableSource((:x, :scale), :(forward($tag, $scope, x, scale)), @__MODULE__)
 end
 register_source_provider!(scalar_source)
 
@@ -55,4 +63,25 @@ end
         end
     end
 end
+const lookups = Ref(0)
+function counted_lookup(tag)
+    lookups[] += 1
+    return (+)
+end
+counted_forward(tag, xs...) = counted_lookup(tag)(xs...)
+
+struct CountedTag
+    function CountedTag()
+        lookups[] += 1
+        new()
+    end
+end
+
+@testset "source preparation keeps observable dispatch and constructor calls" begin
+    @test isnothing(RK._pr_forward_source(counted_forward, (Val{:add}, Float64, Float64)))
+    constructor = Expr(:call, GlobalRef(@__MODULE__, :CountedTag))
+    @test RK._pr_source_constants(constructor) == constructor
+    @test lookups[] == 0
+end
+
 end

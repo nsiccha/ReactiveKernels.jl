@@ -594,56 +594,8 @@ end
 # two records with the same code may hold different bound data.
 _pr_source_cut(@nospecialize(f), ref, args, flags) = nothing
 
-# A registered source describes one Julia method. Select a concrete scalar
-# signature, then require the caller's inferred cell reads to prove that
-# signature before entering the rule. A different overload keeps ordinary AD.
-struct _PRMissingScalarSource end
-const _PR_SOURCE_STACK = gensym(:plate_reverse_sources)
-_pr_contains_source_guard(x) = x isa Expr && (Meta.isexpr(x, :return, 1) &&
-    _index_run_call(only(x.args), GlobalRef(@__MODULE__, :_PRMissingScalarSource), 0) ||
-    any(_pr_contains_source_guard, x.args))
+include("plate_reverse_sources.jl")
 
-Base.@nospecializeinfer function _pr_source_cut(@nospecialize(f::Function), ref, args, flags)
-    types = Tuple(a isa Number ? typeof(a) : Float64 for a in args)
-    source = _traceable_source(typeof(f), types...)
-    if source !== nothing
-        selected = Base._which(Tuple{typeof(f),types...})
-        records = Tuple{typeof(_traceable_source),Type{typeof(f)},(Type{T} for T in types)...}
-        record = Base._which(records)
-        if selected === nothing || selected.method.sig != source[4] ||
-                selected.method.primary_world > record.method.primary_world ||
-                !isempty(source[5]) || source[6]
-            source = nothing
-        end
-    end
-    source === nothing && (source = _provided_source(f, types))
-    source === nothing && return nothing
-    native_type = Base.promote_op(f, types...)
-    native_type in (Float16, Float32, Float64) || return nothing
-    stack = get(task_local_storage(), _PR_SOURCE_STACK, ())
-    any(g -> g === f, stack) && _pr_fail("recursive scalar source for `$(nameof(f))`")
-    names, body, mod = source
-    expression = Expr(:function, Expr(:tuple, names...), body)
-    cut = task_local_storage(_PR_SOURCE_STACK, (stack..., f)) do
-        _pr_expression_cut(expression, mod, args, flags, ())
-    end
-    cut === nothing && return nothing
-    matches = foldl((a, b) -> Expr(:&&, a, b),
-                    (:($x isa $T) for (x, T) in zip(args, types)); init = true)
-    result = gensym(:source_result)
-    quote
-        if !$matches
-            return $(GlobalRef(@__MODULE__, :_PRMissingScalarSource))()
-        end
-        $result = $cut
-        # A native return annotation can convert the raw value of the
-        # registered expression. Propagate the cut only across an identity.
-        if !(first($result) isa $native_type)
-            return $(GlobalRef(@__MODULE__, :_PRMissingScalarSource))()
-        end
-        $result
-    end
-end
 _pr_field(ref, field) = Expr(:call, GlobalRef(Core, :getfield), ref, QuoteNode(field))
 Base.@nospecializeinfer _pr_source_cut(@nospecialize(f::_KernelSourceOp), ref, args, flags) =
     _pr_source_cut(f.f, _pr_field(ref, :f), args, flags)
