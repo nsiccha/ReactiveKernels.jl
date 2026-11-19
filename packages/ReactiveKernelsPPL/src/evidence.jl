@@ -29,11 +29,14 @@ function _evidence_logtail(tail)
     return :(log($tail))
 end
 
-function _evidence_logdifference(a, b)
-    # Equality includes two empty tails (-Inf). Avoid -Inf - -Inf before
-    # log1mexp; a zero interval mass has log mass -Inf.
-    return :($a == $b ? -Inf : $a + $(GlobalRef(LogExpFunctions, :log1mexp))($b - $a))
+# Pass the computed log tails into one scalar kernel. The equality check and
+# subtraction then share both endpoints even in a fused plate. Equality
+# includes two empty tails (-Inf); their interval has zero mass.
+@kernel _ppl_log_tail_difference(a, b) = begin
+    mass = a == b ? -Inf : a + LogExpFunctions.log1mexp(b - a)
+    return mass
 end
+_evidence_logdifference(a, b) = Expr(:call, GlobalRef(@__MODULE__, :_ppl_log_tail_difference), a, b)
 
 function _evidence_logmass(logcdf, logccdf, lo, hi)
     lo === nothing && hi === nothing && return :(0.0)

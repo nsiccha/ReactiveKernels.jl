@@ -1,6 +1,21 @@
 using Test, ReactiveKernels, ReactiveKernelsPPL, Enzyme
 import SpecialFunctions
 
+@testset "log differences evaluate each tail once" begin
+    source = ReactiveKernelsPPL._evidence_logdifference(:(endpoint(1)), :(endpoint(2)))
+    evaluate = Core.eval(@__MODULE__, :(endpoint -> $source))
+    for (tails, expected) in (((log(0.7), log(0.2)), log(0.5)),
+                               ((-0.4, -0.4), -Inf), ((-Inf, -Inf), -Inf))
+        calls = zeros(Int, 2)
+        value = Base.invokelatest(evaluate, i -> begin
+            calls[i] += 1
+            tails[i]
+        end)
+        @test value ≈ expected
+        @test calls == [1, 1]
+    end
+end
+
 # MPFR evaluates the probability before taking its logarithm, independently
 # of the Float64 log-tail implementation. Boundary densities give analytic
 # location and log-scale derivatives with no numerical differentiation.
