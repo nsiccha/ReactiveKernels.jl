@@ -464,8 +464,14 @@ end
     cumsum(hcat(U[:, 1:1], exp.(U[:, 2:end])); dims = 2)
 @traceable _ordered_slices_constrain(o::_SliceCols, U) =
     cumsum(vcat(U[1:1, :], exp.(U[2:end, :])); dims = 1)
-@traceable _ordered_slices_logjac(o::_SliceRows, U) = sum(U[:, 2:end])
-@traceable _ordered_slices_logjac(o::_SliceCols, U) = sum(U[2:end, :])
+@traceable function _ordered_slices_logjac(o::_SliceRows, U)
+    increments = 2:size(U, 2)
+    return sum(U[:, increments])
+end
+@traceable function _ordered_slices_logjac(o::_SliceCols, U)
+    increments = 2:size(U, 1)
+    return sum(U[increments, :])
+end
 _ordered_slices_unconstrain(::_SliceRows, X) =
     hcat(X[:, 1:1], log.(diff(X; dims = 2)))
 _ordered_slices_unconstrain(::_SliceCols, X) =
