@@ -196,6 +196,24 @@ end
     @test occursin("_pr_dense_reverse_cells", string(expr))
     RK.compile(expr)(x, 0.7, Val(false), shadow)
     @test original ≈ expected
+
+    # Separate Julia array headers may share a shifted region of the same
+    # caller-owned memory. Each shadow write then changes the next cell's read.
+    backing = collect(range(-0.3, 0.3; length = 257))
+    expected = copy(backing)
+    for i in 1:256
+        expected[i+1] += 0.7 * cos(expected[i])
+    end
+    GC.@preserve backing begin
+        input = unsafe_wrap(Array, pointer(backing), 256; own = false)
+        output = unsafe_wrap(Array, pointer(backing, 2), 256; own = false)
+        ids = collect(eachindex(input))
+        @test !RK._pr_dense_reverse_cells(eachindex(ids), (input,), (output,))
+        gather = view(input, ids)
+        @test !RK._pr_span_possible(eachindex(ids), gather, view(output, ids), (gather,))
+        RK.compile(expr)(input, 0.7, Val(false), output)
+        @test backing ≈ expected
+    end
 end
 
 # Record the guard chosen by the compiled sweep, including when its shadow

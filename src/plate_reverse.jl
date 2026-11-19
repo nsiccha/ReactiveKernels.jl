@@ -1707,13 +1707,24 @@ const _PRSpanGather = SubArray{Float64,1,<:_PRSpanParent,Tuple{Vector{Int}}}
 # parent or index range whose getindex reads other storage.
 const _PRPlainIndex = Union{Int,UnitRange{Int},Base.Slice{Base.OneTo{Int}},Base.OneTo{Int}}
 const _PRPlainVector{T} = Union{Vector{T},SubArray{T,1,<:Array{T},<:Tuple{Vararg{_PRPlainIndex}}}}
-_pr_plain_vector(x) = x isa _PRPlainVector{<:Union{Float32,Float64}}
+_pr_contiguous_vector(x) = x isa _PRPlainVector{<:Union{Float32,Float64}} && stride(x, 1) == 1
+@inline _pr_clear_storage(a, ::Tuple{}) = true
+@inline function _pr_clear_storage(a, others::Tuple)
+    b = first(others)
+    (b === nothing || !_contiguous_storage_overlaps(a, b)) && _pr_clear_storage(a, Base.tail(others))
+end
+@inline _pr_disjoint_shadows(values, ::Tuple{}) = true
+@inline function _pr_disjoint_shadows(values, shadows::Tuple)
+    shadow, rest = first(shadows), Base.tail(shadows)
+    (shadow === nothing || (_pr_clear_storage(shadow, values) && _pr_clear_storage(shadow, rest))) &&
+        _pr_disjoint_shadows(values, rest)
+end
 _pr_span_possible(cells, value, shadow, operands) = false
 @inline _pr_span_operands(::Tuple{}, cells, value, storage) = true
 @inline function _pr_span_operands(operands::Tuple, cells, value, storage)
     x = first(operands)
-    (x === value || (_pr_plain_vector(x) &&
-        axes(x) == (cells,) && !Base.mightalias(storage, x))) &&
+    (x === value || (_pr_contiguous_vector(x) &&
+        axes(x) == (cells,) && !_contiguous_storage_overlaps(storage, x))) &&
         _pr_span_operands(Base.tail(operands), cells, value, storage)
 end
 @inline function _pr_span_possible(cells::Base.OneTo{Int}, value::_PRSpanGather,
@@ -1723,7 +1734,7 @@ end
     length(cells) >= 8 && length(value) == length(cells) &&
         @inbounds(idx[2] == idx[1] + 1) && only(parentindices(shadow)) === idx &&
         axes(storage) == axes(parent(value)) &&
-        !Base.mightalias(storage, parent(value)) && !Base.mightalias(storage, idx) &&
+        !_contiguous_storage_overlaps(storage, parent(value)) && !_contiguous_storage_overlaps(storage, idx) &&
         _pr_span_operands(operands, cells, value, storage)
 end
 
@@ -1827,11 +1838,10 @@ end
 # cell. Check actual storage: singleton broadcasts, indirect views, aliased
 # operands and overlapping shadows retain the original sweep order.
 @inline function _pr_dense_reverse_cells(cells, operands::Tuple, shadows::Tuple)
-    dense(x) = _pr_plain_vector(x) &&
-               stride(x, 1) == 1 && axes(x, 1) == cells
+    dense(x) = _pr_contiguous_vector(x) && axes(x, 1) == cells
     cells isa Union{Base.OneTo{Int},UnitRange{Int}} && all(dense, operands) &&
         all(x -> x === nothing || dense(x), shadows) &&
-        _pr_run_disjoint(operands, shadows)
+        _pr_disjoint_shadows(operands, shadows)
 end
 
 function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState, indexed::Bool)
