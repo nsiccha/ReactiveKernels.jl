@@ -1767,6 +1767,7 @@ function _array_slices_logjac(e::LayoutEntry, seg)
 end
 
 _array_slices_packed_name(name::Symbol) = Symbol(:_ppl_arru_, name)
+_array_simplex_breaks(name::Symbol) = Symbol(:_ppl_simplex_breaks_, name)
 
 # In-graph constrain edges of an elementwise array: the plate edges over
 # its flat packed block, then (two axes) the column-major reshape. A
@@ -1786,12 +1787,19 @@ function _array_transform_statements(e::LayoutEntry)
         raw = Symbol(flat, :_raw)
         cfn, _ = _slice_function_names(e.transform)
         o = _orientation_expr(_slice_transform_orientation(e.transform))
-        return Expr[
+        stmts = Expr[
             :($raw = $(_entry_view(e))),
             :($flat = Float64.($raw)),
             :($U::Matrix{Float64} = reshape($flat, $(_entry_axes(e)...))),
-            :($(e.name)::Matrix{Float64} = $cfn($o, $U)),
         ]
+        if e.transform in (:simplex_rows, :simplex_cols)
+            breaks = _array_simplex_breaks(e.name)
+            push!(stmts, :($breaks = _simplex_slices_breaks($o, $U)),
+                :($(e.name)::Matrix{Float64} = _simplex_value_from_breaks($o, $breaks)))
+        else
+            push!(stmts, :($(e.name)::Matrix{Float64} = $cfn($o, $U)))
+        end
+        return stmts
     end
     flat = _array_flat_name(e.name, length(e.dims))
     stmts = _plate_transform_statements(_array_flat_entry(e, flat))
@@ -1822,6 +1830,8 @@ function _array_jacobian_term(e::LayoutEntry)
     e.size == 0 && e.positions === nothing && return nothing
     _is_lkj_stack(e.transform) &&
         return _lkj_vine_logjac(e.name, e.dims[1]; stacked = true)
+    e.transform in (:simplex_rows, :simplex_cols) &&
+        return :(_simplex_logjac_from_breaks($(_array_simplex_breaks(e.name))))
     if _is_slice_transform(e.transform)
         _, jfn = _slice_function_names(e.transform)
         o = _orientation_expr(_slice_transform_orientation(e.transform))

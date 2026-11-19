@@ -875,6 +875,7 @@ import .._mvnormal_cholesky_slices_pointwise, .._mvnormal_slices_pointwise
 import .._dirichlet_slices_pointwise, .._ordered_normal_slices_pointwise
 import .._icar_slices_pointwise
 import .._simplex_slices_constrain, .._simplex_slices_logjac
+import .._simplex_slices_breaks, .._simplex_value_from_breaks, .._simplex_logjac_from_breaks
 import .._ordered_slices_constrain, .._ordered_slices_logjac
 end
 
