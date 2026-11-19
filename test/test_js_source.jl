@@ -4,7 +4,7 @@ using ReactiveKernels
 using LogExpFunctions: log1pexp, logistic
 using Test
 using Base: OneTo
-using SpecialFunctions: erf, erfc, erfcx, logerfc, gamma, loggamma, logabsgamma, logbeta, beta_inc,
+using SpecialFunctions: erf, erfc, erfcx, logerfc, gamma, digamma, loggamma, logabsgamma, logbeta, beta_inc,
     beta_inc_inv, gamma_inc, gamma_inc_inv
 using LogExpFunctions: log1pexp, log1mexp
 import Distributions
@@ -354,6 +354,11 @@ end
     g = gamma(a)
     return g
 end
+@kernel js_digamma(a) = begin
+    t = tanpi(a)
+    d = digamma(a)
+    return t, d
+end
 @kernel js_loggamma(a) = begin
     lg = loggamma(a)
     return lg
@@ -665,6 +670,9 @@ const CASES = [
     # `loggamma` where the gamma function is negative
     (:js_gamma, js_gamma, (:a,), :g, (; a = Float64),
      [(a,) for a in (-Inf, -2.0, -1.5, -0.5, -0.0, 0.0, 1e-300, 0.5, 1.0, 5.0, 23.5, 171.0, 172.0, Inf, NaN)]),
+    (:js_digamma, js_digamma, (:a,), (:t, :d), (; a = Float64),
+     [(a,) for a in (-Inf, -2.0, -1.5, -1.0, -0.7, -0.5, -0.0, 0.0, prevfloat(0.5),
+                     0.5, nextfloat(0.5), 1.0, 1.5, 2.0, 2.0^40 + 0.125, 2.0^53, Inf, NaN)]),
     (:js_loggamma, js_loggamma, (:a,), :lg, (; a = Float64),
      [(a,) for a in (-Inf, -40.5, -3.0, -1.5, -0.5, -1e-25, -0.0, 0.0, 1e-25, 0.5, 1.0, 2.0, 7.9, 8.1,
                      171.6, 1e17, 1e300, Inf, NaN)]),

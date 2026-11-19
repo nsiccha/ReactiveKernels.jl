@@ -291,6 +291,19 @@ function _rk_acos(x) { return Math.abs(x) > 1 ? _rk_domain("acos", x, "it must b
 function _rk_acosh(x) { return x < 1 ? _rk_domain("acosh", x, "it must be at least 1") : Math.acosh(x); }""", [:_rk_domain]),
     :_rk_atanh => ("""
 function _rk_atanh(x) { return Math.abs(x) > 1 ? _rk_domain("atanh", x, "it must be in [-1, 1]") : Math.atanh(x); }""", [:_rk_domain]),
+    :_rk_tanpi => ("""
+function _rk_tanpi(x) {
+  if (Number.isNaN(x) || x === 0) return x;
+  if (!Number.isFinite(x)) return _rk_domain("tanpi", x, "it must be finite");
+  const a = Math.abs(x), r = a % 1;
+  let y;
+  // Julia retains the quadrant's sign at exact zeros and poles.
+  if (r === 0) y = a % 2 === 0 ? 0 : -0;
+  else if (r === 0.5) y = a % 2 === 0.5 ? Infinity : -Infinity;
+  else if (r < 0.25 || r > 0.75) y = Math.tan(Math.PI * (r > 0.75 ? r - 1 : r));
+  else y = 1 / Math.tan(Math.PI * (0.5 - r));
+  return x < 0 ? -y : y;
+}""", [:_rk_domain]),
     :_rk_pow => ("""
 function _rk_pow(x, y) {
   if (x === 1 || y === 0) return 1;
@@ -1868,7 +1881,7 @@ const _JS_MATH = Dict{Any,String}(
 const _JS_CHECKED = Dict{Any,Symbol}(
     log => :_rk_log, log2 => :_rk_log2, log10 => :_rk_log10, log1p => :_rk_log1p,
     sqrt => :_rk_sqrt, asin => :_rk_asin, acos => :_rk_acos, acosh => :_rk_acosh,
-    atanh => :_rk_atanh, round => :_rk_round)
+    atanh => :_rk_atanh, tanpi => :_rk_tanpi, round => :_rk_round)
 const _JS_COMPARE = Dict{Any,String}(Base.:< => "<", Base.:<= => "<=", Base.:> => ">",
                                      Base.:>= => ">=", Base.:(==) => "===", Base.:!= => "!==")
 

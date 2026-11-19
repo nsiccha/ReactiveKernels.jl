@@ -20,6 +20,7 @@ are recorded in the git history only.
 
 - The log rising factorial and its shape derivative keep intermediate products
   finite in Float32 for the supported small-count product calculation.
+  JavaScript can emit the shape derivative's digamma fallback through `tanpi`.
 
 - The generated reverse of a summed plate now includes the derivative of a
   shared value first computed inside a lazy branch, including when the
