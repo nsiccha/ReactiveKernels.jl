@@ -26,6 +26,11 @@ _pp_operands(xs...) = xs
             @test isempty(ReactiveKernels._code_findings(statement, types))
         end
     end
+    # Forwarding the operands fixes the outer call. Base's n-ary + can
+    # still splat inside afoldl. Check its audit and left-to-right rounding.
+    terms = ntuple(i -> (1e16, -1e16, 1.0)[mod1(i, 3)], 39)
+    @test statement(+, terms...) === +(terms...) === 1.0
+    @test isempty(ReactiveKernels._code_findings(statement, (typeof(+), map(typeof, terms)...)))
 end
 
 function _pp_window_sum(x, rows, indices, sorted)
