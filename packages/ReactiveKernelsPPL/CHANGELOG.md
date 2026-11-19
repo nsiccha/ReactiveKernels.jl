@@ -16,6 +16,12 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.232
+
+- `prepare_coordinate_conditional` follows a scalar parameter's packed read
+  through its transforms and derived values. A hyperparameter used only in a
+  group prior now skips the observation likelihood on each coordinate trial.
+
 ## 0.1.231
 
 - `marginalize` carries a square root of the filtered covariance for a vector

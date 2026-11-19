@@ -49,6 +49,8 @@ const GROUPED = @rkppl begin
 end
 normal_logpdf(x, m, s) = -0.5 * abs2((x - m) / s) - log(s) - 0.5 * log(2pi)
 
+location_parts(x) = (x, 2x)
+
 at(u, k, z) = (v = copy(u); v[k] = z; v)
 
 # Trials at random values with a coin deciding each move. A conditional may
@@ -156,8 +158,8 @@ end
     rng = Xoshiro(11)
     X = randn(rng, 30, 5)
     y = Int.(rand(rng, 30) .< 0.5)
-    # A scale shared by the vector's prior: the scale's own coordinate reads
-    # every term, a coefficient reads its likelihood and one prior cell.
+    # A scale shared by the vector's prior. A coefficient reads its likelihood
+    # and one prior cell.
     plan = HIERARCHICAL(; X) | (; y)
     problem = PPL.prepare_coordinate_conditional(build_kernel(plan), plan, zeros(6))
     @test length(problem.products) == 1
@@ -205,6 +207,25 @@ end
     @test PPL.refresh_products!(state) == 0.0
 end
 
+@testset "a scalar conditional follows destructured values into the likelihood" begin
+    model = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        (left, right) = location_parts(a)
+        y .~ Normal.(left + right, 1)
+    end
+    y = [0.7, -0.2, 0.1]
+    plan = model(;) | (; y)
+    u = [0.3, -0.1]
+    problem = PPL.prepare_coordinate_conditional(build_kernel(plan), plan, u)
+    state = PPL.coordinate_state(problem, u)
+    for z in (-0.5, 1.1)
+        @test PPL.coordinate_logdensity(state, 1, z) ≈ normal_logpdf(z, 0, 1) +
+            sum(t -> normal_logpdf(t, 3z, 1), y)
+        @test PPL.coordinate_logdensity(state, 2, z) ≈ normal_logpdf(z, 0, 1)
+    end
+end
+
 @testset "the conditional program does not grow with the data" begin
     inventory(ex) = ex isa Expr ? 1 + sum(inventory, ex.args; init=0) : 1
     inventory(program::ReactiveKernels._PlateProgram) = inventory(program.ast)
@@ -237,7 +258,7 @@ end
 # is deliberately not finite (no products to cache in these models).
 unchecked_state(problem, u) = PPL.CoordinateState(problem, copy(u), ())
 
-@testset "a group coordinate reads only its own group's rows" begin
+@testset "hyperparameters read the group prior and a group reads only its own rows" begin
     rng = Xoshiro(21)
     d = grouped_data(rng)
     u0 = [0.2, log(1.5), (0.3 .* randn(rng, d.J))...]
@@ -251,6 +272,14 @@ unchecked_state(problem, u) = PPL.CoordinateState(problem, copy(u), ())
             [(3:(d.J + 2), 2 - parts, parts)]
         state = PPL.coordinate_state(problem, u0)
         mu, tau = u0[1], exp(u0[2])
+        theta = u0[3:end]
+        for z in (-0.4, 1.3)
+            @test PPL.coordinate_logdensity(state, 1, z) ≈ normal_logpdf(z, 0, 5) +
+                sum(t -> normal_logpdf(t, z, tau), theta)
+            scale = exp(z)
+            @test PPL.coordinate_logdensity(state, 2, z) ≈ z - log(5) - scale / 5 +
+                sum(t -> normal_logpdf(t, mu, scale), theta)
+        end
         for j in 1:d.J, z in (-0.4, 1.3)
             expected = normal_logpdf(z, mu, tau) +
                 sum(normal_logpdf(x, z, 1.0) for x in d.groups[j]; init=0.0)
@@ -267,6 +296,8 @@ unchecked_state(problem, u) = PPL.CoordinateState(problem, copy(u), ())
     for plan in (GATHER(; J=d.J, g=d.g) | (; y=bad), GROUPED(; J=d.J) | (; y=badgroups))
         problem = PPL.prepare_coordinate_conditional(build_kernel(plan), plan, u0)
         state = unchecked_state(problem, u0)
+        @test isfinite(PPL.coordinate_logdensity(state, 1, -0.7))
+        @test isfinite(PPL.coordinate_logdensity(state, 2, 0.4))
         @test isnan(PPL.coordinate_logdensity(state, 3, 0.5))
         @test all(j -> isfinite(PPL.coordinate_logdensity(state, j + 2, 0.5)), 2:d.J)
     end
@@ -288,6 +319,7 @@ end
     inventory(program::ReactiveKernels._PlateProgram) = inventory(program.ast)
     for (name, model) in (("gather", GATHER), ("grouped", GROUPED))
         sizes = Int[]
+        scalar_sizes = Tuple{Int,Int}[]
         for J in (3, 30, 300)
             rng = Xoshiro(J)
             groups = [randn(rng, 4) for _ in 1:J]
@@ -296,10 +328,13 @@ end
                 model(; J) | (; y=groups)
             problem = PPL.prepare_coordinate_conditional(build_kernel(plan), plan, zeros(J + 2))
             push!(sizes, inventory(code_expr(only(problem.blocks).kernel)))
+            push!(scalar_sizes, map(s -> inventory(code_expr(s.kernel)), problem.scalars))
         end
         println("GROUP CONDITIONAL NODE INVENTORY $name ", sizes)
         @test maximum(sizes) < 2minimum(sizes)
         @test sizes[3] <= sizes[2] + 8
+        println("SCALAR CONDITIONAL NODE INVENTORY $name ", scalar_sizes)
+        @test all(k -> maximum(s[k] for s in scalar_sizes) <= scalar_sizes[1][k] + 8, 1:2)
     end
 end
 
