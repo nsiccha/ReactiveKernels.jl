@@ -505,6 +505,17 @@ function _decompose_call_resolved(ctx::_FusedDecomposition, callee, f, fref,
                 kw.args[1] === :dims || return nothing
         end
     end
+    if kwargs !== nothing && f === Base.dropdims && length(kwargs) == 1 &&
+       length(positional) == 1
+        dims = _nonalloc_dims_const(only(kwargs))
+        dims === nothing && return nothing
+        d = _decompose(ctx, only(positional), false)
+        d === nothing && return nothing
+        # Keep Base's singleton check and its alias to the operand. The
+        # reduction inside dropdims can now fill its own destination.
+        return (Expr(:call, fref, Expr(:parameters, only(kwargs)), d[1]),
+                _static_dims_type(f, something(dims), d[2]))
+    end
     if kwargs !== nothing && (f === Base.cumsum || f === Base.cumprod) &&
        length(positional) == 1
         # A running sum or product along a constant axis fills its own buffer.
@@ -526,8 +537,8 @@ function _decompose_call_resolved(ctx::_FusedDecomposition, callee, f, fref,
             length(positional) == 1 || return nothing
         dimsval = _nonalloc_dims_const(only(kwargs))
         dimsval === nothing && return nothing
-        reduced = _decompose_singleton_reduction(ctx, positional[1])
-        reduced !== nothing && return reduced
+        # A dimensional reduction retains singleton axes, including when
+        # its operand already has just one entry.
         decomposed = _decompose_arguments(ctx, positional, false)
         decomposed === nothing && return nothing
         args, types = decomposed

@@ -670,6 +670,31 @@ end
         k_cs = prepare_nonallocating(colsum_spec; have = (:m,), want = :out)
         @test k_cs(m) == ordinary_cs(m)
         @test any(op -> op isa ReactiveKernels._RowReduceStep, called_ops(k_cs))
+
+        # Both wrapped operands have strided storage. A matching destination
+        # is reused even when the input is displaced from its parent's start.
+        reduction = ReactiveKernels._RowReduceStep(sum, 1)
+        for A in (view(m, 2:2:64, :), reshape(view(vec(m), 7:18), 3, 4))
+            dest = similar(sum(A; dims = 1))
+            @test MutatingFunctions.apply!!(dest, reduction, A) === dest
+            @test isequal(dest, sum(A; dims = 1))
+        end
+
+        collapsed = @kernel stream_sum(x::Array{Float64,3}) = begin
+            r = dropdims(sum(x; dims = 3); dims = 3)
+            total::Float64 = sum(abs2, r)
+        end
+        streams = prepare_nonallocating(collapsed; have = (:x,), want = :total)
+        @test any(op -> op isa ReactiveKernels._RowReduceStep, called_ops(streams))
+        for shape in ((2, 3, 4), (7, 1, 0), (0, 2, 3))
+            x = reshape(sin.(1:prod(shape)), shape)
+            @test streams(x) == sum(abs2, dropdims(sum(x; dims = 3); dims = 3))
+        end
+        singleton = @kernel singleton_sum(x::Vector{Float64}) = begin
+            one_row = sum(view(x, 2:2); dims = 1)
+            count::Int = ndims(one_row)
+        end
+        @test prepare_nonallocating(singleton; have = (:x,), want = :count)([1.0, 2.0]) == 1
     end
 
     @testset "running sums along a constant axis become destination steps" begin
