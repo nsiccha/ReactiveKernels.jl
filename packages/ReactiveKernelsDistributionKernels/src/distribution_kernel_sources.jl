@@ -1060,8 +1060,9 @@ end
 # invalid side (CONTRIBUTING.md).
 @kernel _nb2_logkernel(observed::Int, mu::Float64, phi::Float64) = begin
     y = float(observed)
-    value::Float64 = logrising(phi, observed) - phi * log1p(mu / phi) +
-        (observed == 0 ? 0.0 : -y * log1p(phi / mu))
+    value::Float64 = observed >= 0 && mu >= 0 && phi > 0 ?
+        logrising(phi, observed) - phi * log1p(mu / phi) +
+            (observed == 0 ? 0.0 : -y * log1p(phi / mu)) : -Inf
 end
 @kernel _count_lognormalizer(observed::Int) = begin
     value::Float64 = observed > 0 ? -loggamma(observed + 1.0) : 0.0
@@ -1073,10 +1074,9 @@ using SpecialFunctions: beta_inc
 
 @kernel negative_binomial2(mu::Float64, phi::Float64) = begin
     lognormalizer(observed::Int)::Float64 = _count_lognormalizer(observed)
-    logkernel(observed::Int)::Float64 = observed >= 0 && mu >= 0 && phi > 0 ?
-        _nb2_logkernel(observed, mu, phi) : -Inf
-    logpdf(observed::Int)::Float64 = observed >= 0 && mu >= 0 && phi > 0 ?
-        _nb2_logkernel(observed, mu, phi) + _count_lognormalizer(observed) : -Inf
+    logkernel(observed::Int)::Float64 = _nb2_logkernel(observed, mu, phi)
+    logpdf(observed::Int)::Float64 = _nb2_logkernel(observed, mu, phi) +
+        _count_lognormalizer(observed)
     cdf(observed::Int)::Float64 = observed < 0 ? 0.0 :
         first(beta_inc(phi, observed + 1.0, phi / (phi + mu)))
     ccdf(observed::Int)::Float64 = observed < 0 ? 1.0 :
