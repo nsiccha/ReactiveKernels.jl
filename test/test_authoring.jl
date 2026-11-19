@@ -231,6 +231,20 @@ end
               Base.invokelatest(prepare(macro_spec; want = :gen_y_7), 2) == 2 + 6 + 7
     end
 
+    @testset "split recipe metadata leaves port names available" begin
+        # The split recipe stores its pieces in a named tuple whose fields
+        # have the same names as the ports in this generated definition.
+        definition = :(model(root::Float64, wholes::Float64, splits::Float64) =
+                           sin(root) + cos(wholes) * splits)
+        kernel = prepare(ReactiveKernels._kernel_eval_definition(@__MODULE__, definition))
+        for (root, wholes, splits) in ((0.3, 0.8, -2.0), (1.0, -0.4, 3.0))
+            @test kernel(root, wholes, splits) == sin(root) + cos(wholes) * splits
+        end
+
+        fields = :((tag = (saved = 7),))
+        @test ReactiveKernels._kernel_construction_locals!(Set{Symbol}(), fields) == Set([:saved])
+    end
+
     @testset "function-shaped definitions, optional types, and exposed ports" begin
         f_calls = Ref(0)
         h_calls = Ref(0)

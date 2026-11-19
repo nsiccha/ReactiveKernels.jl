@@ -5652,7 +5652,9 @@ function _kernel_construction_locals!(locals::Set{Symbol}, @nospecialize(ex))
                 push!(locals, binding.args[1])
         end
     end
-    for arg in ex.args
+    # Named-tuple field labels in recipe metadata do not bind construction
+    # locals. Their values can still contain construction code.
+    for arg in _program_evaluated(ex)
         _kernel_construction_locals!(locals, arg)
     end
     locals
