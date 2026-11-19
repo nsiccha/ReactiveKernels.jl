@@ -19,7 +19,8 @@ are recorded in the git history only.
 ## 0.1.231
 
 - Integer-array marginalization reduces the candidate scores in each element's
-  plate cell.
+  plate cell. JAX emission supports the marginal density, pointwise terms and
+  element posterior probabilities.
 - Predictive queries over a marginalized integer array return one posterior
   mixture law per entry. Joint draws reuse an element's sampled component
   across all responses that read it.

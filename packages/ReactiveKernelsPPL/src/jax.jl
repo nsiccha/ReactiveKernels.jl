@@ -196,6 +196,67 @@ _integer_namedtuple_type(T::Type) = T
 _integer_namedtuple_type(fields::NamedTuple) =
     NamedTuple{keys(fields),Tuple{map(_integer_namedtuple_type, Tuple(fields))...}}
 
+# The array overload applies exactly the scalar support rule to each bound.
+# Use that rule's emitted host helper so invalid trials have the same check.
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_binomial_support), args::Vector{ReactiveKernels._PyVal})
+    n = only(args)
+    ReactiveKernels._jax_is_array(n.T) && ctx.host !== nothing ||
+        return ReactiveKernels._jax_traceable_or_lowered(ctx, _binomial_support, args)
+    item = ReactiveKernels._jax_fresh(ctx, :trials_at_element)
+    rows = ReactiveKernels._jax_fresh(ctx, :supports)
+    ReactiveKernels._jax_emit!(ctx, rows * " = []")
+    ReactiveKernels._jax_emit!(ctx, "for " * item * " in np.ravel(" * n.code * ", order='F'):")
+    ctx.scope.indent += 1
+    try
+        row = ReactiveKernels._jax_traceable_or_lowered(ctx, _binomial_support,
+            [ReactiveKernels._PyVal(item, eltype(n.T), true)])
+        ReactiveKernels._jax_emit!(ctx, rows * ".append(" * row.code * ")")
+    finally
+        ctx.scope.indent -= 1
+    end
+    return ReactiveKernels._PyVal(rows, Vector{UnitRange{Int}}, true)
+end
+
+# A host plate holds rows. Transpose the fixed tuple schema, stacking each
+# numeric column along its trailing state axis. The number of rows is data.
+function _integer_host_stack(T, path, rows)
+    if T <: Union{Tuple,NamedTuple}
+        fields = [_integer_host_stack(fieldtype(T, k), path * "[" * string(k - 1) * "]", rows)
+            for k in 1:fieldcount(T)]
+        return "(" * join(fields, ", ") * (length(fields) == 1 ? "," : "") * ")"
+    end
+    return "np.stack([cell" * path * " for cell in " * rows * "], axis=-1)"
+end
+
+# Native conditional records append a joint-state axis to every numeric leaf.
+# A host plate holds rows of records. vmap already stacked the leaves, with
+# its mapped axis first. Both keep the authored record structure.
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_integer_conditional_columns), args::Vector{ReactiveKernels._PyVal})
+    cells = only(args)
+    T = ReactiveKernels._jax_return_type(_integer_conditional_columns, Any[cells.T])
+    code = if ctx.host === nothing
+        "jax.tree_util.tree_map(lambda a: jnp.moveaxis(a, 0, -1), " * cells.code * ")"
+    else
+        _integer_host_stack(eltype(cells.T), "", cells.code)
+    end
+    return ReactiveKernels._PyVal(code, T, ctx.host !== nothing)
+end
+
+# A shared support already is the candidate axis. For individual supports,
+# prepare their sorted union on the host, preserving holes between ranges.
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_integer_array_values), args::Vector{ReactiveKernels._PyVal})
+    support = only(args)
+    support.T <: AbstractRange && return support
+    ctx.host === nothing && ReactiveKernels._jax_error(
+        "per-element integer support values require host data preparation")
+    rows = ReactiveKernels._jax_bind!(ctx, :supports, support).code
+    code = "np.unique(np.concatenate([np.empty(0, dtype=np.int64), *" * rows * "]))"
+    return ReactiveKernels._PyVal(code, Vector{Int}, true)
+end
+
 function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
         ::typeof(_integer_value), args::Vector{ReactiveKernels._PyVal})
     values, name, dims = args
