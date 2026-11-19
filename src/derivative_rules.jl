@@ -89,7 +89,13 @@ end
 
 @generated function (rule::ScalarDerivativeRule{Name,N,Inputs,Primal})(
         args::Vararg{Any,N}) where {Name,N,Inputs,Primal}
-    _rule_body_expr(Primal, :(getfield(rule, :primal_ops)))
+    body = _rule_body_expr(Primal, :(getfield(rule, :primal_ops)))
+    # A single-recipe primal just forwards to its operation. Let the caller
+    # see that operation even when its inlined arithmetic contains branches.
+    if length(Primal[2]) == 1
+        pushfirst!(body.args, Expr(:meta, :inline))
+    end
+    body
 end
 
 @generated function _derivative_cut_call(
