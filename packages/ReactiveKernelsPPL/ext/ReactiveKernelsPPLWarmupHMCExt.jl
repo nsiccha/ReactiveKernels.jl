@@ -3,6 +3,7 @@ module ReactiveKernelsPPLWarmupHMCExt
 import ReactiveKernelsPPL as PPL
 import WarmupHMC as WH
 import LogDensityProblems as LDP
+using PrecompileTools: @compile_workload
 
 function PPL.adaptive_centering_problem(built, plan::PPL.StructuralPlan, problem, backend;
         cells::NamedTuple = (;), u0 = nothing, on_error = nothing, discrete = nothing)
@@ -64,6 +65,10 @@ function _centering_reparametrization(kernel, records, chains = ())
     end
     isempty(chains) ? WH.IndexedReparametrization(pairs) :
         WH.IndexedReparametrization(pairs; chains)
+end
+
+@compile_workload begin
+    PPL._construction_workload()
 end
 
 end

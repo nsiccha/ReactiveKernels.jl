@@ -16,6 +16,14 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.227
+
+- Loading Distributions or WarmupHMC after RKPPL can use precompiled model
+  construction for binding and `build_kernel`. A separate image covers
+  WarmupHMC together with Enzyme. Building these extension images takes
+  longer once per environment and saves recompilation on a fresh process's
+  first model.
+
 ## 0.1.226
 
 - Row-wise Dirichlet parameters now use the same column scan as column-wise
