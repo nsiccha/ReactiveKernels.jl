@@ -2,7 +2,7 @@ module LoweringWorkload
 using ReactiveKernels, ReactiveKernelsPPL
 
 # A builder retains its own definitions separately from the lowering cache.
-const DEFINITIONS = Module(gensym(:FittedModel))
+const DEFINITIONS = Core.eval(@__MODULE__, Expr(:module, true, gensym(:FittedModel), Expr(:block)))
 Core.eval(DEFINITIONS, :(using ReactiveKernels, ReactiveKernelsPPL))
 Core.eval(DEFINITIONS, :(ReactiveKernels.@kernel fitmean(v) = sum(v) / length(v)))
 Core.eval(DEFINITIONS, :(ReactiveKernelsPPL.@rkppl regression(X, n) = begin
