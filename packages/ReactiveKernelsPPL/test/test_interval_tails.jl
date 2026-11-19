@@ -168,8 +168,8 @@ end
     # Include the original subnormal/underflow boundary, both tails, the
     # downstream distance, and narrow intervals near and far from the centre.
     z = [3., 7., 12., 30., 36., 37., 37.5, 38., 38.5, 40., 332.6,
-        -36., -39., -42., -334.6, -1., 0., 1., 40.]
-    widths = vcat(fill(2., 15), [1e-5, 1e-5, 1e-5, 1e-5])
+        -36., -39., -42., -334.6, -1., 0., 1., 40., -4., -0.5, 0.]
+    widths = vcat(fill(2., 15), fill(1e-5, 4), [0.25, 1., 0.125])
     lo, hi = m .+ z .* s, m .+ (z .+ widths) .* s
     refs = [_normal_interval_reference(l, h, m, s) for (l, h) in zip(lo, hi)]
     data = (; y=lo, hi, s)

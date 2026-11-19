@@ -8,7 +8,7 @@
 # Distributions oracles. (`_distributional_model` / `_distributional_check`
 # come from test_distributional_links.jl and `_zib_oracle_cell` from
 # test_zib.jl, both included first.)
-using Distributions: Beta, Binomial, Gamma, Normal, Poisson, ccdf, cdf, logpdf
+using Distributions: Beta, Binomial, Gamma, NegativeBinomial, Normal, Poisson, ccdf, cdf, logpdf
 using LogExpFunctions: logistic
 using ReactiveKernels
 using ReactiveKernelsPPL
@@ -89,6 +89,9 @@ end
         ("weighted poisson log",
             :(y .~ weighted.(Poisson.(exp.(eta)), w)), (; w = _CN_W),
             eta -> _CN_W .* logpdf.(Poisson.(exp.(eta)), _CN_Y)),
+        ("weighted negative binomial",
+            :(y .~ weighted.(NegativeBinomial2.(exp.(eta), 1.5), w)), (; w = _CN_W),
+            eta -> _CN_W .* logpdf.(NegativeBinomial.(1.5, 1.5 ./ (1.5 .+ exp.(eta))), _CN_Y)),
     )
     for (name, response, data, pointwise) in cases
         @testset "$name" begin

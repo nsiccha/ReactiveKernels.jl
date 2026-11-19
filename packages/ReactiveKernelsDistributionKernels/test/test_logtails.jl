@@ -19,6 +19,28 @@ import ReactiveKernelsDistributionKernels.DistributionKernelSources as LogTailSo
     end
 end
 
+@testset "Central Normal interval value and endpoint derivatives" begin
+    primal = prepare(LogTailSources._normal_interval_graph; have=(:a, :b), want=:value)
+    for (a, b) in ((-8., -7.875), (-0.125, 0.), (0., 0.125),
+                   (-0.0625, 0.0625), (-8., 8.), (7.875, 8.))
+        value, da, db = setprecision(BigFloat, 256) do
+            l, h = BigFloat(a), BigFloat(b)
+            q(z) = SpecialFunctions.erfc(z / sqrt(big(2))) / 2
+            p = l >= 0 ? q(l) - q(h) : q(-h) - q(-l)
+            c = inv(sqrt(2big(pi)) * p)
+            Float64.((log(p), -exp(-l^2/2) * c, exp(-h^2/2) * c))
+        end
+        y, left, right = derivative_cut(LogTailSources._normal_central_logmass, (true, true), a, b)
+        @test y ≈ value rtol=3e-14 atol=3e-15
+        @test left ≈ da rtol=3e-14
+        @test right ≈ db rtol=3e-14
+        ordinary = only(Enzyme.autodiff(Enzyme.Reverse, primal, Enzyme.Active,
+            Enzyme.Active(a), Enzyme.Active(b)))
+        @test ordinary[1] ≈ da rtol=3e-14
+        @test ordinary[2] ≈ db rtol=3e-14
+    end
+end
+
 @testset "Closed-form log tails keep probability underflow out of the graph" begin
     for (object, points, lcdf, lccdf) in (
         (LogTailSources.standard_laplace, [-1000., -1., 0., 1., 1000.],

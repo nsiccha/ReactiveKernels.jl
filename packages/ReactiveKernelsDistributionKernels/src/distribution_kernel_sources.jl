@@ -188,6 +188,31 @@ end
 const _standard_normal_logcdf = scalar_derivative_rule(_normal_logcdf_graph;
     primal = :y, partials = (z = :slope,), name = :standard_normal_logcdf)
 
+# In the central region a width of at least an eighth of a standard
+# deviation keeps the difference of the two smaller tails well conditioned.
+# Narrower or more distant intervals use the caller's log-tail subtraction.
+ReactiveKernels.@_record_source function _normal_direct_interval(a, b)
+    return (a >= -8) & (b <= 8) & (b - a >= 0.125)
+end
+
+@kernel _normal_interval_graph(a::Float64, b::Float64) = begin
+    crosses_zero = (a < 0) & (b > 0)
+    # At a zero endpoint use the side selected by the mass subtraction so
+    # differentiating the primal gives its signed boundary density there too.
+    qa = 0.5 * SpecialFunctions.erfc((a >= 0 ? a : -a) / sqrt(2.0))
+    qb = 0.5 * SpecialFunctions.erfc((b > 0 || a >= 0 ? b : -b) / sqrt(2.0))
+    outside = qa + qb
+    mass = crosses_zero ? 1 - outside : (a >= 0 ? qa - qb : qb - qa)
+    value::Float64 = crosses_zero ? log1p(-outside) : log(mass)
+    # The endpoint derivatives are -ϕ(a)/mass and ϕ(b)/mass.
+    weight = inv(sqrt(2π) * mass)
+    left::Float64 = -exp(-0.5 * a * a) * weight
+    right::Float64 = exp(-0.5 * b * b) * weight
+    return value, left, right
+end
+const _normal_central_logmass = scalar_derivative_rule(_normal_interval_graph;
+    primal = :value, partials = (a = :left, b = :right), name = :normal_central_logmass)
+
 const LOCATION_SCALE_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma, logbeta, rk_beta_inc, rk_student_tail, _standard_normal_logcdf, _student_log_tail, _student_log_kernel
 using SpecialFunctions: erfc, erfcinv, beta_inc_inv
@@ -1021,24 +1046,26 @@ end
 # load-bearing on this). The log1p form is algebraically identical and
 # NaN-free at the mu = 0 / mu = Inf edges; the support guard and the
 # `observed == 0` tail are LAZY branches, so nothing is evaluated on an
-# invalid side (CONTRIBUTING.md). No cdf/quantile (discrete
-# inversion); only `logpdf` is exposed.
-const NEGATIVE_BINOMIAL2_KERNEL_SOURCE = raw"""
-using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma
-using LogExpFunctions: log1p
+# invalid side (CONTRIBUTING.md).
+@kernel _nb2_logkernel(observed::Int, mu::Float64, phi::Float64) = begin
+    y = float(observed)
+    value::Float64 = logrising(phi, observed) - phi * log1p(mu / phi) +
+        (observed == 0 ? 0.0 : -y * log1p(phi / mu))
+end
+@kernel _count_lognormalizer(observed::Int) = begin
+    value::Float64 = observed > 0 ? -loggamma(observed + 1.0) : 0.0
+end
 
+const NEGATIVE_BINOMIAL2_KERNEL_SOURCE = raw"""
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: _count_lognormalizer, _nb2_logkernel
 using SpecialFunctions: beta_inc
 
 @kernel negative_binomial2(mu::Float64, phi::Float64) = begin
-    logpdf(observed::Int)::Float64 = begin
-        valid::Bool = (observed >= 0) & (mu >= 0) & (phi > 0)
-        y::Float64 = float(observed)
-        valid ?
-            (loggamma(y + phi) - loggamma(phi) - loggamma(y + 1.0) -
-             phi * log1p(mu / phi) +
-             (observed == 0 ? 0.0 : -y * log1p(phi / mu))) :
-            -Inf
-    end
+    lognormalizer(observed::Int)::Float64 = _count_lognormalizer(observed)
+    logkernel(observed::Int)::Float64 = observed >= 0 && mu >= 0 && phi > 0 ?
+        _nb2_logkernel(observed, mu, phi) : -Inf
+    logpdf(observed::Int)::Float64 = observed >= 0 && mu >= 0 && phi > 0 ?
+        _nb2_logkernel(observed, mu, phi) + _count_lognormalizer(observed) : -Inf
     cdf(observed::Int)::Float64 = observed < 0 ? 0.0 :
         first(beta_inc(phi, observed + 1.0, phi / (phi + mu)))
     ccdf(observed::Int)::Float64 = observed < 0 ? 1.0 :
@@ -1669,7 +1696,9 @@ Negative binomial law of a count with mean `mu` and variance
 `mu + mu^2 / phi`, Stan's `neg_binomial_2(mu, phi)`: the same law as
 `Distributions.NegativeBinomial(phi, phi / (mu + phi))`.
 
-Endpoints: `logpdf(observed)`, `cdf(observed)`, `ccdf(observed)`.
+Endpoints: `logpdf(observed)`, `logkernel(observed)`, `lognormalizer(observed)`,
+`cdf(observed)`, `ccdf(observed)`. The log density is the sum of the log
+kernel and the data-only log normalizer, `-log(observed!)` on the support.
 """
 const negative_binomial2 = _OTHER_DISTRIBUTION_BINDINGS[14]
 

@@ -541,10 +541,17 @@ end
     # exactly NegativeBinomial(phi, phi/(phi+mu)) — the independent oracle.
     nb2 = prepare(negative_binomial2.logpdf;
         have = (:observed, :mu, :phi), want = :logpdf)
+    kernel = prepare(negative_binomial2.logkernel;
+        have = (:observed, :mu, :phi), want = :logkernel)
+    normalizer = prepare(negative_binomial2.lognormalizer;
+        have = (:observed,), want = :lognormalizer)
+    @test normalizer(-1) == normalizer(0) == 0.0
+    @test normalizer(5) ≈ -log(120)
     for (y, mu, phi) in ((0, 2.5, 1.5), (3, 2.5, 1.5), (7, 0.4, 3.0),
             (1, 10.0, 0.5), (5, 3.0, 3.0))
         ref = logpdf(NegativeBinomial(phi, phi / (phi + mu)), y)
         @test nb2(y, mu, phi) ≈ ref
+        @test kernel(y, mu, phi) + normalizer(y) ≈ ref
     end
     # Impossible events are -Inf, never NaN (branchless ifelse guards).
     @test nb2(3, 0.0, 1.5) == -Inf

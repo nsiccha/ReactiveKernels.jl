@@ -4,6 +4,9 @@
 _evidence_at(b, discrete::Bool) = discrete ? :(Base.trunc(Int, floor($b))) : b
 _evidence_below(b, discrete::Bool) = discrete ? :(Base.trunc(Int, ceil($b)) - 1) : b
 
+_evidence_object(head) = head isa GlobalRef ? getfield(head.mod, head.name) :
+    head isa Symbol && isdefined(PPLGeneratedModels, head) ? getfield(PPLGeneratedModels, head) : nothing
+
 # Select an owned log-tail endpoint at generation time when the distribution
 # supplies one. Other laws keep their existing CDF calculation; taking its
 # log here cannot repair underflow inside that family's CDF implementation.
@@ -14,10 +17,7 @@ function _evidence_logtail(tail)
                 endpoint.args[2] in (QuoteNode(:cdf), QuoteNode(:ccdf))
             dist = endpoint.args[1]
             if dist isa Expr && dist.head === :call
-                head = dist.args[1]
-                object = head isa GlobalRef ? getfield(head.mod, head.name) :
-                    head isa Symbol && isdefined(PPLGeneratedModels, head) ?
-                        getfield(PPLGeneratedModels, head) : nothing
+                object = _evidence_object(dist.args[1])
                 method = endpoint.args[2] == QuoteNode(:cdf) ? :logcdf : :logccdf
                 if applicable(ReactiveKernels.kernel_endpoint_names, object) &&
                         method in ReactiveKernels.kernel_endpoint_names(object)
@@ -38,15 +38,34 @@ end
 end
 _evidence_logdifference(a, b) = Expr(:call, GlobalRef(@__MODULE__, :_ppl_log_tail_difference), a, b)
 
+# Only an actual Normal log-CDF at the lower endpoint identifies these
+# standardized coordinates. Custom tails, including mixtures, keep their
+# own interval calculation.
+function _evidence_normal_logmass(lower_tail, lo, hi, fallback)
+    Meta.isexpr(lower_tail, :call, 2) && isequal(lower_tail.args[2], lo) || return fallback
+    endpoint = lower_tail.args[1]
+    Meta.isexpr(endpoint, :., 2) && endpoint.args[2] == QuoteNode(:logcdf) || return fallback
+    dist = endpoint.args[1]
+    Meta.isexpr(dist, :call, 3) || return fallback
+    head, location, scale = dist.args
+    _evidence_object(head) === DistributionKernelSources.normal || return fallback
+    a, b = :(($lo - $location) / $scale), :(($hi - $location) / $scale)
+    central = GlobalRef(DistributionKernelSources, :_normal_direct_interval)
+    logmass = GlobalRef(DistributionKernelSources, :_normal_central_logmass)
+    return :(($scale > 0 && $central($a, $b)) ? $logmass($a, $b) : $fallback)
+end
+
 function _evidence_logmass(logcdf, logccdf, lo, hi)
     lo === nothing && hi === nothing && return :(0.0)
     lo === nothing && return logcdf(hi)
     hi === nothing && return logccdf(lo)
     # Subtract on the smaller tail, entirely in log space. The selected
     # branch is lazy, including its derivative work.
-    return :($(logcdf(lo)) > -log(2) ?
+    lower_tail = logcdf(lo)
+    fallback = :($lower_tail > -log(2) ?
         $(_evidence_logdifference(logccdf(lo), logccdf(hi))) :
-        $(_evidence_logdifference(logcdf(hi), logcdf(lo))))
+        $(_evidence_logdifference(logcdf(hi), lower_tail)))
+    return _evidence_normal_logmass(lower_tail, lo, hi, fallback)
 end
 
 # A literal infinite bound is no bound (`nothing`) from parsing on. A bound
