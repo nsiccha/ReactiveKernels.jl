@@ -1,7 +1,7 @@
 name = "ReactiveKernelsPPL"
 uuid = "e266ea2a-6817-46cd-8bec-6238f0035f44"
 authors = ["Nikolas Siccha <nikolassiccha@gmail.com>"]
-version = "0.1.233"
+version = "0.1.234"
 
 [deps]
 Compat = "34da2185-b29b-5c13-b0c7-acf172513d20"
@@ -67,7 +67,7 @@ PrecompileTools = "1.2"
 # flatten a matrix of score records. `jax_source` translates in the latest
 # world through ReactiveKernels' own barrier (0.1.313). A sampler prepared on
 # another binding of one build reuses its preparation (0.1.323).
-ReactiveKernels = "0.1.325"
+ReactiveKernels = "0.1.329"
 ReactiveKernelsDistributionKernels = "0.1.12"
 SpecialFunctions = "2"
 StatsFuns = "1, 2"

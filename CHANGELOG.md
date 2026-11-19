@@ -16,6 +16,13 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.329
+
+- Streaming a plate into `logsumexp` skips the first floating-point
+  correction from an empty total. Subsequent cells compute a stable
+  correction with a nonpositive exponent. This speeds up short support
+  reductions inside a larger observation plate.
+
 ## 0.1.328
 
 - When every row of a bound plate selects the same branch arm, subsequent

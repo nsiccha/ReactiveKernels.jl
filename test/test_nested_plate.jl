@@ -357,6 +357,11 @@ end
         @test isequal(ReactiveKernels._tie_exact_logaddexp(a, b),
                       N.LogExpFunctions.logaddexp(a, b))
     end
+    for T in (Float32, Float64), (a, b) in ((-Inf, -0.0), (-Inf, Inf), (-Inf, -Inf),
+            (Inf, Inf), (-Inf, NaN), (0.0, NaN), (0.0, -40.0), (-800.0, -800.0))
+        total = ReactiveKernels._plate_total_add(N.LogExpFunctions.logsumexp, T(a), T(b))
+        @test isapprox(total, N.LogExpFunctions.logaddexp(T(a), T(b)); nans=true)
+    end
 
     shadowed = prepare(N.ShadowedFold.shadowed_logsumexp)
     @test shadowed([0.3, -1.2, 2.5]) ≈ 2 * (0.3 - 1.2 + 2.5)
