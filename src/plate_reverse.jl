@@ -593,6 +593,57 @@ end
 # its own argument names and scope. Keep tables and captures as arguments:
 # two records with the same code may hold different bound data.
 _pr_source_cut(@nospecialize(f), ref, args, flags) = nothing
+
+# A registered source describes one Julia method. Select a concrete scalar
+# signature, then require the caller's inferred cell reads to prove that
+# signature before entering the rule. A different overload keeps ordinary AD.
+struct _PRMissingScalarSource end
+const _PR_SOURCE_STACK = gensym(:plate_reverse_sources)
+_pr_contains_source_guard(x) = x isa Expr && (Meta.isexpr(x, :return, 1) &&
+    _index_run_call(only(x.args), GlobalRef(@__MODULE__, :_PRMissingScalarSource), 0) ||
+    any(_pr_contains_source_guard, x.args))
+
+Base.@nospecializeinfer function _pr_source_cut(@nospecialize(f::Function), ref, args, flags)
+    types = Tuple(a isa Number ? typeof(a) : Float64 for a in args)
+    source = _traceable_source(typeof(f), types...)
+    if source !== nothing
+        selected = Base._which(Tuple{typeof(f),types...})
+        records = Tuple{typeof(_traceable_source),Type{typeof(f)},(Type{T} for T in types)...}
+        record = Base._which(records)
+        if selected === nothing || selected.method.sig != source[4] ||
+                selected.method.primary_world > record.method.primary_world ||
+                !isempty(source[5]) || source[6]
+            source = nothing
+        end
+    end
+    source === nothing && (source = _provided_source(f, types))
+    source === nothing && return nothing
+    native_type = Base.promote_op(f, types...)
+    native_type in (Float16, Float32, Float64) || return nothing
+    stack = get(task_local_storage(), _PR_SOURCE_STACK, ())
+    any(g -> g === f, stack) && _pr_fail("recursive scalar source for `$(nameof(f))`")
+    names, body, mod = source
+    expression = Expr(:function, Expr(:tuple, names...), body)
+    cut = task_local_storage(_PR_SOURCE_STACK, (stack..., f)) do
+        _pr_expression_cut(expression, mod, args, flags, ())
+    end
+    cut === nothing && return nothing
+    matches = foldl((a, b) -> Expr(:&&, a, b),
+                    (:($x isa $T) for (x, T) in zip(args, types)); init = true)
+    result = gensym(:source_result)
+    quote
+        if !$matches
+            return $(GlobalRef(@__MODULE__, :_PRMissingScalarSource))()
+        end
+        $result = $cut
+        # A native return annotation can convert the raw value of the
+        # registered expression. Propagate the cut only across an identity.
+        if !(first($result) isa $native_type)
+            return $(GlobalRef(@__MODULE__, :_PRMissingScalarSource))()
+        end
+        $result
+    end
+end
 _pr_field(ref, field) = Expr(:call, GlobalRef(Core, :getfield), ref, QuoteNode(field))
 Base.@nospecializeinfer _pr_source_cut(@nospecialize(f::_KernelSourceOp), ref, args, flags) =
     _pr_source_cut(f.f, _pr_field(ref, :f), args, flags)
@@ -2172,10 +2223,11 @@ are the positions of the batched operands. The Enzyme extension runs it either
 in the augmented primal with a unit seed (scaling afterwards) or in the reverse
 pass with the seed; see `_pr_one_pass` there.
 """
-struct _PlateSumRule{S,B,P,R,Joint,Projections} <: Function
+struct _PlateSumRule{S,B,P,R,Joint,Projections,CheckedSources} <: Function
     program::P
     reverse::R
 end
+_PlateSumRule{S,B,P,R,J,G}(p::P, r::R) where {S,B,P,R,J,G} = _PlateSumRule{S,B,P,R,J,G,false}(p, r)
 _PlateSumRule{S,B,P,R,J}(p::P, r::R) where {S,B,P,R,J} = _PlateSumRule{S,B,P,R,J,()}(p, r)
 _PlateSumRule{S,B,P,R}(p::P, r::R) where {S,B,P,R} = _PlateSumRule{S,B,P,R,false}(p, r)
 
@@ -2320,10 +2372,33 @@ function _pr_rule_expr(S, B, types, joint, dispatch, projections)
         (target -> Expr(:call, target, operands..., :(getfield(args, $(count + 1))))) : call
     _pr_target_expr(S, B, types, joint, call, one_pass)
 end
-@generated _pr_rule_target(rule::_PlateSumRule{S,B,P,R,J,G}, args::Tuple) where {S,B,P,R,J,G} =
-    _pr_rule_expr(S, B, args.parameters, J, :_pr_rule_target, G)
-@generated _pr_rule_call(rule::_PlateSumRule{S,B,P,R,J,G}, args::Tuple) where {S,B,P,R,J,G} =
-    _pr_rule_expr(S, B, args.parameters, J, :_pr_rule_call, G)
+function _pr_source_checked_expr(S, B, types, joint, dispatch, projections, checked)
+    body = _pr_rule_expr(S, B, types, joint, dispatch, projections)
+    checked || return body
+    count = length(types) - (!isempty(types) && types[end] === _PlateTapeSlot)
+    operands = Any[:(getfield(args, $i)) for i in 1:count]
+    primal = :(getfield(rule, :program))
+    fallback = dispatch === :_pr_rule_target ? primal : Expr(:call, primal, operands...)
+    # Source guards read only forward values. Inference over the reverse
+    # must exclude the missing-source return in both value schedules. This
+    # is a type query; no cells, shadows or numeric inputs are evaluated.
+    shadows = fill(Nothing, length(B))
+    inputs = Any[types[i] for i in 1:count]
+    proof(want) = :(_promote_op(getfield(rule, :reverse), $(inputs...), Float64,
+                                $(Val{want}), $(shadows...)))
+    quote
+        if _pr_proved_tuple($(proof(true))) && _pr_proved_tuple($(proof(false)))
+            $body
+        else
+            $fallback
+        end
+    end
+end
+@inline _pr_proved_tuple(T) = T !== Union{} && T <: Tuple
+@generated _pr_rule_target(rule::_PlateSumRule{S,B,P,R,J,G,C}, args::Tuple) where {S,B,P,R,J,G,C} =
+    _pr_source_checked_expr(S, B, args.parameters, J, :_pr_rule_target, G, C)
+@generated _pr_rule_call(rule::_PlateSumRule{S,B,P,R,J,G,C}, args::Tuple) where {S,B,P,R,J,G,C} =
+    _pr_source_checked_expr(S, B, args.parameters, J, :_pr_rule_call, G, C)
 # One method per operand count, each operand's type a parameter of its own:
 # Julia does not otherwise specialize on a `Function` operand it only passes on
 # (the program's callables), and the call would dispatch dynamically
@@ -2495,7 +2570,8 @@ function _pr_rule_for(call::Expr, outer_active::Set{Symbol}, kernel,
         # dispatch dynamically and box every operand.
         primal = _PlateCall(compile(program.ast))
         rev = _PlateCall(compile(rexpr))
-        return _PlateSumRule{S,B,typeof(primal),typeof(rev),joint,projections}(primal, rev), rexpr
+        checked = _pr_contains_source_guard(rexpr)
+        return _PlateSumRule{S,B,typeof(primal),typeof(rev),joint,projections,checked}(primal, rev), rexpr
     catch err
         err isa _PRIneligible || rethrow()
         return nothing, err.reason
