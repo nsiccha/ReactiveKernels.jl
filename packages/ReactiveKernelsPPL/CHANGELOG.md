@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.231
+## 0.1.233
 
 - Integer-array marginalization reduces the candidate scores in each element's
   plate cell. JAX emission supports the marginal density, pointwise terms and
@@ -24,6 +24,18 @@ are recorded in the git history only.
 - Predictive queries over a marginalized integer array return one posterior
   mixture law per entry. Joint draws reuse an element's sampled component
   across all responses that read it.
+
+## 0.1.232
+
+- `prepare_coordinate_conditional` follows a scalar parameter's packed read
+  through its transforms and derived values. A hyperparameter used only in a
+  group prior now skips the observation likelihood on each coordinate trial.
+
+## 0.1.231
+
+- `marginalize` carries a square root of the filtered covariance for a vector
+  Gaussian scan. This preserves small observation and process variances when
+  successive innovations differ by many orders of magnitude.
 
 ## 0.1.230
 

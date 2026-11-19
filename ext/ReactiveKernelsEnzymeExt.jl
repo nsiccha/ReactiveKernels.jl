@@ -298,10 +298,7 @@ end
     # by the mutable primal result.
     _borrow_all_residuals(residuals, sources, flags) && return residuals
     # A snapshot has its residuals' type. The assertions keep that type where
-    # a rule's residuals are not inferred, so the snapshot is a run-time call:
-    # Enzyme compiles the reverse for the tape type inferred here, and
-    # `stage_reverse` splats the residuals, which infers as throwing for a
-    # tuple of unknown length.
+    # a rule's residuals are not inferred and the snapshot is a run-time call.
     _snapshot_residuals(residuals, sources, flags, Val(true))::typeof(residuals)
 end
 

@@ -519,6 +519,17 @@ staging boundary and may pass `nothing` for the others.
     Reverse[M][4]
 end
 
+# Check the actual tuple length in the emitted code. Inference can reach a
+# generated function through a splat whose arity it does not know.
+function _checked_reverse_body(body, n, cut, inputs)
+    message = "$cut: expected $n $inputs followed by the covector, got "
+    quote
+        length(args) == $(n + 1) ||
+            throw(ArgumentError($message * string(length(args)) * " arguments"))
+        $body
+    end
+end
+
 """
     reverse_cut(rule::DerivativeRule, ::Val{mask}, inputs..., covector)
         -> (cotangents of the active inputs, in input order)
@@ -531,16 +542,14 @@ data-only input is an error.
 """
 @generated function reverse_cut(
         rule::DerivativeRule{Name,N,Inputs,Primal,Forward,Reverse}, ::Val{M},
-        args::Vararg{Any,K}) where {Name,N,Inputs,Primal,Forward,Reverse,M,K}
+        args...) where {Name,N,Inputs,Primal,Forward,Reverse,M}
     Reverse === nothing && return :(throw(ArgumentError(
         "reverse_cut: rule " * $(string(Name)) * " has no reverse branch")))
-    K == N + 1 || return :(throw(ArgumentError(
-        "reverse_cut: expected " * $(string(N)) * " inputs followed by the " *
-        "covector, got " * $(string(K)) * " arguments")))
     error = _rule_activity_error(:reverse_cut, Name, Inputs, Reverse, M)
-    error === nothing || return :(throw(ArgumentError($error)))
-    _rule_body_expr(Reverse[M], :(getfield(getfield(rule, :reverse_ops), $M));
-                    tuple_return = true)
+    body = error === nothing ? _rule_body_expr(Reverse[M],
+        :(getfield(getfield(rule, :reverse_ops), $M)); tuple_return = true) :
+        :(throw(ArgumentError($error)))
+    _checked_reverse_body(body, N, "reverse_cut", "inputs")
 end
 
 """
@@ -611,17 +620,15 @@ stage_reverse(rule::DerivativeRule, mask::Val, residuals::Tuple, covector) =
 
 @generated function _stage_reverse_call(
         rule::DerivativeRule{Name,N,Inputs,Primal,Forward,Reverse,Staged}, ::Val{M},
-        args::Vararg{Any,K}) where {Name,N,Inputs,Primal,Forward,Reverse,Staged,M,K}
+        args...) where {Name,N,Inputs,Primal,Forward,Reverse,Staged,M}
     Staged === nothing && return :(throw(ArgumentError(
         "stage_reverse: rule " * $(string(Name)) * " has no reverse branch")))
     error = _rule_activity_error(:stage_reverse, Name, Inputs, Staged, M)
     error === nothing || return :(throw(ArgumentError($error)))
     _, back_spec, frontier = Staged[M]
-    K == length(frontier) + 1 || return :(throw(ArgumentError(
-        "stage_reverse: expected " * $(string(length(frontier))) *
-        " residuals followed by the covector, got " * $(string(K)) * " arguments")))
-    _rule_body_expr(back_spec,
+    body = _rule_body_expr(back_spec,
         :(getfield(getfield(getfield(rule, :staged_ops), $M), 2)); tuple_return = true)
+    _checked_reverse_body(body, length(frontier), "stage_reverse", "residuals")
 end
 
 """

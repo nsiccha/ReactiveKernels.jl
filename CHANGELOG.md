@@ -16,6 +16,26 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.329
+
+- Streaming a plate into `logsumexp` skips the first floating-point
+  correction from an empty total. Subsequent cells compute a stable
+  correction with a nonpositive exponent. This speeds up short support
+  reductions inside a larger observation plate.
+
+## 0.1.328
+
+- When every row of a bound plate selects the same branch arm, subsequent
+  bindings with the same arm and cell rewrites reuse its prepared program.
+  Each binding evaluates its own guard and refreshes its bound values. This
+  speeds up preparing a regression sampler with a new vector of response scales.
+
+## 0.1.327
+
+- `stage_reverse` and `reverse_cut` check the number of arguments supplied
+  at the call. Enzyme Reverse can now use a valid residual tuple even when
+  Julia cannot infer its length.
+
 ## 0.1.326
 
 - Reading a nonempty batch with `NativeScheduling` in a package-image
