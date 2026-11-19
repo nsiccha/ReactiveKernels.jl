@@ -221,26 +221,45 @@ function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
     return ReactiveKernels._PyVal(code, Vector{eltype(v.T)}, v.static)
 end
 
-# The array overload applies exactly the scalar support rule to each bound.
-# Use that rule's emitted host helper so invalid trials have the same check.
+# Both array overloads apply the scalar support rule to each set of bounds.
+# Keep Julia's trailing singleton axes when broadcasting the bounds.
 function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
-        ::typeof(_binomial_support), args::Vector{ReactiveKernels._PyVal})
-    n = only(args)
-    ReactiveKernels._jax_is_array(n.T) && ctx.host !== nothing ||
-        return ReactiveKernels._jax_traceable_or_lowered(ctx, _binomial_support, args)
-    item = ReactiveKernels._jax_fresh(ctx, :trials_at_element)
+        f::Union{typeof(_binomial_support),typeof(_discrete_uniform_support)},
+        args::Vector{ReactiveKernels._PyVal})
+    rank(a) = ReactiveKernels._jax_is_array(a.T) ? ndims(a.T) : 0
+    dims = maximum(rank, args)
+    dims > 0 && ctx.host !== nothing ||
+        return ReactiveKernels._jax_traceable_or_lowered(ctx, f, args)
+    items = [ReactiveKernels._jax_fresh(ctx, :bound_at_element) for a in args]
+    operands = map(args) do a
+        code = ReactiveKernels._jax_bind!(ctx, :bound, a).code
+        0 < rank(a) < dims || return code
+        return "np.reshape(" * code * ", np.shape(" * code * ") + (1,) * " *
+            string(dims - rank(a)) * ")"
+    end
+    domain = "np.broadcast_arrays(" * join(operands, ", ") * ")"
     rows = ReactiveKernels._jax_fresh(ctx, :supports)
     ReactiveKernels._jax_emit!(ctx, rows * " = []")
-    ReactiveKernels._jax_emit!(ctx, "for " * item * " in np.ravel(" * n.code * ", order='F'):")
+    ReactiveKernels._jax_emit!(ctx, "for (" * join(items, ", ") *
+        ",) in zip(*(np.ravel(a, order='F') for a in " * domain * ")):")
     ctx.scope.indent += 1
     try
-        row = ReactiveKernels._jax_traceable_or_lowered(ctx, _binomial_support,
-            [ReactiveKernels._PyVal(item, eltype(n.T), true)])
+        cells = [ReactiveKernels._PyVal(item, eltype(a.T), true) for (item, a) in zip(items, args)]
+        row = ReactiveKernels._jax_traceable_or_lowered(ctx, f, cells)
         ReactiveKernels._jax_emit!(ctx, rows * ".append(" * row.code * ")")
     finally
         ctx.scope.indent -= 1
     end
     return ReactiveKernels._PyVal(rows, Vector{UnitRange{Int}}, true)
+end
+
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_categorical_support), args::Vector{ReactiveKernels._PyVal})
+    weights = only(args)
+    ctx.host !== nothing && ReactiveKernels._jax_ragged(weights.T) ||
+        return ReactiveKernels._jax_traceable_or_lowered(ctx, _categorical_support, args)
+    code = "[np.arange(1, len(w) + 1, dtype=np.int64) for w in " * weights.code * "]"
+    return ReactiveKernels._PyVal(code, Vector{UnitRange{Int}}, true)
 end
 
 # A host plate holds rows. Transpose the fixed tuple schema, stacking each

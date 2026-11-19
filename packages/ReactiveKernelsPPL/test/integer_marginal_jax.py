@@ -141,7 +141,8 @@ def check_array(name):
 
 
 checks = {"mixture": check_mixture, "joint": check_joint, "rag": check_rag}
-for array_model in ("array_guide", "array_counts", "array_matrix", "array_joint"):
+for array_model in ("array_guide", "array_counts", "array_matrix", "array_joint",
+                    "array_uniform", "array_categorical"):
     checks[array_model] = lambda name=array_model: check_array(name)
 for name in sys.argv[2:] or checks:
     checks[name]()

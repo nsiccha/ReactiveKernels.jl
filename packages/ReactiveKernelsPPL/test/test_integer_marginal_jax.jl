@@ -55,6 +55,16 @@ end
         z[axes(trials, 1)] .~ Binomial.(trials, p)
         y .~ Normal.(z, 0.7)
     end
+    uniform = @rkppl begin
+        p ~ Normal(0, 1)
+        z[axes(y, 1)] .~ DiscreteUniform.(lo, hi)
+        y .~ Normal.(z .+ p, 1.0)
+    end
+    categorical = @rkppl begin
+        p ~ Normal(0, 1)
+        z[axes(y, 1)] .~ Categorical.(ws)
+        y .~ Normal.(z .+ p, 1.0)
+    end
     matrix = @rkppl begin
         p ~ Beta(2, 3)
         z[axes(y, 1), axes(y, 2)] .~ Bernoulli(p)
@@ -69,15 +79,25 @@ end
     mktempdir() do dir
         for (name, model, eliminated) in (("array_guide", guide, (:z,)),
                 ("array_counts", counts, (:z,)), ("array_matrix", matrix, (:z,)),
-                ("array_joint", joint, (:a, :z)))
+                ("array_joint", joint, (:a, :z)), ("array_uniform", uniform, (:z,)),
+                ("array_categorical", categorical, (:z,)))
             @testset "$name" begin
                 program = nothing
                 for n in (name == "array_joint" ? (2, 13) : (2, 13, 0))
                     y = name == "array_matrix" ?
                         reshape(collect(range(-0.2, 0.8; length = 2n)), n, 2) :
                         collect(range(-0.2, 0.8; length = n))
-                    inputs = name == "array_guide" ? (; K = n == 2 ? 3 : 5) :
-                        name == "array_counts" ? (; trials = mod.(1:n, n)) : (;)
+                    inputs = if name == "array_guide"
+                        (; K = n == 2 ? 3 : 5)
+                    elseif name == "array_counts"
+                        (; trials = mod.(1:n, n))
+                    elseif name == "array_uniform"
+                        (; lo = collect(1:n), hi = collect(1:n) .+ mod.(1:n, 3))
+                    elseif name == "array_categorical"
+                        (; ws = [iseven(i) ? [0.1, 0.2, 0.7] : [0.4, 0.6] for i in 1:n])
+                    else
+                        (;)
+                    end
                     plan = marginalize(model(; inputs...), eliminated...) | (; y)
                     built = build_kernel(plan)
                     if program === nothing
