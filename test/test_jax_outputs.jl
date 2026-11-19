@@ -14,6 +14,80 @@ include("jax_python.jl")
               pair = (count, valid))
 end
 
+@kernel add_counts(a, b) = begin
+    c = a + b
+end
+
+@kernel add_prepared_counts(a::Int32, counts::Vector{Int32}) = begin
+    c = a .+ counts
+end
+
+@kernel add_bytes(a::Int32, b::Int32) = begin
+    c = Int32(UInt8(a) + UInt8(b))
+end
+
+@testset "Integer dtypes at JAX kernel boundaries" begin
+    have = (:a, :b)
+    want = :c
+    add = prepare(add_counts; have, want)
+    mktempdir() do dir
+        for T in (Int8, UInt8, Int16, UInt16, Int32, UInt32, Int64, UInt64)
+            @test add(typemax(T), one(T)) === typemin(T)
+            dtype = lowercase(string(T))
+            for float_type in (Float32, Float64)
+                src = jax_source(add_counts; have, want, types = (a = T, b = T), float_type)
+                if float_type === Float64
+                    @test occursin("dtype=jnp." * dtype * ")", string(src))
+                end
+                write(joinpath(dir, "$(float_type)_$dtype.py"), src)
+            end
+        end
+        src = jax_source(add_prepared_counts; have = (:a, :counts), want, data = (:counts,))
+        write(joinpath(dir, "prepared_counts.py"), src)
+        @test prepare(add_bytes; have, want)(Int32(250), Int32(10)) === Int32(4)
+        write(joinpath(dir, "add_bytes.py"), jax_source(add_bytes; have, want))
+        if !rk_jax_available()
+            @test_skip "RK_JAX_PYTHON not set"
+            return
+        end
+        program = raw"""
+import importlib, sys
+import jax, jax.numpy as jnp, numpy as np
+
+sys.path.insert(0, sys.argv[1])
+jax.config.update("jax_enable_x64", False)
+for mode in ("Float32", "Float64", "Float32"):
+    # Repeat the Float32 modules after the Float64 import enables x64.
+    for name in ("int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64"):
+        add = importlib.import_module(f"{mode}_{name}").kernel
+        active = name if jax.config.x64_enabled else name.replace("64", "32")
+        T = getattr(jnp, active)
+        limits = np.iinfo(active)
+        one = T(1)
+        value = jax.jit(add)(T(limits.max), one)
+        assert value.dtype == T and int(value) == limits.min, (mode, name, value)
+        if name == "int32":
+            for stop in (0, 3, 25):
+                carry = jax.lax.while_loop(lambda i: i < stop, lambda i: add(i, one), T(0))
+                assert carry.dtype == T and int(carry) == stop
+
+import prepared_counts as m
+assert m.PREPARED["counts"]["dtype"] == "int32"
+for counts in ([], [1, 2, 3]):
+    prepared = m.prepare_data(counts=counts)
+    assert prepared["counts"].dtype == np.int32
+    result = jax.jit(m.kernel)(jnp.int32(2), **prepared)
+    assert result.dtype == jnp.int32
+    np.testing.assert_array_equal(result, np.array(counts, dtype=np.int32) + 2)
+
+from add_bytes import kernel
+value = jax.jit(kernel)(jnp.int32(250), jnp.int32(10))
+assert int(value) == 4 and value.dtype == jnp.int32
+"""
+        @test success(pipeline(`$RK_JAX_PYTHON -W error -c $program $dir`; stdout, stderr))
+    end
+end
+
 @testset "JAX numerical module outputs are arrays" begin
     functions = (zero_term = :zero_term, host_term = :host_term, single = :single,
                  count = :count, valid = :valid, copied = :copied,
