@@ -1043,12 +1043,15 @@ function _pr_direct_operands!(prepared, body, params, active_params, broadcastab
         function read(ex)
             ex isa Expr && ex.head !== :quote || return
             if Meta.isexpr(ex, :call, 3) &&
-                    _pr_call_function(ex.args[1], mod, values) === _plate_read &&
-                    ex.args[2] isa Symbol && haskey(operands, ex.args[2]) &&
-                    ex.args[3] in (index, linear)
-                raw = ex.args[2]
-                prepared[raw] = operands[raw]
-                reads[ex] = nothing
+                    ex.args[2] isa Symbol && ex.args[3] in (index, linear)
+                operand = ex.args[2]
+                f = _pr_call_function(ex.args[1], mod, values)
+                if f === _plate_read && haskey(operands, operand)
+                    prepared[operand] = operands[operand]
+                    reads[ex] = nothing
+                elseif f === Base.Broadcast._broadcast_getindex && haskey(prepared, operand)
+                    reads[ex] = nothing
+                end
             end
             foreach(read, ex.args)
         end
@@ -1057,11 +1060,14 @@ function _pr_direct_operands!(prepared, body, params, active_params, broadcastab
     visit(body)
     function check(node)
         node isa Expr && node.head !== :quote || return
-        if Meta.isexpr(node, :call, 3) &&
-                _pr_call_function(node.args[1], mod, values) === _plate_read &&
-                get(operands, node.args[2], nothing) in active_params &&
-                !haskey(reads, node)
-            _pr_fail("a direct plate read does not use its cell index")
+        if Meta.isexpr(node, :call, 3) && !haskey(reads, node)
+            f = _pr_call_function(node.args[1], mod, values)
+            if f === _plate_read && get(operands, node.args[2], nothing) in active_params
+                _pr_fail("a direct plate read does not use its cell index")
+            elseif f === Base.Broadcast._broadcast_getindex &&
+                    get(prepared, node.args[2], nothing) in active_params
+                _pr_fail("a prepared plate read does not use its cell index")
+            end
         end
         foreach(check, node.args)
     end
@@ -1583,22 +1589,27 @@ end
 @inline _pr_spans(::Union{Number,Base.RefValue}, cells) = true
 @inline _pr_spans(_, cells) = false
 @inline _pr_spans_all(cells, operands...) = all(A -> _pr_spans(A, cells), operands)
-@inline _pr_direct_read(A::Base.Broadcast.Extruded, i) = @inbounds A.x[i]
+@inline _pr_direct_read(A::Base.Broadcast.Extruded, i) = Base.Broadcast._broadcast_getindex(A, i)
+@inline _pr_direct_read(A::Base.Broadcast.Extruded, i::Int) = @inbounds A.x[i]
+@inline function _pr_direct_read(A::Base.Broadcast.Extruded, i::CartesianIndex{N}) where {N}
+    length(A.keeps) == N || return Base.Broadcast._broadcast_getindex(A, i)
+    @inbounds A.x[i]
+end
 @inline _pr_direct_read(x::Number, i) = x
 @inline _pr_direct_read(r::Base.RefValue, i) = r[]
 
 # The prepared operands the statements read, and the statements with each read
 # of them direct.
-function _pr_direct_reads(stmts, st::_PRProgramState, linear::Symbol, found::Vector{Symbol} = Symbol[])
+function _pr_direct_reads(stmts, st::_PRProgramState, found::Vector{Symbol} = Symbol[])
     out = Any[]
     for s in stmts
         if _pr_is_read(s, st)
             s.args[1] in found || push!(found, s.args[1])
             push!(out, _PRCall(s.lhs, _pr_direct_read, GlobalRef(@__MODULE__, :_pr_direct_read),
-                               Any[s.args[1], linear]))
+                               s.args))
         elseif s isa _PRBranch
-            push!(out, _PRBranch(s.lhs, s.cond, _pr_direct_reads(s.then_stmts, st, linear, found)[1],
-                                 s.then_result, _pr_direct_reads(s.else_stmts, st, linear, found)[1],
+            push!(out, _PRBranch(s.lhs, s.cond, _pr_direct_reads(s.then_stmts, st, found)[1],
+                                 s.then_result, _pr_direct_reads(s.else_stmts, st, found)[1],
                                  s.else_result))
         else
             push!(out, s)
@@ -1692,11 +1703,16 @@ end
 # and write addressed by the loop can be checked for overlap.
 const _PRSpanParent = Union{Vector{Float64},SubArray{Float64,1,Vector{Float64},Tuple{UnitRange{Int}},true}}
 const _PRSpanGather = SubArray{Float64,1,<:_PRSpanParent,Tuple{Vector{Int}}}
+# DenseArray is extensible, and a StridedVector can have a user-defined
+# parent or index range whose getindex reads other storage.
+const _PRPlainIndex = Union{Int,UnitRange{Int},Base.Slice{Base.OneTo{Int}},Base.OneTo{Int}}
+const _PRPlainVector{T} = Union{Vector{T},SubArray{T,1,<:Array{T},<:Tuple{Vararg{_PRPlainIndex}}}}
+_pr_plain_vector(x) = x isa _PRPlainVector{<:Union{Float32,Float64}}
 _pr_span_possible(cells, value, shadow, operands) = false
 @inline _pr_span_operands(::Tuple{}, cells, value, storage) = true
 @inline function _pr_span_operands(operands::Tuple, cells, value, storage)
     x = first(operands)
-    (x === value || (x isa StridedVector{<:Union{Float32,Float64}} &&
+    (x === value || (_pr_plain_vector(x) &&
         axes(x) == (cells,) && !Base.mightalias(storage, x))) &&
         _pr_span_operands(Base.tail(operands), cells, value, storage)
 end
@@ -1787,7 +1803,7 @@ function _pr_vectorized_cell_scalars(stmts, st, linear)
         if s isa _PRAlias
             args = (s.rhs,)
         elseif s isa _PRCall && _pr_is_read(s, st)
-            args = ()
+            args = (s.args[2],)
         elseif s isa _PRCall && any(f -> f === s.f,
                 (+, -, *, /, ^, _native_mul, Base.CartesianIndex, abs, abs2, sin, cos, exp, log))
             args = s.args
@@ -1811,7 +1827,7 @@ end
 # cell. Check actual storage: singleton broadcasts, indirect views, aliased
 # operands and overlapping shadows retain the original sweep order.
 @inline function _pr_dense_reverse_cells(cells, operands::Tuple, shadows::Tuple)
-    dense(x) = x isa StridedVector{<:Union{Float32,Float64}} &&
+    dense(x) = _pr_plain_vector(x) &&
                stride(x, 1) == 1 && axes(x, 1) == cells
     cells isa Union{Base.OneTo{Int},UnitRange{Int}} && all(dense, operands) &&
         all(x -> x === nothing || dense(x), shadows) &&
@@ -1928,7 +1944,7 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState, indexed:
         # the loop, and one partial sum per cell-varying term in it.
         value_pre, value_in, value_post = _pr_value_accumulation(
             inloop, inv2, cellvars, result, total, acc.args[1], ncells, st)
-        direct_in, read_operands = _pr_direct_reads(inloop, st, linear)
+        direct_in, read_operands = _pr_direct_reads(inloop, st)
         cellbody = Expr(:block, forward_in..., value_in..., reverse...)
         plain_loop = :(@inbounds for $linear in $cells
                            $cellbody

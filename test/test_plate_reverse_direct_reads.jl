@@ -100,14 +100,14 @@ end
 # restriction on authored kernels: unsupported programs use ordinary AD.
 function direct_program(; at = :index, outside = false, rebind = false,
                           raw = :raw, callable = GlobalRef(RK, :_plate_read),
-                          density = GlobalRef(Base, :sin))
+                          density = GlobalRef(Base, :sin), domain = :(Base.eachindex(x)))
     body = Expr(:block, :(index = Base.CartesianIndex(linear)))
     rebind && push!(body.args, :(index = Base.CartesianIndex(1)))
     push!(body.args, :(v = $(callable)($raw, $at)),
         :(term = $(density)(v)),
         :(total = $(GlobalRef(RK, :_plate_total_add))(total, term)))
     simd = macroexpand(RK, Expr(:macrocall, GlobalRef(Base, Symbol("@simd")),
-        LineNumberNode(0), Expr(:for, :(linear = Base.eachindex(x)), body)))
+        LineNumberNode(0), Expr(:for, :(linear = $domain), body)))
     prefix = Any[:(raw = Base.broadcastable(x)),
         :(prepared = Base.Broadcast.preprocess(nothing, raw)),
         :(total = $(GlobalRef(RK, :_plate_total_seed))(Float64, 0.0))]
@@ -156,6 +156,24 @@ end
     # Matching the callee's spelling is not proof that it is RK's owned read.
     err = failure(direct_program(; callable = GlobalRef(ForeignPlateRead, :_plate_read)))
     @test err isa RK._PRIneligible
+end
+
+@testset "a prepared active read scatters at its own cell" begin
+    read = GlobalRef(Base.Broadcast, :_broadcast_getindex)
+    x = [0.3, 0.7, 0.2]
+    for domain in (:(Base.eachindex(x)), :(Base.CartesianIndices((Base.axes(x, 1), Base.OneTo(1)))))
+        ast = direct_program(; raw = :prepared, callable = read, domain)
+        expr = first(RK._pr_program_reverse(ast, [:x], RK, Dict{Symbol,Any}()))
+        dx = zeros(length(x))
+        RK.compile(expr)(x, 1.0, Val(false), dx)
+        @test dx ≈ cos.(x)
+    end
+    fixed = direct_program(; raw = :prepared, at = 1, callable = read)
+    # The scalar oracle adds every contribution to x[1]. A cell-index
+    # scatter would write to each element once.
+    @test RK.compile(fixed)(x) ≈ length(x) * sin(first(x))
+    err = failure(fixed)
+    @test err isa RK._PRIneligible && occursin("cell index", err.reason)
 end
 
 @testset "dense reverse checks strided, disjoint storage" begin
@@ -224,6 +242,69 @@ end
 end
 
 seeded_plate(program, x, seed, slots...) = seed * program(x, slots...)
+
+struct ShadowIndex
+    shadow::Vector{Float64}
+end
+Base.to_index(i::ShadowIndex) = iszero(first(i.shadow)) ? 1 : 2
+
+struct WrappedDenseVector <: DenseVector{Float64}
+    data::Vector{Float64}
+end
+Base.size(v::WrappedDenseVector) = size(v.data)
+Base.getindex(v::WrappedDenseVector, i::Int) = v.data[i]
+
+@testset "custom storage and read indices keep the ordered sweep" begin
+    x = ones(16)
+    weights = collect(Float64, eachindex(x))
+    gradient = zeros(length(x))
+    cells = eachindex(x)
+    matrix = reshape(copy(x), :, 1)
+    @test RK._pr_dense_reverse_cells(cells, (view(matrix, :, 1),), (gradient,))
+    for operand in (WrappedDenseVector(gradient), vec(reshape(gradient, :, 1)),
+                    reinterpret(Float64, reinterpret(UInt64, gradient)))
+        @test !RK._pr_dense_reverse_cells(cells, (operand,), (gradient,))
+    end
+    ids = collect(cells)
+    gathered, shadow = view(x, ids), view(gradient, ids)
+    @test !RK._pr_span_possible(cells, gathered, shadow, (gathered, WrappedDenseVector(gradient)))
+
+    ast = direct_program()
+    append!(ast.args[1].args, (:weights, :choice))
+    read = GlobalRef(RK, :_plate_read)
+    ast = RK._index_run_replace(ast) do node
+        Meta.isexpr(node, :(=), 2) && node.args[1] === :term || return node
+        :(term = v * ($read(weights, index) + $read(weights, choice)))
+    end
+    expr = first(RK._pr_program_reverse(ast, [:x], RK, Dict{Symbol,Any}()))
+    sweep = RK.compile(watch_dense_sweep(expr))
+    for (choice, takes_dense) in ((1, true), (ShadowIndex(gradient), false))
+        dense_taken[] = false
+        fill!(gradient, 0.0)
+        sweep(x, weights, choice, 1.0, Val(false), gradient)
+        expected = weights .+ weights[1]
+        takes_dense || (expected[2:end] .= weights[2:end] .+ weights[2])
+        @test dense_taken[] == takes_dense
+        @test gradient == expected
+    end
+end
+
+@testset "a spanning broadcast read keeps an inactive fixed index" begin
+    read = GlobalRef(Base.Broadcast, :_broadcast_getindex)
+    ast = direct_program(; raw = :prepared, callable = read)
+    push!(ast.args[1].args, :weights)
+    pushfirst!(ast.args[2].args, :(prepared_weights = Base.Broadcast.preprocess(nothing, weights)))
+    ast = RK._index_run_replace(ast) do node
+        Meta.isexpr(node, :(=), 2) && node.args[1] === :term || return node
+        :(term = v * ($read(prepared_weights, index) + $read(prepared_weights, 1)))
+    end
+    x = ones(16)
+    weights = collect(Float64, eachindex(x))
+    gradient = zeros(length(x))
+    expr = first(RK._pr_program_reverse(ast, [:x], RK, Dict{Symbol,Any}()))
+    RK.compile(expr)(x, weights, 1.0, Val(false), gradient)
+    @test gradient == weights .+ weights[1]
+end
 
 function lazy_plate(program, x, scale, seed, overwrite)
     # The active scalar and array require the ordinary backend fallback.
