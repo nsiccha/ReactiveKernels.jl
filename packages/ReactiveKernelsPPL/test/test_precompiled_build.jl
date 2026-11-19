@@ -31,6 +31,19 @@ using ReactiveKernels, ReactiveKernelsPPL, ReactiveKernelsDistributionKernels, T
             using ReactiveKernelsPPL, Distributions
             using PrecompileTools: @setup_workload, @compile_workload
             const WAS_PRECOMPILED = ccall(:jl_generating_output, Cint, ()) != 0
+            # The first build initializes generated functions in this module.
+            # Preparation immediately calls one to measure coordinate ranges.
+            function first_conditional()
+                model = @rkppl begin
+                    m ~ Normal(0, 5)
+                    theta[1:J] .~ Normal.(m, 2)
+                    y .~ Normal.(theta[g], 1)
+                end
+                plan = model(; J = 2, g = [1, 2, 1]) | (; y = [0.4, -0.2, 0.7])
+                built = build_kernel(plan)
+                return prepare_coordinate_conditional(built, plan, zeros(built.layout.total))
+            end
+            @compile_workload first_conditional()
             const MODEL = @rkppl begin
                 a ~ Normal(0, 5)
                 b ~ Normal(0, 2)
@@ -132,6 +145,13 @@ using ReactiveKernels, ReactiveKernelsPPL, ReactiveKernelsDistributionKernels, T
                 for r in spec.graph.recipes if r.op isa RK._KernelSourceOp)
             @testset "loaded images" begin
             @test B.WAS_PRECOMPILED && P.WAS_PRECOMPILED
+            problem = B.first_conditional()
+            k = only(findall(==("theta.1"), string.(coordinate_names(problem.layout))))
+            state = coordinate_state(problem, zeros(problem.layout.total))
+            score(t) = normal_logpdf(t, 0, 2) +
+                normal_logpdf(0.4, t, 1) + normal_logpdf(0.7, t, 1)
+            @test coordinate_logdensity(state, k, 0.3) - coordinate_logdensity(state, k, 0.0) ≈
+                  score(0.3) - score(0.0)
             x, y = [0.0, 1.0, 2.0], [0.1, 0.9, 2.2]
             x2, y2 = [0.5, 1.5, 2.5, 3.5], [0.4, 1.7, 2.1, 3.9]
             @test P.VALUE ≈ density([0.3, -0.2, 0.1], x, y)

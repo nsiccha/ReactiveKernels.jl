@@ -16,6 +16,15 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.230
+
+- The package image prepares a coordinate conditional and a marginalized
+  state-space likelihood. Loading Enzyme also activates an image that prepares
+  a mixed discrete/continuous Gibbs problem and the sampler used by batch SMC.
+- A downstream package can call `prepare_coordinate_conditional` during its
+  first model build in a precompile workload. It can immediately read the
+  coordinate ranges of the newly generated program.
+
 ## 0.1.229
 
 - Requires ReactiveKernels 0.1.325. A matrix of simplexes, one per row or
