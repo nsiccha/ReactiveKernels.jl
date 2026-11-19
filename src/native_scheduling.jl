@@ -1,11 +1,13 @@
 """
-    NativeScheduling(; chunk_size, workers=Threads.nthreads())
+    NativeScheduling(; chunk_size, workers=nothing)
 
 Explicit native position-scheduling hints for [`vectorize`](@ref) and
 [`prepare_batched`](@ref). `chunk_size` bounds the positions retained in each
-worker's output buffers; `workers` is an upper bound, capped by available Julia
-execution threads and chunks. Both must be positive integers. There is no
-automatic cost estimate: choose these hints for the workload you measured.
+worker's output buffers. By default, the worker budget follows the Julia
+thread count of the process running the reader. An explicit `workers` sets
+an upper bound. Available threads and chunks cap each runtime call. Supply
+positive integers for these hints and choose values by measuring your
+workload.
 
 During package-image generation, a nonempty scheduled call also exercises the
 worker code on a single Julia thread. Two sample positions suffice even when
