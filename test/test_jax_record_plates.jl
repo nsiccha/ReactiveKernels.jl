@@ -162,17 +162,7 @@ end
         [([-1, 0, 1, 2], [0.2, 0.7]), (Int[], Float64[]), ([-2, 3], [0.5])])
 end
 
-@kernel jax_record_matrix(x::Float64, a::Vector{Int}, b::Vector{Int}, y::Matrix{Float64}) = begin
-    states = collect(Iterators.product(a, b))
-    records = plate(states, x, Ref(y)) do ij, s, ys
-        ((; pointwise = (; y = ys .* s)), (; prior = s * ij[1] + ij[2]))
-    end
-    terms = plate(records) do r
-        sum(r[1].pointwise.y) + r[2].prior
-    end
-    value = sum(terms) + length(records) + size(records, 2)
-    return value
-end
+isdefined(@__MODULE__, :MatrixRecordPlateFixture) || include("fixtures/matrix_record_plate.jl")
 
 jax_record_right_field(record) = record.pointwise.b
 
@@ -185,15 +175,6 @@ jax_record_right_field(record) = record.pointwise.b
     end
     value = sum(terms)
     return value
-end
-
-# The prepared native matrix-record allocation currently raises EnzymeNoTypeError;
-# benchmark/repro_native_matrix_record_reverse.jl isolates that separate boundary.
-# Ordinary Enzyme reverse of the same records in plain Julia is the oracle here.
-function jax_record_matrix_reference(x, a, b, y)
-    records = [((; pointwise = (; y = y .* x)), (; prior = x * i + j)) for i in a, j in b]
-    terms = map(r -> sum(r[1].pointwise.y) + r[2].prior, records)
-    sum(terms) + length(records) + size(records, 2)
 end
 
 @kernel jax_record_padded_matrix(x::Float64, rows::Vector{Vector{Float64}}, weights::Vector{Float64}) = begin
@@ -212,10 +193,10 @@ end
 end
 
 @testset "jax_source: record shape and padding metadata" begin
-    jax_record_parity(jax_record_matrix, (:x, :a, :b, :y),
+    jax_record_parity(MatrixRecordPlateFixture.matrix_records, (:x, :a, :b, :y),
         [([1, 2], [3, 4, 5], [0.2 0.3; 0.5 0.7]),
          ([2], [3], zeros(0, 3)), (Int[], [1, 2], zeros(2, 0)),
-         ([1, 2], Int[], zeros(0, 0))]; reverse_reference = jax_record_matrix_reference)
+         ([1, 2], Int[], zeros(0, 0))]; reverse_reference = MatrixRecordPlateFixture.reference)
     jax_record_parity(jax_record_independent, (:x, :left, :right),
         [([[0.2, 0.7], Float64[], [0.3]], [[0.9], [0.4, 0.2], Float64[]]),
          ([Float64[]], [[0.2, 0.3]]), (Vector{Float64}[], Vector{Float64}[])])
