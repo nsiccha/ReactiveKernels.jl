@@ -27,6 +27,36 @@ function reference(q, s, idx, x)
     value, gradient, scale
 end
 
+@kernel _guarded_log_ratio(y::Int, mu::Float64, scale::Float64) = begin
+    value::Float64 = y >= 0 && mu >= 0 && scale > 0 ?
+        log(float(y) + scale) - log(scale) + mu * scale : -Inf
+end
+@kernel _sum_log_ratios(y::Vector{Int}, mu::Vector{Float64}, scale::Float64) = begin
+    rows = plate(y, mu) do yi, mi
+        _guarded_log_ratio(yi, mi, scale)
+    end
+    total::Float64 = sum(rows)
+end
+
+@testset "an arm's cotangent reaches a shared operand defined after its ready flag" begin
+    scale = 1.56
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    for (y, mu) in (([0, 1, 3, 5], [1.2, 1.5, 2.1, 0.4]), (Int[], Float64[]),
+                    ([-1, -2], [0.4, 1.2]))
+        with_plate_reverse() do
+            k = prepare_nonallocating(prepare(_sum_log_ratios; bound = (; y)), mu, scale)
+            ad = prepare_ad(k, backend, mu, scale; active = (:mu, :scale))
+            dest = (zero(mu), Ref(0.0))
+            value, _ = ad_value_and_gradient!(ad, dest, mu, scale)
+            @test value ≈ sum((yi >= 0 ? log(yi + scale) - log(scale) + mi * scale : -Inf
+                               for (yi, mi) in zip(y, mu)); init = 0.0)
+            @test dest[1] ≈ [yi >= 0 ? scale : 0.0 for yi in y]
+            @test dest[2][] ≈ sum((yi >= 0 ? inv(yi + scale) - inv(scale) + mi : 0.0
+                                    for (yi, mi) in zip(y, mu)); init = 0.0)
+        end
+    end
+end
+
 # The tape slots a preparation owns, read from its AD caches.
 function tape_slots(prepared)
     slots = RK._PlateTapeSlot[]

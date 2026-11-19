@@ -1870,13 +1870,20 @@ struct _PRStatement
     rhs::Any
 end
 
+function _pr_sets_arm_ready(node, flag)
+    node isa Expr && node.head !== :quote || return false
+    Meta.isexpr(node, :(=), 2) && node.args[1] === flag && node.args[2] === true && return true
+    any(arg -> _pr_sets_arm_ready(arg, flag), node.args)
+end
+
 # Transform one block: its forward statements (cell loops fused, branch arms
 # transformed in place), then the reverse of its straight-line active
 # statements whose adjoints received a contribution.
 function _pr_program_block(stmts, st::_PRProgramState)
     fwd = Any[]
     record = _PRStatement[]
-    for s in stmts
+    arm_sweeps = Dict{Int,Vector{_PRStatement}}()
+    for (i, s) in pairs(stmts)
         s isa LineNumberNode && continue
         loop = _pr_cell_loop(s)
         if loop !== nothing
@@ -1896,7 +1903,12 @@ function _pr_program_block(stmts, st::_PRProgramState)
             push!(fwd, s)
             for (lhs, rhs) in _pr_assignments!(Pair{Symbol,Any}[], s)
                 if rhs === false && haskey(st.arm_initializers, lhs)
-                    push!(record, _PRStatement(lhs, rhs))
+                    # The arm's recipes run inside the loop. Their shared
+                    # operands can be defined after this flag's declaration.
+                    # Propagate the arm cotangents before those operands.
+                    site = findlast(stmt -> _pr_sets_arm_ready(stmt, lhs), stmts)
+                    site === nothing && _pr_fail("missing shared arm initialization")
+                    push!(get!(Vector{_PRStatement}, arm_sweeps, site), _PRStatement(lhs, rhs))
                     continue
                 end
                 lhs in st.active || continue
@@ -1911,6 +1923,7 @@ function _pr_program_block(stmts, st::_PRProgramState)
                 push!(record, _PRStatement(lhs, rhs))
             end
         end
+        haskey(arm_sweeps, i) && append!(record, arm_sweeps[i])
     end
     append!(fwd, _pr_outer_reverse(record, st))
 end
