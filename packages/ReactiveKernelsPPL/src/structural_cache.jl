@@ -187,6 +187,19 @@ function _structural(f, plan::StructuralPlan, tag::Tuple;
     return fresh ? _fresh(value) : value
 end
 
+# A cached analysis of a set of names, as a `Set{Symbol}`. A declared return
+# or variable type would convert the cached value with
+# `convert(Set{Symbol}, x)`, which sizes the new set through `IteratorSize` of
+# an abstract type: a package defining `IteratorSize` for a collection of its
+# own (DataStructures' sorted containers, loaded with Distributions) then
+# invalidates every caller, and a fresh process recompiles binding and
+# `build_kernel` (decision `1as3h7s`). Dispatching on the value asks no
+# `IteratorSize`; a value of another set type is copied element by element.
+_structural_set(f, plan::StructuralPlan, tag::Tuple; kwargs...) =
+    _symbol_set(_structural(f, plan, tag; kwargs...))
+_symbol_set(x::Set{Symbol}) = x
+_symbol_set(x) = ReactiveKernels._push_each!(Set{Symbol}(), x)
+
 # ── Data checks inside structural walks ──────────────────────────────
 #
 # Some validations walk a plan's expressions (which names a definition

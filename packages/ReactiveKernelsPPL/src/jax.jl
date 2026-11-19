@@ -229,7 +229,12 @@ function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
     ReactiveKernels._jax_emit!(ctx, "if not (jnp.issubdtype(" * dtype *
         ", jnp.integer) or jnp.issubdtype(" * dtype *
         ", jnp.bool_)): raise TypeError('integer parameters require an integer dtype')")
-    if ReactiveKernels._jax_is_array(value.T)
+    if ReactiveKernels._jax_is_array(value.T) && dims.T <: Tuple && Nothing in fieldtypes(dims.T)
+        # An extent the program does not read (`_entry_reads!`): the rank only.
+        ReactiveKernels._jax_emit!(ctx, "if jnp.ndim(" * value.code * ") != " *
+            string(fieldcount(dims.T)) *
+            ": raise ValueError('integer parameter has a different rank than its declaration')")
+    elseif ReactiveKernels._jax_is_array(value.T)
         shape = ReactiveKernels._jax_call(ctx, size, [value])
         same = ReactiveKernels._jax_call(ctx, ==, [shape, dims])
         message = ReactiveKernels._PyVal(repr("integer parameter has a different shape than its declaration"),
@@ -336,7 +341,10 @@ function _jax_with_layout(src::ReactiveKernels.JAXSource, layout::LayoutTable)
         e.positions[1] isa Int ? string(e.positions[1] - 1) : read(e.positions[1]) * " - 1"
     stop(e) = e.positions === nothing ? string(e.offset - 1 + e.size) : read(e.positions[2])
     tuple(xs) = isempty(xs) ? "()" : "(" * join(xs, ", ") * (length(xs) == 1 ? ",)" : ")")
-    dims(e) = e.axes === nothing ? tuple(string.(e.dims)) : tuple(map(read, e.axes))
+    # An integer axis the program does not read (`nothing`) has this binding's
+    # extent.
+    dims(e) = e.axes === nothing ? tuple(string.(e.dims)) :
+        tuple(map((x, n) -> x === nothing ? string(n) : read(x), e.axes, e.dims))
     entries = ["\"" * String(e.name) * "\": {\"start\": " * start(e) * ", \"stop\": " * stop(e) *
                ", \"transform\": \"" * String(e.transform) * "\", \"dims\": " * dims(e) * "}"
                for e in layout.entries]

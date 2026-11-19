@@ -2146,8 +2146,18 @@ function _entry_reads!(reads, plan, tests, e::LayoutEntry, at, scan, bound_reads
         dims = isempty(e.dims) ? Any[] : p === nothing ?
             _array_packed_reads(plan, tests, e) :
             Any[_plate_rows_read(plan, tests, plan.plate_parameters[p], only(e.dims))]
-        axes = Any[_named_read!(reads, Symbol(:_ppl_axis, d, :_, e.name), a)
-            for (d, a) in enumerate(dims)]
+        # An extent the program cannot read, such as one taken from an
+        # observation (which a design binding may lack, `_read_tests`), would
+        # be this binding's number in the program, and every data size would
+        # compile its own program. Its axis is `nothing` instead: the program
+        # checks the integer state's rank there, and the host checks the
+        # binding's size wherever a state enters (`_check_integer_parameters`).
+        # An authored literal extent (`z[1:3]`) stays.
+        authored = isempty(e.dims) ? Any[] : p === nothing ?
+            Any[_array_param(plan, e.name).dims...] : Any[plan.plate_parameters[p].range]
+        axes = Any[a isa Int && !(d isa Union{Int,UnitRange}) ? nothing :
+                   _named_read!(reads, Symbol(:_ppl_axis, k, :_, e.name), a)
+            for (k, (a, d)) in enumerate(zip(dims, authored))]
         # Even an empty packed block has runtime positions when a preceding
         # continuous block has data-sized extent (JAX layout metadata reads it).
         at isa Int && return with(nothing, axes), at

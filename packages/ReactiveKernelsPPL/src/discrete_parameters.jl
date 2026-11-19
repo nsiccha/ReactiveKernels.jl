@@ -104,15 +104,20 @@ end
 
 _integer_value(values::NamedTuple, name::Symbol, dims::Tuple) =
     _integer_value(values, (name,), dims)
+# `dims` holds an extent per axis, or `nothing` for one the program does not
+# read (`_entry_reads!`): only the rank is checked there.
 function _integer_value(values::NamedTuple, name::Tuple, dims::Tuple)
     value = _scope_lookup(values, name)
     value === _MISSING_SCOPED_VALUE && throw(ArgumentError("missing integer parameter `$name`"))
     valid = isempty(dims) ? value isa Integer :
-        value isa AbstractArray{<:Integer} && size(value) == dims
+        value isa AbstractArray{<:Integer} && _integer_dims_match(size(value), dims)
     valid || throw(ArgumentError("integer parameter `$name` requires " *
-        (isempty(dims) ? "an integer" : "an integer array of size $dims")))
+        (isempty(dims) ? "an integer" : "an integer array of size " *
+            (all(!isnothing, dims) ? "$dims" : "$(length(dims)) dimension(s)"))))
     return value
 end
+_integer_dims_match(shape::Tuple, dims::Tuple) = length(shape) == length(dims) &&
+    all(i -> dims[i] === nothing || shape[i] == dims[i], eachindex(dims))
 
 _discrete_args(::Nothing) = ()
 _discrete_args(d::NamedTuple) = (d,)
