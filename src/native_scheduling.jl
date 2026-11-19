@@ -7,6 +7,10 @@ worker's output buffers; `workers` is an upper bound, capped by available Julia
 execution threads and chunks. Both must be positive integers. There is no
 automatic cost estimate: choose these hints for the workload you measured.
 
+During package-image generation, a nonempty scheduled call also exercises the
+worker code on a single Julia thread. Two sample positions suffice even when
+they fit in one chunk. Set `workers=1` to exercise just the serial path.
+
 For calls using several position workers, materialized data-only prefix plates
 also use the worker budget. Their cells share equal-input results within the
 call; changing data between calls recomputes the prefix. Scalar dependencies,
@@ -17,14 +21,29 @@ an owning batch retains its ordinary serial compiler path. Per-position AD uses
 the scalar kernel with `prepare_ad` and `replica`, independently of this hint.
 """
 struct NativeScheduling
+    # Zero stores the default, which follows the loading process's thread
+    # count. An explicit budget travels with an image-held reader.
     workers::Int
     chunk_size::Int
-    function NativeScheduling(; chunk_size::Integer, workers::Integer=Threads.nthreads())
-        workers > 0 || throw(ArgumentError("workers must be positive"))
+    function NativeScheduling(; chunk_size::Integer, workers::Union{Integer,Nothing}=nothing)
+        isnothing(workers) || workers > 0 || throw(ArgumentError("workers must be positive"))
         chunk_size > 0 || throw(ArgumentError("chunk_size must be positive"))
-        new(Int(workers), Int(chunk_size))
+        new(something(workers, 0), chunk_size)
     end
 end
+
+function Base.getproperty(s::NativeScheduling, name::Symbol)
+    name === :workers && iszero(getfield(s, :workers)) && return Threads.nthreads()
+    getfield(s, name)
+end
+
+function Base.show(io::IO, s::NativeScheduling)
+    print(io, "NativeScheduling(chunk_size=", s.chunk_size)
+    iszero(getfield(s, :workers)) || print(io, ", workers=", s.workers)
+    print(io, ')')
+end
+
+_scheduled_worker_count(s::NativeScheduling) = min(s.workers, Threads.nthreads())
 
 const _SCHEDULED_PREFIX_WORKERS = :ReactiveKernels_scheduled_prefix_workers
 const _SCHEDULED_PREFIX_LOWERING = :ReactiveKernels_scheduled_prefix_lowering
@@ -32,7 +51,7 @@ const _SCHEDULED_PREFIX_LOWERING = :ReactiveKernels_scheduled_prefix_lowering
 function _scheduled_prefix(p::Plan)
     isempty(p.want) && return nothing
     # Rebound readers reuse this program even when their worker budget changes.
-    # The call supplies that budget; one-job calls never enter the prefix.
+    # The call supplies that budget, including during image generation.
     task_local_storage(_SCHEDULED_PREFIX_LOWERING, true) do
         prepare(p)
     end
@@ -45,7 +64,10 @@ function _scheduled_prefix_cells(@nospecialize(f), @nospecialize(args), domain)
     count = length(domain)
     jobs = min(workers, count)
     jobs == 0 && return nothing
-    jobs == 1 && return f(args..., domain, 1:count)
+    # A singleton sample can still warm the task that a larger domain uses.
+    if jobs == 1 && (workers == 1 || ccall(:jl_generating_output, Cint, ()) == 0)
+        return f(args..., domain, 1:count)
+    end
     captured = Ref{Any}((f, args, domain))
     @sync for worker in 1:jobs
         range = fld((worker - 1) * count, jobs) + 1:fld(worker * count, jobs)
@@ -172,13 +194,15 @@ _scheduled_residual(p::Plan, batched) =
 
 # One empty copy of the residual driver per worker, without a container or
 # closure typed by the driver.
-function _scheduled_workers(@nospecialize(residual), schedule::NativeScheduling)
-    workers = Vector{Any}(undef, min(schedule.workers, Threads.nthreads()))
+function _scheduled_workers(@nospecialize(residual), count::Int)
+    workers = Vector{Any}(undef, count)
     for index in eachindex(workers)
         workers[index] = copy(residual)
     end
     workers
 end
+_scheduled_workers(@nospecialize(residual), schedule::NativeScheduling) =
+    _scheduled_workers(residual, _scheduled_worker_count(schedule))
 
 function _position_schedule(@nospecialize(kernel::GraphReplicatedKernel),
                             schedule::NativeScheduling, mode::Val{Reuse}) where {Reuse}
@@ -233,9 +257,9 @@ scalar_kernel(k::_ScheduledBatchedKernel) = scalar_kernel(k.serial)
     Expr(:tuple, values...)
 end
 
-function _scheduled_shared(k::_ScheduledBatchedKernel{R,S,B,BT,PS}, args) where {R,S,B,BT,PS}
+function _scheduled_shared(k::_ScheduledBatchedKernel{R,S,B,BT,PS}, args, budget) where {R,S,B,BT,PS}
     k.prefix === nothing && return ()
-    result = task_local_storage(_SCHEDULED_PREFIX_WORKERS, length(k.workers)) do
+    result = task_local_storage(_SCHEDULED_PREFIX_WORKERS, budget) do
         k.prefix(ntuple(i -> getfield(args, PS[i]), length(PS))...)
     end
     length(outputs(k.prefix)) == 1 ? (result,) : result
@@ -278,8 +302,8 @@ function _scheduled_store!(output::Union{Tuple,NamedTuple}, chunk::Union{Tuple,N
     map((out, value) -> _scheduled_store!(out, value, range), output, chunk)
 end
 
-function _scheduled_chunk(k::_ScheduledBatchedKernel{R,S,B,BT,PS,N}, index, args, shared, range) where {R,S,B,BT,PS,N}
-    result = k.workers[index](_scheduled_worker_args(k, args, shared, range)...)
+function _scheduled_chunk(k::_ScheduledBatchedKernel{R,S,B,BT,PS,N}, workers, index, args, shared, range) where {R,S,B,BT,PS,N}
+    result = workers[index](_scheduled_worker_args(k, args, shared, range)...)
     N == 1 ? (result,) : result
 end
 
@@ -289,9 +313,28 @@ _scheduled_first_range(job::UnitRange{Int}, chunk_size) =
 function (k::_ScheduledBatchedKernel{Reuse,S,B,BT,PS,N})(args...) where {Reuse,S,B,BT,PS,N}
     length(args) == length(inputs(k)) || throw(MethodError(k, args))
     count = _replicated_validate_axes(args, Val(B), BT)
-    jobs = min(length(k.workers), cld(count, k.schedule.chunk_size))
+    budget = _scheduled_worker_count(k.schedule)
+    jobs = min(budget, cld(count, k.schedule.chunk_size))
+    if ccall(:jl_generating_output, Cint, ()) != 0 && count > 0 &&
+            getfield(k.schedule, :workers) !== 1
+        # compilecache may have one physical thread and just one chunk of
+        # samples. Run the production tasks on disjoint positions, using
+        # call-local workers so an image-held reader keeps no virtual pool.
+        jobs = max(jobs, min(count, 2))
+        workers = _scheduled_workers(first(k.workers), jobs)
+        return _run_scheduled(k, args, count, workers, jobs, max(budget, 2))
+    end
     jobs <= 1 && return k.serial(args...)
-    shared = _scheduled_shared(k, args)
+    # A reader prepared in a package image can load with more Julia threads.
+    while length(k.workers) < jobs
+        push!(k.workers, copy(first(k.workers)))
+    end
+    _run_scheduled(k, args, count, k.workers, jobs, budget)
+end
+
+function _run_scheduled(k::_ScheduledBatchedKernel{Reuse,S,B,BT,PS,N},
+                        args, count, workers, jobs, budget) where {Reuse,S,B,BT,PS,N}
+    shared = _scheduled_shared(k, args, budget)
     chunk_size = k.schedule.chunk_size
     ranges = [fld((i - 1) * count, jobs) + 1:fld(i * count, jobs) for i in 1:jobs]
     # Every job's first chunk runs in its own task: computed on the calling
@@ -302,7 +345,7 @@ function (k::_ScheduledBatchedKernel{Reuse,S,B,BT,PS,N})(args...) where {Reuse,S
     # valid until its next call, which its own task makes after storing it.
     firsts = Vector{Any}(undef, jobs)
     @sync for index in 1:jobs
-        Threads.@spawn firsts[index] = _scheduled_chunk(k, index, args, shared,
+        Threads.@spawn firsts[index] = _scheduled_chunk(k, workers, index, args, shared,
             _scheduled_first_range(ranges[index], chunk_size))
     end
     result = ntuple(i -> _scheduled_output!(k.caches[i], firsts[1][i], count, args, Val(Reuse)), N)
@@ -313,7 +356,7 @@ function (k::_ScheduledBatchedKernel{Reuse,S,B,BT,PS,N})(args...) where {Reuse,S
             _scheduled_store!(result, firsts[index], first_range)
             for low in last(first_range)+1:chunk_size:last(job)
                 range = low:min(last(job), low + chunk_size - 1)
-                chunk = _scheduled_chunk(k, index, args, shared, range)
+                chunk = _scheduled_chunk(k, workers, index, args, shared, range)
                 _scheduled_store!(result, chunk, range)
             end
         end
