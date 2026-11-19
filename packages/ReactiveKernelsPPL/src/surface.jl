@@ -76,7 +76,11 @@ struct RKPPLModel
     marginalized::Vector{Symbol}
     chains::Vector{Symbol}
     marginal_values::Vector{_MarginalValues}
+    builds::_ModelBuilds
 end
+RKPPLModel(ast, mod, fixed, rewrites, conditioned, documentation, marginalized, chains,
+        marginal_values) = RKPPLModel(ast, mod, fixed, rewrites, conditioned, documentation,
+    marginalized, chains, marginal_values, _ModelBuilds())
 RKPPLModel(ast, mod, fixed, rewrites, conditioned, documentation) =
     RKPPLModel(ast, mod, fixed, rewrites, conditioned, documentation, Symbol[], Symbol[],
         _MarginalValues[])
@@ -304,7 +308,7 @@ function (m::RKPPLModel)(; kwargs...)
     idx, _, blocked = _merge_base_index(m.ast.args)
     fixes = (; (k => v for (k, v) in kwargs if haskey(idx, k) ||
         k in blocked || occursin('.', String(k)))...)
-    program = isempty(fixes) ? m : Base.merge(m, fixes)
+    program = isempty(fixes) ? m : _merge_fixes(m, fixes; builds = m.builds)
     binding = RKPPLBoundModel(program, cols)
     return isempty(program.conditioned) ? binding : bind_data(binding)
 end
@@ -313,7 +317,7 @@ function condition(m::RKPPLModel; kwargs...)
     observations = merge(copy(m.conditioned),
         Dict{Symbol,ColumnData}(k => _check_col(k, v) for (k, v) in kwargs))
     return RKPPLModel(m.ast, m.mod, copy(m.fixed), copy(m.rewrites), observations,
-        copy(m.documentation), copy(m.marginalized), copy(m.chains), copy(m.marginal_values))
+        copy(m.documentation), copy(m.marginalized), copy(m.chains), copy(m.marginal_values), m.builds)
 end
 condition(m::RKPPLBoundModel; kwargs...) =
     bind_data(RKPPLBoundModel(condition(m.model; kwargs...), copy(m.data)))
@@ -518,7 +522,8 @@ Base.merge(m::RKPPLModel, fix::NamedTuple) = _merge_fixes(m, fix)
 # An author's dotted key names a scoped declaration (`var"z.w.tau"`) and waits
 # for expansion. Expansion pins a local by its plan identifier, which is
 # spelled with the same dots, so it passes `scoped_keys = false`.
-function _merge_fixes(m::RKPPLModel, fix::NamedTuple; scoped_keys::Bool = true)
+function _merge_fixes(m::RKPPLModel, fix::NamedTuple; scoped_keys::Bool = true,
+        builds = _ModelBuilds())
     isempty(fix) && _sfail("merge with an empty NamedTuple fixes nothing")
     out = Any[a for a in m.ast.args]
     idx, dups, blocked = _merge_base_index(out)
@@ -558,7 +563,7 @@ function _merge_fixes(m::RKPPLModel, fix::NamedTuple; scoped_keys::Bool = true)
     end
     kept = Any[a for (i, a) in enumerate(out) if i ∉ drop]
     return RKPPLModel(Expr(:block, kept...), m.mod, new_fixed, copy(m.rewrites), observations,
-        copy(m.documentation), copy(m.marginalized), copy(m.chains), copy(m.marginal_values))
+        copy(m.documentation), copy(m.marginalized), copy(m.chains), copy(m.marginal_values), builds)
 end
 
 function Base.merge(m::RKPPLModel, first, rest...)
@@ -771,6 +776,7 @@ function _lower_model_latest(m::RKPPLModel, supplied; conditioned = keys(m.condi
     for name in _conditioned_inputs(plan)
         values[_conditioned_input(name)] = pop!(values, name)
     end
+    _structural_cache(plan).model_builds = WeakRef(m.builds)
     return _with(plan; documentation, marginalized_integers = integer_marginals), values
 end
 

@@ -16,6 +16,13 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.233
+
+- Rebuilding an eligible program from the same captured `@rkppl` model
+  reuses its graph construction and sampler preparation. Each build has
+  independent public ports and checks. Each binding supplies its own layout,
+  prefix values and sampler buffers.
+
 ## 0.1.232
 
 - `prepare_coordinate_conditional` follows a scalar parameter's packed read

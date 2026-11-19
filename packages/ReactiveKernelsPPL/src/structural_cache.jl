@@ -19,6 +19,26 @@
 # lowering does. A key or value never holds that table, which would keep
 # its own entry alive.
 
+struct _ModelBuildEntry
+    definition::Expr
+    globals::Dict{GlobalRef,Any}
+    packed_total::Union{Int,Symbol}
+    spec::KernelSpec
+    version::Int
+    # Weak keys let each public build disappear as soon as its caller is done.
+    public_graphs::WeakKeyDict{Graph,Tuple{Int,Dict{Symbol,Value}}}
+end
+
+# A captured model owns its most recent reusable build. Derived plans keep a
+# weak reference so the process-wide structural table cannot keep a model alive.
+mutable struct _ModelBuilds
+    const lock::ReentrantLock
+    entry::Union{Nothing,_ModelBuildEntry}
+end
+_ModelBuilds() = _ModelBuilds(ReentrantLock(), nothing)
+# A copied model is an independent owner, including after the original built.
+Base.deepcopy_internal(::_ModelBuilds, ::IdDict) = _ModelBuilds()
+
 mutable struct _StructuralCache
     const lock::ReentrantLock
     entries::IdDict{Any,Any}
@@ -26,9 +46,10 @@ mutable struct _StructuralCache
     # (`_signature_id`): `(kind, hash, length) => [signature => id]`.
     signatures::Dict{Tuple{Symbol,UInt,Int},Vector{Pair{Any,Int}}}
     nsignatures::Int
+    model_builds::WeakRef
 end
 _StructuralCache() = _StructuralCache(ReentrantLock(), IdDict{Any,Any}(),
-    Dict{Tuple{Symbol,UInt,Int},Vector{Pair{Any,Int}}}(), 0)
+    Dict{Tuple{Symbol,UInt,Int},Vector{Pair{Any,Int}}}(), 0, WeakRef(nothing))
 
 # Entries per lowering. A lowering rebound to designs whose sized fields
 # differ (other level counts) adds entries per design; past this many the

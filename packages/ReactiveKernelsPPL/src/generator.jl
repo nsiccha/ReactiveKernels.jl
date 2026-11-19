@@ -27,12 +27,14 @@ bound plan that generates the same program, with other row counts and data
 values or an equivalent lowering in another gensym-created isolation module,
 and refuses one that generates another.
 
-Concurrency: `build_kernel` is concurrency-safe. Independent plans may be
-built from concurrent tasks with no caller-side synchronization: a build
-binds nothing in a shared module and takes no package lock. Construction
-compiles little per-model code, so concurrent builds largely run in
-parallel; Julia serializes only the compilation that remains (1.10: all
-compilation; 1.12 and 1.13: type inference).
+Repeated bindings of a retained `@rkppl` model can reuse the construction
+of its most recent eligible program. Each build has fresh public ports and
+an independently editable graph. Samplers on those builds can reuse the
+model's preparation until their graph is edited. A program with a quoted
+data array or a caller-owned function takes the ordinary construction path.
+
+Concurrent tasks can call `build_kernel` independently. Each model
+synchronizes access to its own construction cache.
 
 The returned spec closes over build-time
 eval'd code. Construction resolves module bindings in a package-owned
@@ -49,9 +51,98 @@ function _build_kernel_latest(plan::StructuralPlan)
         "[generator] build_kernel requires a bound plan (bind_data first)"))
     layout = assign_layout(plan)
     def = kernel_expr(plan, layout)
-    spec = _eval_kernel_def(def)
-    _register_packed_check!(spec, layout)
+    owner = _structural_cache(plan).model_builds.value
+    # A package-image workload prepares its example in that image's evaluation
+    # module. Keep the example graph out of the model's runtime lookup.
+    spec = owner isa _ModelBuilds && ReactiveKernels._image_target_module() === nothing ?
+        _model_build_spec(owner, def, layout) :
+        _fresh_build_spec(def, layout)
     return (; spec, layout, program = _program_identity(def))
+end
+
+_fresh_build_spec(def, layout) = _register_packed_check!(_eval_kernel_def(def), layout)
+
+# The program must consist of package code and scalar literals. In particular,
+# a missingness mask, a caller's global or a captured callable gets an ordinary
+# fresh build. The raw definition retains the lexical identities that the
+# public program summary normalizes for comparison across lowerings.
+_build_module(m) =
+    m in (Core, Base, ReactiveKernels, (@__MODULE__), PPLGeneratedModels, DistributionKernelSources)
+_build_literal(x) = false
+_build_literal(x::Union{LineNumberNode,String,Nothing}) = true
+_build_literal(x::Number) = isprimitivetype(typeof(x)) || x isa Bool
+_build_literal(x::Module) = _build_module(x)
+_build_literal(x::Union{DataType,UnionAll}) = _build_module(parentmodule(x))
+
+function _build_binding(globals, ref::GlobalRef)
+    haskey(globals, ref) && return true
+    _build_module(ref.mod) || return false
+    # Local ports/variables need no global binding. Record that absence too:
+    # a subsequent build resolves the same syntax in its current world.
+    binding = ReactiveKernels._global_value(ref.mod, ref.name)
+    if binding !== nothing
+        ReactiveKernels._global_isconst(ref.mod, ref.name) || return false
+        value = something(binding)
+        safe = if value isa Function
+            _build_module(parentmodule(typeof(value))) &&
+                (Base.issingletontype(typeof(value)) || value isa ReactiveKernels.DerivativeRule)
+        else
+            # Distribution objects reconstruct their endpoints from frozen snapshots.
+            value isa Union{KernelObjectSpec,ReactiveKernels._KernelObjectSkeleton} ||
+                _build_literal(value)
+        end
+        safe || return false
+    end
+    globals[ref] = binding
+    return true
+end
+
+_build_source!(globals, x) = _build_literal(x)
+_build_source!(globals, x::GlobalRef) = _build_binding(globals, x)
+_build_source!(globals, x::Symbol) = _build_binding(globals, GlobalRef(PPLGeneratedModels, x))
+_build_source!(globals, x::QuoteNode) = _build_source!(globals, x.value)
+_build_source!(globals, x::Expr) = all(a -> _build_source!(globals, a), x.args)
+
+function _model_build_spec(owner::_ModelBuilds, def, layout)
+    lock(owner.lock) do
+        entry = owner.entry
+        if !(entry !== nothing && entry.spec.graph.version == entry.version &&
+             entry.packed_total === layout.packed_total && _same_program(entry.definition, def) &&
+             all(p -> ReactiveKernels._global_value(p.first.mod, p.first.name) === p.second,
+                 entry.globals))
+            globals = Dict{GlobalRef,Any}()
+            _build_source!(globals, def) || return _fresh_build_spec(def, layout)
+            spec = _fresh_build_spec(def, layout)
+            definition = ReactiveKernels._deepcopy_code(def, IdDict())
+            entry = _ModelBuildEntry(definition, globals, layout.packed_total, spec, spec.graph.version,
+                WeakKeyDict{Graph,Tuple{Int,Dict{Symbol,Value}}}())
+            owner.entry = entry
+        end
+        # rename allocates independent port identities and excludes preparations.
+        # Copy the nested recipe bodies too, so edits to a public graph are local.
+        spec = deepcopy(ReactiveKernels.rename(entry.spec))
+        entry.public_graphs[spec.graph] = (spec.graph.version, copy(spec.ports))
+        spec
+    end
+end
+
+# Only the sampler's symbolic boundary can use the owner's preparation. Direct
+# graph queries keep the value identities of their public build. A graph edit
+# (e.g. input_check!) must always prepare the caller's own graph.
+function _sampler_build(built, plan)
+    owner = _structural_cache(plan).model_builds.value
+    owner isa _ModelBuilds && built isa NamedTuple && haskey(built, :spec) &&
+        built.spec isa KernelSpec || return built
+    lock(owner.lock) do
+        entry = owner.entry
+        entry isa _ModelBuildEntry && entry.spec.graph.version == entry.version || return built
+        spec = built.spec
+        stamp = get(entry.public_graphs, spec.graph, nothing)
+        stamp === nothing && return built
+        version, ports = stamp
+        version == spec.graph.version && ports == spec.ports || return built
+        merge(built, (; spec = entry.spec))
+    end
 end
 
 """
@@ -879,11 +970,9 @@ import .._simplex_slices_breaks, .._simplex_value_from_breaks, .._simplex_logjac
 import .._ordered_slices_constrain, .._ordered_slices_logjac
 end
 
-# Evaluate the generated `@kernel` definition and return its spec. Nothing is
-# bound in `PPLGeneratedModels`: concurrent builds share no package state (no
-# lock, no counter) and a built spec is retained only by its caller. RK
-# evaluates the recipe closures separately so construction compiles no
-# per-model code (`ReactiveKernels._kernel_eval_definition`).
+# Evaluate the generated `@kernel` definition without binding a name in
+# `PPLGeneratedModels`. RK evaluates the recipe closures separately so
+# construction compiles no per-model code (`ReactiveKernels._kernel_eval_definition`).
 _eval_kernel_def(def::Expr) =
     ReactiveKernels._kernel_eval_definition(PPLGeneratedModels, def;
         latest_world_native_sources = true)
