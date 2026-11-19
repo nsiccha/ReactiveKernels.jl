@@ -751,7 +751,7 @@ const _NativeCatOperand = Union{Number,_NativeVector,_NativeMatrix}
 const _NativeColumnOperand = Union{Number,_NativeVector}
 
 @inline _native_cat_width(a::_NativeColumnOperand) = 1
-@inline _native_cat_width(a::_NativeMatrix) = size(a, 2)
+@inline _native_cat_width(a::AbstractMatrix) = size(a, 2)
 
 # A layout `hcat`/`vcat` does not lay out calls Base for its error (or `vcat`'s
 # fill of leading numbers).  Native Enzyme compiles that call even where it

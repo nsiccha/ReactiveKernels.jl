@@ -16,6 +16,18 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.325
+
+- `prepare_nonallocating` also buffers `hcat` (as it did `vcat`),
+  `permutedims` of a matrix, and `cumsum` / `cumprod` along a constant
+  `dims`: each fills a cache it owns from the second call on, where it
+  allocated a fresh array on every call. `permutedims` of a vector keeps
+  allocating, because Base returns a reshape that shares the vector's memory.
+- `end` and `begin` inside an index, a tuple value such as `(a, b)`, and a
+  destructuring assignment `a, b = f(x)` or `z, _ = f(x)` in a `@traceable`
+  body no longer send that body to the whole-statement fallback, so the
+  buffered steps around them stay buffered.
+
 ## 0.1.324
 
 - `jax_source` again names private helpers for prepared kernels after the

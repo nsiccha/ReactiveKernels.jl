@@ -386,6 +386,47 @@ end
     ReactiveKernels._native_vcat_copy!(cache, n, 0, args)
 end
 
+# A row-wise simplex supplies a transpose view of its column-wise breaks.
+# The block copy reads its entries in logical column order, as for a matrix.
+const _BufferedHcatOperand = Union{ReactiveKernels._NativeCatOperand,
+    LinearAlgebra.Transpose{<:Any,<:ReactiveKernels._NativeMatrix}}
+
+# `hcat` of numeric operands into a matrix cache: each operand's columns in
+# order through the native body's block copy (`_native_hcat_copy!`), as
+# `_native_hcat` fills its fresh matrix. Another element type or shape, or an
+# operand that may share memory with the cache, returns the step's own result.
+@inline function MutatingFunctions.apply!!(
+        cache::Matrix{T}, op::ReactiveKernels._ConcatenateStep{typeof(hcat)},
+        a::_BufferedHcatOperand,
+        rest::Vararg{_BufferedHcatOperand,N}) where {T,N}
+    args = (a, rest...)
+    isbitstype(T) && Base.promote_eltypeof(args...) === T || return op.f(args...)
+    height = size(a, 1)
+    size(cache, 1) == height &&
+        ReactiveKernels._native_cat_heights_equal(height, rest) &&
+        size(cache, 2) == ReactiveKernels._native_cat_width_sum(args) ||
+        return op.f(args...)
+    ReactiveKernels._lane_vcat_aliases(cache, args) && return op.f(args...)
+    ReactiveKernels._native_hcat_copy!(cache, height, 0, args)
+end
+
+# `permutedims` of a dense matrix: each entry copied to its transposed place,
+# which is what Base's `permutedims(A)` computes into its fresh result.
+# Another element type or shape, or an argument that may share memory with
+# the cache, returns the call's own result. A vector's `permutedims` gets no
+# method here: Base returns it reshaped to one row, sharing the vector's
+# memory, so a slot seeded with that first result would be the caller's
+# vector, which a later call would overwrite.
+@inline function MutatingFunctions.apply!!(cache::Matrix{T}, ::typeof(permutedims),
+        A::ReactiveKernels._NativeMatrix) where {T}
+    eltype(A) === T && size(cache) == reverse(size(A)) &&
+        !Base.mightalias(cache, A) || return permutedims(A)
+    for j in axes(A, 2), i in axes(A, 1)
+        @inbounds cache[j, i] = A[i, j]
+    end
+    cache
+end
+
 # `vcat` of dense vectors of the cache's element type into a vector cache:
 # the operands' rows in order, through the native body's unrolled copy
 # (`_native_vcat_copy!`) rather than a loop over the operand tuple, whose
@@ -543,6 +584,48 @@ end
 @inline _rk_rowreduce_inplace!(::typeof(prod), r, A) = Base.prod!(r, A)
 @inline _rk_rowreduce_inplace!(::typeof(minimum), r, A) = Base.minimum!(r, A)
 @inline _rk_rowreduce_inplace!(::typeof(maximum), r, A) = Base.maximum!(r, A)
+
+# Running sum or product of a float matrix along a preparation-constant axis
+# (`cumsum(A; dims)`, `cumprod(A; dims)`), as Base's `accumulate!` computes it
+# into the allocating twin's fresh result: each line's first entry, then
+# `add_sum`/`mul_prod` of the previous result and the next entry, in order.
+# The loop is RK's own: Base reaches the `dims = 2` pass through a function
+# barrier it documents as not type stable, which native Enzyme reverse then
+# dispatches at run time on every gradient. Another shape, element type or
+# axis, or a cache that may share memory with `A`, reseeds through the twin.
+@inline function MutatingFunctions.apply!!(
+        cache::Matrix{T}, op::ReactiveKernels._AccumulateStep{F,D},
+        A::Matrix{T}) where {T<:Base.IEEEFloat,F,D}
+    (D == 1 || D == 2) && size(cache) == size(A) && !Base.mightalias(cache, A) ||
+        return op(A)
+    _rk_accumulate!(_rk_accumulate_op(getfield(op, :f)), cache, A, D)
+end
+
+@inline _rk_accumulate_op(::typeof(cumsum)) = Base.add_sum
+@inline _rk_accumulate_op(::typeof(cumprod)) = Base.mul_prod
+
+@inline function _rk_accumulate!(f, B::Matrix, A::Matrix, d::Int)
+    m, n = size(A)
+    if d == 1
+        for j in 1:n
+            m == 0 && break
+            @inbounds tmp = A[1, j]
+            @inbounds B[1, j] = tmp
+            for i in 2:m
+                @inbounds tmp = f(tmp, A[i, j])
+                @inbounds B[i, j] = tmp
+            end
+        end
+    elseif n > 0
+        for i in 1:m
+            @inbounds B[i, 1] = A[i, 1]
+        end
+        for j in 2:n, i in 1:m
+            @inbounds B[i, j] = f(B[i, j - 1], A[i, j])
+        end
+    end
+    B
+end
 
 # --- cache ownership ---------------------------------------------------------
 # A step keeps a cache slot only when a destination-passing method fills owned
