@@ -18,8 +18,21 @@ end
     F = MatrixRecordPlateFixture
     prepare_value(spec) = prepare(spec; have = (:x, :a, :b, :y), want = :value)
     readers = (mixed = prepare_value(F.matrix_records), named = prepare_value(named_matrix_records))
-    derivative(f, x, a, b, y) = Enzyme.autodiff(Enzyme.Reverse, f, Enzyme.Active,
-        Enzyme.Active(x), Enzyme.Const(a), Enzyme.Const(b), Enzyme.Const(y))[1][1]
+    # Registered 0.13.221 on Julia 1.10 rejects even the comprehension. Older
+    # dogfood at the same version accepts it but rejects a nonempty record
+    # store. Exercise both paths and report only their observed exceptions.
+    legacy = VERSION.major == 1 && VERSION.minor == 10 && pkgversion(Enzyme) == v"0.13.221" &&
+        !(isdefined(Enzyme, :has_dogfood_repair) && Enzyme.has_dogfood_repair(:mixed_record_merges))
+    function check_gradient(f, x, a, b, y, expected, legacy_error)
+        result = try
+            Enzyme.autodiff(Enzyme.Reverse, f, Enzyme.Active,
+                Enzyme.Active(x), Enzyme.Const(a), Enzyme.Const(b), Enzyme.Const(y))[1][1]
+        catch err
+            legacy && err isa legacy_error || rethrow()
+            err
+        end
+        @test result isa Real && result ≈ expected broken=(result isa Exception)
+    end
 
     cases = (
         ([1, 2], [3, 4, 5], [0.2 0.3; 0.5 0.7]),
@@ -35,12 +48,13 @@ end
         @testset "mapped axes $((length(a), length(b))), field $(size(y))" begin
             x = 0.4
             value = F.reference(x, a, b, y)
-            expected = derivative(F.reference, x, a, b, y)
-            @test expected ≈ length(b) * (length(a) * sum(y) + sum(a))
+            expected = length(b) * (length(a) * sum(y) + sum(a))
+            check_gradient(F.reference, x, a, b, y, expected, Enzyme.Compiler.EnzymeRuntimeActivityError)
+            store_error = isempty(a) || isempty(b) ? Union{} : Enzyme.Compiler.EnzymeNoTypeError
             for (layout, native) in pairs(readers)
                 @testset "$layout" begin
                     @test native(x, a, b, y) ≈ value
-                    @test derivative(native, x, a, b, y) ≈ expected
+                    check_gradient(native, x, a, b, y, expected, store_error)
                 end
             end
         end
