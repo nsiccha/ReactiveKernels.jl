@@ -120,8 +120,9 @@ bound data holding one vector per index. A cell definition or per-index
 output read only by that observation (`loc[g] = level[g] .+ x`) is part of
 it. Each of `offset`, `loading` and `noise` is one value per index (a
 declared array or data vector read as `a[g]`, a parameter, a cell scalar) or
-one value per entry of `y[g]` (data holding one vector per index read as
-`w[g]`, and broadcasts of these). The draws hold one trajectory per index.
+one value per entry of `y[g]` (a data vector `w[g]`, a shared predictor
+`mu[rows[g]]` with one row index per observation, or broadcasts of these).
+The draws hold one trajectory per index.
 
 The marginalized program's density is the exact marginal density of the
 observations given the remaining parameters, so `coordinate_names` and the
@@ -703,27 +704,56 @@ end
 # per index it is one value per entry of the observation. Cell-local
 # definitions and per-index outputs are read through their values; a name of
 # the whole program counts only as one value.
-function _cell_shape_leaf(names::_MarginalNames, values, ivar, defs, outputs, drawn)
+function _cell_shape_leaf(names::_MarginalNames, values, ivar, defs, outputs, drawn, observations)
     top = _toplevel_shape_leaf(names, values)
     active = Set{Symbol}()
-    through(name, value) = begin
+    through(f, name, value) = begin
         name in active && return :unknown
         push!(active, name)
-        sh = _shape_of(value, leaf)
+        sh = f(value)
         delete!(active, name)
         sh
+    end
+    shape(ex) = _shape_of(ex, leaf)
+    # A vector index supplies the filter's time axis only when it selects one
+    # entry per observation. Follow cell aliases without evaluating a predictor.
+    function gather_index(ex)
+        ex isa Symbol && haskey(defs, ex) && return through(gather_index, ex, defs[ex])
+        Meta.isexpr(ex, :ref, 2) && ex.args[2] === ivar || return :unknown
+        column = ex.args[1]
+        column isa Symbol && !haskey(defs, column) && !haskey(outputs, column) ||
+            return :unknown
+        rows = get(values, column, nothing)
+        rows isa AbstractVector || return :unknown
+        aligned = all(eachindex(observations)) do i
+            checkbounds(Bool, rows, i) || return false
+            ix = rows[i]
+            ix isa AbstractVector{<:Integer} && !(eltype(ix) <: Bool) &&
+                axes(ix) == axes(observations[i])
+        end
+        return aligned ? :vector : :unknown
     end
     function leaf(ex)
         if ex isa Symbol
             (ex === ivar || ex in drawn) && return :scalar
-            haskey(defs, ex) && return through(ex, defs[ex])
+            haskey(defs, ex) && return through(shape, ex, defs[ex])
             return top(ex) === :scalar ? :scalar : :unknown
         elseif Meta.isexpr(ex, :ref, 2) && ex.args[2] === ivar && ex.args[1] isa Symbol
             a = ex.args[1]
-            haskey(outputs, a) && return through(a, outputs[a])
+            haskey(outputs, a) && return through(shape, a, outputs[a])
             haskey(values, a) && return _entry_shape(values[a])
             a in names.plate_arrays && return :unknown
             return top(a) === :vector ? :scalar : :unknown
+        elseif Meta.isexpr(ex, :ref, 2) && ex.args[1] isa Symbol
+            base, index = ex.args
+            # A shared vector of numbers has the shape of its index after a
+            # gather. A cell-local binding or a column of trajectories need
+            # not contain numbers at those positions.
+            if !haskey(defs, base) && base ∉ drawn && base ∉ names.plate_arrays &&
+                    top(base) === :vector
+                return gather_index(index)
+            end
+            return :unknown
         elseif Meta.isexpr(ex, :ref)
             return :unknown
         end
@@ -1214,7 +1244,7 @@ function _marginalize_cell_latent(ast, p, x, marginalized, values, observing, re
     # them below).
     drawn = Set{Symbol}(c.args[2] for c in cell
         if Meta.isexpr(c, :call, 3) && c.args[1] === :~ && c.args[2] isa Symbol)
-    leaf = _cell_shape_leaf(_marginal_names(ast), values, ivar, defs, outputs, drawn)
+    leaf = _cell_shape_leaf(_marginal_names(ast), values, ivar, defs, outputs, drawn, yvalue)
     if group === nothing
         law = _gaussian_transition(spec, x, hi)
         pieces = Any[]

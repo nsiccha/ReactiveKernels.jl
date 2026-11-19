@@ -16,6 +16,12 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.237
+
+- A marginalized Gaussian scan in a plate can gather a shared predictor by
+  each group's row indices in the observation offset, loading or scale.
+  The index vector may be written inline or assigned to a cell local.
+
 ## 0.1.236
 
 - Repeated sampler density calls reuse intermediate storage when unpacking array parameters, evaluating ordered slices and reducing categorical probability columns.
