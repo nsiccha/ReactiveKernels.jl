@@ -157,12 +157,19 @@ end
 # (authoring.jl). The settings it reads are the effective ones of the
 # enclosing preparation, so a call under another setting prepares its own
 # kernel.
+# A positional KernelSpec call (graph_key === nothing) executes its stored
+# program. Keep a slot for the project default and one for each explicit
+# override. Lowering reads the preference when building the default program;
+# a direct cache hit need not scan the environment's preference files.
+# Explicit preparations continue to key on the effective preference.
+_unbound_plate_mode(graph_key) = _plate_reverse_enabled()
+_unbound_plate_mode(::Nothing) = get(task_local_storage(), _PLATE_REVERSE_SCOPE, nothing)
 Base.@nospecializeinfer _unbound_key(g::Graph, graph_key, have_sig::Vector{ValueId},
                                      want_sig::Vector{ValueId}, @nospecialize(passes),
                                      on_error) =
     (graph_key, g.version, have_sig, want_sig, Tuple(_pass_key(p) for p in passes),
      on_error, _type_stability(), _type_stability_level(), _plan_mode(), _simplify(),
-     _branch_arms(), _plate_reverse_enabled())
+     _branch_arms(), _unbound_plate_mode(graph_key))
 
 # The unbound kernel of `g` for one boundary, prepared at the first lookup of
 # its key.
@@ -330,8 +337,8 @@ for on_error in (Nothing, Symbol)
                   exemplars}
         precompile(isequal, (K, K)) || error("no isequal method for bound key $K")
     end
-    for graph_key in (Nothing, UInt64)
-        K = Tuple{graph_key,Int,S,S,Tuple{},on_error,Symbol,Symbol,Bool,Bool,Symbol,Bool}
+    for (graph_key, mode) in ((Nothing, Nothing), (Nothing, Bool), (UInt64, Bool))
+        K = Tuple{graph_key,Int,S,S,Tuple{},on_error,Symbol,Symbol,Bool,Bool,Symbol,mode}
         precompile(isequal, (K, K)) || error("no isequal method for cache key $K")
     end
 end

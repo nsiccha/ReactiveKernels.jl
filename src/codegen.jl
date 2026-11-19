@@ -4738,8 +4738,10 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
             first_coordinate, shares, output_axes; deferred)
     end
     if cells
-        append!(body.args, declarations)
-        execution = Expr(:block, invariants.args...)
+        # A lane arm's ready flag and cached values live for exactly this
+        # execution of the loop. Initialize them inside the extracted plate
+        # so its caller receives only values consumed after the loop.
+        execution = Expr(:block, declarations..., invariants.args...)
         # The batched tiles of a plate of products (plate_batching.jl), for
         # the plain cell loop only: a strip refill, lane slots, cell tables,
         # scheduled groups, branch arms, scan slices, shared calls, nested
