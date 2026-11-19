@@ -68,16 +68,17 @@ _pr_tmp!(ctx::_PRCtx, base = :t) = (ctx.counter += 1; Symbol(ctx.prefix, base, c
 # code calls. A head that does not resolve to a constant global is opaque.
 function _pr_resolve(head, mod::Module)
     if head isa Symbol
-        isdefined(mod, head) || _pr_fail("unresolved call `$head`")
+        isdefined(mod, head) && isconst(mod, head) || _pr_fail("unresolved call `$head`")
         return getglobal(mod, head), GlobalRef(mod, head)
     elseif head isa GlobalRef
-        isdefined(head.mod, head.name) || _pr_fail("unresolved call `$head`")
+        isdefined(head.mod, head.name) && isconst(head.mod, head.name) ||
+            _pr_fail("unresolved call `$head`")
         return getglobal(head.mod, head.name), head
     elseif Meta.isexpr(head, :., 2) && head.args[2] isa QuoteNode
         parent, _ = _pr_resolve(head.args[1], mod)
         parent isa Module || _pr_fail("call head `$head` is not a module member")
         name = head.args[2].value
-        isdefined(parent, name) || _pr_fail("unresolved call `$head`")
+        isdefined(parent, name) && isconst(parent, name) || _pr_fail("unresolved call `$head`")
         return getglobal(parent, name), GlobalRef(parent, name)
     elseif head isa Function || head isa Type
         return head, head
@@ -1838,7 +1839,7 @@ end
 # The cell already read the primal y, so its result-based partial composes
 # with the cell cotangent without rereading x or materializing exp.(x).
 const _PRExpCells = _CellBroadcast{T,1,B} where
-    {T,B<:Base.Broadcast.Broadcasted{<:Any,<:Any,typeof(exp),Tuple{Vector{T}}}}
+    {T<:Union{Float32,Float64},B<:Base.Broadcast.Broadcasted{<:Any,<:Any,typeof(exp),Tuple{Vector{T}}}}
 struct _PRMappedShadow{F,V}
     f::F
     storage::V
@@ -2082,7 +2083,8 @@ end
 include("plate_reverse_runs.jl")
 
 _pr_check_shadow(::Nothing, x) = nothing
-_pr_check_shadow(s::_PRMappedShadow, x) = _pr_check_shadow(s.storage, x)
+_pr_check_shadow(s::_PRMappedShadow, x::_PRExpCells) =
+    _pr_check_shadow(s.storage, only(x.broadcast.args))
 # A tuple operand's cotangent accumulates in a vector the adapter provides.
 function _pr_check_shadow(shadow::AbstractVector, x::Tuple)
     length(shadow) == length(x) || throw(ArgumentError(
@@ -2115,9 +2117,42 @@ struct _PlateSumRule{S,B,P,R} <: Function
     reverse::R
 end
 
+# Pass the dense leaf itself across the AD rule boundary. Enzyme can then
+# tape it when the caller overwrites it after the primal. The by-value
+# broadcast descriptor alone does not expose that write to its overwrite flag.
+# Keep the descriptor's style and axes so the original program sees the same
+# lazy array, including when its single input broadcasts over a larger axis.
+struct _PRExpProgram{Inputs,Shadows,F,A}
+    f::F
+    shapes::A
+end
+_pr_exp_program(::Val{I}, ::Val{J}, f::F, shapes::A) where {I,J,F,A} =
+    _PRExpProgram{I,J,F,A}(f, shapes)
+@inline function _pr_exp_operand(x::Vector{T}, shape) where {T}
+    bc = Base.Broadcast.Broadcasted(first(shape), exp, (x,), last(shape))
+    _CellBroadcast{T,1,typeof(bc)}(bc)
+end
+@inline _pr_exp_shadow(::Nothing) = nothing
+@inline _pr_exp_shadow(storage) = _PRMappedShadow(exp, storage)
+@generated function (p::_PRExpProgram{I,J})(args::Vararg{Any,N}) where {I,J,N}
+    operands = Any[:(getfield(args, $k)) for k in 1:N]
+    for (j, i) in enumerate(I)
+        operands[i] = :(_pr_exp_operand($(operands[i]), getfield(p.shapes, $j)))
+    end
+    for j in J
+        operands[j] = :(_pr_exp_shadow($(operands[j])))
+    end
+    Expr(:call, :(p.f), operands...)
+end
+@inline function _pr_exp_rule(rule::_PlateSumRule{S,B}, inputs, shadows, shapes) where {S,B}
+    p = _pr_exp_program(inputs, Val(()), rule.program, shapes)
+    r = _pr_exp_program(inputs, shadows, rule.reverse, shapes)
+    _PlateSumRule{S,B,typeof(p),typeof(r)}(p, r)
+end
+
 # Attach the backend rule only after checking the operands' storage types.
-# A lazy cell array has no writable cell shadow. Let ordinary AD see its
-# program before custom-rule annotation construction creates shadow references.
+# For a lazy cell array the reverse must know how to write into its backing
+# storage. Otherwise ordinary AD sees the program before constructing shadows.
 struct _PlateSumRuleBody{S,B,R} <: Function
     rule::R
 end
@@ -2173,11 +2208,11 @@ end
 
 # The target of a call with operands of types `types`, as an expression in
 # `rule` and `args` that `make` turns into the result (the target itself, or
-# its call): the program for a lazy cell array, else the two-pass body, or the
+# its call): the program for a remaining lazy cell array, else the two-pass body, or the
 # one-pass call (`one_pass`, which alone receives a tape slot) when a gathered
 # operand's sizes allow.
 function _pr_target_expr(S, B, types, make, one_pass = make)
-    any(b -> types[b] <: _CellArray && !(types[b] <: _PRExpCells), B) &&
+    any(b -> types[b] <: _CellArray, B) &&
         return make(:(getfield(rule, :program)))
     body = make(:(_PlateSumRuleBody{$S,$B,typeof(rule)}(rule)))
     gathered = [b for b in B if _pr_gather_value(types[b])]
@@ -2192,21 +2227,34 @@ function _pr_target_expr(S, B, types, make, one_pass = make)
         end
     end
 end
-@generated _pr_rule_target(rule::_PlateSumRule{S,B}, args::Tuple) where {S,B} =
-    _pr_target_expr(S, B, args.parameters, identity)
 # The call itself, made in each branch: a target chosen by size and then called
 # would be a union of the two wrappers, boxed in the primal. A trailing tape
 # slot is not an operand of the program: only the one-pass call takes it on.
-@generated function _pr_rule_call(rule::_PlateSumRule{S,B}, args::Tuple) where {S,B}
-    types = args.parameters
+function _pr_rule_expr(S, B, types, dispatch)
     slotted = !isempty(types) && types[end] === _PlateTapeSlot
     count = length(types) - slotted
     operands = Any[:(getfield(args, $i)) for i in 1:count]
+    inputs = Tuple(b for b in B if types[b] <: _PRExpCells)
+    if !isempty(inputs)
+        shadows = Tuple(count + 2 + findfirst(==(i), B) for i in inputs)
+        shapes = Expr(:tuple, (:((args[$i].broadcast.style, args[$i].broadcast.axes)) for i in inputs)...)
+        for i in inputs
+            operands[i] = :(only(getfield(args, $i).broadcast.args))
+        end
+        slotted && push!(operands, :(getfield(args, $(count + 1))))
+        return :($dispatch(_pr_exp_rule(rule, Val($inputs), Val($shadows), $shapes),
+                           ($(operands...),)))
+    end
+    dispatch === :_pr_rule_target && return _pr_target_expr(S, B, types, identity)
     call = target -> Expr(:call, target, operands...)
     one_pass = slotted ?
         (target -> Expr(:call, target, operands..., :(getfield(args, $(count + 1))))) : call
     _pr_target_expr(S, B, types, call, one_pass)
 end
+@generated _pr_rule_target(rule::_PlateSumRule{S,B}, args::Tuple) where {S,B} =
+    _pr_rule_expr(S, B, args.parameters, :_pr_rule_target)
+@generated _pr_rule_call(rule::_PlateSumRule{S,B}, args::Tuple) where {S,B} =
+    _pr_rule_expr(S, B, args.parameters, :_pr_rule_call)
 # One method per operand count, each operand's type a parameter of its own:
 # Julia does not otherwise specialize on a `Function` operand it only passes on
 # (the program's callables), and the call would dispatch dynamically

@@ -3,6 +3,27 @@ using ReactiveKernels, MutatingFunctions, DifferentiationInterface, Enzyme, Test
 using LogExpFunctions: log1pexp
 const RK = ReactiveKernels
 
+rebind_op = sin
+@testset "rebinding an operation after preparing its scalar reverse" begin
+    head = GlobalRef(@__MODULE__, :rebind_op)
+    source = RK.compile(:(function (x)
+        return $head(x)
+    end))
+    cut = try
+        RK._pr_program_cut(source, Any[:x], (true,), ())
+    catch err
+        err isa RK._PRIneligible || rethrow()
+        nothing
+    end
+    global rebind_op = cos
+    @test source(0.4) ≈ cos(0.4)
+    if cut !== nothing
+        value, slope = RK.compile(:(x -> $cut))(0.4)
+        @test value ≈ cos(0.4)
+        @test slope ≈ -sin(0.4)
+    end
+end
+
 @kernel logistic_graph(r::Float64, s::Float64) = begin
     z::Float64 = r / exp(s)
     t::Float64 = tanh(z / 2)

@@ -312,12 +312,16 @@ end
     @test pointwise(Float64[], Float64[], -1.0) == Float64[]
     @test pointwise(y, mu, 1.3) isa Vector{Float64}
 
-    # The taken arm's scale logarithm runs once, above the cell loop.
-    program = _program(k)
-    logcall = "(__callables__[$(findfirst(op -> op === log, k.callables))])("
-    @test occursin(logcall, program)
-    @test findfirst(logcall, program).start < findfirst("for ", program).start
-    @test count("condition", program) == 1
+    # Count the scale logarithm through the actual operation table. The
+    # extracted plate program receives that operation as a positional input.
+    counted = map(op -> op === log ? _counted_log : op, k.callables)
+    for (obs, loc, sigma, calls) in ((y, mu, 1.3, 1), (y, mu, -1.0, 0),
+                                     (Float64[], Float64[], 1.3, 0))
+        _ARM_CALLS[] = 0
+        @test k.f(k.constants, counted, obs, loc, sigma) == k(obs, loc, sigma)
+        @test _ARM_CALLS[] == calls
+    end
+    @test count("condition", _program(k)) == 1
     # The graph keeps the authored lazy branch; only the native loop changes.
     @test [(e.kind, e.depth) for e in recipe_inventory(k)
            if e.kind !== :ordinary] == [(:plate, 0)]

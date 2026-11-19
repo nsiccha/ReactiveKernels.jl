@@ -926,7 +926,7 @@ end
 # and differentiates it with Enzyme's ordinary reverse instead.
 
 using ReactiveKernels: _PlateSumRuleBody, _PlateSumRuleOnePass, _pr_gather_value,
-    _pr_scalar_positions, _pr_batched_positions, _CellArray, _PRExpCells, _PRMappedShadow, _PlateTapeSlot,
+    _pr_scalar_positions, _pr_batched_positions, _CellArray, _PlateTapeSlot,
     _pr_take_tape!, _pr_return_tape!
 
 # A one-pass call made by a preparation that owns AD caches ends with its tape
@@ -1099,13 +1099,8 @@ end
 # reverse pass (`F` counts the function object at position 1) and nothing
 # else: the reverse pass reads every other operand from its annotation, so a
 # call whose operands stay intact keeps an empty tape and allocates none.
-_pr_snapshot(x) = copy(x)
-function _pr_snapshot(x::_PRExpCells)
-    bc = x.broadcast
-    typeof(x)(Base.Broadcast.Broadcasted(bc.style, bc.f, (copy(only(bc.args)),), bc.axes))
-end
 @generated function _pr_tape(::Val{F}, values::Tuple) where {F}
-    Expr(:tuple, (F[i+1] && T <: AbstractArray ? :(_pr_snapshot(getfield(values, $i))) : :nothing
+    Expr(:tuple, (F[i+1] && T <: AbstractArray ? :(copy(getfield(values, $i))) : :nothing
                   for (i, T) in enumerate(values.parameters))...)
 end
 # The operand values for the reverse pass: the tape's copy where it holds one.
@@ -1119,10 +1114,8 @@ end
     Expr(:tuple, (:(_pr_shadow(getfield(args, $b), Val($W), w)) for b in B)...)
 end
 
-@inline _pr_cell_shadow(x) = x
-@inline _pr_cell_shadow(x::_PRExpCells) = _PRMappedShadow(x.broadcast.f, only(x.broadcast.args))
-@inline _pr_shadow(arg::Union{Duplicated,DuplicatedNoNeed}, ::Val{1}, w) = _pr_cell_shadow(arg.dval)
-@inline _pr_shadow(arg::Union{BatchDuplicated,BatchDuplicatedNoNeed}, ::Val, w) = _pr_cell_shadow(arg.dval[w])
+@inline _pr_shadow(arg::Union{Duplicated,DuplicatedNoNeed}, ::Val{1}, w) = arg.dval
+@inline _pr_shadow(arg::Union{BatchDuplicated,BatchDuplicatedNoNeed}, ::Val, w) = arg.dval[w]
 @inline _pr_shadow(arg::Active{<:Tuple}, ::Val{1}, w) = zeros(eltype(arg.val), length(arg.val))
 @inline _pr_shadow(arg, ::Val, w) = nothing
 
@@ -1174,8 +1167,7 @@ end
         if T <: Active
             i in S || (i in B && _pr_tuple_operand(T)) || return :(false)
         elseif T <: Union{Duplicated,DuplicatedNoNeed,BatchDuplicated,BatchDuplicatedNoNeed}
-            V = T.parameters[1]
-            i in B && (!(V <: _CellArray) || V <: _PRExpCells) || return :(false)
+            i in B && !(T.parameters[1] <: _CellArray) || return :(false)
         else
             return :(false)
         end
