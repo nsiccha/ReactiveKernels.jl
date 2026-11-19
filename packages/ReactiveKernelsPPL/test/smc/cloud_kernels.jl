@@ -132,8 +132,11 @@ end
         options=SMCOptions(; moves=4, max_tree_depth=7, stepsize=0.5, metric=[NARROW, WIDE], nthreads=1))
     cloud = smc(t; rng=Xoshiro(31), particles=1024, reference=reference(),
         options=SMCOptions(; moves=4, max_tree_depth=7, nthreads=1, cloud_kernels=4))
-    # One fixed metric suited to mode A diverges in mode B.
-    @test divergent(frozen) > 0.2
+    # At the target the two modes need opposite scales. Early bridge stages
+    # are close to the broad reference and dilute this fixed-metric control.
+    final_frozen = last(frozen.history)
+    @test final_frozen.temperature == 1
+    @test final_frozen.divergences / final_frozen.moves > 0.2
     @test divergent(cloud) < 0.02
     @test mass_a(cloud) ≈ 0.5 atol=0.08
     @test cloud.log_normalizer ≈ LOGMASS atol=0.15
