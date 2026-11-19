@@ -484,16 +484,24 @@ _slice_hcat(::_SliceCols, a, b) = vcat(a, b)
 _slice_dims(::_SliceRows) = 2
 _slice_dims(::_SliceCols) = 1
 _slice_width(o, U) = size(U, _slice_dims(o))
-# The K − 1 stick-breaking offsets `log(K − j)`, laid along the slices.
-_simplex_offsets(::_SliceRows, K) = permutedims(log.(K .- (1:(K - 1))))
-_simplex_offsets(::_SliceCols, K) = log.(K .- (1:(K - 1)))
 
-@traceable function _simplex_slices_breaks(o, U)
-    K = _slice_width(o, U) + 1
-    z = 1.0 ./ (1.0 .+ exp.(-(U .+ _simplex_offsets(o, K))))
+# With one simplex per column, Base scans the leading dimension with a
+# scalar running total. Its matrix scan over the second dimension dispatches
+# at run time on the axes, including in the reverse derivative.
+@traceable function _simplex_slices_breaks(o::_SliceCols, U)
+    K = size(U, 1) + 1
+    offsets = log.(K .- (1:(K - 1)))
+    z = 1.0 ./ (1.0 .+ exp.(-(U .+ offsets)))
     l = log1p.(-z)
-    lr = cumsum(_slice_hcat(o, _slice_zero(o, U), l); dims = _slice_dims(o))
+    lr = cumsum(vcat(_slice_zero(o, U), l); dims = 1)
     return z, l, lr
+end
+
+# Transpose views present rows to the same scan and restore the layout of
+# each result for both the constrained value and its log-Jacobian.
+@traceable function _simplex_slices_breaks(o::_SliceRows, U)
+    z, l, lr = _simplex_slices_breaks(_SliceCols(), transpose(U))
+    return transpose(z), transpose(l), transpose(lr)
 end
 _slice_ones(::_SliceRows, G) = ones(G, 1)
 _slice_ones(::_SliceCols, G) = ones(1, G)
