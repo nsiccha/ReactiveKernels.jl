@@ -16,6 +16,13 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.238
+
+- Packages can retain a `LoweringCache()` and pass it to
+  `lower_rkppl(ast, design; cache, conditioned, frozen)` across image loads.
+  Each call uses its own fitted values and recomputes data-dependent input
+  classifications before reusing compatible structural work.
+
 ## 0.1.237
 
 - A marginalized Gaussian scan in a plate can gather a shared predictor by

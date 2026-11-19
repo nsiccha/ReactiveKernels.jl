@@ -60,7 +60,7 @@ export DesignMatrix
 export StructuralPlan, SubmodelScope
 export ContractValidationError, validate_plan, validate_structure, validate_data
 export topological_order, isbound, bind_data, COLUMN_ROLES
-export FrozenValues, frozen_values
+export FrozenValues, frozen_values, LoweringCache
 export admitted_families, admitted_terms, admitted_functions, admitted_elementwise
 export supports_term
 export block_name
@@ -172,6 +172,7 @@ include("filter.jl")
 include("filter_smc.jl")
 include("display.jl")
 include("distribution_defaults.jl")
+include("lowering_cache.jl")
 include("surface.jl")
 include("scan.jl")
 include("cell_scan.jl")
