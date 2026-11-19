@@ -1674,12 +1674,21 @@ function _partition_branch_has_bound_work(r::Recipe, inner::Plan, bound)
     false
 end
 
-_partition_plate_recipe(g, recipe, known, op, pending, want, fresh, lane_lengths) = nothing
+# A single selected arm has the original plate's inputs and domain. Its
+# operation contains only the cell program. Its own rewrite cache keeps its
+# cell analyses separate from those of other arms and their parent.
+function _single_partition(recipe, arm, fresh)
+    plate = Recipe(fresh(), recipe.inputs, recipe.outputs, arm.op, recipe.cost,
+                   nothing, false, recipe.source)
+    (; expansion = Recipe[plate], rewrite = nothing, arm_rewrites = arm.rewrites)
+end
+
+_partition_plate_recipe(g, recipe, known, op, pending, want, fresh, lane_lengths, rewrites) = nothing
 # Branch partitioning likewise consumes the operation metadata dynamically;
 # its residual operation still retains the precise generated kernel type.
 Base.@nospecializeinfer function _partition_plate_recipe(
         g, recipe, known, @nospecialize(op::_AuthoredPlateOp),
-        pending::Vector{Recipe}, want, fresh, lane_lengths::Dict{ValueId,Int})
+        pending::Vector{Recipe}, want, fresh, lane_lengths::Dict{ValueId,Int}, rewrites)
     atomic_inputs = typeof(op).parameters[2]
     inner = _plate_cell_kernel(op).plan::Plan
     length(inner.have) == length(recipe.inputs) || return nothing
@@ -1822,6 +1831,23 @@ Base.@nospecializeinfer function _partition_plate_recipe(
         end
         push!(lane_values, cid)
     end
+    # Arm construction below depends on the selected branch, which roots are
+    # bound, and which roots vary by lane. A single-arm partition embeds no
+    # gathered data, lane indices or length. Decide the condition anew, then
+    # reuse the arm program only when those structural decisions match.
+    single = length(arms) == 1
+    arm_key = if single && rewrites !== nothing
+        classes = map(inner.have) do v
+            id = canon_id(inner.graph, v.id)
+            (haskey(bound, id), id in lane_values)
+        end
+        (:partition_arm, recipe.id, _SameObject{Any}(op), recipe.inputs,
+         branch_recipe.id, first(only(arms)), classes)
+    end
+    if arm_key !== nothing
+        arm = _plate_rewrite(rewrites, arm_key)
+        arm === nothing || return _single_partition(recipe, arm, fresh)
+    end
     for r in inner.recipes
         any(v -> canon_id(inner.graph, v.id) in lane_values, r.inputs) &&
             push!(lane_values, canon_id(inner.graph, only(r.outputs).id))
@@ -1830,7 +1856,6 @@ Base.@nospecializeinfer function _partition_plate_recipe(
     token = kernel_sourceop_token(branch_recipe.op)
     form = kernel_sourceop_form(branch_recipe.op)
     pointwise = only(recipe.outputs)
-    single = length(arms) == 1
     lanes_value = Dict{Symbol,Value}()
     expansion = Recipe[]
     arm_outputs = Value[]
@@ -1901,13 +1926,18 @@ Base.@nospecializeinfer function _partition_plate_recipe(
         end
         arm_plate = _AuthoredPlateOp{typeof(kernel),atomic_inputs}(
             kernel, op.axis_checks)
+        if single
+            arm = arm_key === nothing ? (; op = arm_plate, rewrites = nothing) :
+                _plate_rewrite!(rewrites, arm_key, (; op = arm_plate, rewrites = _PlateRewrites()))
+            return _single_partition(recipe, arm, fresh)
+        end
 
         # The arm's plate arguments: shared/scalar arguments pass unchanged,
         # bound lane vectors are gathered now, live ones at run time.
         arguments = Value[]
         for (index, outer) in enumerate(recipe.inputs)
             cid = canon_id(g, outer.id)
-            if single || index in atomic_inputs
+            if index in atomic_inputs
                 push!(arguments, outer)
             elseif haskey(known, cid)
                 data = known[cid]
@@ -1938,13 +1968,11 @@ Base.@nospecializeinfer function _partition_plate_recipe(
                 push!(arguments, v)
             end
         end
-        output = single ? pointwise :
-            value!(g, Symbol(pointwise.name, :_, side), valtype(pointwise))
+        output = value!(g, Symbol(pointwise.name, :_, side), valtype(pointwise))
         push!(expansion, Recipe(fresh(), Tuple(arguments), (output,), arm_plate,
             recipe.cost, nothing, false, recipe.source))
         push!(arm_outputs, output)
     end
-    single && return (; expansion, rewrite = nothing)
 
     # Combine the arms. A sole `sum(pointwise)` consumer becomes a sum of
     # per-arm sums (each fuses into its arm's loop); otherwise the pointwise
@@ -1964,7 +1992,7 @@ Base.@nospecializeinfer function _partition_plate_recipe(
         end
         combined = Recipe(total.id, Tuple(totals), total.outputs, +, 0.0,
             nothing, false, Expr(:call, :+, (t.name for t in totals)...))
-        return (; expansion, rewrite = total.id => combined)
+        return (; expansion, rewrite = total.id => combined, arm_rewrites = nothing)
     end
     order = invperm(reduce(vcat, (last(arm) for arm in arms)))
     order_value = value!(g, :plate_lane_order, Vector{Int})
@@ -1973,7 +2001,7 @@ Base.@nospecializeinfer function _partition_plate_recipe(
     known[canon_id(g, order_value.id)] = order
     push!(expansion, Recipe(fresh(), (order_value, arm_outputs...), (pointwise,),
         _LaneAssemble{all_arms}(), 0.0, nothing, false))
-    (; expansion, rewrite = nothing)
+    (; expansion, rewrite = nothing, arm_rewrites = nothing)
 end
 
 # Whether a spliced arm runs less per lane than its closure: one of its recipes
@@ -2029,15 +2057,17 @@ function _partial_inner_plates(p::Plan, known, rewrites, one_object::Set{ValueId
     # again (a nested arm or a further branch in its cell), and a rewritten
     # `sum` consumer replaces the original later in the queue.
     pending = copy(p.recipes)
+    next_rewrites = rewrites
     while !isempty(pending)
         r = popfirst!(pending)
         # Both passes below leave every other recipe as it is. Testing here
         # spares a dynamic call per recipe of the residual and binding.
         r.op isa _AuthoredPlateOp || (push!(recipes, r); continue)
-        # Plates a partition emits get ids of this pass, which another binding
-        # may give a different plate: only the plan's own plates share rewrites.
-        specialized = _partial_plate_recipe(copied, r, known, r.op,
-                                            keyed ? rewrites : nothing, one_object)
+        # A single arm is next in the worklist and has its own cell cache.
+        # A multi-arm partition can embed a data-sized gather operation.
+        cell_rewrites = next_rewrites
+        next_rewrites = keyed ? rewrites : nothing
+        specialized = _partial_plate_recipe(copied, r, known, r.op, cell_rewrites, one_object)
         if specialized !== nothing
             changed = true
             push!(signature, specialized.key)
@@ -2046,7 +2076,7 @@ function _partial_inner_plates(p::Plan, known, rewrites, one_object::Set{ValueId
             if specialized.recipe !== nothing
                 nested = _nested_cell_group_recipe(copied, specialized.recipe, known,
                     specialized.cache_values, specialized.cache_data,
-                    keyed ? rewrites : nothing)
+                    cell_rewrites)
                 if nested !== nothing
                     push!(signature, nested.key)
                     specialized = (; specialized..., recipe = nested.recipe,
@@ -2064,12 +2094,12 @@ function _partial_inner_plates(p::Plan, known, rewrites, one_object::Set{ValueId
             r = specialized.recipe
         end
         partitioned = _partition_plate_recipe(copied, r, known, r.op, pending,
-                                              p.want, fresh, lane_lengths)
+                                              p.want, fresh, lane_lengths, cell_rewrites)
         if partitioned === nothing
             # A summed plate whose rows repeat runs once per distinct row,
             # weighted by its row count (`duplicate_cells.jl`).
             grouped = _cell_group_recipe(copied, p.have, r, known, r.op, recipes,
-                pending, p.want, fresh, keyed ? rewrites : nothing)
+                pending, p.want, fresh, cell_rewrites)
             if grouped === nothing
                 push!(recipes, r)
             else
@@ -2080,7 +2110,12 @@ function _partial_inner_plates(p::Plan, known, rewrites, one_object::Set{ValueId
             continue
         end
         changed = true
-        keyed = false
+        next_rewrites = partitioned.arm_rewrites
+        if next_rewrites === nothing
+            keyed = false
+        else
+            push!(signature, next_rewrites)
+        end
         if partitioned.rewrite !== nothing
             id, combined = partitioned.rewrite
             pending[findfirst(q -> q.id == id, pending)] = combined
@@ -2443,10 +2478,10 @@ end
 # rewrite per entry (`_PlateRewrites`) and a later binding that decides alike
 # gets the same plan up to its `_BoundConstant` values: the template key
 # includes those decisions (the pass's signature), and the template records
-# where every constant sits in the operation table. A data-bound branch
-# partition or a whole-plate value bakes the binding's structure in, so such a
-# binding keeps the ordinary per-binding specialization on the cached plan and
-# prefix. Every other binding shares the template of its plate classes
+# where every constant sits in the operation table. A single selected branch
+# arm keeps its own cell rewrites. Multi-arm partitions and whole-plate folds
+# still specialize per binding on the cached plan and prefix. Every other
+# binding shares the template of its plate classes
 # (`_partial_plate_classes`) and rewrites, whatever its values' element types
 # or array extents. A plate lowers differently for a scalar, vector, rank-N or
 # tuple bound argument, so each class has its own template; a residual whose
@@ -2492,7 +2527,7 @@ _plate_rewrite!(r::_PlateRewrites, @nospecialize(key), @nospecialize(rewrite)) =
 # rebinding of a simulator graph whose two rewritten plates cache one
 # subject's design (snag rebinding-a-prep-661c4370). They hold plans, recipes
 # and types, never a binding's values. Without a cache (an uncached `prepare`,
-# or the plates a branch partition emitted) they are computed every time.
+# or the plates a multi-arm partition emitted) they are computed every time.
 # `nothing` is a decision too, so an absent one is `_NotKept`.
 struct _NotKept end
 _plate_kept(r::_PlateRewrites, table::Dict, key) =
