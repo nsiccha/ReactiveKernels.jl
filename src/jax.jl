@@ -6273,8 +6273,7 @@ function _jax_call_positional(ctx::_JaxContext, k::PreparedKernel, args::Vector{
     # Internal calls carry logical lengths and record fields in addition to
     # their physical arrays. The public signature builder below accepts only
     # types and cannot represent these ports.
-    ctx.host === nothing && return _jax_plan_call(ctx, k, p, args)
-    _jax_typed_plan_call(ctx, k, p, args, hint)
+    _jax_plan_call(ctx, k, p, args, hint)
 end
 
 function _jax_typed_plan_call(ctx, owner, p, args, hint)
@@ -6310,8 +6309,9 @@ function _jax_typed_plan_call(ctx, owner, p, args, hint)
         _jax_bind!(ctx, :value, call) : call
 end
 
-function _jax_plan_call(ctx, owner, p::Plan, args)
-    ctx.host === nothing || return _jax_typed_plan_call(ctx, owner, p, args, nameof_or(owner))
+function _jax_plan_call(ctx, owner, p::Plan, args, hint = nothing)
+    ctx.host === nothing ||
+        return _jax_typed_plan_call(ctx, owner, p, args, something(hint, nameof_or(owner)))
     function emit(inner, arguments)
         for (input, argument) in zip(p.have, arguments)
             _jax_define!(inner, p.graph, input, argument; bind=false)
@@ -6321,7 +6321,7 @@ function _jax_plan_call(ctx, owner, p::Plan, args)
         length(values) == 1 ? only(values) : _jax_call_positional(inner, tuple, values)
     end
     _jax_named_function_call(ctx, owner, [v.name for v in p.have], args,
-        @__MODULE__, emit, () -> emit(ctx, args), "from its kernel plan")
+        @__MODULE__, emit, () -> emit(ctx, args), "from its kernel plan", hint)
 end
 
 # A prepared child a source calls (a distribution's `standardized` step):
@@ -6767,9 +6767,10 @@ end
 # function on its first use (`emit` translates the body in the function's
 # scope); `inline()` translates it in place when its value exists only during
 # translation (a type, a closure).
-function _jax_named_function_call(ctx, f, names, inputs, source_module, emit, inline, origin)
+function _jax_named_function_call(ctx, f, names, inputs, source_module, emit, inline, origin,
+                                  hint = nothing)
     arguments = _jax_take_call_arguments!(ctx, f)
-    defined = _jax_named_function!(ctx, f, names, inputs, source_module, emit, origin)
+    defined = _jax_named_function!(ctx, f, names, inputs, source_module, emit, origin, hint)
     defined === nothing && return inline()
     name, v, bounds, passed, flat, identity, lengths, written = defined
     call = name * "(" * join([passed; bounds], ", ") * ")"
@@ -6845,7 +6846,7 @@ end
 # or `nothing` when the value exists only during translation. A function that
 # writes array arguments in place returns the tuple of its value and those
 # arguments' final values, in the order of their positions `written`.
-function _jax_named_function!(ctx, f, names, inputs, source_module, emit, origin)
+function _jax_named_function!(ctx, f, names, inputs, source_module, emit, origin, hint = nothing)
     # Integer provenance and history access proofs refer to the surrounding
     # loop/scan. Keep those helpers lexically nested so the scan can still
     # resolve its access placeholders and prove a bounded history carry.
@@ -6885,18 +6886,20 @@ function _jax_named_function!(ctx, f, names, inputs, source_module, emit, origin
             _jax_written_parameters(f, names, arguments, body)
         written = first.(writes)
         isempty(writes) || (v = _jax_call_positional(inner, tuple, _PyVal[v; last.(writes)]))
-        name = _jax_named_function(ctx, nameof_or(f); private = _jax_private_function(f))
+        julia_name = nameof_or(f)
+        name = _jax_named_function(ctx, something(hint, julia_name);
+                                   private = _jax_private_function(f))
         text = join(scope.lines, "\n") * "\n" * v.code * "\n" * v.extent * "\n" * v.limit
         bounds = contextual ? String[] : [bn for (bn, _, _) in _jax_prepared_bounds(ctx.mod)
                   if occursin(Regex("\\b" * bn * "\\b"), text)]
         append!(params, bounds)
-        binding = Base.Docs.Binding(parentmodule(typeof(f)), nameof_or(f))
+        binding = Base.Docs.Binding(parentmodule(typeof(f)), julia_name)
         documented = any(Base.Docs.modules) do m
             metadata = Base.Docs.meta(m; autoinit = false)
             metadata !== nothing && haskey(metadata, binding)
         end
-        doc = documented ? string(Base.Docs.doc(f)) :
-              "Compute `$(nameof_or(f))` " * origin * "."
+        quantity = hint === nothing ? julia_name : lstrip(name, '_')
+        doc = documented ? string(Base.Docs.doc(f)) : "Compute `$quantity` " * origin * "."
         signature = [n * ": ArrayLike" for n in params]
         lines = ["def " * name * "(" * join(signature, ", ") * ") -> " *
                  (_jax_plain_function_result(v) ?
