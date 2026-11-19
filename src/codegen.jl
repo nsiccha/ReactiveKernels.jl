@@ -245,8 +245,8 @@ _plate_empty_total(::Type{F}) where {F} = throw(ArgumentError(
 # exact gradient (1/2, 1/2) at a finite tie; `LogExpFunctions.logaddexp` zeroes
 # the difference at every tie and returns (1, 0). Only the infinite tie, whose
 # difference is NaN, returns the shared infinity.
-@inline _tie_exact_logaddexp(x, y) = x >= y ?
-    (isinf(x) & (x == y) ? x : x + log1pexp(y - x)) : y + log1pexp(x - y)
+@inline _tie_exact_logaddexp(x, y, correction=log1pexp) = x >= y ?
+    (isinf(x) & (x == y) ? x : x + correction(y - x)) : y + correction(x - y)
 
 # A plate whose only consumer is `LogExpFunctions.logsumexp` streams too: the
 # accumulator folds each cell into the running log-sum-exp with
@@ -271,6 +271,17 @@ struct _PlateLogSumExpSeed{F} end
 
 @noinline _plate_total_add(::typeof(LogExpFunctions.logsumexp), total, cell) =
     _tie_exact_logaddexp(total, cell)
+
+# The difference passed to the correction is nonpositive, so exp cannot
+# overflow. Short support loops also save one transcendental pair per row
+# by taking the first cell directly from the -Inf seed.
+@inline _nonpositive_log1pexp(x) = log1p(exp(x))
+@inline function _plate_total_add(::typeof(LogExpFunctions.logsumexp), total::T, cell::T
+        ) where {T<:Union{Float32,Float64}}
+    total == -Inf && cell > -Inf && return cell + zero(T)
+    return @noinline _tie_exact_logaddexp(total, cell, _nonpositive_log1pexp)
+end
+
 @inline _plate_total_add(::typeof(LogExpFunctions.logsumexp),
                          ::_PlateLogSumExpSeed, cell) = cell
 
