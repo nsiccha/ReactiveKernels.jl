@@ -38,14 +38,6 @@ function _integer_law(rhs)
     return get(SAMPLED_SUPPORT, family, nothing) === :integer
 end
 
-# The author names of the arrays the plan sums out element by element; native
-# evaluation only so far.
-function _marginalized_integer_arrays(plan)
-    paths = _scope_name_paths(plan.submodel_scopes)
-    return String[_scope_path_string(get(paths, n, (n,))) for n in plan.marginalized_integers
-        if _integer_array_parameter(_integer_declaration(plan, n))]
-end
-_integer_arrays_noun(names) = length(names) == 1 ? " is an integer array" : " are integer arrays"
 function _integer_declaration(plan, name)
     for ps in (plan.parameters, plan.plate_parameters, plan.array_parameters), p in ps
         p.name === name && return p
@@ -205,9 +197,8 @@ end
 # the structure `prepare_gibbs` draws every element from at once
 # (`_gibbs_elementwise_plate`). It then sums out element by element,
 # `Σ_i logsumexp_s (prior_i(s) + likelihood_i(s))`, in time linear in the
-# number of elements and in the support size. One evaluation of those cells
-# with every element at the value `s` gives every element's terms for `s`;
-# the values are an RK plate, so data determine their count at execution.
+# number of elements and in the support size. Each element's plate cell
+# reduces its support scores locally. Both axes have runtime lengths.
 # Elements that couple (a term reading `sum(z)`, a recurrence) would need the
 # joint support, exponential in the number of elements, and are refused.
 
@@ -225,15 +216,126 @@ function _integer_array_term_label(role, term)
     return "the $role term `$term`"
 end
 
-function _integer_array_dims(plan, p)
-    p isa PlateParameter && return Int[_plate_rows(plan, p)]
-    return Int[d for d in _array_dims(plan, p)]
+# A marginalized coordinate packs no entries in the layout. Its axes still
+# come from its declaration, including an observation used only for its size.
+_integer_array_axes(plan, p::ArrayParameter) = map(_array_axis_read, p.dims)
+function _integer_array_axes(plan, p::PlateParameter)
+    range = p.range
+    range isa UnitRange && return (length(range),)
+    range isa Symbol && return (:($(GlobalRef(Base, :length))($range)),)
+    range isa Expr && return (_read_length(range),)
+    return (_rows_source(_value_rows(plan, p.name), _value_rows_anchors(plan, p.name)),)
 end
+
+# Inline a density plate at a single element. Independent broadcast operands
+# become lanes of the outer plate. A nested gather keeps its table shared and
+# uses the candidate as the index. A loop cell's explicit z[i] uses the same
+# candidate. _gibbs_elementwise_plate has already proved these accesses local.
+function _integer_cell_expr(ex, dependent, elementwise, localvalue, operand)
+    scalar(a) = _integer_cell_expr(a, dependent, elementwise, localvalue, operand)
+    if !_gibbs_reads(ex, dependent)
+        return operand(ex)
+    elseif ex isa Symbol
+        return localvalue(ex)
+    elseif _gibbs_plate_parts(ex) !== nothing
+        args, lambda = ex.args[1].args[2:end], ex.args[2]
+        params = lambda.args[1] isa Symbol ? (lambda.args[1],) : lambda.args[1].args
+        body = lambda.args[2]
+        if length(params) == 1
+            for name in elementwise
+                body = _substitute_expr(body, :($name[$(first(params))]), localvalue(name))
+            end
+        end
+        for (param, arg) in zip(params, args)
+            body = _substitute_name(body, param, scalar(arg))
+        end
+        return body
+    elseif ex.head === :ref
+        return Expr(:ref, ex.args[1], scalar(ex.args[2]))
+    elseif ex.head === :.
+        return Expr(:call, ex.args[1], map(scalar, ex.args[2].args)...)
+    elseif _gibbs_callee(ex.args[1], :_ppl_range_values)
+        return scalar(ex.args[2])
+    end
+    return Expr(:call, Symbol(chopprefix(string(ex.args[1]), ".")),
+        map(scalar, ex.args[2:end])...)
+end
+
+# Build only the selected cut. A density needs a scalar log-sum-exp per
+# element. Recovery also needs the vector of scores on that element.
+function _integer_score_plate(x, roots, statements, prior, likelihood, dependent,
+        elementwise, dims, support, values, value; probabilities = false)
+    terms = [prior; likelihood]
+    needed = _gibbs_ancestors!(Set(terms), statements; stop = Set(roots))
+    index = Symbol(:_ppl_element_index_, x)
+    lanes = Any[:(reshape(1:$(foldl(_read_mul, dims.args)), $(dims.args...)))]
+    params = Symbol[index]
+    function operand(a)
+        a isa Number && return a
+        Meta.isexpr(a, :call, 2) && _gibbs_callee(a.args[1], :Ref) && return a.args[2]
+        i = findfirst(==(a), lanes)
+        if i === nothing
+            push!(lanes, a)
+            push!(params, Symbol(:_ppl_element_operand_, x, :_, length(lanes)))
+            i = length(lanes)
+        end
+        return params[i]
+    end
+    localvalue(n) = n in roots ? value : Symbol(:_ppl_element_, x, :_, n)
+    scores = Expr[]
+    for st in statements
+        n = _assigned_name(st)
+        n in needed && n in dependent && n ∉ roots || continue
+        flat = length(roots) > 1 && _gibbs_reads(st.args[2], Set(roots[2:end]))
+        lane(a) = operand(flat && !(a isa Number) ?
+            :($(GlobalRef(@__MODULE__, :_integer_shaped_operand))($a, $dims)) : a)
+        rhs = _integer_cell_expr(st.args[2], dependent, elementwise, localvalue, lane)
+        if Meta.isexpr(rhs, :block)
+            # Keep a guard as the RHS of its own recipe. Statements in two
+            # inlined plate bodies may originally have had the same local name.
+            parts = Any[a for a in rhs.args if !(a isa LineNumberNode)]
+            for part in parts[1:end-1]
+                localname = _assigned_name(part)
+                localname === nothing && continue
+                fresh = Symbol(localvalue(n), :_, localname)
+                parts = Any[_substitute_name(a, localname, fresh) for a in parts]
+            end
+            append!(scores, parts[1:end-1])
+            rhs = last(parts)
+        end
+        push!(scores, Expr(:(=), localvalue(n), rhs))
+    end
+    body = Expr(:block, scores..., _sum_terms(map(localvalue, terms)))
+    allowed = GlobalRef(@__MODULE__, :_integer_array_allowed)
+    weights = Symbol(:_ppl_element_scores_, x)
+    lse = GlobalRef(LogExpFunctions, :logsumexp)
+    # For the mass, iterate the element's actual support. Only a recovery
+    # record needs the union axis, with zeros where this element lacks a value.
+    own = GlobalRef(@__MODULE__, :_integer_element_support)
+    domain = probabilities ? values : :($own($support, $index))
+    score = probabilities ? :(if $allowed($support, $index, $value)
+        $body
+    else
+        -Inf
+    end) : body
+    inner_body = probabilities ? Expr(:block, LineNumberNode(0, :generator), score) : score
+    inner = Expr(:do, Expr(:call, :plate, domain), Expr(:->, Expr(:tuple, value), inner_body))
+    mass = Symbol(:_ppl_element_logmass_, x)
+    result = probabilities ? :(plate($weights, $values) do logweight, candidate
+        $allowed($support, $index, candidate) ? exp(logweight - $mass) : 0.0
+    end) : mass
+    outer = Expr(:block, LineNumberNode(0, :generator), :($weights = $inner),
+        :($mass = $lse($weights)), result)
+    return Expr(:do, Expr(:call, :plate, lanes...), Expr(:->, Expr(:tuple, params...), outer))
+end
+
+_integer_shaped_operand(v, dims) = v
+_integer_shaped_operand(v::AbstractVector, dims) = length(v) == 1 ? v : reshape(v, dims)
 
 function _integer_array_marginal_program(plan, p, def)
     x = p.name
     statements = Expr[s for s in def.args[2].args if s isa Expr && s.head !== :return]
-    extents = _integer_array_dims(plan, p)
+    extents = _integer_array_axes(plan, p)
     # A multidimensional array is also read through its column-major `vec`,
     # which the layout's transform statements would have defined.
     flat = length(extents) > 1 ? (_array_flat_name(x, length(extents)),) : ()
@@ -271,14 +373,8 @@ function _integer_array_marginal_program(plan, p, def)
     pointwise_rhs = pointwise === nothing ? nothing : _integer_array_pointwise_expr!(order,
         pointwise.args[2], plates[:likelihood], dependent, x, pointwise_name)
     likelihoods = Symbol[order..., setdiff(plates[:likelihood], order)...]
-    # Statements the cells need, evaluated once per support value.
-    needed = Set{Symbol}((plates[:prior]..., likelihoods...))
-    _gibbs_ancestors!(needed, statements; stop = Set(roots))
-    cell = Expr[st for st in statements if _assigned_name(st) in needed &&
-        _assigned_name(st) in dependent]
     support, values, value = Symbol(:_ppl_support_, x), Symbol(:_ppl_support_values_, x),
         Symbol(:_ppl_support_value_, x)
-    scores = Symbol(:_ppl_array_scores_, x)
     rhs = _integer_support_expr(p)
     isempty(intersect(_statement_value_reads!(Set{Symbol}(), rhs), dependent)) ||
         throw(ArgumentError("marginalize needs data-bounded support for `$x`"))
@@ -286,30 +382,31 @@ function _integer_array_marginal_program(plan, p, def)
     here = @__MODULE__
     candidate = Expr[:($x = $(GlobalRef(here, :_integer_array_candidate))($support, $value, $dims))]
     foreach(f -> push!(candidate, :($f = vec($x))), flat)
-    body = Expr(:block, LineNumberNode(0, :generator), candidate..., cell...,
-        :((; prior = ($(plates[:prior]...),), likelihood = ($(likelihoods...),))))
-    loop = Expr(:do, Expr(:call, :plate, values), Expr(:->, Expr(:tuple, value), body))
     prior_term, likelihood_term = Symbol(:_ppl_array_prior_, x), Symbol(:_ppl_array_likelihood_, x)
     joint_term = Symbol(:_ppl_array_joint_, x)
     probabilities = Symbol(:_ppl_array_probabilities_, x)
-    arguments = (scores, support, values, dims)
-    mass = GlobalRef(here, :_integer_array_mass)
-    added = Expr[
-        :($support = $rhs),
-        :($values = $(GlobalRef(here, :_integer_array_values))($support)),
-        :($scores = $loop),
-        # The array's integrated prior mass, and its joint mass with the
-        # likelihood cells; the likelihood is their difference, `-Inf`
-        # where the prior has no mass.
-        :($prior_term::Float64 = $mass($(arguments...), 0)),
-        :($joint_term::Float64 = $mass($(arguments...), $(length(likelihoods)))),
-        :($likelihood_term::Float64 = $prior_term == -Inf ? -Inf : $joint_term - $prior_term),
-        :($probabilities = $(GlobalRef(here, :_integer_array_probabilities))($(arguments...))),
+    masses = [Symbol(:_ppl_array_mass_, x, :_, k) for k in 0:length(likelihoods)]
+    score(k; kwargs...) = _integer_score_plate(x, roots, statements, plates[:prior],
+        likelihoods[1:k], dependent, elementwise, dims, support, values, value; kwargs...)
+    added = Expr[:($support = $rhs),
+        :($values = $(GlobalRef(here, :_integer_array_values))($support))]
+    for k in unique([0:length(order); length(likelihoods)])
+        push!(added, :($(masses[k+1]) = $(score(k))))
+    end
+    push!(added,
+        :($prior_term::Float64 = sum($(first(masses)))),
+        :($joint_term::Float64 = sum($(last(masses)))),
+        :($likelihood_term::Float64 = $prior_term == -Inf ? -Inf : $joint_term - $prior_term))
+    rows = Symbol(:_ppl_probability_rows_, x)
+    push!(added, :($rows = $(score(length(likelihoods); probabilities = true))),
+        :($probabilities = $(GlobalRef(here, :_integer_probability_columns))($rows, $values)),
         :($(Symbol(:_ppl_integer_element_, x)) = (; values = plate($values) do value
             value
-        end, probabilities = $probabilities))]
-    isempty(order) || push!(added, :($pointwise_name =
-        $(GlobalRef(here, :_integer_array_pointwise))($(arguments...), $(length(order)))))
+        end, probabilities = $probabilities)))
+    points = [:(plate($(masses[k+1]), $(masses[k])) do current, previous
+        previous == -Inf ? -Inf : current - previous
+    end) for k in eachindex(order)]
+    isempty(points) || push!(added, :($pointwise_name = ($(points...),)))
     # Values reading the array have no single value once it is summed out;
     # queries of them are refused by name. The density aggregates follow the
     # values they read.
@@ -317,6 +414,10 @@ function _integer_array_marginal_program(plan, p, def)
     out = Expr[st for st in statements if _assigned_name(st) ∉ dependent &&
         _assigned_name(st) ∉ aggregates]
     append!(out, added)
+    if :_ppl_predictive in dependent
+        _integer_array_predictive!(out, statements, dependent, roots, candidate, value,
+            values, probabilities)
+    end
     for st in statements
         name = _assigned_name(st)
         if name === :prior || name === :likelihood
@@ -333,6 +434,34 @@ function _integer_array_marginal_program(plan, p, def)
         _sum_terms(Any[kept[:prior]..., kept[:likelihood]..., joint_term, :log_jacobian])),
         :(return posterior))
     return Expr(:(=), def.args[1], Expr(:block, out...))
+end
+
+# Only the responses reading this array need conditional law columns. Keep
+# the array's name on those records so a draw can reuse one set of component
+# indices across all responses that read it, including after vectorization.
+function _integer_array_predictive!(out, statements, dependent, roots, candidate, value,
+        values, probabilities)
+    x = first(roots)
+    fields = _named_statement(statements, :_ppl_predictive).args[2].args
+    selected = filter(field -> _gibbs_reads(field.args[2], dependent), fields)
+    needed = Set{Symbol}()
+    foreach(f -> _statement_value_reads!(needed, f.args[2]), selected)
+    _gibbs_ancestors!(needed, statements; stop = Set(roots))
+    cells = [st for st in statements if _assigned_name(st) in needed &&
+        _assigned_name(st) in dependent && _assigned_name(st) ∉ roots]
+    conditional = Symbol(:_ppl_array_laws_, x)
+    body = Expr(:block, LineNumberNode(0, :generator), candidate..., cells...,
+        Expr(:tuple, selected...))
+    loop = Expr(:do, Expr(:call, :plate, values), Expr(:->, Expr(:tuple, value), body))
+    columns = GlobalRef(@__MODULE__, :_integer_conditional_columns)
+    push!(out, :($conditional = $columns($loop)))
+    entries = map(fields) do f
+        f in selected || return f
+        name = f.args[1]
+        record = :((; probabilities = $probabilities, conditional = $conditional.$name))
+        Expr(:(=), name, :((; _integer_element = (; $x = $record))))
+    end
+    push!(out, Expr(:(=), :_ppl_predictive, Expr(:tuple, entries...)))
 end
 
 # The pointwise NamedTuple with each field that holds a likelihood plate of
@@ -401,100 +530,20 @@ function _integer_array_candidate(supports::AbstractArray{<:AbstractRange}, valu
     return state
 end
 
+_integer_element_support(support::AbstractRange{<:Integer}, i) = support
+_integer_element_support(supports::AbstractArray{<:AbstractRange}, i) = supports[i]
+
 _integer_array_allowed(::AbstractRange{<:Integer}, i, value) = true
 _integer_array_allowed(supports::AbstractArray{<:AbstractRange}, i, value) = value in supports[i]
 
-# Element `i`'s summed cells at one support value.
-_integer_array_cells(cells::Tuple{}, i) = 0.0
-_integer_array_cells(cells::Tuple, i) = first(cells)[i] + _integer_array_cells(Base.tail(cells), i)
-_integer_array_cells(cells::Tuple, i, upto) = upto == 0 ? 0.0 :
-    first(cells)[i] + _integer_array_cells(Base.tail(cells), i, upto - 1)
-
-# log Σ_j exp(a_j) over the values element `i` may take, where
-# a_j = prior_ij + Σ of its first `upto` likelihood cells.
-function _integer_array_lse(scores, support, values, i, upto)
-    top = -Inf
-    for (j, value) in enumerate(values)
-        _integer_array_allowed(support, i, value) || continue
-        score = scores[j]
-        top = max(top, _integer_array_cells(score.prior, i) +
-            _integer_array_cells(score.likelihood, i, upto))
+# The element axes precede the support axis in a public recovery record.
+@traceable function _integer_probability_columns(rows, values)
+    dims = (size(rows)..., length(values))
+    if isempty(rows)
+        zeros(Float64, dims)
+    else
+        reshape(stack(vec(rows); dims = 1), dims)
     end
-    isfinite(top) || return top
-    total = 0.0
-    for (j, value) in enumerate(values)
-        _integer_array_allowed(support, i, value) || continue
-        score = scores[j]
-        total += exp(_integer_array_cells(score.prior, i) +
-            _integer_array_cells(score.likelihood, i, upto) - top)
-    end
-    return top + log(total)
-end
-_integer_array_terms(scores) = isempty(scores) ? 0 : length(first(scores).likelihood)
-
-# Σ_i log Σ_j exp(a_ij), a_ij = prior_ij + Σ of its first `upto` likelihood
-# cells, over the values element `i` may take: the array's integrated prior
-# mass (`upto = 0`) or its joint mass with the observations. Two passes over
-# the values, each reading every element's cells in storage order.
-function _integer_array_mass(scores, support, values, dims, upto::Int)
-    n = prod(dims)
-    top = fill(-Inf, n)
-    for (j, value) in enumerate(values)
-        score = scores[j]
-        for i in 1:n
-            _integer_array_allowed(support, i, value) || continue
-            top[i] = max(top[i], _integer_array_cells(score.prior, i) +
-                _integer_array_cells(score.likelihood, i, upto))
-        end
-    end
-    total = zeros(n)
-    for (j, value) in enumerate(values)
-        score = scores[j]
-        for i in 1:n
-            _integer_array_allowed(support, i, value) && isfinite(top[i]) || continue
-            total[i] += exp(_integer_array_cells(score.prior, i) +
-                _integer_array_cells(score.likelihood, i, upto) - top[i])
-        end
-    end
-    mass = 0.0
-    for i in 1:n
-        mass += isfinite(top[i]) ? top[i] + log(total[i]) : top[i]
-    end
-    return mass
-end
-
-# Each element's sequential predictive factors, one array per pointwise
-# likelihood in field order, shaped like its cells; they sum to the marginal
-# likelihood of the element's observations.
-function _integer_array_pointwise(scores, support, values, dims, fields::Int)
-    n = prod(dims)
-    out = ntuple(_ -> Vector{Float64}(undef, n), fields)
-    for i in 1:n
-        previous = _integer_array_lse(scores, support, values, i, 0)
-        for f in 1:fields
-            current = _integer_array_lse(scores, support, values, i, f)
-            out[f][i] = previous == -Inf ? -Inf : current - previous
-            previous = current
-        end
-    end
-    isempty(scores) && return out
-    return ntuple(f -> reshape(out[f], size(first(scores).likelihood[f])), fields)
-end
-
-# `probabilities[i…, j]`: the posterior probability that element `i…` takes
-# `values[j]`, given everything else; zero outside the element's own support.
-function _integer_array_probabilities(scores, support, values, dims)
-    n, terms = prod(dims), _integer_array_terms(scores)
-    out = Array{Float64}(undef, (dims..., length(values)))
-    for i in 1:n
-        joint = _integer_array_lse(scores, support, values, i, terms)
-        for (j, value) in enumerate(values)
-            out[i + (j - 1) * n] = !_integer_array_allowed(support, i, value) ? 0.0 :
-                joint == -Inf ? NaN : exp(_integer_array_cells(scores[j].prior, i) +
-                    _integer_array_cells(scores[j].likelihood, i, terms) - joint)
-        end
-    end
-    return out
 end
 
 # RK's existing numeric-tree batching machinery owns the array storage. The

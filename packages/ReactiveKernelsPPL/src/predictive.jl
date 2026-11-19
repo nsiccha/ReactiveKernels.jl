@@ -274,12 +274,6 @@ generator. [`predictive_draws!`](@ref) fills existing response storage, and
 [`predictive_laws`](@ref) exposes the corresponding Distributions laws.
 """
 function prepare_predictive(built, plan::StructuralPlan; on_error = nothing)
-    arrays = _marginalized_integer_arrays(plan)
-    isempty(arrays) || throw(ContractValidationError("[query] " * _quoted_names(arrays) *
-        _integer_arrays_noun(arrays) * " summed out by `marginalize`; joint predictive draws " *
-        "over its elements are not implemented yet. Draw it with " *
-        "`discrete_latent_draws` and prepare the predictive query on the model " *
-        "with the array explicit, passing that draw as its integer state."))
     kernel = _prepare_wants(built, plan, predictive_node(built); on_error)
     return PredictiveQuery(kernel, predictive_targets(built, plan))
 end
@@ -455,11 +449,35 @@ function predictive_laws(value::NamedTuple, targets::NamedTuple; position = noth
             _integer_response_laws([component[name] for component in components], weights)
         end |> fields -> NamedTuple{keys(targets)}(fields)
     end
+    return _predictive_entries(value, targets)
+end
+
+function _predictive_entries(value, targets; rng = nothing)
     names = keys(targets)
     keys(value) == names || throw(ArgumentError("[query] the predictive value " *
         "holds the laws of $(keys(value)), the targets $(names): pass the targets " *
         "of the design the value's cut evaluates"))
-    return NamedTuple{names}(map(k -> _response_laws(value[k], targets[k]), names))
+    any(entry -> hasproperty(entry, :_integer_element), value) ||
+        return NamedTuple{names}(map(k -> _response_laws(value[k], targets[k]), names))
+    choices = rng === nothing ? nothing : Dict{Symbol,Vector{Int}}()
+    return NamedTuple{names}(map(names) do k
+        entry = value[k]
+        hasproperty(entry, :_integer_element) || return _response_laws(entry, targets[k])
+        name, record = only(pairs(entry._integer_element))
+        p = record.probabilities
+        nstates = size(p, ndims(p))
+        weights = reshape(p, prod(size(p)[1:end-1]), nstates)
+        laws = [_response_laws(_at_position(record.conditional, j), targets[k])
+            for j in axes(weights, 2)]
+        dims = targets[k].dims
+        prod(dims) == size(weights, 1) || throw(DimensionMismatch(
+            "[query] response `$k` and integer array `$name` have different element counts"))
+        rng === nothing && return _integer_response_laws(laws, weights)
+        indices = get!(choices, name) do
+            _membership_draws(rng, weights)
+        end
+        return map(I -> laws[indices[LinearIndices(dims)[I]]][I], CartesianIndices(dims))
+    end)
 end
 
 _integer_predictive(value::NamedTuple) = keys(value) == (:_integer_mixture,) &&
@@ -470,14 +488,14 @@ struct IntegerPredictiveLaws{N,C,W} <: AbstractArray{Any,N}
     components::C
     weights::W
 end
-function _integer_response_laws(components::AbstractVector{<:PredictiveLaws}, weights)
+function _integer_response_laws(components::AbstractVector{<:AbstractArray}, weights)
     first_law = first(components)
     all(c -> size(c) == size(first_law), components) || throw(DimensionMismatch(
         "[query] integer states give different predictive response shapes"))
     return IntegerPredictiveLaws{ndims(first_law),typeof(components),typeof(weights)}(
         components, weights)
 end
-function _integer_response_laws(components::AbstractVector{<:AbstractVector}, weights)
+function _integer_response_laws(components::AbstractVector{<:AbstractVector{<:PredictiveLaws}}, weights)
     return [_integer_response_laws([c[i] for c in components], weights)
         for i in eachindex(first(components))]
 end
@@ -485,7 +503,15 @@ Base.size(L::IntegerPredictiveLaws) = size(first(L.components))
 Base.IndexStyle(::Type{<:IntegerPredictiveLaws}) = IndexCartesian()
 function Base.getindex(L::IntegerPredictiveLaws{N}, I::Vararg{Int,N}) where {N}
     @boundscheck checkbounds(L, I...)
-    return _predictive_mixture([component[I...] for component in L.components], L.weights)
+    return _integer_entry_mixture(L.components, L.weights, CartesianIndex(I))
+end
+_integer_entry_mixture(components, weights::AbstractVector, I) =
+    _predictive_mixture([component[I] for component in components], weights)
+function _integer_entry_mixture(components, weights::AbstractMatrix, I)
+    row = view(weights, LinearIndices(first(components))[I], :)
+    _check_integer_probabilities(row)
+    active = findall(>(0), row)
+    return _predictive_mixture([components[j][I] for j in active], row[active])
 end
 _predictive_mixture(components, weights) = throw(ArgumentError(
     "predictive laws need `using Distributions`"))
@@ -504,9 +530,9 @@ function _predictive_draw_laws(value, targets, rng; position = nothing)
     if _integer_predictive(value)
         mixture = value._integer_mixture
         index = _integer_draw_index(rng, mixture.probabilities)
-        value = _at_position(mixture.conditional, index)
+        return _predictive_draw_laws(_at_position(mixture.conditional, index), targets, rng)
     end
-    return predictive_laws(value, targets)
+    return _predictive_entries(value, targets; rng)
 end
 predictive_laws(q::PredictiveQuery, u::AbstractVector) =
     predictive_laws(Base.invokelatest(q.kernel, u), q.targets)
@@ -580,7 +606,7 @@ _draws(rng, laws::NamedTuple, targets::NamedTuple) =
     NamedTuple{keys(laws)}(map(k -> _draw(rng, laws[k], targets[k].eltype), keys(laws)))
 
 # An empty response draws nothing, and keeps its element type.
-_draw(rng, L::PredictiveLaws, T) = isempty(L) ? Array{T}(undef, size(L)) :
+_draw(rng, L::AbstractArray, T) = isempty(L) ? Array{T}(undef, size(L)) :
     [rand(rng, L[I]) for I in CartesianIndices(L)]
 _draw(rng, L::AbstractVector{<:PredictiveLaws}, T) = [_draw(rng, Li, T) for Li in L]
 
@@ -607,7 +633,7 @@ function _draws!(rng, out::NamedTuple, laws::NamedTuple)
     return out
 end
 
-function _draw!(rng, out::AbstractArray, L::PredictiveLaws)
+function _draw!(rng, out::AbstractArray, L::AbstractArray)
     size(out) == size(L) || throw(DimensionMismatch("[query] the output has " *
         "shape $(size(out)), the response $(size(L))"))
     for I in CartesianIndices(L)

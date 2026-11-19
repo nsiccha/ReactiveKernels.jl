@@ -208,14 +208,41 @@ end
     @test PPL._gibbs_weights(conditional.logweights) ≈ exact ./ sum(exact) rtol = 1e-12
 end
 
-@testset "native only so far: predictive draws and JAX refuse by name" begin
+@testset "predictive mixtures use each element's posterior" begin
     plan = marginalize(MIXTURE(; K = 3), :z) | (; y = Y)
     built = build_kernel(plan)
-    err = try prepare_predictive(built, plan); nothing catch e; e end
-    @test err isa ContractValidationError && occursin("`z` is an integer array", sprint(showerror, err))
-    err = try jax_source(built, plan); nothing catch e; e end
-    @test err isa ReactiveKernels.JAXEmissionError &&
-        occursin("`z` is an integer array", sprint(showerror, err))
+    u = unconstrain(built.layout, (; w = W, mu = MU))
+    q = prepare_predictive(built, plan)
+    laws = predictive_laws(q, u).y
+    @test size(laws) == size(Y)
+    for (law, y) in zip(laws, Y)
+        weights = W .* pdf.(Normal.(MU, 1), y)
+        expected = MixtureModel(Normal.(MU, 1), weights ./ sum(weights))
+        @test pdf.(Ref(law), MU) ≈ pdf.(Ref(expected), MU)
+    end
+    @test q(u, Xoshiro(123)) == q(u, Xoshiro(123))
+end
+
+@testset "responses draw a shared value once per element" begin
+    model = @rkppl begin
+        z[axes(a, 1)] .~ Bernoulli(0.5)
+        a .~ Normal.(z, 0.01)
+        b .~ Normal.(z, 0.01)
+        c .~ Normal.(3.0, 1.0)
+    end
+    data = fill(0.5, 40)
+    plan = marginalize(model(), :z) | (; a = data, b = data, c = [3.0])
+    built = build_kernel(plan)
+    q = prepare_predictive(built, plan)
+    u = Float64[]
+    @test only(predictive_laws(q, u).c) == Normal(3.0, 1.0)
+    draw = q(u, Xoshiro(31))
+    @test (draw.a .> 0.5) == (draw.b .> 0.5)
+    @test 0 < count(>(0.5), draw.a) < length(data)
+    @test predictive_draws!(deepcopy(draw), q, u, Xoshiro(31)) == draw
+end
+
+@testset "named values reading an eliminated integer" begin
     # A value reading the array has no single value once it is summed out.
     model = @rkppl begin
         w ~ Dirichlet(ones(K))

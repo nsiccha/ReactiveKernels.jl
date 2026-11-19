@@ -16,6 +16,14 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.231
+
+- Integer-array marginalization reduces the candidate scores in each element's
+  plate cell.
+- Predictive queries over a marginalized integer array return one posterior
+  mixture law per entry. Joint draws reuse an element's sampled component
+  across all responses that read it.
+
 ## 0.1.230
 
 - The package image prepares a coordinate conditional and a marginalized
