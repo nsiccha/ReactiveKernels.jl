@@ -679,15 +679,15 @@ Base.@propagate_inbounds @generated function _native_broadcast_getindex(
     # As in Base, inbounds applies to operand reads, not to the user's f.
     values = [:(_native_broadcast_getindex(getfield(bc.args, $j), i))
               for j in 1:fieldcount(Args)]
-    Expr(:call, :_native_broadcast_eval, :(bc.f), Expr(:tuple, values...))
+    Expr(:call, :_native_positional_call, :(bc.f), Expr(:tuple, values...))
 end
-@inline @generated function _native_broadcast_eval(f::F, args::Tuple) where {F}
+@inline @generated function _native_positional_call(f::F, args::Tuple) where {F}
     Expr(:call, :f, [:(getfield(args, $i)) for i in 1:fieldcount(args)]...)
 end
 # Base's n-ary methods for these scalar types are precisely a left fold.
 # Expand that same order over the structural operands, avoiding afoldl's wide
 # vararg splat. Other scalar functions/types retain their n-ary dispatch.
-@inline @generated function _native_broadcast_eval(f::_NativeBroadcastArithmetic,
+@inline @generated function _native_positional_call(f::_NativeBroadcastArithmetic,
         args::Tuple{Vararg{_NativeBroadcastNumber,N}}) where {N}
     values = [:(getfield(args, $i)) for i in 1:N]
     N <= 32 && return Expr(:call, :f, values...)
