@@ -81,8 +81,12 @@ coordinate. A sweep typically costs a few evaluations per coordinate.
   the rows whose index is the moved coordinate's. A group with no rows reads
   none. So a coordinate of a group-level vector costs about its own group's
   rows, whatever the number of groups.
-- Every other coordinate, a shared scale for example, evaluates all terms that
-  read any coordinate.
+- A scalar parameter read at a known packed position evaluates the terms that
+  depend on it. With `theta[1:J] .~ Normal.(mu, tau)` and
+  `y .~ Normal.(theta[g], 1)`, moving `mu` or `tau` evaluates its own prior,
+  its Jacobian and the `J` group priors. It skips every observation row.
+  A scalar used directly in the likelihood still evaluates that likelihood.
+  Unrecognized packed reads use the general conditional.
 
 Not covered yet: models with free integer parameters are refused, a product
 over a transformed vector (a positive coefficient vector, for example) is

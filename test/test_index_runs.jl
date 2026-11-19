@@ -1,6 +1,7 @@
 module IndexRunAcceptance
 using ReactiveKernels, Enzyme, DifferentiationInterface, Test
 include("type_stability_audit.jl")
+include("prepared_structure.jl")
 using .TypeStabilityAudit: findings, ad_call_findings
 const RK=ReactiveKernels
 @kernel subject(q::Vector{Float64},idx::Vector{Int},x::Vector{Float64})=begin
@@ -57,7 +58,7 @@ function verify(k,q,ref)
     pristine=copy(q)
     @test k(q)≈ref[1] rtol=1e-12 atol=1e-12
     ad=prepare_ad(k,AutoEnzyme(;mode=Enzyme.Reverse),q;active=:q,native_forward_batch=false)
-    @test ad.backend.mode===Enzyme.Reverse
+    @test ad.backend.mode isa Enzyme.ReverseMode
     g=zero(q);v,_=ad_value_and_gradient!(ad,g,q)
     @test v≈ref[1] rtol=1e-12 atol=1e-12
     @test g≈ref[2] rtol=1e-11 atol=1e-11
@@ -159,22 +160,19 @@ end
 @testset "index runs: retained loops across fresh data sizes" begin
     # No cached template can conceal data-dependent body replication here:
     # prepare afresh as both the number of runs and observations per run grow.
-    inventories=Dict{Symbol,Int}[]
+    shapes = []
     for (nruns,runlength) in ((1,8),(3,16),(9,64))
         idx=repeat(mod1.(1:nruns,3),inner=runlength)
         x=sin.(eachindex(idx))./2
         k=prepare(subject;bound=(;idx,x))
         @test occursin("run_partial",string(k.ast))
-        counts=Dict{Symbol,Int}()
-        RK._index_run_visit(k.ast) do ex
-            counts[ex.head]=get(counts,ex.head,0)+1
-        end
-        @test get(counts,:for,0)>0
-        @test get(counts,:while,0)>0
-        push!(inventories,counts)
+        # The grouped path iterates over runs and over observations in each run.
+        shape = prepared_structure(k.ast)
+        @test shape.depth >= 2
+        push!(shapes, shape)
         verify(k,[.1,-.4,.3],oracle([.1,-.4,.3],idx,x))
     end
-    @test all(==(first(inventories)),inventories)
+    @test all(==(first(shapes)), shapes)
 end
 
 @testset "index runs: multidimensional plate keeps its flat fallback" begin

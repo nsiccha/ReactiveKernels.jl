@@ -24,34 +24,33 @@ struct _VectorTransition
     loopvar::Symbol
     hi::Any
     comps::Vector{Tuple{Symbol,Int}}
-    # The window's law at step `p`: means, and covariances `(i, k)` with
-    # `i <= k` (absent: structurally zero).
+    # Seed means and their coefficients on independent standard Normal draws.
     m0::Vector{Any}
-    P0::Dict{Tuple{Int,Int},Any}
+    seed_noise::Matrix{Any}
     # Top-level definitions the seed law reads (compound seed pieces).
     seed_defs::Vector{Any}
     # Step locals, then the transition `s[t] = A s[t - 1] + shift + noise`
-    # with noise covariance `Q` (`(i, k)`, `i <= k`); absent entries are 0.
+    # with noise coefficients on independent standard Normal draws.
     locals::Vector{Any}
     A::Dict{Tuple{Int,Int},Any}
     shift::Vector{Any}
-    Q::Dict{Tuple{Int,Int},Any}
+    step_noise::Matrix{Any}
 end
 
 _vname(g::Symbol, parts...) = Symbol(_MARGINAL_PREFIX, g, "__", join(parts, "__"))
-_vsym(D, i, k) = get(D, (min(i, k), max(i, k)), nothing)
 
-# Covariance of two affine forms over independent standard-normal draws
-# (keys `(:noise, n)`): `Σ_n b_in * b_kn`.
-function _noise_cov(fi::_Affine, fk::_Affine)
-    acc = nothing
-    for (key, b) in fi.coefs
-        (key isa Tuple && key[1] === :noise) || continue
-        c = get(fk.coefs, key, nothing)
-        c === nothing && continue
-        acc = _madd(acc, _mmul(b, c, false), false)
+# Each column is one shared innovation, even when several state rows read it.
+function _noise_factor(rows, draws)
+    return Any[get(row.coefs, (:noise, n), nothing) for row in rows, n in draws]
+end
+
+# Inner products of rows of symbolic factors. `nothing` denotes a structural zero.
+function _factor_dot(x, y)
+    total = nothing
+    for (a, b) in zip(x, y)
+        total = _madd(total, _mmul(a, b, false), false)
     end
-    return acc
+    return total
 end
 
 # A compound noise scale is read in every covariance entry: `name!` replaces it
@@ -111,11 +110,8 @@ function _vector_transition(spec::ScanSpec, arrays::Vector{Symbol})
         end
         push!(m0, c)
     end
-    P0 = Dict{Tuple{Int,Int},Any}()
-    for i in eachindex(window), k in i:length(window)
-        c = _noise_cov(window[i], window[k])
-        c === nothing || (P0[(i, k)] = c)
-    end
+    seed_noise = _noise_factor(window, 1:nz[])
+    first_step_draw = nz[] + 1
 
     # The step: each carried array written once, affine in the lags, the
     # values written above it and the step's Normal innovations.
@@ -168,7 +164,7 @@ function _vector_transition(spec::ScanSpec, arrays::Vector{Symbol})
         push!(locals, :($nm = $c)); nm)
     A = Dict{Tuple{Int,Int},Any}()
     shift = Any[nothing for _ in comps]
-    rows = Dict{Int,_Affine}()
+    rows = [_Affine(nothing) for _ in comps]
     for (i, (a, j)) in enumerate(comps)
         if j > 0
             A[(i, index[(a, j - 1)])] = 1
@@ -188,44 +184,71 @@ function _vector_transition(spec::ScanSpec, arrays::Vector{Symbol})
             A[(i, key[2])] = c
         end
     end
-    Q = Dict{Tuple{Int,Int},Any}()
-    for i in keys(rows), k in keys(rows)
-        i <= k || continue
-        c = _noise_cov(rows[i], rows[k])
-        c === nothing || (Q[(i, k)] = c)
-    end
-    return _VectorTransition(g, arrays, p, t, spec.hi, comps, m0, P0, seed_defs,
-        locals, A, shift, Q)
+    return _VectorTransition(g, arrays, p, t, spec.hi, comps, m0, seed_noise, seed_defs,
+        locals, A, shift, _noise_factor(rows, first_step_draw:nz[]))
 end
 
-# One Kalman update of the window at predicted means `pm[i]` and covariances
-# `pv(i, k)`, for an observation of value `yk` reading component `i` with
-# loading `H[i]` (absent: 0), offset `O` and squared scale `SS`. Returns the
-# predictive location and variance, the cross covariances `ph[i]`, and the
-# filtered means and covariances given the update's gains `gain(i)`.
-function _vector_update(pm, pv, H, O, SS, d)
-    ph = Any[nothing for _ in 1:d]
-    for i in 1:d, (k, h) in H
-        ph[i] = _madd(ph[i], _mmul(pv(i, k), h, false), false)
+# Right Givens rotations triangularize a joint square root, one independent
+# noise column at a time. The observation is row 1. Its pivot is the predictive
+# scale, the column below it times the standardized residual updates the means,
+# and the trailing square block factors the conditional covariance.
+# The loops here run over the authored state and innovations, never the data.
+function _observation_triangle(factor, loading, scale, save)
+    d, n = size(factor)
+    joint = Matrix{Any}(nothing, d + 1, max(n, d) + 1)
+    joint[1, 1] = save(Expr(:call, GlobalRef(Base, :abs), scale))
+    joint[2:end, 2:(n + 1)] = factor
+    for col in 1:n
+        joint[1, col + 1] = save(_factor_dot(loading, view(factor, :, col)))
     end
-    fv = SS
-    loc = O
-    for (k, h) in H
-        fv = _madd(fv, _mmul(h, ph[k], false), false)
-        loc = _madd(loc, _mmul(h, pm[k], false), false)
+    function rotate!(row, col)
+        a, b = joint[row, row], joint[row, col]
+        b === nothing && return
+        if a === nothing
+            joint[:, row], joint[:, col] = joint[:, col], joint[:, row]
+            return
+        end
+        # At a zero pair the rotation is the identity. Keep both entries:
+        # a zero loading can have a nonzero derivative.
+        zero_pair = save(:(($a == 0) & ($b == 0)))
+        norm = save(Expr(:call, GlobalRef(Base, :hypot), a, :($zero_pair ? one($b) : $b)))
+        x_unit = save(:($a / $norm))
+        cosine = save(:($zero_pair ? one($norm) : $x_unit))
+        sine = save(:($b / $norm))
+        # The protected norm is one at the origin. These quotients preserve
+        # the entries there, in the same floating type as every other branch.
+        joint[row, row] = save(:($zero_pair ? $x_unit : $norm))
+        joint[row, col] = save(:($zero_pair ? $sine : zero($norm)))
+        for i in 2:(d + 1)
+            i == row && continue
+            x, y = joint[i, row], joint[i, col]
+            joint[i, row] = save(_factor_dot((cosine, sine), (x, y)))
+            joint[i, col] = save(_factor_dot((cosine, _mneg(sine, false)), (y, x)))
+        end
     end
-    return something(loc, 0.0), something(fv, 0.0), ph
-end
-
-function _filtered(pm, pv, ph, gain, residual, d)
-    means = Any[_mfloat(something(_madd(pm[i], _mmul(gain(i), residual, false), false), 0.0))
-        for i in 1:d]
-    covs = Dict{Tuple{Int,Int},Any}()
-    for i in 1:d, k in i:d
-        covs[(i, k)] = _mfloat(something(_madd(pv(i, k),
-            _mneg(_mmul(gain(i), ph[k], false), false), false), 0.0))
+    for col in 2:size(joint, 2)
+        rotate!(1, col)
     end
-    return means, covs
+    # With zero observation noise, a zero pair can precede a nonzero loading.
+    # The remaining row entries are zero-valued, but may have live tangents.
+    # Finish their rotations about the final innovation scale: hypot(sd, 0)
+    # is sd, hence the cosine is one and the sine is the residual over sd.
+    sd = joint[1, 1]
+    for col in 2:size(joint, 2)
+        residual = joint[1, col]
+        residual === nothing && continue
+        sine = save(:($residual / $sd))
+        for i in 2:(d + 1)
+            x, y = joint[i, 1], joint[i, col]
+            joint[i, 1] = save(_madd(x, _mmul(sine, y, false), false))
+            joint[i, col] = save(_madd(y, _mneg(_mmul(sine, x, false), false), false))
+        end
+        joint[1, col] = nothing
+    end
+    for row in 2:(d + 1), col in (row + 1):size(joint, 2)
+        rotate!(row, col)
+    end
+    return joint
 end
 
 _vector_mean(law, i) = _vname(law.group, i, law.comps[i]..., :m)
@@ -242,87 +265,77 @@ _vector_filtered_var(law, a) = _vname(law.group, Symbol(:filtered_, a, :_v))
 
 # The filter `@scan`: seeds condition the window's law at step `p` on
 # `y[1..p]`, the loop predicts and updates on each `y[t]`. `loading(a, k)` is
-# array `a`'s loading at entry `k` (absent: 0), `offset(k)` and `ss(k)` the
-# offset and the squared noise scale. `predictive` also carries each entry's
+# array `a`'s loading at entry `k` (absent: 0), `offset(k)` and `scale(k)` give the
+# observation offset and noise scale. `predictive` also carries each entry's
 # predictive location and variance, and `filtered` each listed array's filtered
 # mean and variance: the window component `(a, p - k)` at seed `k` (the window
 # then holds the seeds `a[p - j]`), `(a, 0)` in the loop.
-function _vector_filter_scan(law::_VectorTransition, y, offset, loading, ss;
+function _vector_filter_scan(law::_VectorTransition, y, offset, loading, scale, defs;
         predictive = false, filtered = Symbol[])
     g, p, t, d = law.group, law.p, law.loopvar, length(law.comps)
     M(i, at) = Expr(:ref, _vector_mean(law, i), at)
     V(i, k, at) = Expr(:ref, _vector_cov(law, i, k), at)
+    L(i, k, at) = Expr(:ref, _vname(g, :root, i, k), at)
     index = Dict(c => i for (i, c) in enumerate(law.comps))
-    observed(k, j) = Dict(index[(a, j)] => h for a in law.arrays
-        for h in (loading(a, k),) if h !== nothing)
-    named(at, loc, fv, lag) = Any[
-        (predictive ? (Expr(:(=), Expr(:ref, _vector_predictive(law, :location), at), loc),
-            Expr(:(=), Expr(:ref, _vector_predictive(law, :variance), at), fv)) : ())...,
-        (Expr(:(=), Expr(:ref, f(law, a), at), v(index[(a, lag)]))
-            for a in filtered for (f, v) in ((_vector_filtered_mean, i -> M(i, at)),
-                (_vector_filtered_var, i -> V(i, i, at))))...]
+
+    # Seeds have scalar definitions outside the scan; the same algebra in the
+    # loop gets step locals. Name each expression once at its point of use.
+    function store!(stmts, at, ex)
+        ex isa Expr || return ex
+        name = _vname(g, :filter, at, length(stmts) + 1)
+        push!(stmts, Expr(:(=), name, ex))
+        return name
+    end
+    function observe!(writes, locals, at, lag, pm, factor)
+        save(ex) = store!(locals, at, ex)
+        H = Any[j == lag ? loading(a, at) : nothing for (a, j) in law.comps]
+        loc = _mfloat(something(_madd(offset(at), _factor_dot(H, pm), false), 0.0))
+        joint = _observation_triangle(factor, H, scale(at), save)
+        sd = joint[1, 1]
+        yt = Expr(:ref, y, at)
+        push!(writes, :($yt ~ Normal($loc, $sd)))
+        residual = :($yt - $loc)
+        root = joint[2:end, 2:(d + 1)]
+        for i in 1:d
+            gain = _mdiv(joint[i + 1, 1], sd, false)
+            mean = _madd(pm[i], _mmul(gain, residual, false), false)
+            push!(writes, Expr(:(=), M(i, at), _mfloat(something(mean, 0.0))))
+            for k in 1:d
+                push!(writes, Expr(:(=), L(i, k, at), _mfloat(something(root[i, k], 0.0))))
+            end
+            for k in i:d
+                cov = _factor_dot(view(root, i, :), view(root, k, :))
+                push!(writes, Expr(:(=), V(i, k, at), _mfloat(something(cov, 0.0))))
+            end
+        end
+        if predictive
+            push!(writes, Expr(:(=), Expr(:ref, _vector_predictive(law, :location), at), loc),
+                Expr(:(=), Expr(:ref, _vector_predictive(law, :scale), at), sd))
+        end
+        for a in filtered
+            i = index[(a, lag)]
+            push!(writes, Expr(:(=), Expr(:ref, _vector_filtered_mean(law, a), at), M(i, at)),
+                Expr(:(=), Expr(:ref, _vector_filtered_var(law, a), at), V(i, i, at)))
+        end
+        return root
+    end
     setup = Any[]
+    factor = law.seed_noise
     for k in 1:p
         pm = k == 1 ? law.m0 : Any[M(i, k - 1) for i in 1:d]
-        pv = k == 1 ? ((i, l) -> _vsym(law.P0, i, l)) : ((i, l) -> V(min(i, l), max(i, l), k - 1))
-        loc, fv, ph = _vector_update(pm, pv, observed(k, p - k), offset(k), ss(k), d)
-        yk = Expr(:ref, y, k)
-        push!(setup, :($yk ~ Normal($loc, sqrt($fv))))
-        gain(i) = ph[i] === nothing ? nothing : Expr(:call, :/, ph[i], fv)
-        means, covs = _filtered(pm, pv, ph, gain, Expr(:call, :-, yk, loc), d)
-        append!(setup, (Expr(:(=), M(i, k), means[i]) for i in 1:d))
-        append!(setup, (Expr(:(=), V(i, l, k), covs[(i, l)]) for i in 1:d for l in i:d))
-        append!(setup, named(k, loc, fv, p - k))
+        factor = observe!(setup, defs, k, p - k, pm, factor)
     end
     prev = Expr(:call, :-, t, 1)
     body = Any[law.locals...]
-    pm = Any[_vname(g, :pm, i) for i in 1:d]
-    for i in 1:d
-        ex = law.shift[i]
-        for l in 1:d
-            ex = _madd(ex, _mmul(get(law.A, (i, l), nothing), M(l, prev), false), false)
-        end
-        push!(body, Expr(:(=), pm[i], _mfloat(something(ex, 0.0))))
-    end
-    pvn = Dict{Tuple{Int,Int},Any}()
-    for i in 1:d, k in i:d
-        ex = _vsym(law.Q, i, k)
-        for (l, r) in Iterators.product(1:d, 1:d)
-            ail, akr = get(law.A, (i, l), nothing), get(law.A, (k, r), nothing)
-            (ail === nothing || akr === nothing) && continue
-            ex = _madd(ex, _mmul(_mmul(ail, akr, false), V(l, r, prev), false), false)
-        end
-        ex === nothing && continue
-        pvn[(i, k)] = _vname(g, :pv, i, k)
-        push!(body, Expr(:(=), pvn[(i, k)], ex))
-    end
-    pv(i, k) = _vsym(pvn, i, k)
-    H = observed(t, 0)
-    loc, _, ph = _vector_update(pm, pv, H, offset(t), ss(t), d)
-    phn = Any[nothing for _ in 1:d]
-    for i in 1:d
-        ph[i] === nothing && continue
-        phn[i] = _vname(g, :ph, i)
-        push!(body, Expr(:(=), phn[i], ph[i]))
-    end
-    # The predictive variance reads the cross covariances through their locals.
-    fv_ex = ss(t)
-    for (k, h) in H
-        fv_ex = _madd(fv_ex, _mmul(h, phn[k], false), false)
-    end
-    fvn, locn = _vname(g, :fv), _vname(g, :loc)
-    fv_ex = something(fv_ex, 0.0)
-    yt = Expr(:ref, y, t)
-    push!(body, Expr(:(=), fvn, fv_ex), Expr(:(=), locn, loc),
-        :($yt ~ Normal($locn, sqrt($fvn))))
-    gains = Any[phn[i] === nothing ? nothing : _vname(g, :gain, i) for i in 1:d]
-    for i in 1:d
-        gains[i] === nothing || push!(body, Expr(:(=), gains[i], Expr(:call, :/, phn[i], fvn)))
-    end
-    means, covs = _filtered(pm, pv, phn, i -> gains[i], Expr(:call, :-, yt, locn), d)
-    append!(body, (Expr(:(=), M(i, t), means[i]) for i in 1:d))
-    append!(body, (Expr(:(=), V(i, k, t), covs[(i, k)]) for i in 1:d for k in i:d))
-    append!(body, named(t, locn, fvn, 0))
+    A = Any[get(law.A, (i, k), nothing) for i in 1:d, k in 1:d]
+    pm = Any[store!(body, t, _madd(law.shift[i],
+        _factor_dot(view(A, i, :), (M(k, prev) for k in 1:d)), false)) for i in 1:d]
+    # Independent columns of [A * L_previous, process noise factor].
+    # At a rank change an entry above the diagonal can be zero with an
+    # active tangent. Carry the whole square block after the rotations.
+    propagated = Any[store!(body, t, _factor_dot(view(A, i, :),
+        (L(l, k, prev) for l in 1:d))) for i in 1:d, k in 1:d]
+    observe!(body, body, t, 0, pm, hcat(propagated, law.step_noise))
     loop = Expr(:for, Expr(:(=), t, Expr(:call, :(:), p + 1, law.hi)), Expr(:block, body...))
     return _scan_macro(Expr(:block, setup..., loop))
 end
@@ -342,8 +355,9 @@ function _vector_transition_scan(law::_VectorTransition)
     for i in 1:d
         push!(entries, _vector_shift(law, i) => something(law.shift[i], 0.0))
     end
-    for (i, k) in sort!(collect(keys(law.Q)))
-        push!(entries, _vector_noise(law, i, k) => law.Q[(i, k)])
+    for i in 1:d, k in i:d
+        q = _factor_dot(view(law.step_noise, i, :), view(law.step_noise, k, :))
+        q === nothing || push!(entries, _vector_noise(law, i, k) => q)
     end
     setup = Any[Expr(:(=), Expr(:ref, n, s), 0.0) for s in 1:p for (n, _) in entries]
     body = Any[law.locals..., (Expr(:(=), Expr(:ref, n, t), _mfloat(v)) for (n, v) in entries)...]
@@ -400,14 +414,14 @@ function _marginalize_vector_latent(ast::Expr, arrays::Vector{Symbol}, values, o
     offset = _vector_piece!(defs, form.constant, :offset, g, y, leaf)
     loadings = Dict(a => _vector_piece!(defs, get(form.coefs, a, nothing),
         Symbol(:loading_, i), g, y, leaf) for (i, a) in enumerate(arrays))
-    ss = _vector_piece!(defs, scale, :scale, g, y, leaf; square = true)
+    noise = _vector_piece!(defs, scale, :scale, g, y, leaf)
     stored = req === nothing ? Symbol[] : unique(Symbol[a for (a, _, _) in req.filtered])
-    filter = _vector_filter_scan(law, y, offset, (a, k) -> loadings[a](k), ss;
+    filter = _vector_filter_scan(law, y, offset, (a, k) -> loadings[a](k), noise, defs;
         predictive = _stores_predictive(req), filtered = stored)
     transition = _vector_transition_scan(law)
-    named = _marginal_value_defs(req, _vector_predictive(law, :location),
-        _vector_predictive(law, :variance),
-        a -> (_vector_filtered_mean(law, a), _vector_filtered_var(law, a)))
+    sd = _vector_predictive(law, :scale)
+    named = _marginal_value_defs(req, _vector_predictive(law, :location), :($sd .* $sd),
+        a -> (_vector_filtered_mean(law, a), _vector_filtered_var(law, a)); scale = sd)
     out = Any[]
     for (i, st) in enumerate(stmts)
         i == k && continue
@@ -450,11 +464,10 @@ function _vector_observation(g, arrays, obs, spelled)
 end
 
 # A piece of the observation (offset, a loading, the scale) at entry `k`:
-# one value as it is, one value per entry as `piece[k]`; with `square` its
-# square. A compound piece is named once as a definition in `defs`.
-function _vector_piece!(defs, piece, role, g, y, leaf; square = false)
+# one value as it is, one value per entry as `piece[k]`. A compound piece is named once as a definition in `defs`.
+function _vector_piece!(defs, piece, role, g, y, leaf)
     piece === nothing && return k -> nothing
-    piece isa Real && return k -> square ? piece * piece : piece
+    piece isa Real && return k -> piece
     shape = _shape_of(piece, leaf)
     shape === :unknown && _marginal_fail(g, "cannot tell whether the observation's " *
         "$role `$piece` is one value or one value per entry of `$y`; write it " *
@@ -464,14 +477,7 @@ function _vector_piece!(defs, piece, role, g, y, leaf; square = false)
         name = _vname(g, role)
         push!(defs, Expr(:(=), name, piece))
     end
-    if shape === :scalar
-        square || return k -> name
-        sq = _vname(g, Symbol(role, :_squared))
-        push!(defs, Expr(:(=), sq, Expr(:call, :*, name, name)))
-        return k -> sq
-    end
-    return k -> square ? Expr(:call, :*, Expr(:ref, name, k), Expr(:ref, name, k)) :
-        Expr(:ref, name, k)
+    return shape === :scalar ? (k -> name) : (k -> Expr(:ref, name, k))
 end
 
 # ── Exact draws of a vector state ─────────────────────────────────────────

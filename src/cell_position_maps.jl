@@ -416,7 +416,8 @@ function _pm_call(st::_PMState, fr::_PMFrame, f::_PMValue, args::Vector{_PMValue
             return _PMValue(:typeval)
         end
     end
-    if fv === Core.typeof && n == 1
+    if n == 1 && (fv === Core.typeof ||
+            isdefined(Core, :_typeof_captured_variable) && fv === Core._typeof_captured_variable)
         a = only(args)
         a.kind === :param && return _PMValue(:typeof, a.data)
         if a.kind === :typeread
@@ -773,19 +774,24 @@ function _pm_loop(st::_PMState, fr::_PMFrame)
     state.kind === :istate || _pm_fail()
     desc = state.data
     function check(k)
+        # Julia can load the iteration slot into an SSA value before the
+        # comparison. Require the comparison to read that exact load.
+        k <= length(code) || _pm_fail()
+        loaded = _pm_slot(code[k]) == I
+        k += loaded
         k + 2 <= length(code) || _pm_fail()
         a, b, c = code[k], code[k+1], code[k+2]
         Meta.isexpr(a, :call, 3) && a.args[1] == GlobalRef(Core, :(===)) &&
-            _pm_slot(a.args[2]) == I && a.args[3] === nothing &&
+            (loaded ? _pm_ssa(a.args[2], k - 1) : _pm_slot(a.args[2]) == I) &&
+            a.args[3] === nothing &&
             Meta.isexpr(b, :call, 2) && b.args[1] == GlobalRef(Base, :not_int) &&
             _pm_ssa(b.args[2], k) && c isa Core.GotoIfNot && _pm_ssa(c.cond, k + 1) ||
             _pm_fail()
-        c.dest
+        (k + 3, c.dest)
     end
-    exit = check(setup + 1)
+    top, exit = check(setup + 1)
     # The loop's top may declare the body's locals (`NewvarNode`) before the
     # head reads `I`; the back edge returns to the top.
-    top = setup + 4
     head = top
     while head < exit - 1 && _pm_noop(code[head])
         head += 1
@@ -794,11 +800,12 @@ function _pm_loop(st::_PMState, fr::_PMFrame)
     back = exit - 1
     code[back] isa Core.GotoNode && code[back].label == top || _pm_fail()
     step = back - 4
+    step > head && _pm_slot(code[step]) == I && (step -= 1)
     step > head || _pm_fail()
     s = code[step]
     Meta.isexpr(s, :(=), 2) && _pm_slot(s.args[1]) == I && _pm_iterate_call(s.args[2], 2) &&
         s.args[2].args[2] == iterator || _pm_fail()
-    check(step + 1) == exit || _pm_fail()
+    check(step + 1) == (back, exit) || _pm_fail()
     # The epilogue returns the result being built.
     acc = nothing
     for i in exit:length(code)

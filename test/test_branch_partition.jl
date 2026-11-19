@@ -792,3 +792,23 @@ end
         @test grad ≈ [-2 / 1.5, 0, -2 / 1.5, 0]
     end
 end
+
+@testset "rebind a single selected plate arm" begin
+    cache = PreparationCache()
+    masks = ([1.0, 2.0], [-1.0, -3.0], [3.0, 2.0, 4.0],
+             [-4.0, -1.0, -2.0], [2.0, -1.0, 3.0])
+    kernels = [prepare!(cache, BranchPartition.guarded; bound=(; y=mask))
+               for mask in masks]
+    for i in (1, 4, 2, 5, 3, 1)
+        mask = masks[i]
+        x = ones(length(mask))
+        BranchPartition.arm_calls[] = 0
+        @test kernels[i](x) ≈ sum(y -> y > 0 ? log(y) : 0.0, mask)
+        @test BranchPartition.arm_calls[] == count(>(0), mask)
+    end
+    @test kernels[1].rebinding !== nothing
+    @test kernels[2].rebinding !== nothing
+    @test kernels[1].rebinding === kernels[3].rebinding
+    @test kernels[2].rebinding === kernels[4].rebinding
+    @test kernels[1].rebinding !== kernels[2].rebinding
+end

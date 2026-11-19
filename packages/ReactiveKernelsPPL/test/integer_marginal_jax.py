@@ -117,6 +117,32 @@ def check_rag():
     print("Marginal RAG JAX: closed-form density, ordinary gradient and exact conditional passed")
 
 
+def check_array(name):
+    m = model(name)
+    assert not m.UNTRANSLATED, m.UNTRANSLATED
+    sizes = []
+    for n in ((2, 13) if name == "array_joint" else (2, 13, 0)):
+        ref = {"np": np}
+        exec((Path(sys.argv[1]) / f"{name}{n}_reference.py").read_text(), ref)
+        data = m.prepare_data(**ref["raw"])
+        u = ref["u"]
+        value, gradient = jax.jit(jax.value_and_grad(m.log_density))(u, **data)
+        np.testing.assert_allclose(value, ref["density"], atol=1e-10)
+        np.testing.assert_allclose(gradient, ref["gradient"], atol=1e-7)
+        output = jax.jit(m.constrain)(u, **data)
+        np.testing.assert_allclose(field(output["pointwise"], "y", 0), ref["pw"], atol=1e-10)
+        parameters = field(output["_ppl_latents"], "parameters", 0)
+        elements = field(parameters, "elements", 2 if name == "array_joint" else 0)
+        record = field(elements, "z", 0)
+        np.testing.assert_array_equal(field(record, "values", 0), ref["values"])
+        np.testing.assert_allclose(field(record, "probabilities", 1), ref["probabilities"], atol=1e-10)
+        sizes.append(equations(jax.make_jaxpr(m.log_density)(u, **data)))
+    assert sizes[1] < 2 * sizes[0], sizes
+
+
 checks = {"mixture": check_mixture, "joint": check_joint, "rag": check_rag}
+for array_model in ("array_guide", "array_counts", "array_matrix", "array_joint",
+                    "array_uniform", "array_categorical"):
+    checks[array_model] = lambda name=array_model: check_array(name)
 for name in sys.argv[2:] or checks:
     checks[name]()

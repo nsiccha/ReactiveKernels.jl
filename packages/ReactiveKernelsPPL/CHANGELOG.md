@@ -20,6 +20,34 @@ are recorded in the git history only.
 
 - Repeated sampler density calls reuse intermediate storage when unpacking array parameters, evaluating ordered slices and reducing categorical probability columns.
 
+## 0.1.234
+
+- Integer-array marginalization reduces the candidate scores in each element's
+  plate cell. JAX emission supports the marginal density, pointwise terms and
+  element posterior probabilities.
+- Predictive queries over a marginalized integer array return one posterior
+  mixture law per entry. Joint draws reuse an element's sampled component
+  across all responses that read it.
+
+## 0.1.233
+
+- Rebuilding an eligible program from the same captured `@rkppl` model
+  reuses its graph construction and sampler preparation. Each build has
+  independent public ports and checks. Each binding supplies its own layout,
+  prefix values and sampler buffers.
+
+## 0.1.232
+
+- `prepare_coordinate_conditional` follows a scalar parameter's packed read
+  through its transforms and derived values. A hyperparameter used only in a
+  group prior now skips the observation likelihood on each coordinate trial.
+
+## 0.1.231
+
+- `marginalize` carries a square root of the filtered covariance for a vector
+  Gaussian scan. This preserves small observation and process variances when
+  successive innovations differ by many orders of magnitude.
+
 ## 0.1.230
 
 - The package image prepares a coordinate conditional and a marginalized

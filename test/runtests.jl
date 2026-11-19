@@ -229,6 +229,7 @@ const _MATRIX_CORE_TESTS = (
     "test_precompiled_guarded_plan.jl",
     "test_position_batching.jl",
     "test_position_record_reverse.jl",
+    "test_native_matrix_record_reverse.jl",
     "test_position_batching_reuse.jl",
     "test_native_scheduling.jl",
     "test_scheduled_prefix.jl",

@@ -263,7 +263,11 @@ observations and the components, and equals the components written out as
 `MixtureModel.(…)` in value and gradient. Each element's posterior is under
 `parameters.elements`. A term that couples elements, such as one reading
 `sum(z)`, is refused: summing it out would enumerate every joint assignment.
-Predictive draws and JAX emission of such a model are not implemented yet.
+For each response entry, `predictive_laws` returns the mixture weighted by
+that element's posterior. A joint `predictive_draws` call draws the element's
+component once and uses it for every response that reads the element. In JAX,
+request `values = (:pointwise, :_ppl_latents)` to recover the per-entry log
+likelihoods and component probabilities alongside the density.
 
 ```@example integer
 summed_plan = marginalize(mixture(; K = 2), :z) | (; y = mixture_y)

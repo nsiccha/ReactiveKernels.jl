@@ -465,8 +465,8 @@ function _gibbs_dependents(statements, roots)
     while true
         before = length(dependent)
         for st in statements
-            name = _assigned_name(st)
-            name === nothing || !_gibbs_reads(st.args[2], dependent) || push!(dependent, name)
+            Meta.isexpr(st, :(=), 2) || continue
+            _gibbs_reads(st.args[2], dependent) && union!(dependent, _assigned_names(st))
         end
         length(dependent) == before && return dependent
     end

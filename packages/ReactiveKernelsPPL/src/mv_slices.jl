@@ -459,7 +459,7 @@ end
 # Ordered slices: the first entry, then cumulative exp-increments along
 # each slice (the vector `ordered_constrain`, per slice). The ordered and
 # simplex slice transforms are `@traceable`: `jax_source` translates their
-# keyword `cumsum` and the simplex's one-entry branch from the authored body.
+# keyword `cumsum` from the authored body.
 @traceable _ordered_slices_constrain(o::_SliceRows, U) =
     cumsum(hcat(U[:, 1:1], exp.(U[:, 2:end])); dims = 2)
 @traceable _ordered_slices_constrain(o::_SliceCols, U) =
@@ -477,65 +477,43 @@ _ordered_slices_unconstrain(::_SliceRows, X) =
 _ordered_slices_unconstrain(::_SliceCols, X) =
     vcat(X[1:1, :], log.(diff(X; dims = 1)))
 
-# Simplex slices: stick-breaking along each slice, the vector
-# `simplex_constrain` per slice. `U` holds K − 1 coordinates per slice.
-# The break fractions `z` and the log stick remainders `lr` feed both the
-# value and the log-Jacobian. The constant leading column of `lr` and
-# trailing column of the value are built from `U` (`0.0 .* U[:, 1:1]`),
-# never as a host array, so the transform is broadcasts and reductions
-# over `U` alone. `U` is finite, so the column is exactly zero. A one-entry simplex (K = 1, no coordinates) is
-# the constant 1. The orientation helpers are `@traceable` straight-line
-# sources: a non-allocating kernel reads them, as it reads the transforms,
-# and keeps one buffer per array they build (`non-allocating-automatically`).
-@traceable _slice_zero(o::_SliceRows, U) = 0.0 .* U[:, 1:1]
-@traceable _slice_zero(o::_SliceCols, U) = 0.0 .* U[1:1, :]
-@traceable _slice_hcat(o::_SliceRows, a, b) = hcat(a, b)
-@traceable _slice_hcat(o::_SliceCols, a, b) = vcat(a, b)
-_slice_dims(::_SliceRows) = 2
-_slice_dims(::_SliceCols) = 1
-_slice_width(o, U) = size(U, _slice_dims(o))
+# Use one column per simplex so the running sum follows the leading axis.
+@traceable _simplex_columns(::_SliceCols, U) = U
+@traceable _simplex_columns(::_SliceRows, U) = transpose(U)
+@traceable _simplex_from_columns(::_SliceCols, P) = P
+@traceable _simplex_from_columns(::_SliceRows, P) = permutedims(P)
 
-# With one simplex per column, Base scans the leading dimension with a
-# scalar running total. Its matrix scan over the second dimension dispatches
-# at run time on the axes, including in the reverse derivative.
-@traceable function _simplex_slices_breaks(o::_SliceCols, U)
-    K = size(U, 1) + 1
-    offsets = log.(K .- (1:(K - 1)))
-    z = 1.0 ./ (1.0 .+ exp.(-(U .+ offsets)))
-    l = log1p.(-z)
-    lr = cumsum(vcat(_slice_zero(o, U), l); dims = 1)
-    return z, l, lr
+# Both projections read the same break fractions and log remaining fractions.
+@traceable function _simplex_slices_breaks(o, U)
+    coordinates = _simplex_columns(o, U)
+    n = size(coordinates, 1)
+    remaining = n:-1:1
+    offsets = log.(remaining)
+    z = 1.0 ./ (1.0 .+ exp.(.-(coordinates .+ offsets)))
+    return z, log1p.(.-z), remaining
 end
 
-# Transpose views present rows to the same scan and restore the layout of
-# each result for both the constrained value and its log-Jacobian.
-@traceable function _simplex_slices_breaks(o::_SliceRows, U)
-    z, l, lr = _simplex_slices_breaks(_SliceCols(), transpose(U))
-    return transpose(z), transpose(l), transpose(lr)
+@traceable function _simplex_value_from_breaks(o, breaks)
+    z, log_remaining, _ = breaks
+    groups = size(z, 2)
+    # A zero-width packed simplex has just the initial stick, of mass one.
+    log_stick = cumsum(vcat(zeros(1, groups), log_remaining); dims = 1)
+    p = exp.(log_stick) .* vcat(z, ones(1, groups))
+    return _simplex_from_columns(o, p)
 end
-@traceable _slice_ones(o::_SliceRows, G) = ones(G, 1)
-@traceable _slice_ones(o::_SliceCols, G) = ones(1, G)
-@traceable _simplex_lr_head(o::_SliceRows, lr) = lr[:, 1:(end - 1)]
-@traceable _simplex_lr_head(o::_SliceCols, lr) = lr[1:(end - 1), :]
 
-# The slice width is a shape, so the one-entry branch is decided while JAX
-# traces, as it is decided natively.
-@traceable function _simplex_slices_constrain(o, U)
-    if _slice_width(o, U) == 0
-        _slice_ones(o, _slice_count(o, U))
-    else
-        z, _, lr = _simplex_slices_breaks(o, U)
-        exp.(lr) .* _slice_hcat(o, z, 1.0 .+ _slice_zero(o, U))
-    end
+@traceable function _simplex_logjac_from_breaks(breaks)
+    z, log_remaining, remaining = breaks
+    # Break j's log remaining fraction occurs in its own Jacobian term
+    # and once in each later log stick length, for n + 1 - j copies.
+    return sum(log.(z) .+ remaining .* log_remaining)
 end
-@traceable function _simplex_slices_logjac(o, U)
-    if _slice_width(o, U) == 0
-        0.0
-    else
-        z, l, lr = _simplex_slices_breaks(o, U)
-        sum(_simplex_lr_head(o, lr) .+ log.(z) .+ l)
-    end
-end
+
+@traceable _simplex_slices_constrain(o, U) =
+    _simplex_value_from_breaks(o, _simplex_slices_breaks(o, U))
+@traceable _simplex_slices_logjac(o, U) =
+    _simplex_logjac_from_breaks(_simplex_slices_breaks(o, U))
+
 # Host inverse: per slice, the vector `simplex_unconstrain`.
 _simplex_slices_unconstrain(::_SliceRows, X) =
     permutedims(reduce(hcat, [simplex_unconstrain(X[g, :])

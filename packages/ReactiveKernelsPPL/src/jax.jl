@@ -84,11 +84,6 @@ function _jax_module_of(built, plan; values, doc, float_type)
         "[jax] jax_source requires a bound plan (bind_data first)"))
     _check_built_program(built, plan)
     _refuse_integer_conditional_values(plan, built.spec, values)
-    arrays = _marginalized_integer_arrays(plan)
-    isempty(arrays) || throw(ReactiveKernels.JAXEmissionError("[jax] " *
-        _quoted_names(arrays) * _integer_arrays_noun(arrays) * " summed out by `marginalize`; " *
-        "emitting that element-by-element sum in JAX is not implemented yet. " *
-        "Run it natively, or emit the model with the array explicit."))
     have = _query_have(plan)
     data = _query_bound(plan)
     types = merge((; unconstrained = Vector{Float64}),
@@ -200,6 +195,127 @@ end
 _integer_namedtuple_type(T::Type) = T
 _integer_namedtuple_type(fields::NamedTuple) =
     NamedTuple{keys(fields),Tuple{map(_integer_namedtuple_type, Tuple(fields))...}}
+
+# Shape reads remain static while tracing. An empty element axis skips every
+# shared component, including components that would index an empty table.
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_integer_used_support), args::Vector{ReactiveKernels._PyVal})
+    s, sizes = args
+    code = "(" * ReactiveKernels._py_atom(s.code) * "[:0] if 0 in " * sizes.code *
+        " else " * s.code * ")"
+    return ReactiveKernels._PyVal(code, s.T, s.static)
+end
+
+# Julia broadcasts missing trailing axes. Preserve that order before the
+# matrix (or higher-rank array) becomes a column-major vector of elements.
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_integer_flat_operand), args::Vector{ReactiveKernels._PyVal})
+    v, dims = args
+    ReactiveKernels._jax_is_array(v.T) || return v
+    rank = fieldcount(dims.T)
+    api = ctx.host === nothing ? "jnp" : "np"
+    a = ReactiveKernels._jax_bind!(ctx, :operand, v).code
+    shape = api * ".shape(" * a * ") + (1,) * " * string(max(0, rank - ndims(v.T)))
+    code = api * ".ravel(" * api * ".broadcast_to(" * api * ".reshape(" * a * ", " *
+        shape * "), " * dims.code * "), order='F')"
+    return ReactiveKernels._PyVal(code, Vector{eltype(v.T)}, v.static)
+end
+
+# Both array overloads apply the scalar support rule to each set of bounds.
+# Keep Julia's trailing singleton axes when broadcasting the bounds.
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        f::Union{typeof(_binomial_support),typeof(_discrete_uniform_support)},
+        args::Vector{ReactiveKernels._PyVal})
+    rank(a) = ReactiveKernels._jax_is_array(a.T) ? ndims(a.T) : 0
+    dims = maximum(rank, args)
+    dims > 0 && ctx.host !== nothing ||
+        return ReactiveKernels._jax_traceable_or_lowered(ctx, f, args)
+    items = [ReactiveKernels._jax_fresh(ctx, :bound_at_element) for a in args]
+    operands = map(args) do a
+        code = ReactiveKernels._jax_bind!(ctx, :bound, a).code
+        0 < rank(a) < dims || return code
+        return "np.reshape(" * code * ", np.shape(" * code * ") + (1,) * " *
+            string(dims - rank(a)) * ")"
+    end
+    domain = "np.broadcast_arrays(" * join(operands, ", ") * ")"
+    rows = ReactiveKernels._jax_fresh(ctx, :supports)
+    ReactiveKernels._jax_emit!(ctx, rows * " = []")
+    ReactiveKernels._jax_emit!(ctx, "for (" * join(items, ", ") *
+        ",) in zip(*(np.ravel(a, order='F') for a in " * domain * ")):")
+    ctx.scope.indent += 1
+    try
+        cells = [ReactiveKernels._PyVal(item, eltype(a.T), true) for (item, a) in zip(items, args)]
+        row = ReactiveKernels._jax_traceable_or_lowered(ctx, f, cells)
+        ReactiveKernels._jax_emit!(ctx, rows * ".append(" * row.code * ")")
+    finally
+        ctx.scope.indent -= 1
+    end
+    return ReactiveKernels._PyVal(rows, Vector{UnitRange{Int}}, true)
+end
+
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_categorical_support), args::Vector{ReactiveKernels._PyVal})
+    weights = only(args)
+    ctx.host !== nothing && ReactiveKernels._jax_ragged(weights.T) ||
+        return ReactiveKernels._jax_traceable_or_lowered(ctx, _categorical_support, args)
+    code = "[np.arange(1, len(w) + 1, dtype=np.int64) for w in " * weights.code * "]"
+    return ReactiveKernels._PyVal(code, Vector{UnitRange{Int}}, true)
+end
+
+# A host plate holds rows. Transpose the fixed tuple schema, stacking each
+# numeric column along its trailing state axis. The number of rows is data.
+function _integer_host_stack(T, path, rows)
+    if T <: Union{Tuple,NamedTuple}
+        fields = [_integer_host_stack(fieldtype(T, k), path * "[" * string(k - 1) * "]", rows)
+            for k in 1:fieldcount(T)]
+        return "(" * join(fields, ", ") * (length(fields) == 1 ? "," : "") * ")"
+    end
+    return "np.stack([cell" * path * " for cell in " * rows * "], axis=-1)"
+end
+
+# Native conditional records append a joint-state axis to every numeric leaf.
+# A host plate holds rows of records. vmap already stacked the leaves, with
+# its mapped axis first. Both keep the authored record structure.
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_integer_conditional_columns), args::Vector{ReactiveKernels._PyVal})
+    cells = only(args)
+    T = ReactiveKernels._jax_return_type(_integer_conditional_columns, Any[cells.T])
+    code = if ctx.host === nothing
+        "jax.tree_util.tree_map(lambda a: jnp.moveaxis(a, 0, -1), " * cells.code * ")"
+    else
+        _integer_host_stack(eltype(cells.T), "", cells.code)
+    end
+    return ReactiveKernels._PyVal(code, T, ctx.host !== nothing)
+end
+
+# The bound supports are host-side arrays of ranges in column-major order.
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_integer_checked_support), args::Vector{ReactiveKernels._PyVal})
+    support, dims = args
+    support.T <: AbstractRange && return support
+    ctx.host === nothing && ReactiveKernels._jax_error(
+        "per-element integer supports require host data preparation")
+    rows = ReactiveKernels._jax_bind!(ctx, :supports, support)
+    ReactiveKernels._jax_emit!(ctx, "if len(" * rows.code * ") != np.prod(" * dims.code *
+        "): raise ValueError('integer array dimensions and number of element supports differ')")
+    ReactiveKernels._jax_emit!(ctx, "if any(len(r) == 0 for r in " * rows.code *
+        ") and any(len(r) > 0 for r in " * rows.code *
+        "): raise ValueError('an element of a marginalized integer array has an empty support')")
+    return rows
+end
+
+# A shared support already is the candidate axis. For individual supports,
+# prepare their sorted union on the host, preserving holes between ranges.
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_integer_array_values), args::Vector{ReactiveKernels._PyVal})
+    support = only(args)
+    support.T <: AbstractRange && return support
+    ctx.host === nothing && ReactiveKernels._jax_error(
+        "per-element integer support values require host data preparation")
+    rows = ReactiveKernels._jax_bind!(ctx, :supports, support).code
+    code = "np.unique(np.concatenate([np.empty(0, dtype=np.int64), *" * rows * "]))"
+    return ReactiveKernels._PyVal(code, Vector{Int}, true)
+end
 
 function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
         ::typeof(_integer_value), args::Vector{ReactiveKernels._PyVal})

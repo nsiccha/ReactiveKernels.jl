@@ -176,9 +176,11 @@ with the data (for example, a longer scan). Each build must match its own
 binding. A build serves every binding that generates its program (other row
 counts and values, see `prepare_sampler`), and a target prepared on another
 binding of the same build reuses the build's earlier preparation: only that
-binding's data prefix runs again. For cumulative updates, keep the first
-batch's build and prepare each later batch's target on it; a build per batch
-is a new graph, which prepares everything again. `model_id` is a caller-supplied identity, not an inferred code hash. Bindings,
+binding's data prefix runs again. For cumulative updates, the first batch's
+build can serve each later target. Calling `build_kernel` per batch on one
+retained `@rkppl` model can also reuse preparation when the generated program
+qualifies for model-owned reuse (see `build_kernel`). The caller supplies
+`model_id`. Bindings,
 captured data and code must remain read-only for a target's lifetime.
 `kwargs` are forwarded to `prepare_sampler`.
 

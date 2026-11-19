@@ -145,15 +145,30 @@ end
         @test isequal((; x, y), original)
 
         changed_x, changed_y = copy(x), copy(y)
-        changed_x[2], changed_y[2], changed_y[3] = 0.5, 0.2, missing
+        changed_x[2], changed_x[3] = 0.5, -1.0
+        changed_y[2], changed_y[3] = 0.2, missing
         changed = model(; x = changed_x) | (; y = changed_y)
-        # Refused: this graph embeds the old selected-argument guard; ignoring
-        # a changed mask would skip a present value and evaluate the wrong model.
-        @test_throws "needs its own `build_kernel(plan)`" prepare_query(built, changed, :pointwise)
-        @test_throws ContractValidationError prepare_cell_query(built, changed, :y)
+        # The generated guard reads a bound mask. Its old missing row is now
+        # present, and its new missing row must skip the invalid square root.
+        mask = ReactiveKernelsPPL._observed_mask_name(:y)
+        @test plan.columns[mask] != changed.columns[mask]
         own = build_kernel(changed)
-        own_values = Base.invokelatest(prepare_query(own, changed, :pointwise), [0.3]).y
-        @test own_values ≈ [ismissing(changed_y[i]) ? 0.0 :
+        @test ReactiveKernelsPPL._same_program(built.program, own.program)
+        expected = [ismissing(changed_y[i]) ? 0.0 :
             normal_logpdf(changed_y[i], 0.3 * sqrt(changed_x[i]), 1.3) for i in 1:n]
+        for b in (built, own)
+            pointwise = prepare_query(b, changed, :pointwise)
+            @test Base.invokelatest(pointwise, [0.3]).y ≈ expected
+            cell = prepare_cell_query(b, changed, :y)
+            @test [cell([0.3], i) for i in 1:n] ≈ expected
+        end
+
+        # Removing the mask port changes the generated program under the same
+        # model owner. The old build still serves its original masked binding.
+        full = model(; x = abs.(x)) | (; y = coalesce.(y, 0.0))
+        unmasked = build_kernel(full)
+        @test !ReactiveKernelsPPL._same_program(built.program, unmasked.program)
+        @test_throws ContractValidationError prepare_query(built, full, :pointwise)
+        @test Base.invokelatest(prepare_query(built, changed, :pointwise), [0.3]).y ≈ expected
     end
 end
