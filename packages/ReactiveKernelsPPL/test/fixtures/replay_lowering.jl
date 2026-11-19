@@ -1,6 +1,7 @@
 using LoweringWorkload, ReactiveKernelsPPL, DifferentiationInterface, Enzyme, Test
 const W = LoweringWorkload
 @test W.IN_IMAGE
+@test !ReactiveKernelsPPL._lowering_named_module(W.DEFINITIONS)
 entry = only(values(W.CACHE.entries))
 @test isempty(entry.plan.frozen.values) && isempty(entry.plan.frozen.inputs)
 @test isempty(entry.plan.columns) && entry.plan.data_values === nothing

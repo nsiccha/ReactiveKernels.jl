@@ -31,6 +31,9 @@ LoweringCache() = LoweringCache(ReentrantLock(), Dict{Any,_LoweringEntry}())
 # The caller itself may be a fresh, unbound Module: its references use slots.
 function _lowering_named_module(m::Module)
     m in (Base, Core, Main) && return true
+    # Builders can bind generated modules under their package during image
+    # construction. Such a module still owns the builder's private globals.
+    Base.isgensym(nameof(m)) && return false
     p = parentmodule(m)
     if p === m
         id = Base.PkgId(m)
@@ -217,7 +220,7 @@ function _cached_lowering(cache::LoweringCache, ast, data, mod;
     names = task_local_storage(ReactiveKernels._KERNEL_EXPANSION_NAMES)
     key = (syntax, bindings, copy(data), copy(conditioned), copy(array_entries), copy(observing),
         names.fingerprint, names.count,
-        _lowering_named_module(mod) ? mod : nothing)
+        _lowering_named_module(mod) ? Base.fullname(mod) : nothing)
     entry = lock(() -> get(cache.entries, key, nothing), cache.lock)
     if entry !== nothing
         names.count = entry.next_name
