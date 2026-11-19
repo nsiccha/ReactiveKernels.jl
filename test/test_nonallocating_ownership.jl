@@ -126,6 +126,49 @@ end
                         string(code_expr(program, field)))
     end
 
+    @testset "a reshape shares only the current producer's storage" begin
+        spec = @kernel shaped_values(x::Vector{Float64}, m::Int, n::Int) = begin
+            data = x .* 2
+            shaped = reshape(data, m, n)
+        end
+        k = prepare_nonallocating(spec; want = :shaped)
+        for (m, n) in ((3, 4), (4, 3), (1, 7), (0, 5))
+            x = Float64.(1:m*n)
+            y = k(x, m, n)
+            @test y == reshape(2 .* x, m, n)
+            @test k(x, m, n) === y
+            @test ownership_allocations(k, (x, m, n)) == 0
+            @test x == Float64.(1:m*n)
+        end
+        @test_throws DimensionMismatch k(zeros(7), 3, 2)
+
+        @static if hasfield(Array, :ref)
+            both = prepare_nonallocating(spec; want = (:data, :shaped))
+            x = collect(1.0:4.0)
+            data, _ = both(x, 2, 2)
+            sizehint!(data, 30)
+            data, original = both(x, 2, 2)
+            popfirst!(data)
+            push!(data, -1.0)
+            data, current = both(x, 2, 2)
+            @test current !== original
+            @test current == reshape(2 .* x, 2, 2)
+            @test Base.mightalias(data, current)
+        end
+
+        borrowed = @kernel shaped_input(x::Vector{Float64}) = begin
+            shaped = reshape(x, 2, 2)
+        end
+        plain = prepare_nonallocating(borrowed; want = :shaped)
+        a, b = ones(4), zeros(4)
+        aview = plain(a)
+        bview = plain(b)
+        aview[1] = 2
+        @test a == [2, 1, 1, 1]
+        @test all(iszero, bview)
+        @test Base.mightalias(b, bview)
+    end
+
     @testset "registered destinations still reuse owned buffers" begin
         g = Graph()
         x = value!(g, :x, Vector{Float64})

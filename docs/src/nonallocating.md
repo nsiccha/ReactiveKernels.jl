@@ -27,6 +27,8 @@ next_result = run([4.0, 5.0, 6.0])
 
 Treat mutable results as borrowed. A later call can overwrite a kernel-owned array; a result that is only an input or field read can alias caller-owned storage. Copy a result if it must survive another call.
 
+For a dense intermediate held in a kernel-owned buffer, a rank-changing `reshape` can also reuse the array header on repeated calls. Changing the requested shape or replacing the underlying storage creates a new header. Reshaping a caller's input preserves Julia's usual aliasing with that input.
+
 The interface selects the same mathematical recipes as ordinary preparation. It routes supported operations through reusable buffers. Operations without an in-place form can still allocate, so the name alone does not establish an allocation count for an arbitrary graph.
 
 ## Generated program
