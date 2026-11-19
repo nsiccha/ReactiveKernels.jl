@@ -316,9 +316,7 @@ end
 # the stick-breaking transform, its log-Jacobian and the Dirichlet density run
 # in buffers of their own (snag `posteriordb-port-e9e2c1d4`: before, each
 # allocated its arrays fresh on every call, in proportion to the number of
-# slices). The constant remainder is outside the slices: the packed
-# block's `reshape` (an array object per call on Julia 1.11+) and the row sum
-# of the shared concentration, a reshaped view.
+# slices).
 _na_slice_entries_columns = @rkppl begin
     eachcol(W[1:K, 1:G]) .~ Dirichlet(alpha)
     s ~ HalfNormal(1)
@@ -328,6 +326,30 @@ _na_slice_entries_rows = @rkppl begin
     eachrow(P[1:G, 1:K]) .~ Dirichlet(fill(1.5, K))
     s ~ HalfNormal(1)
     y .~ Normal.(P[g, 1] .- P[g, 2], s)
+end
+_na_ordered_entries = @rkppl begin
+    eachrow(B[1:G, 1:4]) .~ Ordered(Normal(0, 2), 4)
+    y .~ Normal.(B[g, 1], 1)
+end
+
+@testset "ordered slice density reuses its transforms" begin
+    bytes = map((3, 24)) do G
+        g = mod1.(1:40, G)
+        plan = _na_ordered_entries(; G, g) | (; y = sin.(1:40))
+        built = build_kernel(plan)
+        u = sin.(1:built.layout.total) .* 0.1
+        q = prepare_sampler(built, plan, u; backend = NA_SAMPLER_BACKEND, nonallocating = true)
+        ordinary = prepare_sampler(built, plan, u; backend = NA_SAMPLER_BACKEND, nonallocating = false)
+        for point in (u, -u)
+            g1, g2 = zero(point), zero(point)
+            v, _ = sampler_value_and_gradient!(q, g1, point)
+            reference, _ = sampler_value_and_gradient!(ordinary, g2, point)
+            @test v == reference
+            @test g1 ≈ g2 rtol = 1e-12
+        end
+        Base.invokelatest(_na_density_bytes, q.kernel, u)
+    end
+    @test bytes[2] <= bytes[1]
 end
 
 @testset "simplex slices reuse their buffers" begin
