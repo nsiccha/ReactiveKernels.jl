@@ -101,9 +101,10 @@ keeps everything that does not depend on the bound values — the plan, the
 prepared prefix and the compiled residual — so repeating the call with new
 data for the same ports runs only the prefix on that data. A residual whose
 inner authored plates cache bound-only cell values shares its compiled body
-too, across bindings whose caching decisions agree; one whose plates the pass
-partitions by a data-bound branch, or replaces by a bind-time value, is still
-specialized and compiled per binding and reuses the plan and prefix only.
+across bindings with the same caching decisions. If every row selects one
+branch arm, bindings selecting that arm can also share the residual. A plate
+split across multiple arms or folded to a bind-time value still specializes
+the residual per binding.
 """
 # Set while `partition_plan_kernel(spec; …)` prepares: the lowering emits the
 # plan's body instead of the kernel's.
@@ -279,9 +280,8 @@ function _prepare_bound_entry!(cache::PreparationCache, g::Graph, @nospecialize(
         _data_prefix!(_data_cache, entry.plan, entry.boundary, data)
     classes = _partial_plate_classes(entry.boundary, hoisted)
     _, specialized, signature = _bound_residual(entry, cache, hoisted, classes)
-    # A residual the inner-plate pass rewrote other than through its shared
-    # plate rewrites (a data-bound branch partition, a whole-plate value)
-    # bakes this binding's structure in.
+    # Multi-arm partitions and whole-plate folds still prepare their own
+    # residual. A single selected arm contributes its rewrite to the signature.
     signature === nothing && return prepare(specialized; passes = passes, exemplars)
     # Bindings with the same plate classes, finite loop schedules and plate
     # rewrites share a compiled residual. Extents, index patterns and cached
