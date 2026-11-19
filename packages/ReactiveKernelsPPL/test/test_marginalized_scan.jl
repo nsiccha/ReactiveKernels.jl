@@ -1271,8 +1271,8 @@ end
     @test occursin("missing entry in a `@plate` cell", refusal(cellmodel(quote
         y[g] .~ Normal.(h, 1)
     end), :h, (;), [Union{Missing,Float64}[0.1, missing, 0.4], [0.3, 0.2]]))
-    # A vector state is filtered at top level only.
-    @test occursin("a vector state in a `@plate` cell is not marginalized yet", refusal(quote
+    # A coupled state must be integrated as a group.
+    @test occursin("also carries `k`", refusal(quote
         s ~ Exponential(1)
         @plate for g in eachindex(y)
             @scan begin
@@ -1606,6 +1606,156 @@ end
             @test v[3][g] ≈ fm rtol = 1e-9 atol = 1e-11
             @test v[4][g] ≈ fv rtol = 1e-9 atol = 1e-12
         end
+    end
+end
+
+# The observation sees only the second array. Its innovation shares the first
+# array's current draw, and both previous arrays enter the next step.
+const CELL_PAIR = @rkppl begin
+    s ~ Exponential(1)
+    @plate for g in eachindex(y)
+        @scan begin
+            a[1] ~ Normal(0, s)
+            b[1] ~ Normal(0.5 * a[1], 0.3 * s)
+            for t in 2:length(y[g])
+                a[t] ~ Normal(0.8 * a[t-1] + 0.1 * b[t-1], 0.4 * s)
+                b[t] ~ Normal(0.5 * a[t], 0.3 * s)
+            end
+        end
+        y[g] .~ Normal.(b, 0.3)
+    end
+end
+
+@rkppl pair_observations(s, n) = begin
+    @scan begin
+        a[1] ~ Normal(0, s)
+        b[1] ~ Normal(0.5 * a[1], 0.3 * s)
+        for t in 2:n
+            a[t] ~ Normal(0.8 * a[t-1] + 0.1 * b[t-1], 0.4 * s)
+            b[t] ~ Normal(0.5 * a[t], 0.3 * s)
+        end
+    end
+    obs .~ Normal.(b, 0.3)
+    obs
+end
+
+const CELL_PAIR_SUBMODEL = @rkppl begin
+    s ~ Exponential(1)
+    @plate for g in eachindex(y)
+        y[g] ~ pair_observations(s, length(y[g]))
+    end
+end
+
+function pair_moments(s, n)
+    affine_moments(2n) do z
+        a, b = zeros(n), zeros(n)
+        for t in 1:n
+            a[t] = t == 1 ? s * z[1] : 0.8 * a[t-1] + 0.1 * b[t-1] + 0.4 * s * z[2t-1]
+            b[t] = 0.5 * a[t] + 0.3 * s * z[2t]
+        end
+        vcat(a, b)
+    end
+end
+
+function pair_cell_plan(y; sub = false, named = true)
+    m, a, b = sub ? (CELL_PAIR_SUBMODEL, Symbol("y.a"), Symbol("y.b")) : (CELL_PAIR, :a, :b)
+    kw = named ? (; predictive = (location = :loc, scale = :pred_sd),
+        filtered = Dict(a => (mean = :am,), b => (variance = :bv,))) : (;)
+    return marginalize(m(), a, b; kw...) | (; y)
+end
+
+@testset "coupled Gaussian arrays integrate together in each plate cell" begin
+    y = [[0.3, -0.6, 0.2], [-0.1], [0.7, 0.5, -0.2, 0.1]]
+    plan = pair_cell_plan(y)
+    built = build_kernel(plan)
+    @test coordinate_names(built.layout) == [:s]
+    oracle = cell_oracle(built, c -> logpdf(Exponential(1), c.s),
+        function (c, g)
+            n = length(y[g])
+            m, S = pair_moments(c.s, n)
+            rows = (n + 1):2n
+            return (m[rows], S[rows, rows]), 0.0, 1.0, 0.3
+        end, y)
+    check_density(built, plan, oracle; points = 1)
+    u = [0.2]
+    plain, sub = pair_cell_plan(y; named = false), pair_cell_plan(y; sub = true)
+    subbuilt = build_kernel(sub)
+    @test same_density(built, plan, build_kernel(plain), plain, u)
+    @test same_density(built, plan, subbuilt, sub, u)
+    names = (:loc, :pred_sd, :am, :bv)
+    v = named_values(built, plan, names, u)
+    @test v == named_values(subbuilt, sub, names, u)
+    f = Base.invokelatest(prepare_marginalized_latents(built, plan), u)
+    draws = marginalized_latent_draws(f, Random.Xoshiro(19))
+    subdraws = marginalized_latent_draws(prepare_marginalized_latents(subbuilt, sub), u, Random.Xoshiro(19))
+    @test subdraws.y == draws
+    @test length.(draws.a) == length.(draws.b) == length.(y)
+    for (g, data) in enumerate(y)
+        n = length(data)
+        m, S = pair_moments(exp(only(u)), n)
+        H = [zeros(n, n) Matrix(1.0I, n, n)]
+        loc, var = sequential_moments(H * m, H * S * H' + 0.3^2 * I, data)
+        am, _ = filtered_moments(m, S, H, 0.0, 0.3^2, data, n)
+        _, bv = filtered_moments(m, S, H, 0.0, 0.3^2, data, n; index = t -> t + n)
+        for (actual, expected) in zip(v, (loc, sqrt.(var), am, bv))
+            @test actual[g] ≈ expected atol = 1e-11
+        end
+        @test first.(f.a.mean[g]) ≈ am
+        @test [P[2, 2] for P in f.a.cov[g]] ≈ bv
+    end
+    large = build_kernel(pair_cell_plan([zeros(i) for i in 6:10]))
+    @test structure(built.spec) == structure(large.spec)
+    empty_plan = pair_cell_plan(Vector{Vector{Float64}}())
+    empty_built = build_kernel(empty_plan)
+    @test Base.invokelatest(prepare_query(empty_built, empty_plan, :likelihood), u) == 0
+    eq = prepare_marginalized_latents(empty_built, empty_plan)
+    empty_draws = marginalized_latent_draws(eq, u, Random.Xoshiro(19))
+    @test all(x -> x isa Vector{Vector{Float64}} && isempty(x), empty_draws)
+    src = jax_source(built, plan; values = names)
+    @test occursin("UNTRANSLATED = {}", string(src))
+    if rk_jax_available()
+        args = (u, jax_raw_data(plan, src)...)
+        r = rk_jax_evaluate(src, "log_density", args; grad = true, prepare = true)
+        @test r.value ≈ oracle(u).total
+        h = cbrt(eps(Float64))
+        @test only(r.grad) ≈ (oracle(u .+ h).total - oracle(u .- h).total) / (2h) rtol = 1e-6
+        vals = rk_jax_evaluate(src, "constrain", args; prepare = true).value
+        for (name, column) in zip(names, v)
+            @test vals[string(name, "_lengths")] == length.(y)
+            for g in eachindex(y)
+                @test vals[string(name)][g][eachindex(y[g])] ≈ column[g] atol = 1e-11
+            end
+        end
+    else
+        @test_skip false
+    end
+end
+
+@testset "two structural seeds in a plate cell" begin
+    ar = @rkppl begin
+        @plate for g in eachindex(y)
+            @scan begin
+                x[1] ~ Normal(0, 1)
+                x[2] ~ Normal(0.3 * x[1], 1)
+                for t in 3:length(y[g])
+                    x[t] ~ Normal(0.4 * x[t - 1] - 0.2 * x[t - 2], 1)
+                end
+            end
+            y[g] .~ Normal.(x, 0.3)
+        end
+    end
+    y = [[1.0, -0.2], [-0.1, 1.0, 0.3]]
+    plan = marginalize(ar(), :x; filtered = (mean = :fm,)) | (; y)
+    means = named_values(build_kernel(plan), plan, (:fm,), Float64[])
+    @test length(means) == length(y)
+    # Rows map three independent innovations into the three successive states.
+    L = [1.0 0.0 0.0; 0.3 1.0 0.0; -0.08 0.4 1.0]
+    for (actual, data) in zip(means, y)
+        n = length(data)
+        A = L[1:n, 1:n]
+        expected, _ = filtered_moments(zeros(n), A * A', Matrix(1.0I, n, n),
+            0.0, 0.3^2, data, n)
+        @test actual ≈ expected
     end
 end
 
