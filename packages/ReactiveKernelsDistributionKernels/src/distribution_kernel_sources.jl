@@ -175,10 +175,13 @@ ReactiveKernels.@_record_source function _normal_logcdf(z)
     return result
 end
 
-# In the negative tail, φ(z)/Φ(z) stays finite even when Φ rounds to zero.
+# In the negative tail, logerfc(w) = log(erfcx(w)) - w². Its scaled
+# complement also gives φ(z)/Φ(z) when Φ rounds to zero.
 @kernel _normal_logcdf_graph(z::Float64) = begin
-    y::Float64 = _normal_logcdf(z)
-    slope::Float64 = z < 0 ? sqrt(2 / π) / SpecialFunctions.erfcx(-z / sqrt(2.0)) :
+    w = -z / sqrt(2.0)
+    scaled = z < 0 ? SpecialFunctions.erfcx(w) : 0.0
+    y::Float64 = z < 0 ? log(scaled) - w^2 - log(2.0) : log1p(-0.5 * SpecialFunctions.erfc(-w))
+    slope::Float64 = z < 0 ? sqrt(2 / π) / scaled :
         exp(-0.5 * z^2 - 0.5 * log(2π) - y)
     return y, slope
 end

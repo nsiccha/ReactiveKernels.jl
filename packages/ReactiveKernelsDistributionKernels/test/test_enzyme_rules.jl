@@ -20,13 +20,15 @@ using Test
 const _DKS = ReactiveKernelsDistributionKernels.DistributionKernelSources
 
 @testset "Normal and Poisson tail cuts" begin
-    for z in (-40.0, -3.0, 0.0, 2.0, 12.0)
+    for z in (-40.0, -3.0, -nextfloat(0.0), 0.0, nextfloat(0.0), 2.0, 12.0)
         value, slope = derivative_cut(_DKS._standard_normal_logcdf, (true,), z)
         x = big(z)
         probability = SpecialFunctions.erfc(-x / sqrt(big(2))) / 2
         @test value == _DKS._normal_logcdf(z)
         @test slope ≈ Float64(exp(-x^2 / 2) / (sqrt(2 * big(π)) * probability)) rtol = 2e-14
     end
+    @test derivative_cut(_DKS._standard_normal_logcdf, (true,), -Inf) == (-Inf, Inf)
+    @test derivative_cut(_DKS._standard_normal_logcdf, (true,), Inf) == (0.0, 0.0)
     for (rate, observed) in ((0.0, 0), (0.0, 4), (0.7, 3.9), (20.0, 2),
                              (3.0, big"1.25"), (1e6, 1_000_000),
                              (1e6 + 1000, 1_000_000)), upper in (false, true)
