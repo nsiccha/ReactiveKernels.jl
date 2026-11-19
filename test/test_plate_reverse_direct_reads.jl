@@ -158,6 +158,28 @@ end
     @test err isa RK._PRIneligible
 end
 
+@testset "dense reverse checks strided, disjoint storage" begin
+    original = [0.3 * sin(i) for i in 1:258]
+    x = view(original, 1:256)
+    dx = zeros(length(x))
+    @test RK._pr_dense_reverse_cells(eachindex(x), (x,), (dx, nothing))
+    @test !RK._pr_dense_reverse_cells(ones(Int, length(x)), (x,), (dx,))
+    @test !RK._pr_dense_reverse_cells(eachindex(x), (x,), (dx, view(dx, :)))
+    @test !RK._pr_dense_reverse_cells(eachindex(x), (view(x, ones(Int, length(x))),), (dx,))
+    @test !RK._pr_dense_reverse_cells(eachindex(x), (x,), (view(dx, ones(Int, length(x))),))
+    shadow = view(original, 2:257)
+    @test !RK._pr_dense_reverse_cells(eachindex(x), (x,), (shadow,))
+    expected = copy(original)
+    for i in eachindex(x)
+        expected[i+1] += 0.7 * cos(expected[i])
+    end
+    ast = direct_program()
+    expr = first(RK._pr_program_reverse(ast, [:x], RK, Dict{Symbol,Any}()))
+    @test occursin("_pr_dense_reverse_cells", string(expr))
+    RK.compile(expr)(x, 0.7, Val(false), shadow)
+    @test original ≈ expected
+end
+
 seeded_plate(program, x, seed, slots...) = seed * program(x, slots...)
 
 function lazy_plate(program, x, scale, seed, overwrite)
@@ -352,4 +374,39 @@ end
     @test dx ≈ cos.(x) .+ s .* exp.(x)
     @test ds ≈ sum(exp, x)
 end
+
+@testset "grouped reverse checks the live gather span before addressing its parents" begin
+    expr = first(RK._pr_program_reverse(direct_program(), [:x], RK, Dict{Symbol,Any}()))
+    @test occursin("_pr_span_end", string(expr))
+    sweep = RK.compile(expr)
+    values = [sin(i / 5) for i in 1:16]
+    indices = repeat(collect(eachindex(values)), 3)
+    operand = view(values, indices)
+    destination = zeros(length(values))
+    shadow = view(destination, indices)
+    cells = eachindex(indices)
+    @test RK._pr_span_possible(cells, operand, shadow, (operand,))
+    @test !RK._pr_span_possible(cells, operand, operand, (operand,))
+    @test !RK._pr_span_possible(cells, operand, view(destination, copy(indices)), (operand,))
+    @test !RK._pr_span_possible(cells, operand, shadow, (operand, view(destination, indices)))
+    @test RK._pr_span_end(indices, 1, last(cells), indices[1], length(values)) == 16
+    for (edit, offset) in ((false, .2), (true, -.7), (true, .4))
+        values .+= offset
+        if edit
+            # End the second span in its middle. Both ends still match, so a
+            # check of only its endpoints would misaddress the interior cells.
+            indices[23] = 11
+            @test RK._pr_span_end(indices, 17, last(cells), indices[17], length(values)) < 17
+        end
+        fill!(destination, 0.0)
+        value, = sweep(operand, 1.7, Val(true), shadow)
+        expected = zeros(length(values))
+        for j in indices
+            expected[j] += 1.7 * cos(values[j])
+        end
+        @test destination ≈ expected
+        @test value ≈ sum(sin, operand)
+    end
+end
+
 end
