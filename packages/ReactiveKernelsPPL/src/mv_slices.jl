@@ -411,7 +411,7 @@ reductions, no loop over the slices.
 — the `Ordered(Normal(m, s), K)` convention (no `log(K!)` term), applied
 per slice.
 """
-function _ordered_normal_slices_logpdf(o, B, m, s)
+@traceable function _ordered_normal_slices_logpdf(o, B, m, s)
     n = _slice_count(o, B) * _slice_length(o, B)
     return -0.5 * sum(((B .- m) ./ s) .^ 2) - n * (log(s) + 0.5 * log(2pi))
 end
@@ -464,8 +464,14 @@ end
     cumsum(hcat(U[:, 1:1], exp.(U[:, 2:end])); dims = 2)
 @traceable _ordered_slices_constrain(o::_SliceCols, U) =
     cumsum(vcat(U[1:1, :], exp.(U[2:end, :])); dims = 1)
-_ordered_slices_logjac(::_SliceRows, U) = sum(U[:, 2:end])
-_ordered_slices_logjac(::_SliceCols, U) = sum(U[2:end, :])
+@traceable function _ordered_slices_logjac(o::_SliceRows, U)
+    increments = 2:size(U, 2)
+    return sum(U[:, increments])
+end
+@traceable function _ordered_slices_logjac(o::_SliceCols, U)
+    increments = 2:size(U, 1)
+    return sum(U[increments, :])
+end
 _ordered_slices_unconstrain(::_SliceRows, X) =
     hcat(X[:, 1:1], log.(diff(X; dims = 2)))
 _ordered_slices_unconstrain(::_SliceCols, X) =

@@ -16,6 +16,10 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.331
+
+- `prepare_nonallocating` reuses buffers for mixed scalar and range indexing, dimensional reductions of strided views, and broadcasts that gather array entries. Rank-changing reshapes can reuse their headers when the prepared kernel owns the source buffer.
+
 ## 0.1.330
 
 - Strict cell queries on Julia 1.12 and 1.13 recognize captured

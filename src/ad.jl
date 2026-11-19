@@ -443,27 +443,6 @@ _ad_hidden_operands(call, values) = values
 _ad_hidden_operands(::_ADKernelCall{I,<:_PackedOperandCall}, pack) where {I} =
     Tuple(only(pack))
 
-# Match one non-allocating cache step,
-# `__cache_apply__(__caches__[j], __callables__[j], callargs...)`, returning
-# the slot index and call arguments. Anything else is not a step.
-function _ad_na_step_parts(node, ops_length::Int)
-    node isa Expr && node.head === :call && length(node.args) >= 3 ||
-        return nothing
-    node.args[1] === _CACHE_APPLY_ARG || return nothing
-    caches_ref = node.args[2]
-    ops_ref = node.args[3]
-    caches_ref isa Expr && caches_ref.head === :ref &&
-        length(caches_ref.args) == 2 &&
-        caches_ref.args[1] === _CACHES_ARG &&
-        caches_ref.args[2] isa Int || return nothing
-    ops_ref isa Expr && ops_ref.head === :ref &&
-        length(ops_ref.args) == 2 && ops_ref.args[1] === _CALLABLES_ARG &&
-        ops_ref.args[2] isa Int || return nothing
-    step = caches_ref.args[2]
-    ops_ref.args[2] == step && 1 <= step <= ops_length || return nothing
-    step, node.args[4:end]
-end
-
 # AD-only plate application into an owned cache slot. The nonallocating cache
 # path executes plates via `broadcast!(op.kernel, result, ...)` where the cell
 # kernel is reached through the constant operation table; calling that
@@ -719,9 +698,17 @@ _ad_na_empty_array(::Type{A}) where {A<:Array} = A(undef, ntuple(_ -> 0, ndims(A
 function _ad_na_walk(node, tainted::Set{Symbol}, have_free::Set{Symbol},
                      constants::Tuple, ops::Tuple, caches::Tuple, elided::Set{Int},
                      fold_values::Vector{Any})
-    parts = _ad_na_step_parts(node, length(ops))
-    if parts !== nothing
-        step, callargs = parts
+    if Meta.isexpr(node, :call) && first(node.args) == GlobalRef(@__MODULE__, :_array_header!)
+        # Differentiate Base's reshape of the active parent. A header left
+        # over from a primal evaluation has no independent adjoint.
+        step = _table_slot(node.args[2], _CACHES_ARG)
+        push!(elided, step)
+        return _ad_na_walk(_plain_call(step, node.args[5:end]...), tainted,
+            have_free, constants, ops, caches, elided, fold_values)
+    end
+    step = _nonalloc_step_index(node, length(ops))
+    if step !== nothing
+        callargs = node.args[4:end]
         rewritten = Any[]
         step_tainted = false
         step_free = true

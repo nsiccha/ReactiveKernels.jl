@@ -572,10 +572,11 @@ end
 # bit-identical; the cache must already have the exact result shape and
 # eltype, and anything else reseeds through the twin call.
 @inline function MutatingFunctions.apply!!(
-        cache::Array{T}, op::ReactiveKernels._RowReduceStep, A::Array) where {T}
+        cache::Array{T}, op::ReactiveKernels._RowReduceStep, A::StridedArray) where {T}
     T === Base.promote_op(getfield(op, :f), eltype(A)) || return op(A)
     axes(cache) == Base.reduced_indices(axes(A), getfield(op, :dims)) ||
         return op(A)
+    Base.mightalias(cache, A) && return op(A)
     _rk_rowreduce_inplace!(getfield(op, :f), cache, A)
     cache
 end

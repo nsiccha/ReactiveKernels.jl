@@ -100,7 +100,7 @@ end
 _AccumulateStep(f::F, dims::Int) where {F} = _AccumulateStep{F,dims}(f)
 @inline (op::_AccumulateStep{F,D})(A) where {F,D} = op.f(A; dims = D)
 
-"One-dimensional gather (`x[idx]`); in-place layers may copy into a destination."
+"Slice or gather (`x[idx...]`); in-place layers may copy into a destination."
 struct _GatherStep end
 @inline (::_GatherStep)(x, idx...) = x[idx...]
 @inline (op::_FillConstructorStep)(dims::Integer...) = op.f(dims...)
@@ -156,6 +156,16 @@ end
 _step_call(j::Int, args...) = Expr(:call, _CACHE_APPLY_ARG,
     Expr(:ref, _CACHES_ARG, j), Expr(:ref, _CALLABLES_ARG, j), args...)
 _plain_call(j::Int, args...) = Expr(:call, Expr(:ref, _CALLABLES_ARG, j), args...)
+
+# The cache and operation of a destination step occupy the same table index.
+function _nonalloc_step_index(node, ops_length::Int)
+    Meta.isexpr(node, :call) && length(node.args) >= 3 &&
+        node.args[1] === _CACHE_APPLY_ARG || return nothing
+    step = _table_slot(node.args[2], _CACHES_ARG)
+    step !== nothing && step == _callable_slot(node.args[3]) &&
+        1 <= step <= ops_length || return nothing
+    step
+end
 
 # --- static typing helpers --------------------------------------------------
 
@@ -505,6 +515,17 @@ function _decompose_call_resolved(ctx::_FusedDecomposition, callee, f, fref,
                 kw.args[1] === :dims || return nothing
         end
     end
+    if kwargs !== nothing && f === Base.dropdims && length(kwargs) == 1 &&
+       length(positional) == 1
+        dims = _nonalloc_dims_const(only(kwargs))
+        dims === nothing && return nothing
+        d = _decompose(ctx, only(positional), false)
+        d === nothing && return nothing
+        # Keep Base's singleton check and its alias to the operand. The
+        # reduction inside dropdims can now fill its own destination.
+        return (Expr(:call, fref, Expr(:parameters, only(kwargs)), d[1]),
+                _static_dims_type(f, something(dims), d[2]))
+    end
     if kwargs !== nothing && (f === Base.cumsum || f === Base.cumprod) &&
        length(positional) == 1
         # A running sum or product along a constant axis fills its own buffer.
@@ -526,8 +547,8 @@ function _decompose_call_resolved(ctx::_FusedDecomposition, callee, f, fref,
             length(positional) == 1 || return nothing
         dimsval = _nonalloc_dims_const(only(kwargs))
         dimsval === nothing && return nothing
-        reduced = _decompose_singleton_reduction(ctx, positional[1])
-        reduced !== nothing && return reduced
+        # A dimensional reduction retains singleton axes, including when
+        # its operand already has just one entry.
         decomposed = _decompose_arguments(ctx, positional, false)
         decomposed === nothing && return nothing
         args, types = decomposed
@@ -910,17 +931,19 @@ function _decompose_getindex(ctx::_FusedDecomposition, xraw, idxraws)
     isconcretetype(T) && isbitstype(T) &&
         return (Expr(:call, GlobalRef(Base, :getindex), dx[1], idxs...), T)
     dx[2] isa Type && dx[2] <: AbstractArray || return nothing
-    all(t -> t isa Type &&
-             (t <: AbstractRange || t <: AbstractVector{<:Integer} ||
-              t <: Colon), itypes) || return nothing
+    all(t -> t isa Type && t <: _LaneIndex, itypes) || return nothing
+    if any(t -> t <: Integer, itypes)
+        # A slice drops its scalar axes. An all-scalar read may return a
+        # mutable element of the input, which cannot seed a destination.
+        all(t -> t <: Integer, itypes) && return nothing
+        dx[2] <: StridedArray && T <: Array || return nothing
+    end
     # A dedicated gather step whose arguments are the array and the index
     # values: one-dimensional vector gathers copy without constructing the
     # intermediate view object (which otherwise escapes once per call), while
     # every other shape takes the same view-plus-materialize computation the
     # in-place layer applies below, so behavior never regresses.
-    GT = _static_type(Base.getindex, dx[2], itypes...)
-    GT isa Type || return nothing
-    (_emit_step!(ctx, _GatherStep(), GT, dx[1], idxs...), GT)
+    (_emit_step!(ctx, _GatherStep(), T, dx[1], idxs...), T)
 end
 
 # Whether an index expression reads `endpoint` (`end` or `begin`) of the
@@ -1238,6 +1261,16 @@ end
 # sources, control flow) is kept.
 function _nonalloc_statement!(prog::_StepProgram, recipes::Vector{Recipe},
                               types::Dict{Symbol,Any}, stmt)
+    if _is_plate_block(stmt)
+        # The marked block includes work shared by the entire plate. Give its
+        # straight-line statements the usual destinations inside the existing
+        # nonempty guard. The cell loop keeps its own storage protocol.
+        body = Expr(:block, first(stmt.args))
+        for statement in stmt.args[2:end]
+            append!(body.args, _nonalloc_statement!(prog, recipes, types, statement))
+        end
+        return Any[body]
+    end
     if Meta.isexpr(stmt, :if)
         arms = Any[]
         armtypes = Dict{Symbol,Any}[]
@@ -1258,7 +1291,27 @@ function _nonalloc_statement!(prog::_StepProgram, recipes::Vector{Recipe},
         return Any[Expr(:if, stmt.args[1], arms...)]
     end
     stmt isa Expr && stmt.head === :(=) && stmt.args[1] isa Symbol &&
-        stmt.args[2] isa Expr && stmt.args[2].head === :call || return Any[stmt]
+        stmt.args[2] isa Expr || return Any[stmt]
+    # A plate's cell kernel may already have inlined the recipe in a let.
+    # Its recorded slot and argument names identify the same source a recipe
+    # call uses. Keep computed arguments in their original let, evaluated once.
+    inlined = _inline_statement_call(stmt.args[2])
+    if inlined !== nothing
+        i, args = inlined
+        if 1 <= i <= length(recipes) && !recipes[i].effectful &&
+                recipes[i].op isa _KernelSourceOp && !(recipes[i].source isa _NoKernelSource) &&
+                length(args) == length(recipes[i].inputs) && all(a -> a isa Symbol, args)
+            lhs = stmt.args[1]
+            dec = _decompose_fused_recipe!(prog, recipes[i], args,
+                _nonalloc_argument_types(types, args), lhs)
+            if dec !== nothing
+                types[lhs] = _nonalloc_tighter_type(get(types, lhs, Any), dec[2])
+                return dec[1]
+            end
+        end
+        return Any[stmt]
+    end
+    stmt.args[2].head === :call || return Any[stmt]
     call = stmt.args[2]
     call.args[1] == GlobalRef(@__MODULE__, :_cell_array_broadcast) &&
         length(call.args) == 2 &&
@@ -1466,14 +1519,24 @@ function _nonalloc_table_definitions(body)
     definitions
 end
 
+function _nonalloc_callee(head, ops)
+    slot = _callable_slot(head)
+    slot === nothing || return ops[slot]
+    head isa GlobalRef && isdefined(head.mod, head.name) && isconst(head.mod, head.name) ||
+        return nothing
+    getglobal(head.mod, head.name)
+end
+
 # The static type of `x` in a program body (`_nonallocating_program`): a
 # value's inferred type, a constant's own type, or what Julia infers for a call
 # of a constant function or operation on arguments of such types. `nothing`
 # when no concrete type follows.
 function _nonalloc_static_type(x, types, definitions, constants, ops,
                                seen = Set{Symbol}())
-    x isa Union{Number,Nothing} && return typeof(x)
+    x isa Union{Number,Nothing,Colon} && return typeof(x)
     x isa QuoteNode && return typeof(x.value)
+    Meta.isexpr(x, :tuple) && return _nonalloc_static_type(
+        Expr(:call, GlobalRef(Core, :tuple), x.args...), types, definitions, constants, ops, seen)
     if x isa Symbol
         T = get(types, x, nothing)
         T isa Type && isconcretetype(T) && return T
@@ -1484,11 +1547,7 @@ function _nonalloc_static_type(x, types, definitions, constants, ops,
     slot = _constant_slot(x)
     slot === nothing || return typeof(constants[slot])
     x isa Expr && x.head === :call || return nothing
-    head = first(x.args)
-    slot = _callable_slot(head)
-    f = slot !== nothing ? ops[slot] :
-        head isa GlobalRef && isdefined(head.mod, head.name) &&
-            isconst(head.mod, head.name) ? getglobal(head.mod, head.name) : nothing
+    f = _nonalloc_callee(first(x.args), ops)
     f === nothing && return nothing
     argtypes = Any[]
     for argument in x.args[2:end]
@@ -1498,6 +1557,108 @@ function _nonalloc_static_type(x, types, definitions, constants, ops,
     end
     T = Base.promote_op(f, argtypes...)
     isconcretetype(T) ? T : nothing
+end
+
+# A dense reshape has its own Array header on Julia 1.11+. Cache that header
+# only over an array in the producer's own slot. In particular a HAVE array,
+# and a view that merely borrows it, never become a preparation's destination.
+struct _ArrayHeader{F,D}
+    f::F
+    axis::D
+end
+@inline (h::_ArrayHeader)(A, args...) = h.f(A, args...)
+@inline (h::_ArrayHeader{typeof(dropdims)})(A) = dropdims(A; dims = h.axis)
+
+@inline function _same_array_start(A::Array, B::Array)
+    @static if hasfield(Array, :ref)
+        # The MemoryRef includes the offset. popfirst! can shift a vector
+        # inside the same Memory, even for zero-size elements with union tags.
+        return A.ref === B.ref
+    else
+        return Base.dataids(A) == Base.dataids(B)
+    end
+end
+
+@inline function _array_header!(slot, op, owner, A, args::Vararg{Any,N}) where {N}
+    owner[] === A || return op(A, args...)
+    entry = slot[]
+    if entry !== nothing
+        parent, shape, arguments, result = entry
+        # A Vector can grow and shrink to the same length on new storage.
+        # The returned vector header can also be resized by its caller.
+        if parent === A && shape == size(A) && arguments == args &&
+                length(result) == length(A) && _same_array_start(result, A)
+            return result
+        end
+    end
+    result = op(A, args...)
+    slot[] = (A, size(A), args, result)
+    result
+end
+
+function _nonalloc_header_call!(prog, call, owners, types, definitions, constants)
+    Meta.isexpr(call, :call) || return call
+    f = _nonalloc_callee(first(call.args), prog.ops)
+    (f === reshape || f === vec || f === dropdims) || return call
+    axis = nothing
+    if f === dropdims
+        length(call.args) == 3 && Meta.isexpr(call.args[2], :parameters, 1) || return call
+        kw = only(call.args[2].args)
+        Meta.isexpr(kw, :kw, 2) && kw.args[1] === :dims || return call
+        dim = _nonalloc_dims_const(kw)
+        dim === nothing && return call
+        axis = something(dim)
+        axis isa Int || return call
+        parent, args = call.args[3], Any[]
+    else
+        length(call.args) >= 2 || return call
+        parent, args = call.args[2], call.args[3:end]
+    end
+    parent isa Symbol && haskey(owners, parent) || return call
+    owner = owners[parent]
+    slot = prog.caches[owner]
+    slot isa Base.RefValue || return call
+    A = _nonalloc_slot_value(eltype(slot))
+    A isa DataType && A <: Array && isconcretetype(A) || return call
+    shape_types = map(a -> _nonalloc_static_type(a, types, definitions, constants, prog.ops), args)
+    shape_type = Union{Int,Colon}
+    all(T -> T isa DataType && isconcretetype(T) &&
+        (T <: shape_type || T <: Tuple{Vararg{shape_type}}), shape_types) || return call
+    f === dropdims && !(1 <= axis <= ndims(A)) && return call
+    R = f === dropdims ? Array{eltype(A),ndims(A) - 1} : _static_type(f, A, shape_types...)
+    R isa DataType && isconcretetype(R) && R <: Array && ndims(R) != ndims(A) || return call
+    entry = Tuple{A,NTuple{ndims(A),Int},Tuple{shape_types...},R}
+    j = _step!(prog, _ArrayHeader(f, axis), Ref{Union{Nothing,entry}}(nothing))
+    Expr(:call, GlobalRef(@__MODULE__, :_array_header!), Expr(:ref, _CACHES_ARG, j),
+        Expr(:ref, _CALLABLES_ARG, j), Expr(:ref, _CACHES_ARG, owner), parent, args...)
+end
+
+# Only straight-line storage is shared between calls. A loop iteration may
+# retain its own array results. Its body and nested lexical scopes stay intact.
+function _nonalloc_headers!(prog, body, owners, types, definitions, constants)
+    function rewrite(x)
+        Meta.isexpr(x, :call) || return x
+        replacement = x
+        for i in 2:length(x.args)
+            child = rewrite(x.args[i])
+            child === x.args[i] && continue
+            replacement === x && (replacement = Expr(:call, x.args...))
+            replacement.args[i] = child
+        end
+        _nonalloc_header_call!(prog, replacement, owners, types, definitions, constants)
+    end
+    for (i, st) in pairs(body.args)
+        Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol || continue
+        name, rhs = st.args
+        updated = rewrite(rhs)
+        updated === rhs || (body.args[i] = Expr(:(=), name, updated))
+        step = _nonalloc_step_index(rhs, length(prog.ops))
+        if step !== nothing
+            owners[name] = step
+        elseif rhs isa Symbol && haskey(owners, rhs)
+            owners[name] = owners[rhs]
+        end
+    end
 end
 
 """
@@ -1577,6 +1738,7 @@ function _nonallocating_program(p::Plan; have_types = nothing,
     # streamed into its plate, a row computed in a cell) leaves its lane unused.
     mentioned = _nonalloc_mentions!(Set{Symbol}(), body)
     lanes = Any[]
+    lane_slots = Dict{ValueId,Int}()
     for (cid, lane) in recycle
         lane in mentioned || continue
         # Typed by the value's inferred array type, so the program reads it
@@ -1585,12 +1747,15 @@ function _nonallocating_program(p::Plan; have_types = nothing,
         slot = A isa Type && A <: Array && isconcretetype(A) ?
             Base.RefValue{Union{Nothing,A}}(nothing) : Ref{Any}(nothing)
         j = _step!(prog, _NonallocLane(), slot)
+        lane_slots[cid] = j
         push!(lanes, Expr(:(=), lane, Expr(:ref, _CACHES_ARG, j)))
     end
     # A table's slot is typed by the array its allocation returns for the
     # root's static type, as a lane is by its value's type; a root whose type
     # is not inferred keeps a `Ref{Any}`.
     definitions = _nonalloc_table_definitions(body)
+    owners = Dict(name => lane_slots[cid] for (name, cid) in value_ids if haskey(lane_slots, cid))
+    _nonalloc_headers!(prog, body, owners, types, definitions, constants)
     for (lane, root) in table_lanes
         lane in mentioned || continue
         R = _nonalloc_static_type(root, types, definitions, constants, prog.ops)

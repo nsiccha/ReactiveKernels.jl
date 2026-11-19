@@ -110,8 +110,9 @@ end
 # returned by `_ppl_categorical_column` once the vector is checked. That check
 # uses the column sums and sign of `A` (`_ppl_categorical_columns`), which
 # read `A` only: a plate invariant.
-_ppl_categorical_columns(A::AbstractMatrix) =
-    (vec(sum(A; dims=1)), all(a -> a >= zero(a), A))
+_ppl_nonnegative(a) = a >= zero(a)
+@traceable _ppl_categorical_columns(A::AbstractMatrix) =
+    (sum(A; dims=1), all(_ppl_nonnegative, A))
 _ppl_categorical_columns(A) = nothing
 # The check `_ppl_categorical_probabilities(A * B[:, j])` makes, and `j`.
 function _ppl_categorical_column(columns::Tuple, A::AbstractMatrix,

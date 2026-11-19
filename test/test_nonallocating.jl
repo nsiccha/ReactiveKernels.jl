@@ -32,6 +32,14 @@ const SPEC = @kernel traced_steps(x::Vector{Float64}, w::Float64) = begin
     y::Vector{Float64} = centered_squares(x, w)
     out::Float64 = sum(y)
 end
+@traceable column_stats(A) = (sum(A; dims = 1), all(isfinite, A))
+const COLUMN_TOTAL = @kernel column_total(A::Matrix{Float64}, columns::Vector{Int}) = begin
+    cells = plate(columns) do j
+        stats = column_stats(A)
+        stats[2] ? stats[1][j] : 0.0
+    end
+    total::Float64 = sum(cells)
+end
 end
 
 # An argument check (`... ? s : throw(...)`) feeding a traced helper whose
@@ -75,7 +83,11 @@ using ReactiveKernels
 end
 @traceable function tail_terms(U)
     z, lr = running_parts(U)
-    sum(lr[:, 1:(end - 1)] .+ log.(z)) + sum(lr[:, begin:begin])
+    sum(lr[:, 1:(end - 1)] .+ log.(z)) + sum(lr[:, begin])
+end
+@traceable mixed_slices(U, k) = sum(U[:, k]) + sum(U[k, 2:end])
+const MIXED = @kernel mixed(U::Matrix{Float64}, k::Int) = begin
+    total::Float64 = mixed_slices(U, k)
 end
 @traceable function first_part(U)
     z, _ = running_parts(U)
@@ -463,7 +475,7 @@ end
     @testset "a traced helper's tuple result, running sums and end indices fill buffers" begin
         # `z, lr = running_parts(U)` binds the fields of the helper's tuple
         # result; the `hcat`, the running sum along rows, `lr[:, 1:(end - 1)]`
-        # and `lr[:, begin:begin]` each fill a buffer of their own. Before, the
+        # and `lr[:, begin]` each fill a buffer of their own. Before, the
         # destructuring left the helper's whole call fresh on every
         # evaluation.
         spec = TracedTupleFixture.SPEC
@@ -478,6 +490,16 @@ end
             @test k(U) == ordinary(U)
         end
         @test kernel_allocations(k, [0.3 * sin(i + 2j) for i in 1:6, j in 1:4]) == 0
+    end
+
+    @testset "integer and range indices drop their scalar axes" begin
+        k = prepare_nonallocating(TracedTupleFixture.MIXED; have = (:U, :k), want = :total)
+        @test count(op -> op isa ReactiveKernels._GatherStep, called_ops(k)) == 2
+        for U in (reshape(sin.(1:24), 4, 6), ones(1, 1)), i in 1:min(size(U)...)
+            @test k(U, i) == sum(U[:, i]) + sum(U[i, 2:end])
+            @test kernel_allocations(k, U, i) == 0
+        end
+        @test_throws BoundsError k(zeros(2, 3), 3)
     end
 
     @testset "permutedims and hcat fill buffers of their own" begin
@@ -656,6 +678,31 @@ end
         k_cs = prepare_nonallocating(colsum_spec; have = (:m,), want = :out)
         @test k_cs(m) == ordinary_cs(m)
         @test any(op -> op isa ReactiveKernels._RowReduceStep, called_ops(k_cs))
+
+        # Both wrapped operands have strided storage. A matching destination
+        # is reused even when the input is displaced from its parent's start.
+        reduction = ReactiveKernels._RowReduceStep(sum, 1)
+        for A in (view(m, 2:2:64, :), reshape(view(vec(m), 7:18), 3, 4))
+            dest = similar(sum(A; dims = 1))
+            @test MutatingFunctions.apply!!(dest, reduction, A) === dest
+            @test isequal(dest, sum(A; dims = 1))
+        end
+
+        collapsed = @kernel stream_sum(x::Array{Float64,3}) = begin
+            r = dropdims(sum(x; dims = 3); dims = 3)
+            total::Float64 = sum(abs2, r)
+        end
+        streams = prepare_nonallocating(collapsed; have = (:x,), want = :total)
+        @test any(op -> op isa ReactiveKernels._RowReduceStep, called_ops(streams))
+        for shape in ((2, 3, 4), (7, 1, 0), (0, 2, 3))
+            x = reshape(sin.(1:prod(shape)), shape)
+            @test streams(x) == sum(abs2, dropdims(sum(x; dims = 3); dims = 3))
+        end
+        singleton = @kernel singleton_sum(x::Vector{Float64}) = begin
+            one_row = sum(view(x, 2:2); dims = 1)
+            count::Int = ndims(one_row)
+        end
+        @test prepare_nonallocating(singleton; have = (:x,), want = :count)([1.0, 2.0]) == 1
     end
 
     @testset "running sums along a constant axis become destination steps" begin
@@ -688,6 +735,17 @@ end
         @test k_dyn(m, 2) == ordinary_dyn(m, 2)
         @test any(source_entry, called_ops(k_dyn))
         @test !any(op -> op isa ReactiveKernels._RowReduceStep, called_ops(k_dyn))
+    end
+
+    @testset "a traced column reduction shared by the plate reuses its buffer" begin
+        k = prepare_nonallocating(TracedStepsFixture.COLUMN_TOTAL; want = :total)
+        for n in (2, 5, 1)
+            A = reshape(collect(1.0:3n), 3, n)
+            columns = [n, 1, n]
+            @test k(A, columns) == sum(sum(A; dims = 1)[columns])
+            @test kernel_allocations(k, A, columns) == 0
+            @test k(A, Int[]) == 0.0
+        end
     end
 
     @testset "authored plates keep exact pointwise semantics" begin

@@ -16,6 +16,10 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.236
+
+- Repeated sampler density calls reuse intermediate storage when unpacking array parameters, evaluating ordered slices and reducing categorical probability columns.
+
 ## 0.1.235
 
 - `marginalize` integrates a coupled Gaussian scan inside a plate, including

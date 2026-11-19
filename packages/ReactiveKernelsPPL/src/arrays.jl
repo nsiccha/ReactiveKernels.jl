@@ -1789,8 +1789,8 @@ function _array_transform_statements(e::LayoutEntry)
         o = _orientation_expr(_slice_transform_orientation(e.transform))
         stmts = Expr[
             :($raw = $(_entry_view(e))),
-            :($flat = Float64.($raw)),
-            :($U::Matrix{Float64} = reshape($flat, $(_entry_axes(e)...))),
+            :($U::Matrix{Float64} = Float64.(reshape($raw, $(_entry_axes(e)...)))),
+            :($flat = vec($U)),
         ]
         if e.transform in (:simplex_rows, :simplex_cols)
             breaks = _array_simplex_breaks(e.name)
