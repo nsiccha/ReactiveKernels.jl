@@ -71,6 +71,8 @@ Call the scheduled reader with representative inputs in the consuming package's
 precompile workload. For example, a read with two positions and
 `NativeScheduling(; chunk_size=8)` runs the shared prefix and gives one
 position to each of two worker tasks, even on a single-threaded image builder.
-After loading, ordinary calls use the runtime thread and chunk limits.
+The same call precompiles the serial driver and its generated function for
+the input types it receives. After loading, a batch that fits in one chunk
+can use this code even if the workload ran every batch on worker tasks.
 An explicit `workers=1` warms the serial driver. Empty batches also follow
 the serial path.

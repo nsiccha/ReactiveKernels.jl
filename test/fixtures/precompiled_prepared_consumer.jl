@@ -1,6 +1,7 @@
 module PrecompiledPreparedConsumer
 
 using ReactiveKernels
+using PrecompileTools: @compile_workload
 
 const WAS_PRECOMPILED = ccall(:jl_generating_output, Cint, ()) != 0
 
@@ -56,6 +57,27 @@ const SCHEDULED_WARMUP = SCHEDULED([2.0, 3.0], [4.0, 5.0])
 const SERIAL_WARMUP = ONE_WORKER([2.0, 3.0], [4.0, 5.0])
 const TWO_WORKERS = scheduled(NativeScheduling(; chunk_size=2, workers=2))
 const SINGLE_WARMUP = TWO_WORKERS([2.0], [4.0])
+
+# This graph belongs exclusively to the staged workload. Its wide serial
+# driver can dispatch to the generated function even after driver precompilation.
+const STAGED_OFFSETS = ntuple(Float64, 80)
+const STAGED_SUM = let graph = Graph()
+    ports = ntuple(i -> value!(graph, Symbol(:term, i), Float64), length(STAGED_OFFSETS) + 1)
+    total = value!(graph, :total, Float64)
+    add!(graph, ports => (total,), +)
+    prepare(graph; have=ports, want=(total,))
+end
+staged_reader(reuse) = vectorize(STAGED_SUM; batched=:term1, reuse,
+                                 schedule=NativeScheduling(; chunk_size=8, workers=4))
+@compile_workload begin
+    for reuse in (true, false)
+        reader = staged_reader(reuse)
+        for n in (2, 3, 12)
+            draws = collect(1.0:n)
+            @assert reader(draws, STAGED_OFFSETS...) == draws .+ sum(STAGED_OFFSETS)
+        end
+    end
+end
 
 @kernel pair_locations(x) = begin
     locations = Float64.(x)
