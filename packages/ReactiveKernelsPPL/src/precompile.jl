@@ -31,12 +31,31 @@ function _construction_workload()
     # points there (`condition`, `_lower_model_latest`).
     model = RKPPLModel(body, @__MODULE__)
     surface = model(; x = columns[:x], g = columns[:g]) | (; y = columns[:y])
-    build_kernel(surface)
+    return build_kernel(surface), surface
+end
+
+function _marginalized_workload()
+    model = @rkppl begin
+        scale ~ Exponential(1)
+        @scan begin
+            x[1] = 0.0
+            for t in 2:T
+                innovation ~ Normal(0, 1)
+                step = scale * innovation
+                x[t] = x[t - 1] + step
+            end
+        end
+        y .~ Normal.(x, 1)
+    end
+    plan = marginalize(model(), :x) | (; y = [0.2, -0.1, 0.4])
+    prepare_query(build_kernel(plan), plan, :likelihood)
     return nothing
 end
 
 @setup_workload begin
     @compile_workload begin
-        _construction_workload()
+        built, plan = _construction_workload()
+        prepare_coordinate_conditional(built, plan, zeros(built.layout.total))
+        _marginalized_workload()
     end
 end

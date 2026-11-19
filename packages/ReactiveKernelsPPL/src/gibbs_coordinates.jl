@@ -352,7 +352,7 @@ function prepare_coordinate_conditional(built, plan::StructuralPlan, u0::Abstrac
 
     blocks = NamedTuple[]
     if readers.recognized && !isempty(readers.ranges)
-        values = whole(:_ppl_cg_measured)(u)
+        values = Base.invokelatest(whole(:_ppl_cg_measured), u)
         r = 2length(readers.ranges)
         spans = [Int(values[2i - 1]):Int(values[2i]) for i in eachindex(readers.ranges)]
         plate_length = Dict(first(how) => Int(values[r + c]) for (c, how) in enumerate(candidates))
