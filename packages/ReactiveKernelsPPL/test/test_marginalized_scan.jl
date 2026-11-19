@@ -1731,6 +1731,81 @@ end
     end
 end
 
+@testset "marginalized plate observations gather a shared predictor by each cell's rows" begin
+    function model(offset, logscale)
+        RKPPLModel(quote
+            gain ~ Normal(0, 1)
+            mu = gain .* x
+            @plate for g in eachindex(y)
+                ix = rows[g]
+                @scan begin
+                    a[1] ~ Normal(0, 1)
+                    b[1] ~ Normal(0.5 * a[1], 0.3)
+                    for t in 2:length(y[g])
+                        a[t] ~ Normal(0.8 * a[t-1] + 0.1 * b[t-1], 0.4)
+                        b[t] ~ Normal(0.5 * a[t], 0.3)
+                    end
+                end
+                y[g] .~ Normal.($offset .+ b, exp.($logscale))
+            end
+        end, @__MODULE__)
+    end
+    x = [0.1, -0.3, 0.9, 0.5, 0.2]
+    rows = [[4, 1], [3, 2, 3]]
+    y = [[0.2, 0.3], [-0.1, 0.3, 0.4]]
+    xg = [x[ix] for ix in rows]
+    names = (:pred, :pred_sd)
+    integrate(m) = marginalize(m, :a, :b; predictive = (location = :pred, scale = :pred_sd))
+    gathered = integrate(model(:(mu[ix]), :(mu[rows[g]])))
+    plan = gathered(; x, rows) | (; y)
+    ref = integrate(model(:(gain .* xg[g]), :(gain .* xg[g])))(; x, rows, xg) | (; y)
+    built, refbuilt = build_kernel(plan), build_kernel(ref)
+    u = [0.2]
+    @test same_density(built, plan, refbuilt, ref, u)
+    v = named_values(built, plan, names, u)
+    @test v == named_values(refbuilt, ref, names, u)
+    @test all(col -> length.(col) == length.(y), v)
+    function value_grad(b, p)
+        s = prepare_sampler(b, p, zeros(length(u)); backend = DI.AutoEnzyme(; mode = Enzyme.Reverse))
+        sampler_value_and_gradient!(s, similar(u), u)
+    end
+    expected, grad = value_grad(refbuilt, ref)
+    actual, d = value_grad(built, plan)
+    @test actual ≈ expected
+    @test d ≈ grad
+    ref_density = prepare_query(refbuilt, ref, :sampler)
+    @test d ≈ rk_fd_gradient(p -> Base.invokelatest(ref_density, p), u) rtol = 1e-6
+
+    larger_rows = [mod1.(1:n, length(x)) for n in (7, 4, 9)]
+    larger = gathered(; x, rows = larger_rows) | (; y = [zeros(length(ix)) for ix in larger_rows])
+    largebuilt = build_kernel(larger)
+    @test structure(largebuilt.spec) == structure(built.spec)
+    empty_plan = gathered(; x, rows = Vector{Int}[]) | (; y = Vector{Float64}[])
+    @test Base.invokelatest(prepare_query(build_kernel(empty_plan), empty_plan, :likelihood), u) == 0
+    # Ignoring an extra index would silently discard an observation predictor.
+    @test_throws SurfaceLoweringError gathered(; x, rows = [[4, 1, 2], rows[2]]) | (; y)
+    src = jax_source(built, plan; values = names)
+    @test occursin("UNTRANSLATED = {}", string(src))
+    if rk_jax_available()
+        args = (u, jax_raw_data(plan, src)...)
+        r = rk_jax_evaluate(src, "log_density", args; grad = true, prepare = true)
+        @test r.value ≈ expected
+        @test r.grad ≈ grad
+        large_args = (u, jax_raw_data(larger, src)...)
+        @test rk_jax_evaluate(src, "log_density", large_args; prepare = true).value ≈
+            Base.invokelatest(prepare_query(largebuilt, larger, :sampler), u)
+        vals = rk_jax_evaluate(src, "constrain", args; prepare = true).value
+        for (name, column) in zip(names, v)
+            @test vals[string(name, "_lengths")] == length.(y)
+            for g in eachindex(y)
+                @test vals[string(name)][g][eachindex(y[g])] ≈ column[g]
+            end
+        end
+    else
+        @test_skip false
+    end
+end
+
 @testset "two structural seeds in a plate cell" begin
     ar = @rkppl begin
         @plate for g in eachindex(y)

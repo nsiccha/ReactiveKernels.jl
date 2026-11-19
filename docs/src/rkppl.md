@@ -224,7 +224,8 @@ draws = marginalized_latent_draws(prepare_marginalized_latents(built_trend, smoo
 (; coordinates=coordinate_names(built_trend.layout), draws.level, draws.slope)
 ```
 
-An AR(p) seeded at `x[1]`, …, `x[p]` integrates out the same way, as `marginalize(model, :x)`. A recurrence a submodel holds is named by its path, `marginalize(model, Symbol("z.x"))` for `x` of `z ~ sm(…)`, and its draws nest as `draws.z.x`.
+`marginalize(model, :x)` also integrates an AR(p) seeded at `x[1]`, …, `x[p]`.
+For `x` inside `z ~ sm(…)`, use `marginalize(model, Symbol("z.x"))` and read `draws.z.x`.
 
 A `@plate` filters each group's observation vector separately and returns one trajectory per group:
 
@@ -254,8 +255,10 @@ latents = prepare_marginalized_latents(built_cells, cells)
 ```
 
 For coupled arrays, `marginalize(model, :level, :slope; predictive = (location = :loc, scale = :pred_sd))` returns each group's predictive locations and scales in time order. Submodel paths work inside cells too.
+Offsets, loadings and scales can gather a shared predictor as `mu[rows[g]]` or
+`ix = rows[g]; mu[ix]`, one index per observation.
 
-The filter requires Normal observations. Nested plates, missing entries or gathered rows in a cell, and vector states observed through missing entries, a defined vector or gathered rows are currently unsupported.
+The filter requires Normal observations. Nested plates, missing entries or gathered state steps in a cell, and vector states observed through missing entries, a defined vector or gathered steps are currently unsupported.
 
 ## Adaptive partial centering
 
