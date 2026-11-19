@@ -6466,12 +6466,14 @@ Base.@nospecializeinfer function rename(@nospecialize(spec::KernelSpec),
     end
     port_name(name::Symbol) = get(names, name, name)
     renamed = Symbol[port_name(name) for name in order]
-    for name in unique(renamed)
-        sources = order[renamed .== name]
-        length(sources) == 1 || throw(ArgumentError(
-            "cannot rename ports to :$name: it would name the ports " *
-            join(string.(":", sources), " and ") * "; rename onto a free name, " *
-            "or join same-name ports with `compose`"))
+    if !allunique(renamed)
+        for name in unique(renamed)
+            sources = order[renamed .== name]
+            length(sources) == 1 || throw(ArgumentError(
+                "cannot rename ports to :$name: it would name the ports " *
+                join(string.(":", sources), " and ") * "; rename onto a free name, " *
+                "or join same-name ports with `compose`"))
+        end
     end
 
     graph = Graph()

@@ -628,7 +628,7 @@ function prepare_sampler(built, plan::StructuralPlan, u0::AbstractVector{<:Real}
     choice = nonallocating
     nonallocating = _sampler_nonallocating(choice, backend, retain,
                                            native_forward_batch)
-    built = _binding_build(built, plan)
+    built = _sampler_build(_binding_build(built, plan), plan)
     layout = built.layout::LayoutTable
     length(u0) == layout.total || throw(ContractValidationError(
         "[query] exemplar length $(length(u0)) ≠ layout total $(layout.total)"))
