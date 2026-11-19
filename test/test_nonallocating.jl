@@ -75,7 +75,11 @@ using ReactiveKernels
 end
 @traceable function tail_terms(U)
     z, lr = running_parts(U)
-    sum(lr[:, 1:(end - 1)] .+ log.(z)) + sum(lr[:, begin:begin])
+    sum(lr[:, 1:(end - 1)] .+ log.(z)) + sum(lr[:, begin])
+end
+@traceable mixed_slices(U, k) = sum(U[:, k]) + sum(U[k, 2:end])
+const MIXED = @kernel mixed(U::Matrix{Float64}, k::Int) = begin
+    total::Float64 = mixed_slices(U, k)
 end
 @traceable function first_part(U)
     z, _ = running_parts(U)
@@ -463,7 +467,7 @@ end
     @testset "a traced helper's tuple result, running sums and end indices fill buffers" begin
         # `z, lr = running_parts(U)` binds the fields of the helper's tuple
         # result; the `hcat`, the running sum along rows, `lr[:, 1:(end - 1)]`
-        # and `lr[:, begin:begin]` each fill a buffer of their own. Before, the
+        # and `lr[:, begin]` each fill a buffer of their own. Before, the
         # destructuring left the helper's whole call fresh on every
         # evaluation.
         spec = TracedTupleFixture.SPEC
@@ -478,6 +482,16 @@ end
             @test k(U) == ordinary(U)
         end
         @test kernel_allocations(k, [0.3 * sin(i + 2j) for i in 1:6, j in 1:4]) == 0
+    end
+
+    @testset "integer and range indices drop their scalar axes" begin
+        k = prepare_nonallocating(TracedTupleFixture.MIXED; have = (:U, :k), want = :total)
+        @test count(op -> op isa ReactiveKernels._GatherStep, called_ops(k)) == 2
+        for U in (reshape(sin.(1:24), 4, 6), ones(1, 1)), i in 1:min(size(U)...)
+            @test k(U, i) == sum(U[:, i]) + sum(U[i, 2:end])
+            @test kernel_allocations(k, U, i) == 0
+        end
+        @test_throws BoundsError k(zeros(2, 3), 3)
     end
 
     @testset "permutedims and hcat fill buffers of their own" begin

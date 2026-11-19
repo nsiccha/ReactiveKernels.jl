@@ -100,7 +100,7 @@ end
 _AccumulateStep(f::F, dims::Int) where {F} = _AccumulateStep{F,dims}(f)
 @inline (op::_AccumulateStep{F,D})(A) where {F,D} = op.f(A; dims = D)
 
-"One-dimensional gather (`x[idx]`); in-place layers may copy into a destination."
+"Slice or gather (`x[idx...]`); in-place layers may copy into a destination."
 struct _GatherStep end
 @inline (::_GatherStep)(x, idx...) = x[idx...]
 @inline (op::_FillConstructorStep)(dims::Integer...) = op.f(dims...)
@@ -910,17 +910,19 @@ function _decompose_getindex(ctx::_FusedDecomposition, xraw, idxraws)
     isconcretetype(T) && isbitstype(T) &&
         return (Expr(:call, GlobalRef(Base, :getindex), dx[1], idxs...), T)
     dx[2] isa Type && dx[2] <: AbstractArray || return nothing
-    all(t -> t isa Type &&
-             (t <: AbstractRange || t <: AbstractVector{<:Integer} ||
-              t <: Colon), itypes) || return nothing
+    all(t -> t isa Type && t <: _LaneIndex, itypes) || return nothing
+    if any(t -> t <: Integer, itypes)
+        # A slice drops its scalar axes. An all-scalar read may return a
+        # mutable element of the input, which cannot seed a destination.
+        all(t -> t <: Integer, itypes) && return nothing
+        dx[2] <: StridedArray && T <: Array || return nothing
+    end
     # A dedicated gather step whose arguments are the array and the index
     # values: one-dimensional vector gathers copy without constructing the
     # intermediate view object (which otherwise escapes once per call), while
     # every other shape takes the same view-plus-materialize computation the
     # in-place layer applies below, so behavior never regresses.
-    GT = _static_type(Base.getindex, dx[2], itypes...)
-    GT isa Type || return nothing
-    (_emit_step!(ctx, _GatherStep(), GT, dx[1], idxs...), GT)
+    (_emit_step!(ctx, _GatherStep(), T, dx[1], idxs...), T)
 end
 
 # Whether an index expression reads `endpoint` (`end` or `begin`) of the
