@@ -247,6 +247,15 @@ end
         end
         factored(k) = occursin("_plate_factor_usable", _program(k))
         expected = Dict(on => factored(prepared(PreparationCache(), on)) for on in (false, true))
+        if isempty(binding)
+            # Positional calls keep a graph-owned cache for their default boundary.
+            for on in (true, false, true)
+                with_plate_reverse(on) do
+                    @test _guarded_normal(args...) ≈ _reference_normal(y, mu, 1.3)
+                    @test factored(ReactiveKernels._kernel_direct_callable(_guarded_normal)) == expected[on]
+                end
+            end
+        end
         for order in ((false, true), (true, false))
             cache = PreparationCache()
             for on in order
