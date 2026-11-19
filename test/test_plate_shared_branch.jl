@@ -405,6 +405,18 @@ end
     value, gradient = ad_value_and_gradient(pb, x, 2.0)
     @test value ≈ 5.0 + 5.5log(2.0)
     @test gradient ≈ 5.5 / 2.0
+
+    with_plate_reverse() do
+        k = prepare(_endpoint_law_math_plate)
+        report = plate_reverse_report(k, 2)
+        @test !isempty(report) && all(r -> last(r) == "rule", report)
+        pb = prepare_ad(k, backend, x, 2.0; active = :scale)
+        for (cells, scale) in ((x, 2.0), (Float64[], -1.0), ([-1.0, -3.0], -1.0))
+            value, gradient = ad_value_and_gradient(pb, cells, scale)
+            @test value ≈ sum(xi -> xi > 0 ? xi * log(scale) : -xi, cells; init = 0.0)
+            @test gradient ≈ sum(xi -> xi > 0 ? xi / scale : 0.0, cells; init = 0.0)
+        end
+    end
 end
 
 @testset "bound data and native Reverse through a shared plate branch" begin

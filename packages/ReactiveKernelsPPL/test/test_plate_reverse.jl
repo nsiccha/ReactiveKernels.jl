@@ -356,6 +356,12 @@ end
         built, bound = _prv_build(model, d, Tuple(keys(d)))
         report = _prv_compare(built, bound)
         @info "plate reverse: $name" report
+        if name in ("NegativeBinomial2", "truncated Normal", "interval censored Normal",
+                    "censored counts")
+            # Check every total, including each partition of the censored counts.
+            @test !isempty(report)
+            @test all(r -> last(r) == "rule", report)
+        end
     end
 
     # The rule has no forward branch of its own: forward mode, and so reverse

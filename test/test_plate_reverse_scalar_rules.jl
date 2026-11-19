@@ -219,4 +219,38 @@ end
         @test ds ≈ seed * (x > 0 ? exp(s) : x)
     end
 end
+
+@testset "scalar source cuts preserve bindings and lazy arms" begin
+    source = RK.compile(:(function (x)
+        t = let x = 2x
+            x > 0 ? log(x) : -x
+        end
+        return t + x
+    end))
+    cut = RK._pr_program_cut(source, Any[:x], (true,), ())
+    joint = RK.compile(:(x -> $cut))
+    @test joint(-2.0) == (2.0, -1.0)
+    value, slope = joint(3.0)
+    @test value ≈ log(6.0) + 3.0
+    @test slope ≈ 1 + 1 / 3
+    overwritten = RK.compile(:(function (x)
+        y = x + 1
+        y = y * x
+        return y
+    end))
+    versioned = try
+        RK._pr_program_cut(overwritten, Any[:x], (true,), ())
+    catch err
+        err isa RK._PRIneligible || rethrow()
+        nothing
+    end
+    if versioned !== nothing
+        @test RK.compile(:(x -> $versioned))(3.0) == (12.0, 7.0)
+    end
+
+    # A dynamic field selector can choose either callable at execution.
+    ctx = RK._PRCtx(@__MODULE__, 0, Dict{Symbol,Any}(:record => (field = sin, other = cos)))
+    @test RK._pr_known_value(:(Core.getfield(record, field)), ctx) === nothing
+    @test something(RK._pr_known_value(:(Core.getfield(record, :other)), ctx)) === cos
+end
 end

@@ -134,6 +134,15 @@ function _inline_source_form(r::Recipe, callargs, slot::Int)
     mod isa Module || return nothing
     names = keys(captures)
     native = _kernel_native_body(source, mod, Set{Symbol}(params))
+    # Only exp(::Matrix{Float64}) needs the owned matrix primitive, and
+    # that method returns a matrix. Either end of a real-valued recipe
+    # therefore identifies the scalar call, including a composed endpoint
+    # whose local input has lost its type but whose output is still typed.
+    if Meta.isexpr(native, :call, 2) && native.args[1] == GlobalRef(@__MODULE__, :_native_exp) &&
+            length(params) == 1 && native.args[2] === only(params) &&
+            (valtype(only(r.inputs)) <: Real || length(r.outputs) == 1 && valtype(only(r.outputs)) <: Real)
+        native = Expr(:call, GlobalRef(Base, :exp), only(params))
+    end
     _kernel_source_native_scope(native) && return nothing
     body = try
         macroexpand(mod, native)

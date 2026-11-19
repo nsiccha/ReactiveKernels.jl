@@ -3255,7 +3255,7 @@ end
 # and arm callables are the same branch parts used by plate partitioning;
 # emitting them here retains the authored lazy choice.
 function _native_plate_branch_expr(
-        branch::_KernelBranch{CI,TI,EI}, reference, args) where {CI,TI,EI}
+        branch::Union{_KernelBranch{CI,TI,EI},_KernelBranchCall{CI,TI,EI}}, reference, args) where {CI,TI,EI}
     condition = Expr(:call, :(getfield($reference, :condition)),
                      (args[i] for i in CI)...)
     arm_expr(arm, field, indices) = begin
