@@ -156,6 +156,28 @@ end
     @test all(j -> sum(r.nt.P[:, j]) ≈ 1, 1:3)
 end
 
+@testset "simplex slice values and log-Jacobians agree with individual sticks" begin
+    # No groups, no breaks, an ordinary batch, and sticks whose final mass
+    # underflows. The last case still has a finite log-Jacobian.
+    for (n, groups) in ((3, 0), (0, 3), (4, 3), (220, 2))
+        u = reshape([0.2 * sin(i) for i in 1:(n * groups)], n, groups)
+        expected = zeros(n + 1, groups)
+        jac = 0.0
+        for j in axes(u, 2)
+            expected[:, j] = simplex_constrain(u[:, j])
+            jac += simplex_logjac(u[:, j])
+        end
+        @test isfinite(jac)
+        for (o, packed, p) in ((ReactiveKernelsPPL._SliceCols(), u, expected),
+                               (ReactiveKernelsPPL._SliceRows(), permutedims(u), permutedims(expected)))
+            actual = ReactiveKernelsPPL._simplex_slices_constrain(o, packed)
+            @test size(actual) == size(p)
+            @test actual ≈ p
+            @test ReactiveKernelsPPL._simplex_slices_logjac(o, packed) ≈ jac
+        end
+    end
+end
+
 # Both outputs contribute to the derivative: summing a simplex itself would
 # give a constant and leave only the log-Jacobian to check.
 function _sl_transform_objective(o, u)
