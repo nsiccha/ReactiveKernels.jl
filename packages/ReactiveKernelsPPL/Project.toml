@@ -1,7 +1,7 @@
 name = "ReactiveKernelsPPL"
 uuid = "e266ea2a-6817-46cd-8bec-6238f0035f44"
 authors = ["Nikolas Siccha <nikolassiccha@gmail.com>"]
-version = "0.1.227"
+version = "0.1.228"
 
 [deps]
 Compat = "34da2185-b29b-5c13-b0c7-acf172513d20"
@@ -34,6 +34,7 @@ ReactiveKernelsPPLFilterExt = ["Distributions", "Random", "SequentialMonteCarlo"
 ReactiveKernelsPPLLogDensityProblemsExt = "LogDensityProblems"
 ReactiveKernelsPPLWarmupHMCExt = ["WarmupHMC", "LogDensityProblems"]
 ReactiveKernelsPPLGibbsExt = ["WarmupHMC", "LogDensityProblems", "Random"]
+ReactiveKernelsPPLSamplerConstructionExt = ["WarmupHMC", "Enzyme"]
 
 [sources]
 MutatingFunctions = {url = "https://github.com/nsiccha/MutatingFunctions.jl.git", rev = "02eb981b9770e767f47a7fda287fcbfb9531d587"}

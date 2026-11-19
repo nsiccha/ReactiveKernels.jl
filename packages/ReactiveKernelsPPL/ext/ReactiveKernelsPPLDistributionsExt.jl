@@ -4,6 +4,7 @@ import Distributions
 import ReactiveKernelsPPL
 import ReactiveKernelsDistributionKernels: DistributionKernelSources
 using LogExpFunctions: logistic
+using PrecompileTools: @compile_workload
 
 ReactiveKernelsPPL._predictive_mixture(components::AbstractVector, weights::AbstractVector) =
     Distributions.MixtureModel(components, weights ./ sum(weights))
@@ -226,5 +227,9 @@ _evidence(::Val{:censored}, law, c) = Distributions.censored(law;
     lower = get(c, :lower, nothing), upper = get(c, :upper, nothing))
 _evidence(::Val{:truncated}, law, c) = Distributions.truncated(law;
     lower = get(c, :lower, nothing), upper = get(c, :upper, nothing))
+
+@compile_workload begin
+    ReactiveKernelsPPL._construction_workload()
+end
 
 end

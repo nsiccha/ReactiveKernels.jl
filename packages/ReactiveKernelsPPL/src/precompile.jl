@@ -5,9 +5,9 @@
 # package code once, and Julia serializes that compilation across threads.
 # The workload runs a small synthetic hierarchical regression end to end.
 #
-# `ext/ReactiveKernelsPPLEnzymeExt.jl` runs the same workload again while its
-# own image is generated with Enzyme loaded: loading Enzyme invalidates part of
-# the code this image caches, and that image caches it again.
+# The Distributions, WarmupHMC, Enzyme and joint WarmupHMC/Enzyme extensions
+# rerun this workload while their images are built. Each caches construction
+# with the methods that its dependencies add.
 function _construction_workload()
     body = :(begin
         a ~ Normal(0, 5)
