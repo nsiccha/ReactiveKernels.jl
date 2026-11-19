@@ -1,10 +1,9 @@
 # Native-only reproduction; no JAX emission or Python is involved.
 # Julia 1.10.12-kb6, Enzyme.jl 9430736f8c9f694279002001f08675d52289637b,
 # libEnzyme eb82b697068538ee9074e2751f160838a8154005 / LLVM 15, 2026-11-16.
-# Both primals return 40.68. Plain Julia reverse returns 19.2; the prepared
-# kernel raises EnzymeNoTypeError at the matrix-record plate's setindex!.
-# Keeping the failure here separates native lowering/type analysis from the
-# JAX plate regression. No derivative rule or relaxed type analysis is used.
+# On that build both primals returned 40.68. Plain Julia reverse returned 19.2,
+# and the prepared plate raised EnzymeNoTypeError at setindex!. Enzyme dogfood
+# 22bb66a8 repairs the loop-carried record, giving 19.2 for both gradients.
 using ReactiveKernels, Enzyme
 
 @kernel matrix_record_kernel(x::Float64, a::Vector{Int}, b::Vector{Int}, y::Matrix{Float64}) = begin

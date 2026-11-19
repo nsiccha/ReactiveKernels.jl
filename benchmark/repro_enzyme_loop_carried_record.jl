@@ -1,5 +1,6 @@
-# Run with Enzyme in the active environment. The second Reverse call raises
-# EnzymeNoTypeError on Julia 1.10.12, Enzyme 3f556164, libEnzyme c423e860.
+# Run with Enzyme in the active environment. On Julia 1.10.12 the second
+# Reverse call raised EnzymeNoTypeError with Enzyme 3f556164. Dogfood 22bb66a8
+# repairs the loop-carried record with the same libEnzyme build (c423e860).
 using Enzyme
 
 const Record = Tuple{@NamedTuple{pointwise::@NamedTuple{y::Matrix{Float64}}},
