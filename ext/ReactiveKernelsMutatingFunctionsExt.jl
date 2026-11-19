@@ -624,11 +624,17 @@ end
 
 # The natural consumer call after benchmarking an ordinary prepared kernel:
 # reuse its already-selected plan.
+# A kernel a bound template produced shares the non-allocating program of the
+# template's other bindings (`_prepare_nonallocating_rebinding`).
 function ReactiveKernels.prepare_nonallocating(k::ReactiveKernels.PreparedKernel,
                                                 exemplars...; passes = (),
                                                 simplify = nothing)
-    ReactiveKernels.prepare_nonallocating(k.plan, exemplars...; passes = passes,
-                                          simplify = simplify)
+    ReactiveKernels._with_settings(simplify, nothing) do
+        p = k.plan
+        have_types = ReactiveKernels._nonalloc_exemplar_types(p, exemplars)
+        ReactiveKernels._prepare_nonallocating_rebinding(k, p, cache_apply!; have_types,
+            exact_signature = have_types !== nothing, passes)
+    end
 end
 
 end # module ReactiveKernelsMutatingFunctionsExt

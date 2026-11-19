@@ -33,7 +33,8 @@ Base.@nospecializeinfer _deepcopy_code_fields(@nospecialize(x), stackdict::IdDic
 # (an `Expr` field). `test/test_execution_sources.jl` checks that every type of
 # this package with an `Expr` field is listed.
 for T in (Recipe, PreparedKernel, GraphReplicatedKernel, BorrowedBatchedKernel,
-          NonAllocatingKernel, _BoundTemplate, _RebindReplicated, _RebindBorrowed,
+          NonAllocatingKernel, _BoundTemplate, _NonallocTemplate, _RebindReplicated,
+          _RebindBorrowed,
           _RebindPrepared, _CellEmitter, _ReactiveGetter, _ReactiveGetterInPlace)
     @eval Base.deepcopy_internal(x::$T, stackdict::IdDict) =
         _deepcopy_code_fields(x, stackdict)

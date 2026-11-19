@@ -173,7 +173,12 @@ preprocessing and caller-owned geometry; `binding_id` identifies these exact
 bound data. Use stable strings, and change them when their meanings change.
 Updates additionally check the packed layout; generated programs may change
 with the data (for example, a longer scan). Each build must match its own
-binding. `model_id` is a caller-supplied identity, not an inferred code hash. Bindings,
+binding. A build serves every binding that generates its program (other row
+counts and values, see `prepare_sampler`), and a target prepared on another
+binding of the same build reuses the build's earlier preparation: only that
+binding's data prefix runs again. For cumulative updates, keep the first
+batch's build and prepare each later batch's target on it; a build per batch
+is a new graph, which prepares everything again. `model_id` is a caller-supplied identity, not an inferred code hash. Bindings,
 captured data and code must remain read-only for a target's lifetime.
 `kwargs` are forwarded to `prepare_sampler`.
 

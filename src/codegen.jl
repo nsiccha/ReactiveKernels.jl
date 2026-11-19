@@ -8694,7 +8694,7 @@ preserves the public kernel boundary.
 Base.@nospecializeinfer function _externalize_bound_array_call(@nospecialize(f),
         @nospecialize(constants::Tuple), @nospecialize(callables::Tuple);
         min_elements::Integer = 0, materialize_view_copies::Bool = false,
-        externalize_scalars::Bool = false)
+        externalize_scalars::Bool = false, body_memo = nothing)
     # Walk the table without a generator or `ntuple` over it: those compile
     # once per table type, so once per program (snag `rkbrmi-start-up-c31e3789`).
     found = Int[]
@@ -8718,8 +8718,9 @@ Base.@nospecializeinfer function _externalize_bound_array_call(@nospecialize(f),
     stripped = Tuple(entries)
     structured = any(value -> value isa Union{Tuple,NamedTuple} ||
                               _bound_record(value), values)
-    external_body = structured ?
-        _externalize_bound_array_body(f, positions, values) : nothing
+    external_body = !structured ? nothing :
+        body_memo === nothing ? _externalize_bound_array_body(f, positions, values) :
+        _externalized_body!(body_memo, f, positions, values)
     callable = external_body === nothing ? f : external_body
     external_values = external_body === nothing ? values : _bound_operand_leaves(values)
     call = _kernel_new_instance(_ExternalizedBoundArrayCall{
@@ -8819,6 +8820,39 @@ function _externalize_bound_array_body(
     append!(ast.args[1].args, operands)
     ast.args[2] = body
     compile(ast)
+end
+
+# The rewritten body of `f` for one shape of bound values, kept in `memo`: the
+# body depends on the positions and on how each value rebuilds
+# (`_bound_rebuild_expr`), never on the numbers or arrays it reads, so the
+# bindings of one step program share it (`_ADNAProgram`).
+struct _ExternalizedBodies
+    lock::ReentrantLock
+    bodies::Dict{Any,Any}
+end
+_ExternalizedBodies() = _ExternalizedBodies(ReentrantLock(), Dict{Any,Any}())
+
+function _externalized_body!(memo::_ExternalizedBodies, @nospecialize(f),
+                             positions::Tuple, values::Tuple)
+    key = (positions, map(_bound_value_shape, values))
+    @lock memo.lock begin
+        haskey(memo.bodies, key) && return memo.bodies[key]
+    end
+    body = _externalize_bound_array_body(f, positions, values)
+    @lock memo.lock get!(memo.bodies, key, body)
+end
+
+# How `_bound_rebuild_expr` rebuilds a bound value: its structure and the
+# literals it embeds (by identity), without the numbers and arrays that cross
+# as operands.
+_bound_value_shape(value::NamedTuple) =
+    (:namedtuple, keys(value), map(_bound_value_shape, Tuple(value)))
+_bound_value_shape(value::Tuple) = (:tuple, map(_bound_value_shape, value))
+_bound_value_shape(::AbstractArray) = :array
+function _bound_value_shape(value)
+    _bound_value_leaf(value) && return :leaf
+    _bound_record(value) || return (:literal, typeof(value), objectid(value))
+    (:record, typeof(value), map(_bound_value_shape, _bound_record_fields(value)))
 end
 
 _has_external_bound_array(value, min_elements) =
@@ -9526,14 +9560,16 @@ end
 _nonallocating_plan_supported(p::Plan) = _nonallocating_unsupported_recipe(p) === nothing
 
 function _prepare_nonallocating(p::Plan, cache_apply; have_types=nothing,
-                                exact_signature::Bool=false, passes=())
+                                exact_signature::Bool=false, passes=(),
+                                lowered_recipes::Union{Nothing,Base.RefValue{Any}}=nothing)
     r = _nonallocating_unsupported_recipe(p)
     if r !== nothing
         throw(ArgumentError(
             "prepare_nonallocating requires single-output recipes; recipe $(r.id) has $(length(r.outputs)) outputs"))
     end
-    rewritten, constants, callables, caches = _nonallocating_program(p; have_types,
+    rewritten, constants, callables, caches, recipes = _nonallocating_program(p; have_types,
                                                                      cache_apply, passes)
+    lowered_recipes === nothing || (lowered_recipes[] = recipes)
     exact_signature &&
         (rewritten = _nonalloc_exact_signature(rewritten, have_types))
     f = compile(_nonallocating_body(rewritten))
@@ -9779,9 +9815,9 @@ function prepare(g::Graph; have = (), want = (), passes = (), bound = (),
     _with_branch_arms(branch_arms) do
     _with_settings(simplify, bound_statistics) do
         _with_type_stability(type_stability, type_stability_level) do
-            exemplars === nothing && _reuses_bound_preparation(binding, passes) &&
+            _reuses_bound_preparation(binding, passes) &&
                 return _graph_bound_preparation(g, haves, wants, passes, binding, on_error;
-                    _data_cache)
+                    _data_cache, exemplars)
             p = plan(g; have = haves, want = wants)
             prepare(p; passes = passes, bound = binding, on_error = on_error, exemplars,
                 _data_cache)

@@ -16,6 +16,30 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.323
+
+- A binding prepared on exemplars (`prepare(graph; have, want, bound,
+  exemplars)`, and an authored kernel's `prepare(spec; bound, exemplars)`)
+  takes the graph's bound-preparation cache, as a binding without exemplars
+  already did. The cache keys an entry on the exemplars' call signature as
+  well, so a later binding of the same bound ports and signature runs only its
+  data prefix and shares the first binding's compiled residual, typed for the
+  same exemplars. Before, every such binding planned, partially evaluated,
+  lowered and compiled afresh. Its kernel's values are unchanged.
+- `prepare_nonallocating` of a kernel a bound template produced shares the
+  non-allocating program of the template's earlier bindings, per exemplar
+  signature, passes and settings, and gives each kernel its own copy of the
+  unfilled step caches. `prepare_ad` over non-allocating kernels that share
+  one step program keeps the differentiated program per active input and
+  seeded-cache state: each binding seeds its own caches, concretizes them and
+  computes its own folded values. Values and gradients equal a fresh
+  preparation's bitwise.
+- ReactiveKernelsPPL's `prepare_sampler` prepares on all three, so a sampler
+  or SMC target on another binding of one build (cumulative `update_smc`
+  data, say) costs that binding's data work: on a three-coefficient Bayesian
+  regression (one thread, strato2) a new binding took about 5 ms, against
+  170–280 ms before (snag `rkppl-smc-with-d-80655b87`).
+
 ## 0.1.322
 
 - A summed plate nested in another plate's cell, such as the positions of a

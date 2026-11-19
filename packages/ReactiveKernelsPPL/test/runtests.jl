@@ -297,6 +297,7 @@ const _PPL_TEST_FILES = (
     "test_reduction_calls.jl",
     "test_cell_call_index.jl",
     "test_rebinding_rows.jl",
+    "test_rebinding_preparation.jl",
     "test_structural_cache.jl",
     "test_absent_observations.jl",
     "test_frozen_definitions.jl",

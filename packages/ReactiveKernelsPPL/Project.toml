@@ -1,7 +1,7 @@
 name = "ReactiveKernelsPPL"
 uuid = "e266ea2a-6817-46cd-8bec-6238f0035f44"
 authors = ["Nikolas Siccha <nikolassiccha@gmail.com>"]
-version = "0.1.226"
+version = "0.1.227"
 
 [deps]
 Compat = "34da2185-b29b-5c13-b0c7-acf172513d20"
@@ -61,8 +61,9 @@ PrecompileTools = "1.2"
 # and its JAX pointwise helpers map record rows, loop over `enumerate`, splat
 # per-field tuples, write a shared weight vector across helper calls and
 # flatten a matrix of score records. `jax_source` translates in the latest
-# world through ReactiveKernels' own barrier (0.1.313).
-ReactiveKernels = "0.1.321"
+# world through ReactiveKernels' own barrier (0.1.313). A sampler prepared on
+# another binding of one build reuses its preparation (0.1.323).
+ReactiveKernels = "0.1.323"
 ReactiveKernelsDistributionKernels = "0.1.12"
 SpecialFunctions = "2"
 StatsFuns = "1, 2"

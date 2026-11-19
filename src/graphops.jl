@@ -218,15 +218,25 @@ end
 
 _graph_bound_preparation(g::Graph, @nospecialize(have), @nospecialize(want),
                          @nospecialize(passes), @nospecialize(bound), on_error = nothing;
-                         _data_cache = nothing) =
+                         _data_cache = nothing, exemplars = nothing) =
     _prepare_bound!(_graph_preparations(g), g, have, want, passes, bound, nothing;
-        on_error, _data_cache)
+        on_error, _data_cache, exemplars)
+
+# The exemplars' part of a bound key: their call signature, or `nothing`.
+# Exemplars type the residual's remaining HAVE ports, so a binding prepared on
+# them never serves another signature; their values do not enter the key.
+_bound_exemplar_key(::Nothing) = nothing
+_bound_exemplar_key(@nospecialize(exemplars::Tuple)) = Tuple{map(typeof, exemplars)...}
+_bound_exemplar_key(@nospecialize(exemplars)) = throw(ArgumentError(
+    "prepare exemplars must be a tuple in positional HAVE order"))
 
 # `graph_key` names the graph in a caller-owned cache (its `objectid`), and is
-# `nothing` in the graph's own cache.
+# `nothing` in the graph's own cache. `exemplars`, one value per remaining
+# HAVE port, type the residual as an uncached `prepare(…; exemplars)` types it.
 function _prepare_bound!(cache::PreparationCache, g::Graph, @nospecialize(have),
                          @nospecialize(want), @nospecialize(passes), @nospecialize(bound),
-                         graph_key; on_error = nothing, _data_cache = nothing)
+                         graph_key; on_error = nothing, _data_cache = nothing,
+                         exemplars = nothing)
     ports, data = _partial_bound_pairs(bound)
     isempty(ports) && return prepare!(cache, g; have = have, want = want,
                                      passes = passes, on_error = on_error)
@@ -237,7 +247,21 @@ function _prepare_bound!(cache::PreparationCache, g::Graph, @nospecialize(have),
     key = (:bound, graph_key, g.version, _sig(g, have), _sig(g, want),
            _sig(g, ports), Tuple(_pass_key(p) for p in passes), on_error,
            _type_stability(), _type_stability_level(), _plan_mode(), _simplify(), _branch_arms(),
-           _bound_statistics())
+           _bound_statistics(), _bound_exemplar_key(exemplars))
+    # The bound pre-pass reads the exemplars' types as the uncached
+    # preparation's does (`_cell_group_numbers`); without exemplars it reads
+    # none, not an enclosing preparation's.
+    _with_partial_exemplars(exemplars) do
+        _prepare_bound_entry!(cache, g, have, want, passes, ports, data, key, on_error,
+                              _data_cache, exemplars)
+    end
+end
+
+function _prepare_bound_entry!(cache::PreparationCache, g::Graph, @nospecialize(have),
+                               @nospecialize(want), @nospecialize(passes),
+                               @nospecialize(ports), @nospecialize(data::Tuple),
+                               @nospecialize(key), on_error, @nospecialize(_data_cache),
+                               @nospecialize(exemplars))
     # Locked blocks, not `lock(...) do` closures: a closure's type holds the
     # types it captures (here the signatures in `key`, and below the hoisted
     # values), so it compiled once per program and width.
@@ -258,7 +282,7 @@ function _prepare_bound!(cache::PreparationCache, g::Graph, @nospecialize(have),
     # A residual the inner-plate pass rewrote other than through its shared
     # plate rewrites (a data-bound branch partition, a whole-plate value)
     # bakes this binding's structure in.
-    signature === nothing && return prepare(specialized; passes = passes)
+    signature === nothing && return prepare(specialized; passes = passes, exemplars)
     # Bindings with the same plate classes, finite loop schedules and plate
     # rewrites share a compiled residual. Extents, index patterns and cached
     # cell values stay runtime constants.
@@ -268,12 +292,13 @@ function _prepare_bound!(cache::PreparationCache, g::Graph, @nospecialize(have),
     template = @lock cache.lock begin
         current = get(entry.templates, template_key, _UnbuiltTemplate())
         if current isa _UnbuiltTemplate
-            current, fresh = _bound_build(entry, specialized, hoisted, passes)
+            current, fresh = _bound_build(entry, specialized, hoisted, passes, exemplars)
             entry.templates[template_key] = current
         end
         current
     end
-    fresh === nothing ? _bound_rebind(entry, template, specialized, hoisted, passes) : fresh
+    fresh === nothing ?
+        _bound_rebind(entry, template, specialized, hoisted, passes, exemplars) : fresh
 end
 
 # The bound-preparation path is untyped (partial_evaluation.jl), so one
@@ -288,23 +313,32 @@ for graph_key in (Nothing, UInt64)
     precompile(_prepare_bound!, (PreparationCache, Graph, Any, Any, Any, Any, graph_key)) ||
         error("no _prepare_bound! method for a $graph_key graph key")
 end
+for on_error in (Nothing, Symbol)
+    precompile(_prepare_bound_entry!, (PreparationCache, Graph, Any, Any, Any, Any, Tuple,
+                                       Any, on_error, Any, Any)) ||
+        error("no _prepare_bound_entry! method for a $on_error error policy")
+end
 # A cache hit compares its key with the stored one. Signatures are vectors, so
 # one key type serves every port count (here without passes). The last two
 # elements are `_simplify()` and `_branch_arms()`; a key type change here must
-# follow the key. A bound key ends in `_bound_statistics()`. The unbound key
+# follow the key. A bound key ends in `_bound_statistics()` and the exemplar
+# signature (`nothing`, or a `Tuple` type). The unbound key
 # with no graph identity is a positional `KernelSpec` call's: without it here,
 # a process's first repeated call compiled the comparison.
 for on_error in (Nothing, Symbol)
     S = Vector{ValueId}
-    for graph_key in (Nothing, UInt64)
-        K = Tuple{Symbol,graph_key,Int,S,S,S,Tuple{},on_error,Symbol,Symbol,Bool,Bool,Symbol,Bool}
+    for graph_key in (Nothing, UInt64), exemplars in (Nothing, DataType)
+        K = Tuple{Symbol,graph_key,Int,S,S,S,Tuple{},on_error,Symbol,Symbol,Bool,Bool,Symbol,Bool,
+                  exemplars}
         precompile(isequal, (K, K)) || error("no isequal method for bound key $K")
+    end
+    for graph_key in (Nothing, UInt64)
         K = Tuple{graph_key,Int,S,S,Tuple{},on_error,Symbol,Symbol,Bool,Bool,Symbol}
         precompile(isequal, (K, K)) || error("no isequal method for cache key $K")
     end
 end
 for template in (_BoundTemplate, PreparedKernel, Nothing)
-    precompile(_bound_rebind, (_BoundEntry, template, Any, Any, Any)) ||
+    precompile(_bound_rebind, (_BoundEntry, template, Any, Any, Any, Any)) ||
         error("no _bound_rebind method for a $template template")
 end
 for residual in (Plan, Nothing)
@@ -314,7 +348,7 @@ end
 for (f, types) in ((_bound_entry, (Plan, Any)), (_bound_hoisted, (_BoundEntry, Tuple)),
                    (_bound_residual, (_BoundEntry, PreparationCache, Any, Tuple)),
                    (_bound_fused_residual, (_BoundEntry, PreparationCache, Tuple)),
-                   (_bound_build, (_BoundEntry, Any, Any, Any)),
+                   (_bound_build, (_BoundEntry, Any, Any, Any, Any)),
                    (_partial_residual, (Plan, _PartialBoundary, Any)),
                    (_partial_plate_classes, (_PartialBoundary, Any)),
                    (_partial_narrow_plate_inputs, (Plan, _PartialBoundary, Tuple)),

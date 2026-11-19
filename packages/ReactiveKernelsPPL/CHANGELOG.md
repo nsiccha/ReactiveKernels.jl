@@ -16,6 +16,19 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.227
+
+- A sampler or SMC target prepared on another binding of one build
+  (`prepare_sampler(built, plan, u)`, `prepare_smc(built, plan, u; …)`) reuses
+  the build's earlier preparation: RK's bound template, its non-allocating
+  program and the program of its gradient. Only the new binding's data prefix
+  runs again, and its buffers are its own. For cumulative `update_smc`, keep
+  the first batch's build: on RKPPLBench's batched-SMC regression (three
+  coefficients, 100 rows per batch, one thread) a later batch's target took
+  about 5 ms to prepare, against 170–280 ms before; a build per batch is a new
+  graph, which prepares everything again. The ReactiveKernels compat floor is
+  0.1.323, which provides the reuse (snag `rkppl-smc-with-d-80655b87`).
+
 ## 0.1.226
 
 - Row-wise Dirichlet parameters now use the same column scan as column-wise

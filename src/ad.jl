@@ -747,7 +747,7 @@ function _ad_na_walk(node, tainted::Set{Symbol}, have_free::Set{Symbol},
                 # The step's seeded value, appended to the constants table.
                 push!(elided, step)
                 push!(fold_values,
-                      _ad_na_seed_value(caches[step], step, ops[step]))
+                      _ADFoldedStep(step, _ad_na_seed_value(caches[step], step, ops[step])))
                 slot = length(constants) + length(fold_values)
                 return Expr(:ref, _CONSTANTS_ARG, slot), false, true
             end
@@ -924,6 +924,18 @@ function _ad_na_program(kernel::NonAllocatingKernel, active_selector,
     # scope. Retain each plate's region so its generated reverse can be
     # installed after the cache rewrite, using the rewritten operands.
     plate_reverse = _plate_reverse_enabled()
+    # The bindings of one bound template share their step program's AST
+    # (`_NonallocTemplate`); a later one seeds its own caches into the program
+    # an earlier one rewrote and compiled, when they seeded alike.
+    programs = plate_reverse ? nothing : _ad_na_programs(getfield(kernel, :ast))
+    seeded = false
+    if programs !== nothing && !_ad_na_programs_empty(programs)
+        _ad_na_seed!(kernel, exemplars)
+        seeded = true
+        program = _ad_na_program_entry(programs,
+            (active_selector, _ad_na_seed_signature(getfield(kernel, :caches))))
+        program === nothing || return _ad_na_rebound(kernel, program)
+    end
     ast = _inline_plate_programs(kernel.ast;
         expand = plate_reverse ? _ad_na_plate_region : _ad_na_inline_plate)
     ast.head === :function && ast.args[1] isa Expr &&
@@ -945,7 +957,7 @@ function _ad_na_program(kernel::NonAllocatingKernel, active_selector,
             "AD preparation over a non-allocating kernel requires the " *
             "active selector to name ports among the " *
             "$(length(inputs(kernel))) positional HAVE arguments"))
-    _ad_na_seed!(kernel, exemplars)
+    seeded || _ad_na_seed!(kernel, exemplars)
     tainted = Set{Symbol}(
         have_syms[index] for index in _ad_selector_indices(active_selector))
     have_free = Set{Symbol}()
@@ -966,6 +978,8 @@ function _ad_na_program(kernel::NonAllocatingKernel, active_selector,
         index in elided ? nothing :
             _ad_na_concretize_cache(caches[index], index, ops[index])
     end
+    folded = Int[x.step for x in fold_values]
+    fold_values = Any[x.value for x in fold_values]
     ad_constants = isempty(fold_values) ? constants : (constants..., fold_values...)
     rewritten = Expr(:function, deepcopy(ast.args[1]), Expr(:block, new_stmts...))
     # With the rule disabled, keep the original inline AD program without
@@ -982,7 +996,85 @@ function _ad_na_program(kernel::NonAllocatingKernel, active_selector,
         ad_caches = (ad_caches..., ntuple(_ -> _PlateTapeSlot(), slots[])...)
     end
     f = compile(rewritten)
-    f, ad_caches, ad_constants, ops, new_stmts
+    program = programs === nothing ? nothing :
+        _ad_na_program_store!(programs,
+            (active_selector, _ad_na_seed_signature(caches)),
+            _ADNAProgram(f, new_stmts, elided, folded, _ExternalizedBodies()))
+    f, ad_caches, ad_constants, ops, new_stmts, program
+end
+
+# A step folded into the constants table: its index and seeded value.
+struct _ADFoldedStep
+    step::Int
+    value::Any
+end
+
+# A differentiated step program without one binding's seeded values: the
+# compiled program, its statements, the elided steps, the folded steps in
+# constants-table order, and the externalized bodies of its bound values.
+struct _ADNAProgram
+    f::Any
+    stmts::Vector{Any}
+    elided::Set{Int}
+    folded::Vector{Int}
+    externalized::_ExternalizedBodies
+end
+
+# The differentiated programs of the kernels sharing one step-program AST, by
+# active selector and seeded cache state. A binding seeds its caches with its
+# own data, so a cache its exemplar call did not reach, or reached with
+# another type, selects another program.
+struct _ADNAPrograms
+    lock::ReentrantLock
+    entries::Dict{Any,_ADNAProgram}
+end
+
+_ad_na_programs_empty(p::_ADNAPrograms) = @lock p.lock isempty(p.entries)
+_ad_na_program_entry(p::_ADNAPrograms, key) = @lock p.lock get(p.entries, key, nothing)
+_ad_na_program_store!(p::_ADNAPrograms, key, program::_ADNAProgram) =
+    @lock p.lock get!(p.entries, key, program)
+
+_ad_na_seed_state(slot::Base.RefValue) = (typeof(slot), Core.Typeof(slot[]))
+_ad_na_seed_state(slot) = typeof(slot)
+_ad_na_seed_signature(caches::Tuple) = Any[_ad_na_seed_state(c) for c in caches]
+
+# The tables of one AST, held weakly: `objectid(ast) => [(weak AST, programs)]`,
+# swept now and then as `_structural_cache`'s are.
+const _AD_NA_PROGRAMS = Dict{UInt,Vector{Tuple{WeakRef,_ADNAPrograms}}}()
+const _AD_NA_PROGRAMS_LOCK = ReentrantLock()
+const _AD_NA_PROGRAMS_ADDED = Ref(0)
+
+function _ad_na_programs(ast::Expr)
+    id = objectid(ast)
+    @lock _AD_NA_PROGRAMS_LOCK begin
+        bucket = get!(Vector{Tuple{WeakRef,_ADNAPrograms}}, _AD_NA_PROGRAMS, id)
+        for (ref, programs) in bucket
+            ref.value === ast && return programs
+        end
+        programs = _ADNAPrograms(ReentrantLock(), Dict{Any,_ADNAProgram}())
+        push!(bucket, (WeakRef(ast), programs))
+        if (_AD_NA_PROGRAMS_ADDED[] += 1) % 256 == 0
+            for (k, b) in _AD_NA_PROGRAMS
+                filter!(e -> e[1].value !== nothing, b)
+                isempty(b) && delete!(_AD_NA_PROGRAMS, k)
+            end
+        end
+        programs
+    end
+end
+
+# A later binding's differentiated program: the shared one over this kernel's
+# constants, its own copies of the seeded caches and its own folded values.
+function _ad_na_rebound(kernel::NonAllocatingKernel, program::_ADNAProgram)
+    constants, ops, caches = kernel.constants, kernel.callables, kernel.caches
+    ad_caches = ntuple(length(caches)) do index
+        index in program.elided ? nothing :
+            _ad_na_concretize_cache(caches[index], index, ops[index])
+    end
+    fold_values = Any[_ad_na_seed_value(caches[step], step, ops[step])
+                      for step in program.folded]
+    ad_constants = isempty(fold_values) ? constants : (constants..., fold_values...)
+    program.f, ad_caches, ad_constants, ops, program.stmts, program
 end
 
 # Seed the primal caches with one call at the exemplars. Preparation needs the
@@ -1019,7 +1111,8 @@ end
 
 function _ad_kernel_call(kernel::NonAllocatingKernel, args::Tuple,
                          ::Val{I}) where {I}
-    f, ad_caches, ad_constants, ad_callables, stmts = _ad_na_program(kernel, I, args)
+    f, ad_caches, ad_constants, ad_callables, stmts, program =
+        _ad_na_program(kernel, I, args)
     driver = _ad_na_cache_driver(kernel.cache_apply)
     # A cacheless step program still carries the positional cache-table ABI,
     # but asking the backend to shadow `Tuple{Nothing,...}` marks a ghost-only
@@ -1035,7 +1128,8 @@ function _ad_kernel_call(kernel::NonAllocatingKernel, args::Tuple,
     # table too, exactly as for the dataflow call.
     externalized, values = _externalize_bound_array_call(
         f, ad_constants, ad_callables; materialize_view_copies = true,
-        externalize_scalars = true)
+        externalize_scalars = true,
+        body_memo = program === nothing ? nothing : program.externalized)
     if externalized === nothing
         return _ADNonAllocatingKernelCall{I,false,typeof(f),typeof(ad_constants),
                                           typeof(ad_callables),typeof(driver)}(

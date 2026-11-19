@@ -1356,7 +1356,7 @@ function _nonalloc_static_type(x, types, definitions, constants, ops,
 end
 
 """
-    _nonallocating_program(p::Plan; have_types, cache_apply, passes) -> (ast, constants, callables, caches)
+    _nonallocating_program(p::Plan; have_types, cache_apply, passes) -> (ast, constants, callables, caches, recipes)
 
 The non-allocating step program of `p`. It is the native program ordinary
 `prepare` compiles (`_lower_with_ops` over `_lowering_plan(p)`): plate chains
@@ -1460,5 +1460,5 @@ function _nonallocating_program(p::Plan; have_types = nothing,
     (_extract_plate_programs(Expr(:function,
         Expr(:tuple, _CONSTANTS_ARG, _CALLABLES_ARG, _CACHES_ARG,
              _CACHE_APPLY_ARG, ports...), body)),
-     constants, Tuple(prog.ops), Tuple(prog.caches))
+     constants, Tuple(prog.ops), Tuple(prog.caches), recipes)
 end
