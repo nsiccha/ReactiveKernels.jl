@@ -429,7 +429,7 @@ function _lane_index_call(ctx::_LaneSourceContext, node, outer_ends, callee, lea
     any(index -> Meta.isexpr(index, :...), node.args[2:end]) && return nothing
     array = _lane_source_node(ctx, node.args[1], outer_ends)
     array === nothing && return nothing
-    held = gensym(:lane_array)
+    held = array isa Symbol ? array : gensym(:lane_array)
     count = length(node.args) - 1
     indices = Any[]
     for (k, index) in enumerate(node.args[2:end])
@@ -440,8 +440,8 @@ function _lane_index_call(ctx::_LaneSourceContext, node, outer_ends, callee, lea
         rewritten === nothing && return nothing
         push!(indices, rewritten)
     end
-    Expr(:let, Expr(:(=), held, array),
-         Expr(:call, callee, leading..., held, indices...))
+    call = Expr(:call, callee, leading..., held, indices...)
+    held === array ? call : Expr(:let, Expr(:(=), held, array), call)
 end
 
 # The destination form of recipe `r`, whose arguments are `callargs`, filling

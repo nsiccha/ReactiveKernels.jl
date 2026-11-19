@@ -157,6 +157,28 @@ end
         @test k(args...) === y
     end
 
+    @testset "a gathered power broadcast only writes its own result" begin
+        spec = @kernel gathered_powers(x::Vector{Float64}, g::Vector{Int},
+                powers::Vector{Int}) = begin
+            probability = x[g] .^ powers .* x[g]
+            terms = plate(eachindex(g)) do i
+                probability[i]
+            end
+            total::Float64 = sum(terms)
+        end
+        k = prepare_nonallocating(spec; have = (:x, :g, :powers), want = :total)
+        g = [3, 1, 1, 2]
+        powers = [0, 3, 1, 2]
+        x = [0.2, 0.3, 0.4]
+        other = reverse(x)
+        for values in (x, other, x)
+            @test k(values, g, powers) == sum(values[g] .^ powers .* values[g])
+            @test ownership_allocations(k, (values, g, powers)) == 0
+        end
+        @test x == [0.2, 0.3, 0.4]
+        @test other == [0.4, 0.3, 0.2]
+    end
+
     @testset "exemplar arguments type the program" begin
         args = ((; xs = [1.0, 2.0, 3.0], tag = 1), 2.0)
         exemplar = prepare_nonallocating(FIELD_SCALE, args...; want = :ys)
