@@ -180,6 +180,49 @@ end
     @test original ≈ expected
 end
 
+# Record the guard chosen by the compiled sweep, including when its shadow
+# overlaps a separate inactive input. A captured callable can hide the same
+# array, so checking only the explicit arguments would miss such a read.
+const dense_taken = Ref(false)
+function watch_dense(args...)
+    eligible = RK._pr_dense_reverse_cells(args...)
+    dense_taken[] |= eligible
+    eligible
+end
+function watch_dense_sweep(expr)
+    RK._index_run_replace(expr) do node
+        Meta.isexpr(node, :call) && node.args[1] === GlobalRef(RK, :_pr_dense_reverse_cells) ||
+            return node
+        Expr(:call, GlobalRef(@__MODULE__, :watch_dense), node.args[2:end]...)
+    end
+end
+@testset "an inactive indexed or captured read keeps the sweep ordered" begin
+    x = ones(256)
+    for capture in (false, true)
+        storage = [0.3sin(i) for i in 1:length(x)+1]
+        weights, gradient = view(storage, 1:length(x)), view(storage, 2:length(storage))
+        context = capture ? (i -> weights[i]) : weights
+        ast = direct_program()
+        push!(ast.args[1].args, :weights)
+        read = capture ? :(weights(linear)) : :(Base.getindex(weights, linear))
+        ast = RK._index_run_replace(ast) do node
+            Meta.isexpr(node, :(=), 2) && node.args[1] === :term || return node
+            :(term = v * $read)
+        end
+        known = capture ? Dict{Symbol,Any}(:weights => context) : Dict{Symbol,Any}()
+        expr = first(RK._pr_program_reverse(ast, [:x], RK, known))
+        sweep = RK.compile(watch_dense_sweep(expr))
+        dense_taken[] = false
+        expected = copy(storage)
+        for i in eachindex(x)
+            expected[i+1] += 0.7 * expected[i]
+        end
+        sweep(x, context, 0.7, Val(false), gradient)
+        @test !dense_taken[]
+        @test storage ≈ expected
+    end
+end
+
 seeded_plate(program, x, seed, slots...) = seed * program(x, slots...)
 
 function lazy_plate(program, x, scale, seed, overwrite)
@@ -407,6 +450,44 @@ end
         @test destination ≈ expected
         @test value ≈ sum(sin, operand)
     end
+end
+
+const spanned_cells = Ref(0)
+function watch_span_end(indices, lo, lastcell, start, lastparent)
+    hi = RK._pr_span_end(indices, lo, lastcell, start, lastparent)
+    spanned_cells[] += max(0, hi - lo + 1)
+    hi
+end
+
+@testset "grouped spans preserve inactive direct-read indices" begin
+    ast = direct_program()
+    push!(ast.args[1].args, :weights)
+    read = GlobalRef(RK, :_plate_read)
+    ast = RK._index_run_replace(ast) do node
+        Meta.isexpr(node, :(=), 2) && node.args[1] === :term || return node
+        :(term = v * (2.0 * $read(weights, index) - $read(weights, 1)))
+    end
+    expr = first(RK._pr_program_reverse(ast, [:x], RK, Dict{Symbol,Any}()))
+    expr = RK._index_run_replace(expr) do node
+        Meta.isexpr(node, :call) && first(node.args) === GlobalRef(RK, :_pr_span_end) || return node
+        Expr(:call, GlobalRef(@__MODULE__, :watch_span_end), node.args[2:end]...)
+    end
+    q = [sin(j / 7) for j in 1:16]
+    idx = repeat(collect(eachindex(q)), 3)
+    weights = [cos(i / 11) for i in eachindex(idx)]
+    destination = zeros(length(q))
+    spanned_cells[] = 0
+    value, = RK.compile(expr)(view(q, idx), weights, 1.7, Val(true), view(destination, idx))
+    expected_value = 0.0
+    expected_gradient = zeros(length(q))
+    for (i, j) in pairs(idx)
+        coefficient = 2 * weights[i] - weights[1]
+        expected_value += q[j] * coefficient
+        expected_gradient[j] += 1.7 * coefficient
+    end
+    @test spanned_cells[] == length(idx)
+    @test value ≈ expected_value
+    @test destination ≈ expected_gradient
 end
 
 end

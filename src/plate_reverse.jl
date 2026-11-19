@@ -1723,14 +1723,15 @@ end
     matches ? hi : lo - 1
 end
 
-function _pr_span_loop(linear, cells, value, shadow, operands, direct_body, raw_body, prepared, original)
+function _pr_span_loop(linear, cells, value, shadow, operands, cellbody, prepared, original)
     lo, hi, start, offset = (Symbol(cells, s) for s in (:_lo, :_hi, :_start, :_offset))
     address = :($linear + $offset)
-    inner = _index_run_replace(direct_body) do node
-        if Meta.isexpr(node, :call, 3) && _pr_is_ref(node.args[1], @__MODULE__, :_pr_direct_read) &&
-                node.args[3] === linear
-            operand = node.args[2]
-            return prepared[operand] === value ? :(parent($value)[$address]) : :($operand[$linear])
+    inner = _index_run_replace(cellbody) do node
+        # The direct-operand check proved each active read uses its cell's
+        # index. Inactive operands may also be read at other indices.
+        if Meta.isexpr(node, :call, 3) && _pr_is_ref(node.args[1], @__MODULE__, :_plate_read) &&
+                get(prepared, node.args[2], nothing) === value
+            return :(parent($value)[$address])
         elseif Meta.isexpr(node, :call, 4) && _pr_is_ref(node.args[1], @__MODULE__, :_pr_shadow_add!) &&
                 node.args[2] === shadow && node.args[3] === linear
             return :(parent($shadow)[$address] += $(node.args[4]))
@@ -1761,12 +1762,44 @@ function _pr_span_loop(linear, cells, value, shadow, operands, direct_body, raw_
                 $hi < $lo && break
             end
             @inbounds for $linear in $lo:last($cells)
-                $raw_body
+                $cellbody
             end
         else
             $original
         end
     end
+end
+
+# A reordered sweep may read arrays only through the checked plate operands.
+# Follow the flattened cell: aliases and primitive scalar arithmetic preserve
+# that property. An ordinary index, opaque call or a nested cut could read
+# storage aliased by a shadow. Keep its ordered loop. Check external scalar
+# operands at the call as well, since a user number can overload arithmetic.
+_pr_vector_scalar(x) = x isa Union{Base.IEEEFloat,Base.BitInteger,Bool}
+function _pr_vectorized_cell_scalars(stmts, st, linear)
+    local_values = Set{Symbol}([linear])
+    external = Symbol[]
+    for s in stmts
+        if s isa _PRAlias
+            args = (s.rhs,)
+        elseif s isa _PRCall && _pr_is_read(s, st)
+            args = ()
+        elseif s isa _PRCall && any(f -> f === s.f,
+                (+, -, *, /, ^, _native_mul, Base.CartesianIndex, abs, abs2, sin, cos, exp, log))
+            args = s.args
+        else
+            return nothing
+        end
+        for a in args
+            if a isa Symbol
+                a in local_values || a in external || push!(external, a)
+            elseif !_pr_vector_scalar(a)
+                return nothing
+            end
+        end
+        push!(local_values, s.lhs)
+    end
+    external
 end
 
 # A native direct-read loop already uses SIMD for the value. Its two-pass
@@ -1776,7 +1809,7 @@ end
 @inline function _pr_dense_reverse_cells(cells, operands::Tuple, shadows::Tuple)
     dense(x) = x isa StridedVector{<:Union{Float32,Float64}} &&
                stride(x, 1) == 1 && axes(x, 1) == cells
-    cells isa AbstractUnitRange{<:Integer} && all(dense, operands) &&
+    cells isa Union{Base.OneTo{Int},UnitRange{Int}} && all(dense, operands) &&
         all(x -> x === nothing || dense(x), shadows) &&
         _pr_run_disjoint(operands, shadows)
 end
@@ -1899,7 +1932,10 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState, indexed:
         # The native spans-axis arm reads raw operands. Preserve its SIMD
         # reduction when the reverse writes independently by cell. Run-scheduled
         # loops keep their form for the index-run transformation below.
-        if !indexed && any(s -> _pr_is_read(s, st) && s.f === _plate_read, inloop)
+        raw = any(s -> _pr_is_read(s, st) && s.f === _plate_read, inloop)
+        scalar_inputs = !indexed && raw && isempty(cuts) ?
+            _pr_vectorized_cell_scalars(inloop, st, linear) : nothing
+        if scalar_inputs !== nothing
             written = unique(st.prepared[r] for r in read_operands if haskey(st.shadow, st.prepared[r]))
             shadows = map(p -> st.shadow[p], written)
             loop = :(if $_PR_WANT_VALUE isa Val{false} &&
@@ -1912,10 +1948,15 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState, indexed:
                          $plain_loop
                      end)
             if length(written) == 1
-                direct_body = Expr(:block, _pr_forward_exprs(direct_in, cuts)..., value_in..., reverse...)
                 loop = _pr_span_loop(linear, cells, only(written), only(shadows), read_operands,
-                                     direct_body, cellbody, st.prepared, loop)
+                                     cellbody, st.prepared, loop)
             end
+            scalars = Expr(:tuple, _pr_bar(total), scalar_inputs...)
+            loop = :(if Base.all($(GlobalRef(@__MODULE__, :_pr_vector_scalar)), $scalars)
+                         $loop
+                     else
+                         $plain_loop
+                     end)
         elseif isempty(read_operands)
             loop = plain_loop
         else
