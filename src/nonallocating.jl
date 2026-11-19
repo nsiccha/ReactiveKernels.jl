@@ -1251,6 +1251,16 @@ end
 # sources, control flow) is kept.
 function _nonalloc_statement!(prog::_StepProgram, recipes::Vector{Recipe},
                               types::Dict{Symbol,Any}, stmt)
+    if _is_plate_block(stmt)
+        # The marked block includes work shared by the entire plate. Give its
+        # straight-line statements the usual destinations inside the existing
+        # nonempty guard. The cell loop keeps its own storage protocol.
+        body = Expr(:block, first(stmt.args))
+        for statement in stmt.args[2:end]
+            append!(body.args, _nonalloc_statement!(prog, recipes, types, statement))
+        end
+        return Any[body]
+    end
     if Meta.isexpr(stmt, :if)
         arms = Any[]
         armtypes = Dict{Symbol,Any}[]
@@ -1271,7 +1281,27 @@ function _nonalloc_statement!(prog::_StepProgram, recipes::Vector{Recipe},
         return Any[Expr(:if, stmt.args[1], arms...)]
     end
     stmt isa Expr && stmt.head === :(=) && stmt.args[1] isa Symbol &&
-        stmt.args[2] isa Expr && stmt.args[2].head === :call || return Any[stmt]
+        stmt.args[2] isa Expr || return Any[stmt]
+    # A plate's cell kernel may already have inlined the recipe in a let.
+    # Its recorded slot and argument names identify the same source a recipe
+    # call uses. Keep computed arguments in their original let, evaluated once.
+    inlined = _inline_statement_call(stmt.args[2])
+    if inlined !== nothing
+        i, args = inlined
+        if 1 <= i <= length(recipes) && !recipes[i].effectful &&
+                recipes[i].op isa _KernelSourceOp && !(recipes[i].source isa _NoKernelSource) &&
+                length(args) == length(recipes[i].inputs) && all(a -> a isa Symbol, args)
+            lhs = stmt.args[1]
+            dec = _decompose_fused_recipe!(prog, recipes[i], args,
+                _nonalloc_argument_types(types, args), lhs)
+            if dec !== nothing
+                types[lhs] = _nonalloc_tighter_type(get(types, lhs, Any), dec[2])
+                return dec[1]
+            end
+        end
+        return Any[stmt]
+    end
+    stmt.args[2].head === :call || return Any[stmt]
     call = stmt.args[2]
     call.args[1] == GlobalRef(@__MODULE__, :_cell_array_broadcast) &&
         length(call.args) == 2 &&

@@ -32,6 +32,14 @@ const SPEC = @kernel traced_steps(x::Vector{Float64}, w::Float64) = begin
     y::Vector{Float64} = centered_squares(x, w)
     out::Float64 = sum(y)
 end
+@traceable column_stats(A) = (sum(A; dims = 1), all(isfinite, A))
+const COLUMN_TOTAL = @kernel column_total(A::Matrix{Float64}, columns::Vector{Int}) = begin
+    cells = plate(columns) do j
+        stats = column_stats(A)
+        stats[2] ? stats[1][j] : 0.0
+    end
+    total::Float64 = sum(cells)
+end
 end
 
 # An argument check (`... ? s : throw(...)`) feeding a traced helper whose
@@ -727,6 +735,17 @@ end
         @test k_dyn(m, 2) == ordinary_dyn(m, 2)
         @test any(source_entry, called_ops(k_dyn))
         @test !any(op -> op isa ReactiveKernels._RowReduceStep, called_ops(k_dyn))
+    end
+
+    @testset "a traced column reduction shared by the plate reuses its buffer" begin
+        k = prepare_nonallocating(TracedStepsFixture.COLUMN_TOTAL; want = :total)
+        for n in (2, 5, 1)
+            A = reshape(collect(1.0:3n), 3, n)
+            columns = [n, 1, n]
+            @test k(A, columns) == sum(sum(A; dims = 1)[columns])
+            @test kernel_allocations(k, A, columns) == 0
+            @test k(A, Int[]) == 0.0
+        end
     end
 
     @testset "authored plates keep exact pointwise semantics" begin
