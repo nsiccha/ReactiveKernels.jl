@@ -4,6 +4,7 @@
 # applies no algebraic identities; this file states that one for the emitted
 # program. Everything downstream of the product is the emitted program.
 #
+# A scalar conditional follows reads of its packed slot to the density terms.
 # A coordinate of a vector parameter also needs only the density terms that
 # read that vector. Of a sum over a plate that reads the vector it needs only
 # the cells that read the moved element: the element's own cell when the plate
@@ -11,7 +12,7 @@
 # the plate reads the vector through a gather by a bound index vector.
 
 "Prepared coordinate conditionals returned by [`prepare_coordinate_conditional`](@ref)."
-struct CoordinateConditional{L,J,C,U,R,B<:Tuple}
+struct CoordinateConditional{L,J,C,U,R,B<:Tuple,S<:Tuple}
     layout::L
     joint::J
     conditional::C
@@ -19,6 +20,7 @@ struct CoordinateConditional{L,J,C,U,R,B<:Tuple}
     refresh::R
     products::Vector{Symbol}
     blocks::B
+    scalars::S
 end
 
 # The conditional of the coordinates in `range`: the terms that read them,
@@ -61,11 +63,12 @@ function _packed_scalar_reads!(positions, ex)
 end
 
 # How the statements read the packed coordinates directly: through a whole
-# range (a view, or a plate over a view) or at literal positions. `recognized`
-# is false when some statement reads them in another way.
+# range (a view, or a plate over a view) or at literal positions. Each position
+# records the names assigned from it. Other reads set `recognized` to false.
 function _packed_readers(statements)
     ranges = Pair{Tuple{Any,Any},Vector{Symbol}}[]
-    views, plates, positions = Dict{Symbol,Tuple{Any,Any}}(), Set{Symbol}(), Int[]
+    views, plates = Dict{Symbol,Tuple{Any,Any}}(), Set{Symbol}()
+    positions = Dict{Int,Set{Symbol}}()
     recognized = true
     for st in statements
         Meta.isexpr(st, :(=), 2) && _reads_packed(st.args[2]) || continue
@@ -84,13 +87,51 @@ function _packed_readers(statements)
             end
         end
         if range === nothing
-            _packed_scalar_reads!(positions, rhs) || (recognized = false)
+            indices = Int[]
+            if _packed_scalar_reads!(indices, rhs)
+                names = _assigned_names(st)
+                for k in indices
+                    union!(get!(Set{Symbol}, positions, k), names)
+                end
+            else
+                recognized = false
+            end
             continue
         end
         at = findfirst(entry -> entry.first == range, ranges)
         at === nothing ? push!(ranges, range => Symbol[name]) : push!(ranges[at].second, name)
     end
     return (; ranges, views, plates, positions, recognized)
+end
+
+# Follow a scalar through every statement reading its packed slot. A term can
+# also read the slot directly (for example the Jacobian of a positive scale).
+function _coordinate_scalars(statements, selected, readers, spans, layout)
+    scalars = NamedTuple[]
+    readers.recognized && !isempty(readers.positions) || return scalars
+    direct = map(selected) do term
+        indices = Int[]
+        _packed_scalar_reads!(indices, term)
+        indices
+    end
+    for (i, entry) in enumerate(layout.entries)
+        entry.kind === :sampled || continue
+        k = entry.offset
+        roots = get(readers.positions, k, nothing)
+        roots === nothing && continue
+        # Include every view or plate over a range containing this slot, even
+        # when overlapping reads made that range ineligible for a vector cut.
+        reached = copy(roots)
+        for (span, range) in zip(spans, readers.ranges)
+            k in span && union!(reached, range.second)
+        end
+        reached = _gibbs_dependents(statements, reached)
+        terms = [t for (t, indices) in zip(selected, direct) if
+            k in indices || _gibbs_reads(t, reached)]
+        length(terms) == length(selected) && continue
+        push!(scalars, (; k, name=Symbol(:_ppl_cg_scalar_, i), terms))
+    end
+    return scalars
 end
 
 # Statements `name = A * w` where `w` is a packed view and `A` is constant in
@@ -280,7 +321,9 @@ constant differs between coordinates: compare values of one coordinate only.
   plate reading the vector through a bound index vector, as
   `y .~ Normal.(theta[g], 1)` does, evaluates only the rows whose index is the
   moved coordinate's (none when no row has it).
-- Every other coordinate evaluates all terms that read any coordinate.
+- A scalar parameter read at a known packed position evaluates only the
+  terms that read it, including through transforms and derived values.
+  Unrecognized packed reads use the general conditional.
 
 Use [`coordinate_state`](@ref) to hold a point with its cached products,
 [`coordinate_logdensity`](@ref) for a trial value and [`set_coordinate!`](@ref)
@@ -334,11 +377,11 @@ function prepare_coordinate_conditional(built, plan::StructuralPlan, u0::Abstrac
             dependent, named)) for term in terms if _gibbs_reads(term, reached)]
     end for entry in readers.ranges]
     candidates = unique!([how for entries in found for (_, how) in entries if how !== nothing])
-    keys = unique!(Symbol[how[2] for how in candidates if how[2] isa Symbol])
+    gather_keys = unique!(Symbol[how[2] for how in candidates if how[2] isa Symbol])
     measured = Expr(:tuple, (x for entry in readers.ranges for x in entry.first)...,
         (:($(GlobalRef(@__MODULE__, :_coordinate_plate_length))($(first(how))))
             for how in candidates)...,
-        (:($(GlobalRef(@__MODULE__, :_coordinate_key_length))($key)) for key in keys)...)
+        (:($(GlobalRef(@__MODULE__, :_coordinate_key_length))($key)) for key in gather_keys)...)
 
     # The emitted program with the values this preparation reads once: the
     # cached products at a point, and the measurements above.
@@ -351,17 +394,18 @@ function prepare_coordinate_conditional(built, plan::StructuralPlan, u0::Abstrac
         have=_query_have(plan), want, bound, exemplars=(u,), on_error)
 
     blocks = NamedTuple[]
+    spans = UnitRange{Int}[]
     if readers.recognized && !isempty(readers.ranges)
         values = Base.invokelatest(whole(:_ppl_cg_measured), u)
         r = 2length(readers.ranges)
         spans = [Int(values[2i - 1]):Int(values[2i]) for i in eachindex(readers.ranges)]
         plate_length = Dict(first(how) => Int(values[r + c]) for (c, how) in enumerate(candidates))
         key_length = Dict(key => Int(values[r + length(candidates) + c])
-            for (c, key) in enumerate(keys))
+            for (c, key) in enumerate(gather_keys))
         for (i, entry) in enumerate(readers.ranges)
             span = spans[i]
             isempty(span) && continue
-            any(in(span), readers.positions) && continue
+            any(in(span), keys(readers.positions)) && continue
             all(j -> j == i || isempty(intersect(span, spans[j])), eachindex(spans)) || continue
             cells, direct, parts, rest = Symbol[], Symbol[], NamedTuple[], Any[]
             for (term, how) in found[i]
@@ -380,6 +424,7 @@ function prepare_coordinate_conditional(built, plan::StructuralPlan, u0::Abstrac
                 partial=Symbol(:_ppl_cg_partial_, i)))
         end
     end
+    scalars = _coordinate_scalars(statements, selected, readers, spans, layout)
 
     ports = Symbol[Symbol(:_ppl_cg_product_, i) for i in eachindex(nodes)]
     derived = copy(statements)
@@ -397,6 +442,7 @@ function prepare_coordinate_conditional(built, plan::StructuralPlan, u0::Abstrac
     push!(signature.args, :(_ppl_cg_index::Int), :(_ppl_cg_previous::Float64))
     body = Expr(:block, derived...,
         :(_ppl_cg_density::Float64 = $(_sum_terms(selected))),
+        (:($(s.name)::Float64 = $(_sum_terms(s.terms))) for s in scalars)...,
         (isempty(nodes) ? () : (:(_ppl_cg_products = $products),))...,
         :(return _ppl_cg_density))
     spec = _eval_kernel_def(Expr(:(=), signature, body))
@@ -488,8 +534,9 @@ function prepare_coordinate_conditional(built, plan::StructuralPlan, u0::Abstrac
         end
     end
     joint = prepare_query(built, plan, :sampler; exemplars=(u,), on_error)
+    scalar_blocks = Tuple(CoordinateBlock(s.k:s.k, cut(s.name), (), ()) for s in scalars)
     return CoordinateConditional(layout, joint, conditional, update, refresh,
-        Symbol[node.name for node in nodes], Tuple(prepared))
+        Symbol[node.name for node in nodes], Tuple(prepared), scalar_blocks)
 end
 
 "One point with its cached products, returned by [`coordinate_state`](@ref)."
@@ -514,12 +561,14 @@ function coordinate_state(problem::CoordinateConditional, u0::AbstractVector)
     return CoordinateState(problem, position, map(copy, problem.refresh(position)))
 end
 
-@inline _coordinate_density(::Tuple{}, problem, u, products, k, previous) =
-    problem.conditional(u, products..., k, previous)
-@inline function _coordinate_density(blocks::Tuple, problem, u, products, k, previous)
+@inline _coordinate_density(::Tuple{}, problem::CoordinateConditional, u, products, k, previous) =
+    _coordinate_density(problem.scalars, problem.conditional, u, products, k, previous)
+@inline _coordinate_density(::Tuple{}, kernel, u, products, k, previous) =
+    kernel(u, products..., k, previous)
+@inline function _coordinate_density(blocks::Tuple, fallback, u, products, k, previous)
     block = first(blocks)
     k in block.range && return _block_density(block, u, products, k, previous)
-    return _coordinate_density(Base.tail(blocks), problem, u, products, k, previous)
+    return _coordinate_density(Base.tail(blocks), fallback, u, products, k, previous)
 end
 # The kernel reads the moved element's index in the block's vector, unless the
 # block has neither cells nor partitions.
