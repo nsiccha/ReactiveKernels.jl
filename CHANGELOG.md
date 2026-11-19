@@ -16,6 +16,13 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.323
+
+- `jax_source` again names private helpers for prepared kernels after the
+  captured endpoint or requested result. For example, a truncated Cauchy
+  prior calls `_standardized` and `_standard_logccdf`, and their docstrings
+  identify the quantities they compute.
+
 ## 0.1.322
 
 - A summed plate nested in another plate's cell, such as the positions of a

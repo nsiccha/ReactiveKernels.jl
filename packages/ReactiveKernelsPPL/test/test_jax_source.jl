@@ -683,6 +683,20 @@ end
     @test occursin("jax.lax.fori_loop(", string(rsrc))
 end
 
+@testset "jax_source: prepared endpoints in a truncated Cauchy prior" begin
+    model = @rkppl begin
+        x[axes(y, 1)] .~ truncated.(Cauchy.(0, 1), 0, Inf)
+        y .~ Normal.(x, 1)
+    end
+    plan = model() | (; y = [0.2, 0.4, 0.6])
+    src = jax_source(build_kernel(plan), plan)
+    for name in ("standardized", "standard_logccdf")
+        @test occursin("def _$name(", src.text)
+        @test occursin("Compute `$name` from its kernel plan.", src.text)
+        @test occursin(Regex("\\b$name(?:_\\d+)? = _$name\\("), src.text)
+    end
+end
+
 @testset "jax_source(built, plan): log density and gradient ($name)" for name in keys(_JAX_CASES)
     if !rk_jax_available()
         @info "RK_JAX_PYTHON is not set: JAX parity for $name skipped"

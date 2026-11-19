@@ -1972,6 +1972,9 @@ end
     view_src = jax_source(jax_view_row; have = (:a, :x), want = :total)
     obj_src = jax_source(jax_obj_scores; have = (:location, :x, :scale), want = :total)
     bounded_src = jax_source(jax_obj_bounded; have = (:location, :scale, :x, :lo), want = :total)
+    @test occursin("def _standardized(", bounded_src.text)
+    @test occursin("Compute `standardized` from its kernel plan.", bounded_src.text)
+    @test occursin("standardized = _standardized(", bounded_src.text)
     g = ["b", "c", "a", "b", "a"]
     declared = jax_source(jax_prep_declared_sum; have = (:theta, :g), want = :total, data = (; g))
     iseq = jax_source(jax_prep_isequal; have = (:theta, :g), want = :total, data = (; g))
