@@ -112,3 +112,37 @@ after preparation and exclude the cost of constructing that design.
 ```sh
 julia --startup-file=no --project=<env> benchmark/near_miss/probe_families.jl AC 2000 '^(A12 |A13 |A15 |A16 |C0 |C4 |C5 )'
 ```
+
+## Factor coding and level count
+
+The C1 and C2 probes repeat the four factor spellings with Bernoulli-logit
+and Poisson responses. Suffixes `r`, `m`, `h` and `t` select a reference
+level, missing labels, an authored two-column matrix and a separate scan.
+The `x` sibling binds the same two columns as a matrix. The unsuffixed
+model is the full-cover sibling for the reference, missing and scan cases.
+
+`factor_scaling.jl` measures a fresh model from data binding through
+`prepare_sampler`, then measures the warm density and ordinary Enzyme value
+and gradient. Setup MiB are cumulative Julia allocations. Each law and
+spelling first runs with 100 rows and five levels to warm its Julia methods.
+The target data have 20,000 rows, sorted by group, with 50, 500 or 5,000
+levels. The last two command arguments select laws and spellings.
+
+```sh
+julia --startup-file=no --project=<env> benchmark/near_miss/probe_families.jl C 2000 '^(C1|C2)'
+julia --startup-file=no --project=<env> benchmark/near_miss/factor_scaling.jl 20000 50,500,5000 normal,bernoulli full,reference,missing,bound_matrix,hcat,scan
+```
+
+On `8a7f69f42`, the full-cover and reference-coded siblings had the following
+costs. Each pair gives full cover first and reference coding second.
+The 5,000-level reference design has 99,980,000 entries. Gaussian
+least-squares preparation can hide the cost of building it at smaller sizes.
+
+| Law | Levels | Setup (s) | Setup (MiB) | Density (µs) | Value and gradient (µs) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Normal | 50 | 0.286 / 0.407 | 89.6 / 144 | 2.20 / 0.85 | 4.01 / 2.28 |
+| Normal | 500 | 0.855 / 2.02 | 91.1 / 633 | 3.65 / 82.8 | 10.1 / 166 |
+| Normal | 5,000 | 1.93 / 111 | 278 / 6,042 | 5.72 / 22,290 | 23.9 / 114,133 |
+| Bernoulli-logit | 50 | 0.163 / 0.199 | 62.8 / 76.5 | 170 / 239 | 222 / 346 |
+| Bernoulli-logit | 500 | 0.174 / 0.261 | 64.5 / 284 | 173 / 1,993 | 227 / 3,959 |
+| Bernoulli-logit | 5,000 | 2.41 / 1.51 | 248 / 2,369 | 179 / 48,226 | 216 / 91,627 |

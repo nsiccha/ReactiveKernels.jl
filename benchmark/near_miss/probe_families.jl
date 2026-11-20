@@ -2,6 +2,7 @@
 # sibling spellings / sibling laws on the same data. A cliff between siblings
 # whose mathematics has the same cost structure marks an overspecific fast path.
 include(joinpath(@__DIR__, "harness.jl"))
+include(joinpath(@__DIR__, "factor_variants.jl"))
 
 # usage: julia probe_families.jl [families, e.g. ABCDR] [rows]
 const N = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 2000
@@ -213,6 +214,13 @@ if occursin('C', fam)
     record(probe("C-group", "C4 Normal, reference level", C4, (; x, g = g_sorted), (; y)))
     g_missing = replace(g_sorted, 1 => missing)
     record(probe("C-group", "C5 Normal, missing group", C0, (; x, g = g_missing), (; y)))
+    for (law, base, obs) in ((:bernoulli, "C1", ybinc), (:poisson, "C2", ycnt))
+        for (suffix, form) in (("r", :reference), ("m", :missing), ("x", :bound_matrix),
+                ("h", :hcat), ("t", :scan))
+            model, inputs, observed = factor_case(law, form, x, z, g_sorted, obs)
+            record(probe("C-group", "$base$suffix $law, $form", model, inputs, observed))
+        end
+    end
 end
 
 # ------------------------------------------- D: shared-parameter normalizers
