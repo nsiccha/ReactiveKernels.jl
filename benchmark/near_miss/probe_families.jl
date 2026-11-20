@@ -111,6 +111,26 @@ if occursin('A', fam)
     end
     record(probe("A-gauss", "A14 StudentT alpha[g] sorted", A14, (; x, g = g_sorted), (; y)))
     record(probe("A-gauss", "A14s StudentT alpha[g] shuffled", A14, (; x, g = g_shuf), (; y)))
+    A15 = @rkppl begin
+        sigma ~ Exponential(1.0)
+        X = hcat(x, z)
+        alpha[levels(g)] .~ Normal.(0, 2); beta[axes(X, 2)] .~ Normal.(0, 2)
+        y .~ Normal.(alpha[g] .+ X * beta, sigma)
+    end
+    record(probe("A-gauss", "A15 alpha[g] + hcat(x,z)*beta", A15, (; x, z, g = g_sorted), (; y)))
+    A16 = @rkppl begin
+        b ~ Normal(0, 2); sigma ~ Exponential(1.0)
+        alpha[levels(g)] .~ Normal.(0, 2)
+        @scan begin
+            s[1] ~ Normal(0, 1)
+            for t in 2:T
+                s[t] ~ Normal(s[t - 1], 1)
+            end
+        end
+        y .~ Normal.(alpha[g] .+ b .* x, sigma)
+    end
+    record(probe("A-gauss", "A16 alpha[g] beside three-step scan", A16,
+        (; x, g = g_sorted, T = 3), (; y, s = [0.5, -0.25, 0.1])))
 end
 
 # ------------------------------------------------- B: discrete-covariate GLMs
@@ -185,6 +205,14 @@ if occursin('C', fam)
     end
     record(probe("C-group", "C3 StudentT, sorted g", C3, (; x, g = g_sorted), (; y)))
     record(probe("C-group", "C3s StudentT, shuffled g", C3, (; x, g = g_shuf), (; y)))
+    C4 = @rkppl begin
+        m ~ Normal(0, 5); t ~ Exponential(1.0); b ~ Normal(0, 2); sigma ~ Exponential(1.0)
+        alpha[levels(g)[2:end]] .~ Normal.(m, t)
+        y .~ Normal.(alpha[g] .+ b .* x, sigma)
+    end
+    record(probe("C-group", "C4 Normal, reference level", C4, (; x, g = g_sorted), (; y)))
+    g_missing = replace(g_sorted, 1 => missing)
+    record(probe("C-group", "C5 Normal, missing group", C0, (; x, g = g_missing), (; y)))
 end
 
 # ------------------------------------------- D: shared-parameter normalizers

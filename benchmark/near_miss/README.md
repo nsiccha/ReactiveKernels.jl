@@ -25,9 +25,9 @@ measured; a variant that fails prints its error instead of a timing.
 
 | Family | Base model | Siblings |
 | --- | --- | --- |
-| A | `y .~ Normal.(a .+ b .* x, sigma)` | named location, matrix design, data-weighted scale, LogNormal, `@plate` loop, quadratic term, exp link, Student-t, modeled scale, scalar location, crossed and gathered intercepts |
+| A | `y .~ Normal.(a .+ b .* x, sigma)` | named location, matrix design, data-weighted scale, LogNormal, `@plate` loop, quadratic term, exp link, Student-t, modeled scale, scalar location, crossed and gathered intercepts, gathered intercept beside an authored `hcat` or a separate scan |
 | B | `y .~ BernoulliLogit.(a .+ b .* x)` on a discrete covariate | continuous covariate, `Bernoulli.(logistic.(…))`, Poisson, Binomial, negative binomial, `@plate` loop |
-| C | `y .~ Normal.(alpha[g] .+ b .* x, sigma)` with rows sorted by group | shuffled rows, Bernoulli-logit, Poisson, Student-t |
+| C | `y .~ Normal.(alpha[g] .+ b .* x, sigma)` with rows sorted by group | shuffled rows, Bernoulli-logit, Poisson, Student-t, reference coding, missing group labels |
 | D | `y .~ Normal.(exp.(a .+ b .* x), sigma)` | Student-t, LogNormal, Gamma, Weibull, Cauchy, Laplace, Logistic with shared shape or scale |
 | G | Poisson cubic trend over 40 rows | Binomial quadratic trend, one effect per row, Poisson, Binomial and Bernoulli-logit over a five-column design matrix |
 | R | hand-written loops | Normal, Student-t, Cauchy, Bernoulli-logit, Poisson, gathered Normal |
@@ -86,3 +86,29 @@ formula, so its repeated rows are still evaluated one by one. The plate with
 the exact kernel equals that formula's value-and-gradient time and runs
 repeated rows once (26.0 µs to 0.5 µs), but its density-only call takes 23 to
 34 percent longer on a continuous covariate.
+
+## Grouped Normal factor terms
+
+On `8a7f69f42`, one process timed 2,000 observations sorted into 50
+groups, using Julia 1.10.12, Enzyme 0.13.221 (`dogfood`) and one BLAS
+thread. C4 omits the first group's coefficient. C5 replaces that group's
+labels with `missing`. Both give the same log density at the probe point.
+
+| Variant | Density (ns) | Value and gradient (ns) | Relative to A13 |
+| --- | ---: | ---: | ---: |
+| A13 grouped intercept and slope | 407 | 1,063 | 1.00× |
+| A12 grouped intercept and bound five-column matrix | 1,026 | 2,163 | 2.03× |
+| A15 grouped intercept and two-column `hcat` in the model | 862 | 2,145 | 2.02× |
+| A16 grouped intercept and separate three-step observed scan | 945 | 2,464 | 2.32× |
+| C0 hierarchical grouped intercept and slope | 418 | 1,108 | 1.04× |
+| C4 hierarchical, reference-coded groups | 851 | 2,382 | 2.24× |
+| C5 hierarchical, missing group labels | 846 | 2,285 | 2.15× |
+
+A13 emits a gather by level code. A15, A16, C4 and C5 emit a dense
+rows-by-levels design. Their prepared Gaussian densities use the
+least-squares residual kernel (`_ls_rss`). The timings cover repeated calls
+after preparation and exclude the cost of constructing that design.
+
+```sh
+julia --startup-file=no --project=<env> benchmark/near_miss/probe_families.jl AC 2000 '^(A12 |A13 |A15 |A16 |C0 |C4 |C5 )'
+```
