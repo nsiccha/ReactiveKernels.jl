@@ -2982,6 +2982,8 @@ _pr_projections(::Type{<:_PlateSumRule{S,B,P,R,J,G}}) where {S,B,P,R,J,G} = G
     _pr_group_broadcast_expr(I, _pr_projections(F), args.parameters, :_pr_rule_target)
 @generated _pr_rule_call(rule::_PRGroupBroadcastRule{I,F}, args::Tuple) where {I,F} =
     _pr_group_broadcast_expr(I, _pr_projections(F), args.parameters, :_pr_rule_call)
+@generated _pr_rule_applies(rule::_PRGroupBroadcastRule{I,F}, args::Tuple) where {I,F} =
+    _pr_group_broadcast_expr(I, _pr_projections(F), args.parameters, :_pr_rule_applies)
 # One method per operand count, each operand's type a parameter of its own:
 # Julia does not otherwise specialize on a `Function` operand it only passes on
 # (the program's callables), and the call would dispatch dynamically
@@ -3194,7 +3196,6 @@ function _pr_inline_plate_programs(ast::Expr, kernel, active_ports; tape_slot = 
                 operands = Any[operands..., tape_slot()]
             end
             called = Expr(:(=), node.args[1], Expr(:call, rule, operands...))
-            rule isa _PlateSumRule || return called
             # The else arm keeps the program call, which is inlined below.
             return Expr(:if, Expr(:call, GlobalRef(@__MODULE__, :_pr_rule_applies), rule,
                                   Expr(:tuple, operands...)), called, node)
