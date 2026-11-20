@@ -23,8 +23,9 @@ _retained_normal = @rkppl begin
     y .~ Normal.(mu, sigma)
 end
 
-# A log-link Poisson response: its sampler density uses the whole-vector sum,
-# so the pointwise plate is computed only because it is retained.
+# A log-link Poisson response: its sampler density sums the kernel plate and
+# adds the folded normalizer, so the pointwise plate is computed only because
+# it is retained.
 _retained_poisson = @rkppl begin
     a ~ Normal(0, 1)
     b ~ Normal(0, 1)
@@ -131,7 +132,7 @@ end
         @test all(k -> length(retained.pointwise.ys[k]) == length(rows[k]), 1:5)
     end
 
-    @testset "Poisson whole-vector likelihood" begin
+    @testset "Poisson count-plate likelihood" begin
         plan = _retained_poisson(; g = d.g, t = d.t) | (; c = d.c)
         _check_retained(plan, (:pointwise, :likelihood))
     end

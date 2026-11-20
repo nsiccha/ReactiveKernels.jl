@@ -48,6 +48,31 @@ function ref_student_exp(u, x, y, lgamma)
     lp - 0.5 * (nu + 1) * s + length(y) * norm
 end
 
+# Positive observations, with data-only logs available at binding.
+function ref_gamma_exp(u, x, y, logy, lgamma)
+    a, b, log_shape = u
+    shape = exp(log_shape)
+    prior = nlp(a, 0.0, 1.0) + nlp(b, 0.0, 1.0) - shape + log_shape
+    result = prior + length(y) * (shape * log_shape - lgamma(shape))
+    @inbounds for i in eachindex(x, y, logy)
+        eta = a + b * x[i]
+        result += (shape - 1) * logy[i] - shape * (eta + y[i] * exp(-eta))
+    end
+    result
+end
+
+function ref_weibull_exp(u, x, logy)
+    a, b, log_k = u
+    k = exp(log_k)
+    prior = nlp(a, 0.0, 1.0) + nlp(b, 0.0, 1.0) + nlp(log_k, 0.0, 0.3)
+    result = prior + length(logy) * log_k
+    @inbounds for i in eachindex(x, logy)
+        power = k * (logy[i] - (a + b * x[i]))
+        result += power - exp(power) - logy[i]
+    end
+    result
+end
+
 function ref_cauchy_exp(u, x, y)
     a, b, ls = u[1], u[2], u[3]
     sigma = exp(ls)

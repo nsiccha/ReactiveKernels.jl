@@ -225,7 +225,7 @@ const _normal_central_logmass = scalar_derivative_rule(_normal_interval_graph;
     primal = :value, partials = (a = :left, b = :right), name = :normal_central_logmass)
 
 const LOCATION_SCALE_SOURCE = raw"""
-using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma, logbeta, rk_beta_inc, rk_student_tail, _standard_normal_logcdf, _student_log_tail, _student_log_kernel
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma, logbeta, rk_beta_inc, rk_student_tail, _standard_normal_logcdf, _student_log_tail, _student_log1p
 using SpecialFunctions: erfc, erfcinv, beta_inc_inv
 using LogExpFunctions: log1pexp
 
@@ -272,8 +272,11 @@ end
 @kernel standard_student_t(nu::Float64) = begin
     log_beta::Float64 = nu == Inf ? 0.0 : logbeta(nu / 2, 0.5)
     log_normalizer::Float64 = nu == Inf ? -0.5log(2pi) : -0.5log(nu) - log_beta
+    # The kernel as a factor that reads only `nu`, times `_student_log1p`: a
+    # summed plate whose cells share `nu` takes the factor out of its sum.
     logpdf(z::Float64)::Float64 =
-        log_normalizer + _student_log_kernel(nu, z)
+        log_normalizer +
+        ifelse(nu == Inf, -0.5, -(nu + 1) / 2) * _student_log1p(nu, z)
     cdf(z::Float64)::Float64 = exp(logcdf(z))
     ccdf(z::Float64)::Float64 = exp(logccdf(z))
     logcdf(z::Float64)::Float64 = _student_log_tail(nu, z, log_beta, false)
