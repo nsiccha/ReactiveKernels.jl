@@ -118,8 +118,15 @@ end
     return result
 end
 
+@kernel sine_graph(x::Float64) = begin
+    y::Float64 = sin(x)
+    dy::Float64 = cos(x)
+    return y, dy
+end
+const row_sine = scalar_derivative_rule(sine_graph; primal = :y, partials = (x = :dy,))
+
 @kernel indexed_group_totals(rows::Vector{Vector{Float64}}, ids::Vector{Int},
-                             offsets::Vector{Float64}, scale::Float64) = begin
+                             offsets::Vector{Float64}, scale::Float64, weight::Float64) = begin
     scaled = plate(rows) do xs
         xs .* scale
     end
@@ -127,27 +134,27 @@ end
         xs = scaled[i]
         offset = offsets[i]
         terms = plate(xs) do x
-            sin(x + offset)
+            row_sine(x + offset)
         end
         subtotal::Float64 = sum(terms)
         subtotal
     end
-    result = sum(totals)
+    result = weight * sum(totals)
     return result
 end
 
 @testset "repeated scalar and ragged row lookups in a cached nested plate" begin
     rows = [[0.4, -1.2], Float64[], [0.8]]
     offsets = [0.12, -0.31, 0.7]
-    scale = -0.8
+    scale, weight = -0.8, -1.7
     ids = [3, 1, 2, 1, 3]
     for enabled in (false, true)
         grad = with_plate_reverse(enabled) do
-            k = prepare_nonallocating(indexed_group_totals, rows, ids, offsets, scale)
+            k = prepare_nonallocating(indexed_group_totals, rows, ids, offsets, scale, weight)
             if enabled
                 @test last(last(plate_reverse_report(k, (3, 4)))) == "rule"
             end
-            prepare_ad(k, AutoEnzyme(; mode = Enzyme.Reverse), rows, ids, offsets, scale;
+            prepare_ad(k, AutoEnzyme(; mode = Enzyme.Reverse), rows, ids, offsets, scale, weight;
                        active = (:offsets, :scale))
         end
         for order in (ids, [2, 2, 3], Int[])
@@ -159,10 +166,15 @@ end
                 db[i] += cos(z)
                 ds += x * cos(z)
             end
-            val, (doffsets, dscale) = ad_value_and_gradient(grad, rows, order, offsets, scale)
-            @test val ≈ want
-            @test doffsets ≈ db
-            @test dscale ≈ ds
+            val, (doffsets, dscale) = ad_value_and_gradient(grad, rows, order, offsets, scale, weight)
+            @test val ≈ weight * want
+            @test doffsets ≈ weight .* db
+            @test dscale ≈ weight * ds
+            # Only the nested sum has a joint cut. Its returned tape witnesses
+            # the one-pass schedule through the public nonallocating entry point.
+            slots = [c for t in RK._ad_owned_storage(grad) if t isa Tuple for c in t
+                     if c isa RK._PlateTapeSlot]
+            @test any(c -> length(c.tape) >= length(rows) + 1 + sum(length, rows), slots) == enabled
         end
     end
 end
