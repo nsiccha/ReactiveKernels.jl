@@ -168,4 +168,109 @@ end
     end
 end
 
+module Reached
+using ReactiveKernels
+const scale = Ref{Any}(2.0)
+
+# A helper the prepared program calls, not inlined: its finding is in its own
+# method, which alone does not say which statement of the program calls it.
+@noinline helper(x) = (scale[] * x)::Float64
+@kernel helper_kernel(a::Float64, n::Int) = begin
+    mu = helper(a)
+    nu = helper(n)
+    total = mu + nu
+    return total
+end
+
+# A keyword method that passes its varargs on, as `MutatingFunctions.apply!!`
+# does: Julia compiles it for `Vararg{Any}` whatever the call passes, so the
+# splat in it dispatches at run time (MutatingFunctions snag
+# `reactivekernels-fa93ad90`).
+# The `@noinline` keeps that compiled body a call of its own here, as it is in
+# the reported program, where it was not inlined.
+apply(::Nothing, f, args...; kwargs...) = (@noinline; f(args...; kwargs...))
+struct Gather end
+(::Gather)(x, i) = x[i]
+@inline gathered(x, i) = apply(nothing, Gather(), x, i)
+@kernel gather_kernel(x::Vector{Float64}, i::Vector{Int}) = begin
+    g = gathered(x, i)
+    total = sum(g)
+    return total
+end
+end
+
+# Snag `located-the-caus-a708f08d`: a finding in a callee names the calls that
+# reach it from the prepared program, with the argument types each passes.
+@testset "a code finding in a callee names the calls that reach it" begin
+    refusal(kernel) = try
+        prepare(kernel; type_stability = :error, type_stability_level = :all)
+        nothing
+    catch err
+        err
+    end
+    file = @__FILE__
+    helper_line = only(methods(Reached.helper)).line
+
+    # One message per signature the helper is compiled for, each with its call.
+    e = refusal(Reached.helper_kernel)
+    @test e isa TypeInstabilityError
+    @test length(e.messages) == 2
+    for (T, value) in ((Float64, "mu"), (Int, "nu"))
+        message = only(filter(m -> occursin("`invoke helper(::$T)`", m), e.messages))
+        @test occursin("Reached.helper @ $file:$helper_line` is not type stable", message)
+        @test occursin("The prepared program reaches it through these calls, " *
+                       "outermost first:", message)
+        # The call names the value whose statement makes it, then its frames,
+        # among them that statement's scope.
+        @test occursin(Regex("\\n  - in [^\\n]*: `invoke helper\\(::$T\\)`\\n" *
+                             "      computing `$value`\\n(      at .*\\n)*" *
+                             "      at macro expansion @ rk:$value:"), message)
+        # The call passes exactly the signature it calls.
+        @test !occursin("called with", message)
+    end
+    kernel = ReactiveKernels._with_type_stability(() -> prepare(Reached.helper_kernel),
+                                                  nothing, :values)
+    found = ReactiveKernels._code_findings(kernel, (Float64, Int);
+        recurse = ReactiveKernels._code_recursion(Val(:all)))
+    helper_findings = filter(f -> occursin("Reached.helper @", f.method), found)
+    @test !isempty(helper_findings)
+    for f in helper_findings
+        # Outermost first: the entry call's, down to the call of the helper.
+        @test first(f.calls).method == "call"
+        @test startswith(last(f.calls).statement, "invoke helper(")
+    end
+    @test all(f -> isempty(f.calls), filter(f -> f.method == "call", found))
+
+    # A method compiled for wider types than its call passes: the call's own
+    # argument types are written out beside the signature it calls.
+    e = refusal(Reached.gather_kernel)
+    @test e isa TypeInstabilityError
+    message = only(e.messages)
+    @test occursin("is a call dispatched at run time: `Core._apply_iterate", message)
+    @test occursin(r"`invoke [^`]*apply[^`]*\(::Nothing, ::[^`]*Gather, " *
+                   r"::Vector\{Float64\}, ::Vararg\{Any\}\)`\n      computing `g`\n" *
+                   r"      called with `[^`]*apply[^`]*\(::Nothing, ::[^`]*Gather, " *
+                   r"::Vector\{Float64\}, ::Vector\{Int64\}\)`\n", message)
+    @test occursin(Regex("\\n      at gathered @ $file:" *
+                         "$(only(methods(Reached.gathered)).line)\\n"), message)
+    # The keyword method still runs.
+    gather = ReactiveKernels._with_type_stability(() -> prepare(Reached.gather_kernel),
+                                                  nothing, :values)
+    @test gather([1.0, 2.0, 3.0], [1, 3]) == 4.0
+
+    # The warning is once per call path: the same finding reached through
+    # another call warns again.
+    report(found) = ReactiveKernels._report_type_stability((), found, :warn)
+    frame = ReactiveKernels._CodeFrame(:f, :client, 1)
+    reached(line) = ReactiveKernels._CodeFinding(
+        :dynamic, "f", 1, Any, "g(_2)", [frame],
+        [ReactiveKernels._CodeCall("call", "invoke f(::Int64)", "",
+                                   [ReactiveKernels._CodeFrame(:caller, :client, line)])])
+    @test_logs (:warn, r"at caller @ client:7") (:warn, r"at caller @ client:8") begin
+        report([reached(7)])
+        report([reached(8)])
+        report([reached(7)])
+    end
+end
+
 end # module CompilerAuditTests

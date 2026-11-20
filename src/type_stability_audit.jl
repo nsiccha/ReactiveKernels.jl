@@ -18,7 +18,10 @@
 # in `_CODE_FINDINGS_JUSTIFIED` are exempt; each entry carries its
 # justification. So are the statements of an expansion of Julia's logging
 # macros (`_code_logging`). A finding records where its statement was written
-# (`_code_frames`): after inlining, its method alone does not say.
+# (`_code_frames`): after inlining, its method alone does not say. It also
+# records the calls through which the audit reached that method from the
+# audited call (`_CodeCall`): a callee's own frames do not say which statement
+# of the prepared program calls it, nor with which argument types.
 
 # One frame of a statement's source: a function or a macro expansion, and the
 # line it was written on.
@@ -30,6 +33,26 @@ end
 
 Base.show(io::IO, f::_CodeFrame) = print(io, f.name, " @ ", f.file, ":", f.line)
 
+# A call the audit followed into a callee: the statement of method `method`
+# that invokes it. `statement` is the signature the callee is compiled and
+# audited for (`invoke f(::A, ::B)`); `arguments` is the call's own argument
+# types in that form where they differ, as when Julia compiles a method for
+# wider types than the call passes (`Vararg{Any}` for pass-through varargs),
+# and empty otherwise. In a body RK generates, `location` includes the scope of
+# the value whose statement makes the call (`rk:<name>`, `_source_scope`).
+struct _CodeCall
+    method::String
+    statement::String
+    arguments::String
+    location::Vector{_CodeFrame} # innermost first
+end
+
+Base.:(==)(a::_CodeCall, b::_CodeCall) =
+    a.method == b.method && a.statement == b.statement &&
+    a.arguments == b.arguments && a.location == b.location
+Base.hash(c::_CodeCall, h::UInt) =
+    hash((c.method, c.statement, c.arguments, c.location), hash(_CodeCall, h))
+
 struct _CodeFinding
     kind::Symbol
     method::String
@@ -37,7 +60,11 @@ struct _CodeFinding
     type::Any
     statement::String
     location::Vector{_CodeFrame} # innermost first
+    calls::Vector{_CodeCall} # from the audited call to `method`, outermost first
 end
+
+_CodeFinding(kind, method, index, type, statement, location) =
+    _CodeFinding(kind, method, index, type, statement, location, _CodeCall[])
 
 function Base.show(io::IO, f::_CodeFinding)
     print(io, f.kind, " in ", f.method, " %", f.index, " :: ", f.type, "  ", f.statement)
@@ -191,6 +218,16 @@ function _code_signature_text(@nospecialize(tt))
     callee * "(" * join(("::$T" for T in arguments), ", ") * ")"
 end
 
+# The call `statement` of `ci` makes into `mi`, from the method labelled
+# `method`: the argument types it passes are written out only where they
+# differ from the signature `mi` is compiled for.
+function _code_call(ci::Core.CodeInfo, statement::Expr, mi::Core.MethodInstance,
+                    method::String, frames)
+    passed = Tuple{Any[_code_argument_type(ci, x) for x in statement.args[2:end]]...}
+    arguments = passed == mi.specTypes ? "" : _code_signature_text(passed)
+    _CodeCall(method, _code_statement_text(statement), arguments, frames)
+end
+
 _code_frame_name(m::Core.MethodInstance) = _code_frame_name(m.def)
 _code_frame_name(m::Method) = m.name
 _code_frame_name(m) = m
@@ -275,13 +312,15 @@ end
     _code_findings(f, argtypes; recurse = _rk_or_generated()) -> Vector{_CodeFinding}
 
 Audit `f` called with arguments of types `argtypes`, recursing into every
-statically invoked callee whose method `recurse` accepts.
+statically invoked callee whose method `recurse` accepts. A callee compiled
+for one signature is audited once, through the first call that reaches it.
 """
 _code_findings(@nospecialize(f), @nospecialize(argtypes); recurse = _rk_or_generated()) =
     _code_audit!(_CodeFinding[], Set{Any}(), Base.signature_type(f, argtypes), "call",
-                 recurse)
+                 recurse, _CodeCall[])
 
-function _code_audit!(found, seen, @nospecialize(tt), where, recurse)
+function _code_audit!(found, seen, @nospecialize(tt), where, recurse,
+                      calls::Vector{_CodeCall})
     tt in seen && return found
     push!(seen, tt)
     for (ci, _) in Base.code_typed_by_type(tt; optimize = true, debuginfo = :source)
@@ -310,11 +349,13 @@ function _code_audit!(found, seen, @nospecialize(tt), where, recurse)
                     all(x -> _code_stable(_code_argument_type(ci, x)),
                         _code_call_arguments(statement))
                 push!(found, _CodeFinding(root ? :root : :nonconcrete, where, i, T,
-                                          _code_statement_text(statement), frames))
+                                          _code_statement_text(statement), frames, calls))
             end
             dynamic && push!(found, _CodeFinding(:dynamic, where, i, T,
-                                                 _code_statement_text(statement), frames))
-            recursing && _code_audit!(found, seen, mi.specTypes, _code_label(callee), recurse)
+                                                 _code_statement_text(statement), frames,
+                                                 calls))
+            recursing && _code_audit!(found, seen, mi.specTypes, _code_label(callee), recurse,
+                                      [calls; _code_call(ci, statement, mi, where, frames)])
         end
     end
     found

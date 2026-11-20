@@ -16,6 +16,20 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.349
+
+- A code finding of the type-stability check in a function the prepared
+  program calls now lists the calls that reach it, outermost first, under the
+  heading "The prepared program reaches it through these calls". Each call shows
+  the signature the function is compiled and checked for, the program's value
+  whose statement makes the call (``computing `mu` ``), and the argument types the
+  call passes where that signature is wider, such as pass-through varargs
+  compiled as `Vararg{Any}`. Its frames follow, innermost first. Each signature
+  a function is compiled for is now its own finding. Before, such a finding
+  named only the function's own frames, so it did not say which statement of the
+  program called the function, or with which argument types. The warning's
+  once-per-process key includes the calls.
+
 ## 0.1.348
 
 - The native loop for non-strided matrix products checks the shared dimension

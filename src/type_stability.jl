@@ -470,11 +470,15 @@ Base.@nospecializeinfer _level_code_findings(level::Symbol, @nospecialize(f), ar
 # typed, or a call dispatched at run time. Other findings follow from one.
 _code_source(f::_CodeFinding) = f.kind === :root || f.kind === :dynamic
 
-# The code findings grouped by method, in the order the audit met them.
+# The code findings grouped by the method they are in and the calls that reach
+# it (one group per signature the method is audited for), in the order the
+# audit met them.
 function _code_findings_by_method(found)
     groups = Pair{String,Vector{_CodeFinding}}[]
     for f in found
-        index = findfirst(g -> first(g) == f.method, groups)
+        index = findfirst(groups) do (method, members)
+            method == f.method && first(members).calls == f.calls
+        end
         index === nothing ? push!(groups, f.method => [f]) : push!(last(groups[index]), f)
     end
     groups
@@ -485,6 +489,40 @@ function _code_method_description(method::String)
     occursin("generated_callfunc", method) &&
         return "The body ReactiveKernels generated for the prepared program"
     "`$method`"
+end
+
+# The values of the program whose statements hold a call, as the source
+# scopes of its frames name them (`_source_scope`), innermost first: the value
+# whose statement makes the call, in the body of the value that encloses it.
+function _code_call_values(call::_CodeCall)
+    values = String[]
+    for frame in call.location
+        label = _marker_label(frame)
+        label === nothing || label == _SOURCE_MARKER_PROGRAM || push!(values, label)
+    end
+    isempty(values) && return String[]
+    text = "`$(first(values))`"
+    length(values) > 1 &&
+        (text *= " in the body of " * join(("`$v`" for v in values[2:end]), " within "))
+    ["      computing $text"]
+end
+
+# The calls that reach a finding's method from the prepared program, outermost
+# first: each call's statement, the program's value it computes, the argument
+# types it passes where the signature it calls is wider, and where it is
+# written.
+function _code_calls_text(calls)
+    isempty(calls) && return ""
+    lines = map(calls) do call
+        join(["  - in $(lowercasefirst(_code_method_description(call.method))): " *
+              "`$(call.statement)`";
+              _code_call_values(call);
+              isempty(call.arguments) ? String[] :
+                  ["      called with `$(call.arguments)`"];
+              ["      at $frame" for frame in call.location]], "\n")
+    end
+    "\nThe prepared program reaches it through these calls, outermost first:\n" *
+    join(lines, "\n")
 end
 
 function _code_finding_message(method::String, found)
@@ -501,6 +539,7 @@ function _code_finding_message(method::String, found)
         "$following further values follow"
     "ReactiveKernels: $(_code_method_description(method)) is not type stable:\n" *
     join(lines, "\n") * (following == 0 ? "" : "\n  and $follow from these.") *
+    _code_calls_text(first(found).calls) *
     "\nEvery evaluation pays for the dynamic dispatch, and native reverse-mode AD " *
     "may refuse the prepared program. Make that code type stable; " *
     "`type_stability_level = :values` checks only the types of the program's values."
@@ -516,7 +555,8 @@ function _report_type_stability(values, code, ::Val{:warn})
             u.input_types)
     end
     for (method, found) in _code_findings_by_method(code)
-        id = (:code_finding, method, map(f -> (f.kind, f.statement, f.location), found))
+        id = (:code_finding, method, first(found).calls,
+              map(f -> (f.kind, f.statement, f.location), found))
         @warn _code_finding_message(method, found) _group = :type_stability maxlog = 1 _id = id
     end
 end
