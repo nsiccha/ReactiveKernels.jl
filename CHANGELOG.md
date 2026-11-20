@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.334
+
+- `prepare_nonallocating` reuses the result of a dense numerical `copy(A)` in
+  a `@traceable` helper that fills the copy with indexed stores and returns it.
+  For example, a row replacement written as a loop over `eachindex(v)` keeps
+  the original matrix intact even when `v` is a view into it. A changed shape
+  or an input that aliases the previous destination gets a fresh result.
+
 ## 0.1.333
 
 - `jax_source` preserves the dtype of signed and unsigned 8-, 16-, 32- and

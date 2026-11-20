@@ -62,7 +62,58 @@ const ROW_COUNT = @kernel row_count(plan) = begin
     n = length(rows)
 end
 
+@traceable function ownership_withrow(A, i, v)
+    B = copy(A)
+    for j in eachindex(v)
+        B[i + 1, j] = v[j]
+    end
+    B
+end
+
+const PUT_ROW = @kernel ownership_putrow(A, i, v) = begin
+    result = ownership_withrow(A, i, v)
+end
+
 @testset "nonallocating cache ownership and result typing" begin
+    @testset "indexed writes fill an independent copy" begin
+        p = prepare(PUT_ROW; have = (:A, :i, :v), want = :result)
+        A = reshape(collect(1.0:32), 4, 8)
+        original = copy(A)
+        v = ones(8)
+        run = prepare_nonallocating(p, A, 0, v)
+        @test run(A, 0, v) == ownership_withrow(A, 0, v)
+        @test ownership_allocations(run, (A, 0, v)) == 0
+        # Runtime extents, including a partial row and an empty index domain.
+        for (matrix, i, row) in ((A, 2, [3.0, 4.0]), (A, 99, Float64[]),
+                                 (zeros(2, 19), 1, ones(19)))
+            @test run(matrix, i, row) == ownership_withrow(matrix, i, row)
+            @test ownership_allocations(run, (matrix, i, row)) == 0
+        end
+        @test_throws BoundsError run(A, 4, v)
+        @test_throws BoundsError run(A, 0, ones(9))
+        old = run(A, 0, v)
+        saved = copy(old)
+        next = run(old, 2, v)
+        @test next == ownership_withrow(saved, 2, v)
+        @test !Base.mightalias(next, old)
+        @test old == saved
+
+        # The source row overlaps the row being replaced, in reverse order.
+        row = view(A, 2, 8:-1:1)
+        views = prepare_nonallocating(p, A, 1, row)
+        borrowed = views(A, 1, row)
+        @test borrowed == ownership_withrow(original, 1, row)
+        @test ownership_allocations(views, (A, 1, row)) == 0
+        @test A == original
+        # A view into the previous destination is also a live input.
+        rhs = view(borrowed, 2, 8:-1:1)
+        snapshot = copy(borrowed)
+        expected = ownership_withrow(A, 0, rhs)
+        result = views(A, 0, rhs)
+        @test result == expected
+        @test !Base.mightalias(result, rhs)
+        @test borrowed == snapshot
+    end
     @testset "a range-valued step is recomputed, not written into" begin
         k = prepare_nonallocating(LAZY_DOMAIN; want = :y)
         reference = prepare(LAZY_DOMAIN; want = :y)
