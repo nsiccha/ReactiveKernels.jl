@@ -18,7 +18,7 @@ are recorded in the git history only.
 
 ## 0.1.245
 
-Requires ReactiveKernels 0.1.348.
+Requires ReactiveKernels 0.1.350.
 
 - A ReactiveKernels law with `location` and `scale` ports, a `logpdf` that
   takes one observation, and all kernel-valued arguments bound can serve as an

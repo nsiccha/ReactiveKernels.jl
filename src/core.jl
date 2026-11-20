@@ -956,7 +956,7 @@ end
 # generic method's order over the shared dimension (each product added in turn
 # to a zero start).  Every other operand list, including two strided operands
 # (which Base may send to BLAS), row vectors, structured and static matrices,
-# mismatched sizes and more than two factors, calls Base itself.
+# and more than two factors, calls Base itself.
 @inline _native_mul_operand(::Array) = true
 @inline _native_mul_operand(
     A::Union{SubArray,Base.ReshapedArray,LinearAlgebra.Adjoint,LinearAlgebra.Transpose}) =
@@ -966,6 +966,23 @@ end
 @inline _native_mul_strided(::StridedVecOrMat) = true
 @inline _native_mul_strided(::LinearAlgebra.AdjOrTrans{<:Any,<:StridedVecOrMat}) = true
 @inline _native_mul_strided(_) = false
+
+# For operands the loop handles, an incompatible shared dimension is an error.
+# Falling back to `A * B` here keeps the entire generic multiplication reachable
+# when Enzyme differentiates the valid product.
+@noinline function _native_mul_dimension_error(A, B)
+    @static if isdefined(LinearAlgebra, :matmul_size_check_error)
+        LinearAlgebra.matmul_size_check_error(size(A), size(B))
+    else
+        # Julia 1.10's generic matvec and matmat methods report these separately.
+        m, n = size(A)
+        B isa AbstractVector && throw(DimensionMismatch(
+            lazy"matrix A has dimensions ($m,$n), vector B has length $(length(B))"))
+        k, p = size(B)
+        throw(DimensionMismatch(
+            lazy"matrix A has dimensions ($m,$n), matrix B has dimensions ($k,$p)"))
+    end
+end
 
 # Whether `_native_mul` computes `A * B` with its own loop (the operands
 # above), rather than leaving it to Base. The non-allocating program's product
@@ -979,8 +996,9 @@ end
     _native_mul_operand(A) && _native_mul_operand(B) || return false
     _native_mul_strided(A) && _native_mul_strided(B) && return false
     Base.has_offset_axes(A, B) && return false
-    size(A, 2) == size(B, 1) || return false
-    isbitstype(Base.promote_op(LinearAlgebra.matprod, TA, TB))
+    isbitstype(Base.promote_op(LinearAlgebra.matprod, TA, TB)) || return false
+    size(A, 2) == size(B, 1) || _native_mul_dimension_error(A, B)
+    true
 end
 
 # Adds `A * B` into `C` in the generic method's order over the shared
