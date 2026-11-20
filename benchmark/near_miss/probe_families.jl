@@ -2,6 +2,7 @@
 # sibling spellings / sibling laws on the same data. A cliff between siblings
 # whose mathematics has the same cost structure marks an overspecific fast path.
 include(joinpath(@__DIR__, "harness.jl"))
+import LogExpFunctions
 
 # usage: julia probe_families.jl [families, e.g. ABCDR] [rows]
 const N = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 2000
@@ -153,6 +154,19 @@ if occursin('B', fam)
     end
     record(probe("B-glm", "B5 @plate Bernoulli, discrete", B5, (; x = xd), (; y = ybin)))
     record(probe("B-glm", "B5c @plate Bernoulli, continuous", B5, (; x), (; y = ybinc)))
+    B6 = @rkppl begin
+        a ~ Normal(0, 1); b ~ Normal(0, 2)
+        p = logistic.(a .+ b .* x)
+        y .~ Bernoulli.(p)
+    end
+    B7 = @rkppl begin
+        a ~ Normal(0, 1); b ~ Normal(0, 2)
+        y .~ Bernoulli.(LogExpFunctions.logistic.(a .+ b .* x))
+    end
+    for (label, model) in (("B6 named link", B6), ("B7 qualified link", B7))
+        record(probe("B-glm", "$label, discrete", model, (; x = xd), (; y = ybin)))
+        record(probe("B-glm", "$label, continuous", model, (; x), (; y = ybinc)))
+    end
 end
 
 # ---------------------------------------------------- C: grouped intercepts

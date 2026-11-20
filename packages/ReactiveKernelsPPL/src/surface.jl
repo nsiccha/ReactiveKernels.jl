@@ -8528,7 +8528,7 @@ const _LINK_SLOTS = Dict{Symbol,Int}(:Bernoulli => 1, :Binomial => 2,
     :Poisson => 1, :NegativeBinomial2 => 1, :NegativeBinomial => 1,
     :HurdlePoisson => 1, :ZeroInflatedPoisson => 1,
     :ZeroInflatedBinomial => 2, :InverseGaussian => 1, :Exponential => 1,
-    :BetaBinomial2 => 2)
+    :BetaBinomial2 => 2, :Weibull => 2)
 
 # An undotted inverse link in a link slot is the function applied to its
 # argument whole, as in Julia: over a scalar it is the dotted link's value,
@@ -9587,34 +9587,8 @@ end
 function _dot2call_spine_arg(lhs, f, i, a)
     if f in _DOT_WRAPPERS && i == 1
         return _dot2call_nested_object(lhs, a)
-    elseif (f === :Bernoulli || f === :Poisson) && i == 1
-        # Bare param/literal: the mixture bare-mean slots, single-family
-        # form (sorted downstream in `_lower_location`).
-        (a isa Symbol || a isa Real) && return a
+    elseif get(_LINK_SLOTS, f, 0) == i
         return _dot2call_nested_link(lhs, a, f)
-    elseif f === :Binomial && i == 2
-        # Bare param/literal: see above.
-        (a isa Symbol || a isa Real) && return a
-        return _dot2call_nested_link(lhs, a, f)
-    elseif f === :NegativeBinomial2 && i == 1
-        return _dot2call_nested_link(lhs, a, f)
-    elseif f === :NegativeBinomial && i == 1
-        a isa Real && return a
-        return _dot2call_nested_link(lhs, a, f)
-    elseif f === :HurdlePoisson && i == 1
-        return _dot2call_nested_link(lhs, a, f)
-    elseif f === :ZeroInflatedPoisson && i == 1
-        return _dot2call_nested_link(lhs, a, f)
-    elseif f === :InverseGaussian && i == 1
-        a isa Real && return a
-        return _dot2call_nested_link(lhs, a, f)
-    elseif f === :Exponential && i == 1
-        return _dot2call_nested_link(lhs, a, f)
-    elseif f === :BetaBinomial2 && i == 2
-        return _dot2call_nested_link(lhs, a, f)
-    elseif f === :Weibull && i == 2
-        return _is_composed_map(a) && haskey(_AUXILIARY_LINKS, a.args[1]) ?
-            _dot2call_nested_link(lhs, a, f) : a
     end
     # Gamma position 2 (`exp.(eta) ./ alpha`) passes through; the
     # response branch matches the `./` structure (link + alpha identity).
@@ -9788,6 +9762,40 @@ end
 _bare_slot_name(arg, ctx) = arg isa Symbol && !haskey(ctx.detmap, arg) &&
     !_is_declared_array(arg, ctx)
 
+# A recognized inverse link's scalar function and operand, preserving Julia
+# binding identity for qualified calls, aliases and re-exports.
+function _inverse_link_call(ex, mod)
+    dotted = _is_dotted_call(ex)
+    dotted || Meta.isexpr(ex, :call, 2) || return nothing
+    args = dotted ? ex.args[2].args : ex.args[2:end]
+    length(args) == 1 || return nothing
+    head = ex.args[1]
+    if Meta.isexpr(head, :., 2) && head.args[2] isa QuoteNode &&
+            haskey(_AUXILIARY_LINKS, head.args[2].value)
+        qualifier = _resolve_module_path(head.args[1], mod, "inverse link")
+        head = _module_binding(qualifier, head.args[2].value, "inverse link", head)
+    end
+    if head isa GlobalRef
+        fn = getglobal(head.mod, head.name)
+        head = fn === LogExpFunctions.logistic ? :logistic :
+            fn === LogExpFunctions.cexpexp ? :cexpexp : fn === exp ? :exp : nothing
+    end
+    haskey(_AUXILIARY_LINKS, head) || return nothing
+    return (; head, arg = only(args), dotted)
+end
+
+# Only peel the outer call: its argument is still the original value, and
+# other readers keep the definition itself.
+function _definition_link(value, family, ctx)
+    value isa Symbol || return value
+    target = _alias_target(value, ctx)
+    link = _inverse_link_call(get(ctx.detmap, target, nothing), ctx.mod)
+    link === nothing && return value
+    haskey(_link_names(family), link.head) || return value
+    link.dotted || _canon_shape(link.arg, ctx) === :scalar || return value
+    return Expr(:call, link.head, link.arg)
+end
+
 function _lower_response_base(lhs, rhs::Expr, ctx)
     rhs.head === :call || _sfail("response $lhs: $_RESPONSE_BASE_MSG; " *
                                  "got $(repr(rhs))")
@@ -9801,6 +9809,10 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
         :BetaBinomial2, :VonMises, :CircularVonMises, :LogNormal, :Weibull) ||
         return _lower_response_base_error(lhs, rhs, fam)
     args = _distribution_args(fam, _plain_args(rhs, "`$fam`"))
+    slot = get(_LINK_SLOTS, fam, 0)
+    if 1 <= slot <= length(args)
+        args[slot] = _definition_link(args[slot], fam, ctx)
+    end
     if fam === :Normal
         length(args) == 2 || _sfail("response $lhs: `Normal` takes " *
                                     "`Normal.(mu, sigma)`")
