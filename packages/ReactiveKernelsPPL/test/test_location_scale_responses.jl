@@ -3,6 +3,7 @@ using Test, Random, ReactiveKernels, ReactiveKernelsPPL
 using DifferentiationInterface: AutoEnzyme
 import Distributions as D
 import Enzyme
+import Serialization
 import ReactiveKernelsDistributionKernels.DistributionKernelSources as Laws
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: student_t
 
@@ -85,6 +86,84 @@ end
         built = build_kernel(prior_fit)
         density = prepare_query(built, prior_fit, :prior)
         @test all(z -> Base.invokelatest(density, [z]) ≈ D.logpdf(law, z), draws)
+    end
+end
+
+@testset "standardized Student-t with row-varying degrees of freedom" begin
+    model = @rkppl begin
+        a ~ Normal()
+        y .~ TDist.(exp.(a .* x))
+    end
+    x, y = [-1.2, 0.4, 1.5], [-3.0, 0.1, 8.0]
+    fit = model(; x) | (; y)
+    a = 0.35
+    q = prepare_sampler(build_kernel(fit), fit, [a]; backend)
+    value, gradient = sampler_value_and_gradient!(q, zeros(1), [a])
+    reference(t) = D.logpdf(D.Normal(), t) + sum(D.logpdf.(D.TDist.(exp.(t .* x)), y))
+    @test value ≈ reference(a)
+    @test only(gradient) ≈ (reference(a + 1e-5) - reference(a - 1e-5)) / 2e-5
+end
+
+@testset "location-scale evidence and weighted observations" begin
+    y, w = [-1.0, 0.2, 1.0], [1.0, 2.0, 0.5]
+    for (head, dist) in ((:Cauchy, D.Cauchy), (:Laplace, D.Laplace),
+            (:Logistic, D.Logistic), (:TDist, D.TDist))
+        law = head === :TDist ? :($head.(exp(a))) : :($head.(a, 1.25))
+        distribution(t) = head === :TDist ? dist(exp(t)) : dist(t, 1.25)
+        for (rhs, loglik) in (
+                (:(truncated.($law, -1, 1)), d -> sum(D.logpdf.(D.truncated(d, -1, 1), y))),
+                (:(censored.($law, -1, 1)), d -> sum(D.logpdf.(D.censored(d, -1, 1), y))),
+                (:(interval_censored.($law, 1.7)), d -> sum(log.(D.cdf(d, 1.7) .- D.cdf.(d, y)))),
+                (:(weighted.($law, w)), d -> sum(w .* D.logpdf.(d, y))))
+            @testset "$rhs" begin
+                model = ReactiveKernelsPPL.RKPPLModel(quote
+                    a ~ Normal()
+                    y .~ $rhs
+                end, @__MODULE__)
+                fit = (rhs.args[1] === :weighted ? model(; w) : model()) | (; y)
+                u = [0.3]
+                q = prepare_sampler(build_kernel(fit), fit, u; backend)
+                value, gradient = sampler_value_and_gradient!(q, zeros(1), u)
+                reference(t) = D.logpdf(D.Normal(), t) + loglik(distribution(t))
+                @test value ≈ reference(u[1])
+                @test only(gradient) ≈ (reference(u[1] + 1e-5) - reference(u[1] - 1e-5)) / 2e-5 atol=1e-6
+            end
+        end
+    end
+end
+
+@testset "hand-built location-scale response with a scale predictor" begin
+    # As in the extension serializer, construct the structural plan directly.
+    # The family obtained from lowering identifies the RK kernel across I/O.
+    family = only(lower_rkppl(:(begin y .~ Laplace.(0, 1) end), (:y,);
+        conditioned = (:y,)).responses).family
+    x, y = [-0.4, 0.25, 1.2], [-2.0, 1.0, 3.0]
+    r = LikelihoodSpec(family, ReactiveKernelsPPL.IdentityLink, :y, :mu,
+        ScalePredictorRef(:sigma, ReactiveKernelsPPL.LogLink), nothing,
+        ResponseEvidence(:none, nothing, nothing), :obs)
+    mu = PredictorSpec(:mu, ReactiveKernelsPPL.IdentityLink, [
+        TermSpec(InterceptTerm, ColumnRef[], (;), :Intercept, :mean_intercept)], :mu)
+    scale = PredictorSpec(:sigma, ReactiveKernelsPPL.LogLink, [
+        TermSpec(ContinuousTerm, [:x], (;), :x, :scale_x)], :sigma)
+    plan = StructuralPlan([r], [mu, scale],
+        [PopulationPrior(:mu, :Intercept, 0.0, 1.0), PopulationPrior(:sigma, :x, 0.0, 1.0)],
+        SampledParameter[], AssignmentSpec[], Dict{Symbol,AbstractVector}(:x => x, :y => y), length(y))
+    io = IOBuffer()
+    Serialization.serialize(io, plan)
+    seekstart(io)
+    restored = Serialization.deserialize(io)
+    built = build_kernel(restored)
+    u = [0.2, -0.3]
+    q = prepare_sampler(built, restored, u; backend)
+    value, gradient = sampler_value_and_gradient!(q, zeros(2), u)
+    reference(t) = sum(D.logpdf.(D.Normal(), t)) +
+        sum(D.logpdf.(D.Laplace.(t[1], exp.(t[2] .* x)), y))
+    @test value ≈ reference(u)
+    for i in eachindex(u)
+        hi, lo = copy(u), copy(u)
+        hi[i] += 1e-5
+        lo[i] -= 1e-5
+        @test gradient[i] ≈ (reference(hi) - reference(lo)) / 2e-5
     end
 end
 
