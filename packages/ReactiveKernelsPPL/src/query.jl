@@ -816,6 +816,94 @@ mutable struct QueryAD{P,L,D}
 end
 QueryAD(prepared, layout) = QueryAD(prepared, layout, nothing)
 
+struct _IndexedValue
+    name::Symbol
+end
+
+"""
+    indexed_value(name::Symbol)
+
+Select one row of the authored plate that produces `name`. Use this selector
+with [`prepare_query`](@ref) or [`prepare_query_ad`](@ref). The row index is a
+call argument, so one preparation can serve rows of different lengths.
+"""
+indexed_value(name::Symbol) = _IndexedValue(name)
+
+mutable struct _IndexedValueQuery{K}
+    const kernel::K
+    const ncoordinates::Int
+end
+
+mutable struct _IndexedValueAD{P}
+    const prepared::P
+    const ncoordinates::Int
+end
+
+function _indexed_active(x::AbstractVector{<:Real}, n::Int)
+    length(x) == n || throw(ContractValidationError(
+        "[query] active length $(length(x)) ≠ selection length $n"))
+    return x isa Vector{Float64} ? x : Vector{Float64}(x)
+end
+
+_indexed_value(q, x, row) = q.kernel(x, row)
+(q::_IndexedValueQuery)(x, row) =
+    Base.invokelatest(_indexed_value, q, _indexed_active(x, q.ncoordinates), row)
+
+"""
+    prepare_query(built, plan, indexed_value(name); base, coordinates, locality=nothing)
+
+Prepare `q(x, row)` for one value of the named plate. Preparation snapshots
+the full packed `base` and the sorted, unique packed positions in `coordinates`.
+Each call overlays `x` at those positions. An empty selection takes an empty
+vector and evaluates at the base. Row indices and `locality` follow
+[`ReactiveKernels.plate_cell`](@ref). As for a cell query, `discrete` supplies
+fixed integer parameters when the model has them.
+"""
+function prepare_query(built, plan::StructuralPlan, target::_IndexedValue;
+        base::AbstractVector{<:Real}, coordinates, locality=nothing, on_error=nothing,
+        discrete=nothing)
+    isbound(plan) || throw(ContractValidationError(
+        "[query] indexed_value requires a bound plan (bind_data first)"))
+    built = _binding_build(built, plan)
+    plan = _fixed_integer_query(plan, built.layout, discrete)
+    _check_built_program(built, plan)
+    _refuse_integer_conditional_values(plan, built.spec, target.name)
+    selected = collect(Int, coordinates)
+    _check_compact_cell_indices(base, selected, selected, built.layout.total)
+    slots = _fixed_cell_slots(length(base), selected)
+    fresh(name) = haskey(built.spec.ports, name) ? gensym(name) : name
+    index, want = fresh(:_ppl_indexed_row), fresh(:_ppl_indexed_value)
+    spec = plate_cell(built.spec, target.name; index, name=want, locality)
+    # A row can mix selected and frozen coordinates of the same parameter.
+    have = Tuple(unique(_compact_overlay!(spec, plan, _local_cell_point)))
+    bound = merge(_query_bound(plan),
+        (; _ppl_cell_base=Vector{Float64}(base), _ppl_cell_slots=slots))
+    kernel = _absent_refusal(plan, spec, have, want) do
+        Base.invokelatest(prepare, spec; have, want, bound, on_error)
+    end
+    return _IndexedValueQuery(kernel, length(selected))
+end
+
+"""
+    prepare_query_ad(prepare_operator, built, plan, indexed_value(name), backend,
+                     exemplars..., x0, row0; base, coordinates, kwargs...)
+
+Prepare an ordinary RK derivative operator over the compact input of an
+indexed value query. For a pullback, pass `seed0, x0, row0` after the
+backend. Call `ad_pullback(pb, seed, x, row)` with a seed shaped like the
+current row. The result has one entry per selected coordinate, in order.
+"""
+function prepare_query_ad(prepare_operator, built, plan::StructuralPlan,
+        target::_IndexedValue, backend, exemplars...; kwargs...)
+    length(exemplars) >= 2 || throw(ArgumentError(
+        "indexed_value derivative preparation requires an active vector and row index"))
+    q = prepare_query(built, plan, target; kwargs...)
+    x = _indexed_active(exemplars[end-1], q.ncoordinates)
+    prepared = Base.invokelatest(prepare_operator, q.kernel, backend,
+        Base.front(Base.front(exemplars))..., x, last(exemplars); active=:_ppl_cell_active)
+    return _IndexedValueAD(prepared, q.ncoordinates)
+end
+
 """
     prepare_query_ad(prepare_operator, built, plan, preset, backend, exemplars...;
                      on_error = nothing) -> QueryAD
@@ -872,11 +960,16 @@ for verb in (:ad_gradient, :ad_value_and_gradient, :ad_value_and_gradient!,
         :ad_hvp, :ad_hvp!, :ad_gradient_and_hvp, :ad_gradient_and_hvp!,
         :ad_third, :ad_third!, :ad_gradient_hvp_and_third,
         :ad_gradient_hvp_and_third!)
-    @eval ReactiveKernels.$verb(q::QueryAD, args...) =
+    @eval ReactiveKernels.$verb(q::Union{QueryAD,_IndexedValueAD}, args...) =
         Base.invokelatest(_query_ad_call, ReactiveKernels.$verb, q, args...)
 end
 _query_ad_call(verb::F, q::QueryAD, args::Vararg{Any,N}) where {F,N} =
     verb(q.prepared, args..., _discrete_args(q.discrete)...)
+function _query_ad_call(verb::F, q::_IndexedValueAD, args::Vararg{Any,N}) where {F,N}
+    N >= 2 || throw(ArgumentError("an indexed value derivative takes x, row last"))
+    x = _indexed_active(args[end-1], q.ncoordinates)
+    return verb(q.prepared, Base.front(Base.front(args))..., x, last(args))
+end
 
 """
     CellQuery
@@ -1423,7 +1516,7 @@ end
 # Overlay a compact active vector on a read-only packed base in `spec`: the
 # packed point becomes `_compact_cell_point(base, active, slots)`, and the
 # HAVE boundary starts with the three overlay ports. Returns that boundary.
-function _compact_overlay!(spec, plan::StructuralPlan)
+function _compact_overlay!(spec, plan::StructuralPlan, point=_compact_cell_point)
     for (name, type) in ((:_ppl_cell_base, AbstractVector{Float64}),
             (:_ppl_cell_active, AbstractVector{Float64}),
             (:_ppl_cell_slots, AbstractVector{Int32}))
@@ -1433,7 +1526,7 @@ function _compact_overlay!(spec, plan::StructuralPlan)
         push!(spec.port_order, name)
     end
     add!(spec.graph, (spec[:_ppl_cell_base], spec[:_ppl_cell_active],
-        spec[:_ppl_cell_slots]) => spec[:unconstrained], _compact_cell_point)
+        spec[:_ppl_cell_slots]) => spec[:unconstrained], point)
     _check_overlay_base!(spec.graph, spec[:unconstrained], spec[:_ppl_cell_base])
     filter!(!=(:unconstrained), spec.have_names)
     prepend!(spec.have_names, [:_ppl_cell_base, :_ppl_cell_active, :_ppl_cell_slots])
