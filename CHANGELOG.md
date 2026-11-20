@@ -18,21 +18,23 @@ are recorded in the git history only.
 
 ## 0.1.342
 
-- A bound Normal regression keeps its least-squares statistics in more
-  shapes. Binding factors the coefficient columns once, with a pivoted QR,
-  and each call evaluates the residual sum from that factor instead of from
+- A bound Normal regression keeps its least-squares statistics in more shapes.
+  Binding factors the shared design once with a pivoted QR. When a gathered
+  coefficient stands beside shared columns, binding first projects those
+  columns and the response off the gathered direction in each group. Each call
+  then evaluates the residual sum from the retained statistics instead of from
   the rows. This now applies when the location is affine in the tracked
-  coefficients and the scale or precision varies by row through data
-  (`sigma .* w`, `sigma ./ sqrt.(p)`), when the coefficients are tuple
-  projections or enter through `muladd`, and when one gathered coefficient
-  (`alpha[g]`) stands beside scalar slopes or a bound matrix design. The
-  plain shared-scale regression `Normal.(a .+ b .* x, sigma)` took its scale
-  out of the row sum but still summed every residual on each call; it uses
-  the statistics too. Crossed indices, several gathered directions that share
-  columns, and a coefficient that enters nonlinearly or twice keep the
-  authored row calculation, and a rebinding whose statistics are not valid
-  falls back to it. Priors, Jacobians and input checks are unchanged.
-  `js_source` emits the authored rows for such a regression.
+  coefficients and the scale or precision varies by row through data (`sigma
+  .* w`, `sigma ./ sqrt.(p)`), when the coefficients are tuple projections or
+  enter through `muladd`, and when one gathered coefficient (`alpha[g]`)
+  stands beside scalar slopes or a bound matrix design. The plain shared-scale
+  regression `Normal.(a .+ b .* x, sigma)` took its scale out of the row sum
+  but still summed every residual on each call; it uses the statistics too.
+  Crossed indices, multiple gathered coefficients alongside shared columns,
+  and a coefficient that enters nonlinearly or twice keep the authored row
+  calculation, and a rebinding whose statistics are not valid falls back to
+  it. Priors, Jacobians and input checks are unchanged. `js_source` emits the
+  authored rows for such a regression.
 - A prepared kernel's `vcat` into a reused vector accepts numbers beside
   dense vectors (`vcat(0.0, alpha)`), so a coefficient table with a leading
   entry is refilled without allocating.
