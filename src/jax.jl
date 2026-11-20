@@ -4465,10 +4465,10 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(*), args::Vector{_PyVal})
     length(args) == 2 || return _jax_call(ctx, *, [_jax_call(ctx, *, args[1:2]); args[3:end]])
     a, b = args
     if _jax_is_array(a.T) && _jax_is_array(b.T)
-        a.T <: LinearAlgebra.Adjoint{<:Any,<:AbstractVector} && ndims(b.T) == 1 &&
+        _jax_adjoint_vector(a.T) && ndims(b.T) == 1 &&
             return _jax_result(*, args, "jnp.dot(" * _jax_masked(a, "0") * ", " *
                                         _jax_masked(b, "0") * ")")
-        if ndims(a.T) == 1 && b.T <: LinearAlgebra.Adjoint{<:Any,<:AbstractVector}
+        if ndims(a.T) == 1 && _jax_adjoint_vector(b.T)
             v = _jax_result(*, args, "jnp.outer(" * a.code * ", " * b.code * ")")
             # Padded as `a .* b` is: `a` along the rows, `b` along the columns.
             return _PyVal(v.code, v.T, v.static, v.extent, v.limit, _jax_padded_union(args))

@@ -16,6 +16,13 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.339
+
+- For real vectors, `jax_source` now emits `x * transpose(y)` as a matrix
+  with one row per entry of `x` and one column per entry of `y`.
+  In a ragged plate cell, the scalar inner product `transpose(x) * x`
+  sums only the valid entries.
+
 ## 0.1.338
 
 - The log rising factorial and its shape derivative keep intermediate products
