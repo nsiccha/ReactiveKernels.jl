@@ -1800,6 +1800,7 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers,
     latents = Pair{Symbol,Any}[]
     uncovered_latents = Symbol[]
     for r in plan.responses
+        _whole_response_range(plan, r) && (r = _with(r; range = nothing))
         # A plate loop covers its whole response, so a cell-broadcast
         # response observes every entry of each index's array.
         rs = _cell_broadcast_response(plan, r) ?
@@ -2318,6 +2319,47 @@ _ppl_range_values(x::Number, indices) = x
 ReactiveKernels._cell_row_method(::typeof(_ppl_rows)) =
     (; at = _ppl_rows_at, rows = (1,), dims = (2,))
 
+# Ordinary observation operands selected at the loop index. Categorical logit
+# matrices have a separate slice axis; simplex and covariance values are shared.
+function _indexed_row_operands(r, plan)
+    rows = Set{Symbol}()
+    if !_categorical_logit_slices(r) && r.family ∉ (CategoricalFam, MultinomialFam)
+        push!(rows, _location_node(r, plan))
+        union!(rows, r.extra_predictors)
+    end
+    for slot in (r.scale, r.nu, r.zi, r.discrimination, r.weights, r.trials,
+            r.evidence.lower, r.evidence.upper, r.threshold_columns...,
+            r.count_columns..., r.extra_responses...)
+        if slot isa ScalePredictorRef
+            push!(rows, slot.predictor)
+        elseif slot isa Symbol
+            push!(rows, slot)
+        end
+    end
+    r.thresholds isa ThresholdRows && push!(rows, r.thresholds.name)
+    r.mixture_weights isa MixtureWeightRows && push!(rows, r.mixture_weights.name)
+    return rows
+end
+
+# A vector's own one-dimensional index set selects it unchanged. A loop
+# also indexes its operands: only omit that selection if each one is shared
+# or was already computed on this very iterator. This proof survives rebinding
+# at different lengths; matrix slices and foreign iterators keep their gather.
+function _whole_response_range(plan, r)
+    Meta.isexpr(r.range, :ref, 2) || return false
+    y = get(plan.columns, r.response, nothing)
+    y isa AbstractVector && axes(y, 1) isa Base.OneTo || return false
+    index = r.range.args[2]
+    (index === :(:) || index == Expr(:call, :eachindex, r.response) ||
+        index == Expr(:call, :axes, r.response, 1)) || return false
+    r.response in plan.indexed_observations || return true
+    _categorical_logit_slices(r) && return false
+    return all(_indexed_row_operands(r, plan)) do value
+        value === r.response || _selected_cell_value(plan, r, value) ||
+            _proven_scalar(plan, value)
+    end
+end
+
 # A selected plate column already holds one value per selected response cell
 # (`_selected_plate_indices`); only whole operands are gathered at the
 # authored indices. Positions and indices differ for a literal `a:b`. Read
@@ -2330,32 +2372,14 @@ function _ranged_response_stmts(r, plan, stmts)
     push!(pre, Expr(:(=), selected, Expr(:ref, r.response, idx, r.range.args[3:end]...)))
     aliases = Dict{Symbol,Symbol}(r.response => selected)
     if r.response in plan.indexed_observations
-        rows = Set{Symbol}()
-        # Select ordinary row values before family-specific conversions or
-        # ordinal stage expansion. Simplexes and covariance factors stay whole.
-        # A logit matrix holds one slice per observation: select whole slices.
         if _categorical_logit_slices(r)
             alias = Symbol(:_ppl_range_logits_, r.label)
             getter = GlobalRef(@__MODULE__, r.logit_slices === :rows ?
                 :_ppl_range_rows : :_ppl_range_cols)
             push!(pre, :($alias = $getter($(r.predictor), $idx)))
             aliases[r.predictor] = alias
-        elseif r.family ∉ (CategoricalFam, MultinomialFam)
-            push!(rows, _location_node(r, plan))
-            union!(rows, r.extra_predictors)
         end
-        for slot in (r.scale, r.nu, r.zi, r.discrimination, r.weights, r.trials,
-                r.evidence.lower, r.evidence.upper, r.threshold_columns...,
-                r.count_columns..., r.extra_responses...)
-            if slot isa ScalePredictorRef
-                push!(rows, slot.predictor)
-            elseif slot isa Symbol
-                push!(rows, slot)
-            end
-        end
-        r.thresholds isa ThresholdRows && push!(rows, r.thresholds.name)
-        r.mixture_weights isa MixtureWeightRows && push!(rows, r.mixture_weights.name)
-        for (i, value) in enumerate(sort!(collect(rows)))
+        for (i, value) in enumerate(sort!(collect(_indexed_row_operands(r, plan))))
             value === r.response && continue
             _selected_cell_value(plan, r, value) && continue
             alias = Symbol(:_ppl_range_operand_, r.label, :_, i)

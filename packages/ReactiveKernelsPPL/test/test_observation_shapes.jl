@@ -270,3 +270,21 @@ end
             sum(logpdf.(Normal.(2.0 .* hcat(ones(n), data.x), 0.7), data.y))
     end
 end
+
+@testset "a vector's full range uses the whole response" begin
+    for lhs in (:(y[:]), :(y[eachindex(y)]), :(y[axes(y, 1)]))
+        model = ReactiveKernelsPPL.RKPPLModel(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            $lhs .~ Normal.(a .+ b .* x, 0.7)
+        end, @__MODULE__)
+        for n in (0, 4, 37)
+            x = [sin(i) for i in 1:n]
+            y = [cos(i) for i in 1:n]
+            plan = model(; x) | (; y)
+            built, _, _ = _os_check(plan, _os_oracle(x, y, _OS_U)...)
+            expr = kernel_expr(plan, built.layout)
+            @test !occursin("_ppl_range_response_", string(expr))
+        end
+    end
+end

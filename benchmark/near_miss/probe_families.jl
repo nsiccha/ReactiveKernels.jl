@@ -112,6 +112,11 @@ if occursin('A', fam)
     end
     record(probe("A-gauss", "A14 StudentT alpha[g] sorted", A14, (; x, g = g_sorted), (; y)))
     record(probe("A-gauss", "A14s StudentT alpha[g] shuffled", A14, (; x, g = g_shuf), (; y)))
+    A15 = @rkppl begin
+        a ~ Normal(0, 5); b ~ Normal(0, 2); sigma ~ Exponential(1.0)
+        y[:] .~ Normal.(a .+ b .* x, sigma)
+    end
+    record(probe("A-gauss", "A15 whole-column colon", A15, (; x), (; y)))
 end
 
 # ------------------------------------------------- B: discrete-covariate GLMs
@@ -167,6 +172,17 @@ if occursin('B', fam)
         record(probe("B-glm", "$label, discrete", model, (; x = xd), (; y = ybin)))
         record(probe("B-glm", "$label, continuous", model, (; x), (; y = ybinc)))
     end
+    B8 = @rkppl begin
+        a ~ Normal(0, 1); b ~ Normal(0, 2)
+        y[axes(y, 1)] .~ BernoulliLogit.(a .+ b .* x)
+    end
+    record(probe("B-glm", "B8 whole-column axes, discrete", B8, (; x = xd), (; y = ybin)))
+    record(probe("B-glm", "B8c whole-column axes, continuous", B8, (; x), (; y = ybinc)))
+    B10 = @rkppl begin
+        a ~ Normal(0, 1); b ~ Normal(0, 2)
+        y[:] .~ Binomial.(n, logistic.(a .+ b .* x))
+    end
+    record(probe("B-glm", "B10 whole-column binomial", B10, (; x, n = ntr), (; y = ycnt)))
 end
 
 # ---------------------------------------------------- C: grouped intercepts
