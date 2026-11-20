@@ -156,26 +156,32 @@ julia --startup-file=no --project=<env> benchmark/near_miss/probe_families.jl C 
 julia --startup-file=no --project=<env> benchmark/near_miss/factor_scaling.jl 20000 50,500,5000 normal,bernoulli full,reference,missing,bound_matrix,hcat,scan
 ```
 
-At 20,000 rows, each cell gives the observation on `8a7f69f42` followed by
-the observation with factor gathers on `e9a174633`. The 5,000-level reference
-design previously had 99,980,000 entries. The dense run used Julia 1.10.12
-build kb7 and the gathered run used kb8, both on gordito with one BLAS
-thread. The timing differences in this table include the build change.
+Each cell gives the original and gathered results at 20,000 rows. Both
+samplers ran in the same Julia 1.10.12 kb8 process on gordito, with one
+BLAS thread. The comparison loaded the two versions of the factor lowering
+(`8a7f69f42` and `e9a174633`) and prepared a fresh sampler for each model
+and version. Each law and spelling first ran with 100 rows and five levels.
+Gathered models were prepared first, so the original models could reuse Julia
+specializations from the first pass. Setup is one observation per version.
+For example, original full-cover Normal setup at 5,000 levels allocated
+94.8 MiB when prepared second and 278 MiB in a separate kb8 process.
+The density and gradient times are medians of five alternating measurements.
+Each matched pair agreed on its log density and gradient vector.
 
 | Law | Levels | Factor | Setup (s) | Setup (MiB) | Density (µs) | Value and gradient (µs) |
 | --- | ---: | --- | ---: | ---: | ---: | ---: |
-| Normal | 50 | full | 0.286 → 0.328 | 89.6 → 89.3 | 2.20 → 2.21 | 4.01 → 4.09 |
-| Normal | 50 | reference | 0.407 → 0.428 | 144 → 91.1 | 0.849 → 2.18 | 2.28 → 4.12 |
-| Normal | 500 | full | 0.855 → 1.07 | 91.1 → 90.7 | 3.65 → 3.58 | 10.1 → 10.2 |
-| Normal | 500 | reference | 2.02 → 1.16 | 633 → 92.6 | 82.8 → 3.80 | 166 → 11.1 |
-| Normal | 5,000 | full | 1.93 → 2.89 | 278 → 275 | 5.72 → 5.53 | 23.9 → 23.7 |
-| Normal | 5,000 | reference | 111 → 2.84 | 6,042 → 290 | 22,290 → 5.70 | 114,133 → 25.6 |
-| Bernoulli-logit | 50 | full | 0.163 → 0.218 | 62.8 → 62.7 | 170 → 170 | 222 → 220 |
-| Bernoulli-logit | 50 | reference | 0.199 → 0.232 | 76.5 → 64.6 | 239 → 171 | 346 → 232 |
-| Bernoulli-logit | 500 | full | 0.174 → 0.253 | 64.5 → 64.1 | 173 → 173 | 227 → 223 |
-| Bernoulli-logit | 500 | reference | 0.261 → 0.234 | 284 → 66.0 | 1,993 → 173 | 3,959 → 225 |
-| Bernoulli-logit | 5,000 | full | 2.41 → 2.15 | 248 → 243 | 179 → 178 | 216 → 219 |
-| Bernoulli-logit | 5,000 | reference | 1.51 → 2.49 | 2,369 → 262 | 48,226 → 172 | 91,627 → 216 |
+| Normal | 50 | full | 0.302 → 0.498 | 85.2 → 89.4 | 2.15 → 2.15 | 4.06 → 4.08 |
+| Normal | 50 | reference | 0.553 → 0.550 | 140 → 91.1 | 1.14 → 2.20 | 2.59 → 4.21 |
+| Normal | 500 | full | 0.316 → 1.61 | 86.9 → 90.7 | 3.55 → 3.66 | 10.4 → 10.2 |
+| Normal | 500 | reference | 1.82 → 1.79 | 629 → 92.7 | 101 → 3.66 | 178 → 10.7 |
+| Normal | 5,000 | full | 0.350 → 3.35 | 94.8 → 275 | 5.84 → 5.68 | 23.8 → 24.0 |
+| Normal | 5,000 | reference | 156 → 3.42 | 6,038 → 290 | 27,135 → 6.12 | 151,765 → 24.9 |
+| Bernoulli-logit | 50 | full | 0.416 → 0.304 | 63.0 → 62.8 | 172 → 178 | 235 → 235 |
+| Bernoulli-logit | 50 | reference | 0.326 → 0.361 | 76.8 → 64.6 | 237 → 172 | 343 → 223 |
+| Bernoulli-logit | 500 | full | 0.346 → 0.324 | 64.5 → 64.1 | 180 → 181 | 236 → 236 |
+| Bernoulli-logit | 500 | reference | 0.502 → 0.391 | 284 → 66.1 | 2,711 → 172 | 5,459 → 223 |
+| Bernoulli-logit | 5,000 | full | 0.336 → 2.67 | 84.1 → 243 | 170 → 181 | 218 → 219 |
+| Bernoulli-logit | 5,000 | reference | 1.42 → 2.98 | 2,369 → 262 | 34,639 → 171 | 75,884 → 215 |
 
 ### After lowering factor terms to level gathers
 
@@ -198,16 +204,19 @@ on the density and on every gradient coordinate at the same parameter vector.
 | Authored two-column matrix | 21.3 → 17.3 | 30.5 → 23.1 | 13.7 → 8.90 | 44.3 → 16.4 |
 | Separate scan | 22.2 → 17.2 | 31.3 → 23.1 | 13.1 → 6.18 | 23.9 → 13.5 |
 
-At 20,000 rows and 5,000 levels the reference-coded Normal model on kb8
-took 2.84 s and 290 MiB to prepare and 25.6 µs per gradient. The
-Bernoulli-logit model took 2.49 s and 262 MiB to prepare and 216 µs per
-gradient. The complete observations include all four variants and both
-full-cover controls at each level count. [Scaling measurements](factor_scaling.csv)
+The reference-coded design at 5,000 levels previously contained 99,980,000
+entries. Normal setup fell from 156.1 s and 6,038 MiB to 3.42 s and
+290 MiB. Its gradient fell from 151.8 ms to 24.9 µs. For
+Bernoulli-logit, the gradient fell from 75.9 ms to 215 µs.
+The complete table gives setup and warm-call measurements for all four
+spellings and both controls at each level count. [Scaling measurements](factor_scaling.csv)
 
-At 20,000 rows and 50 levels the standalone reference-coded Normal
-gradient took 4.12 µs and the authored two-column matrix took 12.6 µs.
-The gathered effect and shared slope run in the row loop on this
-revision. The original dense design used bound least-squares statistics.
+At 50 levels the original Normal design used bound least-squares
+statistics. The standalone gather evaluates the likelihood over the rows.
+The reference-coded gradient took 2.59 µs with the dense design and
+4.21 µs with the gather. The authored-matrix gradient took
+2.69 and 13.87 µs respectively. These figures precede
+the mixed gathered-and-shared least-squares statistics.
 
 At 2,000 rows and 50 levels A15 previously took 7.41 µs with the
 initial gather on `a9959a24b`. In the paired run the dense baseline took
