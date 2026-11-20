@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.334
+
+- `prepare_nonallocating` reuses the vector behind a dense row-vector
+  product. Transposed and adjoint vectors multiplied by a dense matrix
+  of the same BLAS element type now follow ordinary Julia's rounding.
+
 ## 0.1.333
 
 - `jax_source` preserves the dtype of signed and unsigned 8-, 16-, 32- and
