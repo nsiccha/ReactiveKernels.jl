@@ -3,6 +3,7 @@ using Enzyme
 using ReactiveKernels
 using ReactiveKernelsPPL
 using Test
+@isdefined(_is_static_reverse) || include("static_enzyme.jl")
 
 const _DERIVED_AFFINE_MODEL = @rkppl begin
     a ~ Normal(0, 2)
@@ -55,7 +56,7 @@ _offset_expr_nodes(x) = x isa Expr ?
                 q = prepare_sampler(built, plan, u;
                     backend=AutoEnzyme(; mode=Enzyme.Reverse),
                     native_forward_batch=false)
-                @test q.ad.backend.mode === Enzyme.Reverse
+                @test _is_static_reverse(q.ad.backend)
                 mu = b .* x .+ a .+ z[group]
                 residual = (y .- mu) ./ 0.9^2
                 gz = -copy(z)

@@ -1,4 +1,5 @@
 using ReactiveKernels, ReactiveKernelsPPL, DifferentiationInterface, Enzyme, Test
+@isdefined(_is_static_reverse) || include("static_enzyme.jl")
 
 function scalar_prior_fixture(family, separated, width=2)
     prior = Dict(:normal => :(Normal(0, 1)), :cauchy => :(Cauchy(0, 1)),
@@ -51,7 +52,7 @@ end
             (Symbol(:extra_,i) => 0.1sin(i) for i in 1:width-2)...)
         u=collect(Float64,unconstrain(built.layout,params))
         q=prepare_sampler(built,plan,u;backend=AutoEnzyme(;mode=Enzyme.Reverse),native_forward_batch=false)
-        @test q.ad.backend.mode === Enzyme.Reverse
+        @test _is_static_reverse(q.ad.backend)
         for shift in (0.0,0.07)
             v=u .+ shift
             saved=copy(v)

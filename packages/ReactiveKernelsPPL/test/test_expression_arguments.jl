@@ -1,6 +1,7 @@
 using Test, ReactiveKernelsPPL
 import ReactiveKernels
 import Distributions as D
+@isdefined(_is_static_reverse) || include("static_enzyme.jl")
 
 function _expression_compare(actual::NamedTuple, expected::NamedTuple)
     for name in keys(expected)
@@ -123,7 +124,7 @@ end
             u0 = unconstrain(built.layout, case.q)
             backend = AutoEnzyme(; mode=Enzyme.Reverse)
             sampler = prepare_sampler(built, bound, u0; backend)
-            @test sampler.ad.backend == backend
+            @test _is_static_reverse(sampler.ad.backend)
             oracle = u -> case.oracle(constrain(built.layout, u))
             for u in (u0, u0 .+ range(-0.15, 0.1; length=length(u0)))
                 original = copy(u)
