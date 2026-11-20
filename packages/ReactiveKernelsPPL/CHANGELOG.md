@@ -16,6 +16,12 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.243
+
+- Fresh `build_kernel` calls can reuse lowered graph construction instructions
+  across models. Each model supplies its current helpers and recipe inputs,
+  including when several tasks construct graphs concurrently.
+
 ## 0.1.242
 
 - A sized prior inside a plate submodel can use a shared base distribution

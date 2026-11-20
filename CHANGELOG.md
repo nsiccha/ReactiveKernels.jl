@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.346
+
+- A program generator can reuse lowered graph construction instructions across
+  fresh definitions in one evaluation module. Each evaluation builds its own
+  graph from the current definition's recipe sources and helper bindings.
+
 ## 0.1.345
 
 - `prepare_into` prepares an ordinary Julia kernel to fill a caller-supplied

@@ -5523,6 +5523,10 @@ precompile workload can build generated programs and keep them in its image.
 """
 function _kernel_eval_definition(mod::Module, definition::Expr;
                                  latest_world_native_sources::Bool = false)
+    _kernel_eval_construction(mod, _kernel_definition_construction(mod, definition))
+end
+
+function _kernel_definition_construction(mod::Module, definition::Expr)
     expanded = macroexpand(mod, Expr(:macrocall, Symbol("@kernel"),
                                      LineNumberNode(@__LINE__, Symbol(@__FILE__)),
                                      definition))
@@ -5530,7 +5534,7 @@ function _kernel_eval_definition(mod::Module, definition::Expr;
         expanded.args[1] isa Symbol || throw(ArgumentError(
             "_kernel_eval_definition requires a stateless `name(args...) = body` " *
             "@kernel definition"))
-    _kernel_eval_construction(mod, expanded.args[2])
+    expanded.args[2]
 end
 
 # Evaluate one already-expanded graph construction without compiling its
@@ -6521,3 +6525,5 @@ function _kernel_rename_signature(::_KernelEndpointCallSignature{I,E}, port_name
     rename_name(x) = x isa Symbol ? port_name(x) : x
     _kernel_endpoint_call_signature(Val(map(rename_name, I)), Val(map(rename_name, E)))
 end
+
+include("kernel_constructors.jl")
