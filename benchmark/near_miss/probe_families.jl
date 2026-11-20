@@ -285,6 +285,8 @@ if occursin('R', fam)
     push!(refs, time_ref("R normal a+b*x (row loop)", ref_normal, u3, x, y))
     push!(refs, time_ref("R normal exp link", ref_normal_exp, u3, x, y))
     push!(refs, time_ref("R studentt exp link", ref_student_exp, u4, x, y, loggamma))
+    push!(refs, time_ref("R gamma log mean", ref_gamma_exp, u3, x, ypos, log.(ypos), loggamma))
+    push!(refs, time_ref("R weibull log scale", ref_weibull_exp, u3, x, log.(ypos)))
     push!(refs, time_ref("R cauchy exp link", ref_cauchy_exp, u3, x, y))
     push!(refs, time_ref("R bernoulli-logit continuous", ref_bernoulli_logit, u2, x, ybinc))
     push!(refs, time_ref("R poisson continuous", ref_poisson, u2, x, ycnt, Float64(sum(ycnt)),
