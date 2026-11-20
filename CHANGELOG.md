@@ -16,6 +16,28 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.348
+
+- The opt-in generated reverse of summed plates (`with_plate_reverse`, the
+  `plate_reverse` preference) now runs on top of the optimized program.
+  Enabling it no longer disables summed-plate factoring, bound least-squares
+  statistics or product batching, so a prepared density is the same program
+  with it on or off. A plate summed from bound statistics stays with the
+  backend, and `plate_reverse_report` says so.
+- A plate call takes a generated rule only where a one-pass schedule applies
+  to its operands: a gather with fewer groups than cells, a joint value and
+  slope cut, or an additive nested total. Every other call runs inline, as
+  it does with the generated reverse disabled. The two-pass rule is no
+  longer used. `plate_reverse_report` still answers `"rule"` when a rule
+  exists for the plate; the call decides whether to take it.
+- Measured on six natural PosteriorDB ports (public sampler, Julia 1.13.1,
+  Enzyme dogfood 0.13.221, one thread, a loaded shared host), value and
+  gradient with the generated reverse on divided by off, default settings:
+  EarnHeight 0.94, NES1984 1.02, WellsDAAEC 1.03, Mesquite 0.98,
+  KidscoreMomiq 1.02, RadonVariableInterceptNCMN 0.81. Before this change the
+  first, second and fifth were 17.9, 16.5 and 7.2, because enabling it
+  replaced their bound statistics with a per-row rule.
+
 ## 0.1.347
 
 - With MutatingFunctions loaded, `prepare_into` automatically reuses private

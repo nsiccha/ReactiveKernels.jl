@@ -3244,7 +3244,9 @@ positions) active: each plate program's result name and either `"rule"`, when
 the source is eligible for generated reverse, or its fallback reason.
 Accepts a `PreparedKernel` or `NonAllocatingKernel`. This is a static report,
 independent of whether the preference is enabled; cache rewrites and backend
-operand annotations can affect the rule used by a prepared gradient.
+operand annotations can affect the rule used by a prepared gradient. A call of
+an eligible plate takes its rule only where a one-pass schedule applies to
+the call's operands, and runs inline otherwise.
 Single-plate programs are listed even when ordinary native execution inlines
 them.
 """
