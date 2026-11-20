@@ -134,7 +134,7 @@ const row_sine = scalar_derivative_rule(sine_graph; primal = :y, partials = (x =
         xs = scaled[i]
         offset = offsets[i]
         terms = plate(xs) do x
-            row_sine(x + offset)
+            scale * x + row_sine(x + offset)
         end
         subtotal::Float64 = sum(terms)
         subtotal
@@ -162,9 +162,9 @@ end
             db = zero(offsets)
             for i in order, x in rows[i]
                 z = x * scale + offsets[i]
-                want += sin(z)
+                want += scale^2 * x + sin(z)
                 db[i] += cos(z)
-                ds += x * cos(z)
+                ds += 2scale * x + x * cos(z)
             end
             val, (doffsets, dscale) = ad_value_and_gradient(grad, rows, order, offsets, scale, weight)
             @test val ≈ weight * want

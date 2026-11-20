@@ -146,6 +146,17 @@ function _pr_flatten!(stmts::Vector{Any}, ex, ctx::_PRCtx)
     elseif ex isa QuoteNode
         return ex
     elseif Meta.isexpr(ex, :block)
+        # A substituted cell read can copy the entire @inbounds block,
+        # including its local name, into multiple operands. Each occurrence
+        # returns its own call result. Keep the local assignment for any
+        # later explicit use, but feed the fresh call value to this consumer.
+        read = _rw_read_parts(ex)
+        if read !== nothing
+            name, call = read
+            value = _pr_flatten!(stmts, call, ctx)
+            push!(stmts, _PRAlias(name, value))
+            return value
+        end
         result = nothing
         for a in ex.args
             a isa LineNumberNode && continue
