@@ -19,9 +19,11 @@
 # `b - a`, as `_normal_direct_interval` does before the central log mass. The
 # width is computed from the infinite endpoint outside the loop and is used
 # only by that comparison. Enzyme dogfood 4ff5e0e4 still returns [finite, NaN]
-# for either open bound, which is what the RKPPL sampler returns (Enzyme snag
-# `reverse-nan-hois-9f3292ff`). The same arm without the width comparison
-# ("plain" below) gives the gradient.
+# for either open bound, as the RKPPL sampler did with it. The same arm without
+# the width comparison ("plain" below) gives the gradient. Dogfood 9770912c
+# (libEnzyme 078431a8, repair `compared_operand_adjoints`, Enzyme snag
+# `reverse-nan-hois-9f3292ff`) passes all 10 checks here, and the sampler's
+# infinite-bound testset in `test_evidence_edgecases.jl` passes 49 of 49.
 # Recorded on a Linux fleet host, Julia 1.10.12, 2026-11-20.
 using Enzyme
 using Test
