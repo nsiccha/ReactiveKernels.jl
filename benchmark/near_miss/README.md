@@ -193,6 +193,15 @@ and cumulative MiB allocated for 20,000 rows.
 | Bernoulli-logit, full cover | 2.45 s / 247.7 MiB | 0.34 s / 84.1 MiB | 2.67 s / 243.3 MiB | 0.30 s / 79.9 MiB |
 | Bernoulli-logit, reference | 1.47 s / 2,373.2 MiB | 1.42 s / 2,369.0 MiB | 2.98 s / 261.6 MiB | 2.82 s / 261.7 MiB |
 
+To locate the reference-coded Bernoulli-logit setup cost, each lowering
+also ran in its own Julia process after a 100-row warmup. On the first
+20,000-row, 5,000-level case, `prepare_sampler` took 1.04 s for the dense
+design and 2.48 s for the gather. Julia recorded 0.99 s of compilation
+during gathered sampler preparation. Rebuilding the model and sampler on
+the same data took 1.83 s in total with the dense design and 0.34 s with
+the gather. On that second binding, `prepare_sampler` alone allocated
+2,329 MiB and 45.8 MiB, respectively.
+
 ### After lowering factor terms to level gathers
 
 The factor reads one effect per observation in all four spellings. For a
