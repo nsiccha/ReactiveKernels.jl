@@ -16,6 +16,29 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.351
+
+- Under Enzyme reverse mode, a derivative rule no longer copies the arrays
+  held inside an unchanged input, such as a struct, tuple or view passed as
+  `Const` data, when the loaded Enzyme carries the dogfood repair
+  `overwritten_reachable_data` (Enzyme.jl dogfood `8a381501` with libEnzyme
+  `05ce259c`). That repair makes `EnzymeRules.overwritten` cover the data
+  behind the references an argument holds. The adapter reads such an input in
+  place when its flag is unset and the rule's result is a bits value or an
+  array of numbers whose memory overlaps none of the input's arrays. That
+  check covers the arrays of a mutable struct such as a `Dict`, and costs
+  one comparison per array, not per element. Before, every array inside a
+  container was copied on each reverse call. For example, one weight read
+  from a struct of 65,536 numbers took 524,464 B per gradient, where it now
+  takes 128 B. A rule's pullback over a BRM GMRF footprint grew from
+  105,440 B at 256 states to 1,190,928 B at 4,096 states, and now takes
+  34,208 B at both. Without the repair, or in split mode, those arrays are
+  still copied. So are they when the caller writes, after the rule's call, to
+  memory Enzyme cannot show is apart from the input. A prepared RK program
+  that stores the rule's result into its output buffers does this, so a BRM
+  GMRF coefficient row read through a prepared query still copies the
+  footprint: 15.5 MB per row Jacobian at 4,096 states.
+
 ## 0.1.350
 
 - A tuple selector's derivative accepts a fixed-size immutable array port or

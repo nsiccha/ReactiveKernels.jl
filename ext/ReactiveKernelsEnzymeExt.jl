@@ -168,8 +168,23 @@ end
 @inline _zero_like(x::Number) = zero(x)
 
 # Graph provenance does not prove storage ownership. Preserve derivative
-# snapshots across caller mutation, borrowing only backend-proven stable input
-# arrays in flat environments when no mutable primal alias escapes.
+# snapshots across caller mutation, borrowing only input storage the backend
+# proves unchanged through the reverse, and none that a mutable primal result
+# can expose.
+#
+# What Enzyme's `overwritten` flag of an input proves depends on the build:
+# - every build: the memory the operand points to, so the elements of an array
+#   passed directly;
+# - with the dogfood repair `overwritten_reachable_data` (Enzyme.jl dogfood
+#   `8a381501` with libEnzyme `05ce259c`; `enzyme-use`, "Custom rules:
+#   `overwritten(config)` for an argument that holds a reference"), also the
+#   data behind the references the input holds: the arrays inside a struct,
+#   tuple or view. Before it, that flag stayed `false` after the caller wrote
+#   into such an array (Enzyme snag `used-the-public-c34388a0`, module
+#   `CompositeInputChecks` in test/test_derivative_rule_snapshots.jl).
+# So without the repair an array inside a container is always copied
+# (`deep = false`), and with it an array inside an unchanged input is kept
+# like an input array (`deep = true`).
 #
 # The snapshot is concretely typed code generated from the residuals' type, not
 # Base's `deepcopy`: `deepcopy(@nospecialize x)` compiles to a boxed `jl_invoke`
@@ -179,8 +194,9 @@ end
 # `deepcopy` gives with the borrowed inputs seeded in its memo:
 # - the leaves are the dense bits arrays the residuals hold, directly or inside
 #   immutable containers (tuples, named tuples, views, immutable structs);
-# - a leaf is kept when it is, or is the same object as, a top-level residual
-#   whose input the backend proves unchanged through the reverse (`borrow`);
+# - a leaf is kept (`borrow`) when it is a top-level residual whose input the
+#   backend proves unchanged through the reverse, or with `deep` lies inside
+#   one, or when it is the same object as a kept leaf;
 # - every other leaf is copied once, and leaves holding the same array share
 #   the copy (an array and a view of it, say);
 # - containers holding a leaf are rebuilt around the copies, as `deepcopy`
@@ -220,7 +236,7 @@ function _snapshot_rebuild(::Type{T}, path, saved) where {T}
 end
 
 @generated function _snapshot_residuals(residuals::R, sources::NTuple{N,Int}, flags,
-        ::Val{borrow}) where {R<:Tuple,N,borrow}
+        ::Val{borrow}, ::Val{deep}) where {R<:Tuple,N,borrow,deep}
     leaves = Pair{Tuple,Type}[]
     _snapshot_leaves!(leaves, R, ()) || return :(Base.@noinline deepcopy(residuals))
     value(k) = Symbol(:leaf_, k)
@@ -229,8 +245,9 @@ end
     body = Expr(:block)
     for (k, (path, _)) in enumerate(leaves)
         push!(body.args, :($(value(k)) = $(_snapshot_get(:residuals, path))))
-        # The flags describe the inputs, which are top-level residuals only.
-        push!(body.args, borrow && length(path) == 1 ?
+        # The flags describe the inputs, which are top-level residuals only;
+        # with `deep`, an input's flag also covers the arrays it holds.
+        push!(body.args, borrow && (deep || length(path) == 1) ?
             :($(keep(k)) = _residual_borrowable(getfield(sources, $(path[1])), flags)) :
             :($(keep(k)) = false))
     end
@@ -250,14 +267,53 @@ end
     body
 end
 
-@inline _residual_storage_overlaps(a::Array, b::Array) =
+@inline _residual_storage_overlaps(a, b::Array) =
     ReactiveKernels._contiguous_storage_overlaps(a, b)
+
+# Contiguous storage of bits values: a dense array, or (Julia 1.11 on) the
+# `Memory` a `Dict` or an array keeps its elements in.
+@static if isdefined(Core, :GenericMemory)
+    _memory_type(::Type{T}) where {T} = T <: Core.GenericMemory
+else
+    _memory_type(::Type{T}) where {T} = false
+end
+_dense_bits_storage(::Type{T}) where {T} =
+    _dense_bits_array(T) || (_memory_type(T) && isbitstype(eltype(T)))
+
+# Generation-time helper of `_residual_overlaps`: an expression that is `true`
+# when storage reachable from `ex`, a value of type `T`, may overlap `primal`,
+# or `nothing` where that storage cannot be listed from the type alone: an
+# array of references (listing it would scan its elements), an abstractly
+# typed field, or a type that holds itself (`within` are the struct types
+# enclosing `ex`). Unlike a snapshot, the listing goes through the fields of
+# mutable structs, such as the arrays of a `Dict`.
+function _overlap_expr(::Type{T}, ex, within) where {T}
+    isbitstype(T) && return false
+    _dense_bits_storage(T) && return :(_residual_storage_overlaps($ex, primal))
+    (T <: Type || T === String || T === Symbol || T === Module) && return false
+    (isconcretetype(T) && isstructtype(T)) || return nothing
+    (T <: Array || _memory_type(T) || T in within) && return nothing
+    terms = Any[]
+    for i in 1:fieldcount(T)
+        term = _overlap_expr(fieldtype(T, i), :(getfield($ex, $i)), (within..., T))
+        term === nothing && return nothing
+        term === false || push!(terms, :(isdefined($ex, $i) && $term))
+    end
+    foldl((a, b) -> :($a || $b), terms; init = false)
+end
+
+# Whether a residual can share storage with the dense primal result: one range
+# test per array the residual holds, not a scan of its elements. A residual
+# whose storage cannot be listed counts as sharing it.
+@generated function _residual_overlaps(value::T, primal::Array) where {T}
+    term = _overlap_expr(T, :value, ())
+    term === nothing ? :(true) : term
+end
 
 _protect_primal_aliases(::Tuple{}, ::Tuple{}, flags, primal) = flags
 function _protect_primal_aliases(residuals::Tuple, sources::Tuple, flags, primal)
     value, source = first(residuals), first(sources)
-    if value isa Array && isbitstype(eltype(value)) &&
-            _residual_borrowable(source, flags) && _residual_storage_overlaps(value, primal)
+    if _residual_borrowable(source, flags) && _residual_overlaps(value, primal)
         flags = Base.setindex(flags, true, source + 1)
     end
     _protect_primal_aliases(Base.tail(residuals), Base.tail(sources), flags, primal)
@@ -270,27 +326,42 @@ function _borrow_all_residuals(residuals::Tuple, sources::Tuple, flags)
         _borrow_all_residuals(Base.tail(residuals), Base.tail(sources), flags)
 end
 
+# Whether the loaded Enzyme carries `overwritten_reachable_data`: its Julia
+# source and the libEnzyme build it loaded, both fixed for the process (set in
+# `__init__`).
+const _OVERWRITTEN_REACHABLE_DATA = Ref(false)
+_overwritten_reachable_data() =
+    isdefined(Enzyme, :has_dogfood_repair) &&
+    Enzyme.has_dogfood_repair(:overwritten_reachable_data)
+
 @inline function _retain_residuals(sources::NTuple{R,Int}, residuals::NTuple{R,Any},
         primal, flags) where {R}
     isbitstype(typeof(residuals)) && return residuals
-    # Nested containers keep the conservative snapshot: every array is copied.
-    _flat_residual_environment(residuals) ||
-        return _snapshot_residuals(residuals, sources, flags, Val(false))::typeof(residuals)
+    _OVERWRITTEN_REACHABLE_DATA[] ?
+        _retain_residuals(Val(true), sources, residuals, primal, flags) :
+        _retain_residuals(Val(false), sources, residuals, primal, flags)
+end
+
+@inline function _retain_residuals(::Val{deep}, sources::NTuple{R,Int},
+        residuals::NTuple{R,Any}, primal, flags) where {deep,R}
+    # Without the repair, an array inside a container is copied.
+    deep || _flat_residual_environment(residuals) ||
+        return _snapshot_residuals(residuals, sources, flags, Val(false), Val(false))::typeof(residuals)
     # A mutable result can expose input storage independently of its write
     # flag. For a dense bits-array result, protect only inputs whose storage
     # overlaps it; a fresh result need not force copies of readonly inputs.
     # Other mutable result structures copy every array.
     if !isbitstype(typeof(primal))
         primal isa Array && isbitstype(eltype(primal)) ||
-            return _snapshot_residuals(residuals, sources, flags, Val(false))::typeof(residuals)
+            return _snapshot_residuals(residuals, sources, flags, Val(false), Val(false))::typeof(residuals)
         flags = _protect_primal_aliases(residuals, sources, flags, primal)
     end
-    # Flat readonly inputs need no copy. Check after protecting storage exposed
-    # by the mutable primal result.
+    # Readonly inputs need no copy. Check after protecting storage exposed by
+    # the mutable primal result.
     _borrow_all_residuals(residuals, sources, flags) && return residuals
     # A snapshot has its residuals' type. The assertions keep that type where
     # a rule's residuals are not inferred and the snapshot is a run-time call.
-    _snapshot_residuals(residuals, sources, flags, Val(true))::typeof(residuals)
+    _snapshot_residuals(residuals, sources, flags, Val(true), Val(deep))::typeof(residuals)
 end
 
 function EnzymeRules.augmented_primal(
@@ -646,9 +717,11 @@ function _enzyme_derivative_report(f)
     ReactiveKernels.ADDerivativeReport(report.value, report.derivatives)
 end
 
-# Every answer depends on the loaded Enzyme's Julia source alone.
+# Every answer is fixed for the process: it depends on the loaded Enzyme's
+# Julia source and, for `overwritten_reachable_data`, the libEnzyme it loaded.
 function __init__()
     _STRUCTURED_GRADIENT_INPLACE[] = _structured_gradient_inplace()
+    _OVERWRITTEN_REACHABLE_DATA[] = _overwritten_reachable_data()
     ReactiveKernels._PR_INDEX_RUN_REFUSAL[] = _index_run_refusal()
     ReactiveKernels._DERIVATIVE_REPORTER[] =
         _derivative_report_available() ? _enzyme_derivative_report : missing
