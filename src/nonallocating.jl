@@ -354,6 +354,9 @@ function _decompose(ctx::_FusedDecomposition, node, allow_lazy_broadcast::Bool)
         return (node, typeof(something(resolved)))
     end
     node isa Expr || return (node, typeof(node))
+    if node.head === :vcat && !any(a -> Meta.isexpr(a, :row) || Meta.isexpr(a, :...), node.args)
+        return _decompose_call(ctx, GlobalRef(@__MODULE__, :_native_vcat), node.args)
+    end
     if node.head === :call && !isempty(node.args)
         callee = node.args[1]
         callee isa Symbol || callee isa Expr || callee isa GlobalRef ||
@@ -614,7 +617,9 @@ function _decompose_call_resolved(ctx::_FusedDecomposition, callee, f, fref,
         return (Expr(:call, fref, args...), T)
     end
     T isa Type || return nothing
-    (f === Base.vcat || f === Base.hcat) &&
+    (f === Base.vcat || f === Base.hcat ||
+     (f === _native_vcat && T <: Vector && isbitstype(eltype(T)) &&
+      all(t -> t isa Type && t <: _NativeColumnOperand, types))) &&
         return (_emit_step!(ctx, _ConcatenateStep(f), T, args...), T)
     if (f === Base.zeros || f === Base.ones) && !isempty(types) &&
        all(t -> t isa Type && t <: Integer, types)
