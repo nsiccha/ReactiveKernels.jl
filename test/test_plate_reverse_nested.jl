@@ -32,14 +32,14 @@ Base.getindex(x::ScaledGather, i::Vector{Int}) = 2 .* x.data[i]
     # The same compiled caller can receive either array. Only the plain
     # projection can add the unscaled cell partials directly to its parent.
     primal = (source, groups) -> sum(source[only(groups)])
-    projection = (RK._PRGroupProjection{Any}(1, 2, true, true),)
+    projection = (RK._PRGroupProjection{Any}(1, 2, true, true, true),)
     rule = RK._PlateSumRule{(),(1,),typeof(primal),typeof(identity),false,projection}(primal, identity)
     @test RK._pr_rule_target(rule, (x, indices)) isa RK._PlateSumRuleBody
     @test RK._pr_rule_target(rule, (projected, indices)) === primal
     @test rule(projected, indices) == primal(projected, indices)
     types = (Vector{Float64}, Vector{Int})
-    @test RK._pr_group_projection_covers(RK._PRGroupProjection{Float64}(1, 2, true, false), types)
-    @test !RK._pr_group_projection_covers(RK._PRGroupProjection{Int}(1, 2, true, false), types)
+    @test RK._pr_group_projection_covers(RK._PRGroupProjection{Float64}(1, 2, true, false, true), types)
+    @test !RK._pr_group_projection_covers(RK._PRGroupProjection{Int}(1, 2, true, false, true), types)
     # A slot and its indices can both be refilled between the two passes.
     ext = Base.get_extension(RK, :ReactiveKernelsEnzymeExt)
     shared = [1, 2]
@@ -49,6 +49,37 @@ Base.getindex(x::ScaledGather, i::Vector{Int}) = 2 .* x.data[i]
     shared[1] = 2
     @test tape == ([[0.4]], [[1, 2], [1, 2]])
     @test tape[2][1] === tape[2][2]
+end
+
+@testset "logical ragged tape scatters repeated and aliased rows" begin
+    ext = Base.get_extension(RK, :ReactiveKernelsEnzymeExt)
+    layout, batched = Val(:logical), Val((1,))
+    projection = Val((RK._PRGroupProjection{Any}(1, 2, true, true, true),))
+    for x in ([0.3, -1.7], [0.8], Float64[])
+        rows = [x, Float64[], x]
+        shared = fill(0.4, length(x))
+        drows = [shared, Float64[], shared]
+        ids = [3, 1, 2, 1]
+        args = (Enzyme.Duplicated(rows, drows), Enzyme.Const(ids))
+        eligible(overwritten, proof) = ext._pr_one_pass(layout, Val(()), batched,
+            Val((false, overwritten, false)), args, proof)
+        @test eligible(false, projection)
+        @test !eligible(true, projection)
+        @test !eligible(false, Val(()))
+        @test !eligible(false, Val((RK._PRGroupProjection{Any}(1, 2, true, true, false),)))
+        tape = zeros(ext._pr_buffer_length(layout, batched, args))
+        buffers = ext._pr_tape_buffers(layout, batched, args, tape)
+        buffer = only(buffers)
+        RK._pr_check_shadow(buffer, rows)
+        @test_throws DimensionMismatch RK._pr_check_shadow(buffer, [[0.0]])
+        for i in ids
+            RK._pr_group_view(buffer, i) .+= rows[i]
+        end
+        seed = -1.7
+        ext._pr_scaled_shadows(layout, batched, args, ext._pr_tape_buffers(layout, batched, args, tape), seed)
+        @test shared ≈ 0.4 .+ (3seed) .* x
+        @test isempty(drows[2])
+    end
 end
 
 @kernel weighted_groups(groups::Vector{Vector{Float64}}, weights::Vector{Float64},

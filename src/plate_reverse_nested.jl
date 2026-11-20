@@ -78,11 +78,39 @@ end
 @inline _pr_group_view(shadow::_PRMappedShadow, indices) =
     _PRMappedShadow(shadow.f, _pr_group_view(shadow.storage, indices))
 
+# One logical cotangent per row entry, including separate slots for two
+# logical rows that alias. The reverse accumulates both into the shared row.
+# The prefix offsets occupy the head of this operand's leased tape slice.
+struct _PRRaggedBuffer{O,V}
+    offsets::O
+    values::V
+end
+function _pr_ragged_buffer(slice, rows)
+    n = length(rows)
+    offsets = reinterpret(Int64, view(slice, 1:n+1))
+    values = view(slice, n+2:length(slice))
+    offsets[1] = 0
+    @inbounds for i in eachindex(rows)
+        offsets[i+1] = offsets[i] + length(rows[i])
+    end
+    _PRRaggedBuffer(offsets, values)
+end
+@inline function _pr_group_view(buffer::_PRRaggedBuffer, i::Int)
+    view(buffer.values, buffer.offsets[i]+1:buffer.offsets[i+1])
+end
+function _pr_check_shadow(s::_PRRaggedBuffer, rows::Vector{Vector{Float64}})
+    length(s.offsets) == length(rows) + 1 &&
+        all(i -> s.offsets[i+1] - s.offsets[i] == length(rows[i]), eachindex(rows)) ||
+        throw(DimensionMismatch("ragged plate shadow has different row lengths"))
+    nothing
+end
+
 struct _PRGroupProjection{Declared}
     parent::Int
     rows::Int
     grouped::Bool
     batched::Bool
+    only_group_reads::Bool
 end
 
 # A gathered group operand uses its own indices in both directions. A view
@@ -124,7 +152,7 @@ function _pr_group_shadows!(reads, groups, params, active, prepared, mod, values
         end
         batched = name in Base.values(prepared)
         push!(projections, _PRGroupProjection{declaration}(findfirst(==(parent), params),
-            findfirst(==(rows), params), rows !== indices, batched))
+            findfirst(==(rows), params), rows !== indices, batched, !(parent in Base.values(prepared))))
         push!(sources, parent)
         reads[rhs] = nothing
         shadow = Symbol(parent, :_shadow)
