@@ -16,6 +16,7 @@ const SITE_PAGES = [
         "JAX host preparation" => "jax-host.md",
         "JAX translations" => "jax-translations.md",
         "JAX runtime and derivatives" => "jax-runtime.md",
+        "JAX ODE solves" => "jax-ode.md",
         "Derivative graphs" => "manual-derivative-rules.md",
     ],
     "Examples" => [
