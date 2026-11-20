@@ -2,6 +2,7 @@
 # sibling spellings / sibling laws on the same data. A cliff between siblings
 # whose mathematics has the same cost structure marks an overspecific fast path.
 include(joinpath(@__DIR__, "harness.jl"))
+import LogExpFunctions
 include(joinpath(@__DIR__, "factor_variants.jl"))
 
 # usage: julia probe_families.jl [families, e.g. ABCDR] [rows]
@@ -151,6 +152,11 @@ if occursin('A', fam)
     end
     record(probe("A-gauss", "A16 alpha[g] beside three-step scan", A16,
         (; x, g = g_sorted, T = 3), (; y, s = [0.5, -0.25, 0.1])))
+    A17 = @rkppl begin
+        a ~ Normal(0, 5); b ~ Normal(0, 2); sigma ~ Exponential(1.0)
+        y[:] .~ Normal.(a .+ b .* x, sigma)
+    end
+    record(probe("A-gauss", "A17 whole-column colon", A17, (; x), (; y)))
 end
 
 # ------------------------------------------------- B: discrete-covariate GLMs
@@ -193,6 +199,40 @@ if occursin('B', fam)
     end
     record(probe("B-glm", "B5 @plate Bernoulli, discrete", B5, (; x = xd), (; y = ybin)))
     record(probe("B-glm", "B5c @plate Bernoulli, continuous", B5, (; x), (; y = ybinc)))
+    B6 = @rkppl begin
+        a ~ Normal(0, 1); b ~ Normal(0, 2)
+        p = logistic.(a .+ b .* x)
+        y .~ Bernoulli.(p)
+    end
+    B7 = @rkppl begin
+        a ~ Normal(0, 1); b ~ Normal(0, 2)
+        y .~ Bernoulli.(LogExpFunctions.logistic.(a .+ b .* x))
+    end
+    for (label, model) in (("B6 named link", B6), ("B7 qualified link", B7))
+        record(probe("B-glm", "$label, discrete", model, (; x = xd), (; y = ybin)))
+        record(probe("B-glm", "$label, continuous", model, (; x), (; y = ybinc)))
+    end
+    B8 = @rkppl begin
+        a ~ Normal(0, 1); b ~ Normal(0, 2)
+        y[axes(y, 1)] .~ BernoulliLogit.(a .+ b .* x)
+    end
+    record(probe("B-glm", "B8 whole-column axes, discrete", B8, (; x = xd), (; y = ybin)))
+    record(probe("B-glm", "B8c whole-column axes, continuous", B8, (; x), (; y = ybinc)))
+    B9 = @rkppl begin
+        a ~ Normal(0, 1); b ~ Normal(0, 2)
+        y .~ Poisson.(exp.(a .+ b .* x) .* exposure)
+    end
+    B9log = @rkppl begin
+        a ~ Normal(0, 1); b ~ Normal(0, 2)
+        y .~ PoissonLog.(a .+ b .* x .+ log_exposure)
+    end
+    record(probe("B-glm", "B9 rate times exposure", B9, (; x, exposure = w), (; y = ycnt)))
+    record(probe("B-glm", "B9log positive exposure offset", B9log, (; x, log_exposure = log.(w)), (; y = ycnt)))
+    B10 = @rkppl begin
+        a ~ Normal(0, 1); b ~ Normal(0, 2)
+        y[:] .~ Binomial.(n, logistic.(a .+ b .* x))
+    end
+    record(probe("B-glm", "B10 whole-column binomial", B10, (; x, n = ntr), (; y = ycnt)))
 end
 
 # ---------------------------------------------------- C: grouped intercepts

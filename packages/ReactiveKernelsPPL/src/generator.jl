@@ -977,6 +977,85 @@ _eval_kernel_def(def::Expr) =
     ReactiveKernels._kernel_eval_definition(PPLGeneratedModels, def;
         latest_world_native_sources = true)
 
+# An elementwise cell can take its scalar arguments and selected columns as
+# plate operands. Strict indexing remains a gather even for singleton and
+# longer columns. Each lane runs its scalar math and keeps its local bindings.
+# Leave conditionals in the indexed cell: an inactive row must not be read.
+function _selected_elementwise_plate(ex, plan)
+    _selected_plate_indices(ex) === nothing && return ex
+    indices = ex.args[1].args[2]
+    formals, body = ex.args[2].args
+    Meta.isexpr(formals, :tuple, 1) && Meta.isexpr(body, :block) || return ex
+    index = only(formals.args)
+    inputs, lanes = Any[], Symbol[]
+    taken = _expr_names(ex)
+    sources, locals = Dict{Symbol,Symbol}(), Set{Symbol}()
+    function lane(value)
+        entry = findfirst(isequal(value), inputs)
+        entry === nothing || return lanes[entry]
+        k = length(inputs) + 1
+        while _dovar(k) in taken
+            k += 1
+        end
+        name = _dovar(k)
+        push!(taken, name)
+        push!(inputs, value)
+        push!(lanes, name)
+        return name
+    end
+    indexed = false
+    function read(node)
+        if Meta.isexpr(node, :ref, 2) && node.args[2] === index
+            col = get(sources, node.args[1], node.args[1])
+            col isa Symbol && col ∉ locals || return nothing
+            value = get(plan.columns, col, nothing)
+            value isa AbstractArray{<:Real} || return nothing
+            values = value isa AbstractVector ? col : Expr(:call, GlobalRef(Base, :vec), col)
+            indexed = true
+            return lane(Expr(:ref, values, indices))
+        elseif node isa Symbol
+            node in locals && return node
+            (node === index || haskey(sources, node) || !_proven_scalar(plan, node)) && return nothing
+            return lane(node)
+        elseif node isa Real
+            return node
+        end
+        Meta.isexpr(node, :call) && !isempty(node.args) || return nothing
+        f = node.args[1]
+        f isa Symbol && (Symbol(".", f) in ELEMENTWISE_OPS ||
+            f in ELEMENTWISE_FNS || f in _COMPOSED_UNARY) || return nothing
+        args = map(read, node.args[2:end])
+        any(isnothing, args) && return nothing
+        return Expr(:call, f, args...)
+    end
+    stmts = Any[]
+    for st in body.args
+        if Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol
+            name, rhs = st.args
+            (name === index || name in locals || haskey(sources, name)) && return ex
+            if Meta.isexpr(rhs, :call, 2) && rhs.args[1] == GlobalRef(Base, :vec) &&
+                    rhs.args[2] isa Symbol
+                rhs.args[2] in locals && return ex
+                sources[name] = rhs.args[2]
+                continue
+            end
+            v = read(rhs)
+            v === nothing && return ex
+            push!(locals, name)
+            push!(stmts, Expr(:(=), name, v))
+        elseif st isa LineNumberNode
+            push!(stmts, st)
+        else
+            v = read(st)
+            v === nothing && return ex
+            push!(stmts, v)
+        end
+    end
+    indexed || return ex
+    return Expr(:do, Expr(:call, :plate, inputs...),
+        Expr(:->, Expr(:tuple, lanes...), Expr(:block, stmts...)))
+end
+
 # Scalar + derived assignments in topo order (params already constrained
 # above, so every scalar name resolves; derived columns resolve as locals
 # for the recipes below). Unannotated: Int temporaries (e.g. `length`)
@@ -1011,6 +1090,7 @@ function _assignment_statements(plan::StructuralPlan;
         ex = _guard_missing_observation_argument(name, by_name[name].expr, plan, plan.columns)
         ex === by_name[name].expr || !_guarded_argument_is_bound(ex, plan.columns) ||
             (ex = _concrete_guarded_argument(ex))
+        ex = _selected_elementwise_plate(ex, plan)
         push!(order, name)
         rewritten[name] = _bound_extent_indices(name,
             _unit_logit_rewrite(_value_math_rewrite(
@@ -1518,6 +1598,8 @@ function _composed_rewrite(node, subs::Vector{Symbol}, plan::StructuralPlan,
     if _is_plate_column_expr(node)
         original = node
         node = _guard_missing_observation_argument(pred, node, plan, plan.columns)
+        lifted = _selected_elementwise_plate(node, plan)
+        lifted === node || return _value_math_rewrite(lifted)
         value = Expr(:do, Expr(:call, :plate, node.args[1].args[2:end]...),
             node.args[2])
         return node !== original && _guarded_argument_is_bound(node, plan.columns) ?
@@ -1800,6 +1882,7 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers,
     latents = Pair{Symbol,Any}[]
     uncovered_latents = Symbol[]
     for r in plan.responses
+        _whole_response_range(plan, r) && (r = _with(r; range = nothing))
         # A plate loop covers its whole response, so a cell-broadcast
         # response observes every entry of each index's array.
         rs = _cell_broadcast_response(plan, r) ?
@@ -2318,6 +2401,47 @@ _ppl_range_values(x::Number, indices) = x
 ReactiveKernels._cell_row_method(::typeof(_ppl_rows)) =
     (; at = _ppl_rows_at, rows = (1,), dims = (2,))
 
+# Ordinary observation operands selected at the loop index. Categorical logit
+# matrices have a separate slice axis; simplex and covariance values are shared.
+function _indexed_row_operands(r, plan)
+    rows = Set{Symbol}()
+    if !_categorical_logit_slices(r) && r.family ∉ (CategoricalFam, MultinomialFam)
+        push!(rows, _location_node(r, plan))
+        union!(rows, r.extra_predictors)
+    end
+    for slot in (r.scale, r.nu, r.zi, r.discrimination, r.weights, r.trials,
+            r.evidence.lower, r.evidence.upper, r.threshold_columns...,
+            r.count_columns..., r.extra_responses...)
+        if slot isa ScalePredictorRef
+            push!(rows, slot.predictor)
+        elseif slot isa Symbol
+            push!(rows, slot)
+        end
+    end
+    r.thresholds isa ThresholdRows && push!(rows, r.thresholds.name)
+    r.mixture_weights isa MixtureWeightRows && push!(rows, r.mixture_weights.name)
+    return rows
+end
+
+# A vector's own one-dimensional index set selects it unchanged. A loop
+# also indexes its operands: only omit that selection if each one is shared
+# or was already computed on this very iterator. This proof survives rebinding
+# at different lengths; matrix slices and foreign iterators keep their gather.
+function _whole_response_range(plan, r)
+    Meta.isexpr(r.range, :ref, 2) || return false
+    y = get(plan.columns, r.response, nothing)
+    y isa AbstractVector && axes(y, 1) isa Base.OneTo || return false
+    index = r.range.args[2]
+    (index === :(:) || index == Expr(:call, :eachindex, r.response) ||
+        index == Expr(:call, :axes, r.response, 1)) || return false
+    r.response in plan.indexed_observations || return true
+    _categorical_logit_slices(r) && return false
+    return all(_indexed_row_operands(r, plan)) do value
+        value === r.response || _selected_cell_value(plan, r, value) ||
+            _proven_scalar(plan, value)
+    end
+end
+
 # A selected plate column already holds one value per selected response cell
 # (`_selected_plate_indices`); only whole operands are gathered at the
 # authored indices. Positions and indices differ for a literal `a:b`. Read
@@ -2330,32 +2454,14 @@ function _ranged_response_stmts(r, plan, stmts)
     push!(pre, Expr(:(=), selected, Expr(:ref, r.response, idx, r.range.args[3:end]...)))
     aliases = Dict{Symbol,Symbol}(r.response => selected)
     if r.response in plan.indexed_observations
-        rows = Set{Symbol}()
-        # Select ordinary row values before family-specific conversions or
-        # ordinal stage expansion. Simplexes and covariance factors stay whole.
-        # A logit matrix holds one slice per observation: select whole slices.
         if _categorical_logit_slices(r)
             alias = Symbol(:_ppl_range_logits_, r.label)
             getter = GlobalRef(@__MODULE__, r.logit_slices === :rows ?
                 :_ppl_range_rows : :_ppl_range_cols)
             push!(pre, :($alias = $getter($(r.predictor), $idx)))
             aliases[r.predictor] = alias
-        elseif r.family ∉ (CategoricalFam, MultinomialFam)
-            push!(rows, _location_node(r, plan))
-            union!(rows, r.extra_predictors)
         end
-        for slot in (r.scale, r.nu, r.zi, r.discrimination, r.weights, r.trials,
-                r.evidence.lower, r.evidence.upper, r.threshold_columns...,
-                r.count_columns..., r.extra_responses...)
-            if slot isa ScalePredictorRef
-                push!(rows, slot.predictor)
-            elseif slot isa Symbol
-                push!(rows, slot)
-            end
-        end
-        r.thresholds isa ThresholdRows && push!(rows, r.thresholds.name)
-        r.mixture_weights isa MixtureWeightRows && push!(rows, r.mixture_weights.name)
-        for (i, value) in enumerate(sort!(collect(rows)))
+        for (i, value) in enumerate(sort!(collect(_indexed_row_operands(r, plan))))
             value === r.response && continue
             _selected_cell_value(plan, r, value) && continue
             alias = Symbol(:_ppl_range_operand_, r.label, :_, i)

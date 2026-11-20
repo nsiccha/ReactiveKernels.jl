@@ -4724,7 +4724,7 @@ function _expand_plates(args, data::Set{Symbol};
             end
             arg = _expand_cell_scans(arg)
             arg, locals = _scope_plate_locals(arg, plate_locals, taken)
-            stmts, stx, prm = _desugar_plate(arg, pl, plate_data; broadcasts, arrays)
+            stmts, stx, prm = _desugar_plate(arg, pl, plate_data; broadcasts, arrays, mod)
             _array_entry_values!(arrays, definitions)
             for st in stmts
                 pl > 0 && push!(expanded, LineNumberNode(pl))
@@ -4843,7 +4843,7 @@ function _respell_value(ex::Expr, from::Symbol, to::Symbol)
     return Expr(ex.head, (_respell_value(a, from, to) for a in ex.args)...)
 end
 
-function _desugar_plate(st::Expr, line::Int, data::Set{Symbol};
+function _desugar_plate(st::Expr, line::Int, data::Set{Symbol}; mod::Module = Main,
         broadcasts::Dict{Symbol,Vector{Symbol}} = Dict{Symbol,Vector{Symbol}}(),
         arrays::Set{Symbol} = Set{Symbol}())
     (length(st.args) == 3 && st.args[3] isa Expr &&
@@ -4903,13 +4903,13 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol};
         Meta.isexpr(c.args[2], :ref) && c.args[2].args[1] in data, cells)
     (selected || scanned) &&
         return _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
-            broadcasts, arrays)
+            broadcasts, arrays, mod)
     (rkind[1] === :levels || _plate_has_array_cells(cells)) &&
         return _desugar_array_plate(cells, ivar, rkind, line, data,
             plate_defs)
     (reads_arrays || _plate_needs_retained_cells(cells, ivar)) &&
         return _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
-            broadcasts, arrays)
+            broadcasts, arrays, mod)
     # Cell locals bound from a per-index value (they vary with the loop
     # variable, so arithmetic over them vectorizes in the desugar).
     pidx = Set{Symbol}()
@@ -5040,7 +5040,7 @@ end
 
 # Partial observation loops compute their arguments inside retained RK cells.
 # Slicing a fully computed vector would evaluate arithmetic in unselected cells.
-function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
+function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs; mod::Module = Main,
         broadcasts::Dict{Symbol,Vector{Symbol}} = Dict{Symbol,Vector{Symbol}}(),
         arrays::Set{Symbol} = Set{Symbol}())
     indices = _plate_index_values(rkind)
@@ -5105,7 +5105,7 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
         latent = Meta.isexpr(lhs, :ref, 2) && lhs.args[1] ∉ data
         lnames = Set(first.(locals))
         external = _external_rhs(c.args[3])
-        function arg(ex; object=false)
+        function arg(ex; object=false, link_family=nothing)
             # Preserve sharing within a dotted cell while lowering the
             # indexed vector through the ordinary selected-plate path.
             if _is_ref_call(ex) && _expr_has_sym(ex, ivar)
@@ -5117,10 +5117,28 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
             # stripping it to a column would broadcast a singleton instead.
             !external && Meta.isexpr(ex, :ref, 2) && ex.args[2] === ivar &&
                 ex.args[1] isa Symbol && ex.args[1] ∉ lnames && return ex
+            # Preserve the link around its selected argument. The latter
+            # still reads precisely this row and keeps its missing-data guard.
+            if link_family !== nothing && !external && !latent && !_is_broadcast_sample(c)
+                definition = ex
+                # Read aliases in declaration order. An index argument still
+                # belongs to the local scope in which its link was applied.
+                for (name, rhs) in Iterators.reverse(locals)
+                    definition === name && (definition = rhs)
+                end
+                link = _inverse_link_call(definition, mod)
+                if link !== nothing && haskey(_link_names(link_family), link.head) &&
+                        (_expr_has_sym(link.arg, ivar) ||
+                        !isdisjoint(_value_symbols(link.arg), lnames)) &&
+                        allunique(first.(locals))
+                    return Expr(:call, link.head, arg(link.arg))
+                end
+            end
             if ex isa Expr && (ex.head === :call || _is_dotted_call(ex)) &&
                     !isempty(ex.args) && (_cell_object_call(ex.args[1]) || object)
                 vals = ex.head === :call ? ex.args[2:end] : ex.args[2].args
-                arguments = map(arg, vals)
+                slot = get(_LINK_SLOTS, ex.args[1], 0)
+                arguments = [arg(v; link_family = k == slot ? ex.args[1] : nothing) for (k, v) in enumerate(vals)]
                 return ex.head === :call ? Expr(:call, ex.args[1], arguments...) :
                     Expr(:., ex.args[1], Expr(:tuple, arguments...))
             end
@@ -8528,7 +8546,7 @@ const _LINK_SLOTS = Dict{Symbol,Int}(:Bernoulli => 1, :Binomial => 2,
     :Poisson => 1, :NegativeBinomial2 => 1, :NegativeBinomial => 1,
     :HurdlePoisson => 1, :ZeroInflatedPoisson => 1,
     :ZeroInflatedBinomial => 2, :InverseGaussian => 1, :Exponential => 1,
-    :BetaBinomial2 => 2)
+    :BetaBinomial2 => 2, :Weibull => 2)
 
 # An undotted inverse link in a link slot is the function applied to its
 # argument whole, as in Julia: over a scalar it is the dotted link's value,
@@ -9587,34 +9605,8 @@ end
 function _dot2call_spine_arg(lhs, f, i, a)
     if f in _DOT_WRAPPERS && i == 1
         return _dot2call_nested_object(lhs, a)
-    elseif (f === :Bernoulli || f === :Poisson) && i == 1
-        # Bare param/literal: the mixture bare-mean slots, single-family
-        # form (sorted downstream in `_lower_location`).
-        (a isa Symbol || a isa Real) && return a
+    elseif get(_LINK_SLOTS, f, 0) == i
         return _dot2call_nested_link(lhs, a, f)
-    elseif f === :Binomial && i == 2
-        # Bare param/literal: see above.
-        (a isa Symbol || a isa Real) && return a
-        return _dot2call_nested_link(lhs, a, f)
-    elseif f === :NegativeBinomial2 && i == 1
-        return _dot2call_nested_link(lhs, a, f)
-    elseif f === :NegativeBinomial && i == 1
-        a isa Real && return a
-        return _dot2call_nested_link(lhs, a, f)
-    elseif f === :HurdlePoisson && i == 1
-        return _dot2call_nested_link(lhs, a, f)
-    elseif f === :ZeroInflatedPoisson && i == 1
-        return _dot2call_nested_link(lhs, a, f)
-    elseif f === :InverseGaussian && i == 1
-        a isa Real && return a
-        return _dot2call_nested_link(lhs, a, f)
-    elseif f === :Exponential && i == 1
-        return _dot2call_nested_link(lhs, a, f)
-    elseif f === :BetaBinomial2 && i == 2
-        return _dot2call_nested_link(lhs, a, f)
-    elseif f === :Weibull && i == 2
-        return _is_composed_map(a) && haskey(_AUXILIARY_LINKS, a.args[1]) ?
-            _dot2call_nested_link(lhs, a, f) : a
     end
     # Gamma position 2 (`exp.(eta) ./ alpha`) passes through; the
     # response branch matches the `./` structure (link + alpha identity).
@@ -9788,6 +9780,55 @@ end
 _bare_slot_name(arg, ctx) = arg isa Symbol && !haskey(ctx.detmap, arg) &&
     !_is_declared_array(arg, ctx)
 
+# StatsFuns is optional. Look up its actual normcdf binding only when the
+# package has already been loaded by the model, including through a re-export.
+const _STATSFUNS_ID = Base.PkgId(Base.UUID("4c63d2b9-4356-54db-8cca-17b64c39e42c"), "StatsFuns")
+function _inverse_link_head(ref::GlobalRef)
+    isconst(ref.mod, ref.name) || return nothing
+    fn = getglobal(ref.mod, ref.name)
+    fn === exp && return :exp
+    fn === LogExpFunctions.logistic && return :logistic
+    fn === LogExpFunctions.cexpexp && return :cexpexp
+    Base.root_module_exists(_STATSFUNS_ID) &&
+        fn === getglobal(Base.root_module(_STATSFUNS_ID), :normcdf) && return :normcdf
+    return nothing
+end
+
+# A recognized inverse link's scalar function and operand, preserving Julia
+# binding identity for qualified calls, aliases and re-exports.
+function _inverse_link_call(ex, mod)
+    dotted = _is_dotted_call(ex)
+    dotted || Meta.isexpr(ex, :call, 2) || return nothing
+    args = dotted ? ex.args[2].args : ex.args[2:end]
+    length(args) == 1 || return nothing
+    head = ex.args[1]
+    if Meta.isexpr(head, :., 2) && head.args[2] isa QuoteNode &&
+            haskey(_AUXILIARY_LINKS, head.args[2].value)
+        qualifier = _resolve_module_path(head.args[1], mod, "inverse link")
+        head = _module_binding(qualifier, head.args[2].value, "inverse link", head)
+    end
+    head isa GlobalRef && (head = _inverse_link_head(head))
+    haskey(_AUXILIARY_LINKS, head) || return nothing
+    return (; head, arg = only(args), dotted)
+end
+
+# Only peel the outer call: its argument is still the original value, and
+# other readers keep the definition itself.
+function _definition_link(value, family, ctx)
+    value isa Symbol || return value
+    target = _alias_target(value, ctx)
+    link = _inverse_link_call(get(ctx.detmap, target, nothing), ctx.mod)
+    link === nothing && return value
+    haskey(_link_names(family), link.head) || return value
+    if !link.dotted
+        # A module call can return a whole array even when shape analysis
+        # classifies it as a model-level scalar. exp(matrix) reads it whole.
+        _canon_shape(link.arg, ctx) === :scalar &&
+            !_maybe_array_operand(link.arg, ctx.detmap, ctx.shape_env) || return value
+    end
+    return Expr(:call, link.head, link.arg)
+end
+
 function _lower_response_base(lhs, rhs::Expr, ctx)
     rhs.head === :call || _sfail("response $lhs: $_RESPONSE_BASE_MSG; " *
                                  "got $(repr(rhs))")
@@ -9801,6 +9842,10 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
         :BetaBinomial2, :VonMises, :CircularVonMises, :LogNormal, :Weibull) ||
         return _lower_response_base_error(lhs, rhs, fam)
     args = _distribution_args(fam, _plain_args(rhs, "`$fam`"))
+    slot = get(_LINK_SLOTS, fam, 0)
+    if 1 <= slot <= length(args)
+        args[slot] = _definition_link(args[slot], fam, ctx)
+    end
     if fam === :Normal
         length(args) == 2 || _sfail("response $lhs: `Normal` takes " *
                                     "`Normal.(mu, sigma)`")
