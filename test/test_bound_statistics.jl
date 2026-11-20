@@ -392,4 +392,96 @@ end
     @test isempty(ad_call_findings(ad, beta, 0.7))
 end
 
+@kernel ls_weighted(x::Vector{Float64}, w::Vector{Float64}, y::Vector{Float64},
+                    a::Float64, b::Float64, sigma::Float64) = begin
+    mu = muladd.(b, x, a)
+    scales = sigma .* w
+    lp = plate(y, mu, scales) do yi, mi, si
+        cell::Float64 = si > 0 ? normal(mi, si).logpdf(yi) : -Inf
+        cell
+    end
+    total::Float64 = sum(lp)
+    return total
+end
+
+@kernel ls_precision(x::Vector{Float64}, w::Vector{Float64}, y::Vector{Float64},
+                     a::Float64, b::Float64, sigma::Float64) = begin
+    mu = plate(a, b, x) do a, b, x
+        a + *(b, x, x)
+    end
+    scales = plate(sigma, w) do s, n
+        s / sqrt(n)
+    end
+    lp = plate(y, mu, scales) do yi, mi, si
+        1.25 + 0.75 * ((yi - mi) / si)^2 - 2.0 * log(si)
+    end
+    total::Float64 = sum(lp)
+    return total
+end
+
+@kernel ls_bounded_scale(w::Vector{Float64}, y::Vector{Float64}, a::Float64, sigma::Float64) = begin
+    scales = sigma .* w
+    lp = plate(y, a, scales) do yi, mi, si
+        si > 1.0 ? -((yi - mi) / si)^2 : 0.0
+    end
+    total::Float64 = sum(lp)
+    return total
+end
+
+@testset "separable row scales bind a weighted design" begin
+    for (model, precision) in ((ls_weighted, false), (ls_precision, true))
+        kernels = Any[]
+        for n in (0, 1, 40, 400)
+            x = randn(RNG, n)
+            y = randn(RNG, n)
+            w = [isodd(i) ? 0.75 : 1.5 for i in 1:n]
+            k = prepare(model; bound = (; x, w, y))
+            push!(kernels, k)
+            stats = only(filter(v -> v isa RK._LSWeightedStatistics, k.constants))
+            @test stats.fit.usable == (n >= 40)
+            n == 40 && @test isempty(findings(k, (Float64, Float64, Float64)))
+            a, b = 0.2, -0.5
+            for sigma in (1e-6, 1.1, 500.0)
+                value, gradient = _value_gradient(k, a, b, sigma)
+                ref, da, db, ds = 0.0, 0.0, 0.0, 0.0
+                for i in eachindex(x)
+                    feature = precision ? x[i]^2 : x[i]
+                    s = precision ? sigma/sqrt(w[i]) : sigma*w[i]
+                    residual = y[i] - (a + b*feature)
+                    c, l, q = precision ? (1.25, -2.0, 0.75) : (-log(2pi)/2, -1.0, -0.5)
+                    ref += c + l*log(s) + q*(residual/s)^2
+                    slope = -2q*residual/s^2
+                    da += slope
+                    db += slope*feature
+                    ds += (l - 2q*(residual/s)^2)/sigma
+                end
+                @test value ≈ ref rtol=1e-12
+                @test collect(gradient) ≈ [da, db, ds] rtol=1e-12
+            end
+        end
+        @test allequal(typeof.(kernels))
+        @test allequal(_shape.(kernels))
+    end
+    x = randn(RNG, 35)
+    y = randn(RNG, 35)
+    for w in (fill(0.7,35), [0.0; ones(34)], [-1.0; ones(34)], [Inf; ones(34)])
+        k = prepare(ls_weighted; bound=(; x,w,y))
+        original = prepare(ls_weighted; bound=(; x,w,y), bound_statistics=false)
+        for s in (-1.0, 0.0, 1e-160, 0.8, Inf)
+            v, ref = k(0.1, 0.3, s), original(0.1, 0.3, s)
+            @test isequal(v,ref) || isapprox(v,ref)
+        end
+    end
+    # This guard changes truth within the positive-scale domain. The plate
+    # must still test it on each row, in both the primal and reverse.
+    w = [isodd(i) ? 0.5 : 2.0 for i in eachindex(y)]
+    bounded = prepare(ls_bounded_scale; bound = (; w, y))
+    @test !any(s -> s isa RK._LSWeightedStatistics, bounded.constants)
+    value, gradient = _value_gradient(bounded, 0.2, 1.0)
+    active = findall(>(1), w)
+    residual = y[active] .- 0.2
+    @test value ≈ -sum(abs2, residual ./ w[active])
+    @test collect(gradient) ≈ [2sum(residual ./ w[active].^2), -2value]
+end
+
 end

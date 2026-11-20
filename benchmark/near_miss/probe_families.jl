@@ -48,6 +48,25 @@ if occursin('A', fam)
         y .~ Normal.(a .+ b .* x, sigma .* w)
     end
     record(probe("A-gauss", "A3 scale sigma .* w (w data)", A3, (; x, w), (; y)))
+    A3p = @rkppl begin
+        a ~ Normal(0, 5); b ~ Normal(0, 2); sigma ~ Exponential(1.0)
+        y .~ Normal.(a .+ b .* x, sigma ./ sqrt.(precision))
+    end
+    record(probe("A-gauss", "A3p scale sigma ./ sqrt.(precision)", A3p,
+                 (; x, precision = inv.(w .^ 2)), (; y)))
+    A3m = @rkppl begin
+        a ~ Normal(0, 5); b ~ Normal(0, 2); sigma ~ Exponential(1.0)
+        mu = muladd.(b, x, a)
+        y .~ Normal.(mu, sigma .* w)
+    end
+    record(probe("A-gauss", "A3m muladd location, weighted scale", A3m,
+                 (; x, w), (; y)))
+    A3t = @rkppl begin
+        a ~ Normal(0, 5); b ~ Normal(0, 2); sigma ~ Exponential(1.0)
+        y .~ Normal.(a .+ b .* x .* z, sigma .* w)
+    end
+    record(probe("A-gauss", "A3t product location, weighted scale", A3t,
+                 (; x, z, w), (; y)))
     A4 = @rkppl begin
         a ~ Normal(0, 5); b ~ Normal(0, 2); sigma ~ Exponential(1.0)
         y .~ LogNormal.(a .+ b .* x, sigma)
