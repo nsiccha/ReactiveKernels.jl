@@ -16,6 +16,13 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.342
+
+- The generated reverse of a summed plate preserves finite quotients and
+  seeded derivatives when a shared divisor is subnormal or an intermediate
+  product would overflow. It checks the input range before reusing a shared
+  reciprocal and otherwise evaluates the original division.
+
 ## 0.1.341
 
 - A kernel prepared with `prepare_nonallocating` can reuse the factor matrix for
