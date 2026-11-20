@@ -13,6 +13,8 @@ Private = false
 
 ## Functions
 
+For a Julia kernel that fills a caller's array, see the [alternating-buffer example](nonallocating.md#Caller-owned-outputs).
+
 ```@autodocs
 Modules = [ReactiveKernels]
 Order = [:function]

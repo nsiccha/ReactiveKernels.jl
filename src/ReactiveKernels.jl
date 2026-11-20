@@ -55,6 +55,7 @@ include("graphops.jl")
 include("scan_history.jl")
 include("authored_loops.jl")
 include("authoring.jl")
+include("prepare_into.jl")
 include("value_metadata.jl")
 include("cells.jl")
 include("cell_windows.jl")
@@ -122,7 +123,7 @@ export PartitionLocalityError, PartitionSeparabilityError, partition_locality, p
     partition_footprint, partition_footprint_kernel, partition_separability,
     partition_plan, partition_plan_kernel
 export PreparedADOperator, PreparedADPushforward, PreparedADHVP, PreparedADThird
-export value, value!, add!, plan, prepare, prepare_nonallocating, plate, scan, @plate, @scan
+export value, value!, add!, plan, prepare, prepare_into, prepare_nonallocating, plate, scan, @plate, @scan
 export partial_evaluation
 export prepare_ad, ad_gradient, ad_value_and_gradient, ad_value_and_gradient!
 export ad_cost_profile, ADCostProfile, ADCostPart

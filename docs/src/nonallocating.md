@@ -31,6 +31,38 @@ For a dense intermediate held in a kernel-owned buffer, a rank-changing `reshape
 
 The interface selects the same mathematical recipes as ordinary preparation. It routes supported operations through reusable buffers. Operations without an in-place form can still allocate, so the name alone does not establish an allocation count for an arbitrary graph.
 
+## Caller-owned outputs
+
+Use [`prepare_into`](@ref) when the caller already owns the output storage.
+Pass the destination first on every call. One writer can advance two
+alternating arrays while the caller controls when each is overwritten.
+
+```@example buffers
+@kernel center_vector(x) = begin
+    y = x .- sum(x)
+end
+
+write_center! = prepare_into(center_vector)
+a = [1.0, 2.0, 4.0]
+b = similar(a)
+@assert write_center!(b, a) === b
+@assert b == [-6.0, -5.0, -3.0]
+write_center!(a, b)
+(; a, b)
+```
+
+The writer evaluates `sum(x)` once on the whole vector. A final numeric
+broadcast such as `x .+ (h / 2) .* g` on dense vectors can fill the destination
+directly. For other array results the writer evaluates the prepared program
+once and copies its elements. Supply the result's axes and keep the destination
+disjoint from runtime and bound inputs. Array element conversions follow
+Julia's assignment rules.
+
+ForwardDiff can differentiate the pointwise writer. On Julia 1.10.12,
+Enzyme 0.13.221 raises `EnzymeNoDerivativeError` in the storage-overlap
+check when differentiating the same writer in reverse mode. A standalone
+reproducer is in `benchmark/enzyme_prepare_into_overlap.jl`.
+
 ## Generated program
 
 The generated expression makes the buffer boundary inspectable.
