@@ -754,14 +754,14 @@ sampler_value_and_gradient!(q::SamplerQuery, g::AbstractVector, u::AbstractVecto
 _sampler_gradient!(q::SamplerQuery, g, u) = first(ad_value_and_gradient!(q.ad, g, u, _discrete_args(q.discrete)...))
 
 """
-    ReactiveKernels.ad_cost_profile(q::SamplerQuery, u; seconds = 1.0, threshold = nothing, allocations = true)
+    ReactiveKernels.ad_cost_profile(q::SamplerQuery, u; kwargs...)
 
 Where the posterior value `q(u)` and its gradient
 `sampler_value_and_gradient!(q, g, u)` spend their time at `u`, split by the
 statements of the prepared program: the authored names (`mu`), the
 likelihood and prior terms (`_ppl_lik_y`, `_ppl_prior_z`), `log_jacobian`, and
 a plate cell's statements as `plate_<name>`. `ReactiveKernels.ad_cost_profile`
-documents the measurement, `threshold` and the result.
+documents the measurement, `threshold`, sampling budgets and the result.
 """
 function ReactiveKernels.ad_cost_profile(q::SamplerQuery, u::AbstractVector{<:Real};
                                          kwargs...)

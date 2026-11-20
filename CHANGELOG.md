@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.335
+
+- `ad_cost_profile` accepts `min_samples` and `max_sample_seconds` to spend
+  additional sampling time on a value or gradient pass with few observations
+  of the calling thread. The default keeps one fixed window per pass.
+
 ## 0.1.334
 
 - The opt-in generated reverse of a summed plate can vectorize dense

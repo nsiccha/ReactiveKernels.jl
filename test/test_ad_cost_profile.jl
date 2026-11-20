@@ -1,5 +1,6 @@
 using DifferentiationInterface
 import Enzyme
+import Profile
 using ReactiveKernels
 using Test
 
@@ -62,6 +63,45 @@ using Test
     @test !RK._has_source_markers(RK._program_expression(native))
     @test !RK._has_source_markers(code_expr(k))
     @test k([0.5, 2.0], [1.0, -1.0, 3.0]) == sum(abs2, 0.5 .+ 2.0 .* [1.0, -1.0, 3.0])
+end
+
+@testset "sampling budget counts running observations of the calling thread" begin
+    # Each retry appends whole blocks so that their stack frames can be read
+    # once. A sleeping stack and a running stack on another thread count zero.
+    running = Profile.add_fake_meta(UInt[0x110, 0]; threadid = 1)
+    other = Profile.add_fake_meta(UInt[0x120, 0]; threadid = 2)
+    sleeping = copy(running)
+    sleeping[end - Profile.META_OFFSET_SLEEPSTATE] = 2
+    kept = UInt[]
+    @test ReactiveKernels._append_running_samples!(kept, vcat(sleeping, other), 1) == 0
+    for _ in 1:2
+        @test ReactiveKernels._append_running_samples!(kept, vcat(other, running, sleeping), 1) == 1
+    end
+    @test kept == vcat(running, running)
+
+    x = Ref(1.0)
+    f() = (x[] = sqrt(1.0 + x[]))
+    before = Profile.init()
+    profile(; kwargs...) = ad_cost_profile(f, f; allocations = false, kwargs...)
+    # A one-nanosecond first window cannot supply eight samples at 100 µs
+    # intervals. Reaching the target exercises additional windows for both passes.
+    p = profile(; seconds = 1e-9, min_samples = 8, max_sample_seconds = 2)
+    @test p.primal_samples >= 8 && p.gradient_samples >= 8
+    @test sum(part.primal_samples for part in p.parts) == p.primal_samples
+    @test sum(part.gradient_samples for part in p.parts) == p.gradient_samples
+    @test Profile.init() == before
+    # An exhausted cap returns the samples it has, even if the target is unreachable.
+    capped = profile(; seconds = 0.005, min_samples = typemax(Int), max_sample_seconds = 0.01)
+    @test capped.profiled && max(capped.primal_samples, capped.gradient_samples) < typemax(Int)
+    @test !profile(; seconds = 0.01, threshold = Inf, min_samples = 8).profiled
+    @test_throws ArgumentError profile(; min_samples = -1)
+    @test_throws ArgumentError profile(; seconds = 0.1, max_sample_seconds = 0.01)
+    @test_throws ArgumentError profile(; seconds = Inf)
+    @test_throws ArgumentError profile(; max_sample_seconds = Inf)
+    @test_throws ErrorException ReactiveKernels._running_profile_data(
+        () -> error("profiled call failed"), 1.0, 8, 1.0)
+    @test Profile.init() == before
+    @test !Profile.is_running()
 end
 
 @testset "sample labels" begin
