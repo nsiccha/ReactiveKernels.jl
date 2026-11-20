@@ -43,6 +43,7 @@ end
         restored = constrain(built.layout, u)
         @test restored.channel.term.shift == shift
         @test restored.channel.term.scale ≈ scale
+        @test restored.channel.term.beta_raw isa Vector{Vector{Float64}}
         @test restored.channel.term.beta_raw == beta
         oracle = sum(eachindex(modes); init = 0.0) do i
             logpdf(Normal(0, data.sd[i]), shift[i]) + logpdf(LogNormal(), scale[i]) + loggap[i] +
@@ -102,6 +103,8 @@ end
     built = build([2, 1], [[-0.3, 0.1], [0.5]])
     u = collect(0.1:0.1:0.6)
     @test constrain(built.layout, u).group.w == [reshape(u[1:4], 2, 2), reshape(u[5:6], 1, 2)]
+    empty_model = build(Int[], Vector{Float64}[])
+    @test constrain(empty_model.layout, Float64[]).group.w isa Vector{Matrix{Float64}}
     @test_throws "could not be broadcast" build([2], [[0.1, 0.2, 0.3]])
     @test_throws "nonnegative integer" build([-1], [[0.1]])
 end

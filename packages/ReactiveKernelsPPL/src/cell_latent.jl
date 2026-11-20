@@ -376,8 +376,10 @@ function _expand_cell_array_latents(st, taken, scope::_CellLatentScope)
         end
         dimscells = fresh(Symbol(prefix, :_shapes))
         push!(prelude, Expr(:(=), dimscells, column(celldims)))
-        push!(prelude, Expr(:(=), dims, Expr(:call,
-            GlobalRef(@__MODULE__, :_ppl_cell_latent_shapes), QuoteNode(name), dimscells)))
+        table = Expr(:call, GlobalRef(@__MODULE__, :_ppl_cell_latent_shapes),
+            QuoteNode(name), dimscells)
+        sized && push!(table.args, length(lhs.args) - 1)
+        push!(prelude, Expr(:(=), dims, table))
         push!(prelude, Expr(:(=), offsets,
             Expr(:call, GlobalRef(@__MODULE__, :_ppl_cell_latent_offsets), dims)))
         push!(prelude, Expr(:(=), blocks,
@@ -638,6 +640,10 @@ function _ppl_cell_latent_shapes(name::Symbol, cells::AbstractVector)
         "stable; give every index's `$name[i]` the same number of dimensions"
     return Tuple{Vararg{Int}}[d for d in cells]
 end
+
+# A sized declaration establishes its rank even when the plate has no cells.
+_ppl_cell_latent_shapes(::Symbol, cells::AbstractVector, rank::Int) =
+    NTuple{rank,Int}[d for d in cells]
 
 function _ppl_cell_latent_offsets(dims::AbstractVector{<:Tuple})
     offsets = Vector{Int}(undef, length(dims) + 1)
