@@ -16,6 +16,37 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.243
+
+Requires ReactiveKernels 0.1.342.
+
+- An exported ReactiveKernels density with a location and a scale is an
+  elementwise response without its own entry in the lowering: `Cauchy`,
+  `Laplace`, `Logistic` and the standardized `TDist.(nu)` join `Normal` and
+  `StudentT`, for example `y .~ Laplace.(mu, sigma)`. They lower to the
+  summed observation plate, so a shared scale leaves the row sum and
+  repeated rows run once, and they take weights, truncation, censoring and
+  interval censoring like the other responses. A further numeric parameter
+  of the law may vary by row.
+- An inverse link may be named or qualified. `p = logistic.(eta)` followed
+  by `y .~ Bernoulli.(p)`, and `LogExpFunctions.logistic.(eta)`, select the
+  same natural-parameter likelihood as the inline `logistic.(eta)`. A
+  qualified call is identified by its binding, so an alias or a re-export of
+  the link function counts and another module's function of the same name
+  does not. Other readers of the named value still get the value.
+- An observation written as an indexed loop,
+  `@plate for i in eachindex(y); y[i] ~ Normal(a + b * x[i], sigma); end`,
+  exposes its row operands to the summed plate like the dotted form, so the
+  same row grouping and regression statistics apply. A response selected
+  whole (`y[:]`, `y[eachindex(y)]`, `y[axes(y, 1)]`) uses the likelihood of
+  the unsliced `y`.
+- A factor term (`alpha[g]` with declared levels) gathers its coefficients
+  by level in every spelling: with a reference level, with missing labels,
+  beside matrix terms and beside a scan. Preparation no longer builds a
+  dense contrast matrix for the cases the direct gather did not cover, whose
+  cost grew with rows times levels. A row outside the declared axis
+  contributes zero, including when every row has the reference level.
+
 ## 0.1.242
 
 - A sized prior inside a plate submodel can use a shared base distribution
