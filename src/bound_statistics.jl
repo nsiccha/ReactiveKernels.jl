@@ -351,6 +351,8 @@ _ls_coefficient_expr(x::Real) = x
 function _ls_coefficient_expr(x::Tuple)
     op, args... = x
     op === :data && return :(_ls_at(data[$(only(args))], i))
+    op === :live_product && return Expr(:call, GlobalRef(@__MODULE__, :_ls_bound_product),
+        map(_ls_coefficient_expr, args)...)
     Expr(:call, GlobalRef(Base, op), map(_ls_coefficient_expr, args)...)
 end
 _ls_coefficient_expr(c, x) = c == 1 ? x : :($(_ls_coefficient_expr(c)) * $x)
@@ -628,8 +630,24 @@ struct _LSLinearForm
 end
 _ls_scale(c::_LSCoefficient, d::_LSCoefficient) = c.tree == 1 ? d : d.tree == 1 ? c :
     _LSCoefficient((:*, c.tree, d.tree))
+# Combining successive multipliers of a live value changes their evaluation
+# order. Keep this distinction from a product authored wholly over bound data.
+_ls_scale_live(c, d) = c.tree == 1 ? d : d.tree == 1 ? c :
+    _LSCoefficient((:live_product, c.tree, d.tree))
+_ls_has_live_product(tree) = false
+_ls_has_live_product(tree::Tuple) = first(tree) === :live_product ||
+    any(_ls_has_live_product, Base.tail(tree))
+_ls_product_range(x::Float64) = iszero(x) ||
+    sqrt(floatmin(Float64)) <= abs(x) <= sqrt(floatmax(Float64))
+function _ls_bound_product(a, b)
+    x, y = Float64(a), Float64(b)
+    xy = x*y
+    # The intermediate, its next multiplier, and the full coefficient must
+    # remain representable when multiplied by any admitted live value.
+    _ls_product_range(x) && _ls_product_range(y) && _ls_product_range(xy) ? xy : NaN
+end
 _ls_scale(x::_LSLinearForm, d::_LSCoefficient) = _LSLinearForm(
-    [(_ls_scale(c, d), l, m, i) for (c, l, m, i) in x.terms], [_ls_scale(c, d) for c in x.offsets])
+    [(_ls_scale_live(c, d), l, m, i) for (c, l, m, i) in x.terms], [_ls_scale(c, d) for c in x.offsets])
 _ls_add(x::_LSLinearForm, y::_LSLinearForm) = _LSLinearForm(vcat(x.terms, y.terms), vcat(x.offsets, y.offsets))
 
 # An operand of a location's arithmetic: a data coefficient, a live value the
@@ -1036,6 +1054,9 @@ function _ls_plate_rewrite(p::Plan, r::Recipe, total::Recipe, dataonly::Set{Valu
     x = _ls_location(p, location, dataonly, false)
     x === nothing && return nothing
     _ls_consistent(x) || return nothing
+    # A rearranged product also needs the live-magnitude guard of the
+    # location-scale region. Try that rewrite before retaining the row loop.
+    any(t -> _ls_has_live_product(t[1].tree), x.terms) && return nothing
     data, live = _ls_inputs(x)
     S = _ls_structure(x, data, live)
     # The location operation reads the live values and the data itself.

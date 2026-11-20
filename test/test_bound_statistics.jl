@@ -439,8 +439,13 @@ end
             push!(kernels, k)
             stats = only(filter(v -> v isa RK._LSWeightedStatistics, k.constants))
             @test stats.fit.usable == (n >= 40)
-            n == 40 && @test isempty(findings(k, (Float64, Float64, Float64)))
             a, b = 0.2, -0.5
+            if n == 40
+                @test isempty(findings(k, (Float64, Float64, Float64)))
+                ad = prepare_ad(k, AutoEnzyme(; mode = Enzyme.Reverse), a, b, 1.1;
+                    active = (:a, :b, :sigma), native_forward_batch = false)
+                @test isempty(ad_call_findings(ad, a, b, 1.1))
+            end
             for sigma in (1e-6, 1.1, 500.0)
                 value, gradient = _value_gradient(k, a, b, sigma)
                 ref, da, db, ds = 0.0, 0.0, 0.0, 0.0
@@ -482,6 +487,20 @@ end
     residual = y[active] .- 0.2
     @test value ≈ -sum(abs2, residual ./ w[active])
     @test collect(gradient) ≈ [2sum(residual ./ w[active].^2), -2value]
+
+    cache = PreparationCache()
+    bindings = ((; x, w, y), (; x, w = [0.0; w[2:end]], y), (; x = 2x, w, y = -y))
+    rebound = map(data -> prepare!(cache, ls_weighted; bound = data), bindings)
+    @test allequal(typeof.(rebound)) && allequal(_shape.(rebound))
+    @test map(k -> only(v.fit.usable for v in k.constants if v isa RK._LSWeightedStatistics),
+              rebound) == (true, false, true)
+    for (k, data) in zip(rebound, bindings)
+        literal = prepare(ls_weighted; bound = data, bound_statistics = false)
+        value, grad = _value_gradient(k, 0.2, -0.3, 0.8)
+        ref, dref = _value_gradient(literal, 0.2, -0.3, 0.8)
+        @test value ≈ ref
+        @test collect(grad) ≈ collect(dref)
+    end
 end
 
 @kernel ls_mixed(X::Matrix{Float64}, idx::Vector{Int}, y::Vector{Float64},
@@ -560,6 +579,41 @@ end
                                    y, nothing)
     @test tiny.usable
     @test RK._ls_rss_mixed(tiny, fill(1e180, 4), (0.0,)) ≈ length(y) * 1e200
+end
+
+@kernel ls_product_scale(x::Vector{Int}, z::Vector{Int}, w::Vector{Float64},
+                         v::Vector{Float64}, y::Vector{Float64}, b::Float64, sigma::Float64) = begin
+    mu = plate(b, x, z) do b, x, z
+        *(b, x, z)
+    end
+    scales = plate(sigma, w, v) do s, w, v
+        *(s, w, v)
+    end
+    lp = plate(y, mu, scales) do yi, mi, si
+        si > 0 ? normal(mi, si).logpdf(yi) : -Inf
+    end
+    total::Float64 = sum(lp)
+    return total
+end
+
+@testset "moving data multipliers across a live value" begin
+    n = 40
+    # The authored multiplication promotes to Float64 before x*z can wrap.
+    x = fill(isqrt(typemax(Int)) + 1, n)
+    y = ones(n)
+    b = 0.1 / Float64(first(x))^2
+    for (w, v, sigma, usable) in ((2.0, 0.5, 0.8, true), (1e200, 1e-200, 1e120, false))
+        data = (; x, z=x, w=fill(w,n), v=fill(v,n), y)
+        k = prepare(ls_product_scale; bound = data)
+        literal = prepare(ls_product_scale; bound = data, bound_statistics = false)
+        @test only(s.fit.usable for s in k.constants if s isa RK._LSWeightedStatistics) == usable
+        @test k(b, sigma) ≈ literal(b, sigma)
+        if usable
+            _, grad = _value_gradient(k, b, sigma)
+            _, ref = _value_gradient(literal, b, sigma)
+            @test collect(grad) ≈ collect(ref)
+        end
+    end
 end
 
 end

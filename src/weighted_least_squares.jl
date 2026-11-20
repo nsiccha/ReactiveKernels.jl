@@ -196,12 +196,19 @@ _ls_magnitude(x::AbstractVector{Float64}) = maximum(abs, x; init=0.0)
 @generated function _ls_scalar_slots(::Val{I}, xs::Tuple) where {I}
     foldr((i, tail) -> :(xs[$i] isa Float64 && $tail), I; init = true)
 end
-struct _LSScaleGuard{I}
+_ls_product_argument(x) = false
+_ls_product_argument(x::Float64) = _ls_product_range(x)
+_ls_product_argument(x::AbstractVector{Float64}) = all(_ls_product_range, x)
+@generated function _ls_product_arguments(::Val{P}, args::Tuple) where {P}
+    foldr((i, tail) -> :(_ls_product_argument(args[$i]) && $tail), P; init = true)
+end
+struct _LSScaleGuard{I,P}
     maxnorm::Float64
     maxrows::Float64
 end
-function (guard::_LSScaleGuard{I})(w::_LSWeightedStatistics, sigma::Float64, live::Vararg{Any,N}) where {I,N}
+function (guard::_LSScaleGuard{I,P})(w::_LSWeightedStatistics, sigma::Float64, live::Vararg{Any,N}) where {I,P,N}
     w.fit.usable && sigma > 0 && _ls_scalar_slots(Val(I), live) || return false
+    _ls_product_arguments(Val(P), (sigma, live...)) || return false
     w.fit.rows <= guard.maxrows || return false
     small, large = sigma*w.smallest, sigma*w.largest
     floatmin(Float64) <= small && isfinite(large) || return false
@@ -268,7 +275,10 @@ function _ls_weighted_rewrite(p, plate, dataonly, wanted)
             _authored_plate_sum_recipe(p, q) !== nothing), selected) && continue
         scalars = Tuple(i for (i, (_, l, matrix, index)) in enumerate(loc.terms) if
                         matrix === nothing && index === nothing && valtype(p.graph.values[l]) === Any)
-        return (; plate, total, selected, drop, response, sigma, law, data, live, scalars,
+        product_slots = Int[i + 1 for (i, t) in enumerate(loc.terms) if _ls_has_live_product(t[1].tree)]
+        _ls_has_live_product(c.tree) && pushfirst!(product_slots, 1)
+        products = Tuple(product_slots)
+        return (; plate, total, selected, drop, response, sigma, law, data, live, scalars, products,
             S = _ls_structure(loc, data, live), W = _ls_slots(c.tree, data))
     end
     nothing
@@ -282,7 +292,9 @@ function _ls_weighted_recipes(p, g, w, id)
     live = [g.values[i] for i in w.live]
     a = Recipe(id, (w.response, data...), (stats,), _LSWeightedBind{w.S,w.W}(), 0.0, nothing, false)
     headroom = floatmax(Float64) / 4
-    guard = _LSScaleGuard{w.scalars}(sqrt(headroom / max(1.0, abs(w.law.square))),
+    # |log(s)| is at most about 745 on positive finite Float64 scales,
+    # including subnormals. Budget this much log-scale contribution per row.
+    guard = _LSScaleGuard{w.scalars,w.products}(sqrt(headroom / max(1.0, abs(w.law.square))),
         headroom / max(1.0, abs(w.law.constant), 750 * abs(w.law.logscale)))
     b = Recipe(id-1, (stats, w.sigma, live...), (usable,), guard, 0.0, nothing, false)
     cold = w.selected
