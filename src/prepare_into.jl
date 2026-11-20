@@ -1,6 +1,7 @@
 # The ordinary prepared program supplies the vector semantics, including any
 # passes the caller already applied. Only its terminal materialization can be
-# deferred to the writer. Every other result goes through the same copy path.
+# deferred directly to the destination. The buffered path below reads this
+# same prepared body.
 struct _IntoBroadcast{B}
     value::B
 end
@@ -37,9 +38,161 @@ function _into_program(k::PreparedKernel)
                      k.plan, ast, k.lowered_recipes; exact_signature = _exact_signature(k))
 end
 
-struct _IntoWriter{K,B}
+mutable struct _IntoScratch{S,K}
+    kernel::K
+    @atomic busy::Bool
+end
+
+# An intermediate can be retained across calls only when it cannot escape to
+# user code. Read a straight-line numerical region of the *executed* program,
+# including its let bindings, then let the usual buffered lowering choose the
+# destination steps. This never rebuilds the selected plan or reruns a pass.
+const _IntoNumeric = Union{_NativeBroadcastNumber,Array{<:_NativeBroadcastNumber},BitArray}
+const _INTO_NUMERIC_CALLS = (+, -, *, /, min, max, abs, abs2, sqrt, exp, log,
+    copy, reverse, sort, sum, prod, minimum, maximum, cumsum, cumprod, length,
+    size, zeros, ones, fill, vcat, hcat, _NONALLOC_LAZY_CALLEES..., _native_vcat, _native_mul,
+    _native_broadcasted, _native_broadcast_materialize)
+
+function _into_operand(ctx, ex, k)
+    ex isa Symbol && return haskey(ctx.argmap, ex) ? ex : nothing
+    ex isa _NativeBroadcastNumber && return ex
+    if ex isa GlobalRef
+        r = _nonalloc_resolve_const(ex.mod, ex.name)
+        r === nothing && return nothing
+        value = something(r)
+        (value isa _IntoNumeric || any(f -> f === value, _INTO_NUMERIC_CALLS)) || return nothing
+        return ex
+    end
+    ex isa Expr || return nothing
+    j = _constant_slot(ex)
+    if j !== nothing && 1 <= j <= length(k.constants)
+        value = k.constants[j]
+        value isa _IntoNumeric || return nothing
+        name = gensym(:bound)
+        ctx.argmap[name], ctx.argtypes[name] = ex, typeof(value)
+        return name
+    end
+    Meta.isexpr(ex, :call) && !isempty(ex.args) || return nothing
+    callee = first(ex.args)
+    j = _callable_slot(callee)
+    if j !== nothing && 1 <= j <= length(k.callables)
+        f = k.callables[j]
+        any(x -> x === f, _INTO_NUMERIC_CALLS) || return nothing
+        callee = _const_call_ref(f)
+    end
+    callee isa GlobalRef || return nothing
+    r = _nonalloc_resolve_const(callee.mod, callee.name)
+    r !== nothing && any(f -> f === something(r), _INTO_NUMERIC_CALLS) || return nothing
+    args = Any[]
+    for arg in @view ex.args[2:end]
+        operand = _into_operand(ctx, arg, k)
+        operand === nothing && return nothing
+        if operand isa Expr
+            # Complete each argument before computing the next. Decomposition
+            # can otherwise hoist a later buffer step ahead of an earlier error.
+            d = _decompose(ctx, operand, false)
+            d === nothing && return nothing
+            name = gensym(:operand)
+            ctx.argmap[name], ctx.argtypes[name] = _traced_value!(ctx, d)
+            operand = name
+        end
+        push!(args, operand)
+    end
+    Expr(:call, callee, args...)
+end
+
+function _into_bind!(ctx, stmt, k, locals = nothing)
+    Meta.isexpr(stmt, :(=), 2) && stmt.args[1] isa Symbol || return false
+    name = stmt.args[1]
+    name in (_CONSTANTS_ARG, _CALLABLES_ARG) && return false
+    # The native emitter gives each let fresh names. A pass that shadows or
+    # changes an outer binding keeps Julia's ordinary lexical evaluation.
+    locals !== nothing && haskey(ctx.argmap, name) && return false
+    d = _into_expression!(ctx, stmt.args[2], k, locals)
+    d === nothing && return false
+    ctx.argmap[name], ctx.argtypes[name] = _traced_value!(ctx, d)
+    locals === nothing || push!(locals, name)
+    true
+end
+
+function _into_expression!(ctx, ex, k, locals = nothing)
+    if Meta.isexpr(ex, :let, 2)
+        bindings, body = ex.args
+        names = Symbol[]
+        for stmt in (Meta.isexpr(bindings, :block) ? bindings.args : (bindings,))
+            _into_bind!(ctx, stmt, k, names) || return nothing
+        end
+        d = _into_expression!(ctx, body, k, names)
+        for name in names
+            delete!(ctx.argmap, name)
+            delete!(ctx.argtypes, name)
+        end
+        return d
+    elseif Meta.isexpr(ex, :block) && !isempty(ex.args)
+        for stmt in @view ex.args[1:end-1]
+            stmt isa LineNumberNode || _into_bind!(ctx, stmt, k, locals) || return nothing
+        end
+        return _into_expression!(ctx, last(ex.args), k, locals)
+    end
+    operand = _into_operand(ctx, ex, k)
+    operand === nothing ? nothing : _decompose(ctx, operand, false)
+end
+
+# A single directly writable broadcast needs no workspace or lease.
+_into_direct_operand_type(T) = T <: _IntoNumeric || T <: Base.RefValue{<:_NativeBroadcastNumber}
+function _into_direct_operand_type(T::Type{<:Base.Broadcast.Broadcasted})
+    isconcretetype(T) && T <: Base.Broadcast.Broadcasted{<:Base.Broadcast.DefaultArrayStyle} &&
+        fieldtype(T, :axes) === Nothing && fieldtype(T, :f) <: _NativeBroadcastArithmetic &&
+        let args = fieldtypes(fieldtype(T, :args))
+            length(args) <= 32 && all(_into_direct_operand_type, args)
+        end
+end
+_into_direct_result(T) = false
+_into_direct_result(::Type{_IntoBroadcast{B}}) where {B} = _into_direct_operand_type(B)
+
+function _into_scratch(k, direct, types, cache_apply)
+    all(T -> isconcretetype(T) && T <: _IntoNumeric, types) || return nothing
+    ast = code_expr(k)
+    Meta.isexpr(ast, :function, 2) || return nothing
+    signature, body = ast.args
+    Meta.isexpr(signature, :tuple) && length(signature.args) == 2 + length(types) &&
+        signature.args[1:2] == [_CONSTANTS_ARG, _CALLABLES_ARG] || return nothing
+    Meta.isexpr(body, :block) && !isempty(body.args) &&
+        Meta.isexpr(last(body.args), :return, 1) || return nothing
+    ports = signature.args[3:end]
+    ctx = _FusedDecomposition(@__MODULE__, Dict{Symbol,Any}(), Dict{Symbol,Any}(),
+        Any[], Any[], Any[], 0, cache_apply)
+    for (port, T) in zip(ports, types)
+        name = Meta.isexpr(port, :(::), 2) ? port.args[1] : port
+        name isa Symbol || return nothing
+        name in (_TABLES_ARG, _CACHES_ARG, _CACHE_APPLY_ARG) && return nothing
+        ctx.argmap[name], ctx.argtypes[name] = name, T
+    end
+    for stmt in @view body.args[1:end-1]
+        stmt isa LineNumberNode || _into_bind!(ctx, stmt, k) || return nothing
+    end
+    d = _into_expression!(ctx, only(last(body.args).args), k)
+    d === nothing && return nothing
+    result, T = d
+    isempty(ctx.caches) && return nothing
+    isconcretetype(T) && T <: Array{<:_NativeBroadcastNumber} || return nothing
+    if direct !== k && length(ctx.ops) == 1 && only(ctx.ops) isa _MaterializeStep &&
+       _into_direct_result(Base.promote_op(direct, types...))
+        return nothing
+    end
+    push!(ctx.stmts, Expr(:return, result))
+    buffered = Expr(:function, Expr(:tuple, _CONSTANTS_ARG, _CALLABLES_ARG,
+        _CACHES_ARG, _CACHE_APPLY_ARG, ports...), Expr(:block, ctx.stmts...))
+    S = Tuple{types...}
+    kernel = NonAllocatingKernel{S}(compile(_nonallocating_body(buffered)), k.constants,
+        Tuple(ctx.ops), Tuple(ctx.caches), cache_apply, k.inputs, k.outputs, k.plan, buffered)
+    _IntoScratch{S,typeof(kernel)}(kernel, false)
+end
+
+struct _IntoWriter{K,B,S}
     program::K
     bound::B
+    scratch::S
 end
 
 """
@@ -51,10 +204,12 @@ fill and return `dst`. Pass a writable array with the result's axes and storage
 disjoint from runtime and bound inputs. Each call chooses its destination.
 Values use Julia's ordinary array element conversion when needed.
 
-A terminal native array broadcast can fill the destination directly. Other
-recipes evaluate once and copy their result into it. Array elements are
-copied shallowly, as with `copyto!`. A call that throws during a direct
-broadcast can leave a partially written destination.
+A terminal native array broadcast can fill the destination directly. With
+MutatingFunctions loaded and concrete input types from exemplars or declared
+ports, a writer can reuse private buffers in straight-line dense numerical
+recipes before copying the result. Other recipes evaluate once and copy.
+Array elements are copied shallowly, as with `copyto!`. A call that throws
+during a direct broadcast can leave a partially written destination.
 
 For a `KernelSpec`, `Graph` or `Plan`, selection and binding keywords are
 those of [`prepare`](@ref). Positional exemplars describe the remaining HAVE
@@ -66,7 +221,7 @@ function prepare_into(source::Union{KernelSpec,Graph,Plan}, exemplars...;
     binding = bound isa Union{Pair,NamedTuple,Tuple} ? bound : collect(bound)
     held = binding isa NamedTuple ? values(binding) : last(_partial_bound_pairs(binding))
     k = prepare(source; bound = binding, exemplars = isempty(exemplars) ? nothing : exemplars, kwargs...)
-    _prepare_into(k, held)
+    _prepare_into(k, held, exemplars)
 end
 
 function prepare_into(k::Union{PreparedKernel,_KernelSignatureCallable{<:PreparedKernel}}, exemplars...)
@@ -77,17 +232,27 @@ function prepare_into(k::Union{PreparedKernel,_KernelSignatureCallable{<:Prepare
         signature === Nothing || exemplars isa signature ||
             _prepared_argument_types_error(program, signature, exemplars)
     end
-    _prepare_into(k, ())
+    _prepare_into(k, (), exemplars)
 end
 
-_prepare_into(k::_KernelSignatureCallable, bound) =
-    _KernelSignatureCallable(_prepare_into(k.target, bound), k.signature)
-_prepare_into(k::_ShapedKernel, bound) =
+_prepare_into(k::_KernelSignatureCallable, bound, exemplars) =
+    _KernelSignatureCallable(_prepare_into(k.target, bound, exemplars), k.signature)
+_prepare_into(k::_ShapedKernel, bound, exemplars) =
     throw(ArgumentError("prepare_into requires one array result; select its WANT port"))
 
-function _prepare_into(k::PreparedKernel, bound)
+function _prepare_into(k::PreparedKernel, bound, exemplars)
     length(k.outputs) == 1 || throw(ArgumentError("prepare_into requires one array result"))
-    _IntoWriter(_into_program(k), bound)
+    direct = _into_program(k)
+    ext = Base.get_extension(@__MODULE__, :ReactiveKernelsMutatingFunctionsExt)
+    types = if !isempty(exemplars)
+        map(typeof, exemplars)
+    elseif _exact_signature(k) !== Nothing
+        fieldtypes(_exact_signature(k))
+    else
+        map(valtype, k.inputs)
+    end
+    scratch = ext === nothing ? nothing : _into_scratch(k, direct, types, ext.cache_apply!)
+    _IntoWriter(direct, bound, scratch)
 end
 
 @inline function (callable::_KernelSignatureCallable{<:_IntoWriter})(
@@ -99,8 +264,10 @@ end
 @inline function (w::_IntoWriter)(dst::AbstractArray, args::Vararg{Any,N}) where {N}
     _into_aliases(dst, (args, w.bound, w.program.constants, w.program.callables)) &&
         throw(ArgumentError("destination overlaps an input to the prepared kernel"))
-    _write_result!(dst, w.program(args...))
+    _into_run!(w.scratch, w.program, dst, args)
 end
+
+@inline _into_run!(scratch, ordinary, dst, args) = _write_result!(dst, ordinary(args...))
 
 # Base knows the index geometry of views. For contiguous dense storage, also
 # catch distinct array headers around overlapping regions of the same memory.
@@ -116,6 +283,29 @@ const _IntoDense = Union{Array,SubArray{<:Any,<:Any,<:Array}}
     # Distinct dense headers may wrap overlapping memory at different offsets.
     a, b = parent(dst), parent(src)
     a !== b && isbitstype(eltype(a)) && isbitstype(eltype(b)) && _contiguous_storage_overlaps(a, b)
+end
+
+# Only publish a borrowed buffer through ordinary, eager destination storage.
+# A custom copyto! can retain its source. Overlapping invocations (including a
+# recursive call) and reverse tapes likewise need independent primal storage.
+@inline function _into_run!(scratch::_IntoScratch{S}, ordinary, dst::_IntoDense, args) where {S}
+    if !(args isa S) || !(dst isa StridedArray{<:_NativeBroadcastNumber}) ||
+       EnzymeCore.within_autodiff() ||
+       !(@atomicreplace :acquire scratch.busy false => true).success
+        return _write_result!(dst, ordinary(args...))
+    end
+    try
+        _write_result!(dst, scratch.kernel(args...))
+    catch
+        # A BoundsError can expose an intermediate array to its caller.
+        # Subsequent calls must never overwrite storage reachable through it.
+        for slot in scratch.kernel.caches
+            slot[] = nothing
+        end
+        rethrow()
+    finally
+        @atomic :release scratch.busy = false
+    end
 end
 
 # Inspect only data reachable by the call. Numerical arrays take a single
