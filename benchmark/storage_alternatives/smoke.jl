@@ -1,6 +1,6 @@
 using ReactiveKernels, MutatingFunctions, Enzyme, DifferentiationInterface
 using ReactiveKernelsDistributionKernels
-using ReactiveKernelsDistributionKernels.DistributionKernelSources: _student_log_kernel
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: _student_log1p
 using Test
 include("prototypes.jl")
 const RK = ReactiveKernels
@@ -9,7 +9,7 @@ const RK = ReactiveKernels
     w = exp.(u)
     squared = w .^ 2
     prior = plate(w, Ref(nu)) do wi, ni
-        _student_log_kernel(ni, wi)
+        -(ni + 1) / 2 * _student_log1p(ni, wi)
     end
     total = sum(squared) + sum(prior)
     return total

@@ -87,6 +87,29 @@ the exact kernel equals that formula's value-and-gradient time and runs
 repeated rows once (26.0 µs to 0.5 µs), but its density-only call takes 23 to
 34 percent longer on a continuous covariate.
 
+## After the Student-t factor form
+
+The Student-t kernel is a factor that reads only the degrees of freedom times
+`log1p(z^2 / nu)`, so the summed-plate factor pass takes the factor out of the
+row sum. Same conditions as the first measurement, under a load of 33 to 45;
+nanoseconds for one value-and-gradient call over 2000 rows. The Normal rows
+are controls from the same two runs.
+
+| Variant | Before | After |
+| --- | ---: | ---: |
+| A8 Student-t at a linear location | 48270 | 22149 |
+| A14 Student-t with `alpha[g]`, sorted groups | 47300 | 24350 |
+| A14s the same, shuffled groups | 47310 | 23380 |
+| C3 Student-t with `alpha[g]` and a slope, sorted groups | 53659 | 25320 |
+| C3s the same, shuffled groups | 51369 | 22249 |
+| D1 Student-t with an exp link, shared `nu` and `sigma` | 89780 | 40800 |
+| A0 Normal at a linear location (control) | 383 | 361 |
+| A7 Normal with an exp link (control) | 13270 | 13170 |
+| D0 Normal with an exp link, shared `sigma` (control) | 13120 | 13269 |
+
+The hand-written Student-t loop with an exp link takes 28760, so D1 went from
+3.1 to 1.4 times the hand loop.
+
 ## Grouped Normal factor terms
 
 On `8a7f69f42`, one process timed 2,000 observations sorted into 50

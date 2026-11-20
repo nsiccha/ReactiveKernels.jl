@@ -26,7 +26,7 @@ function _psp_check(nu, nonallocating)
     literal = ReactiveKernels._with_simplify(prep, false)
     code = string(ReactiveKernels.code_expr(q.kernel))
     @test occursin("_rk_at_exp_std(", code)
-    @test !occursin("_student_log_kernel(", code)
+    @test !occursin("_student_log1p(", code)
     tails = copy(u0)
     tails[1], tails[end] = -20.0, 20.0
     for u in (u0, zeros(m), tails)

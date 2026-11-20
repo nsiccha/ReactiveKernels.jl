@@ -771,6 +771,7 @@ end
 include("test_glm.jl")
 include("test_bernoulli_shared_softplus.jl")
 include("test_binomial_logit_kernel.jl")
+include("test_student_kernel.jl")
 include("test_enzyme_rules.jl")
 include("test_rk_beta_inc.jl")
 include("test_logtails.jl")
