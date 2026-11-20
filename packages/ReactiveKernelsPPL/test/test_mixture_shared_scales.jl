@@ -42,7 +42,9 @@ function finite_gradient(f, u)
     end
 end
 nodes(ex) = ex isa Expr ? 1 + sum(nodes, ex.args; init=0) : 1
-loops(ex) = ex isa Expr ? (ex.head === :for) + sum(loops, ex.args; init=0) : 0
+nodes(program::ReactiveKernels._PlateProgram) = nodes(program.ast)
+loops(ex) = ex isa Expr ? (ex.head in (:for, :while)) + sum(loops, ex.args; init=0) : 0
+loops(program::ReactiveKernels._PlateProgram) = loops(program.ast)
 include("scale_log_bindings.jl")
 
 function check(q, u, y)
