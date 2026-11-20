@@ -242,7 +242,7 @@ end
 
 """
     ad_cost_profile(value, value_and_gradient; seconds = 1.0, threshold = nothing,
-                    allocations = true) -> ADCostProfile
+                    allocations = true, min_samples = 0, max_sample_seconds = 10 * seconds) -> ADCostProfile
     ad_cost_profile(prepared::PreparedADKernel, args...; kernel = prepared.kernel, kwargs...)
 
 Measure where a prepared program's value and gradient spend their time.
@@ -265,8 +265,15 @@ derivative, and the parts add up to the whole. With
 the Julia heap bytes of a warm call the same way.
 
 The result lists parts by gradient time, each with its gradient ÷ value ratio.
-Estimates rest on the sample counts shown; a part with few samples is
-imprecise. Profiling clears Julia's profile buffer and restores the
+Estimates rest on the sample counts shown. A part with few samples is
+imprecise. With `min_samples > 0`, each pass starts with the usual `seconds`
+window. A pass with too few running samples from its calling thread continues
+in windows until it reaches the target or its `max_sample_seconds` deadline.
+For example, `seconds=0.2, min_samples=100, max_sample_seconds=2` gives each
+pass up to two seconds to collect 100 samples. A call already running can
+finish after the deadline. The result reports the samples actually collected.
+Timing, resolving stack frames and allocation profiling take additional time.
+Profiling clears Julia's profile buffer and restores the
 profiler's settings afterwards. Measure on a quiet thread: the samples of
 other threads are ignored, but their load slows the measured one.
 
@@ -290,8 +297,13 @@ this profile names shows what is stored.
 """
 function ad_cost_profile(value, value_and_gradient; seconds::Real = 1.0,
                          threshold::Union{Nothing,Real} = nothing,
-                         allocations::Bool = true)
-    seconds > 0 || throw(ArgumentError("`seconds` must be positive; got $seconds"))
+                         allocations::Bool = true, min_samples::Integer = 0,
+                         max_sample_seconds::Real = 10.0 * seconds)
+    isfinite(seconds) && seconds > 0 ||
+        throw(ArgumentError("`seconds` must be finite and positive; got $seconds"))
+    min_samples >= 0 || throw(ArgumentError("`min_samples` must be nonnegative; got $min_samples"))
+    isfinite(max_sample_seconds) && max_sample_seconds >= seconds ||
+        throw(ArgumentError("`max_sample_seconds` must be finite and at least `seconds`; got $max_sample_seconds"))
     # Warm: compile both, then run each once more.
     value(); value_and_gradient()
     value(); value_and_gradient()
@@ -306,8 +318,8 @@ function ad_cost_profile(value, value_and_gradient; seconds::Real = 1.0,
         return ADCostProfile(primal, gradient, ratio, primal_bytes, gradient_bytes,
                              limit, false, 0, 0, ADCostPart[])
     end
-    primal_samples = _marker_samples(value, seconds)
-    gradient_samples = _marker_samples(value_and_gradient, seconds)
+    primal_samples = _marker_samples(value, seconds, min_samples, max_sample_seconds)
+    gradient_samples = _marker_samples(value_and_gradient, seconds, min_samples, max_sample_seconds)
     primal_total, gradient_total = primal_samples.total, gradient_samples.total
     primal_allocated = allocations ? _marker_allocations(value) : Dict{String,Float64}()
     gradient_allocated = allocations ? _marker_allocations(value_and_gradient) :
@@ -458,45 +470,74 @@ function _language_file(file)
     any(directory -> startswith(file, directory), _RK_OWN_DIRECTORIES)
 end
 
-# Samples of `f` run for `seconds` on this thread, counted by label (`counts`),
-# by label for those spent managing memory (`memory`) and by label and called
-# function (`callees`).
-function _marker_samples(f::F, seconds::Real) where {F}
+# Keep complete blocks so Profile can resolve the retained stacks once across
+# all windows. Each block ends in thread, task, clock and sleep metadata.
+function _append_running_samples!(kept, data, thread)
+    start = 1
+    count = 0
+    for i in eachindex(data)
+        Profile.is_block_end(data, i) || continue
+        if data[i - Profile.META_OFFSET_THREADID] == thread &&
+                data[i - Profile.META_OFFSET_SLEEPSTATE] == 1
+            append!(kept, @view data[start:i])
+            count += 1
+        end
+        start = i + 1
+    end
+    count
+end
+
+function _running_profile_data(f::F, seconds, min_samples, max_sample_seconds) where {F}
     previous = Profile.init()
-    thread = Threads.threadid()
-    counts = Dict{String,Int}()
-    memory = Dict{String,Int}()
-    callees = Dict{Tuple{String,String},Int}()
+    kept = UInt[]
     total = 0
     try
-        # About 10^4 samples per second, with room for deep stacks.
         Profile.init(; n = max(first(previous), 10^7), delay = 1e-4)
-        Profile.clear()
-        deadline = time() + seconds
-        Profile.@profile while time() < deadline
-            f()
+        started = time_ns()
+        elapsed() = (time_ns() - started) / 1e9
+        window_start = 0.0
+        deadline = seconds
+        while true
+            Profile.clear()
+            thread = Threads.threadid()
+            Profile.@profile while elapsed() < deadline
+                f()
+            end
+            added = _append_running_samples!(kept, Profile.fetch(), thread)
+            total += added
+            now = elapsed()
+            (total >= min_samples || now >= max_sample_seconds) && break
+            # Use the measured window, including profiler overhead, so even
+            # an empty, very short first pass makes progress on the next one.
+            window = now - window_start
+            growth = added == 0 ? 2.0 : min(2.0, (min_samples - total) / added)
+            window_start = now
+            deadline = min(now + window * growth, max_sample_seconds)
         end
-        data = Profile.fetch(; include_meta = true)
-        frames = Profile.getdict(data)
-        start = 1
-        for i in eachindex(data)
-            Profile.is_block_end(data, i) || continue
-            ips = view(data, start:(i - Profile.nmeta - 2))
-            start = i + 1
-            data[i - Profile.META_OFFSET_THREADID] == thread || continue
-            # The sleep state is stored plus one: 1 running, 2 sleeping.
-            data[i - Profile.META_OFFSET_SLEEPSTATE] == 1 || continue
-            label, managing, callee = _sample_info(collect(Iterators.flatten(
-                get(frames, ip, Base.StackTraces.StackFrame[]) for ip in ips)))
-            counts[label] = get(counts, label, 0) + 1
-            managing && (memory[label] = get(memory, label, 0) + 1)
-            callee === nothing ||
-                (callees[(label, callee)] = get(callees, (label, callee), 0) + 1)
-            total += 1
-        end
+        # Resolve instruction pointers while this pass's profiler buffer is installed.
+        return kept, Profile.getdict(kept), total
     finally
         Profile.clear()
         Profile.init(first(previous), last(previous))
+    end
+end
+
+function _marker_samples(f::F, seconds, min_samples, max_sample_seconds) where {F}
+    data, frames, total = _running_profile_data(f, seconds, min_samples, max_sample_seconds)
+    counts = Dict{String,Int}()
+    memory = Dict{String,Int}()
+    callees = Dict{Tuple{String,String},Int}()
+    start = 1
+    for i in eachindex(data)
+        Profile.is_block_end(data, i) || continue
+        ips = view(data, start:(i - Profile.nmeta - 2))
+        start = i + 1
+        label, managing, callee = _sample_info(collect(Iterators.flatten(
+            get(frames, ip, Base.StackTraces.StackFrame[]) for ip in ips)))
+        counts[label] = get(counts, label, 0) + 1
+        managing && (memory[label] = get(memory, label, 0) + 1)
+        callee === nothing ||
+            (callees[(label, callee)] = get(callees, (label, callee), 0) + 1)
     end
     (; counts, memory, callees, total)
 end
