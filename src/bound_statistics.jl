@@ -109,9 +109,12 @@ end
 # double-double (hi, lo) pair, or `nothing` when the factor cannot safely
 # represent independent parameter directions.
 function _ls_block!(factor::Array{Float64,3}, perm::Matrix{Int}, hi::Matrix{Float64},
-                    lo::Matrix{Float64}, j::Int, A::Matrix{Float64}, b::Vector{Float64})
+                    lo::Matrix{Float64}, j::Int, A::Matrix{Float64}, b::Vector{Float64}, scales)
     n, k = size(A)
-    F = qr(A, ColumnNorm())
+    design = scales === nothing ? A : A ./ scales
+    response = scales === nothing ? b : b ./ scales
+    all(isfinite, design) && all(isfinite, response) || return nothing
+    F = qr(design, ColumnNorm())
     R = F.R
     # Test the small factor, reusing the QR already needed for preparation.
     # Include the original row count in the tolerance: accumulated QR roundoff
@@ -123,13 +126,13 @@ function _ls_block!(factor::Array{Float64,3}, perm::Matrix{Int}, hi::Matrix{Floa
         factor[r, c, j] = R[r, c]
     end
     perm[:, j] .= F.p
-    θh = F \ b
+    θh = F \ response
     θl = zeros(k)
     r = Vector{Float64}(undef, n)
     for _ in 1:_LS_REFINEMENTS
         for i in 1:n
             rh, rl = _ls_residual(A, b, θh, θl, i)
-            r[i] = rh + rl
+            r[i] = scales === nothing ? rh + rl : (rh + rl) / scales[i]
         end
         δ = F \ r
         for c in 1:k
@@ -142,6 +145,9 @@ function _ls_block!(factor::Array{Float64,3}, perm::Matrix{Int}, hi::Matrix{Floa
     sh, sl = 0.0, 0.0
     for i in 1:n
         rh, rl = _ls_residual(A, b, θh, θl, i)
+        if scales !== nothing
+            rh, rl = rh / scales[i], rl / scales[i]
+        end
         ph, pl = _ls_two_prod(rh, rh)
         pl += 2 * rh * rl
         sh, sl = _ls_dd_add(sh, sl, ph, pl)
@@ -158,7 +164,7 @@ Statistics of one block over every row: `A` is the bound design (one column
 per live scalar or vector entry, in the order the evaluation reads them), `b`
 the bound response.
 """
-function _ls_statistics_dense(A::AbstractMatrix{<:Real}, b::AbstractVector{<:Real})
+function _ls_statistics_dense(A::AbstractMatrix{<:Real}, b::AbstractVector{<:Real}, scales = nothing)
     n, k = size(A)
     length(b) == n || throw(DimensionMismatch(
         "least-squares statistics: $(n) design rows, $(length(b)) responses"))
@@ -171,7 +177,7 @@ function _ls_statistics_dense(A::AbstractMatrix{<:Real}, b::AbstractVector{<:Rea
     perm = Matrix{Int}(undef, k, 1)
     hi = zeros(k, 1)
     lo = zeros(k, 1)
-    result = _ls_block!(factor, perm, hi, lo, 1, Af, bf)
+    result = _ls_block!(factor, perm, hi, lo, 1, Af, bf, scales)
     result === nothing && return _ls_unusable(k, 1, Int[], n)
     sh, sl = result
     _LSStatistics(k, 1, factor, perm, hi, lo, Int[], sh + sl, n, true)
@@ -186,7 +192,7 @@ Statistics of one block per value of the bound `index` present in the data.
 """
 function _ls_statistics_grouped(index::AbstractVector{<:Integer},
                                 columns::Tuple{Vararg{AbstractVector{<:Real}}},
-                                b::AbstractVector{<:Real})
+                                b::AbstractVector{<:Real}, scales = nothing)
     n = length(b)
     k = length(columns)
     length(index) == n && all(c -> length(c) == n, columns) || throw(DimensionMismatch(
@@ -222,13 +228,15 @@ function _ls_statistics_grouped(index::AbstractVector{<:Integer},
             A[r, c] = column[i]
         end
         bj = Float64[b[i] for i in rows]
-        result = _ls_block!(factor, perm, hi, lo, j, A, bj)
+        result = _ls_block!(factor, perm, hi, lo, j, A, bj, scales === nothing ? nothing : view(scales, rows))
         result === nothing && return _ls_unusable(k, blocks, Vector{Int}(groups), n)
         bh, bl = result
         sh, sl = _ls_dd_add(sh, sl, bh, bl)
     end
     _LSStatistics(k, blocks, factor, perm, hi, lo, Vector{Int}(groups), sh + sl, n, true)
 end
+
+include("mixed_least_squares.jl")
 
 # --- evaluation --------------------------------------------------------------
 
@@ -302,21 +310,22 @@ end
 #
 # The plan rewrite (below) recognises a plate's location as a sum of terms, each
 # a live value times a coefficient of bound data, plus bound offsets. Its
-# structure `S` is a type parameter of the operations, built from integers and
-# numbers only:
+# structure `S` records the operations and argument positions:
 #
-#     S = (grouped::Bool, index::Int, terms, offsets)
+#     S = (gathered_slots, index::Int, terms, offsets)
 #     term = (coefficient, live::Int, matrix::Int)
-#     coefficient = (literal::Float64, data::NTuple{N,Int})
+#     coefficient = literal | (:data, position) | (operation, coefficients...)
 #
 # `live` and `matrix` are positions among the operation's live and data
-# arguments; a coefficient is `literal` times the elementwise product of the
-# data arguments it names (a number, or one entry per row). A dense location
-# (`grouped = false`) reads a live number as is (`matrix = 0`) or a live vector
+# arguments. A coefficient reads a number or one bound entry per row. A dense location
+# (empty `gathered_slots`) reads a live number as is (`matrix = 0`) or a live vector
 # through a data matrix (`(X * v)[i]`); a grouped one reads each live vector at
-# the data index `index` (`v[index[i]]`). Offsets are coefficients alone.
+# the data index `index` (`v[index[i]]`). A mixed location reads one grouped
+# term and its other terms directly or through shared data matrices.
 
-_ls_grouped(S) = S[1]
+_ls_mixed(S) = 0 < length(first(S)) < length(_ls_terms(S))
+_ls_fit_type(S) = _ls_mixed(S) ? _LSMixedStatistics : _LSStatistics
+_ls_grouped(S) = !isempty(first(S))
 _ls_index(S) = S[2]
 _ls_terms(S) = S[3]
 _ls_offsets(S) = S[4]
@@ -336,22 +345,28 @@ end
 
 # The expressions of structure `S` at row `i` over `data` and `live`: generated,
 # so every position is a literal and every read concretely typed.
-function _ls_coefficient_expr((literal, positions), x)
-    factors = Any[:(_ls_at(data[$p], i)) for p in positions]
-    literal == 1 || pushfirst!(factors, literal)
-    isempty(factors) ? (x === nothing ? Float64(literal) : x) :
-        x === nothing ? Expr(:call, :*, factors...) : Expr(:call, :*, factors..., x)
+# Coefficients contain only literals, data slots and admitted scalar arithmetic.
+# The same expression evaluates a bound design column and reads a literal row.
+_ls_coefficient_expr(x::Real) = x
+function _ls_coefficient_expr(x::Tuple)
+    op, args... = x
+    op === :data && return :(_ls_at(data[$(only(args))], i))
+    op === :live_product && return Expr(:call, GlobalRef(@__MODULE__, :_ls_bound_product),
+        map(_ls_coefficient_expr, args)...)
+    Expr(:call, GlobalRef(Base, op), map(_ls_coefficient_expr, args)...)
 end
+_ls_coefficient_expr(c, x) = c == 1 ? x : :($(_ls_coefficient_expr(c)) * $x)
 function _ls_row_expr(S)
     grouped, index, terms, offsets = S
     parts = Any[]
-    for (coefficient, l, m) in terms
-        x = grouped ? :(live[$l][data[$index][i]]) :
+    for (j, (coefficient, l, m)) in enumerate(terms)
+        gather = j in grouped
+        x = gather ? :(live[$l][data[$index][i]]) :
             m == 0 ? :(live[$l]) : :(_ls_row_product(data[$m], live[$l], i))
         push!(parts, _ls_coefficient_expr(coefficient, x))
     end
     for coefficient in offsets
-        push!(parts, _ls_coefficient_expr(coefficient, nothing))
+        push!(parts, _ls_coefficient_expr(coefficient))
     end
     foldl((a, b) -> :($a + $b), parts)
 end
@@ -365,8 +380,8 @@ least-squares statistics of its plate's response (`_ls_rss`). It holds no
 array of its own: the plate's own loop, which runs only where the collapsed
 residual is not used, reads it row by row.
 """
-struct _LSLocation{S,T,D<:Tuple,L<:Tuple} <: AbstractVector{T}
-    stats::_LSStatistics
+struct _LSLocation{S,T,D<:Tuple,L<:Tuple,F} <: AbstractVector{T}
+    stats::F
     data::D
     live::L
     rows::Int
@@ -387,10 +402,19 @@ end
     sources = Expr(:tuple, (:(live[$l]) for (_, l, _) in terms)...)
     # `X * v` requires `v` to be a vector with one entry per column of `X`.
     checks = Any[:(_ls_check_product(data[$m], live[$l])) for (_, l, m) in terms if m != 0]
+    norm = if _ls_mixed(S)
+        local_slot = only(grouped)
+        shared = Expr(:tuple, (:(live[$l]) for (i, (_, l, _)) in enumerate(terms) if i != local_slot)...)
+        :(_ls_rss_mixed(x.stats, live[$(terms[local_slot][2])], $shared))
+    elseif _ls_grouped(S)
+        :(_ls_rss_grouped(x.stats, $sources))
+    else
+        :(_ls_rss_dense(x.stats, $sources))
+    end
     quote
         data, live = x.data, x.live
         $(checks...)
-        $(grouped ? :(_ls_rss_grouped(x.stats, $sources)) : :(_ls_rss_dense(x.stats, $sources)))
+        $norm
     end
 end
 _ls_check_product(X::AbstractMatrix, v::AbstractVector) = size(X, 2) == length(v) ||
@@ -409,12 +433,12 @@ only that location, which the eligible arm drops (`_ls_class_residual`).
 """
 struct _LSLocationCall{S,ND,NL,DROP} end
 _LSLocationCall(S, ndata::Int, nlive::Int, drop::Tuple) = _LSLocationCall{S,ndata,nlive,drop}()
-@inline function (::_LSLocationCall{S,ND,NL})(stats::_LSStatistics, response,
+@inline function (::_LSLocationCall{S,ND,NL})(stats, response,
                                              args::Vararg{Any,N}) where {S,ND,NL,N}
     data = ntuple(k -> args[k], Val(ND))
     live = ntuple(k -> args[ND + k], Val(NL))
     T = _ls_location_eltype(data, live)
-    _LSLocation{S,T,typeof(data),typeof(live)}(stats, data, live, length(response))
+    _LSLocation{S,T,typeof(data),typeof(live),typeof(stats)}(stats, data, live, length(response))
 end
 _ls_drop(::_LSLocationCall{S,ND,NL,DROP}) where {S,ND,NL,DROP} = DROP
 _ls_eltype(x::Number) = typeof(x)
@@ -442,16 +466,40 @@ _ls_row_data(x, n) = false
 
 # A coefficient over data `ds` as one Float64 per row, or `nothing` where its
 # data do not fit.
-function _ls_coefficient_rows(literal::Float64, ds::Tuple, n::Int)
+function _ls_coefficient_rows(f, ds::Tuple, n::Int)
     all(d -> _ls_row_data(d, n), ds) || return nothing
-    rows = Vector{Float64}(undef, n)
-    for i in 1:n
-        rows[i] = literal * _ls_coefficient_at(ds, i)
+    try
+        Float64[f(i) for i in 1:n]
+    catch err
+        err isa DomainError || rethrow()
+        nothing
     end
-    rows
 end
-@inline _ls_coefficient_at(::Tuple{}, i) = 1.0
-@inline _ls_coefficient_at(ds::Tuple, i) = _ls_at(first(ds), i) * _ls_coefficient_at(Base.tail(ds), i)
+
+function _ls_coefficient_slots!(slots, tree)
+    tree isa Tuple || return slots
+    if first(tree) === :data
+        push!(slots, tree[2])
+    else
+        foreach(a -> _ls_coefficient_slots!(slots, a), Base.tail(tree))
+    end
+    slots
+end
+function _ls_column_expr(tree)
+    slots = unique!(_ls_coefficient_slots!(Int[], tree))
+    # A generator in a generated method must call a named function, rather
+    # than introduce a closure into its returned expression.
+    :(_ls_coefficient_rows(_LSCoefficientAt{$(QuoteNode(tree)),typeof(data)}(data),
+        ($((:(data[$i]) for i in slots)...),), n))
+end
+struct _LSCoefficientAt{C,D}
+    data::D
+end
+@generated function (f::_LSCoefficientAt{C})(i) where {C}
+    :(let data = f.data
+        $(_ls_coefficient_expr(C))
+    end)
+end
 
 _ls_design_matrix(X::AbstractMatrix{<:Real}, n) =
     size(X, 1) == n && firstindex(X, 1) == 1 && firstindex(X, 2) == 1
@@ -461,34 +509,44 @@ _ls_index_data(x::AbstractVector{<:Integer}, n) =
 _ls_index_data(x, n) = false
 
 # Generated from `S`, so each data read is concretely typed.
-@generated function _ls_bind(::Val{S}, response, data::Tuple) where {S}
+@generated function _ls_bind(::Val{S}, response, data::Tuple, scales = nothing) where {S}
     grouped, index, terms, offsets = S
-    coefficient((literal, positions)) =
-        :(_ls_coefficient_rows($(Float64(literal)), ($((:(data[$p]) for p in positions)...),), n))
+    unusable = _ls_mixed(S) ? :(_ls_mixed_unusable(n)) : :(_ls_unusable(0, 0, Int[], n))
     body = Any[]
     for c in offsets
         push!(body, quote
-            rows = $(coefficient(c))
-            rows === nothing && return _ls_unusable(0, 0, Int[], n)
+            rows = $(_ls_column_expr(c))
+            rows === nothing && return $unusable
             b .-= rows
         end)
     end
     columns = Symbol[Symbol(:column_, k) for k in eachindex(terms)]
     for ((c, _, m), column) in zip(terms, columns)
-        push!(body, :($column = $(coefficient(c))), :($column === nothing && return _ls_unusable(0, 0, Int[], n)))
-        if !grouped && m != 0
-            push!(body, :(_ls_design_matrix(data[$m], n) || return _ls_unusable(0, 0, Int[], n)),
+        push!(body, :($column = $(_ls_column_expr(c))), :($column === nothing && return $unusable))
+        if m != 0
+            push!(body, :(_ls_design_matrix(data[$m], n) || return $unusable),
                   :($column = $column .* data[$m]))
         end
     end
-    result = grouped ? quote
-        _ls_index_data(data[$index], n) || return _ls_unusable(0, 0, Int[], n)
-        _ls_statistics_grouped(data[$index], ($(columns...),), b)
-    end : :(_ls_statistics_dense(hcat($(columns...)), b))
+    result = if _ls_mixed(S)
+        local_slot = only(grouped)
+        shared = [v for (i, v) in enumerate(columns) if i != local_slot]
+        quote
+            _ls_index_data(data[$index], n) || return _ls_mixed_unusable(n)
+            _ls_statistics_mixed(data[$index], $(columns[local_slot]), hcat($(shared...)), b, scales)
+        end
+    elseif _ls_grouped(S)
+        quote
+            _ls_index_data(data[$index], n) || return $unusable
+            _ls_statistics_grouped(data[$index], ($(columns...),), b, scales)
+        end
+    else
+        :(_ls_statistics_dense(hcat($(columns...)), b, scales))
+    end
     quote
+        n = response isa AbstractVector ? length(response) : 0
         response isa AbstractVector{<:Real} && firstindex(response) == 1 ||
-            return _ls_unusable(0, 0, Int[], 0)
-        n = length(response)
+            return $unusable
         b = Vector{Float64}(response)
         $(body...)
         $result
@@ -535,9 +593,15 @@ function _ls_resolved_source(ex, mod, params::Set{Symbol})
     ex isa Expr || return ex
     ex.head in (:quote, :inert) && return ex
     args = Any[_ls_resolved_source(a, mod, params) for a in ex.args]
-    if ex.head === :call && ex.args[1] isa Symbol && !(ex.args[1] in params) &&
-            isdefined(mod, ex.args[1])
-        args[1] = GlobalRef(mod, ex.args[1])
+    if ex.head in (:call, :.) && ex.args[1] isa Symbol && !(ex.args[1] in params)
+        name = ex.args[1]
+        dotted = String(name)
+        if ex.head === :call && startswith(dotted, ".") && length(dotted) > 1
+            op = Symbol(dotted[2:end])
+            callee = op in params ? op : GlobalRef(mod, op)
+            return Expr(:., callee, Expr(:tuple, args[2:end]...))
+        end
+        args[1] = GlobalRef(mod, name)
     end
     Expr(ex.head, args...)
 end
@@ -547,18 +611,44 @@ _ls_is_call(x, f, n) = x isa Expr && x.head === :call && length(x.args) == n + 1
 
 # --- the location ----------------------------------------------------------------
 
-# A coefficient: `literal` times the product of data values.
-const _LSCoef = Tuple{Float64,Vector{ValueId}}
+# Cold polynomial analysis. Data-only expressions are coefficients. Only a
+# product with at most one live operand remains degree one.
+struct _LSCoefficient
+    tree::Union{Float64,ValueId,Tuple}
+end
+_ls_one() = _LSCoefficient(1.0)
+_ls_data_ids(c::_LSCoefficient) = _ls_data_ids(c.tree)
+_ls_data_ids(id::ValueId) = (id,)
+_ls_data_ids(x::Float64) = ()
+_ls_data_ids(x::Tuple) = Iterators.flatten(_ls_data_ids(a) for a in Base.tail(x))
+
 # A location linear in live values: terms `(coefficient, live, matrix, index)`
 # (`matrix`/`index` `nothing` where absent) and data offsets.
-struct _LSAffine
-    terms::Vector{Tuple{_LSCoef,ValueId,Union{Nothing,ValueId},Union{Nothing,ValueId}}}
-    offsets::Vector{_LSCoef}
+struct _LSLinearForm
+    terms::Vector{Tuple{_LSCoefficient,ValueId,Union{Nothing,ValueId},Union{Nothing,ValueId}}}
+    offsets::Vector{_LSCoefficient}
 end
-_ls_scale(c::_LSCoef, d::_LSCoef) = (c[1] * d[1], vcat(c[2], d[2]))
-_ls_scale(x::_LSAffine, d::_LSCoef) = _LSAffine(
-    [(_ls_scale(c, d), l, m, i) for (c, l, m, i) in x.terms], [_ls_scale(c, d) for c in x.offsets])
-_ls_add(x::_LSAffine, y::_LSAffine) = _LSAffine(vcat(x.terms, y.terms), vcat(x.offsets, y.offsets))
+_ls_scale(c::_LSCoefficient, d::_LSCoefficient) = c.tree == 1 ? d : d.tree == 1 ? c :
+    _LSCoefficient((:*, c.tree, d.tree))
+# Combining successive multipliers of a live value changes their evaluation
+# order. Keep this distinction from a product authored wholly over bound data.
+_ls_scale_live(c, d) = c.tree == 1 ? d : d.tree == 1 ? c :
+    _LSCoefficient((:live_product, c.tree, d.tree))
+_ls_has_live_product(tree) = false
+_ls_has_live_product(tree::Tuple) = first(tree) === :live_product ||
+    any(_ls_has_live_product, Base.tail(tree))
+_ls_product_range(x::Float64) = iszero(x) ||
+    sqrt(floatmin(Float64)) <= abs(x) <= sqrt(floatmax(Float64))
+function _ls_bound_product(a, b)
+    x, y = Float64(a), Float64(b)
+    xy = x*y
+    # The intermediate, its next multiplier, and the full coefficient must
+    # remain representable when multiplied by any admitted live value.
+    _ls_product_range(x) && _ls_product_range(y) && _ls_product_range(xy) ? xy : NaN
+end
+_ls_scale(x::_LSLinearForm, d::_LSCoefficient) = _LSLinearForm(
+    [(_ls_scale_live(c, d), l, m, i) for (c, l, m, i) in x.terms], [_ls_scale(c, d) for c in x.offsets])
+_ls_add(x::_LSLinearForm, y::_LSLinearForm) = _LSLinearForm(vcat(x.terms, y.terms), vcat(x.offsets, y.offsets))
 
 # An operand of a location's arithmetic: a data coefficient, a live value the
 # terms read whole (a number, or a vector a data matrix or index reads), or an
@@ -569,20 +659,20 @@ struct _LSLive
 end
 
 # The affine form of value `v` in plan `p`, or `nothing`. `dataonly` holds the
-# data-only values; `seen` the recipes the form reads through.
-function _ls_location(p::Plan, v::Value, dataonly::Set{ValueId}, seen::Vector{Recipe})
-    x = _ls_operand(p, v, dataonly, seen, 0)
-    x = x isa _LSAffine ? x : nothing
+# data-only values. A weighted region can also guard a projected scalar at runtime.
+function _ls_location(p::Plan, v::Value, dataonly::Set{ValueId}, guarded::Bool)
+    x = _ls_operand(p, v, dataonly, guarded, 0)
+    x = _ls_affine_of(x, p)
     x === nothing && return nothing
     isempty(x.terms) ? nothing : x
 end
 
 const _LS_MAX_DEPTH = 32
 
-function _ls_operand(p::Plan, v::Value, dataonly, seen, depth)
+function _ls_operand(p::Plan, v::Value, dataonly, guarded, depth)
     g = p.graph
     id = canon_id(g, v.id)
-    id in dataonly && return (1.0, ValueId[id])::_LSCoef
+    id in dataonly && return _LSCoefficient(id)
     depth > _LS_MAX_DEPTH && return nothing
     r = get(p.producer, id, nothing)
     r === nothing && return _LSLive(id, v)
@@ -596,20 +686,26 @@ function _ls_operand(p::Plan, v::Value, dataonly, seen, depth)
             (_index_run_gather(r.op) || r.op === _readonly_gather_runs)
         src, index = r.inputs
         canon_id(g, index.id) in dataonly && !(canon_id(g, src.id) in dataonly) || return _LSLive(id, v)
-        push!(seen, r)
-        return _LSAffine([((1.0, ValueId[]), canon_id(g, src.id), nothing, canon_id(g, index.id))],
-                         _LSCoef[])
+        return _LSLinearForm([(_ls_one(), canon_id(g, src.id), nothing, canon_id(g, index.id))],
+                         _LSCoefficient[])
     end
     length(r.outputs) == 1 && !r.effectful || return _LSLive(id, v)
-    r.op isa _AuthoredPlateOp && return _ls_plate_operand(p, r, id, v, dataonly, seen, depth)
+    r.op isa _AuthoredPlateOp && return _ls_plate_operand(p, r, id, v, dataonly, guarded, depth)
     source = _ls_recipe_source(r)
     source === nothing && return _LSLive(id, v)
     names, source = source
     length(names) == length(r.inputs) || return _LSLive(id, v)
     env = Dict{Symbol,Any}(zip(names, r.inputs))
-    x = _ls_expr(p, source, env, dataonly, seen, depth + 1, false)
+    x = _ls_expr(p, source, env, dataonly, guarded, depth + 1, false)
+    if x === nothing && guarded && declared === Any && Meta.isexpr(source, :ref, 2)
+        owner, slot = source.args
+        if slot isa Int && owner isa Symbol && haskey(env, owner) && valtype(env[owner]) <: AbstractVector
+            # Inference may only know AbstractVector at this projection. The
+            # weighted guard checks its actual value before reading it as a scalar.
+            return _LSLive(id, Value{Float64}(v.id, v.name))
+        end
+    end
     x === nothing && return _LSLive(id, v)
-    push!(seen, r)
     x
 end
 
@@ -617,18 +713,27 @@ end
 # (`plate(x, b) do x, v; x * v end` is `x .* b`): RKPPL builds a location from
 # such plates. Each cell recipe is read from its source, over the operands of
 # the plate's arguments.
-function _ls_plate_operand(p::Plan, r::Recipe, id::ValueId, v::Value, dataonly, seen, depth)
+function _ls_plate_operand(p::Plan, r::Recipe, id::ValueId, v::Value, dataonly, guarded, depth)
     inner = getfield(r.op.kernel, :plan)
+    isempty(r.op.axis_checks) && isempty(inner.checks) && isempty(typeof(r.op).parameters[2]) ||
+        return _LSLive(id, v)
     length(inner.have) == length(r.inputs) && length(inner.want) == 1 || return _LSLive(id, v)
     ig = inner.graph
     env = Dict{ValueId,Any}()
+    read = Set(canon_id(ig, h.id) for q in inner.recipes for h in q.inputs)
+    push!(read, canon_id(ig, only(inner.want).id))
     for (k, h) in enumerate(inner.have)
-        x = _ls_operand(p, r.inputs[k], dataonly, seen, depth + 1)
+        # An unused array still sets the axes of the authored broadcast.
+        canon_id(ig, h.id) in read || valtype(r.inputs[k]) <: Number || return _LSLive(id, v)
+        x = _ls_operand(p, r.inputs[k], dataonly, guarded, depth + 1)
         x === nothing && return _LSLive(id, v)
         env[canon_id(ig, h.id)] = x
     end
     for q in inner.recipes
         length(q.outputs) == 1 && !q.effectful || return _LSLive(id, v)
+        declared = valtype(only(q.outputs))
+        declared === Any || _promote_op(q.op, map(valtype, q.inputs)...) <: declared ||
+            return _LSLive(id, v)
         source = _ls_recipe_source(q)
         source === nothing && return _LSLive(id, v)
         names, source = source
@@ -638,45 +743,71 @@ function _ls_plate_operand(p::Plan, r::Recipe, id::ValueId, v::Value, dataonly, 
             haskey(env, canon_id(ig, input.id)) || return _LSLive(id, v)
             local_env[name] = env[canon_id(ig, input.id)]
         end
-        x = _ls_expr(p, source, local_env, dataonly, seen, depth + 1, true)
+        x = _ls_expr(p, source, local_env, dataonly, guarded, depth + 1, true)
         x === nothing && return _LSLive(id, v)
         env[canon_id(ig, only(q.outputs).id)] = x
     end
     x = get(env, canon_id(ig, only(inner.want).id), nothing)
     x === nothing && return _LSLive(id, v)
-    push!(seen, r)
     x
 end
 
-_ls_affine_of(x::_LSAffine, p) = x
-_ls_affine_of(x::_LSCoef, p) = _LSAffine([], [x])
+_ls_affine_of(x::_LSLinearForm, p) = x
+_ls_affine_of(x::_LSCoefficient, p) = _LSLinearForm([], [x])
 # A live value read whole: a live number; anything else has no known reading.
-_ls_affine_of(x::_LSLive, p) = valtype(x.value) <: Number ?
-    _LSAffine([((1.0, ValueId[]), x.id, nothing, nothing)], _LSCoef[]) : nothing
+function _ls_affine_of(x::_LSLive, p)
+    T = valtype(x.value)
+    if T === Any
+        r = get(p.producer, x.id, nothing)
+        r === nothing && return nothing
+        T = _promote_op(r.op, map(valtype, r.inputs)...)
+    end
+    T !== Union{} && T <: Number || return nothing
+    _LSLinearForm([(_ls_one(), x.id, nothing, nothing)], _LSCoefficient[])
+end
 _ls_affine_of(::Nothing, p) = nothing
+
+# A literal projection through tuple construction reads the corresponding
+# input. This preserves scalar information when the projection port has type Any.
+function _ls_tuple_entry(p, v, i, dataonly, guarded, depth)
+    r = get(p.producer, canon_id(p.graph, v.id), nothing)
+    r === nothing && return nothing
+    length(r.outputs) == 1 && !r.effectful || return nothing
+    declared = valtype(v)
+    declared === Any || _promote_op(r.op, map(valtype, r.inputs)...) <: declared || return nothing
+    source = _ls_recipe_source(r)
+    source === nothing && return nothing
+    names, rhs = source
+    Meta.isexpr(rhs, :tuple) && all(x -> x isa Symbol && x in names, rhs.args) || return nothing
+    1 <= i <= length(rhs.args) || return nothing
+    _ls_operand(p, r.inputs[findfirst(==(rhs.args[i]), names)], dataonly, guarded, depth + 1)
+end
 
 # `elementwise`: the expression is a plate cell's, whose arithmetic is per
 # element of its batched arguments.
-function _ls_expr(p::Plan, ex, env::Dict{Symbol,Any}, dataonly, seen, depth, elementwise::Bool)
+function _ls_expr(p::Plan, ex, env::Dict{Symbol,Any}, dataonly, guarded, depth, elementwise::Bool)
     if ex isa Symbol
         haskey(env, ex) || return nothing
         x = env[ex]
-        return x isa Value ? _ls_operand(p, x, dataonly, seen, depth) : x
+        return x isa Value ? _ls_operand(p, x, dataonly, guarded, depth) : x
     end
-    ex isa Real && !(ex isa Bool) && return (Float64(ex), ValueId[])::_LSCoef
+    ex isa Real && !(ex isa Bool) && return _LSCoefficient(Float64(ex))
     ex isa Expr || return nothing
     if ex.head === :block
         statements = Any[a for a in ex.args if !(a isa LineNumberNode)]
         length(statements) == 1 || return nothing
-        return _ls_expr(p, only(statements), env, dataonly, seen, depth, elementwise)
+        return _ls_expr(p, only(statements), env, dataonly, guarded, depth, elementwise)
     end
     # Dotted calls `a .+ b` and calls `+(a, b)` read alike here: the plate
     # reads the result row by row in either case.
+    ex.head in (:call, :.) && first(ex.args) isa Symbol && haskey(env, first(ex.args)) &&
+        return nothing
     f, args = if ex.head === :call && ex.args[1] isa Union{Symbol,GlobalRef}
         name = ex.args[1] isa GlobalRef ? ex.args[1].name : ex.args[1]
         s = String(name)
         if startswith(s, ".") && length(s) > 1
-            (_rw_resolve(Symbol(s[2:end]), Base), ex.args[2:end])
+            mod = ex.args[1] isa GlobalRef ? ex.args[1].mod : @__MODULE__
+            (_rw_resolve(Symbol(s[2:end]), mod), ex.args[2:end])
         else
             (_rw_resolve(ex.args[1], @__MODULE__), ex.args[2:end])
         end
@@ -688,77 +819,97 @@ function _ls_expr(p::Plan, ex, env::Dict{Symbol,Any}, dataonly, seen, depth, ele
     elseif ex.head === :ref && length(ex.args) == 2
         # `src[index]`: a gather of a live source by a data index.
         src, index = ex.args
+        if index isa Int && src isa Symbol && get(env, src, nothing) isa Value
+            return _ls_tuple_entry(p, env[src], index, dataonly, guarded, depth)
+        end
         src isa Symbol && index isa Symbol && haskey(env, src) && haskey(env, index) &&
             env[src] isa Value && env[index] isa Value || return nothing
         g = p.graph
         sid, iid = canon_id(g, env[src].id), canon_id(g, env[index].id)
         iid in dataonly && !(sid in dataonly) || return nothing
-        return _LSAffine([((1.0, ValueId[]), sid, nothing, iid)], _LSCoef[])
+        return _LSLinearForm([(_ls_one(), sid, nothing, iid)], _LSCoefficient[])
     else
         return nothing
     end
     dotted = elementwise || ex.head === :. || (ex.head === :call && ex.args[1] isa Union{Symbol,GlobalRef} &&
         startswith(String(ex.args[1] isa GlobalRef ? ex.args[1].name : ex.args[1]), "."))
-    operands = Any[_ls_expr(p, a, env, dataonly, seen, depth, elementwise) for a in args]
+    operands = Any[_ls_expr(p, a, env, dataonly, guarded, depth, elementwise) for a in args]
     any(o -> o === nothing, operands) && return nothing
     if f === Base.:+
+        if all(o -> o isa _LSCoefficient, operands)
+            return _LSCoefficient((:+, (o.tree for o in operands)...))
+        end
         forms = Any[_ls_affine_of(o, p) for o in operands]
         any(isnothing, forms) && return nothing
         return foldl(_ls_add, forms)
-    elseif f === Base.:- && length(operands) == 1
-        x = _ls_affine_of(operands[1], p)
-        return x === nothing ? nothing : _ls_scale(x, (-1.0, ValueId[]))
-    elseif f === Base.:- && length(operands) == 2
-        x, y = _ls_affine_of(operands[1], p), _ls_affine_of(operands[2], p)
-        (x === nothing || y === nothing) && return nothing
-        return _ls_add(x, _ls_scale(y, (-1.0, ValueId[])))
-    elseif f === Base.:* && length(operands) == 2
-        a, b = operands
-        # `X * v`: a data matrix times a live vector, not elementwise.
-        if !dotted && a isa _LSCoef && b isa _LSLive && a[1] == 1.0 && length(a[2]) == 1 &&
-                !(valtype(b.value) <: Number)
-            return _LSAffine([((1.0, ValueId[]), b.id, only(a[2]), nothing)], _LSCoef[])
+    elseif f === Base.:- && length(operands) in (1, 2)
+        if all(o -> o isa _LSCoefficient, operands)
+            return _LSCoefficient((:-, (o.tree for o in operands)...))
         end
-        # Otherwise a coefficient times a location, either side. A product
-        # of data with a non-dotted `*` is elementwise only for numbers, which
-        # the binding checks.
-        a isa _LSCoef && b isa _LSCoef &&
-            return dotted || isempty(a[2]) || isempty(b[2]) ? _ls_scale(a, b) : nothing
-        a isa _LSCoef && (x = _ls_affine_of(b, p); return x === nothing ? nothing :
-            (dotted || isempty(a[2]) ? _ls_scale(x, a) : nothing))
-        b isa _LSCoef && (x = _ls_affine_of(a, p); return x === nothing ? nothing :
-            (dotted || isempty(b[2]) ? _ls_scale(x, b) : nothing))
-        return nothing
-    elseif f === Base.:/ && length(operands) == 2 && operands[2] isa _LSCoef &&
-            isempty(operands[2][2]) && operands[2][1] != 0
-        x = operands[1] isa _LSCoef ? _LSAffine([], [operands[1]]) : _ls_affine_of(operands[1], p)
-        return x === nothing ? nothing : _ls_scale(x, (1 / operands[2][1], ValueId[]))
+        x = _ls_affine_of(last(operands), p)
+        x === nothing && return nothing
+        negative = _ls_scale(x, _LSCoefficient(-1.0))
+        length(operands) == 1 && return negative
+        firstform = _ls_affine_of(first(operands), p)
+        return firstform === nothing ? nothing : _ls_add(firstform, negative)
+    elseif f === Base.:* && length(operands) >= 2
+        return foldl((a,b) -> _ls_product(a, b, p, dotted), operands)
+    elseif f === Base.muladd && length(operands) == 3 && dotted
+        product = _ls_affine_of(_ls_product(operands[1], operands[2], p, true), p)
+        addend = _ls_affine_of(operands[3], p)
+        return product === nothing || addend === nothing ? nothing : _ls_add(product, addend)
+    elseif f === Base.:/ && length(operands) == 2 && operands[2] isa _LSCoefficient
+        a, b = operands
+        (dotted || b.tree isa Float64 && b.tree != 0) || return nothing
+        reciprocal = _LSCoefficient((:/, 1.0, b.tree))
+        return _ls_product(reciprocal, a, p, true)
+    elseif f === sqrt && length(operands) == 1 && only(operands) isa _LSCoefficient && dotted
+        return _LSCoefficient((:sqrt, only(operands).tree))
     elseif f === identity && length(operands) == 1
         return operands[1]
     end
     nothing
 end
 
+function _ls_product(a, b, p, dotted)
+    (a === nothing || b === nothing) && return nothing
+    if !dotted && a isa _LSCoefficient && a.tree isa ValueId && b isa _LSLive &&
+            !(valtype(b.value) <: Number)
+        return _LSLinearForm([(_ls_one(), b.id, a.tree, nothing)], _LSCoefficient[])
+    end
+    a isa _LSCoefficient || b isa _LSCoefficient || return nothing
+    c, other = a isa _LSCoefficient ? (a, b) : (b, a)
+    if other isa _LSCoefficient
+        return dotted || c.tree isa Float64 || other.tree isa Float64 ? _ls_scale(c, other) : nothing
+    end
+    (dotted || c.tree isa Float64) || return nothing
+    x = _ls_affine_of(other, p)
+    x === nothing ? nothing : _ls_scale(x, c)
+end
+
+_ls_slots(x::Float64, data) = x
+_ls_slots(id::ValueId, data) = (:data, something(findfirst(==(id), data)))
+_ls_slots(x::Tuple, data) = (first(x), (_ls_slots(a, data) for a in Base.tail(x))...)
+
 # --- the plan pass -----------------------------------------------------------------
 
 # The structure `S` of an affine location over `data` and `live` (positions).
-function _ls_structure(x::_LSAffine, data::Vector{ValueId}, live::Vector{ValueId})
-    coef((literal, ids)) = (literal, Tuple(findfirst(==(id), data) for id in ids))
-    grouped = x.terms[1][4] !== nothing
-    index = grouped ? findfirst(==(x.terms[1][4]), data) : 0
+function _ls_structure(x::_LSLinearForm, data::Vector{ValueId}, live::Vector{ValueId})
+    coef(c) = _ls_slots(c.tree, data)
+    local_terms = findall(t -> t[4] !== nothing, x.terms)
+    index = isempty(local_terms) ? 0 : findfirst(==(x.terms[first(local_terms)][4]), data)
     terms = Tuple((coef(c), findfirst(==(l), live),
                    m === nothing ? 0 : findfirst(==(m), data)) for (c, l, m, _) in x.terms)
-    (grouped, index, terms, Tuple(coef(c) for c in x.offsets))
+    (Tuple(local_terms), index, terms, Tuple(coef(c) for c in x.offsets))
 end
 
-# Whether the terms read one way: all through one index, or none through any;
-# and each live value once.
-function _ls_consistent(x::_LSAffine)
-    indices = unique(i for (_, _, _, i) in x.terms)
-    length(indices) == 1 || return false
-    if only(indices) !== nothing
-        all(m === nothing for (_, _, m, _) in x.terms) || return false
-    end
+# One bound index supplies the disjoint blocks. A mixture of shared and
+# local columns currently uses a single local direction per group.
+function _ls_consistent(x::_LSLinearForm)
+    local_terms = [t for t in x.terms if t[4] !== nothing]
+    all(t -> t[3] === nothing, local_terms) || return false
+    length(unique(t[4] for t in local_terms)) <= 1 || return false
+    length(local_terms) <= 1 || length(local_terms) == length(x.terms) || return false
     lives = [l for (_, l, _, _) in x.terms]
     allunique(lives)
 end
@@ -832,17 +983,40 @@ function _partial_bound_statistics(p::Plan, bound_values::Vector{Value})
     end
     isempty(candidates) && return p
     _, _, dataonly = _partial_split(p, bound)
+    weighted = Dict{Int,Any}()
     rewrites = Dict{Int,Any}()
+    next_start = 1
     for r in candidates
-        rewrite = _ls_plate_rewrite(p, r, _authored_plate_sum_recipe(p, r), dataonly, wanted)
-        rewrite === nothing || (rewrites[r.id] = rewrite)
+        total = _authored_plate_sum_recipe(p, r)
+        rewrite = _ls_plate_rewrite(p, r, total, dataonly, wanted)
+        if rewrite !== nothing
+            rewrites[r.id] = rewrite
+        else
+            candidate = _ls_weighted_rewrite(p, r, total, dataonly, wanted, next_start)
+            candidate === nothing && continue
+            weighted[r.id] = candidate
+        end
+        # Each guarded region owns its reduction. Producers for the next
+        # plate can precede this total and arrive as ordinary region outputs.
+        next_start = max(next_start, findfirst(==(total), p.recipes) + 1)
     end
-    isempty(rewrites) && return p
+    isempty(rewrites) && isempty(weighted) && return p
     copied = Graph(copy(g.values), copy(g.recipes), copy(g.producers), copy(g.aliases),
                    g.version, nothing, copy(g.checks))
     recipes = Recipe[]
     fresh = minimum((r.id for r in p.recipes); init = 0) - 1
+    omitted = Set{Int}()
+    for w in values(weighted)
+        union!(omitted, (r.id for r in w.selected))
+    end
+    totals = Dict(w.total.id => w for w in values(weighted))
     for r in p.recipes
+        if haskey(totals, r.id)
+            append!(recipes, _ls_weighted_recipes(p, copied, totals[r.id], fresh))
+            fresh -= 3
+            continue
+        end
+        r.id in omitted && continue
         rewrite = get(rewrites, r.id, nothing)
         if rewrite === nothing
             push!(recipes, r)
@@ -852,7 +1026,7 @@ function _partial_bound_statistics(p::Plan, bound_values::Vector{Value})
         stem = Symbol(location.name)
         # Named from the location, never a fresh gensym: a name that changes
         # between preparations changes the prepared program's identity.
-        stats = value!(copied, Symbol(stem, :_least_squares), _LSStatistics)
+        stats = value!(copied, Symbol(stem, :_least_squares), _ls_fit_type(S))
         loc = value!(copied, Symbol(stem, :_least_squares_location), Any)
         datavalues = Value[copied.values[id] for id in data]
         livevalues = Value[copied.values[id] for id in live]
@@ -874,6 +1048,7 @@ end
 function _ls_plate_rewrite(p::Plan, r::Recipe, total::Recipe, dataonly::Set{ValueId},
                            wanted::Set{ValueId})
     g = p.graph
+    any(v -> canon_id(g, v.id) in dataonly && typeintersect(valtype(v), AbstractVector) !== Union{}, r.inputs) || return nothing
     pair = _ls_squared_ports(p, r, total)
     pair === nothing && return nothing
     a, b = pair
@@ -882,20 +1057,27 @@ function _ls_plate_rewrite(p::Plan, r::Recipe, total::Recipe, dataonly::Set{Valu
     position, response, location = ida in dataonly && !(idb in dataonly) ? (b, r.inputs[a], r.inputs[b]) :
         idb in dataonly && !(ida in dataonly) ? (a, r.inputs[b], r.inputs[a]) : (0, nothing, nothing)
     position == 0 && return nothing
-    seen = Recipe[]
-    x = _ls_location(p, location, dataonly, seen)
+    x = _ls_location(p, location, dataonly, false)
     x === nothing && return nothing
     _ls_consistent(x) || return nothing
-    data = unique!(ValueId[id for (c, _, m, i) in x.terms for id in
-        (c[2]..., (m === nothing ? () : (m,))..., (i === nothing ? () : (i,))...)])
-    append!(data, unique!(ValueId[id for c in x.offsets for id in c[2] if !(id in data)]))
-    unique!(data)
-    live = ValueId[l for (_, l, _, _) in x.terms]
+    # A rearranged product also needs the live-magnitude guard of the
+    # location-scale region. Try that rewrite before retaining the row loop.
+    any(t -> _ls_has_live_product(t[1].tree), x.terms) && return nothing
+    data, live = _ls_inputs(x)
     S = _ls_structure(x, data, live)
     # The location operation reads the live values and the data itself.
     kept = union(wanted, Set(live), Set(data))
     drop = _ls_exclusive(p, canon_id(g, location.id), r, kept, dataonly)
     (; S, response, location, position, data, live, drop)
+end
+
+function _ls_inputs(x)
+    data = unique!(ValueId[id for (c, _, m, i) in x.terms for id in
+        (_ls_data_ids(c)..., (m === nothing ? () : (m,))..., (i === nothing ? () : (i,))...)])
+    append!(data, unique!(ValueId[id for c in x.offsets for id in _ls_data_ids(c) if !(id in data)]))
+    unique!(data)
+    live = ValueId[l for (_, l, _, _) in x.terms]
+    data, live
 end
 
 # The recipes that compute only the authored location for this plate: none
@@ -1043,11 +1225,17 @@ function _ls_region_recipe(p::Plan, residual::Vector{Recipe}, region::UnitRange{
     literal_plan = _partial_subplan(p, have, want, literal)
     fast_plan, literal_plan = _lowering_plan(fast_plan), _lowering_plan(literal_plan)
     statistics = Value[first(r.inputs) for r in locations]
+    _ls_make_region(id, fast_plan, literal_plan, statistics,
+        sum(r.cost for r in selected; init = 0.0), any(r -> r.effectful, selected))
+end
+
+function _ls_make_region(id, fast_plan, literal_plan, statistics, cost, effectful)
+    have, want = literal_plan.have, literal_plan.want
     ast, constants, ops, recipes = _ls_region_program(fast_plan, literal_plan, statistics)
     kernel = _prepared_kernel(_ArrayFunction(compile(ast)), constants, _native_table(ast, ops),
         Tuple(have), Tuple(want), literal_plan, ast, recipes)
     Recipe(id, Tuple(have), Tuple(want), _LSRegion(fast_plan, literal_plan, statistics, kernel),
-           sum(r.cost for r in selected; init = 0.0), nothing, any(r -> r.effectful, selected))
+           cost, nothing, effectful)
 end
 
 function _ls_region_program(fast::Plan, literal::Plan, statistics;
@@ -1069,8 +1257,9 @@ function _ls_region_program(fast::Plan, literal::Plan, statistics;
     args = Any[names[canon_id(g, v.id)] for v in literal.have]
     lanes = last.(recycle)
     result = gensym(:least_squares_result)
-    checks = Any[Expr(:call, GlobalRef(Core, :getfield),
-        names[canon_id(g, v.id)], QuoteNode(:usable)) for v in statistics]
+    checks = Any[valtype(v) === Bool ? names[canon_id(g, v.id)] :
+        Expr(:call, GlobalRef(Core, :getfield), names[canon_id(g, v.id)], QuoteNode(:usable))
+        for v in statistics]
     condition = foldl((a, c) -> Expr(:&&, a, c), checks)
     ast = Expr(:function, Expr(:tuple, _CONSTANTS_ARG, _CALLABLES_ARG,
         (Expr(:(::), a, valtype(v)) for (a, v) in zip(args, literal.have))..., lanes...),
@@ -1229,3 +1418,5 @@ function _ls_unread_statistics(g::Graph, recipes::Vector{Recipe})
     read = Set{ValueId}(canon_id(g, v.id) for r in recipes for v in r.inputs)
     filter(r -> !_ls_dropped_constant(r) || canon_id(g, only(r.outputs).id) in read, recipes)
 end
+
+include("weighted_least_squares.jl")

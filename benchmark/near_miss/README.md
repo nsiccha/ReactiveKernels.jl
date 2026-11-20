@@ -176,3 +176,14 @@ least-squares preparation can hide the cost of building it at smaller sizes.
 | Bernoulli-logit | 50 | 0.163 / 0.199 | 62.8 / 76.5 | 170 / 239 | 222 / 346 |
 | Bernoulli-logit | 500 | 0.174 / 0.261 | 64.5 / 284 | 173 / 1,993 | 227 / 3,959 |
 | Bernoulli-logit | 5,000 | 2.41 / 1.51 | 248 / 2,369 | 179 / 48,226 | 216 / 91,627 |
+
+For mixed least squares, `full` uses a grouped intercept and one shared
+slope (A13). `bound_matrix` uses the grouped intercept and shared matrix
+columns (A12). The optional fifth argument sets the number of bound-matrix
+columns. Two reproduces the factor comparison above and five reproduces the
+width of A12. The final two output columns report allocated bytes per warm
+density call and per ordinary Enzyme value-and-gradient call.
+
+```sh
+julia --startup-file=no --project=<env> benchmark/near_miss/factor_scaling.jl 20000 50,500,5000 normal full,bound_matrix 5
+```

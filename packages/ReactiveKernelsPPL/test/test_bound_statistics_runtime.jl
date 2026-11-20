@@ -71,4 +71,66 @@ end
 end
 
 
+@testset "row scales in a bound Normal regression" begin
+    scaled = @rkppl begin
+        a ~ Normal(0, 1); b ~ Normal(0, 1); sigma ~ Exponential(1.0)
+        y .~ Normal.(a .+ b .* x, sigma .* w)
+    end
+    by_precision = @rkppl begin
+        a ~ Normal(0, 1); b ~ Normal(0, 1); sigma ~ Exponential(1.0)
+        y .~ Normal.(a .+ b .* x, sigma ./ sqrt.(w))
+    end
+    by_product = @rkppl begin
+        a ~ Normal(0, 1); b ~ Normal(0, 1); sigma ~ Exponential(1.0)
+        y .~ Normal.(a .+ b .* x .* z, sigma .* w)
+    end
+    u = [0.25, -0.45, -0.2]
+    a, b, logscale = u
+    sigma = exp(logscale)
+    for model in (scaled, by_precision, by_product), n in (0, 48)
+        x = [cos(i) for i in 1:n]
+        y = [sin(i) for i in 1:n]
+        w = [isodd(i) ? 2.0 : 0.5 for i in 1:n]
+        z = [cos(2i) for i in 1:n]
+        inputs = model === by_product ? (; x, z, w) : (; x, w)
+        fit = model(; inputs...) | (; y)
+        built = build_kernel(fit)
+        k = prepare_query(built, fit, :sampler; exemplars = (u,))
+        stats = only(filter(s -> s isa ReactiveKernels._LSWeightedStatistics, k.constants))
+        @test stats.fit.usable == (n > 0)
+        ref = -(a^2 + b^2)/2 - log(2pi) - sigma + logscale
+        grad = [-a, -b, 1 - sigma]
+        for i in eachindex(y)
+            sd = model === by_precision ? sigma / sqrt(w[i]) : sigma * w[i]
+            feature = model === by_product ? x[i]*z[i] : x[i]
+            residual = y[i] - a - b*feature
+            ref += -0.5*log(2pi) - log(sd) - 0.5*(residual/sd)^2
+            grad[1] += residual/sd^2
+            grad[2] += feature*residual/sd^2
+            grad[3] += (residual/sd)^2 - 1
+        end
+        q = prepare_sampler(built, fit, u; backend)
+        actual = similar(u)
+        value, _ = sampler_value_and_gradient!(q, actual, u)
+        @test value ≈ ref
+        @test actual ≈ grad
+    end
+    # A common location and scale give a design and a weight of one.
+    iid = @rkppl begin
+        m ~ Normal(0, 1); sigma ~ Exponential(1.0)
+        y .~ Normal.(m, sigma)
+    end
+    y = [sin(i) for i in 1:48]
+    fit = iid() | (; y)
+    built = build_kernel(fit)
+    point = [a, logscale]
+    k = prepare_query(built, fit, :sampler; exemplars = (point,))
+    @test only(s.fit.usable for s in k.constants if s isa ReactiveKernels._LSWeightedStatistics)
+    q = prepare_sampler(built, fit, point; backend)
+    r = y .- a
+    gradient = similar(point)
+    sampler_value_and_gradient!(q, gradient, point)
+    @test gradient ≈ [sum(r)/sigma^2 - a, sum(abs2, r)/sigma^2 - length(r) + 1 - sigma]
+end
+
 end # module
