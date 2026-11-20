@@ -117,6 +117,11 @@ _AccumulateStep(f::F, dims::Int) where {F} = _AccumulateStep{F,dims}(f)
 "Slice or gather (`x[idx...]`); in-place layers may copy into a destination."
 struct _GatherStep end
 @inline (::_GatherStep)(x, idx...) = x[idx...]
+
+# The extra operands are live during the stores that follow the copy. They
+# let the destination driver protect a previous result passed back as a view.
+struct _CopyForUpdate end
+@inline (::_CopyForUpdate)(A, inputs...) = copy(A)
 @inline (op::_FillConstructorStep)(dims::Integer...) = op.f(dims...)
 _fill_constructor_value(::_FillConstructorStep{typeof(zeros)}) = 0.0
 _fill_constructor_value(::_FillConstructorStep{typeof(ones)}) = 1.0
@@ -691,6 +696,8 @@ function _decompose_traceable(ctx::_FusedDecomposition, f, args, types)
                                 Dict{Symbol,Any}(zip(names, formal_types)),
                                 ctx.stmts, ctx.ops, ctx.caches, ctx.offset,
                                 ctx.cache_apply)
+    updated = _decompose_copy_update!(inner, statements, body, f, types, source)
+    updated === nothing || return updated
     d = all(st -> _decompose_traced_statement!(inner, st), statements) ?
         _decompose(inner, body, false) : nothing
     d === nothing || return d
@@ -698,6 +705,87 @@ function _decompose_traceable(ctx::_FusedDecomposition, f, args, types)
     resize!(ctx.ops, marks[2])
     resize!(ctx.caches, marks[3])
     nothing
+end
+
+function _update_callee(mod, callee, bindings)
+    root = callee
+    while Meta.isexpr(root, :., 2)
+        root = first(root.args)
+    end
+    haskey(bindings, root) ? nothing : _nonalloc_resolve_function(mod, callee)
+end
+
+# Translate only reads of the visible operands and writes to the private
+# copy. Preserve the loop's lexical binding, iteration order and bounds checks.
+function _traced_update_expr(ex, mod, bindings, target)
+    ex isa Symbol && return get(bindings, ex, nothing)
+    ex isa Union{Number,LineNumberNode} && return ex
+    ex isa Expr || return nothing
+    lower(arg) = _traced_update_expr(arg, mod, bindings, target)
+    if Meta.isexpr(ex, :for, 2)
+        iter, body = ex.args
+        Meta.isexpr(iter, :(=), 2) || return nothing
+        name, domain = iter.args
+        name isa Symbol && name !== target || return nothing
+        range = lower(domain)
+        range === nothing && return nothing
+        index = gensym(name)
+        locals = merge(bindings, Dict(name => index))
+        store = _traced_update_expr(body, mod, locals, target)
+        store === nothing && return nothing
+        return Expr(:for, Expr(:(=), index, range), store)
+    elseif ex.head === :call
+        resolved = _update_callee(mod, first(ex.args), bindings)
+        resolved === nothing && return nothing
+        f, ref = resolved
+        f in (eachindex, axes, firstindex, lastindex, length, size, (:),
+              +, -, *, div, rem, min, max) || return nothing
+        args = map(lower, ex.args[2:end])
+        any(isnothing, args) && return nothing
+        return Expr(:call, ref, args...)
+    elseif Meta.isexpr(ex, :(=), 2)
+        lhs = first(ex.args)
+        Meta.isexpr(lhs, :ref) && first(lhs.args) === target || return nothing
+    elseif ex.head !== :block && ex.head !== :ref
+        return nothing
+    end
+    args = map(lower, ex.args)
+    any(isnothing, args) ? nothing : Expr(ex.head, args...)
+end
+
+function _decompose_copy_update!(ctx, statements, result, f, types, source)
+    length(statements) >= 2 && result isa Symbol && !haskey(ctx.argmap, result) ||
+        return nothing
+    init = first(statements)
+    Meta.isexpr(init, :(=), 2) && init.args[1] === result || return nothing
+    call = init.args[2]
+    Meta.isexpr(call, :call, 2) || return nothing
+    callee, array = call.args
+    # A static parameter can shadow a global function just as a formal can.
+    bindings = copy(ctx.argmap)
+    for name in (length(source) >= 5 ? keys(source[5]) : ())
+        bindings[name] = nothing
+    end
+    resolved = _update_callee(ctx.mod, callee, bindings)
+    resolved !== nothing && first(resolved) === copy || return nothing
+    T = get(ctx.argtypes, array, Any)
+    T <: Array && isconcretetype(T) && _static_type(f, types...) === T || return nothing
+    which(copy, Tuple{T}) === which(copy, Tuple{Array}) || return nothing
+    # All storage the update can read is visible to the runtime alias check.
+    all(t -> (t <: Number && isbitstype(t)) ||
+             (t <: StridedArray{<:Number} && isbitstype(eltype(t))), values(ctx.argtypes)) ||
+        return nothing
+    others = filter(!=(array), first(source))
+    op = _CopyForUpdate()
+    _nonalloc_destination(ctx.cache_apply, op, T, (T, (ctx.argtypes[n] for n in others)...)) ||
+        return nothing
+    dest = gensym(:updated)
+    bindings[result] = dest
+    stores = _traced_update_expr(Expr(:block, statements[2:end]...), ctx.mod, bindings, result)
+    stores === nothing && return nothing
+    tmp = _emit_step!(ctx, op, T, ctx.argmap[array], (ctx.argmap[n] for n in others)...)
+    push!(ctx.stmts, Expr(:(=), dest, tmp), stores)
+    (dest, T)
 end
 
 # A body's statements before its final expression, past line numbers and

@@ -232,6 +232,13 @@ end
 # match the allocating result exactly, so value parity is preserved
 # bit-for-bit and a mismatch simply reseeds the cache.
 
+@inline function MutatingFunctions.apply!!(cache::Array{T,N},
+        ::ReactiveKernels._CopyForUpdate, A::Array{T,N}, inputs...) where {T,N}
+    size(cache) == size(A) && !ReactiveKernels._replicated_aliases(cache, (A, inputs...)) ||
+        return copy(A)
+    copyto!(cache, A)
+end
+
 @inline function MutatingFunctions.apply!!(
         cache::AbstractArray, ::ReactiveKernels._MaterializeStep,
         bc::Base.Broadcast.Broadcasted)
