@@ -16,6 +16,12 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.244
+
+- `indexed_value(name)` selects one authored plate row for `prepare_query`
+  and `prepare_query_ad`. Supply a frozen packed base and coordinate positions
+  at preparation, then pass the compact active vector and row index per call.
+
 ## 0.1.243
 
 - Fresh `build_kernel` calls can reuse lowered graph construction instructions
