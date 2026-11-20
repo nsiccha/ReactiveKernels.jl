@@ -12,23 +12,31 @@ isdefined(@__MODULE__, :GuardedNormalizers) || include("fixtures/guarded_normali
             f = G.fixture(family, n)
             original = deepcopy(f.data)
             k = G.build(f)
-            caches = [r.op.value for r in k.plan.recipes if
-                r.op isa ReactiveKernels._BoundConstant &&
-                startswith(String(only(r.outputs).name), "bound_plate_")]
-            @test !isempty(caches)
             y = f.data.y
             lg = G.loggamma
-            terms = family === :Gamma ? (log.(y),) :
-                family === :Beta ? (log.(y), log1p.(-y)) :
-                family === :StudentT ?
-                    (lg.((f.data.df .+ 1) ./ 2) .- lg.(f.data.df ./ 2) .-
-                     0.5 .* log.(f.data.df .* pi),) :
-                family === :BetaBinomial ?
-                    (lg.(f.data.trials .+ 1.0) .- lg.(y .+ 1.0) .-
-                     lg.(f.data.trials .- y .+ 1.0),) : (lg.(y .+ 1.0),)
-            for term in terms
-                @test any(v -> v isa AbstractVector && length(v) == n &&
-                          (isapprox(v, term) || isapprox(v, -term)), caches)
+            if family === :NB2
+                # The count-only plate sum folds to a single log normalizer.
+                normalizer = -sum(lg, y .+ 1.0)
+                @test any(k.plan.recipes) do r
+                    r.op isa ReactiveKernels._BoundConstant &&
+                        r.op.value isa Real && isapprox(r.op.value, normalizer)
+                end
+            else
+                caches = [r.op.value for r in k.plan.recipes if
+                    r.op isa ReactiveKernels._BoundConstant &&
+                    startswith(String(only(r.outputs).name), "bound_plate_")]
+                terms = family === :Gamma ? (log.(y),) :
+                    family === :Beta ? (log.(y), log1p.(-y)) :
+                    family === :StudentT ?
+                        (lg.((f.data.df .+ 1) ./ 2) .- lg.(f.data.df ./ 2) .-
+                         0.5 .* log.(f.data.df .* pi),) :
+                    family === :BetaBinomial ?
+                        (lg.(f.data.trials .+ 1.0) .- lg.(y .+ 1.0) .-
+                         lg.(f.data.trials .- y .+ 1.0),) : (lg.(y .+ 1.0),)
+                for term in terms
+                    @test any(v -> v isa AbstractVector && length(v) == n &&
+                              (isapprox(v, term) || isapprox(v, -term)), caches)
+                end
             end
             uninferred = Base.invokelatest(ReactiveKernels._uninferred_values,
                                            k, (Vector{Float64},))
