@@ -20,14 +20,15 @@ are recorded in the git history only.
 
 Requires ReactiveKernels 0.1.342.
 
-- An exported ReactiveKernels density with a location and a scale is an
-  elementwise response without its own entry in the lowering: `Cauchy`,
-  `Laplace`, `Logistic` and the standardized `TDist.(nu)` join `Normal` and
-  `StudentT`, for example `y .~ Laplace.(mu, sigma)`. They lower to the
-  summed observation plate, so a shared scale leaves the row sum and
-  repeated rows run once, and they take weights, truncation, censoring and
-  interval censoring like the other responses. A further numeric parameter
-  of the law may vary by row.
+- A ReactiveKernels law with `location` and `scale` ports, a `logpdf` that
+  takes one observation, and all kernel-valued arguments bound can serve as an
+  elementwise response, including a law defined in the model's own module.
+  `Cauchy`, `Laplace`, `Logistic` and the standardized `TDist.(nu)` join
+  `Normal` and `StudentT`, for example `y .~ Laplace.(mu, sigma)`. The summed
+  observation plate can compute a shared log scale once and group identical
+  bound rows. All four new responses support weighting, truncation, censoring
+  and interval censoring in native Julia and JAX. Additional numeric law
+  parameters may vary by row.
 - An inverse link may be named or qualified. `p = logistic.(eta)` followed
   by `y .~ Bernoulli.(p)`, and `LogExpFunctions.logistic.(eta)`, select the
   same natural-parameter likelihood as the inline `logistic.(eta)`. A

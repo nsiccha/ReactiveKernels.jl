@@ -38,8 +38,8 @@ are recorded in the git history only.
 - A prepared kernel's `vcat` into a reused vector accepts numbers beside
   dense vectors (`vcat(0.0, alpha)`), so a coefficient table with a leading
   entry is refilled without allocating.
-- `js_source` names an embedded prepared kernel whose source plan was
-  discarded for execution, instead of failing on the missing plan.
+- When an embedded prepared kernel has discarded its source plan, `js_source`
+  raises `JSEmissionError` and names the endpoint it could not translate.
 
 ## 0.1.341
 
