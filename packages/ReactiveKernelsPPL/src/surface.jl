@@ -9780,6 +9780,20 @@ end
 _bare_slot_name(arg, ctx) = arg isa Symbol && !haskey(ctx.detmap, arg) &&
     !_is_declared_array(arg, ctx)
 
+# StatsFuns is optional. Look up its actual normcdf binding only when the
+# package has already been loaded by the model, including through a re-export.
+const _STATSFUNS_ID = Base.PkgId(Base.UUID("4c63d2b9-4356-54db-8cca-17b64c39e42c"), "StatsFuns")
+function _inverse_link_head(ref::GlobalRef)
+    isconst(ref.mod, ref.name) || return nothing
+    fn = getglobal(ref.mod, ref.name)
+    fn === exp && return :exp
+    fn === LogExpFunctions.logistic && return :logistic
+    fn === LogExpFunctions.cexpexp && return :cexpexp
+    Base.root_module_exists(_STATSFUNS_ID) &&
+        fn === getglobal(Base.root_module(_STATSFUNS_ID), :normcdf) && return :normcdf
+    return nothing
+end
+
 # A recognized inverse link's scalar function and operand, preserving Julia
 # binding identity for qualified calls, aliases and re-exports.
 function _inverse_link_call(ex, mod)
@@ -9793,11 +9807,7 @@ function _inverse_link_call(ex, mod)
         qualifier = _resolve_module_path(head.args[1], mod, "inverse link")
         head = _module_binding(qualifier, head.args[2].value, "inverse link", head)
     end
-    if head isa GlobalRef
-        fn = getglobal(head.mod, head.name)
-        head = fn === LogExpFunctions.logistic ? :logistic :
-            fn === LogExpFunctions.cexpexp ? :cexpexp : fn === exp ? :exp : nothing
-    end
+    head isa GlobalRef && (head = _inverse_link_head(head))
     haskey(_AUXILIARY_LINKS, head) || return nothing
     return (; head, arg = only(args), dotted)
 end
@@ -9810,7 +9820,12 @@ function _definition_link(value, family, ctx)
     link = _inverse_link_call(get(ctx.detmap, target, nothing), ctx.mod)
     link === nothing && return value
     haskey(_link_names(family), link.head) || return value
-    link.dotted || _canon_shape(link.arg, ctx) === :scalar || return value
+    if !link.dotted
+        # A module call can return a whole array even when shape analysis
+        # classifies it as a model-level scalar. exp(matrix) reads it whole.
+        _canon_shape(link.arg, ctx) === :scalar &&
+            !_maybe_array_operand(link.arg, ctx.detmap, ctx.shape_env) || return value
+    end
     return Expr(:call, link.head, link.arg)
 end
 

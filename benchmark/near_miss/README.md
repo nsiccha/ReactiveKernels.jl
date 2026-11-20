@@ -180,6 +180,7 @@ five alternating measurements. Times are microseconds per call.
 | --- | ---: | ---: | ---: | ---: |
 | A0 dotted Normal | 0.136 | 0.135 | 0.365 | 0.360 |
 | A5 Normal in an indexed plate | 0.238 | 0.037 | 0.642 | 0.062 |
+| A17 Normal with `y[:]` | 0.137 | 0.134 | 0.381 | 0.372 |
 | B0 dotted Bernoulli-logit, five distinct covariates | 0.116 | 0.117 | 0.143 | 0.148 |
 | B5 the same in an indexed plate | 0.249 | 0.120 | 0.510 | 0.138 |
 | B6 named logistic, five distinct covariates | 33.97 | 0.126 | 85.59 | 0.153 |
@@ -188,6 +189,8 @@ five alternating measurements. Times are microseconds per call.
 | B5c the same in an indexed plate | 40.82 | 17.74 | 98.02 | 20.74 |
 | B6c named logistic, continuous covariate | 33.70 | 18.05 | 83.68 | 20.72 |
 | B7c qualified logistic, continuous covariate | 23.88 | 16.99 | 52.68 | 19.57 |
+| B8 Bernoulli with `y[axes(y,1)]`, five distinct covariates | 0.119 | 0.116 | 0.142 | 0.143 |
+| B8c the same with a continuous covariate | 17.08 | 16.99 | 19.71 | 20.50 |
 | B3c dotted Binomial, continuous covariate | 15.27 | 15.35 | 26.19 | 26.19 |
 | B10 the same with `y[:]` | 20.08 | 15.16 | 26.15 | 26.25 |
 
