@@ -118,7 +118,7 @@ end
     @test built.spec isa ReactiveKernels.KernelSpec
     @test built.layout.total == 3
     # Gaussian and Bernoulli-logit likelihoods lower to plate calls
-    # (Expr(:do)); Poisson-log base GLMs use whole-vector reductions.
+    # (Expr(:do)), as Poisson-log base GLMs do.
     _has_do(ex::Expr) = ex.head === :do ||
         any(a -> a isa Expr && _has_do(a), ex.args)
     _has_do(_) = false
@@ -224,8 +224,9 @@ function _gen_query_has_response_plate(spec, plan, want)
         startswith(String(name), "_ppl_pw_y_resp_"), names)
 end
 
-# Bernoulli-logit keeps stable cells; base Poisson-log uses a whole-vector
-# reduction (`dot` + `sum(f, x)`). Ranged ≡ bare up to summation order
+# Bernoulli-logit keeps stable cells; base Poisson-log is the summed count
+# plate of every count law (a `logkernel` plate plus the folded normalizer),
+# with no whole-vector reduction. Ranged ≡ bare up to summation order
 # (the cover rule), with pointwise queries retaining the same densities.
 function _gen_ranged_plan(base::StructuralPlan, range::UnitRange{Int})
     r = base.responses[1]
@@ -240,7 +241,7 @@ function _gen_ranged_plan(base::StructuralPlan, range::UnitRange{Int})
     return plan
 end
 
-@testset "stable Bernoulli cells and Poisson whole-vector fusion" begin
+@testset "stable Bernoulli cells and the Poisson count plate" begin
     # Base Bernoulli keeps the stable endpoint through its reduction.
     plan = _gen_bernoulli_plan(repeat([false, true], 3))
     built = build_kernel(plan)
@@ -271,17 +272,19 @@ end
     @test _query(rbuilt.spec, rplan, :posterior, u) ≈
         _query(built.spec, plan, :posterior, u)
     _check_gradient(rbuilt.spec, rplan, u)
-    # Base Poisson routes fused.
+    # Base Poisson is the count plate: the density cut sums the kernel plate
+    # and adds the folded normalizer, without the pointwise vector.
     pplan = _gen_poisson_plan()
     pbuilt = build_kernel(pplan)
     pex = kernel_expr(pplan, pbuilt.layout)
-    @test _has_call(pex, :dot)
+    @test !_has_call(pex, :dot)
+    @test occursin(".logkernel(", string(pex)) && occursin(".lognormalizer(", string(pex))
     @test _has_sym(pex, :_ppl_pw_y_resp)
     for want in (:likelihood, :posterior)
         @test !_gen_query_has_response_plate(pbuilt.spec, pplan, want)
     end
     @test _gen_query_has_response_plate(pbuilt.spec, pplan, :pointwise)
-    # Ranged Poisson routes plate and matches the fused density.
+    # Ranged Poisson matches the whole response's density.
     rpplan = _gen_ranged_plan(pplan, 1:6)
     rpbuilt = build_kernel(rpplan)
     rpex = kernel_expr(rpplan, rpbuilt.layout)
