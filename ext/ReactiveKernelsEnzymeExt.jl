@@ -916,7 +916,8 @@ end
 
 using ReactiveKernels: _PlateSumRuleBody, _PlateSumRuleOnePass, _pr_gather_value,
     _pr_scalar_positions, _pr_batched_positions, _pr_tape_layout, _CellArray, _PlateTapeSlot,
-    _pr_take_tape!, _pr_return_tape!
+    _pr_take_tape!, _pr_return_tape!, _pr_projections, _pr_ragged_buffer, _PRRaggedBuffer,
+    _pr_group_view
 
 # A one-pass call made by a preparation that owns AD caches ends with its tape
 # slot (`_PlateTapeSlot`, src/plate_reverse.jl), which is no operand of the
@@ -983,7 +984,8 @@ function EnzymeRules.augmented_primal(
     S, B = _pr_scalar_positions(r), _pr_batched_positions(r)
     layout = _pr_tape_layout(rule.val)
     if width(config) == 1 && !(RT <: Const) && _pr_covers(Val(S), Val(B), args) &&
-            _pr_one_pass(layout, Val(S), Val(B), Val(overwritten(config)), args)
+            _pr_one_pass(layout, Val(S), Val(B), Val(overwritten(config)), args,
+                         Val(_pr_projections(typeof(r))))
         tape = _pr_take_tape!(_pr_slot(annotations),
                               _pr_buffer_length(layout, Val(B), args) + length(S))
         swept = r.reverse(values..., 1.0, layout, _pr_tape_buffers(layout, Val(B), args, tape)...)
@@ -1003,7 +1005,7 @@ end
 # other is constant, every active scalar is a `Float64`, and no array operand
 # may be overwritten before the reverse pass (which, in two passes, reads the
 # operands themselves).
-@generated function _pr_one_pass(::Val{true}, ::Val{S}, ::Val{B}, ::Val{O}, args::Tuple) where {S,B,O}
+@generated function _pr_one_pass(::Val{true}, ::Val{S}, ::Val{B}, ::Val{O}, args::Tuple, ::Val) where {S,B,O}
     gathered = false
     for b in B
         T = args.parameters[b]
@@ -1025,13 +1027,25 @@ end
 # A logical buffer has one partial per operand entry. Contents of dense
 # inputs may change after the sweep. An indirect view, however, needs its
 # index map again when the reverse scatters into the shadow.
-@generated function _pr_one_pass(::Val{:logical}, ::Val{S}, ::Val{B}, ::Val{O}, args::Tuple) where {S,B,O}
+@generated function _pr_one_pass(::Val{:logical}, ::Val{S}, ::Val{B}, ::Val{O},
+                                 args::Tuple, ::Val{G}) where {S,B,O,G}
     for b in B
         T = args.parameters[b]
         T <: Union{Const,Active{<:Tuple{Vararg{Float64}}}} && continue
         T <: Union{Duplicated,DuplicatedNoNeed} || return :(false)
         V = T.parameters[1]
         V <: Vector{Float64} && continue
+        # The reverse revisits the row layout to scatter the scaled tape.
+        # A caller that could replace rows after the primal keeps two passes.
+        if V === Vector{Vector{Float64}} && !O[b + 1]
+            projections = filter(p -> p.parent == b, G)
+            if !isempty(projections) && all(projections) do p
+                    rows = args.parameters[p.rows].parameters[1]
+                    p.batched && p.only_group_reads && (p.grouped ? eltype(rows) : rows) === Int
+                end
+                continue
+            end
+        end
         V <: SubArray{Float64,1,<:AbstractVector} && !O[b + 1] || return :(false)
     end
     all(s -> args.parameters[s] <: Union{Const,Active{Float64}}, S) ? :(true) : :(false)
@@ -1040,6 +1054,9 @@ end
 _pr_buffer_size(::Val{true}, a) = length(parent(a.dval))
 _pr_buffer_size(::Val{:logical}, a::Active) = length(a.val)
 _pr_buffer_size(::Val{:logical}, a::Union{Duplicated,DuplicatedNoNeed}) = length(a.dval)
+const _PRRaggedOperand = Union{Duplicated{Vector{Vector{Float64}}},DuplicatedNoNeed{Vector{Vector{Float64}}}}
+_pr_buffer_size(::Val{:logical}, a::_PRRaggedOperand) =
+    length(a.dval) + 1 + sum(length, a.dval; init = 0)
 @generated function _pr_buffer_length(layout::Val, ::Val{B}, args::Tuple) where {B}
     terms = Any[:(_pr_buffer_size(layout, getfield(args, $b))) for b in B
                 if !(args.parameters[b] <: Const)]
@@ -1050,6 +1067,8 @@ end
 # `_pr_gather_dot`. Logical buffers address their slices in cell order.
 @inline _pr_buffer_view(::Val{true}, a, slice) = Base.SubArray(slice, parentindices(a.val))
 @inline _pr_buffer_view(::Val{:logical}, a, slice) = slice
+@inline _pr_buffer_view(::Val{:logical}, a::_PRRaggedOperand, slice) =
+    _pr_ragged_buffer(slice, a.dval)
 @generated function _pr_tape_buffers(layout::Val, ::Val{B}, args::Tuple, tape::Vector{Float64}) where {B}
     body = Any[:(offset = 0)]
     names = Symbol[]
@@ -1088,6 +1107,16 @@ end
     ntuple(k -> ȳ * @inbounds(buffer[k]), Val(fieldcount(T)))
 @inline _pr_buffer_storage(::Val{true}, x) = parent(x)
 @inline _pr_buffer_storage(::Val{:logical}, x) = x
+@inline function _pr_scaled_shadow(::Val{:logical}, arg::_PRRaggedOperand, buffer::_PRRaggedBuffer, ȳ)
+    for i in eachindex(arg.dval)
+        row = arg.dval[i]
+        source = _pr_group_view(buffer, i)
+        @inbounds for j in eachindex(row, source)
+            row[j] += ȳ * source[j]
+        end
+    end
+    arg.dval
+end
 @inline function _pr_scaled_shadow(layout::Val, arg::Union{Duplicated,DuplicatedNoNeed}, buffer::SubArray, ȳ)
     shadow = _pr_buffer_storage(layout, arg.dval)
     source = _pr_buffer_storage(layout, buffer)
@@ -1109,9 +1138,13 @@ end
 # else: the reverse pass reads every other operand from its annotation, so a
 # call whose operands stay intact keeps an empty tape and allocates none.
 @generated function _pr_tape(::Val{F}, values::Tuple) where {F}
-    Expr(:tuple, (F[i+1] && T <: AbstractArray ? :(copy(getfield(values, $i))) : :nothing
+    Expr(:tuple, (F[i+1] && T <: AbstractArray ? :(_pr_snapshot(getfield(values, $i))) : :nothing
                   for (i, T) in enumerate(values.parameters))...)
 end
+_pr_snapshot(x) = copy(x)
+# A producer can refill ragged values or index rows after the primal. Preserve
+# the entries and their sharing when the backend marks the operand overwritten.
+_pr_snapshot(x::Vector{<:Vector}) = deepcopy(x)
 # The operand values for the reverse pass: the tape's copy where it holds one.
 @generated function _pr_operands(tape::Tuple, args::Tuple)
     Expr(:tuple, (tape.parameters[i] === Nothing ? :(getfield(args, $i).val) :

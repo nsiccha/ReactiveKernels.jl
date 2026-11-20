@@ -1216,6 +1216,7 @@ end
 # element type (`_authored_plate_result_eltype`) rather than the plan-level
 # `Any` of an unannotated body, as the ordinary native lowering does.
 _nested_plate_cache(op, argtypes, T, N) = nothing
+_nested_plate_result_type(slot) = Any
 function _nonalloc_plan_result_types(kernel, argument_types)
     p = kernel.plan
     types = _nonalloc_value_types(p, argument_types)
