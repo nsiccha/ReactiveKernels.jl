@@ -1043,12 +1043,15 @@ function _pr_direct_operands!(prepared, body, params, active_params, broadcastab
         function read(ex)
             ex isa Expr && ex.head !== :quote || return
             if Meta.isexpr(ex, :call, 3) &&
-                    _pr_call_function(ex.args[1], mod, values) === _plate_read &&
-                    ex.args[2] isa Symbol && haskey(operands, ex.args[2]) &&
-                    ex.args[3] in (index, linear)
-                raw = ex.args[2]
-                prepared[raw] = operands[raw]
-                reads[ex] = nothing
+                    ex.args[2] isa Symbol && ex.args[3] in (index, linear)
+                operand = ex.args[2]
+                f = _pr_call_function(ex.args[1], mod, values)
+                if f === _plate_read && haskey(operands, operand)
+                    prepared[operand] = operands[operand]
+                    reads[ex] = nothing
+                elseif f === Base.Broadcast._broadcast_getindex && haskey(prepared, operand)
+                    reads[ex] = nothing
+                end
             end
             foreach(read, ex.args)
         end
@@ -1057,11 +1060,14 @@ function _pr_direct_operands!(prepared, body, params, active_params, broadcastab
     visit(body)
     function check(node)
         node isa Expr && node.head !== :quote || return
-        if Meta.isexpr(node, :call, 3) &&
-                _pr_call_function(node.args[1], mod, values) === _plate_read &&
-                get(operands, node.args[2], nothing) in active_params &&
-                !haskey(reads, node)
-            _pr_fail("a direct plate read does not use its cell index")
+        if Meta.isexpr(node, :call, 3) && !haskey(reads, node)
+            f = _pr_call_function(node.args[1], mod, values)
+            if f === _plate_read && get(operands, node.args[2], nothing) in active_params
+                _pr_fail("a direct plate read does not use its cell index")
+            elseif f === Base.Broadcast._broadcast_getindex &&
+                    get(prepared, node.args[2], nothing) in active_params
+                _pr_fail("a prepared plate read does not use its cell index")
+            end
         end
         foreach(check, node.args)
     end
@@ -1583,22 +1589,27 @@ end
 @inline _pr_spans(::Union{Number,Base.RefValue}, cells) = true
 @inline _pr_spans(_, cells) = false
 @inline _pr_spans_all(cells, operands...) = all(A -> _pr_spans(A, cells), operands)
-@inline _pr_direct_read(A::Base.Broadcast.Extruded, i) = @inbounds A.x[i]
+@inline _pr_direct_read(A::Base.Broadcast.Extruded, i) = Base.Broadcast._broadcast_getindex(A, i)
+@inline _pr_direct_read(A::Base.Broadcast.Extruded, i::Int) = @inbounds A.x[i]
+@inline function _pr_direct_read(A::Base.Broadcast.Extruded, i::CartesianIndex{N}) where {N}
+    length(A.keeps) == N || return Base.Broadcast._broadcast_getindex(A, i)
+    @inbounds A.x[i]
+end
 @inline _pr_direct_read(x::Number, i) = x
 @inline _pr_direct_read(r::Base.RefValue, i) = r[]
 
 # The prepared operands the statements read, and the statements with each read
 # of them direct.
-function _pr_direct_reads(stmts, st::_PRProgramState, linear::Symbol, found::Vector{Symbol} = Symbol[])
+function _pr_direct_reads(stmts, st::_PRProgramState, found::Vector{Symbol} = Symbol[])
     out = Any[]
     for s in stmts
         if _pr_is_read(s, st)
             s.args[1] in found || push!(found, s.args[1])
             push!(out, _PRCall(s.lhs, _pr_direct_read, GlobalRef(@__MODULE__, :_pr_direct_read),
-                               Any[s.args[1], linear]))
+                               s.args))
         elseif s isa _PRBranch
-            push!(out, _PRBranch(s.lhs, s.cond, _pr_direct_reads(s.then_stmts, st, linear, found)[1],
-                                 s.then_result, _pr_direct_reads(s.else_stmts, st, linear, found)[1],
+            push!(out, _PRBranch(s.lhs, s.cond, _pr_direct_reads(s.then_stmts, st, found)[1],
+                                 s.then_result, _pr_direct_reads(s.else_stmts, st, found)[1],
                                  s.else_result))
         else
             push!(out, s)
@@ -1686,7 +1697,154 @@ function _pr_value_accumulation(stmts, invariant, cellvars, result, total, add, 
     pre, inloop, post
 end
 
-function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState)
+# A grouped tape has one writable Float64 view through the same index vector
+# as its operand. A contiguous portion of that map gives both parents a
+# unit-stride loop. Only built-in numeric storage participates, so every read
+# and write addressed by the loop can be checked for overlap.
+const _PRSpanParent = Union{Vector{Float64},SubArray{Float64,1,Vector{Float64},Tuple{UnitRange{Int}},true}}
+const _PRSpanGather = SubArray{Float64,1,<:_PRSpanParent,Tuple{Vector{Int}}}
+# DenseArray is extensible, and a StridedVector can have a user-defined
+# parent or index range whose getindex reads other storage.
+const _PRPlainIndex = Union{Int,UnitRange{Int},Base.Slice{Base.OneTo{Int}},Base.OneTo{Int}}
+const _PRPlainVector{T} = Union{Vector{T},SubArray{T,1,<:Array{T},<:Tuple{Vararg{_PRPlainIndex}}}}
+_pr_contiguous_vector(x) = x isa _PRPlainVector{<:Union{Float32,Float64}} && stride(x, 1) == 1
+@inline _pr_clear_storage(a, ::Tuple{}) = true
+@inline function _pr_clear_storage(a, others::Tuple)
+    b = first(others)
+    (b === nothing || !_contiguous_storage_overlaps(a, b)) && _pr_clear_storage(a, Base.tail(others))
+end
+@inline _pr_disjoint_shadows(values, ::Tuple{}) = true
+@inline function _pr_disjoint_shadows(values, shadows::Tuple)
+    shadow, rest = first(shadows), Base.tail(shadows)
+    (shadow === nothing || (_pr_clear_storage(shadow, values) && _pr_clear_storage(shadow, rest))) &&
+        _pr_disjoint_shadows(values, rest)
+end
+_pr_span_possible(cells, value, shadow, operands) = false
+@inline _pr_span_operands(::Tuple{}, cells, value, storage) = true
+@inline function _pr_span_operands(operands::Tuple, cells, value, storage)
+    x = first(operands)
+    (x === value || (_pr_contiguous_vector(x) &&
+        axes(x) == (cells,) && !_contiguous_storage_overlaps(storage, x))) &&
+        _pr_span_operands(Base.tail(operands), cells, value, storage)
+end
+@inline function _pr_span_possible(cells::Base.OneTo{Int}, value::_PRSpanGather,
+                                   shadow::_PRSpanGather, operands::Tuple)
+    idx = only(parentindices(value))
+    storage = parent(shadow)
+    length(cells) >= 8 && length(value) == length(cells) &&
+        @inbounds(idx[2] == idx[1] + 1) && only(parentindices(shadow)) === idx &&
+        axes(storage) == axes(parent(value)) &&
+        !_contiguous_storage_overlaps(storage, parent(value)) && !_contiguous_storage_overlaps(storage, idx) &&
+        _pr_span_operands(operands, cells, value, storage)
+end
+
+# The candidate span ends at the bound of either the plate or the parent.
+# Check every index before using it. The first failed span leaves the
+# remaining cells to their original loop, including their scatter order.
+@inline function _pr_span_end(indices, lo, lastcell, start, lastparent)
+    1 <= start <= lastparent || return lo - 1
+    count = min(lastcell - lo, lastparent - start)
+    count >= 7 && @inbounds(indices[lo + 1]) == start + 1 || return lo - 1
+    offset = start - lo
+    hi = lo + count
+    different = 0
+    @inbounds @simd for i in lo+2:hi
+        different |= xor(indices[i], i + offset)
+    end
+    iszero(different) ? hi : lo - 1
+end
+
+function _pr_span_loop(linear, cells, value, shadow, operands, cellbody, prepared, original)
+    lo, hi, start, offset = (Symbol(cells, s) for s in (:_lo, :_hi, :_start, :_offset))
+    address = :($linear + $offset)
+    inner = _index_run_replace(cellbody) do node
+        # The direct-operand check proved each active read uses its cell's
+        # index. Inactive operands may also be read at other indices.
+        if Meta.isexpr(node, :call, 3) && _pr_is_ref(node.args[1], @__MODULE__, :_plate_read) &&
+                get(prepared, node.args[2], nothing) === value
+            return :(parent($value)[$address])
+        elseif Meta.isexpr(node, :call, 4) && _pr_is_ref(node.args[1], @__MODULE__, :_pr_shadow_add!) &&
+                node.args[2] === shadow && node.args[3] === linear
+            return :(parent($shadow)[$address] += $(node.args[4]))
+        end
+        node
+    end
+    quote
+        $hi = 0
+        if $_PR_WANT_VALUE isa Val{true} &&
+                $(GlobalRef(@__MODULE__, :_pr_span_possible))($cells, $value, $shadow, ($(operands...),))
+            $start = @inbounds only(parentindices($value))[1]
+            $hi = $(GlobalRef(@__MODULE__, :_pr_span_end))(only(parentindices($value)),
+                    1, last($cells), $start, lastindex(parent($value)))
+        end
+        if $hi > 0
+            $lo = 1
+            while true
+                $start = @inbounds only(parentindices($value))[$lo]
+                $offset = $start - $lo
+                @inbounds @simd for $linear in $lo:$hi
+                    $inner
+                end
+                $lo = $hi + 1
+                $lo > last($cells) && break
+                $start = @inbounds only(parentindices($value))[$lo]
+                $hi = $(GlobalRef(@__MODULE__, :_pr_span_end))(only(parentindices($value)),
+                        $lo, last($cells), $start, lastindex(parent($value)))
+                $hi < $lo && break
+            end
+            @inbounds for $linear in $lo:last($cells)
+                $cellbody
+            end
+        else
+            $original
+        end
+    end
+end
+
+# A reordered sweep may read arrays only through the checked plate operands.
+# Follow the flattened cell: aliases and primitive scalar arithmetic preserve
+# that property. An ordinary index, opaque call or a nested cut could read
+# storage aliased by a shadow. Keep its ordered loop. Check external scalar
+# operands at the call as well, since a user number can overload arithmetic.
+_pr_vector_scalar(x) = x isa Union{Base.IEEEFloat,Base.BitInteger,Bool}
+function _pr_vectorized_cell_scalars(stmts, st, linear)
+    local_values = Set{Symbol}([linear])
+    external = Symbol[]
+    for s in stmts
+        if s isa _PRAlias
+            args = (s.rhs,)
+        elseif s isa _PRCall && _pr_is_read(s, st)
+            args = (s.args[2],)
+        elseif s isa _PRCall && any(f -> f === s.f,
+                (+, -, *, /, ^, _native_mul, Base.CartesianIndex, abs, abs2, sin, cos, exp, log))
+            args = s.args
+        else
+            return nothing
+        end
+        for a in args
+            if a isa Symbol
+                a in local_values || a in external || push!(external, a)
+            elseif !_pr_vector_scalar(a)
+                return nothing
+            end
+        end
+        push!(local_values, s.lhs)
+    end
+    external
+end
+
+# A native direct-read loop already uses SIMD for the value. Its two-pass
+# reverse can reorder scalar reductions when its writes are independent by
+# cell. Check actual storage: singleton broadcasts, indirect views, aliased
+# operands and overlapping shadows retain the original sweep order.
+@inline function _pr_dense_reverse_cells(cells, operands::Tuple, shadows::Tuple)
+    dense(x) = _pr_contiguous_vector(x) && axes(x, 1) == cells
+    cells isa Union{Base.OneTo{Int},UnitRange{Int}} && all(dense, operands) &&
+        all(x -> x === nothing || dense(x), shadows) &&
+        _pr_disjoint_shadows(operands, shadows)
+end
+
+function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState, indexed::Bool)
     body = Any[a for a in cell.args if !(a isa LineNumberNode)]
     isempty(body) && _pr_fail("empty cell")
     last_stmt = body[end]
@@ -1796,26 +1954,52 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState)
         # the loop, and one partial sum per cell-varying term in it.
         value_pre, value_in, value_post = _pr_value_accumulation(
             inloop, inv2, cellvars, result, total, acc.args[1], ncells, st)
-        direct_in, read_operands = _pr_direct_reads(inloop, st, linear)
-        loop = isempty(read_operands) ?
-            :(@inbounds for $linear in $cells
-                  $(forward_in...)
-                  $(value_in...)
-                  $(reverse...)
-              end) :
-            :(if $(GlobalRef(@__MODULE__, :_pr_spans_all))($cells, $(read_operands...))
-                  @inbounds for $linear in $cells
-                      $(_pr_forward_exprs(direct_in, cuts)...)
-                      $(value_in...)
-                      $(reverse...)
-                  end
-              else
-                  @inbounds for $linear in $cells
-                      $(forward_in...)
-                      $(value_in...)
-                      $(reverse...)
-                  end
-              end)
+        direct_in, read_operands = _pr_direct_reads(inloop, st)
+        cellbody = Expr(:block, forward_in..., value_in..., reverse...)
+        plain_loop = :(@inbounds for $linear in $cells
+                           $cellbody
+                       end)
+        # The native spans-axis arm reads raw operands. Preserve its SIMD
+        # reduction when the reverse writes independently by cell. Run-scheduled
+        # loops keep their form for the index-run transformation below.
+        raw = any(s -> _pr_is_read(s, st) && s.f === _plate_read, inloop)
+        scalar_inputs = !indexed && raw && isempty(cuts) ?
+            _pr_vectorized_cell_scalars(inloop, st, linear) : nothing
+        if scalar_inputs !== nothing
+            written = unique(st.prepared[r] for r in read_operands if haskey(st.shadow, st.prepared[r]))
+            shadows = map(p -> st.shadow[p], written)
+            loop = :(if $_PR_WANT_VALUE isa Val{false} &&
+                            $(GlobalRef(@__MODULE__, :_pr_dense_reverse_cells))(
+                                $cells, ($(read_operands...),), ($(shadows...),))
+                         @inbounds @simd for $linear in $cells
+                             $cellbody
+                         end
+                     else
+                         $plain_loop
+                     end)
+            if length(written) == 1
+                loop = _pr_span_loop(linear, cells, only(written), only(shadows), read_operands,
+                                     cellbody, st.prepared, loop)
+            end
+            scalars = Expr(:tuple, _pr_bar(total), scalar_inputs...)
+            loop = :(if Base.all($(GlobalRef(@__MODULE__, :_pr_vector_scalar)), $scalars)
+                         $loop
+                     else
+                         $plain_loop
+                     end)
+        elseif isempty(read_operands)
+            loop = plain_loop
+        else
+            loop = :(if $(GlobalRef(@__MODULE__, :_pr_spans_all))($cells, $(read_operands...))
+                         @inbounds for $linear in $cells
+                             $(_pr_forward_exprs(direct_in, cuts)...)
+                             $(value_in...)
+                             $(reverse...)
+                         end
+                     else
+                         $plain_loop
+                     end)
+        end
         quote
             $(forward_pre...)
             $(init...)
@@ -1873,23 +2057,23 @@ end
 # Transform one block: its forward statements (cell loops fused, branch arms
 # transformed in place), then the reverse of its straight-line active
 # statements whose adjoints received a contribution.
-function _pr_program_block(stmts, st::_PRProgramState)
+function _pr_program_block(stmts, st::_PRProgramState, indexed_cells)
     fwd = Any[]
     record = _PRStatement[]
     for s in stmts
         s isa LineNumberNode && continue
         loop = _pr_cell_loop(s)
         if loop !== nothing
-            push!(fwd, _pr_fused_loop(loop..., st))
+            push!(fwd, _pr_fused_loop(loop..., st, loop[2] in indexed_cells))
         elseif Meta.isexpr(s, :if)
             arms = Any[s.args[1]]
             for arm in s.args[2:end]
                 push!(arms, Expr(:block, _pr_program_block(
-                    Meta.isexpr(arm, :block) ? arm.args : Any[arm], st)...))
+                    Meta.isexpr(arm, :block) ? arm.args : Any[arm], st, indexed_cells)...))
             end
             push!(fwd, Expr(:if, arms...))
         elseif Meta.isexpr(s, :block)
-            append!(fwd, _pr_program_block(s.args, st))
+            append!(fwd, _pr_program_block(s.args, st, indexed_cells))
         else
             _pr_has_loop(s) && !isdisjoint(_pr_reads!(Set{Symbol}(), s, st.mod, st.values), st.active) &&
                 _pr_fail("a loop over active values that is not a summed cell loop")
@@ -2073,7 +2257,7 @@ function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict
     outer = Set{Symbol}(a for a in active if !(a in cell_locals))
     st = _PRProgramState(mod, values, active, prepared, shadow, totals, output,
                          Set{Symbol}(), 0, outer, _pr_read_counts(body, prepared, mod, values), initializers, false)
-    new_body = _pr_program_block(stmts, st)
+    new_body = _pr_program_block(stmts, st, keys(index_runs))
     # Every outer adjoint starts at zero; every total's adjoint is the seed.
     init = Any[:($(_pr_bar(a)) = 0.0) for a in sort!(collect(outer)) if !(a in totals)]
     seeds = Any[:($(_pr_bar(t)) = $seed) for t in sort!(collect(totals))]

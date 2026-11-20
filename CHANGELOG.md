@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.334
+
+- The opt-in generated reverse of a summed plate can vectorize dense
+  derivatives when each cell writes to distinct storage. For a grouped
+  derivative, it also checks whether successive group indices address
+  consecutive entries in the parameter and gradient buffers. It vectorizes
+  verified spans and processes the remaining observations in order.
+
 ## 0.1.333
 
 - `jax_source` preserves the dtype of signed and unsigned 8-, 16-, 32- and
