@@ -21,7 +21,7 @@ ybinc = Int.(rand(rng, N) .< 1 ./ (1 .+ exp.(-(0.2 .+ 0.5 .* x))))
 ycnt = [rand(rng, 0:6) for _ in 1:N]
 ntr = fill(8, N)
 
-fam = isempty(ARGS) ? "ABCDR" : ARGS[1]
+fam = isempty(ARGS) ? "ABCDGR" : ARGS[1]
 report_header()
 record(r) = report(r, N)
 
@@ -233,6 +233,47 @@ if occursin('D', fam)
     record(probe("D-shared", "D7 Logistic, shared sigma", D7, (; x), (; y)))
 end
 
+
+# ------------------------------------------- G: count regressions, small and wide
+# The shapes of the small count regressions in the benchmark suites (a cubic
+# trend over 40 rows, with and without one effect per row) and their wide
+# siblings over a design matrix.
+if occursin('G', fam)
+    yr = collect(range(-1.0, 1.0; length = 40)); yr2 = yr .^ 2; yr3 = yr .^ 3
+    cnt40 = [rand(rng, 0:30) for _ in 1:40]; trials40 = fill(40, 40)
+    G0 = @rkppl begin
+        alpha ~ Normal(0, 10); b1 ~ Normal(0, 10); b2 ~ Normal(0, 10); b3 ~ Normal(0, 10)
+        counts .~ Poisson.(exp.(alpha .+ b1 .* yr .+ b2 .* yr2 .+ b3 .* yr3))
+    end
+    record(probe("G-count", "G0 Poisson cubic, 40 rows", G0, (; yr, yr2, yr3), (; counts = cnt40)))
+    G1 = @rkppl begin
+        alpha ~ Normal(0, 10); b1 ~ Normal(0, 10); b2 ~ Normal(0, 10)
+        counts .~ Binomial.(trials, logistic.(alpha .+ b1 .* yr .+ b2 .* yr2))
+    end
+    record(probe("G-count", "G1 Binomial quadratic, 40 rows", G1, (; yr, yr2, trials = trials40), (; counts = cnt40)))
+    G2 = @rkppl begin
+        alpha ~ Normal(0, 10); b1 ~ Normal(0, 10); b2 ~ Normal(0, 10); b3 ~ Normal(0, 10)
+        s ~ Exponential(1.0)
+        eps[axes(counts, 1)] .~ Normal.(0, s)
+        counts .~ Poisson.(exp.(alpha .+ b1 .* yr .+ b2 .* yr2 .+ b3 .* yr3 .+ eps))
+    end
+    record(probe("G-count", "G2 Poisson cubic + row effects", G2, (; yr, yr2, yr3), (; counts = cnt40)))
+    G3 = @rkppl begin
+        a ~ Normal(0, 1); beta[axes(X, 2)] .~ Normal.(0, 1)
+        y .~ Poisson.(exp.(a .+ X * beta))
+    end
+    record(probe("G-count", "G3 Poisson a + X*beta (K=5)", G3, (; X), (; y = ycnt)))
+    G4 = @rkppl begin
+        a ~ Normal(0, 1); beta[axes(X, 2)] .~ Normal.(0, 1)
+        y .~ Binomial.(n, logistic.(a .+ X * beta))
+    end
+    record(probe("G-count", "G4 Binomial a + X*beta (K=5)", G4, (; X, n = ntr), (; y = ycnt)))
+    G5 = @rkppl begin
+        a ~ Normal(0, 1); beta[axes(X, 2)] .~ Normal.(0, 1)
+        y .~ BernoulliLogit.(a .+ X * beta)
+    end
+    record(probe("G-count", "G5 BernoulliLogit a + X*beta", G5, (; X), (; y = ybinc)))
+end
 
 # ------------------------------------------------------ R: hand-written loops
 if occursin('R', fam)
