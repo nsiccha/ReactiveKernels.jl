@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.15
+
+- `binomial`'s logit route (`logkernel` and `logpdf` at a supplied logit)
+  evaluates one shared softplus and has no branch on the logit:
+  `weight * logit - n * log1pexp(-abs(logit))`, with the weight `observed` at
+  a nonpositive logit and `observed - n` at a positive one. Values agree with
+  the previous two-arm form to rounding; zero and full counts, zero trials,
+  infinite and NaN logits and the score on both sides of zero are unchanged
+  (`test_binomial_logit_kernel.jl` checks them against an extended-precision
+  reference). The ordinary reverse gradient of a Binomial-logit observation
+  plate takes about a quarter less time: 34.3 to 25.3 µs for 2000 rows and
+  five covariates (Julia 1.10.12, Enzyme `dogfood` 0.13.221, a Linux fleet
+  host, both kernels timed in one process). The density takes the same time.
+
 ## 0.1.14
 
 - `negative_binomial2` exposes `logkernel(observed)` and

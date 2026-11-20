@@ -2545,16 +2545,9 @@ function _response_likelihood_stmts_full(r::LikelihoodSpec, plan::StructuralPlan
         # positive tails. RK can fuse the predictor into this same plate.
         return _bernoulli_plate_stmts(r, plan, node, pw)
     elseif r.family === PoissonLogFam
-        # Base GLM case (no evidence, no weights, no literal range): fused
-        # whole-vector reduction (faster; the per-cell
-        # plate handles evidence/weights/ranges).
-        r.evidence.kind === :none && r.weights === nothing &&
-            r.range === nothing && r.mi_jobs === nothing && r.link === LogLink &&
-            !haskey(plan.columns, _observed_mask_name(r.response)) &&
-            !_is_bare_param_location(r, plan) &&
-            !_cell_broadcast_response(plan, r) &&
-            _wholevec_location(r, plan) &&
-            return _poisson_wholevec_stmts(r, plan, node)
+        # A summed plate like every other law: RK fuses the predictor into
+        # it, folds the data-only normalizer at binding and runs repeated
+        # rows once.
         return _poisson_plate_stmts(r, plan, node, pw)
     elseif r.family === HurdlePoissonFam
         return _hurdle_plate_stmts(r, plan, node, pw)
@@ -3035,7 +3028,7 @@ function _latent_rows(plan::StructuralPlan, name::Symbol)
     return i === nothing ? nothing : _plate_rows(plan, plan.plate_parameters[i])
 end
 
-# The fused whole-vector likelihoods (`dot(y, η)`, `sum(exp, η)`) need one
+# The fused whole-vector Binomial likelihood (`dot(y, η)`) needs one
 # location entry per response entry. A latent vector keeps its own length and
 # broadcasts as a Julia array does (one entry stretches over every row), and so
 # does a response: a number or one-entry `y` stretches over a longer location.
@@ -3550,17 +3543,7 @@ function _bernoulli_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::S
     return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
-# Fused whole-vector Poisson-log likelihood (base case: no evidence, no
-# weights). Value-identical to `Σ poisson(; log_rate=ηᵢ).logpdf(yᵢ)` for the
-# contract's nonnegative-integer `y`: `Σ yᵢ·ηᵢ − Σ exp(ηᵢ) − C`, with
-# `C = Σ loggamma(yᵢ+1)` a NAMED data-only recipe over the bound response
-# (`_ppl_lfact_<label>`), never on the gradient tape. `bound=` folds it to a
-# constant, and a binding with other counts computes its own (it is not a
-# build-time literal). `_ppl_yf_<label> = Float64.(y)` is a NAMED
-# recipe so `bound=` folds it to a constant Float vector (no per-eval alloc)
-# AND gives the fused `dot` a Float operand.
-# `sum(exp, η)` reduces without materialising the intermediate. Gradient stays
-# ordinary Enzyme AD — no analytic adjoint.
+# The Float64 response of a GLM object, named so binding folds it.
 _yfloat_name(label::Symbol) = Symbol(:_ppl_yf_, label)
 
 # A fused form keeps its emitter's statements through the pointwise plate,
@@ -3568,19 +3551,6 @@ _yfloat_name(label::Symbol) = Symbol(:_ppl_yf_, label)
 function _through_pointwise(stmts::Vector{Expr}, r::LikelihoodSpec)
     pw = _pw_name(r.label)
     return stmts[1:findfirst(st -> st.head === :(=) && st.args[1] === pw, stmts)]
-end
-
-function _poisson_wholevec_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol)
-    y = r.response
-    lp = _location_node(r, plan)
-    yf = _yfloat_name(r.label)
-    cterm = Symbol(:_ppl_lfact_, r.label)
-    return Expr[
-        _through_pointwise(_poisson_plate_stmts(r, plan, node, _pw_name(r.label)), r)...,
-        :($yf = Float64.($y)),
-        :($cterm = sum(loggamma.($yf .+ 1.0))),
-        :($node::Float64 = dot($yf, $lp) - sum(exp, $lp) - $cterm),
-    ]
 end
 
 # Fused whole-vector Binomial-logit likelihood (base case). For counts the

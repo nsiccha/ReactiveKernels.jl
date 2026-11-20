@@ -965,6 +965,7 @@ end
 const BINOMIAL_KERNEL_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma
 using LogExpFunctions: log1pexp
+using ReactiveKernels: rk_log1pexp
 using SpecialFunctions: beta_inc
 
 @kernel binomial(n::Int, p::Float64) = begin
@@ -983,19 +984,26 @@ using SpecialFunctions: beta_inc
     # `logpdf` without `lognormalizer`: the terms that read `p` or `logit`.
     logkernel(observed::Int)::Float64 = begin
         # Read the supplied logit directly so HAVE planning preserves tails.
-        # An interior count evaluates one `log1pexp` and forms the other tail
-        # term from it (`log1pexp(x) = log1pexp(-x) + x`) on the side where the
-        # sum has no cancellation; infinite and NaN logits keep their values.
+        # One softplus serves both tails. With `t = log1pexp(-|logit|)`,
+        # `log(p) = min(logit, 0) - t` and `log(1 - p) = min(-logit, 0) - t`,
+        # so the kernel is `w * logit - n * t`, with weight `w = observed` at
+        # a nonpositive logit and `w = observed - n` at a positive one: both
+        # terms are nonpositive, so neither tail cancels. The sign of the
+        # logit selects between two numbers the data fix, so a cell has no
+        # branch on the live logit, and its derivative is that of the
+        # selected side (at zero, the nonpositive side's
+        # `observed - n / 2`). A zero weight's term is selected away, not
+        # multiplied, so infinite logits keep their endpoint masses; NaN
+        # logits stay NaN. The weights stay inside this one recipe: as named
+        # values they would outnumber the probability route's recipes, and
+        # planning would then derive `p` from a supplied logit.
         lp::Float64 =
             (observed >= 0) & (observed <= n) ?
-                (n == 0 ? 0.0 :
-                 observed == 0 ? -n * log1pexp(logit) :
-                 observed == n ? -n * log1pexp(-logit) :
-                 logit >= 0 ?
-                     (l1pe = log1pexp(-logit);
-                      -observed * l1pe - (n - observed) * (l1pe + logit)) :
-                     (l1pe = log1pexp(logit);
-                      -observed * (l1pe - logit) - (n - observed) * l1pe)) :
+                (positive = logit > 0;
+                 weight = ifelse(positive, float(observed - n), float(observed));
+                 ifelse(weight == 0, 0.0, weight * logit) -
+                 ifelse(n == 0, 0.0,
+                        float(n) * rk_log1pexp(ifelse(positive, -logit, logit)))) :
                 -Inf
         lp::Float64 =
             (observed >= 0) & (observed <= n) ?
@@ -1017,17 +1025,15 @@ using SpecialFunctions: beta_inc
             loggamma(n + 1.0) - loggamma(observed + 1.0) -
                 loggamma(n - observed + 1.0) : 0.0
         # Read the supplied logit directly so HAVE planning preserves tails.
+        # The kernel as in `logkernel`; the coefficient is zero at a zero or
+        # full count and with no trials.
         lp::Float64 =
             (observed >= 0) & (observed <= n) ?
-                (n == 0 ? 0.0 :
-                 observed == 0 ? -n * log1pexp(logit) :
-                 observed == n ? -n * log1pexp(-logit) :
-                 coefficient +
-                 (logit >= 0 ?
-                     (l1pe = log1pexp(-logit);
-                      -observed * l1pe - (n - observed) * (l1pe + logit)) :
-                     (l1pe = log1pexp(logit);
-                      -observed * (l1pe - logit) - (n - observed) * l1pe))) :
+                (positive = logit > 0;
+                 weight = ifelse(positive, float(observed - n), float(observed));
+                 coefficient + ifelse(weight == 0, 0.0, weight * logit) -
+                 ifelse(n == 0, 0.0,
+                        float(n) * rk_log1pexp(ifelse(positive, -logit, logit)))) :
                 -Inf
         lp::Float64 =
             (observed >= 0) & (observed <= n) ?

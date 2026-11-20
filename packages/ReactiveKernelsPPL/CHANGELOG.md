@@ -16,6 +16,24 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.241
+
+- A Poisson-log regression without weights, evidence or a response range
+  lowers to the summed observation plate every other count likelihood uses:
+  a `logkernel` plate plus a `lognormalizer` plate whose sum folds to one
+  constant at binding. Its whole-vector formula (`dot(y, eta) - sum(exp, eta)`
+  with the generated names `_ppl_yf_<label>` and `_ppl_lfact_<label>`) is
+  removed, so the general plate passes now apply to it: the predictor is
+  computed inside the plate, and rows that repeat run once. Values and
+  gradients agree with the removed formula to rounding. Timed against it in
+  one process (2000 rows unless stated, Julia 1.10.12, Enzyme `dogfood`
+  0.13.221, a Linux fleet host), density and value-with-gradient: one
+  continuous covariate 8.0 to 4.6 µs and 13.8 to 10.7 µs; one covariate with
+  five distinct values 7.95 µs to 117 ns and 13.8 µs to 277 ns; a cubic trend
+  over 40 rows 215 to 154 ns and 377 to 326 ns, with one effect per row 236
+  to 205 ns and 458 to 409 ns; a five-column design matrix unchanged.
+  The Binomial-logit regression keeps its whole-vector form.
+
 ## 0.1.240
 
 - A submodel called in a plate can declare an elementwise prior such as

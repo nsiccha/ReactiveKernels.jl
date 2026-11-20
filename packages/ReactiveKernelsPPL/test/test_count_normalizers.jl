@@ -1,7 +1,8 @@
 # A count likelihood evaluates its data-only normalizer once, at preparation.
 # The Binomial-logit GLM base case is one whole-vector reduction whose log
 # binomial coefficients are a named data-only recipe. The Binomial,
-# zero-inflated Binomial and Poisson observation plates sum a `logkernel`
+# zero-inflated Binomial and Poisson observation plates, the Poisson-log
+# regression without weights or evidence included, sum a `logkernel`
 # plate and a `lognormalizer` plate over the bound response and trials; the
 # normalizer sum folds to one constant and the pointwise plate keeps the
 # whole `logpdf`. Values, gradients and pointwise densities match
@@ -78,6 +79,8 @@ end
     u = [0.3, -0.2]
     eta = _cn_eta(u)
     cases = (
+        ("poisson log", :(y .~ Poisson.(exp.(eta))), (;),
+            eta -> logpdf.(Poisson.(exp.(eta)), _CN_Y)),
         ("weighted binomial logit",
             :(y .~ weighted.(Binomial.(n, logistic.(eta)), w)), (; n = _CN_N, w = _CN_W),
             eta -> _CN_W .* logpdf.(Binomial.(_CN_N, logistic.(eta)), _CN_Y)),
