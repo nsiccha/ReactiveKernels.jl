@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.1.16
+
+- `standard_student_t`'s density, and with it `student_t`, is a factor that
+  reads only the degrees of freedom, `-(nu + 1) / 2`, times `log1p(z^2 / nu)`.
+  The helper `_student_log1p(nu, z)` returns that logarithm and the law
+  multiplies outside the call, so a summed plate whose cells share `nu` takes
+  the factor out of its row sum and the reverse pass differentiates it once
+  per call instead of once per row. `_student_log1p` computes
+  `log1p(z^2 / nu)` as written wherever the quotient is finite and takes the
+  form that never squares `z` only where the quotient overflows; no row
+  branches on `abs(z) > sqrt(nu)` any more. Values agree with the previous
+  kernel to rounding and the density stays finite where `z^2` overflows
+  (`test_student_kernel.jl` checks the logarithm against an extended-precision
+  reference to 4 eps on both sides of `sqrt(nu)`, zero, infinite and NaN
+  arguments, infinite `nu`, the `DomainError` of a negative `nu`, and the
+  ordinary reverse gradients of a summed plate). The ordinary reverse gradient
+  of a Student-t regression over 2000 rows takes 48.3 to 22.1 µs at a linear
+  location, 89.8 to 40.8 µs with an exp link and 47.3 to 24.4 µs with a
+  gathered intercept (Julia 1.10.12, Enzyme `dogfood` 0.13.221, a Linux fleet
+  host under a load of 20 to 50; Normal controls in the same runs moved by
+  less than 6%).
+- `_student_log_kernel` and `_student_log_kernel_at_log_abs` are removed. A
+  caller writes `ifelse(nu == Inf, -0.5, -(nu + 1) / 2) * _student_log1p(nu, z)`
+  and `_student_log1p_at_log_abs(l, nu)` with the same factor. The
+  log-magnitude form at an exponential (`ReactiveKernels._rk_log_abs_form`)
+  is registered for `_student_log1p`.
+
 ## 0.1.15
 
 - `binomial`'s logit route (`logkernel` and `logpdf` at a supplied logit)

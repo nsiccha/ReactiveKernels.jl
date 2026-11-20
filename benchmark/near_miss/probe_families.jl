@@ -3,6 +3,7 @@
 # whose mathematics has the same cost structure marks an overspecific fast path.
 include(joinpath(@__DIR__, "harness.jl"))
 import LogExpFunctions
+include(joinpath(@__DIR__, "factor_variants.jl"))
 
 # usage: julia probe_families.jl [families, e.g. ABCDR] [rows]
 const N = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 2000
@@ -113,10 +114,30 @@ if occursin('A', fam)
     record(probe("A-gauss", "A14 StudentT alpha[g] sorted", A14, (; x, g = g_sorted), (; y)))
     record(probe("A-gauss", "A14s StudentT alpha[g] shuffled", A14, (; x, g = g_shuf), (; y)))
     A15 = @rkppl begin
+        sigma ~ Exponential(1.0)
+        X = hcat(x, z)
+        alpha[levels(g)] .~ Normal.(0, 2); beta[axes(X, 2)] .~ Normal.(0, 2)
+        y .~ Normal.(alpha[g] .+ X * beta, sigma)
+    end
+    record(probe("A-gauss", "A15 alpha[g] + hcat(x,z)*beta", A15, (; x, z, g = g_sorted), (; y)))
+    A16 = @rkppl begin
+        b ~ Normal(0, 2); sigma ~ Exponential(1.0)
+        alpha[levels(g)] .~ Normal.(0, 2)
+        @scan begin
+            s[1] ~ Normal(0, 1)
+            for t in 2:T
+                s[t] ~ Normal(s[t - 1], 1)
+            end
+        end
+        y .~ Normal.(alpha[g] .+ b .* x, sigma)
+    end
+    record(probe("A-gauss", "A16 alpha[g] beside three-step scan", A16,
+        (; x, g = g_sorted, T = 3), (; y, s = [0.5, -0.25, 0.1])))
+    A17 = @rkppl begin
         a ~ Normal(0, 5); b ~ Normal(0, 2); sigma ~ Exponential(1.0)
         y[:] .~ Normal.(a .+ b .* x, sigma)
     end
-    record(probe("A-gauss", "A15 whole-column colon", A15, (; x), (; y)))
+    record(probe("A-gauss", "A17 whole-column colon", A17, (; x), (; y)))
 end
 
 # ------------------------------------------------- B: discrete-covariate GLMs
@@ -225,6 +246,21 @@ if occursin('C', fam)
     end
     record(probe("C-group", "C3 StudentT, sorted g", C3, (; x, g = g_sorted), (; y)))
     record(probe("C-group", "C3s StudentT, shuffled g", C3, (; x, g = g_shuf), (; y)))
+    C4 = @rkppl begin
+        m ~ Normal(0, 5); t ~ Exponential(1.0); b ~ Normal(0, 2); sigma ~ Exponential(1.0)
+        alpha[levels(g)[2:end]] .~ Normal.(m, t)
+        y .~ Normal.(alpha[g] .+ b .* x, sigma)
+    end
+    record(probe("C-group", "C4 Normal, reference level", C4, (; x, g = g_sorted), (; y)))
+    g_missing = replace(g_sorted, 1 => missing)
+    record(probe("C-group", "C5 Normal, missing group", C0, (; x, g = g_missing), (; y)))
+    for (law, base, obs) in ((:bernoulli, "C1", ybinc), (:poisson, "C2", ycnt))
+        for (suffix, form) in (("r", :reference), ("m", :missing), ("x", :bound_matrix),
+                ("h", :hcat), ("t", :scan))
+            model, inputs, observed = factor_case(law, form, x, z, g_sorted, obs)
+            record(probe("C-group", "$base$suffix $law, $form", model, inputs, observed))
+        end
+    end
 end
 
 # ------------------------------------------- D: shared-parameter normalizers
@@ -325,6 +361,8 @@ if occursin('R', fam)
     push!(refs, time_ref("R normal a+b*x (row loop)", ref_normal, u3, x, y))
     push!(refs, time_ref("R normal exp link", ref_normal_exp, u3, x, y))
     push!(refs, time_ref("R studentt exp link", ref_student_exp, u4, x, y, loggamma))
+    push!(refs, time_ref("R gamma log mean", ref_gamma_exp, u3, x, ypos, log.(ypos), loggamma))
+    push!(refs, time_ref("R weibull log scale", ref_weibull_exp, u3, x, log.(ypos)))
     push!(refs, time_ref("R cauchy exp link", ref_cauchy_exp, u3, x, y))
     push!(refs, time_ref("R bernoulli-logit continuous", ref_bernoulli_logit, u2, x, ybinc))
     push!(refs, time_ref("R poisson continuous", ref_poisson, u2, x, ycnt, Float64(sum(ycnt)),
