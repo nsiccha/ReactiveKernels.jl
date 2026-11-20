@@ -151,9 +151,9 @@ end
 end
 
 @testset "log-link responses stretch a singleton response" begin
-    # Bernoulli-logit and Poisson-log fuse a full response into whole-vector
-    # sums (`dot(y, eta)`); a number or one-entry response stretches over the
-    # location's rows, as Julia broadcasting and the Normal response do.
+    # Bernoulli-logit and Poisson-log responses sum one plate over the full
+    # response; a number or one-entry response stretches over the location's
+    # rows, as Julia broadcasting and the Normal response do.
     x = [-1.2, -0.4, 0.3, 0.9, 1.6]
     u = [0.1, 0.2]
     eta = u[1] .+ u[2] .* x

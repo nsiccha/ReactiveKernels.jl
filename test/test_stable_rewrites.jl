@@ -515,7 +515,9 @@ end
 # `exp.(eta)` reads `eta` and computes its `log(nu)` and `log(scale)` once.
 const student_t = DistributionKernelSources.student_t
 const standard_student_t = DistributionKernelSources.standard_student_t
-const student_log_kernel = DistributionKernelSources._student_log_kernel
+# The Student-t kernel's logarithm, `log1p(z^2 / nu)`; the law multiplies it by
+# a factor that reads only `nu`.
+const student_log1p = DistributionKernelSources._student_log1p
 
 @kernel stable_half_student(eta::Vector{Float64}, nu::Float64, location::Float64,
                             scale::Float64) = begin
@@ -538,7 +540,7 @@ end
     return total
 end
 @kernel stable_student_dotted(eta::Vector{Float64}, nu::Float64) = begin
-    lp = student_log_kernel.(nu, exp.(eta))
+    lp = student_log1p.(nu, exp.(eta))
     total = sum(lp)
     return total
 end
@@ -558,7 +560,7 @@ end
     literal = prepare(stable_half_student; simplify = false)
     code = _code(k)
     @test occursin("_rk_at_exp_std(", code) && occursin("#stable_scale#", code)
-    @test !occursin("_student_log_kernel(", code)
+    @test !occursin("_student_log1p(", code)
     mid = [-1.0, 0.0, 0.5, 2.0]
     for nu in (1.0, 4.0, Inf), (location, scale) in ((0.0, 1.0), (0.0, 2.5), (0.7, 1.0))
         args = (nu, location, scale)
@@ -604,7 +606,7 @@ end
 end
 
 @testset "log-magnitude helpers: the literal unless the form applies" begin
-    f = student_log_kernel
+    f = student_log1p
     @test RK._rk_at_exp_std1(f, exp, 0.3, 0.0, 2.0, 3.0) ≈ f(3.0, exp(0.3) / 2) rtol = 1e-15
     @test RK._rk_at_exp_std1(f, exp, 0.3, 0.5, 2.0, 3.0) === f(3.0, (exp(0.3) - 0.5) / 2)
     @test RK._rk_at_exp1(f, exp, 0.5f0, 3.0f0) isa Float32
@@ -642,13 +644,13 @@ end
     ast = :((y, n) -> begin
         t = 0.0
         for k in 1:n
-            t = t + y / exp(2.0) + student_log_kernel(3.0, exp(1.5))
+            t = t + y / exp(2.0) + student_log1p(3.0, exp(1.5))
         end
         t
     end)
     rewritten = RK._stable_rewrites(ast, ())
     @test !occursin("#stable_scale#", string(rewritten))
-    @test eval(rewritten)(1.0, 3) ≈ 3 * (exp(-2.0) + student_log_kernel(3.0, exp(1.5)))
+    @test eval(rewritten)(1.0, 3) ≈ 3 * (exp(-2.0) + student_log1p(3.0, exp(1.5)))
 end
 
 end # module
