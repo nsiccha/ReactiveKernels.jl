@@ -423,8 +423,7 @@ end
 # reads the preferences at its first preparation; forgetting that read stands in
 # for a new session.
 forget_type_stability_preferences() =
-    foreach(preference -> preference[] = nothing,
-            ReactiveKernels._TYPE_STABILITY_PREFERENCES)
+    foreach(ReactiveKernels._clear_preference!, ReactiveKernels._TYPE_STABILITY_PREFERENCES)
 
 function with_type_stability_preferences(f, preferences::Pair...)
     dir = mktempdir()
@@ -446,6 +445,13 @@ function with_type_stability_preferences(f, preferences::Pair...)
         forget_type_stability_preferences()
         rm(dir; recursive = true)
     end
+end
+
+@testset "concurrent first reads of preparation preferences" begin
+    fixture = joinpath(@__DIR__, "concurrent_preparation_preferences.jl")
+    project = Base.active_project()
+    cmd = `$(Base.julia_cmd()) --startup-file=no --threads=4 --project=$project $fixture`
+    @test success(pipeline(cmd; stdout, stderr))
 end
 
 @testset "uninferred client values: refusal with type_stability = :error" begin

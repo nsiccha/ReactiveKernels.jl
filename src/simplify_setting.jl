@@ -14,6 +14,26 @@
 #   `ReactiveKernels:snag.bound-data-suffi-7c8369bd/decisions/2026-11-12T12-04-45-460-1gq53h7`,
 #   option 1: on by default, `bound_statistics = false` opts out.
 
+# Use the UUID overload of load_preference. Looking up a Module in Preferences
+# can write its shared module-to-UUID dictionary during concurrent preparation.
+const _PREFERENCE_UUID = Base.PkgId(@__MODULE__).uuid
+
+mutable struct _PreferenceCache{T}
+    @atomic value::Union{Nothing,T}
+end
+
+function _cached_preference(read_value, cache::_PreferenceCache{T}) where {T}
+    cached = @atomic cache.value
+    cached === nothing || return cached
+    # Concurrent first readers can each load the project preference. Use the
+    # first published value, and keep subsequent reads free of preference I/O.
+    value = read_value()::T
+    old, stored = @atomicreplace cache.value nothing => value
+    stored ? value : old::T
+end
+
+_clear_preference!(cache::_PreferenceCache) = (@atomic cache.value = nothing)
+
 struct _PreparationSetting
     # The preference key (`[ReactiveKernels] <name> = false` in the project's
     # `LocalPreferences.toml`) and the preparation keyword.
@@ -23,22 +43,22 @@ struct _PreparationSetting
     # The preference, read at the first preparation of a process, as the
     # type-stability preferences are (`type_stability.jl`); `__init__` forgets
     # a value read while an image was generated.
-    preference::Base.RefValue{Union{Nothing,Bool}}
+    preference::_PreferenceCache{Bool}
 end
 _PreparationSetting(name::String) =
-    _PreparationSetting(name, Symbol(:ReactiveKernels_, name), Ref{Union{Nothing,Bool}}(nothing))
+    _PreparationSetting(name, Symbol(:ReactiveKernels_, name), _PreferenceCache{Bool}(nothing))
 
 const _SIMPLIFY = _PreparationSetting("simplify")
 const _BOUND_STATISTICS = _PreparationSetting("bound_statistics")
 const _PREPARATION_SETTINGS = (_SIMPLIFY, _BOUND_STATISTICS)
 
 function _setting_preference(s::_PreparationSetting)
-    cached = s.preference[]
-    cached === nothing || return cached
-    value = Preferences.load_preference(@__MODULE__, s.name, true)
-    value isa Bool || throw(ArgumentError(
-        "the ReactiveKernels preference `$(s.name)` must be true or false; got $(repr(value))"))
-    s.preference[] = value
+    _cached_preference(s.preference) do
+        value = Preferences.load_preference(_PREFERENCE_UUID, s.name, true)
+        value isa Bool || throw(ArgumentError(
+            "the ReactiveKernels preference `$(s.name)` must be true or false; got $(repr(value))"))
+        value
+    end
 end
 
 # The setting of the preparation in progress: the innermost enclosing keyword,

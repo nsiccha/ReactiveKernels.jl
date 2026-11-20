@@ -2614,7 +2614,7 @@ const _PLATE_REVERSE_SCOPE = :ReactiveKernels_plate_reverse
 function _plate_reverse_enabled()
     scoped = get(task_local_storage(), _PLATE_REVERSE_SCOPE, nothing)
     scoped === nothing || return scoped::Bool
-    value = Preferences.load_preference(@__MODULE__, "plate_reverse", "off")
+    value = Preferences.load_preference(_PREFERENCE_UUID, "plate_reverse", "off")
     value in ("off", "on") || throw(ArgumentError(
         "the ReactiveKernels preference `plate_reverse` must be \"off\" or \"on\"; got $(repr(value))"))
     value == "on"

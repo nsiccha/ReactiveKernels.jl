@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.342
+
+- Concurrent kernel preparations can read their project preferences safely on
+  first use. A preparation's keywords still override the project settings for
+  its nested preparations.
+
 ## 0.1.341
 
 - A kernel prepared with `prepare_nonallocating` can reuse the factor matrix for
