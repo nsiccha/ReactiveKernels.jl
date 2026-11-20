@@ -284,10 +284,10 @@ function _ls_weighted_rewrite(p, plate, total, dataonly, wanted, next_start)
         product_slots = Int[i + 1 for (i, t) in enumerate(loc.terms) if _ls_has_live_product(t[1].tree)]
         _ls_has_live_product(c.tree) && pushfirst!(product_slots, 1)
         products = Tuple(product_slots)
-        columns = isempty(_ls_data_ids(c)) &&
-            all(t -> t[3] === nothing && t[4] === nothing, loc.terms)
+        factor = _ls_row_factor(isempty(_ls_data_ids(c)),
+            all(t -> t[3] === nothing && t[4] === nothing, loc.terms))
         return (; plate, total, selected, response, sigma, law, data, live, scalars, products,
-            columns, S = _ls_structure(loc, data, live), W = _ls_slots(c.tree, data))
+            factor, S = _ls_structure(loc, data, live), W = _ls_slots(c.tree, data))
     end
     nothing
 end
@@ -315,9 +315,9 @@ struct _LSPendingStatistics
     # The statistics arm: recipes that compute `output` from the fit.
     fast::Vector{Recipe}
     output::ValueId
-    # Whether the authored rows are one loop over bound columns: a common
-    # scale, and every term a live number times bound per-row data.
-    columns::Bool
+    # What one authored row costs, as a multiple of a row of a vectorized
+    # loop over bound columns (`_ls_row_factor`).
+    factor::Int
 end
 # A marker no binding closed computes nothing the program reads.
 (::_LSPendingStatistics)(stats, live) = false
@@ -337,7 +337,7 @@ function _ls_weighted_recipes(g, w, id)
     check = Recipe(id-1, (stats, w.sigma, live...), (usable,), guard, 0.0, nothing, false)
     fast = Recipe(id-2, (stats, w.sigma, w.response, data..., live...), (output,),
         _LSWeightedTotal{w.S,length(data)}(w.law...), 0.0, nothing, false)
-    pending = _LSPendingStatistics(check, Recipe[fast], canon_id(g, output.id), w.columns)
+    pending = _LSPendingStatistics(check, Recipe[fast], canon_id(g, output.id), w.factor)
     b = Recipe(id-1, (stats, w.sigma), (usable,), pending, 0.0, nothing, false)
     (a, b)
 end
@@ -377,7 +377,7 @@ function _ls_location_pending(p::Plan, g::Graph, r::Recipe, total::Recipe, rewri
     inputs[position] = loc
     plate = Recipe(r.id, Tuple(inputs), r.outputs, r.op, r.cost, r.cse_key, r.effectful, r.source)
     pending = _LSPendingStatistics(nothing, Recipe[read, plate, total],
-        canon_id(g, only(total.outputs).id), true)
+        canon_id(g, only(total.outputs).id), 1)
     b = Recipe(id-1, (stats, first(livevalues)), (flag,), pending, 0.0, nothing, false)
     (; first = first(selected), recipes = (a, b))
 end
@@ -392,11 +392,13 @@ end
 #   coefficient beside a shared design about 1 ns per level plus 0.26 ns per
 #   level and shared column.
 # - An authored row costs about 0.05 ns plus 0.05 ns per term where the plate
-#   is one vectorized loop over bound columns (`columns`). The grouped loop
-#   over distinct rows weights each cell by its row count and is not
-#   vectorized: about three times that per row. A row with its own scale, a
-#   gather or a matrix product costs at least six times it (a per-row scale
-#   measured 7.7 ns per row).
+#   is one vectorized loop over bound columns: a common scale, and every term
+#   a live number times bound per-row data. Other rows cost a multiple of
+#   that: the grouped loop over distinct rows, which weights each cell by its
+#   row count, about 3 times (0.46 ns per row at two coefficients); a row
+#   that reads a gather or a matrix product at least 6 times; a row with its
+#   own scale, which takes a logarithm and a division, 50 to 60 times (7.7 to
+#   9.2 ns per row; 40 is used).
 #
 # The costs below are those, in units of 0.05 ns. A binding runs its
 # statistics when they cost less than the rows its authored arm would visit:
@@ -406,7 +408,23 @@ const _LS_ENTRY_COST = 56
 const _LS_LEVEL_COST = 20
 const _LS_LEVEL_COLUMN_COST = 5
 const _LS_GROUPED_ROW_FACTOR = 3
-const _LS_SCALAR_ROW_FACTOR = 6
+const _LS_INDIRECT_ROW_FACTOR = 6
+const _LS_SCALED_ROW_FACTOR = 40
+
+# The row factor a plan fixes: `common` scale or one per row, and whether
+# every term reads bound `columns`.
+_ls_row_factor(common::Bool, columns::Bool) =
+    !common ? _LS_SCALED_ROW_FACTOR : columns ? 1 : _LS_INDIRECT_ROW_FACTOR
+
+# Whether one block per index value costs less per call than the `n` gathered
+# rows the blocks replace. With few rows per value it does not: two
+# coefficients per value pay from about ten rows each (the Rats regression,
+# five rows per rat, ran 11 to 20% slower from its blocks). A binding that
+# fails this keeps its rows through the region's authored arm, like any
+# other unusable fit, so the compiled program does not depend on it.
+_ls_blocks_pay(n::Int, k::Int, blocks::Int) =
+    n * (1 + k) * _LS_INDIRECT_ROW_FACTOR >=
+        _LS_REGION_COST + _LS_ENTRY_COST * blocks * (k * (k + 1) ÷ 2)
 
 _ls_fit(w::_LSWeightedStatistics) = w.fit
 _ls_fit(fit::Union{_LSStatistics,_LSMixedStatistics}) = fit
@@ -420,9 +438,9 @@ _ls_row_terms(fit::_LSMixedStatistics) = fit.shared.k + 1
 
 # Whether a binding's statistics arm costs less than its `rows` authored
 # rows. A fit that can never be used (`usable = false`) never does.
-function _ls_prefers_statistics(fit, rows::Int, grouped::Bool, columns::Bool)
+function _ls_prefers_statistics(fit, rows::Int, grouped::Bool, factor::Int)
     fit.usable || return false
-    factor = !columns ? _LS_SCALAR_ROW_FACTOR : grouped ? _LS_GROUPED_ROW_FACTOR : 1
+    grouped && (factor = max(factor, _LS_GROUPED_ROW_FACTOR))
     rows * (1 + _ls_row_terms(fit)) * factor >= _LS_REGION_COST + _ls_statistics_cost(fit)
 end
 
@@ -496,7 +514,7 @@ function _ls_pending_close!(g::Graph, p::Plan, recipes::Vector{Recipe}, pending:
     cold = Recipe[r for r in inside if !(r.op isa _BoundConstant)]
     any(r -> r.effectful || r.op isa Union{_LSRegion,_LSPendingStatistics}, cold) && return abandon()
     rows, grouped = _ls_pending_rows(g, cold, known)
-    _ls_prefers_statistics(fit, rows, grouped, op.columns) || return abandon()
+    _ls_prefers_statistics(fit, rows, grouped, op.factor) || return abandon()
     # Every value the statistics arm reads is ready in front of the marker: a
     # HAVE port, or the output of an earlier recipe. A bound vector the
     # grouping replaced is bound again from this binding's data.

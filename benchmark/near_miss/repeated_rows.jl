@@ -66,9 +66,9 @@ end
 # Forcing wraps the package's own rule, called in the world before the wrapper.
 const FORCED = Ref(0)
 const PACKAGE_WORLD = Base.get_world_counter()
-@eval RK _ls_prefers_statistics(fit, rows::Int, grouped::Bool, columns::Bool) =
+@eval RK _ls_prefers_statistics(fit, rows::Int, grouped::Bool, factor::Int) =
     Main.FORCED[] == 2 ? fit.usable :
-    Base.invoke_in_world($PACKAGE_WORLD, _ls_prefers_statistics, fit, rows, grouped, columns)::Bool
+    Base.invoke_in_world($PACKAGE_WORLD, _ls_prefers_statistics, fit, rows, grouped, factor)::Bool
 
 function prepared(model, inputs, rows, distinct, arm)
     ins, observed = data(inputs, rows, distinct)

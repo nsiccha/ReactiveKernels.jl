@@ -200,7 +200,7 @@ function _ls_statistics_grouped(index::AbstractVector{<:Integer},
     groups = sort!(unique(index))
     blocks = length(groups)
     usable = k >= 1 && n >= _LS_MINIMUM_ROWS_PER_PARAMETER * k * blocks &&
-        all(_ls_finite, columns) && _ls_finite(b)
+        _ls_blocks_pay(n, k, blocks) && all(_ls_finite, columns) && _ls_finite(b)
     usable || return _ls_unusable(k, blocks, Vector{Int}(groups), n)
     # Rows of each group, by a counting pass over the sorted group values.
     position = Dict{Int,Int}(g => j for (j, g) in enumerate(groups))

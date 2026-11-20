@@ -556,6 +556,31 @@ end
     end
 end
 
+@testset "blocks of few rows keep their rows" begin
+    # Two coefficients per index value cost more than the gathered rows they
+    # replace until a value has about ten rows. The binding decides; the
+    # program is the same either way.
+    kernels = Any[]
+    for (per, usable) in ((2, false), (5, false), (20, true), (200, true))
+        levels = 30
+        idx = repeat(1:levels; inner = per)
+        f, y = randn(RNG, levels * per), randn(RNG, levels * per)
+        k = prepare(ls_gathered; bound = (; idx, f, y))
+        literal = prepare(ls_gathered; bound = (; idx, f, y), bound_statistics = false)
+        push!(kernels, k)
+        @test only(v for v in k.constants if v isa RK._LSStatistics).usable == usable
+        alpha, beta = randn(RNG, levels), randn(RNG, levels)
+        value, gradient = _value_gradient(k, alpha, beta, 0.9)
+        expected, reference = _value_gradient(literal, alpha, beta, 0.9)
+        @test value ≈ expected rtol = 1e-12
+        @test gradient[1] ≈ reference[1] rtol = 1e-10
+        @test gradient[2] ≈ reference[2] rtol = 1e-10
+        @test gradient[3] ≈ reference[3] rtol = 1e-10
+    end
+    @test allequal(typeof.(kernels))
+    @test allequal(_shape.(kernels))
+end
+
 @kernel ls_columns(x::Vector{Float64}, y::Vector{Float64}, a::Float64, b::Float64,
                    sigma::Float64) = begin
     # A plate of its own, so the location is composed into the cell and the
@@ -638,11 +663,12 @@ end
     @test isempty(_weighted_fits(k)) && region(k) == 0
     @test _shape(k) == _shape(prepare(ls_columns; bound = (; x, y), bound_statistics = false))
     check(k, x, y)
-    # A per-row scale is no vectorized loop: its statistics pay from few rows.
-    for (n, statistics) in ((4, false), (24, true))
+    # A per-row scale is no vectorized loop: each row takes a logarithm and
+    # a division, so its statistics cost less from the first usable fit on.
+    for n in (4, 24)
         x, y, w = randn(RNG, n), randn(RNG, n), 0.5 .+ rand(RNG, n)
         k = prepare(ls_weighted; bound = (; x, w, y))
-        @test length(_weighted_fits(k)) == statistics
+        @test length(_weighted_fits(k)) == 1
         check(k, x, y; w)
     end
     # Rebinding: bindings that choose alike share one compiled program.
