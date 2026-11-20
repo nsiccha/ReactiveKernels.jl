@@ -16,6 +16,14 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.241
+
+- A sized prior inside a plate submodel can use a shared base distribution
+  in `restricted.` or `truncated.`. For example,
+  `x[1:n] .~ restricted.(Normal(m, 1), 0, Inf)` gives each element in that
+  cell the Normal prior and a positive transform with its log Jacobian.
+  Using `truncated.` also normalizes the prior over the interval.
+
 ## 0.1.240
 
 - A submodel called in a plate can declare an elementwise prior such as
