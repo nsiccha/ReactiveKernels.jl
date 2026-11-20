@@ -30,6 +30,96 @@ function program(cells; aliases = false)
     end
     Expr(:function, Expr(:tuple, :x, :s), Expr(:block, prefix..., loops..., :total))
 end
+
+@testset "quotient values and seeded cotangents across the floating-point range" begin
+    divop = GlobalRef(Base, :/)
+    function quotient_sweep(op)
+        q = :($divop(v1, s))
+        ast = program([op === identity ? q : Expr(:call, GlobalRef(Base, nameof(op)), q)])
+        RK.compile(first(RK._pr_program_reverse(ast, [:x, :s], RK, Dict{Symbol,Any}())))
+    end
+
+    for (op, slope) in ((abs2, z -> 2z), (sin, cos), (identity, one))
+        sweep = quotient_sweep(op)
+        for (x, d, seed) in (([1e250], 1e100, 1.0),
+                             ([0.0, 1e-313], 1e-310, 1.0),
+                             ([0.0, 1e-313], -1e-310, -0.5),
+                             ([2.0, -0.5], -0.75, 2.0),
+                             ([0.25, 1.0], Inf, 1.0),
+                             (Float32[0, 1f-38], 1f-40, 1e-100),
+                             (Float64[], 0.0, 1.0))
+            q = x ./ d
+            # Form each product in a wider exponent range before rounding to
+            # the gradient's Float64 destination. The primal uses native /.
+            dy = BigFloat(seed) .* BigFloat.(slope.(q))
+            gx = Float64.(dy ./ BigFloat(d))
+            gd = Float64(-sum(dy .* BigFloat.(q) ./ BigFloat(d); init = big"0.0"))
+            for want in (false, true)
+                dx = zeros(length(x))
+                value, ds = sweep(x, d, seed, Val(want), dx)
+                want && @test value ≈ sum(op, q; init = 0.0)
+                tolerance = eltype(x) === Float32 ? 5e-7 : 1e-13
+                @test all(isapprox.(dx, gx; rtol = tolerance, atol = 0.0))
+                @test isapprox(ds, gd; rtol = tolerance, atol = 0.0)
+            end
+        end
+    end
+
+    linear = quotient_sweep(identity)
+    # Adjacent rounding boundaries where multiplication by inv(d) changes
+    # whether the quotient or its divisor cotangent is finite.
+    for (x, d) in ((0x1.f335084b9e1fcp+1023, 0x1.f335084b9e1fdp-1),
+                   (0x1.77ee5e8d806e2p+1023, 0x1.77ee5e8d806e2p-1),
+                   (0x1.8368cae763e03p+1023, 0x1.bd5e79a7c1822p-1))
+        dx = zeros(1)
+        value, ds = linear([x], d, 1.0, Val(true), dx)
+        @test value == x / d
+        @test ds == -(x / d) / d
+    end
+    # Mutating the same bound storage must recheck its range on the next call.
+    x, dx = [1.0], zeros(1)
+    d = 0x1.bd5e79a7c1822p-1
+    linear(x, d, 1.0, Val(true), dx)
+    x[1] = 0x1.8368cae763e03p+1023
+    fill!(dx, 0)
+    value, ds = linear(x, d, 1.0, Val(true), dx)
+    @test value == x[1] / d
+    @test ds == -value / d
+
+    # The original cell order cancels to a finite result even though
+    # multiplying the seed into the first two numerators would overflow.
+    d, seed = 1e300, floatmax(Float64)
+    for want in (false, true)
+        x = [2d, 2d, -2d]
+        dx = zeros(3)
+        value, ds = linear(x, d, seed, Val(want), dx)
+        want && @test value ≈ 2.0
+        @test all(≈(seed / d), dx)
+        @test ds ≈ -2 * (seed / d)
+    end
+end
+
+@testset "distinct incoming terms exceed the exponent range before division" begin
+    divide, add, multiply, square = (GlobalRef(Base, f) for f in (:/, :+, :*, :abs2))
+    ast = program([quote
+        z = $divide(v1, s)
+        $add($multiply(a, $square(z)), $multiply(b, z))
+    end])
+    append!(ast.args[1].args, (:a, :b))
+    sweep = RK.compile(first(RK._pr_program_reverse(ast, [:x, :s], RK, Dict{Symbol,Any}())))
+    x, d, seed = [1e300], 1e250, 1e300
+    a, b = 1.0, 2.0
+    q = BigFloat(only(x)) / BigFloat(d)
+    dy = BigFloat(seed) * (2a * q + b)
+    for want in (false, true)
+        dx = zeros(1)
+        value, dd = sweep(x, d, a, b, seed, Val(want), dx)
+        want && @test value ≈ Float64(a * q^2 + b * q)
+        @test only(dx) ≈ Float64(dy / d)
+        @test dd ≈ Float64(-dy * q / d)
+    end
+end
+
 const MUL, ADD, SIN = GlobalRef(Base, :*), GlobalRef(Base, :+), GlobalRef(Base, :sin)
 # The two loops of `program(cells)` in the arms of `if 0 < s`, as the native
 # lowering puts a cell loop's direct and extruded copies: one call runs one.
