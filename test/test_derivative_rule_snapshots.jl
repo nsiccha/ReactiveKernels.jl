@@ -332,4 +332,56 @@ end
     end
 end
 end
+
+# The caller writes, after the rule's call, to an array that a constant
+# composite input holds: through the input's field, through another argument or
+# a view that is the same array, and through a global. Enzyme's write flag of
+# the composite input stays unset in each case
+# (benchmark/repro_enzyme_nested_overwrite.jl), so the reverse has to read the
+# weight the adapter retained, not the caller's array.
+module CompositeInputChecks
+using ReactiveKernels, Test
+import Enzyme
+
+struct Weights
+    values::Vector{Float64}
+end
+@kernel function weighted(g, x::Float64, seed::Float64)
+    y::Float64 = g.values[1] * x
+    dx::Float64 = g.values[1] * seed
+    return y, dx
+end
+const rule = derivative_rule(weighted; primal=:y, covector=:seed,
+    cotangents=(g=nothing, x=:dx))
+const shared = [3.0]
+
+function through_field(g, alias, x)
+    y = rule(g, x)
+    g.values[1] = 42.0
+    y
+end
+function through_alias(g, alias, x)
+    y = rule(g, x)
+    alias[1] = 42.0
+    y
+end
+function through_global(g, alias, x)
+    y = rule(g, x)
+    shared[1] = 42.0
+    y
+end
+
+@testset "caller writes to storage inside a constant rule input" begin
+    for (f, alias) in ((through_field, shared), (through_alias, shared),
+            (through_alias, view(shared, :)), (through_global, shared)), w in (3.0, -2.0)
+        shared[1] = w
+        g = Weights(shared)
+        cotangents, y = Enzyme.autodiff(Enzyme.ReverseWithPrimal, Enzyme.Const(f), Enzyme.Active,
+            Enzyme.Const(g), Enzyme.Const(alias), Enzyme.Active(2.0))
+        @test y == 2w
+        @test last(cotangents) == w
+        @test shared[1] == 42.0
+    end
+end
+end
 end
