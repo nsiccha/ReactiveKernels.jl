@@ -1,4 +1,5 @@
 using Distributions
+using Enzyme
 using ReactiveKernels
 using ReactiveKernelsPPL
 using ReactiveKernelsPPL: IdentityLink, LogitLink
@@ -6,7 +7,7 @@ using Test
 
 # SB-mirroring `me(x, sd)` measurement-error latent-predictor support:
 # a length-n_obs plate vector with shared scalar Normal args, usable as
-# (a) a ContinuousTerm design column with a free coefficient and (b) a
+# (a) a ContinuousTerm with a free coefficient and (b) a
 # likelihood mean (`x_obs ~ Normal(x_true, sd)`, scalar constant sd).
 # Oracles are independent per-row Distributions.jl loops, never the
 # emitted plate forms; gradients cross-check Enzyme against central
@@ -40,10 +41,14 @@ end
 # posterior test adds it, mirroring the gaussian value test).
 function _me_oracle(cols, a, b, sigma, x_true; loc = 0.5, scale = 1.5,
         sd = 0.5)
-    mu = a .+ b .* x_true
-    ll_main = sum(logpdf.(Normal.(mu, sigma), cols[:y]))
-    ll_obs = sum(logpdf.(Normal.(x_true, sd), cols[:x_obs]))
-    pr_lat = sum(logpdf.(Normal(loc, scale), x_true))
+    y, x_obs = cols[:y], cols[:x_obs]
+    ll_main, ll_obs, pr_lat = 0.0, 0.0, 0.0
+    for i in eachindex(y, x_obs, x_true)
+        x = x_true[i]
+        ll_main += logpdf(Normal(a + b * x, sigma), y[i])
+        ll_obs += logpdf(Normal(x, sd), x_obs[i])
+        pr_lat += logpdf(Normal(loc, scale), x)
+    end
     pr_coef = logpdf(Normal(0, 1), a) + logpdf(Normal(0, 2), b)
     pr_sig = logpdf(Exponential(1), sigma)
     return (; ll_main, ll_obs, pr_lat, pr_coef, pr_sig)
@@ -160,7 +165,7 @@ end
     @test :a in [p.name for p in plan.parameters]
     @test isempty(plan.population_priors)
     # Undotted scaling keeps Julia scalar×vector semantics through the
-    # transform path too (the dotted spelling takes the design path).
+    # transform path too (the dotted spelling lowers to a ContinuousTerm).
     ast2 = Expr(:block,
         :(a ~ Normal(0, 1)),
         :(b ~ Normal(0, 2)),
@@ -225,14 +230,12 @@ end
     @test shape.width == 2
     @test shape.blocks[2].kind === ContinuousTerm
     @test shape.blocks[2].column === :x_true
-    # The design recipe materializes the latent view so the hcat stays
-    # homogeneous (Enzyme), while data columns stay bare. The intercept's
-    # rows are read from the observed column the latent is measured by.
-    recs = preprocessing_recipes(plan)
-    drec = only(r for r in recs if r.args[1] === design_name(:mu))
-    rows = Expr(:call, GlobalRef(ReactiveKernelsPPL, :_observation_rows), :x_obs)
-    @test drec == :(_ppl_design_mu =
-        Float64.(hcat(ones($rows), Float64.(x_true))))
+    # The latent plate supplies the rows of the affine predictor directly.
+    @test all(r -> r.args[1] !== design_name(:mu), preprocessing_recipes(plan))
+    body = kernel_expr(plan, assign_layout(plan)).args[2]
+    rhs = only(st.args[2] for st in body.args if Meta.isexpr(st, :(=), 2) &&
+        st.args[1] === :mu)
+    @test ReactiveKernelsPPL._is_plate_do(rhs) && :x_true in rhs.args[1].args[2:end]
 end
 
 @testset "contract me: latent offsets and invalid factor terms" begin
@@ -370,17 +373,18 @@ end
     built = build_kernel(plan)
     @test built.layout.total == 9
     u = [0.1, -0.2, 0.3, 0.5, -0.4, 0.2, -0.1, 0.0, 0.15]
-    nt = constrain(built.layout, u)
-    a, b = nt.a, nt.b
-    ref = _me_oracle(plan.columns, a, b, nt.sigma, Vector(nt.x_true))
+    components(v) = _me_oracle(plan.columns, v[1], v[2], exp(v[3]), @view(v[4:end]))
+    # The exponential transform of sigma contributes its log-Jacobian.
+    posterior(v) = sum(components(v)) + v[3]
+    ref = components(u)
     @test abs(_query(built.spec, plan, :likelihood, u) -
         (ref.ll_main + ref.ll_obs)) < 1e-12
     @test abs(_query(built.spec, plan, :prior, u) -
         (ref.pr_lat + ref.pr_coef + ref.pr_sig)) < 1e-12
-    # Posterior adds the sigma exp-Jacobian (u[3] is log-sigma).
-    @test abs(_query(built.spec, plan, :posterior, u) -
-        (ref.ll_main + ref.ll_obs + ref.pr_lat + ref.pr_coef + ref.pr_sig +
-            u[3])) < 1e-12
+    kernel = prepare_query(built, plan, :sampler)
+    @test abs(Base.invokelatest(kernel, u) - posterior(u)) < 1e-12
+    gradient = only(Base.invokelatest(Enzyme.gradient, Enzyme.Reverse, kernel, u))
+    @test all(isapprox.(gradient, _findiff_grad(posterior, u); rtol=1e-6, atol=1e-8))
     _check_gradient(built.spec, plan, u)
 end
 
