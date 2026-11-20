@@ -484,4 +484,82 @@ end
     @test collect(gradient) ≈ [2sum(residual ./ w[active].^2), -2value]
 end
 
+@kernel ls_mixed(X::Matrix{Float64}, idx::Vector{Int}, y::Vector{Float64},
+                 alpha::Vector{Float64}, beta::Vector{Float64}, sigma::Float64) = begin
+    mu = alpha[idx] .+ X * beta
+    lp = plate(y, mu) do yi, mi
+        normal(mi, sigma).logpdf(yi)
+    end
+    total::Float64 = sum(lp)
+    return total
+end
+
+@kernel ls_mixed_weighted(X::Matrix{Float64}, idx::Vector{Int}, w::Vector{Float64}, y::Vector{Float64},
+                         alpha::Vector{Float64}, beta::Vector{Float64}, sigma::Float64) = begin
+    mu = alpha[idx] .+ X * beta
+    scales = sigma .* w
+    lp = plate(y, mu, scales) do yi, mi, si
+        si > 0 ? normal(mi, si).logpdf(yi) : -Inf
+    end
+    total::Float64 = sum(lp)
+    return total
+end
+
+@testset "one grouped coefficient and a shared design" begin
+    for weighted in (false, true)
+        model = weighted ? ls_mixed_weighted : ls_mixed
+        kernels = Any[]
+        for (n, levels) in ((0, 5), (1, 1), (60, 15), (400, 100))
+            X = randn(RNG, n, 3)
+            y = randn(RNG, n)
+            idx = shuffle(RNG, repeat(1:levels, cld(n, levels))[1:n])
+            w = [isodd(i) ? 0.75 : 1.5 for i in 1:n]
+            data = weighted ? (; X, idx, w, y) : (; X, idx, y)
+            k = prepare(model; bound = data)
+            push!(kernels, k)
+            stats = weighted ? only(v.fit for v in k.constants if v isa RK._LSWeightedStatistics) :
+                only(v for v in k.constants if v isa RK._LSMixedStatistics)
+            @test stats.usable == (n >= 60)
+            if stats.usable
+                @test size(stats.cross) == (levels, 3)
+                @test n > 100 || isempty(findings(k, (Vector{Float64}, Vector{Float64}, Float64)))
+            end
+            alpha, beta, sigma = randn(RNG, levels), randn(RNG, 3), 0.8
+            value, grad = _value_gradient(k, alpha, beta, sigma)
+            expected, da, db, ds = 0.0, zero(alpha), zero(beta), 0.0
+            for i in eachindex(y)
+                sd = weighted ? sigma*w[i] : sigma
+                r = y[i] - (alpha[idx[i]] + dot(view(X, i, :), beta))
+                expected += -0.5 * log(2pi) - log(sd) - 0.5 * (r/sd)^2
+                da[idx[i]] += r/sd^2
+                db .+= (r/sd^2) .* view(X,i,:)
+                ds += ((r/sd)^2 - 1) / sigma
+            end
+            @test value ≈ expected
+            @test grad[1] ≈ da
+            @test grad[2] ≈ db
+            @test grad[3] ≈ ds
+        end
+        @test allequal(typeof.(kernels))
+        @test allequal(_shape.(kernels))
+    end
+
+    # A shared intercept belongs to the span of the grouped intercepts.
+    # For these large opposite coefficients the literal rows cancel exactly.
+    idx, X, y = repeat(1:4, 20), ones(80, 1), zeros(80)
+    k = prepare(ls_mixed; bound = (; idx, X, y))
+    @test !only(v for v in k.constants if v isa RK._LSMixedStatistics).usable
+    value, grad = _value_gradient(k, fill(1e14, 4), [-1e14], 0.8)
+    @test value ≈ length(y) * (-log(2pi)/2 - log(0.8))
+    @test iszero(grad[1]) && iszero(grad[2])
+
+    # A large coordinate can have a moderate contribution through a tiny
+    # local column. Scale the residual by its column norm before squaring.
+    local_column = fill(1e-80, length(idx))
+    tiny = RK._ls_statistics_mixed(idx, local_column, 1e-80 .* randn(RNG, length(idx), 1),
+                                   y, nothing)
+    @test tiny.usable
+    @test RK._ls_rss_mixed(tiny, fill(1e180, 4), (0.0,)) ≈ length(y) * 1e200
+end
+
 end

@@ -236,6 +236,8 @@ function _ls_statistics_grouped(index::AbstractVector{<:Integer},
     _LSStatistics(k, blocks, factor, perm, hi, lo, Vector{Int}(groups), sh + sl, n, true)
 end
 
+include("mixed_least_squares.jl")
+
 # --- evaluation --------------------------------------------------------------
 
 # The live values of one dense block, `θ` the concatenation of `sources`: a
@@ -310,17 +312,20 @@ end
 # a live value times a coefficient of bound data, plus bound offsets. Its
 # structure `S` records the operations and argument positions:
 #
-#     S = (grouped::Bool, index::Int, terms, offsets)
+#     S = (gathered_slots, index::Int, terms, offsets)
 #     term = (coefficient, live::Int, matrix::Int)
 #     coefficient = literal | (:data, position) | (operation, coefficients...)
 #
 # `live` and `matrix` are positions among the operation's live and data
 # arguments. A coefficient reads a number or one bound entry per row. A dense location
-# (`grouped = false`) reads a live number as is (`matrix = 0`) or a live vector
+# (empty `gathered_slots`) reads a live number as is (`matrix = 0`) or a live vector
 # through a data matrix (`(X * v)[i]`); a grouped one reads each live vector at
-# the data index `index` (`v[index[i]]`). Offsets are coefficients alone.
+# the data index `index` (`v[index[i]]`). A mixed location reads one grouped
+# term and its other terms directly or through shared data matrices.
 
-_ls_grouped(S) = S[1]
+_ls_mixed(S) = 0 < length(first(S)) < length(_ls_terms(S))
+_ls_fit_type(S) = _ls_mixed(S) ? _LSMixedStatistics : _LSStatistics
+_ls_grouped(S) = !isempty(first(S))
 _ls_index(S) = S[2]
 _ls_terms(S) = S[3]
 _ls_offsets(S) = S[4]
@@ -352,8 +357,9 @@ _ls_coefficient_expr(c, x) = c == 1 ? x : :($(_ls_coefficient_expr(c)) * $x)
 function _ls_row_expr(S)
     grouped, index, terms, offsets = S
     parts = Any[]
-    for (coefficient, l, m) in terms
-        x = grouped ? :(live[$l][data[$index][i]]) :
+    for (j, (coefficient, l, m)) in enumerate(terms)
+        gather = j in grouped
+        x = gather ? :(live[$l][data[$index][i]]) :
             m == 0 ? :(live[$l]) : :(_ls_row_product(data[$m], live[$l], i))
         push!(parts, _ls_coefficient_expr(coefficient, x))
     end
@@ -372,8 +378,8 @@ least-squares statistics of its plate's response (`_ls_rss`). It holds no
 array of its own: the plate's own loop, which runs only where the collapsed
 residual is not used, reads it row by row.
 """
-struct _LSLocation{S,T,D<:Tuple,L<:Tuple} <: AbstractVector{T}
-    stats::_LSStatistics
+struct _LSLocation{S,T,D<:Tuple,L<:Tuple,F} <: AbstractVector{T}
+    stats::F
     data::D
     live::L
     rows::Int
@@ -394,10 +400,19 @@ end
     sources = Expr(:tuple, (:(live[$l]) for (_, l, _) in terms)...)
     # `X * v` requires `v` to be a vector with one entry per column of `X`.
     checks = Any[:(_ls_check_product(data[$m], live[$l])) for (_, l, m) in terms if m != 0]
+    norm = if _ls_mixed(S)
+        local_slot = only(grouped)
+        shared = Expr(:tuple, (:(live[$l]) for (i, (_, l, _)) in enumerate(terms) if i != local_slot)...)
+        :(_ls_rss_mixed(x.stats, live[$(terms[local_slot][2])], $shared))
+    elseif _ls_grouped(S)
+        :(_ls_rss_grouped(x.stats, $sources))
+    else
+        :(_ls_rss_dense(x.stats, $sources))
+    end
     quote
         data, live = x.data, x.live
         $(checks...)
-        $(grouped ? :(_ls_rss_grouped(x.stats, $sources)) : :(_ls_rss_dense(x.stats, $sources)))
+        $norm
     end
 end
 _ls_check_product(X::AbstractMatrix, v::AbstractVector) = size(X, 2) == length(v) ||
@@ -416,12 +431,12 @@ only that location, which the eligible arm drops (`_ls_class_residual`).
 """
 struct _LSLocationCall{S,ND,NL,DROP} end
 _LSLocationCall(S, ndata::Int, nlive::Int, drop::Tuple) = _LSLocationCall{S,ndata,nlive,drop}()
-@inline function (::_LSLocationCall{S,ND,NL})(stats::_LSStatistics, response,
+@inline function (::_LSLocationCall{S,ND,NL})(stats, response,
                                              args::Vararg{Any,N}) where {S,ND,NL,N}
     data = ntuple(k -> args[k], Val(ND))
     live = ntuple(k -> args[ND + k], Val(NL))
     T = _ls_location_eltype(data, live)
-    _LSLocation{S,T,typeof(data),typeof(live)}(stats, data, live, length(response))
+    _LSLocation{S,T,typeof(data),typeof(live),typeof(stats)}(stats, data, live, length(response))
 end
 _ls_drop(::_LSLocationCall{S,ND,NL,DROP}) where {S,ND,NL,DROP} = DROP
 _ls_eltype(x::Number) = typeof(x)
@@ -494,30 +509,42 @@ _ls_index_data(x, n) = false
 # Generated from `S`, so each data read is concretely typed.
 @generated function _ls_bind(::Val{S}, response, data::Tuple, scales = nothing) where {S}
     grouped, index, terms, offsets = S
+    unusable = _ls_mixed(S) ? :(_ls_mixed_unusable(n)) : :(_ls_unusable(0, 0, Int[], n))
     body = Any[]
     for c in offsets
         push!(body, quote
             rows = $(_ls_column_expr(c))
-            rows === nothing && return _ls_unusable(0, 0, Int[], n)
+            rows === nothing && return $unusable
             b .-= rows
         end)
     end
     columns = Symbol[Symbol(:column_, k) for k in eachindex(terms)]
     for ((c, _, m), column) in zip(terms, columns)
-        push!(body, :($column = $(_ls_column_expr(c))), :($column === nothing && return _ls_unusable(0, 0, Int[], n)))
-        if !grouped && m != 0
-            push!(body, :(_ls_design_matrix(data[$m], n) || return _ls_unusable(0, 0, Int[], n)),
+        push!(body, :($column = $(_ls_column_expr(c))), :($column === nothing && return $unusable))
+        if m != 0
+            push!(body, :(_ls_design_matrix(data[$m], n) || return $unusable),
                   :($column = $column .* data[$m]))
         end
     end
-    result = grouped ? quote
-        _ls_index_data(data[$index], n) || return _ls_unusable(0, 0, Int[], n)
-        _ls_statistics_grouped(data[$index], ($(columns...),), b, scales)
-    end : :(_ls_statistics_dense(hcat($(columns...)), b, scales))
+    result = if _ls_mixed(S)
+        local_slot = only(grouped)
+        shared = [v for (i, v) in enumerate(columns) if i != local_slot]
+        quote
+            _ls_index_data(data[$index], n) || return _ls_mixed_unusable(n)
+            _ls_statistics_mixed(data[$index], $(columns[local_slot]), hcat($(shared...)), b, scales)
+        end
+    elseif _ls_grouped(S)
+        quote
+            _ls_index_data(data[$index], n) || return $unusable
+            _ls_statistics_grouped(data[$index], ($(columns...),), b, scales)
+        end
+    else
+        :(_ls_statistics_dense(hcat($(columns...)), b, scales))
+    end
     quote
+        n = response isa AbstractVector ? length(response) : 0
         response isa AbstractVector{<:Real} && firstindex(response) == 1 ||
-            return _ls_unusable(0, 0, Int[], 0)
-        n = length(response)
+            return $unusable
         b = Vector{Float64}(response)
         $(body...)
         $result
@@ -851,21 +878,20 @@ _ls_slots(x::Tuple, data) = (first(x), (_ls_slots(a, data) for a in Base.tail(x)
 # The structure `S` of an affine location over `data` and `live` (positions).
 function _ls_structure(x::_LSLinearForm, data::Vector{ValueId}, live::Vector{ValueId})
     coef(c) = _ls_slots(c.tree, data)
-    grouped = x.terms[1][4] !== nothing
-    index = grouped ? findfirst(==(x.terms[1][4]), data) : 0
+    local_terms = findall(t -> t[4] !== nothing, x.terms)
+    index = isempty(local_terms) ? 0 : findfirst(==(x.terms[first(local_terms)][4]), data)
     terms = Tuple((coef(c), findfirst(==(l), live),
                    m === nothing ? 0 : findfirst(==(m), data)) for (c, l, m, _) in x.terms)
-    (grouped, index, terms, Tuple(coef(c) for c in x.offsets))
+    (Tuple(local_terms), index, terms, Tuple(coef(c) for c in x.offsets))
 end
 
-# Whether the terms read one way: all through one index, or none through any;
-# and each live value once.
+# One bound index supplies the disjoint blocks. A mixture of shared and
+# local columns currently uses a single local direction per group.
 function _ls_consistent(x::_LSLinearForm)
-    indices = unique(i for (_, _, _, i) in x.terms)
-    length(indices) == 1 || return false
-    if only(indices) !== nothing
-        all(m === nothing for (_, _, m, _) in x.terms) || return false
-    end
+    local_terms = [t for t in x.terms if t[4] !== nothing]
+    all(t -> t[3] === nothing, local_terms) || return false
+    length(unique(t[4] for t in local_terms)) <= 1 || return false
+    length(local_terms) <= 1 || length(local_terms) == length(x.terms) || return false
     lives = [l for (_, l, _, _) in x.terms]
     allunique(lives)
 end
@@ -976,7 +1002,7 @@ function _partial_bound_statistics(p::Plan, bound_values::Vector{Value})
         stem = Symbol(location.name)
         # Named from the location, never a fresh gensym: a name that changes
         # between preparations changes the prepared program's identity.
-        stats = value!(copied, Symbol(stem, :_least_squares), _LSStatistics)
+        stats = value!(copied, Symbol(stem, :_least_squares), _ls_fit_type(S))
         loc = value!(copied, Symbol(stem, :_least_squares_location), Any)
         datavalues = Value[copied.values[id] for id in data]
         livevalues = Value[copied.values[id] for id in live]

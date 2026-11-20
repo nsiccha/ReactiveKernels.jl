@@ -148,8 +148,8 @@ function _ls_scale_law(r::Recipe, y, m, s)
        square = poly[:square])
 end
 
-struct _LSWeightedStatistics
-    fit::_LSStatistics
+struct _LSWeightedStatistics{F}
+    fit::F
     logsum::Float64
     smallest::Float64
     largest::Float64
@@ -159,22 +159,30 @@ struct _LSWeightedStatistics
 end
 struct _LSWeightedBind{S,W} end
 @generated function (::_LSWeightedBind{S,W})(response, args...) where {S,W}
+    missing = _ls_mixed(S) ? :(_ls_mixed_unusable(n)) : :(_ls_unusable(0, 0, Int[], n))
     quote
         data = args
         n = response isa AbstractVector ? length(response) : 0
         scales = $(_ls_column_expr(W))
         if scales === nothing || isempty(scales) || !all(_ls_positive_scale, scales)
-            return _LSWeightedStatistics(_ls_unusable(0, 0, Int[], n), NaN, NaN, NaN, NaN, NaN)
+            return _LSWeightedStatistics($missing, NaN, NaN, NaN, NaN, NaN)
         end
         fit = _ls_bind(Val($(QuoteNode(S))), response, data, scales)
         _ls_weighted_statistics(fit, scales)
     end
 end
 _ls_positive_scale(x) = isfinite(x) && x > 0
+_ls_rss0(fit::_LSStatistics) = fit.rss0
+_ls_rss0(fit::_LSMixedStatistics) = fit.shared.rss0
+_ls_factor_bound(fit::_LSStatistics) = norm(fit.factor)*sqrt(fit.k)
+_ls_centre_bound(fit) = maximum(abs, fit.hi; init=0.0) + maximum(abs, fit.lo; init=0.0)
+_ls_factor_bound(fit::_LSMixedStatistics) = _ls_factor_bound(fit.shared) +
+    norm(fit.norms) + sqrt(fit.shared.k) * norm(fit.cross)
 function _ls_weighted_statistics(fit, scales)
     lo, hi = extrema(scales)
-    _LSWeightedStatistics(fit, sum(log, scales), lo, hi,
-        norm(fit.factor)*sqrt(fit.k), maximum(abs, fit.hi; init=0.0) + maximum(abs, fit.lo; init=0.0))
+    centre = _ls_centre_bound(fit)
+    fit isa _LSMixedStatistics && (centre = max(centre, _ls_centre_bound(fit.shared)))
+    _LSWeightedStatistics(fit, sum(log, scales), lo, hi, _ls_factor_bound(fit), centre)
 end
 
 _ls_magnitude(x) = Inf
@@ -198,7 +206,7 @@ function (guard::_LSScaleGuard{I})(w::_LSWeightedStatistics, sigma::Float64, liv
     small, large = sigma*w.smallest, sigma*w.largest
     floatmin(Float64) <= small && isfinite(large) || return false
     m = _ls_magnitude(live)
-    radius = w.factor_norm * (m + w.centre) + sqrt(w.fit.rss0)
+    radius = w.factor_norm * (m + w.centre) + sqrt(_ls_rss0(w.fit))
     isfinite(radius * w.largest) && radius < sqrt(floatmax(Float64)) &&
         radius / sigma < guard.maxnorm && _plate_factor_usable(inv(sigma)^2)
 end
@@ -268,7 +276,7 @@ end
 
 function _ls_weighted_recipes(p, g, w, id)
     output = only(w.total.outputs)
-    stats = value!(g, Symbol(output.name, :_weighted_statistics), _LSWeightedStatistics)
+    stats = value!(g, Symbol(output.name, :_weighted_statistics), _LSWeightedStatistics{_ls_fit_type(w.S)})
     usable = value!(g, Symbol(output.name, :_weighted_usable), Bool)
     data = [g.values[i] for i in w.data]
     live = [g.values[i] for i in w.live]
