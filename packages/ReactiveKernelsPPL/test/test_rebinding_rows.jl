@@ -310,6 +310,36 @@ end
         build_kernel(scalar() | (; y)), scalar() | (; y = [1, 2, 3]), :likelihood)
 end
 
+@testset "a reference-only factor rebinds to observed effects" begin
+    model = @rkppl begin
+        a ~ Normal(0, 1)
+        c[levels(g)[2:end]] .~ Normal.(0, 1)
+        mu = a .+ c[g]
+        y .~ Normal.(mu, 1.0)
+    end
+    cases = (([7, 7], [0.2, -0.4], Float64[], [0, 0]),
+             ([4, 8, 4, 12], [0.3, 0.1, -0.2, 0.7], [0.25, -0.4], [0, 1, 0, 2]))
+    bindings = [model(; g) | (; y) for (g, y, _, _) in cases]
+    builds = build_kernel.(bindings)
+    @test ReactiveKernelsPPL._same_program(builds[1].program, builds[2].program)
+    for (plan, (_, y, c, codes)) in zip(bindings, cases)
+        a = 0.15
+        residual = y .- [a + (j == 0 ? 0.0 : c[j]) for j in codes]
+        expected = logpdf(Normal(), a) + sum(logpdf.(Normal(), c)) +
+            sum(logpdf.(Normal(), residual))
+        dc = [sum(residual[codes .== j]) - c[j] for j in eachindex(c)]
+        layout = assign_layout(plan)
+        u = collect(Float64, unconstrain(layout, (; a, c)))
+        score = unconstrain(layout, (; a = sum(residual) - a, c = dc))
+        for built in builds
+            sampler = prepare_sampler(built, plan, u; backend = _RR_BACKEND)
+            value, gradient = sampler_value_and_gradient!(sampler, similar(u), u)
+            @test value ≈ expected
+            @test gradient ≈ score
+        end
+    end
+end
+
 # A censored response with a bound scale per row partitions its rows by the
 # guards it is written with (`sig > 0`, `y < lim`, `y <= lim`). With
 # ReactiveKernels' `branch_arms = :all` (its `[ReactiveKernels]` preference;
