@@ -133,19 +133,25 @@ julia --startup-file=no --project=<env> benchmark/near_miss/probe_families.jl C 
 julia --startup-file=no --project=<env> benchmark/near_miss/factor_scaling.jl 20000 50,500,5000 normal,bernoulli full,reference,missing,bound_matrix,hcat,scan
 ```
 
-On `8a7f69f42`, the full-cover and reference-coded siblings had the following
-costs. Each pair gives full cover first and reference coding second.
-The 5,000-level reference design has 99,980,000 entries. Gaussian
-least-squares preparation can hide the cost of building it at smaller sizes.
+At 20,000 rows, each cell gives the cost on `8a7f69f42` followed by the
+cost with factor gathers on `a9959a24b`. The 5,000-level reference design
+previously had 99,980,000 entries. The two revisions ran in separate Julia
+processes on gordito with one BLAS thread.
 
-| Law | Levels | Setup (s) | Setup (MiB) | Density (µs) | Value and gradient (µs) |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Normal | 50 | 0.286 / 0.407 | 89.6 / 144 | 2.20 / 0.85 | 4.01 / 2.28 |
-| Normal | 500 | 0.855 / 2.02 | 91.1 / 633 | 3.65 / 82.8 | 10.1 / 166 |
-| Normal | 5,000 | 1.93 / 111 | 278 / 6,042 | 5.72 / 22,290 | 23.9 / 114,133 |
-| Bernoulli-logit | 50 | 0.163 / 0.199 | 62.8 / 76.5 | 170 / 239 | 222 / 346 |
-| Bernoulli-logit | 500 | 0.174 / 0.261 | 64.5 / 284 | 173 / 1,993 | 227 / 3,959 |
-| Bernoulli-logit | 5,000 | 2.41 / 1.51 | 248 / 2,369 | 179 / 48,226 | 216 / 91,627 |
+| Law | Levels | Factor | Setup (s) | Setup (MiB) | Density (µs) | Value and gradient (µs) |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| Normal | 50 | full | 0.286 → 0.383 | 89.5 → 89.1 | 2.20 → 2.24 | 4.01 → 4.20 |
+| Normal | 50 | reference | 0.407 → 0.442 | 144 → 90.8 | 0.849 → 2.38 | 2.28 → 4.15 |
+| Normal | 500 | full | 0.855 → 2.07 | 91.0 → 90.6 | 3.65 → 4.00 | 10.1 → 10.4 |
+| Normal | 500 | reference | 2.02 → 1.90 | 633 → 92.5 | 82.8 → 5.75 | 166 → 11.2 |
+| Normal | 5,000 | full | 1.93 → 2.59 | 278 → 276 | 5.72 → 5.71 | 23.9 → 23.9 |
+| Normal | 5,000 | reference | 111 → 3.29 | 6,042 → 286 | 22,290 → 7.44 | 114,133 → 30.8 |
+| Bernoulli-logit | 50 | full | 0.163 → 0.272 | 62.8 → 62.5 | 170 → 172 | 222 → 227 |
+| Bernoulli-logit | 50 | reference | 0.199 → 0.271 | 76.5 → 64.2 | 239 → 257 | 346 → 324 |
+| Bernoulli-logit | 500 | full | 0.174 → 0.287 | 64.5 → 64.0 | 173 → 269 | 227 → 238 |
+| Bernoulli-logit | 500 | reference | 0.261 → 0.264 | 284 → 65.9 | 1,993 → 182 | 3,959 → 235 |
+| Bernoulli-logit | 5,000 | full | 2.41 → 2.77 | 248 → 245 | 179 → 173 | 216 → 324 |
+| Bernoulli-logit | 5,000 | reference | 1.51 → 3.06 | 2,369 → 258 | 48,226 → 208 | 91,627 → 325 |
 
 ### After lowering factor terms to level gathers
 
@@ -186,3 +192,21 @@ both paths. The A15 model with an authored matrix went from 2.13 to
 7.41 µs. Reference coding, missing labels and the separate scan at this
 smaller row count improved from 2.28, 2.30 and 2.37 µs to 1.21, 1.24
 and 1.05 µs respectively.
+
+### Allocation of the reference-level coefficient table
+
+At 20,000 rows the original gather implementation allocated a new
+`vcat(0.0, effects)` on every call. The prepared sampler had a vector cache
+for this step, but the concatenation method accepted only vector operands.
+Allowing the scalar zero to fill the same cache as the coefficient vector
+gave the following results for both reference coding and missing labels.
+Normal, Bernoulli-logit and Poisson gave the same allocation counts.
+
+| Levels | Density allocations / bytes, initial gather | Density allocations / bytes, reusable table | Gradient allocations / bytes, initial gather | Gradient allocations / bytes, reusable table |
+| ---: | ---: | ---: | ---: | ---: |
+| 50 | 2 / 512 | 1 / 16 | 6 / 1,184 | 0 / 0 |
+| 5,000 | 3 / 40,064 | 1 / 16 | 8 / 80,288 | 0 / 0 |
+
+The full-cover and scan controls also used 1 allocation of 16 bytes for
+`q(u)` and zero for `sampler_value_and_gradient!`. The public density call
+returns a boxed `Float64` through its world-age barrier.

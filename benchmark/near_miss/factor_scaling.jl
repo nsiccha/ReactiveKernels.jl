@@ -23,9 +23,10 @@ function measure_factor(law, form, n, k)
     isfinite(value) && all(isfinite, g) || error("nonfinite result for $law $form ($n, $k)")
     density = @b $q($u) seconds=0.3
     gradient = @b sampler_value_and_gradient!($q, $g, $u) seconds=0.3
-    @printf("%-10s %-12s %6d %5d %10.4f %12.2f %12.0f %12.0f\n",
+    @printf("%-10s %-12s %6d %5d %10.4f %12.2f %12.0f %12.0f %7d %9d %7d %9d\n",
         law, form, n, k, preparation.time, preparation.bytes / 2^20,
-        density.time * 1e9, gradient.time * 1e9)
+        density.time * 1e9, gradient.time * 1e9,
+        density.allocs, density.bytes, gradient.allocs, gradient.bytes)
     flush(stdout)
 end
 
@@ -34,7 +35,7 @@ counts = length(ARGS) < 2 ? [50, 500, 5000] : parse.(Int, split(ARGS[2], ','))
 laws = length(ARGS) < 3 ? [:normal, :bernoulli] : Symbol.(split(ARGS[3], ','))
 forms = length(ARGS) < 4 ? [:full, :reference, :missing, :bound_matrix, :hcat, :scan] :
     Symbol.(split(ARGS[4], ','))
-println("law        form           rows levels    setup_s    setup_MiB   density_ns  val_grad_ns")
+println("law        form           rows levels    setup_s    setup_MiB   density_ns  val_grad_ns   d_alloc   d_bytes   g_alloc   g_bytes")
 for law in laws, form in forms
     # A fresh model for each preparation excludes sampler-cache hits. The
     # small case first warms Julia methods and is printed with its row count.
