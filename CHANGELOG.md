@@ -16,6 +16,27 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.353
+
+- On a CUDA device, a `jax_source` module integrates each `rk_ode_rk45_tol`
+  solve per lane in one Pallas (Triton) kernel, instead of diffrax's
+  batched while loop. Every vmapped call (plate cells, a sampler's chains)
+  joins one kernel call; each lane steps with its own step sizes, and only
+  the 32 lanes of a program wait for each other. The kernel takes diffrax's
+  `Dopri5` steps (first step, tableau, PID control, dense output, per-output
+  budget, retry of a non-finite trial, failure statuses), so values match the
+  CPU module up to rounding. Gradients are forward-mode sensitivities carried
+  through the kernel and contracted by a custom VJP: the derivative of the
+  same discrete solve. On a density with a five-state solve in each of 24
+  plate cells, a batched value and gradient of 64 chains took 45 ms instead
+  of 431 ms on a shared RTX 5060 Ti. `rk_ode_bdf_tol` keeps diffrax's
+  `Kvaerno5` on CUDA, with forward-mode sensitivities; so does a right-hand
+  side the kernel cannot evaluate, with a warning. CPU modules are unchanged.
+  `RK_JAX_ODE_KERNEL` (or the module's `RK_ODE_KERNEL`) is `auto`; `off` keeps
+  diffrax on CUDA, `interpret` runs the CUDA path on any backend in Pallas'
+  interpreter. The ODE section of the JAX guides is now its own page,
+  "JAX ODE solves" (`docs/src/jax-ode.md`).
+
 ## 0.1.352
 
 - The opt-in generated reverse of summed plates (`with_plate_reverse`, the

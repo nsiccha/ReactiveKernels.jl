@@ -100,6 +100,6 @@ Translation errors identify an unsupported operation instead of substituting a d
 - [JAX helpers and submodels](jax-helpers.md): shared submodel functions, and helpers with loops and branches.
 - [JAX host preparation](jax-host.md): data-only Julia in `prepare_data`.
 - [JAX translations](jax-translations.md): package-defined translations.
-- [JAX runtime and derivatives](jax-runtime.md): accelerator runtime checks, derivative rules, stable rewrites and ODE solves.
+- [JAX runtime and derivatives](jax-runtime.md), [ODE solves](jax-ode.md): runtime checks, derivative rules, stable rewrites, ODE bridges.
 
 The [Eight-schools example](eight-schools.md) explains the model and coordinate boundary that a PPL export must preserve.

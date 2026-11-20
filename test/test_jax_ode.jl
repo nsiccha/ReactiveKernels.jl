@@ -185,7 +185,8 @@ end
     sources = [jax_source(jax_ode_cells; have = (:u, :doses, :times), want = :total, data)
                for data in cases]
     @test all(==(string(first(sources))), string.(sources))
-    @test count("diffrax.diffeqsolve(", string(first(sources))) == 1
+    # One ODE solve (its definition and one call).
+    @test count("_rk_ode_solve(", string(first(sources))) == 2
     native = prepare(jax_ode_cells; have = (:u, :doses, :times), want = :total)
     if _JAX_ODE_PYTHON
         backend = AutoEnzyme(; mode = Enzyme.Reverse)
@@ -295,12 +296,11 @@ end
     return total
 end
 
-@testset "a failed solve answers -inf in a rejecting function and raises in the others" begin
-    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+# (kernel, inputs, parameters, data that solves, data where one solve fails)
+function jax_ode_reject_cases()
     ts = [1.0, 2.0, 30.0]
     good, bad = [10_000, 10_000, 10_000], [10_000, 2, 10_000]
-    # (kernel, inputs, parameters, data that solves, data where one solve fails)
-    cases = [
+    return [
         (jax_ode_reject_cells, (:u, :limits, :ts), [0.7], (good, ts), (bad, ts)),
         (jax_ode_reject_scan, (:u, :limits, :ts), [0.7], (good, ts), (bad, ts)),
         # The failing cell's arm is taken (its sign is positive), then not.
@@ -318,7 +318,13 @@ end
         (jax_ode_reject_chain, (:u, :limits, :ts), [0.7], (good, ts), ([2, 10_000, 10_000], ts)),
         (jax_ode_reject_loop, (:u, :limits, :ts), [0.7], (good, ts), (bad, ts)),
     ]
-    for (kernel, have, u, solves, fails) in cases
+end
+
+@testset "a failed solve answers -inf in a rejecting function and raises in the others" begin
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    ts = [1.0, 2.0, 30.0]
+    good, bad = [10_000, 10_000, 10_000], [10_000, 2, 10_000]
+    for (kernel, have, u, solves, fails) in jax_ode_reject_cases()
         source = jax_source(kernel; have, functions = (density = :total, value = :total),
                             rejecting = (:density,))
         text = string(source)
@@ -430,4 +436,95 @@ end
                               rejecting = (:density,)))
     @test plain == string(jax_source(jax_ode_none; have = (:u,), functions = (density = :total,)))
     @test !occursin("checkify", plain)
+end
+
+# On CUDA a module integrates every solve per lane in one Pallas kernel, with
+# forward-mode sensitivities (snag jax-ode-solve-gp-d427eb5a); `rk_ode_bdf_tol`
+# keeps diffrax there, also with forward-mode sensitivities.
+# `RK_JAX_ODE_KERNEL=interpret` runs that path on any backend, its kernel in
+# Pallas' interpreter, so these checks need no GPU. Run on a CUDA device, the
+# testsets above check the compiled kernel the same way.
+const _JAX_ODE_PALLAS = _JAX_ODE_PYTHON &&
+    success(`$RK_JAX_PYTHON -c "from jax.experimental import pallas"`)
+
+@testset "the CUDA path's per-lane solves match the native bridge (Pallas' interpreter)" begin
+    @test occursin("_rk_lane_kernel(", string(jax_source(jax_ode_cells; have = (:u, :doses, :times),
+                                                           want = :total)))
+    if _JAX_ODE_PALLAS
+        backend = AutoEnzyme(; mode = Enzyme.Reverse)
+        lanes(f) = withenv(f, "RK_JAX_ODE_KERNEL" => "interpret")
+        diffrax_only(f) = withenv(f, "RK_JAX_ODE_KERNEL" => "off")
+        # Plates of solves with ragged output times: the native values and
+        # gradients, and diffrax's own to rounding, as the lanes take its steps.
+        source = jax_source(jax_ode_cells; have = (:u, :doses, :times), want = :total)
+        native = prepare(jax_ode_cells; have = (:u, :doses, :times), want = :total)
+        doses = [100.0, 80.0, 120.0]
+        times = [[0.5, 1.0, 2.0], [0.5, 3.0], [1.0, 2.0, 4.0, 8.0]]
+        for u in ([0.3, -0.5, 1.2], [-0.2, 0.1, 0.8])
+            query = x -> native(x, doses, times)
+            got = lanes(() -> rk_jax_evaluate(source, "kernel", (u, doses, times); grad = :joint))
+            @test got.value ≈ query(u) rtol = 1e-8
+            @test got.joint_value == got.value
+            @test got.grad ≈ gradient(query, backend, u) rtol = 1e-6
+            ref = diffrax_only(() -> rk_jax_evaluate(source, "kernel", (u, doses, times); grad = true))
+            @test got.value ≈ ref.value rtol = 1e-11
+            @test got.grad ≈ ref.grad rtol = 1e-8
+        end
+        # The stiff solver: diffrax with forward-mode sensitivities.
+        stiff = jax_source(jax_ode_stiff; have = (:u, :ts), want = :total)
+        stiff_native = prepare(jax_ode_stiff; have = (:u, :ts), want = :total)
+        ts = [0.4, 4.0, 40.0, 400.0]
+        u = [log(0.04)]
+        got = lanes(() -> rk_jax_evaluate(stiff, "kernel", (u, ts); grad = true))
+        @test got.value ≈ stiff_native(u, ts) rtol = 1e-6
+        @test got.grad ≈ gradient(x -> stiff_native(x, ts), backend, u) rtol = 1e-4
+        # A trial that overflows is retried at a smaller step, alone and beside
+        # a lane that needs no retry.
+        u, ts = [100.0], [1.0, 2.0]
+        retry = jax_source(jax_ode_retry; have = (:u, :ts), want = :total)
+        got = lanes(() -> rk_jax_evaluate(retry, "kernel", (u, ts); grad = true))
+        @test got.value ≈ log1p(u[1] / 2) rtol = 1e-6
+        @test only(got.grad) ≈ 1 / (2 + u[1]) rtol = 1e-6
+        batched = jax_source(jax_ode_retry_cells; have = (:rates, :ts), want = :total)
+        for rates in ([10.0, 12.0], [10.0, 100.0])
+            got = lanes(() -> rk_jax_evaluate(batched, "kernel", (rates, ts); grad = :joint))
+            @test got.joint_value ≈ sum(log1p.(rates ./ 2)) rtol = 1e-6
+            @test got.grad ≈ 1 ./ (2 .+ rates) rtol = 1e-6
+        end
+        # A right-hand side reached through a splatting helper.
+        wrapped = jax_source(jax_ode_wrapped; have = (:u, :doses, :times), want = :total)
+        wrapped_native = prepare(jax_ode_wrapped; have = (:u, :doses, :times), want = :total)
+        u = [log(0.3)]
+        query = x -> wrapped_native(x, doses, times)
+        got = lanes(() -> rk_jax_evaluate(wrapped, "kernel", (u, doses, times); grad = true))
+        @test got.value ≈ query(u) rtol = 1e-5
+        @test got.grad ≈ gradient(query, backend, u) rtol = 1e-4
+        # Budgets and invalid inputs fail as natively.
+        budget = jax_source(jax_ode_budget; have = (:u, :ts, :limit), want = :total)
+        u, ts = [log(2.0)], [1.0, 2.0, 30.0]
+        @test lanes(() -> rk_jax_evaluate(budget, "kernel", (u, ts, 10_000))).value ≈
+              sum(exp.(-2.0 .* ts)) rtol = 1e-8
+        @test_throws r"exceeded maxsteps between requested outputs" lanes(
+            () -> rk_jax_evaluate(budget, "kernel", (u, ts, 2)))
+        @test_throws r"invalid initial state, output times" lanes(
+            () -> rk_jax_evaluate(budget, "kernel", (u, [1.0, 0.5, 2.0], 10_000)))
+        # A failed solve answers -inf in a rejecting function, in plates, scans,
+        # branches, chained solves and loops, after a blow-up or a NaN.
+        for (kernel, have, u, solves, fails) in jax_ode_reject_cases()
+            source = jax_source(kernel; have, functions = (density = :total, value = :total),
+                                rejecting = (:density,))
+            native = prepare(kernel; have, want = :total)
+            query = x -> native(x, solves...)
+            got = lanes(() -> rk_jax_evaluate(source, "density", (u, solves...); grad = :joint))
+            @test got.value ≈ query(u) rtol = 1e-6
+            @test got.joint_value == got.value
+            @test got.grad ≈ gradient(query, backend, u) rtol = 1e-4
+            failed = lanes(() -> rk_jax_evaluate(source, "density", (u, fails...); grad = :joint))
+            @test failed.value == -Inf && failed.joint_value == -Inf
+            @test_throws r"exceeded maxsteps between requested outputs|\) failed" lanes(
+                () -> rk_jax_evaluate(source, "value", (u, fails...)))
+        end
+    else
+        @test_skip false
+    end
 end
