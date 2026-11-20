@@ -6525,3 +6525,5 @@ function _kernel_rename_signature(::_KernelEndpointCallSignature{I,E}, port_name
     rename_name(x) = x isa Symbol ? port_name(x) : x
     _kernel_endpoint_call_signature(Val(map(rename_name, I)), Val(map(rename_name, E)))
 end
+
+include("kernel_constructors.jl")
