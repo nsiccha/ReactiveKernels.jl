@@ -75,11 +75,19 @@ _declared_value_name(lhs::Expr) = Meta.isexpr(lhs, :ref) ? _declared_value_name(
         _declared_value_name(lhs.args[2]) : nothing
 _declared_value_name(lhs) = nothing
 
-_is_cell_array_latent(c, ivar::Symbol, data::Set{Symbol}) =
-    Meta.isexpr(c, :call, 3) && c.args[1] === :.~ &&
-    Meta.isexpr(c.args[2], :ref, 2) && c.args[2].args[1] isa Symbol &&
-    c.args[2].args[2] === ivar && !(c.args[2].args[1] in data) &&
-    _is_cell_latent_object(c.args[3])
+# After hygienic substitution, a local `w[1:n] .~ …` has the cell's
+# indexed binding as its base: `component.w[i][1:n] .~ …`.
+_cell_sized_lhs(lhs) = Meta.isexpr(lhs, :ref) && length(lhs.args) in (2, 3) &&
+    all(_is_literal_range, lhs.args[2:end])
+
+function _is_cell_array_latent(c, ivar::Symbol, data::Set{Symbol})
+    Meta.isexpr(c, :call, 3) && c.args[1] === :.~ && _is_cell_latent_object(c.args[3]) ||
+        return false
+    lhs = c.args[2]
+    cell = _cell_sized_lhs(lhs) ? lhs.args[1] : lhs
+    return Meta.isexpr(cell, :ref, 2) && cell.args[1] isa Symbol &&
+        cell.args[2] === ivar && !(cell.args[1] in data)
+end
 
 _is_cell_latent_object(ex) = _is_dotted_call(ex) && ex.args[1] isa Symbol &&
     _cell_object_call(ex.args[1])
@@ -335,18 +343,21 @@ function _expand_cell_array_latents(st, taken, scope::_CellLatentScope)
             push!(cx.scalars, c.args[2].args[1])
         end
         _is_cell_array_latent(c, ivar, scope.data) || (push!(cells, c); continue)
-        name = c.args[2].args[1]
+        lhs = c.args[2]
+        sized = _cell_sized_lhs(lhs)
+        cell = sized ? lhs.args[1] : lhs
+        name = cell.args[1]
         leaves = _cell_latent_leaves(c.args[3])
         shapes = Any[]
         for leaf in leaves
             shape = _cell_latent_shape(leaf, cx)
-            shape isa Tuple && _sfail("cell latent `$name[$ivar] .~ …`: at each " *
+            !sized && shape isa Tuple && _sfail("cell latent `$name[$ivar] .~ …`: at each " *
                 "index `$name[$ivar]` holds the broadcast of its arguments, so " *
                 "their shapes must follow from data; the shape of " *
                 "`$(repr(leaf))` does not: $(last(shape))")
             push!(shapes, shape)
         end
-        if all(s -> s === :scalar, shapes)
+        if !sized && all(s -> s === :scalar, shapes)
             # Numbers at every index: one scalar draw per index.
             push!(cx.scalars, name)
             push!(cells, Expr(:call, :~, c.args[2], c.args[3]))
@@ -356,12 +367,19 @@ function _expand_cell_array_latents(st, taken, scope::_CellLatentScope)
         site, dims = fresh(prefix), fresh(Symbol(prefix, :_dims))
         offsets, count = fresh(Symbol(prefix, :_offsets)), fresh(Symbol(prefix, :_size))
         blocks = fresh(Symbol(prefix, :_blocks))
-        shape = _cell_broadcast_shape(shapes)
+        celldims = if sized
+            Expr(:tuple, (Expr(:call, GlobalRef(@__MODULE__, :_ppl_cell_extent),
+                _array_axis(name, axis, scope.data)) for axis in lhs.args[2:end])...)
+        else
+            Expr(:call, GlobalRef(@__MODULE__, :_ppl_cell_latent_dims),
+                _cell_broadcast_shape(shapes))
+        end
         dimscells = fresh(Symbol(prefix, :_shapes))
-        push!(prelude, Expr(:(=), dimscells, column(Expr(:call,
-            GlobalRef(@__MODULE__, :_ppl_cell_latent_dims), shape))))
-        push!(prelude, Expr(:(=), dims, Expr(:call,
-            GlobalRef(@__MODULE__, :_ppl_cell_latent_shapes), QuoteNode(name), dimscells)))
+        push!(prelude, Expr(:(=), dimscells, column(celldims)))
+        table = Expr(:call, GlobalRef(@__MODULE__, :_ppl_cell_latent_shapes),
+            QuoteNode(name), dimscells)
+        sized && push!(table.args, length(lhs.args) - 1)
+        push!(prelude, Expr(:(=), dims, table))
         push!(prelude, Expr(:(=), offsets,
             Expr(:call, GlobalRef(@__MODULE__, :_ppl_cell_latent_offsets), dims)))
         push!(prelude, Expr(:(=), blocks,
@@ -394,7 +412,7 @@ function _expand_cell_array_latents(st, taken, scope::_CellLatentScope)
         block = fresh(Symbol(prefix, :_block))
         push!(cells, Expr(:(=), block,
             Expr(:call, GlobalRef(Base, :view), site, :($blocks[$pos]))))
-        push!(cells, Expr(:(=), c.args[2], Expr(:call,
+        push!(cells, Expr(:(=), cell, Expr(:call,
             GlobalRef(@__MODULE__, :_ppl_cell_latent_block), block, :($dims[$pos]))))
         _push_cell_local!(cx, pos, position)
         cx.arrays[name] = (dims, pos)
@@ -602,6 +620,12 @@ end
 # One index's dimensions: the broadcast axes of the arguments there.
 _ppl_cell_latent_dims(axes::Tuple) = map(length, axes)
 
+@traceable function _ppl_cell_extent(n)
+    n isa Integer && !(n isa Bool) && n >= 0 || throw(ArgumentError(
+        "a cell latent's declared extent must be a nonnegative integer"))
+    return Int(n)
+end
+
 # Every index's dimensions. With one rank at every index each cell's block
 # has one concrete type. Different ranks are valid Julia but make the cells
 # type unstable, so they are warned about rather than refused.
@@ -616,6 +640,10 @@ function _ppl_cell_latent_shapes(name::Symbol, cells::AbstractVector)
         "stable; give every index's `$name[i]` the same number of dimensions"
     return Tuple{Vararg{Int}}[d for d in cells]
 end
+
+# A sized declaration establishes its rank even when the plate has no cells.
+_ppl_cell_latent_shapes(::Symbol, cells::AbstractVector, rank::Int) =
+    NTuple{rank,Int}[d for d in cells]
 
 function _ppl_cell_latent_offsets(dims::AbstractVector{<:Tuple})
     offsets = Vector{Int}(undef, length(dims) + 1)
@@ -661,6 +689,7 @@ end
 # (column-major), in one fresh vector.
 _ppl_cell_latent_entries(x::Number, dims::Tuple) = fill(x, prod(dims))
 function _ppl_cell_latent_entries(x::AbstractArray, dims::Tuple)
+    Base.Broadcast.check_broadcast_axes(map(Base.OneTo, dims), x)
     out = Vector{eltype(x)}(undef, prod(dims))
     for (k, I) in enumerate(CartesianIndices(dims))
         # A singleton dimension of `x` stretches, as broadcasting does.
