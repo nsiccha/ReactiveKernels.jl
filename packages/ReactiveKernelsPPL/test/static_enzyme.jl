@@ -1,3 +1,8 @@
+# Prepared reverse may disable atomic updates to its private shadows. That
+# setting changes neither the AD algorithm nor Enzyme's activity analysis.
+_is_static_reverse(backend) = backend isa AutoEnzyme{<:Enzyme.ReverseMode} &&
+    !Enzyme.runtime_activity(backend.mode)
+
 # Compact cell and compact partition samplers are differentiated by ordinary
 # static Reverse. Their overlay reads either a constant base entry or an active
 # one; registered Enzyme (0.13.218 measured) refuses that read

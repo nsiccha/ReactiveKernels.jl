@@ -1,4 +1,5 @@
 using Test, ReactiveKernels, ReactiveKernelsPPL, DifferentiationInterface, Enzyme
+@isdefined(_is_static_reverse) || include("static_enzyme.jl")
 
 @testset "native forward batching requires opt-in and respects explicit mode" begin
     backend = AutoEnzyme(; mode = Enzyme.Reverse)
@@ -42,7 +43,7 @@ using Test, ReactiveKernels, ReactiveKernelsPPL, DifferentiationInterface, Enzym
         @test ordinary.ad isa PreparedADKernel
         @test default_mode.ad isa PreparedADKernel
         @test requested_reverse.ad isa PreparedADKernel
-        @test requested_reverse.ad.backend == backend
+        @test _is_static_reverse(requested_reverse.ad.backend)
         basis = uses_forward ? deepcopy(fast.ad.basis) : nothing
         if case_index == 1
             direct = Base.invokelatest(prepare_ad, fast.ad.reverse.kernel,
@@ -54,7 +55,7 @@ using Test, ReactiveKernels, ReactiveKernelsPPL, DifferentiationInterface, Enzym
             reverse_direct = Base.invokelatest(prepare_ad, ordinary.ad.kernel,
                 backend, u; active=:unconstrained, native_forward_batch=true)
             @test reverse_direct isa PreparedADKernel
-            @test reverse_direct.backend == backend
+            @test _is_static_reverse(reverse_direct.backend)
             @test Base.invokelatest(ad_value_and_gradient, reverse_direct, u) ==
                 Base.invokelatest(ad_value_and_gradient, ordinary.ad, u)
         end

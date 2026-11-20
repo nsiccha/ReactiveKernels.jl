@@ -15,6 +15,7 @@ using ReactiveKernels
 using ReactiveKernelsPPL
 using ReactiveKernelsPPL: LogitLink, LogLink, ProbitLink
 using Test
+@isdefined(_is_static_reverse) || include("static_enzyme.jl")
 
 # Lower + bind + build + query a bare-location program; return
 # `(bound, built, kern, layout)`.
@@ -931,7 +932,7 @@ end
         cols = Dict{Symbol,Any}(:g => mod1.(1:n, 3), :x => sin.(1:n), :y => cos.(1:n))
         pristine = deepcopy(cols)
         bound, built, q, u = _rows_sampler(prog, cols; native_forward_batch = false)
-        @test q.ad.backend.mode === Enzyme.Reverse
+        @test _is_static_reverse(q.ad.backend)
         @test ReactiveKernelsPPL._value_axes(bound, :(a[g]); data_axes = true) == Any[n]
         @test ReactiveKernelsPPL._value_axes(bound, :(scaled[g]); data_axes = true) == Any[n]
         @test ReactiveKernelsPPL._value_axes(bound, :v; data_axes = true) == Any[n]
