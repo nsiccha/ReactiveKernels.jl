@@ -711,6 +711,12 @@ _ad_na_empty_array(::Type{A}) where {A<:Array} = A(undef, ntuple(_ -> 0, ndims(A
 function _ad_na_walk(node, tainted::Set{Symbol}, have_free::Set{Symbol},
                      constants::Tuple, ops::Tuple, caches::Tuple, elided::Set{Int},
                      fold_values::Vector{Any})
+    if Meta.isexpr(node, :if, 3) &&
+            node.args[1] == Expr(:call, GlobalRef(@__MODULE__, :_differentiate_rule))
+        _nonalloc_cache_reads!(elided, node.args[3])
+        return _ad_na_walk(node.args[2], tainted, have_free, constants, ops, caches,
+                           elided, fold_values)
+    end
     if Meta.isexpr(node, :call) && first(node.args) == GlobalRef(@__MODULE__, :_array_header!)
         # Differentiate Base's reshape of the active parent. A header left
         # over from a primal evaluation has no independent adjoint.
@@ -857,9 +863,15 @@ function _ad_na_seed_value(slot::Base.RefValue, step::Int, op)
         "cache slot to be seeded by the exemplar primal call, but step " *
         "$step ($(_opname(op))) still holds `nothing`; every step must " *
         "execute once during preparation"))
-    seeded isa Array ? copy(seeded) :
-        seeded isa AbstractArray ? collect(seeded) : seeded
+    _ad_na_owned_seed(seeded)
 end
+
+_ad_na_owned_seed(x) = x
+_ad_na_owned_seed(x::Array) = copy(x)
+_ad_na_owned_seed(x::AbstractArray) = collect(x)
+_ad_na_owned_seed(x::LinearAlgebra.Cholesky) = copy(x)
+_ad_na_owned_seed(x::LinearAlgebra.LowerTriangular{T,Matrix{T}}) where {T} =
+    LinearAlgebra.LowerTriangular(copy(parent(x)))
 
 # Re-wrap one seeded primal slot as a concretely-typed AD-owned slot.
 function _ad_na_concretize_cache(slot::Base.RefValue, step::Int, op)

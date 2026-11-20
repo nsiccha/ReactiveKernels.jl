@@ -4028,6 +4028,16 @@ end
 Base.@nospecializeinfer _plate_cell_value_type(@nospecialize(T), atomic::Bool) =
     atomic || T <: Number ? T : T <: AbstractArray ? eltype(T) : Any
 
+# A sum of cells of one machine float type starts and stays in that type.
+# If its output local declares that same type, assignment needs no conversion.
+function _plate_identity_sum_type(op::_AuthoredPlateOp{K,A}, callvalues, declared) where {K,A}
+    declared in (Float16, Float32, Float64) || return nothing
+    _owns_array_regions(op.kernel.plan) && return nothing
+    types = Any[_plate_cell_value_type(valtype(v), i in A) for (i, v) in pairs(callvalues)]
+    all(_concrete_value_type, types) || return nothing
+    Base.promote_op(op.kernel, types...) === declared ? declared : nothing
+end
+
 # The types the cell ports of `inner` (a plate's cell plan) receive from the
 # plate's call values, keyed by their identities in the cell's scalar plan.
 # The ports themselves are declared untyped; a plate nested in the cell reads
@@ -6069,13 +6079,13 @@ end
 # declared untyped, but the enclosing plate's operand types say what each cell
 # receives (`_nested_cell_have_types`).
 function _plate_inferred_input_types(p::Plan; exemplar_types = nothing,
-                                     have_types = nothing)
+                                     have_types = nothing, infer_ranks = exemplar_types !== nothing)
     g = p.graph
     target = Set(canon_id(g, v.id) for r in p.recipes
         if r.op isa _AuthoredPlateOp &&
-           (exemplar_types !== nothing ||
+           (infer_ranks ||
             any(q -> _plate_branch_operation(q.op), r.op.kernel.plan.recipes))
-        for v in r.inputs if exemplar_types !== nothing || valtype(v) === Any)
+        for v in r.inputs if infer_ranks || valtype(v) === Any)
     producer = Dict(canon_id(g, v.id) => r for r in p.recipes for v in r.outputs)
     needed = Set{Int}()
     while !isempty(target)
@@ -6126,6 +6136,8 @@ end
 function _recipe_inferred_output_types(recipe::Recipe, inputs)
     T = if recipe.op isa _BoundConstant
         typeof(recipe.op.value)
+    elseif recipe.op isa _NonallocNestedPlate
+        _nested_plate_result_type(recipe.op.slot)
     elseif recipe.op isa _LoweredOnlyOp
         Any
     elseif all(t -> t isa Type, inputs)
@@ -6430,11 +6442,19 @@ function _lower_with_ops_collecting(p::Plan;
             # number the cell received is decided once per nested call.
             branch = any(q -> _plate_branch_operation(q.op),
                          r.op.kernel.plan.recipes)
+            # The enclosing plate can prove the rank of a group's observations
+            # and gathers, just as a top-level exemplar can. Use it to select
+            # the existing vector loop, including for a branch-free inner sum.
+            cell_window = cells !== nothing && r.id in cells.recipes
+            total_recipe = cell_window ? nothing : _authored_plate_total_recipe(p, r)
+            total_fold = total_recipe === nothing ? sum : _plate_total_consumer_fold(total_recipe)
+            nested_reverse = cell_have_types !== nothing && _plate_reverse_enabled()
+            nested_ranks = nested_reverse && total_recipe !== nothing && total_fold === sum
             if (type_hints === nothing || cell_have_types !== nothing) &&
-                    (exemplar_types !== nothing || branch)
+                    (exemplar_types !== nothing || branch || nested_ranks)
                 inferred_plate_types === nothing &&
                     (inferred_plate_types = _plate_inferred_input_types(p;
-                        have_types = cell_have_types))
+                        have_types = cell_have_types, infer_ranks = nested_reverse))
                 if exemplar_types !== nothing
                     inferred_exemplar_types === nothing &&
                         (inferred_exemplar_types =
@@ -6442,13 +6462,13 @@ function _lower_with_ops_collecting(p::Plan;
                 end
                 scalars = something(inferred_exemplar_types, inferred_plate_types)
                 callvalues = _plate_inferred_values(g, r.inputs, scalars;
-                    rank_types = inferred_exemplar_types)
+                    rank_types = nested_ranks ? scalars : inferred_exemplar_types)
             end
             length(r.outputs) == 1 || throw(ArgumentError(
                 "an authored plate recipe must have exactly one pointwise output"))
             pointwise = only(r.outputs)
             pointwise_id = canon_id(g, pointwise.id)
-            if cells !== nothing && r.id in cells.recipes
+            if cell_window
                 # Computed only at the rows its reading cells read
                 # (`_cell_window!`): reserve its table slots here, as for a
                 # strip member, and lower it at each of those rows.
@@ -6473,9 +6493,6 @@ function _lower_with_ops_collecting(p::Plan;
                 push!(assigned, pointwise_id)
                 continue
             end
-            total_recipe = _authored_plate_total_recipe(p, r)
-            total_fold = total_recipe === nothing ? sum :
-                _plate_total_consumer_fold(total_recipe)
             # Scan consumers and strip refills stream sums only; another fold
             # reads its materialized pointwise port there.
             if total_fold !== sum && (haskey(pending_scans, r.id) || r.id in strip_members)
@@ -6555,15 +6572,22 @@ function _lower_with_ops_collecting(p::Plan;
                         _readonly_value_types(p, exemplar_types))
                     batch = _plate_batch_plan(p, r, readonly_value_types)
                 end
+                sum_type = if nested_ranks && declare_types
+                    _plate_identity_sum_type(r.op, callvalues, valtype(only(total_recipe.outputs)))
+                end
+                raw_total = sum_type === nothing ? total_lhs : gensym(:group_sum)
                 _lower_authored_plate_native!(
                     plate_body, runtime_ops, runtime_recipes, r.op, callargs, callvalues,
-                    pointwise_lhs, total_lhs; recycled = recycled(pointwise_id),
+                    pointwise_lhs, raw_total; recycled = recycled(pointwise_id),
                     total_fold, program = own_program,
                     readonly_slices, batch,
                     element_type = plate_element_types ?
                         first(_declared_array_layout(valtype(pointwise))) : nothing,
                     input_type_hints = type_hints === nothing ? nothing :
                         Any[type_hints[canon_id(g, v.id)] for v in r.inputs])
+                # Keep the declaration for Julia's inference. The assertion
+                # also exposes the raw sum's proved type to its reverse.
+                sum_type === nothing || push!(plate_body.args, :($total_lhs = $raw_total::$sum_type))
                 # The program is the plate's cell work where the lowering marked
                 # it (`_lower_authored_plate_cells_native!`), so the setup runs in
                 # the body and an empty domain calls no program; otherwise the

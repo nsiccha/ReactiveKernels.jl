@@ -1,5 +1,6 @@
 using ReactiveKernels
 using MutatingFunctions
+using LinearAlgebra: Symmetric, cholesky, PosDefException
 using Test
 using ReactiveKernels: plate, scan
 
@@ -74,7 +75,73 @@ const PUT_ROW = @kernel ownership_putrow(A, i, v) = begin
     result = ownership_withrow(A, i, v)
 end
 
+const OWNED_CHOLESKY = @kernel ownership_cholesky(A, triangle) = begin
+    result = cholesky(Symmetric(A, triangle))
+end
+const CHOLESKY_ENTRY = @kernel ownership_cholesky_entry(A) = begin
+    factor = cholesky(Symmetric(A)).L
+    entry = factor[2, 1]
+end
+const OWNED_LOWER = @kernel ownership_lower(A) = begin
+    result = rk_cholesky_lower(A)
+end
+
 @testset "nonallocating cache ownership and result typing" begin
+    @testset "Cholesky workspaces respect triangle, shape and input ownership" begin
+        A = [4.0 1.0; 2.0 5.0]
+        chol = prepare_nonallocating(OWNED_CHOLESKY, A, :U; want=:result)
+        lower = prepare_nonallocating(OWNED_LOWER, A; want=:result)
+        original = copy(A)
+        first_chol = chol(A, :U)
+        first_lower = lower(A)
+        entry = prepare_nonallocating(CHOLESKY_ENTRY, A; want=:entry)
+        @test entry(A) == cholesky(Symmetric(A)).L[2, 1]
+        # LinearAlgebra 1.10 materializes the transposed L of an upper
+        # factor. Later versions return a view over its factors.
+        if Base.mightalias(parent(first_chol.L), first_chol.factors)
+            @test ownership_allocations(entry, (A,)) == 0
+        end
+        @test first_chol.L == cholesky(Symmetric(A)).L
+        @test first_lower == rk_cholesky_lower(A)
+        @test A == original
+        A[2, 1] = -0.5
+        original = copy(A)
+        changed_chol = chol(A, :L)
+        parent(first_lower)[1, 2] = NaN
+        changed_lower = lower(A)
+        @test changed_chol.factors === first_chol.factors
+        @test parent(changed_lower) === parent(first_lower)
+        @test changed_chol.L == cholesky(Symmetric(A, :L)).L
+        @test parent(changed_lower) == parent(rk_cholesky_lower(A))
+        @test A == original
+
+        # A previous result can itself be the next call's covariance.
+        for (run, reference, storage) in (
+                (B -> chol(B, :L).L, B -> cholesky(Symmetric(B, :L)).L, changed_chol.factors),
+                (lower, rk_cholesky_lower, parent(changed_lower)))
+            before = copy(storage)
+            factor = run(storage)
+            @test isequal(storage, before)
+            @test factor == reference(before)
+        end
+        for B in (zeros(0, 0), [9.0;;], [6.0 0.0; 0.0 3.0])
+            @test chol(B, :U).L == cholesky(Symmetric(B)).L
+            @test lower(B) == rk_cholesky_lower(B)
+        end
+        B = view(Float32.(A), :, :)
+        chol32 = prepare_nonallocating(OWNED_CHOLESKY, B, :U; want=:result)
+        lower32 = prepare_nonallocating(OWNED_LOWER, B; want=:result)
+        f32, l32 = chol32(B, :U), lower32(B)
+        B[1, 1] += 1
+        @test chol32(B, :U).factors === f32.factors
+        @test parent(lower32(B)) === parent(l32)
+        @test f32.L == cholesky(Symmetric(B)).L
+        @test l32 == rk_cholesky_lower(B)
+        @test_throws PosDefException lower([-1.0;;])
+        @test_throws PosDefException chol([-1.0;;], :U)
+        @test lower([9.0;;])[1, 1] == chol([9.0;;], :U).L[1, 1] == 3.0
+    end
+
     @testset "indexed writes fill an independent copy" begin
         p = prepare(PUT_ROW; have = (:A, :i, :v), want = :result)
         A = reshape(collect(1.0:32), 4, 8)

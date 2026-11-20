@@ -272,7 +272,7 @@ function _jax_region_call!(ctx, p, unit, demand, labels, selector, available, mo
                                 outputs = Val(true), regions = nested)
     end
     results = _PyVal[]
-    flat_results = Union{Nothing,Vector{Pair{String,String}}}[]
+    flat_results = Union{Nothing,Vector{Pair{String,_JaxFlatRows}}}[]
     for (v, key) in zip(want, keys)
         _jax_emit!(inner, "if " * repr(key) * " in outputs:")
         scope.indent += 1

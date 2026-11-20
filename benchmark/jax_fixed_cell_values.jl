@@ -41,6 +41,31 @@ function native_value_gradient(query, u)
     query(u), gradient
 end
 
+kept_ragged_vcat(d) = @brm d begin
+    sigma ~ Exponential(1)
+    level ~ 1 + (1 | u | unit)
+    fall ~ 0 + x
+    @plate for i in eachindex(level)
+        mean_y[i] = vcat(level[i], level[i] .- fall[i] .* visit[i])
+        y[i] ~ Normal(mean_y[i], sigma)
+    end
+end
+
+@testset "BRM kept baseline followed by each unit's visits" begin
+    visit = [[0.5, 1.0], Float64[], [1.5]]
+    d = (; unit = ["a", "b", "c"], x = [0.5, 1.0, 2.0], visit,
+         y = [zeros(1 + length(t)) for t in visit])
+    rk = RKBRMI(kept_ragged_vcat(d))
+    bound = rk_bound_plan(rk)
+    src = jax_source(rk.model, bound; values = (:mean_y,))
+    query = prepare_query(rk.model, bound, (:mean_y,))
+    u = collect(range(-0.2, 0.4; length = rk.model.layout.total))
+    expected = Base.invokelatest(query, u)
+    @test length(expected) == length(visit) + sum(length, visit)
+    actual = rk_jax_evaluate(src, :constrain, (u, raw_inputs(rk, src)...); prepare = :arguments)
+    @test actual.value["mean_y"] ≈ expected rtol = 1e-12
+end
+
 @testset "BRM kept vcat cell values export through RK" begin
     @test rk_jax_available()
     @test Base.get_extension(BayesianRegressionModels,

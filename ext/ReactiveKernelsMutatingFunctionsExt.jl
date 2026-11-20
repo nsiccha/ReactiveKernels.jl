@@ -12,6 +12,10 @@ mutable struct _NestedPlateCache{K,R}
     result::R
 end
 
+# The step returns its owned result array. A following plate can use its
+# rank and element type even when the authored plate's fallback is opaque.
+ReactiveKernels._nested_plate_result_type(::Base.RefValue{_NestedPlateCache{K,R}}) where {K,R} = R
+
 function ReactiveKernels._nested_plate_cache(op::ReactiveKernels._AuthoredPlateOp{K,A},
         argtypes, ::Type{T}, N) where {K,A,T<:AbstractArray}
     isconcretetype(T) && N !== nothing || return nothing
@@ -96,21 +100,18 @@ end
     result
 end
 
-# A step whose result is a tuple of a buffer and numbers, such as RKPPL's
-# simplex and its log-Jacobian, keeps that tuple in a `Union{Nothing,T}`
-# slot, which stores it boxed: storing every call's result would allocate the
-# box every call. The slot is the destination offered to `apply!!`, which
-# reads its buffers, never its numbers, so a result that kept the slot's
-# buffers is not stored again. The differentiated driver below never stores.
+# A tuple or factor wrapper lives boxed in its `Union{Nothing,T}` slot.
+# Reuse the box when the factor is identical, or when a tuple (such as
+# RKPPL's simplex and its log-Jacobian) keeps its destination buffers.
 @inline function cache_apply!(slot::Base.RefValue{Union{Nothing,T}}, op,
-                              args...) where {T<:Tuple}
+                              args...) where {T<:Union{Tuple,LinearAlgebra.Cholesky,LinearAlgebra.LowerTriangular}}
     cache = slot[]
     result = MutatingFunctions.apply!!(cache, op, args...)
     _keeps_buffers(cache, result) || (slot[] = result)
     result
 end
 
-@inline _keeps_buffers(cache, result) = false
+@inline _keeps_buffers(cache, result) = cache === result
 @inline _keeps_buffers(cache::T, result::T) where {T<:Tuple} =
     all(map((c, r) -> isbits(c) || c === r, cache, result))
 
@@ -252,6 +253,29 @@ end
 end
 
 const _LA = ReactiveKernels.LinearAlgebra
+
+@inline function MutatingFunctions.apply!!(cache::_LA.LowerTriangular{Float64,Matrix{Float64}},
+        op::typeof(ReactiveKernels.rk_cholesky_lower), A::StridedMatrix{<:Real})
+    L = parent(cache)
+    size(L) == size(A) && !Base.mightalias(L, A) || return op(A)
+    ReactiveKernels._rk_cholesky_lower!(fill!(L, 0.0), A)
+end
+
+@inline function MutatingFunctions.apply!!(cache::_LA.Cholesky{T,Matrix{T}},
+        op::ReactiveKernels._CholeskyStep,
+        A::_LA.Symmetric{T,<:StridedMatrix{T}}) where {T<:Union{Float32,Float64}}
+    factors = cache.factors
+    size(factors) == size(A) && !Base.mightalias(factors, parent(A)) || return op(A)
+    workspace = _LA.Symmetric(factors, A.uplo == 'U' ? :U : :L)
+    # Match the allocating cholcopy: newer LinearAlgebra copies just the
+    # selected triangle, older releases materialize the symmetric matrix.
+    @static if isdefined(_LA, :copytrito!)
+        copyto!(workspace, A)
+    else
+        copyto!(factors, A)
+    end
+    _LA.cholesky!(workspace)
+end
 
 @inline function MutatingFunctions.apply!!(cache::Vector{T},
         op::typeof(ReactiveKernels._row_product_parent),

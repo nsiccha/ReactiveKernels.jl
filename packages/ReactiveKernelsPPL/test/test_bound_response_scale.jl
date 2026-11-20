@@ -18,6 +18,8 @@ using Distributions
 using Enzyme
 using DifferentiationInterface
 
+include("scale_log_bindings.jl")
+
 const backend = AutoEnzyme(; mode = Enzyme.Reverse)
 
 function bind(source, data; conditioned = (:y,))
@@ -106,10 +108,13 @@ end
         @test any(v -> v isa AbstractVector && v ≈ log.(y), B.cached(lognormal))
         @test Base.invokelatest(lognormal, u) ≈
               logpdf(Normal(0, 1), u[1]) + sum(logpdf.(LogNormal(u[1], 0.2), y))
-        # A written Student-t normalizer calls `logbeta`, which does not fold.
+        # Julia folds log(0.2) in the selected arm's pre-loop assignment.
+        # Storing that value during preparation also avoids per-row work.
         student = :(begin a ~ Normal(0, 1); y .~ StudentT.(4.0, a, 0.2) end)
         q = B.query(student, (; y))
-        @test any(v -> v isa Real && v ≈ log(0.2), B.cached(q))
+        outside, inside = B.scale_log_bindings(code_expr(q))
+        @test outside > 0 || any(v -> v isa Real && v ≈ log(0.2), q.constants)
+        @test inside == 0
         reference(v) = logpdf(Normal(0, 1), v) + sum(logpdf.(TDist(4.0), (y .- v) ./ 0.2) .- log(0.2))
         @test Base.invokelatest(q, u) ≈ reference(u[1])
         r = B.gradient_at(student, (; y), u)

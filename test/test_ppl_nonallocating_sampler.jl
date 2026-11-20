@@ -149,6 +149,36 @@ _na_density_bytes(q, u) = (q(u); q(u); @allocated q(u))
 _na_gradient_bytes(q, g, u) = (sampler_value_and_gradient!(q, g, u);
     sampler_value_and_gradient!(q, g, u); @allocated sampler_value_and_gradient!(q, g, u))
 
+@testset "NormalIDGLM reuses coefficient and residual storage" begin
+    regression = @rkppl begin
+        intercept ~ Flat()
+        beta[axes(X, 2)] .~ Flat()
+        y ~ NormalIDGLM(X, intercept, beta, 1.0)
+    end
+    for n in (5, 61)
+        X = [cos(i + j) for i in 1:n, j in 1:3]
+        y = sin.(1:n)
+        plan = regression(; X) | (; y)
+        built = build_kernel(plan)
+        u = [0.1, -0.3, 0.5, 0.2]
+        q = prepare_sampler(built, plan, u; backend = NA_SAMPLER_BACKEND)
+        @test q.kernel isa NonAllocatingKernel
+        for point in (u, -2u, u)
+            params = constrain(built.layout, point)
+            residual = y .- (params.intercept .+ X * params.beta)
+            expected = -0.5 * (sum(abs2, residual) + n * log(2π))
+            @test q(point) ≈ expected
+            @test _na_density_bytes(q.kernel, point) == 0
+            value, gradient = sampler_value_and_gradient!(q, similar(u), point)
+            @test value ≈ expected
+            # Both parameter blocks use the identity transform.
+            blocks = constrain(built.layout, gradient)
+            @test blocks.intercept ≈ sum(residual)
+            @test blocks.beta ≈ transpose(X) * residual
+        end
+    end
+end
+
 @testset "non-allocating sampler equals the ordinary sampler" begin
     for (label, plan) in _na_sampler_cases()
         @testset "$label" begin

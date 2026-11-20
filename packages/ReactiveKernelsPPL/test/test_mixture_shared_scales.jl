@@ -42,18 +42,10 @@ function finite_gradient(f, u)
     end
 end
 nodes(ex) = ex isa Expr ? 1 + sum(nodes, ex.args; init=0) : 1
-loops(ex) = ex isa Expr ? (ex.head === :for) + sum(loops, ex.args; init=0) : 0
-function scale_log_bindings(ex, in_loop=false)
-    ex isa Expr || return (0, 0)
-    in_loop |= ex.head in (:for, :while)
-    own = if ex.head === :(=) && ex.args[1] isa Symbol &&
-            occursin("plate_", String(ex.args[1])) && occursin("log_scale", String(ex.args[1]))
-        in_loop ? (0, 1) : (1, 0)
-    else
-        (0, 0)
-    end
-    foldl((a, b) -> a .+ b, (scale_log_bindings(x, in_loop) for x in ex.args); init=own)
-end
+nodes(program::ReactiveKernels._PlateProgram) = nodes(program.ast)
+loops(ex) = ex isa Expr ? (ex.head in (:for, :while)) + sum(loops, ex.args; init=0) : 0
+loops(program::ReactiveKernels._PlateProgram) = loops(program.ast)
+include("scale_log_bindings.jl")
 
 function check(q, u, y)
     g = similar(u)

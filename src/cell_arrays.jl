@@ -484,6 +484,11 @@ function _cell_array_elementwise_operands!(out, ex::Expr)
         for a in ex.args[3:end]
             a isa Symbol && push!(out, a)
         end
+    elseif fn === Base.broadcastable && length(ex.args) == 2 && ex.args[2] isa Symbol
+        # A plate over one known vector uses the vector itself as its marker.
+        # Its broadcast argument still nominates a gather for the same full
+        # read-only use check as a multi-operand marker.
+        push!(out, ex.args[2])
     end
     out
 end

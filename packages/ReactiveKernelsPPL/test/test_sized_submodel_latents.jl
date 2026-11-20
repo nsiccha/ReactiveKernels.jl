@@ -85,6 +85,66 @@ end
     @test length(constrain(built.layout, zeros(6)).channel.beta_raw) == 4
 end
 
+@rkppl positive_offsets(n, center) = begin
+    x[1:n] .~ restricted.(Normal(center, 1), 0, Inf)
+    return sum(x)
+end
+
+@rkppl truncated_offsets(n, center) = begin
+    x[1:n] .~ truncated.(Normal(center, 1), 0, Inf)
+    return sum(x)
+end
+
+@testset "bounded array priors with a shared distribution in each cell" begin
+    for submodel in (:positive_offsets, :truncated_offsets)
+        ast = quote
+            @plate for i in eachindex(n)
+                group[i] ~ $submodel(n[i], center[i])
+                y[i] ~ Normal(group[i], 1)
+            end
+        end
+        plan = lower_rkppl(ast, (:n, :center, :y); conditioned = (:y,), mod = @__MODULE__)
+        structures = []
+        for (n, center, y, u) in (([1, 1], [0.0, 0.0], [0.5, -0.1], [0.1, -0.2]),
+                ([0, 3, 2], [0.4, -0.3, 0.7], [0.1, 0.9, 1.5], collect(-0.4:0.2:0.4)),
+                (Int[], Float64[], Float64[], Float64[]))
+            bound = bind_data(plan, (; n, center, y))
+            built = build_kernel(bound)
+            @test built.layout.total == sum(n)
+            draws = constrain(built.layout, u).group.x
+            @test length.(draws) == n
+            logprior, loglik = 0.0, 0.0
+            grad = similar(u)
+            k = 0
+            for i in eachindex(n)
+                block = k .+ (1:n[i])
+                x = exp.(u[block])
+                @test draws[i] ≈ x
+                law = Normal(center[i], 1)
+                prior = submodel === :truncated_offsets ? truncated(law, 0, Inf) : law
+                logprior += sum(logpdf.(prior, x))
+                loglik += logpdf(Normal(sum(x), 1), y[i])
+                grad[block] .= 1 .+ x .* (center[i] .- x .+ (y[i] - sum(x)))
+                k += n[i]
+            end
+            for (role, term) in ((:prior, logprior), (:likelihood, loglik), (:log_jacobian, sum(u)))
+                @test Base.invokelatest(prepare_query(built, bound, role), u) ≈ term atol = 1e-12
+            end
+            expected = logprior + loglik + sum(u)
+            q = prepare_query(built, bound, :sampler)
+            @test Base.invokelatest(q, u) ≈ expected
+            isempty(u) && continue
+            sampler = prepare_sampler(built, bound, u; backend = AutoEnzyme(; mode = Enzyme.Reverse))
+            value, gradient = sampler_value_and_gradient!(sampler, similar(u), u)
+            @test value ≈ expected
+            @test gradient ≈ grad
+            push!(structures, [(r.kind, r.depth) for r in recipe_inventory(q) if r.kind !== :ordinary])
+        end
+        @test structures[1] == structures[2]
+        @test any(r -> first(r) == :plate, first(structures))
+    end
+end
+
 @rkppl matrix_weights(n, center) = begin
     w[1:n, 1:2] .~ Normal.(center, 1)
     return w

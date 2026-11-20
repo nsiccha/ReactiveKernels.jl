@@ -18,11 +18,16 @@ function rk_cholesky_lower(A::AbstractMatrix)
     n = size(A, 1)
     size(A, 2) == n || throw(ArgumentError(
         "rk_cholesky_lower needs a square matrix, got $(size(A))"))
+    _rk_cholesky_lower!(zeros(Float64, n, n), A)
+end
+
+# L is a disjoint square workspace with a zero strict upper triangle.
+function _rk_cholesky_lower!(L::Matrix{Float64}, A::AbstractMatrix)
+    n = size(A, 1)
     # Each entry of `L` is stored exactly once, after its sum is accumulated
     # in a scalar. Updating `L` in place (`L[j, j] -= …`) between the loop's
     # reads of `L` makes native Enzyme reverse tape those reads; RKPPL's
     # `_covariance_cholesky!` follows the same rule.
-    L = zeros(Float64, n, n)
     @inbounds for j in 1:n
         s = Float64(A[j, j])
         for k in 1:j-1

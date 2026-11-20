@@ -112,6 +112,61 @@ end
 # jax-source-value-3bf4c69e: BRM's `mean_y[i] = vcat(level[i], level[i] - fall[i])`).
 # The helper is translated from its authored body, as BRM's `values` recipe is.
 @traceable flatten_cells(cells) = isempty(cells) ? Float64[] : reduce(vcat, cells)
+@traceable prepend_scalar(a, row) = vcat(a, row)
+
+# A record field and a separate plate pass different per-row prefixes to
+# the same helper. A prefix survives an empty tail.
+@kernel prefixed_rows(a::Float64, x::Vector{Float64}, R::Vector{Vector{Float64}}) = begin
+    records = plate(eachindex(x), Ref(x), Ref(R)) do i, xs, rs
+        (a + xs[i], vcat(a * xs[i], a .* rs[i]))
+    end
+    singles = plate(records) do record
+        retained_second(record)
+    end
+    doubles = plate(eachindex(x), Ref(x), Ref(R)) do i, xs, rs
+        vcat(a, prepend_scalar(xs[i], a .* rs[i]))
+    end
+    first_flat = flatten_cells(singles)
+    second_flat = flatten_cells(doubles)
+    total = sum(abs2, first_flat) + sum(abs2, second_flat)
+end
+
+@testset "scalar prefixes count once per ragged row" begin
+    data = [(; x = [0.2, -0.5, 0.9], R = [[1., 2.], [3.], Float64[]]),
+            (; x = collect(range(-0.4, 0.7; length = 23)),
+               R = [collect(1.0:(i % 7)) for i in 1:23]),
+            (; x = [0.3], R = [Float64[]]),
+            (; x = Float64[], R = Vector{Float64}[])]
+    have = (:a, :x, :R)
+    functions = (firsts = :first_flat, seconds = :second_flat, total = :total)
+    sources = [jax_source(prefixed_rows; have, functions, data = d) for d in data]
+    src = first(sources)
+    @test all(s -> s.text == src.text, sources)
+    @test occursin("jax.vmap(", src.text)
+    @test occursin("do not add up", src.text)
+    if rk_jax_available()
+        native = prepare(prefixed_rows; have, want = :total)
+        a = -0.7
+        @test trace_inventory(src, (a, data[1].x, data[1].R)) ==
+              trace_inventory(src, (a, data[2].x, data[2].R))
+        for d in data
+            args = (a, d.x, d.R)
+            for (name, prefix) in ((:firsts, x -> [a * x]), (:seconds, x -> [a, x]))
+                expected = Float64[v for (x, r) in zip(d.x, d.R) for v in vcat(prefix(x), a .* r)]
+                actual = rk_jax_evaluate(src, name, args; prepare = :arguments).value
+                @test length(actual) == length(expected)
+                @test isempty(expected) || actual ≈ expected
+            end
+            result = rk_jax_evaluate(src, :total, args; grad = true, prepare = :arguments)
+            @test result.value ≈ native(args...)
+            derivative = Enzyme.autodiff(Enzyme.Reverse, native, Enzyme.Active,
+                Enzyme.Active(a), Enzyme.Const(d.x), Enzyme.Const(d.R))[1][1]
+            @test result.grad ≈ derivative
+        end
+    else
+        @test_skip "RK_JAX_PYTHON not set"
+    end
+end
 
 @kernel fixed_rows(a::Float64, x::Vector{Float64}) = begin
     groups = eachindex(x)
