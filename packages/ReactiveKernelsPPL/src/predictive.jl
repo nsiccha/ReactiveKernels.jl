@@ -104,6 +104,10 @@ _law_refused(r::LikelihoodSpec) = r.weights !== nothing || r.mi_jobs !== nothing
 # the density is not one RK distribution object of the response.
 function _law_statement(r::LikelihoodSpec, stmts::Vector{Expr})
     _law_refused(r) && return nothing
+    # Predictive adapters identify RK library objects by their name. A caller
+    # can author a density with the same name and a different sampling law.
+    r.family isa _LocationScaleFamily &&
+        r.family.binding.mod !== DistributionKernelSources && return nothing
     pw = _pw_name(r.label)
     i = findlast(st -> Meta.isexpr(st, :(=), 2) && st.args[1] === pw, stmts)
     i === nothing && return nothing

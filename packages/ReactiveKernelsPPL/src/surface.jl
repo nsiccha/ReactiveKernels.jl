@@ -1210,7 +1210,7 @@ function _lower_rkppl_once(ast, input_data::Set{Symbol}, mod::Module;
     # (`observed_scan.jl`); the rewrite is an ordinary program.
     ast = Expr(:block, _expand_observed_scans(ast.args, data)...)
     ast = _observation_call_definitions(ast, data, mod)
-    ast = _gathered_value_definitions(ast, data)
+    ast = _gathered_value_definitions(ast, data, mod)
     sample, factors, det, plate_ctx, plate_specs, scans, joints, glms, cell_broadcasts,
         cell_priors, cell_latents, cell_geometries =
         _partition_statements(ast, data; array_entries, mod)
@@ -1530,7 +1530,8 @@ function _lower_rkppl_once(ast, input_data::Set{Symbol}, mod::Module;
         # Declared arrays lower with the parameters.
         s.dims !== nothing && continue
         _external_rhs(s.rhs) && s.lhs in conditioned && continue
-        if _external_rhs(s.rhs) && s.broadcast && (s.lhs in data || s.lhs in ctx.vecdefs)
+        if s.broadcast && (s.lhs in data || s.lhs in ctx.vecdefs) &&
+                _external_observation_rhs(s.rhs, mod)
             args = _external_parameter(s.lhs, s.rhs, (), mod, ctx.taken;
                 observed=true, broadcast=true)
             observation = s.range isa UnitRange ? Expr(:ref, s.lhs,
@@ -3361,13 +3362,13 @@ _rhs_spelling_head(fn, dotted::Bool) = _builtin_rhs_head(fn) ||
     (dotted ? fn === :vcat : fn in _RHS_SPELLING_HEADS)
 
 # Apply `f` to each value argument of a built-in sampling RHS.
-_map_rhs_values(f, ex) = _map_rhs_arguments((value, _, _, _) -> f(value), ex)
+_map_rhs_values(f, ex; mod = nothing) = _map_rhs_arguments((value, _, _, _) -> f(value), ex; mod)
 
 # Apply `f(value, head, position, nargs)` to each value argument of a
 # built-in sampling RHS: positional argument `position` of the `nargs` that
 # `head` spells (`Normal.(mu, s)`: `s` is 2 of 2 of `:Normal`), or the
 # keyword's name as `position`.
-function _map_rhs_arguments(f, ex, head = nothing, position = 0, nargs = 0)
+function _map_rhs_arguments(f, ex, head = nothing, position = 0, nargs = 0; mod = nothing)
     # A mixture's component constructors are sampling syntax even when the
     # caller owns their bindings. Visit their arguments without hoisting the
     # distribution object itself into an opaque model value.
@@ -3377,35 +3378,37 @@ function _map_rhs_arguments(f, ex, head = nothing, position = 0, nargs = 0)
             _is_dotted_call(component) || return f(component, :vcat, 0, 0)
             Expr(:., component.args[1], Expr(:tuple,
                 _map_rhs_positions(f, component.args[2].args,
-                    _rhs_head_symbol(component.args[1]))...))
+                    _rhs_head_symbol(component.args[1]); mod)...))
         end
         return Expr(:., :vcat, Expr(:tuple, components...))
     end
     if ex isa Expr && ex.head === :call && !isempty(ex.args) &&
             _rhs_spelling_head(ex.args[1], false)
         return Expr(:call, ex.args[1],
-            _map_rhs_positions(f, ex.args[2:end], _rhs_head_symbol(ex.args[1]))...)
-    elseif _is_dotted_call(ex) && _rhs_spelling_head(ex.args[1], true)
+            _map_rhs_positions(f, ex.args[2:end], _rhs_head_symbol(ex.args[1]); mod)...)
+    elseif _is_dotted_call(ex) && (_rhs_spelling_head(ex.args[1], true) ||
+            (mod !== nothing && (head === nothing || head in _DOT_WRAPPERS && position == 1) &&
+                _location_scale_response(ex.args[1], mod) !== nothing))
         return Expr(:., ex.args[1], Expr(:tuple,
-            _map_rhs_positions(f, ex.args[2].args, _rhs_head_symbol(ex.args[1]))...))
+            _map_rhs_positions(f, ex.args[2].args, _rhs_head_symbol(ex.args[1]); mod)...))
     elseif ex isa Expr && ex.head === :parameters
         return Expr(:parameters,
-            Any[_map_rhs_arguments(f, a, head, position, nargs) for a in ex.args]...)
+            Any[_map_rhs_arguments(f, a, head, position, nargs; mod) for a in ex.args]...)
     elseif ex isa Expr && ex.head === :kw && length(ex.args) == 2
         return Expr(:kw, ex.args[1],
-            _map_rhs_arguments(f, ex.args[2], head, ex.args[1], nargs))
+            _map_rhs_arguments(f, ex.args[2], head, ex.args[1], nargs; mod))
     end
     return f(ex, head, position, nargs)
 end
 
-function _map_rhs_positions(f, args, head)
+function _map_rhs_positions(f, args, head; mod = nothing)
     nargs = count(a -> !Meta.isexpr(a, :parameters), args)
     out, position = Any[], 0
     for a in args
         Meta.isexpr(a, :parameters) ||
             (position += 1)
         push!(out, _map_rhs_arguments(f, a, head,
-            Meta.isexpr(a, :parameters) ? 0 : position, nargs))
+            Meta.isexpr(a, :parameters) ? 0 : position, nargs; mod))
     end
     return out
 end
@@ -3501,7 +3504,7 @@ function _observation_call_definitions(ast::Expr, data::Set{Symbol},
     end
     for st in ast.args
         if st isa Expr && (_is_sample(st) || _is_broadcast_sample(st)) &&
-                !_external_rhs(st.args[3])
+                !_external_observation_rhs(st.args[3], mod)
             observed = _sampled_lhs_names!(Set{Symbol}(), st.args[2])
             if any(in(data), observed) ||
                     (_is_broadcast_sample(st) && any(in(defined), observed))
@@ -3512,7 +3515,7 @@ function _observation_call_definitions(ast::Expr, data::Set{Symbol},
                 rhs = _categorical_logit_slice_names(rhs) do value, role
                     name!(value, stem, role)
                 end
-                rhs = _map_rhs_arguments(rhs) do value, head, position, nargs
+                rhs = _map_rhs_arguments(rhs; mod) do value, head, position, nargs
                     # Base's numbers are literals here too, so the predictor
                     # analysis reads `exp.(ifelse.(f, -Inf, 0.0))` as written.
                     value = _base_number_literals(value, mod, names)
@@ -3612,7 +3615,7 @@ _synthesized_response_names(stem::Symbol) =
 # evaluation context. Identical values share one name. Runs after
 # `_observation_call_definitions`, so a module call in a response argument
 # is already a name here.
-function _gathered_value_definitions(ast::Expr, data::Set{Symbol})
+function _gathered_value_definitions(ast::Expr, data::Set{Symbol}, mod::Module)
     detmap = Dict{Symbol,Any}(st.args[1] => st.args[2] for st in ast.args
         if Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol)
     taken = union(data, _expr_names(ast))
@@ -3655,12 +3658,12 @@ function _gathered_value_definitions(ast::Expr, data::Set{Symbol})
         if Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol
             st = Expr(:(=), st.args[1], walk(st.args[2], st.args[1]))
         elseif st isa Expr && (_is_sample(st) || _is_broadcast_sample(st)) &&
-                !_external_rhs(st.args[3])
+                !_external_observation_rhs(st.args[3], mod)
             observed = _sampled_lhs_names!(Set{Symbol}(), st.args[2])
             if any(in(data), observed) ||
                     (_is_broadcast_sample(st) && any(in(defined), observed))
                 stem = first(sort!(collect(observed)))
-                rhs = _map_rhs_values(ex -> walk(ex, stem), st.args[3])
+                rhs = _map_rhs_values(ex -> walk(ex, stem), st.args[3]; mod)
                 rhs == st.args[3] ||
                     (st = Expr(:call, st.args[1], st.args[2], rhs))
             end
@@ -8572,7 +8575,7 @@ function _lower_response(lhs, rhs, range, ctx, predictors, pred_idx, coefuse;
             ctx, predictors, pred_idx, coefuse; count_columns)
     end
     family, lik_link, pred_link, loc, scale_raw, trials, nu_raw, zi_raw,
-    interval_raw = _lower_response_base(lhs, call, ctx)
+    interval_raw, extra_args... = _lower_response_base(lhs, call, ctx)
     # Prob-space families retain a sampled scalar or a fixed value
     # predictor. Every other family
     # routes through `_lower_location`, which admits a value location
@@ -8590,9 +8593,11 @@ function _lower_response(lhs, rhs, range, ctx, predictors, pred_idx, coefuse;
     nu = _lower_nu_use(lhs, nu_raw, ctx, predictors, pred_idx, coefuse)
     zi = _lower_zi_use(lhs, zi_raw, ctx, predictors, pred_idx, coefuse)
     interval = _lower_interval_use(lhs, interval_raw, ctx)
+    extra_predictors = Symbol[_lower_argument_predictor!(lhs, ex, ctx, predictors,
+        pred_idx, coefuse, Symbol(lhs, :_, port)) for (port, ex) in extra_args]
     return LikelihoodSpec(family, lik_link, lhs, pname, scale, weights,
         evidence, Symbol(lhs, "_resp"), trials, range; nu = nu, zi = zi,
-        interval = interval)
+        interval = interval, extra_predictors = extra_predictors)
 end
 
 # Run `thunk()`; on a surface failure, attribute it to mixture component
@@ -9546,8 +9551,7 @@ function _dot2call_response(lhs, rhs)
         rhs.args[1] === :Categorical && return rhs
     rhs isa Expr && rhs.head === :. ||
         return _dot2call_object_error(lhs, rhs)
-    length(rhs.args) == 2 && rhs.args[1] isa Symbol &&
-        rhs.args[2] isa Expr && rhs.args[2].head === :tuple ||
+    _is_dotted_call(rhs) ||
         _sfail("response $lhs: malformed dotted object $(repr(rhs)) " *
                "(`Normal.(mu, sigma)` — no field access, no keywords)")
     targs = rhs.args[2].args
@@ -9626,9 +9630,7 @@ function _dot2call_nested_object(lhs, a)
     # wrapper level, just as it does directly under the dotted tilde.
     a isa Expr && !isempty(a.args) && a.args[1] === :Categorical &&
         return _dot2call_response(lhs, a)
-    a isa Expr && a.head === :. && length(a.args) == 2 &&
-        a.args[1] isa Symbol && a.args[2] isa Expr &&
-        a.args[2].head === :tuple ||
+    _is_dotted_call(a) ||
         _sfail("response $lhs: broadcast the object " *
                "(`Normal.(...)` — `.~` is elementwise at every level)")
     targs = a.args[2].args
@@ -9788,6 +9790,39 @@ end
 _bare_slot_name(arg, ctx) = arg isa Symbol && !haskey(ctx.detmap, arg) &&
     !_is_declared_array(arg, ctx)
 
+# Existing constructor aliases (including TDist's standardized Student-t)
+# share their prior mapping. An exported RK density with the location/scale
+# boundary also supplies a response without a separate surface declaration.
+# A model module's unrelated Julia constructor still owns its sampling RHS.
+function _location_scale_response(head::Symbol, mod::Module)
+    name = get(_PARAM_FAMILIES, head, nothing)
+    name === nothing || return get(_LOCATION_SCALE_LAWS, name, nothing)
+    isdefined(mod, head) && return _location_scale_response(GlobalRef(mod, head), mod)
+    spelling = String(head)
+    isuppercase(first(spelling)) || return nothing
+    return get(_LOCATION_SCALE_LAWS, Symbol(lowercasefirst(spelling)), nothing)
+end
+function _location_scale_response(head::Expr, mod::Module)
+    Meta.isexpr(head, :., 2) && head.args[2] isa QuoteNode &&
+        head.args[2].value isa Symbol || return nothing
+    owner = _lowering_module_path(head.args[1], mod)
+    owner === nothing && return nothing
+    return _location_scale_response(GlobalRef(owner, head.args[2].value), mod)
+end
+function _location_scale_response(ref::GlobalRef, mod::Module)
+    isdefined(ref.mod, ref.name) || return nothing
+    object = getglobal(ref.mod, ref.name)
+    applicable(ReactiveKernels.kernel_endpoint_names, object) || return nothing
+    # An alias for an exported kernel shares its predictive law too.
+    for law in values(_LOCATION_SCALE_LAWS)
+        getglobal(law.binding.mod, law.binding.name) === object && return law
+    end
+    return _location_scale_law(ref)
+end
+_location_scale_response(head, mod) = nothing
+_external_observation_rhs(rhs, mod) = _external_rhs(rhs) &&
+    !(_is_dotted_call(rhs) && _location_scale_response(rhs.args[1], mod) !== nothing)
+
 function _lower_response_base(lhs, rhs::Expr, ctx)
     rhs.head === :call || _sfail("response $lhs: $_RESPONSE_BASE_MSG; " *
                                  "got $(repr(rhs))")
@@ -9795,23 +9830,26 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
     fam === :weighted &&
         _sfail("`weighted.(...)` goes outermost: " *
                "`y .~ weighted.(Normal.(mu, sigma), w)`")
-    fam in (:Normal, :StudentT, :Bernoulli, :Poisson, :Binomial,
+    law = _location_scale_response(fam, ctx.mod)
+    if law !== nothing
+        args = _plain_args(rhs, "`$fam`")
+        fam isa Symbol && (args = _distribution_args(fam, args))
+        length(args) == length(law.ports) || _sfail("response $lhs: `$fam` takes " *
+            "`$fam.($(join(law.ports, ", ")))`")
+        inputs = NamedTuple{law.ports}(Tuple(args))
+        family = _location_scale_family(law)
+        nu = family === StudentTFam ? inputs.nu : nothing
+        extras = (port => inputs[port] for port in _location_scale_extra_ports(law))
+        return family, IdentityLink, IdentityLink, inputs.location, inputs.scale,
+            nothing, nu, nothing, nothing, extras...
+    end
+    fam in (:Bernoulli, :Poisson, :Binomial,
         :NegativeBinomial2, :NegativeBinomial, :Gamma, :Beta, :HurdlePoisson,
         :ZeroInflatedPoisson, :ZeroInflatedBinomial, :InverseGaussian, :Exponential,
-        :BetaBinomial2, :VonMises, :CircularVonMises, :LogNormal, :Weibull) ||
+        :BetaBinomial2, :VonMises, :CircularVonMises, :Weibull) ||
         return _lower_response_base_error(lhs, rhs, fam)
     args = _distribution_args(fam, _plain_args(rhs, "`$fam`"))
-    if fam === :Normal
-        length(args) == 2 || _sfail("response $lhs: `Normal` takes " *
-                                    "`Normal.(mu, sigma)`")
-        return GaussianFam, IdentityLink, IdentityLink, args[1], args[2],
-        nothing, nothing, nothing, nothing
-    elseif fam === :StudentT
-        length(args) == 3 || _sfail("response $lhs: `StudentT` takes " *
-                                    "`StudentT.(nu, mu, sigma)`")
-        return StudentTFam, IdentityLink, IdentityLink, args[2], args[3],
-        nothing, args[1], nothing, nothing
-    elseif fam === :Bernoulli
+    if fam === :Bernoulli
         length(args) == 1 || _sfail("response $lhs: `Bernoulli` takes " *
                                     "`Bernoulli.(logistic.(eta))` (or `normcdf`/`cexpexp` for the inverse link)")
         if _bare_slot_name(args[1], ctx)
@@ -9939,11 +9977,6 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
                                     "`CircularVonMises.(mu, kappa, lo, hi)`")
         return VonMisesFam, IdentityLink, IdentityLink, args[1], args[2],
         nothing, nothing, nothing, (args[3], args[4])
-    elseif fam === :LogNormal
-        length(args) == 2 || _sfail("response $lhs: `LogNormal` takes " *
-                                    "`LogNormal.(mu, sigma)`")
-        return LogNormalFam, IdentityLink, IdentityLink, args[1], args[2],
-        nothing, nothing, nothing, nothing
     else
         length(args) == 1 || _sfail("response $lhs: `Poisson` takes " *
                                     "`Poisson.(exp.(eta))`")
@@ -10103,7 +10136,7 @@ function _lower_response_base_error(lhs, rhs, fam)
         "or one vector per index with `$lhs[i] ~ MvNormal(mu, Sigma)` in a " *
         "`@plate` cell")
     return _sfail("response $lhs: unknown distribution `$(repr(fam))` " *
-                  "(admitted: Normal, StudentT, Bernoulli, Poisson, Binomial, " *
+                  "(admitted: location-scale density kernels, Bernoulli, Poisson, Binomial, " *
                   "NegativeBinomial2, NegativeBinomial, Weibull, " *
                   "HurdlePoisson, ZeroInflatedPoisson, " *
                   "ZeroInflatedBinomial, " *
