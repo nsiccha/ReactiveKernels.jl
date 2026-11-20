@@ -101,8 +101,10 @@ end
         pr = sum(logpdf.(Normal(), q.b)) + sum(logpdf.(Normal(0, 2), q.c)),
         jac = 0.0))
 
-    @test occursin("_declared_codes", sprint(show, result.built.program))
-    @test !occursin("isequal.(", sprint(show, result.built.program))
+    source = sprint(show, result.built.program)
+    @test occursin("_declared_codes", source)
+    @test occursin("_readonly_gather", source)
+    @test !occursin("isequal.(", source)
 
     # Exercise the legacy PopulationPrior route directly, independently of
     # the surface's ordinary array-parameter route.

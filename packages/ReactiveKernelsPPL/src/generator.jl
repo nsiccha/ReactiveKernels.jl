@@ -1292,8 +1292,14 @@ function _predictor_plate_addition(plan::StructuralPlan, pred::PredictorSpec,
     n = only(located)
     axes = map(pred.terms) do t
         t.kind === InterceptTerm && return Any[]
-        t.kind === OffsetTerm && length(t.columns) == 1 &&
+        t.kind in (OffsetTerm, FactorTerm) && length(t.columns) == 1 &&
             return _value_axes(plan, only(t.columns); data_axes = true)
+        # Multiplying the design by its coefficient vector preserves its row
+        # axis. The hcat and its Float64 conversion still run once at binding.
+        if t.kind === MatrixTerm && !isempty(t.columns) &&
+                all(c -> _value_axes(plan, c; data_axes = true) == Any[n], t.columns)
+            return Any[n]
+        end
         t.kind === ComposedTerm &&
             return _value_axes(plan, _composed_expr(plan, pred, t);
                 data_axes = true)
@@ -1440,7 +1446,10 @@ function _factor_gather!(pre, plan, pred, term, block, value, i)
         value = table
     end
     push!(pre, :($codes = $lookup))
-    return :($value[$codes])
+    # A plate may borrow this named gather when its consumers read entries.
+    gathered = Symbol(:_ppl_gathered_, pred.name, :_, i)
+    push!(pre, :($gathered = $value[$codes]))
+    return gathered
 end
 
 # Keep the authored broadcast axes of each affine block. Beside a factor,
