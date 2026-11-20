@@ -263,6 +263,12 @@ function _ls_weighted_rewrite(p, plate, dataonly, wanted)
         # Begin after every input to the guard and bound fit is available.
         required = Set([shared; ids[y]; live; data])
         lastinput = findlast(q -> any(v -> canon_id(p.graph, v.id) in required, q.outputs), p.recipes)
+        # A common scale already factors out of the authored row reduction.
+        # If an exclusive producer must run before the guard, the fit would
+        # pay for that location twice. Keep the factored reduction in this case.
+        if isempty(_ls_data_ids(c)) && lastinput !== nothing && start <= lastinput
+            continue
+        end
         lastinput === nothing || (start = max(start, lastinput + 1))
         start <= findfirst(==(plate), p.recipes) || continue
         selected = p.recipes[start:stop]
