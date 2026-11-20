@@ -9,7 +9,8 @@
 # - rows repeated 60, 10 and 2 times and all distinct, for 1, 2 and 5
 #   coefficients, for coefficients declared as numbers and read from a
 #   declared vector, for a scale that is no parameter, and for a per-row scale;
-# - two gathered coefficient vectors with 2, 5, 20 and 200 rows per group.
+# - one gathered coefficient vector with 2, 3, 4 and 8 rows per group (both
+#   sides of its switch in `_ls_blocks_pay`), and two with 2, 4, 5, 20 and 200.
 #
 # usage: julia repeated_rows.jl [rows = 240] [rounds = 7]
 #
@@ -69,6 +70,13 @@ per_group() = @rkppl begin
     beta[1:N] .~ Normal.(mu_beta, sigma_beta)
     mu = alpha[g] .+ beta[g] .* (x1 .- xbar)
     y .~ Normal.(mu, sigma)
+end
+# An intercept per group alone (the RadonCounty shape).
+group_intercept() = @rkppl begin
+    mu_alpha ~ Normal(0, 100)
+    sigma ~ restricted(Flat(), 0, Inf); sigma_alpha ~ restricted(Flat(), 0, Inf)
+    alpha[1:N] .~ Normal.(mu_alpha, sigma_alpha)
+    y .~ Normal.(alpha[g], sigma)
 end
 const MODELS = ("1 coefficient" => (intercept, ()), "2, from a vector" => (slope_vector, (:x1,)),
     "2 coefficients" => (slope, (:x1,)), "2, fixed scale" => (fixed_scale, (:x1,)),
@@ -154,7 +162,12 @@ function main(rows, rounds)
         inputs, observed = repeated(names, rows, distinct)
         line(label, model, inputs, observed, rows, "$(distinct) distinct", rounds)
     end
-    for per in (2, 5, 20, 200)
+    for per in (2, 3, 4, 8)
+        inputs, observed = grouped(30, per)
+        line("1 per group", group_intercept, (; N = inputs.N, g = inputs.g), observed, 30 * per,
+            "$(per) per group", rounds)
+    end
+    for per in (2, 4, 5, 20, 200)
         inputs, observed = grouped(30, per)
         line("2 per group", per_group, inputs, observed, 30 * per, "$(per) per group", rounds)
     end

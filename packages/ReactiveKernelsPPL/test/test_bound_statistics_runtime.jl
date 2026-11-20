@@ -205,4 +205,80 @@ end
     end
 end
 
+@testset "coefficients gathered per group differentiate at every count" begin
+    fits(k) = filter(!isnothing, map(ReactiveKernels._ls_fit, collect(k.constants)))
+    # One to six coefficient vectors gathered through one bound index, as an
+    # RKPPL model spells them: each source is a view of the packed point.
+    models = (
+        (@rkppl begin
+            sigma ~ restricted(Flat(), 0, Inf)
+            c1[1:N] .~ Normal(0, 10)
+            y .~ Normal.(c1[g], sigma)
+        end),
+        (@rkppl begin
+            sigma ~ restricted(Flat(), 0, Inf)
+            c1[1:N] .~ Normal(0, 10); c2[1:N] .~ Normal(0, 10)
+            mu = c1[g] .+ c2[g] .* x1
+            y .~ Normal.(mu, sigma)
+        end),
+        (@rkppl begin
+            sigma ~ restricted(Flat(), 0, Inf)
+            c1[1:N] .~ Normal(0, 10); c2[1:N] .~ Normal(0, 10); c3[1:N] .~ Normal(0, 10)
+            mu = c1[g] .+ c2[g] .* x1 .+ c3[g] .* x2
+            y .~ Normal.(mu, sigma)
+        end),
+        (@rkppl begin
+            sigma ~ restricted(Flat(), 0, Inf)
+            c1[1:N] .~ Normal(0, 10); c2[1:N] .~ Normal(0, 10); c3[1:N] .~ Normal(0, 10)
+            c4[1:N] .~ Normal(0, 10)
+            mu = c1[g] .+ c2[g] .* x1 .+ c3[g] .* x2 .+ c4[g] .* x3
+            y .~ Normal.(mu, sigma)
+        end),
+        (@rkppl begin
+            sigma ~ restricted(Flat(), 0, Inf)
+            c1[1:N] .~ Normal(0, 10); c2[1:N] .~ Normal(0, 10); c3[1:N] .~ Normal(0, 10)
+            c4[1:N] .~ Normal(0, 10); c5[1:N] .~ Normal(0, 10)
+            mu = c1[g] .+ c2[g] .* x1 .+ c3[g] .* x2 .+ c4[g] .* x3 .+ c5[g] .* x4
+            y .~ Normal.(mu, sigma)
+        end),
+        (@rkppl begin
+            sigma ~ restricted(Flat(), 0, Inf)
+            c1[1:N] .~ Normal(0, 10); c2[1:N] .~ Normal(0, 10); c3[1:N] .~ Normal(0, 10)
+            c4[1:N] .~ Normal(0, 10); c5[1:N] .~ Normal(0, 10); c6[1:N] .~ Normal(0, 10)
+            mu = c1[g] .+ c2[g] .* x1 .+ c3[g] .* x2 .+ c4[g] .* x3 .+ c5[g] .* x4 .+ c6[g] .* x5
+            y .~ Normal.(mu, sigma)
+        end),
+    )
+    groups = 6
+    columns = (:x1, :x2, :x3, :x4, :x5)
+    for (k, model) in enumerate(models)
+        used = Bool[]
+        # Few rows per group, where the rows run, and many, where the blocks do.
+        for per in (k + 1, 240)
+            n = groups * per
+            g = repeat(1:groups; inner = per)
+            xs = NamedTuple{columns[1:k-1]}(Tuple([sin(0.7i * j + j) for i in 1:n] for j in 1:k-1))
+            y = [cos(1.3i) + 0.1 * g[i] for i in 1:n]
+            fit = model(; N = groups, g, xs...) | (; y)
+            built = build_kernel(fit)
+            u = [0.05 * sin(2.1i) for i in 1:built.layout.total]
+            q = prepare_sampler(built, fit, u; backend)
+            literal = with_bound_statistics(false) do
+                prepare_sampler(build_kernel(fit), fit, u; backend)
+            end
+            @test isempty(fits(literal.kernel))
+            fit_used = only(fits(q.kernel)).usable
+            push!(used, fit_used)
+            gradient, expected = similar(u), similar(u)
+            value, _ = sampler_value_and_gradient!(q, gradient, u)
+            reference, _ = sampler_value_and_gradient!(literal, expected, u)
+            @test value ≈ reference rtol = 1e-11
+            @test q(u) ≈ literal(u) rtol = 1e-11
+            @test gradient ≈ expected rtol = 1e-9
+            @test gradient_bytes(q, u) == 0
+        end
+        @test used == [false, true]
+    end
+end
+
 end # module

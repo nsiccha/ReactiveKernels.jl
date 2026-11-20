@@ -556,29 +556,61 @@ end
     end
 end
 
-@testset "blocks of few rows keep their rows" begin
-    # Two coefficients per index value cost more than the gathered rows they
-    # replace until a value has about ten rows. The binding decides; the
-    # program is the same either way.
-    kernels = Any[]
-    for (per, usable) in ((2, false), (5, false), (20, true), (200, true))
-        levels = 30
-        idx = repeat(1:levels; inner = per)
-        f, y = randn(RNG, levels * per), randn(RNG, levels * per)
-        k = prepare(ls_gathered; bound = (; idx, f, y))
-        literal = prepare(ls_gathered; bound = (; idx, f, y), bound_statistics = false)
-        push!(kernels, k)
-        @test only(v for v in k.constants if v isa RK._LSStatistics).usable == usable
-        alpha, beta = randn(RNG, levels), randn(RNG, levels)
-        value, gradient = _value_gradient(k, alpha, beta, 0.9)
-        expected, reference = _value_gradient(literal, alpha, beta, 0.9)
-        @test value ≈ expected rtol = 1e-12
-        @test gradient[1] ≈ reference[1] rtol = 1e-10
-        @test gradient[2] ≈ reference[2] rtol = 1e-10
-        @test gradient[3] ≈ reference[3] rtol = 1e-10
+# One and four vectors gathered through one bound index, beside `ls_gathered`.
+@kernel ls_gathered_one(idx::Vector{Int}, y::Vector{Float64}, alpha::Vector{Float64},
+                        sigma::Float64) = begin
+    mu = alpha[idx]
+    lp = plate(y, mu) do yi, mi
+        normal(mi, sigma).logpdf(yi)
     end
-    @test allequal(typeof.(kernels))
-    @test allequal(_shape.(kernels))
+    total::Float64 = sum(lp)
+    return total
+end
+@kernel ls_gathered_four(idx::Vector{Int}, f::Vector{Float64}, g::Vector{Float64}, h::Vector{Float64},
+                         y::Vector{Float64}, alpha::Vector{Float64}, beta::Vector{Float64},
+                         gamma::Vector{Float64}, delta::Vector{Float64}, sigma::Float64) = begin
+    mu = alpha[idx] .+ f .* beta[idx] .+ g .* gamma[idx] .+ h .* delta[idx]
+    lp = plate(y, mu) do yi, mi
+        normal(mi, sigma).logpdf(yi)
+    end
+    total::Float64 = sum(lp)
+    return total
+end
+
+@testset "gathered blocks run where they cost less than their rows" begin
+    # The rows per index value from which blocks run (`_ls_blocks_pay`): four
+    # at one coefficient per value, the admission minimum at two, and 64 at
+    # four. The binding decides; the program is the same either way.
+    levels = 30
+    shapes = (
+        (ls_gathered_one, 0, ((2, false), (3, false), (4, true), (40, true))),
+        (ls_gathered, 1, ((2, false), (4, true), (5, true), (200, true))),
+        (ls_gathered_four, 3, ((8, false), (32, false), (64, true))),
+    )
+    for (kernel, columns, cases) in shapes
+        kernels = Any[]
+        for (per, usable) in cases
+            n = levels * per
+            idx = repeat(1:levels; inner = per)
+            data = ntuple(_ -> randn(RNG, n), columns)
+            y = randn(RNG, n)
+            bound = columns == 0 ? (; idx, y) : columns == 1 ? (; idx, f = data[1], y) :
+                (; idx, f = data[1], g = data[2], h = data[3], y)
+            k = prepare(kernel; bound)
+            literal = prepare(kernel; bound, bound_statistics = false)
+            push!(kernels, k)
+            @test only(v for v in k.constants if v isa RK._LSStatistics).usable == usable
+            live = ntuple(_ -> randn(RNG, levels), columns + 1)
+            value, gradient = _value_gradient(k, live..., 0.9)
+            expected, reference = _value_gradient(literal, live..., 0.9)
+            @test value ≈ expected rtol = 1e-12
+            for i in eachindex(gradient)
+                @test gradient[i] ≈ reference[i] rtol = 1e-10
+            end
+        end
+        @test allequal(typeof.(kernels))
+        @test allequal(_shape.(kernels))
+    end
 end
 
 @kernel ls_columns(x::Vector{Float64}, y::Vector{Float64}, a::Float64, b::Float64,

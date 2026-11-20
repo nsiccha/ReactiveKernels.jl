@@ -423,15 +423,32 @@ const _LS_SCALED_ROW_FACTOR = 40
 _ls_row_factor(common::Bool, columns::Bool) =
     !common ? _LS_SCALED_ROW_FACTOR : columns ? 1 : _LS_INDIRECT_ROW_FACTOR
 
-# Whether one block per index value costs less per call than the `n` gathered
-# rows the blocks replace. With few rows per value it does not: two
-# coefficients per value pay from about ten rows each (the Rats regression,
-# five rows per rat, ran 11 to 20% slower from its blocks). A binding that
-# fails this keeps its rows through the region's authored arm, like any
-# other unusable fit, so the compiled program does not depend on it.
-_ls_blocks_pay(n::Int, k::Int, blocks::Int) =
-    n * (1 + k) * _LS_INDIRECT_ROW_FACTOR >=
-        _LS_REGION_COST + _LS_ENTRY_COST * blocks * (k * (k + 1) ÷ 2)
+# Whether one block per index value costs less than the `n` gathered rows the
+# blocks replace. Both arms run inside the one region, so its cost does not
+# enter. Measured with each arm forced, at 30 index values with one to six
+# coefficients per value and 2 to 64 rows per value
+# (`benchmark/near_miss/repeated_rows.jl` repeats it for one and two):
+#
+# - One coefficient: with two or three rows per value the blocks cost a
+#   density 12 to 22% more than the rows and a gradient the same or 11% more.
+#   From four rows their gradient costs less, and from five their density.
+# - Two and three coefficients: the blocks cost less in both from the fewest
+#   rows a fit is admitted with (`_LS_MINIMUM_ROWS_PER_PARAMETER`), at every
+#   size measured, also where the rows fill whole vector blocks (16, 32, 64
+#   rows per value). So the Rats regression, five rows per rat, runs blocks.
+# - Four and more coefficients: a block's gradient costs far more than its
+#   few products suggest. At four coefficients it is slower than the rows at
+#   8, 12, 16 and 32 rows per value (by 4 to 41%) and faster at 24 and 64; at
+#   five and six it is slower at every size measured. The rows are cheapest
+#   where they fill vector blocks of 32. Priced there, the blocks cost less
+#   from about 40 rows per value at four coefficients, 85 at five and 110 at
+#   six: 32 rows for each coefficient beyond two are required, which is past
+#   each of those. Seven and more coefficients are not measured.
+#
+# A binding that fails this keeps its rows through the region's authored arm,
+# like any other unusable fit, so the compiled program does not depend on it.
+_ls_block_rows(k::Int) = k == 1 ? 4 : k <= 3 ? 0 : 32 * (k - 2)
+_ls_blocks_pay(n::Int, k::Int, blocks::Int) = n >= _ls_block_rows(k) * blocks
 
 _ls_fit(w::_LSWeightedStatistics) = w.fit
 _ls_fit(fit::Union{_LSStatistics,_LSMixedStatistics}) = fit

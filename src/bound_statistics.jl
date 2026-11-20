@@ -253,10 +253,10 @@ include("mixed_least_squares.jl")
 end
 @inline _ls_sources_length(::Tuple{}) = 0
 @inline _ls_sources_length(s::Tuple) = _ls_source_length(first(s)) + _ls_sources_length(Base.tail(s))
-# Entry `g` of source `j` of a tuple of gathered sources.
-@inline _ls_group_entry(s::Tuple{Any}, j, g) = first(s)[g]
-@inline _ls_group_entry(s::Tuple, j, g) =
-    j == 1 ? first(s)[g] : _ls_group_entry(Base.tail(s), j - 1, g)
+# Entry `g` of every source of a tuple of gathered sources. Each read keeps
+# its bounds check, so an index value beyond a source raises as the row-wise
+# gather does.
+@inline _ls_group_entries(s::Tuple, g) = map(source -> source[g], s)
 
 # ‖R_p * (θ[perm] - θ̂[perm])‖² of block `b`, `θ` read by `entry(c)`. Only the
 # statistics' own arrays are read in bounds: a live source keeps its bounds
@@ -301,7 +301,10 @@ function _ls_rss_grouped(s::_LSStatistics, sources::Tuple)
     total = s.rss0
     for b in 1:s.blocks
         g = @inbounds s.groups[b]
-        total += _ls_block_norm(s, b, j -> _ls_group_entry(sources, j, g))
+        # One read per source and block. The block's triangle reads each entry
+        # once per row, through `perm`, which holds positions of this tuple.
+        entries = _ls_group_entries(sources, g)
+        total += _ls_block_norm(s, b, j -> @inbounds entries[j])
     end
     total
 end
