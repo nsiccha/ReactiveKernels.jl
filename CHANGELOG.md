@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.336
+
+- `prepare_nonallocating` reuses the vector behind a dense row-vector
+  product. Transposed and adjoint vectors multiplied by a dense matrix
+  of the same BLAS element type now follow ordinary Julia's rounding.
+
 ## 0.1.335
 
 - `ad_cost_profile` accepts `min_samples` and `max_sample_seconds` to spend

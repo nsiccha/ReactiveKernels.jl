@@ -71,6 +71,20 @@ struct _MatMulStep end
 # for an operand BLAS cannot take.
 @inline (::_MatMulStep)(A, B) = _native_mul(A, B)
 
+# LinearAlgebra computes a dense row product by wrapping a matrix-vector
+# product. The wrapper borrows its parent vector's storage.
+const _StridedBlasRow{T<:LinearAlgebra.BlasFloat} =
+    LinearAlgebra.AdjOrTrans{T,<:StridedVector{T}}
+@inline _row_product_parent(row, A) = parent(row * A)
+
+function _row_product_wrapper(f, types)
+    (f === (*) || f === _native_mul) && length(types) == 2 || return nothing
+    row, matrix = types
+    row isa Type && isconcretetype(row) && row <: _StridedBlasRow &&
+        matrix isa Type && matrix <: StridedMatrix{eltype(row)} || return nothing
+    GlobalRef(Base, row <: LinearAlgebra.Transpose ? :transpose : :adjoint)
+end
+
 "Array constructor with a known fill value (`zeros`/`ones`)."
 struct _FillConstructorStep{F}
     f::F
@@ -572,6 +586,11 @@ function _decompose_call_resolved(ctx::_FusedDecomposition, callee, f, fref,
     args, types = decomposed
     T = _static_type(f, types...)
     _nonalloc_is_lazy(f) && return (Expr(:call, fref, args...), T)
+    wrap = _row_product_wrapper(f, types)
+    if wrap !== nothing
+        buffer = _emit_step!(ctx, _row_product_parent, Vector{eltype(types[1])}, args...)
+        return (Expr(:call, wrap, buffer), T)
+    end
     bits = isconcretetype(T) && isbitstype(T)
     if bits || T isa DataType && isconcretetype(T) && !ismutabletype(T)
         # An immutable value owns no reusable buffer: a cache step would only
@@ -1395,6 +1414,11 @@ function _nonalloc_step!(prog::_StepProgram, r::Recipe, i::Int,
     argtypes = _nonalloc_argument_types(types, callargs)
     T = _static_type(op, argtypes...)
     if !r.effectful
+        wrap = _row_product_wrapper(op, argtypes)
+        if wrap !== nothing
+            j = _step!(prog, _row_product_parent, _nonalloc_slot(Vector{eltype(argtypes[1])}))
+            return Any[Expr(:(=), lhs, Expr(:call, wrap, _step_call(j, callargs...)))]
+        end
         if r.op isa _KernelSourceOp && !(r.source isa _NoKernelSource)
             dec = _decompose_fused_recipe!(prog, r, callargs, argtypes, lhs)
             if dec !== nothing

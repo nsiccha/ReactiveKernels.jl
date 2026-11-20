@@ -246,6 +246,17 @@ end
 
 const _LA = ReactiveKernels.LinearAlgebra
 
+@inline function MutatingFunctions.apply!!(cache::Vector{T},
+        op::typeof(ReactiveKernels._row_product_parent),
+        row::ReactiveKernels._StridedBlasRow{T}, A::StridedMatrix{T}) where {T<:_LA.BlasFloat}
+    x = parent(row)
+    if length(cache) == size(A, 2) && !Base.mightalias(cache, x) && !Base.mightalias(cache, A)
+        matrix = row isa _LA.Transpose ? transpose(A) : adjoint(A)
+        return _LA.mul!(cache, matrix, x)
+    end
+    op(row, A)
+end
+
 @inline _matmul_destination_matches(cache::AbstractVector, A, B::AbstractVector) =
     size(cache) == (size(A, 1),)
 @inline _matmul_destination_matches(cache::AbstractMatrix, A, B::AbstractMatrix) =
