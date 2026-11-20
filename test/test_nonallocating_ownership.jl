@@ -378,3 +378,157 @@ end
         @test ownership_allocations(from_prepared, args) == 0
     end
 end
+
+module BufferedIntoTests
+
+using ReactiveKernels, MutatingFunctions, Test
+
+@kernel product(A, x) = begin
+    y = A * x
+end
+@kernel typed_product(A::Matrix{Float64}, x::Vector{Float64}) = begin
+    y = A * x
+end
+@kernel joined(a, b, c) = begin
+    y = (a .- b) .+ c
+end
+@kernel centered(a, b, c) = begin
+    y = a .- (b .+ c) ./ 2
+end
+@kernel staged(A, x, c) = begin
+    ax = A * x
+    y = ax .- c
+end
+@kernel pointwise(a, h, g) = begin
+    y = a .+ (h / 2) .* g
+end
+@kernel ragged_copy(x) = begin
+    y = reverse(x)
+end
+@kernel product_entry(A, x, i) = begin
+    ax = A * x
+    y = fill(sum(view(ax, i)), 1)
+end
+
+@noinline writer_bytes(w::W, dst, xs::T) where {W,T} = @allocated w(dst, xs...)
+@noinline retained_bytes(f::F, dst, xs::T) where {F,T} = @allocated copyto!(dst, f(xs...))
+
+# A destination is allowed to retain the source passed to its copy protocol.
+struct RetainsSource{T} <: AbstractVector{T}
+    data::Vector{T}
+    source::Base.RefValue{Vector{T}}
+end
+Base.size(d::RetainsSource) = size(d.data)
+function Base.copyto!(d::RetainsSource{T}, src::Vector{T}) where {T}
+    d.source[] = src
+    copyto!(d.data, src)
+    d
+end
+
+@testset "caller-owned writers reuse private numerical results" begin
+    for T in (Float32, Float64)
+        x = T.(1:8)
+        b, c = x .- 1, 2x
+        A = reshape(T.(1:64), 8, 8)
+        for (spec, xs, expected) in (
+                (product, (A, x), A * x),
+                (joined, (x, b, c), (x .- b) .+ c),
+                (centered, (x, b, c), x .- (b .+ c) ./ 2),
+                (staged, (A, x, c), A * x .- c),
+                (pointwise, (x, T(0.25), c), x .+ T(0.125) .* c))
+            k = prepare(spec; have = Tuple(spec.have_names), want = :y)
+            w, f = prepare_into(k, xs...), prepare_nonallocating(k, xs...)
+            dst = similar(expected)
+            @test (@inferred w(dst, xs...)) === dst
+            @test isequal(dst, expected)
+            writer_bytes(w, dst, xs)
+            retained_bytes(f, dst, xs)
+            @test writer_bytes(w, dst, xs) == retained_bytes(f, dst, xs) == 0
+        end
+    end
+
+    x = collect(1.:8.)
+    A = reshape(collect(1.:64.), 8, 8)
+    k = prepare(product; have = (:A, :x), want = :y)
+    w = prepare_into(k, A, x)
+    kept = w(similar(x), A, x)
+    declared = prepare_into(typed_product)
+    @test declared(similar(x), A, x) == kept
+    writer_bytes(declared, similar(x), (A, x))
+    @test writer_bytes(declared, similar(x), (A, x)) == 0
+    for n in (0, 1, 5, 64, 8)
+        m, a = reshape(collect(1.:n^2), n, n), ones(n)
+        @test w(similar(a), m, a) == m * a
+        @test kept == A * x
+        @test writer_bytes(w, similar(a), (m, a)) == 0
+    end
+    @test typeof(w.scratch.kernel.f) === typeof(prepare_into(k, zeros(3, 3), zeros(3)).scratch.kernel.f)
+    @test w(zeros(Float32, 8), Float32.(A), Float32.(x)) == Float32.(A) * Float32.(x)
+    store = [x; zeros(8)]
+    @test w(view(store, 9:16), A, view(store, 1:8)) == kept
+    @test_throws ArgumentError w(view(store, 2:9), A, view(store, 1:8))
+    @test_throws ArgumentError w(x, A, x)
+    bound = prepare_into(product, x; bound = (; A))
+    @test bound(similar(x), x) == kept
+    @test_throws ArgumentError bound(view(A, :, 1), x)
+    ints = fill(71, 2)
+    @test_throws InexactError w(ints, [1.0 0; 0 0.5], [1., 1.])
+    @test ints == [71, 71]
+    @test_throws DimensionMismatch w(ints, A, x)
+    @test ints == [71, 71]
+    @test !(@atomic w.scratch.busy)
+    @test w(ints, [1.0 0; 0 2.0], [2., 3.]) === ints
+    @test ints == [2, 6]
+
+    dst = RetainsSource(zeros(8), Ref(Float64[]))
+    @test w(dst, A, x) === dst
+    w(zeros(8), A, -x)
+    @test dst.source[] == A * x
+
+    entry_kernel = prepare(product_entry; have = (:A, :x, :i), want = :y)
+    entry! = prepare_into(entry_kernel, A, x, 1)
+    @test entry!.scratch !== nothing
+    @test entry!(zeros(1), A, x, 1) == kept[1:1]
+    err = try
+        entry!(zeros(1), A, x, length(x) + 1)
+        nothing
+    catch e
+        e
+    end
+    @test err isa BoundsError
+    @test entry!(zeros(1), A, -x, 1) == -kept[1:1]
+    @test err.a == kept
+
+    rows = [[1.0], [2.0, 3.0]]
+    write_rows! = prepare_into(ragged_copy, rows)
+    saved = write_rows!(similar(rows), rows)
+    @test saved[1] === rows[2]
+    write_rows!(similar(rows), [[4.0], [5.0]])
+    @test saved == [[2.0, 3.0], [1.0]]
+
+    # Enter the public writer while another call holds its workspace. The
+    # second call can finish immediately and leaves the first result intact.
+    w(zeros(8), A, x)
+    @atomic w.scratch.busy = true
+    try
+        @test w(zeros(8), A, -x) == -(A * x)
+        @test only(w.scratch.kernel.caches)[] == A * x
+    finally
+        @atomic w.scratch.busy = false
+    end
+
+    passed = prepare(product; have = (:A, :x), want = :y,
+        passes = (ast -> Expr(:function, ast.args[1], Expr(:block, :(return x))),))
+    @test prepare_into(passed, A, x)(similar(x), A, x) == x
+
+    function change_outer(ast)
+        local_body = Expr(:block, Expr(:(=), :z, Expr(:call, GlobalRef(Base, :reverse), :x)), :z)
+        body = Expr(:block, :(z = x), Expr(:(=), :tmp, Expr(:let, Expr(:block), local_body)),
+                    :(return z))
+        Expr(:function, ast.args[1], body)
+    end
+    scoped = prepare(product; have = (:A, :x), want = :y, passes = (change_outer,))
+    @test prepare_into(scoped, A, x)(similar(x), A, x) == scoped(A, x) == reverse(x)
+end
+
+end

@@ -1,12 +1,8 @@
 using ReactiveKernels, ReactiveKernelsPPL, Test
 include(joinpath(pkgdir(ReactiveKernels), "test", "jax_python.jl"))
 
-# A distribution law spliced into a model reads as authored code does (snag
-# jax-source-on-rk-d32d60bd): a `censored(Normal)` law's arms that are one
-# expression are `lambda:`, its single-use values stay expressions under the
-# law's own names (`logcdf_z = jax.lax.cond(...)`), and nothing binds a
-# `value_N` or a `let` result. A literal prior location is read as the
-# literal (`amp != 0.0`), not bound as `location_binding = 0.0`.
+# A spliced law keeps its authored names and single-expression arms (snag
+# jax-source-on-rk-d32d60bd). A literal prior location stays a literal.
 
 const jax_law_censored_model = @rkppl begin
     "Mean."
@@ -52,9 +48,15 @@ end
         built = build_kernel(plan)
         src = jax_source(built, plan)
         text = src.text
-        @test !occursin(r"(?m)^\s*(value|let_value)(_\d+)? = ", text)
-        @test occursin(r"logcdf_z\w* = jax\.lax\.cond\([^\n]*, lambda: jnp\.ones_like\(", text)
-        @test occursin("lambda: jax.lax.cond(lower", text)
+        # The law runs in the model's plate cells. The separate log-CDF
+        # wrapper and its JVP have their own locals (the JVP reuses its primal).
+        model = only(block for block in eachsplit(text, "\ndef ") if startswith(block, "model("))
+        @test !occursin(r"(?m)^\s*(value|let_value)(_\d+)? = ", model)
+        @test occursin(r"logcdf_z\w* = jax\.lax\.cond\([^\n]*, lambda: jnp\.ones_like\(", model)
+        # The infinite-bound arms are expressions. The finite arm calls the
+        # named endpoint and can use a def to bind its result.
+        @test occursin(r"jax\.lax\.cond\(lower\w* == -jnp\.inf, lambda: -jnp\.inf,", model)
+        @test occursin(r"jax\.lax\.cond\(lower\w* == jnp\.inf, lambda: 0\.0,", model)
         n > 0 && push!(texts, text)
         rk_jax_available() ? jax_law_check(src, built, plan, raw) : @test_skip false
     end

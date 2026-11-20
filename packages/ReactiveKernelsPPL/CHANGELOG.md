@@ -16,9 +16,9 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.243
+## 0.1.244
 
-Requires ReactiveKernels 0.1.345.
+Requires ReactiveKernels 0.1.348.
 
 - A ReactiveKernels law with `location` and `scale` ports, a `logpdf` that
   takes one observation, and all kernel-valued arguments bound can serve as an
@@ -48,6 +48,12 @@ Requires ReactiveKernels 0.1.345.
   grew with rows times levels. The factor term contributes zero to the
   predictor for a row whose label is outside its declared axis, including when
   every row has the reference level.
+
+## 0.1.243
+
+- Fresh `build_kernel` calls can reuse lowered graph construction instructions
+  across models. Each model supplies its current helpers and recipe inputs,
+  including when several tasks construct graphs concurrently.
 
 ## 0.1.242
 

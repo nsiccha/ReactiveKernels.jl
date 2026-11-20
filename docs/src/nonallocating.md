@@ -31,6 +31,58 @@ For a dense intermediate held in a kernel-owned buffer, a rank-changing `reshape
 
 The interface selects the same mathematical recipes as ordinary preparation. It routes supported operations through reusable buffers. Operations without an in-place form can still allocate, so the name alone does not establish an allocation count for an arbitrary graph.
 
+## Caller-owned outputs
+
+Use [`prepare_into`](@ref) when the caller already owns the output storage.
+Pass the destination first on every call. One writer can advance two
+alternating arrays while the caller controls when each is overwritten.
+
+```@example buffers
+@kernel center_vector(x) = begin
+    y = x .- sum(x)
+end
+
+write_center! = prepare_into(center_vector)
+a = [1.0, 2.0, 4.0]
+b = similar(a)
+@assert write_center!(b, a) === b
+@assert b == [-6.0, -5.0, -3.0]
+write_center!(a, b)
+(; a, b)
+```
+
+The writer evaluates `sum(x)` once on the whole vector. A final numeric
+broadcast such as `x .+ (h / 2) .* g` on dense vectors can fill the destination
+directly. With MutatingFunctions loaded, pass representative inputs to reuse
+private scratch for straight-line dense numerical computations such as matrix
+products and nested arithmetic broadcasts. Concrete declared input types also
+supply this information. The writer copies the result into the destination
+before releasing its scratch. An overlapping call uses independent storage.
+
+```@example buffers
+@kernel matrix_update(A, x, c) = begin
+    ax = A * x
+    y = ax .- c
+end
+A = [1.0 2.0; 3.0 4.0]
+x, c = [2.0, 1.0], [0.5, 2.0]
+update! = prepare_into(matrix_update, A, x, c)
+dst = similar(x)
+@assert update!(dst, A, x, c) === dst
+@assert dst == A * x .- c
+dst
+```
+
+Opaque calls, lazy branches and other unsupported programs use the ordinary
+prepared computation. Supply the result's axes and keep the destination
+disjoint from runtime and bound inputs. Array element conversions follow
+Julia's assignment rules.
+
+ForwardDiff can differentiate the pointwise writer. On Julia 1.10.12,
+Enzyme 0.13.221 raises `EnzymeNoDerivativeError` in the storage-overlap
+check when differentiating the same writer in reverse mode. A standalone
+reproducer is in `benchmark/enzyme_prepare_into_overlap.jl`.
+
 ## Generated program
 
 The generated expression makes the buffer boundary inspectable.
@@ -40,7 +92,9 @@ using Main.Tutorials
 Tutorials.generated(run)
 ```
 
-A prepared object with mutable caches is for direct use by one caller at a time. Give concurrent callers their own prepared objects. For differentiation, use the prepared AD APIs that manage the derivative storage contract; do not assume that wrapping an arbitrary mutating callable preserves its primal state for reverse evaluation.
+Give each concurrent caller its own `prepare_nonallocating` object when
+consuming borrowed results directly. For differentiation of those kernels,
+use the prepared AD APIs that manage derivative storage.
 
 A prepared reverse gradient reuses its buffers' derivative storage across calls. For Enzyme differentiation through a matrix product's buffer, use the `blas_overwritten_output` repair (dogfood `cb2b2b1e` or later). Registered Enzyme keeps a non-finite adjoint in that storage, so after one call whose gradient is not finite, later gradients from the same preparation can also be `NaN`. The non-allocating acceptance suite checks that a gradient after such a call equals the first one bit for bit.
 

@@ -1,5 +1,5 @@
 # JAX translation of the native ODE bridges `rk_ode_rk45_tol` and
-# `rk_ode_bdf_tol` (`native_ode.jl`): one adaptive diffrax solve with the
+# `rk_ode_bdf_tol` (`native_ode.jl`): adaptive diffrax integration with the
 # caller's tolerances and per-output step budget, outputs from the solver's
 # dense interpolant, and reverse-mode derivatives of the discrete solve
 # (diffrax's `RecursiveCheckpointAdjoint`), so a gradient's accuracy follows
@@ -52,11 +52,11 @@ class _RKFiniteTrial:
 
 
 class _RKDopri5(_RKFiniteTrial, diffrax.Dopri5):
-    pass
+    unguarded = diffrax.Dopri5
 
 
 class _RKKvaerno5(_RKFiniteTrial, diffrax.Kvaerno5):
-    pass
+    unguarded = diffrax.Kvaerno5
 
 
 class _RKOutputBudget(diffrax.AbstractAdaptiveStepSizeController):
@@ -65,6 +65,7 @@ class _RKOutputBudget(diffrax.AbstractAdaptiveStepSizeController):
     inner: diffrax.PIDController
     ts: Any
     limit: Any
+    check_trials: bool = eqx.field(static=True)
 
     @property
     def rtol(self):
@@ -79,7 +80,7 @@ class _RKOutputBudget(diffrax.AbstractAdaptiveStepSizeController):
         return self.inner.norm
 
     def wrap(self, direction):
-        return _RKOutputBudget(self.inner.wrap(direction), self.ts, self.limit)
+        return _RKOutputBudget(self.inner.wrap(direction), self.ts, self.limit, self.check_trials)
 
     def init(self, terms, t0, t1, y0, dt0, args, func, error_order):
         t, state = self.inner.init(terms, t0, t1, y0, dt0, args, func, error_order)
@@ -98,6 +99,10 @@ class _RKOutputBudget(diffrax.AbstractAdaptiveStepSizeController):
                                        result)
         # A non-finite starting state or unusable next step cannot advance.
         unstable = ~jnp.all(jnp.isfinite(y0)) | ~jnp.isfinite(next_t1 - next_t0)
+        if self.check_trials:
+            # Even a rejected infinite error can leave the solve successful
+            # but poison its reverse pass. Inspect attempted steps here.
+            unstable |= ~jnp.all(jnp.isfinite(y1_candidate)) | ~jnp.all(jnp.isfinite(y_error))
         result = diffrax.RESULTS.where(unstable, diffrax.RESULTS.nonfinite, result)
         return keep, next_t0, next_t1, jump, (state, count, now), result
 
@@ -131,18 +136,28 @@ def _rk_ode_solve(solver, rhs, y0, t0, ts, n, reltol, abstol, maxsteps, args):
     dtmin = jax.lax.stop_gradient(16 * jnp.finfo(dtype).eps * jnp.maximum(jnp.abs(t0), jnp.abs(last)))
     # Include traced values captured by the RHS among the trial's AD inputs.
     term = diffrax.ODETerm(eqx.filter_closure_convert(rhs, t0, y0, args))
-    sol = diffrax.diffeqsolve(
-        term, solver, t0, last, None, y0, args=args,
-        saveat=diffrax.SaveAt(ts=ts),
-        stepsize_controller=_RKOutputBudget(
-            diffrax.PIDController(rtol=jnp.where(ok, reltol, 1.0), atol=jnp.where(ok, abstol, 1.0),
-                                  dtmin=dtmin, force_dtmin=False),
-            ts, jnp.where(ok, maxsteps, cap)),
-        max_steps=cap, adjoint=diffrax.RecursiveCheckpointAdjoint(checkpoints=64), throw=False)
-    status = jnp.where(sol.result == diffrax.RESULTS.successful, 0,
-                       jnp.where(sol.result == diffrax.RESULTS.max_steps_reached, 2, 3))
+    pid = diffrax.PIDController(rtol=jnp.where(ok, reltol, 1.0), atol=jnp.where(ok, abstol, 1.0),
+                                dtmin=dtmin, force_dtmin=False)
+
+    def outputs(method, check_trials=False):
+        sol = diffrax.diffeqsolve(
+            term, method, t0, last, None, y0, args=args, saveat=diffrax.SaveAt(ts=ts),
+            stepsize_controller=_RKOutputBudget(pid, ts, jnp.where(ok, maxsteps, cap), check_trials),
+            max_steps=cap, adjoint=diffrax.RecursiveCheckpointAdjoint(checkpoints=64), throw=False)
+        return sol.ys, sol.result
+
+    def plain_outputs():
+        return outputs(solver.unguarded(), check_trials=True)
+
+    # Only the status escapes the first call, so failed trials have no reverse
+    # pass. A scalar predicate keeps cond lazy even under nested vmap.
+    _, probe_result = plain_outputs()
+    all_finite = eqx.internal.unvmap_all(probe_result == diffrax.RESULTS.successful)
+    ys, result = jax.lax.cond(all_finite, plain_outputs, lambda: outputs(solver))
+    status = jnp.where(result == diffrax.RESULTS.successful, 0,
+                       jnp.where(result == diffrax.RESULTS.max_steps_reached, 2, 3))
     status = jnp.where(valid, status, 1)
-    return sol.ys, jnp.where(n > 0, status, 0)
+    return ys, jnp.where(n > 0, status, 0)
 """
 
 _jax_ode_solver(::typeof(rk_ode_rk45_tol)) = "Dopri5"

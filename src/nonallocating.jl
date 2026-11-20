@@ -1619,10 +1619,10 @@ end
 # it `Any`-typed, where the native kernel is specialized on the runtime
 # argument types instead. Exemplar arguments supply those runtime types: they
 # type the program exactly as the arguments of later calls will be typed.
-function _nonalloc_exemplar_types(p::Plan, exemplars::Tuple)
+function _nonalloc_exemplar_types(p::Plan, exemplars::Tuple, caller = :prepare_nonallocating)
     isempty(exemplars) && return nothing
     length(exemplars) == length(p.have) || throw(ArgumentError(
-        "prepare_nonallocating received $(length(exemplars)) exemplar " *
+        "$caller received $(length(exemplars)) exemplar " *
         "arguments for $(length(p.have)) HAVE ports " *
         "($(join((v.name for v in p.have), ", "))); pass one value per " *
         "positional HAVE port, in that order"))

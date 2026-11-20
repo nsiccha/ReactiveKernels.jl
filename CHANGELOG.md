@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.345
+## 0.1.348
 
 - A bound Normal regression keeps its least-squares statistics in more shapes.
   Binding factors the shared design once with a pivoted QR. When a gathered
@@ -40,6 +40,25 @@ are recorded in the git history only.
   length matches and the inputs do not alias the buffer.
 - When an embedded prepared kernel has discarded its source plan, `js_source`
   raises `JSEmissionError` and names the endpoint it could not translate.
+## 0.1.347
+
+- With MutatingFunctions loaded, `prepare_into` automatically reuses private
+  storage for eligible dense numerical computations, including matrix products
+  and nested broadcasts. The writer copies the result into the caller's array.
+
+## 0.1.346
+
+- A program generator can reuse lowered graph construction instructions across
+  fresh definitions in one evaluation module. Each evaluation builds its own
+  graph from the current definition's recipe sources and helper bindings.
+
+## 0.1.345
+
+- `prepare_into` prepares an ordinary Julia kernel to fill a caller-supplied
+  array. One writer can alternate destinations across calls. A supported final
+  broadcast writes directly, and other kernels run once and copy their array
+  result.
+
 ## 0.1.344
 
 - JAX exports retry an adaptive ODE trial that overflows from a finite state.

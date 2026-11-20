@@ -31,10 +31,12 @@ Repeated bindings of a retained `@rkppl` model can reuse the construction
 of its most recent eligible program. Each build has fresh public ports and
 an independently editable graph. Samplers on those builds can reuse the
 model's preparation until their graph is edited. A program with a quoted
-data array or a caller-owned function takes the ordinary construction path.
+data array or a caller-owned function constructs its graph from those
+inputs on every build.
 
-Concurrent tasks can call `build_kernel` independently. Each model
-synchronizes access to its own construction cache.
+Fresh models can share the lowered instructions for building a graph.
+Each call supplies its own recipe sources, helper bindings and data.
+Concurrent tasks can call `build_kernel` independently.
 
 The returned spec closes over build-time
 eval'd code. Construction resolves module bindings in a package-owned
@@ -971,12 +973,9 @@ import .._simplex_slices_breaks, .._simplex_value_from_breaks, .._simplex_logjac
 import .._ordered_slices_constrain, .._ordered_slices_logjac
 end
 
-# Evaluate the generated `@kernel` definition without binding a name in
-# `PPLGeneratedModels`. RK evaluates the recipe closures separately so
-# construction compiles no per-model code (`ReactiveKernels._kernel_eval_definition`).
-_eval_kernel_def(def::Expr) =
-    ReactiveKernels._kernel_eval_definition(PPLGeneratedModels, def;
-        latest_world_native_sources = true)
+# The module fixes how unqualified names in the constructor resolve.
+const _kernel_constructors = ReactiveKernels._KernelConstructors(PPLGeneratedModels)
+_eval_kernel_def(def::Expr) = ReactiveKernels._kernel_eval_definition(_kernel_constructors, def)
 
 # An elementwise cell can take its scalar arguments and selected columns as
 # plate operands. Strict indexing remains a gather even for singleton and

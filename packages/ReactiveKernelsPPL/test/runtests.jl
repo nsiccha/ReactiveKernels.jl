@@ -80,6 +80,7 @@ const _PPL_TEST_FILES = (
     "test_lognormal_statistics_reverse.jl",
     "test_concurrent_build.jl",
     "test_fresh_module.jl",
+    "test_fresh_constructors.jl",
     "test_precompiled_build.jl",
     "test_enzyme_cached_construction.jl",
     "test_construction_invalidation.jl",
