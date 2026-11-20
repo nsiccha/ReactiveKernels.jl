@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.342
+
+- JAX exports retry an adaptive ODE trial that overflows from a finite state.
+  A recovered solve returns its values and differentiates through its accepted
+  steps. The caller's tolerances and per-output step budget still apply.
+
 ## 0.1.341
 
 - A kernel prepared with `prepare_nonallocating` can reuse the factor matrix for

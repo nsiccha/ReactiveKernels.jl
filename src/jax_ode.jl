@@ -28,6 +28,37 @@ import diffrax
 import equinox as eqx
 
 
+class _RKFiniteTrial:
+    def step(self, terms, t0, t1, y0, args, solver_state, made_jump):
+        step = super().step
+        inputs = (terms, t0, t1, y0, args, solver_state, made_jump)
+        candidate, error, *_ = step(*inputs)
+        finite = jnp.all(jnp.isfinite(candidate)) & jnp.all(jnp.isfinite(error))
+
+        # The accepted solution has no dependence on a discarded trial. Mask
+        # its inputs in AD: a zero cotangent at its output can still multiply
+        # an infinite intermediate in the Runge-Kutta stages. For values alone
+        # stop_gradient is the identity and both calls have the same inputs.
+        def step_input(x):
+            return jnp.where(finite, x, jax.lax.stop_gradient(x)) if eqx.is_inexact_array(x) else x
+
+        candidate, error, dense, state, result = step(*jax.tree.map(step_input, inputs))
+        # PID scales error by the size of the candidate. Inf / Inf gives NaN
+        # and hence a NaN step size. A finite scale and infinite error ask it
+        # to retry at a smaller step. Diffrax discards the solver result on a
+        # rejection; a controller that accepts this trial must report failure.
+        return (jnp.where(finite, candidate, y0), jnp.where(finite, error, jnp.inf),
+                dense, state, diffrax.RESULTS.where(finite, result, diffrax.RESULTS.nonfinite))
+
+
+class _RKDopri5(_RKFiniteTrial, diffrax.Dopri5):
+    pass
+
+
+class _RKKvaerno5(_RKFiniteTrial, diffrax.Kvaerno5):
+    pass
+
+
 class _RKOutputBudget(diffrax.AbstractAdaptiveStepSizeController):
     # ReactiveKernels' per-output step budget: at most `limit` accepted steps
     # between consecutive requested outputs.
@@ -65,9 +96,7 @@ class _RKOutputBudget(diffrax.AbstractAdaptiveStepSizeController):
         count = jnp.where(keep, count + 1, count)
         result = diffrax.RESULTS.where(count > self.limit, diffrax.RESULTS.max_steps_reached,
                                        result)
-        # A non-finite state, or the step size a non-finite error estimate
-        # leaves (it stays NaN, so every later step is rejected), fails the
-        # solve, as the native solve stops as `Unstable`.
+        # A non-finite starting state or unusable next step cannot advance.
         unstable = ~jnp.all(jnp.isfinite(y0)) | ~jnp.isfinite(next_t1 - next_t0)
         result = diffrax.RESULTS.where(unstable, diffrax.RESULTS.nonfinite, result)
         return keep, next_t0, next_t1, jump, (state, count, now), result
@@ -100,8 +129,10 @@ def _rk_ode_solve(solver, rhs, y0, t0, ts, n, reltol, abstol, maxsteps, args):
     # A step this short no longer advances time controllably: diffrax steps
     # to rounded times, and a few ulps of t are as short as a step gets.
     dtmin = jax.lax.stop_gradient(16 * jnp.finfo(dtype).eps * jnp.maximum(jnp.abs(t0), jnp.abs(last)))
+    # Include traced values captured by the RHS among the trial's AD inputs.
+    term = diffrax.ODETerm(eqx.filter_closure_convert(rhs, t0, y0, args))
     sol = diffrax.diffeqsolve(
-        diffrax.ODETerm(rhs), solver, t0, last, None, y0, args=args,
+        term, solver, t0, last, None, y0, args=args,
         saveat=diffrax.SaveAt(ts=ts),
         stepsize_controller=_RKOutputBudget(
             diffrax.PIDController(rtol=jnp.where(ok, reltol, 1.0), atol=jnp.where(ok, abstol, 1.0),
@@ -114,8 +145,8 @@ def _rk_ode_solve(solver, rhs, y0, t0, ts, n, reltol, abstol, maxsteps, args):
     return sol.ys, jnp.where(n > 0, status, 0)
 """
 
-_jax_ode_solver(::typeof(rk_ode_rk45_tol)) = "diffrax.Dopri5()"
-_jax_ode_solver(::typeof(rk_ode_bdf_tol)) = "diffrax.Kvaerno5()"
+_jax_ode_solver(::typeof(rk_ode_rk45_tol)) = "Dopri5"
+_jax_ode_solver(::typeof(rk_ode_bdf_tol)) = "Kvaerno5"
 
 for f in (rk_ode_rk45_tol, rk_ode_bdf_tol)
     @eval _jax_function_call(ctx::_JaxContext, f::typeof($f), args::Vector{_PyVal}) =
@@ -156,9 +187,9 @@ function _jax_ode_call(ctx::_JaxContext, f, args::Vector{_PyVal})
     solution = _jax_fresh(ctx, :solution)
     status = _jax_fresh(ctx, :status)
     _jax_emit!(ctx, solution * ", " * status * " = " * helper * "(" *
-               join([_jax_ode_solver(f), fun, y0.code, t0.code, ts.code, n, rt.code, at.code,
+               join(["_RK" * _jax_ode_solver(f) * "()", fun, y0.code, t0.code, ts.code, n, rt.code, at.code,
                      mx.code, _jax_tuple_code(passed)], ", ") * ")")
-    label = string(name, " (", _jax_ode_solver(f)[9:end-2], ")")
+    label = string(name, " (", _jax_ode_solver(f), ")")
     # Invalid inputs raise, as natively (`ArgumentError`); an exceeded budget
     # or a failed solve is a numerical failure (`ODESolveFailure` natively),
     # where a density function answers -inf.

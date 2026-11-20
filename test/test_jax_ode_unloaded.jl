@@ -24,7 +24,7 @@ end
         @test_throws "rk_ode_rk45_tol needs OrdinaryDiffEqLowOrderRK, SciMLBase and SciMLSensitivity" rk_ode_rk45_tol(args...)
         @test_throws "rk_ode_bdf_tol needs OrdinaryDiffEqBDF, SciMLBase and SciMLSensitivity" rk_ode_bdf_tol(args...)
         source = string(jax_source(jax_ode_unloaded; have = (:u, :ts), want = :total))
-        @test occursin("diffrax.Dopri5()", source)
+        @test occursin("_RKDopri5()", source)
         @test !occursin("<function", source)
     else
         @test_skip false
