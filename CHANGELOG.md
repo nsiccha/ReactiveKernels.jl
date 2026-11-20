@@ -20,7 +20,8 @@ are recorded in the git history only.
 
 - The native loop for non-strided matrix products checks the shared dimension
   directly. This removes a generic multiplication from the compiled derivative
-  that could make strict `prepare_ad_hvp` fail on a valid row-gather product.
+  that made strict `prepare_ad` and `prepare_ad_hvp` refuse a valid row-gather
+  product.
 
 ## 0.1.347
 

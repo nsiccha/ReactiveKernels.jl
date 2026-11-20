@@ -125,22 +125,30 @@ if !HOOK
     end
 else
 
-@testset "strict Hessian of a gathered matrix product" begin
+@testset "strict gradient and Hessian of a gathered matrix product" begin
     q = [0.3, 0.6, 0.7, -0.5, -0.1, 0.9]
     v = [0.6, -1.0, 0.2, 0.7, 0.3, -0.9]
     factor = [0.8 -0.3 0.5; -0.6 0.3 0.7]
     rows = [3, 1]
-    V = reshape(v, :, size(factor, 1))
-    expected = zeros(size(V))
-    expected[rows, :] .= 2 * (V[rows, :] * factor) * transpose(factor)
-    backend = SecondOrder(AutoEnzyme(; mode = Enzyme.Forward), AutoEnzyme(; mode = Enzyme.Reverse))
+    # The gradient of `sum(abs2, Q[rows, :] * factor)` in the gathered rows of
+    # `X` is `2 * (X[rows, :] * factor) * factor'`, and zero in the other rows.
+    function gathered_rows(x)
+        X = reshape(x, :, size(factor, 1))
+        result = zeros(size(X))
+        result[rows, :] .= 2 * (X[rows, :] * factor) * transpose(factor)
+        vec(result)
+    end
+    second = SecondOrder(AutoEnzyme(; mode = Enzyme.Forward), AutoEnzyme(; mode = Enzyme.Reverse))
     for bound in (false, true)
         data = (; rows, factor)
         preparation_args = bound ? (; bound = data) : data
         call_args = bound ? (;) : data
-        p = prepare_ad_hvp(gathered_product, backend, (v,), q; active = :q, want = :total,
+        g = prepare_ad(gathered_product, backend, q; active = :q, want = :total,
+                       type_stability = :error, preparation_args...)
+        @test ad_gradient(g, q; call_args...) ≈ gathered_rows(q)
+        p = prepare_ad_hvp(gathered_product, second, (v,), q; active = :q, want = :total,
                            type_stability = :error, preparation_args...)
-        @test only(ad_hvp(p, (v,), q; call_args...)) ≈ vec(expected)
+        @test only(ad_hvp(p, (v,), q; call_args...)) ≈ gathered_rows(v)
     end
 end
 
