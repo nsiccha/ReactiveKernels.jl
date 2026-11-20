@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.339
+
+- `jax_source` can flatten plate cells that prepend scalars to a prepared
+  ragged row with `vcat`. Each scalar contributes one entry per cell,
+  including cells whose ragged row is empty.
+
 ## 0.1.338
 
 - The log rising factorial and its shape derivative keep intermediate products
