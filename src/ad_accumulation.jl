@@ -90,9 +90,9 @@ constant function annotation. Load Enzyme before preparation.
 
 Use [`ad_accumulator_storage`](@ref) once to allocate a matching destination,
 then [`ad_accumulate!`](@ref) repeatedly. Storage follows `active` as a tuple,
-even for one port; scalar ports, and the scalar fields of a tuple or
-`NamedTuple` port, use `Ref` storage. The operator and its destinations serve
-one caller at a time.
+even for one port. Immutable ports (scalars and isbits arrays such as a
+StaticArrays `SVector`), and immutable fields of a tuple or `NamedTuple` port,
+use `Ref` storage. The operator and its destinations serve one caller at a time.
 """
 function prepare_ad_accumulator(kernel::PreparedKernel, backend, args...;
         active, directional = active, order::Integer = 0, kwargs...)
