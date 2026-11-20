@@ -95,11 +95,14 @@ end
         mu = X * b .+ c[g]
         y .~ Normal.(mu, 1)
     end
-    _admission_check(matrix, data, q -> (;
+    result = _admission_check(matrix, data, q -> (;
         ll = sum(logpdf(Normal(q.b[1] + q.b[2] * x + q.c[g], 1), y)
             for (x, g, y) in zip(data[:x], data[:g], data[:y])),
         pr = sum(logpdf.(Normal(), q.b)) + sum(logpdf.(Normal(0, 2), q.c)),
         jac = 0.0))
+
+    @test occursin("_declared_codes", sprint(show, result.built.program))
+    @test !occursin("isequal.(", sprint(show, result.built.program))
 
     # Exercise the legacy PopulationPrior route directly, independently of
     # the surface's ordinary array-parameter route.
@@ -114,11 +117,14 @@ end
         [SampledParameter(:sigma, :exponential, (arg1 = 1.0,), nothing, :sigma)],
         AssignmentSpec[], Dict{Symbol,Any}(), 0;
         levelmaps = [LevelMap(:mu, :g, Int[], :levels, Colon())])
-    _admission_check(plan, data, q -> (;
+    legacy = _admission_check(plan, data, q -> (;
         ll = ll(q.mu[1], q.mu[2:3]; sigma = q.sigma),
         pr = logpdf(Normal(), q.mu[1]) +
             sum(logpdf.(Normal(0, 2), q.mu[2:3])) +
             logpdf(Exponential(1), q.sigma), jac = log(q.sigma)))
+
+    @test occursin("_declared_codes", sprint(show, legacy.built.program))
+    @test !occursin("isequal.(", sprint(show, legacy.built.program))
 
     # The likelihood ridge exists, but the proper authored prior changes
     # under that shift; preserving both effects is intentional.
@@ -196,4 +202,29 @@ end
             sum(logpdf.(Normal(), q.c)), jac = 0.0))
     a, b, c, shift = 0.2, -0.3, [-0.7, 0.6], 0.7
     @test cumulative_ll(a, b, c) ≈ cumulative_ll(a + shift, b, c .+ shift)
+end
+
+@testset "independent scan beside a factor location" begin
+    data = Dict{Symbol,Any}(:g => ["b","c","a","a","b"], :y => [0.3,-0.2,0.5,1.1,-0.8],
+        :s => [0.5, -0.25, 0.1], :T => 3)
+    program = quote
+        c[levels(g)] .~ Normal.(0, 1)
+        @scan begin
+            s[1] ~ Normal(0, 1)
+            for i in 2:T
+                s[i] ~ Normal(s[i-1], 1)
+            end
+        end
+        y .~ Normal.(c[g], 1)
+    end
+    function oracle(q)
+        labels = sort(unique(data[:g]))
+        ll = sum(logpdf(Normal(q.c[findfirst(isequal(g), labels)], 1), y)
+            for (g, y) in zip(data[:g], data[:y]))
+        ll += logpdf(Normal(), data[:s][1]) + sum(logpdf.(Normal(), diff(data[:s])))
+        (; ll, pr = sum(logpdf.(Normal(), q.c)), jac = 0.0)
+    end
+    result = _admission_check(program, data, oracle)
+    @test occursin("_declared_codes", sprint(show, result.built.program))
+    @test !occursin("isequal.(", sprint(show, result.built.program))
 end

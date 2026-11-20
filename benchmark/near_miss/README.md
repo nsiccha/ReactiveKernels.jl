@@ -146,3 +146,43 @@ least-squares preparation can hide the cost of building it at smaller sizes.
 | Bernoulli-logit | 50 | 0.163 / 0.199 | 62.8 / 76.5 | 170 / 239 | 222 / 346 |
 | Bernoulli-logit | 500 | 0.174 / 0.261 | 64.5 / 284 | 173 / 1,993 | 227 / 3,959 |
 | Bernoulli-logit | 5,000 | 2.41 / 1.51 | 248 / 2,369 | 179 / 48,226 | 216 / 91,627 |
+
+### After lowering factor terms to level gathers
+
+The factor reads one effect per observation in all four spellings. For a
+partial axis, the coefficient table begins with zero. A covered label
+indexes its declared coefficient and an uncovered label indexes the zero.
+A separately requested design matrix still contains its contrast columns.
+
+These paired measurements use 2,000 rows, 50 groups and one BLAS thread
+on gordito. Each pair is the median of five alternating old and new
+Chairmarks runs in the same Julia process. The old and new samplers agreed
+on the density and on every gradient coordinate at the same parameter vector.
+
+| Spellings | Bernoulli-logit density (µs) | Bernoulli-logit value + gradient (µs) | Poisson density (µs) | Poisson value + gradient (µs) |
+| --- | ---: | ---: | ---: | ---: |
+| Full cover | 18.0 → 17.9 | 23.5 → 23.4 | 6.30 → 6.30 | 14.0 → 14.0 |
+| Reference level | 21.7 → 17.3 | 30.1 → 23.6 | 13.4 → 6.11 | 24.4 → 13.7 |
+| Missing labels | 21.3 → 17.2 | 30.0 → 22.6 | 12.9 → 5.86 | 23.3 → 13.8 |
+| Bound two-column matrix | 17.2 → 17.2 | 22.9 → 22.9 | 8.51 → 8.57 | 15.9 → 15.8 |
+| Authored two-column matrix | 21.5 → 17.9 | 30.3 → 27.3 | 13.4 → 8.60 | 42.7 → 15.9 |
+| Separate scan | 22.1 → 17.8 | 31.1 → 23.5 | 12.9 → 6.35 | 23.8 → 13.5 |
+
+At 20,000 rows and 5,000 levels the reference-coded Normal setup went
+from 111 s and 6,042 MiB to 3.29 s and 286 MiB. Its gradient fell from
+114 ms to 30.8 µs. For Bernoulli-logit, the gradient fell from 91.6 ms to
+325 µs and setup allocations from 2,369 MiB to 258 MiB. Setup time rose
+from 1.51 s to 3.06 s in those two Bernoulli-logit runs. They ran in
+separate processes on a shared host. The complete observations include
+all four variants and both full-cover controls at each level count.
+[Scaling measurements](factor_scaling.csv)
+
+The standalone lowering leaves a small-level Normal trade-off. At 20,000
+rows and 50 levels the reference-coded gradient went from 2.28 to 4.15 µs.
+The old dense design used bound least-squares statistics. The new location
+mixes a gathered effect and a shared coefficient, so this measurement runs
+its row loop. At 2,000 rows the full-cover A13 gradient took 1.09 µs on
+both paths. The A15 model with an authored matrix went from 2.13 to
+7.41 µs. Reference coding, missing labels and the separate scan at this
+smaller row count improved from 2.28, 2.30 and 2.37 µs to 1.21, 1.24
+and 1.05 µs respectively.

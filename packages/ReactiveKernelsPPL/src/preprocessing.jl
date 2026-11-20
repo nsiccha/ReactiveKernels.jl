@@ -212,28 +212,8 @@ function _scalar_column_plate_eligible(plan::StructuralPlan, pred::PredictorSpec
     end
 end
 
-# A predictor with a factor term reads that term's coefficients by level code
-# (`_factor_gather_terms!`): one gather per row. Its full-rank dummies would
-# make the design product an N×J matrix product in every evaluation. Each of
-# its intercept, covariate and factor terms reads its own declared parameter,
-# so the program holds no coefficient position, which would grow with a
-# factor's level count. Matrix terms keep the design path, and so does a
-# factor whose axis may leave a row off it (`_factor_axis_covers_rows`).
-function _factor_gather_affine(plan::StructuralPlan, pred::PredictorSpec)
-    any(t -> t.kind === FactorTerm, pred.terms) || return false
-    return all(pred.terms) do t
-        t.kind in (InterceptTerm, ContinuousTerm, FactorTerm, MatrixTerm) || return true
-        t.kind !== MatrixTerm && _parameter_term(t) || return false
-        t.kind !== FactorTerm || _factor_axis_covers_rows(plan, pred, t)
-    end
-end
-
-# Whether every row's label of a factor term lies on its axis, so its level
-# code (`_declared_codes`) is a position of the coefficient vector: the axis
-# is its own column's complete label set. `unique` and a values axis hold
-# every entry, and `levels` every entry that is not `missing`. A row off a
-# subset of the axis contributes zero (`_validate_levelmaps_data`) and keeps
-# the design path, as a column that may hold `missing` does.
+# A full label axis over its own column needs no extra zero coefficient.
+# Otherwise the coefficient table starts with the off-axis effect, zero.
 function _factor_axis_covers_rows(plan::StructuralPlan, pred::PredictorSpec,
         t::TermSpec)
     col = only(t.columns)
@@ -245,6 +225,8 @@ function _factor_axis_covers_rows(plan::StructuralPlan, pred::PredictorSpec,
     x = get(plan.columns, col, nothing)
     return x isa AbstractVector && !(Missing <: eltype(x))
 end
+
+_has_factor_terms(pred::PredictorSpec) = any(t -> t.kind === FactorTerm, pred.terms)
 
 # Affine predictors with singleton, non-vector or live derived operands
 # use per-block coefficient expressions. This retains
@@ -259,10 +241,10 @@ function _broadcast_affine(plan::StructuralPlan, pred::PredictorSpec)
     # index and so needs the rows.
     packed = any(r -> r.mi_jobs !== nothing, plan.responses)
     _scalar_valued_predictor(plan, pred) && !packed && return true
+    _has_factor_terms(pred) && return true
     _uses_structured_observation_axes(plan) &&
         return !packed && _computed_rows_predictor(plan, pred)
     _scalar_valued_predictor(plan, pred) && return true
-    _factor_gather_affine(plan, pred) && return true
     # An intercept added to a vector expression remains a scalar broadcast.
     # Turning it into a ones-column matrix product creates a needless GEMV
     # and its reverse-mode tape, even when the other summand is already a
@@ -422,7 +404,7 @@ _subset_index_expr(s::Tuple{Int,Symbol}) = Expr(:call, :(:), s[1], :end)
 _subset_index_expr(s::Tuple{Int,Int,Symbol}) = Expr(:call, :(:), s[1], s[2], :end)
 
 """
-    _declared_codes(x, levels) -> Vector{Int}
+    _declared_codes(x, levels[, offset]) -> Vector{Int}
 
 In-model grouping encoder: the 1-based position of each element of raw
 grouping column `x` in DECLARED `levels` order — no sorting (SB
@@ -436,19 +418,22 @@ match through a dictionary (`isequal` and `hash`, as `Dict` compares:
 a categorical value finds its unwrapped label), so a column of n rows over
 K labels costs n lookups, not n × K comparisons: the 43,796-row region
 columns of a downstream application program took 1.2 s per preparation with
-the nested loop. Validated plans only: bind-time coverage validation
-proves every value occurs in `levels`, so the 0 fallback for uncovered
-values is unreachable in-graph (a loud bind error beats a silent wrong
-gather).
+the nested loop. A label outside the axis has code zero. An offset of one
+indexes the coefficient table of a partially covered factor, whose first
+entry is its zero effect.
 """
-ReactiveKernels.@_record_source function _declared_codes(x::AbstractVector, levels::AbstractVector)
+ReactiveKernels.@_record_source _declared_codes(x::AbstractVector, levels::AbstractVector) =
+    _declared_codes(x, levels, 0)
+
+ReactiveKernels.@_record_source function _declared_codes(x::AbstractVector, levels::AbstractVector,
+        offset::Int)
     positions = Dict{eltype(levels),Int}()
     for (j, lv) in enumerate(levels)
         get!(positions, lv, j)
     end
     codes = zeros(Int, length(x))
     for (i, v) in enumerate(x)
-        codes[i] = get(positions, v, 0)
+        codes[i] = get(positions, v, 0) + offset
     end
     return codes
 end
