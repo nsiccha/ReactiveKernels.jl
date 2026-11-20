@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.348
+
+- The native loop for non-strided matrix products checks the shared dimension
+  directly. This removes a generic multiplication from the compiled derivative
+  that could make strict `prepare_ad_hvp` fail on a valid row-gather product.
+
 ## 0.1.347
 
 - With MutatingFunctions loaded, `prepare_into` automatically reuses private

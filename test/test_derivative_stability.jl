@@ -12,6 +12,12 @@ using ReactiveKernels, DifferentiationInterface, Enzyme, Test
 const HOOK = isdefined(Enzyme, :derivative_report) &&
     isdefined(Enzyme, :has_dogfood_repair) && Enzyme.has_dogfood_repair(:derivative_report)
 
+@kernel gathered_product(q::Vector{Float64}; rows::Vector{Int}, factor::Matrix{Float64}) = begin
+    matrix = reshape(q, :, size(factor, 1))
+    selected = view(matrix, rows, :)
+    total::Float64 = sum(abs2, selected * factor)
+end
+
 @kernel linear_gaussian(a::Float64, b::Float64, s::Float64, x::Vector{Float64},
                         y::Vector{Float64}) = begin
     mu = a .+ b .* x
@@ -118,6 +124,25 @@ if !HOOK
         @test_throws ArgumentError ad_derivative_report(prepared, 0.1, 0.5, 1.2, x, y)
     end
 else
+
+@testset "strict Hessian of a gathered matrix product" begin
+    q = [0.3, 0.6, 0.7, -0.5, -0.1, 0.9]
+    v = [0.6, -1.0, 0.2, 0.7, 0.3, -0.9]
+    factor = [0.8 -0.3 0.5; -0.6 0.3 0.7]
+    rows = [3, 1]
+    V = reshape(v, :, size(factor, 1))
+    expected = zeros(size(V))
+    expected[rows, :] .= 2 * (V[rows, :] * factor) * transpose(factor)
+    backend = SecondOrder(AutoEnzyme(; mode = Enzyme.Forward), AutoEnzyme(; mode = Enzyme.Reverse))
+    for bound in (false, true)
+        data = (; rows, factor)
+        preparation_args = bound ? (; bound = data) : data
+        call_args = bound ? (;) : data
+        p = prepare_ad_hvp(gathered_product, backend, (v,), q; active = :q, want = :total,
+                           type_stability = :error, preparation_args...)
+        @test only(ad_hvp(p, (v,), q; call_args...)) ≈ vec(expected)
+    end
+end
 
 @testset "the derivative's allocations: report, warn, refuse" begin
     args = (0.1, 0.5, 1.2, x, y)
