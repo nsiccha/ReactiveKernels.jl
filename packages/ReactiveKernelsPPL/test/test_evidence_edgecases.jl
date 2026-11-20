@@ -66,7 +66,10 @@ const _INF_BOUND_HI = [Inf, Inf, 2.0, 2.0, Inf, 1.5]
         (np, :(truncated.(Normal.(a, s), lo, hi)), Dict(:y => [1.2, 0.9, 0.5, 1.4, -0.5, 1.1],
             :lo => _INF_BOUND_LO, :hi => _INF_BOUND_HI), nq, normal,
             (d, y, i, D) -> EvidenceD.logpdf(EvidenceD.truncated(d, D[:lo][i], D[:hi][i]), y)),
-        # A scalar datum removes the bound for every row.
+        # A scalar datum removes the bound for every row. Ordinary Enzyme Reverse
+        # returns a NaN scale gradient for the two truncated cases through
+        # dogfood 4ff5e0e4 (`benchmark/repro_enzyme_open_bound_gradient.jl`,
+        # Enzyme snag `reverse-nan-hois-9f3292ff`).
         (np, :(truncated.(Normal.(a, s), lo, 2.0)), Dict(:y => [1.2, 0.9, -0.5], :lo => -Inf), nq, normal,
             (d, y, i, D) -> EvidenceD.logpdf(EvidenceD.truncated(d, -Inf, 2.0), y)),
         (np, :(truncated.(Normal.(a, s), 0.0, hi)), Dict(:y => [1.2, 0.9, 0.5], :hi => Inf), nq, normal,
