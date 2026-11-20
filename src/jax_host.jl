@@ -142,11 +142,9 @@ function _host_lines!(ctx::_JaxContext, first::Int)
     end
 end
 
-# Host integers stay int64 in every module: NumPy computes the data with
-# them, and JAX converts them when a float32 module's functions read them.
+# NumPy prepares integers at their Julia width, independently of JAX's x64 mode.
 _host_dtype(@nospecialize(E)) = E isa Type && E <: Bool ? "np.bool_" :
-    E isa Type && E <: Integer ? "np.int64" :
-    E isa Type && E <: AbstractFloat ? "np." * _jax_dtype_name(E) :
+    E isa Type && E <: Union{Integer,AbstractFloat} ? "np." * _jax_dtype_name(E) :
     "object"
 _host_is_numeric_array(@nospecialize(T)) = T isa Type && T <: AbstractArray && !_jax_ragged(T) &&
     eltype(T) isa Type && eltype(T) <: Number
@@ -1325,7 +1323,10 @@ function _host_construct(ctx::_JaxContext, T::Type, args::Vector{_PyVal})
     end
     length(args) == 1 && !_jax_is_array(args[1].T) || return nothing
     T <: Bool && return _PyVal("bool(" * args[1].code * ")", Bool, true)
-    T <: Integer && return _PyVal("int(" * args[1].code * ")", T, true)
+    if T <: Integer
+        cast = T === Int || !haskey(_JAX_INTEGER_DTYPES, T) ? "int" : _host_dtype(T)
+        return _PyVal(cast * "(" * args[1].code * ")", T, true)
+    end
     T <: AbstractFloat && return _PyVal(_host_dtype(T) * "(" * args[1].code * ")", T, true)
     nothing
 end

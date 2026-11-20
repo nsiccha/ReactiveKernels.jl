@@ -175,6 +175,19 @@ end
 @inline _ad_stored_point_component(slot::NamedTuple{K}, x::NamedTuple{K}) where {K} =
     map(_ad_stored_point_component, slot, x)
 @inline _ad_stored_point_component(slot, x) = _ad_active_point_component(x)
+
+# The callers establish contiguous storage. Compare occupied byte ranges,
+# including distinct headers that wrap overlapping storage.
+# Subtract the smaller address so an end-address addition cannot overflow.
+@inline function _contiguous_storage_overlaps(a, b)
+    isempty(a) && return false
+    isempty(b) && return false
+    GC.@preserve a b begin
+        pa, pb = UInt(pointer(a)), UInt(pointer(b))
+        pa <= pb ? pb - pa < sizeof(a) : pa - pb < sizeof(b)
+    end
+end
+
 _ad_gradient_buffer_storage(backend, point, contexts) = nothing
 _ad_prepared_storage(op, backend, point, contexts) = nothing
 _ad_prepared_storage(::Val{:gradient}, backend, point::Tuple, contexts) =

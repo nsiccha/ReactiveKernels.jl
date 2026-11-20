@@ -883,7 +883,7 @@ _jax_is_singleton_value(v::_PyVal) = v.T isa Type && v.T !== Nothing && !(v.T <:
 _jax_type_of_value(v::_PyVal) = v.T isa _JaxCallable ? (v.T.f isa Type ? v.T.f : nothing) :
     v.T isa DataType && v.T <: Type && length(v.T.parameters) == 1 ?
         v.T.parameters[1] : nothing
-_jax_dtype(@nospecialize(E)) = E <: Bool ? "jnp.bool_" : E <: Integer ? _jax_int_dtype() :
+_jax_dtype(@nospecialize(E)) = E <: Bool ? "jnp.bool_" : E <: Integer ? _jax_int_dtype(E) :
     E <: AbstractFloat ? "jnp." * _jax_dtype_name(E) : "jnp." * _jax_float_name()
 
 # The module's float type, `jax_source`'s `float_type`: the dtype of every
@@ -893,11 +893,16 @@ _jax_dtype(@nospecialize(E)) = E <: Bool ? "jnp.bool_" : E <: Integer ? _jax_int
 const _JAX_FLOAT_TYPE_KEY = :reactivekernels_jax_float_type
 _jax_float_type() = get(task_local_storage(), _JAX_FLOAT_TYPE_KEY, Float64)::DataType
 _jax_float_name() = _jax_float_type() === Float32 ? "float32" : "float64"
-# A float32 module does not turn on JAX's 64-bit mode (`_jax_needs_x64`), so
-# its integers are JAX's default integer, Python's `int` as a dtype: int32,
-# or int64 where another module turned 64-bit mode on, as `jnp.arange` and
-# the integer data are there.
-_jax_int_dtype() = _jax_float_type() === Float32 ? "int" : "jnp.int64"
+# In a float32 module, JAX's active x64 setting determines whether 64-bit
+# integers are available. Narrower integers keep their declared width.
+function _jax_int_dtype(@nospecialize(T))
+    name = _jax_dtype_name(T)
+    if _jax_float_type() === Float32
+        name == "int64" && return "int"
+        name == "uint64" && return "jnp.result_type(jnp.uint64)"
+    end
+    "jnp." * name
+end
 function _jax_with_float_type(f, float_type)
     float_type in (Float64, Float32) || throw(ArgumentError(
         "jax_source: `float_type` is `Float64` or `Float32`; got `$float_type`"))
@@ -5847,11 +5852,8 @@ function _jax_call_positional(ctx::_JaxContext, T::Type, args::Vector{_PyVal})
         return _PyVal("jnp.asarray(" * args[1].code * ", dtype=" * dtype * ")",
                       Array{E,ndims(args[1].T)})
     end
-    if T <: AbstractFloat && length(args) == 1
+    if T <: Union{AbstractFloat,Integer} && length(args) == 1
         return _PyVal("jnp.asarray(" * args[1].code * ", dtype=" * _jax_dtype(T) * ")", T)
-    end
-    if T <: Integer && length(args) == 1
-        return _PyVal("jnp.asarray(" * args[1].code * ", dtype=" * _jax_dtype(Int) * ")", T)
     end
     _jax_error("constructing a `", T, "` has no JAX translation", _jax_where(ctx))
 end
@@ -8606,9 +8608,10 @@ float value the program does not type `Float32` itself: Julia's default
 emitted with `float_type = Float32`, for an accelerator whose float64 is slow.
 Such a module casts its float inputs to `float32`, `prepare_data` returns
 `float32` data, and the dtype metadata says so. It does not turn on JAX's
-64-bit mode (`jax_enable_x64`), so its device integers are JAX's default
-(`int32`), unless it rounds an `fma` once, which takes a float64 product; it
-stays float32 where another module turned that mode on. Its results carry
+64-bit mode (`jax_enable_x64`) unless it rounds an `fma` once, which takes
+a float64 product. With that mode off, 64-bit integer dtypes become their
+32-bit counterparts. Narrower integer dtypes keep their width and signedness.
+The module's floats stay float32 where another module turned x64 on. Its results carry
 float32 rounding: compare it with the `Float64` module of the same program at
 a tolerance relative to `eps(Float32)` and the size of the value.
 
@@ -9310,7 +9313,9 @@ def _rk_columns(value, dtypes):
 _jax_dtype_name(::Type{<:AbstractArray{T}}) where {T} = _jax_dtype_name(T)
 _jax_dtype_name(::Type{<:AbstractArray{<:AbstractArray{T}}}) where {T} = _jax_dtype_name(T)
 _jax_dtype_name(::Type{Bool}) = "bool"
-_jax_dtype_name(::Type{<:Integer}) = "int64"
+const _JAX_INTEGER_DTYPES = Dict(T => lowercase(string(T)) for T in
+    (Int8, UInt8, Int16, UInt16, Int32, UInt32, Int64, UInt64))
+_jax_dtype_name(T::Type{<:Integer}) = get(_JAX_INTEGER_DTYPES, T, "int64")
 _jax_dtype_name(::Type{Float32}) = "float32"
 # Every other float is the module's float type (`jax_source`'s `float_type`).
 _jax_dtype_name(::Type{<:AbstractFloat}) = _jax_float_name()

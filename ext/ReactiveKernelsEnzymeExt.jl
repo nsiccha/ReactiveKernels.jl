@@ -250,17 +250,8 @@ end
     body
 end
 
-# Dense bits arrays have contiguous payloads. Compare their occupied byte
-# ranges, including distinct array headers that wrap overlapping storage.
-# Subtract the smaller address so an end-address addition cannot overflow.
-@inline function _residual_storage_overlaps(a::Array, b::Array)
-    isempty(a) && return false
-    isempty(b) && return false
-    GC.@preserve a b begin
-        pa, pb = UInt(pointer(a)), UInt(pointer(b))
-        pa <= pb ? pb - pa < sizeof(a) : pa - pb < sizeof(b)
-    end
-end
+@inline _residual_storage_overlaps(a::Array, b::Array) =
+    ReactiveKernels._contiguous_storage_overlaps(a, b)
 
 _protect_primal_aliases(::Tuple{}, ::Tuple{}, flags, primal) = flags
 function _protect_primal_aliases(residuals::Tuple, sources::Tuple, flags, primal)
