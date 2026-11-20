@@ -29,18 +29,18 @@ Requires ReactiveKernels 0.1.342.
   bound rows. All four new responses support weighting, truncation, censoring
   and interval censoring in native Julia and JAX. Additional numeric law
   parameters may vary by row.
-- An inverse link may be named or qualified. `p = logistic.(eta)` followed
-  by `y .~ Bernoulli.(p)`, and `LogExpFunctions.logistic.(eta)`, select the
-  same natural-parameter likelihood as the inline `logistic.(eta)`. A
-  qualified call is identified by its binding, so an alias or a re-export of
-  the link function counts and another module's function of the same name
-  does not. Other readers of the named value still get the value.
-- An observation written as an indexed loop,
-  `@plate for i in eachindex(y); y[i] ~ Normal(a + b * x[i], sigma); end`,
-  exposes its row operands to the summed plate like the dotted form, so the
-  same row grouping and regression statistics apply. A response selected
-  whole (`y[:]`, `y[eachindex(y)]`, `y[axes(y, 1)]`) uses the likelihood of
-  the unsliced `y`.
+- An inverse link may be named or qualified. `p = logistic.(eta)` followed by
+  `y .~ Bernoulli.(p)`, and `LogExpFunctions.logistic.(eta)`, select the same
+  natural-parameter likelihood as the inline `logistic.(eta)`. A qualified
+  call is identified by its constant binding, including aliases and re-exports
+  of the same function; a mutable global alias keeps ordinary call semantics.
+  Other readers of the named value still get the value.
+- An indexed observation with elementwise row arithmetic, such as `@plate for
+  i in eachindex(y); y[i] ~ Normal(a + b * x[i], sigma); end`, exposes its row
+  operands to grouping and regression statistics like the dotted form. Opaque
+  calls and conditionals in the row expression stay in the indexed cell.
+- For a one-based response vector, `y[:]`, `y[eachindex(y)]` and `y[axes(y,
+  1)]` use the unsliced likelihood when their operands cover the same rows.
 - A factor term (`alpha[g]` with declared levels) gathers its coefficients
   by level in every spelling: with a reference level, with missing labels,
   beside matrix terms and beside a scan. Preparation no longer builds a
