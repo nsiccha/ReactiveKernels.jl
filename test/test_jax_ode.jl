@@ -48,6 +48,15 @@ _jax_ode_ramp(t, y, k) = [k * max(t - 1, 0.0) * exp(-y[1])]
     return total
 end
 
+@kernel jax_ode_retry_cells(rates::Vector{Float64}, ts::Vector{Float64}) = begin
+    values = plate(rates) do k
+        sol = rk_ode_rk45_tol(_jax_ode_ramp, [0.0], 0.0, ts, 1e-8, 1e-8, 10^4, k)
+        sol[end, 1]
+    end
+    total = sum(values)
+    return total
+end
+
 @kernel jax_ode_stiff(u::Vector{Float64}, ts::Vector{Float64}) = begin
     sol = rk_ode_bdf_tol(_jax_ode_robertson, [1.0, 0.0, 0.0], 0.0, ts, 1e-8, 1e-10, 10^6,
                          exp(u[1]), 3e7, 1e4)
@@ -84,7 +93,7 @@ end
     text = string(source)
     @test occursin("import diffrax", text)
     @test occursin("_RKDopri5()", text)
-    # One solve, vmapped over the cells: no body per subject or output time.
+    # One call to the ODE bridge, vmapped over the cells.
     @test count("_rk_ode_solve(", text) == 2
     # A module without an ODE does not import diffrax.
     @test !occursin("diffrax", string(jax_source(jax_ode_none; have = (:u,), want = :total)))
@@ -129,6 +138,12 @@ end
         got = rk_jax_evaluate(source, "kernel", (u, ts); grad = true)
         @test got.value ≈ value rtol = 1e-6
         @test got.grad ≈ grad rtol = 1e-6
+        batched = jax_source(jax_ode_retry_cells; have = (:rates, :ts), want = :total)
+        for rates in ([10.0, 12.0], [10.0, 100.0])
+            got = rk_jax_evaluate(batched, "kernel", (rates, ts); grad = :joint)
+            @test got.joint_value ≈ sum(log1p.(rates ./ 2)) rtol = 1e-6
+            @test got.grad ≈ 1 ./ (2 .+ rates) rtol = 1e-6
+        end
     else
         @test_skip false
     end
