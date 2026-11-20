@@ -66,9 +66,20 @@ const _INF_BOUND_HI = [Inf, Inf, 2.0, 2.0, Inf, 1.5]
         (np, :(truncated.(Normal.(a, s), lo, hi)), Dict(:y => [1.2, 0.9, 0.5, 1.4, -0.5, 1.1],
             :lo => _INF_BOUND_LO, :hi => _INF_BOUND_HI), nq, normal,
             (d, y, i, D) -> EvidenceD.logpdf(EvidenceD.truncated(d, D[:lo][i], D[:hi][i]), y)),
-        # A scalar datum removes the bound for every row.
+        # A scalar datum removes the bound for every row. Ordinary Enzyme Reverse
+        # returned a NaN scale gradient for the two truncated cases through
+        # dogfood 4ff5e0e4; dogfood 9770912c (libEnzyme 078431a8, repair
+        # `compared_operand_adjoints`, Enzyme snag `reverse-nan-hois-9f3292ff`)
+        # returns the gradient (`benchmark/repro_enzyme_open_bound_gradient.jl`).
         (np, :(truncated.(Normal.(a, s), lo, 2.0)), Dict(:y => [1.2, 0.9, -0.5], :lo => -Inf), nq, normal,
             (d, y, i, D) -> EvidenceD.logpdf(EvidenceD.truncated(d, -Inf, 2.0), y)),
+        (np, :(truncated.(Normal.(a, s), 0.0, hi)), Dict(:y => [1.2, 0.9, 0.5], :hi => Inf), nq, normal,
+            (d, y, i, D) -> EvidenceD.logpdf(EvidenceD.truncated(d, 0.0, Inf), y)),
+        # Include an observation at the remaining clamp as well as interior densities.
+        (np, :(censored.(Normal.(a, s), lo, 2.0)), Dict(:y => [2.0, 0.9, -0.5], :lo => -Inf), nq, normal,
+            (d, y, i, D) -> EvidenceD.logpdf(EvidenceD.censored(d, -Inf, 2.0), y)),
+        (np, :(censored.(Normal.(a, s), 0.0, hi)), Dict(:y => [1.2, 0.9, 0.0], :hi => Inf), nq, normal,
+            (d, y, i, D) -> EvidenceD.logpdf(EvidenceD.censored(d, 0.0, Inf), y)),
         # An `Inf` interval upper end is the right-censored event (y, Inf).
         (np, :(interval_censored.(Normal.(a, s), hi)), Dict(:y => [1.2, 0.9, 0.5, 1.4, 0.5, 1.1],
             :hi => [2.0, Inf, 1.0, Inf, 0.9, Inf]), nq, normal,
@@ -86,7 +97,7 @@ const _INF_BOUND_HI = [Inf, Inf, 2.0, 2.0, Inf, 1.5]
             :hi => [2.0, Inf, 4.0, Inf, 3.0, Inf], :x => zeros(6)), pq, poisson,
             (d, y, i, D) -> log(EvidenceD.cdf(d, D[:hi][i]) - EvidenceD.cdf(d, y))),
     )
-    for (priors, law, data, q, dist, reference) in cases
+    @testset "$law" for (priors, law, data, q, dist, reference) in cases
         expr = Expr(:block, priors..., :(y .~ $law))
         bound, built, k, u = _evidence_query(expr, data, q)
         ll = sum(reference(dist(q), y, i, data) for (i, y) in enumerate(data[:y]))
@@ -94,6 +105,7 @@ const _INF_BOUND_HI = [Inf, Inf, 2.0, 2.0, Inf, 1.5]
             @test k(u) ≈ prior(q) + ll atol = 1e-10
             sampler = prepare_sampler(built, bound, u; backend = AutoEnzyme(; mode = Enzyme.Reverse))
             value, g = sampler_value_and_gradient!(sampler, similar(u), u)
+            @test value ≈ prior(q) + ll atol = 1e-10
             fd = [(k(u .+ 1e-6 .* (1:length(u) .== j)) - k(u .- 1e-6 .* (1:length(u) .== j))) / 2e-6
                   for j in eachindex(u)]
             @test all(isfinite, g)
