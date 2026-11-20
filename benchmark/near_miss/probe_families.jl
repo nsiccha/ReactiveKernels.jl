@@ -326,6 +326,16 @@ if occursin('D', fam)
         y .~ Logistic.(exp.(a .+ b .* x), sigma)
     end
     record(probe("D-shared", "D7 Logistic, shared sigma", D7, (; x), (; y)))
+    D8 = @rkppl begin
+        nu ~ Gamma(2, 0.1)
+        y .~ TDist.(nu)
+    end
+    record(probe("D-shared", "D8 TDist, shared nu", D8, (;), (; y)))
+    D8s = @rkppl begin
+        nu ~ Gamma(2, 0.1)
+        y .~ StudentT.(nu, 0, 1)
+    end
+    record(probe("D-shared", "D8s StudentT, unit scale", D8s, (;), (; y)))
 end
 
 
@@ -383,6 +393,8 @@ if occursin('R', fam)
     push!(refs, time_ref("R gamma log mean", ref_gamma_exp, u3, x, ypos, log.(ypos), loggamma))
     push!(refs, time_ref("R weibull log scale", ref_weibull_exp, u3, x, log.(ypos)))
     push!(refs, time_ref("R cauchy exp link", ref_cauchy_exp, u3, x, y))
+    push!(refs, time_ref("R laplace exp link", ref_laplace_exp, u3, x, y))
+    push!(refs, time_ref("R logistic exp link", ref_logistic_exp, u3, x, y))
     push!(refs, time_ref("R bernoulli-logit continuous", ref_bernoulli_logit, u2, x, ybinc))
     push!(refs, time_ref("R poisson continuous", ref_poisson, u2, x, ycnt, Float64(sum(ycnt)),
         sum(x .* ycnt), sum(loggamma.(ycnt .+ 1.0))))

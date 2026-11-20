@@ -38,6 +38,7 @@ function ref_student_exp(u, x, y, lgamma)
     a, b, ls, lnu = u[1], u[2], u[3], u[4]
     sigma = exp(ls); nu = exp(lnu)
     lp = nlp(a, 0.0, 1.0) + nlp(b, 0.0, 1.0) - sigma + ls
+    lp += 2 * (lnu - log(0.1)) - nu / 0.1  # Gamma(2, 0.1) and the log-coordinate Jacobian
     s = 0.0
     c = 1 / (nu * sigma * sigma)
     @inbounds @simd for i in eachindex(y)
@@ -84,6 +85,30 @@ function ref_cauchy_exp(u, x, y)
         s += log1p(r * r * c)
     end
     lp - s - length(y) * (log(π) + ls)
+end
+
+function ref_laplace_exp(u, x, y)
+    a, b, ls = u
+    sigma = exp(ls)
+    total = 0.0
+    @inbounds @simd for i in eachindex(y)
+        total += abs(y[i] - exp(a + b * x[i]))
+    end
+    prior = nlp(a, 0.0, 1.0) + nlp(b, 0.0, 1.0) - sigma + ls
+    prior - total / sigma - length(y) * (log(2.0) + ls)
+end
+
+function ref_logistic_exp(u, x, y)
+    a, b, ls = u
+    sigma = exp(ls)
+    invscale = inv(sigma)
+    total = 0.0
+    @inbounds @simd for i in eachindex(y)
+        z = abs((y[i] - exp(a + b * x[i])) * invscale)
+        total += z + 2 * log1p(exp(-z))
+    end
+    prior = nlp(a, 0.0, 1.0) + nlp(b, 0.0, 1.0) - sigma + ls
+    prior - total - length(y) * ls
 end
 
 function ref_bernoulli_logit(u, x, y)

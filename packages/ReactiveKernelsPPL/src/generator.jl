@@ -1969,7 +1969,6 @@ end
 # so entry `i` of each argument belongs to entry `i` of the response's
 # `:pointwise` densities. A location or scale shared by every observation stays
 # a scalar.
-const _OBSERVATION_LOCATION_SCALE_FAMILIES = (GaussianFam, StudentTFam, LogNormalFam)
 
 function _observation_arguments(r::LikelihoodSpec, plan::StructuralPlan,
         rs::Vector{Expr})
@@ -1983,7 +1982,8 @@ function _observation_arguments(r::LikelihoodSpec, plan::StructuralPlan,
 end
 
 function _observation_argument_inputs(r::LikelihoodSpec, rs::Vector{Expr})
-    if r.family ∉ _OBSERVATION_LOCATION_SCALE_FAMILIES
+    law = _location_scale_law(r.family)
+    if law === nothing
         i = findlast(st -> _assigned_name(st) === _observation_argument_node(r), rs)
         i === nothing && return nothing
         return Pair{Symbol,Any}[f.args[1] => f.args[2] for f in rs[i].args[2].args]
@@ -1996,7 +1996,12 @@ function _observation_argument_inputs(r::LikelihoodSpec, rs::Vector{Expr})
         rhs.args[1].args[1] === :plate) || return nothing
     inputs = rhs.args[1].args[2:end]
     scale = r.scale isa Real ? Float64(r.scale) : deepcopy(inputs[3])
-    return Pair{Symbol,Any}[:location => deepcopy(inputs[2]), :scale => scale]
+    arguments = Pair{Symbol,Any}[:location => deepcopy(inputs[2]), :scale => scale]
+    n = 2 + !(r.scale isa Real) + (r.nu !== nothing && !(r.nu isa Real))
+    for (i, port) in enumerate(_location_scale_extra_ports(law))
+        push!(arguments, port => deepcopy(inputs[n + i]))
+    end
+    return arguments
 end
 
 function _observations_statement(points::Vector{Pair{Symbol,Any}},
@@ -2631,16 +2636,9 @@ end
 function _response_likelihood_stmts_full(r::LikelihoodSpec, plan::StructuralPlan)
     node = _lik_name(r.label)
     pw = _pw_name(r.label)
-    if r.family === GaussianFam
-        # Every location, a data-matrix product `M * v` included, sums its
-        # cells in the observation plate. RK reduces a total-only plate in one
-        # loop with the scale's invariants hoisted, so the reverse pass reads
-        # the location in place instead of a materialized residual vector.
-        return _gaussian_plate_stmts(r, plan, node, pw)
-    elseif r.family === StudentTFam
-        return _student_plate_stmts(r, plan, node, pw)
-    elseif r.family === LogNormalFam
-        return _lognormal_plate_stmts(r, plan, node, pw)
+    law = _location_scale_law(r.family)
+    if law !== nothing
+        return _location_scale_plate_stmts(r, plan, node, pw, law)
     elseif r.family === BernoulliLogitFam
         # Keep stable scalar arithmetic through the summed plate. The
         # algebraic dot(y, eta) - sum(log1pexp, eta) loses representable
@@ -3496,82 +3494,35 @@ function _weighted_cell(wv, cell::Expr)
     return Expr[:(_ppl_arm::Float64 = $cell), :($wv * _ppl_arm)]
 end
 
-function _gaussian_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
-    y = r.response
+# Keep the response, location and any varying scale in the same plate
+# positions for the observation query. A shared scale or degrees of freedom
+# is then also visible to RK when it prepares the sum.
+function _location_scale_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
+        node::Symbol, pw::Symbol, law::_LocationScaleFamily)
     pre = Expr[]
     lp = _response_value_node!(pre, r, plan)
-    sarg = _scale_plate_arg(r, plan, pre)
-    inputs = Any[y, lp]
+    inputs = Any[r.response, lp]
     yv, lpv = _dovar(1), _dovar(2)
-    sref = _thread_ref!(inputs, sarg)
-    base = :(normal($lpv, $sref).logpdf($yv))
-    cell = base
-    cell = _wrap_evidence!(r, plan, pre, inputs, cell)
-    cell = :($sref > 0 ? $cell : -Inf)
-    if r.weights !== nothing
-        wv = _thread_ref!(inputs, r.weights)
-        cell = _weighted_cell(wv, cell)
+    sref = _thread_ref!(inputs, _scale_plate_arg(r, plan, pre))
+    values = (; location = lpv, scale = sref)
+    valid = :($sref > 0)
+    if r.nu !== nothing
+        nu = _scale_use_plate_arg(r, plan, pre, r.nu, Symbol(r.label, :_nu))
+        nuv = _thread_ref!(inputs, nu)
+        values = (; values..., nu = nuv)
+        valid = :($valid && $nuv > 0)
     end
-    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
-end
-
-_gaussian_cell(kind::Symbol, base::Expr, yv::Symbol, lb, ub, lpv::Symbol, sref) =
-    _evidence_cell(Val(kind), base, yv, lb, ub,
-        b -> :(normal($lpv, $sref).cdf($b)),
-        b -> :(normal($lpv, $sref).ccdf($b)), false)
-
-# Student-t plate: the Gaussian shape with a df argument — validation
-# guarantees `nu` (a sampled name, a literal, or a predictor-fed
-# per-observation nu) and sigma; evidence arms mirror the Gaussian
-# clamp law over the `student_t` cdf (`_student_cell`), plus optional
-# weights. A predictor-fed nu binds its own `_ppl_sc_<label>_nu` node
-# (the `_nu`-suffixed label cannot collide with any `<lhs>_resp` scale
-# node), so scale and nu predictors coexist.
-function _student_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
-    y = r.response
-    pre = Expr[]
-    lp = _response_value_node!(pre, r, plan)
-    sarg = _scale_plate_arg(r, plan, pre)
-    nuarg = _scale_use_plate_arg(r, plan, pre, r.nu, Symbol(r.label, :_nu))
-    inputs = Any[y, lp]
-    yv, lpv = _dovar(1), _dovar(2)
-    sref = _thread_ref!(inputs, sarg)
-    nuv = _thread_ref!(inputs, nuarg)
-    base = :(student_t($nuv, $lpv, $sref).logpdf($yv))
-    cell = base
-    cell = _wrap_evidence!(r, plan, pre, inputs, cell)
-    cell = :($sref > 0 && $nuv > 0 ? $cell : -Inf)
-    if r.weights !== nothing
-        wv = _thread_ref!(inputs, r.weights)
-        cell = _weighted_cell(wv, cell)
+    for (port, name) in zip(_location_scale_extra_ports(law), r.extra_predictors)
+        values = merge(values, NamedTuple{(port,)}((_thread_ref!(inputs, name),)))
     end
-    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
-end
-
-# LogNormal likelihood (Stan `lognormal_lpdf` mirror): the cell calls
-# the prior-proven `lognormal` distribution endpoint
-# (`LOGNORMAL_KERNEL_SOURCE`, Distributions.jl `LogNormal(mu, sigma)`
-# order) — no closed-form respelling, so SB parity is by shared
-# operation order. Mu reads its argument value; sigma threads scalar
-# or per observation via `_scale_plate_arg`, including a modeled sigma.
-# The endpoint's lazy `y > 0` guard returns
-# -Inf off support; `y` is bound data so preparation splits the plate
-# per taken arm and no backend receives the branch. The shared evidence
-# algebra wraps its density and tails before optional weights.
-function _lognormal_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
-    y = r.response
-    pre = Expr[]
-    lp = _response_value_node!(pre, r, plan)
-    sarg = _scale_plate_arg(r, plan, pre)
-    inputs = Any[y, lp]
-    yv, lpv = _dovar(1), _dovar(2)
-    sref = _thread_ref!(inputs, sarg)
-    cell = :(lognormal($lpv, $sref).logpdf($yv))
-    cell = _wrap_evidence!(r, plan, pre, inputs, cell)
-    cell = :($sref > 0 ? $cell : -Inf)
+    ref = law.binding
+    ctor = isdefined(PPLGeneratedModels, ref.name) &&
+        getglobal(PPLGeneratedModels, ref.name) === getglobal(ref.mod, ref.name) ? ref.name : ref
+    object = Expr(:call, ctor, (values[p] for p in law.ports)...)
+    cell = _wrap_evidence!(r, plan, pre, inputs, :($object.logpdf($yv)))
+    cell = :($valid ? $cell : -Inf)
     if r.weights !== nothing
-        wv = _thread_ref!(inputs, r.weights)
-        cell = _weighted_cell(wv, cell)
+        cell = _weighted_cell(_thread_ref!(inputs, r.weights), cell)
     end
     return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
@@ -3613,13 +3564,6 @@ function _bernoulli_yplate!(pre::Vector{Expr}, plan::StructuralPlan,
     push!(pre, :($yb = Array{Bool}($y .!= 0)))
     return yb, yv
 end
-
-# Student-t evidence arms: the Gaussian clamp law over the `student_t`
-# cdf (continuous bounds, non-strict censored arms).
-_student_cell(kind::Symbol, base::Expr, yv::Symbol, lb, ub, nuv, lpv::Symbol, sref) =
-    _evidence_cell(Val(kind), base, yv, lb, ub,
-        b -> :(student_t($nuv, $lpv, $sref).cdf($b)),
-        b -> :(student_t($nuv, $lpv, $sref).ccdf($b)), false)
 
 function _bernoulli_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response

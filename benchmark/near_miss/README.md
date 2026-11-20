@@ -28,9 +28,9 @@ measured; a variant that fails prints its error instead of a timing.
 | A | `y .~ Normal.(a .+ b .* x, sigma)` | named location, matrix design, data-weighted scale, LogNormal, `@plate` loop, quadratic term, exp link, Student-t, modeled scale, scalar location, crossed and gathered intercepts, gathered intercept beside an authored `hcat` or a separate scan, whole-vector range |
 | B | `y .~ BernoulliLogit.(a .+ b .* x)` on a discrete covariate | continuous covariate, `Bernoulli.(logistic.(…))`, Poisson, Binomial, negative binomial, `@plate` loop, named and qualified links, whole-vector range, Poisson exposure |
 | C | `y .~ Normal.(alpha[g] .+ b .* x, sigma)` with rows sorted by group | shuffled rows, Bernoulli-logit, Poisson, Student-t, reference coding, missing group labels |
-| D | `y .~ Normal.(exp.(a .+ b .* x), sigma)` | Student-t, LogNormal, Gamma, Weibull, Cauchy, Laplace, Logistic with shared shape or scale |
+| D | `y .~ Normal.(exp.(a .+ b .* x), sigma)` | Student-t, LogNormal, Gamma, Weibull, Cauchy, Laplace, Logistic with shared shape or scale, plus the equivalent standardized `TDist.(nu)` and `StudentT.(nu, 0, 1)` |
 | G | Poisson cubic trend over 40 rows | Binomial quadratic trend, one effect per row, Poisson, Binomial and Bernoulli-logit over a five-column design matrix |
-| R | hand-written loops | Normal, Student-t, Cauchy, Bernoulli-logit, Poisson, gathered Normal |
+| R | hand-written loops | Normal, Student-t, Cauchy, Laplace, Logistic, Gamma, Weibull, Bernoulli-logit, Poisson, gathered Normal |
 
 ## First measurement
 
@@ -335,3 +335,28 @@ states. B9 took 29.67 µs per gradient. B9log took 11.30 µs with the logarithm
 of its positive exposure supplied as an offset. Replacing a general product
 with a log offset would change what happens for negative exposure or when the
 first exponential overflows before multiplication.
+
+## Location-scale response laws
+
+D5–D7 previously failed during model lowering. Each now calls the law's
+`logpdf` in a summed plate. The shared log scale is computed before the row
+loop. Times below are microseconds for 2,000 rows on gordito with the Student-t
+factor form from `5f79a995e`. The models and hand loops ran in the same
+Julia 1.10.12 (kb8) process using ordinary Enzyme reverse mode. All the
+value-and-gradient calls allocated zero bytes.
+
+| Response | Model density | Hand density | Model value and gradient | Hand value and gradient |
+| --- | ---: | ---: | ---: | ---: |
+| D1 Student-t, exp link | 24.32 | 20.24 | 41.15 | 28.95 |
+| D5 Cauchy | 20.21 | 20.32 | 29.44 | 29.04 |
+| D6 Laplace | 4.80 | 4.60 | 13.47 | 13.95 |
+| D7 Logistic | 29.19 | 29.08 | 52.82 | 46.09 |
+
+The Logistic kernel uses `log1pexp(-abs(z))` and the hand loop uses
+`log1p(exp(-abs(z)))`. Substituting the kernel's `log1pexp` in the hand
+loop gave 51.95 µs for value and gradient.
+
+D8 `TDist.(nu)` previously failed during lowering. It now agrees exactly in
+value and gradient with D8s `StudentT.(nu, 0, 1)` at the checked parameter
+point. In the same run their densities took 11.68 and 11.65 µs respectively,
+and their value-and-gradient calls took 18.06 and 17.94 µs.

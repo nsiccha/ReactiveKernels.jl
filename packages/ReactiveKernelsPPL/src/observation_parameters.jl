@@ -66,7 +66,7 @@ function _observation_port(name::Symbol, bindings, port::Symbol)
 end
 
 function _observation_parameter_stmts(r::LikelihoodSpec, stmts::Vector{Expr})
-    r.family in _OBSERVATION_LOCATION_SCALE_FAMILIES && return Expr[]
+    _location_scale_law(r.family) !== nothing && return Expr[]
     i = findlast(st -> _assigned_name(st) === _pw_name(r.label), stmts)
     i === nothing && return Expr[]
     rhs = stmts[i].args[2]
