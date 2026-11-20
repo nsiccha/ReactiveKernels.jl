@@ -92,19 +92,22 @@ end
 _is_cell_latent_object(ex) = _is_dotted_call(ex) && ex.args[1] isa Symbol &&
     _cell_object_call(ex.args[1])
 
-# Rebuild a dotted constructor tree (`truncated.(Normal.(m, s), lo, hi)`),
-# replacing each argument that is not itself a constructor by `f(argument)`.
-_cell_latent_object(f, ex) = _is_cell_latent_object(ex) ?
-    Expr(:., ex.args[1], Expr(:tuple, (_cell_latent_object(f, a) for a in ex.args[2].args)...)) :
-    f(ex)
-
-function _cell_latent_leaves(ex)
-    out = Any[]
-    _cell_latent_object(ex) do leaf
-        push!(out, leaf)
-        leaf
+# Visit the value arguments of a prior. A bounded prior's first argument
+# is itself a distribution. An undotted base constructs one law per cell:
+# each of its arguments is taken whole and shared across that cell's draws.
+function _map_cell_prior_args(f, ex)
+    dotted = _is_dotted_call(ex)
+    head = ex.args[1]
+    args = dotted ? ex.args[2].args : ex.args[2:end]
+    mapped = map(eachindex(args)) do j
+        a = args[j]
+        if j == 1 && head in (:restricted, :truncated) &&
+                (_is_cell_latent_object(a) || _scalar_prior_object(a))
+            return _map_cell_prior_args(f, a)
+        end
+        return f(a, !dotted)
     end
-    return out
+    return dotted ? _dotted_obj(head, mapped...) : Expr(:call, head, mapped...)
 end
 
 # What one plate's cells say about the shapes of the values they read.
@@ -347,15 +350,16 @@ function _expand_cell_array_latents(st, taken, scope::_CellLatentScope)
         sized = _cell_sized_lhs(lhs)
         cell = sized ? lhs.args[1] : lhs
         name = cell.args[1]
-        leaves = _cell_latent_leaves(c.args[3])
         shapes = Any[]
-        for leaf in leaves
+        _map_cell_prior_args(c.args[3]) do leaf, shared
+            shared && return leaf
             shape = _cell_latent_shape(leaf, cx)
             !sized && shape isa Tuple && _sfail("cell latent `$name[$ivar] .~ …`: at each " *
                 "index `$name[$ivar]` holds the broadcast of its arguments, so " *
                 "their shapes must follow from data; the shape of " *
                 "`$(repr(leaf))` does not: $(last(shape))")
             push!(shapes, shape)
+            return leaf
         end
         if !sized && all(s -> s === :scalar, shapes)
             # Numbers at every index: one scalar draw per index.
@@ -389,15 +393,19 @@ function _expand_cell_array_latents(st, taken, scope::_CellLatentScope)
         # A shared number broadcasts against the packed array as written;
         # every other argument contributes its entries at each index.
         k = 0
-        object = _cell_latent_object(c.args[3]) do leaf
+        object = _map_cell_prior_args(c.args[3]) do leaf, shared
             k += 1
-            shapes[k] === :scalar && !_expr_has_sym(leaf, ivar) &&
-                !any(l -> _expr_has_sym(leaf, first(l)), cx.locals) && return leaf
+            if !_expr_has_sym(leaf, ivar) && !any(l -> _expr_has_sym(leaf, first(l)), cx.locals) &&
+                    _cell_latent_shape(leaf, cx) === :scalar
+                return leaf
+            end
             entries = fresh(Symbol(prefix, :_arg, k, :_cells))
             flat = fresh(Symbol(prefix, :_arg, k))
-            push!(prelude, Expr(:(=), entries, column(Expr(:call,
-                GlobalRef(@__MODULE__, :_ppl_cell_latent_entries), leaf,
-                Expr(:ref, dims, position)))))
+            cell_dims = Expr(:ref, dims, position)
+            values = shared ?
+                Expr(:call, GlobalRef(Base, :fill), leaf, Expr(:call, GlobalRef(Base, :prod), cell_dims)) :
+                Expr(:call, GlobalRef(@__MODULE__, :_ppl_cell_latent_entries), leaf, cell_dims)
+            push!(prelude, Expr(:(=), entries, column(values)))
             push!(prelude, Expr(:(=), flat, Expr(:call,
                 GlobalRef(@__MODULE__, :_ppl_cell_latent_flatten), entries)))
             return flat
