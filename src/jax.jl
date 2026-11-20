@@ -374,6 +374,14 @@ const _JAX_RESERVED = Set{String}(split("""
     range sum min max abs str int float bool print type object id iter next map zip
     all any round pow filter sorted set""" ))
 
+# A ragged collection has as many valid entries as its prepared flat positions,
+# plus a fixed number of scalar entries per row. A helper renames the positions
+# array but keeps the per-row count as translation-time metadata.
+struct _JaxFlatRows
+    positions::String
+    prefix::Int
+end
+
 # One Python function body under construction. `links` maps an input of a
 # nested plan (a branch arm's, a plate cell's unmapped argument) to the
 # `(plan, value)` of the enclosing plan it is the same value as, so the
@@ -391,14 +399,18 @@ mutable struct _JaxScope
     links::Dict{ValueId,Any}
     hints::Dict{ValueId,Symbol}
     named_hints::Dict{Symbol,Symbol}
-    flat_positions::Dict{String,String}
+    flat_positions::Dict{String,_JaxFlatRows}
+    # A scalar-prefixed vcat inside a plate cell, before the plate substitutes
+    # its arguments and can identify which prepared input owns the tail.
+    prefixed_extents::Dict{String,Tuple{Int,String}}
     carried::Set{Symbol}
 end
 _JaxScope(parent::Union{Nothing,_JaxScope} = nothing) =
     _JaxScope(String[], 1, parent === nothing ? Set{String}() : copy(parent.used),
               Dict{ValueId,_PyVal}(), parent, Dict{ValueId,Any}(), Dict{ValueId,Symbol}(),
               parent === nothing ? Dict{Symbol,Symbol}() : parent.named_hints,
-              parent === nothing ? Dict{String,String}() : copy(parent.flat_positions),
+              parent === nothing ? Dict{String,_JaxFlatRows}() : copy(parent.flat_positions),
+              parent === nothing ? Dict{String,Tuple{Int,String}}() : copy(parent.prefixed_extents),
               Set{Symbol}())
 # The `flat_positions` entry of the lengths of cells that each fill their stored
 # rows: a plate's cells returning vectors whose length the cell's own expression
@@ -406,7 +418,7 @@ _JaxScope(parent::Union{Nothing,_JaxScope} = nothing) =
 # entry is valid, so their flattening reads the rows in order, and a later
 # plate reads each cell as a dense array. It is translation-time knowledge, not
 # a Python value: nothing emits it, and a helper receives it without an argument.
-const _JAX_FULL_ROWS = "<full rows>"
+const _JAX_FULL_ROWS = _JaxFlatRows("", 0)
 
 # An authored lexical region of an otherwise transparent graph. The authoring
 # frontend supplies its explicit boundary and names; RK owns the graph cut and
@@ -5315,6 +5327,10 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(sizehint!), args::Vector{
                                     _jax_where(ctx))
     args[1]
 end
+function _jax_record_prefix!(scope, extent, count, tail)
+    prefix, core = get(scope.prefixed_extents, tail, (0, tail))
+    scope.prefixed_extents[extent] = (count + prefix, core)
+end
 function _jax_function_call(ctx::_JaxContext, ::typeof(vcat), args::Vector{_PyVal})
     v = _jax_result(vcat, args, "jnp.concatenate([" * join(
         (_jax_is_array(a.T) ? a.code : "jnp.atleast_1d(" * a.code * ")" for a in args), ", ") * "])")
@@ -5326,14 +5342,19 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(vcat), args::Vector{_PyVa
     padded == [length(args)] && _jax_rank(args[end].T) == 1 ||
         _jax_error("`vcat` with a padded (ragged) value before other values", _jax_where(ctx))
     before = String[_jax_is_array(a.T) ? _py_atom(a.code) * ".shape[0]" : "1" for a in args[1:end-1]]
-    _PyVal(v.code, v.T, v.static, _py_infix("+", [before; args[end].extent]))
+    tail = args[end].extent
+    extent = _py_infix("+", [before; tail])
+    if !isempty(before) && all(==("1"), before)
+        _jax_record_prefix!(ctx.scope, extent, length(before), tail)
+    end
+    _PyVal(v.code, v.T, v.static, extent)
 end
 # `reduce(vcat, cells)`: the cells' entries in order. On the host, a list of
 # arrays concatenated; under JAX an equal-length vector of vectors is a matrix,
 # read row by row, as are cells that fill their stored rows (`_JAX_FULL_ROWS`),
 # and a ragged one's padded entries are dropped: its valid positions number its
-# total length, the flat positions of the prepared input whose lengths its own
-# are (a static shape). A runtime check confirms they add up.
+# total length: the prepared input's flat positions and any scalar prefix per
+# cell. A runtime check confirms that the lengths add up to this static shape.
 function _jax_call_positional(ctx::_JaxContext, ::typeof(reduce), args::Vector{_PyVal})
     # The reducer is a value: its type at the program level, a callable
     # (`_JaxCallable`) inside a helper's lowered body.
@@ -5354,12 +5375,15 @@ function _jax_call_positional(ctx::_JaxContext, ::typeof(reduce), args::Vector{_
     padded = _jax_bind!(ctx, :cells, x)
     lengths = _jax_bind!(ctx, :lengths, _PyVal(x.extent, Vector{Int}))
     mask = "(jnp.arange(" * padded.code * ".shape[1])[None, :] < " * lengths.code * "[:, None])"
-    _jax_call(ctx, _runtime_check, [_PyVal("jnp.sum(" * lengths.code * ") == " * flat * ".shape[0]", Bool),
+    total = flat.positions * ".shape[0]"
+    if flat.prefix != 0
+        total *= " + " * string(flat.prefix) * " * " * padded.code * ".shape[0]"
+    end
+    _jax_call(ctx, _runtime_check, [_PyVal("jnp.sum(" * lengths.code * ") == " * total, Bool),
         _PyVal(repr("reduce(vcat, cells): the cells' lengths do not add up to their input's total"),
                ArgumentError)])
     positions = _jax_fresh(ctx, :positions)
-    _jax_emit!(ctx, positions * " = jnp.nonzero(jnp.ravel(" * mask * "), size=" * flat *
-                    ".shape[0])[0]")
+    _jax_emit!(ctx, positions * " = jnp.nonzero(jnp.ravel(" * mask * "), size=" * total * ")[0]")
     _PyVal("jnp.ravel(" * padded.code * ")[" * positions * "]", Vector{E})
 end
 # The flat positions of the prepared ragged input whose lengths `extent` reads,
@@ -5367,8 +5391,15 @@ end
 # their rows. Only that exact extent qualifies: a length computed from such
 # lengths (`n - 1`, a gather of them) need not fill its cells' storage.
 function _jax_flat_positions(ctx::_JaxContext, extent::AbstractString)
-    get(ctx.scope.flat_positions, extent, nothing) == _JAX_FULL_ROWS && return _JAX_FULL_ROWS
-    found = String[]
+    exact = get(ctx.scope.flat_positions, extent, nothing)
+    exact === nothing || return exact
+    if haskey(ctx.scope.prefixed_extents, extent)
+        prefix, core = ctx.scope.prefixed_extents[extent]
+        rows = _jax_flat_positions(ctx, core)
+        return rows === nothing || rows == _JAX_FULL_ROWS ? nothing :
+               _JaxFlatRows(rows.positions, rows.prefix + prefix)
+    end
+    found = _JaxFlatRows[]
     for (key, flat) in ctx.scope.flat_positions
         flat == _JAX_FULL_ROWS && continue
         occursin(Regex("(?<![.\\w])\\Q" * key * "\\E(?!\\w)"), extent) && push!(found, flat)
@@ -5387,7 +5418,7 @@ _jax_without_lengths(v::_PyVal) = _PyVal(v.code, v.T, v.static, "", "", 0,
 # translated over it: nothing known, full rows, or a prepared input's positions.
 function _jax_flat_kind(ctx::_JaxContext, extent::AbstractString)
     flat = _jax_flat_positions(ctx, extent)
-    flat === nothing ? :none : flat == _JAX_FULL_ROWS ? :full_rows : :positions
+    flat === nothing ? :none : flat == _JAX_FULL_ROWS ? :full_rows : (:positions, flat.prefix)
 end
 
 _jax_function_call(ctx::_JaxContext, ::typeof(zero), args::Vector{_PyVal}) =
@@ -6785,7 +6816,7 @@ function _jax_named_function_call(ctx, f, names, inputs, source_module, emit, in
         _jax_bind!(ctx, name, _PyVal(call, v.T, v.static, "", "", v.padded, v.origin))
     else
         returned = _jax_bind!(ctx, name, _PyVal(call, Any))
-        _jax_identity_return(_jax_function_return!(ctx, v, flat, returned.code), identity, lengths,
+        _jax_identity_return(ctx, _jax_function_return!(ctx, v, flat, returned.code), identity, lengths,
                              returned.code)
     end
     isempty(written) && return result
@@ -6801,11 +6832,12 @@ end
 # field of a retained tuple passed through, `getfield(pair, 2)`): the caller
 # reads its own expression for that length, which keeps the length's prepared
 # flat positions for a later `reduce(vcat, cells)`. `identity` pairs each
-# packed result length with the function's expression it returns.
-function _jax_identity_extents(v, result)
-    out = Pair{String,String}[]
+# packed result length with its source length and any scalar prefix. A helper
+# within a cell can return a prefixed row before the enclosing plate is known.
+function _jax_identity_extents(scope, v, result)
+    out = Pair{String,Tuple{Int,String}}[]
     for (e, p) in zip((v.extent, v.field_extents...), (result.extent, result.field_extents...))
-        isempty(e) || isempty(p) || push!(out, p => e)
+        isempty(e) || isempty(p) || push!(out, p => get(scope.prefixed_extents, e, (0, e)))
     end
     out
 end
@@ -6835,11 +6867,17 @@ function _jax_caller_length(lengths, e)
     base = get(lengths, m[1], nothing)
     base === nothing ? nothing : _py_atom(base) * m[2]
 end
-function _jax_identity_return(v, identity, lengths, returned)
+function _jax_identity_return(ctx, v, identity, lengths, returned)
     sub = Dict{String,String}()
-    for (p, e) in identity
+    for (p, (prefix, e)) in identity
         caller = _jax_caller_length(lengths, e)
-        caller === nothing || (sub[replace(p, "__rk_function_result__" => returned)] = caller)
+        caller === nothing && continue
+        extent = replace(p, "__rk_function_result__" => returned)
+        if prefix == 0
+            sub[extent] = caller
+        else
+            _jax_record_prefix!(ctx.scope, extent, prefix, caller)
+        end
     end
     isempty(sub) && return v
     swap(e) = get(sub, e, e)
@@ -6914,7 +6952,7 @@ function _jax_named_function!(ctx, f, names, inputs, source_module, emit, origin
                  _jax_docstring(doc, "    ")]
         append!(lines, scope.lines)
         returned, result, flat = _jax_function_result(inner, v)
-        identity = _jax_identity_extents(v, result)
+        identity = _jax_identity_extents(scope, v, result)
         push!(lines, "    return " * returned)
         if contextual
             foreach(line -> _jax_emit!(ctx, line), lines)
@@ -6956,14 +6994,13 @@ function _jax_function_result(ctx, v)
         "__rk_function_result__[" * string(length(parts) - 1) * "]"
     end
     result = _jax_map_value(v, pack)
-    flat = Pair{String,String}[]
+    flat = Pair{String,_JaxFlatRows}[]
     extents = isempty(v.field_extents) ? (v.extent,) : v.field_extents
     returned_extents = isempty(v.field_extents) ? (result.extent,) : result.field_extents
     for (extent, returned_extent) in zip(extents, returned_extents)
         isempty(extent) && continue
-        positions = _jax_flat_positions(ctx, extent)
-        positions === nothing ||
-            push!(flat, returned_extent => (positions == _JAX_FULL_ROWS ? positions : pack(positions)))
+        rows = _jax_flat_positions(ctx, extent)
+        rows === nothing || push!(flat, returned_extent => _JaxFlatRows(pack(rows.positions), rows.prefix))
     end
     "(" * join(parts, ", ") * (length(parts) == 1 ? ",)" : ")"), result, flat
 end
@@ -6971,8 +7008,8 @@ function _jax_function_return!(ctx, v, flat, returned)
     code(s) = replace(s, "__rk_function_result__" => returned)
     result = _jax_map_value(v, code)
     if flat !== nothing
-        for (extent, positions) in flat
-            ctx.scope.flat_positions[code(extent)] = code(positions)
+        for (extent, rows) in flat
+            ctx.scope.flat_positions[code(extent)] = _JaxFlatRows(code(rows.positions), rows.prefix)
         end
     end
     result
@@ -7060,8 +7097,8 @@ function _jax_function_input!(ctx, scope, params, passed, hint, v::_PyVal, T)
             scope.flat_positions[target] = flat
         elseif flat !== nothing
             flat_name = _jax_identifier(scope.used, Symbol(hint, :_flat))
-            push!(params, flat_name); push!(passed, flat)
-            scope.flat_positions[target] = flat_name
+            push!(params, flat_name); push!(passed, flat.positions)
+            scope.flat_positions[target] = _JaxFlatRows(flat_name, flat.prefix)
         end
     end
     if !isempty(extent)
@@ -7896,7 +7933,7 @@ function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
     append!(outer.lines, inner.lines)
     push!(outer.lines, "    "^inner.indent * "return " * (length(returned) == 1 ?
         returned[1] : "(" * join(returned, ", ") * ")"))
-    name, wants, Bool[!isempty(w.extent) for w in wants], names
+    name, wants, Bool[!isempty(w.extent) for w in wants], names, inner.prefixed_extents
 end
 
 # Positions of plate cells' entries (`_JaxOrigin`): one per plate translated.
@@ -7980,7 +8017,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     masks = [_jax_padded_mask(v) for v in axis_inputs[padded]]
     masked = any(padded) && all(m -> m !== nothing, masks)
     effects_before = _JAX_EFFECTS[]
-    cell, wants, with_length, cell_params = _jax_plan_function!(ctx, _jax_body_hint(ctx, recipe, :cell), body, cell_types;
+    cell, wants, with_length, cell_params, prefixes = _jax_plan_function!(ctx, _jax_body_hint(ctx, recipe, :cell), body, cell_types;
                                                                 extents = cell_extents,
                                                                 statics = cell_statics,
                                                                 links = cell_links,
@@ -8049,6 +8086,19 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     for shape in shapes[2:end]
         empty *= " and " * shape * " == " * first(shapes)
     end
+    function result_extent(extent, lengths)
+        outer(e) = _jax_outer_extent(e, cell_params, args, axes; field_lengths)
+        if haskey(prefixes, extent)
+            prefix, tail = prefixes[extent]
+            core = outer(tail)
+            rows = core === nothing ? nothing : _jax_flat_positions(ctx, core)
+            if rows !== nothing && rows != _JAX_FULL_ROWS
+                ctx.scope.flat_positions[lengths] = _JaxFlatRows(rows.positions, rows.prefix + prefix)
+                return lengths
+            end
+        end
+        something(outer(extent), lengths)
+    end
     # A stored leaf carries the mapped shape; empty fields beside it need none.
     if _jax_numeric_record(E) && _jax_record_leaf(want.code, E) !== nothing
         empty_value = _jax_empty_record(want, first(shapes))
@@ -8063,8 +8113,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
             _jax_emit!(ctx, result * ", " * lengths * " = " * call)
             extents = Tuple(begin
                 extent = _jax_field_extent(want, k, fieldtype(E, k))
-                outer = _jax_outer_extent(extent, cell_params, args, axes; field_lengths)
-                outer === nothing ? lengths * "[" * string(k - 1) * "]" : outer
+                result_extent(extent, lengths * "[" * string(k - 1) * "]")
             end for k in 1:fieldcount(E))
             return [_PyVal(result, Array{E,R}, false, lengths, "", _jax_padded_fields(want),
                            layout, extents)]
@@ -8091,8 +8140,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
             # The cell's length in terms of the plate's arguments (an input's
             # lengths, or their gather by the plate index) keeps their link
             # to the input, whose flat positions a flattening reads.
-            outer = _jax_outer_extent(want.extent, cell_params, args, axes; field_lengths)
-            outer === nothing || return [_PyVal(result, Vector{E}, false, outer)]
+            return [_PyVal(result, Vector{E}, false, result_extent(want.extent, lengths))]
         else
             _jax_emit!(ctx, result * " = " * call)
             _jax_emit!(ctx, lengths * " = jnp.full((" * result * ".shape[0],), " * result *
@@ -9388,7 +9436,7 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
                 flat = keyed ? _jax_param_name(scope.used, flat_key; stable = false) :
                     (push!(scope.used, flat_key); flat_key)
                 push!(params, flat); push!(inputs, flat_key => Vector{Int}); push!(input_locals, flat)
-                scope.flat_positions[extent] = flat
+                scope.flat_positions[extent] = _JaxFlatRows(flat, 0)
             end
         end
         # A prepared integer is a `StaticInt` (`prepare_data`), an `int` under
