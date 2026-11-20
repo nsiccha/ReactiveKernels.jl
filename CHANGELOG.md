@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.333
+
+- `jax_source` preserves the dtype of signed and unsigned 8-, 16-, 32- and
+  64-bit integers in scalar result casts, typed constructors, and prepared
+  arrays. With JAX's 64-bit mode off, 64-bit device dtypes use 32 bits.
+  Adding two `Int32` counters now works as the body of a JAX loop with an
+  `int32` carry.
+
 ## 0.1.332
 
 - A scheduled reader used in a package precompile workload retains its serial
