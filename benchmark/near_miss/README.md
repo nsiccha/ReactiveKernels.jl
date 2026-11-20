@@ -156,10 +156,11 @@ julia --startup-file=no --project=<env> benchmark/near_miss/probe_families.jl C 
 julia --startup-file=no --project=<env> benchmark/near_miss/factor_scaling.jl 20000 50,500,5000 normal,bernoulli full,reference,missing,bound_matrix,hcat,scan
 ```
 
-At 20,000 rows, each cell gives the cost on `8a7f69f42` followed by the
-cost with factor gathers on `e9a174633`. The 5,000-level reference design
-previously had 99,980,000 entries. The two revisions ran in separate Julia
-processes on gordito with one BLAS thread.
+At 20,000 rows, each cell gives the observation on `8a7f69f42` followed by
+the observation with factor gathers on `e9a174633`. The 5,000-level reference
+design previously had 99,980,000 entries. The dense run used Julia 1.10.12
+build kb7 and the gathered run used kb8, both on gordito with one BLAS
+thread. The timing differences in this table include the build change.
 
 | Law | Levels | Factor | Setup (s) | Setup (MiB) | Density (µs) | Value and gradient (µs) |
 | --- | ---: | --- | ---: | ---: | ---: | ---: |
@@ -197,20 +198,16 @@ on the density and on every gradient coordinate at the same parameter vector.
 | Authored two-column matrix | 21.3 → 17.3 | 30.5 → 23.1 | 13.7 → 8.90 | 44.3 → 16.4 |
 | Separate scan | 22.2 → 17.2 | 31.3 → 23.1 | 13.1 → 6.18 | 23.9 → 13.5 |
 
-At 20,000 rows and 5,000 levels the reference-coded Normal setup fell
-from 111 s and 6,042 MiB to 2.84 s and 290 MiB. Its gradient fell from
-114 ms to 25.6 µs. For Bernoulli-logit the gradient fell from 91.6 ms
-to 216 µs and setup allocations from 2,369 MiB to 262 MiB. Bernoulli-logit
-setup took 1.51 s before and 2.49 s after, in separate processes on a
-shared host. The complete observations include all four variants and both
+At 20,000 rows and 5,000 levels the reference-coded Normal model on kb8
+took 2.84 s and 290 MiB to prepare and 25.6 µs per gradient. The
+Bernoulli-logit model took 2.49 s and 262 MiB to prepare and 216 µs per
+gradient. The complete observations include all four variants and both
 full-cover controls at each level count. [Scaling measurements](factor_scaling.csv)
 
-At 20,000 rows and 50 levels the reference-coded Normal gradient still
-rose from 2.28 to 4.12 µs. The old dense design used bound least-squares
-statistics. The gathered effect and shared slope run in the row loop on
-this revision. With an authored two-column matrix, the gradient at this
-size went from 2.10 to 12.6 µs. Both comparisons bear on the integration
-of least-squares statistics for mixed gathered and shared terms.
+At 20,000 rows and 50 levels the standalone reference-coded Normal
+gradient took 4.12 µs and the authored two-column matrix took 12.6 µs.
+The gathered effect and shared slope run in the row loop on this
+revision. The original dense design used bound least-squares statistics.
 
 At 2,000 rows and 50 levels A15 previously took 7.41 µs with the
 initial gather on `a9959a24b`. In the paired run the dense baseline took
@@ -234,10 +231,21 @@ Normal, Bernoulli-logit and Poisson gave the same allocation counts.
 | 50 | 2 / 512 | 1 / 16 | 6 / 1,184 | 0 / 0 |
 | 5,000 | 3 / 40,064 | 1 / 16 | 8 / 80,288 | 0 / 0 |
 
-With the matrix product and factor fused in one observation loop, all
-four spellings and the full-cover control used 1 allocation of 16 bytes for
-`q(u)` and zero for `sampler_value_and_gradient!`. The public density call
-returns a boxed `Float64` through its world-age barrier.
+The table below compares the original lowering with the gathered lowering
+after sampler storage reuse and matrix fusion. Each entry is the number
+of allocations and the total bytes allocated per warm call at 20,000 rows.
+Normal, Bernoulli-logit and Poisson gave the same counts for each spelling.
+
+| Spelling | Levels | Original density | Gathered density | Original value and gradient | Gathered value and gradient |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Reference level or missing labels | 50 | 4 / 1,024 | 1 / 16 | 6 / 2,016 | 0 / 0 |
+| Reference level or missing labels | 5,000 | 6 / 80,176 | 1 / 16 | 10 / 160,320 | 0 / 0 |
+| Separate scan | 50 | 4 / 1,072 | 1 / 16 | 6 / 2,112 | 0 / 0 |
+| Separate scan | 5,000 | 6 / 80,240 | 1 / 16 | 10 / 160,448 | 0 / 0 |
+| Authored two-column matrix or full-cover control | 50 and 5,000 | 1 / 16 | 1 / 16 | 0 / 0 | 0 / 0 |
+
+The public density call `q(u)` returns a boxed `Float64` through its
+world-age barrier. The prepared gradient writes into the caller’s buffer.
 
 A second implementation fed the bound level codes into a plate that returned
 zero for code zero and otherwise indexed the declared parameter directly.
