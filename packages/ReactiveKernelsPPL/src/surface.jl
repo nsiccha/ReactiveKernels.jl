@@ -5101,6 +5101,8 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
         end
         (_is_sample(c) || _is_broadcast_sample(c)) ||
             _sfail("cells hold `~` observations and `=` assignments only")
+        lhs = c.args[2]
+        latent = Meta.isexpr(lhs, :ref, 2) && lhs.args[1] ∉ data
         lnames = Set(first.(locals))
         external = _external_rhs(c.args[3])
         function arg(ex; object=false)
@@ -5136,6 +5138,10 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
                 end
                 push!(plate_defs, nm)
                 push!(pidx, nm)
+                # This column already evaluates the argument once per authored
+                # index, in plate order. A latent prior consumes that column
+                # directly, including when it supplies one support bound per cell.
+                latent && return nm
                 return Expr(:ref, nm, ivar)
             end
             return ex
@@ -5145,7 +5151,6 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
         # Julia. Record the operands it reads per index: when the bound
         # response holds one array per index, each of these supplies that
         # index's value and every other operand is shared by all indices.
-        lhs = c.args[2]
         if _is_broadcast_sample(c) && Meta.isexpr(lhs, :ref, 2) &&
                 lhs.args[1] isa Symbol && lhs.args[1] in data && lhs.args[2] === ivar
             broadcasts[lhs.args[1]] = sort!(collect(_cell_index_reads(obj, ivar)))
@@ -8157,8 +8162,8 @@ end
 # observation stream (`col` a data column). No new IR: the inlined statements
 # reduce to the per-cell parameter / derived-cell / observation shapes the
 # primitive already supports. A per-cell body holds what a hand-written cell
-# holds: `~` / `=` statements over bare names, `@scan` blocks (a returned
-# carried array is written `col[i][t]`, the per-index cell scan), and
+# holds: `~` / `=` statements over bare names, sized elementwise draws,
+# `@scan` blocks (a returned carried array is written `col[i][t]`), and
 # per-cell submodel calls, which expand per cell in turn (`col_w_b[i]`).
 
 # A plate cell that is a per-cell submodel call `col[i] ~ sm(…)`: returns
@@ -8262,18 +8267,19 @@ function _expand_cell_submodel(colref::Expr, callexpr::Expr, ivar::Symbol,
         _all_symbols!(used.used, st)
     end
     _all_symbols!(used.used, ret)
-    # A per-cell body holds what a hand-written cell holds: `~` / `=`
-    # statements over bare names and `@scan` blocks (no indexed priors or
-    # plates).
+    # A sized dotted draw keeps its axes through substitution. The cell
+    # latent pass packs the declared shape at each index.
     for st in stmts
         (st isa Expr && (_is_cell_scan_block(st) ||
+            (_is_broadcast_sample(st) && _cell_sized_lhs(_stmt_lhs(st)) &&
+                _stmt_lhs(st).args[1] isa Symbol && _is_cell_latent_object(st.args[3])) ||
             (_is_sample(st) || _is_broadcast_sample(st) ||
                 (st.head === :(=) && length(st.args) == 2)) &&
             _stmt_lhs(st) isa Symbol)) || _sfail(
             "submodel `$(sm.name)` is called per cell (`$col[$ivar] ~ " *
             "$(sm.name)(...)`), so its body holds what a cell holds: `~`/`=` " *
-            "statements over bare names and `@scan` blocks; `$(repr(st))` is " *
-            "not one (call it at top level for plates and sized priors)")
+            "statements over bare names, elementwise priors with `1:n` axes, " *
+            "and `@scan` blocks; unsupported statement: `$(repr(st))`")
     end
     scans = filter(_is_cell_scan_block, stmts)
     lines = filter(!_is_cell_scan_block, stmts)
@@ -8305,7 +8311,7 @@ function _expand_cell_submodel(colref::Expr, callexpr::Expr, ivar::Symbol,
     latent_stream = col ∉ data && slot !== nothing && _is_dotted_obj(lines[slot])
     argset = Set{Symbol}(_submodel_args(sm))
     for st in lines
-        nm = _stmt_lhs(st)
+        nm = _declared_value_name(_stmt_lhs(st))
         nm in argset && _sfail("submodel `$(sm.name)`: `$nm` is both an " *
             "argument and a local statement — rename the local")
     end

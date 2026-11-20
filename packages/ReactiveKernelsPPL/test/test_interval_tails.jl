@@ -41,6 +41,15 @@ function _tail_query(expr, data, q; want=:sampler, conditioned=(:y,))
     return k, u
 end
 
+@testset "A narrow Normal interval at the median has finite pointwise mass" begin
+    expr = quote
+        m ~ Normal(0., 1.)
+        y .~ interval_censored.(Normal.(m, 1.), hi)
+    end
+    k, u = _tail_query(expr, (; y=[nextfloat(0.)], hi=[eps()/2]), (; m=0.); want=:pointwise)
+    @test isfinite(only(Base.invokelatest(k, u).y))
+end
+
 @testset "LogNormal and mixture intervals preserve Normal tail masses" begin
     m, s = 0.03, 0.5
     for mixture in (false, true)
@@ -168,8 +177,8 @@ end
     # Include the original subnormal/underflow boundary, both tails, the
     # downstream distance, and narrow intervals near and far from the centre.
     z = [3., 7., 12., 30., 36., 37., 37.5, 38., 38.5, 40., 332.6,
-        -36., -39., -42., -334.6, -1., 0., 1., 40.]
-    widths = vcat(fill(2., 15), [1e-5, 1e-5, 1e-5, 1e-5])
+        -36., -39., -42., -334.6, -1., 0., 1., 40., -4., -0.5, 0.]
+    widths = vcat(fill(2., 15), fill(1e-5, 4), [0.25, 1., 0.125])
     lo, hi = m .+ z .* s, m .+ (z .+ widths) .* s
     refs = [_normal_interval_reference(l, h, m, s) for (l, h) in zip(lo, hi)]
     data = (; y=lo, hi, s)

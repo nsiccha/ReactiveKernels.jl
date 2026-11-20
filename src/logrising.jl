@@ -2,21 +2,28 @@
 # shape-plus-count difference of the overdispersed count laws (beta-binomial,
 # negative binomial, Dirichlet-multinomial). For a whole count
 # 0 <= m <= _LOGRISING_PRODUCT_MAX it is log Π_{j<m} (a + j), and its partial
-# in `a`, Σ_{j<m} 1/(a + j) = P'/P, comes from the same pass: each chunk of up
-# to 32 factors carries four interleaved product/derivative recurrences and
-# costs one `log` and one division, with no `loggamma` or `digamma`. A
-# shape at most 2^30 keeps 32 factors below `floatmax`. Other counts and
+# in `a`, Σ_{j<m} 1/(a + j) = P'/P, comes from the same pass. Each chunk
+# carries four interleaved product/derivative recurrences and costs one
+# `log` and one division. Other counts and
 # shapes take the `loggamma`/`digamma` difference. The partial in `m` is
 # digamma(a + m); a count is data, so ordinary AD selects only the `a` cut.
 const _LOGRISING_PRODUCT_MAX = 64
 const _LOGRISING_SHAPE_MAX = 1073741824.0
+const _LOGRISING_FLOAT32_MAX = floatmax(Float32)
 
 @_record_source @inline function _logrising_product(a, m, partial::Bool)
+    # Float64 can hold 32 factors below 2^30 + 64. For Float32, use at
+    # most 16 factors below 256, or four across the full shape range.
+    chunk = if floatmax(float(a)) > _LOGRISING_FLOAT32_MAX
+        32
+    else
+        a + m <= 256 ? 16 : 4
+    end
     L = zero(a)
     D = zero(a)
     j = 0
     while j < m
-        stop = min(m, j + 32)
+        stop = min(m, j + chunk)
         P1 = one(a)
         P2 = one(a)
         P3 = one(a)

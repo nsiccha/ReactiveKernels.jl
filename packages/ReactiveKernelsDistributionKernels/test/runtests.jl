@@ -541,10 +541,24 @@ end
     # exactly NegativeBinomial(phi, phi/(phi+mu)) — the independent oracle.
     nb2 = prepare(negative_binomial2.logpdf;
         have = (:observed, :mu, :phi), want = :logpdf)
+    kernel = prepare(negative_binomial2.logkernel;
+        have = (:observed, :mu, :phi), want = :logkernel)
+    normalizer = prepare(negative_binomial2.lognormalizer;
+        have = (:observed,), want = :lognormalizer)
+    @test normalizer(-1) == normalizer(0) == 0.0
+    @test normalizer(5) ≈ -log(120)
     for (y, mu, phi) in ((0, 2.5, 1.5), (3, 2.5, 1.5), (7, 0.4, 3.0),
-            (1, 10.0, 0.5), (5, 3.0, 3.0))
+            (1, 10.0, 0.5), (5, 3.0, 3.0), (16, 5.0, 240.0),
+            (17, 5.0, 240.0), (32, 5.0, 10.0), (64, 3.0, 4.0),
+            (65, 3.0, 4.0), (250, 5.0, 0.125))
         ref = logpdf(NegativeBinomial(phi, phi / (phi + mu)), y)
         @test nb2(y, mu, phi) ≈ ref
+        @test kernel(y, mu, phi) + normalizer(y) ≈ ref
+        dshape = sum(i -> inv(phi + i), 0:(y - 1); init = 0.0) -
+            log1p(mu / phi) + (mu - y) / (mu + phi)
+        dphi = only(only(Enzyme.autodiff(Enzyme.Reverse, p -> nb2(y, mu, p),
+            Enzyme.Active, Enzyme.Active(phi))))
+        @test dphi ≈ dshape rtol = 2e-12 atol = 2e-12
     end
     # Impossible events are -Inf, never NaN (branchless ifelse guards).
     @test nb2(3, 0.0, 1.5) == -Inf

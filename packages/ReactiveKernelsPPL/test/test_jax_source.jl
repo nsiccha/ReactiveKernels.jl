@@ -177,7 +177,8 @@ const _JAX_CASES = (
     negative_binomial = () -> (@rkppl(begin
         a ~ Normal(0, 1); phi ~ Exponential(1.0)
         y .~ NegativeBinomial2.(exp.(a .+ 0.1 .* x), phi)
-    end))(; x = _JAX_X) | (; y = rand(_JAX_RNG, 0:6, _JAX_N)),
+    end))(; x = _JAX_X) | (; y = repeat([0, 1, 3, 7, 8, 16, 17, 32, 64],
+        cld(_JAX_N, 9))[1:_JAX_N]),
     design_groups = () -> (@rkppl(begin
         beta[1:3] .~ Normal(0, 2); tau ~ Exponential(1.0); s ~ Exponential(1.0)
         alpha[1:4] .~ Normal(0, tau)

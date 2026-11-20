@@ -64,7 +64,7 @@ The measured gradient equals the hand loop where a benchmark model has the
 shape (Normal, Bernoulli-logit, gathered Normal) and is 3 to 8 times a hand
 loop's cost for the sibling laws.
 
-## After ReactiveKernelsPPL 0.1.239 and ReactiveKernelsDistributionKernels 0.1.14
+## After the Poisson plate lowering and the one-softplus Binomial kernel
 
 The Poisson-log regression lowers to the summed plate of the other count
 laws, and the binomial logit kernel reads one softplus without a branch on

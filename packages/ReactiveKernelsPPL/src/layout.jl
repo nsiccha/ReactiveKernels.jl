@@ -1336,7 +1336,14 @@ end
 function _resolved_entry(layout::LayoutTable, e::LayoutEntry, values)
     (_dynamic_bounds(e) && e.sampling === nothing) || return e
     lookup = _layout_lookup(layout, values)
-    resolve(x) = _static_bound(x) ? x : _eval_value_expr(x, lookup, e.name)
+    function resolve(x)
+        _static_bound(x) && return x
+        value = _eval_value_expr(x, lookup, e.name)
+        # An interpreted plate with no cells can return Any[]. Its empty
+        # numeric bound has the same shape and no values to convert.
+        value isa AbstractArray{Any} && isempty(value) && return similar(value, Float64)
+        return value
+    end
     lo, hi = resolve(e.lo), resolve(e.hi)
     # A side holds one number, or one per element when the entry's bound does.
     valid(b, elementwise) = elementwise ?

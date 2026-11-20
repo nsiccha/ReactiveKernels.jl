@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.239
+## 0.1.241
 
 - A Poisson-log regression without weights, evidence or a response range
   lowers to the summed observation plate every other count likelihood uses:
@@ -33,6 +33,22 @@ are recorded in the git history only.
   over 40 rows 215 to 154 ns and 377 to 326 ns, with one effect per row 236
   to 205 ns and 458 to 409 ns; a five-column design matrix unchanged.
   The Binomial-logit regression keeps its whole-vector form.
+
+## 0.1.240
+
+- A submodel called in a plate can declare an elementwise prior such as
+  `w[1:prod(modes)] .~ Normal.(0, 1)`. Each call gets its own array under
+  the submodel's name, with dimensions taken from that cell's bound data.
+  A scalar prior in the same cell can use a computed per-cell lower or upper
+  bound. Empty plates retain the declared rank of their array draws.
+
+## 0.1.239
+
+- Prepared `NegativeBinomial2` samplers can fold the count factorial sum
+  into bound data. Pointwise queries continue to return full log densities.
+  Finite Normal interval likelihoods share the interval probability with
+  both endpoint derivatives and use log-tail subtraction for narrow or
+  distant intervals.
 
 ## 0.1.238
 

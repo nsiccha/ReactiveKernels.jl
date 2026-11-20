@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.14
+## 0.1.15
 
 - `binomial`'s logit route (`logkernel` and `logpdf` at a supplied logit)
   evaluates one shared softplus and has no branch on the logit:
@@ -13,6 +13,15 @@
   plate takes about a quarter less time: 34.3 to 25.3 µs for 2000 rows and
   five covariates (Julia 1.10.12, Enzyme `dogfood` 0.13.221, a Linux fleet
   host, both kernels timed in one process). The density takes the same time.
+
+## 0.1.14
+
+- `negative_binomial2` exposes `logkernel(observed)` and
+  `lognormalizer(observed)`. Their sum is the full log density. The
+  normalizer depends only on the observed count and the kernel uses the
+  log rising factorial for the shape-dependent term.
+- The prepared standard Normal log-CDF supports direct reverse
+  differentiation with registered Enzyme on Julia 1.10.
 
 ## 0.1.13
 
