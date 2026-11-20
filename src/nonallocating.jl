@@ -71,6 +71,18 @@ struct _MatMulStep end
 # for an operand BLAS cannot take.
 @inline (::_MatMulStep)(A, B) = _native_mul(A, B)
 
+# Give the extension an RK-owned callable on which to register the
+# destination method for LinearAlgebra's unpivoted factorization.
+struct _CholeskyStep end
+@inline (::_CholeskyStep)(A) = LinearAlgebra.cholesky(A)
+_nonalloc_destination_op(f, types) = f
+function _nonalloc_destination_op(f::typeof(LinearAlgebra.cholesky), types)
+    length(types) == 1 && only(types) isa Type &&
+        only(types) <: LinearAlgebra.Symmetric{<:Union{Float32,Float64},<:StridedMatrix} &&
+        return _CholeskyStep()
+    f
+end
+
 # LinearAlgebra computes a dense row product by wrapping a matrix-vector
 # product. The wrapper borrows its parent vector's storage.
 const _StridedBlasRow{T<:LinearAlgebra.BlasFloat} =
@@ -454,10 +466,19 @@ end
 # `f.(args)` parses as `Expr(:., f, Expr(:tuple, ...))` — unlike operator-dot
 # `a .+ b`, which is a `:call` with a dotted callee. Same broadcast
 # semantics, same treatment; `f` may be a bare name or a module-qualified
-# path. Anything else in dot position (field access into a non-module value,
-# a non-`const` binding) falls back safely.
+# path. A Cholesky property such as `cholesky(Symmetric(A)).L` reads the
+# factor after the reusable step. Leave that property access to Julia so
+# each LinearAlgebra version retains its own triangle and wrapper semantics.
 function _decompose_dotcall(ctx::_FusedDecomposition, func, tup,
                              allow_lazy_broadcast::Bool)
+    if tup isa QuoteNode && tup.value isa Symbol
+        operand = _decompose(ctx, func, false)
+        operand === nothing && return nothing
+        value, T = operand
+        T isa Type && T <: LinearAlgebra.Cholesky || return nothing
+        property_type = _static_type(_nonalloc_property, T, Val{tup.value})
+        return (Expr(:., value, tup), property_type)
+    end
     tup isa Expr && tup.head === :tuple || return nothing
     if func isa Symbol
         return _decompose_broadcast(ctx, func, tup.args, allow_lazy_broadcast)
@@ -466,6 +487,8 @@ function _decompose_dotcall(ctx::_FusedDecomposition, func, tup,
     rf === nothing && return nothing
     _decompose_broadcast(ctx, rf[1], rf[2], tup.args, allow_lazy_broadcast)
 end
+
+@inline _nonalloc_property(x, ::Val{field}) where {field} = getproperty(x, field)
 
 function _decompose_arguments(ctx::_FusedDecomposition, rawargs,
                               allow_lazy_broadcast::Bool)
@@ -597,6 +620,7 @@ function _decompose_call_resolved(ctx::_FusedDecomposition, callee, f, fref,
         return (Expr(:call, wrap, buffer), T)
     end
     bits = isconcretetype(T) && isbitstype(T)
+    dest_op = _nonalloc_destination_op(f, types)
     if bits || T isa DataType && isconcretetype(T) && !ismutabletype(T)
         # An immutable value owns no reusable buffer: a cache step would only
         # store it back through the passthrough fallback, so emit the
@@ -607,8 +631,8 @@ function _decompose_call_resolved(ctx::_FusedDecomposition, callee, f, fref,
         # buffers it holds (RKPPL's simplex and its log-Jacobian), and a
         # `@traceable` helper's body may build arrays of its own (an
         # `MvNormal` density's factor).
-        !bits && _nonalloc_destination(ctx.cache_apply, f, T, types) &&
-            return (_emit_step!(ctx, f, T, args...), T)
+        !bits && _nonalloc_destination(ctx.cache_apply, dest_op, T, types) &&
+            return (_emit_step!(ctx, dest_op, T, args...), T)
         traced = _decompose_traceable(ctx, f, args, types)
         traced === nothing || return traced
         return (Expr(:call, fref, args...), T)
@@ -1529,9 +1553,11 @@ function _nonalloc_step!(prog::_StepProgram, r::Recipe, i::Int,
         !(r.op isa _KernelSourceOp) && _nonalloc_is_lazy(op) && return Any[stmt]
     end
     slot_type = T isa Type && isconcretetype(T) ? T : valtype(only(r.outputs))
-    if _nonalloc_destination(prog.cache_apply, op, slot_type, argtypes)
-        slot = _nonalloc_slot(op, slot_type)
+    dest_op = _nonalloc_destination_op(op, argtypes)
+    if _nonalloc_destination(prog.cache_apply, dest_op, slot_type, argtypes)
+        slot = _nonalloc_slot(dest_op, slot_type)
         slot === nothing && return Any[stmt]
+        prog.ops[i] = dest_op
         prog.caches[i] = slot
         return Any[Expr(:(=), lhs, _step_call(i, callargs...))]
     end

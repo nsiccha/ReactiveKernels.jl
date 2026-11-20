@@ -14,6 +14,38 @@ using Test
 # callable holds no data a plain backend must prove readonly.
 const NA_AD_BACKEND = AutoEnzyme(mode = Enzyme.Reverse)
 
+@testset "reverse owns its Cholesky factor storage" begin
+    standard = @kernel stock_factor_entry(A) = begin
+        L = cholesky(Symmetric(A)).L
+        score = L[1, 1] + L[2, 1] + L[2, 2]
+    end
+    lower = @kernel lower_factor_entry(A) = begin
+        L = rk_cholesky_lower(A)
+        score = L[1, 1] + L[2, 1] + L[2, 2]
+    end
+    A = [6.0 1.0; 2.0 8.0]
+    for spec in (standard, lower)
+        plain = prepare(spec; have=:A, want=:score)
+        buffered = prepare_nonallocating(plain, A)
+        expected = prepare_ad(plain, NA_AD_BACKEND, A; active=:A)
+        actual = prepare_ad(buffered, NA_AD_BACKEND, A; active=:A)
+        factor = only(s[] for s in buffered.caches if s isa Ref &&
+                      s[] isa Union{Cholesky,LowerTriangular})
+        storage = factor isa Cholesky ? factor.factors : parent(factor)
+        before = copy(storage)
+        grad, reference = similar(A), similar(A)
+        for B in (2.5 .* A, A)
+            input = copy(B)
+            value, _ = ad_value_and_gradient!(actual, grad, B)
+            oracle, _ = ad_value_and_gradient!(expected, reference, B)
+            @test value == oracle
+            @test grad ≈ reference
+            @test isequal(storage, before)
+            @test B == input
+        end
+    end
+end
+
 # NA gradients stay size-invariant on every Julia version, bounds checks on.
 # Registered Enzyme on Julia 1.12+ with `--check-bounds=yes` taped the shadow
 # of a cached buffer's `Memory` pointer once per element when a loop stored

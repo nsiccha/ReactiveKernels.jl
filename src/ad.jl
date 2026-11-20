@@ -857,9 +857,15 @@ function _ad_na_seed_value(slot::Base.RefValue, step::Int, op)
         "cache slot to be seeded by the exemplar primal call, but step " *
         "$step ($(_opname(op))) still holds `nothing`; every step must " *
         "execute once during preparation"))
-    seeded isa Array ? copy(seeded) :
-        seeded isa AbstractArray ? collect(seeded) : seeded
+    _ad_na_owned_seed(seeded)
 end
+
+_ad_na_owned_seed(x) = x
+_ad_na_owned_seed(x::Array) = copy(x)
+_ad_na_owned_seed(x::AbstractArray) = collect(x)
+_ad_na_owned_seed(x::LinearAlgebra.Cholesky) = copy(x)
+_ad_na_owned_seed(x::LinearAlgebra.LowerTriangular{T,Matrix{T}}) where {T} =
+    LinearAlgebra.LowerTriangular(copy(parent(x)))
 
 # Re-wrap one seeded primal slot as a concretely-typed AD-owned slot.
 function _ad_na_concretize_cache(slot::Base.RefValue, step::Int, op)

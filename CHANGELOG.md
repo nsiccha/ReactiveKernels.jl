@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.339
+
+- A kernel prepared with `prepare_nonallocating` can reuse the factor matrix for
+  `cholesky(Symmetric(A))` on strided Float32 or Float64 matrices and for
+  `rk_cholesky_lower(A)` on strided real matrices. A change in size or an
+  input that aliases the previous factor gets fresh storage. Both operations
+  preserve the caller's covariance and use their ordinary triangle conventions.
+
 ## 0.1.338
 
 - The log rising factorial and its shape derivative keep intermediate products
