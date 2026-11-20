@@ -3,7 +3,8 @@ using DifferentiationInterface, Distributions, Enzyme, ReactiveKernels, Reactive
 
 @rkppl weights(modes, sd) = begin
     shift ~ Normal(0, sd)
-    scale ~ LogNormal(0, 1)
+    floor = 0.25 * sd
+    scale ~ restricted(LogNormal(0, 1), floor, Inf)
     beta_raw[1:prod(modes)] .~ Normal.(0, 1)
     return shift + scale * sum(beta_raw)
 end
@@ -30,8 +31,9 @@ end
         sizes = prod.(modes)
         shift = (1:n) .* 0.15
         beta = [collect(1:k) .* (-0.1 * i) for (i, k) in enumerate(sizes)]
-        logscale = (1:n) .* -0.2
-        scale = exp.(logscale)
+        loggap = (1:n) .* -0.2
+        gap = exp.(loggap)
+        scale = 0.25 .* data.sd .+ gap
         names = coordinate_names(built.layout)
         @test Set(names) == Set(vcat([Symbol("channel.term.shift.", i) for i in 1:n],
             [Symbol("channel.term.scale.", i) for i in 1:n],
@@ -43,7 +45,7 @@ end
         @test restored.channel.term.scale ≈ scale
         @test restored.channel.term.beta_raw == beta
         oracle = sum(eachindex(modes); init = 0.0) do i
-            logpdf(Normal(0, data.sd[i]), shift[i]) + logpdf(Normal(), logscale[i]) +
+            logpdf(Normal(0, data.sd[i]), shift[i]) + logpdf(LogNormal(), scale[i]) + loggap[i] +
                 sum(x -> logpdf(Normal(), x), beta[i]; init = 0.0) +
                 logpdf(Normal(shift[i] + scale[i] * sum(beta[i]), 1), data.y[i])
         end
@@ -54,7 +56,8 @@ end
         grad = Dict(Symbol("channel.term.shift.", i) => residual[i] - shift[i] / data.sd[i]^2
             for i in 1:n)
         for i in 1:n
-            grad[Symbol("channel.term.scale.", i)] = residual[i] * scale[i] * sum(beta[i]) - logscale[i]
+            grad[Symbol("channel.term.scale.", i)] = 1 + gap[i] *
+                (residual[i] * sum(beta[i]) - (1 + log(scale[i])) / scale[i])
         end
         for i in 1:n, j in 1:sizes[i]
             grad[Symbol("channel.term.beta_raw.", i, ".", j)] = scale[i] * residual[i] - beta[i][j]

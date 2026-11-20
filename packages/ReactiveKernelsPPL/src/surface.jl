@@ -5101,6 +5101,8 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
         end
         (_is_sample(c) || _is_broadcast_sample(c)) ||
             _sfail("cells hold `~` observations and `=` assignments only")
+        lhs = c.args[2]
+        latent = Meta.isexpr(lhs, :ref, 2) && lhs.args[1] ∉ data
         lnames = Set(first.(locals))
         external = _external_rhs(c.args[3])
         function arg(ex; object=false)
@@ -5136,6 +5138,10 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
                 end
                 push!(plate_defs, nm)
                 push!(pidx, nm)
+                # This column already evaluates the argument once per authored
+                # index, in plate order. A latent prior consumes that column
+                # directly, including when it supplies one support bound per cell.
+                latent && return nm
                 return Expr(:ref, nm, ivar)
             end
             return ex
@@ -5145,7 +5151,6 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
         # Julia. Record the operands it reads per index: when the bound
         # response holds one array per index, each of these supplies that
         # index's value and every other operand is shared by all indices.
-        lhs = c.args[2]
         if _is_broadcast_sample(c) && Meta.isexpr(lhs, :ref, 2) &&
                 lhs.args[1] isa Symbol && lhs.args[1] in data && lhs.args[2] === ivar
             broadcasts[lhs.args[1]] = sort!(collect(_cell_index_reads(obj, ivar)))

@@ -21,6 +21,7 @@ are recorded in the git history only.
 - A submodel called in a plate can declare an elementwise prior such as
   `w[1:prod(modes)] .~ Normal.(0, 1)`. Each call gets its own array under
   the submodel's name, with dimensions taken from that cell's bound data.
+  A scalar prior in the same cell can use a computed per-cell lower or upper bound.
 
 ## 0.1.238
 
