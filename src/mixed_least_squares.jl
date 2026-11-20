@@ -132,20 +132,34 @@ function _ls_mixed_group_sum(s, local_source, groups, shared::Tuple{Float64})
     total
 end
 
-function _ls_mixed_group_sum(s, local_source, groups, shared::Tuple)
-    d = similar(s.norms)
-    @inbounds @simd for g in eachindex(groups)
-        d[g] = s.norms[g] * ((local_source[groups[g]] - s.hi[g]) - s.lo[g])
+@inline function _ls_group_update(d::NTuple{L,Float64}, cross, slope, g, c) where {L}
+    ntuple(i -> muladd(@inbounds(cross[g + i - 1, c]), slope, d[i]), Val(L))
+end
+
+# Keep a cache line of local residuals in registers. Each shared coordinate
+# updates adjacent levels. The last partial line uses the same sum of squares
+# one level at a time. Both the group count and the column count remain data.
+@inline function _ls_group_tile(s, local_source, groups, shared, start, ::Val{L}) where {L}
+    d = ntuple(Val(L)) do i
+        g = start + i - 1
+        @inbounds s.norms[g] * ((local_source[groups[g]] - s.hi[g]) - s.lo[g])
     end
     for c in axes(s.cross, 2)
-        slope = _ls_mixed_delta(s, shared, c)
-        @inbounds @simd for g in eachindex(groups)
-            d[g] = muladd(s.cross[g, c], slope, d[g])
-        end
+        d = _ls_group_update(d, s.cross, _ls_mixed_delta(s, shared, c), start, c)
     end
+    sum(abs2, d)
+end
+
+function _ls_mixed_group_sum(s, local_source, groups, shared::Tuple)
+    width = 64 ÷ sizeof(Float64)
+    g = 1
     total = 0.0
-    @inbounds @simd for g in eachindex(d)
-        total += d[g]*d[g]
+    while g <= length(groups) - width + 1
+        total += _ls_group_tile(s, local_source, groups, shared, g, Val(width))
+        g += width
+    end
+    for j in g:length(groups)
+        total += _ls_group_tile(s, local_source, groups, shared, j, Val(1))
     end
     total
 end

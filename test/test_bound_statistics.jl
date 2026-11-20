@@ -492,6 +492,7 @@ end
     bindings = ((; x, w, y), (; x, w = [0.0; w[2:end]], y), (; x = 2x, w, y = -y))
     rebound = map(data -> prepare!(cache, ls_weighted; bound = data), bindings)
     @test allequal(typeof.(rebound)) && allequal(_shape.(rebound))
+    @test all(k -> k.f === first(rebound).f, rebound)
     @test map(k -> only(v.fit.usable for v in k.constants if v isa RK._LSWeightedStatistics),
               rebound) == (true, false, true)
     for (k, data) in zip(rebound, bindings)
@@ -532,6 +533,8 @@ end
             X = randn(RNG, n, 3)
             y = randn(RNG, n)
             idx = shuffle(RNG, repeat(1:levels, cld(n, levels))[1:n])
+            # Exercise both the indexed levels and the final partial block.
+            n == 60 && (idx .*= 2)
             w = [isodd(i) ? 0.75 : 1.5 for i in 1:n]
             data = weighted ? (; X, idx, w, y) : (; X, idx, y)
             k = prepare(model; bound = data)
@@ -543,7 +546,8 @@ end
                 @test size(stats.cross) == (levels, 3)
                 @test n > 100 || isempty(findings(k, (Vector{Float64}, Vector{Float64}, Float64)))
             end
-            alpha, beta, sigma = randn(RNG, levels), randn(RNG, 3), 0.8
+            alpha = randn(RNG, maximum(idx; init = levels))
+            beta, sigma = randn(RNG, 3), 0.8
             value, grad = _value_gradient(k, alpha, beta, sigma)
             expected, da, db, ds = 0.0, zero(alpha), zero(beta), 0.0
             for i in eachindex(y)
