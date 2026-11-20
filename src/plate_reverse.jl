@@ -1046,12 +1046,34 @@ end
 # call, rather than its containing assignment or operand name: another read
 # of that operand outside the cell, or at a different index, still needs an
 # ordinary derivative. The shadow write below uses the cell's linear index.
-function _pr_direct_operands!(prepared, body, params, active_params, broadcastables, mod, values)
+function _pr_direct_operands!(prepared, body, params, active_params, broadcastables, mod, values, groups)
     operands = Dict{Symbol,Symbol}(p => p for p in params)
     merge!(operands, broadcastables)
     reads = IdDict{Expr,Nothing}()
+    function read(ex, indices)
+        ex isa Expr && !(ex.head in (:quote, :for, :while)) || return
+        if Meta.isexpr(ex, :call, 3) && ex.args[2] isa Symbol && ex.args[3] in indices
+            operand = ex.args[2]
+            f = _pr_call_function(ex.args[1], mod, values)
+            if f === _plate_read && haskey(operands, operand)
+                prepared[operand] = operands[operand]
+                reads[ex] = nothing
+            elseif f === Base.Broadcast._broadcast_getindex && haskey(prepared, operand)
+                reads[ex] = nothing
+            end
+        end
+        foreach(arg -> read(arg, indices), ex.args)
+    end
     function visit(node)
         node isa Expr && node.head !== :quote || return
+        group = get(groups, node, nothing)
+        if group !== nothing && !(group.index in group.locals)
+            # Each outer read and its scatter use this group's coordinate.
+            # Reads in nested cell loops must establish their own coordinate.
+            for stmt in group.prefix
+                _pr_has_loop(stmt) || read(stmt, (group.index,))
+            end
+        end
         loop = _pr_cell_loop(node)
         if loop === nothing
             foreach(visit, node.args)
@@ -1067,22 +1089,7 @@ function _pr_direct_operands!(prepared, body, params, active_params, broadcastab
             _pr_call_function(rhs.args[1], mod, values) === Base.CartesianIndex || return
         rebound = _program_bound!(Set{Symbol}(), Expr(:block, statements[2:end]...))
         (index in rebound || linear in rebound) && return
-        function read(ex)
-            ex isa Expr && ex.head !== :quote || return
-            if Meta.isexpr(ex, :call, 3) &&
-                    ex.args[2] isa Symbol && ex.args[3] in (index, linear)
-                operand = ex.args[2]
-                f = _pr_call_function(ex.args[1], mod, values)
-                if f === _plate_read && haskey(operands, operand)
-                    prepared[operand] = operands[operand]
-                    reads[ex] = nothing
-                elseif f === Base.Broadcast._broadcast_getindex && haskey(prepared, operand)
-                    reads[ex] = nothing
-                end
-            end
-            foreach(read, ex.args)
-        end
-        foreach(read, statements[2:end])
+        foreach(stmt -> read(stmt, (index, linear)), statements[2:end])
     end
     visit(body)
     function check(node)
@@ -2270,7 +2277,7 @@ function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict
     # A group's gathered array can itself be active. Its direct reads must
     # pass the same coordinate check as reads of a program argument.
     cell_reads = _pr_direct_operands!(prepared, body, params, active,
-                                     broadcastables, mod, values)
+                                     broadcastables, mod, values, groups)
     sources, group_shadows, scatters, projections = _pr_group_shadows!(
         cell_reads, groups, params, active, prepared, mod, values, declared)
     batched = Symbol[p for p in params if p in active_params &&

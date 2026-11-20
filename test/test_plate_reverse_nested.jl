@@ -16,6 +16,22 @@ const RK = ReactiveKernels
     return result
 end
 
+@testset "group reads keep their own coordinate" begin
+    operand = GlobalRef(Base.Broadcast, :_broadcast_getindex)
+    function validate(prefix)
+        loop = Expr(:for, :(group = groups), Expr(:block, prefix...))
+        locals = collect(RK._program_bound!(Set{Symbol}(), loop.args[2]))
+        group = RK._PRAdditiveGroup(prefix, Any[], :group, locals)
+        RK._pr_direct_operands!(Dict(:p => :offsets), loop, [:offsets], [:offsets],
+            Dict{Symbol,Symbol}(), RK, Dict{Symbol,Any}(), IdDict(loop => group))
+    end
+    read = :($operand(p, group))
+    @test haskey(validate(Any[:(offset = $read)]), read)
+    @test_throws RK._PRIneligible validate(Any[:(offset = $operand(p, 1))])
+    @test_throws RK._PRIneligible validate(Any[:(group = 1), :(offset = $read)])
+    @test_throws RK._PRIneligible validate(Any[:(for cell in cells; offset = $read; end)])
+end
+
 # Scalar indexing reads the stored coordinate, but this type defines a
 # different vector-index operation. Its pullback multiplies by two.
 struct ScaledGather <: AbstractVector{Float64}
