@@ -10,6 +10,17 @@ using Test
 const NODE = ReactiveKernels._js_default_node() !== nothing
 const V = Vector{Float64}
 
+@kernel js_weighted_residual(x::Vector{Float64}, w::Vector{Float64}, y::Vector{Float64},
+                             a::Float64, b::Float64, sigma::Float64) = begin
+    mu = muladd.(b, x, a)
+    scales = sigma .* w
+    cells = plate(y, mu, scales) do yi, mi, si
+        si > 0 ? -log(si) - 0.5 * ((yi - mi) / si)^2 : -Inf
+    end
+    total::Float64 = sum(cells)
+    return total
+end
+
 @kernel js_weighted(x, scale, weights) = begin
     y = scale .* x .+ weights
     total = sum(y)
@@ -147,6 +158,20 @@ end
         NODE ? check_against(WEIGHTED_EXEMPLAR, source, :exemplar, CASES) : @test_skip "no node on the PATH"
         # without exemplars, an abstract HAVE type needs `types`
         @test_throws ArgumentError ReactiveKernels.js_source(WEIGHTED)
+    end
+
+    @testset "prepared least squares emits its authored rows" begin
+        for weights in (repeat([0.5, 1.5], 30), [0.0; ones(59)])
+            bound = (; x = sin.(1:60), w = weights, y = cos.(1:60))
+            kernel = prepare(js_weighted_residual; bound)
+            @test any(s -> s isa ReactiveKernels._LSWeightedStatistics, kernel.constants)
+            source = ReactiveKernels.js_source(kernel; types = (Float64, Float64, Float64), name = :residual)
+            if NODE
+                check_against(kernel, source, :residual, [(0.2, 0.5, 0.8), (0.1, -0.1, 0.0)])
+            else
+                @test_skip "no node on the PATH"
+            end
+        end
     end
 
     @testset "an input check runs in the module" begin
