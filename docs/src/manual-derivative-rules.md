@@ -52,6 +52,8 @@ reverse = reverse_cut(scaled, Val(1), 2.0, geometry, 1.0)
 
 The reverse mask uses original input positions. A bit for a data-only input is invalid. Data remains available to the primal and any derivative that reads it, but has no authored derivative port.
 
+Under Enzyme reverse mode, the adapter keeps what the reverse branch reads between the two passes. It reads an input in place when Enzyme proves that nothing writes it before the reverse pass and the result cannot expose it: the result is a plain-bits value such as a number, or an array of numbers whose memory does not overlap the input's. Otherwise it copies the input once per call. Enzyme proves this for an array passed directly, unless the caller writes, after the call, to memory Enzyme cannot show is apart from it, such as an output array it also received. For arrays held inside a value such as a struct, tuple or view, Enzyme dogfood with the `overwritten_reachable_data` repair is required (`Enzyme.has_dogfood_repair(:overwritten_reachable_data)`). Without that repair, such arrays are copied on every reverse call, so the cost grows with their length.
+
 `jax_source` generates `custom_jvp` adapters for scalar rules from these same
 activity-selected graph cuts. Joint value/partials recipes are shared across
 calls and activity patterns. General rules generate their forward and staged

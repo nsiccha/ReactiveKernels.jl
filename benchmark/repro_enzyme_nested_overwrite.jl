@@ -11,20 +11,22 @@
 #
 # With the array passed directly the flag is set, and the rule returns the
 # weight the primal used (3). With the same array inside the immutable
-# `Weights` the flag stays unset, so the rule reloads the overwritten weight and
-# returns 42. Ordinary Enzyme through `native`, without the rule, returns 3 in
-# both cases, and so does the rule when nothing is written.
+# `Weights`, Enzyme before its dogfood repair `overwritten_reachable_data`
+# leaves the flag unset, so the rule reloads the overwritten weight and returns
+# 42. Ordinary Enzyme through `native`, without the rule, returns 3 in both
+# cases, and so does the rule when nothing is written.
 #
-# Recorded on a Linux fleet host, 2026-11-20: Julia 1.10.12, Enzyme dogfood
-# `83fc0bfc`, libEnzyme `09013d21` (LLVM 15). 15 of 16 checks pass and
-# "Weights, write_alias, row" fails with `42.0 == 3.0`, so the script exits
-# nonzero. Enzyme snag `used-the-public-c34388a0` tracks whether the flag is
-# meant to cover storage reached through a composite operand.
+# Recorded on a Linux fleet host, 2026-11-20, Julia 1.10.12 (LLVM 15):
+# - Enzyme dogfood `83fc0bfc`, libEnzyme `09013d21`: 15 of 16 checks pass and
+#   "Weights, write_alias, row" fails with `42.0 == 3.0`, so the script exits
+#   nonzero (Enzyme snag `used-the-public-c34388a0`).
+# - Enzyme dogfood `8a381501`, libEnzyme `05ce259c`, which carry the repair
+#   (`Enzyme.has_dogfood_repair(:overwritten_reachable_data)`): 16 of 16.
 #
-# This is why the Enzyme adapter of derivative rules
-# (`_retain_residuals`, ext/ReactiveKernelsEnzymeExt.jl) borrows only arrays
-# passed directly and copies every array held inside a composite input on each
-# reverse call (snag `native-reverse-r-b8de62b9`). The module
+# The Enzyme adapter of derivative rules (`_retain_residuals`,
+# ext/ReactiveKernelsEnzymeExt.jl) therefore borrows an array held inside an
+# unchanged composite input only when the repair is loaded, and copies it on
+# each reverse call otherwise (snag `native-reverse-r-b8de62b9`). The module
 # `CompositeInputChecks` in test/test_derivative_rule_snapshots.jl holds the
 # same writes at a declared rule.
 module NestedOverwrite

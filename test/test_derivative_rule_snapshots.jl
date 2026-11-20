@@ -151,25 +151,37 @@ end
         @test saved[2] === saved[1]
         @test saved[3] === 1.5
     end
+    # Without Enzyme's repair `overwritten_reachable_data` (`Val(false)`), an
+    # input's flag proves nothing about the arrays it holds, so they are
+    # copied. With it (`Val(true)`), an unchanged input is kept whole.
     nested = [a]
-    saved = @inferred r((1,), (nested,), 1.0, (false,false))
+    saved = @inferred r(Val(false), (1,), (nested,), 1.0, (false,false))
     @test saved[1] !== nested
     @test only(saved[1]) !== a
+    @test (@inferred r(Val(true), (1,), (nested,), 1.0, (false,false)))[1] === nested
     # Audit the generated snapshot directly as well as its caller.
-    findings = ReactiveKernels._level_code_findings(:all, ext._snapshot_residuals,
-        (Tuple{Int,Int,Int}, typeof(tape), Tuple{Bool,Bool}, Val{true}))
-    println("OWNED_SNAPSHOT_AUDIT ", findings)
-    @test isempty(findings)
+    for deep in (false, true)
+        signature = (typeof(tape), Tuple{Int,Int,Int}, Tuple{Bool,Bool}, Val{true}, Val{deep})
+        @test hasmethod(ext._snapshot_residuals, signature)
+        findings = ReactiveKernels._level_code_findings(:all, ext._snapshot_residuals, signature)
+        println("OWNED_SNAPSHOT_AUDIT ", findings)
+        @test isempty(findings)
+    end
     record = Record(a)
     for value in (view(a,:), (a,), (;data=a), record,
             MutableRecord(a), [a])
         @test !ext._flat_residual_environment((a,value))
-        saved = r((1,-1), (a,value), 1.0, (false,false))
-        @test saved[1] !== a
-        if value isa SubArray
-            @test parent(saved[2]) === saved[1]
-        else
-            @test unwrap(saved[2]) === saved[1]
+        for deep in (false, true)
+            saved = r(Val(deep), (1,-1), (a,value), 1.0, (false,false))
+            # With the repair, the unchanged input `a` is kept, and so is the
+            # intermediate that holds it, unless that is snapshot by `deepcopy`.
+            kept = deep && !(value isa Union{MutableRecord,Vector{Vector{Float64}}})
+            @test (saved[1] === a) == kept
+            if value isa SubArray
+                @test parent(saved[2]) === saved[1]
+            else
+                @test unwrap(saved[2]) === saved[1]
+            end
         end
         # Unsupported borrowing forms retain the original snapshot path. Audit
         # that reachable path, rather than a hook it never calls.
@@ -263,10 +275,22 @@ end
             (((; data = a), Record(b)), (-1, -1), view(b, :), (false,), false))
         types = Tuple{typeof(sources), typeof(tape), typeof(primal), typeof(flags)}
         @test no_dispatch(retention_llvm(retain, types))
-        @test no_dispatch(retention_llvm(ext._snapshot_residuals,
-            Tuple{typeof(tape), typeof(sources), typeof(flags), Val{borrow}}))
+        for deep in (false, true)
+            @test no_dispatch(retention_llvm(ext._snapshot_residuals,
+                Tuple{typeof(tape), typeof(sources), typeof(flags), Val{borrow}, Val{deep}}))
+        end
         @test only(Base.return_types(retain, types)) === typeof(tape)
     end
+    # The overlap check of a dense result lists storage from the types alone,
+    # through mutable structs such as a `Dict` too; an array of arrays cannot
+    # be listed without reading it and counts as overlapping.
+    for value in (Record(a), MutableRecord(a), Dict(1 => 2.0), (a, view(b, :)))
+        @test no_dispatch(retention_llvm(ext._residual_overlaps,
+            Tuple{typeof(value), Vector{Float64}}))
+        @test ext._residual_overlaps(value, a) == !(value isa Dict)
+        @test !ext._residual_overlaps(value, [1.0])
+    end
+    @test ext._residual_overlaps([a], [1.0])
     # Residuals the rule's graph does not infer (a type as its callable's
     # field, as `Record` in the first testset) reach the snapshot through a
     # run-time call. Retention preserves the known tuple shape for the reverse.
@@ -278,7 +302,7 @@ end
     # Positive control: a mutable container keeps Base's `deepcopy`.
     tape = (MutableRecord(a), b)
     @test occursin("deepcopy", retention_llvm(ext._snapshot_residuals,
-        Tuple{typeof(tape), Tuple{Int,Int}, Tuple{Bool}, Val{false}}))
+        Tuple{typeof(tape), Tuple{Int,Int}, Tuple{Bool}, Val{false}, Val{false}}))
     saved = retain((-1, -1), tape, 0.0, (false,))
     @test saved[1] !== tape[1] && saved[1].data == a && saved[1].data !== a
 end
@@ -335,13 +359,19 @@ end
 
 # The caller writes, after the rule's call, to an array that a constant
 # composite input holds: through the input's field, through another argument or
-# a view that is the same array, and through a global. Enzyme's write flag of
-# the composite input stays unset in each case
-# (benchmark/repro_enzyme_nested_overwrite.jl), so the reverse has to read the
-# weight the adapter retained, not the caller's array.
+# a view that is the same array, and through a global. Before Enzyme's dogfood
+# repair `overwritten_reachable_data`, the write flag of the composite input
+# stays unset in each case (benchmark/repro_enzyme_nested_overwrite.jl), so the
+# reverse has to read the weight the adapter retained, not the caller's array.
+# With the repair the flag is set, and when nothing is written the adapter
+# borrows the input's array instead of copying it.
 module CompositeInputChecks
 using ReactiveKernels, Test
 import Enzyme
+
+const ext = Base.get_extension(ReactiveKernels, :ReactiveKernelsEnzymeExt)
+const repaired = isdefined(Enzyme, :has_dogfood_repair) &&
+    Enzyme.has_dogfood_repair(:overwritten_reachable_data)
 
 struct Weights
     values::Vector{Float64}
@@ -382,6 +412,82 @@ end
         @test last(cotangents) == w
         @test shared[1] == 42.0
     end
+end
+
+steady(g, x) = rule(g, x)
+function reverse_bytes(g)
+    Enzyme.autodiff(Enzyme.Reverse, Enzyme.Const(steady), Enzyme.Active,
+        Enzyme.Const(g), Enzyme.Active(2.0))
+    @allocated Enzyme.autodiff(Enzyme.Reverse, Enzyme.Const(steady), Enzyme.Active,
+        Enzyme.Const(g), Enzyme.Active(2.0))
+end
+
+# A geometry that also holds a `Dict`, read by a rule with an array result:
+# the result's storage is checked against every array the input holds.
+struct Indexed
+    index::Dict{Int,Int32}
+    values::Vector{Float64}
+end
+row_value(g, x) = [g.values[1] * x]
+row_slope(g, bar) = g.values[1] * only(bar)
+@kernel function indexed_row(g, x::Float64, bar::Vector{Float64})
+    y::Vector{Float64} = row_value(g, x)
+    dx::Float64 = row_slope(g, bar)
+    return y, dx
+end
+const row_rule = derivative_rule(indexed_row; primal=:y, covector=:bar,
+    cotangents=(g=nothing, x=:dx))
+row_loss(g, x) = only(row_rule(g, x))
+function row_bytes(g)
+    Enzyme.autodiff(Enzyme.Reverse, Enzyme.Const(row_loss), Enzyme.Active,
+        Enzyme.Const(g), Enzyme.Active(2.0))
+    @allocated Enzyme.autodiff(Enzyme.Reverse, Enzyme.Const(row_loss), Enzyme.Active,
+        Enzyme.Const(g), Enzyme.Active(2.0))
+end
+
+# Borrowing an array inside an input is sound only where Enzyme's flag covers
+# it, so the adapter copies the array exactly when the repair is missing.
+@testset "an unchanged composite input is borrowed only with the repair" begin
+    @test ext._OVERWRITTEN_REACHABLE_DATA[] == repaired
+    g = Weights(fill(3.0, 1 << 16))
+    @test (reverse_bytes(g) < sizeof(g.values)) == repaired
+    indexed = Indexed(Dict(1 => Int32(1)), fill(3.0, 1 << 16))
+    @test Enzyme.autodiff(Enzyme.Reverse, Enzyme.Const(row_loss), Enzyme.Active,
+        Enzyme.Const(indexed), Enzyme.Active(2.0))[1][2] == 3.0
+    @test (row_bytes(indexed) < sizeof(indexed.values)) == repaired
+end
+
+# Retention given the flags, for either build: `Val(true)` is the repaired one.
+@testset "retention of arrays inside an input" begin
+    v = [3.0, 1.0, 2.0]
+    g = Weights(v)
+    residuals = (g, view(v, 1:2))
+    unchanged = (false, false, false)
+    written = (false, true, false)
+    # Kept inside an unchanged input, also through an intermediate view of it.
+    kept = ext._retain_residuals(Val(true), (1, -1), residuals, 0.0, unchanged)
+    @test kept[1].values === v && parent(kept[2]) === v
+    # A fresh dense result keeps it too.
+    @test ext._retain_residuals(Val(true), (1,), (g,), [1.0], unchanged)[1].values === v
+    # Copied once and shared by the view: the input may be written, the flag
+    # proves nothing without the repair, or a dense result shares its storage
+    # (itself, or another header over the same memory).
+    for (deep, primal, flags) in ((true, 0.0, written), (false, 0.0, unchanged),
+            (true, v, unchanged), (true, reshape(v, 3, 1), unchanged))
+        saved = ext._retain_residuals(Val(deep), (1, -1), residuals, primal, flags)
+        @test saved[1].values !== v && saved[1].values == v
+        @test parent(saved[2]) === saved[1].values
+    end
+    # The arrays of a mutable struct, such as a `Dict`, are listed for that
+    # check without reading its elements.
+    indexed = Indexed(Dict(1 => Int32(2)), v)
+    @test ext._retain_residuals(Val(true), (1,), (indexed,), [1.0], unchanged)[1] === indexed
+    saved = ext._retain_residuals(Val(true), (1,), (indexed,), v, unchanged)[1]
+    @test saved.values !== v && saved.values == v && saved.index == indexed.index
+    # An array of arrays cannot be listed without reading its elements, so it
+    # counts as sharing the result's storage.
+    nested = [v]
+    @test only(ext._retain_residuals(Val(true), (1,), (nested,), [1.0], unchanged)[1]) !== v
 end
 end
 end
