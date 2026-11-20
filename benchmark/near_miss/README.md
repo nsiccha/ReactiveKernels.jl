@@ -25,9 +25,9 @@ measured; a variant that fails prints its error instead of a timing.
 
 | Family | Base model | Siblings |
 | --- | --- | --- |
-| A | `y .~ Normal.(a .+ b .* x, sigma)` | named location, matrix design, data-weighted scale, LogNormal, `@plate` loop, quadratic term, exp link, Student-t, modeled scale, scalar location, crossed and gathered intercepts |
+| A | `y .~ Normal.(a .+ b .* x, sigma)` | named location, matrix design, data-weighted scale, LogNormal, `@plate` loop, quadratic term, exp link, Student-t, modeled scale, scalar location, crossed and gathered intercepts, gathered intercept beside an authored `hcat` or a separate scan |
 | B | `y .~ BernoulliLogit.(a .+ b .* x)` on a discrete covariate | continuous covariate, `Bernoulli.(logistic.(…))`, Poisson, Binomial, negative binomial, `@plate` loop |
-| C | `y .~ Normal.(alpha[g] .+ b .* x, sigma)` with rows sorted by group | shuffled rows, Bernoulli-logit, Poisson, Student-t |
+| C | `y .~ Normal.(alpha[g] .+ b .* x, sigma)` with rows sorted by group | shuffled rows, Bernoulli-logit, Poisson, Student-t, reference coding, missing group labels |
 | D | `y .~ Normal.(exp.(a .+ b .* x), sigma)` | Student-t, LogNormal, Gamma, Weibull, Cauchy, Laplace, Logistic with shared shape or scale |
 | G | Poisson cubic trend over 40 rows | Binomial quadratic trend, one effect per row, Poisson, Binomial and Bernoulli-logit over a five-column design matrix |
 | R | hand-written loops | Normal, Student-t, Cauchy, Bernoulli-logit, Poisson, gathered Normal |
@@ -42,8 +42,8 @@ Times are nanoseconds per row for one value-and-gradient call.
 
 | Variant | Gradient, ns per row | Remark |
 | --- | ---: | --- |
-| A0 `Normal.(a .+ b .* x, sigma)` | 0.19 | bound least-squares statistics: the cost does not depend on the rows |
-| A3 the same with scale `sigma .* w`, `w` data | 7.97 | 42 times A0; weighted least squares has the same statistics |
+| A0 `Normal.(a .+ b .* x, sigma)` | 0.19 | a fast row sum: the cost grows with the rows (see the note below the table) |
+| A3 the same with scale `sigma .* w`, `w` data | 7.97 | 42 times A0 for a scale that differs only by a data weight per row |
 | A8 Student-t at the same location | 24.1 | one `log1p` per row is inherent; see D1 for the hand loop |
 | A9 scale `exp.(c .+ d .* z)` | 15.9 | |
 | B0 Bernoulli-logit, covariate with 5 values | 0.07 | duplicate cells: one cell per distinct row |
@@ -60,11 +60,18 @@ Times are nanoseconds per row for one value-and-gradient call.
 | D4 Weibull, shared shape | 59.4 | one `exp` per row is inherent |
 | D5 to D7 Cauchy, Laplace, Logistic | none | `SurfaceLoweringError: unknown distribution` as a response |
 
+An earlier version of this table said that A0 uses the bound least-squares
+statistics and that its cost does not depend on the rows. That was wrong. Its
+prepared program has no residual kernel (`_ls_rss`) and its value-and-gradient
+call takes 361 ns at 2,000 rows, 3,286 ns at 20,000 and 39,590 ns at 200,000
+(Julia 1.10.12 build kb8, Enzyme `dogfood` 0.13.221, one process): 0.16 to
+0.20 ns per row, the speed of a vectorized row sum.
+
 The measured gradient equals the hand loop where a benchmark model has the
 shape (Normal, Bernoulli-logit, gathered Normal) and is 3 to 8 times a hand
 loop's cost for the sibling laws.
 
-## After ReactiveKernelsPPL 0.1.241 and ReactiveKernelsDistributionKernels 0.1.15
+## After the Poisson plate lowering and the one-softplus Binomial kernel
 
 The Poisson-log regression lowers to the summed plate of the other count
 laws, and the binomial logit kernel reads one softplus without a branch on
@@ -86,3 +93,86 @@ formula, so its repeated rows are still evaluated one by one. The plate with
 the exact kernel equals that formula's value-and-gradient time and runs
 repeated rows once (26.0 µs to 0.5 µs), but its density-only call takes 23 to
 34 percent longer on a continuous covariate.
+
+## After the Student-t factor form
+
+The Student-t kernel is a factor that reads only the degrees of freedom times
+`log1p(z^2 / nu)`, so the summed-plate factor pass takes the factor out of the
+row sum. Same conditions as the first measurement, under a load of 33 to 45;
+nanoseconds for one value-and-gradient call over 2000 rows. The Normal rows
+are controls from the same two runs.
+
+| Variant | Before | After |
+| --- | ---: | ---: |
+| A8 Student-t at a linear location | 48270 | 22149 |
+| A14 Student-t with `alpha[g]`, sorted groups | 47300 | 24350 |
+| A14s the same, shuffled groups | 47310 | 23380 |
+| C3 Student-t with `alpha[g]` and a slope, sorted groups | 53659 | 25320 |
+| C3s the same, shuffled groups | 51369 | 22249 |
+| D1 Student-t with an exp link, shared `nu` and `sigma` | 89780 | 40800 |
+| A0 Normal at a linear location (control) | 383 | 361 |
+| A7 Normal with an exp link (control) | 13270 | 13170 |
+| D0 Normal with an exp link, shared `sigma` (control) | 13120 | 13269 |
+
+The hand-written Student-t loop with an exp link takes 28760, so D1 went from
+3.1 to 1.4 times the hand loop.
+
+## Grouped Normal factor terms
+
+On `8a7f69f42`, one process timed 2,000 observations sorted into 50
+groups, using Julia 1.10.12, Enzyme 0.13.221 (`dogfood`) and one BLAS
+thread. C4 omits the first group's coefficient. C5 replaces that group's
+labels with `missing`. Both give the same log density at the probe point.
+
+| Variant | Density (ns) | Value and gradient (ns) | Relative to A13 |
+| --- | ---: | ---: | ---: |
+| A13 grouped intercept and slope | 407 | 1,063 | 1.00× |
+| A12 grouped intercept and bound five-column matrix | 1,026 | 2,163 | 2.03× |
+| A15 grouped intercept and two-column `hcat` in the model | 862 | 2,145 | 2.02× |
+| A16 grouped intercept and separate three-step observed scan | 945 | 2,464 | 2.32× |
+| C0 hierarchical grouped intercept and slope | 418 | 1,108 | 1.04× |
+| C4 hierarchical, reference-coded groups | 851 | 2,382 | 2.24× |
+| C5 hierarchical, missing group labels | 846 | 2,285 | 2.15× |
+
+A13 emits a gather by level code. A15, A16, C4 and C5 emit a dense
+rows-by-levels design. Their prepared Gaussian densities use the
+least-squares residual kernel (`_ls_rss`). The timings cover repeated calls
+after preparation and exclude the cost of constructing that design.
+
+```sh
+julia --startup-file=no --project=<env> benchmark/near_miss/probe_families.jl AC 2000 '^(A12 |A13 |A15 |A16 |C0 |C4 |C5 )'
+```
+
+## Factor coding and level count
+
+The C1 and C2 probes repeat the four factor spellings with Bernoulli-logit
+and Poisson responses. Suffixes `r`, `m`, `h` and `t` select a reference
+level, missing labels, an authored two-column matrix and a separate scan.
+The `x` sibling binds the same two columns as a matrix. The unsuffixed
+model is the full-cover sibling for the reference, missing and scan cases.
+
+`factor_scaling.jl` measures a fresh model from data binding through
+`prepare_sampler`, then measures the warm density and ordinary Enzyme value
+and gradient. Setup MiB are cumulative Julia allocations. Each law and
+spelling first runs with 100 rows and five levels to warm its Julia methods.
+The target data have 20,000 rows, sorted by group, with 50, 500 or 5,000
+levels. The last two command arguments select laws and spellings.
+
+```sh
+julia --startup-file=no --project=<env> benchmark/near_miss/probe_families.jl C 2000 '^(C1|C2)'
+julia --startup-file=no --project=<env> benchmark/near_miss/factor_scaling.jl 20000 50,500,5000 normal,bernoulli full,reference,missing,bound_matrix,hcat,scan
+```
+
+On `8a7f69f42`, the full-cover and reference-coded siblings had the following
+costs. Each pair gives full cover first and reference coding second.
+The 5,000-level reference design has 99,980,000 entries. Gaussian
+least-squares preparation can hide the cost of building it at smaller sizes.
+
+| Law | Levels | Setup (s) | Setup (MiB) | Density (µs) | Value and gradient (µs) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Normal | 50 | 0.286 / 0.407 | 89.6 / 144 | 2.20 / 0.85 | 4.01 / 2.28 |
+| Normal | 500 | 0.855 / 2.02 | 91.1 / 633 | 3.65 / 82.8 | 10.1 / 166 |
+| Normal | 5,000 | 1.93 / 111 | 278 / 6,042 | 5.72 / 22,290 | 23.9 / 114,133 |
+| Bernoulli-logit | 50 | 0.163 / 0.199 | 62.8 / 76.5 | 170 / 239 | 222 / 346 |
+| Bernoulli-logit | 500 | 0.174 / 0.261 | 64.5 / 284 | 173 / 1,993 | 227 / 3,959 |
+| Bernoulli-logit | 5,000 | 2.41 / 1.51 | 248 / 2,369 | 179 / 48,226 | 216 / 91,627 |
