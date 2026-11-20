@@ -24,6 +24,7 @@ const _MATRIX_CORE_TESTS = (
     "test_runtests_selector.jl",
     "test_changelog.jl",
     "test_stateless.jl",
+    "test_prepare_into.jl",
     "test_planner_groundability.jl",
     "test_planner_cyclic_ad.jl",
     "test_planning_scaling.jl",

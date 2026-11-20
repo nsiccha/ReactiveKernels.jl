@@ -16,6 +16,13 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.342
+
+- `prepare_into` prepares an ordinary Julia kernel to fill a caller-supplied
+  array. One writer can alternate destinations across calls. A supported final
+  broadcast writes directly, and other kernels run once and copy their array
+  result.
+
 ## 0.1.341
 
 - A kernel prepared with `prepare_nonallocating` can reuse the factor matrix for
