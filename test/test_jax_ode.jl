@@ -39,6 +39,15 @@ end
     return total
 end
 
+# The solution after t = 1 is log1p(k * (t - 1)^2 / 2). A large trial step
+# across the onset overflows exp(-y) even though the solution stays finite.
+_jax_ode_ramp(t, y, k) = [k * max(t - 1, 0.0) * exp(-y[1])]
+@kernel jax_ode_retry(u::Vector{Float64}, ts::Vector{Float64}) = begin
+    sol = rk_ode_rk45_tol(_jax_ode_ramp, [0.0], 0.0, ts, 1e-8, 1e-8, 10^4, u[1])
+    total = sol[end, 1]
+    return total
+end
+
 @kernel jax_ode_stiff(u::Vector{Float64}, ts::Vector{Float64}) = begin
     sol = rk_ode_bdf_tol(_jax_ode_robertson, [1.0, 0.0, 0.0], 0.0, ts, 1e-8, 1e-10, 10^6,
                          exp(u[1]), 3e7, 1e4)
@@ -74,7 +83,7 @@ end
     source = jax_source(jax_ode_cells; have = (:u, :doses, :times), want = :total)
     text = string(source)
     @test occursin("import diffrax", text)
-    @test occursin("diffrax.Dopri5()", text)
+    @test occursin("_RKDopri5()", text)
     # One solve, vmapped over the cells: no body per subject or output time.
     @test count("_rk_ode_solve(", text) == 2
     # A module without an ODE does not import diffrax.
@@ -93,7 +102,7 @@ end
         @test_skip false
     end
     stiff = jax_source(jax_ode_stiff; have = (:u, :ts), want = :total)
-    @test occursin("diffrax.Kvaerno5()", string(stiff))
+    @test occursin("_RKKvaerno5()", string(stiff))
     stiff_native = prepare(jax_ode_stiff; have = (:u, :ts), want = :total)
     ts = [0.4, 4.0, 40.0, 400.0]
     if _JAX_ODE_PYTHON
@@ -102,6 +111,24 @@ end
         got = rk_jax_evaluate(stiff, "kernel", (u, ts); grad = true)
         @test got.value ≈ query(u) rtol = 1e-6
         @test got.grad ≈ gradient(query, backend, u) rtol = 1e-4
+    else
+        @test_skip false
+    end
+end
+
+@testset "a rejected non-finite ODE trial leaves a finite solution and gradient" begin
+    u, ts = [100.0], [1.0, 2.0]
+    source = jax_source(jax_ode_retry; have = (:u, :ts), want = :total)
+    native = prepare(jax_ode_retry; have = (:u, :ts), want = :total)
+    query = x -> native(x, ts)
+    value = query(u)
+    grad = gradient(query, AutoEnzyme(; mode = Enzyme.Reverse), u)
+    @test value ≈ log1p(u[1] / 2) rtol = 1e-6
+    @test only(grad) ≈ 1 / (2 + u[1]) rtol = 1e-6
+    if _JAX_ODE_PYTHON
+        got = rk_jax_evaluate(source, "kernel", (u, ts); grad = true)
+        @test got.value ≈ value rtol = 1e-6
+        @test got.grad ≈ grad rtol = 1e-6
     else
         @test_skip false
     end
