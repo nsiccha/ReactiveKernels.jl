@@ -428,6 +428,40 @@ end
     return total
 end
 
+@kernel ls_interleaved(w::Vector{Float64}, y::Vector{Float64}, v::Vector{Float64},
+                       z::Vector{Float64}, a::Float64, b::Float64, sigma::Float64) = begin
+    scales = w .* sigma
+    first_cells = plate(y, a, scales) do yy, m, s
+        s > 0 ? -log(s) - 0.5 * ((yy-m)/s)^2 : -Inf
+    end
+    other = v .* sigma
+    first_sum = sum(first_cells)
+    second_cells = plate(z, b, other) do yy, m, s
+        s > 0 ? -log(s) - 0.5 * ((yy-m)/s)^2 : -Inf
+    end
+    second_sum = sum(second_cells)
+    total = first_sum + second_sum
+    return total
+end
+
+@testset "interleaved weighted sums own their reductions" begin
+    y = sin.(1:48)
+    z = cos.(1:48)
+    weights = 2 .+ y
+    for (w, v) in ((weights, reverse(weights)), ([0.0; weights[2:end]], weights),
+                   (weights, [0.0; weights[2:end]]))
+        bound = (; w, y, v, z)
+        k = prepare(ls_interleaved; bound)
+        literal = prepare(ls_interleaved; bound, bound_statistics = false)
+        fits = [s.fit.usable for s in k.constants if s isa RK._LSWeightedStatistics]
+        @test sort(fits) == sort([all(>(0), w), all(>(0), v)])
+        actual, gradient = _value_gradient(k, 0.1, -0.3, 0.8)
+        expected, reference = _value_gradient(literal, 0.1, -0.3, 0.8)
+        @test actual ≈ expected
+        @test collect(gradient) ≈ collect(reference)
+    end
+end
+
 @testset "separable row scales bind a weighted design" begin
     for (model, precision) in ((ls_weighted, false), (ls_precision, true))
         kernels = Any[]

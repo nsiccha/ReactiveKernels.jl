@@ -985,14 +985,20 @@ function _partial_bound_statistics(p::Plan, bound_values::Vector{Value})
     _, _, dataonly = _partial_split(p, bound)
     weighted = Dict{Int,Any}()
     rewrites = Dict{Int,Any}()
+    next_start = 1
     for r in candidates
-        rewrite = _ls_plate_rewrite(p, r, _authored_plate_sum_recipe(p, r), dataonly, wanted)
+        total = _authored_plate_sum_recipe(p, r)
+        rewrite = _ls_plate_rewrite(p, r, total, dataonly, wanted)
         if rewrite !== nothing
             rewrites[r.id] = rewrite
         else
-            candidate = _ls_weighted_rewrite(p, r, dataonly, wanted)
-            candidate === nothing || (weighted[r.id] = candidate)
+            candidate = _ls_weighted_rewrite(p, r, total, dataonly, wanted, next_start)
+            candidate === nothing && continue
+            weighted[r.id] = candidate
         end
+        # Each guarded region owns its reduction. Producers for the next
+        # plate can precede this total and arrive as ordinary region outputs.
+        next_start = max(next_start, findfirst(==(total), p.recipes) + 1)
     end
     isempty(rewrites) && isempty(weighted) && return p
     copied = Graph(copy(g.values), copy(g.recipes), copy(g.producers), copy(g.aliases),

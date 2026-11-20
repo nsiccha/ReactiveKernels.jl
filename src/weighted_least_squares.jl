@@ -230,7 +230,7 @@ end
         f.square * (_ls_rss(loc) / sigma / sigma)
 end
 
-function _ls_weighted_rewrite(p, plate, dataonly, wanted)
+function _ls_weighted_rewrite(p, plate, total, dataonly, wanted, next_start)
     length(plate.inputs) == 3 && isempty(typeof(plate.op).parameters[2]) || return nothing
     ids = [canon_id(p.graph, v.id) for v in plate.inputs]
     length(unique(ids)) == 3 && count(in(dataonly), ids) == 1 || return nothing
@@ -257,8 +257,8 @@ function _ls_weighted_rewrite(p, plate, dataonly, wanted)
         kept = union(wanted, Set(data), Set(live), Set([shared]))
         drop = union(_ls_exclusive(p, ids[m], plate, kept, dataonly),
                      _ls_exclusive(p, ids[s], plate, kept, dataonly))
-        total = _authored_plate_sum_recipe(p, plate)
-        start = findfirst(q -> q.id in drop || q === plate, p.recipes)
+        earliest = findfirst(q -> q.id in drop || q === plate, p.recipes)
+        start = max(earliest, next_start)
         stop = findfirst(==(total), p.recipes)
         # Begin after every input to the guard and bound fit is available.
         required = Set([shared; ids[y]; live; data])
@@ -266,10 +266,8 @@ function _ls_weighted_rewrite(p, plate, dataonly, wanted)
         # A common scale already factors out of the authored row reduction.
         # If an exclusive producer must run before the guard, the fit would
         # pay for that location twice. Keep the factored reduction in this case.
-        if isempty(_ls_data_ids(c)) && lastinput !== nothing && start <= lastinput
-            continue
-        end
         lastinput === nothing || (start = max(start, lastinput + 1))
+        isempty(_ls_data_ids(c)) && earliest < start && continue
         start <= findfirst(==(plate), p.recipes) || continue
         selected = p.recipes[start:stop]
         # Keep all intervening definitions in their original order in both
