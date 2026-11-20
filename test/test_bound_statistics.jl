@@ -444,6 +444,9 @@ end
     return total
 end
 
+# The fits of scale-guarded plates a binding chose to run from its statistics.
+_weighted_fits(k) = [s for s in k.constants if s isa RK._LSWeightedStatistics]
+
 @testset "interleaved weighted sums own their reductions" begin
     y = sin.(1:48)
     z = cos.(1:48)
@@ -453,8 +456,12 @@ end
         bound = (; w, y, v, z)
         k = prepare(ls_interleaved; bound)
         literal = prepare(ls_interleaved; bound, bound_statistics = false)
-        fits = [s.fit.usable for s in k.constants if s isa RK._LSWeightedStatistics]
-        @test sort(fits) == sort([all(>(0), w), all(>(0), v)])
+        # Each sum decides alone. A fit the guard could never accept is not
+        # bound: that sum is the authored plate, outside any region.
+        fits = _weighted_fits(k)
+        @test all(s -> s.fit.usable, fits)
+        @test length(fits) == count((all(>(0), w), all(>(0), v)))
+        @test count(r -> r.op isa RK._LSRegion, k.plan.recipes) == length(fits)
         actual, gradient = _value_gradient(k, 0.1, -0.3, 0.8)
         expected, reference = _value_gradient(literal, 0.1, -0.3, 0.8)
         @test actual ≈ expected
@@ -470,9 +477,17 @@ end
             y = randn(RNG, n)
             w = [isodd(i) ? 0.75 : 1.5 for i in 1:n]
             k = prepare(model; bound = (; x, w, y))
-            push!(kernels, k)
-            stats = only(filter(v -> v isa RK._LSWeightedStatistics, k.constants))
-            @test stats.fit.usable == (n >= 40)
+            # A binding whose rows cost less than the statistics, or whose fit
+            # is unusable, is the plan without the rewrite.
+            fits = _weighted_fits(k)
+            @test length(fits) == (n >= 40)
+            if n >= 40
+                @test only(fits).fit.usable
+                push!(kernels, k)
+            else
+                literal = prepare(model; bound = (; x, w, y), bound_statistics = false)
+                @test _shape(k) == _shape(literal)
+            end
             a, b = 0.2, -0.5
             if n == 40
                 @test isempty(findings(k, (Float64, Float64, Float64)))
@@ -525,10 +540,13 @@ end
     cache = PreparationCache()
     bindings = ((; x, w, y), (; x, w = [0.0; w[2:end]], y), (; x = 2x, w, y = -y))
     rebound = map(data -> prepare!(cache, ls_weighted; bound = data), bindings)
-    @test allequal(typeof.(rebound)) && allequal(_shape.(rebound))
-    @test all(k -> k.f === first(rebound).f, rebound)
-    @test map(k -> only(v.fit.usable for v in k.constants if v isa RK._LSWeightedStatistics),
-              rebound) == (true, false, true)
+    # Bindings that choose alike share one compiled program. The binding with
+    # a zero scale has no usable fit and runs the authored plate.
+    @test map(k -> length(_weighted_fits(k)), rebound) == (1, 0, 1)
+    @test typeof(rebound[1]) === typeof(rebound[3]) && _shape(rebound[1]) == _shape(rebound[3])
+    @test rebound[1].f === rebound[3].f
+    @test _shape(rebound[2]) ==
+        _shape(prepare(ls_weighted; bound = bindings[2], bound_statistics = false))
     for (k, data) in zip(rebound, bindings)
         literal = prepare(ls_weighted; bound = data, bound_statistics = false)
         value, grad = _value_gradient(k, 0.2, -0.3, 0.8)
@@ -536,6 +554,110 @@ end
         @test value ≈ ref
         @test collect(grad) ≈ collect(dref)
     end
+end
+
+@kernel ls_columns(x::Vector{Float64}, y::Vector{Float64}, a::Float64, b::Float64,
+                   sigma::Float64) = begin
+    # A plate of its own, so the location is composed into the cell and the
+    # cell reads the bound columns, as a PPL's broadcast location does.
+    mu = plate(a, b, x) do a, b, x
+        a + b * x
+    end
+    lp = plate(y, mu, sigma) do yi, mi, si
+        normal(mi, si).logpdf(yi)
+    end
+    total::Float64 = sum(lp)
+    return total
+end
+
+# The Normal log density of `y` at `a .+ b .* x`, scale `sigma .* w`, and its
+# gradient in `(a, b, sigma)`, row by row.
+function _columns_reference(x, y, a, b, sigma; w = ones(length(y)))
+    value, da, db, ds = 0.0, 0.0, 0.0, 0.0
+    for i in eachindex(y)
+        s = sigma * w[i]
+        r = y[i] - (a + b * x[i])
+        value += -log(2pi) / 2 - log(s) - (r / s)^2 / 2
+        da += r / s^2
+        db += r * x[i] / s^2
+        ds += ((r / s)^2 - 1) / sigma
+    end
+    value, [da, db, ds]
+end
+
+@testset "a binding runs the arm that costs less" begin
+    region(k) = count(r -> r.op isa RK._LSRegion, k.plan.recipes)
+    multiplicities(k) = [length(c) for c in k.constants if c isa Vector{Int}]
+    a, b, sigma = 0.3, -0.7, 0.9
+    check(k, x, y; w = ones(length(y))) = begin
+        value, gradient = _value_gradient(k, a, b, sigma)
+        reference, expected = _columns_reference(x, y, a, b, sigma; w)
+        @test value ≈ reference rtol = 1e-12
+        @test collect(gradient) ≈ expected rtol = 1e-11
+    end
+    # Rows that differ: a few cost less than the statistics, many cost more.
+    for (n, statistics) in ((8, false), (40, false), (400, true), (4000, true))
+        x, y = randn(RNG, n), randn(RNG, n)
+        k = prepare(ls_columns; bound = (; x, y))
+        literal = prepare(ls_columns; bound = (; x, y), bound_statistics = false)
+        @test length(_weighted_fits(k)) == statistics
+        @test region(k) == statistics
+        # Without the statistics the plan is the one without the rewrite.
+        statistics || @test _shape(k) == _shape(literal)
+        check(k, x, y)
+    end
+    # Rows that repeat: the authored arm visits one row per distinct row, so
+    # the distinct rows decide, in the region's authored arm too.
+    for (distinct, repeats, statistics) in ((4, 100, false), (16, 25, false), (200, 2, true),
+                                            (400, 10, true))
+        rows = repeat(1:distinct, repeats)[randperm(RNG, distinct * repeats)]
+        x, y = randn(RNG, distinct)[rows], randn(RNG, distinct)[rows]
+        k = prepare(ls_columns; bound = (; x, y))
+        literal = prepare(ls_columns; bound = (; x, y), bound_statistics = false)
+        @test multiplicities(literal) == [distinct]
+        @test multiplicities(k) == [distinct]
+        @test length(_weighted_fits(k)) == statistics
+        statistics || @test _shape(k) == _shape(literal)
+        check(k, x, y)
+        statistics || continue
+        # The guard refuses these scales: the grouped rows answer, as the
+        # plan without the rewrite does.
+        for s in (0.0, 1e-170, 1e170, Inf)
+            v, ref = k(a, b, s), literal(a, b, s)
+            @test isequal(v, ref) || isapprox(v, ref; rtol = 1e-12)
+        end
+        value, gradient = _value_gradient(k, a, b, 1e-170)
+        expected, reference = _value_gradient(literal, a, b, 1e-170)
+        @test isequal(value, expected)
+        @test all(isequal.(collect(gradient), collect(reference)))
+    end
+    # A design without independent columns has no usable fit however many
+    # rows it has.
+    x, y = fill(0.5, 600), randn(RNG, 600)
+    k = prepare(ls_columns; bound = (; x, y))
+    @test isempty(_weighted_fits(k)) && region(k) == 0
+    @test _shape(k) == _shape(prepare(ls_columns; bound = (; x, y), bound_statistics = false))
+    check(k, x, y)
+    # A per-row scale is no vectorized loop: its statistics pay from few rows.
+    for (n, statistics) in ((4, false), (24, true))
+        x, y, w = randn(RNG, n), randn(RNG, n), 0.5 .+ rand(RNG, n)
+        k = prepare(ls_weighted; bound = (; x, w, y))
+        @test length(_weighted_fits(k)) == statistics
+        check(k, x, y; w)
+    end
+    # Rebinding: bindings that choose alike share one compiled program.
+    cache = PreparationCache()
+    sizes = (400, 8, 1000, 12, 400)
+    rebound = map(sizes) do n
+        x, y = randn(RNG, n), randn(RNG, n)
+        k = prepare!(cache, ls_columns; bound = (; x, y))
+        check(k, x, y)
+        k
+    end
+    @test map(k -> length(_weighted_fits(k)), rebound) == (1, 0, 1, 0, 1)
+    @test rebound[1].f === rebound[3].f === rebound[5].f
+    @test rebound[2].f === rebound[4].f
+    @test rebound[1].f !== rebound[2].f
 end
 
 @kernel ls_mixed(X::Matrix{Float64}, idx::Vector{Int}, y::Vector{Float64},
@@ -572,9 +694,15 @@ end
             w = [isodd(i) ? 0.75 : 1.5 for i in 1:n]
             data = weighted ? (; X, idx, w, y) : (; X, idx, y)
             k = prepare(model; bound = data)
-            push!(kernels, k)
-            stats = weighted ? only(v.fit for v in k.constants if v isa RK._LSWeightedStatistics) :
-                only(v for v in k.constants if v isa RK._LSMixedStatistics)
+            # The scale-guarded fit is bound only where the binding runs it.
+            if weighted
+                @test length(_weighted_fits(k)) == (n >= 60)
+                n >= 60 && push!(kernels, k)
+            else
+                push!(kernels, k)
+            end
+            stats = !weighted ? only(v for v in k.constants if v isa RK._LSMixedStatistics) :
+                n >= 60 ? only(_weighted_fits(k)).fit : RK._ls_mixed_unusable(n)
             @test stats.usable == (n >= 60)
             if stats.usable
                 @test size(stats.cross) == (levels, 3)
@@ -638,13 +766,16 @@ end
     n = 40
     # The authored multiplication promotes to Float64 before x*z can wrap.
     x = fill(isqrt(typemax(Int)) + 1, n)
-    y = ones(n)
+    # Distinct rows: equal rows are one grouped cell, which costs less than
+    # any statistics.
+    y = 1 .+ (1:n) ./ n
     b = 0.1 / Float64(first(x))^2
     for (w, v, sigma, usable) in ((2.0, 0.5, 0.8, true), (1e200, 1e-200, 1e120, false))
         data = (; x, z=x, w=fill(w,n), v=fill(v,n), y)
         k = prepare(ls_product_scale; bound = data)
         literal = prepare(ls_product_scale; bound = data, bound_statistics = false)
-        @test only(s.fit.usable for s in k.constants if s isa RK._LSWeightedStatistics) == usable
+        @test !isempty(_weighted_fits(k)) == usable
+        @test all(s -> s.fit.usable, _weighted_fits(k))
         @test k(b, sigma) ≈ literal(b, sigma)
         if usable
             _, grad = _value_gradient(k, b, sigma)

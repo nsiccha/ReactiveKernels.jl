@@ -206,7 +206,9 @@ struct _LSScaleGuard{I,P}
     maxnorm::Float64
     maxrows::Float64
 end
-function (guard::_LSScaleGuard{I,P})(w::_LSWeightedStatistics, sigma::Float64, live::Vararg{Any,N}) where {I,P,N}
+# Inlined: as a call, ordinary reverse paid for the guard's active arguments on
+# every evaluation (about 5 ns of a 40 ns gradient), although it returns a Bool.
+@inline function (guard::_LSScaleGuard{I,P})(w::_LSWeightedStatistics, sigma::Float64, live::Vararg{Any,N}) where {I,P,N}
     w.fit.usable && sigma > 0 && _ls_scalar_slots(Val(I), live) || return false
     _ls_product_arguments(Val(P), (sigma, live...)) || return false
     w.fit.rows <= guard.maxrows || return false
@@ -282,13 +284,45 @@ function _ls_weighted_rewrite(p, plate, total, dataonly, wanted, next_start)
         product_slots = Int[i + 1 for (i, t) in enumerate(loc.terms) if _ls_has_live_product(t[1].tree)]
         _ls_has_live_product(c.tree) && pushfirst!(product_slots, 1)
         products = Tuple(product_slots)
-        return (; plate, total, selected, drop, response, sigma, law, data, live, scalars, products,
-            S = _ls_structure(loc, data, live), W = _ls_slots(c.tree, data))
+        columns = isempty(_ls_data_ids(c)) &&
+            all(t -> t[3] === nothing && t[4] === nothing, loc.terms)
+        return (; plate, total, selected, response, sigma, law, data, live, scalars, products,
+            columns, S = _ls_structure(loc, data, live), W = _ls_slots(c.tree, data))
     end
     nothing
 end
 
-function _ls_weighted_recipes(p, g, w, id)
+# The statistics alternative of one summed plate, until a binding decides.
+#
+# The port-level pass leaves the authored plate, its total and their producers
+# where they are, so every later pass (index runs, the data-only prefix, class
+# narrowing, plate fusion, and per binding the cell caches, branch partitions
+# and duplicate-row grouping) treats them as it treats a plate without
+# statistics. It adds the bound fit and this marker in front of them. The
+# marker reads the fit and one live value, which keeps it in the residual; it
+# holds the statistics arm's own recipes, so it is no reader of anything else.
+#
+# Per binding, the inner-plate pass closes the marker at the plate's total
+# (`_ls_pending_close!`): the recipes between them are then that binding's own
+# row program. Where the statistics cost less than those rows
+# (`_ls_prefers_statistics`), they become the authored arm of a region whose
+# other arm is `fast`. Otherwise the marker and the unread fit are removed,
+# and what remains is the plan without the rewrite.
+struct _LSPendingStatistics
+    # The scale guard whose Bool selects the arm; `nothing` where the fit's
+    # own `usable` does.
+    guard::Union{Nothing,Recipe}
+    # The statistics arm: recipes that compute `output` from the fit.
+    fast::Vector{Recipe}
+    output::ValueId
+    # Whether the authored rows are one loop over bound columns: a common
+    # scale, and every term a live number times bound per-row data.
+    columns::Bool
+end
+# A marker no binding closed computes nothing the program reads.
+(::_LSPendingStatistics)(stats, live) = false
+
+function _ls_weighted_recipes(g, w, id)
     output = only(w.total.outputs)
     stats = value!(g, Symbol(output.name, :_weighted_statistics), _LSWeightedStatistics{_ls_fit_type(w.S)})
     usable = value!(g, Symbol(output.name, :_weighted_usable), Bool)
@@ -300,22 +334,235 @@ function _ls_weighted_recipes(p, g, w, id)
     # including subnormals. Budget this much log-scale contribution per row.
     guard = _LSScaleGuard{w.scalars,w.products}(sqrt(headroom / max(1.0, abs(w.law.square))),
         headroom / max(1.0, abs(w.law.constant), 750 * abs(w.law.logscale)))
-    b = Recipe(id-1, (stats, w.sigma, live...), (usable,), guard, 0.0, nothing, false)
-    cold = w.selected
-    produced = Set(canon_id(g,v.id) for r in cold for v in r.outputs)
+    check = Recipe(id-1, (stats, w.sigma, live...), (usable,), guard, 0.0, nothing, false)
     fast = Recipe(id-2, (stats, w.sigma, w.response, data..., live...), (output,),
         _LSWeightedTotal{w.S,length(data)}(w.law...), 0.0, nothing, false)
-    have = unique(v -> canon_id(g, v.id), Value[usable; fast.inputs...;
-        (v for r in cold for v in r.inputs if !(canon_id(g,v.id) in produced))...])
-    selected_ids = Set(r.id for r in cold)
-    outside = Set(canon_id(g, v.id) for r in p.recipes if !(r.id in selected_ids) for v in r.inputs)
+    pending = _LSPendingStatistics(check, Recipe[fast], canon_id(g, output.id), w.columns)
+    b = Recipe(id-1, (stats, w.sigma), (usable,), pending, 0.0, nothing, false)
+    (a, b)
+end
+
+# The lazy location's rewrite (`_ls_plate_rewrite`) as a pending alternative:
+# its statistics arm is the plate reading the fit's location, as
+# `_ls_class_residual` builds it for a location with a matrix product or a
+# gather. `nothing` where that arm cannot start after its inputs and before
+# the plate, or the recipes between hold what a region may not.
+function _ls_location_pending(p::Plan, g::Graph, r::Recipe, total::Recipe, rewrite,
+                              next_start::Int, id::Int)
+    (; S, response, location, position, data, live, drop) = rewrite
+    at = findfirst(==(r), p.recipes)
+    stop = findfirst(==(total), p.recipes)
+    earliest = minimum((i for (i, q) in enumerate(p.recipes) if q.id in drop); init = at)
+    required = Set([canon_id(g, response.id); live; data])
+    lastinput = findlast(q -> any(v -> canon_id(g, v.id) in required, q.outputs), p.recipes)
+    start = max(earliest, next_start, lastinput === nothing ? 1 : lastinput + 1)
+    # An exclusive producer in front of the region would run beside the fit.
+    earliest < start && return nothing
+    start <= at || return nothing
+    selected = p.recipes[start:stop]
+    checked = Set(canon_id(g, a.id) for check in p.checks for a in check.args if a isa Value)
+    any(q -> any(v -> canon_id(g, v.id) in checked, q.outputs), selected) && return nothing
+    any(q -> q.effectful || (q !== r && q.op isa _AuthoredPlateOp &&
+        _authored_plate_sum_recipe(p, q) !== nothing), selected) && return nothing
+    stem = Symbol(location.name)
+    stats = value!(g, Symbol(stem, :_least_squares), _ls_fit_type(S))
+    loc = value!(g, Symbol(stem, :_least_squares_location), Any)
+    flag = value!(g, Symbol(stem, :_least_squares_pending), Bool)
+    datavalues = Value[g.values[i] for i in data]
+    livevalues = Value[g.values[i] for i in live]
+    a = Recipe(id, (response, datavalues...), (stats,), _LSStatisticsOp{S}(), 0.0, nothing, false)
+    read = Recipe(id-2, (stats, response, datavalues..., livevalues...), (loc,),
+        _LSLocationCall(S, length(data), length(live), ()), 0.0, nothing, false)
+    inputs = collect(Value, r.inputs)
+    inputs[position] = loc
+    plate = Recipe(r.id, Tuple(inputs), r.outputs, r.op, r.cost, r.cse_key, r.effectful, r.source)
+    pending = _LSPendingStatistics(nothing, Recipe[read, plate, total],
+        canon_id(g, only(total.outputs).id), true)
+    b = Recipe(id-1, (stats, first(livevalues)), (flag,), pending, 0.0, nothing, false)
+    (; first = first(selected), recipes = (a, b))
+end
+
+# --- one binding's choice -----------------------------------------------------
+#
+# Measured per value-and-gradient call (ordinary Enzyme reverse, one core;
+# `benchmark/near_miss/repeated_rows.jl` repeats the measurement):
+#
+# - The statistics arm costs about 6 ns for its guard and region, about 2.8 ns
+#   per entry of a dense block's triangular factor, and for a grouped
+#   coefficient beside a shared design about 1 ns per level plus 0.26 ns per
+#   level and shared column.
+# - An authored row costs about 0.05 ns plus 0.05 ns per term where the plate
+#   is one vectorized loop over bound columns (`columns`). The grouped loop
+#   over distinct rows weights each cell by its row count and is not
+#   vectorized: about three times that per row. A row with its own scale, a
+#   gather or a matrix product costs at least six times it (a per-row scale
+#   measured 7.7 ns per row).
+#
+# The costs below are those, in units of 0.05 ns. A binding runs its
+# statistics when they cost less than the rows its authored arm would visit:
+# the distinct rows where the duplicate-row grouping applied, else every row.
+const _LS_REGION_COST = 120
+const _LS_ENTRY_COST = 56
+const _LS_LEVEL_COST = 20
+const _LS_LEVEL_COLUMN_COST = 5
+const _LS_GROUPED_ROW_FACTOR = 3
+const _LS_SCALAR_ROW_FACTOR = 6
+
+_ls_fit(w::_LSWeightedStatistics) = w.fit
+_ls_fit(fit::Union{_LSStatistics,_LSMixedStatistics}) = fit
+_ls_fit(x) = nothing
+_ls_statistics_cost(fit::_LSStatistics) =
+    _LS_ENTRY_COST * fit.blocks * (fit.k * (fit.k + 1) ÷ 2)
+_ls_statistics_cost(fit::_LSMixedStatistics) = _ls_statistics_cost(fit.shared) +
+    length(fit.norms) * (_LS_LEVEL_COST + _LS_LEVEL_COLUMN_COST * size(fit.cross, 2))
+_ls_row_terms(fit::_LSStatistics) = fit.k
+_ls_row_terms(fit::_LSMixedStatistics) = fit.shared.k + 1
+
+# Whether a binding's statistics arm costs less than its `rows` authored
+# rows. A fit that can never be used (`usable = false`) never does.
+function _ls_prefers_statistics(fit, rows::Int, grouped::Bool, columns::Bool)
+    fit.usable || return false
+    factor = !columns ? _LS_SCALAR_ROW_FACTOR : grouped ? _LS_GROUPED_ROW_FACTOR : 1
+    rows * (1 + _ls_row_terms(fit)) * factor >= _LS_REGION_COST + _ls_statistics_cost(fit)
+end
+
+# Whether the duplicate-row grouping rewrote this plate: its cell ends in the
+# row-count weight (`_cell_group_kernel`).
+_ls_grouped_plate(r::Recipe) = any(q -> q.op === _cell_multiplicity_weighted,
+    (_plate_cell_kernel(r.op).plan::Plan).recipes)
+
+# Rows the authored arm visits at this binding, and whether a grouped plate
+# visits them: the longest bound vector of each plate between the marker and
+# the total. A grouped plate reads its compacted vectors, one entry per
+# distinct row.
+function _ls_pending_rows(g::Graph, cold::Vector{Recipe}, known)
+    rows, grouped = 0, false
+    for r in cold
+        r.op isa _AuthoredPlateOp || continue
+        longest = 0
+        for v in r.inputs
+            data = get(known, canon_id(g, v.id), nothing)
+            data isa AbstractVector && (longest = max(longest, length(data)))
+        end
+        rows += longest
+        grouped |= _ls_grouped_plate(r)
+    end
+    rows, grouped
+end
+
+# Remove an open marker and the fit only it read: the plan without the rewrite.
+function _ls_pending_abandon!(g::Graph, recipes::Vector{Recipe}, pending::Vector{Recipe},
+                              want, marker::Recipe)
+    at = findfirst(r -> r === marker, recipes)
+    at === nothing || deleteat!(recipes, at)
+    stale = Set{ValueId}((canon_id(g, first(marker.inputs).id),))
+    _cell_group_drop_unread!(g, recipes, pending, want, stale)
+    :rows
+end
+
+# Whether recipe `r` produces the total the open `marker` waits for.
+_ls_pending_closes(g::Graph, marker::Recipe, r::Recipe) =
+    any(v -> canon_id(g, v.id) == (marker.op::_LSPendingStatistics).output, r.outputs)
+
+# Settle the open `marker`: close it against the total just emitted (`found`),
+# or abandon it. The binding's choice joins the pass's signature, since the
+# two choices are different plans.
+function _ls_pending_settle!(g::Graph, p::Plan, recipes::Vector{Recipe}, pending::Vector{Recipe},
+                             known, signature::Vector{Any}, marker::Recipe, opened::Int,
+                             rewrites, fresh, found::Bool)
+    at = findfirst(r -> r === marker, recipes)
+    at === nothing && (found = false)
+    # The plates rewritten since the marker fix the region up to its bind-time
+    # constants, as they fix the plan.
+    key = (:pending_statistics, marker.id, Tuple(signature[opened+1:end]))
+    choice = found ?
+        _ls_pending_close!(g, p, recipes, pending, known, at::Int, rewrites, key, fresh) :
+        _ls_pending_abandon!(g, recipes, pending, p.want, marker)
+    push!(signature, (:pending_statistics, marker.id, choice))
+    nothing
+end
+
+# Close the marker at `recipes[at]` against the total just emitted, the last
+# of `recipes`. Returns `:statistics` or `:rows`, this binding's choice.
+function _ls_pending_close!(g::Graph, p::Plan, recipes::Vector{Recipe}, pending::Vector{Recipe},
+                            known, at::Int, rewrites, @nospecialize(key), fresh)
+    marker = recipes[at]
+    op = marker.op::_LSPendingStatistics
+    abandon() = _ls_pending_abandon!(g, recipes, pending, p.want, marker)
+    fit = _ls_fit(get(known, canon_id(g, first(marker.inputs).id), nothing))
+    fit === nothing && return abandon()
+    inside = recipes[at+1:end]
+    constants = Recipe[r for r in inside if r.op isa _BoundConstant]
+    cold = Recipe[r for r in inside if !(r.op isa _BoundConstant)]
+    any(r -> r.effectful || r.op isa Union{_LSRegion,_LSPendingStatistics}, cold) && return abandon()
+    rows, grouped = _ls_pending_rows(g, cold, known)
+    _ls_prefers_statistics(fit, rows, grouped, op.columns) || return abandon()
+    # Every value the statistics arm reads is ready in front of the marker: a
+    # HAVE port, or the output of an earlier recipe. A bound vector the
+    # grouping replaced is bound again from this binding's data.
+    ready = Set{ValueId}(canon_id(g, v.id) for v in p.have)
+    for r in view(recipes, 1:at-1), v in r.outputs
+        push!(ready, canon_id(g, v.id))
+    end
+    arm = op.guard === nothing ? op.fast : Recipe[op.guard; op.fast]
+    made = Set(canon_id(g, v.id) for r in arm for v in r.outputs)
+    restored = Recipe[]
+    for r in arm, v in r.inputs
+        id = canon_id(g, v.id)
+        (id in made || id in ready) && continue
+        haskey(known, id) || return abandon()
+        push!(restored, Recipe(fresh(), (), (g.values[id],), _BoundConstant(known[id]),
+                               0.0, nothing, false))
+        push!(ready, id)
+    end
+    region = rewrites === nothing ? nothing : _plate_rewrite(rewrites, key)
+    if region === nothing
+        region = _ls_pending_region(g, p, pending, marker, cold)
+        rewrites === nothing || (region = _plate_rewrite!(rewrites, key, region))
+    end
+    resize!(recipes, at - 1)
+    append!(recipes, restored)
+    append!(recipes, constants)
+    op.guard === nothing || push!(recipes, op.guard)
+    push!(recipes, region)
+    :statistics
+end
+
+# The two-arm region of one closed marker. `cold` is the binding's row program
+# between the marker and the total, in order. The statistics arm keeps what
+# something outside the region reads and replaces the rest, the plate and its
+# exclusive producers, by the marker's own recipes.
+function _ls_pending_region(g::Graph, p::Plan, pending::Vector{Recipe}, marker::Recipe,
+                            cold::Vector{Recipe})
+    op = marker.op::_LSPendingStatistics
+    statistics = Value[op.guard === nothing ? first(marker.inputs) : only(op.guard.outputs)]
+    made = Set(canon_id(g, v.id) for r in op.fast for v in r.outputs)
+    produced = Set(canon_id(g, v.id) for r in cold for v in r.outputs)
+    have = unique(v -> canon_id(g, v.id), Value[statistics;
+        (v for r in op.fast for v in r.inputs if !(canon_id(g, v.id) in made))...;
+        (v for r in cold for v in r.inputs if !(canon_id(g, v.id) in produced))...])
+    outside = Set(canon_id(g, v.id) for r in pending for v in r.inputs)
     union!(outside, (canon_id(g, v.id) for v in p.want))
-    want = Value[v for r in cold for v in r.outputs if canon_id(g, v.id) in outside]
-    hot = Recipe[r for r in cold if !(r.id in w.drop) && r !== w.plate && r !== w.total]
-    push!(hot, fast)
+    union!(outside, (canon_id(g, a.id) for c in p.checks for a in c.args if a isa Value))
+    push!(outside, op.output)
+    want = unique(v -> canon_id(g, v.id),
+                  Value[v for r in cold for v in r.outputs if canon_id(g, v.id) in outside])
+    # What the statistics arm still computes of the rows: the producers of
+    # every region output other than the total.
+    needed = Set(canon_id(g, v.id) for v in want)
+    delete!(needed, op.output)
+    kept = falses(length(cold))
+    for index in reverse(eachindex(cold))
+        r = cold[index]
+        any(v -> canon_id(g, v.id) in needed, r.outputs) || continue
+        kept[index] = true
+        union!(needed, (canon_id(g, v.id) for v in r.inputs))
+    end
+    hot = Recipe[cold[index] for index in eachindex(cold) if kept[index]]
+    append!(hot, op.fast)
     template = Plan(g, p.have, p.want, p.recipes, p.producer, p.cost, p.candidates)
     literal = _lowering_plan(_partial_subplan(template, have, want, cold))
     quick = _lowering_plan(_partial_subplan(template, have, want, hot))
-    region = _ls_make_region(w.total.id, quick, literal, Value[usable], sum(r.cost for r in cold), false)
-    (a, b, region)
+    _ls_make_region(last(cold).id, quick, literal, statistics,
+                    sum(r.cost for r in cold; init = 0.0), false)
 end

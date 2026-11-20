@@ -984,39 +984,61 @@ function _partial_bound_statistics(p::Plan, bound_values::Vector{Value})
     isempty(candidates) && return p
     _, _, dataonly = _partial_split(p, bound)
     weighted = Dict{Int,Any}()
+    deferred = Dict{Int,Any}()
     rewrites = Dict{Int,Any}()
     next_start = 1
     for r in candidates
         total = _authored_plate_sum_recipe(p, r)
         rewrite = _ls_plate_rewrite(p, r, total, dataonly, wanted)
-        if rewrite !== nothing
+        # A location that reads a matrix product or a gather keeps the lazy
+        # location: its rows pay for that product or gather on every call.
+        # One whose terms are live numbers times bound columns is a loop over
+        # bound vectors, which the duplicate-row grouping can shorten, so only
+        # a binding can tell which arm costs less (`_LSPendingStatistics`).
+        if rewrite !== nothing && !rewrite.columns
             rewrites[r.id] = rewrite
         else
             candidate = _ls_weighted_rewrite(p, r, total, dataonly, wanted, next_start)
-            candidate === nothing && continue
-            weighted[r.id] = candidate
+            if candidate !== nothing
+                weighted[r.id] = candidate
+            elseif rewrite !== nothing
+                # The scale-guarded form does not express this plate (its
+                # cell already holds the location). The lazy location is the
+                # statistics arm; where that arm cannot be placed, the plate
+                # keeps its rows.
+                deferred[r.id] = (r, total, rewrite, next_start)
+            else
+                continue
+            end
         end
         # Each guarded region owns its reduction. Producers for the next
         # plate can precede this total and arrive as ordinary region outputs.
         next_start = max(next_start, findfirst(==(total), p.recipes) + 1)
     end
-    isempty(rewrites) && isempty(weighted) && return p
+    isempty(rewrites) && isempty(weighted) && isempty(deferred) && return p
     copied = Graph(copy(g.values), copy(g.recipes), copy(g.producers), copy(g.aliases),
                    g.version, nothing, copy(g.checks))
     recipes = Recipe[]
     fresh = minimum((r.id for r in p.recipes); init = 0) - 1
-    omitted = Set{Int}()
-    for w in values(weighted)
-        union!(omitted, (r.id for r in w.selected))
-    end
-    totals = Dict(w.total.id => w for w in values(weighted))
-    for r in p.recipes
-        if haskey(totals, r.id)
-            append!(recipes, _ls_weighted_recipes(p, copied, totals[r.id], fresh))
-            fresh -= 3
+    # A binding-chosen candidate keeps its recipes; its fit and marker precede
+    # the first of them (`_LSPendingStatistics`). Three ids each: the fit, the
+    # marker, and one recipe of the statistics arm.
+    starts = Dict{Int,Any}()
+    for r in candidates
+        if haskey(weighted, r.id)
+            w = weighted[r.id]
+            starts[first(w.selected).id] = _ls_weighted_recipes(copied, w, fresh)
+        elseif haskey(deferred, r.id)
+            pending = _ls_location_pending(p, copied, deferred[r.id]..., fresh)
+            pending === nothing && continue
+            starts[pending.first.id] = pending.recipes
+        else
             continue
         end
-        r.id in omitted && continue
+        fresh -= 3
+    end
+    for r in p.recipes
+        append!(recipes, get(starts, r.id, ()))
         rewrite = get(rewrites, r.id, nothing)
         if rewrite === nothing
             push!(recipes, r)
@@ -1068,7 +1090,9 @@ function _ls_plate_rewrite(p::Plan, r::Recipe, total::Recipe, dataonly::Set{Valu
     # The location operation reads the live values and the data itself.
     kept = union(wanted, Set(live), Set(data))
     drop = _ls_exclusive(p, canon_id(g, location.id), r, kept, dataonly)
-    (; S, response, location, position, data, live, drop)
+    # Whether every term is a live number times bound per-row data.
+    columns = all(t -> t[3] === nothing && t[4] === nothing, x.terms)
+    (; S, response, location, position, data, live, drop, columns)
 end
 
 function _ls_inputs(x)
@@ -1208,7 +1232,9 @@ end
 
 function _ls_region_recipe(p::Plan, residual::Vector{Recipe}, region::UnitRange{Int}, id::Int)
     g = p.graph
-    selected = residual[region]
+    # The inner-plate pass closes a scale-guarded marker only at top level.
+    # One this region encloses is dropped: its plate keeps its rows in both arms.
+    selected = Recipe[r for r in residual[region] if !(r.op isa _LSPendingStatistics)]
     locations = Recipe[r for r in selected if r.op isa _LSLocationCall]
     fast = _ls_select_residual(g, selected, true)
     literal = _ls_select_residual(g, selected, false)
@@ -1237,6 +1263,13 @@ function _ls_make_region(id, fast_plan, literal_plan, statistics, cost, effectfu
     Recipe(id, Tuple(have), Tuple(want), _LSRegion(fast_plan, literal_plan, statistics, kernel),
            cost, nothing, effectful)
 end
+
+# The exemplar types of a region's arms, in the order of their HAVE ports,
+# from the types the enclosing lowering inferred for its values; `nothing`
+# without exemplars.
+_ls_region_exemplar_types(g::Graph, region::_LSRegion, ::Nothing) = nothing
+_ls_region_exemplar_types(g::Graph, region::_LSRegion, types::AbstractDict) =
+    Tuple(get(types, canon_id(g, v.id), valtype(v)) for v in region.literal.have)
 
 function _ls_region_program(fast::Plan, literal::Plan, statistics;
                             recycle = Pair{ValueId,Symbol}[], value_ids = nothing, kwargs...)
@@ -1412,7 +1445,8 @@ end
 # runs (index_runs.jl) of a gather a usable binding dropped. An unusable
 # binding's residual is then the plan without the rewrite.
 _ls_dropped_constant(r::Recipe) =
-    r.op isa Union{_BoundConstant{_LSStatistics},_BoundConstant{_IndexRunData}}
+    r.op isa Union{_BoundConstant{_LSStatistics},_BoundConstant{_IndexRunData},
+                   _BoundConstant{<:_LSWeightedStatistics}}
 function _ls_unread_statistics(g::Graph, recipes::Vector{Recipe})
     any(_ls_dropped_constant, recipes) || return recipes
     read = Set{ValueId}(canon_id(g, v.id) for r in recipes for v in r.inputs)

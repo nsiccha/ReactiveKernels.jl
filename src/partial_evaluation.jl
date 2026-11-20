@@ -2037,7 +2037,7 @@ _partial_inner_plates(p::Plan, known, one_object::Set{ValueId}) =
 # `rewrites` (every later binding with the same signature then has the same
 # plan up to its `_BoundConstant` values), and `nothing` otherwise.
 function _partial_inner_plates(p::Plan, known, rewrites, one_object::Set{ValueId})
-    any(r -> r.op isa _AuthoredPlateOp, p.recipes) || return p, ()
+    any(r -> r.op isa Union{_AuthoredPlateOp,_LSPendingStatistics}, p.recipes) || return p, ()
     # A shallow structural copy preserves public Value identities and recipe
     # operations. Only its value registry is extended; no shared graph changes.
     g = p.graph
@@ -2058,11 +2058,34 @@ function _partial_inner_plates(p::Plan, known, rewrites, one_object::Set{ValueId
     # `sum` consumer replaces the original later in the queue.
     pending = copy(p.recipes)
     next_rewrites = rewrites
+    # The open statistics marker (`_LSPendingStatistics`,
+    # weighted_least_squares.jl), if any, and the signature's length when it
+    # opened. The marker is found again by identity: grouping a plate deletes
+    # recipes in front of it.
+    marker::Union{Nothing,Recipe} = nothing
+    marker_signature = 0
     while !isempty(pending)
         r = popfirst!(pending)
         # Both passes below leave every other recipe as it is. Testing here
         # spares a dynamic call per recipe of the residual and binding.
-        r.op isa _AuthoredPlateOp || (push!(recipes, r); continue)
+        if !(r.op isa _AuthoredPlateOp)
+            if r.op isa _LSPendingStatistics
+                marker === nothing || _ls_pending_settle!(copied, p, recipes, pending, known,
+                    signature, marker, marker_signature, nothing, fresh, false)
+                push!(recipes, r)
+                marker, marker_signature = r, length(signature)
+                changed = true
+                continue
+            end
+            push!(recipes, r)
+            marker === nothing && continue
+            if _ls_pending_closes(copied, marker, r)
+                _ls_pending_settle!(copied, p, recipes, pending, known, signature,
+                    marker, marker_signature, keyed ? rewrites : nothing, fresh, true)
+                marker = nothing
+            end
+            continue
+        end
         # A single arm is next in the worklist and has its own cell cache.
         # A multi-arm partition can embed a data-sized gather operation.
         cell_rewrites = next_rewrites
@@ -2122,6 +2145,9 @@ function _partial_inner_plates(p::Plan, known, rewrites, one_object::Set{ValueId
         end
         prepend!(pending, partitioned.expansion)
     end
+    # A marker whose total never reached the top level keeps its rows.
+    marker === nothing || _ls_pending_settle!(copied, p, recipes, pending, known, signature,
+        marker, marker_signature, nothing, fresh, false)
     changed || return p, ()
     template = Plan(copied, p.have, p.want, p.recipes, p.producer,
                     p.cost, p.candidates)
