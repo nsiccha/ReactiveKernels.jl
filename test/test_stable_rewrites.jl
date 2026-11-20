@@ -35,6 +35,15 @@ end
 _scalar_reverse(k, u::Float64, rest...) = Enzyme.autodiff(Enzyme.Reverse, Enzyme.Const(k),
     Enzyme.Active, Enzyme.Active(u), map(Enzyme.Const, rest)...)[1][1]
 _code(k) = string(code_expr(k))
+# Count calls to exp, including its native wrapper. A function passed to a
+# stable helper as an argument does not itself evaluate the exponential.
+_exp_calls(x) = 0
+function _exp_calls(ex::Expr)
+    ex.head in (:quote, :inert) && return 0
+    calls_exp = Meta.isexpr(ex, :call, 2) &&
+                RK._rw_is_exp(RK._rw_resolve(ex.args[1], @__MODULE__))
+    calls_exp + sum(_exp_calls, ex.args; init = 0)
+end
 # Relative agreement with a BigFloat oracle, absolute near zero.
 _close(x, oracle; rtol = 1e-13, atol = 1e-300) =
     isfinite(x) && abs(x - Float64(oracle)) <= max(atol, rtol * abs(Float64(oracle)))
@@ -53,7 +62,7 @@ end
     @test !occursin("Base.log(", _code(k))
     # The inner exponential nothing reads any more is gone, so its reverse
     # cannot form 0 * Inf either.
-    @test !occursin("_native_exp(", _code(k))
+    @test _exp_calls(code_expr(k)) == 0
     @test occursin("Base.log(", _code(literal)) && !occursin("_rk_", _code(literal))
     for u in (-800.0, -746.0, -700.0, -1.5, 0.0, 2.5, 700.0, 709.0, 710.0, 800.0)
         U = big(u)
@@ -427,8 +436,9 @@ end
                     simplify = false)
     before, loop = _around_loop(k)
     @test occursin("_rk_log_of", string(before))
-    @test occursin("_native_exp", string(before))
-    @test !occursin("exp", string(loop)) && !occursin("_rk_", string(loop))
+    @test sum(_exp_calls, before) == 1
+    @test _exp_calls(loop) == 0
+    @test !occursin("_rk_", string(loop))
     ys = [0.3, -1.2, 2.0]
     @test _close(k(ys, 800.0), -3 * big(800.0))
     @test literal(ys, 800.0) == -Inf
