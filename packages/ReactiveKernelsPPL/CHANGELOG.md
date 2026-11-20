@@ -16,6 +16,13 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.245
+
+- `cell_pullback!` and partition-sampler gradients accept a shared prefix
+  value that is a fixed-size immutable array, such as a StaticArrays
+  `SVector`. Before, the pass threw `setindex!(::SVector, ...)` while zeroing
+  that value's shadow.
+
 ## 0.1.244
 
 - `indexed_value(name)` selects one authored plate row for `prepare_query`
