@@ -3260,7 +3260,7 @@ end
 # the kernel plate's cells only when the response spans the domain.
 function _count_plate_stmts!(pre::Vector{Expr}, r::LikelihoodSpec,
         plan::StructuralPlan, node::Symbol, pw::Symbol, inputs::Vector{Any},
-        law, ninputs::Vector{Any}, normalizer::Expr)
+        law, ninputs::Vector{Any}, normalizer::Expr; evidence_support = nothing)
     y = get(plan.columns, r.response, nothing)
     split = r.evidence.kind === :none && r.mi_jobs === nothing &&
         r.range === nothing &&
@@ -3268,6 +3268,9 @@ function _count_plate_stmts!(pre::Vector{Expr}, r::LikelihoodSpec,
         !_cell_broadcast_response(plan, r) &&
         y isa AbstractArray && length(y) == _response_rows(plan, r)
     cell = _wrap_evidence!(r, plan, pre, inputs, law(:logpdf))
+    if r.evidence.kind !== :none && evidence_support !== nothing
+        cell = :($evidence_support ? $cell : -Inf)
+    end
     kernel = split ? law(:logkernel) : nothing
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
@@ -3957,14 +3960,11 @@ function _nb2_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol,
     inputs = Any[y, mu]
     yv, muv = _dovar(1), _dovar(2)
     phiref = _thread_ref!(inputs, sarg)
-    cell = :(negative_binomial2($muv, $phiref).logpdf($yv))
-    cell = _wrap_evidence!(r, plan, pre, inputs, cell)
-    cell = :($phiref > 0 && $muv >= 0 ? $cell : -Inf)
-    if r.weights !== nothing
-        wv = _thread_ref!(inputs, r.weights)
-        cell = _weighted_cell(wv, cell)
-    end
-    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+    law = m -> :(negative_binomial2($muv, $phiref).$m($yv))
+    normalizer = :(negative_binomial2(;).lognormalizer($(_dovar(1))))
+    stmts = _count_plate_stmts!(pre, r, plan, node, pw, inputs, law, Any[y], normalizer;
+        evidence_support = :($phiref > 0 && $muv >= 0))
+    return Expr[pre..., stmts...]
 end
 
 # NB1 likelihood (SB `neg_binomial` mirror): the successes-shape r

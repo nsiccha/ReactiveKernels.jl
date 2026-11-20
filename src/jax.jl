@@ -5743,6 +5743,11 @@ function _jax_call_positional(ctx::_JaxContext, ::typeof(isa), args::Vector{_PyV
 end
 _jax_call_positional(ctx::_JaxContext, ::typeof(promote_type), args::Vector{_PyVal}) =
     _jax_type_value(promote_type(map(_jax_type_of, args)...))
+function _jax_call_positional(ctx::_JaxContext, ::typeof(floatmax), args::Vector{_PyVal})
+    T = isempty(args) ? Float64 : _jax_type_of(only(args))
+    T in (Float32, Float64) || _jax_error("`floatmax` of ", T, _jax_where(ctx))
+    return _jax_literal(floatmax(T === Float32 ? Float32 : _jax_float_type()))
+end
 function _jax_call_positional(ctx::_JaxContext, f::Union{typeof(one),typeof(zero)},
                               args::Vector{_PyVal})
     x = only(args)
