@@ -403,6 +403,13 @@ end
 # The costs below are those, in units of 0.05 ns. A binding runs its
 # statistics when they cost less than the rows its authored arm would visit:
 # the distinct rows where the duplicate-row grouping applied, else every row.
+#
+# A row is priced as the loop's vector blocks run it, its cheapest. A loop of
+# a few dozen rows or fewer runs mostly its scalar remainder, at about 1.2 ns
+# per row: there the statistics would already cost less from 12 to 16 rows,
+# and those bindings keep their rows. So a binding's statistics cost less
+# than its rows however the loop splits them, and some that would pay do not
+# run.
 const _LS_REGION_COST = 120
 const _LS_ENTRY_COST = 56
 const _LS_LEVEL_COST = 20

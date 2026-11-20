@@ -137,7 +137,8 @@ end
 end
 
 @testset "a binding runs its statistics only where they cost less" begin
-    fits(k) = filter(s -> s isa ReactiveKernels._LSWeightedStatistics, k.constants)
+    # The bound fits among a program's constants, whichever form holds them.
+    fits(k) = filter(!isnothing, map(ReactiveKernels._ls_fit, collect(k.constants)))
     shape(k) = replace(string(code_expr(k)), r"#\d+" => "#")
     # Coefficients declared as numbers, and read from a declared vector.
     numbers = @rkppl begin
@@ -150,30 +151,35 @@ end
         mu = beta[1] .+ beta[2] .* x
         y .~ Normal.(mu, sigma)
     end
+    # A scale that is no parameter: the fit is the lazy location's.
+    fixed = @rkppl begin
+        a ~ Flat(); b ~ Flat()
+        y .~ Normal.(a .+ b .* x, 1.2)
+    end
     a, b, sigma = 0.3, -0.6, 1.2
     # (rows, distinct rows, statistics). 240 rows of two binary columns are
     # four distinct rows: the grouped loop costs less than any statistics.
     cases = ((240, 4, false), (60, 60, false), (2000, 2000, true), (2000, 500, true))
-    for model in (numbers, vector), (n, distinct, statistics) in cases
+    for model in (numbers, vector, fixed), (n, distinct, statistics) in cases
         base = distinct == 4 ? [(0.0, 0.0), (0.0, 1.0), (1.0, 0.0), (1.0, 1.0)] :
             [(cos(i), sin(3i)) for i in 1:distinct]
         rows = [base[mod1(7i, distinct)] for i in 1:n]
         x, y = first.(rows), last.(rows)
         fit = model(; x) | (; y)
         built = build_kernel(fit)
-        named = model === numbers ? (; a, b, sigma) : (; beta = [a, b], sigma)
-        u = collect(Float64, unconstrain(built.layout, named))
+        named(a, b, sigma) = model === numbers ? (; a, b, sigma) :
+            model === vector ? (; beta = [a, b], sigma) : (; a, b)
+        u = collect(Float64, unconstrain(built.layout, named(a, b, sigma)))
         # Where each coordinate sits in the packed point.
-        at(named) = findfirst(!iszero, collect(Float64, unconstrain(built.layout, named)) .- u)
-        ia = at(model === numbers ? (; a = a + 1, b, sigma) : (; beta = [a + 1, b], sigma))
-        ib = at(model === numbers ? (; a, b = b + 1, sigma) : (; beta = [a, b + 1], sigma))
-        is = at(model === numbers ? (; a, b, sigma = 2sigma) : (; beta = [a, b], sigma = 2sigma))
+        at(moved) = findfirst(!iszero, collect(Float64, unconstrain(built.layout, moved)) .- u)
+        ia, ib = at(named(a + 1, b, sigma)), at(named(a, b + 1, sigma))
+        is = model === fixed ? nothing : at(named(a, b, 2sigma))
         k = prepare_query(built, fit, :sampler; exemplars = (u,))
         literal = with_bound_statistics(false) do
             prepare_query(build_kernel(fit), fit, :sampler; exemplars = (u,))
         end
         @test length(fits(k)) == statistics
-        @test all(s -> s.fit.usable, fits(k))
+        @test all(fit -> fit.usable, fits(k))
         # Rows that repeat are grouped in either program: in the plan without
         # the rewrite, and in the authored arm beside the statistics.
         grouped(q) = [length(c) for c in q.constants if c isa Vector{Int}]
@@ -182,11 +188,13 @@ end
         # Where the rows cost less, the program is the one without the rewrite.
         statistics || @test shape(k) == shape(literal)
         residual = y .- a .- b .* x
-        reference = sum(-log(2pi) / 2 .- log(sigma) .- (residual ./ sigma) .^ 2 ./ 2) + log(sigma)
-        expected = zeros(3)
+        # A scale parameter adds its transform's log-Jacobian and a coordinate.
+        reference = sum(-log(2pi) / 2 .- log(sigma) .- (residual ./ sigma) .^ 2 ./ 2) +
+            (is === nothing ? 0.0 : log(sigma))
+        expected = zeros(length(u))
         expected[ia] = sum(residual) / sigma^2
         expected[ib] = sum(residual .* x) / sigma^2
-        expected[is] = sum((residual ./ sigma) .^ 2 .- 1) + 1
+        is === nothing || (expected[is] = sum((residual ./ sigma) .^ 2 .- 1) + 1)
         q = prepare_sampler(built, fit, u; backend)
         gradient = similar(u)
         value, _ = sampler_value_and_gradient!(q, gradient, u)

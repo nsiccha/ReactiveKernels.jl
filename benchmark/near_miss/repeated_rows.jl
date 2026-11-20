@@ -8,7 +8,7 @@
 #
 # - rows repeated 60, 10 and 2 times and all distinct, for 1, 2 and 5
 #   coefficients, for coefficients declared as numbers and read from a
-#   declared vector, and for a per-row scale;
+#   declared vector, for a scale that is no parameter, and for a per-row scale;
 # - two gathered coefficient vectors with 2, 5, 20 and 200 rows per group.
 #
 # usage: julia repeated_rows.jl [rows = 240] [rounds = 7]
@@ -51,6 +51,11 @@ five() = @rkppl begin
     sigma ~ Exponential(1.0)
     y .~ Normal.(a .+ b1 .* x1 .+ b2 .* x2 .+ b3 .* x3 .+ b4 .* x4, sigma)
 end
+# A scale that is no parameter: its fit is the lazy location's.
+fixed_scale() = @rkppl begin
+    a ~ Normal(0, 5); b ~ Normal(0, 2)
+    y .~ Normal.(a .+ b .* x1, 1.5)
+end
 row_scaled() = @rkppl begin
     a ~ Normal(0, 5); b ~ Normal(0, 2); sigma ~ Exponential(1.0)
     y .~ Normal.(a .+ b .* x1, sigma .* w)
@@ -66,7 +71,8 @@ per_group() = @rkppl begin
     y .~ Normal.(mu, sigma)
 end
 const MODELS = ("1 coefficient" => (intercept, ()), "2, from a vector" => (slope_vector, (:x1,)),
-    "2 coefficients" => (slope, (:x1,)), "5 coefficients" => (five, (:x1, :x2, :x3, :x4)),
+    "2 coefficients" => (slope, (:x1,)), "2, fixed scale" => (fixed_scale, (:x1,)),
+    "5 coefficients" => (five, (:x1, :x2, :x3, :x4)),
     "2, row scale" => (row_scaled, (:x1, :w)))
 
 # `distinct` distinct rows, each `rows ÷ distinct` times, in shuffled order.
