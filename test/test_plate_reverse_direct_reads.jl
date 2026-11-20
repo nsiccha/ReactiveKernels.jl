@@ -14,8 +14,10 @@ const RK = ReactiveKernels
     return total
 end
 
-rule_count(x::RK._PlateSumRule) = 1
-rule_count(x::Expr) = sum(rule_count, x.args; init = 0)
+# Calls of a generated rule. The AD body also names the rule in the test that
+# decides between its call and the plate's own inline program.
+rule_count(x::Expr) = (Meta.isexpr(x, :call) && first(x.args) isa RK._PlateSumRule) +
+    sum(rule_count, x.args; init = 0)
 rule_count(x) = 0
 structure(x) = (1, 0)
 structure(x::RK._PlateProgram) = structure(x.ast)
@@ -374,7 +376,9 @@ end
             (slotted ? (Enzyme.Const(slot),) : ())...)
         @test value ≈ sum(sin, y; init = 0.0)
         @test dx ≈ (overwrite ? 0.0 : 0.3) .+ y .* cos.(y)
-        @test exp_sweeps[] == 1
+        # Only a call with a tape slot takes the one-pass rule. Without one the
+        # backend differentiates the lazy broadcast's own program.
+        @test exp_sweeps[] == Int(slotted)
         slotted && @test length(slot.tape) == n
     end
 end
@@ -386,8 +390,9 @@ end
     rule = RK._PlateSumRule{(),(1,),typeof(primal),typeof(reverse)}(primal, reverse)
     cells = RK._cell_array_broadcast(Base.broadcasted(*, 0.7, [0.2, -0.3]))
     @test RK._pr_rule_target(rule, (cells,)) === primal
-    @test RK._pr_rule_target(rule, ([0.2, -0.3],)) isa RK._PlateSumRuleBody
-    @test RK._pr_rule_target(rule, ((0.2, -0.3),)) isa RK._PlateSumRuleBody
+    # Without a one-pass schedule the call runs the plate's own program.
+    @test RK._pr_rule_target(rule, ([0.2, -0.3],)) === primal
+    @test RK._pr_rule_target(rule, ((0.2, -0.3),)) === primal
     for n in (0, 1, 17), seed in (1.7, -0.4), overwrite in (false, true)
         original = [0.2cos(i) for i in 1:n]
         scale = 0.7
@@ -499,14 +504,16 @@ end
     return total
 end
 
-@testset "intermediate reduction adjoints remain an explicit fallback" begin
+@testset "a factored plate takes the rule beside an explicit fallback" begin
     kernel = with_plate_reverse(false) do
         prepare(late_factored)
     end
     report = plate_reverse_report(kernel, (1, 2))
     @test length(report) == 2
     @test count(r -> last(r) == "rule", report) == 1
-    @test any(r -> occursin("intermediate plate total", last(r)), report)
+    # The generator reads the loop the factoring pass preserves, so a factored
+    # total is no fallback. A cell it cannot differentiate still names why.
+    @test count(r -> last(r) != "rule", report) == 1
     x, s = [0.2, -0.3, 0.5], 0.7
     ad = with_plate_reverse(true) do
         prepare_ad(kernel, AutoEnzyme(; mode = Enzyme.Reverse), x, s; active = (:x, :s))
