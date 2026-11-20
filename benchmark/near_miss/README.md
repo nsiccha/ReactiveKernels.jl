@@ -163,8 +163,6 @@ BLAS thread. The comparison loaded the two versions of the factor lowering
 and version. Each law and spelling first ran with 100 rows and five levels.
 Gathered models were prepared first, so the original models could reuse Julia
 specializations from the first pass. Setup is one observation per version.
-For example, original full-cover Normal setup at 5,000 levels allocated
-94.8 MiB when prepared second and 278 MiB in a separate kb8 process.
 The density and gradient times are medians of five alternating measurements.
 Each matched pair agreed on its log density and gradient vector.
 
@@ -182,6 +180,18 @@ Each matched pair agreed on its log density and gradient vector.
 | Bernoulli-logit | 500 | reference | 0.502 → 0.391 | 284 → 66.1 | 2,711 → 172 | 5,459 → 223 |
 | Bernoulli-logit | 5,000 | full | 0.336 → 2.67 | 84.1 → 243 | 170 → 181 | 218 → 219 |
 | Bernoulli-logit | 5,000 | reference | 1.42 → 2.98 | 2,369 → 262 | 34,639 → 171 | 75,884 → 215 |
+
+Repeating setup in reverse order made the full-cover controls cheaper on
+the second pass with either lowering. At 5,000 levels the reference-coded
+Bernoulli-logit gather still took longer to prepare and allocated about
+one ninth as much memory in both orders. Each cell below gives seconds
+and cumulative MiB allocated for 20,000 rows.
+
+| Law and coding | Original first | Original second | Gathered first | Gathered second |
+| --- | ---: | ---: | ---: | ---: |
+| Normal, full cover | 2.85 s / 279.1 MiB | 0.35 s / 94.8 MiB | 3.35 s / 274.7 MiB | 0.29 s / 90.6 MiB |
+| Bernoulli-logit, full cover | 2.45 s / 247.7 MiB | 0.34 s / 84.1 MiB | 2.67 s / 243.3 MiB | 0.30 s / 79.9 MiB |
+| Bernoulli-logit, reference | 1.47 s / 2,373.2 MiB | 1.42 s / 2,369.0 MiB | 2.98 s / 261.6 MiB | 2.82 s / 261.7 MiB |
 
 ### After lowering factor terms to level gathers
 
