@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.347
+
+- With MutatingFunctions loaded, `prepare_into` automatically reuses private
+  storage for eligible dense numerical computations, including matrix products
+  and nested broadcasts. The writer copies the result into the caller's array.
+
 ## 0.1.346
 
 - A program generator can reuse lowered graph construction instructions across
