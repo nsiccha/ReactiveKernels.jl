@@ -89,7 +89,7 @@ export prepare_query, prepare_sampler, SamplerQuery, sampler_value_and_gradient!
 # `adaptive_centering_problem`, and two exports of one name leave it undefined
 # in every module that loads both (snag rkppl-export-ada-38f23f30).
 @compat public adaptive_centering_problem
-export QueryAD, prepare_query_ad
+export QueryAD, prepare_query_ad, indexed_value
 export DensityFactor, DensityFactors, FactorSelection, density_factors, select_factors,
     factor_coordinates, factor_support, FactorQueryAD
 export prepare_cell_query, CellQuery, prepare_cell_sampler, CellSampler, cell_value_and_gradient!

@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.244
+## 0.1.245
 
 Requires ReactiveKernels 0.1.348.
 
@@ -48,6 +48,12 @@ Requires ReactiveKernels 0.1.348.
   grew with rows times levels. The factor term contributes zero to the
   predictor for a row whose label is outside its declared axis, including when
   every row has the reference level.
+
+## 0.1.244
+
+- `indexed_value(name)` selects one authored plate row for `prepare_query`
+  and `prepare_query_ad`. Supply a frozen packed base and coordinate positions
+  at preparation, then pass the compact active vector and row index per call.
 
 ## 0.1.243
 

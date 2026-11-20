@@ -1,4 +1,5 @@
 using Test, ReactiveKernels, ReactiveKernelsPPL, DifferentiationInterface, Enzyme
+@isdefined(_is_static_reverse) || include("static_enzyme.jl")
 
 @testset "native forward batching requires opt-in and respects explicit mode" begin
     backend = AutoEnzyme(; mode = Enzyme.Reverse)
@@ -20,15 +21,15 @@ using Test, ReactiveKernels, ReactiveKernelsPPL, DifferentiationInterface, Enzym
         y .~ Normal.(a .+ x, 1)
     end
     cases = (
-        (bernoulli, (; x = [-2.0, -0.5, 0.3, 1.7]),
-         (; y = Bool[false, true, true, false]), true),
-        (poisson, (; x = [-1.0, 0.2, 0.7, 1.5]), (; y = [0, 1, 2, 4]), true),
-        (normal, (; x = [-1.0, 0.2, 0.7]),
-         (; y = [-0.8, 0.3, 1.1]), true),
-        (normal, (; x = Float64[]), (; y = Float64[]), false),
+        BernoulliLogit = (bernoulli, (; x = [-2.0, -0.5, 0.3, 1.7]),
+            (; y = Bool[false, true, true, false]), true),
+        Poisson = (poisson, (; x = [-1.0, 0.2, 0.7, 1.5]),
+            (; y = [0, 1, 2, 4]), true),
+        Normal = (normal, (; x = [-1.0, 0.2, 0.7]), (; y = [-0.8, 0.3, 1.1]), true),
+        Normal_empty = (normal, (; x = Float64[]), (; y = Float64[]), false),
     )
-    for (case_index, (model, data, observations, uses_forward)) in
-            enumerate(cases)
+    @testset "$name" for name in keys(cases)
+        model, data, observations, uses_forward = cases[name]
         plan = model(; data...) | observations
         built = build_kernel(plan)
         u = [-0.35 + 0.15 * (i - 1) for i in 1:built.layout.total]
@@ -42,19 +43,20 @@ using Test, ReactiveKernels, ReactiveKernelsPPL, DifferentiationInterface, Enzym
         @test ordinary.ad isa PreparedADKernel
         @test default_mode.ad isa PreparedADKernel
         @test requested_reverse.ad isa PreparedADKernel
-        @test requested_reverse.ad.backend == backend
+        @test _is_static_reverse(requested_reverse.ad.backend)
         basis = uses_forward ? deepcopy(fast.ad.basis) : nothing
-        if case_index == 1
-            direct = Base.invokelatest(prepare_ad, fast.ad.reverse.kernel,
+        if name === :BernoulliLogit
+            kernel = fast.ad.reverse.kernel
+            direct = Base.invokelatest(prepare_ad, kernel,
                 automatic, u; active = :unconstrained,
                 native_forward_batch = true)
             @test !(direct isa PreparedADKernel)
             @test Base.invokelatest(ad_value_and_gradient, direct, u) ==
                 Base.invokelatest(ad_value_and_gradient, fast.ad, u)
-            reverse_direct = Base.invokelatest(prepare_ad, ordinary.ad.kernel,
+            reverse_direct = Base.invokelatest(prepare_ad, kernel,
                 backend, u; active=:unconstrained, native_forward_batch=true)
             @test reverse_direct isa PreparedADKernel
-            @test reverse_direct.backend == backend
+            @test _is_static_reverse(reverse_direct.backend)
             @test Base.invokelatest(ad_value_and_gradient, reverse_direct, u) ==
                 Base.invokelatest(ad_value_and_gradient, ordinary.ad, u)
         end
