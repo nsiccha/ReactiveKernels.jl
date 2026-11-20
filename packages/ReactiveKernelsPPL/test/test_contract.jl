@@ -1824,6 +1824,11 @@ end
     @test validate_plan(_factor_plan(; intercept = false,
         subset = Colon())) === nothing
     @test validate_plan(_factor_plan(; subset = Colon())) === nothing
+    # An open-ended level selection has Julia's indexing semantics, including
+    # when its first index is beyond the position following the final level.
+    fourth_onward = LevelMap(:mu, :g, Int[], :levels, (4, :end))
+    @test ReactiveKernelsPPL._apply_subset([7], fourth_onward) == Int[]
+    @test ReactiveKernelsPPL._apply_subset([7, 8, 9, 10], fourth_onward) == [10]
     # Missing / duplicate maps.
     # refused: factor term without its level map (IR contract)
     @test_throws ContractValidationError validate_plan(_factor_plan(;

@@ -469,15 +469,15 @@ end
     cache
 end
 
-# `vcat` of dense vectors of the cache's element type into a vector cache:
+# `vcat` of numbers and dense vectors of the cache's element type into a vector cache:
 # the operands' rows in order, through the native body's unrolled copy
 # (`_native_vcat_copy!`) rather than a loop over the operand tuple, whose
 # per-operand views and loads native Enzyme reverse records on its tape on
 # every gradient call. Other operands take the general method above.
 @inline function MutatingFunctions.apply!!(
         cache::Vector{T}, op::ReactiveKernels._ConcatenateStep{typeof(vcat)},
-        a::ReactiveKernels._NativeVector,
-        rest::Vararg{ReactiveKernels._NativeVector,N}) where {T,N}
+        a::ReactiveKernels._NativeColumnOperand,
+        rest::Vararg{ReactiveKernels._NativeColumnOperand,N}) where {T,N}
     args = (a, rest...)
     all(x -> eltype(x) === T, args) || return op.f(args...)
     n = ReactiveKernels._native_cat_height_sum(args)

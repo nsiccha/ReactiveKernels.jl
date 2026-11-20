@@ -5355,9 +5355,8 @@ function _apply_subset(levels::Vector, m::LevelMap)
         levels[indices]
     else
         lo = s[1]::Int
-        lo <= K || _fail(:plan,
-            "LevelMap ($(lo), :end) exceeds $K observed levels of " *
-            "$(m.column)")
+        # An open-ended selection can be empty, e.g. a reference-coded
+        # factor with only its reference level in this binding.
         levels[lo:end]
     end
     length(unique(vals)) == length(vals) ||

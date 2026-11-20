@@ -610,7 +610,7 @@ end
 # one-based axes, or a level-code vector. A level-code vector is the
 # compiler-owned data-only value `_ppl_lvx_… = _declared_codes(g, labels)`
 # (`_array_level_index_statements`): one `Int` position per entry of the bound
-# column `g`, which bind-time coverage validation proves lies on the level axis.
+# column `g`, optionally shifted to address a leading zero coefficient.
 function _pointwise_index_infos(plan::StructuralPlan, stmts, bound_names)
     indices = Dict{Symbol,_OS.ValueInfo}()
     for (name, idx) in plan.columns
@@ -622,7 +622,8 @@ function _pointwise_index_infos(plan::StructuralPlan, stmts, bound_names)
         Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol || continue
         name, rhs = st.args
         startswith(String(name), "_ppl_lvx_") || continue
-        Meta.isexpr(rhs, :call, 3) && rhs.args[1] === :_declared_codes &&
+        Meta.isexpr(rhs, :call) && length(rhs.args) in (3, 4) &&
+            rhs.args[1] === :_declared_codes &&
             rhs.args[1] ∉ bound_names && rhs.args[2] isa Symbol || continue
         column = get(plan.columns, rhs.args[2], nothing)
         column isa AbstractVector || continue
@@ -779,7 +780,7 @@ end
 function _affine_coefficient_statements(plan::StructuralPlan, layout::LayoutTable)
     stmts = Expr[]
     for p in plan.predictors
-        _parameter_terms(p) || continue
+        _parameter_terms(p) && !_has_factor_terms(p) || continue
         shape = design_shape(p, plan.columns; levelmaps = plan.levelmaps,
             matrices = plan.matrices)
         chunks = Any[]
@@ -1371,8 +1372,14 @@ function _predictor_plate_addition(plan::StructuralPlan, pred::PredictorSpec,
     n = only(located)
     axes = map(pred.terms) do t
         t.kind === InterceptTerm && return Any[]
-        t.kind === OffsetTerm && length(t.columns) == 1 &&
+        t.kind in (OffsetTerm, FactorTerm) && length(t.columns) == 1 &&
             return _value_axes(plan, only(t.columns); data_axes = true)
+        # Multiplying the design by its coefficient vector preserves its row
+        # axis. The hcat and its Float64 conversion still run once at binding.
+        if t.kind === MatrixTerm && !isempty(t.columns) &&
+                all(c -> _value_axes(plan, c; data_axes = true) == Any[n], t.columns)
+            return Any[n]
+        end
         t.kind === ComposedTerm &&
             return _value_axes(plan, _composed_expr(plan, pred, t);
                 data_axes = true)
@@ -1423,8 +1430,7 @@ function _predictor_statements(plan::StructuralPlan)
         end
         terms = Any[]
         if _broadcast_affine(plan, pred)
-            append!(terms, _affine_block_terms(plan, shape; broadcast = true,
-                pre = stmts))
+            append!(terms, _affine_block_terms!(stmts, plan, pred, shape))
         elseif shape.width > 0
             push!(terms, :($(design_name(pred.name)) * $(_affine_block_name(pred))))
         end
@@ -1504,72 +1510,62 @@ end
 # over a coefficient block rather than the packed vector).
 _coef_coord(coef::Symbol, k::Int) = :($coef[$k])
 
-# Broadcast affine blocks against their coefficient coordinates while
-# retaining the authored axes. Factor and matrix blocks use their own
-# coefficient slices in design order. With `pre`, a predictor whose factor
-# terms gather by level code (`_factor_gather_affine`) takes
-# `_factor_gather_terms!` instead, which pushes its code statements to `pre`.
-function _affine_block_terms(plan::StructuralPlan, shape::DesignShape;
-        broadcast::Bool = false, pre::Union{Nothing,Vector{Expr}} = nothing)
-    pred = only(p for p in plan.predictors if p.name === shape.predictor)
-    pre === nothing || !_factor_gather_affine(plan, pred) ||
-        return _factor_gather_terms!(pre, pred, shape)
-    coef = _affine_block_name(pred)
-    terms = Any[]
-    k = 1
-    for b in shape.blocks
-        if b.kind === InterceptTerm
-            push!(terms, broadcast ? _coef_coord(coef, k) :
-                Expr(:call, :.*, Expr(:call, :ones, _predictor_rows_source(plan, shape.predictor)),
-                    _coef_coord(coef, k)))
-            k += 1
-        elseif b.kind === ContinuousTerm
-            push!(terms, :($(b.column) .* $(_coef_coord(coef, k))))
-            k += 1
-        elseif b.kind === FactorTerm
-            w = b.width
-            push!(terms, :($(_contrast_expr(b)) *
-                $(:(view($coef, $k:$(k + w - 1))))))
-            k += w
-        elseif b.kind === MatrixTerm
-            w = b.width
-            push!(terms, :($(_matrix_block_expr(b, _predictor_rows_source(plan, shape.predictor))) *
-                $(:(view($coef, $k:$(k + w - 1))))))
-            k += w
-        end
+# A factor code selects one effect. When the declared axis can omit a row,
+# index a table whose first entry is the zero effect and the remaining entries
+# are the declared coefficients. This also handles an empty coefficient table.
+function _factor_gather!(pre, plan, pred, term, block, value, i)
+    codes = Symbol(:_ppl_lvx_, pred.name, :_, block.column, :_factor_, i)
+    lookup = :(_declared_codes($(block.column), $(block.axis)))
+    if !_factor_axis_covers_rows(plan, pred, term)
+        push!(lookup.args, 1)
+        value = Expr(:call, GlobalRef(Base, :vcat), 0.0, value)
     end
-    return terms
+    if !(value isa Symbol)
+        table = Symbol(:_ppl_effects_, pred.name, :_, i)
+        push!(pre, :($table = $value))
+        value = table
+    end
+    push!(pre, :($codes = $lookup))
+    # A plate may borrow this named gather when its consumers read entries.
+    gathered = Symbol(:_ppl_gathered_, pred.name, :_, i)
+    push!(pre, :($gathered = $value[$codes]))
+    return gathered
 end
 
-
-# The summands of a predictor with a factor term (`_factor_gather_affine`):
-# every intercept, covariate and factor term reads its own declared parameter
-# (sign applied), so no summand names a coefficient position or a level count.
-# A factor term `c[g]` is the level gather `c[codes]` with
-# `codes = _declared_codes(g, axis)` (pushed to `pre`), the form a value
-# gather `z[g]` lowers to: one gather per row, where its dummies were an N×J
-# product. Its axis holds every row's label (`_factor_axis_covers_rows`).
-function _factor_gather_terms!(pre::Vector{Expr}, pred::PredictorSpec,
-        shape::DesignShape)
-    length(shape.blocks) == length(pred.terms) || throw(ContractValidationError(
-        "[generator] predictor $(pred.name): $(length(shape.blocks)) design " *
-        "blocks for $(length(pred.terms)) terms"))
+# Keep the authored broadcast axes of each affine block. Beside a factor,
+# declared parameters are read directly. A legacy PopulationPrior owns a
+# packed block, so each of its terms reads the next coordinates of that block.
+function _affine_block_terms!(pre, plan, pred, shape)
+    has_factors = _has_factor_terms(pred)
+    coef = has_factors ? block_name(pred.name) : _affine_block_name(pred)
     terms = Any[]
+    offset = 0
     for (i, (t, b)) in enumerate(zip(pred.terms, shape.blocks))
-        t.kind in (InterceptTerm, ContinuousTerm, FactorTerm) || continue
-        b.width == 0 && continue
-        value = t.options.parameter
-        value = t.options.sign == 1 ? value : :(-$value)
-        if t.kind === InterceptTerm
-            push!(terms, value)
-        elseif t.kind === ContinuousTerm
-            push!(terms, :($(b.column) .* $value))
+        t.kind in (InterceptTerm, ContinuousTerm, FactorTerm, MatrixTerm) || continue
+        declared = has_factors && _parameter_term(t)
+        value = if declared
+            t.options.parameter
+        elseif t.kind === FactorTerm && b.width == 0
+            # A zero-width legacy block has no packed layout entry.
+            :(Float64[])
         else
-            codes = Symbol(:_ppl_lvx_, pred.name, :_, b.column, :_factor_, i)
-            push!(pre, :($codes = _declared_codes($(b.column), $(b.axis))))
-            gathered = :($(t.options.parameter)[$codes])
-            push!(terms, t.options.sign == 1 ? gathered : :(0.0 .- $gathered))
+            first = _read_add(offset, 1)
+            width = t.kind === FactorTerm ? _read_length(b.axis) : b.width
+            offset = _read_add(offset, width)
+            t.kind in (FactorTerm, MatrixTerm) ? :(view($coef, $first:$offset)) :
+                :($coef[$first])
         end
+        term = if t.kind === FactorTerm
+            _factor_gather!(pre, plan, pred, t, b, value, i)
+        elseif t.kind === MatrixTerm
+            design = _matrix_block_expr(b, _predictor_rows_source(plan, pred.name))
+            :($design * $value)
+        elseif t.kind === ContinuousTerm
+            :($(b.column) .* $value)
+        else
+            value
+        end
+        push!(terms, declared && t.options.sign == -1 ? :(.-($term)) : term)
     end
     return terms
 end
@@ -5129,6 +5125,7 @@ end
 function _parameter_prior_input(ps, plan, layout)
     names = [p.name for p in ps]
     for pred in plan.predictors
+        _has_factor_terms(pred) && continue
         shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps,
             matrices = plan.matrices)
         terms = [t for (t, b) in zip(pred.terms, shape.blocks) if b.width > 0]
