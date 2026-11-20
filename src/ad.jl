@@ -147,25 +147,27 @@ _ad_selector_indices(index::Int) = (index,)
 _ad_selector_indices(indices::Tuple) = indices
 
 # DifferentiationInterface's Enzyme extension cannot annotate a structured
-# point that mixes duplicated storage (arrays) and active scalars. Represent a
-# scalar component as mutable scalar storage so the whole tuple is duplicated,
-# then unwrap it at the RK callable boundary and restore its cotangent before
-# returning to the caller. A scalar field of a tuple or NamedTuple port is a
-# scalar leaf too: left immutable, an accumulating reverse pass could neither
-# zero nor add into its shadow (snag rkppl-zero-cell-a7c54028).
-_ad_active_point_component(value::Number) = Ref(value)
+# point that mixes duplicated storage (arrays) and active immutable values.
+# Represent an immutable leaf as mutable `Ref` storage so the whole tuple is
+# duplicated, then unwrap it at the RK callable boundary and restore its
+# cotangent before returning to the caller. Immutable leaves are scalars and
+# isbits arrays, such as a StaticArrays `SVector`, at the top level or as a
+# field of a tuple or NamedTuple port. Left immutable, an accumulating reverse
+# pass could neither zero nor add into their shadows (snags
+# rkppl-zero-cell-a7c54028, rkppl-zero-cell-0a0880ea).
+_ad_ref_leaf(::Type{T}) where {T} = T <: Number || (T <: AbstractArray && isbitstype(T))
 _ad_active_point_component(value::Union{Tuple,NamedTuple}) =
     map(_ad_active_point_component, value)
-_ad_active_point_component(value) = value
+_ad_active_point_component(value::T) where {T} = _ad_ref_leaf(T) ? Ref(value) : value
 
-# Scalar normalization storage belongs to one prepared gradient, just like its
-# backend preparation. Rebind every scalar before evaluating; arrays remain
-# caller-owned inputs. Unsupported or changed component types keep the ordinary
-# normalization path.
-_ad_scalar_point_storage(x::Base.RefValue{T}) where {T<:Number} = Ref(x[])
+# Leaf normalization storage belongs to one prepared gradient, just like its
+# backend preparation. Rebind every immutable leaf before evaluating; mutable
+# arrays remain caller-owned inputs. Unsupported or changed component types
+# keep the ordinary normalization path.
+_ad_scalar_point_storage(x::Base.RefValue{T}) where {T} = _ad_ref_leaf(T) ? Ref(x[]) : nothing
 _ad_scalar_point_storage(x::Union{Tuple,NamedTuple}) = map(_ad_scalar_point_storage, x)
 _ad_scalar_point_storage(x) = nothing
-@inline function _ad_stored_point_component(slot::Base.RefValue{T}, x::T) where {T<:Number}
+@inline function _ad_stored_point_component(slot::Base.RefValue{T}, x::T) where {T}
     slot[] = x
     slot
 end
@@ -2334,13 +2336,15 @@ _ad_tangent_shape(value::Base.RefValue) = _ad_tangent_shape(value[])
 _ad_tangent_shape(value::Tuple) = "(" * join(map(_ad_tangent_shape, value), ", ") * ")"
 _ad_tangent_shape(value) = string(typeof(value))
 
-# A tuple selector's scalar components cross DI as mutable `Ref` storage
+# A tuple selector's immutable leaves cross DI as mutable `Ref` storage
 # (`_ad_active_point_component`); tangents follow the same representation.
 _ad_tangent_point(point::Tuple, tangent::Tuple) =
     map(_ad_tangent_point, point, tangent)
 _ad_tangent_point(point::NamedTuple{N}, tangent::NamedTuple{N}) where {N} =
     map(_ad_tangent_point, point, tangent)
 _ad_tangent_point(::Base.RefValue, tangent::Number) = Ref(tangent)
+_ad_tangent_point(::Base.RefValue{T}, tangent::AbstractArray) where {T<:AbstractArray} =
+    Base.RefValue{T}(tangent)
 _ad_tangent_point(point, tangent) = tangent
 
 _ad_tangents_point(point, tangents::Tuple) =

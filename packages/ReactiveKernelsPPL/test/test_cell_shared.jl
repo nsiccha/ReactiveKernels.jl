@@ -1,5 +1,6 @@
 using Test, ReactiveKernels, ReactiveKernelsPPL, Distributions, Enzyme
 using DifferentiationInterface: AutoEnzyme, SecondOrder
+using StaticArrays: SVector
 
 # map remains a whole-array helper; the independent helper-locality lowering
 # can now evaluate a collect(Generator) directly at rows.
@@ -97,6 +98,19 @@ const _CS_NAMED = @rkppl begin
     source = _cs_source(grid, beta)
     @plate for k in eachindex(y)
         y[k] ~ Poisson(exp(z[id[k]]) * _cs_source_rate(source, k))
+    end
+end
+# A shared value that is a fixed-size immutable SVector beside a vector, as a
+# BRM event-kernel record is (snag rkppl-zero-cell-0a0880ea).
+_cs_pair(beta) = SVector(exp(beta), beta^2 / 2)
+_cs_pair_rate(pair, t) = pair[1] * exp(t) + pair[2]
+const _CS_STATIC = @rkppl begin
+    beta ~ Normal(0, 1)
+    z[levels(id)] .~ Normal.(0, 1)
+    pair = _cs_pair(beta)
+    field = _cs_field(grid, beta)
+    @plate for k in eachindex(y)
+        y[k] ~ Poisson(exp(z[id[k]]) * (_cs_pair_rate(pair, grid[k]) + field[k]))
     end
 end
 # A cell that reads more shared values than DifferentiationInterface and
@@ -587,11 +601,13 @@ end
     @test gradient ≈ fd rtol = 2e-8 atol = 2e-8
 end
 
-@testset "A shared NamedTuple value with scalar fields" begin
+# Cell pullbacks at orders 0-2 and partition-sampler gradients against finite
+# differences, for a model whose shared prefix values pass `shared_values`.
+function _cs_check_shared_values(model, shared_values)
     n = 4
     data = (; id = collect(1:n), grid = collect(range(-0.7, 0.9; length = n)),
         y = mod.(1:n, 4))
-    bound = _CS_NAMED(; data.id, data.grid) | (; data.y)
+    bound = model(; data.id, data.grid) | (; data.y)
     built = build_kernel(bound)
     u = collect(range(-0.2, 0.3; length = built.layout.total))
     fd(f, point) = map(eachindex(point)) do j
@@ -601,7 +617,7 @@ end
     end
     q = prepare_compact_cell_ad(prepare_ad_third, built, bound, :y, u, [2],
         _CS_THIRD, ([0.6],); partitioned = :z, locality = :error)
-    @test only(q.shared.cache.values) isa NamedTuple{(:scale, :weights, :offset)}
+    @test shared_values(q.shared.cache.values)
     p = prepare_cell_pullback(q, _CS_REVERSE, u)
     reference = prepare_cell_query(built, bound, :y; locality = :ignore)
     weights = [0.3, -0.4, 1.2, 0.8]
@@ -640,6 +656,18 @@ end
         partition_batch_value_and_gradient!(sampler, g, u, collect(1:n))
         @test g ≈ fd(point -> sum(label -> partition(point, label), 1:n), u) rtol = 1e-7 atol = 1e-8
     end
+end
+
+@testset "A shared NamedTuple value with scalar fields" begin
+    _cs_check_shared_values(_CS_NAMED,
+        values -> only(values) isa NamedTuple{(:scale, :weights, :offset)})
+end
+
+@testset "A shared immutable SVector value" begin
+    # Its cell shadow is an immutable array: the pullback could neither zero
+    # it nor add into it (snag rkppl-zero-cell-0a0880ea).
+    _cs_check_shared_values(_CS_STATIC,
+        values -> any(v -> v isa SVector{2,Float64}, values))
 end
 
 @testset "A cell that reads more shared values than the splat limit" begin

@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.349
+
+- A tuple selector's derivative accepts a fixed-size immutable array port or
+  field, such as a StaticArrays `SVector`, beside mutable arrays. It crosses
+  the derivative as `Ref` storage like a scalar, so `ad_accumulator_storage`
+  gives it a `Ref` that `ad_accumulate!` adds into, and a gradient returns
+  the array type unchanged.
+
 ## 0.1.348
 
 - The native loop for non-strided matrix products checks the shared dimension
