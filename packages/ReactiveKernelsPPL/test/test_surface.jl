@@ -4605,15 +4605,18 @@ end
             :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)),
             :(eta = a .+ b .* x),
             :(y .~ OrderedLogistic.(eta))), (:y, :x); conditioned = (:y, :x))
-    # Cutpoints follow the location as one shared vector.
-    # refused: OrderedLogistic.(eta, eta): scalar cutpoints are malformed
-    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
-            :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)),
-            :(eta = a .+ b .* x),
-            :(y .~ OrderedLogistic.(eta, eta))), (:y, :x); conditioned = (:y, :x))
-    # Bind + value roundtrip.
     cols = Dict{Symbol,AbstractVector}(:y => [1, 2, 3, 2, 1, 3],
         :x => [0.5, -1.0, 1.5, 0.0, -0.5, 1.0])
+    scalar_cuts = Expr(:block,
+        :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)),
+        :(eta = a .+ b .* x),
+        :(y .~ OrderedLogistic.(eta, eta)))
+    # Refused because broadcasting this predictor supplies a scalar where
+    # OrderedLogistic requires a cutpoint vector per observation.
+    @test_throws Union{SurfaceLoweringError,ContractValidationError} bind_data(
+        lower_rkppl(scalar_cuts, (:y, :x); conditioned = (:y, :x)), cols)
+
+    # Bind + value roundtrip for the shared cutpoint vector.
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     u = [0.5, -0.25, 0.1, 0.3]
