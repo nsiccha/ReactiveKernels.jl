@@ -2261,12 +2261,14 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState, indexed:
         if scalar_inputs !== nothing
             written = unique(st.prepared[r] for r in read_operands if haskey(st.shadow, st.prepared[r]))
             shadows = map(p -> st.shadow[p], written)
+            dense = Expr(:for, :($linear = $cells), cellbody)
+            # Only the range-checked quotient variant needs the stronger
+            # independence annotation to keep the dense reduction vectorized.
+            simd = isempty(q.divisors) ? :(@simd $dense) : :(@simd ivdep $dense)
             loop = :(if $_PR_WANT_VALUE isa Val{false} &&
                             $(GlobalRef(@__MODULE__, :_pr_dense_reverse_cells))(
                                 $cells, ($(read_operands...),), ($(shadows...),))
-                         @inbounds @simd ivdep for $linear in $cells
-                             $cellbody
-                         end
+                         @inbounds $simd
                      else
                          $plain_loop
                      end)
@@ -2362,12 +2364,12 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState, indexed:
                 loop = specialize(plain_loop, 3)
             end
         end
+        isempty(q.divisors) || pushfirst!(coefficients, :($(q.normal) = $certificate))
         quote
             $(forward_pre...)
             $(init...)
             $cells = $range
             $ncells = Float64(length($cells))
-            $(isempty(q.divisors) ? nothing : :($(q.normal) = $certificate))
             $(coefficients...)
             $(value_pre...)
             $loop
