@@ -1,8 +1,13 @@
 using ReactiveKernels, MutatingFunctions, DifferentiationInterface, LinearAlgebra, Test
+using Random: Xoshiro, randn!
 import Enzyme
 
 module NestedProductFixture
 using ReactiveKernels
+@kernel row_product(A, x) = begin
+    v = ((A * x) ./ 2) .+ vec(transpose(x ./ 2) * A)
+    loss = sum(abs2.(v))
+end
 @kernel inline_product(x, A, s, t) = begin
     z = (A * (x .* s) .+ A * x) .* t
     terms = plate(z) do v
@@ -31,6 +36,71 @@ end
 # Count syntax, not the printed lengths of names or values in the tables.
 # This measures RK emission; Julia may specialize its executable afterwards.
 nested_product_nodes(ex) = ex isa Expr ? 1 + sum(nested_product_nodes, ex.args; init=0) : 0
+function row_product_bytes(k, A, x)
+    k(A, x)
+    @allocated k(A, x)
+end
+
+@testset "a dense row product reuses its vector and preserves Julia arithmetic" begin
+    spec = NestedProductFixture.row_product
+    ordinary = prepare(spec; have=(:A, :x), want=:v)
+    A = Matrix(SymTridiagonal(ones(8), fill(0.08, 7)))
+    x = zeros(8)
+    k = prepare_nonallocating(ordinary, A, x)
+    result = k(A, x)
+    rng = Xoshiro(9)
+    for _ in 1:100
+        randn!(rng, x)
+        @test k(A, x) === result
+        @test isequal(result, ordinary(A, x))
+    end
+    @test row_product_bytes(k, A, x) == 0
+    source = jax_source(spec; have=(:A, :x), want=:v,
+                        types=(A=Matrix{Float64}, x=Vector{Float64}))
+    @test occursin("x / 2 @ A", string(source))
+    larger = prepare_nonallocating(ordinary, ones(19, 19), ones(19))
+    @test nested_product_nodes(code_expr(k)) == nested_product_nodes(code_expr(larger))
+
+    # A raw graph recipe returns the row itself. Complex inputs distinguish
+    # transpose from adjoint, including when the previous result is an input.
+    for wrap in (transpose, adjoint)
+        z = randn(rng, ComplexF64, 5)
+        g = Graph()
+        r = value!(g, :r, typeof(wrap(z)))
+        m = value!(g, :m, Matrix{ComplexF64})
+        y = value!(g, :y, typeof(wrap(z)))
+        add!(g, (r, m) => y, *)
+        product = prepare_nonallocating(g; have=(r, m), want=(y,))
+        for n in (3, 0, 5)
+            B = randn(rng, ComplexF64, 5, n)
+            row = product(wrap(z), B)
+            @test typeof(row) === typeof(wrap(z))
+            @test parent(product(wrap(z), B)) === parent(row)
+            @test isequal(row, wrap(z) * B)
+            if n == 5
+                saved = copy(parent(row))
+                next = product(row, B)
+                @test isequal(next, wrap(saved) * B)
+                @test isequal(parent(row), saved)
+            end
+        end
+        @test product(wrap(ComplexF64[]), zeros(ComplexF64, 0, 5)) == wrap(zeros(ComplexF64, 5))
+        @test_throws DimensionMismatch product(wrap(z), zeros(ComplexF64, 4, 5))
+    end
+
+    # Differentiate the bound, buffered primal through ordinary Enzyme reverse.
+    B = randn(rng, 8, 8)
+    bound = prepare(spec; have=(:A, :x), want=:loss, bound=(A=B,))
+    cached = prepare_nonallocating(bound, x)
+    grad = prepare_ad(cached, AutoEnzyme(mode=Enzyme.Reverse), x; active=:x)
+    g = similar(x)
+    for point in (x, x .+ 0.25)
+        v = ((B * point) ./ 2) .+ vec(transpose(point ./ 2) * B)
+        loss, _ = ad_value_and_gradient!(grad, g, point)
+        @test loss ≈ sum(abs2, v)
+        @test g ≈ (B + transpose(B)) * v
+    end
+end
 function nested_product_bytes(k, x, A, s, t)
     k(x, A, s, t)
     @allocated k(x, A, s, t)

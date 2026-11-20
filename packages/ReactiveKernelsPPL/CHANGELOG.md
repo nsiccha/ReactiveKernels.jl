@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.238
+## 0.1.239
 
 - A Poisson-log regression without weights, evidence or a response range
   lowers to the summed observation plate every other count likelihood uses:
@@ -33,6 +33,13 @@ are recorded in the git history only.
   over 40 rows 215 to 154 ns and 377 to 326 ns, with one effect per row 236
   to 205 ns and 458 to 409 ns; a five-column design matrix unchanged.
   The Binomial-logit regression keeps its whole-vector form.
+
+## 0.1.238
+
+- Packages can retain a `LoweringCache()` and pass it to
+  `lower_rkppl(ast, design; cache, conditioned, frozen)` across image loads.
+  Each call uses its own fitted values and recomputes data-dependent input
+  classifications before reusing compatible structural work.
 
 ## 0.1.237
 

@@ -957,10 +957,10 @@ _mentions_symbol(ex, s::Symbol) = ex === s ||
     (ex isa Expr && any(a -> _mentions_symbol(a, s), ex.args))
 
 """
-    lower_rkppl(ast, data_names; mod=Main) -> StructuralPlan
-    lower_rkppl(ast, data; mod=Main) -> StructuralPlan
+    lower_rkppl(ast, data_names; mod=Main, conditioned=(), frozen=nothing, cache=nothing) -> StructuralPlan
+    lower_rkppl(ast, data; mod=Main, conditioned=(), frozen=nothing, cache=nothing) -> StructuralPlan
 
-Lower a captured `@rkppl` block AST to a data-free (unbound) plan.
+Lower a captured `@rkppl` block AST to an unbound plan.
 `data_names` (or the keys of `data`, a dict or `NamedTuple` of values)
 declares supplied values. Pass their observation roles separately with
 `conditioned = (:y, :tau)`. The keyword accepts names or the keys of a
@@ -1037,13 +1037,22 @@ record describes and `data` omits (a fit-role copy `x_fit` of training data)
 is data of its recorded type and size, so the plan is the one lowering with
 that input gives. The plan carries `frozen`, and [`bind_data`](@ref) binds it
 by default.
+
+A consuming package can define `const plans = LoweringCache()` and pass
+`cache=plans` during precompilation and subsequent calls. Each lowering
+inspects the current inputs, expands submodels in their current modules and
+attaches the supplied frozen record. Compatible calls reuse the structural
+pass. For a fitted design, pass the design values even when their names and
+types match the workload. See [`LoweringCache`](@ref).
 """
 lower_rkppl(ast, data::NamedTuple; mod::Module = Main, conditioned=(),
-        frozen::Union{FrozenValues,Nothing} = nothing) =
-    lower_rkppl(ast, Dict{Symbol,Any}(pairs(data)); mod, conditioned, frozen)
+        frozen::Union{FrozenValues,Nothing} = nothing,
+        cache::Union{LoweringCache,Nothing} = nothing) =
+    lower_rkppl(ast, Dict{Symbol,Any}(pairs(data)); mod, conditioned, frozen, cache)
 
 function lower_rkppl(ast, data::AbstractDict; mod::Module = Main, conditioned=(),
-        frozen::Union{FrozenValues,Nothing} = nothing)
+        frozen::Union{FrozenValues,Nothing} = nothing,
+        cache::Union{LoweringCache,Nothing} = nothing)
     frozen === nothing || (data = _with_frozen_inputs(data, frozen))
     names = Symbol[]
     scalars = Set{Symbol}()
@@ -1053,14 +1062,15 @@ function lower_rkppl(ast, data::AbstractDict; mod::Module = Main, conditioned=()
         v isa Number && push!(scalars, k)
     end
     return _with_frozen(_lower_rkppl(ast, names, scalars, mod; conditioned,
-        values = data), frozen)
+        values = data, cache), frozen)
 end
 
 function lower_rkppl(ast, data_names; mod::Module = Main, conditioned=(),
-        frozen::Union{FrozenValues,Nothing} = nothing)
+        frozen::Union{FrozenValues,Nothing} = nothing,
+        cache::Union{LoweringCache,Nothing} = nothing)
     names = collect(data_names)
     frozen === nothing || union!(names, keys(_with_frozen_inputs(Dict{Symbol,Any}(), frozen)))
-    return _with_frozen(_lower_rkppl(ast, names, Set{Symbol}(), mod; conditioned), frozen)
+    return _with_frozen(_lower_rkppl(ast, names, Set{Symbol}(), mod; conditioned, cache), frozen)
 end
 
 # The data a lowering with `frozen` reads: `data`, plus each input the record
@@ -1086,14 +1096,15 @@ _with_frozen(plan::StructuralPlan, frozen::FrozenValues) = _with(plan; frozen)
 # so one source lowers to one set of names (`ReactiveKernels._kernel_gensym`; snag
 # `gensym-in-kernel-54164b85`).
 _lower_rkppl(ast, data_names, scalars::Set{Symbol}, mod::Module; conditioned=(),
-        values::Union{Nothing,AbstractDict} = nothing)::StructuralPlan =
+        values::Union{Nothing,AbstractDict} = nothing, cache = nothing)::StructuralPlan =
     ReactiveKernels._within_kernel_names(ast) do
         Base.invokelatest(_lower_rkppl_latest, ast, data_names, scalars, mod;
-            conditioned, values)
+            conditioned, values, cache)
     end
 
 function _lower_rkppl_latest(ast, data_names, scalars::Set{Symbol},
-        mod::Module; conditioned=(), values::Union{Nothing,AbstractDict} = nothing)::StructuralPlan
+        mod::Module; conditioned=(), values::Union{Nothing,AbstractDict} = nothing,
+        cache = nothing)::StructuralPlan
     data = Set{Symbol}()
     for n in data_names
         n isa Symbol || _sfail("data names must be Symbols, got $(repr(n))")
@@ -1116,11 +1127,14 @@ function _lower_rkppl_latest(ast, data_names, scalars::Set{Symbol},
     ast, data = _scalar_value_definitions(ast, data, setdiff(scalars, observed_parameters))
     ast = _indexed_observation_definitions(ast, data)
     values === nothing || (ast = _merged_observations(ast, values, observing))
-    plan = _lower_rkppl_once(ast, data, mod;
-        submodel_scopes = scopes, conditioned = observed_parameters, array_entries,
-        observing)
+    plan = if cache === nothing
+        _lower_rkppl_once(ast, data, mod; submodel_scopes = scopes,
+            conditioned = observed_parameters, array_entries, observing)
+    else
+        _cached_lowering(cache, ast, data, mod; submodel_scopes = scopes,
+            conditioned = observed_parameters, array_entries, observing)
+    end
     return _with(plan; documentation)
-
 end
 
 # A data-indexed observation is an ordinary gather followed by an
@@ -2064,7 +2078,12 @@ function _hoist_data_gather_indices!(sample, det, data, taken; resolve = identit
         end
         return ex
     end
-    out = Pair{Symbol,Any}[nm => walk(rhs) for (nm, rhs) in det]
+    # Keep the append! destination concrete even when inference cannot see
+    # the shape of det. A typed comprehension fixes only the element type.
+    out = Pair{Symbol,Any}[]
+    for (nm, rhs) in det
+        push!(out, nm => walk(rhs))
+    end
     for (i, s) in enumerate(sample)
         rhs = walk(s.rhs)
         sample[i] = SampleStmt(s.lhs, rhs, s.broadcast, s.range, s.levels,

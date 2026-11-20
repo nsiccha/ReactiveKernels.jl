@@ -232,6 +232,13 @@ end
 # match the allocating result exactly, so value parity is preserved
 # bit-for-bit and a mismatch simply reseeds the cache.
 
+@inline function MutatingFunctions.apply!!(cache::Array{T,N},
+        ::ReactiveKernels._CopyForUpdate, A::Array{T,N}, inputs...) where {T,N}
+    size(cache) == size(A) && !ReactiveKernels._replicated_aliases(cache, (A, inputs...)) ||
+        return copy(A)
+    copyto!(cache, A)
+end
+
 @inline function MutatingFunctions.apply!!(
         cache::AbstractArray, ::ReactiveKernels._MaterializeStep,
         bc::Base.Broadcast.Broadcasted)
@@ -245,6 +252,17 @@ end
 end
 
 const _LA = ReactiveKernels.LinearAlgebra
+
+@inline function MutatingFunctions.apply!!(cache::Vector{T},
+        op::typeof(ReactiveKernels._row_product_parent),
+        row::ReactiveKernels._StridedBlasRow{T}, A::StridedMatrix{T}) where {T<:_LA.BlasFloat}
+    x = parent(row)
+    if length(cache) == size(A, 2) && !Base.mightalias(cache, x) && !Base.mightalias(cache, A)
+        matrix = row isa _LA.Transpose ? transpose(A) : adjoint(A)
+        return _LA.mul!(cache, matrix, x)
+    end
+    op(row, A)
+end
 
 @inline _matmul_destination_matches(cache::AbstractVector, A, B::AbstractVector) =
     size(cache) == (size(A, 1),)
