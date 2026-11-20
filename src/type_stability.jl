@@ -341,9 +341,7 @@ end
 # are not compiled in, so a new session picks up a change without recompiling.
 # `__init__` forgets values read while an image was generated.
 const _TYPE_STABILITY_PREFERENCES =
-    (Ref{Union{Nothing,Symbol}}(nothing), Ref{Union{Nothing,Symbol}}(nothing),
-     Ref{Union{Nothing,Symbol}}(nothing), Ref{Union{Nothing,Symbol}}(nothing),
-     Ref{Union{Nothing,Symbol}}(nothing))
+    ntuple(_ -> _PreferenceCache{Symbol}(nothing), 5)
 _type_stability_preference_cache(::Val{:type_stability}) = _TYPE_STABILITY_PREFERENCES[1]
 _type_stability_preference_cache(::Val{:type_stability_level}) =
     _TYPE_STABILITY_PREFERENCES[2]
@@ -355,15 +353,14 @@ _type_stability_preference_cache(::Val{:branch_arms}) = _TYPE_STABILITY_PREFEREN
 _type_stability_preference_cache(::Val{:ad_allocations}) = _TYPE_STABILITY_PREFERENCES[5]
 
 function _type_stability_preference(setting::Val{S}) where {S}
-    cache = _type_stability_preference_cache(setting)
-    cached = cache[]
-    cached === nothing || return cached
-    choices = string.(_type_stability_choices(setting))
-    value = Preferences.load_preference(@__MODULE__, string(S), first(choices))
-    value in choices || throw(ArgumentError(
-        "the ReactiveKernels preference `$S` must be one of " *
-        "$(join(repr.(choices), ", ")); got $(repr(value))"))
-    cache[] = Symbol(value)
+    _cached_preference(_type_stability_preference_cache(setting)) do
+        choices = string.(_type_stability_choices(setting))
+        value = Preferences.load_preference(_PREFERENCE_UUID, string(S), first(choices))
+        value in choices || throw(ArgumentError(
+            "the ReactiveKernels preference `$S` must be one of " *
+            "$(join(repr.(choices), ", ")); got $(repr(value))"))
+        Symbol(value)
+    end
 end
 
 # The task-local keys of the settings a call's keywords give the preparations it

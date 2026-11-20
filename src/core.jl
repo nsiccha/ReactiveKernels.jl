@@ -88,10 +88,10 @@ function __init__()
     # Programs that package images loaded from now on compiled (`compile`).
     push!(Base.package_callbacks, _register_image_programs)
     # This process reads its own project's type-stability preferences.
-    foreach(preference -> preference[] = nothing, _TYPE_STABILITY_PREFERENCES)
+    foreach(_clear_preference!, _TYPE_STABILITY_PREFERENCES)
     # and its own `simplify` and `bound_statistics` preferences
     # (`simplify_setting.jl`).
-    foreach(setting -> setting.preference[] = nothing, _PREPARATION_SETTINGS)
+    foreach(setting -> _clear_preference!(setting.preference), _PREPARATION_SETTINGS)
     # The repository's package UUIDs are read from this process's installed
     # tree (`_rk_repository_module`).
     _RK_REPOSITORY_PACKAGE_UUIDS[] = nothing

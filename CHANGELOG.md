@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.342
+## 0.1.345
 
 - A bound Normal regression keeps its least-squares statistics in more shapes.
   Binding factors the shared design once with a pivoted QR. When a gathered
@@ -40,6 +40,24 @@ are recorded in the git history only.
   length matches and the inputs do not alias the buffer.
 - When an embedded prepared kernel has discarded its source plan, `js_source`
   raises `JSEmissionError` and names the endpoint it could not translate.
+## 0.1.344
+
+- JAX exports retry an adaptive ODE trial that overflows from a finite state.
+  A recovered solve returns its values and differentiates through its accepted
+  steps. The caller's tolerances and per-output step budget still apply.
+
+## 0.1.343
+
+- Concurrent kernel preparations can read their project preferences safely on
+  first use. A preparation's keywords still override the project settings for
+  its nested preparations.
+
+## 0.1.342
+
+- The generated reverse of a summed plate preserves finite quotients and
+  seeded derivatives when a shared divisor is subnormal or an intermediate
+  product would overflow. It checks the input range before reusing a shared
+  reciprocal and otherwise evaluates the original division.
 
 ## 0.1.341
 
