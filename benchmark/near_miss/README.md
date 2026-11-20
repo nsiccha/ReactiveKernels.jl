@@ -42,8 +42,8 @@ Times are nanoseconds per row for one value-and-gradient call.
 
 | Variant | Gradient, ns per row | Remark |
 | --- | ---: | --- |
-| A0 `Normal.(a .+ b .* x, sigma)` | 0.19 | bound least-squares statistics: the cost does not depend on the rows |
-| A3 the same with scale `sigma .* w`, `w` data | 7.97 | 42 times A0; weighted least squares has the same statistics |
+| A0 `Normal.(a .+ b .* x, sigma)` | 0.19 | a fast row sum: the cost grows with the rows (see the note below the table) |
+| A3 the same with scale `sigma .* w`, `w` data | 7.97 | 42 times A0 for a scale that differs only by a data weight per row |
 | A8 Student-t at the same location | 24.1 | one `log1p` per row is inherent; see D1 for the hand loop |
 | A9 scale `exp.(c .+ d .* z)` | 15.9 | |
 | B0 Bernoulli-logit, covariate with 5 values | 0.07 | duplicate cells: one cell per distinct row |
@@ -59,6 +59,13 @@ Times are nanoseconds per row for one value-and-gradient call.
 | D3 Gamma, shared shape | 33.2 | one `exp` per row is inherent |
 | D4 Weibull, shared shape | 59.4 | one `exp` per row is inherent |
 | D5 to D7 Cauchy, Laplace, Logistic | none | `SurfaceLoweringError: unknown distribution` as a response |
+
+An earlier version of this table said that A0 uses the bound least-squares
+statistics and that its cost does not depend on the rows. That was wrong. Its
+prepared program has no residual kernel (`_ls_rss`) and its value-and-gradient
+call takes 361 ns at 2,000 rows, 3,286 ns at 20,000 and 39,590 ns at 200,000
+(Julia 1.10.12 build kb8, Enzyme `dogfood` 0.13.221, one process): 0.16 to
+0.20 ns per row, the speed of a vectorized row sum.
 
 The measured gradient equals the hand loop where a benchmark model has the
 shape (Normal, Bernoulli-logit, gathered Normal) and is 3 to 8 times a hand
