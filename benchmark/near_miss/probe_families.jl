@@ -178,6 +178,16 @@ if occursin('B', fam)
     end
     record(probe("B-glm", "B8 whole-column axes, discrete", B8, (; x = xd), (; y = ybin)))
     record(probe("B-glm", "B8c whole-column axes, continuous", B8, (; x), (; y = ybinc)))
+    B9 = @rkppl begin
+        a ~ Normal(0, 1); b ~ Normal(0, 2)
+        y .~ Poisson.(exp.(a .+ b .* x) .* exposure)
+    end
+    B9log = @rkppl begin
+        a ~ Normal(0, 1); b ~ Normal(0, 2)
+        y .~ PoissonLog.(a .+ b .* x .+ log_exposure)
+    end
+    record(probe("B-glm", "B9 rate times exposure", B9, (; x, exposure = w), (; y = ycnt)))
+    record(probe("B-glm", "B9log positive exposure offset", B9log, (; x, log_exposure = log.(w)), (; y = ycnt)))
     B10 = @rkppl begin
         a ~ Normal(0, 1); b ~ Normal(0, 2)
         y[:] .~ Binomial.(n, logistic.(a .+ b .* x))

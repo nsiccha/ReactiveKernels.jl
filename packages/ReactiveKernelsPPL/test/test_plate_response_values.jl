@@ -1,4 +1,5 @@
 using DifferentiationInterface, Distributions, Enzyme, ReactiveKernels, ReactiveKernelsPPL, Test
+import LogExpFunctions
 
 # General response values, independent of the legacy grouped-model fixtures.
 function _prv_fixture(kind, n; unbound = nothing)
@@ -109,5 +110,41 @@ end
             end
             @test isequal(fx.data, saved)
         end
+    end
+end
+
+@testset "scalar row arithmetic and links in an indexed observation" begin
+    model = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        @plate for i in eachindex(y)
+            y[i] ~ Bernoulli(logistic(a + b * x[i]))
+        end
+    end
+    named = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        @plate for i in eachindex(y)
+            eta = a + b * x[i]
+            p = LogExpFunctions.logistic(eta)
+            y[i] ~ Bernoulli(p)
+        end
+    end
+    for m in (model, named), n in (0, 3, 41)
+        x = [(-1.0)^i * i for i in 1:(n + 2)]
+        y = [isodd(i) for i in 1:n]
+        bound = m(; x) | (; y)
+        @test only(bound.responses).link === ReactiveKernelsPPL.LogitLink
+        u = [0.1, 45.0]
+        built = build_kernel(bound)
+        sampler = prepare_sampler(built, bound, u; backend = DifferentiationInterface.AutoEnzyme(; mode=Enzyme.Reverse))
+        eta = u[1] .+ u[2] .* x[eachindex(y)]
+        loss = ifelse.(y, .-eta, eta)
+        v = sum(logpdf.(Normal(), u)) - sum(z -> max(z, 0) + log1p(exp(-abs(z))), loss; init=0.0)
+        residual = y .- (1 ./ (1 .+ exp.(-eta)))
+        @test sampler(u) ≈ v
+        g = similar(u)
+        sampler_value_and_gradient!(sampler, g, u)
+        @test g ≈ [sum(residual), sum(x[eachindex(y)] .* residual)] .- u
     end
 end

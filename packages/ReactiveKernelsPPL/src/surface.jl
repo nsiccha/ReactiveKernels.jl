@@ -4724,7 +4724,7 @@ function _expand_plates(args, data::Set{Symbol};
             end
             arg = _expand_cell_scans(arg)
             arg, locals = _scope_plate_locals(arg, plate_locals, taken)
-            stmts, stx, prm = _desugar_plate(arg, pl, plate_data; broadcasts, arrays)
+            stmts, stx, prm = _desugar_plate(arg, pl, plate_data; broadcasts, arrays, mod)
             _array_entry_values!(arrays, definitions)
             for st in stmts
                 pl > 0 && push!(expanded, LineNumberNode(pl))
@@ -4843,7 +4843,7 @@ function _respell_value(ex::Expr, from::Symbol, to::Symbol)
     return Expr(ex.head, (_respell_value(a, from, to) for a in ex.args)...)
 end
 
-function _desugar_plate(st::Expr, line::Int, data::Set{Symbol};
+function _desugar_plate(st::Expr, line::Int, data::Set{Symbol}; mod::Module = Main,
         broadcasts::Dict{Symbol,Vector{Symbol}} = Dict{Symbol,Vector{Symbol}}(),
         arrays::Set{Symbol} = Set{Symbol}())
     (length(st.args) == 3 && st.args[3] isa Expr &&
@@ -4903,13 +4903,13 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol};
         Meta.isexpr(c.args[2], :ref) && c.args[2].args[1] in data, cells)
     (selected || scanned) &&
         return _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
-            broadcasts, arrays)
+            broadcasts, arrays, mod)
     (rkind[1] === :levels || _plate_has_array_cells(cells)) &&
         return _desugar_array_plate(cells, ivar, rkind, line, data,
             plate_defs)
     (reads_arrays || _plate_needs_retained_cells(cells, ivar)) &&
         return _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
-            broadcasts, arrays)
+            broadcasts, arrays, mod)
     # Cell locals bound from a per-index value (they vary with the loop
     # variable, so arithmetic over them vectorizes in the desugar).
     pidx = Set{Symbol}()
@@ -5040,7 +5040,7 @@ end
 
 # Partial observation loops compute their arguments inside retained RK cells.
 # Slicing a fully computed vector would evaluate arithmetic in unselected cells.
-function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
+function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs; mod::Module = Main,
         broadcasts::Dict{Symbol,Vector{Symbol}} = Dict{Symbol,Vector{Symbol}}(),
         arrays::Set{Symbol} = Set{Symbol}())
     indices = _plate_index_values(rkind)
@@ -5105,7 +5105,7 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
         latent = Meta.isexpr(lhs, :ref, 2) && lhs.args[1] ∉ data
         lnames = Set(first.(locals))
         external = _external_rhs(c.args[3])
-        function arg(ex; object=false)
+        function arg(ex; object=false, link_family=nothing)
             # Preserve sharing within a dotted cell while lowering the
             # indexed vector through the ordinary selected-plate path.
             if _is_ref_call(ex) && _expr_has_sym(ex, ivar)
@@ -5117,10 +5117,28 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
             # stripping it to a column would broadcast a singleton instead.
             !external && Meta.isexpr(ex, :ref, 2) && ex.args[2] === ivar &&
                 ex.args[1] isa Symbol && ex.args[1] ∉ lnames && return ex
+            # Preserve the link around its selected argument. The latter
+            # still reads precisely this row and keeps its missing-data guard.
+            if link_family !== nothing && !external && !latent && !_is_broadcast_sample(c)
+                definition = ex
+                # Read aliases in declaration order. An index argument still
+                # belongs to the local scope in which its link was applied.
+                for (name, rhs) in Iterators.reverse(locals)
+                    definition === name && (definition = rhs)
+                end
+                link = _inverse_link_call(definition, mod)
+                if link !== nothing && haskey(_link_names(link_family), link.head) &&
+                        (_expr_has_sym(link.arg, ivar) ||
+                        !isdisjoint(_value_symbols(link.arg), lnames)) &&
+                        allunique(first.(locals))
+                    return Expr(:call, link.head, arg(link.arg))
+                end
+            end
             if ex isa Expr && (ex.head === :call || _is_dotted_call(ex)) &&
                     !isempty(ex.args) && (_cell_object_call(ex.args[1]) || object)
                 vals = ex.head === :call ? ex.args[2:end] : ex.args[2].args
-                arguments = map(arg, vals)
+                slot = get(_LINK_SLOTS, ex.args[1], 0)
+                arguments = [arg(v; link_family = k == slot ? ex.args[1] : nothing) for (k, v) in enumerate(vals)]
                 return ex.head === :call ? Expr(:call, ex.args[1], arguments...) :
                     Expr(:., ex.args[1], Expr(:tuple, arguments...))
             end

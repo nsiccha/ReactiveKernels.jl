@@ -20,13 +20,13 @@ julia --startup-file=no --project=<env> benchmark/near_miss/probe_families.jl [f
 `families` is a string of family letters (default `ABCDGR`), `rows` the number of
 observations (default 2000), and `filter` a regular expression over variant
 names. The environment needs ReactiveKernelsPPL, ReactiveKernels, Enzyme,
-ADTypes and Chairmarks. One line is printed per variant as soon as it is
+ADTypes, Chairmarks and LogExpFunctions. One line is printed per variant as soon as it is
 measured; a variant that fails prints its error instead of a timing.
 
 | Family | Base model | Siblings |
 | --- | --- | --- |
-| A | `y .~ Normal.(a .+ b .* x, sigma)` | named location, matrix design, data-weighted scale, LogNormal, `@plate` loop, quadratic term, exp link, Student-t, modeled scale, scalar location, crossed and gathered intercepts |
-| B | `y .~ BernoulliLogit.(a .+ b .* x)` on a discrete covariate | continuous covariate, `Bernoulli.(logistic.(…))`, Poisson, Binomial, negative binomial, `@plate` loop |
+| A | `y .~ Normal.(a .+ b .* x, sigma)` | named location, matrix design, data-weighted scale, LogNormal, `@plate` loop, quadratic term, exp link, Student-t, modeled scale, scalar location, crossed and gathered intercepts, whole-vector range |
+| B | `y .~ BernoulliLogit.(a .+ b .* x)` on a discrete covariate | continuous covariate, `Bernoulli.(logistic.(…))`, Poisson, Binomial, negative binomial, `@plate` loop, named and qualified links, whole-vector range, Poisson exposure |
 | C | `y .~ Normal.(alpha[g] .+ b .* x, sigma)` with rows sorted by group | shuffled rows, Bernoulli-logit, Poisson, Student-t |
 | D | `y .~ Normal.(exp.(a .+ b .* x), sigma)` | Student-t, LogNormal, Gamma, Weibull, Cauchy, Laplace, Logistic with shared shape or scale |
 | G | Poisson cubic trend over 40 rows | Binomial quadratic trend, one effect per row, Poisson, Binomial and Bernoulli-logit over a five-column design matrix |
@@ -86,3 +86,36 @@ formula, so its repeated rows are still evaluated one by one. The plate with
 the exact kernel equals that formula's value-and-gradient time and runs
 repeated rows once (26.0 µs to 0.5 µs), but its density-only call takes 23 to
 34 percent longer on a continuous covariate.
+
+## Observation spelling
+
+Paired prepared calls on 2,000 rows, before and after the observation lowering
+relative to `8a7f69f42`. Each pair ran in one Julia process on one CPU, with
+five alternating measurements. Times are microseconds per call.
+
+| Variant | Density before | Density after | Value and gradient before | Value and gradient after |
+| --- | ---: | ---: | ---: | ---: |
+| A0 dotted Normal | 0.136 | 0.135 | 0.365 | 0.360 |
+| A5 Normal in an indexed plate | 0.238 | 0.037 | 0.642 | 0.062 |
+| B0 dotted Bernoulli-logit, five distinct covariates | 0.116 | 0.117 | 0.143 | 0.148 |
+| B5 the same in an indexed plate | 0.249 | 0.120 | 0.510 | 0.138 |
+| B6 named logistic, five distinct covariates | 33.97 | 0.126 | 85.59 | 0.153 |
+| B7 qualified logistic, five distinct covariates | 25.35 | 0.124 | 53.02 | 0.144 |
+| B0c dotted Bernoulli-logit, continuous covariate | 17.03 | 17.04 | 19.58 | 19.60 |
+| B5c the same in an indexed plate | 40.82 | 17.74 | 98.02 | 20.74 |
+| B6c named logistic, continuous covariate | 33.70 | 18.05 | 83.68 | 20.72 |
+| B7c qualified logistic, continuous covariate | 23.88 | 16.99 | 52.68 | 19.57 |
+| B3c dotted Binomial, continuous covariate | 15.27 | 15.35 | 26.19 | 26.19 |
+| B10 the same with `y[:]` | 20.08 | 15.16 | 26.15 | 26.25 |
+
+The indexed plate exposes its row operands to the summed likelihood. RK can
+group duplicate Bernoulli observations and bind least-squares statistics for
+the Normal regression. Named and qualified logistic calls retain the logit
+predictor. The whole-vector Binomial range now uses the same density formula
+as the unsliced observation.
+
+A Poisson rate multiplied by exposure still consumes the product the model
+states. B9 took 29.67 µs per gradient. B9log took 11.30 µs with the logarithm
+of its positive exposure supplied as an offset. Replacing a general product
+with a log offset would change what happens for negative exposure or when the
+first exponential overflows before multiplication.
