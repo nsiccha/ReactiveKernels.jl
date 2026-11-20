@@ -41,12 +41,13 @@ Requires ReactiveKernels 0.1.342.
   calls and conditionals in the row expression stay in the indexed cell.
 - For a one-based response vector, `y[:]`, `y[eachindex(y)]` and `y[axes(y,
   1)]` use the unsliced likelihood when their operands cover the same rows.
-- A factor term (`alpha[g]` with declared levels) gathers its coefficients
-  by level in every spelling: with a reference level, with missing labels,
-  beside matrix terms and beside a scan. Preparation no longer builds a
-  dense contrast matrix for the cases the direct gather did not cover, whose
-  cost grew with rows times levels. A row outside the declared axis
-  contributes zero, including when every row has the reference level.
+- A factor term (`alpha[g]` with declared levels) gathers its coefficients by
+  level in every spelling: with a reference level, with missing labels, beside
+  matrix terms and beside a scan. Preparation no longer builds a dense
+  contrast matrix for the cases the direct gather did not cover, whose cost
+  grew with rows times levels. The factor term contributes zero to the
+  predictor for a row whose label is outside its declared axis, including when
+  every row has the reference level.
 
 ## 0.1.242
 

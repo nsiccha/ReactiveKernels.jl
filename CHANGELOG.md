@@ -35,9 +35,9 @@ are recorded in the git history only.
   calculation, and a rebinding whose statistics are not valid falls back to
   it. Priors, Jacobians and input checks are unchanged. `js_source` emits the
   authored rows for such a regression.
-- A prepared kernel's `vcat` into a reused vector accepts numbers beside
-  dense vectors (`vcat(0.0, alpha)`), so a coefficient table with a leading
-  entry is refilled without allocating.
+- A prepared `vcat` can refill its vector buffer from numbers and dense
+  vectors of the buffer's element type, as in `vcat(0.0, alpha)`, when the
+  length matches and the inputs do not alias the buffer.
 - When an embedded prepared kernel has discarded its source plan, `js_source`
   raises `JSEmissionError` and names the endpoint it could not translate.
 
