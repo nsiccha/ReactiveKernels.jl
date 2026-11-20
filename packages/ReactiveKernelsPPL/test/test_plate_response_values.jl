@@ -148,3 +148,40 @@ end
         @test g ≈ [sum(residual), sum(x[eachindex(y)] .* residual)] .- u
     end
 end
+
+# No row form: each entry reads every earlier one.
+_prv_field(grid, b) = b .* cumsum(grid) ./ length(grid)
+
+# A link kept around a selected argument does not change which rows that
+# argument holds: one per authored index, in loop order. The observation reads
+# the column at its positions and does not gather it at the indices again, so
+# a strict partition evaluates the cell at its own rows.
+@testset "a linked selected argument is read at the plate's own rows" begin
+    grid = collect(range(-0.7, 0.9; length = 6))
+    data = (; grid, unit = [1, 1, 2, 2, 3, 3], y = [mod(i, 4) for i in 1:6])
+    u = [0.2, -0.3]
+    rate = exp.(u[1] .+ _prv_field(grid, u[2]))
+    for iterator in (:(eachindex(y)), :(axes(y, 1)), :(1:6))
+        ast = quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            field = _prv_field(grid, b)
+        end
+        push!(ast.args, Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+            Expr(:for, :(i = $iterator), Expr(:block, :(y[i] ~ Poisson(exp(a + field[i])))))))
+        bound = bind_data(lower_rkppl(ast, data; conditioned = (:y,), mod = @__MODULE__), data)
+        @test only(bound.responses).link === ReactiveKernelsPPL.LogLink
+        built = build_kernel(bound)
+        @test !occursin("_ppl_range_operand", string(kernel_expr(bound, built.layout)))
+        sampler = prepare_sampler(built, bound, u;
+            backend = DifferentiationInterface.AutoEnzyme(; mode = Enzyme.Reverse))
+        @test sampler(u) ≈ sum(logpdf.(Normal(), u)) + sum(logpdf.(Poisson.(rate), data.y))
+        query = prepare_partition(built, bound, :y; by = :unit, locality = :error,
+            partitioned = :none, u0 = u)
+        @test any(e -> e.value === :field && e.status === :input, partition_locality(query))
+        for label in 1:3
+            rows = findall(==(label), data.unit)
+            @test query(u, label) ≈ sum(logpdf.(Poisson.(rate[rows]), data.y[rows]))
+        end
+    end
+end

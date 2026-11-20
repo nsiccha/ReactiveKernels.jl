@@ -2161,6 +2161,8 @@ end
 
 # A selected plate result already holds values in the authored index order.
 # Its positions must not be indexed a second time by the original indices.
+# A predictor over one such column keeps that order under any link: the link
+# is applied to each entry.
 function _selected_cell_value(plan::StructuralPlan, r::LikelihoodSpec, value::Symbol)
     d = findfirst(d -> d.name === value, plan.derived)
     d !== nothing && _authored_spelling(_selected_plate_indices(plan.derived[d].expr)) ==
@@ -2168,8 +2170,7 @@ function _selected_cell_value(plan::StructuralPlan, r::LikelihoodSpec, value::Sy
     i = findfirst(p -> p.name === value, plan.predictors)
     i === nothing && return false
     p = plan.predictors[i]
-    p.link === IdentityLink && length(p.terms) == 1 &&
-        p.terms[1].kind === OffsetTerm || return false
+    length(p.terms) == 1 && p.terms[1].kind === OffsetTerm || return false
     d = findfirst(d -> d.name === only(p.terms[1].columns), plan.derived)
     return d !== nothing && _authored_spelling(
         _selected_plate_indices(plan.derived[d].expr)) == r.range.args[2]
