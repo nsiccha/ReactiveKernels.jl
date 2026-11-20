@@ -9,29 +9,43 @@
 # the struct's vector in place when `EnzymeRules.overwritten` proves it
 # unchanged, and copies it otherwise (snag `native-reverse-r-b8de62b9`).
 #
-# The script prints the bytes per gradient at two sizes of the vector, and
-# checks the gradients, for three callers:
+# The script prints the bytes per call at two sizes of the vector, and checks
+# the derivatives, for four callers:
 # - `direct`: Enzyme on a function that sums two rule calls;
 # - `prepared`: a prepared RK program whose plate cells hold `sum(row(...))`;
-# - `stored`: the same program with cells that hold the rule's vector itself.
+# - `stored`: the same program with cells that hold the rule's vector itself;
+# - `pullback`: a prepared pullback (`prepare_ad_pullback`) of the rule's
+#   vector, one `ad_pullback` per call.
 #
-# Recorded on a Linux fleet host, 2026-11-20: Julia 1.10.12, Enzyme dogfood
-# `8a381501`, libEnzyme `05ce259c` (the repair present), ReactiveKernels
-# 0.1.351. Bytes per gradient at n = 1,024 and 65,536:
+# Recorded on a Linux fleet host, 2026-11-20: Julia 1.10.12, ReactiveKernels
+# 0.1.351, Enzyme dogfood `b862f996` with libEnzyme `400c1bdc` (repairs
+# `overwritten_reachable_data` and `unexposed_storage_barriers` present).
+# Bytes per call at n = 1,024 and 65,536:
 #
 #     direct   320 / 320
 #     prepared 1,376 / 1,376
-#     stored   18,208 / 1,050,240
+#     stored   1,568 / 1,568
+#     pullback 8,560 / 524,576
 #
-# A probe of the rule's Enzyme config shows why. `overwritten` is
-# `(false, false, false, false)` for `direct` and `prepared`, and
-# `(false, true, false, false)` for `stored`: there Enzyme marks the struct
-# (the rule's first argument) as possibly overwritten. The program's store of
-# the rule's returned vector into the plate's storage follows the call, and
-# Enzyme cannot show that it misses the struct's vector. So the adapter
-# copies all `n` numbers, once per rule call. A BRM GMRF coefficient row read
-# through `prepare_query_ad` has the same shape: 15.5 MB per row at 4,096
-# states.
+# A probe of the rule's Enzyme config shows why `pullback` grows with `n`.
+# `overwritten` is `(false, false, false, false)` for the first three callers
+# and `(false, true, false, false)` for `pullback`: Enzyme marks the struct
+# (the rule's first argument) as possibly overwritten, so the adapter copies
+# all `n` numbers on every call. With Enzyme's reverse mode a prepared
+# pullback keeps the port's value for `ad_value_and_pullback`:
+# `_ADSeededCall{true}` stores it into a `Ref` the preparation passes in
+# (`box[] = values`, src/ad.jl). `Enzyme.API.printperf!(true)` names that store
+# as the write that follows the rule call. With `ad_retains_primal_sweep`
+# overridden to `false` for this backend (a diagnostic only, so no value is
+# kept), the flag is `false` and a pullback takes 736 / 1,040 B. A BRM GMRF
+# coefficient row read through `prepare_ad_pullback` has this shape: 15.5 MB
+# per row Jacobian at 4,096 states. Snag `native-reverse-r-b8de62b9` reported
+# this case to Enzyme after `rule-overwritten-cc607ba7` landed.
+#
+# Before libEnzyme `400c1bdc` (dogfood `8a381501`, libEnzyme `05ce259c`),
+# `stored` copied too: 18,208 / 1,050,240 B. The program's store of the rule's
+# vector into plate storage it had allocated counted as a write the rule cannot
+# see (Enzyme snag `rule-overwritten-cc607ba7`).
 module PreparedRuleOverwritten
 using ReactiveKernels, Test
 using ReactiveKernels.DifferentiationInterface: AutoEnzyme
@@ -83,16 +97,31 @@ function prepared_bytes(g, spec = spec)
     @allocated ad_value_and_gradient(ad, theta, g, rows)
 end
 
+# The kernel's WANT is the rule's vector; a pullback seeds it with `seed`.
+const pullback_spec = @kernel prepared_row(theta, g, i) = begin
+    y = row(g, i, theta[1])
+end
+function pullback_bytes(g)
+    theta, i, seed = [2.0], 1, [1.0, 0.5]
+    k = prepare(pullback_spec; have = (:theta, :g, :i), want = :y)
+    p = prepare_ad_pullback(k, AutoEnzyme(; mode = Enzyme.Reverse), seed, theta, g, i;
+        active = :theta)
+    @test only(ad_pullback(p, seed, theta, g, i)) ≈ g.values[1] + 0.5 * g.values[2]
+    ad_pullback(p, seed, theta, g, i)
+    @allocated ad_pullback(p, seed, theta, g, i)
+end
+
+repair(name) = isdefined(Enzyme, :has_dogfood_repair) && Enzyme.has_dogfood_repair(name)
+
 @testset "a derivative rule over a struct input, direct and in a prepared program" begin
-    println("REPAIR overwritten_reachable_data = ",
-        isdefined(Enzyme, :has_dogfood_repair) &&
-            Enzyme.has_dogfood_repair(:overwritten_reachable_data))
+    println("REPAIRS ", (; overwritten_reachable_data = repair(:overwritten_reachable_data),
+        unexposed_storage_barriers = repair(:unexposed_storage_barriers)))
     @test Enzyme.autodiff(Enzyme.Reverse, Enzyme.Const(direct), Enzyme.Active,
         Enzyme.Const(Geometry([1.0, 2.0, 3.0, 4.0])), Enzyme.Active(2.0))[1][2] == 10.0
     for n in (1_024, 65_536)
         g = Geometry(collect(1.0:n))
         println("RULE_BYTES ", (; n, direct = direct_bytes(g), prepared = prepared_bytes(g),
-            stored = prepared_bytes(g, stored_spec)))
+            stored = prepared_bytes(g, stored_spec), pullback = pullback_bytes(g)))
     end
 end
 end
