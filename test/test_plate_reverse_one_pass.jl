@@ -230,9 +230,10 @@ end
 end
 
 # The primal picks the rule per call: one pass for a gathered operand with at
-# least `_PR_ONE_PASS_MIN_CELLS` cells and a shorter parent, the two-pass body
-# otherwise (an identity gather on a small plate, as RKPPL's `b[axes(n, 1)]`,
-# or a parent as long as the plate). Gradients through Enzyme agree either way.
+# least `_PR_ONE_PASS_MIN_CELLS` cells and a shorter parent, the plate's own
+# program otherwise (an identity gather on a small plate, as RKPPL's
+# `b[axes(n, 1)]`, or a parent as long as the plate), which the backend
+# differentiates. Gradients through Enzyme agree either way.
 seeded(rule, x, s, ȳ) = ȳ * rule(x, s)
 @testset "one pass is chosen per call: $name, $n cells, parent of $J" for
         (name, (ast, value, dx, ds, _)) in PROGRAMS[1:2],
@@ -244,10 +245,10 @@ seeded(rule, x, s, ȳ) = ȳ * rule(x, s)
     z = [0.3 * cos(j) for j in 1:J]
     g = n == J ? collect(1:n) : [mod1(3i, J) for i in 1:n]
     x = view(z, g)
-    @test RK._pr_rule_target(rule, (x, 0.6)) isa
-          (onepass ? RK._PlateSumRuleOnePass : RK._PlateSumRuleBody)
-    @test RK._pr_rule_target(rule, (collect(x), 0.6)) isa RK._PlateSumRuleBody
-    @test RK._pr_rule_target(rule, (view(zeros(n + 3), 2:n+1), 0.6)) isa RK._PlateSumRuleBody
+    target = RK._pr_rule_target(rule, (x, 0.6))
+    @test onepass ? target isa RK._PlateSumRuleOnePass : target === primal
+    @test RK._pr_rule_target(rule, (collect(x), 0.6)) === primal
+    @test RK._pr_rule_target(rule, (view(zeros(n + 3), 2:n+1), 0.6)) === primal
     @test rule(x, 0.6) ≈ value(x, 0.6)
     dz = zeros(J)
     cot = first(Enzyme.autodiff(Enzyme.Reverse, seeded, Enzyme.Active, Enzyme.Const(rule),

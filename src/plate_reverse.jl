@@ -2617,11 +2617,39 @@ real shadow. Under `Val(:logical)` the sweep accumulates the cell values in
 their loop and writes cotangents to zeroed buffers indexed like the operands.
 Under `Val(false)` it only adds cotangents into the supplied shadows.
 """
+# The summed-plate factoring pass (summed_plate_factors.jl) keeps the plate's
+# own loop in the fallback arm of the block it emits. That loop supplies the
+# derivative graph, while the primal keeps the factored sum. A factored sum
+# that reads frozen least-squares statistics (bound_statistics.jl) leaves no
+# cell work for a generated reverse, so the backend differentiates it.
+_pr_reads_statistics(x) = x isa Expr && x.head !== :quote &&
+    (_index_run_call(x, GlobalRef(@__MODULE__, :_ls_rss)) || any(_pr_reads_statistics, x.args))
+# A block the factoring pass produced, also after an embedded plan renamed its
+# locals: the count's name then carries the renaming suffix, which
+# `_spf_produced` does not accept, and the outer lowering factors the kept loop
+# again inside the renamed block's fallback arm.
+_pr_factored_block(x) = x isa Expr && x.head === :block && any(x.args) do a
+    Meta.isexpr(a, :(=), 2) && a.args[1] isa Symbol &&
+        occursin(_spf_mark() * "_count", String(a.args[1]))
+end
+function _pr_factored_source(ast)
+    _index_run_replace(ast) do node
+        _pr_factored_block(node) || return node
+        _pr_reads_statistics(node) && _pr_fail("the plate is summed from bound statistics")
+        fallback = node.args[end]
+        Meta.isexpr(fallback, :if, 2) || _pr_fail("unrecognized factored plate")
+        own = Any[a for a in (Meta.isexpr(fallback.args[2], :block) ? fallback.args[2].args : Any[fallback.args[2]])
+                  if !(a isa LineNumberNode)]
+        length(own) == 1 || _pr_fail("unrecognized factored plate")
+        _pr_factored_source(only(own))
+    end
+end
+
 function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict{Symbol,Any})
     Meta.isexpr(ast, :function, 2) && Meta.isexpr(ast.args[1], :tuple) ||
         _pr_fail("not a plate program")
     params = Symbol[p for p in ast.args[1].args]
-    source, index_runs = _pr_index_run_source(ast)
+    source, index_runs = _pr_index_run_source(_pr_factored_source(ast))
     body = source.args[2]
     initializers = Dict{Symbol,Vector{Pair{Symbol,Any}}}()
     _pr_arm_initializers!(initializers, body)
@@ -2872,7 +2900,7 @@ function _pr_target_expr(S, B, types, joint, make, one_pass = make)
     buffered = !isempty(types) && types[end] === _PlateTapeSlot &&
                (joint || any(b -> types[b] <: Tuple{Vararg{Float64}}, B))
     body = buffered ? one_pass(:(_PlateSumRuleOnePass{$S,$B,typeof(rule),:logical}(rule))) :
-                      make(:(_PlateSumRuleBody{$S,$B,typeof(rule)}(rule)))
+                      make(:(getfield(rule, :program)))
     gathered = [b for b in B if _pr_gather_value(types[b])]
     isempty(gathered) && return body
     buffers = Expr(:call, :+, (:(length(parent(getfield(args, $b)))) for b in gathered)...)
@@ -2893,6 +2921,7 @@ function _pr_rule_expr(S, B, types, joint, dispatch, projections)
     count = length(types) - slotted
     operands = Any[:(getfield(args, $i)) for i in 1:count]
     if !_pr_group_projections_cover(projections, types)
+        dispatch === :_pr_rule_applies && return false
         primal = :(getfield(rule, :program))
         return dispatch === :_pr_rule_target ? primal : Expr(:call, primal, operands...)
     end
@@ -2908,6 +2937,8 @@ function _pr_rule_expr(S, B, types, joint, dispatch, projections)
                            ($(operands...),)))
     end
     dispatch === :_pr_rule_target && return _pr_target_expr(S, B, types, joint, identity)
+    dispatch === :_pr_rule_applies &&
+        return _pr_target_expr(S, B, types, joint, _ -> false, _ -> true)
     call = target -> Expr(:call, target, operands...)
     one_pass = slotted ?
         (target -> Expr(:call, target, operands..., :(getfield(args, $(count + 1))))) : call
@@ -2919,7 +2950,8 @@ function _pr_source_checked_expr(S, B, types, joint, dispatch, projections, chec
     count = length(types) - (!isempty(types) && types[end] === _PlateTapeSlot)
     operands = Any[:(getfield(args, $i)) for i in 1:count]
     primal = :(getfield(rule, :program))
-    fallback = dispatch === :_pr_rule_target ? primal : Expr(:call, primal, operands...)
+    fallback = dispatch === :_pr_rule_target ? primal :
+               dispatch === :_pr_rule_applies ? false : Expr(:call, primal, operands...)
     # Source guards read only forward values. Inference over the reverse
     # must exclude the missing-source return in both value schedules. This
     # is a type query; no cells, shadows or numeric inputs are evaluated.
@@ -2940,6 +2972,11 @@ end
     _pr_source_checked_expr(S, B, args.parameters, J, :_pr_rule_target, G, C)
 @generated _pr_rule_call(rule::_PlateSumRule{S,B,P,R,J,G,C}, args::Tuple) where {S,B,P,R,J,G,C} =
     _pr_source_checked_expr(S, B, args.parameters, J, :_pr_rule_call, G, C)
+# Whether this call takes a one-pass schedule, from its operand types and
+# sizes alone. A call that does not runs the plate inline, where the backend
+# differentiates the optimized program exactly as it does without a rule.
+@generated _pr_rule_applies(rule::_PlateSumRule{S,B,P,R,J,G,C}, args::Tuple) where {S,B,P,R,J,G,C} =
+    _pr_source_checked_expr(S, B, args.parameters, J, :_pr_rule_applies, G, C)
 _pr_projections(::Type{<:_PlateSumRule{S,B,P,R,J,G}}) where {S,B,P,R,J,G} = G
 @generated _pr_rule_target(rule::_PRGroupBroadcastRule{I,F}, args::Tuple) where {I,F} =
     _pr_group_broadcast_expr(I, _pr_projections(F), args.parameters, :_pr_rule_target)
@@ -3156,15 +3193,23 @@ function _pr_inline_plate_programs(ast::Expr, kernel, active_ports; tape_slot = 
                     length(operands) < _PLATE_CALL_MAX_ARGUMENTS
                 operands = Any[operands..., tape_slot()]
             end
-            return Expr(:(=), node.args[1], Expr(:call, rule, operands...))
+            called = Expr(:(=), node.args[1], Expr(:call, rule, operands...))
+            rule isa _PlateSumRule || return called
+            # The else arm keeps the program call, which is inlined below.
+            return Expr(:if, Expr(:call, GlobalRef(@__MODULE__, :_pr_rule_applies), rule,
+                                  Expr(:tuple, operands...)), called, node)
         elseif node isa Expr && node.head !== :quote
             return Expr(node.head, Any[replace(a) for a in node.args]...)
         end
         node
     end
     new = replace(ast)
-    # The remaining programs inline, as before.
-    _inline_plate_programs(new), report
+    # The remaining programs inline, as before. A preparation that owns AD
+    # caches (the non-allocating program) inlines every plate without a rule,
+    # as it does with the generated reverse disabled (`_ad_na_inline_plate`).
+    expand = tape_slot === nothing ? _plate_program_or_inline :
+        (node, call, declared) -> _inline_plate_program(call, declared)
+    _inline_plate_programs(new; expand), report
 end
 
 _pr_active_ports(kernel::PreparedKernel, I) = begin

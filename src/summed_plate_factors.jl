@@ -458,7 +458,7 @@ _spf_produced(ex::Expr) = ex.head === :block && any(ex.args) do a
 end
 
 function _lower_summed_plate_factors_native(body::Expr, ops)
-    _simplify() && !_plate_reverse_enabled() && !_footprint_recording() || return body
+    _simplify() && !_footprint_recording() || return body
     _index_run_replace(body) do ex
         # A loop this pass already rewrote keeps its own loop in the fallback:
         # a fresh node stops the descent, so the pass is idempotent.

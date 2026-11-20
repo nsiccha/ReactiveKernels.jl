@@ -54,8 +54,10 @@ const logistic = scalar_derivative_rule(logistic_graph;
     return total
 end
 
-rule_count(x::RK._PlateSumRule) = 1
-rule_count(x::Expr) = sum(rule_count, x.args; init = 0)
+# Calls of a generated rule. The AD body also names the rule in the test that
+# decides between its call and the plate's own inline program.
+rule_count(x::Expr) = (Meta.isexpr(x, :call) && first(x.args) isa RK._PlateSumRule) +
+    sum(rule_count, x.args; init = 0)
 rule_count(x) = 0
 structure(x) = (1, 0)
 structure(x::RK._PlateProgram) = structure(x.ast)
