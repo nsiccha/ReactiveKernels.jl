@@ -532,25 +532,33 @@ _pr_wide_quotient(factors, d) = prod(Base.front(factors); init = 1) * (last(fact
 # Several incoming cotangent terms can cancel. Add their normalized
 # products before contracting the quotient partial, even when an individual
 # term exceeds the scalar type's exponent range.
-@noinline function _pr_sum_quotient(terms::Tuple{Vararg{Tuple{Vararg{_PRBinaryScalar}}}},
-                                    n::_PRBinaryScalar, d::_PRBinaryScalar)
+@inline function _pr_add_parts(a, b)
+    v, p = a
+    w, e = b
+    iszero(v) && return b
+    iszero(w) && return a
+    common = max(p, e)
+    mantissa, shift = frexp(ldexp(v, p - common) + ldexp(w, e - common))
+    mantissa, common + shift
+end
+@inline _pr_parts_value((v, p)) = iszero(p) ? v : ldexp(v, p)
+
+@noinline function _pr_accumulate_quotient(acc, terms::Tuple{Vararg{Tuple{Vararg{_PRBinaryScalar}}}},
+                                           n::_PRBinaryScalar, d::_PRBinaryScalar)
     T = float(promote_type(typeof(n), typeof(d), map(t -> Base.promote_typeof(t...), terms)...))
-    value, power = zero(T), 0
+    value = (zero(T), 0)
     for factors in terms
-        v, p = _pr_product_parts(factors, T)
-        if iszero(value)
-            value, power = v, p
-        elseif !iszero(v)
-            common = max(power, p)
-            value, shift = frexp(ldexp(value, power - common) + ldexp(v, p - common))
-            power = common + shift
-        end
+        value = _pr_add_parts(value, _pr_product_parts(factors, T))
     end
     m, e = frexp(T(d))
     v, p = frexp(T(n))
-    ldexp((value * v) / m, power + p - e)
+    partial, shift = frexp(value[1] * v / m)
+    _pr_add_parts(acc, (partial, value[2] + p - e + shift))
 end
-_pr_sum_quotient(terms, n, d) = sum(prod, terms) * (n / d)
+function _pr_accumulate_quotient(acc, terms, n, d)
+    (_pr_parts_value(acc) + sum(prod, terms) * (n / d), 0)
+end
+_pr_sum_quotient(terms, n, d) = _pr_parts_value(_pr_accumulate_quotient((0.0, 0), terms, n, d))
 
 function _pr_partial_product(cotangent, partial, quotient)
     if quotient
@@ -586,7 +594,7 @@ function _pr_reverse_exprs!(out, stmts, active::Set{Symbol}, defined::Set{Symbol
             for (a, p) in zip(s.args, partials)
                 a isa Symbol && a in active || continue
                 p === nothing && _pr_fail("`$(s.fref)` has no derivative in an active argument")
-                _pr_accumulate!(out, defined, a, _pr_partial_product(ybar, p, s.f === Base.:/); touched)
+                _pr_accumulate!(out, defined, a, _pr_partial_product(ybar, p, s.f === Base.:/ && length(s.args) == 2); touched)
             end
         elseif s isa _PRBranch
             s.lhs in active && _pr_bar(s.lhs) in defined || continue
@@ -1407,14 +1415,17 @@ end
 # A bounded quotient can leave its common coefficient outside the cell
 # reduction. Otherwise contract all the factors with the original divisor
 # in the cell, so an intermediate product need not be representable.
+function _pr_quotient_products(terms)
+    map(terms) do term
+        factors = Any[term.num, term.inv...]
+        term.var === nothing || push!(factors, term.var)
+        Expr(:tuple, factors...)
+    end
+end
 function _pr_factored_quotient!(out, fc, terms, partial, toplevel, q)
     _, num, d = partial.args
     if length(terms) != 1
-        products = map(terms) do term
-            factors = Any[term.num, term.inv...]
-            term.var === nothing || push!(factors, term.var)
-            Expr(:tuple, factors...)
-        end
+        products = _pr_quotient_products(terms)
         value = :($(GlobalRef(@__MODULE__, :_pr_sum_quotient))(($(products...),), $num, $d))
         return _PRTerm(1.0, Any[], _pr_bind!(out, fc, value))
     end
@@ -1445,6 +1456,37 @@ function _pr_factored_quotient!(out, fc, terms, partial, toplevel, q)
     _PRTerm(negative ? -1.0 : 1.0, Any[], _pr_bind!(out, fc, value))
 end
 
+function _pr_quotient_contribution!(out, fc, adj, mutable, a, terms, p, toplevel, q)
+    if !(a in fc.shared)
+        scaled = _pr_factored_quotient!(out, fc, terms, p, toplevel, q)
+        _pr_contribute!(out, fc, adj, mutable, a, [scaled], toplevel)
+        return
+    end
+    normal = Any[]
+    scaled = _pr_factored_quotient!(normal, fc, terms, p, toplevel, q)
+    # A shared cotangent can be finite after cancellation even
+    # when individual rows exceed the destination's exponent range.
+    state = get!(q.sums, a) do
+        temp = _pr_fresh!(fc, :quotient_sum)
+        push!(fc.pre, :($temp = (0.0, 0)))
+        push!(fc.post, :(if !iszero(first($temp))
+            $(_pr_bar(a)) += $(GlobalRef(@__MODULE__, :_pr_parts_value))($temp)
+        end))
+        temp
+    end
+    push!(fc.st.touched, a)
+    _, n, d = p.args
+    products = _pr_quotient_products(terms)
+    wide = :($state = $(GlobalRef(@__MODULE__, :_pr_accumulate_quotient))(
+        $state, ($(products...),), $n, $d))
+    if isempty(scaled.inv)
+        push!(out, wide)
+    else
+        _pr_contribute!(normal, fc, adj, mutable, a, [scaled], toplevel)
+        push!(out, Expr(:if, q.normal, Expr(:block, normal...), wide))
+    end
+end
+
 # The factored reverse sweep of `stmts`.
 function _pr_factored_sweep!(out, fc::_PRFactored, stmts, adj, mutable, toplevel::Bool, cuts, q)
     st = fc.st; active = fc.active
@@ -1456,7 +1498,7 @@ function _pr_factored_sweep!(out, fc::_PRFactored, stmts, adj, mutable, toplevel
             _pr_contribute!(out, fc, adj, mutable, s.rhs, terms, toplevel)
         elseif s isa _PRCall
             s.lhs in active || continue
-            terms = if s.f === Base.:/ && !haskey(mutable, s.lhs)
+            terms = if s.f === Base.:/ && length(s.args) == 2 && !haskey(mutable, s.lhs)
                 get(adj, s.lhs, nothing)
             else
                 _pr_adjoint_terms!(out, fc, adj, mutable, s.lhs)
@@ -1472,9 +1514,8 @@ function _pr_factored_sweep!(out, fc::_PRFactored, stmts, adj, mutable, toplevel
             for (a, p) in zip(s.args, partials)
                 a isa Symbol && a in active || continue
                 p === nothing && _pr_fail("`$(s.fref)` has no derivative in an active argument")
-                if s.f === Base.:/
-                    scaled = _pr_factored_quotient!(out, fc, terms, p, toplevel, q)
-                    _pr_contribute!(out, fc, adj, mutable, a, [scaled], toplevel)
+                if s.f === Base.:/ && length(s.args) == 2
+                    _pr_quotient_contribution!(out, fc, adj, mutable, a, terms, p, toplevel, q)
                     continue
                 end
                 num, inv, vars = _pr_split_partial(fc, p, toplevel)
@@ -1940,13 +1981,16 @@ end
 @inline _pr_bound_storage(x::Base.Broadcast.Extruded) = x.x
 _pr_bounded_vector(x) = false
 @inline _pr_bounded_vector(x::_PRSpanGather) = _pr_bounded_vector(parent(x))
+@inline function _pr_range_delta(x::Float64)
+    bits = reinterpret(UInt64, abs(x))
+    ifelse(iszero(bits), zero(UInt64), bits - reinterpret(UInt64, 0x1p-40))
+end
 function _pr_bounded_vector(x::_PRPlainVector{Float64})
     lo = reinterpret(UInt64, 0x1p-40)
     hi = reinterpret(UInt64, 0x1p40)
     bound = zero(UInt64)
     @inbounds @simd for i in eachindex(x)
-        bits = reinterpret(UInt64, abs(x[i]))
-        bound = max(bound, ifelse(iszero(bits), zero(UInt64), bits - lo))
+        bound = max(bound, _pr_range_delta(x[i]))
     end
     bound <= hi - lo
 end
@@ -1973,7 +2017,7 @@ function _pr_quotient_bounds!(q, stmts, st, external, invariant)
     defs = Dict{Symbol,Any}()
     for s in stmts
         s isa Union{_PRCall,_PRAlias} || continue
-        haskey(defs, s.lhs) && return false
+        (haskey(defs, s.lhs) || s.lhs in external) && return false
         # Only inspect storage ahead of calls whose target is known to be pure.
         # A local callable is checked against the value used during preparation.
         if s isa _PRCall && s.fref isa Expr
@@ -2004,6 +2048,64 @@ function _pr_quotient_bounds!(q, stmts, st, external, invariant)
     # Squaring uses at most 680 bits, three shared factors and division
     # another 160, and an Int-sized reduction at most 63.
     all(x -> bound(x) <= 340, q.targets)
+end
+
+# Range checks can share the gather loop's reads on long consecutive runs.
+# Only a sole zeroed shadow, reached exactly once in the program, can be
+# restored for a retry. Plain floating storage and cell-index-only reads
+# make the tentative arithmetic free of observable effects.
+@inline function _pr_check_in_gather(cells, value, shadow, operands)
+    value isa _PRSpanGather && length(parent(value)) >= 128 &&
+        _pr_span_possible(cells, value, shadow, operands) &&
+        all(x -> eltype(x) === Float64, operands) && _pr_bounded_vector(parent(value))
+end
+
+function _pr_checked_reads(stmts, st, linear, written)
+    indices = Set([linear])
+    reads = Set{Symbol}()
+    for s in stmts
+        if s isa _PRAlias
+            s.rhs in indices && push!(indices, s.lhs)
+        elseif _pr_is_read(s, st)
+            s.args[2] in indices || return nothing
+            st.prepared[s.args[1]] === written || push!(reads, s.lhs)
+        elseif s isa _PRCall && s.f === Base.CartesianIndex && s.args == [linear]
+            push!(indices, s.lhs)
+        elseif !(s isa _PRCall && (s.f in (+, -, *, /, _native_mul, abs, abs2) ||
+                (s.f === (^) && length(s.args) == 2 && s.args[2] isa Int && s.args[2] >= 0)))
+            return nothing
+        end
+    end
+    reads
+end
+
+function _pr_checked_loop(ordinary, exceptional, visible, reads, check, shadow,
+                          coefficients, value_pre, normal)
+    bound = gensym(:range_delta)
+    inspected = _index_run_replace(ordinary) do node
+        if Meta.isexpr(node, :(=), 2) && node.args[1] in reads
+            lhs = node.args[1]
+            return Expr(:block, node, :($bound = max($bound,
+                $(GlobalRef(@__MODULE__, :_pr_range_delta))($lhs))))
+        end
+        node
+    end
+    limit = reinterpret(UInt64, 0x1p40) - reinterpret(UInt64, 0x1p-40)
+    quote
+        if $check
+            $bound = zero(UInt64)
+            $(_pr_quotient_loop(inspected, union(visible, [bound])))
+            if $bound > $limit
+                fill!(parent($shadow), 0.0)
+                $normal = false
+                $(coefficients...)
+                $(value_pre...)
+                $exceptional
+            end
+        else
+            $(_pr_quotient_loop(ordinary, visible))
+        end
+    end
 end
 
 # Compile the bounded and exceptional loops independently. Placing the cold
@@ -2100,7 +2202,8 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState, indexed:
         cells = Symbol(:_pr_cells, st.counter)
         ncells = Symbol(:_pr_ncells, st.counter)
         coefficients = Any[]
-        q = (normal = gensym(:bounded_quotients), targets = Any[], shared = Any[], divisors = Any[])
+        q = (normal = gensym(:bounded_quotients), targets = Any[], shared = Any[], divisors = Any[],
+             sums = Dict{Symbol,Symbol}())
         flush = Any[]
         if result isa Symbol && result in active
             shared = Set{Symbol}(s for s in st.outer if !(s in st.totals))
@@ -2195,7 +2298,7 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState, indexed:
             function specialize(body, arm)
                 _index_run_replace(body) do node
                     if Meta.isexpr(node, :if, 3) && node.args[1] === q.normal
-                        return node.args[arm]
+                        return specialize(node.args[arm], arm)
                     elseif arm == 2 && Meta.isexpr(node, :(=), 2) && haskey(fast_divisions, node.args[1])
                         return Expr(:(=), node.args[1], fast_divisions[node.args[1]])
                     end
@@ -2229,8 +2332,30 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState, indexed:
                         writes = _pr_assignments!(Pair{Symbol,Any}[], Expr(:block, init_block...))
                         union!(visible, first.(writes))
                     end
-                    ordinary = _pr_quotient_loop(ordinary, visible)
                     exceptional = _pr_quotient_loop(exceptional, visible)
+                    reads = if raw && length(st.shadow) == length(written) == 1 &&
+                            get(st.reads, only(written), 0) == 1
+                        _pr_checked_reads(inloop, st, linear, only(written))
+                    end
+                    if reads === nothing || isempty(reads)
+                        ordinary = _pr_quotient_loop(ordinary, visible)
+                    else
+                        check = gensym(:check_in_gather)
+                        certificate = _index_run_replace(certificate) do node
+                            if !(Meta.isexpr(node, :call) &&
+                                    first(node.args) == GlobalRef(@__MODULE__, :_pr_bounded_storage))
+                                return node
+                            end
+                            quote
+                                $check = $_PR_WANT_VALUE isa Val{true} &&
+                                    $(GlobalRef(@__MODULE__, :_pr_check_in_gather))(
+                                        $cells, $(only(written)), $(only(shadows)), ($(read_operands...),))
+                                $check || $node
+                            end
+                        end
+                        ordinary = _pr_checked_loop(ordinary, exceptional, visible, reads,
+                            check, only(shadows), coefficients, value_pre, q.normal)
+                    end
                 end
                 loop = Expr(:if, q.normal, ordinary, exceptional)
             else

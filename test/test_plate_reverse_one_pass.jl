@@ -86,6 +86,19 @@ end
     @test value == x[1] / d
     @test ds == -value / d
 
+    # The final shared cotangent is representable, even when an individual
+    # row or the partial sum of the first two rows exceeds Float64.
+    for (x, d) in (([1e100, -1e100], 1e-150), ([1.0, 1.0, -1.0], 1e-154))
+        expected = Float64(-sum(BigFloat.(x ./ d)) / BigFloat(d))
+        for want in (false, true)
+            dx = zeros(length(x))
+            value, ds = linear(x, d, 1.0, Val(want), dx)
+            want && @test value ≈ sum(x ./ d)
+            @test all(≈(1 / d), dx)
+            @test ds ≈ expected
+        end
+    end
+
     # The original cell order cancels to a finite result even though
     # multiplying the seed into the first two numerators would overflow.
     d, seed = 1e300, floatmax(Float64)

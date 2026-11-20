@@ -571,6 +571,38 @@ function watch_span_end(indices, lo, lastcell, start, lastparent)
     hi
 end
 
+@testset "checked quotient gather restores its owned shadow for exceptional rows" begin
+    read = GlobalRef(RK, :_plate_read)
+    ast = direct_program(; raw = :x)
+    append!(ast.args[1].args, (:weights, :d))
+    ast = RK._index_run_replace(ast) do node
+        Meta.isexpr(node, :(=), 2) && node.args[1] === :term || return node
+        :(term = (v + $read(weights, index)) / d)
+    end
+    expr = first(RK._pr_program_reverse(ast, [:x, :d], RK, Dict{Symbol,Any}()))
+    @test occursin("_pr_check_in_gather", string(expr))
+    sweep = RK.compile(expr)
+    z = zeros(256)
+    indices = repeat(collect(eachindex(z)), 4)
+    weights = ones(length(indices))
+    gradient = zeros(length(z))
+    x, shadow = view(z, indices), view(gradient, indices)
+    @test RK._pr_check_in_gather(axes(x, 1), x, shadow, (x, weights))
+    d = 0x1.77ee5e8d806e2p-1
+    for last_weight in (1.0, 0x1.77ee5e8d806e2p+1023, 1.0)
+        weights[end] = last_weight
+        for want in (true, false)
+            existing = want ? 0.0 : 0.25
+            fill!(gradient, existing)
+            value, ds = sweep(x, weights, d, 1.0, Val(want), shadow)
+            quotients = weights ./ d
+            want && @test value ≈ sum(quotients)
+            @test ds ≈ Float64(-sum(BigFloat.(quotients)) / BigFloat(d))
+            @test all(≈(4 / d + existing), gradient)
+        end
+    end
+end
+
 @testset "grouped spans preserve inactive direct-read indices" begin
     ast = direct_program()
     push!(ast.args[1].args, :weights)
