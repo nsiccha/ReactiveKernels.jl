@@ -2794,6 +2794,10 @@ _js_bound(mod::_JsModule, x, hint) = _js_static(x)
 function _js_function_call(ir::_JsIR, k::PreparedKernel, args, T)
     mod = ir.fn.mod
     p = k.plan
+    # An execution copy keeps the callable and its real ports but discards
+    # the plan this translator reads (_execution_copy_object).
+    p === _EXECUTION_PLAN && _js_error(mod, "cannot translate the embedded prepared kernel for `",
+        join((v.name for v in outputs(k)), ", "), "` to JavaScript because its source plan was discarded")
     length(p.have) == length(args) ||
         _js_error(mod, "a prepared kernel of ", length(p.have), " inputs called with ", length(args))
     argtypes = Any[_js_argtype(a) for a in args]

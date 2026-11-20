@@ -167,6 +167,36 @@ end
     end
 end
 
+@testset "JavaScript evidence for location-scale responses" begin
+    # Both calls reach a log tail. The Cauchy tail also calls a prepared
+    # standardized endpoint whose execution copy can lack its source plan.
+    for (law, has_embedded_endpoint) in ((:(Cauchy.(a, 1.25)), true), (:(TDist.(exp(a))), false))
+        model = ReactiveKernelsPPL.RKPPLModel(quote
+            a ~ Normal()
+            y .~ interval_censored.($law, 1.7)
+        end, @__MODULE__)
+        plan = model() | (; y = [-1.0, 0.2, 1.0])
+        density = prepare_query(build_kernel(plan), plan, :sampler)
+        source = try
+            ReactiveKernels.js_source(density; types = (; unconstrained = Vector{Float64}), name = :density)
+        catch err
+            has_embedded_endpoint || rethrow()
+            @test err isa ReactiveKernels.JSEmissionError &&
+                occursin("source plan was discarded", err.message)
+            continue
+        end
+        if ReactiveKernels._js_default_node() !== nothing
+            args = [([0.3],), ([-1.5],)]
+            for (arg, r) in zip(args, ReactiveKernels.js_run(source, :density, args))
+                @test r.error === nothing
+                r.error === nothing && @test r.value ≈ Base.invokelatest(density, arg...)
+            end
+        else
+            @test_skip "no node on the PATH"
+        end
+    end
+end
+
 @testset "a caller's density with scale before location" begin
     model = @rkppl begin
         a ~ Normal()
