@@ -1,13 +1,13 @@
 module StorageWorkloads
 using ReactiveKernels
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
-    _student_log_kernel, _student_log_kernel_at_log_abs
+    _student_log1p, _student_log1p_at_log_abs
 
 @kernel stored(u::Vector{Float64}, nu::Float64) = begin
     w = exp.(u)
     squared = w .^ 2
     prior = plate(w, Ref(nu)) do wi, ni
-        _student_log_kernel(ni, wi)
+        -(ni + 1) / 2 * _student_log1p(ni, wi)
     end
     total = sum(squared) + sum(prior)
     return total
@@ -16,7 +16,7 @@ end
 @kernel explicit(u::Vector{Float64}, nu::Float64) = begin
     squared = exp.(2 .* u)
     prior = plate(u, Ref(nu)) do ui, ni
-        _student_log_kernel_at_log_abs(ui, ni)
+        -(ni + 1) / 2 * _student_log1p_at_log_abs(ui, ni)
     end
     total = sum(squared) + sum(prior)
     return total
@@ -26,7 +26,7 @@ end
     w = exp.(u)
     squared = w .^ 2
     prior = plate(w, Ref(nu)) do wi, ni
-        _student_log_kernel(ni, wi)
+        -(ni + 1) / 2 * _student_log1p(ni, wi)
     end
     total = sum(squared) + sum(prior) + sum(w)
     return total
@@ -36,7 +36,7 @@ end
     w = exp.(u)
     logarithms = log.(w)
     prior = plate(w, Ref(nu)) do wi, ni
-        _student_log_kernel(ni, wi)
+        -(ni + 1) / 2 * _student_log1p(ni, wi)
     end
     total = sum(logarithms) + sum(prior)
     return total
@@ -45,7 +45,7 @@ end
 @kernel returned(u::Vector{Float64}, nu::Float64) = begin
     w = exp.(u)
     prior = plate(w, Ref(nu)) do wi, ni
-        _student_log_kernel(ni, wi)
+        -(ni + 1) / 2 * _student_log1p(ni, wi)
     end
     total = sum(prior)
     return w, total
@@ -78,7 +78,7 @@ end
     w = exp.(u)
     squared = w .^ 2
     prior = plate(y, w, Ref(nu)) do yi, wi, ni
-        yi + _student_log_kernel(ni, wi)
+        yi - (ni + 1) / 2 * _student_log1p(ni, wi)
     end
     total = sum(squared) + sum(prior)
     return total
@@ -89,7 +89,7 @@ end
     squared = w .^ 2
     other = MutatingPeer(data, point)
     prior = plate(other, w, Ref(nu)) do yi, wi, ni
-        yi + _student_log_kernel(ni, wi)
+        yi - (ni + 1) / 2 * _student_log1p(ni, wi)
     end
     total = sum(squared) + sum(prior)
     return total
