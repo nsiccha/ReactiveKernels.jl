@@ -1,5 +1,6 @@
 using Test, ReactiveKernels, DifferentiationInterface
 import Enzyme
+using StaticArrays: SVector
 
 @kernel _accumulation_cell(x::Vector{Float64}, base::Vector{Float64},
                           field::Vector{Float64}, cell::Int) = begin
@@ -136,4 +137,60 @@ end
     other = (; scale = -0.5, weights = [0.25, 4.0])
     @test ad_pullback(pullback, other, b) ≈
         [other.scale * exp(b[1]), 0.0] .+ 2 .* b .* other.weights
+end
+
+@testset "An immutable SVector port and WANT" begin
+    # A tuple selector holds an isbits array leaf, like a scalar, as `Ref`
+    # storage: left immutable beside a mutable array, an accumulator could
+    # neither zero nor add into its shadow (snag rkppl-zero-cell-0a0880ea).
+    graph = Graph()
+    x = value!(graph, :x, Vector{Float64})
+    pair = value!(graph, :pair, SVector{2,Float64})
+    density = value!(graph, :density, Float64)
+    add!(graph, (x, pair) => density, (q, p) -> p[1] * q[1]^2 + p[2]^2 * q[1])
+    kernel = prepare(graph; have = (x, pair), want = density)
+    reverse = AutoEnzyme(; mode = Enzyme.Reverse)
+    second = SecondOrder(reverse, AutoEnzyme(; mode = Enzyme.Forward))
+    xv, pv = [0.5], SVector(2.0, 0.75)
+    expected_x = [2 * pv[1] * xv[1] + pv[2]^2]
+    expected_pair = SVector(xv[1]^2, 2 * pv[2] * xv[1])
+
+    g = ad_gradient(kernel, reverse, xv, pv; active = (:x, :pair))
+    @test g[1] ≈ expected_x
+    @test g[2] isa SVector{2,Float64}
+    @test g[2] ≈ expected_pair
+    prepared = prepare_ad(kernel, reverse, xv, pv; active = (:x, :pair))
+    value, h = ad_value_and_gradient(prepared, xv, pv)
+    @test value ≈ pv[1] * xv[1]^2 + pv[2]^2 * xv[1]
+    @test h[2] isa SVector{2,Float64}
+    @test h[2] ≈ expected_pair
+
+    q = prepare_ad_accumulator(kernel, reverse, xv, pv; active = (:x, :pair))
+    storage = ad_accumulator_storage(q, xv, pv)
+    @test storage[2] isa Base.RefValue{SVector{2,Float64}}
+    for _ in 1:2
+        ad_accumulate!(q, storage, nothing, 0.5, xv, pv)
+    end
+    @test storage[1] ≈ expected_x
+    @test storage[2][] ≈ expected_pair
+    # The shadow is held fixed by a directional pass over `x` and still
+    # receives the mixed derivative: d/dpair (Hxx v) = (2 v, 0).
+    q1 = prepare_ad_accumulator(kernel, second, xv, pv;
+        active = (:x, :pair), directional = :x, order = 1)
+    storage1 = ad_accumulator_storage(q1, xv, pv)
+    ad_accumulate!(q1, storage1, [0.4], 1.0, xv, pv)
+    @test storage1[1] ≈ [2 * pv[1] * 0.4]
+    @test storage1[2][] ≈ SVector(2 * xv[1] * 0.4, 2 * pv[2] * 0.4)
+
+    # An SVector as the one WANT of a pullback.
+    produced = Graph()
+    beta = value!(produced, :beta, Vector{Float64})
+    record = value!(produced, :record, SVector{2,Float64})
+    add!(produced, beta => record, b -> SVector(exp(b[1]), b[1] * b[2]))
+    producer = prepare(produced; have = beta, want = record)
+    b, seed = [0.3, -0.4], SVector(1.5, 2.0)
+    expected_b = [seed[1] * exp(b[1]) + seed[2] * b[2], seed[2] * b[1]]
+    @test ad_pullback(producer, reverse, seed, b; active = :beta) ≈ expected_b
+    pullback = prepare_ad_pullback(producer, reverse, seed, b; active = :beta)
+    @test ad_pullback(pullback, seed, b) ≈ expected_b
 end

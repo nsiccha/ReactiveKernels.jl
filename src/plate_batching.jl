@@ -119,7 +119,7 @@ end
 # typing.
 _plate_batch_candidate(r::Recipe) = _plate_batch_candidate(r.op)
 _plate_batch_candidate(op::_AuthoredPlateOp) = _plate_batching_enabled() &&
-    !_plate_reverse_enabled() && any(_batch_has_product, getfield(op.kernel, :plan).recipes)
+    any(_batch_has_product, getfield(op.kernel, :plan).recipes)
 _batch_has_product(q::Recipe) = q.op === Base.:* || _batch_source_has_product(q.source)
 _batch_source_has_product(ex) = ex isa Expr && ((ex.head === :call && length(ex.args) >= 3 &&
     _batch_star(ex.args[1])) || any(_batch_source_has_product, ex.args))

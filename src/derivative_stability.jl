@@ -48,6 +48,22 @@ ran, with ReactiveKernels' reading of their findings.
   allocations, on Julia's heap (`:gc_allocation`) or native (`:native_allocation`,
   such as Enzyme's tape), with their size where it is a constant (`bytes`).
 
+A finding's `frames` are its source lines, innermost first. In the program
+ReactiveKernels generates, the statement a call is in is a frame
+`macro expansion` at line 1 of the file `./rk:<value>`: `<value>` is the value
+the statement assigns, the name [`ad_cost_profile`](@ref) reports
+(`plate_<value>` for a plate cell's `<value>`, on some loop paths with a
+suffix such as `#direct`), and `(other statements)` is code between
+statements (loop control, branch conditions, calls whose result is not
+assigned), such as the buffers Enzyme keeps for a plate's loop as a whole. A
+statement that assigns inside another is a frame inside the other's. Calls of
+one function in different statements are different findings, each with its
+own `count`. A finding inside a function Enzyme
+differentiates on its own (an `in_function` such as `augmented_julia_copyto_…`)
+has frames up to its call site only where that function has one call site in
+the derivative's code; with several, its frames end in the function itself
+(Enzyme snag `derivative-repor-e519a164`).
+
 `unstable` and `allocations` leave out calls only reached on a path that ends
 in an error (`throw_only`), and calls an expansion of Julia's logging macros
 writes, which the primal check exempts too. Calls in code the derivative runs
@@ -95,8 +111,10 @@ const _DERIVATIVE_REPORT_REACHABILITY = Ref(false)
 # Whether a frame of debug info is in Julia's own code (Base, Core and the
 # standard libraries), whose bodies the primal check treats as leaves: debug
 # info names Base's files `./x.jl` and the standard libraries by their install
-# path.
+# path. A statement scope of RK's generated code (`./rk:<name>`, ad_cost.jl)
+# is not.
 function _julia_own_frame(frame)
+    _marker_label(frame) === nothing || return false
     file = String(frame.file)
     startswith(file, "./") || startswith(file, Sys.STDLIB) ||
         occursin("/share/julia/base/", file) || occursin("/share/julia/stdlib/", file)

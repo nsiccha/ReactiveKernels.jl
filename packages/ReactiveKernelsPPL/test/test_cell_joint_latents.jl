@@ -12,6 +12,7 @@ module _CJLFixtures
 using ReactiveKernelsPPL
 import Distributions
 using LogExpFunctions: logsumexp
+using SpecialFunctions: loggamma
 
 # Stan's isometric sum-to-zero basis: K × (K - 1), orthonormal columns
 # orthogonal to the ones vector.
@@ -153,6 +154,35 @@ ReactiveKernelsPPL.sampling_geometry(::Type{LiveShape}, args, shape) =
     ParameterGeometry((args[1],), args[1]; support = :real,
         constrain = (u, shape, n) -> collect(u), unconstrain = (x, shape, n) -> collect(x),
         logjac = (u, shape, n) -> 0.0)
+
+# A simplex of `n` entries per index under a Dirichlet whose concentration is
+# one vector shared by every index, as BRM's cell `theta ~ Dirichlet(alpha)`:
+# its coordinates are the first `n - 1` additive log-ratios.
+alr_values(u) = (e = exp.(vcat(u, zero(eltype(u)))); e ./ sum(e))
+@inline dirichlet_logdensity(alpha, x) =
+    loggamma(sum(alpha)) - sum(loggamma, alpha) + sum((alpha .- 1) .* log.(x))
+simplex_geometry(n) = ParameterGeometry((n,), :($n - 1); support = :simplex,
+    constrain = (u, shape, args...; kwargs...) -> alr_values(u),
+    unconstrain = (x, shape, args...; kwargs...) -> log.(x[1:(end - 1)] ./ x[end]),
+    logjac = (u, shape, args...; kwargs...) -> sum(log, alr_values(u)))
+struct SharedDirichlet{N,A}
+    n::N
+    alpha::A
+end
+@inline ReactiveKernelsPPL.sampling_logdensity(d::SharedDirichlet, x) =
+    dirichlet_logdensity(d.alpha, x)
+ReactiveKernelsPPL.sampling_geometry(::Type{SharedDirichlet}, args, shape) =
+    simplex_geometry(args[1])
+# The same law with its concentration as a keyword.
+struct SharedDirichletKeyword{N,A}
+    n::N
+    alpha::A
+end
+SharedDirichletKeyword(n; alpha) = SharedDirichletKeyword(n, alpha)
+@inline ReactiveKernelsPPL.sampling_logdensity(d::SharedDirichletKeyword, x) =
+    dirichlet_logdensity(d.alpha, x)
+ReactiveKernelsPPL.sampling_geometry(::Type{SharedDirichletKeyword}, args, shape) =
+    simplex_geometry(_positional(args)[1])
 end
 
 _cjl_fd(f, u; h = cbrt(eps(Float64))) = [begin
@@ -170,11 +200,28 @@ _cjl_structure(program) = [(e.kind, e.depth) for e in recipe_inventory(program)
 _cjl_blocks(u, lengths) = [u[(sum(lengths[1:(i - 1)]; init = 0) + 1):sum(lengths[1:i])]
     for i in eachindex(lengths)]
 
+_cjl_reports_derivatives() =
+    isdefined(Enzyme, :has_dogfood_repair) && Enzyme.has_dogfood_repair(:derivative_report)
+
+# The native reverse is also type stable: no run-time dispatch or boxed value
+# in any derivative it compiles (`ad_derivative_report`, Enzyme dogfood repair
+# `derivative_report`). The cells' endpoint call `_ppl_cell_joint_constrain`
+# was once compiled for widened arguments, and Enzyme differentiated the
+# geometry's `constrain` at run time in every cell, for a law with two or more
+# arguments (`ZeroSum(x[i], s)`), a law given a type
+# (`TotalLogSumExp(Distributions.Normal, …)`) and an endpoint written
+# `(u, shape, args...)`.
 function _cjl_check(built, bound, u, oracle)
     sampler = prepare_sampler(built, bound, u; backend = AutoEnzyme(; mode = Enzyme.Reverse))
     value, gradient = sampler_value_and_gradient!(sampler, similar(u), u)
     @test value ≈ oracle(u) rtol = 1e-12
     @test gradient ≈ _cjl_fd(oracle, u) rtol = 1e-6 atol = 1e-8
+    if _cjl_reports_derivatives()
+        report = ReactiveKernels.ad_derivative_report(
+            () -> sampler_value_and_gradient!(sampler, similar(u), u))
+        @test !isempty(report.derivatives)
+        @test isempty(report.unstable)
+    end
     return nothing
 end
 
@@ -444,6 +491,146 @@ end
         lp
     end
     _cjl_check(built, bound, u, oracle)
+end
+
+# A law may read a vector shared by every index, read whole rather than at
+# the index: each index's draw is one `Dirichlet(alpha)` with the whole
+# `alpha`, as in the Julia loop, whatever the number of indices. Binding used
+# to read a data vector there as one entry per index and refused it when the
+# counts differed (snag rkppl-joint-cell-c8a61b47).
+const _CJL_SHARED = quote
+    sigma ~ Exponential(1.0)
+    @plate for i in eachindex(y)
+        theta[i] ~ _CJLFixtures.SharedDirichlet(length(alpha), alpha)
+        th = theta[i]
+        y[i] ~ Normal(th[1] * x1[i] + th[2] * x2[i], sigma)
+    end
+end
+
+_cjl_shared_data(n) = (; alpha = [2.0, 3.0, 4.0], y = [0.1 + 0.8 * (k - 1) / 3 for k in 1:n],
+    x1 = [1.0 + (k - 1) / 3 for k in 1:n], x2 = [-1.0 + 0.5 * (k - 1) for k in 1:n])
+
+# `u` holds log(sigma), then each index's two coordinates; `conc` is the
+# concentration every index reads.
+function _cjl_shared_terms(u, d; conc = d.alpha, at = 2)
+    sigma = exp(u[1])
+    prior, likelihood, jacobian = logpdf(Exponential(1.0), sigma), 0.0, u[1]
+    for (i, w) in enumerate(_cjl_blocks(u[at:end], fill(length(conc) - 1, length(d.y))))
+        th = _CJLFixtures.alr_values(w)
+        prior += logpdf(Dirichlet(conc), th)
+        jacobian += sum(log, th)
+        likelihood += logpdf(Normal(th[1] * d.x1[i] + th[2] * d.x2[i], sigma), d.y[i])
+    end
+    return prior, likelihood, jacobian
+end
+
+@testset "a joint cell latent's law may read a data vector shared by every index" begin
+    # 3 indices, as many as `alpha` has entries: every index still reads it whole.
+    for n in (4, 3, 2)
+        d = _cjl_shared_data(n)
+        saved = deepcopy(d)
+        for source in (d, keys(d))
+            bound = bind_data(lower_rkppl(_CJL_SHARED, source; conditioned = (:y,)), d)
+            built = build_kernel(bound)
+            @test coordinate_names(built.layout) ==
+                [:sigma; [Symbol("theta.", i, ".", j) for i in 1:n for j in 1:2]]
+            for u in ([-0.4 + 0.1 * k for k in 0:2n], [0.3 - 0.07 * k for k in 0:2n])
+                prior, likelihood, jacobian = _cjl_shared_terms(u, d)
+                nt = constrain(built.layout, u)
+                @test nt.theta ≈ [_CJLFixtures.alr_values(w) for w in _cjl_blocks(u[2:end], fill(2, n))]
+                @test unconstrain(built.layout, nt) ≈ u
+                @test logjac(built.layout, u) ≈ jacobian
+                @test _cjl_q(built, bound, :prior, u) ≈ prior rtol = 1e-12
+                @test _cjl_q(built, bound, :likelihood, u) ≈ likelihood rtol = 1e-12
+                _cjl_check(built, bound, u, v -> sum(_cjl_shared_terms(v, d)))
+            end
+        end
+        @test d == saved
+    end
+    # One plan rebinds with more indices; its cells stay one retained plate.
+    plan = lower_rkppl(_CJL_SHARED, keys(_cjl_shared_data(2)); conditioned = (:y,))
+    structures = map((2, 6)) do n
+        d = _cjl_shared_data(n)
+        bound = bind_data(plan, d)
+        built = build_kernel(bound)
+        u = [0.2 - 0.05 * k for k in 0:2n]
+        @test _cjl_q(built, bound, :sampler, u) ≈ sum(_cjl_shared_terms(u, d)) rtol = 1e-12
+        _cjl_structure(built.spec)
+    end
+    @test structures[1] == structures[2]
+    # The concentration as a keyword is read whole too.
+    keyword = quote
+        sigma ~ Exponential(1.0)
+        @plate for i in eachindex(y)
+            theta[i] ~ _CJLFixtures.SharedDirichletKeyword(length(alpha); alpha = alpha)
+            th = theta[i]
+            y[i] ~ Normal(th[1] * x1[i] + th[2] * x2[i], sigma)
+        end
+    end
+    d = _cjl_shared_data(4)
+    bound = bind_data(lower_rkppl(keyword, d; conditioned = (:y,)), d)
+    built = build_kernel(bound)
+    u = [0.1 * k - 0.3 for k in 0:8]
+    @test logjac(built.layout, u) ≈ last(_cjl_shared_terms(u, d))
+    _cjl_check(built, bound, u, v -> sum(_cjl_shared_terms(v, d)))
+    # An empty domain adds no cell. Not built yet: its native Reverse gradient
+    # (EnzymeRuntimeActivityError with any joint cell latent, not only a
+    # shared argument; todo 08q0pwy).
+    d = _cjl_shared_data(0)
+    bound = bind_data(lower_rkppl(_CJL_SHARED, d; conditioned = (:y,)), d)
+    built = build_kernel(bound)
+    @test built.layout.total == 1
+    @test _cjl_q(built, bound, :sampler, [0.2]) ≈ sum(_cjl_shared_terms([0.2], d)) rtol = 1e-12
+    @test_broken begin
+        sampler = prepare_sampler(built, bound, [0.2];
+            backend = AutoEnzyme(; mode = Enzyme.Reverse))
+        last(sampler_value_and_gradient!(sampler, zeros(1), [0.2])) ≈
+            _cjl_fd(v -> sum(_cjl_shared_terms(v, d)), [0.2])
+    end
+end
+
+@testset "a joint cell latent's law may read a sampled vector shared by every index" begin
+    # The concentration is a model value; its size, the simplex's length, is data.
+    ast = quote
+        lconc[1:K] .~ Normal.(0, 1)
+        conc = 2.0 .* exp.(lconc)
+        sigma ~ Exponential(1.0)
+        @plate for i in eachindex(y)
+            theta[i] ~ _CJLFixtures.SharedDirichlet(K, conc)
+            th = theta[i]
+            y[i] ~ Normal(th[1] * x1[i] + th[2] * x2[i], sigma)
+        end
+    end
+    d = merge(_cjl_shared_data(4), (; K = 3))
+    function oracle(u)   # u: log(sigma), lconc, then each index's coordinates
+        lconc = u[2:4]
+        sum(logpdf.(Normal(0, 1), lconc)) +
+            sum(_cjl_shared_terms(u, d; conc = 2.0 .* exp.(lconc), at = 5))
+    end
+    bound = bind_data(lower_rkppl(ast, d; conditioned = (:y,)), d)
+    built = build_kernel(bound)
+    @test coordinate_names(built.layout) == [:sigma, Symbol("lconc.1"), Symbol("lconc.2"),
+        Symbol("lconc.3"), (Symbol("theta.", i, ".", j) for i in 1:4 for j in 1:2)...]
+    for u in ([-0.4 + 0.1 * k for k in 0:11], [0.3 - 0.07 * k for k in 0:11])
+        @test _cjl_q(built, bound, :sampler, u) ≈ oracle(u) rtol = 1e-12
+        @test unconstrain(built.layout, constrain(built.layout, u)) ≈ u
+        _cjl_check(built, bound, u, oracle)
+    end
+    # Not built yet: a size read from the sampled vector, `length(conc)`.
+    # Its length follows from `lconc`'s declaration, but binding refuses it as
+    # a shape reading a sampled value (todo 0w88l65).
+    sized = quote
+        lconc[1:3] .~ Normal.(0, 1)
+        conc = 2.0 .* exp.(lconc)
+        sigma ~ Exponential(1.0)
+        @plate for i in eachindex(y)
+            theta[i] ~ _CJLFixtures.SharedDirichlet(length(conc), conc)
+            th = theta[i]
+            y[i] ~ Normal(th[1] * x1[i] + th[2] * x2[i], sigma)
+        end
+    end
+    d = _cjl_shared_data(4)
+    @test_broken (bind_data(lower_rkppl(sized, d; conditioned = (:y,)), d); true)
 end
 
 @testset "a joint cell latent's shape must follow from data" begin

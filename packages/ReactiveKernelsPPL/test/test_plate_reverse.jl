@@ -267,6 +267,16 @@ end
                      :(sigma ~ Exponential(1)), :(mu = $mu), :(y .~ Normal.(mu, sigma)))
         built, bound = _prv_build(model, data, (:y, xs...))
         report = _prv_compare(built, bound)
+        # The bound Gaussian likelihood is summed from least-squares statistics,
+        # which the generated reverse leaves to the backend.
+        @test any(r -> occursin("bound statistics", last(r)), report)
+        # Without the statistics its plate keeps every operand and is eligible
+        # for a rule. This dense call runs inline; only a one-pass call reaches
+        # the adapter's unrolled operand tuple.
+        report = with_bound_statistics(false) do
+            built, bound = _prv_build(model, data, (:y, xs...))
+            _prv_compare(built, bound)
+        end
         @test any(r -> first(r) === :_ppl_lik_y_resp && last(r) == "rule", report)
     end
 

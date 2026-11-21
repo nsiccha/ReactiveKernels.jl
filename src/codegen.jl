@@ -3447,6 +3447,48 @@ _kernel_ops(variant::_PlateArmVariant) =
 _plate_arm_plan(spec) = plan(spec)
 _plate_arm_plan(p::Plan) = p
 
+# The cell kernel with every branch its cells' concrete operand types decide
+# replaced by the arm it takes, as a `_PlateArmVariant`, or `nothing` when no
+# branch is decided. Such a condition (`typeof(x) <: Number`, Stan's scalar
+# and array `+`) takes the same arm in every cell of every call, and Julia
+# folds it, but the cell would keep the branch: its arm then ran as a closure
+# that materialized the arm's broadcast into a fresh array in every cell,
+# where the arm written alone stays a lazy broadcast its reader consumes
+# (snag `type-decided-bra-2686ef6f`). A condition is decided only when Julia
+# reduces its whole body to a literal for these types (`_type_constant_bool`),
+# so dropping it drops no effect or error; no condition or arm is evaluated.
+# Within one preparation every lowering of the plate reads one variant
+# (`_SHARED_CELL_PLANS`), as its nested cell plan does.
+Base.@nospecializeinfer function _plate_type_selected_kernel(
+        @nospecialize(inner_kernel), @nospecialize(atomic), @nospecialize(callvalues))
+    inner = getfield(inner_kernel, :plan)::Plan
+    any(r -> _plate_branch_operation(r.op), inner.recipes) || return nothing
+    argument_types = Any[_plate_cell_value_type(valtype(callvalues[position]),
+                                                position in atomic)
+                         for position in eachindex(inner.have)]
+    any(isconcretetype, argument_types) || return nothing
+    build() = _plate_type_selected_variant(inner, argument_types)
+    shared = get(task_local_storage(), _SHARED_CELL_PLANS, nothing)
+    shared === nothing && return build()
+    get!(build, shared, (:type_selected, inner_kernel, Tuple(argument_types)))
+end
+
+Base.@nospecializeinfer function _plate_type_selected_variant(inner::Plan, argument_types)
+    types = _cell_value_types(inner; argument_types)
+    g = inner.graph
+    recipes = map(inner.recipes) do r
+        _plate_branch_operation(r.op) || return r
+        selected = _type_selected_branch(r,
+            Any[get(types, canon_id(g, v.id), Any) for v in r.inputs])
+        selected === nothing ? r : selected.recipe
+    end
+    all(i -> recipes[i] === inner.recipes[i], eachindex(recipes)) && return nothing
+    variant = _partial_subplan(inner, inner.have, inner.want, recipes)
+    _, constants, callables, lowered = _lower_with_ops(variant; inline_embedded = false)
+    length(callables) == length(variant.recipes) || return nothing
+    _PlateArmVariant(variant, constants, callables, lowered)
+end
+
 # Shared scalar evidence can arrive after an arm graph was authored. Split
 # its retained mixed recipes at that boundary, using the same decomposition
 # as partial evaluation. No value is evaluated, and captured callables and
@@ -4256,6 +4298,12 @@ Base.@nospecializeinfer function _lower_authored_plate_cells_native!(
     # shared branch is decided at that cell, where its body runs.
     one |= cell !== nothing
     unswitch &= !one
+    # A branch the cell's operand types decide is its taken arm. With `types`,
+    # the caller already tabled this kernel's operations.
+    if types === nothing
+        selected = _plate_type_selected_kernel(inner_kernel, atomic, callvalues)
+        selected === nothing || (inner_kernel = selected)
+    end
     inner = getfield(inner_kernel, :plan)::Plan
     if unswitch
         branch = _plate_shared_branch(inner_kernel, atomic, callargs, callvalues)

@@ -59,7 +59,8 @@ end
             rule = only(rules)
             args = (xs, axes(xs), scale, 0.0, supplied_term)
             target = RK._pr_rule_target(rule, args)
-            @test T === Float64 ? target isa RK._PlateSumRuleBody : target === rule.program
+            # No one-pass schedule applies to this dense plate.
+            @test target === rule.program
         end
     end
 end
