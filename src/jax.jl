@@ -1452,6 +1452,13 @@ function _jax_index_part(ctx::_JaxContext, x::_PyVal, dim::Int, index; target::B
         # static limit, or ends `_jax_trip_bound` bounds): a gather by the
         # range's elements, padded (`_jax_call_positional(::Colon)`).
         if !(_jax_known(ctx, lo) && _jax_known(ctx, hi))
+            if !target && !isempty(x.extent) && x.T <: AbstractVector{<:Number} &&
+                    _jax_mentions(index, :end)
+                # The range uses this row's end, including in expressions
+                # like end + 1. Check both bounds against its logical length.
+                i = _jax_window(ctx, x, lo, hi)
+                return (_py_infix("-", [i.code, "1"]), 1, i)
+            end
             if _jax_known(ctx, lo) && !isempty(hi.limit) || _jax_trip_bound(ctx, lo, hi) !== nothing
                 i = _jax_call_positional(ctx, Colon(), [lo, hi])
                 return (_py_infix("-", [i.code, "1"]), 1, i)
@@ -1561,12 +1568,15 @@ function _jax_bound_expr(ctx::_JaxContext, x::_PyVal, dim::Int, index)
     # A history access may already have resolved its index while checking
     # the storage layout. Reuse it without repeating any emitted effects.
     index isa _PyVal && return index
-    index === :end && return _PyVal(_jax_dim_code(ctx, x, dim), Int, true)
+    last_index() = ctx.host === nothing && !isempty(x.extent) && _jax_is_array(x.T) &&
+        !_jax_ragged(x.T) ? _jax_call(ctx, size, [x, _jax_literal(dim)]) :
+        _PyVal(_jax_dim_code(ctx, x, dim), Int, true)
+    index === :end && return last_index()
     index === :begin && return _PyVal("1", Int)
     if index isa Expr && (_jax_mentions(index, :end) || _jax_mentions(index, :begin))
         saved = copy(ctx.locals)
         try
-            ctx.locals[:end] = _PyVal(_jax_dim_code(ctx, x, dim), Int, true)
+            ctx.locals[:end] = last_index()
             ctx.locals[:begin] = _PyVal("1", Int)
             return _host_index_value(ctx, _jax_expr(ctx, index))
         finally
@@ -3574,6 +3584,10 @@ function _jax_expr(ctx::_JaxContext, ::Val{:call}, ex)
     end
     f = head isa Symbol && _jax_has_local(ctx, head) ? _jax_local_callable(ctx, head) :
         _jax_resolve(ctx, head)
+    if isempty(kwargs) && isempty(ctx.locals)
+        structural = _jax_structural_call(ctx, f, positional)
+        structural === nothing || return structural
+    end
     # Host calls that read a list or dictionary in place (`push!`, `haskey`).
     if ctx.host !== nothing
         v = _host_call(ctx, f, positional, kwargs)
@@ -3599,6 +3613,10 @@ function _jax_expr(ctx::_JaxContext, ::Val{:call}, ex)
         _jax_call(ctx, f, values, kw)
     end
 end
+
+# A compiler integration may decode its own closed, quoted constructor syntax
+# before ordinary expression translation. Model inputs remain runtime values.
+_jax_structural_call(ctx::_JaxContext, f, positional) = nothing
 
 # A literal/type-level tuple arity is structural, unlike a data-derived
 # collection length. Record its fields in order, with runtime captures and

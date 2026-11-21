@@ -16,6 +16,14 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.252
+
+- `jax_source` supports joint cell latents with translatable geometry and
+  density endpoints. Each cell reads its own packed coordinates. The constrained
+  shape and the packed size can differ and are recomputed by `prepare_data`.
+  For vector-valued cells, `constrain` returns the padded constrained rows
+  under the parameter name and their logical lengths under `<name>_lengths`.
+
 ## 0.1.251
 
 Requires ReactiveKernels 0.1.358.
