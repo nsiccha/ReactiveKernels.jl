@@ -118,7 +118,10 @@ end
     derivative = (; func = Nothing, mode = :reverse, note = "",
         findings = [finding(:primal), finding(:forward), finding(:primal; throw_only = true),
                     finding(:primal; file = "./sort.jl"),
-                    finding(:primal; file = joinpath(Sys.STDLIB, "Logging", "src", "x.jl"))])
+                    finding(:primal; file = joinpath(Sys.STDLIB, "Logging", "src", "x.jl")),
+                    # A statement of RK's generated code is not Julia's own,
+                    # though its file starts like Base's.
+                    finding(:primal; file = "./rk:mu")])
     flag = ReactiveKernels._DERIVATIVE_REPORT_REACHABILITY
     saved = flag[]
     try
@@ -127,7 +130,7 @@ end
             [:forward]
         flag[] = true
         @test [last(p).sweep for p in ADDerivativeReport(nothing, [derivative]).unstable] ==
-            [:primal, :forward]
+            [:primal, :forward, :primal]
     finally
         flag[] = saved
     end
@@ -214,6 +217,39 @@ end
     report = ad_derivative_report(() -> ad_value_and_gradient!(prepared, zeros(2), rule_args...))
     @test any(p -> last(p).kind === :native_allocation && last(p).bytes === nothing,
               report.allocations)
+end
+
+# Snag `ad-derivative-re-ad950539`: Enzyme's report keeps only frames with a
+# line, and the statement scopes of RK's generated code had line 0, so every
+# finding there named only the generated body. Each statement now has a frame
+# `rk:<value>` at line 1, and calls of one function in different statements are
+# different findings.
+@testset "the derivative's findings name the statement they are in" begin
+    statement(frame) = ReactiveKernels._marker_label(frame)
+    generated(finding) =
+        any(frame -> occursin("RuntimeGeneratedFunctions", String(frame.file)), finding.frames)
+    args = (0.1, 0.5, 1.2, x, y)
+    prepared = @test_logs min_level = quiet prepare_ad(prepare(linear_gaussian), backend, args...;
+                                                       active = :a)
+    report = ad_derivative_report(prepared, args...)
+    in_body = [f for (_, f) in report.allocations if generated(f)]
+    @test !isempty(in_body)
+    # Each names its statement, as a frame with a line.
+    @test all(f -> any(frame -> statement(frame) !== nothing && frame.line == 1, f.frames), in_body)
+    # The broadcast that materializes `mu` allocates in `mu`'s statement, and
+    # not in one finding shared with the other statements.
+    named = [only(unique(filter(!=("(other statements)"),
+                                [statement(fr) for fr in f.frames if statement(fr) !== nothing])))
+             for f in in_body]
+    @test "mu" in named
+    @test allunique(named)
+    # A statement frame is not Julia's own code.
+    @test !any(f -> any(frame -> statement(frame) !== nothing &&
+                                 ReactiveKernels._julia_own_frame(frame), f.frames), in_body)
+    # The message folds each statement into one frame.
+    message = ReactiveKernels._derivative_finding_line(first(in_body))
+    @test occursin(r"at macro expansion @ \.?/?rk:\w+:1", message)
+    @test !occursin(r"rk:[^\n]*:0\n", message)
 end
 
 @testset "the derivative's run-time dispatch at type_stability_level = :all" begin

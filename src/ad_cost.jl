@@ -17,22 +17,67 @@
 # the frames of a sample in the reverse pass name the same statement, which is
 # what lets `ad_cost_profile` split the actual (fused) gradient by statement.
 #
+# Every scope has line 1 (`_SOURCE_SCOPE_LINE`): a line node without a file
+# right after `push_loc`, which Julia's lowering reads as the line of the scope
+# itself ("(line n) after push_loc just updates the line for the new file",
+# `julia-syntax.scm`), and the same node right after `pop_loc`, which gives the
+# enclosing scope's code its line back. Without them a scope had line 0 (-1
+# from Julia 1.12), and two readers lost it (snag `ad-derivative-re-ad950539`):
+#
+# - Enzyme's report of a derivative keeps only frames with `line > 0`
+#   (`source_frames` of `Enzyme.derivative_report`), so its findings in RK's
+#   generated code named no statement, only the RuntimeGeneratedFunctions body
+#   around them, and Enzyme merged the calls of one function in different
+#   statements into one finding.
+# - Native debug info keeps the previous location for a location of line 0:
+#   on Julia 1.10, code of the body (not of an inlined call) after a block's
+#   first statement read as that statement's; from Julia 1.12, code between
+#   two statements read as the first's.
+#
+# With the line nodes, the frames of a call in statement `mu` read
+# `macro expansion @ rk:mu:1` within `macro expansion @ rk:(other statements):1`,
+# one frame per scope, on Julia 1.10, 1.12 and 1.13 (a line node with a file
+# would instead nest a frame inside the scope's own, and leave its line-0 frame
+# around the statements after it). They are debug information only: the
+# compiled code, its derivative and their values are the same.
+#
 # Readers of a compiled program's source (`_program_expression`) get it without
 # the scopes: displays, the JAX emitter and the AD slot analysis see what they
 # saw before the scopes existed.
 
 const _SOURCE_MARKER_PREFIX = "rk:"
 const _SOURCE_MARKER_PROGRAM = "(other statements)"
+const _SOURCE_SCOPE_LINE = 1
 
 _source_scope(name::AbstractString) =
     Expr(:meta, :push_loc, Symbol(_SOURCE_MARKER_PREFIX, name))
 const _SOURCE_SCOPE_END = Expr(:meta, :pop_loc)
+# The line node after a scope's `push_loc` and after its `pop_loc` (see above).
+const _SOURCE_SCOPE_LINE_NODE = LineNumberNode(_SOURCE_SCOPE_LINE, nothing)
 
 _is_source_scope(x) = x isa Expr && x.head === :meta && length(x.args) == 2 &&
     x.args[1] === :push_loc && x.args[2] isa Symbol &&
     startswith(String(x.args[2]), _SOURCE_MARKER_PREFIX)
+_is_scope_line(x) = x == _SOURCE_SCOPE_LINE_NODE
 _is_scope_end(x) = x isa Expr && x.head === :meta && length(x.args) == 1 &&
     x.args[1] === :pop_loc
+
+# The items that open a scope named `name`, and those that close it.
+_source_scope_open(name::AbstractString) = (_source_scope(name), _SOURCE_SCOPE_LINE_NODE)
+const _SOURCE_SCOPE_CLOSE = (_SOURCE_SCOPE_END, _SOURCE_SCOPE_LINE_NODE)
+
+# The statement a scope opened at `args[index]` wraps and the index after the
+# scope's close, or `nothing` when no scope opens there. A scope written before
+# its line nodes existed (`push_loc`, statement, `pop_loc`) is read as well.
+function _scoped_statement(args, index::Int)
+    _is_source_scope(args[index]) || return nothing
+    statement = index + 1
+    statement <= length(args) && _is_scope_line(args[statement]) && (statement += 1)
+    statement + 1 <= length(args) && _is_scope_end(args[statement + 1]) || return nothing
+    after = statement + 2
+    after <= length(args) && _is_scope_line(args[after]) && (after += 1)
+    (args[statement], after)
+end
 
 # The name a scope shows for an assigned local: generated numbering and the
 # leading `#`s of a generated name dropped.
@@ -80,7 +125,7 @@ function _source_markers(ast::Expr)
     body = _insert_source_markers(ast.args[2], true)
     # Julia's own generated-function body has this shape: the scope, then a
     # return of the body, so the body's value is unchanged.
-    Expr(ast.head, ast.args[1], Expr(:block, _source_scope(_SOURCE_MARKER_PROGRAM),
+    Expr(ast.head, ast.args[1], Expr(:block, _source_scope_open(_SOURCE_MARKER_PROGRAM)...,
         Expr(:return, body), _SOURCE_SCOPE_END))
 end
 
@@ -122,7 +167,7 @@ function _insert_source_markers(ex::Expr, value::Bool = true)
             if name === nothing
                 push!(args, marked)
             else
-                push!(args, _source_scope(name), marked, _SOURCE_SCOPE_END)
+                push!(args, _source_scope_open(name)..., marked, _SOURCE_SCOPE_CLOSE...)
             end
         end
         return Expr(:block, args...)
@@ -137,25 +182,25 @@ function _strip_source_markers(ex::Expr)
     # The program scope `_source_markers` wraps a function body in.
     if ex.head in (:function, :->) && length(ex.args) == 2
         body = ex.args[2]
-        if body isa Expr && body.head === :block && length(body.args) == 3 &&
-                _is_source_scope(body.args[1]) && _is_scope_end(body.args[3]) &&
-                body.args[2] isa Expr && body.args[2].head === :return &&
-                length(body.args[2].args) == 1
-            return Expr(ex.head, ex.args[1], _strip_source_markers(body.args[2].args[1]))
+        scoped = body isa Expr && body.head === :block && !isempty(body.args) ?
+            _scoped_statement(body.args, 1) : nothing
+        if scoped !== nothing && last(scoped) == length(body.args) + 1
+            returned = first(scoped)
+            returned isa Expr && returned.head === :return && length(returned.args) == 1 &&
+                return Expr(ex.head, ex.args[1], _strip_source_markers(returned.args[1]))
         end
     end
     if ex.head === :block
         args = Any[]
         index = 1
         while index <= length(ex.args)
-            arg = ex.args[index]
-            if _is_source_scope(arg) && index + 2 <= length(ex.args) &&
-                    _is_scope_end(ex.args[index + 2])
-                push!(args, _strip_source_markers(ex.args[index + 1]))
-                index += 3
-            else
-                push!(args, _strip_source_markers(arg))
+            scoped = _scoped_statement(ex.args, index)
+            if scoped === nothing
+                push!(args, _strip_source_markers(ex.args[index]))
                 index += 1
+            else
+                push!(args, _strip_source_markers(first(scoped)))
+                index = last(scoped)
             end
         end
         return Expr(:block, args...)

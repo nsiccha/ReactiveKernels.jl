@@ -16,6 +16,27 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.354
+
+- A finding of `ad_derivative_report` (and of the derivative check at
+  preparation) in the program ReactiveKernels generates names the statement
+  it is in: its `frames` hold `macro expansion` at `rk:<value>:1`, `<value>`
+  being the value the statement assigns, the name `ad_cost_profile` reports
+  (`(other statements)` for code between statements). Before, Enzyme's report
+  dropped those statement scopes, whose line was 0, and such a finding named
+  only the generated body (`RuntimeGeneratedFunctions.jl:243` above
+  `codegen.jl:8664`), and Enzyme merged the calls of one function in
+  different statements into one finding. Each scope now has line 1 (a line
+  node without a file after its `push_loc` and after its `pop_loc`); the
+  compiled code and its derivative are unchanged. This also corrects native
+  debug info, so the frames of profile samples and backtraces too: on Julia
+  1.10, code of the generated body itself (a call that is not inlined, a
+  buffer Enzyme keeps) after a block's first statement read as that
+  statement's, and from Julia 1.12 code between two statements read as the
+  earlier one's. Code of a plate's loop outside its cells, such as the
+  buffers Enzyme keeps for the loop, is in `(other statements)`, as in
+  `ad_cost_profile`.
+
 ## 0.1.353
 
 - On a CUDA device, a `jax_source` module integrates each `rk_ode_rk45_tol`
