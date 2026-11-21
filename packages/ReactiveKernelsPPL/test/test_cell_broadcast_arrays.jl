@@ -494,3 +494,53 @@ end
         x = [[0.1, 0.2], [0.3], [0.4, 0.5]]) | (; c = [[1, 2], [0], [3, -1]],
         total = [0.3, 0.3, 0.9])
 end
+
+# A cell value that is a branch its operands' concrete types decide, Stan's
+# scalar and array `+` as a generated model writes it (inline, or a spliced
+# function-shaped kernel), costs a native Reverse gradient what its taken arm
+# costs alone: RK lowers the cell with that arm in its place (RK 0.1.354, snag
+# `type-decided-bra-2686ef6f`). Before, each cell materialized the arm's
+# operands and result: 42,560 B in 406 allocations over 100 cells, against
+# 80 B in one. The cells' rows differ: identical rows run once.
+ReactiveKernels.@kernel _cba_stan_add(x, y) = begin
+    value = typeof(x) <: Number || typeof(y) <: Number ? x .+ y : x + y
+    return value
+end
+
+@testset "a cell branch its operand types decide costs what its arm costs" begin
+    u = [0.1, -0.2, 0.3]
+    function gradient_bytes(cell, d)
+        body = Expr(:block, cell.args..., :(y[i] .~ Normal.(m, sigma)))
+        ast = Expr(:block, :(log_k ~ Normal(0, 1)), :(b ~ Normal(0, 1)),
+            :(sigma ~ Exponential(1.0)), Expr(:macrocall, Symbol("@plate"),
+                LineNumberNode(1), Expr(:for, :(i = eachindex(t)), body)))
+        bound = bind_data(lower_rkppl(ast, d; conditioned = (:y,),
+            mod = @__MODULE__), d)
+        sampler = prepare_sampler(build_kernel(bound), bound, u;
+            backend = AutoEnzyme(; mode = Enzyme.Reverse))
+        g = similar(u)
+        sampler_value_and_gradient!(sampler, g, u)
+        sampler_value_and_gradient!(sampler, g, u)
+        bytes = @allocated sampler_value_and_gradient!(sampler, g, u)
+        value, _ = sampler_value_and_gradient!(sampler, g, u)
+        (; value, g = copy(g), bytes)
+    end
+    data(n) = (; t = [collect(range(0.5, 2.0; length = 5)) .+ 0.01 * c for c in 1:n],
+                 y = [fill(0.4, 5) .+ 0.001 * c for c in 1:n])
+    arm = quote m = b .+ t[i] .* exp(log_k) end
+    inline = quote
+        v = t[i] .* exp(log_k)
+        m = typeof(b) <: Number ? b .+ v : b + v
+    end
+    spliced = quote m = _cba_stan_add(b, t[i] .* exp(log_k)) end
+    for n in (20, 80)
+        d = data(n)
+        alone = gradient_bytes(arm, d)
+        for cell in (inline, spliced)
+            taken = gradient_bytes(cell, d)
+            @test taken.value == alone.value
+            @test taken.g == alone.g
+            @test taken.bytes == alone.bytes
+        end
+    end
+end
