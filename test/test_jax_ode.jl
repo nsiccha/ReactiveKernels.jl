@@ -8,6 +8,15 @@ isdefined(@__MODULE__, :rk_jax_evaluate) ||
 # the `RK_JAX_PYTHON` environment (`pip install diffrax`).
 const _JAX_ODE_PYTHON = rk_jax_available() && success(`$RK_JAX_PYTHON -c "import diffrax"`)
 
+# The value a function answers alone and under `jax.value_and_grad`. On a CUDA
+# device these are two programs, the per-lane kernel without and with the
+# tangents, and they agree to rounding: in the NaN case below by one unit in the
+# last place (-2.6271005178169045 against -2.627100517816905). Elsewhere they
+# agree exactly.
+const _JAX_ODE_CUDA = _JAX_ODE_PYTHON &&
+    readchomp(`$RK_JAX_PYTHON -c "import jax; print(jax.default_backend())"`) == "gpu"
+jax_ode_same_value(a, b) = _JAX_ODE_CUDA ? isapprox(a, b; rtol = 1e-12) : a == b
+
 _jax_ode_elimination(t, y, k) = -k .* y
 _jax_ode_absorption(t, y, ka, cl, v) = [-ka * y[1], ka * y[1] - cl / v * y[2]]
 # Robertson's stiff chemical kinetics.
@@ -339,7 +348,7 @@ end
             query = x -> native(x, solves...)
             got = rk_jax_evaluate(source, "density", (u, solves...); grad = :joint)
             @test got.value ≈ query(u) rtol = 1e-6
-            @test got.joint_value == got.value
+            @test jax_ode_same_value(got.joint_value, got.value)
             @test got.grad ≈ gradient(query, backend, u) rtol = 1e-4
             @test rk_jax_evaluate(source, "value", (u, solves...)).value ≈ got.value
             # -inf also from jax.value_and_grad, as a sampler evaluates the
@@ -447,6 +456,58 @@ end
 const _JAX_ODE_PALLAS = _JAX_ODE_PYTHON &&
     success(`$RK_JAX_PYTHON -c "from jax.experimental import pallas"`)
 
+# Pallas' interpreter also runs a kernel that Triton refuses to compile: Triton
+# takes `select_n` only with two cases and a bool predicate, and a branch in a
+# right-hand side once picked with an int32 one. So this reads the jaxpr of
+# `jax.value_and_grad(name)` at `args`, as the lanes trace it: the number of
+# Pallas kernels and of the selects in them that Triton refuses. It also checks
+# the selection tree against `select_n` of the clamped index, at every index from
+# below to above range, for one to five cases.
+const _JAX_ODE_TRITON_SELECTS = raw"""
+import importlib.util, sys
+import numpy as np
+spec = importlib.util.spec_from_file_location("rk_module", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+import jax, jax.numpy as jnp
+from jax.extend.core import ClosedJaxpr, Jaxpr
+exec(open(sys.argv[2]).read())
+f = getattr(module, sys.argv[3])
+first, rest = ARGS[0], ARGS[1:]
+counts = {"kernels": 0, "refused": 0}
+
+def walk(jaxpr, inside):
+    for e in jaxpr.eqns:
+        kernel = e.primitive.name == "pallas_call"
+        counts["kernels"] += kernel
+        if inside and e.primitive.name == "select_n" and (
+                len(e.invars) != 3 or e.invars[0].aval.dtype != np.bool_):
+            counts["refused"] += 1
+        for v in e.params.values():
+            for x in (v if isinstance(v, (tuple, list)) else (v,)):
+                if isinstance(x, (ClosedJaxpr, Jaxpr)):
+                    walk(getattr(x, "jaxpr", x), inside or kernel)
+
+walk(jax.make_jaxpr(jax.value_and_grad(lambda u: f(u, *rest)))(first).jaxpr, False)
+which = jnp.arange(-2, 7, dtype=jnp.int32)
+tree = True
+for n in range(1, 6):
+    cases = [jnp.full(which.shape, float(k)) for k in range(n)]
+    got = module._rk_soa_select(which.shape, module._RKLane(which), *map(module._RKLane, cases))
+    tree &= bool(jnp.all(got.v == jax.lax.select_n(jnp.clip(which, 0, n - 1), *cases)))
+print(counts["kernels"], counts["refused"], tree)
+"""
+
+function jax_ode_triton_selects(src, name, args)
+    dir = mktempdir()
+    check, path, inputs = joinpath.(dir, ("check.py", "module.py", "args.py"))
+    write(check, _JAX_ODE_TRITON_SELECTS)
+    write(path, src)
+    write(inputs, _rk_jax_args(rk_jax_inputs(args), nothing))
+    kernels, refused, tree = split(readchomp(`$RK_JAX_PYTHON $check $path $inputs $name`))
+    return (; kernels = parse(Int, kernels), refused = parse(Int, refused), tree = tree == "True")
+end
+
 @testset "the CUDA path's per-lane solves match the native bridge (Pallas' interpreter)" begin
     @test occursin("_rk_lane_kernel(", string(jax_source(jax_ode_cells; have = (:u, :doses, :times),
                                                            want = :total)))
@@ -464,7 +525,7 @@ const _JAX_ODE_PALLAS = _JAX_ODE_PYTHON &&
             query = x -> native(x, doses, times)
             got = lanes(() -> rk_jax_evaluate(source, "kernel", (u, doses, times); grad = :joint))
             @test got.value ≈ query(u) rtol = 1e-8
-            @test got.joint_value == got.value
+            @test jax_ode_same_value(got.joint_value, got.value)
             @test got.grad ≈ gradient(query, backend, u) rtol = 1e-6
             ref = diffrax_only(() -> rk_jax_evaluate(source, "kernel", (u, doses, times); grad = true))
             @test got.value ≈ ref.value rtol = 1e-11
@@ -517,12 +578,16 @@ const _JAX_ODE_PALLAS = _JAX_ODE_PYTHON &&
             query = x -> native(x, solves...)
             got = lanes(() -> rk_jax_evaluate(source, "density", (u, solves...); grad = :joint))
             @test got.value ≈ query(u) rtol = 1e-6
-            @test got.joint_value == got.value
+            @test jax_ode_same_value(got.joint_value, got.value)
             @test got.grad ≈ gradient(query, backend, u) rtol = 1e-4
             failed = lanes(() -> rk_jax_evaluate(source, "density", (u, fails...); grad = :joint))
             @test failed.value == -Inf && failed.joint_value == -Inf
             @test_throws r"exceeded maxsteps between requested outputs|\) failed" lanes(
                 () -> rk_jax_evaluate(source, "value", (u, fails...)))
+            # Triton compiles every select in the kernels, among them the NaN
+            # case's branch in its right-hand side.
+            selects = lanes(() -> jax_ode_triton_selects(source, "density", (u, solves...)))
+            @test selects.kernels >= 1 && selects.refused == 0 && selects.tree
         end
     else
         @test_skip false

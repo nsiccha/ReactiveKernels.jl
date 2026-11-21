@@ -196,6 +196,29 @@ def _rk_soa_elem(prim, params, lane_shape, *xs):
     return _RKLane(prim.bind(*[_rk_soa_lift(x, lane_shape) for x in xs], **params))
 
 
+def _rk_soa_select(lane_shape, which, *cases):
+    # Pallas' Triton lowering takes `select_n` only with two cases and a bool
+    # predicate: an int32 one, as a branch's index, fails to compile on the card,
+    # and Pallas' interpreter does not check it (JAX 0.12.0.1). So an int32 `which`
+    # selects as XLA lowers `select_n`: a tree of `which < mid` tests, which takes
+    # the first case below range and the last above it.
+    if len(cases) == 1:
+        return cases[0]
+    w = which.v if isinstance(which, _RKLane) else which
+    dtype = np.dtype(w.dtype) if hasattr(w, "dtype") else np.asarray(w).dtype
+    if dtype == np.bool_:
+        return _rk_soa_elem(jax.lax.select_n_p, {}, lane_shape, which, *cases)
+
+    def tree(offset, cs):
+        if len(cs) == 1:
+            return cs[0]
+        mid = len(cs) // 2
+        low = _rk_soa_elem(jax.lax.lt_p, {}, lane_shape, which, np.asarray(offset + mid, dtype))
+        return _rk_soa_elem(jax.lax.select_n_p, {}, lane_shape, low,
+                            tree(offset + mid, cs[mid:]), tree(offset, cs[:mid]))
+    return tree(0, list(cases))
+
+
 def _rk_soa_obj(shape):
     return np.empty(shape, dtype=object)
 
@@ -277,6 +300,9 @@ def _rk_soa_eval(jaxpr, consts, args, lane_shape):
 
 def _rk_soa_rule(eqn, ins, lane_shape):
     name, p = eqn.primitive.name, eqn.params
+    if name == "select_n":
+        return [_rk_soa_apply(lambda w, *cs: _rk_soa_select(lane_shape, w, *cs), ins,
+                              eqn.outvars[0].aval.shape)]
     if name in _RK_SOA_ELEMENTWISE:
         return [_rk_soa_apply(lambda *xs: _rk_soa_elem(eqn.primitive, p, lane_shape, *xs), ins,
                               eqn.outvars[0].aval.shape)]
@@ -371,7 +397,7 @@ def _rk_soa_rule(eqn, ins, lane_shape):
         def pick(i, *cs):
             i = _rk_soa_elem(jax.lax.convert_element_type_p, to_int, lane_shape, i)
             i = _rk_soa_elem(jax.lax.clamp_p, {}, lane_shape, np.int32(0), i, last)
-            return _rk_soa_elem(jax.lax.select_n_p, {}, lane_shape, i, *cs)
+            return _rk_soa_select(lane_shape, i, *cs)
         return [_rk_soa_apply(pick, [np.broadcast_to(index, v.aval.shape)] + [b[k] for b in branches], v.aval.shape)
                 for k, v in enumerate(eqn.outvars)]
     raise _RKSoAUnsupported(f"primitive `{name}`")
