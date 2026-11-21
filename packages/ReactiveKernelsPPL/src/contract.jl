@@ -8205,6 +8205,16 @@ function _uncached_model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Sym
         end
         push!(defs, Symbol(:_ppl_scan_input_, s.label) => Expr(:tuple, exprs...))
     end
+    # A joint cell latent's shared arguments (`c[i] ~ F(n, alpha)` with
+    # `alpha` read whole) are one value for every index: each cell closes
+    # over it, and the host transforms evaluate it once
+    # (`_cell_geometry_frame`). Like a prior's arguments they are model
+    # values, never observation rows.
+    for (site, g) in plan.cell_geometries
+        shared = Any[last(a) for a in g.arguments if first(a) === :shared]
+        append!(shared, (last(last(k)) for k in g.keywords if first(last(k)) === :shared))
+        push!(defs, Symbol(:_ppl_cell_geometry_input_, site) => Expr(:tuple, shared...))
+    end
     for r in plan.responses
         r.family === MixtureFam &&
             r.mixture_weights isa Union{Symbol,MixtureWeightValue} || continue
@@ -8261,6 +8271,17 @@ function _uncached_model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Sym
                 _drop_held_names!(free, filter(d -> !_is_axis_dim(d) &&
                     !_is_bound_extent_dim(d) &&
                     _level_pool_source(d) === nothing, p.dims))
+            end
+        elseif f === :cell_geometries
+            # Its shared arguments are whole inputs above, and its geometry's
+            # shape expressions are read through `g.shapes`. Its values,
+            # per-index argument columns, shapes, offsets and cell terms
+            # remain nodes.
+            for g in values(plan.cell_geometries)
+                _drop_held_names!(free, (g.name, g.shapes, g.offsets, g.logjac, g.prior))
+                for a in (g.arguments..., (last(k) for k in g.keywords)...)
+                    first(a) === :cells && _drop_held_names!(free, last(a))
+                end
             end
         elseif f === :responses
             for r in plan.responses

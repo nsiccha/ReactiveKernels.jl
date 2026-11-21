@@ -16,6 +16,15 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.248
+
+- A joint cell latent's law may read a data array shared by every index,
+  `theta[i] ~ F(length(alpha), alpha)` with `alpha` read whole rather than at
+  the index. Every index's density and geometry endpoints receive the whole
+  `alpha`, whatever the number of indices. Before, binding read `alpha` as one
+  entry per index and refused it with `column length 3 ≠ n_obs 4` when the
+  counts differed.
+
 ## 0.1.247
 
 - The constrained factor of an `LKJCholesky` prior and its diagonal are each
