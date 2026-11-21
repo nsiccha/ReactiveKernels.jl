@@ -1825,15 +1825,10 @@ function _nonalloc_static_type(x, types, definitions, constants, ops,
     isconcretetype(T) ? T : nothing
 end
 
-# A dense reshape has its own Array header on Julia 1.11+. Cache that header
-# only over an array in the producer's own slot. In particular a HAVE array,
-# and a view that merely borrows it, never become a preparation's destination.
-struct _ArrayHeader{F,D}
-    f::F
-    axis::D
-end
-@inline (h::_ArrayHeader)(A, args...) = h.f(A, args...)
-@inline (h::_ArrayHeader{typeof(dropdims)})(A) = dropdims(A; dims = h.axis)
+# Keep the literal dimension visible to inference when the operation is read
+# from the callables table. Base.dropdims uses it to construct the axes tuple.
+struct _DropDims{D} end
+@inline (::_DropDims{D})(A) where {D} = dropdims(A; dims = D)
 
 @inline function _same_array_start(A::Array, B::Array)
     @static if hasfield(Array, :ref)
@@ -1845,6 +1840,9 @@ end
     end
 end
 
+# A dense reshape has its own Array header on Julia 1.11+. Cache that header
+# only over an array in the producer's own slot. In particular a HAVE array,
+# and a view that merely borrows it, never become a preparation's destination.
 @inline function _array_header!(slot, op, owner, A, args::Vararg{Any,N}) where {N}
     owner[] === A || return op(A, args...)
     entry = slot[]
@@ -1894,7 +1892,8 @@ function _nonalloc_header_call!(prog, call, owners, types, definitions, constant
     R = f === dropdims ? Array{eltype(A),ndims(A) - 1} : _static_type(f, A, shape_types...)
     R isa DataType && isconcretetype(R) && R <: Array && ndims(R) != ndims(A) || return call
     entry = Tuple{A,NTuple{ndims(A),Int},Tuple{shape_types...},R}
-    j = _step!(prog, _ArrayHeader(f, axis), Ref{Union{Nothing,entry}}(nothing))
+    op = f === dropdims ? _DropDims{axis}() : f
+    j = _step!(prog, op, Ref{Union{Nothing,entry}}(nothing))
     Expr(:call, GlobalRef(@__MODULE__, :_array_header!), Expr(:ref, _CACHES_ARG, j),
         Expr(:ref, _CALLABLES_ARG, j), Expr(:ref, _CACHES_ARG, owner), parent, args...)
 end

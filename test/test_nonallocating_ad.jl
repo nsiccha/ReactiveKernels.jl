@@ -14,6 +14,25 @@ using Test
 # callable holds no data a plain backend must prove readonly.
 const NA_AD_BACKEND = AutoEnzyme(mode = Enzyme.Reverse)
 
+@testset "dropdims keeps a literal axis in the non-allocating reverse" begin
+    spec = @kernel stream_score(x::Array{Float64,3}) = begin
+        totals = dropdims(sum(x; dims = 3); dims = 3)
+        score = sum(abs2, totals)
+    end
+    kernel = prepare_nonallocating(spec; have = :x, want = :score)
+    for shape in ((2, 3, 1), (5, 3, 4), (0, 3, 2))
+        x = reshape(sin.(1:prod(shape)), shape)
+        totals = sum(x; dims = 3)
+        @test kernel(x) ≈ sum(abs2, totals)
+        reverse = prepare_ad(kernel, NA_AD_BACKEND, x; active = :x,
+                             type_stability = :error, type_stability_level = :all)
+        gradient = similar(x)
+        value, _ = ad_value_and_gradient!(reverse, gradient, x)
+        @test value ≈ sum(abs2, totals)
+        @test all(gradient .≈ 2 .* totals)
+    end
+end
+
 @testset "reverse owns its Cholesky factor storage" begin
     standard = @kernel stock_factor_entry(A) = begin
         L = cholesky(Symmetric(A)).L
