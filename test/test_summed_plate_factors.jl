@@ -223,11 +223,13 @@ end
     @test isempty(ad_call_findings(ad, Y, MU, 0.7))
 end
 
-@testset "the opt-in plate reverse keeps the plate's loop" begin
+@testset "the opt-in plate reverse keeps the factored sum" begin
+    # The generated reverse reads the loop the factoring keeps in its fallback
+    # arm, so the prepared program is factored with it on or off.
     k = RK.with_plate_reverse() do
         prepare(shared_normal; bound = (; y = Y))
     end
-    @test !_factored(k)
+    @test _factored(k)
 end
 
 end
