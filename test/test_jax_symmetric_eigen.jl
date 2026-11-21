@@ -24,10 +24,17 @@ end
 @kernel function positive_part(A)
     F = eigen(Symmetric(A))
     result = if minimum(F.values) < 0
-        F.vectors * Diagonal(max.(F.values, 0.0)) * transpose(F.vectors)
+        Matrix(Symmetric(F.vectors * Diagonal(max.(F.values, 0.0)) * transpose(F.vectors)))
     else
         A
     end
+    return result
+end
+@kernel function projected_gap(A::Matrix{Float64}, positive::Bool)
+    symmetric = (A .+ transpose(A)) ./ 2
+    estimate = positive ? positive_part(symmetric) : symmetric
+    gap = estimate - diagm(ones(size(A, 1)))
+    result = (gap, maximum(abs.(eigvals(Symmetric(gap)))))
     return result
 end
 @kernel function scaled_radius(scale::Float64, A::Matrix{Float64})
@@ -45,7 +52,7 @@ end
 end
 @kernel function symmetric_rows(scale::Float64, rows::Vector{Vector{Float64}})
     scores = plate(rows) do row
-        sum(Symmetric(Diagonal(scale .* row)))
+        sum(Matrix(Symmetric(Diagonal(scale .* row))))
     end
     result = sum(scores)
     return result
@@ -67,6 +74,7 @@ emit(graph, T=Float64) = jax_source(graph; have=(:A,), functions=(evaluate=:resu
     if rk_jax_available()
         mktempdir() do dir
             for (name, src) in pairs((; upper, lower, values, owned, prepared, positive=emit(positive_part),
+                                        gap=jax_source(projected_gap; have=(:A, :positive), want=:result),
                                         diagonal=jax_source(diagonal_values; have=(:v,), want=:result),
                                         rows=jax_source(symmetric_rows; have=(:scale, :rows), want=:result),
                                         guarded=jax_source(guarded_value; have=(:active, :A), want=:result),
@@ -142,6 +150,8 @@ emit(graph, T=Float64) = jax_source(graph; have=(:A,), functions=(evaluate=:resu
                 positive = load('positive')
                 np.testing.assert_allclose(positive(A), $(_rk_py_input(prepare(positive_part)(A))), atol=1e-12)
                 np.testing.assert_allclose(positive(S), S)
+                import gap
+                projected_gap = jax.jit(gap.kernel)
                 g = jax.jit(jax.grad(radius))(A)
                 assert g[1, 0] == 0
                 np.testing.assert_allclose(np.sum(g * np.triu(D)), $dr, rtol=1e-7)
@@ -149,6 +159,15 @@ emit(graph, T=Float64) = jax_source(graph; have=(:A,), functions=(evaluate=:resu
                     g = jax.jit(jax.grad(lambda a: f(a)[1][0, 0]**2))(A)
                     np.testing.assert_allclose(np.sum(g * D), $dq, rtol=1e-7, atol=1e-10)
                 """
+            nonsymmetric = [-0.5 0.3; 0.1 1.0]
+            for positive in (false, true)
+                expected_gap, expected_radius = prepare(projected_gap)(nonsymmetric, positive)
+                program *= """
+                    matrix, radius_value = projected_gap($(_rk_py_input(nonsymmetric)), $(_rk_py(positive)))
+                    np.testing.assert_allclose(matrix, $(_rk_py_input(expected_gap)), atol=1e-12)
+                    np.testing.assert_allclose(radius_value, $expected_radius, atol=1e-12)
+                    """
+            end
             script = joinpath(dir, "check.py")
             write(script, program)
             @test success(pipeline(`$RK_JAX_PYTHON $script`; stdout, stderr))

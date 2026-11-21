@@ -6074,11 +6074,16 @@ function _jax_call_positional(ctx::_JaxContext, T::Type, args::Vector{_PyVal})
         return _PyVal("jnp.zeros(" * shape * ", dtype=" * dtype * ")", Array{E,N})
     end
     if T <: AbstractArray && length(args) == 1 && _jax_is_array(args[1].T)
-        E = T isa UnionAll ? eltype(Base.unwrap_unionall(T)) : eltype(T)
-        E isa TypeVar && (E = eltype(args[1].T))
+        x = only(args)
+        # Matrix(A) and Array(A) inherit the source element type. Querying
+        # eltype on the unparameterized constructor would widen it to Any.
+        E = T <: Array ? Base.unwrap_unionall(T).parameters[1] : eltype(T)
+        E isa TypeVar && (E = eltype(x.T))
         dtype = _jax_dtype(E)
-        return _PyVal("jnp.asarray(" * args[1].code * ", dtype=" * dtype * ")",
-                      Array{E,ndims(args[1].T)})
+        code = "jnp.asarray(" * x.code * ", dtype=" * dtype * ")"
+        _jax_adjoint_vector(x.T) && (code *= "[None, :]")
+        result = _jax_typed_result(Array{E,ndims(x.T)}, args, code)
+        return _PyVal(result.code, result.T, result.static, x.extent, "", _jax_padded_axes(x))
     end
     if T <: Union{AbstractFloat,Integer} && length(args) == 1
         return _PyVal("jnp.asarray(" * args[1].code * ", dtype=" * _jax_dtype(T) * ")", T)
