@@ -643,8 +643,7 @@ end
 end
 
 # A factor over a subset of its column's levels leaves rows off its axis.
-# Those rows contribute zero, as their all-zero dummy rows do, so such a factor
-# keeps the design path.
+# Those rows contribute zero to the location.
 @testset "a factor over a level subset keeps zero rows off its axis" begin
     model = @rkppl begin
         a ~ Normal(0, 2)
@@ -663,4 +662,57 @@ end
     expected = logpdf(Normal(0, 2), 0.3) + sum(logpdf.(Normal(), params.c)) +
         sum(logpdf(Normal(0.3 + effect[l], 0.7), v) for (l, v) in zip(g, y))
     @test Base.invokelatest(q, u) ≈ expected rtol = 1e-12
+end
+
+# Each label reads one coefficient, including the implicit zero for an
+# unselected level. The oracle computes the scalar density and score directly.
+@testset "level gathers with omitted and missing labels" begin
+    reference = @rkppl begin
+        a ~ Normal(0, 2)
+        c[levels(g)[2:end]] .~ Normal.(0, 1)
+        mu = a .- c[g]
+        y .~ Normal.(mu, 0.7)
+    end
+    full = @rkppl begin
+        a ~ Normal(0, 2)
+        c[levels(g)] .~ Normal.(0, 1)
+        mu = a .- c[g]
+        y .~ Normal.(mu, 0.7)
+    end
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    programs = Expr[]
+    for (model, g, labels) in (
+            (reference, ["a", "b", "c", "b", "a"], ["b", "c"]),
+            (reference, repeat(["b", "d", "f", "h"]; inner = 40), ["d", "f", "h"]),
+            (reference, ["a", "a"], String[]),
+            (full, Union{Missing,String}[missing, "z", "a", missing], ["a", "z"]),
+            (full, Union{Missing,String}[missing, missing], String[]),
+            (full, String[], String[]))
+        y = [(-1)^i * 4.5 + 0.01i for i in eachindex(g)]
+        plan = model(; g) | (; y)
+        built = build_kernel(plan)
+        source = sprint(show, built.program)
+        @test !occursin("isequal.(", source)
+        @test occursin("_declared_codes", source)
+        model === reference && !isempty(labels) && push!(programs, built.program)
+        effects = [0.25 - i / 8 for i in eachindex(labels)]
+        a = 0.3
+        u = collect(Float64, unconstrain(built.layout, (; a, c = effects)))
+        sampler = prepare_sampler(built, plan, u; backend)
+        value, grad = sampler_value_and_gradient!(sampler, similar(u), u)
+        expected = logpdf(Normal(0, 2), a) + sum(logpdf.(Normal(), effects))
+        da, dc = -a / 4, -copy(effects)
+        for (label, obs) in zip(g, y)
+            j = findfirst(isequal(label), labels)
+            location = a - (isnothing(j) ? 0.0 : effects[j])
+            expected += logpdf(Normal(location, 0.7), obs)
+            score = (obs - location) / 0.7^2
+            da += score
+            isnothing(j) || (dc[j] -= score)
+        end
+        @test value ≈ expected rtol=1e-12
+        # The unconstrained coordinates are identity for both declarations.
+        @test grad ≈ unconstrain(built.layout, (; a=da, c=dc)) rtol=1e-11 atol=1e-11
+    end
+    @test ReactiveKernelsPPL._same_program(programs...)
 end

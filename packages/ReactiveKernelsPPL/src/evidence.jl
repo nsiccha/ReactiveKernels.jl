@@ -126,7 +126,7 @@ function _evidence_cell(::Val{:interval_censored}, base, y, lo, hi, cdf, ccdf, d
     return :($y < $hi ? $mass : -Inf)
 end
 
-_evidence_discrete(f::LikelihoodFamily) = _is_bernoulli_family(f) ||
+_evidence_discrete(f::_ResponseFamily) = _is_bernoulli_family(f) ||
     _is_binomial_family(f) || f in (PoissonLogFam, NegativeBinomial2Fam,
     NegativeBinomialFam, HurdlePoissonFam, ZeroInflatedPoissonFam,
     CategoricalFam, CategoricalLogitFam, OrderedLogisticFam, OrdinalFam)

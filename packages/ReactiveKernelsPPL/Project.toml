@@ -1,7 +1,7 @@
 name = "ReactiveKernelsPPL"
 uuid = "e266ea2a-6817-46cd-8bec-6238f0035f44"
 authors = ["Nikolas Siccha <nikolassiccha@gmail.com>"]
-version = "0.1.250"
+version = "0.1.251"
 
 [deps]
 Compat = "34da2185-b29b-5c13-b0c7-acf172513d20"
@@ -68,7 +68,7 @@ PrecompileTools = "1.2"
 # world through ReactiveKernels' own barrier (0.1.313). A sampler prepared on
 # another binding of one build reuses its preparation (0.1.323). A cell
 # pullback accumulates into a shared fixed-size immutable array (0.1.350).
-ReactiveKernels = "0.1.350"
+ReactiveKernels = "0.1.358"
 ReactiveKernelsDistributionKernels = "0.1.14"
 SpecialFunctions = "2"
 StaticArrays = "1"

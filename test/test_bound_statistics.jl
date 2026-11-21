@@ -392,4 +392,455 @@ end
     @test isempty(ad_call_findings(ad, beta, 0.7))
 end
 
+@kernel ls_weighted(x::Vector{Float64}, w::Vector{Float64}, y::Vector{Float64},
+                    a::Float64, b::Float64, sigma::Float64) = begin
+    mu = muladd.(b, x, a)
+    scales = sigma .* w
+    lp = plate(y, mu, scales) do yi, mi, si
+        cell::Float64 = si > 0 ? normal(mi, si).logpdf(yi) : -Inf
+        cell
+    end
+    total::Float64 = sum(lp)
+    return total
+end
+
+@kernel ls_precision(x::Vector{Float64}, w::Vector{Float64}, y::Vector{Float64},
+                     a::Float64, b::Float64, sigma::Float64) = begin
+    mu = plate(a, b, x) do a, b, x
+        a + *(b, x, x)
+    end
+    scales = plate(sigma, w) do s, n
+        s / sqrt(n)
+    end
+    lp = plate(y, mu, scales) do yi, mi, si
+        1.25 + 0.75 * ((yi - mi) / si)^2 - 2.0 * log(si)
+    end
+    total::Float64 = sum(lp)
+    return total
+end
+
+@kernel ls_bounded_scale(w::Vector{Float64}, y::Vector{Float64}, a::Float64, sigma::Float64) = begin
+    scales = sigma .* w
+    lp = plate(y, a, scales) do yi, mi, si
+        si > 1.0 ? -((yi - mi) / si)^2 : 0.0
+    end
+    total::Float64 = sum(lp)
+    return total
+end
+
+@kernel ls_interleaved(w::Vector{Float64}, y::Vector{Float64}, v::Vector{Float64},
+                       z::Vector{Float64}, a::Float64, b::Float64, sigma::Float64) = begin
+    scales = w .* sigma
+    first_cells = plate(y, a, scales) do yy, m, s
+        s > 0 ? -log(s) - 0.5 * ((yy-m)/s)^2 : -Inf
+    end
+    other = v .* sigma
+    first_sum = sum(first_cells)
+    second_cells = plate(z, b, other) do yy, m, s
+        s > 0 ? -log(s) - 0.5 * ((yy-m)/s)^2 : -Inf
+    end
+    second_sum = sum(second_cells)
+    total = first_sum + second_sum
+    return total
+end
+
+# The fits of scale-guarded plates a binding chose to run from its statistics.
+_weighted_fits(k) = [s for s in k.constants if s isa RK._LSWeightedStatistics]
+
+@testset "interleaved weighted sums own their reductions" begin
+    y = sin.(1:48)
+    z = cos.(1:48)
+    weights = 2 .+ y
+    for (w, v) in ((weights, reverse(weights)), ([0.0; weights[2:end]], weights),
+                   (weights, [0.0; weights[2:end]]))
+        bound = (; w, y, v, z)
+        k = prepare(ls_interleaved; bound)
+        literal = prepare(ls_interleaved; bound, bound_statistics = false)
+        # Each sum decides alone. A fit the guard could never accept is not
+        # bound: that sum is the authored plate, outside any region.
+        fits = _weighted_fits(k)
+        @test all(s -> s.fit.usable, fits)
+        @test length(fits) == count((all(>(0), w), all(>(0), v)))
+        @test count(r -> r.op isa RK._LSRegion, k.plan.recipes) == length(fits)
+        actual, gradient = _value_gradient(k, 0.1, -0.3, 0.8)
+        expected, reference = _value_gradient(literal, 0.1, -0.3, 0.8)
+        @test actual ≈ expected
+        @test collect(gradient) ≈ collect(reference)
+    end
+end
+
+@testset "separable row scales bind a weighted design" begin
+    for (model, precision) in ((ls_weighted, false), (ls_precision, true))
+        kernels = Any[]
+        for n in (0, 1, 40, 400)
+            x = randn(RNG, n)
+            y = randn(RNG, n)
+            w = [isodd(i) ? 0.75 : 1.5 for i in 1:n]
+            k = prepare(model; bound = (; x, w, y))
+            # A binding whose rows cost less than the statistics, or whose fit
+            # is unusable, is the plan without the rewrite.
+            fits = _weighted_fits(k)
+            @test length(fits) == (n >= 40)
+            if n >= 40
+                @test only(fits).fit.usable
+                push!(kernels, k)
+            else
+                literal = prepare(model; bound = (; x, w, y), bound_statistics = false)
+                @test _shape(k) == _shape(literal)
+            end
+            a, b = 0.2, -0.5
+            if n == 40
+                @test isempty(findings(k, (Float64, Float64, Float64)))
+                ad = prepare_ad(k, AutoEnzyme(; mode = Enzyme.Reverse), a, b, 1.1;
+                    active = (:a, :b, :sigma), native_forward_batch = false)
+                @test isempty(ad_call_findings(ad, a, b, 1.1))
+            end
+            for sigma in (1e-6, 1.1, 500.0)
+                value, gradient = _value_gradient(k, a, b, sigma)
+                ref, da, db, ds = 0.0, 0.0, 0.0, 0.0
+                for i in eachindex(x)
+                    feature = precision ? x[i]^2 : x[i]
+                    s = precision ? sigma/sqrt(w[i]) : sigma*w[i]
+                    residual = y[i] - (a + b*feature)
+                    c, l, q = precision ? (1.25, -2.0, 0.75) : (-log(2pi)/2, -1.0, -0.5)
+                    ref += c + l*log(s) + q*(residual/s)^2
+                    slope = -2q*residual/s^2
+                    da += slope
+                    db += slope*feature
+                    ds += (l - 2q*(residual/s)^2)/sigma
+                end
+                @test value ≈ ref rtol=1e-12
+                @test collect(gradient) ≈ [da, db, ds] rtol=1e-12
+            end
+        end
+        @test allequal(typeof.(kernels))
+        @test allequal(_shape.(kernels))
+    end
+    x = randn(RNG, 35)
+    y = randn(RNG, 35)
+    for w in (fill(0.7,35), [0.0; ones(34)], [-1.0; ones(34)], [Inf; ones(34)])
+        k = prepare(ls_weighted; bound=(; x,w,y))
+        original = prepare(ls_weighted; bound=(; x,w,y), bound_statistics=false)
+        for s in (-1.0, 0.0, 1e-160, 0.8, Inf)
+            v, ref = k(0.1, 0.3, s), original(0.1, 0.3, s)
+            @test isequal(v,ref) || isapprox(v,ref)
+        end
+    end
+    # This guard changes truth within the positive-scale domain. The plate
+    # must still test it on each row, in both the primal and reverse.
+    w = [isodd(i) ? 0.5 : 2.0 for i in eachindex(y)]
+    bounded = prepare(ls_bounded_scale; bound = (; w, y))
+    @test !any(s -> s isa RK._LSWeightedStatistics, bounded.constants)
+    value, gradient = _value_gradient(bounded, 0.2, 1.0)
+    active = findall(>(1), w)
+    residual = y[active] .- 0.2
+    @test value ≈ -sum(abs2, residual ./ w[active])
+    @test collect(gradient) ≈ [2sum(residual ./ w[active].^2), -2value]
+
+    cache = PreparationCache()
+    bindings = ((; x, w, y), (; x, w = [0.0; w[2:end]], y), (; x = 2x, w, y = -y))
+    rebound = map(data -> prepare!(cache, ls_weighted; bound = data), bindings)
+    # Bindings that choose alike share one compiled program. The binding with
+    # a zero scale has no usable fit and runs the authored plate.
+    @test map(k -> length(_weighted_fits(k)), rebound) == (1, 0, 1)
+    @test typeof(rebound[1]) === typeof(rebound[3]) && _shape(rebound[1]) == _shape(rebound[3])
+    @test rebound[1].f === rebound[3].f
+    @test _shape(rebound[2]) ==
+        _shape(prepare(ls_weighted; bound = bindings[2], bound_statistics = false))
+    for (k, data) in zip(rebound, bindings)
+        literal = prepare(ls_weighted; bound = data, bound_statistics = false)
+        value, grad = _value_gradient(k, 0.2, -0.3, 0.8)
+        ref, dref = _value_gradient(literal, 0.2, -0.3, 0.8)
+        @test value ≈ ref
+        @test collect(grad) ≈ collect(dref)
+    end
+end
+
+# One and four vectors gathered through one bound index, beside `ls_gathered`.
+@kernel ls_gathered_one(idx::Vector{Int}, y::Vector{Float64}, alpha::Vector{Float64},
+                        sigma::Float64) = begin
+    mu = alpha[idx]
+    lp = plate(y, mu) do yi, mi
+        normal(mi, sigma).logpdf(yi)
+    end
+    total::Float64 = sum(lp)
+    return total
+end
+@kernel ls_gathered_four(idx::Vector{Int}, f::Vector{Float64}, g::Vector{Float64}, h::Vector{Float64},
+                         y::Vector{Float64}, alpha::Vector{Float64}, beta::Vector{Float64},
+                         gamma::Vector{Float64}, delta::Vector{Float64}, sigma::Float64) = begin
+    mu = alpha[idx] .+ f .* beta[idx] .+ g .* gamma[idx] .+ h .* delta[idx]
+    lp = plate(y, mu) do yi, mi
+        normal(mi, sigma).logpdf(yi)
+    end
+    total::Float64 = sum(lp)
+    return total
+end
+
+@testset "gathered blocks run from the admission minimum" begin
+    # Coefficients that are bound columns: two rows per coefficient and index
+    # value admit the blocks, whatever the count of coefficients. The binding
+    # decides; the program is the same either way.
+    levels = 30
+    shapes = (
+        (ls_gathered_one, 0, ((1, false), (2, true), (3, true), (40, true))),
+        (ls_gathered, 1, ((2, false), (4, true), (5, true), (200, true))),
+        (ls_gathered_four, 3, ((4, false), (8, true), (32, true), (64, true))),
+    )
+    for (kernel, columns, cases) in shapes
+        kernels = Any[]
+        for (per, usable) in cases
+            n = levels * per
+            idx = repeat(1:levels; inner = per)
+            data = ntuple(_ -> randn(RNG, n), columns)
+            y = randn(RNG, n)
+            bound = columns == 0 ? (; idx, y) : columns == 1 ? (; idx, f = data[1], y) :
+                (; idx, f = data[1], g = data[2], h = data[3], y)
+            k = prepare(kernel; bound)
+            literal = prepare(kernel; bound, bound_statistics = false)
+            push!(kernels, k)
+            @test only(v for v in k.constants if v isa RK._LSStatistics).usable == usable
+            live = ntuple(_ -> randn(RNG, levels), columns + 1)
+            value, gradient = _value_gradient(k, live..., 0.9)
+            expected, reference = _value_gradient(literal, live..., 0.9)
+            @test value ≈ expected rtol = 1e-12
+            for i in eachindex(gradient)
+                @test gradient[i] ≈ reference[i] rtol = 1e-10
+            end
+        end
+        @test allequal(typeof.(kernels))
+        @test allequal(_shape.(kernels))
+    end
+end
+
+@kernel ls_columns(x::Vector{Float64}, y::Vector{Float64}, a::Float64, b::Float64,
+                   sigma::Float64) = begin
+    # A plate of its own, so the location is composed into the cell and the
+    # cell reads the bound columns, as a PPL's broadcast location does.
+    mu = plate(a, b, x) do a, b, x
+        a + b * x
+    end
+    lp = plate(y, mu, sigma) do yi, mi, si
+        normal(mi, si).logpdf(yi)
+    end
+    total::Float64 = sum(lp)
+    return total
+end
+
+# The Normal log density of `y` at `a .+ b .* x`, scale `sigma .* w`, and its
+# gradient in `(a, b, sigma)`, row by row.
+function _columns_reference(x, y, a, b, sigma; w = ones(length(y)))
+    value, da, db, ds = 0.0, 0.0, 0.0, 0.0
+    for i in eachindex(y)
+        s = sigma * w[i]
+        r = y[i] - (a + b * x[i])
+        value += -log(2pi) / 2 - log(s) - (r / s)^2 / 2
+        da += r / s^2
+        db += r * x[i] / s^2
+        ds += ((r / s)^2 - 1) / sigma
+    end
+    value, [da, db, ds]
+end
+
+@testset "a binding runs the arm that costs less" begin
+    region(k) = count(r -> r.op isa RK._LSRegion, k.plan.recipes)
+    multiplicities(k) = [length(c) for c in k.constants if c isa Vector{Int}]
+    a, b, sigma = 0.3, -0.7, 0.9
+    check(k, x, y; w = ones(length(y))) = begin
+        value, gradient = _value_gradient(k, a, b, sigma)
+        reference, expected = _columns_reference(x, y, a, b, sigma; w)
+        @test value ≈ reference rtol = 1e-12
+        @test collect(gradient) ≈ expected rtol = 1e-11
+    end
+    # Rows that differ: a few cost less than the statistics, many cost more.
+    for (n, statistics) in ((8, false), (40, false), (400, true), (4000, true))
+        x, y = randn(RNG, n), randn(RNG, n)
+        k = prepare(ls_columns; bound = (; x, y))
+        literal = prepare(ls_columns; bound = (; x, y), bound_statistics = false)
+        @test length(_weighted_fits(k)) == statistics
+        @test region(k) == statistics
+        # Without the statistics the plan is the one without the rewrite.
+        statistics || @test _shape(k) == _shape(literal)
+        check(k, x, y)
+    end
+    # Rows that repeat: the authored arm visits one row per distinct row, so
+    # the distinct rows decide, in the region's authored arm too.
+    for (distinct, repeats, statistics) in ((4, 100, false), (16, 25, false), (200, 2, true),
+                                            (400, 10, true))
+        rows = repeat(1:distinct, repeats)[randperm(RNG, distinct * repeats)]
+        x, y = randn(RNG, distinct)[rows], randn(RNG, distinct)[rows]
+        k = prepare(ls_columns; bound = (; x, y))
+        literal = prepare(ls_columns; bound = (; x, y), bound_statistics = false)
+        @test multiplicities(literal) == [distinct]
+        @test multiplicities(k) == [distinct]
+        @test length(_weighted_fits(k)) == statistics
+        statistics || @test _shape(k) == _shape(literal)
+        check(k, x, y)
+        statistics || continue
+        # The guard refuses these scales: the grouped rows answer, as the
+        # plan without the rewrite does.
+        for s in (0.0, 1e-170, 1e170, Inf)
+            v, ref = k(a, b, s), literal(a, b, s)
+            @test isequal(v, ref) || isapprox(v, ref; rtol = 1e-12)
+        end
+        value, gradient = _value_gradient(k, a, b, 1e-170)
+        expected, reference = _value_gradient(literal, a, b, 1e-170)
+        @test isequal(value, expected)
+        @test all(isequal.(collect(gradient), collect(reference)))
+    end
+    # A design without independent columns has no usable fit however many
+    # rows it has.
+    x, y = fill(0.5, 600), randn(RNG, 600)
+    k = prepare(ls_columns; bound = (; x, y))
+    @test isempty(_weighted_fits(k)) && region(k) == 0
+    @test _shape(k) == _shape(prepare(ls_columns; bound = (; x, y), bound_statistics = false))
+    check(k, x, y)
+    # A per-row scale is no vectorized loop: each row takes a logarithm and
+    # a division, so its statistics cost less from the first usable fit on.
+    for n in (4, 24)
+        x, y, w = randn(RNG, n), randn(RNG, n), 0.5 .+ rand(RNG, n)
+        k = prepare(ls_weighted; bound = (; x, w, y))
+        @test length(_weighted_fits(k)) == 1
+        check(k, x, y; w)
+    end
+    # Rebinding: bindings that choose alike share one compiled program.
+    cache = PreparationCache()
+    sizes = (400, 8, 1000, 12, 400)
+    rebound = map(sizes) do n
+        x, y = randn(RNG, n), randn(RNG, n)
+        k = prepare!(cache, ls_columns; bound = (; x, y))
+        check(k, x, y)
+        k
+    end
+    @test map(k -> length(_weighted_fits(k)), rebound) == (1, 0, 1, 0, 1)
+    @test rebound[1].f === rebound[3].f === rebound[5].f
+    @test rebound[2].f === rebound[4].f
+    @test rebound[1].f !== rebound[2].f
+end
+
+@kernel ls_mixed(X::Matrix{Float64}, idx::Vector{Int}, y::Vector{Float64},
+                 alpha::Vector{Float64}, beta::Vector{Float64}, sigma::Float64) = begin
+    mu = alpha[idx] .+ X * beta
+    lp = plate(y, mu) do yi, mi
+        normal(mi, sigma).logpdf(yi)
+    end
+    total::Float64 = sum(lp)
+    return total
+end
+
+@kernel ls_mixed_weighted(X::Matrix{Float64}, idx::Vector{Int}, w::Vector{Float64}, y::Vector{Float64},
+                         alpha::Vector{Float64}, beta::Vector{Float64}, sigma::Float64) = begin
+    mu = alpha[idx] .+ X * beta
+    scales = sigma .* w
+    lp = plate(y, mu, scales) do yi, mi, si
+        si > 0 ? normal(mi, si).logpdf(yi) : -Inf
+    end
+    total::Float64 = sum(lp)
+    return total
+end
+
+@testset "one grouped coefficient and a shared design" begin
+    for weighted in (false, true)
+        model = weighted ? ls_mixed_weighted : ls_mixed
+        kernels = Any[]
+        for (n, levels) in ((0, 5), (1, 1), (60, 15), (400, 100))
+            X = randn(RNG, n, 3)
+            y = randn(RNG, n)
+            idx = shuffle(RNG, repeat(1:levels, cld(n, levels))[1:n])
+            # Exercise both the indexed levels and the final partial block.
+            n == 60 && (idx .*= 2)
+            w = [isodd(i) ? 0.75 : 1.5 for i in 1:n]
+            data = weighted ? (; X, idx, w, y) : (; X, idx, y)
+            k = prepare(model; bound = data)
+            # The scale-guarded fit is bound only where the binding runs it.
+            if weighted
+                @test length(_weighted_fits(k)) == (n >= 60)
+                n >= 60 && push!(kernels, k)
+            else
+                push!(kernels, k)
+            end
+            stats = !weighted ? only(v for v in k.constants if v isa RK._LSMixedStatistics) :
+                n >= 60 ? only(_weighted_fits(k)).fit : RK._ls_mixed_unusable(n)
+            @test stats.usable == (n >= 60)
+            if stats.usable
+                @test size(stats.cross) == (levels, 3)
+                @test n > 100 || isempty(findings(k, (Vector{Float64}, Vector{Float64}, Float64)))
+            end
+            alpha = randn(RNG, maximum(idx; init = levels))
+            beta, sigma = randn(RNG, 3), 0.8
+            value, grad = _value_gradient(k, alpha, beta, sigma)
+            expected, da, db, ds = 0.0, zero(alpha), zero(beta), 0.0
+            for i in eachindex(y)
+                sd = weighted ? sigma*w[i] : sigma
+                r = y[i] - (alpha[idx[i]] + dot(view(X, i, :), beta))
+                expected += -0.5 * log(2pi) - log(sd) - 0.5 * (r/sd)^2
+                da[idx[i]] += r/sd^2
+                db .+= (r/sd^2) .* view(X,i,:)
+                ds += ((r/sd)^2 - 1) / sigma
+            end
+            @test value ≈ expected
+            @test grad[1] ≈ da
+            @test grad[2] ≈ db
+            @test grad[3] ≈ ds
+        end
+        @test allequal(typeof.(kernels))
+        @test allequal(_shape.(kernels))
+    end
+
+    # A shared intercept belongs to the span of the grouped intercepts.
+    # For these large opposite coefficients the literal rows cancel exactly.
+    idx, X, y = repeat(1:4, 20), ones(80, 1), zeros(80)
+    k = prepare(ls_mixed; bound = (; idx, X, y))
+    @test !only(v for v in k.constants if v isa RK._LSMixedStatistics).usable
+    value, grad = _value_gradient(k, fill(1e14, 4), [-1e14], 0.8)
+    @test value ≈ length(y) * (-log(2pi)/2 - log(0.8))
+    @test iszero(grad[1]) && iszero(grad[2])
+
+    # A large coordinate can have a moderate contribution through a tiny
+    # local column. Scale the residual by its column norm before squaring.
+    local_column = fill(1e-80, length(idx))
+    tiny = RK._ls_statistics_mixed(idx, local_column, 1e-80 .* randn(RNG, length(idx), 1),
+                                   y, nothing)
+    @test tiny.usable
+    @test RK._ls_rss_mixed(tiny, fill(1e180, 4), (0.0,)) ≈ length(y) * 1e200
+end
+
+@kernel ls_product_scale(x::Vector{Int}, z::Vector{Int}, w::Vector{Float64},
+                         v::Vector{Float64}, y::Vector{Float64}, b::Float64, sigma::Float64) = begin
+    mu = plate(b, x, z) do b, x, z
+        *(b, x, z)
+    end
+    scales = plate(sigma, w, v) do s, w, v
+        *(s, w, v)
+    end
+    lp = plate(y, mu, scales) do yi, mi, si
+        si > 0 ? normal(mi, si).logpdf(yi) : -Inf
+    end
+    total::Float64 = sum(lp)
+    return total
+end
+
+@testset "moving data multipliers across a live value" begin
+    n = 40
+    # The authored multiplication promotes to Float64 before x*z can wrap.
+    x = fill(isqrt(typemax(Int)) + 1, n)
+    # Distinct rows: equal rows are one grouped cell, which costs less than
+    # any statistics.
+    y = 1 .+ (1:n) ./ n
+    b = 0.1 / Float64(first(x))^2
+    for (w, v, sigma, usable) in ((2.0, 0.5, 0.8, true), (1e200, 1e-200, 1e120, false))
+        data = (; x, z=x, w=fill(w,n), v=fill(v,n), y)
+        k = prepare(ls_product_scale; bound = data)
+        literal = prepare(ls_product_scale; bound = data, bound_statistics = false)
+        @test !isempty(_weighted_fits(k)) == usable
+        @test all(s -> s.fit.usable, _weighted_fits(k))
+        @test k(b, sigma) ≈ literal(b, sigma)
+        if usable
+            _, grad = _value_gradient(k, b, sigma)
+            _, ref = _value_gradient(literal, b, sigma)
+            @test collect(grad) ≈ collect(ref)
+        end
+    end
+end
+
 end

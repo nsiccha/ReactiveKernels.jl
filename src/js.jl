@@ -2650,11 +2650,11 @@ _js_returns(w::NamedTuple) =
 
 # The recipes of a plan, in order, in the current function; `values` holds its
 # HAVE values. Returns its WANT values.
-function _js_plan_body!(fn::_JsFn, p::Plan, values::Dict{ValueId,Any})
+function _js_plan_body!(fn::_JsFn, p::Plan, values::Dict{ValueId,Any}; checks = p.checks)
     mod = fn.mod
     kir = _js_ir(fn, only(Base.code_lowered(_js_noop, Tuple{})), 0)
     # The plan's input checks, each as soon as its arguments are known.
-    checks = collect(p.checks)
+    checks = collect(checks)
     function run_checks!()
         for c in copy(checks)
             all(a -> !(a isa Value) || haskey(values, canon_id(p.graph, a.id)), c.args) || continue
@@ -2680,7 +2680,20 @@ function _js_plan_body!(fn::_JsFn, p::Plan, values::Dict{ValueId,Any})
         hint = length(recipe.outputs) == 1 ? string(only(recipe.outputs).name) : "outputs"
         start = length(fn.lines)
         before = copy(fn.taken)
-        result, RT = if op isa _BoundConstant
+        result, RT = if op isa _LSRegion
+            # Emit the authored rows. The containing plan runs their input checks.
+            body = op.literal
+            args = Dict{ValueId,Any}(canon_id(body.graph, v.id) => a for (v, a) in zip(body.have, inputs))
+            outs = _js_plan_body!(fn, body, args; checks = ())
+            if length(outs) == 1
+                only(outs), _js_value_type(only(outs))
+            else
+                T = Tuple{map(_js_value_type, outs)...}
+                _JsTuple(outs, T), T
+            end
+        elseif op isa _LSScaleGuard && _js_region_guard(p, only(recipe.outputs))
+            _js_static(false), Bool
+        elseif op isa _BoundConstant
             # bound data: known while translating, emitted where read at run time
             _js_bound(mod, op.value, hint), typeof(op.value)
         elseif op isa _KernelSourceOp
@@ -2729,6 +2742,20 @@ end
 
 # The type a sub-plan's value has, for a WANT value of a cell or step.
 _js_value_type(v) = v isa _JsVal ? (v.static ? typeof(v.value) : v.T) : _js_type(v)
+
+# Only a native choice between equivalent programs may be replaced with the
+# authored arm. A guard requested as a result or read as data stays observable.
+function _js_region_guard(p::Plan, guard)
+    id = canon_id(p.graph, guard.id)
+    same(v) = canon_id(p.graph, v.id) == id
+    any(same, p.want) && return false
+    any(c -> any(v -> v isa Value && same(v), c.args), p.checks) && return false
+    all(p.recipes) do r
+        all(zip(eachindex(r.inputs), r.inputs)) do (i, v)
+            !same(v) || (r.op isa _LSRegion && r.op.literal.have[i] in r.op.statistics)
+        end
+    end
+end
 
 # A module-level name `prefix * hint`, unique in the module. Function locals
 # never start with `_`, so they cannot shadow it.
@@ -2794,6 +2821,10 @@ _js_bound(mod::_JsModule, x, hint) = _js_static(x)
 function _js_function_call(ir::_JsIR, k::PreparedKernel, args, T)
     mod = ir.fn.mod
     p = k.plan
+    # An execution copy keeps the callable and its real ports but discards
+    # the plan this translator reads (_execution_copy_object).
+    p === _EXECUTION_PLAN && _js_error(mod, "cannot translate the embedded prepared kernel for `",
+        join((v.name for v in outputs(k)), ", "), "` to JavaScript because its source plan was discarded")
     length(p.have) == length(args) ||
         _js_error(mod, "a prepared kernel of ", length(p.have), " inputs called with ", length(args))
     argtypes = Any[_js_argtype(a) for a in args]

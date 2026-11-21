@@ -434,6 +434,16 @@ end
         # out (an adjoint row, three-dimensional blocks).
         op = ReactiveKernels._ConcatenateStep(vcat)
         u = collect(1.0:8.0)
+        for v in (view(u, 1:3), view(u, 1:0))
+            dest = zeros(length(v) + 1)
+            @test (@inferred MutatingFunctions.apply!!(dest, op, 0.0, v)) === dest
+            @test dest == vcat(0.0, v)
+            @test (@allocated MutatingFunctions.apply!!(dest, op, 0.0, v)) == 0
+        end
+        shared_tail = view(u, 1:7)
+        expected_tail = vcat(-1.0, shared_tail)
+        copied = MutatingFunctions.apply!!(u, op, -1.0, shared_tail)
+        @test copied !== u && copied == expected_tail
         row = [10.0 20.0]
         block = reshape(view(u, 1:4), 2, 2)
         cache = zeros(3, 2)

@@ -361,7 +361,7 @@ function _ln_plan(n = 9)
 end
 
 @testset "contract admission predicates" begin
-    @test admitted_families() == (GaussianFam, BernoulliLogitFam, PoissonLogFam,
+    @test filter(f -> f isa LikelihoodFamily, admitted_families()) == (GaussianFam, BernoulliLogitFam, PoissonLogFam,
         BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam,
         BernoulliProbitFam, BernoulliCloglogFam, BinomialProbitFam,
         BinomialCloglogFam, BinomialProbFam, BetaLogitFam, CategoricalLogitFam,
@@ -370,7 +370,7 @@ end
         PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,
         ZeroInflatedPoissonFam, InverseGaussianFam, BetaBinomial2Fam, VonMisesFam,
         NegativeBinomialFam, ExponentialLogFam, LogNormalFam, WeibullFam,
-        ZeroInflatedBinomialFam, GammaValueFam, WeibullValueFam, BetaShapeFam)
+        ZeroInflatedBinomialFam, GammaValueFam, WeibullValueFam, BetaShapeFam, CauchyFam)
     @test admitted_terms() == (InterceptTerm, ContinuousTerm, FactorTerm,
         OffsetTerm, ScanSummandTerm, MatrixTerm, ComposedTerm)
     @test :log in admitted_functions()
@@ -1824,6 +1824,11 @@ end
     @test validate_plan(_factor_plan(; intercept = false,
         subset = Colon())) === nothing
     @test validate_plan(_factor_plan(; subset = Colon())) === nothing
+    # An open-ended level selection has Julia's indexing semantics, including
+    # when its first index is beyond the position following the final level.
+    fourth_onward = LevelMap(:mu, :g, Int[], :levels, (4, :end))
+    @test ReactiveKernelsPPL._apply_subset([7], fourth_onward) == Int[]
+    @test ReactiveKernelsPPL._apply_subset([7, 8, 9, 10], fourth_onward) == [10]
     # Missing / duplicate maps.
     # refused: factor term without its level map (IR contract)
     @test_throws ContractValidationError validate_plan(_factor_plan(;

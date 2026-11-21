@@ -16,6 +16,39 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.251
+
+Requires ReactiveKernels 0.1.358.
+
+- A ReactiveKernels law with `location` and `scale` ports, a `logpdf` that
+  takes one observation, and all kernel-valued arguments bound can serve as an
+  elementwise response, including a law defined in the model's own module.
+  `Cauchy`, `Laplace`, `Logistic` and the standardized `TDist.(nu)` join
+  `Normal` and `StudentT`, for example `y .~ Laplace.(mu, sigma)`. The summed
+  observation plate can compute a shared log scale once and group identical
+  bound rows. All four new responses support weighting, truncation, censoring
+  and interval censoring in native Julia and JAX. Additional numeric law
+  parameters may vary by row.
+- An inverse link may be named or qualified. `p = logistic.(eta)` followed by
+  `y .~ Bernoulli.(p)`, and `LogExpFunctions.logistic.(eta)`, select the same
+  natural-parameter likelihood as the inline `logistic.(eta)`. A qualified
+  call is identified by its constant binding, including aliases and re-exports
+  of the same function; a mutable global alias keeps ordinary call semantics.
+  Other readers of the named value still get the value.
+- An indexed observation with elementwise row arithmetic, such as `@plate for
+  i in eachindex(y); y[i] ~ Normal(a + b * x[i], sigma); end`, exposes its row
+  operands to grouping and regression statistics like the dotted form. Opaque
+  calls and conditionals in the row expression stay in the indexed cell.
+- For a one-based response vector, `y[:]`, `y[eachindex(y)]` and `y[axes(y,
+  1)]` use the unsliced likelihood when their operands cover the same rows.
+- A factor term (`alpha[g]` with declared levels) gathers its coefficients by
+  level in every spelling: with a reference level, with missing labels, beside
+  matrix terms and beside a scan. Preparation no longer builds a dense
+  contrast matrix for the cases the direct gather did not cover, whose cost
+  grew with rows times levels. The factor term contributes zero to the
+  predictor for a row whose label is outside its declared axis, including when
+  every row has the reference level.
+
 ## 0.1.250
 
 - A submodel called in a plate can build an indexed fitted value and observe

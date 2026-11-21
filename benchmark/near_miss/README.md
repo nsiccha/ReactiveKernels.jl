@@ -20,17 +20,17 @@ julia --startup-file=no --project=<env> benchmark/near_miss/probe_families.jl [f
 `families` is a string of family letters (default `ABCDGR`), `rows` the number of
 observations (default 2000), and `filter` a regular expression over variant
 names. The environment needs ReactiveKernelsPPL, ReactiveKernels, Enzyme,
-ADTypes and Chairmarks. One line is printed per variant as soon as it is
+ADTypes, Chairmarks and LogExpFunctions. One line is printed per variant as soon as it is
 measured; a variant that fails prints its error instead of a timing.
 
 | Family | Base model | Siblings |
 | --- | --- | --- |
-| A | `y .~ Normal.(a .+ b .* x, sigma)` | named location, matrix design, data-weighted scale, LogNormal, `@plate` loop, quadratic term, exp link, Student-t, modeled scale, scalar location, crossed and gathered intercepts, gathered intercept beside an authored `hcat` or a separate scan |
-| B | `y .~ BernoulliLogit.(a .+ b .* x)` on a discrete covariate | continuous covariate, `Bernoulli.(logistic.(…))`, Poisson, Binomial, negative binomial, `@plate` loop |
+| A | `y .~ Normal.(a .+ b .* x, sigma)` | named location, matrix design, data-weighted scale, LogNormal, `@plate` loop, quadratic term, exp link, Student-t, modeled scale, scalar location, crossed and gathered intercepts, gathered intercept beside an authored `hcat` or a separate scan, whole-vector range |
+| B | `y .~ BernoulliLogit.(a .+ b .* x)` on a discrete covariate | continuous covariate, `Bernoulli.(logistic.(…))`, Poisson, Binomial, negative binomial, `@plate` loop, named and qualified links, whole-vector range, Poisson exposure |
 | C | `y .~ Normal.(alpha[g] .+ b .* x, sigma)` with rows sorted by group | shuffled rows, Bernoulli-logit, Poisson, Student-t, reference coding, missing group labels |
-| D | `y .~ Normal.(exp.(a .+ b .* x), sigma)` | Student-t, LogNormal, Gamma, Weibull, Cauchy, Laplace, Logistic with shared shape or scale |
+| D | `y .~ Normal.(exp.(a .+ b .* x), sigma)` | Student-t, LogNormal, Gamma, Weibull, Cauchy, Laplace, Logistic with shared shape or scale, plus the equivalent standardized `TDist.(nu)` and `StudentT.(nu, 0, 1)` |
 | G | Poisson cubic trend over 40 rows | Binomial quadratic trend, one effect per row, Poisson, Binomial and Bernoulli-logit over a five-column design matrix |
-| R | hand-written loops | Normal, Student-t, Cauchy, Bernoulli-logit, Poisson, gathered Normal |
+| R | hand-written loops | Normal, Student-t, Cauchy, Laplace, Logistic, Gamma, Weibull, Bernoulli-logit, Poisson, gathered Normal |
 
 ## First measurement
 
@@ -163,16 +163,200 @@ julia --startup-file=no --project=<env> benchmark/near_miss/probe_families.jl C 
 julia --startup-file=no --project=<env> benchmark/near_miss/factor_scaling.jl 20000 50,500,5000 normal,bernoulli full,reference,missing,bound_matrix,hcat,scan
 ```
 
-On `8a7f69f42`, the full-cover and reference-coded siblings had the following
-costs. Each pair gives full cover first and reference coding second.
-The 5,000-level reference design has 99,980,000 entries. Gaussian
-least-squares preparation can hide the cost of building it at smaller sizes.
+Each cell gives the original and gathered results at 20,000 rows. Both
+samplers ran in the same Julia 1.10.12 kb8 process on gordito, with one
+BLAS thread. The comparison loaded the two versions of the factor lowering
+(`8a7f69f42` and `e9a174633`) and prepared a fresh sampler for each model
+and version. Each law and spelling first ran with 100 rows and five levels.
+Gathered models were prepared first, so the original models could reuse Julia
+specializations from the first pass. Setup is one observation per version.
+The density and gradient times are medians of five alternating measurements.
+Each matched pair agreed on its log density and gradient vector.
 
-| Law | Levels | Setup (s) | Setup (MiB) | Density (µs) | Value and gradient (µs) |
+| Law | Levels | Factor | Setup (s) | Setup (MiB) | Density (µs) | Value and gradient (µs) |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| Normal | 50 | full | 0.302 → 0.498 | 85.2 → 89.4 | 2.15 → 2.15 | 4.06 → 4.08 |
+| Normal | 50 | reference | 0.553 → 0.550 | 140 → 91.1 | 1.14 → 2.20 | 2.59 → 4.21 |
+| Normal | 500 | full | 0.316 → 1.61 | 86.9 → 90.7 | 3.55 → 3.66 | 10.4 → 10.2 |
+| Normal | 500 | reference | 1.82 → 1.79 | 629 → 92.7 | 101 → 3.66 | 178 → 10.7 |
+| Normal | 5,000 | full | 0.350 → 3.35 | 94.8 → 275 | 5.84 → 5.68 | 23.8 → 24.0 |
+| Normal | 5,000 | reference | 156 → 3.42 | 6,038 → 290 | 27,135 → 6.12 | 151,765 → 24.9 |
+| Bernoulli-logit | 50 | full | 0.416 → 0.304 | 63.0 → 62.8 | 172 → 178 | 235 → 235 |
+| Bernoulli-logit | 50 | reference | 0.326 → 0.361 | 76.8 → 64.6 | 237 → 172 | 343 → 223 |
+| Bernoulli-logit | 500 | full | 0.346 → 0.324 | 64.5 → 64.1 | 180 → 181 | 236 → 236 |
+| Bernoulli-logit | 500 | reference | 0.502 → 0.391 | 284 → 66.1 | 2,711 → 172 | 5,459 → 223 |
+| Bernoulli-logit | 5,000 | full | 0.336 → 2.67 | 84.1 → 243 | 170 → 181 | 218 → 219 |
+| Bernoulli-logit | 5,000 | reference | 1.42 → 2.98 | 2,369 → 262 | 34,639 → 171 | 75,884 → 215 |
+
+Repeating setup in reverse order made the full-cover controls cheaper on
+the second pass with either lowering. At 5,000 levels the reference-coded
+Bernoulli-logit gather still took longer to prepare and allocated about
+one ninth as much memory in both orders. Each cell below gives seconds
+and cumulative MiB allocated for 20,000 rows.
+
+| Law and coding | Original first | Original second | Gathered first | Gathered second |
+| --- | ---: | ---: | ---: | ---: |
+| Normal, full cover | 2.85 s / 279.1 MiB | 0.35 s / 94.8 MiB | 3.35 s / 274.7 MiB | 0.29 s / 90.6 MiB |
+| Bernoulli-logit, full cover | 2.45 s / 247.7 MiB | 0.34 s / 84.1 MiB | 2.67 s / 243.3 MiB | 0.30 s / 79.9 MiB |
+| Bernoulli-logit, reference | 1.47 s / 2,373.2 MiB | 1.42 s / 2,369.0 MiB | 2.98 s / 261.6 MiB | 2.82 s / 261.7 MiB |
+
+To locate the reference-coded Bernoulli-logit setup cost, each lowering
+also ran in its own Julia process after a 100-row warmup. On the first
+20,000-row, 5,000-level case, `prepare_sampler` took 1.04 s for the dense
+design and 2.48 s for the gather. Julia recorded 0.99 s of compilation
+during gathered sampler preparation. Rebuilding the model and sampler on
+the same data took 1.83 s in total with the dense design and 0.34 s with
+the gather. On that second binding, `prepare_sampler` alone allocated
+2,329 MiB and 45.8 MiB, respectively.
+
+### After lowering factor terms to level gathers
+
+The factor reads one effect per observation in all four spellings. For a
+partial axis, the coefficient table begins with zero. A covered label
+indexes its declared coefficient and an uncovered label indexes the zero.
+A separately requested design matrix still contains its contrast columns.
+
+These paired measurements use 2,000 rows, 50 groups and one BLAS thread
+on gordito. Each pair is the median of five alternating old and new
+Chairmarks runs in the same Julia process. The old and new samplers agreed
+on the density and on every gradient coordinate at the same parameter vector.
+
+| Spellings | Bernoulli-logit density (µs) | Bernoulli-logit value + gradient (µs) | Poisson density (µs) | Poisson value + gradient (µs) |
+| --- | ---: | ---: | ---: | ---: |
+| Full cover | 18.0 → 18.0 | 23.8 → 23.9 | 6.10 → 6.09 | 13.5 → 13.6 |
+| Reference level | 21.2 → 17.2 | 29.4 → 22.4 | 13.4 → 5.85 | 24.6 → 13.2 |
+| Missing labels | 21.3 → 17.3 | 29.7 → 22.5 | 12.9 → 6.08 | 23.4 → 13.2 |
+| Bound two-column matrix | 17.4 → 17.4 | 23.1 → 23.1 | 8.56 → 8.52 | 15.7 → 15.8 |
+| Authored two-column matrix | 21.3 → 17.3 | 30.5 → 23.1 | 13.7 → 8.90 | 44.3 → 16.4 |
+| Separate scan | 22.2 → 17.2 | 31.3 → 23.1 | 13.1 → 6.18 | 23.9 → 13.5 |
+
+The reference-coded design at 5,000 levels previously contained 99,980,000
+entries. Normal setup fell from 156.1 s and 6,038 MiB to 3.42 s and
+290 MiB. Its gradient fell from 151.8 ms to 24.9 µs. For
+Bernoulli-logit, the gradient fell from 75.9 ms to 215 µs.
+The complete table gives setup and warm-call measurements for all four
+spellings and both controls at each level count. [Scaling measurements](factor_scaling.csv)
+
+At 50 levels the original Normal design used bound least-squares
+statistics. The standalone gather evaluates the likelihood over the rows.
+The reference-coded gradient took 2.59 µs with the dense design and
+4.21 µs with the gather. The authored-matrix gradient took
+2.69 and 13.87 µs respectively. These figures precede
+the mixed gathered-and-shared least-squares statistics.
+
+At 2,000 rows and 50 levels A15 previously took 7.41 µs with the
+initial gather on `a9959a24b`. In the paired run the dense baseline took
+2.06 µs and the revised gather took 1.58 µs. The generator gives the observation
+plate a borrowed factor gather and the result of the matrix product.
+Native and compiled JAX values and gradients agreed at 12 rows, 3 levels
+and at 240 rows, 60 levels. Both compiled gradients had 90 traced operations,
+including one gather, one scatter-add and two matrix products.
+
+### Allocation of the reference-level coefficient table
+
+At 20,000 rows the original gather implementation allocated a new
+`vcat(0.0, effects)` on every call. The prepared sampler had a vector cache
+for this step, but the concatenation method accepted only vector operands.
+Allowing the scalar zero to fill the same cache as the coefficient vector
+gave the following results for both reference coding and missing labels.
+Normal, Bernoulli-logit and Poisson gave the same allocation counts.
+
+| Levels | Density allocations / bytes, initial gather | Density allocations / bytes, reusable table | Gradient allocations / bytes, initial gather | Gradient allocations / bytes, reusable table |
+| ---: | ---: | ---: | ---: | ---: |
+| 50 | 2 / 512 | 1 / 16 | 6 / 1,184 | 0 / 0 |
+| 5,000 | 3 / 40,064 | 1 / 16 | 8 / 80,288 | 0 / 0 |
+
+The table below compares the original lowering with the gathered lowering
+after sampler storage reuse and matrix fusion. Each entry is the number
+of allocations and the total bytes allocated per warm call at 20,000 rows.
+Normal, Bernoulli-logit and Poisson gave the same counts for each spelling.
+
+| Spelling | Levels | Original density | Gathered density | Original value and gradient | Gathered value and gradient |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Normal | 50 | 0.286 / 0.407 | 89.6 / 144 | 2.20 / 0.85 | 4.01 / 2.28 |
-| Normal | 500 | 0.855 / 2.02 | 91.1 / 633 | 3.65 / 82.8 | 10.1 / 166 |
-| Normal | 5,000 | 1.93 / 111 | 278 / 6,042 | 5.72 / 22,290 | 23.9 / 114,133 |
-| Bernoulli-logit | 50 | 0.163 / 0.199 | 62.8 / 76.5 | 170 / 239 | 222 / 346 |
-| Bernoulli-logit | 500 | 0.174 / 0.261 | 64.5 / 284 | 173 / 1,993 | 227 / 3,959 |
-| Bernoulli-logit | 5,000 | 2.41 / 1.51 | 248 / 2,369 | 179 / 48,226 | 216 / 91,627 |
+| Reference level or missing labels | 50 | 4 / 1,024 | 1 / 16 | 6 / 2,016 | 0 / 0 |
+| Reference level or missing labels | 5,000 | 6 / 80,176 | 1 / 16 | 10 / 160,320 | 0 / 0 |
+| Separate scan | 50 | 4 / 1,072 | 1 / 16 | 6 / 2,112 | 0 / 0 |
+| Separate scan | 5,000 | 6 / 80,240 | 1 / 16 | 10 / 160,448 | 0 / 0 |
+| Authored two-column matrix or full-cover control | 50 and 5,000 | 1 / 16 | 1 / 16 | 0 / 0 | 0 / 0 |
+
+The public density call `q(u)` returns a boxed `Float64` through its
+world-age barrier. The prepared gradient writes into the caller’s buffer.
+
+A second implementation fed the bound level codes into a plate that returned
+zero for code zero and otherwise indexed the declared parameter directly.
+At 20,000 rows it allocated 320,112 bytes per density and 640,192 bytes per
+gradient for both Normal and Bernoulli-logit, at both 50 and 5,000 levels.
+At 5,000 levels the reference-coded Normal gradient took 76.5 µs with this
+plate and 24.6 µs with the buffered table in the same Julia process.
+
+For mixed least squares, `full` uses a grouped intercept and one shared
+slope (A13). `bound_matrix` uses the grouped intercept and shared matrix
+columns (A12). The optional fifth argument sets the number of bound-matrix
+columns. Two reproduces the factor comparison above and five reproduces the
+width of A12. The final four output columns report the allocations and the allocated
+bytes per warm density call and per ordinary Enzyme value-and-gradient call.
+
+```sh
+julia --startup-file=no --project=<env> benchmark/near_miss/factor_scaling.jl 20000 50,500,5000 normal full,bound_matrix 5
+```
+
+## Observation spelling
+
+Paired prepared calls on 2,000 rows, before and after the observation lowering
+relative to `8a7f69f42`. Each pair ran in one Julia process on one CPU, with
+five alternating measurements. Times are microseconds per call.
+
+| Variant | Density before | Density after | Value and gradient before | Value and gradient after |
+| --- | ---: | ---: | ---: | ---: |
+| A0 dotted Normal | 0.136 | 0.135 | 0.365 | 0.360 |
+| A5 Normal in an indexed plate | 0.238 | 0.037 | 0.642 | 0.062 |
+| A17 Normal with `y[:]` | 0.137 | 0.134 | 0.381 | 0.372 |
+| B0 dotted Bernoulli-logit, five distinct covariates | 0.116 | 0.117 | 0.143 | 0.148 |
+| B5 the same in an indexed plate | 0.249 | 0.120 | 0.510 | 0.138 |
+| B6 named logistic, five distinct covariates | 33.97 | 0.126 | 85.59 | 0.153 |
+| B7 qualified logistic, five distinct covariates | 25.35 | 0.124 | 53.02 | 0.144 |
+| B0c dotted Bernoulli-logit, continuous covariate | 17.03 | 17.04 | 19.58 | 19.60 |
+| B5c the same in an indexed plate | 40.82 | 17.74 | 98.02 | 20.74 |
+| B6c named logistic, continuous covariate | 33.70 | 18.05 | 83.68 | 20.72 |
+| B7c qualified logistic, continuous covariate | 23.88 | 16.99 | 52.68 | 19.57 |
+| B8 Bernoulli with `y[axes(y,1)]`, five distinct covariates | 0.119 | 0.116 | 0.142 | 0.143 |
+| B8c the same with a continuous covariate | 17.08 | 16.99 | 19.71 | 20.50 |
+| B3c dotted Binomial, continuous covariate | 15.27 | 15.35 | 26.19 | 26.19 |
+| B10 the same with `y[:]` | 20.08 | 15.16 | 26.15 | 26.25 |
+
+The indexed plate exposes its row operands to the summed likelihood. RK can
+group duplicate Bernoulli observations and bind least-squares statistics for
+the Normal regression. Named and qualified logistic calls retain the logit
+predictor. The whole-vector Binomial range now uses the same density formula
+as the unsliced observation.
+
+A Poisson rate multiplied by exposure still consumes the product the model
+states. B9 took 29.67 µs per gradient. B9log took 11.30 µs with the logarithm
+of its positive exposure supplied as an offset. Replacing a general product
+with a log offset would change what happens for negative exposure or when the
+first exponential overflows before multiplication.
+
+## Location-scale response laws
+
+D5–D7 previously failed during model lowering. Each now calls the law's
+`logpdf` in a summed plate. The shared log scale is computed before the row
+loop. Times below are microseconds for 2,000 rows on gordito with the Student-t
+factor form from `5f79a995e`. The models and hand loops ran in the same
+Julia 1.10.12 (kb8) process using ordinary Enzyme reverse mode. All the
+value-and-gradient calls allocated zero bytes.
+
+| Response | Model density | Hand density | Model value and gradient | Hand value and gradient |
+| --- | ---: | ---: | ---: | ---: |
+| D1 Student-t, exp link | 24.32 | 20.24 | 41.15 | 28.95 |
+| D5 Cauchy | 20.21 | 20.32 | 29.44 | 29.04 |
+| D6 Laplace | 4.80 | 4.60 | 13.47 | 13.95 |
+| D7 Logistic | 29.19 | 29.08 | 52.82 | 46.09 |
+
+The Logistic kernel uses `log1pexp(-abs(z))` and the hand loop uses
+`log1p(exp(-abs(z)))`. Substituting the kernel's `log1pexp` in the hand
+loop gave 51.95 µs for value and gradient.
+
+D8 `TDist.(nu)` previously failed during lowering. It now agrees exactly in
+value and gradient with D8s `StudentT.(nu, 0, 1)` at the checked parameter
+point. In the same run their densities took 11.68 and 11.65 µs respectively,
+and their value-and-gradient calls took 18.06 and 17.94 µs.

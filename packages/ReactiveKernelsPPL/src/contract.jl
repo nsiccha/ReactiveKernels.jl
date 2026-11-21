@@ -154,6 +154,53 @@ univariate components, SB `MixtureModel` mirror)."""
     BetaShapeFam
 end
 
+# A location-scale observation carries the RK law it calls. Keep the public
+# enum identities already used by structural-plan callers.
+struct _LocationScaleFamily
+    binding::GlobalRef
+    ports::Tuple{Vararg{Symbol}}
+end
+const _ResponseFamily = Union{LikelihoodFamily,_LocationScaleFamily}
+const _LOCATION_SCALE_ENUMS = (normal = GaussianFam, lognormal = LogNormalFam,
+    student_t = StudentTFam, cauchy = CauchyFam)
+
+function _location_scale_law(ref::GlobalRef)
+    law = getglobal(ref.mod, ref.name)
+    applicable(ReactiveKernels.kernel_endpoint_names, law) || return nothing
+    :logpdf in ReactiveKernels.kernel_endpoint_names(law) || return nothing
+    ports = Tuple(ReactiveKernels.kernel_spec(law).have_names)
+    :location in ports && :scale in ports || return nothing
+    # The plate calls logpdf with one observation. A factory still waiting
+    # for a kernel (e.g. the standard law of location_scale) cannot do so.
+    skeleton = ReactiveKernels._kernel_object_skeleton(law)
+    templates = ReactiveKernels._kernel_endpoint_templates(skeleton)
+    length(Dict(templates.method_args)[:logpdf]) == 1 || return nothing
+    bound = keys(ReactiveKernels._kernel_object_bindings(law))
+    all(in(bound), templates.binding_names) || return nothing
+    return _LocationScaleFamily(ref, ports)
+end
+
+const _LOCATION_SCALE_LAWS = let laws = Dict{Symbol,_LocationScaleFamily}()
+    for name in names(DistributionKernelSources)
+        law = _location_scale_law(GlobalRef(DistributionKernelSources, name))
+        law === nothing || (laws[name] = law)
+    end
+    laws
+end
+_location_scale_law(f::_LocationScaleFamily) = f
+# Preserve the Student-t IR's existing degrees-of-freedom slot and guard.
+# For other laws each argument beyond location and scale is an ordinary value.
+function _location_scale_extra_ports(law::_LocationScaleFamily)
+    slots = _location_scale_family(law) === StudentTFam ? (:location, :scale, :nu) : (:location, :scale)
+    return filter(p -> p ∉ slots, law.ports)
+end
+const _LOCATION_SCALE_BY_ENUM = Dict(family => _LOCATION_SCALE_LAWS[name]
+    for (name, family) in pairs(_LOCATION_SCALE_ENUMS))
+_location_scale_law(f::LikelihoodFamily) = get(_LOCATION_SCALE_BY_ENUM, f, nothing)
+_location_scale_family(law::_LocationScaleFamily) =
+    law.binding.mod === DistributionKernelSources ?
+        get(_LOCATION_SCALE_ENUMS, law.binding.name, law) : law
+
 """Link functions. The enum crosses the boundary; the thin layer owns the
 inverse-link numerics (R1 counter).
 
@@ -308,7 +355,9 @@ at their defaults:
 - `thresholds`: shared ordered/vector parameter ([`VectorParameter`](@ref)),
   shared data vector, or `ThresholdRows` for vectors broadcast per observation
   for OrderedLogistic/Ordinal; `nothing` otherwise.
-- `extra_predictors`: CategoricalLogit non-reference predictors after
+- `extra_predictors`: For a location-scale law, values of its additional
+  constructor ports (after accounting for location, scale and nu), in their
+  declared order. For CategoricalLogit, non-reference predictors after
   `predictor` (class order 2..K is `[predictor; extra_predictors...]`,
   K−1 total); empty otherwise.
 - `logit_slices`: `:rows` or `:cols` for a CategoricalLogit response
@@ -445,7 +494,7 @@ with keywords (`interval=`); every other family leaves it at `nothing`:
   `y` to the support, exactly the SB branch structure.
 """
 struct LikelihoodSpec
-    family::LikelihoodFamily
+    family::_ResponseFamily
     link::LinkFunction
     response::ColumnRef
     predictor::Symbol
@@ -1646,7 +1695,12 @@ _elementwise_arity(f::Symbol) = get(ELEMENTWISE_FN_ARITY, f, 1)
 _operands_phrase(n::Int) = ("one", "two", "three")[n] *
     (n == 1 ? " operand" : " operands")
 
-"""Families the thin layer can lower (ext handshake predicate)."""
+const _ADDITIONAL_LOCATION_SCALE_FAMILIES = Tuple(
+    _location_scale_family(_LOCATION_SCALE_LAWS[k]) for k in sort!(collect(keys(_LOCATION_SCALE_LAWS)))
+    if _location_scale_family(_LOCATION_SCALE_LAWS[k]) ∉ (GaussianFam, LogNormalFam, StudentTFam))
+
+"""Built-in families the thin layer can lower. Model-defined location-scale
+kernels are checked from their ports and density when the model lowers."""
 admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
     BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam,
     BernoulliProbitFam, BernoulliCloglogFam, BinomialProbitFam,
@@ -1656,7 +1710,8 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
     PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,
     ZeroInflatedPoissonFam, InverseGaussianFam, BetaBinomial2Fam, VonMisesFam,
     NegativeBinomialFam, ExponentialLogFam, LogNormalFam, WeibullFam,
-    ZeroInflatedBinomialFam, GammaValueFam, WeibullValueFam, BetaShapeFam)
+    ZeroInflatedBinomialFam, GammaValueFam, WeibullValueFam, BetaShapeFam,
+    _ADDITIONAL_LOCATION_SCALE_FAMILIES...)
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
@@ -2123,6 +2178,8 @@ end
 
 # A selected plate result already holds values in the authored index order.
 # Its positions must not be indexed a second time by the original indices.
+# A predictor over one such column keeps that order under any link: the link
+# is applied to each entry.
 function _selected_cell_value(plan::StructuralPlan, r::LikelihoodSpec, value::Symbol)
     d = findfirst(d -> d.name === value, plan.derived)
     d !== nothing && _authored_spelling(_selected_plate_indices(plan.derived[d].expr)) ==
@@ -2130,8 +2187,7 @@ function _selected_cell_value(plan::StructuralPlan, r::LikelihoodSpec, value::Sy
     i = findfirst(p -> p.name === value, plan.predictors)
     i === nothing && return false
     p = plan.predictors[i]
-    p.link === IdentityLink && length(p.terms) == 1 &&
-        p.terms[1].kind === OffsetTerm || return false
+    length(p.terms) == 1 && p.terms[1].kind === OffsetTerm || return false
     d = findfirst(d -> d.name === only(p.terms[1].columns), plan.derived)
     return d !== nothing && _authored_spelling(
         _selected_plate_indices(plan.derived[d].expr)) == r.range.args[2]
@@ -5372,9 +5428,8 @@ function _apply_subset(levels::Vector, m::LevelMap)
         levels[indices]
     else
         lo = s[1]::Int
-        lo <= K || _fail(:plan,
-            "LevelMap ($(lo), :end) exceeds $K observed levels of " *
-            "$(m.column)")
+        # An open-ended selection can be empty, e.g. a reference-coded
+        # factor with only its reference level in this binding.
         levels[lo:end]
     end
     length(unique(vals)) == length(vals) ||
@@ -5566,8 +5621,10 @@ function _validate_unleveled_fields(r::LikelihoodSpec)
         _fail(r.label, "only leveled families take n_levels")
     r.thresholds === nothing ||
         _fail(r.label, "only ordered families take thresholds")
-    isempty(r.extra_predictors) ||
-        _fail(r.label, "only CategoricalLogit takes extra_predictors")
+    law = _location_scale_law(r.family)
+    extras = law === nothing ? () : _location_scale_extra_ports(law)
+    length(r.extra_predictors) == length(extras) ||
+        _fail(r.label, "expected extra predictors for constructor arguments $extras")
     isempty(r.count_columns) ||
         _fail(r.label, "only Multinomial takes count_columns")
     r.ordinal_structure === nothing ||
@@ -6458,6 +6515,14 @@ function _validate_responses(plan::StructuralPlan)
             push!(used_predictors, r.nu.predictor)
         r.zi isa ScalePredictorRef &&
             push!(used_predictors, r.zi.predictor)
+        if _location_scale_law(r.family) !== nothing
+            for name in r.extra_predictors
+                name in scan_states || _is_plate_param(plan, name) ||
+                    any(p -> p.name === name, plan.predictors) ||
+                    _fail(r.label, "unknown constructor argument predictor $name")
+                push!(used_predictors, name)
+            end
+        end
         # A scan-state latent vector location: the mean is the carried state
         # directly (no linear predictor), with the response's ordinary family/link.
         if r.predictor in scan_states
@@ -6471,7 +6536,8 @@ function _validate_responses(plan::StructuralPlan)
         end
         # A per-cell latent feeds the ordinary scalar-family location path.
         if _is_plate_param(plan, r.predictor)
-            any(t -> t[1] === r.family && t[2] === r.link, ADMITTED_TRIPLES) ||
+            _location_scale_law(r.family) !== nothing ||
+                any(t -> t[1] === r.family && t[2] === r.link, ADMITTED_TRIPLES) ||
                 _fail(r.label, "plate location family/link $(r.family)/$(r.link) has no scalar observation emitter")
             _validate_scale(r, plan)
             _validate_nu(r, plan)
@@ -6579,7 +6645,8 @@ function _validate_responses(plan::StructuralPlan)
             _fail(r.label, "response addresses unknown predictor $(r.predictor)")
         push!(used_predictors, r.predictor)
         pred = plan.predictors[idx]
-        (r.family, r.link, pred.link) in ADMITTED_TRIPLES || _fail(
+        _location_scale_law(r.family) !== nothing ||
+            (r.family, r.link, pred.link) in ADMITTED_TRIPLES || _fail(
             r.label,
             "link triple ($(r.family), $(r.link), $(pred.link)) not admitted " *
             "(admitted: Gaussian/identity, Bernoulli-logit/probit/cloglog, " *
@@ -6895,13 +6962,9 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
         (eltype(col) <: Real && all(>(0), col)) ||
             _fail(r.label, "LogNormal response must be strictly positive numerics")
         return nothing
-    elseif r.family === GaussianFam
+    elseif _location_scale_law(r.family) !== nothing
         eltype(col) <: Real ||
-            _fail(r.label, "Gaussian response must be numeric")
-        return nothing
-    elseif r.family === StudentTFam
-        eltype(col) <: Real ||
-            _fail(r.label, "Student response must be numeric")
+            _fail(r.label, "$(r.family) response must be numeric")
         return nothing
     elseif r.family === NormalIDGLMFam
         eltype(col) <: Real ||
@@ -7076,20 +7139,18 @@ _is_binomial_family(f) =
 # Scale-auxiliary requirement per family: the need string, or `nothing`
 # when the family takes no scale (`_validate_scale` for single responses,
 # `_validate_mixture_response` per component).
-_scale_need(fam::LikelihoodFamily) =
-    fam === GaussianFam ? "Gaussian response requires a scale" :
+_scale_need(fam::_ResponseFamily) =
+    _location_scale_law(fam) !== nothing ? "$(fam) response requires a scale" :
     fam === NegativeBinomial2Fam ? "NB2 response requires a dispersion phi" :
     fam in (GammaLogFam, GammaValueFam) ? "Gamma response requires a shape alpha" :
     fam === BetaLogitFam ? "Beta response requires a concentration kappa" :
     fam === BetaShapeFam ? "Beta response requires a second shape beta" :
     fam === NormalIDGLMFam ? "NormalIDGLM response requires a scale sigma" :
-    fam === StudentTFam ? "Student response requires a scale sigma" :
     fam === HurdlePoissonFam ? "Hurdle response requires a hurdle probability p_zero" :
     fam === InverseGaussianFam ? "InverseGaussian response requires a shape lambda" :
     fam === BetaBinomial2Fam ? "BetaBinomial2 response requires a precision phi" :
     fam === VonMisesFam ? "VonMises response requires a concentration kappa" :
     fam === NegativeBinomialFam ? "NB1 response requires a success probability p" :
-    fam === LogNormalFam ? "LogNormal response requires a scale sigma" :
     fam in (WeibullFam, WeibullValueFam) ? "Weibull response requires a shape k" : nothing
 
 function _validate_scale(r::LikelihoodSpec, plan::StructuralPlan)
@@ -7110,7 +7171,7 @@ end
 # symbols defer to bind (parameter/assignment now, raw per-observation
 # column at `_validate_scale_data`).
 function _validate_scale_use(r::LikelihoodSpec, plan::StructuralPlan, s,
-        what::AbstractString, fam::LikelihoodFamily = r.family,
+        what::AbstractString, fam::_ResponseFamily = r.family,
         forbidden::Vector{Symbol} = [r.predictor])
     s === nothing && return nothing
     if s isa Real
@@ -7147,9 +7208,9 @@ function _validate_scale_predictor(r::LikelihoodSpec, plan::StructuralPlan,
 end
 
 function _validate_scale_predictor_use(r::LikelihoodSpec, plan::StructuralPlan,
-        s::ScalePredictorRef, fam::LikelihoodFamily,
+        s::ScalePredictorRef, fam::_ResponseFamily,
         forbidden::Vector{Symbol}, slot::String = "scale")
-    _scale_need(fam) !== nothing || fam === StudentTFam ||
+    _scale_need(fam) !== nothing ||
         _fail(r.label, "this response family takes no $slot predictor")
     any(p -> p.name === s.predictor, plan.predictors) || _fail(r.label,
         "$slot addresses unknown predictor $(s.predictor)")
