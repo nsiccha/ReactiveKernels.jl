@@ -101,10 +101,15 @@ do not fit: fewer rows than twice the parameters per block, a non-finite
 entry, or data of another shape. With unchanged input types, crossing this
 boundary keeps the same compiled program type. The plate's own loop also still runs where
 the factored sum is not used, for example at a scale of zero. Per-row and
-per-cell queries keep the per-row plate. So does a location that mixes a
-gathered term with a second grouping or with an ungathered live term, such
-as `alpha[g] .+ f .* beta` with a scalar `beta`: its blocks share
-parameters. A gathered source may itself be computed, as a noncentred
+per-cell queries keep the per-row plate. One gathered term may stand beside
+values that every row shares, as in `alpha[g] .+ f .* beta` with a scalar
+`beta`, `alpha .+ f .* beta[g]`, or `alpha[g] .+ X * beta`. The guard then
+also selects the per-row plate when the gathered term already accounts for a
+shared column, as a shared intercept beside one intercept per index value
+does. A location keeps the per-row plate when it gathers through two
+different indices, reads several gathered terms beside shared values, or
+reads a shared value as one position of a vector (`beta[1] .* x`). A
+gathered source may itself be computed, as a noncentred
 `alpha = m .+ s .* alpha_raw` is. `bound_statistics = false` on a
 preparation, or `bound_statistics = false` under `[ReactiveKernels]` in the
 project's `LocalPreferences.toml`, keeps the per-row plate everywhere.
