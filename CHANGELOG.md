@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.362
+
+- JAX export supports dense real symmetric eigenpairs and eigenvalues, including
+  the RK-owned spectral primitives. `Symmetric(A, :L)` reads the lower triangle
+  and `Symmetric(A)` reads the upper triangle.
+
 ## 0.1.361
 
 - `jax_source` translates the reduced factors `F.R` and `Matrix(F.Q)` of
