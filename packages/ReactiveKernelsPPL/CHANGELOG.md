@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.252
+## 0.1.253
 
 - **Breaking:** the fused GLM statements `y ~ NormalIDGLM(X, alpha, beta,
   sigma)`, `y ~ BernoulliLogitGLM(X, alpha, beta)` and `y ~ PoissonLogGLM(X,
@@ -36,11 +36,19 @@ are recorded in the git history only.
   as in `y .~ Normal.(alpha .+ X * beta, sigma)`. The rebinding builds the
   matrix again from its columns. Before, it was refused with `column X is
   computed by the model (X = hcat(...)) — drop it from bind_data`.
-- With ReactiveKernels 0.1.359 or later, a model that stacks its intercept on
+- With ReactiveKernels 0.1.360 or later, a model that stacks its intercept on
   its coefficients (`coefficients = [alpha; beta]`, then
   `y .~ Normal.(design * coefficients, sigma)`) reuses that vector's storage
   in the default non-allocating sampler, as the fused Normal statement did
   inside its rule.
+
+## 0.1.252
+
+- `jax_source` supports joint cell latents with translatable geometry and
+  density endpoints. Each cell reads its own packed coordinates. The constrained
+  shape and the packed size can differ and are recomputed by `prepare_data`.
+  For vector-valued cells, `constrain` returns the padded constrained rows
+  under the parameter name and their logical lengths under `<name>_lengths`.
 
 ## 0.1.251
 

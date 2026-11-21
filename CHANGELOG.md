@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.359
+## 0.1.360
 
 - `prepare_nonallocating` reuses the result of `vcat(a, v)` and `[a; v]` when
   a number stands beside dense vectors, as a model stacks an intercept on its
@@ -25,6 +25,11 @@ are recorded in the git history only.
   numbers (`vcat([a], v)`) only, so the stacked vector was allocated on every
   call: 96 B for an intercept on three coefficients, in the density and again
   under native Enzyme Reverse. Values and gradients are unchanged.
+
+## 0.1.359
+
+- JAX index expressions such as `row[2:end]` read the logical length of a
+  padded numerical row. The same expression works for rows of different lengths.
 
 ## 0.1.358
 

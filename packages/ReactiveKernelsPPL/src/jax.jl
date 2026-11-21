@@ -98,7 +98,11 @@ function _jax_module_of(built, plan; values, doc, float_type)
     # reads data (`b[axes(X, 2)]` with no columns), so one module serves every
     # binding; a structurally empty one (the thresholds of a two-category
     # ordinal response) has no value in the program.
-    parameters = [entry.name for entry in built.layout.entries
+    # A joint cell latent packs free coordinates under an internal name. The
+    # authored plate output holds the constrained values, one per cell.
+    geometries = built.layout.cell_geometries
+    parameters = [haskey(geometries, entry.name) ? geometries[entry.name].name : entry.name
+                  for entry in built.layout.entries
                   if entry.size > 0 || haskey(built.spec.ports, entry.name)]
     # A name in `values` that is a parameter (`:mu`, `Symbol("lv.sigma")`)
     # is returned once, as the parameter.
@@ -972,6 +976,85 @@ _jax_cell_dims_rank(ctx, @nospecialize(D), what) =
     D isa Type && D <: Tuple && isconcretetype(D) && all(T -> T === Int, fieldtypes(D)) ?
     fieldcount(D) : ReactiveKernels._jax_error(what, " of dimensions `", D,
         "` has no host translation", ReactiveKernels._jax_where(ctx))
+
+# sampling_geometry selects code from the constructor and its authored
+# argument expressions. These are the same literals used for source replay.
+# The singleton endpoints have no runtime state. Their types select the two
+# calls in the cell, while its shape and packed coordinates remain inputs.
+function ReactiveKernels._jax_structural_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_ppl_cell_joint_endpoints), positional)
+    length(positional) == 2 && Meta.isexpr(positional[2], :tuple) || return nothing
+    constructor = ReactiveKernels._jax_resolve(ctx, positional[1])
+    arguments = _sampling_read_literal(positional[2], ctx.source_module)
+    endpoints = _ppl_cell_joint_endpoints(constructor, arguments)
+    all(f -> Base.issingletontype(typeof(f)), endpoints) || return nothing
+    return ReactiveKernels._PyVal("(None, None)", typeof(endpoints), true)
+end
+
+function ReactiveKernels._jax_call_keywords(ctx::ReactiveKernels._JaxContext,
+        f::Union{typeof(_ppl_cell_joint_constrain),typeof(_ppl_cell_joint_logjac)},
+        args::Vector{ReactiveKernels._PyVal}, kw)
+    endpoints, block, shape, pos = args
+    constrain = f === _ppl_cell_joint_constrain
+    field = ReactiveKernels._jax_literal(constrain ? 1 : 2)
+    endpoint = ReactiveKernels._jax_function_of(
+        ReactiveKernels._jax_tuple_element(ctx, endpoints, field))
+    value = ReactiveKernels._jax_call(ctx, endpoint, [block, shape, args[5:end]...], kw)
+    return constrain ? ReactiveKernels._jax_call(ctx, _ppl_cell_joint_checked,
+        [value, shape, pos]) : value
+end
+
+const _JAX_JOINT_EXTENTS = """
+def _rk_cell_extent(n, name, position):
+    if (isinstance(n, (bool, np.bool_)) or not isinstance(n, (int, np.integer))
+            or not 0 <= int(n) <= np.iinfo(np.intp).max):
+        raise ValueError(f"cell latent {name}: invalid geometry extent {n} at index {position}")
+    return int(n)
+"""
+
+# Validate each authored extent while binding, before padding or converting
+# the rows. A joint law declares its packed size separately from its shape.
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        f::Union{typeof(_ppl_cell_joint_shapes),typeof(_ppl_cell_joint_offsets)},
+        args::Vector{ReactiveKernels._PyVal})
+    ctx.host === nothing && return ReactiveKernels._jax_traceable_or_lowered(ctx, f, args)
+    name, cells = args
+    extent = ReactiveKernels._jax_helper!(ctx, "_rk_cell_extent", _JAX_JOINT_EXTENTS)
+    rows = " for k, row in enumerate(" * cells.code * ", 1)"
+    if f === _ppl_cell_joint_offsets
+        sizes = "[" * extent * "(row, " * name.code * ", k)" * rows * "]"
+        code = "np.cumsum([0] + " * sizes * ", dtype=np.int64)"
+        return ReactiveKernels._jax_bind!(ctx, :offsets, ReactiveKernels._PyVal(code, Vector{Int}, true))
+    end
+    D = ReactiveKernels._jax_eltype(cells.T)
+    D isa DataType && D <: Tuple && isconcretetype(D) ||
+        return ReactiveKernels._jax_traceable_or_lowered(ctx, f, args)
+    rank = fieldcount(D)
+    code = "[tuple(" * extent * "(n, " * name.code * ", k) for n in row)" * rows * "]"
+    return ReactiveKernels._jax_bind!(ctx, :shapes,
+        ReactiveKernels._PyVal(code, Vector{NTuple{rank,Int}}, true))
+end
+
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_ppl_cell_joint_checked), args::Vector{ReactiveKernels._PyVal})
+    value, shape, _ = args
+    rank = _jax_cell_dims_rank(ctx, shape.T, "a joint cell latent")
+    rank_matches = rank == 0 ? ReactiveKernels._jax_is_scalar(value.T) :
+        ReactiveKernels._jax_is_array(value.T) && ndims(value.T) == rank
+    matches = ReactiveKernels._jax_literal(rank_matches)
+    if rank_matches
+        for axis in 1:rank
+            d = ReactiveKernels._jax_literal(axis)
+            actual = ReactiveKernels._jax_call(ctx, size, [value, d])
+            expected = ReactiveKernels._jax_tuple_element(ctx, shape, d)
+            same = ReactiveKernels._jax_call(ctx, ==, [actual, expected])
+            matches = ReactiveKernels._jax_call(ctx, &, [matches, same])
+        end
+    end
+    message = ReactiveKernels._PyVal(repr("cell latent geometry constrained a value to the wrong shape"), ArgumentError)
+    ReactiveKernels._jax_call(ctx, ReactiveKernels._runtime_check, [matches, message])
+    return value
+end
 
 # One index's dimensions, `map(length, axes)`.
 function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
