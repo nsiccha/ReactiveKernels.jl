@@ -75,6 +75,49 @@ const PUT_ROW = @kernel ownership_putrow(A, i, v) = begin
     result = ownership_withrow(A, i, v)
 end
 
+# A lower-triangular factor built from a fresh `zeros` array by one loop over
+# packed entries: scalar locals carry the entry's position and a running
+# product, a branch moves to the next column, and integer powers and `sqrt`
+# compute each entry. Its diagonal starts from `ones` the same way, with a
+# temporary local to the loop and `+=`-style updates.
+@traceable function ownership_running_factor(z, K, P)
+    out = zeros(Float64, K, K)
+    out[1, 1] = 1.0
+    i, j, w = 1, 2, 1.0
+    for p in 1:P
+        out[j, i] = z[p] * w
+        w = w * sqrt(1 - z[p]^2)
+        if i + 1 < j
+            i = i + 1
+        else
+            out[j, j] = w
+            i, j, w = 1, j + 1, 1.0
+        end
+    end
+    out
+end
+
+@traceable function ownership_running_diagonal(z, K, P)
+    out = ones(K)
+    i, j, d = 1, 2, 1.0
+    for p in 1:P
+        t = sqrt(1 - z[p]^2)
+        d *= t
+        if i + 1 < j
+            i += 1
+        else
+            out[j] = d
+            i, j, d = 1, j + 1, 1.0
+        end
+    end
+    out
+end
+
+const FILL_FACTOR = @kernel ownership_fillfactor(z, K, P) = begin
+    factor = ownership_running_factor(z, K, P)
+    diagonal = ownership_running_diagonal(z, K, P)
+end
+
 const OWNED_CHOLESKY = @kernel ownership_cholesky(A, triangle) = begin
     result = cholesky(Symmetric(A, triangle))
 end
@@ -180,6 +223,37 @@ end
         @test result == expected
         @test !Base.mightalias(result, rhs)
         @test borrowed == snapshot
+    end
+    @testset "indexed writes fill a fresh zeros or ones array" begin
+        z3, z6 = [0.3, -0.2, 0.5], [0.1, 0.4, -0.3, 0.2, -0.6, 0.25]
+        for (want, helper) in ((:factor, ownership_running_factor),
+                               (:diagonal, ownership_running_diagonal))
+            p = prepare(FILL_FACTOR; have = (:z, :K, :P), want = want)
+            run = prepare_nonallocating(p, z3, 3, 3)
+            @test run(z3, 3, 3) == helper(z3, 3, 3)
+            @test ownership_allocations(run, (z3, 3, 3)) == 0
+            # Runtime dimensions, including a factor with no packed entries.
+            for (z, K, P) in ((z6, 4, 6), (Float64[], 1, 0), (-z3, 3, 3))
+                @test run(z, K, P) == helper(z, K, P)
+                @test ownership_allocations(run, (z, K, P)) == 0
+            end
+            @test_throws BoundsError run(z3, 2, 3)
+            @test_throws DomainError run([2.0, 0.0, 0.0], 3, 3)
+            # The stores read a view into the previous result: it gets a fresh
+            # array, and the previous result stays intact.
+            exemplar = view(helper(z3, 3, 3), 1:3)
+            views = prepare_nonallocating(p, exemplar, 3, 3)
+            old = views(view(z6, 1:3), 3, 3)
+            @test ownership_allocations(views, (view(z6, 1:3), 3, 3)) == 0
+            old = views(view(z6, 1:3), 3, 3)
+            saved = copy(old)
+            column = view(old, 1:3)
+            expected = helper(copy(column), 3, 3)
+            next = views(column, 3, 3)
+            @test next == expected
+            @test !Base.mightalias(next, column)
+            @test old == saved
+        end
     end
     @testset "a range-valued step is recomputed, not written into" begin
         k = prepare_nonallocating(LAZY_DOMAIN; want = :y)

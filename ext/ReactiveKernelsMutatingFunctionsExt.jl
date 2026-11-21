@@ -240,6 +240,17 @@ end
     copyto!(cache, A)
 end
 
+# The fresh `zeros`/`ones` array of a fill-and-store update
+# (`ReactiveKernels._FillForUpdate`): refilled in place when the dimensions
+# match and no operand the stores read aliases it.
+@inline function MutatingFunctions.apply!!(cache::Array{Float64,N},
+        op::ReactiveKernels._FillForUpdate{F,N}, args::Vararg{Any,M}) where {F,N,M}
+    dims = ReactiveKernels._fill_update_dims(Val(N), args)
+    size(cache) == dims && !ReactiveKernels._replicated_aliases(cache, args) ||
+        return op(args...)
+    fill!(cache, ReactiveKernels._fill_constructor_value(op))
+end
+
 @inline function MutatingFunctions.apply!!(
         cache::AbstractArray, ::ReactiveKernels._MaterializeStep,
         bc::Base.Broadcast.Broadcasted)
