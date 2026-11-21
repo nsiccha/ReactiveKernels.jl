@@ -66,8 +66,8 @@ end
         @test _rewrite_node(rebound, :sampler, u) ≈
             _rewrite_design_oracle(head, merge(data, (; y = reverse(data.y))), u[1], u[2:3])
         # Call pins remove the response statement (conditioning principle 9).
-        # The model still computes X, whose shape sizes the remaining beta prior.
-        pinned = bind_data(model(; data.x1, data.x2, y = data.y))
+        # Pin X too: only its shape is needed by the remaining beta prior.
+        pinned = bind_data(model(; X = hcat(data.x1, data.x2), y = data.y))
         @test isempty(pinned.responses)
         @test _rewrite_node(pinned, :sampler, u) ≈
             logpdf(Normal(0, 5), u[1]) + sum(logpdf.(Normal(0, 2), u[2:3]))

@@ -329,6 +329,9 @@ function condition(plan::StructuralPlan; kwargs...)
         plan.vector_parameters, plan.plate_parameters) for p in ps)
     computed = _bound_module_data_names(plan)
     union!(computed, _derived_response_names(plan))
+    # A value matrix (`X = hcat(x1, x2)`) is bound under its own name; the
+    # rebinding builds it again from its columns.
+    union!(computed, _value_design_matrix_names(plan))
     columns = Dict{Symbol,ColumnData}(k => v for (k,v) in plan.columns if k ∉ computed)
     # Bound response storage is numeric. Restore its host-side missing entries
     # before rebinding so replacement data gets a fresh presence mask, while

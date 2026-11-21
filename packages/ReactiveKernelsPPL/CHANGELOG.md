@@ -31,6 +31,11 @@ are recorded in the git history only.
   `BernoulliLogitGLMFam` and `PoissonLogGLMFam` are gone. A hand-built plan
   uses `GaussianFam`, `BernoulliLogitFam` or `PoissonLogFam` with a predictor.
   The all-fields positional constructors take two arguments fewer.
+- `condition(plan; y = ...)` and `plan | (; y = ...)` rebind a bound plan
+  whose model computes a design matrix (`X = hcat(x1, x2)`) read as a value,
+  as in `y .~ Normal.(alpha .+ X * beta, sigma)`. The rebinding builds the
+  matrix again from its columns. Before, it was refused with `column X is
+  computed by the model (X = hcat(...)) — drop it from bind_data`.
 
 ## 0.1.249
 
