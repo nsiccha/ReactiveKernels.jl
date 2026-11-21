@@ -180,6 +180,11 @@ end
         end
         @test length(fits(k)) == statistics
         @test all(fit -> fit.usable, fits(k))
+        if model === fixed
+            # The selected density arm must expose the squared residual so the
+            # prepared program actually reads the fit when QR wins.
+            @test occursin("ReactiveKernels._ls_rss(", string(code_expr(k))) == statistics
+        end
         # Rows that repeat are grouped in either program: in the plan without
         # the rewrite, and in the authored arm beside the statistics.
         grouped(q) = [length(c) for c in q.constants if c isa Vector{Int}]

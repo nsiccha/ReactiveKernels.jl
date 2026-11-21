@@ -3476,17 +3476,34 @@ end
 Base.@nospecializeinfer function _plate_type_selected_variant(inner::Plan, argument_types)
     types = _cell_value_types(inner; argument_types)
     g = inner.graph
-    recipes = map(inner.recipes) do r
-        _plate_branch_operation(r.op) || return r
-        selected = _type_selected_branch(r,
+    selections = map(inner.recipes) do r
+        _plate_branch_operation(r.op) || return nothing
+        _type_selected_branch(r,
             Any[get(types, canon_id(g, v.id), Any) for v in r.inputs])
-        selected === nothing ? r : selected.recipe
     end
-    all(i -> recipes[i] === inner.recipes[i], eachindex(recipes)) && return nothing
-    variant = _partial_subplan(inner, inner.have, inner.want, recipes)
-    _, constants, callables, lowered = _lower_with_ops(variant; inline_embedded = false)
-    length(callables) == length(variant.recipes) || return nothing
-    _PlateArmVariant(variant, constants, callables, lowered)
+    all(isnothing, selections) && return nothing
+    copied = Graph(copy(g.values), copy(g.recipes), copy(g.producers),
+                   copy(g.aliases), g.version, nothing, copy(g.checks))
+    next_id = Ref(minimum((q.id for q in inner.recipes); init = 0) - 1)
+    fresh() = (id = next_id[]; next_id[] -= 1; id)
+    recipes = Recipe[]
+    for (r, selected) in zip(inner.recipes, selections)
+        if selected === nothing
+            push!(recipes, r)
+            continue
+        end
+        # A composed arm already has a graph. Keep its operations visible to
+        # the plate passes (including factoring a summed squared residual).
+        if selected.spec !== nothing
+            arm = _plate_branch_arm_recipes!(copied, selected.spec, r, _recipe_source_names(r), fresh)
+            if arm !== nothing
+                append!(recipes, arm)
+                continue
+            end
+        end
+        push!(recipes, selected.recipe)
+    end
+    _plate_arm_variant(inner, copied, recipes)
 end
 
 # Shared scalar evidence can arrive after an arm graph was authored. Split
@@ -3695,6 +3712,10 @@ Base.@nospecializeinfer function _plate_branch_arm_kernel(
     for (i, q) in enumerate(inner.recipes)
         i == index ? append!(recipes, replacement) : push!(recipes, q)
     end
+    _plate_arm_variant(inner, copied, recipes)
+end
+
+function _plate_arm_variant(inner::Plan, copied::Graph, recipes::Vector{Recipe})
     template = Plan(copied, inner.have, inner.want, inner.recipes,
                     inner.producer, inner.cost, inner.candidates)
     variant = _partial_subplan(template, inner.have, inner.want, recipes)
@@ -3723,23 +3744,19 @@ Base.@nospecializeinfer function _plate_branch_arm_recipes!(
     value = canon_id(ag, only(arm.want).id)
     haskey(mapping, value) && return nothing
     mapping[value] = only(r.outputs)
-    for (id, v) in ag.values
-        existing = get(copied.values, id, nothing)
-        existing === nothing || existing === v || return nothing
-        _register!(copied, v)
-    end
-    for (id, target) in ag.aliases
-        get(copied.aliases, id, target) == target || return nothing
-        copied.aliases[id] = target
-    end
-    mapped(v) = get(mapping, canon_id(ag, v.id), v)
     recipes = Recipe[]
     for q in arm.recipes
         (q.effectful || length(q.outputs) != 1 ||
          q.op isa Union{_AuthoredPlateOp,_AuthoredScanOp} ||
          _embedded_kernel(q.op) !== nothing) && return nothing
-        push!(recipes, Recipe(fresh(), Tuple(mapped(v) for v in q.inputs),
-            (mapped(only(q.outputs)),), q.op, q.cost, nothing, false, q.source))
+        args = Tuple(mapping[canon_id(ag, v.id)] for v in q.inputs)
+        v = only(q.outputs)
+        # Two branches in one cell can use the same arm graph. Each occurrence
+        # needs its own intermediate values over its own inputs.
+        output = get!(mapping, canon_id(ag, v.id)) do
+            value!(copied, v.name, valtype(v))
+        end
+        push!(recipes, Recipe(fresh(), args, (output,), q.op, q.cost, nothing, false, q.source))
     end
     recipes
 end
