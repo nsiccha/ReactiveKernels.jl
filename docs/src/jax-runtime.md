@@ -1,6 +1,6 @@
 # JAX runtime and derivatives
 
-This guide continues [JAX source](jax.md): runtime checks on accelerators, derivative rules in emitted modules and stable rewrites. [JAX ODE solves](jax-ode.md) covers the ODE bridges.
+This guide continues [JAX source](jax.md): runtime checks on accelerators, chains sampled as one batch, derivative rules in emitted modules and stable rewrites. [JAX ODE solves](jax-ode.md) covers the ODE bridges.
 
 ## Accelerator runtime checks
 
@@ -29,6 +29,40 @@ and [platform configuration](https://docs.jax.dev/en/latest/config_options.html#
 `python benchmark/jax_runtime_checks.py` verifies the helper's values,
 gradients, device placement, invalid-input rejection and missing-GPU failure
 with a CUDA-enabled JAX installation.
+
+## Chains under `vmap`
+
+A sampler that advances several chains as one batch, `jax.vmap` over its
+transition (BlackJAX's NUTS, for example), runs each of its while loops until
+the last chain is done. JAX runs a batched loop's body for every lane and keeps
+the old carry where a lane's loop has ended, so a chain that is done is still
+evaluated on every later step of the batch, and the result is discarded. In
+NUTS such a chain stays at the state where it stopped: after a divergence,
+every remaining leapfrog step of the batch evaluates the density one step past
+the divergent point, and a chain that is done can even keep an inner loop
+running after every live chain has left it.
+
+This costs nothing extra when a density costs the same everywhere. It does
+when the cost depends on the position, as an ODE solve's does
+([JAX ODE solves](jax-ode.md)): past a divergence the system can be stiff, and
+one lane's solve then holds every call of the batch. In a four-chain warm-up on
+CUDA of a density with a five-state solve in each of 24 plate cells (float64,
+tolerances `1e-8`, at most 100,000 steps per output), one chain diverged after
+5 of 127 leapfrog steps. Its remaining evaluations took ten times the solver
+attempts of each running chain's, and the transition took 25 s where the
+others took about 4 s. At a saved proposal whose solves exhaust the step budget,
+one value and gradient takes 16.7 s on the card and 0.11 s on one CPU core.
+
+Guard the sampler, not the model: give a chain that is done a state it has
+already evaluated. In BlackJAX 1.7.1 that is two changes in
+`blackjax.mcmc.trajectory`. In `dynamic_progressive_integration`'s loop body,
+integrate from the subtree's initial state instead of
+`trajectory.rightmost_state` when the lane had already diverged, terminated or
+taken its steps. In `dynamic_multiplicative_expansion`'s, start a finished
+lane's subtree at the transition's initial state with zero steps. Only
+discarded results change. Compiled to round alike, the guarded and unguarded
+samplers gave bitwise identical draws on Neal's funnel, with 420 instead of
+2,694 evaluations far out in it (`|v| > 6`).
 
 ## Derivative rules
 
