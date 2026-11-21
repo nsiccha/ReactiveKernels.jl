@@ -16,6 +16,13 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.249
+
+- For a joint latent `theta[i] ~ F(args...)` with an ordinary Julia geometry,
+  cell and partition footprints now report the packed coordinates of the
+  selected cells. A unit that reads its own simplex keeps its own coordinates
+  local in downstream inference. Shared arguments still contribute their reads.
+
 ## 0.1.248
 
 - A joint cell latent's law may read a data array shared by every index,
