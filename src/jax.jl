@@ -1075,9 +1075,6 @@ function _jax_destructure!(ctx::_JaxContext, lhs, v::_PyVal)
     if _jax_property_destructuring(lhs)
         # `(; a, b) = x`: each name takes the field of that name, as Julia's
         # `getproperty(x, :a)` does; `x` is computed once.
-        v.T isa Type && v.T <: Union{NamedTuple,_JaxReducedQR} ||
-            _jax_error("the destructuring `", lhs, "` of a value of type `", v.T, "`",
-                       _jax_where(ctx))
         bound = _jax_bind!(ctx, :record, v)
         for s in lhs.args[1].args
             _jax_destructure!(ctx, s, _jax_property(ctx, bound, s))
@@ -4668,6 +4665,62 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(\), args::Vector{_PyVal})
     _PyVal(result.code, result.T, result.static, result.extent, "", padded)
 end
 
+# Materialize the logical symmetric matrix before passing it to a numerical
+# operation. Selection also sends gradients back to the authoritative triangle.
+function _jax_call_positional(ctx::_JaxContext, ::Type{Symmetric}, args::Vector{_PyVal})
+    length(args) in (1, 2) && args[1].T isa Type && args[1].T !== Union{} &&
+        args[1].T <: AbstractMatrix{<:Real} ||
+        _jax_error("Symmetric needs a real matrix", _jax_where(ctx))
+    A = _jax_bind!(ctx, :matrix, first(args))
+    length(args) == 1 && A.T <: Symmetric && return A
+    length(args) == 2 && A.T <: Union{Symmetric, Hermitian} &&
+        _jax_error("checking the original triangle of an already wrapped matrix", _jax_where(ctx))
+    half = length(args) == 1 ? :U : _jax_static_symbol(ctx, args[2])
+    half in (:U, :L) || _jax_error("Symmetric triangle must be :U or :L", _jax_where(ctx))
+    T = _jax_return_type(Symmetric, [a.T for a in args])
+    n, m = (_jax_function_call(ctx, size, [A, _jax_literal(d)]) for d in (1, 2))
+    _jax_call(ctx, _runtime_check, [_jax_call(ctx, ==, [n, m]),
+        _PyVal(repr("Symmetric needs a square matrix"), DimensionMismatch)])
+    api = _jax_known(ctx, A) ? "np" : "jnp"
+    code = api * ".asarray(" * A.code * ")"
+    if !isempty(A.extent)
+        # A square logical block fits in the smaller of the two storage axes.
+        width = _jax_bind!(ctx, :width, _PyVal("min(" * A.code * ".shape)", Int, true))
+        code *= "[:" * width.code * ", :" * width.code * "]"
+    end
+    matrix = _jax_bind!(ctx, :matrix, _PyVal(code, A.T, A.static))
+    indices = _jax_bind!(ctx, :axis, _PyVal(api * ".arange(" * matrix.code * ".shape[0])",
+                                            Vector{Int}, A.static))
+    cmp = half === :U ? " <= " : " >= "
+    code = api * ".where(" * indices.code * "[:, None]" * cmp * indices.code * ", " *
+           matrix.code * ", " * matrix.code * ".T)"
+    _PyVal(code, T, A.static, A.extent, "", isempty(A.extent) ? 0 : 3)
+end
+
+function _jax_function_call(ctx::_JaxContext, f::Union{typeof(eigen),typeof(LinearAlgebra.eigvals)},
+                            args::Vector{_PyVal})
+    length(args) == 1 && only(args).T isa Type && only(args).T !== Union{} &&
+        only(args).T <: Symmetric{<:Real} ||
+        return _jax_traceable_or_lowered(ctx, f, args)
+    A = _jax_bind!(ctx, :symmetric, only(args))
+    isempty(A.extent) || _jax_error("a symmetric eigensolver cannot include padding in the spectrum",
+                                    _jax_where(ctx))
+    T = _jax_return_type(f, [A.T])
+    E = eltype(T)
+    E in (Float32, Float64) || _jax_error("`", f, "` with result type ", T, _jax_where(ctx))
+    host = _jax_known(ctx, A)
+    api = host ? "np" : "jnp"
+    _jax_call(ctx, _runtime_check, [_PyVal(api * ".all(" * api * ".isfinite(" * A.code * "))", Bool, host),
+        _PyVal(repr("matrix contains Infs or NaNs"), ArgumentError)])
+    dtype = host ? _host_dtype(E) : _jax_dtype(E)
+    op = f === eigen ? "eigh" : "eigvalsh"
+    matrix = api * ".asarray(" * A.code * ", dtype=" * dtype * ")"
+    result = _PyVal(api * ".linalg." * op * "(" * matrix *
+                    (host ? ")" : ", symmetrize_input=False)"), T, host)
+    # A derivative cut can read both fields several times.
+    f === eigen ? _jax_bind!(ctx, :eigenpairs, result) : result
+end
+
 function _jax_function_call(ctx::_JaxContext, ::typeof(LinearAlgebra.diag), args::Vector{_PyVal})
     length(args) == 1 && _jax_rank(args[1].T) == 2 ||
         return _jax_traceable_or_lowered(ctx, LinearAlgebra.diag, args)
@@ -5908,6 +5961,8 @@ end
 # When `n` is data with a static bound (a ragged cell's length) the matrix is
 # allocated at the bound, its rows and columns past `n` padding the extent
 # marks, as a padded vector's are.
+_jax_value(ctx::_JaxContext, J::LinearAlgebra.UniformScaling, hint) =
+    _PyVal("<uniform scaling>", _JaxCallable(J), true)
 function _jax_call_positional(ctx::_JaxContext, J::LinearAlgebra.UniformScaling,
                               args::Vector{_PyVal})
     length(args) == 1 && args[1].T isa Type && args[1].T <: Integer ||
@@ -5989,6 +6044,22 @@ function _jax_call_positional(ctx::_JaxContext, T::Type, args::Vector{_PyVal})
         v = only(args)
         return _PyVal("jnp.diag(" * v.code * ")", LinearAlgebra.Diagonal{eltype(v.T),v.T}, false,
                       v.extent, "", isempty(v.extent) ? 0 : 3)
+    end
+    if T <: Matrix && !isempty(args) && args[1].T isa _JaxCallable{<:LinearAlgebra.UniformScaling}
+        scale = first(args).T.f.λ
+        E = T === Matrix ? typeof(scale) : eltype(T)
+        E <: Union{Integer,AbstractFloat} ||
+            _jax_error("a uniform scaling matrix with element type ", E, _jax_where(ctx))
+        dims = _jax_dimension_values(args[2:end])
+        length(dims) == 2 || _jax_error("a matrix needs two dimensions", _jax_where(ctx))
+        shape, extent, axes, _ = something(_jax_padded_dims(ctx, T, dims),
+                                           (first(_jax_dims(ctx, T, dims)), "", 0, 2))
+        dtype = _jax_dtype(E)
+        eye = "jnp.eye(*" * shape * ", dtype=" * dtype * ")"
+        scale = convert(E, scale)
+        code = isone(scale) ? eye : "jnp.where(" * eye * ", " * _jax_literal(scale).code *
+                                    ", 0).astype(" * dtype * ")"
+        return _PyVal(code, Matrix{E}, false, extent, "", axes)
     end
     if T <: AbstractArray && !isempty(args) && args[1].T === UndefInitializer
         dims = _jax_dimension_values(args[2:end])
@@ -7608,13 +7679,13 @@ function _jax_call_positional(ctx::_JaxContext, ::typeof(getproperty), args::Vec
 end
 
 function _jax_property(ctx, x::_PyVal, name)
-    if x.T isa Type && x.T <: _JaxReducedQR
+    if x.T isa Type && x.T !== Union{} && x.T <: _JaxReducedQR
         name === :R && return _jax_qr_component(ctx, x, 2)
         name === :Q && return _jax_qr_component(ctx, x, 1)
         _jax_error("QR property `", name, "`; use `F.R` or `Matrix(F.Q)`", _jax_where(ctx))
     end
-    x.T isa Type && x.T <: NamedTuple || _jax_error("the field read `", name, "` on `", x.T, "`",
-                                                    _jax_where(ctx))
+    x.T isa Type && x.T !== Union{} && x.T <: Union{NamedTuple,LinearAlgebra.Eigen} ||
+        _jax_error("the field read `", name, "` on `", x.T, "`", _jax_where(ctx))
     k = findfirst(==(name), fieldnames(x.T))
     k === nothing && _jax_error("`", x.T, "` has no field `", name, "`", _jax_where(ctx))
     _jax_named_field(x, k)
@@ -7871,8 +7942,10 @@ _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe, op, inputs) =
 
 # Recipe registration wraps type constructors to retain their concrete identity.
 # Use the same constructor translation as a call inside authored source.
+_jax_call_positional(ctx::_JaxContext, op::_TypeOperation, inputs::Vector{_PyVal}) =
+    _jax_call(ctx, _type_operation_type(op), inputs)
 _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe, op::_TypeOperation, inputs) =
-    _jax_split_outputs(ctx, recipe, _jax_call(ctx, _type_operation_type(op), inputs))
+    _jax_split_outputs(ctx, recipe, _jax_call_positional(ctx, op, inputs))
 
 # A bare function identity (`+`, `sum`, `log`): its call on the inputs.
 function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe, op::Function, inputs)

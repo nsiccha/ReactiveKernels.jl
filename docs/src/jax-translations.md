@@ -29,6 +29,19 @@ matrix and a vector or matrix right-hand side. Only the selected triangle
 contributes. `norm(v)` computes a real vector's Euclidean norm with scaling
 for large and small magnitudes.
 
+## Symmetric eigendecomposition
+
+`F = eigen(Symmetric(A))` exports one symmetric eigendecomposition of a dense
+real matrix. `F.values` contains ascending eigenvalues and the columns of
+`F.vectors` are orthonormal. Use `eigvals(Symmetric(A))` for eigenvalues alone.
+The default and `:U` use the upper triangle, and `:L` uses the lower triangle.
+When comparing Julia and JAX, compare reconstructed matrices or eigenspace
+projectors because signs and bases within repeated eigenspaces can differ.
+The RK-owned `rk_symmetric_eigvals` and `rk_symmetric_eigvecs` use the upper
+triangle and retain their authored derivative rules. A dynamically padded
+matrix cannot be passed to the eigensolver because the padding would
+contribute additional eigenvalues.
+
 ## Statistics reductions
 
 With Statistics loaded (`ReactiveKernelsStatisticsExt`, RK 0.1.262), `mean(x)`, `mean(f, x)`, `var(x)` and `std(x)` translate, with the keywords `dims` (one integer known while JAX traces, or `:`), and for `var` and `std` also `corrected` (a literal `true` or `false`) and `mean`. Each is the core `sum`, `length` and `size` translation it composes, `sum(x) / length(x)` and `sum(abs2.(x .- m)) / (n - corrected)`, so a padded row or a `dims` reduction reads only its valid entries and `prepare_data` takes NumPy's spelling. Over `dims` the reduced axis keeps length one, as in Julia. An empty argument, or one entry with `corrected`, gives Julia's NaN. Before, Statistics' own methods, which branch, were refused as "the function `_mean` has loops or branches".
