@@ -68,7 +68,7 @@ PrecompileTools = "1.2"
 # world through ReactiveKernels' own barrier (0.1.313). A sampler prepared on
 # another binding of one build reuses its preparation (0.1.323). A cell
 # pullback accumulates into a shared fixed-size immutable array (0.1.350).
-ReactiveKernels = "0.1.350"
+ReactiveKernels = "0.1.358"
 ReactiveKernelsDistributionKernels = "0.1.14"
 SpecialFunctions = "2"
 StaticArrays = "1"

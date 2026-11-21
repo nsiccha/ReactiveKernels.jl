@@ -2,6 +2,7 @@
 # sibling spellings / sibling laws on the same data. A cliff between siblings
 # whose mathematics has the same cost structure marks an overspecific fast path.
 include(joinpath(@__DIR__, "harness.jl"))
+import LogExpFunctions
 include(joinpath(@__DIR__, "factor_variants.jl"))
 
 # usage: julia probe_families.jl [families, e.g. ABCDR] [rows]
@@ -49,6 +50,25 @@ if occursin('A', fam)
         y .~ Normal.(a .+ b .* x, sigma .* w)
     end
     record(probe("A-gauss", "A3 scale sigma .* w (w data)", A3, (; x, w), (; y)))
+    A3p = @rkppl begin
+        a ~ Normal(0, 5); b ~ Normal(0, 2); sigma ~ Exponential(1.0)
+        y .~ Normal.(a .+ b .* x, sigma ./ sqrt.(precision))
+    end
+    record(probe("A-gauss", "A3p scale sigma ./ sqrt.(precision)", A3p,
+                 (; x, precision = inv.(w .^ 2)), (; y)))
+    A3m = @rkppl begin
+        a ~ Normal(0, 5); b ~ Normal(0, 2); sigma ~ Exponential(1.0)
+        mu = muladd.(b, x, a)
+        y .~ Normal.(mu, sigma .* w)
+    end
+    record(probe("A-gauss", "A3m muladd location, weighted scale", A3m,
+                 (; x, w), (; y)))
+    A3t = @rkppl begin
+        a ~ Normal(0, 5); b ~ Normal(0, 2); sigma ~ Exponential(1.0)
+        y .~ Normal.(a .+ b .* x .* z, sigma .* w)
+    end
+    record(probe("A-gauss", "A3t product location, weighted scale", A3t,
+                 (; x, z, w), (; y)))
     A4 = @rkppl begin
         a ~ Normal(0, 5); b ~ Normal(0, 2); sigma ~ Exponential(1.0)
         y .~ LogNormal.(a .+ b .* x, sigma)
@@ -132,6 +152,11 @@ if occursin('A', fam)
     end
     record(probe("A-gauss", "A16 alpha[g] beside three-step scan", A16,
         (; x, g = g_sorted, T = 3), (; y, s = [0.5, -0.25, 0.1])))
+    A17 = @rkppl begin
+        a ~ Normal(0, 5); b ~ Normal(0, 2); sigma ~ Exponential(1.0)
+        y[:] .~ Normal.(a .+ b .* x, sigma)
+    end
+    record(probe("A-gauss", "A17 whole-column colon", A17, (; x), (; y)))
 end
 
 # ------------------------------------------------- B: discrete-covariate GLMs
@@ -174,6 +199,40 @@ if occursin('B', fam)
     end
     record(probe("B-glm", "B5 @plate Bernoulli, discrete", B5, (; x = xd), (; y = ybin)))
     record(probe("B-glm", "B5c @plate Bernoulli, continuous", B5, (; x), (; y = ybinc)))
+    B6 = @rkppl begin
+        a ~ Normal(0, 1); b ~ Normal(0, 2)
+        p = logistic.(a .+ b .* x)
+        y .~ Bernoulli.(p)
+    end
+    B7 = @rkppl begin
+        a ~ Normal(0, 1); b ~ Normal(0, 2)
+        y .~ Bernoulli.(LogExpFunctions.logistic.(a .+ b .* x))
+    end
+    for (label, model) in (("B6 named link", B6), ("B7 qualified link", B7))
+        record(probe("B-glm", "$label, discrete", model, (; x = xd), (; y = ybin)))
+        record(probe("B-glm", "$label, continuous", model, (; x), (; y = ybinc)))
+    end
+    B8 = @rkppl begin
+        a ~ Normal(0, 1); b ~ Normal(0, 2)
+        y[axes(y, 1)] .~ BernoulliLogit.(a .+ b .* x)
+    end
+    record(probe("B-glm", "B8 whole-column axes, discrete", B8, (; x = xd), (; y = ybin)))
+    record(probe("B-glm", "B8c whole-column axes, continuous", B8, (; x), (; y = ybinc)))
+    B9 = @rkppl begin
+        a ~ Normal(0, 1); b ~ Normal(0, 2)
+        y .~ Poisson.(exp.(a .+ b .* x) .* exposure)
+    end
+    B9log = @rkppl begin
+        a ~ Normal(0, 1); b ~ Normal(0, 2)
+        y .~ PoissonLog.(a .+ b .* x .+ log_exposure)
+    end
+    record(probe("B-glm", "B9 rate times exposure", B9, (; x, exposure = w), (; y = ycnt)))
+    record(probe("B-glm", "B9log positive exposure offset", B9log, (; x, log_exposure = log.(w)), (; y = ycnt)))
+    B10 = @rkppl begin
+        a ~ Normal(0, 1); b ~ Normal(0, 2)
+        y[:] .~ Binomial.(n, logistic.(a .+ b .* x))
+    end
+    record(probe("B-glm", "B10 whole-column binomial", B10, (; x, n = ntr), (; y = ycnt)))
 end
 
 # ---------------------------------------------------- C: grouped intercepts
@@ -267,6 +326,16 @@ if occursin('D', fam)
         y .~ Logistic.(exp.(a .+ b .* x), sigma)
     end
     record(probe("D-shared", "D7 Logistic, shared sigma", D7, (; x), (; y)))
+    D8 = @rkppl begin
+        nu ~ Gamma(2, 0.1)
+        y .~ TDist.(nu)
+    end
+    record(probe("D-shared", "D8 TDist, shared nu", D8, (;), (; y)))
+    D8s = @rkppl begin
+        nu ~ Gamma(2, 0.1)
+        y .~ StudentT.(nu, 0, 1)
+    end
+    record(probe("D-shared", "D8s StudentT, unit scale", D8s, (;), (; y)))
 end
 
 
@@ -324,6 +393,8 @@ if occursin('R', fam)
     push!(refs, time_ref("R gamma log mean", ref_gamma_exp, u3, x, ypos, log.(ypos), loggamma))
     push!(refs, time_ref("R weibull log scale", ref_weibull_exp, u3, x, log.(ypos)))
     push!(refs, time_ref("R cauchy exp link", ref_cauchy_exp, u3, x, y))
+    push!(refs, time_ref("R laplace exp link", ref_laplace_exp, u3, x, y))
+    push!(refs, time_ref("R logistic exp link", ref_logistic_exp, u3, x, y))
     push!(refs, time_ref("R bernoulli-logit continuous", ref_bernoulli_logit, u2, x, ybinc))
     push!(refs, time_ref("R poisson continuous", ref_poisson, u2, x, ycnt, Float64(sum(ycnt)),
         sum(x .* ycnt), sum(loggamma.(ycnt .+ 1.0))))

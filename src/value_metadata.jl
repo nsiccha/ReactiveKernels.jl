@@ -179,8 +179,11 @@ function _type_selected_branch(r::Recipe, types)
     selected = Recipe(r.id, Tuple(r.inputs[i] for i in positions), r.outputs,
                       op, r.cost, nothing, false, _kernel_branch_unwrap(parts[chosen ? 2 : 3]))
     nested = _type_selected_branch(selected, Any[types[i] for i in positions])
-    nested === nothing && return (; recipe = selected, positions)
-    (; recipe = nested.recipe, positions = Tuple(positions[i] for i in nested.positions))
+    if nested === nothing
+        spec = chosen ? branch.then_spec : branch.else_spec
+        return (; recipe = selected, positions, spec)
+    end
+    (; recipe = nested.recipe, positions = Tuple(positions[i] for i in nested.positions), nested.spec)
 end
 
 function _recipe_value_metadata(r::Recipe, args)

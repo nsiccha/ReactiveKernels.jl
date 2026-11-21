@@ -5,7 +5,7 @@ using LogExpFunctions: logistic, cexpexp, logaddexp
 using ReactiveKernels
 using ReactiveKernelsPPL
 using ReactiveKernelsPPL: LogitLink, LogLink
-using StatsFuns: normcdf
+using StatsFuns: StatsFuns, normcdf
 using Test
 
 function _distributional_model(ast, data; conditioned = (:y,))
@@ -212,4 +212,78 @@ end
         _distributional_check(model, f.oracle, f.u)
         _distributional_check(model, f.oracle, f.invalid)
     end
+end
+
+@testset "a named inverse link can supply more than one response" begin
+    x = [-1.2, 0.3, 0.9]
+    z = [0.1, 0.4, -0.2]
+    for (dist, inverse, link, y, law) in (
+            (:(Poisson.(m)), :exp, LogLink, [0, 1, 3], Poisson),
+            (:(NegativeBinomial2.(m, 2.0)), :exp, LogLink, [0, 1, 3],
+                m -> NegativeBinomial(2.0, 2.0 / (2.0 + m))),
+            (:(Binomial.(trials, m)), :logistic, LogitLink, [0, 1, 3],
+                p -> Binomial(4, p)),
+            (:(Weibull.(2.0, m)), :exp, LogLink, [0.2, 0.9, 1.5],
+                s -> Weibull(2.0, s)))
+        @testset "$dist" begin
+            ast = quote
+                a ~ Normal(0, 1)
+                b ~ Normal(0, 1)
+                eta = a .+ b .* x
+                m = $inverse.(eta)
+                y .~ $dist
+                z .~ Normal.(m, 0.5)
+            end
+            data = (; x, y, z, trials = fill(4, length(y)))
+            model = _distributional_model(ast, data; conditioned = (:y, :z))
+            @test only(r for r in model.plan.responses if r.response === :y).link === link
+            function oracle(u)
+                m = (inverse === :exp ? exp : logistic).(u[1] .+ u[2] .* x)
+                return sum(logpdf.(Normal(), u)) + sum(logpdf.(law.(m), y)) +
+                    sum(logpdf.(Normal.(m, 0.5), z))
+            end
+            _distributional_check(model, oracle, [0.4, -0.6])
+        end
+    end
+end
+
+@testset "qualified normal CDF identifies the probit predictor" begin
+    data = (; x = [-1.2, 0.3, 0.9], y = [0, 1, 1])
+    model = _distributional_model(quote
+        a ~ Normal(0, 1)
+        y .~ Bernoulli.(StatsFuns.normcdf.(a .+ x))
+    end, data)
+    @test only(model.plan.responses).link === ReactiveKernelsPPL.ProbitLink
+    oracle(u) = logpdf(Normal(), only(u)) +
+        sum(logpdf.(Bernoulli.(cdf.(Ref(Normal()), only(u) .+ data.x)), data.y))
+    _distributional_check(model, oracle, [0.2])
+end
+
+@testset "Poisson exposure includes a zero-exposure observation" begin
+    data = (; exposure = [0.0, 2.0, 0.75], x = [-0.2, 0.8, -0.1], y = [0, 1, 2])
+    model = _distributional_model(quote
+        a ~ Normal(0, 1)
+        y .~ Poisson.(exp.(a .+ x) .* exposure)
+    end, data)
+    oracle(u) = logpdf(Normal(), only(u)) +
+        sum(logpdf.(Poisson.(exp.(only(u) .+ data.x) .* data.exposure), data.y))
+    _distributional_check(model, oracle, [-0.3])
+end
+
+module WholeMatrixLinkArgument
+matrix(x) = reshape(x, 2, 2)
+end
+
+@testset "an undotted exponential of a matrix reads the whole value" begin
+    data = (; x = [0.1, 0.3, 0.2, 0.4], y = [0.4 1.2; 0.5 0.8])
+    model = _distributional_model(quote
+        a ~ Normal(0, 1)
+        mat = WholeMatrixLinkArgument.matrix(x)
+        scale = Base.exp(mat)
+        y .~ Weibull.(exp(a), scale)
+    end, data)
+    scales = exp(reshape(data.x, 2, 2))
+    oracle(u) = logpdf(Normal(), only(u)) +
+        sum(logpdf.(Weibull.(exp(only(u)), scales), data.y))
+    _distributional_check(model, oracle, [0.3])
 end

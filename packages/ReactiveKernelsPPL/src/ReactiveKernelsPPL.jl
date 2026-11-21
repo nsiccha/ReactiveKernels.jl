@@ -136,11 +136,11 @@ export rk_expm
 export rk_symmetric_eigvals, rk_symmetric_eigvecs
 
 include("documentation.jl")
+import ReactiveKernelsDistributionKernels: DistributionKernelSources
 include("contract.jl")
 include("structural_cache.jl")
 include("frozen.jl")
 include("sampling.jl")
-import ReactiveKernelsDistributionKernels: DistributionKernelSources
 # The general numerical callables and rule graphs are owned by RK proper;
 # existing PPL-qualified names import those same bindings for compatibility.
 include("design.jl")

@@ -71,4 +71,270 @@ end
 end
 
 
+@testset "row scales in a bound Normal regression" begin
+    scaled = @rkppl begin
+        a ~ Normal(0, 1); b ~ Normal(0, 1); sigma ~ Exponential(1.0)
+        y .~ Normal.(a .+ b .* x, sigma .* w)
+    end
+    by_precision = @rkppl begin
+        a ~ Normal(0, 1); b ~ Normal(0, 1); sigma ~ Exponential(1.0)
+        y .~ Normal.(a .+ b .* x, sigma ./ sqrt.(w))
+    end
+    by_product = @rkppl begin
+        a ~ Normal(0, 1); b ~ Normal(0, 1); sigma ~ Exponential(1.0)
+        y .~ Normal.(a .+ b .* x .* z, sigma .* w)
+    end
+    u = [0.25, -0.45, -0.2]
+    a, b, logscale = u
+    sigma = exp(logscale)
+    for model in (scaled, by_precision, by_product), n in (0, 48)
+        x = [cos(i) for i in 1:n]
+        y = [sin(i) for i in 1:n]
+        w = [isodd(i) ? 2.0 : 0.5 for i in 1:n]
+        z = [cos(2i) for i in 1:n]
+        inputs = model === by_product ? (; x, z, w) : (; x, w)
+        fit = model(; inputs...) | (; y)
+        built = build_kernel(fit)
+        k = prepare_query(built, fit, :sampler; exemplars = (u,))
+        # A binding without rows has no usable fit and binds none.
+        stats = filter(s -> s isa ReactiveKernels._LSWeightedStatistics, k.constants)
+        @test length(stats) == (n > 0)
+        @test all(s -> s.fit.usable, stats)
+        ref = -(a^2 + b^2)/2 - log(2pi) - sigma + logscale
+        grad = [-a, -b, 1 - sigma]
+        for i in eachindex(y)
+            sd = model === by_precision ? sigma / sqrt(w[i]) : sigma * w[i]
+            feature = model === by_product ? x[i]*z[i] : x[i]
+            residual = y[i] - a - b*feature
+            ref += -0.5*log(2pi) - log(sd) - 0.5*(residual/sd)^2
+            grad[1] += residual/sd^2
+            grad[2] += feature*residual/sd^2
+            grad[3] += (residual/sd)^2 - 1
+        end
+        q = prepare_sampler(built, fit, u; backend)
+        actual = similar(u)
+        value, _ = sampler_value_and_gradient!(q, actual, u)
+        @test value ≈ ref
+        @test actual ≈ grad
+    end
+    # A common location and scale give a design and a weight of one.
+    iid = @rkppl begin
+        m ~ Normal(0, 1); sigma ~ Exponential(1.0)
+        y .~ Normal.(m, sigma)
+    end
+    # Enough rows that the statistics cost less than the vectorized loop.
+    y = [sin(i) for i in 1:480]
+    fit = iid() | (; y)
+    built = build_kernel(fit)
+    point = [a, logscale]
+    k = prepare_query(built, fit, :sampler; exemplars = (point,))
+    @test only(s.fit.usable for s in k.constants if s isa ReactiveKernels._LSWeightedStatistics)
+    q = prepare_sampler(built, fit, point; backend)
+    r = y .- a
+    gradient = similar(point)
+    sampler_value_and_gradient!(q, gradient, point)
+    @test gradient ≈ [sum(r)/sigma^2 - a, sum(abs2, r)/sigma^2 - length(r) + 1 - sigma]
+end
+
+@testset "a binding runs its statistics only where they cost less" begin
+    # The bound fits among a program's constants, whichever form holds them.
+    fits(k) = filter(!isnothing, map(ReactiveKernels._ls_fit, collect(k.constants)))
+    shape(k) = replace(string(code_expr(k)), r"#\d+" => "#")
+    # Coefficients declared as numbers, and read from a declared vector.
+    numbers = @rkppl begin
+        a ~ Flat(); b ~ Flat(); sigma ~ restricted(Flat(), 0, Inf)
+        y .~ Normal.(a .+ b .* x, sigma)
+    end
+    vector = @rkppl begin
+        beta[1:2] .~ Flat()
+        sigma ~ restricted(Flat(), 0, Inf)
+        mu = beta[1] .+ beta[2] .* x
+        y .~ Normal.(mu, sigma)
+    end
+    # A scale that is no parameter: the fit is the lazy location's.
+    fixed = @rkppl begin
+        a ~ Flat(); b ~ Flat()
+        y .~ Normal.(a .+ b .* x, 1.2)
+    end
+    a, b, sigma = 0.3, -0.6, 1.2
+    # (rows, distinct rows, statistics). 240 rows of two binary columns are
+    # four distinct rows: the grouped loop costs less than any statistics.
+    cases = ((240, 4, false), (60, 60, false), (2000, 2000, true), (2000, 500, true))
+    for model in (numbers, vector, fixed), (n, distinct, statistics) in cases
+        base = distinct == 4 ? [(0.0, 0.0), (0.0, 1.0), (1.0, 0.0), (1.0, 1.0)] :
+            [(cos(i), sin(3i)) for i in 1:distinct]
+        rows = [base[mod1(7i, distinct)] for i in 1:n]
+        x, y = first.(rows), last.(rows)
+        fit = model(; x) | (; y)
+        built = build_kernel(fit)
+        named(a, b, sigma) = model === numbers ? (; a, b, sigma) :
+            model === vector ? (; beta = [a, b], sigma) : (; a, b)
+        u = collect(Float64, unconstrain(built.layout, named(a, b, sigma)))
+        # Where each coordinate sits in the packed point.
+        at(moved) = findfirst(!iszero, collect(Float64, unconstrain(built.layout, moved)) .- u)
+        ia, ib = at(named(a + 1, b, sigma)), at(named(a, b + 1, sigma))
+        is = model === fixed ? nothing : at(named(a, b, 2sigma))
+        k = prepare_query(built, fit, :sampler; exemplars = (u,))
+        literal = with_bound_statistics(false) do
+            prepare_query(build_kernel(fit), fit, :sampler; exemplars = (u,))
+        end
+        @test length(fits(k)) == statistics
+        @test all(fit -> fit.usable, fits(k))
+        if model === fixed
+            # The selected density arm must expose the squared residual so the
+            # prepared program actually reads the fit when QR wins.
+            @test occursin("ReactiveKernels._ls_rss(", string(code_expr(k))) == statistics
+        end
+        # Rows that repeat are grouped in either program: in the plan without
+        # the rewrite, and in the authored arm beside the statistics.
+        grouped(q) = [length(c) for c in q.constants if c isa Vector{Int}]
+        @test grouped(literal) == (distinct < n ? [distinct] : Int[])
+        @test grouped(k) == grouped(literal)
+        # Where the rows cost less, the program is the one without the rewrite.
+        statistics || @test shape(k) == shape(literal)
+        residual = y .- a .- b .* x
+        # A scale parameter adds its transform's log-Jacobian and a coordinate.
+        reference = sum(-log(2pi) / 2 .- log(sigma) .- (residual ./ sigma) .^ 2 ./ 2) +
+            (is === nothing ? 0.0 : log(sigma))
+        expected = zeros(length(u))
+        expected[ia] = sum(residual) / sigma^2
+        expected[ib] = sum(residual .* x) / sigma^2
+        is === nothing || (expected[is] = sum((residual ./ sigma) .^ 2 .- 1) + 1)
+        q = prepare_sampler(built, fit, u; backend)
+        gradient = similar(u)
+        value, _ = sampler_value_and_gradient!(q, gradient, u)
+        @test value ≈ reference rtol = 1e-12
+        @test q(u) ≈ reference rtol = 1e-12
+        @test gradient ≈ expected rtol = 1e-10
+        @test gradient_bytes(q, u) == 0
+    end
+end
+
+@testset "coefficients gathered per group differentiate at every count" begin
+    fits(k) = filter(!isnothing, map(ReactiveKernels._ls_fit, collect(k.constants)))
+    # One to six coefficient vectors gathered through one bound index, as an
+    # RKPPL model spells them: each source is a view of the packed point.
+    models = (
+        (@rkppl begin
+            sigma ~ restricted(Flat(), 0, Inf)
+            c1[1:N] .~ Normal(0, 10)
+            y .~ Normal.(c1[g], sigma)
+        end),
+        (@rkppl begin
+            sigma ~ restricted(Flat(), 0, Inf)
+            c1[1:N] .~ Normal(0, 10); c2[1:N] .~ Normal(0, 10)
+            mu = c1[g] .+ c2[g] .* x1
+            y .~ Normal.(mu, sigma)
+        end),
+        (@rkppl begin
+            sigma ~ restricted(Flat(), 0, Inf)
+            c1[1:N] .~ Normal(0, 10); c2[1:N] .~ Normal(0, 10); c3[1:N] .~ Normal(0, 10)
+            mu = c1[g] .+ c2[g] .* x1 .+ c3[g] .* x2
+            y .~ Normal.(mu, sigma)
+        end),
+        (@rkppl begin
+            sigma ~ restricted(Flat(), 0, Inf)
+            c1[1:N] .~ Normal(0, 10); c2[1:N] .~ Normal(0, 10); c3[1:N] .~ Normal(0, 10)
+            c4[1:N] .~ Normal(0, 10)
+            mu = c1[g] .+ c2[g] .* x1 .+ c3[g] .* x2 .+ c4[g] .* x3
+            y .~ Normal.(mu, sigma)
+        end),
+        (@rkppl begin
+            sigma ~ restricted(Flat(), 0, Inf)
+            c1[1:N] .~ Normal(0, 10); c2[1:N] .~ Normal(0, 10); c3[1:N] .~ Normal(0, 10)
+            c4[1:N] .~ Normal(0, 10); c5[1:N] .~ Normal(0, 10)
+            mu = c1[g] .+ c2[g] .* x1 .+ c3[g] .* x2 .+ c4[g] .* x3 .+ c5[g] .* x4
+            y .~ Normal.(mu, sigma)
+        end),
+        (@rkppl begin
+            sigma ~ restricted(Flat(), 0, Inf)
+            c1[1:N] .~ Normal(0, 10); c2[1:N] .~ Normal(0, 10); c3[1:N] .~ Normal(0, 10)
+            c4[1:N] .~ Normal(0, 10); c5[1:N] .~ Normal(0, 10); c6[1:N] .~ Normal(0, 10)
+            mu = c1[g] .+ c2[g] .* x1 .+ c3[g] .* x2 .+ c4[g] .* x3 .+ c5[g] .* x4 .+ c6[g] .* x5
+            y .~ Normal.(mu, sigma)
+        end),
+    )
+    groups = 6
+    columns = (:x1, :x2, :x3, :x4, :x5)
+    for (k, model) in enumerate(models)
+        used = Bool[]
+        # Too few rows per group for a fit, where the rows run, and many,
+        # where the blocks do.
+        for per in (k, 240)
+            n = groups * per
+            g = repeat(1:groups; inner = per)
+            xs = NamedTuple{columns[1:k-1]}(Tuple([sin(0.7i * j + j) for i in 1:n] for j in 1:k-1))
+            y = [cos(1.3i) + 0.1 * g[i] for i in 1:n]
+            fit = model(; N = groups, g, xs...) | (; y)
+            built = build_kernel(fit)
+            u = [0.05 * sin(2.1i) for i in 1:built.layout.total]
+            q = prepare_sampler(built, fit, u; backend)
+            literal = with_bound_statistics(false) do
+                prepare_sampler(build_kernel(fit), fit, u; backend)
+            end
+            @test isempty(fits(literal.kernel))
+            fit_used = only(fits(q.kernel)).usable
+            push!(used, fit_used)
+            gradient, expected = similar(u), similar(u)
+            value, _ = sampler_value_and_gradient!(q, gradient, u)
+            reference, _ = sampler_value_and_gradient!(literal, expected, u)
+            @test value ≈ reference rtol = 1e-11
+            @test q(u) ≈ literal(u) rtol = 1e-11
+            @test gradient ≈ expected rtol = 1e-9
+            @test gradient_bytes(q, u) == 0
+        end
+        @test used == [false, true]
+    end
+end
+
+@testset "a derived coefficient per group runs blocks only where they cost less" begin
+    fits(k) = filter(!isnothing, map(ReactiveKernels._ls_fit, collect(k.constants)))
+    # `x1 .- xbar` is computed from bound data. Before such coefficients were
+    # read these plates ran their rows, so their blocks also need the rows
+    # per group of `_ls_blocks_pay`: five at one and two coefficients, 64 at
+    # four.
+    one = @rkppl begin
+        sigma ~ restricted(Flat(), 0, Inf)
+        c1[1:N] .~ Normal(0, 10)
+        y .~ Normal.(c1[g] .* (x1 .- xbar), sigma)
+    end
+    two = @rkppl begin
+        sigma ~ restricted(Flat(), 0, Inf)
+        c1[1:N] .~ Normal(0, 10); c2[1:N] .~ Normal(0, 10)
+        mu = c1[g] .+ c2[g] .* (x1 .- xbar)
+        y .~ Normal.(mu, sigma)
+    end
+    four = @rkppl begin
+        sigma ~ restricted(Flat(), 0, Inf)
+        c1[1:N] .~ Normal(0, 10); c2[1:N] .~ Normal(0, 10); c3[1:N] .~ Normal(0, 10)
+        c4[1:N] .~ Normal(0, 10)
+        mu = c1[g] .+ c2[g] .* (x1 .- xbar) .+ c3[g] .* x2 .+ c4[g] .* x3
+        y .~ Normal.(mu, sigma)
+    end
+    groups = 6
+    shapes = ((one, (), ((4, false), (5, true))), (two, (), ((4, false), (5, true))),
+              (four, (:x2, :x3), ((32, false), (64, true))))
+    for (model, extra, cases) in shapes, (per, usable) in cases
+        n = groups * per
+        g = repeat(1:groups; inner = per)
+        x1 = [sin(0.7i) + 2 for i in 1:n]
+        more = NamedTuple{extra}(Tuple([cos(0.9i * j + j) for i in 1:n] for j in eachindex(extra)))
+        y = [cos(1.3i) + 0.1 * g[i] for i in 1:n]
+        fit = model(; N = groups, g, x1, xbar = 2.0, more...) | (; y)
+        built = build_kernel(fit)
+        u = [0.05 * sin(2.1i) for i in 1:built.layout.total]
+        q = prepare_sampler(built, fit, u; backend)
+        literal = with_bound_statistics(false) do
+            prepare_sampler(build_kernel(fit), fit, u; backend)
+        end
+        @test only(fits(q.kernel)).usable == usable
+        gradient, expected = similar(u), similar(u)
+        value, _ = sampler_value_and_gradient!(q, gradient, u)
+        reference, _ = sampler_value_and_gradient!(literal, expected, u)
+        @test value ≈ reference rtol = 1e-11
+        @test gradient ≈ expected rtol = 1e-9
+        @test gradient_bytes(q, u) == 0
+    end
+end
+
 end # module

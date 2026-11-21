@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.358
+## 0.1.359
 
 - `prepare_nonallocating` reuses the result of `vcat(a, v)` and `[a; v]` when
   a number stands beside dense vectors, as a model stacks an intercept on its
@@ -25,6 +25,35 @@ are recorded in the git history only.
   numbers (`vcat([a], v)`) only, so the stacked vector was allocated on every
   call: 96 B for an intercept on three coefficients, in the density and again
   under native Enzyme Reverse. Values and gradients are unchanged.
+
+## 0.1.358
+
+- A bound Normal regression keeps its least-squares statistics in more shapes.
+  Binding factors the shared design once with a pivoted QR. When a gathered
+  coefficient stands beside shared columns, binding first projects those
+  columns and the response off the gathered direction in each group. Each call
+  then evaluates the residual sum from the retained statistics instead of from
+  the rows. This now applies when the location is affine in the tracked
+  coefficients and the scale or precision varies by row through data (`sigma
+  .* w`, `sigma ./ sqrt.(p)`), when the coefficients are tuple projections or
+  enter through `muladd`, and when one gathered coefficient (`alpha[g]`)
+  stands beside scalar slopes or a bound matrix design. For a shared-scale
+  regression such as `Normal.(a .+ b .* x, sigma)`, binding compares the
+  estimated cost of QR evaluation with the cost of visiting the rows after
+  duplicate-row grouping. If the scale guard fails during evaluation, the
+  fallback retains that grouping. Grouped intercepts and slopes with a
+  centered bound column can use QR from five observations per group when
+  the fit is usable.
+  Crossed indices, multiple gathered coefficients alongside shared columns,
+  and a coefficient that enters nonlinearly or twice keep the authored row
+  calculation, and a rebinding whose statistics are not valid falls back to
+  it. Priors, Jacobians and input checks are unchanged. `js_source` emits the
+  authored rows for such a regression.
+- A prepared `vcat` can refill its vector buffer from numbers and dense
+  vectors of the buffer's element type, as in `vcat(0.0, alpha)`, when the
+  length matches and the inputs do not alias the buffer.
+- When an embedded prepared kernel has discarded its source plan, `js_source`
+  raises `JSEmissionError` and names the endpoint it could not translate.
 
 ## 0.1.357
 

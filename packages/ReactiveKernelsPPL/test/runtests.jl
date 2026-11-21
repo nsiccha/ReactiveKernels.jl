@@ -36,6 +36,7 @@ const _PPL_TEST_FILES = (
     "test_auxiliary_data.jl",
     "test_probability_values.jl",
     "test_distributional_primary.jl",
+    "test_location_scale_responses.jl",
     "test_distributional_boundaries.jl",
     "test_distributional_combinations.jl",
     "test_distributional_means.jl",

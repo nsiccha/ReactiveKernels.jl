@@ -100,7 +100,7 @@ _has_linenumber(x) = x isa LineNumberNode ||
         view = model_view(built; bound, query)
         source = string(view.source)
         @test view.source == Base.remove_linenums!(deepcopy(source_before))
-        @test occursin(" = ReactiveKernelsPPL._ppl_range_values(", source)
+        @test occursin("return posterior", source)
         @test !occursin("#=", source)
         @test !_has_linenumber(view.source)
         prepared = string(view.prepared)
@@ -130,4 +130,19 @@ _has_linenumber(x) = x isa LineNumberNode ||
         @test Base.invokelatest(query, u) == expected
         @test_throws ArgumentError model_view(built; bound = :not_a_plan)
     end
+end
+
+@testset "pre-build source shows an indexed scale column" begin
+    model = @rkppl begin
+        a ~ Normal(0, 1)
+        @plate for i in eachindex(y)
+            y[i] ~ Normal(a, scales[i])
+        end
+    end
+    # Both responses are observed, using only the first two scales.
+    bound = model(; scales = [0.5, 1.0, 1.5]) | (; y = [0.1, 0.2])
+    built = build_kernel(bound)
+    source = model_view(built; bound).source
+    @test source == Base.remove_linenums!(deepcopy(kernel_expr(bound, built.layout)))
+    @test occursin("ReactiveKernelsPPL._ppl_range_values(scales,", string(source))
 end

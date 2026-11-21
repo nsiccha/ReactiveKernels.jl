@@ -207,3 +207,40 @@ end
         end
     end
 end
+
+import LogExpFunctions
+module OtherLinkSpelling
+logistic(x) = 0.25 + zero(x)
+end
+
+@testset "response links through definitions and qualified bindings" begin
+    x = [-2.0, 0.5, 1.0]
+    y = [true, false, false]
+    for probability in (:(logistic.(a .* x)), :(LogExpFunctions.logistic.(a .* x)))
+        model = ReactiveKernelsPPL.RKPPLModel(quote
+            a ~ Normal(0, 1)
+            p = $probability
+            alias = p
+            y .~ Bernoulli.(alias)
+        end, @__MODULE__)
+        for (features, observed) in ((x, y), (Float64[], Bool[]))
+            plan = model(; x = features) | (; y = observed)
+            @test only(plan.responses).link === ReactiveKernelsPPL.LogitLink
+            u = [50.0]
+            sampler = prepare_sampler(build_kernel(plan), plan, u; backend = _GEN_BACKEND)
+            v = sampler(u)
+            g = similar(u)
+            sampler_value_and_gradient!(sampler, g, u)
+            eta = only(u) .* features
+            @test v ≈ logpdf(Normal(), only(u)) - sum(
+                LogExpFunctions.log1pexp.(ifelse.(observed, .-eta, eta)))
+            @test only(g) ≈ -only(u) + sum(features .* (observed .- LogExpFunctions.logistic.(eta)))
+        end
+    end
+    other = @rkppl begin
+        a ~ Normal(0, 1)
+        y .~ Bernoulli.(OtherLinkSpelling.logistic.(a .* x))
+    end
+    bound = other(; x) | (; y)
+    @test only(bound.responses).link === ReactiveKernelsPPL.IdentityLink
+end
