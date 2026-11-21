@@ -138,12 +138,15 @@ end
 # Select a lazy arm only when Julia reduces its condition to a literal return
 # for these input types. Requiring the *entire* optimized body to be that
 # return also proves that dropping the condition drops no effects or errors.
+# A short-circuit condition its first operand decides (`a && b` false at `a`,
+# `a || b` true at `a`) leaves a deleted statement, `nothing`, before the
+# return; it does nothing and is skipped.
 # No input value, branch condition or arm is evaluated by this analysis.
 Base.@nospecializeinfer function _type_constant_bool(@nospecialize(f), types)
     all(isconcretetype, types) || return nothing
     inferred = Base.code_typed(f, Tuple{types...})
     length(inferred) == 1 || return nothing
-    code = first(only(inferred)).code
+    code = filter(statement -> statement !== nothing, first(only(inferred)).code)
     length(code) == 1 || return nothing
     node = only(code)
     node isa Core.ReturnNode && isdefined(node, :val) || return nothing

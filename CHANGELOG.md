@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.352
+## 0.1.358
 
 - A bound Normal regression keeps its least-squares statistics in more shapes.
   Binding factors the shared design once with a pivoted QR. When a gathered
@@ -40,6 +40,112 @@ are recorded in the git history only.
   length matches and the inputs do not alias the buffer.
 - When an embedded prepared kernel has discarded its source plan, `js_source`
   raises `JSEmissionError` and names the endpoint it could not translate.
+
+## 0.1.357
+
+- A plate cell value that is a lazy branch whose condition the cell's
+  concrete operand types decide, such as Stan's scalar and array `+` written
+  `typeof(x) <: Number ? x .+ y : x + y` (in the cell, or in a
+  function-shaped kernel spliced into it), is lowered as the arm it takes.
+  The arm's broadcast then keeps the lowering it has when written alone,
+  such as a lazy broadcast its reader consumes, instead of a fresh array in
+  every cell. Native Reverse gradients of such a cell allocate what the arm
+  alone does: over 100 cells of five entries each, 80 B in one allocation
+  instead of 42,560 B in 406 (snag `type-decided-bra-2686ef6f`). A condition
+  is decided only when Julia reduces it to a constant for those types, so no
+  effect or error is dropped; a condition read from the cell's data stays a
+  lazy branch. Values and derivatives are unchanged.
+- A short-circuit condition its first operand decides (`typeof(x) <: Number ||
+  typeof(y) <: Number`, `typeof(x) <: Integer && …` for a float `x`) now counts
+  as decided by concrete types, here and in the selected-row locality of
+  0.1.49. Before, the deleted statement Julia leaves before its return kept it
+  dynamic.
+
+## 0.1.356
+
+- `prepare_nonallocating` reuses the array a `@traceable` helper creates with
+  `zeros` or `ones` (`zeros(Float64, K, K)`, `ones(n)`) and then fills by
+  indexed stores. Those stores, and the stores of the `copy(A)` updates of
+  0.1.337, may now use scalar locals (`i, j, w = 1, 2, 1.0`, or a temporary
+  inside the loop), `if` branches, `+=`-style updates and scalar arithmetic
+  such as `sqrt`, `exp`, `log`, `^` and comparisons. A changed size, or an argument that aliases the previous
+  result, gets a fresh array. Native Enzyme Reverse through such a helper
+  gives the ordinary program's gradient and allocates nothing for it.
+
+## 0.1.355
+
+- On a CUDA device, a `jax_source` module whose ODE right-hand side branches
+  (a ternary or `if` in a `@traceable` function, which becomes a
+  `jax.lax.cond`) or selects with an integer index compiles again. 0.1.353's
+  per-lane kernel picked a branch with an int32 `select_n`, which Pallas'
+  Triton lowering refuses, so such a module failed with `Failed to parse
+  Triton module: … 'arith.select' op operand #0 must be bool-like`. It now
+  selects with bool predicates only, as XLA lowers `select_n`. Pallas'
+  interpreter accepts either, so the tests read the kernels' jaxprs for it.
+
+## 0.1.354
+
+- A finding of `ad_derivative_report` (and of the derivative check at
+  preparation) in the program ReactiveKernels generates names the statement
+  it is in: its `frames` hold `macro expansion` at `rk:<value>:1`, `<value>`
+  being the value the statement assigns, the name `ad_cost_profile` reports
+  (`(other statements)` for code between statements). Before, Enzyme's report
+  dropped those statement scopes, whose line was 0, and such a finding named
+  only the generated body (`RuntimeGeneratedFunctions.jl:243` above
+  `codegen.jl:8664`), and Enzyme merged the calls of one function in
+  different statements into one finding. Each scope now has line 1 (a line
+  node without a file after its `push_loc` and after its `pop_loc`); the
+  compiled code and its derivative are unchanged. This also corrects native
+  debug info, so the frames of profile samples and backtraces too: on Julia
+  1.10, code of the generated body itself (a call that is not inlined, a
+  buffer Enzyme keeps) after a block's first statement read as that
+  statement's, and from Julia 1.12 code between two statements read as the
+  earlier one's. Code of a plate's loop outside its cells, such as the
+  buffers Enzyme keeps for the loop, is in `(other statements)`, as in
+  `ad_cost_profile`.
+
+## 0.1.353
+
+- On a CUDA device, a `jax_source` module integrates each `rk_ode_rk45_tol`
+  solve per lane in one Pallas (Triton) kernel, instead of diffrax's
+  batched while loop. Every vmapped call (plate cells, a sampler's chains)
+  joins one kernel call; each lane steps with its own step sizes, and only
+  the 32 lanes of a program wait for each other. The kernel takes diffrax's
+  `Dopri5` steps (first step, tableau, PID control, dense output, per-output
+  budget, retry of a non-finite trial, failure statuses), so values match the
+  CPU module up to rounding. Gradients are forward-mode sensitivities carried
+  through the kernel and contracted by a custom VJP: the derivative of the
+  same discrete solve. On a density with a five-state solve in each of 24
+  plate cells, a batched value and gradient of 64 chains took 45 ms instead
+  of 431 ms on a shared RTX 5060 Ti. `rk_ode_bdf_tol` keeps diffrax's
+  `Kvaerno5` on CUDA, with forward-mode sensitivities; so does a right-hand
+  side the kernel cannot evaluate, with a warning. CPU modules are unchanged.
+  `RK_JAX_ODE_KERNEL` (or the module's `RK_ODE_KERNEL`) is `auto`; `off` keeps
+  diffrax on CUDA, `interpret` runs the CUDA path on any backend in Pallas'
+  interpreter. The ODE section of the JAX guides is now its own page,
+  "JAX ODE solves" (`docs/src/jax-ode.md`).
+
+## 0.1.352
+
+- The opt-in generated reverse of summed plates (`with_plate_reverse`, the
+  `plate_reverse` preference) now runs on top of the optimized program.
+  Enabling it no longer disables summed-plate factoring, bound least-squares
+  statistics or product batching, so a prepared density is the same program
+  with it on or off. A plate summed from bound statistics stays with the
+  backend, and `plate_reverse_report` says so.
+- A plate call takes a generated rule only where a one-pass schedule applies
+  to its operands: a gather with fewer groups than cells, a joint value and
+  slope cut, or an additive nested total. Every other call runs inline, as
+  it does with the generated reverse disabled. The two-pass rule is no
+  longer used. `plate_reverse_report` still answers `"rule"` when a rule
+  exists for the plate; the call decides whether to take it.
+- Measured on six natural PosteriorDB ports (public sampler, Julia 1.13.1,
+  Enzyme dogfood 0.13.221, one thread, a loaded shared host), value and
+  gradient with the generated reverse on divided by off, default settings:
+  EarnHeight 0.94, NES1984 1.02, WellsDAAEC 1.03, Mesquite 0.98,
+  KidscoreMomiq 1.02, RadonVariableInterceptNCMN 0.81. Before this change the
+  first, second and fifth were 17.9, 16.5 and 7.2, because enabling it
+  replaced their bound statistics with a per-row rule.
 
 ## 0.1.351
 

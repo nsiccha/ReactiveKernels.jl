@@ -1,6 +1,6 @@
 # JAX runtime and derivatives
 
-This guide continues [JAX source](jax.md): runtime checks on accelerators, derivative rules in emitted modules, stable rewrites, and ODE solves.
+This guide continues [JAX source](jax.md): runtime checks on accelerators, chains sampled as one batch, derivative rules in emitted modules and stable rewrites. [JAX ODE solves](jax-ode.md) covers the ODE bridges.
 
 ## Accelerator runtime checks
 
@@ -29,6 +29,40 @@ and [platform configuration](https://docs.jax.dev/en/latest/config_options.html#
 `python benchmark/jax_runtime_checks.py` verifies the helper's values,
 gradients, device placement, invalid-input rejection and missing-GPU failure
 with a CUDA-enabled JAX installation.
+
+## Chains under `vmap`
+
+A sampler that advances several chains as one batch, `jax.vmap` over its
+transition (BlackJAX's NUTS, for example), runs each of its while loops until
+the last chain is done. JAX runs a batched loop's body for every lane and keeps
+the old carry where a lane's loop has ended, so a chain that is done is still
+evaluated on every later step of the batch, and the result is discarded. In
+NUTS such a chain stays at the state where it stopped: after a divergence,
+every remaining leapfrog step of the batch evaluates the density one step past
+the divergent point, and a chain that is done can even keep an inner loop
+running after every live chain has left it.
+
+This costs nothing extra when a density costs the same everywhere. It does
+when the cost depends on the position, as an ODE solve's does
+([JAX ODE solves](jax-ode.md)): past a divergence the system can be stiff, and
+one lane's solve then holds every call of the batch. In a four-chain warm-up on
+CUDA of a density with a five-state solve in each of 24 plate cells (float64,
+tolerances `1e-8`, at most 100,000 steps per output), one chain diverged after
+5 of 127 leapfrog steps. Its remaining evaluations took ten times the solver
+attempts of each running chain's, and the transition took 25 s where the
+others took about 4 s. At a saved proposal whose solves exhaust the step budget,
+one value and gradient takes 16.7 s on the card and 0.11 s on one CPU core.
+
+Guard the sampler, not the model: give a chain that is done a state it has
+already evaluated. In BlackJAX 1.7.1 that is two changes in
+`blackjax.mcmc.trajectory`. In `dynamic_progressive_integration`'s loop body,
+integrate from the subtree's initial state instead of
+`trajectory.rightmost_state` when the lane had already diverged, terminated or
+taken its steps. In `dynamic_multiplicative_expansion`'s, start a finished
+lane's subtree at the transition's initial state with zero steps. Only
+discarded results change. Compiled to round alike, the guarded and unguarded
+samplers gave bitwise identical draws on Neal's funnel, with 420 instead of
+2,694 evaluations far out in it (`|v| > 6`).
 
 ## Derivative rules
 
@@ -66,18 +100,3 @@ higher derivatives remain available through ordinary JAX differentiation.
 ## Stable rewrites
 
 Unless `simplify = false`, each emitted recipe computes numerically fragile compositions in the stable form native preparation computes, together with the statements that compute its inputs, also from a lazy arm or a plate's cell: `log(exp(u))` is emitted as `u`, and `log1p(-p)` of `p = logistic(u)` reads `u`, so the value and `jax.grad` stay finite where `exp(u)` overflows. A law's term on a value computed outside the law (`Normal(0, s)`'s `log(s)` of `s = exp(a)`) is still translated as written: the law's endpoint is translated from its compiled lowered code, which the rewrites do not read yet.
-
-## ODE solves
-
-A call of the native ODE bridges `rk_ode_rk45_tol(f, y0, t0, ts, reltol, abstol, maxsteps, args...)` or `rk_ode_bdf_tol` with the same arguments, also inside a plate cell and through a helper such as BayesianRegressionModels' `ode_rk45`, uses [diffrax](https://docs.kidger.site/diffrax/) to integrate across the requested output times. A module that solves an ODE imports `diffrax` (`pip install diffrax`); other modules do not. Emitting needs none of the Julia solver packages the native bridges load. The right-hand side `f(t, y, args...)` is translated like any helper into a nested Python function, and the extra arguments that are runtime values reach it through diffrax's `args`.
-
-- `rk_ode_rk45_tol` is `diffrax.Dopri5()`, the Dormand–Prince 5(4) method of the native `DP5()`. `rk_ode_bdf_tol` is `diffrax.Kvaerno5()`, diffrax's stiff (L-stable implicit Runge–Kutta) method: diffrax has no BDF method, so the stiff solve uses a different method than the native `FBDF()`, with the same tolerances.
-- The caller's tolerances are passed unchanged and may be traced (data or parameters). The step size follows a PID controller; outputs come from the solver's dense interpolant, so the native and JAX solves agree to the tolerances, not to the last bit.
-- `maxsteps` limits the accepted steps between consecutive requested outputs, as natively, and may be traced too. diffrax's own static bound on attempted steps is the largest int32, which costs nothing: a gradient keeps 64 checkpoints whatever the bound.
-- A preliminary integration checks each attempted step and stops at the first non-finite candidate or error estimate. Only its status is used. If every mapped solve completes this check, the output pass uses the ordinary solver. Otherwise the batch uses the solver that isolates rejected trials from differentiation.
-- `jax.grad` differentiates the discrete solve (diffrax's `RecursiveCheckpointAdjoint`, 64 checkpoints a solve), including with respect to the initial and output times, so a gradient's accuracy follows the caller's tolerances, as the native forward sensitivities' does. A backward-solve adjoint such as `jax.experimental.ode.odeint`'s does not: on a seven-state pharmacokinetic model its gradient was about 35 times less accurate at the same tolerances.
-- Under `jax.vmap` (a sampler's chains, or a plate's cells) one lane's solve never changes another lane's value: the batch steps until its slowest lane is done and masks the others' extra steps. A lane's gradient is independent of the other lanes only up to rounding. diffrax keeps a batch's backward-pass checkpoints in lockstep, so the lane that needs the most steps decides which steps the backward pass recomputes, and on CUDA XLA's autotuner can compile those recomputed steps to round differently from the forward ones. A lane's gradient then changes in its trailing digits when another lane, valid or failed, needs more steps than it does. The autotuner chooses anew in each process, so one program's gradients also differ between processes, and a point evaluated alone differs from the same point in a batch, by about as much. On a density with a five-state solve in each of 24 plate cells (float64, tolerances `1e-8`) each of these differences was at most `2.1e-4` on gradient entries up to `2e3`, a fifth of the difference between the JAX and native gradients. Compare such gradients with a tolerance, not bitwise. With `XLA_FLAGS=--xla_gpu_autotune_level=0` that experiment gave identical gradients across processes and neighbours. A neighbour that triggers the guarded solver can also change the rounding of a successful lane's gradient on CPU.
-- A ragged row of output times solves to the row's last time; its padded rows repeat that time's state, a column `sol[:, j]` keeps the padding, and reductions mask it.
-- Invalid inputs (non-finite or non-increasing times, invalid tolerances or `maxsteps`) raise at run time through the module's runtime checks, as the native bridge throws. A row without output times raises nothing.
-- An exceeded per-output budget and a failed solve are numerical failures, natively `ReactiveKernels.ODESolveFailure`. From a finite state, a trial with a non-finite candidate or error estimate is rejected and retried with a smaller step. Its discarded stages contribute no gradient. The solve fails if the step size falls below its minimum, if the controller proposes a non-finite step size, or if integration starts a step from a non-finite state. The failure is a `jax.experimental.checkify` check, which leaves every `vmap`, `scan`, `cond` and loop as a value: the functions `jax_source`'s `rejecting` names answer `-inf` for the whole evaluation, and the module's other functions raise. The module's other runtime checks are `checkify` checks too, so the first failure in program order decides, as the native program stops at its first throw: a check on a failed solve's state (a solve continuing from it) neither raises nor hides the failure. ReactiveKernelsPPL's density functions (`log_density` and its parts) are such functions, as its native sampler targets answer `-Inf`. Their gradient there is unspecified.
-- A module with an ODE solve therefore needs a JAX whose `checkify` has `checkify.Error.has_error` and differentiates a `custom_vjp` (every diffrax solve) after a check. No JAX release has either yet: with jax 0.12.0.1 such a gradient is wrong or fails (`benchmark/repro_jax_checkify_custom_vjp_control_flow.py`). Branch `jax-v0.12.0.1-checkify` of [nsiccha/jax](https://github.com/nsiccha/jax) carries both, and the module refuses to import without them.

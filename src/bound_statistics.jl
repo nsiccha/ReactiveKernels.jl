@@ -916,8 +916,7 @@ end
 
 # Whether this preparation rewrites: the setting, and the lowering that sums
 # the factored residuals (summed_plate_factors.jl) runs.
-_ls_enabled() = _bound_statistics() && _simplify() && !_plate_reverse_enabled() &&
-    !_footprint_recording()
+_ls_enabled() = _bound_statistics() && _simplify() && !_footprint_recording()
 
 function _ls_vector_value(v::Value)
     T = typeintersect(valtype(v), AbstractVector)

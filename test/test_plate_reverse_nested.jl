@@ -50,7 +50,7 @@ Base.getindex(x::ScaledGather, i::Vector{Int}) = 2 .* x.data[i]
     primal = (source, groups) -> sum(source[only(groups)])
     projection = (RK._PRGroupProjection{Any}(1, 2, true, true, true),)
     rule = RK._PlateSumRule{(),(1,),typeof(primal),typeof(identity),false,projection}(primal, identity)
-    @test RK._pr_rule_target(rule, (x, indices)) isa RK._PlateSumRuleBody
+    @test RK._pr_rule_target(rule, (x, indices)) === primal
     @test RK._pr_rule_target(rule, (projected, indices)) === primal
     @test rule(projected, indices) == primal(projected, indices)
     types = (Vector{Float64}, Vector{Int})

@@ -27,8 +27,10 @@ unruled_density(x) = sin(x) + cos(x)
     return total
 end
 
-count_rules(x::RK._PlateSumRule) = 1
-count_rules(x::Expr) = sum(count_rules, x.args; init = 0)
+# Calls of a generated rule. The AD body also names the rule in the test that
+# decides between its call and the plate's own inline program.
+count_rules(x::Expr) = (Meta.isexpr(x, :call) && first(x.args) isa RK._PlateSumRule) +
+    sum(count_rules, x.args; init = 0)
 count_rules(x) = 0
 count_calls(x::RK._PlateCall) = 1
 count_calls(x::Expr) = sum(count_calls, x.args; init = 0)
@@ -110,17 +112,17 @@ end
     end
 end
 
-@testset "one factored plate reports and preserves its fallback" begin
+@testset "one factored plate derives its reverse from the preserved loop" begin
     kernel = with_plate_reverse(false) do
         prepare(single_factored)
     end
     report = plate_reverse_report(kernel, (1, 2))
     @test length(report) == 1
-    @test occursin("intermediate plate total", last(only(report)))
+    @test last(only(report)) == "rule"
     @test occursin("factored_partial", string(kernel.ast))
     backend = AutoEnzyme(; mode = Enzyme.Reverse)
     ad = with_plate_reverse(true) do
-        @test count_rules(ad_ast(kernel, ([0.2], 0.7))) == 0
+        @test count_rules(ad_ast(kernel, ([0.2], 0.7))) == 1
         prepare_ad(kernel, backend, [0.2], 0.7; active = (:x, :s))
     end
     for n in (0, 1, 73)

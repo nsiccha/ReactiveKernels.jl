@@ -190,7 +190,9 @@ struct _SamplingGraphEndpoint{F}
     graph::KernelSpec
     prepared::F
 end
-(endpoint::_SamplingGraphEndpoint)(args...; kwargs...) = endpoint.prepared(args...; kwargs...)
+# Specialized and inlined as the endpoint wrappers (`_sampling_constrain`).
+@inline (endpoint::_SamplingGraphEndpoint)(args::Vararg{Any,N}; kwargs...) where {N} =
+    @inline endpoint.prepared(args...; kwargs...)
 _sampling_endpoint(f) = f
 _sampling_endpoint(f::KernelSpec) = _SamplingGraphEndpoint(f, prepare(f))
 
@@ -496,24 +498,36 @@ function _external_endpoint_call(head, args, keywords)
     return isempty(keywords) ? Expr(:call, head, args...) :
         Expr(:call, head, Expr(:parameters, keywords...), args...)
 end
-_sampling_constrain(g, u, shape, args...; kwargs...) = g.constrain(u, shape, args...; kwargs...)
-_sampling_logjac(g, u, shape, args...; kwargs...) = g.logjac(u, shape, args...; kwargs...)
+# The wrappers that call a geometry's endpoints from a program. A call Julia
+# does not inline runs the callee compiled for a signature of Julia's choosing:
+# its second and later trailing `args...` are widened to `Vararg{Any}` and an
+# argument that is a type to `Type`. Such a call passes boxed arguments, and
+# native Enzyme differentiates it at run time (`runtime_generic_augfwd`), in
+# every evaluation of the program. So the wrappers take `Vararg{Any,N}`, are
+# inlined, and inline the endpoint call too: an endpoint written
+# `(u, shape, args...)`, or given a type such as a family, would otherwise
+# meet the same widening at its own call.
+@inline _sampling_constrain(g, u, shape, args::Vararg{Any,N}; kwargs...) where {N} =
+    @inline g.constrain(u, shape, args...; kwargs...)
+@inline _sampling_logjac(g, u, shape, args::Vararg{Any,N}; kwargs...) where {N} =
+    @inline g.logjac(u, shape, args...; kwargs...)
 
-function _sampling_scalar_constrain(g, u, args...; kwargs...)
-    value = g.constrain([u], (), args...; kwargs...)
+@inline function _sampling_scalar_constrain(g, u, args::Vararg{Any,N}; kwargs...) where {N}
+    value = @inline g.constrain([u], (), args...; kwargs...)
     return _sampling_scalar_check(value)
 end
 function _sampling_scalar_check(value)
     value isa Number || throw(ArgumentError("scalar sampling geometry must constrain to a number"))
     return value
 end
-function _sampling_scalar_unconstrain(g, value, args...; kwargs...)
-    u = g.unconstrain(value, (), args...; kwargs...)
+@inline function _sampling_scalar_unconstrain(g, value, args::Vararg{Any,N}; kwargs...) where {N}
+    u = @inline g.unconstrain(value, (), args...; kwargs...)
     u isa AbstractVector && length(u) == 1 ||
         throw(ArgumentError("scalar sampling geometry must invert to one packed coordinate"))
     return only(u)
 end
-_sampling_scalar_logjac(g, u, args...; kwargs...) = g.logjac([u], (), args...; kwargs...)
+@inline _sampling_scalar_logjac(g, u, args::Vararg{Any,N}; kwargs...) where {N} =
+    @inline g.logjac([u], (), args...; kwargs...)
 
 function _external_host_cells(e, edge, values, args; kwargs...)
     endpoint = getglobal(@__MODULE__, Symbol(:_sampling_scalar_, edge))

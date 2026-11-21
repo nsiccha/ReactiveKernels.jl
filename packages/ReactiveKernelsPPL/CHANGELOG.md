@@ -16,9 +16,9 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.246
+## 0.1.249
 
-Requires ReactiveKernels 0.1.352.
+Requires ReactiveKernels 0.1.358.
 
 - A ReactiveKernels law with `location` and `scale` ports, a `logpdf` that
   takes one observation, and all kernel-valued arguments bound can serve as an
@@ -48,6 +48,41 @@ Requires ReactiveKernels 0.1.352.
   grew with rows times levels. The factor term contributes zero to the
   predictor for a row whose label is outside its declared axis, including when
   every row has the reference level.
+
+## 0.1.248
+
+- A joint cell latent's law may read a data array shared by every index,
+  `theta[i] ~ F(length(alpha), alpha)` with `alpha` read whole rather than at
+  the index. Every index's density and geometry endpoints receive the whole
+  `alpha`, whatever the number of indices. Before, binding read `alpha` as one
+  entry per index and refused it with `column length 3 ≠ n_obs 4` when the
+  counts differed.
+
+## 0.1.247
+
+- The constrained factor of an `LKJCholesky` prior and its diagonal are each
+  built by one helper (`_ppl_lkj_lower`, and now `_ppl_lkj_diagonal`) from a
+  fresh `zeros`/`ones` array. With ReactiveKernels 0.1.356 or later, the
+  default non-allocating sampler keeps one buffer for each, so its native
+  Enzyme Reverse gradient no longer allocates them, and Enzyme's shadows of
+  them, on every call. For a correlated `MvNormalCholesky` response with an
+  `LKJCholesky(K, 2.0)` prior, those four arrays were the gradient's only
+  allocations (384 B at K = 2 and 448 B at K = 3 per call, measured through a
+  dynamically dispatched call that adds 32 B of its own); it now allocates
+  0 B.
+
+## 0.1.246
+
+- A parameter geometry whose law has two or more arguments, for example a
+  joint `@plate` cell latent such as BRM's simplex per cell, now compiles a
+  type stable primal and native Enzyme derivative. So does a law given a type
+  (`Law(Normal, loc, scale)`), and an endpoint written `(u, shape, args...)`.
+  Before, Julia compiled the call to the endpoint for widened argument types
+  (`Vararg{Any}`, `Type`), so every cell called `constrain` with boxed
+  arguments and Enzyme differentiated it at run time (`runtime_generic_augfwd`,
+  `runtime_generic_rev` and `jl_box_int64` at `_ppl_cell_joint_constrain`,
+  with a type-stability warning at preparation). The endpoint wrappers now
+  take `Vararg{Any,N}` and inline the endpoint call.
 
 ## 0.1.245
 

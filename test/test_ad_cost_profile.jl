@@ -125,6 +125,55 @@ end
                             frame("f", "x.jl")]) == "(other statements)"
 end
 
+# Snag `ad-derivative-re-ad950539`: Julia gave a scope's own location no line,
+# and readers that keep only frames with a line (Enzyme's report of a
+# derivative) dropped it; native debug info also kept the previous location
+# for a line-0 one. A line node without a file after `push_loc` and after
+# `pop_loc` gives each scope line 1: one frame per statement.
+@noinline traced_frames(x) = (stacktrace(backtrace()), x)
+@kernel traced_statements(a::Float64) = begin
+    first_frames = traced_frames(a)
+    second_frames = traced_frames(a + 1)
+    total = (first_frames, second_frames)
+end
+
+@testset "statement scopes have a frame with a line" begin
+    RK = ReactiveKernels
+    ast = :((a, b) -> begin
+        x = a + 1
+        y = x * b
+        y
+    end)
+    marked = RK._source_markers(ast)
+    # Every scope opens and closes with the line node.
+    scoped = Tuple{Symbol,Any,Any}[]
+    walk(x) = x isa Expr && (x.head === :block && foreach(eachindex(x.args)) do i
+            RK._is_source_scope(x.args[i]) || return
+            close = findnext(RK._is_scope_end, x.args, i)
+            push!(scoped, (x.args[i].args[2], get(x.args, i + 1, nothing),
+                           get(x.args, close + 1, nothing)))
+        end; foreach(walk, x.args))
+    walk(marked)
+    @test first.(scoped) == Symbol.(["rk:(other statements)", "rk:x", "rk:y"])
+    @test all(s -> s[2] == LineNumberNode(1, nothing), scoped)
+    # The program's scope ends the function; a statement's is followed by one.
+    @test all(s -> s[3] == LineNumberNode(1, nothing), scoped[2:end])
+    @test RK._strip_source_markers(marked) == ast
+    @test RK._source_markers(marked) == marked
+    # A scope written before its line nodes existed is still read.
+    old = Expr(:block, RK._source_scope("x"), :(x = 1), RK._SOURCE_SCOPE_END, :x)
+    @test RK._strip_source_markers(old) == Expr(:block, :(x = 1), :x)
+
+    # In a compiled program each statement is one frame at line 1, inside the
+    # program's own, and no other statement's frame encloses it.
+    k = prepare(traced_statements; have = (:a,), want = :total)
+    first_frames, second_frames = first.(k(0.5))
+    scopes(frames) = [(RK._marker_label(f), f.line) for f in frames if RK._marker_label(f) !== nothing]
+    @test scopes(first_frames) == [("first_frames", 1), ("(other statements)", 1)]
+    @test scopes(second_frames) == [("second_frames", 1), ("(other statements)", 1)]
+    @test RK._sample_label(second_frames) == "second_frames"
+end
+
 @testset "samples spent managing memory, collecting and in called functions" begin
     RK = ReactiveKernels
     frame(func, file; c = false) =

@@ -62,6 +62,25 @@ end
     return total
 end
 
+# A packed vector whose selected entries come from an active vector, the shape
+# of ReactiveKernelsPPL's compact cell point: `base` and `slots` are constant.
+struct Overlay{B,A,S} <: AbstractVector{Float64}
+    base::B
+    active::A
+    slots::S
+end
+Base.size(p::Overlay) = size(p.base)
+Base.IndexStyle(::Type{<:Overlay}) = IndexLinear()
+@inline Base.getindex(p::Overlay, j::Int) =
+    iszero(p.slots[j]) ? p.base[j] : p.active[p.slots[j]]
+
+# Two WANT ports, one a view of the overlay: a pullback keeps both values.
+@kernel overlay_ports(base::Vector{Float64}, active::Vector{Float64},
+                      slots::Vector{Int32}) = begin
+    block = view(Overlay(base, active, slots), 1:4)
+    total::Float64 = sum(abs2, block)
+end
+
 const n = 16
 const x = collect(range(-1, 1; length = n))
 const y = 0.3 .+ 0.7 .* x .+ 0.1 .* sin.(1:n)
@@ -99,7 +118,10 @@ end
     derivative = (; func = Nothing, mode = :reverse, note = "",
         findings = [finding(:primal), finding(:forward), finding(:primal; throw_only = true),
                     finding(:primal; file = "./sort.jl"),
-                    finding(:primal; file = joinpath(Sys.STDLIB, "Logging", "src", "x.jl"))])
+                    finding(:primal; file = joinpath(Sys.STDLIB, "Logging", "src", "x.jl")),
+                    # A statement of RK's generated code is not Julia's own,
+                    # though its file starts like Base's.
+                    finding(:primal; file = "./rk:mu")])
     flag = ReactiveKernels._DERIVATIVE_REPORT_REACHABILITY
     saved = flag[]
     try
@@ -108,7 +130,7 @@ end
             [:forward]
         flag[] = true
         @test [last(p).sweep for p in ADDerivativeReport(nothing, [derivative]).unstable] ==
-            [:primal, :forward]
+            [:primal, :forward, :primal]
     finally
         flag[] = saved
     end
@@ -197,6 +219,39 @@ end
               report.allocations)
 end
 
+# Snag `ad-derivative-re-ad950539`: Enzyme's report keeps only frames with a
+# line, and the statement scopes of RK's generated code had line 0, so every
+# finding there named only the generated body. Each statement now has a frame
+# `rk:<value>` at line 1, and calls of one function in different statements are
+# different findings.
+@testset "the derivative's findings name the statement they are in" begin
+    statement(frame) = ReactiveKernels._marker_label(frame)
+    generated(finding) =
+        any(frame -> occursin("RuntimeGeneratedFunctions", String(frame.file)), finding.frames)
+    args = (0.1, 0.5, 1.2, x, y)
+    prepared = @test_logs min_level = quiet prepare_ad(prepare(linear_gaussian), backend, args...;
+                                                       active = :a)
+    report = ad_derivative_report(prepared, args...)
+    in_body = [f for (_, f) in report.allocations if generated(f)]
+    @test !isempty(in_body)
+    # Each names its statement, as a frame with a line.
+    @test all(f -> any(frame -> statement(frame) !== nothing && frame.line == 1, f.frames), in_body)
+    # The broadcast that materializes `mu` allocates in `mu`'s statement, and
+    # not in one finding shared with the other statements.
+    named = [only(unique(filter(!=("(other statements)"),
+                                [statement(fr) for fr in f.frames if statement(fr) !== nothing])))
+             for f in in_body]
+    @test "mu" in named
+    @test allunique(named)
+    # A statement frame is not Julia's own code.
+    @test !any(f -> any(frame -> statement(frame) !== nothing &&
+                                 ReactiveKernels._julia_own_frame(frame), f.frames), in_body)
+    # The message folds each statement into one frame.
+    message = ReactiveKernels._derivative_finding_line(first(in_body))
+    @test occursin(r"at macro expansion @ \.?/?rk:\w+:1", message)
+    @test !occursin(r"rk:[^\n]*:0\n", message)
+end
+
 @testset "the derivative's run-time dispatch at type_stability_level = :all" begin
     args = (0.1, y)
     kernel = prepare(hidden_scale; type_stability_level = :rk)
@@ -237,6 +292,45 @@ end
     @test !isempty(report.derivatives)
     @test isempty(report.unstable)
     @test only(ad_hvp(hvp, tangents, q, 1.7)) ≈ 1.7 .* only(tangents)
+end
+
+@testset "strict pullback whose kept port values view constant data" begin
+    # The pullback stores its port values in a `Duplicated` box. The view holds
+    # the constant `base`, which Enzyme gives a zero shadow there, reusing the
+    # copy the previous call left in the box (its repair
+    # `retained_shadow_emission`). Until its repair `static_zero_shadow_calls`
+    # that reuse was a call dispatched at run time, and the strict check refused
+    # the preparation (snag `rk-seeded-pullba-213e61b8`: RKPPL's shared-prefix
+    # partition pullback; Enzyme snag `retained-shadow-0a3488a8`).
+    static_zero_shadows = isdefined(Enzyme, :has_dogfood_repair) &&
+        Enzyme.has_dogfood_repair(:static_zero_shadow_calls)
+    base = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    active = [-0.7, 1.3]
+    slots = Int32[0, 1, 0, 2, 0, 0]
+    args = (base, active, slots)
+    seed = ([0.5, -1.0, 2.0, 0.25], 1.5)
+    # The pullback of `⟨seed₁, block⟩ + seed₂ * sum(abs2, block)` in the two
+    # active entries, which are entries 2 and 4 of the block.
+    expected = [seed[1][2] + 2 * seed[2] * active[1], seed[1][4] + 2 * seed[2] * active[2]]
+    pullback = @test_logs min_level = quiet prepare_ad_pullback(overlay_ports, backend,
+        seed, args...; want = (:block, :total), active = :active, type_stability_level = :rk)
+    value, cotangent = ad_value_and_pullback(pullback, seed, args...)
+    @test collect(value[1]) == [0.1, -0.7, 0.3, 1.3]
+    @test value[2] ≈ sum(abs2, value[1])
+    @test cotangent ≈ expected
+    # A warm call reuses the zero shadow the first one left in the box.
+    @test ad_pullback(pullback, seed, args...) ≈ expected
+    @test base == [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    report = ad_derivative_report(pullback, seed, args...)
+    @test !isempty(report.derivatives)
+    if static_zero_shadows
+        @test isempty(report.unstable)
+        strict = @test_logs min_level = quiet prepare_ad_pullback(overlay_ports, backend,
+            seed, args...; want = (:block, :total), active = :active, type_stability = :error)
+        @test ad_pullback(strict, seed, args...) ≈ expected
+    else
+        @test_broken isempty(report.unstable)
+    end
 end
 
 end # HOOK
