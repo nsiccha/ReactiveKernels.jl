@@ -16,6 +16,17 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.354
+
+- On a CUDA device, a `jax_source` module whose ODE right-hand side branches
+  (a ternary or `if` in a `@traceable` function, which becomes a
+  `jax.lax.cond`) or selects with an integer index compiles again. 0.1.353's
+  per-lane kernel picked a branch with an int32 `select_n`, which Pallas'
+  Triton lowering refuses, so such a module failed with `Failed to parse
+  Triton module: … 'arith.select' op operand #0 must be bool-like`. It now
+  selects with bool predicates only, as XLA lowers `select_n`. Pallas'
+  interpreter accepts either, so the tests read the kernels' jaxprs for it.
+
 ## 0.1.353
 
 - On a CUDA device, a `jax_source` module integrates each `rk_ode_rk45_tol`
