@@ -571,7 +571,7 @@ function _expand_cell_joint_latents(st, taken, data::Set{Symbol}, mod::Module,
             call.args[1], Expr(:tuple, (_sampling_ast_literal(a) for a in call.args[2:end])...))))
         push!(prelude, Expr(:(=), shapecells, column(Expr(:tuple, deepcopy.(g.shape)...))))
         push!(prelude, Expr(:(=), shapes, Expr(:call, ref(:_ppl_cell_joint_shapes),
-            QuoteNode(name), shapecells)))
+            QuoteNode(name), shapecells, length(g.shape))))
         push!(prelude, Expr(:(=), sizecells, column(deepcopy(g.unconstrained))))
         push!(prelude, Expr(:(=), offsets, Expr(:call, ref(:_ppl_cell_joint_offsets),
             QuoteNode(name), sizecells)))
@@ -736,13 +736,13 @@ end
 _ppl_cell_joint_extent(n) = n isa Integer && !(n isa Bool) && n >= 0
 
 # Each index's constrained shape, from the joint geometry's extents there.
-function _ppl_cell_joint_shapes(name::Symbol, cells::AbstractVector)
+function _ppl_cell_joint_shapes(name::Symbol, cells::AbstractVector, rank::Int...)
     for (k, extents) in enumerate(cells)
         extents isa Tuple && all(_ppl_cell_joint_extent, extents) || throw(ArgumentError(
             "cell latent `$name`: its geometry's shape at index $k must be a tuple " *
             "of nonnegative integers, got $(repr(extents))"))
     end
-    return _ppl_cell_latent_shapes(name, [map(Int, extents) for extents in cells])
+    return _ppl_cell_latent_shapes(name, [map(Int, extents) for extents in cells], rank...)
 end
 
 # Each index's packed block is `(offsets[k] + 1):offsets[k + 1]`.

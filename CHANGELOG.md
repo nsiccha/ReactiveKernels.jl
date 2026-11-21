@@ -16,6 +16,11 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.358
+
+- JAX index expressions such as `row[2:end]` read the logical length of a
+  padded numerical row. The same expression works for rows of different lengths.
+
 ## 0.1.357
 
 - A plate cell value that is a lazy branch whose condition the cell's

@@ -314,4 +314,6 @@ term_value(fx, v, i, t) = -log(2pi) / 2 - log(0.2) -
     f = prepare_cell_factors(fx.built, fx.bound, :y; locality = :error)
     @test_throws ReactiveKernels.PartitionLocalityError prepare_cell_factor_query(f, 1)
 end
+
+include("cell_joint_jax.jl")
 end
