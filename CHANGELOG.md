@@ -16,6 +16,13 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.360
+
+- `jax_source` translates the reduced factors `F.R` and `Matrix(F.Q)` of
+  `F = qr(A)` for dense real matrices. A kernel can construct
+  `LowerTriangular(A)` or `UpperTriangular(A)`, solve with either factor,
+  and compute the Euclidean norm of a real vector.
+
 ## 0.1.359
 
 - JAX index expressions such as `row[2:end]` read the logical length of a

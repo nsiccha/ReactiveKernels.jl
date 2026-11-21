@@ -1075,19 +1075,23 @@ function _jax_destructure!(ctx::_JaxContext, lhs, v::_PyVal)
     if _jax_property_destructuring(lhs)
         # `(; a, b) = x`: each name takes the field of that name, as Julia's
         # `getproperty(x, :a)` does; `x` is computed once.
-        v.T isa Type && v.T <: NamedTuple ||
+        v.T isa Type && v.T <: Union{NamedTuple,_JaxReducedQR} ||
             _jax_error("the destructuring `", lhs, "` of a value of type `", v.T, "`",
                        _jax_where(ctx))
         bound = _jax_bind!(ctx, :record, v)
         for s in lhs.args[1].args
-            k = findfirst(==(s), fieldnames(v.T))
-            k === nothing && _jax_error("`", v.T, "` has no field `", s, "`", _jax_where(ctx))
-            _jax_destructure!(ctx, s, _jax_named_field(bound, k))
+            _jax_destructure!(ctx, s, _jax_property(ctx, bound, s))
         end
         return
     end
     if lhs isa Expr && lhs.head === :tuple
         bound = _jax_bind!(ctx, :tuple, v)
+        if v.T isa Type && v.T <: _JaxReducedQR
+            for (k, target) in enumerate(lhs.args)
+                _jax_destructure!(ctx, target, _jax_qr_component(ctx, bound, k))
+            end
+            return
+        end
         if _jax_is_array(v.T)
             n = _jax_call(ctx, length, [bound])
             _jax_call(ctx, _runtime_check,
@@ -1618,12 +1622,7 @@ function _jax_expr(ctx::_JaxContext, ::Val{:.}, ex)
             return _jax_value(ctx, _jax_resolve(ctx, ex), field)
         end
         x = _jax_expr(ctx, owner)
-        x.T isa Type && x.T <: NamedTuple ||
-            _jax_error("the field read `", ex, "` on a value of type `", x.T, "`",
-                       _jax_where(ctx))
-        k = findfirst(==(field), fieldnames(x.T))
-        k === nothing && _jax_error("`", x.T, "` has no field `", field, "`", _jax_where(ctx))
-        return _jax_named_field(x, k)
+        return _jax_property(ctx, x, field)
     end
     if length(ex.args) == 2 && ex.args[2] isa Expr && ex.args[2].head === :tuple
         f = _jax_resolve(ctx, ex.args[1])
@@ -3662,6 +3661,22 @@ _jax_is_indexing(f) = f === getindex || f === view || f === Base.maybeview
 _jax_call(ctx::_JaxContext, f, args::Vector{_PyVal}) = _jax_call(ctx, f, args, Pair{Symbol,_PyVal}[])
 
 function _jax_call(ctx::_JaxContext, f, args::Vector{_PyVal}, kw)
+    if any(_jax_qr_object, args)
+        if isempty(kw) && f === Matrix && length(args) == 1 && only(args).T <: _JaxImplicitQ
+            q = only(args)
+            return _PyVal(q.code, Matrix{eltype(q.T)}, q.static)
+        end
+        if !(f in (getproperty, tuple, identity, typeof, isa))
+            # A helper may itself project the factors. Library operations on the
+            # packed representation would otherwise act on different values.
+            if f isa Function && !(parentmodule(typeof(f)) in (Base, Core, LinearAlgebra))
+                return isempty(kw) ? _jax_traceable_or_lowered(ctx, f, args) :
+                       _jax_call_keywords(ctx, f, args, kw)
+            end
+            _jax_error("`", f, "` on an implicit QR factor; use `F.R` or `Matrix(F.Q)`",
+                       _jax_where(ctx))
+        end
+    end
     if any(_jax_slots, args) && !(f in (isassigned, length, size, eachindex, axes, lastindex,
                                       identity, getindex, view, Base.maybeview))
         # Numerical-array mappings cannot consume the storage/bitmap pair.
@@ -4516,6 +4531,61 @@ end
 _jax_function_call(ctx::_JaxContext, ::typeof(exp), args::Vector{_PyVal}) =
     _jax_function_call(ctx, _native_exp, args)
 
+const _JaxReducedQR = Union{LinearAlgebra.QR,LinearAlgebra.QRCompactWY}
+const _JaxImplicitQ = Union{LinearAlgebra.QRCompactWYQ,LinearAlgebra.QRPackedQ}
+_jax_qr_object(v::_PyVal) = v.T isa Type && v.T !== Union{} && v.T <: Union{_JaxReducedQR,_JaxImplicitQ}
+
+# Julia iterates an unpivoted factorization as (implicit Q, dense R).
+function _jax_qr_component(ctx, x, k)
+    k == 1 && return _PyVal(_py_atom(x.code) * "[0]", _jax_return_type(f -> f.Q, [x.T]), x.static)
+    k == 2 && return _PyVal(_py_atom(x.code) * "[1]", Matrix{eltype(x.T)}, x.static)
+    _jax_error("an unpivoted QR factorization has two factors", _jax_where(ctx))
+end
+
+function _jax_function_call(ctx::_JaxContext, ::typeof(qr), args::Vector{_PyVal})
+    length(args) == 1 && args[1].T isa Type &&
+        args[1].T <: AbstractMatrix{<:Union{Float32,Float64,Integer}} ||
+        return _jax_traceable_or_lowered(ctx, qr, args)
+    A = only(args)
+    isempty(A.extent) || _jax_error("reduced QR of a padded matrix with a variable extent",
+                                    _jax_where(ctx))
+    T = _jax_return_type(qr, [A.T])
+    T <: _JaxReducedQR && eltype(T) in (Float32, Float64) ||
+        return _jax_traceable_or_lowered(ctx, qr, args)
+    A = _jax_bind!(ctx, :matrix, A)
+    rows, cols = (_jax_dim_code(ctx, A, d) for d in (1, 2))
+    # Julia's dense LAPACK path rejects a zero-row matrix with columns.
+    valid = _PyVal("(" * rows * " != 0 or " * cols * " == 0)", Bool, true)
+    _jax_call(ctx, _runtime_check, [valid, _PyVal(repr("QR needs a row for nonempty columns"), ArgumentError)])
+    a = "jnp.asarray(" * A.code * ", dtype=" * _jax_dtype(eltype(T)) * ")"
+    _jax_typed_result(T, args, "jnp.linalg.qr(" * a * ", mode=\"reduced\")")
+end
+
+# Scale by a power of two before squaring. Its exponent is locally constant,
+# and finite nonzero vectors retain their norm and ordinary derivative even
+# when the unscaled sum of squares would overflow or underflow.
+const _JAX_VECTOR_NORM = """
+def _rk_vector_norm(x):
+    peak = jnp.max(jnp.abs(x), initial=0)
+    exponent = jnp.frexp(peak)[1]
+    scale = jnp.ldexp(jnp.ones_like(peak), exponent - 1)
+    scaled = x / scale
+    squares = jnp.sum(scaled * scaled)
+    return jnp.where(peak == 0, 0, scale * jnp.sqrt(jnp.where(peak == 0, 1, squares)))
+"""
+function _jax_function_call(ctx::_JaxContext, ::typeof(norm), args::Vector{_PyVal})
+    length(args) == 1 && args[1].T isa Type &&
+        args[1].T <: AbstractVector{<:Union{Float32,Float64,Integer}} ||
+        return _jax_traceable_or_lowered(ctx, norm, args)
+    x = only(args)
+    T = _jax_return_type(norm, [x.T])
+    T in (Float32, Float64) || return _jax_traceable_or_lowered(ctx, norm, args)
+    helper = _jax_known(ctx, x) ? _host_helper! : _jax_helper!
+    name = helper(ctx, "_rk_vector_norm", _JAX_VECTOR_NORM)
+    code = "jnp.asarray(" * _jax_masked(x, "0") * ", dtype=" * _jax_dtype(T) * ")"
+    _jax_result(norm, args, name * "(" * code * ")")
+end
+
 # RK's factorization uses the lower triangle only, even when the ignored
 # upper entries are nonfinite. JAX otherwise symmetrizes its input. Both
 # libraries supply their ordinary derivatives; no backend-specific rule is
@@ -4554,7 +4624,7 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(rk_cholesky_lower), args:
 end
 
 function _jax_function_call(ctx::_JaxContext, ::typeof(\), args::Vector{_PyVal})
-    length(args) == 2 && args[1].T isa Type && args[1].T <: LinearAlgebra.LowerTriangular &&
+    length(args) == 2 && args[1].T isa Type && args[1].T <: Union{LowerTriangular,UpperTriangular} &&
         _jax_rank(args[2].T) in (1, 2) || return _jax_traceable_or_lowered(ctx, \, args)
     L, b = args
     # One _PyVal extent cannot describe independently padded rows and
@@ -4577,11 +4647,23 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(\), args::Vector{_PyVal})
         _jax_rank(b.T) == 2 && (padding = "(" * padding * ", (0, 0))")
         rhs = "jnp.pad(" * rhs * ", " * padding * ")[:" * width * "]"
     end
-    # SciPy's optional full-array finite check would read an ignored upper
-    # triangle; JAX already checks only the selected triangle.
+    # LAPACK's triangular solve throws on an exact zero pivot. Test the
+    # padded factor after its unused block has become an identity.
+    _jax_call(ctx, _runtime_check, [_PyVal("jnp.all(jnp.diag(" * factor * ") != 0)", Bool),
+        _PyVal(repr("triangular solve: singular matrix"), SingularException)])
+    # SciPy promotes a Float32 factor and an integer RHS to Float64.
+    # Julia solves in Float32. Promote both operands as Julia's solve does.
+    T = _jax_return_type(\, [L.T, b.T])
+    if _jax_is_array(T) && eltype(T) in (Float32, Float64)
+        dtype = ", dtype=" * _jax_dtype(eltype(T)) * ")"
+        eltype(L.T) == eltype(T) || (factor = "jnp.asarray(" * factor * dtype)
+        eltype(b.T) == eltype(T) || (rhs = "jnp.asarray(" * rhs * dtype)
+    end
+    # SciPy's optional full-array finite check would read the unused triangle.
+    lower = L.T <: LowerTriangular ? "True" : "False"
     code = "jax.scipy.linalg.solve_triangular(" * factor * ", " * rhs *
-           ", lower=True, check_finite=False)"
-    result = _jax_result(\, args, code)
+           ", lower=" * lower * ", check_finite=False)"
+    result = _jax_typed_result(T, args, code)
     padded = _jax_padded_axes(b) | (isempty(L.extent) ? 0 : 1)
     _PyVal(result.code, result.T, result.static, result.extent, "", padded)
 end
@@ -5850,6 +5932,27 @@ function _jax_call_positional(ctx::_JaxContext, T::Union{Type{Base.Fix1},Type{Ba
     captures = [_PyVal("<callable>", _JaxCallable(_jax_function_of(args[1]))), args[2]]
     F = T{_jax_argument_type(args[1]),_jax_argument_type(args[2])}
     _PyVal("<closure>", _JaxCallable(_JaxClosure(F, captures)), false)
+end
+
+# Preserve both the triangle's numerical entries and its solve dispatch.
+function _jax_call_positional(ctx::_JaxContext, T::Union{Type{LowerTriangular},Type{UpperTriangular}},
+                              args::Vector{_PyVal})
+    length(args) == 1 && _jax_rank(only(args).T) == 2 ||
+        _jax_error("`", T, "` needs a matrix", _jax_where(ctx))
+    A = _jax_bind!(ctx, :matrix, only(args))
+    n, m = (_jax_function_call(ctx, size, [A, _jax_literal(d)]) for d in (1, 2))
+    _jax_call(ctx, _runtime_check, [_jax_call(ctx, ==, [n, m]),
+        _PyVal(repr("triangular matrix must be square"), DimensionMismatch)])
+    op = T === LowerTriangular ? "jnp.tril" : "jnp.triu"
+    code = _jax_padded_reduced(ctx, T, A, "0")
+    extent = A.extent
+    if !isempty(extent)
+        # The logical block is square even for different storage capacities.
+        width = "min(" * A.code * ".shape)"
+        code = code * "[:" * width * ", :" * width * "]"
+    end
+    v = _jax_result(T, args, op * "(" * code * ")")
+    _PyVal(v.code, v.T, v.static, extent, "", isempty(extent) ? 0 : 3)
 end
 
 # A Julia type called as a function: a conversion.
@@ -7501,6 +7604,15 @@ function _jax_call_positional(ctx::_JaxContext, ::typeof(getproperty), args::Vec
     name = _jax_static_symbol(ctx, field)
     # `StanBlocks.jcall` in lowered code is `getproperty(StanBlocks, :jcall)`.
     x.T isa _JaxCallable{Module} && return _jax_module_global(ctx, x.T.f, name, getproperty)
+    _jax_property(ctx, x, name)
+end
+
+function _jax_property(ctx, x::_PyVal, name)
+    if x.T isa Type && x.T <: _JaxReducedQR
+        name === :R && return _jax_qr_component(ctx, x, 2)
+        name === :Q && return _jax_qr_component(ctx, x, 1)
+        _jax_error("QR property `", name, "`; use `F.R` or `Matrix(F.Q)`", _jax_where(ctx))
+    end
     x.T isa Type && x.T <: NamedTuple || _jax_error("the field read `", name, "` on `", x.T, "`",
                                                     _jax_where(ctx))
     k = findfirst(==(name), fieldnames(x.T))
@@ -7746,6 +7858,8 @@ _jax_scope_chain(scope) = scope === nothing ? _JaxScope[] : [scope; _jax_scope_c
 function _jax_split_outputs(ctx::_JaxContext, recipe::Recipe, v::_PyVal)
     length(recipe.outputs) == 1 && return [v]
     bound = _jax_bind!(ctx, :outputs, v)
+    v.T isa Type && v.T <: _JaxReducedQR &&
+        return [_jax_qr_component(ctx, bound, i) for i in eachindex(recipe.outputs)]
     [_PyVal(_py_atom(bound.code) * "[" * string(i - 1) * "]",
             v.T isa Type && v.T <: Tuple ? fieldtype(v.T, i) : Any)
      for i in eachindex(recipe.outputs)]
@@ -9589,6 +9703,8 @@ end
 # A returned named tuple is a `dict` keyed by its field names.
 function _jax_returned(ctx::_JaxContext, v::_PyVal; arrays::Bool = false)
     v.T === Union{} && return v # an unconditional diagnostic has no returned fields
+    arrays && _jax_qr_object(v) && _jax_error("an implicit QR factor as a public output; ",
+        "return `F.R` or `Matrix(F.Q)`", _jax_where(ctx))
     arrays && _jax_optional_payload(v.T) !== nothing &&
         _jax_error("an optional numerical module output needs a fixed JAX result structure; ",
                    "consume it with `something` or `isnothing` inside the program", _jax_where(ctx))

@@ -2,6 +2,33 @@
 
 Companion to [JAX source](jax.md): statistics reductions and package mappings. The Julia that `prepare_data` runs is in [JAX host preparation](jax-host.md).
 
+## Factorizations and triangular solves
+
+For a dense `Float32` or `Float64` matrix `A`, use `F = qr(A)`, `R = F.R`
+and `Q = Matrix(F.Q)`. Machine integers promote to floating point as in Julia.
+The two projections share one unpivoted QR factorization. For an `m × n`
+matrix, `Q` has `min(m, n)` orthonormal columns and `Q * R` reconstructs
+`A`. On a tall matrix the explicit `Matrix` conversion selects thin Q from
+Julia's implicit square operator. QR signs follow the numerical library.
+For a full-column-rank matrix, make the diagonal of R positive by multiplying
+each column of Q and the corresponding row of R by the sign of that diagonal
+entry. JAX can differentiate both factors on tall, full-column-rank inputs.
+On Julia 1.10.12, Enzyme 0.13.221 fails to differentiate the native signed
+factor sum in `LinearAlgebra.getproperty`. A device cell with a padded matrix
+of variable size cannot yet export its QR.
+
+`rk_cholesky_lower(A)` reads only the lower triangle, including when unused
+upper entries are nonfinite. It checks for square input and positive pivots,
+with runtime checks masked by the enclosing branch or plate. Empty factors and
+padded leading square blocks are supported. `diag(L)` reads the diagonal.
+Data-only factorizations and solves run in `prepare_data`. Arithmetic follows
+the module's `float_type`.
+
+Use `LowerTriangular(A) \ b` or `UpperTriangular(A) \ b` with a square
+matrix and a vector or matrix right-hand side. Only the selected triangle
+contributes. `norm(v)` computes a real vector's Euclidean norm with scaling
+for large and small magnitudes.
+
 ## Statistics reductions
 
 With Statistics loaded (`ReactiveKernelsStatisticsExt`, RK 0.1.262), `mean(x)`, `mean(f, x)`, `var(x)` and `std(x)` translate, with the keywords `dims` (one integer known while JAX traces, or `:`), and for `var` and `std` also `corrected` (a literal `true` or `false`) and `mean`. Each is the core `sum`, `length` and `size` translation it composes, `sum(x) / length(x)` and `sum(abs2.(x .- m)) / (n - corrected)`, so a padded row or a `dims` reduction reads only its valid entries and `prepare_data` takes NumPy's spelling. Over `dims` the reduced axis keeps length one, as in Julia. An empty argument, or one entry with `corrected`, gives Julia's NaN. Before, Statistics' own methods, which branch, were refused as "the function `_mean` has loops or branches".
