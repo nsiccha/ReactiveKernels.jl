@@ -78,7 +78,7 @@ ReactiveKernels.jax_source(built::NamedTuple, plan::StructuralPlan; values = (),
             _jax_module_of(built, plan; values, doc, float_type)
         end
     end
-function _jax_module_of(built, plan; values, doc, float_type)
+function _jax_module_of(built, plan; values, doc, float_type, events = (;))
     built = _binding_build(built, plan)
     isbound(plan) || throw(ContractValidationError(
         "[jax] jax_source requires a bound plan (bind_data first)"))
@@ -116,7 +116,7 @@ function _jax_module_of(built, plan; values, doc, float_type)
                  log_prior = workflow_wants(:prior),
                  log_likelihood = workflow_wants(:likelihood),
                  log_jacobian = workflow_wants(:log_jacobian),
-                 constrain = constrained)
+                 constrain = constrained, events...)
     # The layout's data-derived positions and axis lengths (`_layout_reads`):
     # `prepare_data` returns them, and `dimension`/`parameters` read them, so
     # the module states no binding's sizes. A layout that reads no data is

@@ -188,6 +188,7 @@ include("merged_observations.jl")
 include("chains.jl")
 # After the scan lowerings: it translates their helpers.
 include("jax.jl")
+include("jax_partition.jl")
 include("mutating.jl")
 
 include("precompile.jl")

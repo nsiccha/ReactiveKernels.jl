@@ -305,6 +305,13 @@ function Base.iterate(c::DensityFactors, state = (1, 1))
     nothing
 end
 
+function _density_factor_spec(plan, layout, sites)
+    def = Base.invokelatest(_kernel_expr_latest, plan, layout; density_sites = sites)
+    spec = _eval_kernel_def(_finish_kernel_expr(plan, def))
+    _register_packed_check!(spec, layout)
+    spec
+end
+
 """
     density_factors(built, plan) -> DensityFactors
 
@@ -335,7 +342,7 @@ function density_factors(built, plan::StructuralPlan; discrete = nothing)
     plan = _fixed_integer_query(plan, built.layout, discrete)
     _check_built_program(built, plan)
     sites = _DensitySite[]
-    def = Base.invokelatest(_kernel_expr_latest, plan, built.layout; density_sites = sites)
+    spec = _density_factor_spec(plan, built.layout, sites)
     coordinates = [_density_coordinates(s, plan, built.layout) for s in sites]
     counts = Dict{Tuple{Symbol,Symbol},Int}()
     for (i, s) in enumerate(sites)
@@ -349,11 +356,6 @@ function density_factors(built, plan::StructuralPlan; discrete = nothing)
         sites[i] = _DensitySite(s.kind, authored, s.total, s.plate, s.count, offset, s.owner)
         counts[key] = offset + s.count
     end
-    def = _elide_named_location_aliases(plan, def)
-    def = _pointwise_arithmetic_plates(plan, def)
-    def = _name_plate_cells(def, _location_value_aliases(plan, def))
-    spec = _eval_kernel_def(def)
-    _register_packed_check!(spec, built.layout)
     # The catalogue reads the binding's own data. A copy of it, kept to detect a
     # later in-place change, held a second copy of every bound array for the
     # catalogue's lifetime (snag per-unit-partiti-9d46c6de); its fingerprint

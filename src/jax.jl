@@ -9655,3 +9655,6 @@ function _jax_have_types(p::Plan, types)
     end
     argtypes
 end
+
+Base.include_dependency(joinpath(@__DIR__, "jax_indexed.py"))
+const _JAX_INDEXED = read(joinpath(@__DIR__, "jax_indexed.py"), String)

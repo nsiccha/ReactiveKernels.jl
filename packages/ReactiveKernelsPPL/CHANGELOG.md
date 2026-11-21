@@ -16,6 +16,12 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.253
+
+Requires ReactiveKernels 0.1.360.
+
+`jax_source(built, plan, observations; by, partitioned, global_factors, unit_factors, expected_layout)` exports the full sampler and constrain functions together with a shared density and an indexed unit density. The caller supplies disjoint atomic factor selections and passes the returned ownership data to the module’s `prepare_partition`. Each unit takes its own full packed point under JAX batching and differentiation.
+
 ## 0.1.252
 
 - `jax_source` supports joint cell latents with translatable geometry and
