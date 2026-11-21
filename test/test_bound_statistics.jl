@@ -577,15 +577,15 @@ end
     return total
 end
 
-@testset "gathered blocks run where they cost less than their rows" begin
-    # The rows per index value from which blocks run (`_ls_blocks_pay`): four
-    # at one coefficient per value, the admission minimum at two, and 64 at
-    # four. The binding decides; the program is the same either way.
+@testset "gathered blocks run from the admission minimum" begin
+    # Coefficients that are bound columns: two rows per coefficient and index
+    # value admit the blocks, whatever the count of coefficients. The binding
+    # decides; the program is the same either way.
     levels = 30
     shapes = (
-        (ls_gathered_one, 0, ((2, false), (3, false), (4, true), (40, true))),
+        (ls_gathered_one, 0, ((1, false), (2, true), (3, true), (40, true))),
         (ls_gathered, 1, ((2, false), (4, true), (5, true), (200, true))),
-        (ls_gathered_four, 3, ((8, false), (32, false), (64, true))),
+        (ls_gathered_four, 3, ((4, false), (8, true), (32, true), (64, true))),
     )
     for (kernel, columns, cases) in shapes
         kernels = Any[]

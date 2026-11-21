@@ -423,31 +423,35 @@ const _LS_SCALED_ROW_FACTOR = 40
 _ls_row_factor(common::Bool, columns::Bool) =
     !common ? _LS_SCALED_ROW_FACTOR : columns ? 1 : _LS_INDIRECT_ROW_FACTOR
 
-# Whether one block per index value costs less than the `n` gathered rows the
-# blocks replace. Both arms run inside the one region, so its cost does not
-# enter. Measured with each arm forced, at 30 index values with one to six
-# coefficients per value and 2 to 64 rows per value
-# (`benchmark/near_miss/repeated_rows.jl` repeats it for one and two):
+# Whether one block per index value costs less than the `n` gathered rows it
+# replaces, for a location with a derived coefficient
+# (`_ls_statistics_grouped`). A location whose coefficients are bound columns
+# has run blocks from the admission minimum since before derived coefficients
+# were read, and its rows can cost several times an RKPPL plate's (a kernel
+# that gathers four vectors in a broadcast: 2.6 ns per row and density), so
+# that minimum stays. A derived coefficient reaches the blocks only through
+# this rewrite; before it the plate ran its rows, and it must not run slower.
+#
+# Measured on RKPPL models with one to six coefficients per index value, each
+# arm forced, 30 index values, 2 to 64 rows per value, and paired against the
+# plain rows (`benchmark/near_miss/repeated_rows.jl` repeats the first two):
 #
 # - One coefficient: with two or three rows per value the blocks cost a
-#   density 12 to 22% more than the rows and a gradient the same or 11% more.
-#   From four rows their gradient costs less, and from five their density.
-# - Two and three coefficients: the blocks cost less in both from the fewest
-#   rows a fit is admitted with (`_LS_MINIMUM_ROWS_PER_PARAMETER`), at every
-#   size measured, also where the rows fill whole vector blocks (16, 32, 64
-#   rows per value). So the Rats regression, five rows per rat, runs blocks.
-# - Four and more coefficients: a block's gradient costs far more than its
-#   few products suggest. At four coefficients it is slower than the rows at
-#   8, 12, 16 and 32 rows per value (by 4 to 41%) and faster at 24 and 64; at
-#   five and six it is slower at every size measured. The rows are cheapest
-#   where they fill vector blocks of 32. Priced there, the blocks cost less
-#   from about 40 rows per value at four coefficients, 85 at five and 110 at
-#   six: 32 rows for each coefficient beyond two are required, which is past
-#   each of those. Seven and more coefficients are not measured.
+#   density 12 to 22% more than the rows and a gradient up to 11% more; with
+#   four the density still costs up to 6% more. From five both cost less.
+# - Two coefficients: with four rows per value the density is within 4%
+#   either way and the gradient costs 10% less; from five (the Rats
+#   regression) both cost less, at every size measured.
+# - Three coefficients: both cost less from the admission minimum of six.
+# - Four to six coefficients: a block's gradient costs far more than its few
+#   products suggest. It is slower than the rows at most sizes from 8 to 32
+#   rows per value (by up to 65%) and faster at 64 (by 15 to 28%).
 #
-# A binding that fails this keeps its rows through the region's authored arm,
-# like any other unusable fit, so the compiled program does not depend on it.
-_ls_block_rows(k::Int) = k == 1 ? 4 : k <= 3 ? 0 : 32 * (k - 2)
+# Seven and more coefficients, and 33 to 63 rows per value at four and more,
+# are not measured. A binding that fails this keeps its rows through the
+# region's authored arm, like any other unusable fit, so the compiled program
+# does not depend on it.
+_ls_block_rows(k::Int) = k <= 2 ? 5 : k == 3 ? 6 : 64
 _ls_blocks_pay(n::Int, k::Int, blocks::Int) = n >= _ls_block_rows(k) * blocks
 
 _ls_fit(w::_LSWeightedStatistics) = w.fit

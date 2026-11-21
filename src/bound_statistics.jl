@@ -184,15 +184,19 @@ function _ls_statistics_dense(A::AbstractMatrix{<:Real}, b::AbstractVector{<:Rea
 end
 
 """
-    _ls_statistics_grouped(index, columns, b)
+    _ls_statistics_grouped(index, columns, b, scales = nothing, derived = false)
 
 Statistics of one block per value of the bound `index` present in the data.
 `columns` holds one bound per-row coefficient vector per gathered live source
-(`ones` for a source added as is), `b` the bound response.
+(`ones` for a source added as is), `b` the bound response. `derived` says that
+a coefficient is computed from bound data by more than a product
+(`_ls_product_coefficient`): such a location needs the rows per value of
+`_ls_blocks_pay` as well.
 """
 function _ls_statistics_grouped(index::AbstractVector{<:Integer},
                                 columns::Tuple{Vararg{AbstractVector{<:Real}}},
-                                b::AbstractVector{<:Real}, scales = nothing)
+                                b::AbstractVector{<:Real}, scales = nothing,
+                                derived::Bool = false)
     n = length(b)
     k = length(columns)
     length(index) == n && all(c -> length(c) == n, columns) || throw(DimensionMismatch(
@@ -200,7 +204,7 @@ function _ls_statistics_grouped(index::AbstractVector{<:Integer},
     groups = sort!(unique(index))
     blocks = length(groups)
     usable = k >= 1 && n >= _LS_MINIMUM_ROWS_PER_PARAMETER * k * blocks &&
-        _ls_blocks_pay(n, k, blocks) && all(_ls_finite, columns) && _ls_finite(b)
+        (!derived || _ls_blocks_pay(n, k, blocks)) && all(_ls_finite, columns) && _ls_finite(b)
     usable || return _ls_unusable(k, blocks, Vector{Int}(groups), n)
     # Rows of each group, by a counting pass over the sorted group values.
     position = Dict{Int,Int}(g => j for (j, g) in enumerate(groups))
@@ -256,7 +260,11 @@ end
 # Entry `g` of every source of a tuple of gathered sources. Each read keeps
 # its bounds check, so an index value beyond a source raises as the row-wise
 # gather does.
-@inline _ls_group_entries(s::Tuple, g) = map(source -> source[g], s)
+@inline _ls_group_entries(::Tuple{}, g) = ()
+@inline _ls_group_entries(s::Tuple, g) = (first(s)[g], _ls_group_entries(Base.tail(s), g)...)
+# Entry `j` of those: a single source has only one.
+@inline _ls_tuple_entry(t::Tuple{Any}, j) = first(t)
+@inline _ls_tuple_entry(t::Tuple, j) = @inbounds t[j]
 
 # ‖R_p * (θ[perm] - θ̂[perm])‖² of block `b`, `θ` read by `entry(c)`. Only the
 # statistics' own arrays are read in bounds: a live source keeps its bounds
@@ -304,7 +312,7 @@ function _ls_rss_grouped(s::_LSStatistics, sources::Tuple)
         # One read per source and block. The block's triangle reads each entry
         # once per row, through `perm`, which holds positions of this tuple.
         entries = _ls_group_entries(sources, g)
-        total += _ls_block_norm(s, b, j -> @inbounds entries[j])
+        total += _ls_block_norm(s, b, j -> _ls_tuple_entry(entries, j))
     end
     total
 end
@@ -511,6 +519,12 @@ _ls_index_data(x::AbstractVector{<:Integer}, n) =
     !(eltype(x) <: Bool) && length(x) == n && firstindex(x) == 1
 _ls_index_data(x, n) = false
 
+# A coefficient that is a number, a bound column or a product of those: the
+# form a location had before derived coefficients such as `x .- xbar` were read.
+_ls_product_coefficient(x::Real) = true
+_ls_product_coefficient(x::Tuple) = first(x) === :data ||
+    (first(x) === :* && all(_ls_product_coefficient, Base.tail(x)))
+
 # Generated from `S`, so each data read is concretely typed.
 @generated function _ls_bind(::Val{S}, response, data::Tuple, scales = nothing) where {S}
     grouped, index, terms, offsets = S
@@ -541,7 +555,8 @@ _ls_index_data(x, n) = false
     elseif _ls_grouped(S)
         quote
             _ls_index_data(data[$index], n) || return $unusable
-            _ls_statistics_grouped(data[$index], ($(columns...),), b, scales)
+            _ls_statistics_grouped(data[$index], ($(columns...),), b, scales,
+                $(!all(term -> _ls_product_coefficient(first(term)), terms)))
         end
     else
         :(_ls_statistics_dense(hcat($(columns...)), b, scales))

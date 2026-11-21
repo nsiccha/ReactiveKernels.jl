@@ -253,8 +253,9 @@ end
     columns = (:x1, :x2, :x3, :x4, :x5)
     for (k, model) in enumerate(models)
         used = Bool[]
-        # Few rows per group, where the rows run, and many, where the blocks do.
-        for per in (k + 1, 240)
+        # Too few rows per group for a fit, where the rows run, and many,
+        # where the blocks do.
+        for per in (k, 240)
             n = groups * per
             g = repeat(1:groups; inner = per)
             xs = NamedTuple{columns[1:k-1]}(Tuple([sin(0.7i * j + j) for i in 1:n] for j in 1:k-1))
@@ -278,6 +279,56 @@ end
             @test gradient_bytes(q, u) == 0
         end
         @test used == [false, true]
+    end
+end
+
+@testset "a derived coefficient per group runs blocks only where they cost less" begin
+    fits(k) = filter(!isnothing, map(ReactiveKernels._ls_fit, collect(k.constants)))
+    # `x1 .- xbar` is computed from bound data. Before such coefficients were
+    # read these plates ran their rows, so their blocks also need the rows
+    # per group of `_ls_blocks_pay`: five at one and two coefficients, 64 at
+    # four.
+    one = @rkppl begin
+        sigma ~ restricted(Flat(), 0, Inf)
+        c1[1:N] .~ Normal(0, 10)
+        y .~ Normal.(c1[g] .* (x1 .- xbar), sigma)
+    end
+    two = @rkppl begin
+        sigma ~ restricted(Flat(), 0, Inf)
+        c1[1:N] .~ Normal(0, 10); c2[1:N] .~ Normal(0, 10)
+        mu = c1[g] .+ c2[g] .* (x1 .- xbar)
+        y .~ Normal.(mu, sigma)
+    end
+    four = @rkppl begin
+        sigma ~ restricted(Flat(), 0, Inf)
+        c1[1:N] .~ Normal(0, 10); c2[1:N] .~ Normal(0, 10); c3[1:N] .~ Normal(0, 10)
+        c4[1:N] .~ Normal(0, 10)
+        mu = c1[g] .+ c2[g] .* (x1 .- xbar) .+ c3[g] .* x2 .+ c4[g] .* x3
+        y .~ Normal.(mu, sigma)
+    end
+    groups = 6
+    shapes = ((one, (), ((4, false), (5, true))), (two, (), ((4, false), (5, true))),
+              (four, (:x2, :x3), ((32, false), (64, true))))
+    for (model, extra, cases) in shapes, (per, usable) in cases
+        n = groups * per
+        g = repeat(1:groups; inner = per)
+        x1 = [sin(0.7i) + 2 for i in 1:n]
+        more = NamedTuple{extra}(Tuple([cos(0.9i * j + j) for i in 1:n] for j in eachindex(extra)))
+        y = [cos(1.3i) + 0.1 * g[i] for i in 1:n]
+        fit = model(; N = groups, g, x1, xbar = 2.0, more...) | (; y)
+        built = build_kernel(fit)
+        u = [0.05 * sin(2.1i) for i in 1:built.layout.total]
+        q = prepare_sampler(built, fit, u; backend)
+        literal = with_bound_statistics(false) do
+            prepare_sampler(build_kernel(fit), fit, u; backend)
+        end
+        @test only(fits(q.kernel)).usable == usable
+        gradient, expected = similar(u), similar(u)
+        value, _ = sampler_value_and_gradient!(q, gradient, u)
+        reference, _ = sampler_value_and_gradient!(literal, expected, u)
+        @test value ≈ reference rtol = 1e-11
+        @test gradient ≈ expected rtol = 1e-9
+        @test gradient_bytes(q, u) == 0
     end
 end
 

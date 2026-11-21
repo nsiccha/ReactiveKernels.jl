@@ -9,8 +9,9 @@
 # - rows repeated 60, 10 and 2 times and all distinct, for 1, 2 and 5
 #   coefficients, for coefficients declared as numbers and read from a
 #   declared vector, for a scale that is no parameter, and for a per-row scale;
-# - one gathered coefficient vector with 2, 3, 4 and 8 rows per group (both
-#   sides of its switch in `_ls_blocks_pay`), and two with 2, 4, 5, 20 and 200.
+# - one gathered coefficient vector with 2, 3, 4 and 8 rows per group (bound
+#   columns only: blocks from the admission minimum), and two with a derived
+#   column and 2, 4, 5, 20 and 200 (both sides of `_ls_blocks_pay`).
 #
 # usage: julia repeated_rows.jl [rows = 240] [rounds = 7]
 #
