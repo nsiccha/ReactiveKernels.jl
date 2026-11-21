@@ -16,6 +16,16 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.250
+
+- A submodel called in a plate can build an indexed fitted value and observe
+  readings in an inner subject plate. Each endpoint keeps its own parameters.
+  Pointwise densities follow the endpoint, subject and reading axes, including
+  subjects with no readings. A named scale or degrees of freedom can be
+  shared or supplied separately for each endpoint.
+- Latent parameters indexed over an observed response read their packed
+  length from the binding. One generated program serves different row counts.
+
 ## 0.1.249
 
 - For a joint latent `theta[i] ~ F(args...)` with an ordinary Julia geometry,

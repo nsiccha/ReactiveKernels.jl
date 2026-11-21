@@ -1993,6 +1993,10 @@ end
 
 # A plate latent's rows as the program reads them.
 function _plate_rows_read(plan::StructuralPlan, tests, p::PlateParameter, value::Int)
+    if _plate_observation_extent(plan, p)
+        input = _plate_extent_input(p.name)
+        haskey(plan.columns, input) && return input
+    end
     r = p.range
     r isa UnitRange && return value
     iterator = r isa Symbol ? Expr(:call, :eachindex, r) : r

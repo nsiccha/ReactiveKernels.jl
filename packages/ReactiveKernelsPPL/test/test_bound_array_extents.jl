@@ -362,17 +362,17 @@ end
         _extent_check(loop, [(x = [0.9, 1.0], y = [0.5]), (x = [0.9, 1.0, 1.1, 0.7], y = [0.5])], want)
         _extent_check(loop, [(x = [0.9, 1.0], y = [0.5]), (x = Float64[], y = [0.5])], want;
             same_type = false)
-        # A latent over an observation's rows stays literal: the observation can
-        # be absent, and a design binding of a fit's build generates this program.
-        over_response = lower_rkppl(quote
-                @plate for i in eachindex(y)
-                    a[i] ~ Normal(0, 1)
-                    y[i] ~ Normal(a[i], 1.0)
-                end
-            end, (y = [0.9, 1.0],); conditioned = (:y,))
-        fit = bind_data(over_response, (y = [0.9, 1.0],))
-        @test occursin("view(unconstrained, 1:2)",
-            string(kernel_expr(fit, build_kernel(fit).layout)))
+        # The binding supplies the response extent, including when no rows are
+        # present. The unpacker can use it without reading observed values.
+        over_response = quote
+            @plate for i in eachindex(y)
+                a[i] ~ Normal(0, 1)
+                y[i] ~ Normal(a[i], 1.0)
+            end
+        end
+        want_response = (v, d) -> _normals(v.a) + sum(logpdf.(Normal.(v.a, 1.0), d.y); init=0.0)
+        _extent_check(over_response, [(y=ys,) for ys in ([0.9, 1.0], Float64[], zeros(4))],
+            want_response; same_type=false)
     end
     @testset "scans, centered and non-centered" begin
         _extent_check(quote
