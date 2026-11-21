@@ -1939,6 +1939,24 @@ for (name, row, col) in ((:_ppl_lkj_lower, :j, :i), (:_ppl_lkj_upper, :i, :j))
     end
 end
 
+# The factor's diagonal by the same running product, entry j the final
+# product of column block j. Its own helper, like the factor, so a
+# non-allocating preparation keeps one buffer for it across calls.
+@traceable function _ppl_lkj_diagonal(z, K, P)
+    out = ones(Float64, K)
+    i, j, d = 1, 2, 1.0
+    for p in 1:P
+        d = d * sqrt(1 - z[p]^2)
+        if i + 1 < j
+            i = i + 1
+        else
+            out[j] = d
+            i, j, d = 1, j + 1, 1.0
+        end
+    end
+    out
+end
+
 # The rows of the factor at a cell's rows (`ReactiveKernels._cell_row_method`),
 # by the same arithmetic in the same order: column block j holds the partials
 # (j - 1)(j - 2)/2 + 1, ... and carries its running product over them from 1.
@@ -2000,20 +2018,8 @@ function _lkj_array_transform_statements(e::LayoutEntry)
         # The diagonal is part of constructing the factor. Publish it as a
         # graph value so a guarded prior need not share the whole matrix with
         # response products. Each diagonal entry is still computed once.
-        :($diagonal::Vector{Float64} = let
-            out = ones(Float64, $K)
-            i, j, d = 1, 2, 1.0
-            for p in 1:$P
-                d = d * sqrt(1 - $z[p]^2)
-                if i + 1 < j
-                    i = i + 1
-                else
-                    out[j] = d
-                    i, j, d = 1, j + 1, 1.0
-                end
-            end
-            out
-        end),
+        :($diagonal::Vector{Float64} =
+            $(GlobalRef(@__MODULE__, :_ppl_lkj_diagonal))($z, $K, $P)),
         :($L::Matrix{Float64} = $(GlobalRef(@__MODULE__,
             _is_upper_lkj(e.transform) ? :_ppl_lkj_upper : :_ppl_lkj_lower))($z, $diagonal, $K, $P)),
         :($lj::Float64 = let

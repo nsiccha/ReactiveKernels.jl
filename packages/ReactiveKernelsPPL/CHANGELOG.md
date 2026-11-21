@@ -16,6 +16,19 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.246
+
+- The constrained factor of an `LKJCholesky` prior and its diagonal are each
+  built by one helper (`_ppl_lkj_lower`, and now `_ppl_lkj_diagonal`) from a
+  fresh `zeros`/`ones` array. With ReactiveKernels 0.1.354 or later, the
+  default non-allocating sampler keeps one buffer for each, so its native
+  Enzyme Reverse gradient no longer allocates them, and Enzyme's shadows of
+  them, on every call. For a correlated `MvNormalCholesky` response with an
+  `LKJCholesky(K, 2.0)` prior, those four arrays were the gradient's only
+  allocations (384 B at K = 2 and 448 B at K = 3 per call, measured through a
+  dynamically dispatched call that adds 32 B of its own); it now allocates
+  0 B.
+
 ## 0.1.245
 
 - `cell_pullback!` and partition-sampler gradients accept a shared prefix

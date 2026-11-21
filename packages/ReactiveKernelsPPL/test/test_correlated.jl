@@ -550,3 +550,54 @@ end
     @test occursin("_ppl_prior_L_L_corr", src) # LKJ prior node
     @test occursin("plate", src) # the row-grouped plate
 end
+
+# Warm bytes of one gradient call, behind a function barrier so that the
+# sampler's type is known where it is called.
+function _corr_gradient_bytes(q, g, u)
+    sampler_value_and_gradient!(q, g, u)
+    @allocated sampler_value_and_gradient!(q, g, u)
+end
+
+# The constrained LKJ factor and its diagonal are built from fresh `zeros` /
+# `ones` arrays by indexed stores (`_ppl_lkj_lower`, `_ppl_lkj_diagonal`). The
+# default non-allocating sampler keeps one buffer for each, so its native
+# Reverse gradient over this model allocates nothing at any point, for any K.
+@testset "correlated sampler gradient reuses the LKJ factor's storage" begin
+    function corr_plan(K)
+        body = Expr(:block)
+        for k in 1:K
+            push!(body.args, :($(Symbol(:a, k)) ~ Normal(0, 1)),
+                :($(Symbol(:b, k)) ~ Normal(0, 1)),
+                :($(Symbol(:mu, k)) = $(Symbol(:a, k)) .+ $(Symbol(:b, k)) .* x))
+        end
+        ys = [Symbol(:y, k) for k in 1:K]
+        push!(body.args, :(L_scales[1:$K] .~ Exponential.(1.0)),
+            :(L_L_corr ~ LKJCholesky($K, 2.0)), :(L = L_scales .* L_L_corr),
+            :([$(ys...)] ~ MvNormalCholesky([$((Symbol(:mu, k) for k in 1:K)...)], L)))
+        data = Dict{Symbol,AbstractVector}(:x => [0.5, -1.0, 1.5, 0.0, 0.3])
+        for k in 1:K
+            data[ys[k]] = [0.1k * sin(i + k) for i in 1:5]
+        end
+        names = (ys..., :x)
+        lower_rkppl(body, names; conditioned = names), data
+    end
+    for K in (2, 3)
+        plan, data = corr_plan(K)
+        bound = bind_data(plan, data)
+        built = build_kernel(bound)
+        u = [0.1sin(i) for i in 1:built.layout.total]
+        v = [0.2cos(i) for i in 1:built.layout.total]
+        q = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+        ordinary = prepare_sampler(built, bound, u; backend = _GEN_BACKEND,
+            nonallocating = false)
+        g, reference = similar(u), similar(u)
+        for point in (u, v, u)
+            value, _ = sampler_value_and_gradient!(q, g, point)
+            oracle, _ = sampler_value_and_gradient!(ordinary, reference, point)
+            @test value ≈ oracle
+            @test g ≈ reference
+        end
+        @test _corr_gradient_bytes(q, g, v) == 0
+        @test _corr_gradient_bytes(q, g, u) == 0
+    end
+end
