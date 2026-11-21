@@ -7050,7 +7050,7 @@ struct JointSampleStmt
     line::Int
 end
 
-# RKPPL accepted three fused GLM statements until 0.1.249:
+# RKPPL once accepted three fused GLM statements:
 # `y ~ NormalIDGLM(X, alpha, beta, sigma)`, `y ~ BernoulliLogitGLM(X, alpha,
 # beta)` and `y ~ PoissonLogGLM(X, alpha, beta)`. They are refused: a model
 # states its per-observation likelihood, and the lowering of that statement
@@ -7086,7 +7086,7 @@ function _refuse_fused_glm_statement(lhs, rhs)
     inside = found.wrapper === nothing ? "" :
         " inside the dotted `$(found.wrapper).(...)` wrapper"
     _sfail("response $lhs: `$head` is not an RKPPL statement (the fused " *
-           "GLM statements were removed in ReactiveKernelsPPL 0.1.250). " *
+           "GLM statements were removed). " *
            "State the per-observation likelihood$inside: `$lhs .~ $law`")
 end
 

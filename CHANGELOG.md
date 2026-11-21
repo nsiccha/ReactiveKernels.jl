@@ -16,6 +16,16 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.358
+
+- `prepare_nonallocating` reuses the result of `vcat(a, v)` and `[a; v]` when
+  a number stands beside dense vectors, as a model stacks an intercept on its
+  coefficient vector (`coefficients = [alpha; beta]`). Before, a retained
+  destination was filled for array operands and for a vector literal of
+  numbers (`vcat([a], v)`) only, so the stacked vector was allocated on every
+  call: 96 B for an intercept on three coefficients, in the density and again
+  under native Enzyme Reverse. Values and gradients are unchanged.
+
 ## 0.1.357
 
 - A plate cell value that is a lazy branch whose condition the cell's
