@@ -6134,6 +6134,10 @@ function _plate_inferred_input_types(p::Plan; exemplar_types = nothing,
            (infer_ranks ||
             any(q -> _plate_branch_operation(q.op), r.op.kernel.plan.recipes))
         for v in r.inputs if infer_ranks || valtype(v) === Any)
+    # A statistics region's arms are lowered from its inputs
+    # (`_ls_region_exemplar_types`), which are no plate's operands here.
+    exemplar_types === nothing || union!(target, (canon_id(g, v.id) for r in p.recipes
+        if r.op isa _LSRegion for v in r.inputs))
     producer = Dict(canon_id(g, v.id) => r for r in p.recipes for v in r.outputs)
     needed = Set{Int}()
     while !isempty(target)
@@ -6825,8 +6829,16 @@ function _lower_with_ops_collecting(p::Plan;
             # The containing body runs the native passes once after embedding;
             # factoring a lowered arm again would also factor its fallback.
             region_ids = value_ids === nothing ? nothing : Dict{Symbol,ValueId}()
+            # The arms' plates classify their operands as this lowering's own
+            # plates do: from the types the exemplars prove for the region's
+            # inputs. Without them an untyped shared scalar (RKPPL's
+            # `beta[2]`) is lowered as a possible array in both arms.
+            if exemplar_types !== nothing && inferred_exemplar_types === nothing
+                inferred_exemplar_types = _plate_inferred_input_types(p; exemplar_types)
+            end
             ast, constants, callables, recipes = _ls_region_program(
                 r.op.fast, r.op.literal, r.op.statistics;
+                exemplar_types = _ls_region_exemplar_types(g, r.op, inferred_exemplar_types),
                 native_passes = false,
                 declare, recycle, pushdowns, outline, plate_element_types,
                 inline_sources, plate_programs, value_ids = region_ids)

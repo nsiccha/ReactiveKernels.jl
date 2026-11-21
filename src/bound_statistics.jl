@@ -184,15 +184,19 @@ function _ls_statistics_dense(A::AbstractMatrix{<:Real}, b::AbstractVector{<:Rea
 end
 
 """
-    _ls_statistics_grouped(index, columns, b)
+    _ls_statistics_grouped(index, columns, b, scales = nothing, derived = false)
 
 Statistics of one block per value of the bound `index` present in the data.
 `columns` holds one bound per-row coefficient vector per gathered live source
-(`ones` for a source added as is), `b` the bound response.
+(`ones` for a source added as is), `b` the bound response. `derived` says that
+a coefficient is computed from bound data by more than a product
+(`_ls_product_coefficient`): such a location needs the rows per value of
+`_ls_blocks_pay` as well.
 """
 function _ls_statistics_grouped(index::AbstractVector{<:Integer},
                                 columns::Tuple{Vararg{AbstractVector{<:Real}}},
-                                b::AbstractVector{<:Real}, scales = nothing)
+                                b::AbstractVector{<:Real}, scales = nothing,
+                                derived::Bool = false)
     n = length(b)
     k = length(columns)
     length(index) == n && all(c -> length(c) == n, columns) || throw(DimensionMismatch(
@@ -200,7 +204,7 @@ function _ls_statistics_grouped(index::AbstractVector{<:Integer},
     groups = sort!(unique(index))
     blocks = length(groups)
     usable = k >= 1 && n >= _LS_MINIMUM_ROWS_PER_PARAMETER * k * blocks &&
-        all(_ls_finite, columns) && _ls_finite(b)
+        (!derived || _ls_blocks_pay(n, k, blocks)) && all(_ls_finite, columns) && _ls_finite(b)
     usable || return _ls_unusable(k, blocks, Vector{Int}(groups), n)
     # Rows of each group, by a counting pass over the sorted group values.
     position = Dict{Int,Int}(g => j for (j, g) in enumerate(groups))
@@ -253,10 +257,14 @@ include("mixed_least_squares.jl")
 end
 @inline _ls_sources_length(::Tuple{}) = 0
 @inline _ls_sources_length(s::Tuple) = _ls_source_length(first(s)) + _ls_sources_length(Base.tail(s))
-# Entry `g` of source `j` of a tuple of gathered sources.
-@inline _ls_group_entry(s::Tuple{Any}, j, g) = first(s)[g]
-@inline _ls_group_entry(s::Tuple, j, g) =
-    j == 1 ? first(s)[g] : _ls_group_entry(Base.tail(s), j - 1, g)
+# Entry `g` of every source of a tuple of gathered sources. Each read keeps
+# its bounds check, so an index value beyond a source raises as the row-wise
+# gather does.
+@inline _ls_group_entries(::Tuple{}, g) = ()
+@inline _ls_group_entries(s::Tuple, g) = (first(s)[g], _ls_group_entries(Base.tail(s), g)...)
+# Entry `j` of those: a single source has only one.
+@inline _ls_tuple_entry(t::Tuple{Any}, j) = first(t)
+@inline _ls_tuple_entry(t::Tuple, j) = @inbounds t[j]
 
 # ‖R_p * (θ[perm] - θ̂[perm])‖² of block `b`, `θ` read by `entry(c)`. Only the
 # statistics' own arrays are read in bounds: a live source keeps its bounds
@@ -301,7 +309,10 @@ function _ls_rss_grouped(s::_LSStatistics, sources::Tuple)
     total = s.rss0
     for b in 1:s.blocks
         g = @inbounds s.groups[b]
-        total += _ls_block_norm(s, b, j -> _ls_group_entry(sources, j, g))
+        # One read per source and block. The block's triangle reads each entry
+        # once per row, through `perm`, which holds positions of this tuple.
+        entries = _ls_group_entries(sources, g)
+        total += _ls_block_norm(s, b, j -> _ls_tuple_entry(entries, j))
     end
     total
 end
@@ -508,6 +519,12 @@ _ls_index_data(x::AbstractVector{<:Integer}, n) =
     !(eltype(x) <: Bool) && length(x) == n && firstindex(x) == 1
 _ls_index_data(x, n) = false
 
+# A coefficient that is a number, a bound column or a product of those: the
+# form a location had before derived coefficients such as `x .- xbar` were read.
+_ls_product_coefficient(x::Real) = true
+_ls_product_coefficient(x::Tuple) = first(x) === :data ||
+    (first(x) === :* && all(_ls_product_coefficient, Base.tail(x)))
+
 # Generated from `S`, so each data read is concretely typed.
 @generated function _ls_bind(::Val{S}, response, data::Tuple, scales = nothing) where {S}
     grouped, index, terms, offsets = S
@@ -538,7 +555,8 @@ _ls_index_data(x, n) = false
     elseif _ls_grouped(S)
         quote
             _ls_index_data(data[$index], n) || return $unusable
-            _ls_statistics_grouped(data[$index], ($(columns...),), b, scales)
+            _ls_statistics_grouped(data[$index], ($(columns...),), b, scales,
+                $(!all(term -> _ls_product_coefficient(first(term)), terms)))
         end
     else
         :(_ls_statistics_dense(hcat($(columns...)), b, scales))
@@ -983,39 +1001,61 @@ function _partial_bound_statistics(p::Plan, bound_values::Vector{Value})
     isempty(candidates) && return p
     _, _, dataonly = _partial_split(p, bound)
     weighted = Dict{Int,Any}()
+    deferred = Dict{Int,Any}()
     rewrites = Dict{Int,Any}()
     next_start = 1
     for r in candidates
         total = _authored_plate_sum_recipe(p, r)
         rewrite = _ls_plate_rewrite(p, r, total, dataonly, wanted)
-        if rewrite !== nothing
+        # A location that reads a matrix product or a gather keeps the lazy
+        # location: its rows pay for that product or gather on every call.
+        # One whose terms are live numbers times bound columns is a loop over
+        # bound vectors, which the duplicate-row grouping can shorten, so only
+        # a binding can tell which arm costs less (`_LSPendingStatistics`).
+        if rewrite !== nothing && !rewrite.columns
             rewrites[r.id] = rewrite
         else
             candidate = _ls_weighted_rewrite(p, r, total, dataonly, wanted, next_start)
-            candidate === nothing && continue
-            weighted[r.id] = candidate
+            if candidate !== nothing
+                weighted[r.id] = candidate
+            elseif rewrite !== nothing
+                # The scale-guarded form does not express this plate (its
+                # cell already holds the location). The lazy location is the
+                # statistics arm; where that arm cannot be placed, the plate
+                # keeps its rows.
+                deferred[r.id] = (r, total, rewrite, next_start)
+            else
+                continue
+            end
         end
         # Each guarded region owns its reduction. Producers for the next
         # plate can precede this total and arrive as ordinary region outputs.
         next_start = max(next_start, findfirst(==(total), p.recipes) + 1)
     end
-    isempty(rewrites) && isempty(weighted) && return p
+    isempty(rewrites) && isempty(weighted) && isempty(deferred) && return p
     copied = Graph(copy(g.values), copy(g.recipes), copy(g.producers), copy(g.aliases),
                    g.version, nothing, copy(g.checks))
     recipes = Recipe[]
     fresh = minimum((r.id for r in p.recipes); init = 0) - 1
-    omitted = Set{Int}()
-    for w in values(weighted)
-        union!(omitted, (r.id for r in w.selected))
-    end
-    totals = Dict(w.total.id => w for w in values(weighted))
-    for r in p.recipes
-        if haskey(totals, r.id)
-            append!(recipes, _ls_weighted_recipes(p, copied, totals[r.id], fresh))
-            fresh -= 3
+    # A binding-chosen candidate keeps its recipes; its fit and marker precede
+    # the first of them (`_LSPendingStatistics`). Three ids each: the fit, the
+    # marker, and one recipe of the statistics arm.
+    starts = Dict{Int,Any}()
+    for r in candidates
+        if haskey(weighted, r.id)
+            w = weighted[r.id]
+            starts[first(w.selected).id] = _ls_weighted_recipes(copied, w, fresh)
+        elseif haskey(deferred, r.id)
+            pending = _ls_location_pending(p, copied, deferred[r.id]..., fresh)
+            pending === nothing && continue
+            starts[pending.first.id] = pending.recipes
+        else
             continue
         end
-        r.id in omitted && continue
+        fresh -= 3
+    end
+    for r in p.recipes
+        append!(recipes, get(starts, r.id, ()))
         rewrite = get(rewrites, r.id, nothing)
         if rewrite === nothing
             push!(recipes, r)
@@ -1067,7 +1107,9 @@ function _ls_plate_rewrite(p::Plan, r::Recipe, total::Recipe, dataonly::Set{Valu
     # The location operation reads the live values and the data itself.
     kept = union(wanted, Set(live), Set(data))
     drop = _ls_exclusive(p, canon_id(g, location.id), r, kept, dataonly)
-    (; S, response, location, position, data, live, drop)
+    # Whether every term is a live number times bound per-row data.
+    columns = all(t -> t[3] === nothing && t[4] === nothing, x.terms)
+    (; S, response, location, position, data, live, drop, columns)
 end
 
 function _ls_inputs(x)
@@ -1207,7 +1249,9 @@ end
 
 function _ls_region_recipe(p::Plan, residual::Vector{Recipe}, region::UnitRange{Int}, id::Int)
     g = p.graph
-    selected = residual[region]
+    # The inner-plate pass closes a scale-guarded marker only at top level.
+    # One this region encloses is dropped: its plate keeps its rows in both arms.
+    selected = Recipe[r for r in residual[region] if !(r.op isa _LSPendingStatistics)]
     locations = Recipe[r for r in selected if r.op isa _LSLocationCall]
     fast = _ls_select_residual(g, selected, true)
     literal = _ls_select_residual(g, selected, false)
@@ -1236,6 +1280,13 @@ function _ls_make_region(id, fast_plan, literal_plan, statistics, cost, effectfu
     Recipe(id, Tuple(have), Tuple(want), _LSRegion(fast_plan, literal_plan, statistics, kernel),
            cost, nothing, effectful)
 end
+
+# The exemplar types of a region's arms, in the order of their HAVE ports,
+# from the types the enclosing lowering inferred for its values; `nothing`
+# without exemplars.
+_ls_region_exemplar_types(g::Graph, region::_LSRegion, ::Nothing) = nothing
+_ls_region_exemplar_types(g::Graph, region::_LSRegion, types::AbstractDict) =
+    Tuple(get(types, canon_id(g, v.id), valtype(v)) for v in region.literal.have)
 
 function _ls_region_program(fast::Plan, literal::Plan, statistics;
                             recycle = Pair{ValueId,Symbol}[], value_ids = nothing, kwargs...)
@@ -1411,7 +1462,8 @@ end
 # runs (index_runs.jl) of a gather a usable binding dropped. An unusable
 # binding's residual is then the plan without the rewrite.
 _ls_dropped_constant(r::Recipe) =
-    r.op isa Union{_BoundConstant{_LSStatistics},_BoundConstant{_IndexRunData}}
+    r.op isa Union{_BoundConstant{_LSStatistics},_BoundConstant{_IndexRunData},
+                   _BoundConstant{<:_LSWeightedStatistics}}
 function _ls_unread_statistics(g::Graph, recipes::Vector{Recipe})
     any(_ls_dropped_constant, recipes) || return recipes
     read = Set{ValueId}(canon_id(g, v.id) for r in recipes for v in r.inputs)

@@ -164,7 +164,10 @@ end
         for weights in (repeat([0.5, 1.5], 30), [0.0; ones(59)])
             bound = (; x = sin.(1:60), w = weights, y = cos.(1:60))
             kernel = prepare(js_weighted_residual; bound)
-            @test any(s -> s isa ReactiveKernels._LSWeightedStatistics, kernel.constants)
+            # A zero scale leaves no usable fit: that binding binds none and
+            # is the authored plate alone.
+            @test any(s -> s isa ReactiveKernels._LSWeightedStatistics, kernel.constants) ==
+                all(>(0), weights)
             source = ReactiveKernels.js_source(kernel; types = (Float64, Float64, Float64), name = :residual)
             if NODE
                 check_against(kernel, source, :residual, [(0.2, 0.5, 0.8), (0.1, -0.1, 0.0)])

@@ -27,9 +27,13 @@ are recorded in the git history only.
   coefficients and the scale or precision varies by row through data (`sigma
   .* w`, `sigma ./ sqrt.(p)`), when the coefficients are tuple projections or
   enter through `muladd`, and when one gathered coefficient (`alpha[g]`)
-  stands beside scalar slopes or a bound matrix design. The plain shared-scale
-  regression `Normal.(a .+ b .* x, sigma)` took its scale out of the row sum
-  but still summed every residual on each call; it uses the statistics too.
+  stands beside scalar slopes or a bound matrix design. For a shared-scale
+  regression such as `Normal.(a .+ b .* x, sigma)`, binding compares the
+  estimated cost of QR evaluation with the cost of visiting the rows after
+  duplicate-row grouping. If the scale guard fails during evaluation, the
+  fallback retains that grouping. Grouped intercepts and slopes with a
+  centered bound column can use QR from five observations per group when
+  the fit is usable.
   Crossed indices, multiple gathered coefficients alongside shared columns,
   and a coefficient that enters nonlinearly or twice keep the authored row
   calculation, and a rebinding whose statistics are not valid falls back to
