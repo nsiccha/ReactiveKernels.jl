@@ -170,11 +170,28 @@ _cjl_structure(program) = [(e.kind, e.depth) for e in recipe_inventory(program)
 _cjl_blocks(u, lengths) = [u[(sum(lengths[1:(i - 1)]; init = 0) + 1):sum(lengths[1:i])]
     for i in eachindex(lengths)]
 
+_cjl_reports_derivatives() =
+    isdefined(Enzyme, :has_dogfood_repair) && Enzyme.has_dogfood_repair(:derivative_report)
+
+# The native reverse is also type stable: no run-time dispatch or boxed value
+# in any derivative it compiles (`ad_derivative_report`, Enzyme dogfood repair
+# `derivative_report`). The cells' endpoint call `_ppl_cell_joint_constrain`
+# was once compiled for widened arguments, and Enzyme differentiated the
+# geometry's `constrain` at run time in every cell, for a law with two or more
+# arguments (`ZeroSum(x[i], s)`), a law given a type
+# (`TotalLogSumExp(Distributions.Normal, …)`) and an endpoint written
+# `(u, shape, args...)`.
 function _cjl_check(built, bound, u, oracle)
     sampler = prepare_sampler(built, bound, u; backend = AutoEnzyme(; mode = Enzyme.Reverse))
     value, gradient = sampler_value_and_gradient!(sampler, similar(u), u)
     @test value ≈ oracle(u) rtol = 1e-12
     @test gradient ≈ _cjl_fd(oracle, u) rtol = 1e-6 atol = 1e-8
+    if _cjl_reports_derivatives()
+        report = ReactiveKernels.ad_derivative_report(
+            () -> sampler_value_and_gradient!(sampler, similar(u), u))
+        @test !isempty(report.derivatives)
+        @test isempty(report.unstable)
+    end
     return nothing
 end
 

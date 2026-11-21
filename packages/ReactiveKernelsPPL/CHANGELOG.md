@@ -16,6 +16,19 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.246
+
+- A parameter geometry whose law has two or more arguments, for example a
+  joint `@plate` cell latent such as BRM's simplex per cell, now compiles a
+  type stable primal and native Enzyme derivative. So does a law given a type
+  (`Law(Normal, loc, scale)`), and an endpoint written `(u, shape, args...)`.
+  Before, Julia compiled the call to the endpoint for widened argument types
+  (`Vararg{Any}`, `Type`), so every cell called `constrain` with boxed
+  arguments and Enzyme differentiated it at run time (`runtime_generic_augfwd`,
+  `runtime_generic_rev` and `jl_box_int64` at `_ppl_cell_joint_constrain`,
+  with a type-stability warning at preparation). The endpoint wrappers now
+  take `Vararg{Any,N}` and inline the endpoint call.
+
 ## 0.1.245
 
 - `cell_pullback!` and partition-sampler gradients accept a shared prefix

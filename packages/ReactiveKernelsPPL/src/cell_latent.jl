@@ -774,15 +774,19 @@ _ppl_cell_blocks(offsets) =
 
 # A cell's constrained value of its joint latent: the geometry's `constrain`
 # on its packed block, read in place, with the cell's argument values.
-function _ppl_cell_joint_constrain(endpoints::Tuple, block, shape,
-        pos::Int, args...; kwargs...)
-    value = first(endpoints)(block, shape, args...; kwargs...)
+# Specialized and inlined as the endpoint wrappers (`_sampling_constrain`).
+# With plain `args...` and no inlining, a law with two or more arguments, or
+# with a type among them, called the endpoint with boxed arguments in every
+# cell, and Enzyme differentiated that call at run time.
+@inline function _ppl_cell_joint_constrain(endpoints::Tuple, block, shape,
+        pos::Int, args::Vararg{Any,N}; kwargs...) where {N}
+    value = @inline first(endpoints)(block, shape, args...; kwargs...)
     _ppl_cell_joint_check(value, shape, pos)
     return value
 end
-_ppl_cell_joint_logjac(endpoints::Tuple, block, shape, pos::Int,
-        args...; kwargs...) =
-    last(endpoints)(block, shape, args...; kwargs...)
+@inline _ppl_cell_joint_logjac(endpoints::Tuple, block, shape, pos::Int,
+        args::Vararg{Any,N}; kwargs...) where {N} =
+    @inline last(endpoints)(block, shape, args...; kwargs...)
 
 function _ppl_cell_joint_check(value, shape::Tuple, pos::Int)
     (isempty(shape) ? value isa Number : value isa AbstractArray && size(value) == shape) ||
