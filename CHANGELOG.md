@@ -16,6 +16,26 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.357
+
+- A plate cell value that is a lazy branch whose condition the cell's
+  concrete operand types decide, such as Stan's scalar and array `+` written
+  `typeof(x) <: Number ? x .+ y : x + y` (in the cell, or in a
+  function-shaped kernel spliced into it), is lowered as the arm it takes.
+  The arm's broadcast then keeps the lowering it has when written alone,
+  such as a lazy broadcast its reader consumes, instead of a fresh array in
+  every cell. Native Reverse gradients of such a cell allocate what the arm
+  alone does: over 100 cells of five entries each, 80 B in one allocation
+  instead of 42,560 B in 406 (snag `type-decided-bra-2686ef6f`). A condition
+  is decided only when Julia reduces it to a constant for those types, so no
+  effect or error is dropped; a condition read from the cell's data stays a
+  lazy branch. Values and derivatives are unchanged.
+- A short-circuit condition its first operand decides (`typeof(x) <: Number ||
+  typeof(y) <: Number`, `typeof(x) <: Integer && …` for a float `x`) now counts
+  as decided by concrete types, here and in the selected-row locality of
+  0.1.49. Before, the deleted statement Julia leaves before its return kept it
+  dynamic.
+
 ## 0.1.356
 
 - `prepare_nonallocating` reuses the array a `@traceable` helper creates with
