@@ -21,7 +21,8 @@ are recorded in the git history only.
 - A submodel called in a plate can build an indexed fitted value and observe
   readings in an inner subject plate. Each endpoint keeps its own parameters.
   Pointwise densities follow the endpoint, subject and reading axes, including
-  subjects with no readings.
+  subjects with no readings. A named scale or degrees of freedom can be
+  shared or supplied separately for each endpoint.
 - Latent parameters indexed over an observed response read their packed
   length from the binding. One generated program serves different row counts.
 

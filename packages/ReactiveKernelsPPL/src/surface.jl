@@ -10353,8 +10353,11 @@ end
 # while a bare use
 # keeps them scalar — naming a stated name must not re-bucket it.
 # A retained value keeps its name for every reader, so a scale reads it.
+# A plate column already computes the argument at its authored indices.
+# Keep that column so binding can broadcast its values with each cell.
 _is_scale_predictor_def(s::Symbol, ctx, allow_stated::Bool) =
     haskey(ctx.detmap, s) && !(s in ctx.plate_names) && s ∉ ctx.value_defs &&
+    !_is_plate_column_call(ctx.detmap[s]) &&
     !_derived_reads_latent(s, ctx) &&
     (get(ctx.detshape, s, :scalar) === :vector ||
         _is_factor_index_def(ctx.detmap[s], ctx) ||

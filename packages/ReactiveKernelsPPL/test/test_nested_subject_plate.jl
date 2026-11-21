@@ -2,6 +2,7 @@ module TestNestedSubjectPlate
 
 using Test, ReactiveKernels, ReactiveKernelsPPL, ReactiveKernelsDistributionKernels, Enzyme
 using ReactiveKernels.DifferentiationInterface: AutoEnzyme
+import Distributions
 
 @kernel signal_path(raw, shift) = begin
     signal = plate(raw) do subject
@@ -12,9 +13,10 @@ end
 
 @rkppl channel(rows, signal, picks) = begin
     offset ~ Normal(0, 1)
+    width = 1.0
     @plate for s in eachindex(rows)
         loc[s] = signal[s][picks[s]] .+ offset
-        rows[s] .~ Normal.(loc[s], 1.0)
+        rows[s] .~ Normal.(loc[s], width)
     end
     return loc
 end
@@ -117,6 +119,81 @@ end
     @test measured[1] == [[0.0], Float64[]]
     @test measured[2][1] ≈ [-0.02]
     @test measured[2][2] ≈ [-2.0, 0.0]
+end
+
+@rkppl scaled_channel(rows, signal, picks, sigma) = begin
+    offset ~ Normal(0, 1)
+    width = sigma
+    @plate for s in eachindex(rows)
+        loc[s] = signal[s][picks[s]] .+ offset
+        rows[s] .~ Normal.(loc[s], width)
+    end
+    return loc
+end
+
+@testset "Nested Normal scales follow their authored observation axes" begin
+    data = (; readings=[[[0.1, 0.2], Float64[]], [[0.3], [0.4, 0.5]]],
+        signal=[[1., 2.], [3., 4.]], picks=[[[1, 2], Int[]], [[2], [1, 2]]],
+        widths=[0.7, 1.2])
+    offsets = [0.12, -0.42]
+    sum_rows(x) = sum(row -> sum(row; init=0.0), x; init=0.0)
+    for (scale, widths) in ((1.0, ones(2)), (:(widths[e]), data.widths))
+        model = quote
+            @plate for e in eachindex(readings)
+                endpoint[e] ~ scaled_channel(readings[e], signal, picks[e], $scale)
+            end
+            fitted = endpoint.loc
+        end
+        plan = lower_rkppl(model, data; mod=@__MODULE__, conditioned=(:readings,))
+        bound = bind_data(plan, data)
+        built = build_kernel(bound)
+        fits = [[data.signal[s][j] .+ offsets[e] for (s, j) in pairs(p)]
+            for (e, p) in pairs(data.picks)]
+        errors = [map(-, ys, ms) for (ys, ms) in zip(data.readings, fits)]
+        expected = [[-0.5 .* ((r ./ w).^2 .+ log(2pi)) .- log(w) for r in group]
+            for (group, w) in zip(errors, widths)]
+        query(w) = Base.invokelatest(prepare_query(built, bound, w), offsets)
+        @test query((:fitted,)) == fits
+        got = query(:pointwise).readings
+        @test all(all(isapprox.(p, q)) for (p, q) in zip(got, expected))
+        @test query(:likelihood) ≈ sum(sum_rows, expected)
+        sampler = prepare_sampler(built, bound, offsets; backend=AutoEnzyme(; mode=Enzyme.Reverse))
+        _, grad = Base.invokelatest(sampler_value_and_gradient!, sampler, similar(offsets), offsets)
+        @test grad ≈ sum_rows.(errors) ./ widths.^2 .- offsets
+        if scale isa Expr
+            @test_throws ContractValidationError bind_data(plan, merge(data, (; widths=[0.7, -1.0])))
+        end
+    end
+end
+
+@rkppl student_channel(rows, df, width) = begin
+    offset ~ Normal(0, 1)
+    @plate for s in eachindex(rows)
+        rows[s] .~ StudentT.(df, offset, width)
+    end
+    return offset
+end
+
+@testset "Nested Student degrees of freedom and scale" begin
+    data = (; readings=[[[0.2], Float64[]], [[-0.3, 0.7]]],
+        degrees=[3, 7], widths=[0.7, 1.2])
+    model = quote
+        @plate for e in eachindex(readings)
+            endpoint[e] ~ student_channel(readings[e], degrees[e], widths[e])
+        end
+    end
+    plan = lower_rkppl(model, data; mod=@__MODULE__, conditioned=(:readings,))
+    bound = bind_data(plan, data)
+    query = prepare_query(build_kernel(bound), bound, :pointwise)
+    got = Base.invokelatest(query, zeros(2)).readings
+    for e in eachindex(data.readings)
+        law = Distributions.LocationScale(0.0, data.widths[e], Distributions.TDist(data.degrees[e]))
+        @test length(got[e]) == length(data.readings[e])
+        for s in eachindex(data.readings[e])
+            @test got[e][s] ≈ Distributions.logpdf.(Ref(law), data.readings[e][s])
+        end
+    end
+    @test_throws ContractValidationError bind_data(plan, merge(data, (; degrees=[0, 7])))
 end
 
 end
