@@ -2157,10 +2157,27 @@ function _cell_broadcast_group(plan::StructuralPlan, response::Symbol, node::Sym
     # its per-index totals; RK evaluates only the plate a query selects. The
     # declared total type also seeds RK's summed plate when the operands'
     # element types are known only at run time (a composed child's output).
-    groupplate_on(sub, statements, result...) = Expr(:do, Expr(:call, :plate, sub...),
-        Expr(:(->), Expr(:tuple, (aliases[v] for v in sub)...),
-            Expr(:block, LineNumberNode(0, :generator), deepcopy(statements)..., result...)))
-    groupplate(statements, result...) = groupplate_on(lanes, statements, result...)
+    function plate_expr(inputs, names, statements...)
+        return Expr(:do, Expr(:call, :plate, inputs...), Expr(:->, Expr(:tuple, names...),
+            Expr(:block, LineNumberNode(0, :generator), statements...)))
+    end
+    nested = response in plan.nested_broadcasts &&
+        _nested_array_entries(plan.columns[response])
+    function groupplate_on(sub, statements, result...; total=false)
+        params = [aliases[v] for v in sub]
+        cellbody = Any[deepcopy(statements)..., result...]
+        nested || return plate_expr(sub, params, cellbody...)
+        outer = [Symbol(p, :_outer) for p in params]
+        subject_values = plate_expr(outer, params, cellbody...)
+        values = Symbol(pw, :_subjects)
+        if total
+            return plate_expr(sub, outer, :($values = $subject_values),
+                :(_ppl_endpoint_total::Float64 = sum($values)), :_ppl_endpoint_total)
+        end
+        return plate_expr(sub, outer, :($values = $subject_values), values)
+    end
+    groupplate(statements, result...; total=false) =
+        groupplate_on(lanes, statements, result...; total)
     # A value the observation's arguments determine (its law, its location
     # and scale) zips only the per-index values it reads: the response is
     # not among them, so a binding that leaves the response absent evaluates
@@ -2178,7 +2195,7 @@ function _cell_broadcast_group(plan::StructuralPlan, response::Symbol, node::Sym
         :($pw = $(groupplate(cell, Expr(:call, GlobalRef(Base, :identity),
             _hsubst(pointvalue, aliases))))),
         :($totals = $(groupplate(cell, :(_ppl_group_total::Float64 = sum($group)),
-            :_ppl_group_total))),
+            :_ppl_group_total; total=true))),
         :($node::Float64 = sum($totals))]
     if lawstmt !== nothing
         lawgroup = Symbol(law, :_group)
@@ -2208,7 +2225,12 @@ function _cell_broadcast_group(plan::StructuralPlan, response::Symbol, node::Sym
             _cell_value_types!(argument_cell, Set{Symbol}(aliases[v] for v in sub))
             grouped_node = Symbol(argument_node, :_groups)
             push!(result, :($grouped_node = $(groupplate_on(sub, argument_cell, groupvalue))))
-            project(field) = :(plate($grouped_node) do argument
+            project(field) = nested ? :(plate($grouped_node) do group
+                subject = plate(group) do argument
+                    getproperty(argument, $(QuoteNode(field)))
+                end
+                subject
+            end) : :(plate($grouped_node) do argument
                 getproperty(argument, $(QuoteNode(field)))
             end)
             arguments = [field => (grouped(value) ?

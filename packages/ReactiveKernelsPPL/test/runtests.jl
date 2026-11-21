@@ -152,6 +152,7 @@ const _PPL_TEST_FILES = (
     "test_leveled_k_invariance.jl",
     "test_corpus.jl",
     "test_submodels_full.jl",
+    "test_nested_subject_plate.jl",
     "test_scoped_submodels.jl",
     "test_submodel_return_values.jl",
     "test_qualified_submodels.jl",
