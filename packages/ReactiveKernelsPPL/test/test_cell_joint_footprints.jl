@@ -53,6 +53,8 @@ for (Law, constrain, unconstrain, jacobian) in (
         (:IdentityLaw, identity_coordinates, identity_coordinates, zero_jacobian),
         (:CumulativeLaw, cumulative_coordinates, cumulative_inverse, zero_jacobian),
         (:ExpLaw, exp_coordinates, exp_inverse, exp_jacobian),
+        (:JuliaExpLaw, (u, shape, n) -> exp.(u), (v, shape, n) -> log.(v),
+            (u, shape, n) -> sum(u)),
         (:ShortLaw, short_coordinates, identity_coordinates, zero_jacobian))
     @eval begin
         struct $Law{N}
@@ -67,7 +69,7 @@ for (Law, constrain, unconstrain, jacobian) in (
 end
 
 values_of(law, block) = law === :IdentityLaw ? block :
-    law === :CumulativeLaw ? cumsum(block) : law === :ExpLaw ? exp.(block) :
+    law === :CumulativeLaw ? cumsum(block) : law in (:ExpLaw, :JuliaExpLaw) ? exp.(block) :
     block[2:end]
 
 # Records every packed position a call reads.
@@ -114,11 +116,12 @@ const SELECTIONS = (([3, 2], [[1], Int[]]),
                     ([4, 1], [[2, 2, 4], [1]]))
 
 @testset "joint cell latent observations read their selected coordinates" begin
-    for law in (:IdentityLaw, :CumulativeLaw, :ExpLaw), (n, picks) in SELECTIONS
+    for law in (:IdentityLaw, :CumulativeLaw, :ExpLaw, :JuliaExpLaw), (n, picks) in SELECTIONS
         fx = fixture(law, n, picks)
         saved = deepcopy((fx.data, fx.u))
         cell = prepare_cell_query(fx.built, fx.bound, :y; locality = :error)
         footprint = partition_footprint_kernel(cell.kernel)
+        partition = prepare_partition(fx.built, fx.bound, :y; by = :y => collect(eachindex(n)))
         ad = prepare_ad(cell.kernel, AutoEnzyme(; mode = Enzyme.Reverse), fx.u, 1;
             active = :unconstrained)
         for i in eachindex(n)
@@ -138,6 +141,7 @@ const SELECTIONS = (([3, 2], [[1], Int[]]),
                 @test read == block
                 @test issubset(tracked.reads, read)
             end
+            @test partition_footprint(partition.kernel, fx.u, i, nothing).unconstrained == read
             value, gradient = ad_value_and_gradient(ad, fx.u, i)
             @test value ≈ expected
             @test gradient ≈ central(v -> observation(law, fx, v, i), fx.u) atol = 1e-8 rtol = 1e-6
