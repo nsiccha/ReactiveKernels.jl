@@ -1,7 +1,6 @@
-# Whole-data GLM objects (`y ~ NormalIDGLM/BernoulliLogitGLM/PoissonLogGLM`)
-# under dataflow and non-allocating reverse AD. The desugared models carry a
-# beta-prior plate plus fused link/likelihood steps; NA gradients agree with
-# dataflow, Distributions.jl oracles, and central differences. Runs only
+# Per-observation likelihoods located at an intercept plus a design product,
+# under dataflow and non-allocating reverse AD. Non-allocating gradients agree
+# with dataflow, Distributions.jl oracles, and central differences. Runs only
 # through `test/run_nonallocating_integration.jl`, not the default suite,
 # because it needs the unregistered MutatingFunctions weak dependency.
 using ReactiveKernels
@@ -14,27 +13,27 @@ import Enzyme
 using Test
 
 # Ordinary reverse mode: the bound design matrix reaches BLAS through the
-# GLM likelihood, so this also covers bound data under a plain backend.
-const GLM_NA_BACKEND = AutoEnzyme(mode = Enzyme.Reverse)
+# design product, so this also covers bound data under a plain backend.
+const DESIGN_NA_BACKEND = AutoEnzyme(mode = Enzyme.Reverse)
 
-const _GLM_X1 = [0.5, -0.3, 1.2, 0.1, -0.8, 0.4]
-const _GLM_X2 = [1.0, 0.5, -0.5, 0.3, 0.9, -0.2]
-const _GLM_XB = hcat(_GLM_X1, _GLM_X2)
+const _DESIGN_X1 = [0.5, -0.3, 1.2, 0.1, -0.8, 0.4]
+const _DESIGN_X2 = [1.0, 0.5, -0.5, 0.3, 0.9, -0.2]
+const _DESIGN_XB = hcat(_DESIGN_X1, _DESIGN_X2)
 
-# Lowering/prepare run at top level: defining the fused-source closures and
+# Lowering/prepare run at top level: defining the generated closures and
 # calling them from inside one function frame trips Julia world-age gating.
-const _GLM_CASES = Any[]
+const _DESIGN_CASES = Any[]
 
 begin
     nast = :(begin
         X = hcat(x1, x2)
         alpha ~ Normal(0, 5)
         beta[axes(X, 2)] .~ Normal.(0, 2)
-        y ~ NormalIDGLM(X, alpha, beta, 2.0)
+        y .~ Normal.(alpha .+ X * beta, 2.0)
     end)
     yn = [1.5, -0.5, 2.0, 0.3, -1.2, 0.8]
     nplan = lower_rkppl(nast, [:y, :x1, :x2]; conditioned = [:y, :x1, :x2])
-    nbound = bind_data(nplan, Dict(:y => yn, :x1 => _GLM_X1, :x2 => _GLM_X2))
+    nbound = bind_data(nplan, Dict(:y => yn, :x1 => _DESIGN_X1, :x2 => _DESIGN_X2))
     nbuilt = build_kernel(nbound)
     ncols = sort!(collect(keys(nbound.columns)))
     nbnt = NamedTuple{Tuple(ncols)}(Tuple(nbound.columns[k] for k in ncols))
@@ -44,11 +43,11 @@ begin
         bound = nbnt)
     un = [0.1, -0.2, 0.3]
     nnt = ReactiveKernelsPPL.constrain(nbuilt.layout, un)
-    neta = nnt.alpha .+ _GLM_XB * nnt.beta
+    neta = nnt.alpha .+ _DESIGN_XB * nnt.beta
     noracle = sum(logpdf.(Normal.(neta, 2.0), yn)) +
         logpdf(Normal(0, 5), nnt.alpha) +
         sum(logpdf.(Normal(0, 2), nnt.beta))
-    push!(_GLM_CASES, ("normal-id", ndf, nna, un, noracle))
+    push!(_DESIGN_CASES, ("normal-id", ndf, nna, un, noracle))
 end
 
 begin
@@ -56,11 +55,11 @@ begin
         X = hcat(x1, x2)
         alpha ~ Normal(0, 5)
         beta[axes(X, 2)] .~ Normal.(0, 2)
-        y ~ BernoulliLogitGLM(X, alpha, beta)
+        y .~ BernoulliLogit.(alpha .+ X * beta)
     end)
     yb = [1, 0, 1, 1, 0, 1]
     bplan = lower_rkppl(bast, [:y, :x1, :x2]; conditioned = [:y, :x1, :x2])
-    bbound = bind_data(bplan, Dict(:y => yb, :x1 => _GLM_X1, :x2 => _GLM_X2))
+    bbound = bind_data(bplan, Dict(:y => yb, :x1 => _DESIGN_X1, :x2 => _DESIGN_X2))
     bbuilt = build_kernel(bbound)
     bcols = sort!(collect(keys(bbound.columns)))
     bbnt = NamedTuple{Tuple(bcols)}(Tuple(bbound.columns[k] for k in bcols))
@@ -70,11 +69,11 @@ begin
         bound = bbnt)
     ub = [0.1, -0.2, 0.3]
     bnt = ReactiveKernelsPPL.constrain(bbuilt.layout, ub)
-    beta_ = bnt.alpha .+ _GLM_XB * bnt.beta
+    beta_ = bnt.alpha .+ _DESIGN_XB * bnt.beta
     boracle = sum(logpdf.(Bernoulli.(1 ./ (1 .+ exp.(-beta_))), yb)) +
         logpdf(Normal(0, 5), bnt.alpha) +
         sum(logpdf.(Normal(0, 2), bnt.beta))
-    push!(_GLM_CASES, ("bernoulli-logit", bdf, bna, ub, boracle))
+    push!(_DESIGN_CASES, ("bernoulli-logit", bdf, bna, ub, boracle))
 end
 
 begin
@@ -82,11 +81,11 @@ begin
         X = hcat(x1, x2)
         alpha ~ Normal(0, 5)
         beta[axes(X, 2)] .~ Normal.([0.0, 0.0], [2.0, 3.0])
-        y ~ PoissonLogGLM(X, alpha, beta)
+        y .~ Poisson.(exp.(alpha .+ X * beta))
     end)
     yp = [3, 1, 5, 2, 0, 4]
     pplan = lower_rkppl(past, [:y, :x1, :x2]; conditioned = [:y, :x1, :x2])
-    pbound = bind_data(pplan, Dict(:y => yp, :x1 => _GLM_X1, :x2 => _GLM_X2))
+    pbound = bind_data(pplan, Dict(:y => yp, :x1 => _DESIGN_X1, :x2 => _DESIGN_X2))
     pbuilt = build_kernel(pbound)
     pcols = sort!(collect(keys(pbound.columns)))
     pbnt = NamedTuple{Tuple(pcols)}(Tuple(pbound.columns[k] for k in pcols))
@@ -96,14 +95,14 @@ begin
         bound = pbnt)
     up = [0.2, 0.1, -0.1]
     pnt = ReactiveKernelsPPL.constrain(pbuilt.layout, up)
-    peta = pnt.alpha .+ _GLM_XB * pnt.beta
+    peta = pnt.alpha .+ _DESIGN_XB * pnt.beta
     poracle = sum(logpdf.(Poisson.(exp.(peta)), yp)) +
         logpdf(Normal(0, 5), pnt.alpha) + logpdf(Normal(0, 2), pnt.beta[1]) +
         logpdf(Normal(0, 3), pnt.beta[2])
-    push!(_GLM_CASES, ("poisson-log", pdf, pna, up, poracle))
+    push!(_DESIGN_CASES, ("poisson-log", pdf, pna, up, poracle))
 end
 
-function _glm_findiff(kern, u0; h = 1e-6)
+function _design_findiff(kern, u0; h = 1e-6)
     g = similar(u0, Float64)
     for i in eachindex(u0)
         up = copy(u0)
@@ -115,12 +114,12 @@ function _glm_findiff(kern, u0; h = 1e-6)
     return g
 end
 
-@testset "GLM objects dataflow/nonallocating AD agreement" begin
+@testset "design-product likelihoods dataflow/nonallocating AD agreement" begin
     @test Base.get_extension(ReactiveKernels,
         :ReactiveKernelsMutatingFunctionsExt) !== nothing
-    for (tag, df, na, u0, oracle) in _GLM_CASES
-        ad_df = prepare_ad(df, GLM_NA_BACKEND, u0; active = :unconstrained)
-        ad_na = prepare_ad(na, GLM_NA_BACKEND, u0; active = :unconstrained)
+    for (tag, df, na, u0, oracle) in _DESIGN_CASES
+        ad_df = prepare_ad(df, DESIGN_NA_BACKEND, u0; active = :unconstrained)
+        ad_na = prepare_ad(na, DESIGN_NA_BACKEND, u0; active = :unconstrained)
         g_df, g_na = similar(u0), similar(u0)
         v_df, _ = ad_value_and_gradient!(ad_df, g_df, u0)
         v_na, _ = ad_value_and_gradient!(ad_na, g_na, u0)
@@ -128,6 +127,6 @@ end
         @test v_na ≈ oracle
         @test v_na ≈ v_df
         @test g_na ≈ g_df
-        @test g_na ≈ _glm_findiff(df, u0) rtol = 1e-5
+        @test g_na ≈ _design_findiff(df, u0) rtol = 1e-5
     end
 end

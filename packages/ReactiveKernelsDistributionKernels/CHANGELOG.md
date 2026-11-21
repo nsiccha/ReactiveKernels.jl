@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.17
+
+- **Breaking:** the fused whole-vector GLM objects `normal_id_glm`,
+  `bernoulli_logit_glm`, `poisson_log_glm`, `binomial_logit_glm`,
+  `neg_binomial_2_log_glm`, `categorical_logit_glm` and `ordered_logistic_glm`,
+  their `*_GLM_KERNEL_SOURCE` and `*_GLM_SOURCE` strings and the
+  `normal_id_glm_lpdf` derivative rule are removed. Write the per-observation
+  law in a plate over the linear predictor, for example
+  `plate(y, eta) do yi, ei; poisson(; log_rate = ei).logpdf(yi) end` with
+  `eta = X * beta`, and sum it.
+
 ## 0.1.16
 
 - `standard_student_t`'s density, and with it `student_t`, is a factor that

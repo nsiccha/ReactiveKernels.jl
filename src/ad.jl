@@ -711,12 +711,6 @@ _ad_na_empty_array(::Type{A}) where {A<:Array} = A(undef, ntuple(_ -> 0, ndims(A
 function _ad_na_walk(node, tainted::Set{Symbol}, have_free::Set{Symbol},
                      constants::Tuple, ops::Tuple, caches::Tuple, elided::Set{Int},
                      fold_values::Vector{Any})
-    if Meta.isexpr(node, :if, 3) &&
-            node.args[1] == Expr(:call, GlobalRef(@__MODULE__, :_differentiate_rule))
-        _nonalloc_cache_reads!(elided, node.args[3])
-        return _ad_na_walk(node.args[2], tainted, have_free, constants, ops, caches,
-                           elided, fold_values)
-    end
     if Meta.isexpr(node, :call) && first(node.args) == GlobalRef(@__MODULE__, :_array_header!)
         # Differentiate Base's reshape of the active parent. A header left
         # over from a primal evaluation has no independent adjoint.

@@ -65,9 +65,6 @@ const _DISTRIBUTION_ROLES = Dict{Symbol,Tuple{Vararg{Symbol}}}(
     :InverseGaussian => (:location, :shape),
     :VonMises => (:location, :concentration),
     :ZeroInflatedPoisson => (:rate, :zi), :ZeroInflatedBinomial => (:n, :p, :zi),
-    :NormalIDGLM => (:design, :intercept, :coefficients, :scale),
-    :BernoulliLogitGLM => (:design, :intercept, :coefficients),
-    :PoissonLogGLM => (:design, :intercept, :coefficients),
     :MvNormal => (:mean, :covariance), :MvNormalCholesky => (:mean, :factor),
     :Dirichlet => (:concentration,), :ICAR => (:node1, :node2),
 )

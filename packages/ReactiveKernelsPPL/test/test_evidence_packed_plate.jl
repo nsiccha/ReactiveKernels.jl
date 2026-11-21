@@ -80,30 +80,31 @@ end
     end
 end
 
-@testset "packed GLM evidence selects rows and bounds once" begin
-    for family in (:NormalIDGLM, :BernoulliLogitGLM, :PoissonLogGLM),
+@testset "packed design-product evidence selects rows and bounds once" begin
+    for family in (:normal, :bernoulli, :poisson),
             kind in (:truncated, :censored, :interval_censored)
         x = [-1., .5, 2., .25]
         jobs = [1, 3]
-        lo = family === :NormalIDGLM ? [-.5, -.2, .2, -.4] : [.2, .3, .4, .1]
-        hi = family === :BernoulliLogitGLM ? ones(4) : [2., 3., 2.8, 4.]
+        lo = family === :normal ? [-.5, -.2, .2, -.4] : [.2, .3, .4, .1]
+        hi = family === :bernoulli ? ones(4) : [2., 3., 2.8, 4.]
         ys = kind === :censored ? [lo[1], hi[3]] :
             kind === :interval_censored ? [.3, .5] : [1., 1.]
         data = Dict{Symbol,Any}(:y=>ys, :x=>x, :Jobs=>jobs, :lo=>lo, :hi=>hi)
-        ctor = family === :NormalIDGLM ? :(NormalIDGLM(X,a,b,1.2)) :
-            Expr(:call, family, :X, :a, :b)
-        wrap = kind === :interval_censored ? Expr(:call,kind,ctor,:hi) :
-            Expr(:call,kind,ctor,:lo,:hi)
+        ctor = family === :normal ? :(Normal.(a .+ X * b,1.2)) :
+            family === :bernoulli ? :(BernoulliLogit.(a .+ X * b)) :
+            :(Poisson.(exp.(a .+ X * b)))
+        wrap = kind === :interval_censored ? Expr(:.,kind,Expr(:tuple,ctor,:hi)) :
+            Expr(:.,kind,Expr(:tuple,ctor,:lo,:hi))
         expr = quote
             X=hcat(x); a ~ Normal(0,1); b[axes(X,2)] .~ Normal.(0,1)
-            y ~ $wrap
+            y .~ $wrap
         end
         plan = lower_rkppl(expr, keys(data); conditioned=keys(data))
         r = ReactiveKernelsPPL._with(only(plan.responses); mi_jobs=:Jobs)
         plan = bind_data(ReactiveKernelsPPL._with(plan; responses=[r]), data)
         positions = eachindex(jobs)
-        law(eta) = family === :NormalIDGLM ? PackedEvidenceD.Normal(eta,1.2) :
-            family === :BernoulliLogitGLM ? PackedEvidenceD.Bernoulli(1/(1+exp(-eta))) :
+        law(eta) = family === :normal ? PackedEvidenceD.Normal(eta,1.2) :
+            family === :bernoulli ? PackedEvidenceD.Bernoulli(1/(1+exp(-eta))) :
             PackedEvidenceD.Poisson(exp(eta))
         expected = sum(_packed_wrapped_logpdf(kind,law(.2-.1*x[jobs[k]]),
             ys[k],lo[jobs[k]],hi[jobs[k]]) for k in positions)

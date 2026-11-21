@@ -138,11 +138,10 @@ end
         @test_throws ContractValidationError validate_plan(plan)
     end
     # These original scalar plans omit the tensor families' required
-    # simplex/trials, covariance factor or design matrix. Valid packed
+    # simplex/trials or covariance factor. Valid packed
     # counterparts are numerical fixtures in test_capability_packed_tensor.
     for (family, diagnostic) in ((MultinomialFam, "simplex"),
-            (MvNormalCholeskyFam, "factor_scales"),
-            (NormalIDGLMFam, "bound design matrix"))
+            (MvNormalCholeskyFam, "factor_scales"))
         pred = PredictorSpec(:mu, IdentityLink, _mi_terms(), :mu)
         plan = StructuralPlan(
             LikelihoodSpec[LikelihoodSpec(family, IdentityLink, :y, :mu,

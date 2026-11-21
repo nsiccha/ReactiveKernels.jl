@@ -29,16 +29,17 @@ function _cap_packed_tensor(kind, n; selected_range=nothing)
             L = L_scales .* L_L_corr
             [y1, y2] ~ MvNormalCholesky([mu1, mu2], L)
         end
-    elseif kind in (:glm, :bernoulli_glm, :poisson_glm)
-        data[:y] = kind === :glm ? 0.2 .+ 0.3 .* x1[jobs] :
-            kind === :bernoulli_glm ? Int.(x1[jobs] .> 0) : Int.(x1[jobs] .> 0) .+ 1
-        obj = kind === :glm ? :(NormalIDGLM(X, a, b, 0.7)) :
-            kind === :bernoulli_glm ? :(BernoulliLogitGLM(X, a, b)) : :(PoissonLogGLM(X, a, b))
+    elseif kind in (:normal_design, :bernoulli_design, :poisson_design)
+        data[:y] = kind === :normal_design ? 0.2 .+ 0.3 .* x1[jobs] :
+            kind === :bernoulli_design ? Int.(x1[jobs] .> 0) : Int.(x1[jobs] .> 0) .+ 1
+        obj = kind === :normal_design ? :(Normal.(a .+ X * b, 0.7)) :
+            kind === :bernoulli_design ? :(BernoulliLogit.(a .+ X * b)) :
+            :(Poisson.(exp.(a .+ X * b)))
         quote
             X = hcat(x1, x2)
             a ~ Normal(0, 1)
             b[axes(X, 2)] .~ Normal.(0, 2)
-            y ~ $obj
+            y .~ $obj
         end
     else
         error("unknown packed tensor fixture $kind")
@@ -66,8 +67,8 @@ function _cap_packed_tensor(kind, n; selected_range=nothing)
                 [data[:y1][k], data[:y2][k]])
                 for (j, k) in zip(observed_jobs, packed_positions)]
         else
-            family(eta) = kind === :glm ? Normal(eta, 0.7) :
-                kind === :bernoulli_glm ? Bernoulli(1/(1+exp(-eta))) : Poisson(exp(eta))
+            family(eta) = kind === :normal_design ? Normal(eta, 0.7) :
+                kind === :bernoulli_design ? Bernoulli(1/(1+exp(-eta))) : Poisson(exp(eta))
             [logpdf(family(p.a + p.b[1]*x1[j] + p.b[2]*x2[j]), data[:y][k])
                 for (j, k) in zip(observed_jobs, packed_positions)]
         end
@@ -119,7 +120,7 @@ end
 end
 
 @testset "packed tensor observations preserve outcome columns and full predictor rows" begin
-    for kind in (:multinomial, :joint, :glm, :bernoulli_glm, :poisson_glm), n in (6, 18)
+    for kind in (:multinomial, :joint, :normal_design, :bernoulli_design, :poisson_design), n in (6, 18)
         fx = _cap_packed_tensor(kind, n)
         value, gradient = sampler_value_and_gradient!(fx.sampler, similar(fx.u), fx.u)
         @test value ≈ fx.oracle(fx.u)

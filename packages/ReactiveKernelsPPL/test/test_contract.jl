@@ -366,8 +366,7 @@ end
         BernoulliProbitFam, BernoulliCloglogFam, BinomialProbitFam,
         BinomialCloglogFam, BinomialProbFam, BetaLogitFam, CategoricalLogitFam,
         OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
-        MvNormalCholeskyFam, NormalIDGLMFam, BernoulliLogitGLMFam,
-        PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,
+        MvNormalCholeskyFam, MixtureFam, StudentTFam, HurdlePoissonFam,
         ZeroInflatedPoissonFam, InverseGaussianFam, BetaBinomial2Fam, VonMisesFam,
         NegativeBinomialFam, ExponentialLogFam, LogNormalFam, WeibullFam,
         ZeroInflatedBinomialFam, GammaValueFam, WeibullValueFam, BetaShapeFam)
@@ -2290,7 +2289,7 @@ end
 # field shows up as a mismatch against its input.
 _all_fields_spec() = LikelihoodSpec(OrderedLogisticFam, LogitLink, :y, :mu,
     :s, :w, _none_evidence(), :y_resp, 7, 1:5, nothing, :cuts, [:p2], [:c2],
-    :cumulative, 2.0, [:tc], :tco, [:y2], :fs, :fc, :ga, :gb, GaussianFam,
+    :cumulative, 2.0, [:tc], :tco, [:y2], :fs, :fc, GaussianFam,
     Union{Symbol,Real}[:l1], Union{Nothing,Symbol,Real,ScalePredictorRef}[:s1],
     :mw, Union{Int,Symbol}[:n2], 4.0, 0.2, :jobs, (0.0, 2pi), :teffects)
 
@@ -2308,15 +2307,6 @@ _all_fields_spec() = LikelihoodSpec(OrderedLogisticFam, LogitLink, :y, :mu,
     @test p2.n_obs == good.n_obs + 1
     @test all(getfield(p2, f) === getfield(good, f)
         for f in fieldnames(StructuralPlan) if f !== :n_obs)
-    # GLM-object fields fail closed on a non-GLM response (they are never
-    # read there, so carrying them would silently change nothing).
-    for (k, v) in ((:glm_alpha, :ga), (:glm_beta, :gb))
-        rg = LikelihoodSpec(OrderedLogisticFam, LogitLink, :y, :mu, nothing,
-            nothing, _none_evidence(), :y_resp, nothing, nothing;
-            thresholds = :y_cutpoints, (k => v,)...)
-        # refused: GLM-object field on a non-GLM response (IR contract)
-        @test_throws ContractValidationError _ordered_plan(; resp = rg)
-    end
 end
 
 function _ordinal_plan(n = 9; link = LogitLink, structure = :cumulative,

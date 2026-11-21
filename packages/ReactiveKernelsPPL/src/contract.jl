@@ -133,9 +133,6 @@ univariate components, SB `MixtureModel` mirror)."""
     CategoricalFam
     MvNormalCholeskyFam
     CensoredAddpropnormalFam
-    NormalIDGLMFam
-    BernoulliLogitGLMFam
-    PoissonLogGLMFam
     MixtureFam
     StudentTFam
     HurdlePoissonFam
@@ -314,7 +311,7 @@ at their defaults:
 - `logit_slices`: `:rows` or `:cols` for a CategoricalLogit response
   over the slices of one logit matrix (`y .~ CategoricalLogit.(eachrow(E))`
   or `eachcol(E)`), `nothing` otherwise. `predictor` then names the matrix
-  value `E`, which the response reads whole (the GLM-object precedent): no
+  value `E`, which the response reads whole: no
   [`PredictorSpec`](@ref), no `extra_predictors`, and no `n_levels`. Each
   slice holds observation `i`'s K−1 non-reference logits, with class 1 the
   zero reference, so K is the slice length + 1 at run time.
@@ -365,23 +362,6 @@ Joint widths are structural (K = 1 + `length(extra_responses)`):
 no `n_levels`, no bind-time size inference — the factor parameters
 carry concrete sizes validated against K.
 
-GLM-object responses (`NormalIDGLMFam`, `BernoulliLogitGLMFam`,
-`PoissonLogGLMFam`) name their design matrix in `predictor` (no linear
-predictor — the object owns eta, the Multinomial/Categorical scan-state
-precedent): an intercept-free [`DesignMatrix`](@ref), or any matrix value
-(bound data, a definition) the object reads whole. They carry the split
-coefficients in the trailing `glm_alpha`/`glm_beta` fields, built with
-keywords; every other family leaves them at their defaults:
-
-- `glm_alpha`: the scalar intercept — a value's name or a number (the
-  generator prepends the ones column and `alpha`; a literal zero prepends
-  nothing) — `nothing` otherwise.
-- `glm_beta`: the coefficient vector's name (one element per matrix
-  column), `nothing` otherwise. A declared array or any other value
-  carries its own prior; otherwise the plan's population priors address
-  each design-matrix column by the response label
-  (`_glm_coefficient_block`).
-
 Finite-mixture responses (`MixtureFam`, SB `y ~ MixtureModel(comps, w)`
 mirror) carry K same-family univariate components in the trailing
 mixture fields, built with keywords; every other family leaves them at
@@ -426,8 +406,7 @@ every other response leaves it at `nothing`:
   response, every Multinomial count column and every joint outcome cross
   PACKED (aligned with `Jobs`); they ride the managed-columns exemption.
   Vector predictors and trials gather by full-row `Jobs`; shared probabilities
-  and covariance factors stay whole. GLM objects select full design rows
-  before constructing eta. Only observed rows contribute, with no missing
+  and covariance factors stay whole. Only observed rows contribute, with no missing
   response latent (SB keeps `y_mis` in generated quantities here). Scalar
   observation families compose with weights, evidence, ranges and trials.
   A range filters Jobs on the full axis and the same packed outcome positions;
@@ -466,8 +445,6 @@ struct LikelihoodSpec
     extra_responses::Vector{ColumnRef}
     factor_scales::Union{Nothing,ParamName}
     factor_corr::Union{Nothing,ParamName}
-    glm_alpha::Union{Nothing,ParamName,Float64}
-    glm_beta::Union{Nothing,ParamName}
     mixture_family::Union{Nothing,LikelihoodFamily}
     mixture_locs::Vector{Union{Symbol,Real}}
     mixture_scales::Vector{Union{Nothing,Symbol,Real,ScalePredictorRef}}
@@ -482,20 +459,20 @@ struct LikelihoodSpec
     logit_slices::Union{Nothing,Symbol}
 end
 # Preserve the all-fields constructor predating categorical logit slices.
-LikelihoodSpec(args::Vararg{Any,34}) = LikelihoodSpec(args..., nothing)
+LikelihoodSpec(args::Vararg{Any,32}) = LikelihoodSpec(args..., nothing)
 # Preserve the all-fields constructor predating graph-backed mixture components.
-LikelihoodSpec(args::Vararg{Any,33}) = LikelihoodSpec(args..., NamedTuple[])
+LikelihoodSpec(args::Vararg{Any,31}) = LikelihoodSpec(args..., NamedTuple[])
 # Preserve the all-fields constructor predating per-component trials.
 LikelihoodSpec(family, link, response, predictor, scale, weights, evidence,
     label, trials, range, n_levels, thresholds, extra_predictors, count_columns,
     ordinal_structure, discrimination, threshold_columns, threshold_coefs,
-    extra_responses, factor_scales, factor_corr, glm_alpha, glm_beta,
+    extra_responses, factor_scales, factor_corr,
     mixture_family, mixture_locs, mixture_scales, mixture_weights,
     nu, zi, mi_jobs, interval, threshold_effects) =
     LikelihoodSpec(family, link, response, predictor, scale, weights, evidence,
         label, trials, range, n_levels, thresholds, extra_predictors, count_columns,
         ordinal_structure, discrimination, threshold_columns, threshold_coefs,
-        extra_responses, factor_scales, factor_corr, glm_alpha, glm_beta,
+        extra_responses, factor_scales, factor_corr,
         mixture_family, mixture_locs, mixture_scales, mixture_weights,
         Union{ColumnRef,Int}[], nu, zi, mi_jobs, interval, threshold_effects)
 
@@ -522,8 +499,6 @@ function LikelihoodSpec(family, link, response, predictor, scale, weights,
         extra_responses::Vector{ColumnRef} = Symbol[],
         factor_scales::Union{Nothing,ParamName} = nothing,
         factor_corr::Union{Nothing,ParamName} = nothing,
-        glm_alpha::Union{Nothing,ParamName,Real} = nothing,
-        glm_beta::Union{Nothing,ParamName} = nothing,
         mixture_family::Union{Nothing,LikelihoodFamily} = nothing,
         mixture_locs::Vector{Union{Symbol,Real}} = Union{Symbol,Real}[],
         mixture_scales::Vector{Union{Nothing,Symbol,Real,ScalePredictorRef}} =
@@ -541,8 +516,7 @@ function LikelihoodSpec(family, link, response, predictor, scale, weights,
         evidence, label, trials, range, n_levels, thresholds,
         extra_predictors, count_columns, ordinal_structure, discrimination,
         threshold_columns, threshold_coefs, extra_responses, factor_scales,
-        factor_corr, glm_alpha isa Real ? Float64(glm_alpha) : glm_alpha,
-        glm_beta, mixture_family, mixture_locs,
+        factor_corr, mixture_family, mixture_locs,
         mixture_scales, mixture_weights, mixture_trials, nu, zi, mi_jobs, interval,
         threshold_effects, mixture_components, logit_slices)
 end
@@ -980,7 +954,7 @@ nested `hcat` stays a follow-up. The generator emits each matrix once
 and splice `X * view(coef, ...)` matvecs. Width is static
 (`length(columns)`); the surface sizes coefficient vectors from it.
 
-A matrix no matrix term and no GLM response reads is a VALUE matrix (the
+A matrix no matrix term reads is a VALUE matrix (the
 program reads `X` as a matrix: `var.(eachcol(X))`, `X * v` over an array):
 [`bind_data`](@ref) builds it from its data columns and binds it under its
 name, so every reader sees a bound data matrix
@@ -1450,8 +1424,8 @@ function _find_matrix(plan::StructuralPlan, name::Symbol)
     return i === nothing ? nothing : plan.matrices[i]
 end
 
-"""Value matrices of `plan`: design matrices no `MatrixTerm` and no
-GLM response reads. The program reads each as a matrix value, so
+"""Value matrices of `plan`: design matrices no `MatrixTerm` reads. The
+program reads each as a matrix value, so
 [`bind_data`](@ref) builds it from its columns and binds it as data."""
 function _value_design_matrix_names(plan::StructuralPlan)
     used = Set{Symbol}()
@@ -1461,9 +1435,6 @@ function _value_design_matrix_names(plan::StructuralPlan)
         t.kind === MatrixTerm || continue
         X = get(t.options, :matrix, nothing)
         X isa Symbol && push!(used, X)
-    end
-    for r in plan.responses
-        _is_glm_family(r.family) && push!(used, r.predictor)
     end
     return Set{Symbol}(m.name for m in plan.matrices if m.name ∉ used)
 end
@@ -1635,8 +1606,7 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
     BernoulliProbitFam, BernoulliCloglogFam, BinomialProbitFam,
     BinomialCloglogFam, BinomialProbFam, BetaLogitFam, CategoricalLogitFam,
     OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
-    MvNormalCholeskyFam, NormalIDGLMFam, BernoulliLogitGLMFam,
-    PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,
+    MvNormalCholeskyFam, MixtureFam, StudentTFam, HurdlePoissonFam,
     ZeroInflatedPoissonFam, InverseGaussianFam, BetaBinomial2Fam, VonMisesFam,
     NegativeBinomialFam, ExponentialLogFam, LogNormalFam, WeibullFam,
     ZeroInflatedBinomialFam, GammaValueFam, WeibullValueFam, BetaShapeFam)
@@ -2272,8 +2242,7 @@ _valueless_response_eltype(r::LikelihoodSpec) =
         _is_ordered_family(r.family) || r.family in
         (PoissonLogFam, NegativeBinomial2Fam, NegativeBinomialFam,
          HurdlePoissonFam, ZeroInflatedPoissonFam, CategoricalFam,
-         CategoricalLogitFam, BernoulliLogitGLMFam, PoissonLogGLMFam,
-         MultinomialFam) ? Int : Float64
+         CategoricalLogitFam, MultinomialFam) ? Int : Float64
 
 # ── Absent observations ──────────────────────────────────────────────
 # A binding that supplies no value for an observation (a response, or a
@@ -2850,12 +2819,6 @@ function _observation_design_columns(plan::StructuralPlan)
     for (B, w) in _named_matrix_products(plan)
         get(plan.columns, B, nothing) isa AbstractMatrix &&
             _observation_array_operand(plan, w) && push!(out, B)
-    end
-    # A GLM object multiplies its design matrix by its coefficients.
-    for r in plan.responses
-        _is_glm_family(r.family) &&
-            get(plan.columns, r.predictor, nothing) isa AbstractMatrix &&
-            push!(out, r.predictor)
     end
     return out
 end
@@ -4475,33 +4438,20 @@ _is_ordered_family(f) = f === OrderedLogisticFam || f === OrdinalFam
 _is_simplex_family(f) = f === MultinomialFam || f === CategoricalFam
 _is_leveled_family(f) = f === CategoricalLogitFam || _is_ordered_family(f) ||
     _is_simplex_family(f)
-_is_glm_family(f) = f === NormalIDGLMFam || f === BernoulliLogitGLMFam ||
-    f === PoissonLogGLMFam
 
-# The fields a response's observations read entry by entry. A GLM object
-# reads its intercept and coefficients whole: neither has an observation
-# axis. A mixture reads its component slots; its predictor is only an
-# anchor and can name a shared weight vector with an independent axis.
-_observation_fields(r::LikelihoodSpec) = _is_glm_family(r.family) ?
-    _with(r; glm_alpha = nothing, glm_beta = nothing) :
+# The fields a response's observations read entry by entry. A mixture reads
+# its component slots; its predictor is only an anchor and can name a shared
+# weight vector with an independent axis.
+_observation_fields(r::LikelihoodSpec) =
     r.family === MixtureFam ? _with(r; predictor = r.response,
         mixture_weights = r.mixture_weights isa MixtureWeightRows ? r.mixture_weights : nothing) :
     _is_ordered_family(r.family) && r.thresholds isa Symbol ?
         _with(r; thresholds = nothing) : r
 
-# A GLM-object coefficient block: the coefficient vector of an
-# intercept-free design matrix whose per-column priors the plan addresses
-# by the response label (`_lower_glm_beta_priors`). Any other coefficient
-# vector is a value — a declared array, a definition, data — read whole.
-_glm_coefficient_block(plan, r) = r.glm_beta isa Symbol &&
-    !_is_array_param(plan, r.glm_beta) &&
-    _find_matrix(plan, r.predictor) !== nothing &&
-    any(p -> p.predictor === r.label, plan.population_priors)
-
-# Whether a GLM object's argument `nm` names a value of `plan`: a sampled
-# or declared parameter, a definition, or bound data. An unbound plan does
-# not know its data names; binding checks them.
-function _glm_value_name(plan, nm::Symbol)
+# Whether `nm` names a value of `plan` a response reads whole: a sampled or
+# declared parameter, a definition, or bound data. An unbound plan does not
+# know its data names; binding checks them.
+function _plan_value_name(plan, nm::Symbol)
     named(xs) = any(x -> x.name === nm, xs)
     return named(plan.parameters) || named(plan.vector_parameters) ||
         named(plan.array_parameters) || named(plan.plate_parameters) ||
@@ -5405,10 +5355,8 @@ function _validate_priors(plan::StructuralPlan)
     param_names = Set{Symbol}(p.name for p in plan.parameters)
     by_param = Dict{Symbol,SampledParameter}(p.name => p for p in plan.parameters)
     assign_names = Set{Symbol}(a.name for a in plan.assignments)
-    glm_labels = Set{Symbol}(r.label for r in plan.responses if _is_glm_family(r.family))
     for pr in plan.population_priors
         any(p -> p.name === pr.predictor, plan.predictors) ||
-            pr.predictor in glm_labels ||
             _fail(:plan, "prior addresses unknown predictor $(pr.predictor)")
         key = (pr.predictor, pr.addressee)
         key in seen &&
@@ -5523,21 +5471,6 @@ function _validate_priors(plan::StructuralPlan)
                 _fail(:plan, "no prior for ($(pred.name), $a)")
         end
     end
-    for r in plan.responses
-        _is_glm_family(r.family) && _glm_coefficient_block(plan, r) || continue
-        m = _find_matrix(plan, r.predictor)
-        for c in m.columns
-            c === nothing && continue
-            (r.label, c) in seen ||
-                _fail(:plan, "no prior for ($(r.label), $c)")
-            # GLM-object beta vectors are Normal-only; non-Normal
-            # betas use the decomposed predictor form.
-            rows[(r.label, c)].family === :normal || _fail(:plan,
-                "GLM-object beta prior for ($(r.label), $c) is " *
-                "Normal-only (got $(rows[(r.label, c)].family)) — write " *
-                "the decomposed predictor form for other families")
-        end
-    end
     return nothing
 end
 
@@ -5617,7 +5550,7 @@ function _validate_categorical_slices_response(r::LikelihoodSpec,
     r.logit_slices in (:rows, :cols) || _fail(r.label,
         "logit_slices is :rows or :cols, got $(repr(r.logit_slices))")
     _find_matrix(plan, r.predictor) !== nothing ||
-        _glm_value_name(plan, r.predictor) || _fail(r.label,
+        _plan_value_name(plan, r.predictor) || _fail(r.label,
             "categorical logits $(r.predictor) name no value — bind it as " *
             "data or define it (`$(r.predictor) = X * B`)")
     isempty(r.extra_predictors) || _fail(r.label,
@@ -6000,94 +5933,6 @@ function _validate_joint_response(r::LikelihoodSpec, plan::StructuralPlan,
     return nothing
 end
 
-# GLM-object fields belong to the GLM families only: on any other response
-# a stray glm_alpha/glm_beta means nothing and would silently change nothing
-# (the `_validate_unleveled_fields` rule) — reject it. Runs on every response.
-function _validate_glm_fields(r::LikelihoodSpec)
-    _is_glm_family(r.family) && return nothing
-    r.glm_alpha === nothing ||
-        _fail(r.label, "only GLM-object responses take glm_alpha")
-    r.glm_beta === nothing ||
-        _fail(r.label, "only GLM-object responses take glm_beta")
-    return nothing
-end
-
-function _validate_glm_response(r::LikelihoodSpec, plan::StructuralPlan)
-    want_link = r.family === NormalIDGLMFam ? IdentityLink :
-        r.family === BernoulliLogitGLMFam ? LogitLink : LogLink
-    r.link === want_link || _fail(r.label,
-        "a GLM-object response uses its canonical link (got $(r.link))")
-    m = _find_matrix(plan, r.predictor)
-    m === nothing && !_glm_value_name(plan, r.predictor) && _fail(r.label,
-        "GLM-object response addresses $(r.predictor), which is neither a " *
-        "bound design matrix (`X = hcat(...)`) nor a matrix value")
-    if m !== nothing
-        # The design-matrix recipe builds bare columns; an intercept
-        # column belongs to a matrix value.
-        any(c -> c === nothing, m.columns) && _fail(r.label,
-            "GLM-object design matrix $(m.name) has an intercept-ones " *
-            "position — the recipe builds bare columns")
-        length(m.columns) >= 1 || _fail(r.label,
-            "GLM-object design matrix $(m.name) has no columns")
-    end
-    r.glm_alpha === nothing && _fail(r.label,
-        "a GLM-object response requires its scalar intercept")
-    r.glm_alpha isa Symbol && !_glm_value_name(plan, r.glm_alpha) && _fail(
-        r.label, "GLM intercept :$(r.glm_alpha) names no value " *
-        "(`$(r.glm_alpha) ~ Normal(0, 10)`)")
-    r.glm_alpha isa Real && !isfinite(r.glm_alpha) && _fail(r.label,
-        "GLM intercept $(r.glm_alpha) is not finite")
-    r.glm_alpha isa Symbol && haskey(plan.columns, r.glm_alpha) &&
-        !(plan.columns[r.glm_alpha] isa Number) && _fail(r.label,
-            "GLM intercept :$(r.glm_alpha) is an array; the object takes " *
-            "one scalar intercept (a per-observation intercept is not " *
-            "built yet)")
-    r.glm_beta === nothing && _fail(r.label,
-        "a GLM-object response requires its coefficient vector")
-    _glm_coefficient_block(plan, r) || _is_array_param(plan, r.glm_beta) ||
-        _glm_value_name(plan, r.glm_beta) || _fail(r.label,
-            "GLM coefficients :$(r.glm_beta) name no value")
-    r.n_levels === nothing ||
-        _fail(r.label, "a GLM-object response takes no n_levels")
-    r.thresholds === nothing ||
-        _fail(r.label, "a GLM-object response takes no thresholds")
-    isempty(r.extra_predictors) ||
-        _fail(r.label, "a GLM-object response takes no extra_predictors")
-    isempty(r.count_columns) ||
-        _fail(r.label, "a GLM-object response takes no count_columns")
-    r.ordinal_structure === nothing ||
-        _fail(r.label, "a GLM-object response takes no ordinal_structure")
-    r.discrimination === nothing ||
-        _fail(r.label, "a GLM-object response takes no discrimination")
-    isempty(r.threshold_columns) ||
-        _fail(r.label, "a GLM-object response takes no threshold_columns")
-    r.threshold_coefs === nothing ||
-        _fail(r.label, "a GLM-object response takes no threshold_coefs")
-    isempty(r.extra_responses) ||
-        _fail(r.label, "a GLM-object response takes no extra_responses")
-    r.factor_scales === nothing ||
-        _fail(r.label, "a GLM-object response takes no factor_scales")
-    r.factor_corr === nothing ||
-        _fail(r.label, "a GLM-object response takes no factor_corr")
-    r.mixture_family === nothing ||
-        _fail(r.label, "a GLM-object response takes no mixture_family")
-    isempty(r.mixture_locs) ||
-        _fail(r.label, "a GLM-object response takes no mixture_locs")
-    isempty(r.mixture_scales) ||
-        _fail(r.label, "a GLM-object response takes no mixture_scales")
-    r.mixture_weights === nothing ||
-        _fail(r.label, "a GLM-object response takes no mixture_weights")
-    r.trials === nothing ||
-        _fail(r.label, "a GLM-object response takes no trials")
-    r.weights === nothing ||
-        _fail(r.label, "GLM-object responses take no weights " *
-            "(weighted GLMs stay on the predictor path)")
-    r.range === nothing ||
-        _fail(r.label, "a GLM-object response takes no range " *
-            "(ranged responses stay on the predictor path)")
-    return nothing
-end
-
 # Finite-mixture component families admitted in v1 (the D3/slice-2 scalar
 # families under their primary link; probit/cloglog are follow-ups).
 const _MIXTURE_V1_FAMILIES = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
@@ -6310,10 +6155,6 @@ function _validate_mixture_response(r::LikelihoodSpec, plan::StructuralPlan,
         _fail(r.label, "a mixture response takes no factor_scales")
     r.factor_corr === nothing ||
         _fail(r.label, "a mixture response takes no factor_corr")
-    r.glm_alpha === nothing ||
-        _fail(r.label, "a mixture response takes no glm_alpha")
-    r.glm_beta === nothing ||
-        _fail(r.label, "a mixture response takes no glm_beta")
     if f === BinomialLogitFam
         (r.trials !== nothing || length(r.mixture_trials) == K) ||
             _fail(r.label, "mixture over Binomial requires shared trials or one trials use per component")
@@ -6344,7 +6185,7 @@ function _mi_managed_columns(plan::StructuralPlan)
 end
 
 # Runs first in the per-response loop: every special predictor shape
-# (scan/plate/simplex/joint/GLM) `continue`s past the standard checks,
+# (scan/plate/simplex/joint) `continue`s past the standard checks,
 # so the mi gate must precede them all.
 function _validate_mi_structure(r::LikelihoodSpec, plan::StructuralPlan)
     r.mi_jobs === nothing && return nothing
@@ -6408,9 +6249,8 @@ function _validate_responses(plan::StructuralPlan)
         r.logit_slices === nothing || r.family === CategoricalLogitFam ||
             _fail(r.label, "only CategoricalLogit takes logit_slices")
         _validate_mi_structure(r, plan)
-        _validate_glm_fields(r)
         # A CategoricalLogit over the slices of one logit matrix reads the
-        # matrix whole, by name (the GLM-object precedent): it has no
+        # matrix whole, by name: it has no
         # PredictorSpec, and its K is the slice length + 1 at run time.
         if _categorical_logit_slices(r)
             _validate_categorical_slices_response(r, plan)
@@ -6538,18 +6378,6 @@ function _validate_responses(plan::StructuralPlan)
         # single-predictor triple.
         if r.family === MvNormalCholeskyFam
             _validate_joint_response(r, plan, used_predictors)
-            _validate_scale(r, plan)
-            _validate_nu(r, plan)
-            _validate_zi(r, plan)
-            _validate_interval(r, plan)
-            _validate_evidence_structure(r, plan)
-            continue
-        end
-        # A GLM-object response (whole-data head over a design matrix —
-        # the object owns eta, so no PredictorSpec): validated whole,
-        # skipping the single-predictor triple.
-        if _is_glm_family(r.family)
-            _validate_glm_response(r, plan)
             _validate_scale(r, plan)
             _validate_nu(r, plan)
             _validate_zi(r, plan)
@@ -6788,8 +6616,7 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
     mask === nothing || (col = col[mask])
     _holds_arrays(col) && _refuse_array_response(r, plan)
     if r.evidence.kind in (:interval_censored, :censored) ||
-            (r.evidence.kind === :truncated && (_evidence_discrete(r.family) ||
-            r.family in (BernoulliLogitGLMFam, PoissonLogGLMFam)))
+            (r.evidence.kind === :truncated && _evidence_discrete(r.family))
         # Interval endpoints need not lie in the underlying support. A clamp
         # atom can likewise lie outside that support, or between integers.
         eltype(col) <: Real && all(isfinite, col) ||
@@ -6874,17 +6701,6 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
         eltype(col) <: Real ||
             _fail(r.label, "Student response must be numeric")
         return nothing
-    elseif r.family === NormalIDGLMFam
-        eltype(col) <: Real ||
-            _fail(r.label, "NormalIDGLM response must be numeric")
-        return nothing
-    elseif r.family === BernoulliLogitGLMFam
-        eltype(col) === Bool && return nothing
-        eltype(col) <: Integer && all(x -> x == 0 || x == 1, col) && return nothing
-        return _fail(r.label, "BernoulliLogitGLM response must be Bool or 0/1 integers")
-    elseif r.family === PoissonLogGLMFam
-        eltype(col) <: Integer && all(>=(0), col) && return nothing
-        return _fail(r.label, "PoissonLogGLM response must be non-negative integers")
     elseif r.family === GammaLogFam || r.family === GammaValueFam
         # Strictly positive: the gamma kernel guards x > 0, and at exactly
         # 0 it is wrong for shape ≤ 1 (says -Inf; truth is finite/+Inf) —
@@ -7053,7 +6869,6 @@ _scale_need(fam::LikelihoodFamily) =
     fam in (GammaLogFam, GammaValueFam) ? "Gamma response requires a shape alpha" :
     fam === BetaLogitFam ? "Beta response requires a concentration kappa" :
     fam === BetaShapeFam ? "Beta response requires a second shape beta" :
-    fam === NormalIDGLMFam ? "NormalIDGLM response requires a scale sigma" :
     fam === StudentTFam ? "Student response requires a scale sigma" :
     fam === HurdlePoissonFam ? "Hurdle response requires a hurdle probability p_zero" :
     fam === InverseGaussianFam ? "InverseGaussian response requires a shape lambda" :
@@ -8217,12 +8032,6 @@ function _uncached_model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Sym
         push!(defs, Symbol(:_ppl_threshold_input_, r.label) =>
             Expr(:call, GlobalRef(Base, :identity), r.thresholds))
     end
-    for r in plan.responses
-        _is_glm_family(r.family) || continue
-        push!(defs, Symbol(:_ppl_glm_input_, r.label) => Expr(:tuple,
-            (Expr(:call, GlobalRef(Base, :identity), v)
-                for v in (r.glm_alpha, r.glm_beta) if v isa Symbol)...))
-    end
     _has_observation_axis(plan) || return Set{Symbol}(raw), Set{Symbol}(first.(defs))
 
     # Whole-context definitions can exist without raw data dependencies
@@ -8267,7 +8076,7 @@ function _uncached_model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Sym
                 _drop_held_names!(free, _observation_fields(r))
             end
         elseif f === :matrices
-            # Affine/GLM matrices retain their row contract. Value-matrix
+            # Affine matrices retain their row contract. Value-matrix
             # recipes are definitions above, not observation consumers.
             for m in plan.matrices
                 m.name in value_matrices || _drop_held_names!(free, m)

@@ -23,7 +23,7 @@ const _CORPUS_FIELDS = Dict{Type,Tuple{Vararg{Symbol}}}(
         :evidence, :label, :trials, :range, :n_levels, :thresholds,
         :extra_predictors, :count_columns, :ordinal_structure, :discrimination,
         :threshold_columns, :threshold_coefs, :extra_responses, :factor_scales,
-        :factor_corr, :glm_alpha, :glm_beta, :mixture_family, :mixture_locs,
+        :factor_corr, :mixture_family, :mixture_locs,
         :mixture_scales, :mixture_weights, :nu, :zi, :mi_jobs, :interval),
     ResponseEvidence => (:kind, :lower, :upper),
     PredictorSpec => (:name, :link, :terms, :label),

@@ -3,42 +3,43 @@ using ReactiveKernelsPPL, Distributions, Test, LinearAlgebra
 _rewrite_node(plan, node, u) = Base.invokelatest(
     prepare_query(build_kernel(plan), plan, node), u)
 
-function _rewrite_glm_ast(head)
-    rhs = Expr(:call, head, :X, :alpha, :beta)
-    head === :NormalIDGLM && push!(rhs.args, 2.0)
+function _rewrite_design_ast(head)
+    rhs = head === :normal ? :(Normal.(alpha .+ X * beta, 2.0)) :
+        head === :bernoulli ? :(BernoulliLogit.(alpha .+ X * beta)) :
+        :(Poisson.(exp.(alpha .+ X * beta)))
     return quote
         X = hcat(x1, x2)
         alpha ~ Normal(0, 5)
         beta[axes(X, 2)] .~ Normal.(0, 2)
-        y ~ $rhs
+        y .~ $rhs
     end
 end
 
-function _rewrite_glm_data(head, n)
+function _rewrite_design_data(head, n)
     x1 = collect(range(-0.8, 0.9; length = n))
     x2 = fill(0.4, n)
-    y = head === :NormalIDGLM ? 0.2 .+ x1 :
-        head === :BernoulliLogitGLM ? Int.(x1 .> 0) : Int.(x1 .> 0) .+ 1
+    y = head === :normal ? 0.2 .+ x1 :
+        head === :bernoulli ? Int.(x1 .> 0) : Int.(x1 .> 0) .+ 1
     return (; x1, x2, y)
 end
 
-function _rewrite_glm_oracle(head, data, alpha, beta)
+function _rewrite_design_oracle(head, data, alpha, beta)
     eta = alpha .+ hcat(data.x1, data.x2) * beta
-    family = head === :NormalIDGLM ? Normal.(eta, 2.0) :
-        head === :BernoulliLogitGLM ? Bernoulli.(1 ./ (1 .+ exp.(-eta))) :
+    family = head === :normal ? Normal.(eta, 2.0) :
+        head === :bernoulli ? Bernoulli.(1 ./ (1 .+ exp.(-eta))) :
         Poisson.(exp.(eta))
     return logpdf(Normal(0, 5), alpha) + sum(logpdf.(Normal(0, 2), beta)) +
         sum(logpdf.(family, data.y))
 end
 
-@testset "whole-data GLM observations keep response roles" begin
-    for head in (:NormalIDGLM, :BernoulliLogitGLM, :PoissonLogGLM), n in (2, 4, 9)
-        ast = _rewrite_glm_ast(head)
-        data = _rewrite_glm_data(head, n)
+@testset "design-product observations keep response roles" begin
+    for head in (:normal, :bernoulli, :poisson), n in (2, 4, 9)
+        ast = _rewrite_design_ast(head)
+        data = _rewrite_design_data(head, n)
         ast_before, data_before = deepcopy(ast), deepcopy(data)
         model = ReactiveKernelsPPL.RKPPLModel(ast, @__MODULE__)
         u = [0.1, -0.2, 0.3]
-        oracle = _rewrite_glm_oracle(head, data, u[1], u[2:3])
+        oracle = _rewrite_design_oracle(head, data, u[1], u[2:3])
         columns = Dict(pairs(data))
         # Names-only, values, and model entry points share observation roles.
         plans = (
@@ -63,10 +64,10 @@ end
         @test _rewrite_node(fixed, :sampler, u[2:3]) ≈ oracle
         rebound = condition(first(plans); y = reverse(data.y))
         @test _rewrite_node(rebound, :sampler, u) ≈
-            _rewrite_glm_oracle(head, merge(data, (; y = reverse(data.y))), u[1], u[2:3])
+            _rewrite_design_oracle(head, merge(data, (; y = reverse(data.y))), u[1], u[2:3])
         # Call pins remove the response statement (conditioning principle 9).
-        # Pin X too: only its shape is needed by the remaining beta prior.
-        pinned = bind_data(model(; X = hcat(data.x1, data.x2), y = data.y))
+        # The model still computes X, whose shape sizes the remaining beta prior.
+        pinned = bind_data(model(; data.x1, data.x2, y = data.y))
         @test isempty(pinned.responses)
         @test _rewrite_node(pinned, :sampler, u) ≈
             logpdf(Normal(0, 5), u[1]) + sum(logpdf.(Normal(0, 2), u[2:3]))

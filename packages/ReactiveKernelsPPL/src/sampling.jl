@@ -239,9 +239,11 @@ function _external_rhs(rhs)
     return !_builtin_rhs_head(head)
 end
 
-# The built-in sampling spellings: families, GLM objects and wrappers.
+# The built-in sampling spellings: families and wrappers. The removed fused
+# GLM heads stay listed so their statements reach the refusal that names the
+# per-observation statement (`_refuse_fused_glm_statement`).
 _builtin_rhs_head(head::Symbol) =
-    head in union(keys(_PARAM_FAMILIES), _GLM_HEADS,
+    head in union(keys(_PARAM_FAMILIES), _REMOVED_GLM_HEADS,
         (:BernoulliLogit, :PoissonLog, :BinomialLogit,
          :NegativeBinomial2Log, :GammaLog, :BetaLogit,
          :HalfNormal, :HalfCauchy, :Flat, :flat, :positive, :truncated, :restricted,
@@ -252,8 +254,7 @@ _builtin_rhs_head(head::Symbol) =
          :CircularVonMises, :Categorical, :CategoricalLogit, :OrderedLogistic, :Ordinal,
          :Multinomial, :MvNormal, :MvNormalCholesky, :VonMises,
          :InverseGaussian, :HurdlePoisson, :ZeroInflatedPoisson,
-         :ZeroInflatedBinomial, :normal_id_glm, :bernoulli_logit_glm,
-         :poisson_log_glm))
+         :ZeroInflatedBinomial))
 _builtin_rhs_head(head) = false
 
 function _external_parameter(name, rhs, shape, mod, names; observed=false,

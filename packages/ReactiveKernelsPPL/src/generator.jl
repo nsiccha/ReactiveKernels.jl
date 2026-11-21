@@ -918,15 +918,9 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     uniform, laplace, logistic,
     student_t, zero_inflated_poisson, zero_inflated_binomial,
     zero_inflated_binomial_logit_zi,
-    normal_id_glm, bernoulli_logit_glm, poisson_log_glm,
     rk_inverse_gaussian_tail, rk_von_mises_cdf, rk_logprob_tail,
     rk_von_mises_periodic_cdf, rk_ordinal_stopping_logpdf, rk_ordinal_stopping_logtail,
     _half_normal_logpdf_on_support, _half_cauchy_logpdf_on_support
-# This copy is used only by generated PPL code. Its cuts were created at
-# package load, before any model built by a caller; generated model methods
-# still require the query's documented latest-world entry.
-const normal_id_glm_lpdf = ReactiveKernels._kernel_latest_rule(
-    DistributionKernelSources.normal_id_glm_lpdf)
 using SpecialFunctions: besseli, besselix, erfc, loggamma
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: logbeta
 # Selective (explicit imports win over any re-export chain, so no `using`
@@ -2404,7 +2398,6 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
     if r.family === OrdinalFam && r.ordinal_structure === :stopping
         return _mi_stopping_response_stmts(r, plan, stmts)
     end
-    _is_glm_family(r.family) && r.evidence.kind === :none && return stmts # fused design selects Jobs before eta
     pre = Expr[]
     jobs = r.mi_jobs
     packed = nothing
@@ -2607,8 +2600,6 @@ function _response_likelihood_stmts_full(r::LikelihoodSpec, plan::StructuralPlan
         return _mvn_cholesky_plate_stmts(r, plan, node, pw)
     elseif r.family === MixtureFam
         return _mixture_plate_stmts(r, plan, node, pw)
-    elseif _is_glm_family(r.family)
-        return _glm_object_stmts(r, plan, node, pw)
     else
         throw(ContractValidationError(
             "[generator] response family $(r.family) has no emitter"))
@@ -2893,86 +2884,6 @@ function _mixture_component_lpdf(f::LikelihoodFamily, r::LikelihoodSpec,
         return :($avv > 0 && $bvv > 0 ? beta($avv, $bvv).logpdf($yv) : -Inf)
     end
     throw(ContractValidationError("[generator] mixture over $f has no cell emitter"))
-end
-
-# A GLM-object response: fused constructed-endpoint applications
-# over the whole column (no plate — the object owns eta). The
-# intercept-free design matrix gains its ones column from the bound
-# row count (data-only, folds at prepare) and the split coefficients
-# rejoin as `beta_full = [alpha; beta]` (the validated P2 spelling).
-function _glm_object_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol,
-        pw::Symbol)
-    if r.evidence.kind !== :none || haskey(plan.columns, _observed_mask_name(r.response))
-        lp = Symbol(:_ppl_glm_eta_, r.label)
-        pre = Expr[:($lp = $(r.glm_alpha) .+ $(r.predictor) * $(r.glm_beta))]
-        inputs = Any[r.response, lp]
-        yv, etav = _dovar(1), _dovar(2)
-        base = if r.family === NormalIDGLMFam
-            sv = _thread_ref!(inputs, r.scale)
-            :(normal($etav, $sv).logpdf($yv))
-        elseif r.family === BernoulliLogitGLMFam
-            :(bernoulli(; logit=$etav).logpdf($yv == 1))
-        else
-            :(poisson(; log_rate=$etav).logpdf($yv))
-        end
-        cell = _wrap_evidence!(r, plan, pre, inputs, base)
-        return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
-    end
-    obj = r.family === NormalIDGLMFam ? :normal_id_glm :
-        r.family === BernoulliLogitGLMFam ? :bernoulli_logit_glm :
-        :poisson_log_glm
-    y, X = r.response, r.predictor
-    yf = _yfloat_name(r.label)
-    xaug = Symbol(:_ppl_glm_X_, r.label)
-    bfull = Symbol(:_ppl_glm_b_, r.label)
-    yconv = r.family === NormalIDGLMFam ? :Float64 : :Int
-    s = r.scale isa Symbol ? r.scale : :(Float64($(r.scale)))
-    o = r.family === NormalIDGLMFam ? :($obj($xaug, $bfull, $s)) : :($obj($xaug, $bfull))
-    design = r.mi_jobs === nothing ? X : Expr(:ref, X, r.mi_jobs, :(:))
-    n = r.mi_jobs === nothing ? _response_rows_source(plan, r) : Expr(:call, :length, r.mi_jobs)
-    xaug_expr, bfull_expr = _glm_design_args(design, r.glm_alpha, r.glm_beta, n)
-    head = Expr[
-        :($yf = $yconv.($y)),
-        :($xaug = $xaug_expr),
-        :($bfull = $bfull_expr),
-    ]
-    r.family === PoissonLogGLMFam &&
-        return Expr[head..., _poisson_glm_split_stmts(r, o, yf, pw, node)...]
-    # Call the owned Normal rule directly, as the equivalent per-observation
-    # design-product path does. The object remains for pointwise queries, but
-    # the sampler need not enter its constructed `logpdf` endpoint. Its
-    # reverse branch is one X'r product; Bernoulli still sums its pointwise
-    # vector.
-    density = r.family === NormalIDGLMFam ?
-        :(normal_id_glm_lpdf($xaug, $bfull, $s, $yf)) : :(sum($pw))
-    return Expr[head..., :($pw = $o.pointwise($yf)), :($node::Float64 = $density)]
-end
-
-# The GLM design and coefficients over `n` rows. A literal zero intercept adds
-# nothing: the object reads X and beta as they are, with no ones column; any
-# other intercept prepends a ones column (data-only, folded at preparation)
-# and its coefficient.
-_glm_design_args(design, alpha, beta, n) = alpha isa Real && iszero(alpha) ?
-    (:(Float64.($design)), :([$beta;])) :
-    (:(hcat(ones($n), $design)), :([$alpha; $beta]))
-
-# The Poisson-log object's density in its two endpoint parts, as a count plate
-# sums them (`_count_plate_stmts!`): `logkernel` reads eta, and
-# `lognormalizer`, `-log(y!)`, reads the bound response only, so preparation
-# folds it and its sum and no `loggamma` runs per evaluation. The pointwise
-# vector adds the two, so a sweep that retains it evaluates the kernel once.
-function _poisson_glm_split_stmts(r::LikelihoodSpec, o::Expr, yf::Symbol,
-        pw::Symbol, node::Symbol)
-    pwk, kern = Symbol(:_ppl_pwk_, r.label), Symbol(:_ppl_kernel_, r.label)
-    pwn, norm = Symbol(:_ppl_pwn_, r.label), Symbol(:_ppl_lnorm_, r.label)
-    return Expr[
-        :($pwk = $o.logkernel($yf)),
-        :($pwn = $o.lognormalizer($yf)),
-        :($pw = $pwk .+ $pwn),
-        :($kern::Float64 = sum($pwk)),
-        :($norm = sum($pwn)),
-        :($node::Float64 = $kern + $norm),
-    ]
 end
 
 _predictor(plan::StructuralPlan, name::Symbol) =
@@ -3542,7 +3453,7 @@ function _bernoulli_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::S
     return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
-# The Float64 response of a GLM object, named so binding folds it.
+# A response converted to Float64, named so binding folds it.
 _yfloat_name(label::Symbol) = Symbol(:_ppl_yf_, label)
 
 # A fused form keeps its emitter's statements through the pointwise plate,
@@ -5184,42 +5095,6 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
         end
     end
     _factor_density_statements!(stmts, terms, plan; context, density_sites)
-    # GLM-object coefficient vectors: the same plate-prior shape as a
-    # population-prior coefficient block, driven by the response matrix
-    # columns (priors addressed by response label — validation pins
-    # full coverage).
-    for r in plan.responses
-        _is_glm_family(r.family) && _glm_coefficient_block(plan, r) || continue
-        m = _find_matrix(plan, r.predictor)
-        cols = Symbol[c for c in m.columns if c !== nothing]
-        loc = Float64[]
-        sca = Float64[]
-        for c in cols
-            i = findfirst(p -> p.predictor === r.label && p.addressee === c,
-                plan.population_priors)
-            pr = plan.population_priors[i]
-            (pr.location isa Real && pr.scale isa Real) ||
-                throw(ContractValidationError(
-                    "[generator] internal: GLM beta prior for " *
-                    "$(r.label).$c carries a hyperparameter " *
-                    "(hierarchical GLM priors are not in slice 1)"))
-            push!(loc, Float64(pr.location))
-            push!(sca, Float64(pr.scale))
-        end
-        node = Symbol(:_ppl_prior_, r.label)
-        pw = Symbol(:_ppl_pw_prior_, r.label)
-        mut = Symbol(:_ppl_prmu_, r.label)
-        sdt = Symbol(:_ppl_prsd_, r.label)
-        push!(stmts, :($mut = Float64[$(loc...)]))
-        push!(stmts, :($sdt = Float64[$(sca...)]))
-        cv, mv, sv = _dovar(1), _dovar(2), _dovar(3)
-        cell = :(normal($mv, $sv).logpdf($cv))
-        append!(stmts, _plate_sum_stmts(pw, node,
-            Any[r.glm_beta, mut, sdt], cell))
-        push!(terms, node)
-        _record_density!(density_sites, stmts, :prior, r.label, node;
-            pointwise = pw, count = length(cols), owner = r.glm_beta)
-    end
     # Vector latents (cutpoints/thresholds/simplexes/coefficient packs,
     # joint-factor scales/Cholesky): one plate-sum or broadcast per vector
     # (bound plans carry concrete sizes). Empty packs contribute 0.0.

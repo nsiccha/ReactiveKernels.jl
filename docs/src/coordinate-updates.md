@@ -88,10 +88,9 @@ coordinate. A sweep typically costs a few evaluations per coordinate.
   A scalar used directly in the likelihood still evaluates that likelihood.
   Unrecognized packed reads use the general conditional.
 
-Not covered yet: models with free integer parameters are refused, a product
-over a transformed vector (a positive coefficient vector, for example) is
-recomputed in full, and the fused `BernoulliLogitGLM` spelling hides its
-product from the cache. Execution is native; there is no JAX coordinate
+Not covered yet: models with free integer parameters are refused, and a
+product over a transformed vector (a positive coefficient vector, for example)
+is recomputed in full. Execution is native; there is no JAX coordinate
 sampler.
 
 ## When it pays

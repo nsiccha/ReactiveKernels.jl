@@ -17,7 +17,7 @@ let d = _posteriordb_data("GLM_Binomial_data-GLM_Binomial_model")
 end
 
 const GLM_BINOMIAL_SOURCE = raw"""
-using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, binomial_logit_glm
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, binomial
 using LogExpFunctions: logistic
 
 @kernel model(unconstrained::Vector{Float64},
@@ -42,11 +42,14 @@ using LogExpFunctions: logistic
     prior::Float64 = alpha_prior + beta1_prior + beta2_prior
 
     # Likelihood: C ~ Binomial_logit(N, X·β). The design matrix X (quadratic
-    # basis over year, built in the preamble and bound as data) and the
-    # coefficient vector splice into the explicit-math GLM object through one
-    # fused endpoint application — no predictor or likelihood plates.
+    # basis over year, built in the preamble and bound as data) times the
+    # coefficient vector is the log odds, and each count reads its own trials
+    # and log odds.
     beta::Vector{Float64} = [alpha, beta1, beta2]
-    pointwise = binomial_logit_glm(X, beta, totals).pointwise(counts)
+    logit_p = X * beta
+    pointwise = plate(counts, totals, logit_p) do c, nt, lp
+        binomial(; n = nt, logit = lp).logpdf(c)
+    end
     likelihood::Float64 = sum(pointwise)
 
     constrained_logdensity::Float64 = prior + likelihood
@@ -88,7 +91,7 @@ docs_example = (;
     output,
     requested_nodes,
     normal_object = normal,
-    glm_object = binomial_logit_glm,
+    likelihood_object = binomial,
 )
 """
 
@@ -111,8 +114,8 @@ end
 Build the posteriordb `GLM_Binomial_model` (a binomial-logit quadratic-trend
 GLM) as a declarative `ReactiveKernels.KernelSpec`. The parameters are
 unconstrained with `Normal(0, 100)` priors reusing the shared Normal endpoint;
-the binomial-logit likelihood splices the explicit-math `binomial_logit_glm`
-object over the bound design matrix (quadratic basis over year). The prior,
+the binomial-logit likelihood is a plate of `binomial` laws over the log odds
+`X * beta` of the bound design matrix (quadratic basis over year). The prior,
 pointwise log-likelihood, likelihood reduction, densities, posterior, and the
 generated-quantity probabilities `p` are separate named nodes, and the
 constrained parameters are a plain NamedTuple.

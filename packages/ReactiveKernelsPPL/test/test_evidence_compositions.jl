@@ -82,16 +82,16 @@ end
     end
 end
 
-@testset "whole-data GLM evidence" begin
-    for family in (:NormalIDGLM,:BernoulliLogitGLM,:PoissonLogGLM), kind in (:truncated,:censored,:interval_censored)
-        println("COMPOSITION_BEGIN ",family," ",kind); flush(stdout)
-        lo,hi=family===:BernoulliLogitGLM ? (.2,1.) : (.2,2.8)
+@testset "design-product evidence" begin
+    for family in (:normal,:bernoulli,:poisson), kind in (:truncated,:censored,:interval_censored)
+        println("COMPOSITION_BEGIN design-product ",family," ",kind); flush(stdout)
+        lo,hi=family===:bernoulli ? (.2,1.) : (.2,2.8)
         ys=kind===:censored ? [lo,1.,hi] : kind===:interval_censored ? [lo,(lo+hi)/2] : [1.,1.]
         data=Dict{Symbol,Any}(:y=>ys,:x=>zeros(length(ys)))
-        ctor=family===:NormalIDGLM ? :(NormalIDGLM(X,a,b,1.2)) : Expr(:call,family,:X,:a,:b)
-        wrap=kind===:interval_censored ? Expr(:call,kind,ctor,hi) : Expr(:call,kind,ctor,lo,hi)
-        expr=quote X=hcat(x); a ~ Normal(0,1); b[axes(X,2)] .~ Normal.(0,1); y ~ $wrap end
-        d=family===:NormalIDGLM ? EvidenceD.Normal(.2,1.2) : family===:BernoulliLogitGLM ? EvidenceD.Bernoulli(1/(1+exp(-.2))) : EvidenceD.Poisson(exp(.2))
+        ctor=family===:normal ? :(Normal.(a .+ X * b,1.2)) : family===:bernoulli ? :(BernoulliLogit.(a .+ X * b)) : :(Poisson.(exp.(a .+ X * b)))
+        wrap=kind===:interval_censored ? Expr(:.,kind,Expr(:tuple,ctor,hi)) : Expr(:.,kind,Expr(:tuple,ctor,lo,hi))
+        expr=quote X=hcat(x); a ~ Normal(0,1); b[axes(X,2)] .~ Normal.(0,1); y .~ $wrap end
+        d=family===:normal ? EvidenceD.Normal(.2,1.2) : family===:bernoulli ? EvidenceD.Bernoulli(1/(1+exp(-.2))) : EvidenceD.Poisson(exp(.2))
         @test _composition_likelihood(expr,data,(a=.2,b=[.1])) ≈ _composition_oracle(kind,d,ys,lo,hi) atol=2e-12
     end
 end

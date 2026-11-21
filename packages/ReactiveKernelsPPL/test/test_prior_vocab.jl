@@ -371,17 +371,6 @@ end
         0.0, 1.0, 3.0)
     # refused: one prior family per data-width coefficient block (IR contract)
     @test_throws ContractValidationError validate_structure(plan)
-    @testset "glm-object beta vectors retain ordinary priors" begin
-        plan = lower_rkppl(quote
-                    X = hcat(x1, x2)
-                    y ~ NormalIDGLM(X, alpha, beta, 1.0)
-                    alpha ~ Normal(0, 10)
-                    beta[axes(X, 2)] .~ Laplace.(0, 1)
-                end, (:y, :x1, :x2); conditioned = (:y, :x1, :x2))
-        @test only(plan.array_parameters).name === :beta
-        @test only(plan.array_parameters).family === :laplace
-        @test isempty(plan.population_priors)
-    end
 end
 
 # M1: mixed population priors (StudentT intercept, Laplace slope).

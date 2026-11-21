@@ -16,6 +16,22 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.245
+
+- **Breaking:** the fused GLM statements `y ~ NormalIDGLM(X, alpha, beta,
+  sigma)`, `y ~ BernoulliLogitGLM(X, alpha, beta)` and `y ~ PoissonLogGLM(X,
+  alpha, beta)` are removed. Lowering refuses them and names the statement to
+  write: `y .~ Normal.(alpha .+ X * beta, sigma)`,
+  `y .~ BernoulliLogit.(alpha .+ X * beta)` or
+  `y .~ Poisson.(exp.(alpha .+ X * beta))`. A model states its per-observation
+  likelihood, and the lowering of that statement carries the efficient
+  computation.
+- **Breaking:** `LikelihoodSpec` no longer has the `glm_alpha` and `glm_beta`
+  fields or keywords, and the families `NormalIDGLMFam`,
+  `BernoulliLogitGLMFam` and `PoissonLogGLMFam` are gone. A hand-built plan
+  uses `GaussianFam`, `BernoulliLogitFam` or `PoissonLogFam` with a predictor.
+  The all-fields positional constructors take two arguments fewer.
+
 ## 0.1.244
 
 - `indexed_value(name)` selects one authored plate row for `prepare_query`

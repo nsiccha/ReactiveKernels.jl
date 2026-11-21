@@ -111,21 +111,22 @@ end
     end
 end
 
-@testset "missing GLM rows guard density values and ordinary reverse" begin
-    for head in (:NormalIDGLM, :BernoulliLogitGLM, :PoissonLogGLM)
-        y = head === :NormalIDGLM ? Union{Missing,Float64}[0.2, missing, 0.5, missing] :
+@testset "missing design-product rows guard density values and ordinary reverse" begin
+    for head in (:normal, :bernoulli, :poisson)
+        y = head === :normal ? Union{Missing,Float64}[0.2, missing, 0.5, missing] :
             Union{Missing,Int}[1, missing, 0, missing]
         # Poisson's inactive rates overflow. A zero selected output must also
         # have zero derivative, rather than multiplying an infinite tape by 0.
         data = (; y, x1=[0.1, 10000.0, -0.3, 10000.0], x2=[0.2, 0.2, 0.4, -0.2])
         saved = deepcopy(data)
-        rhs = Expr(:call, head, :X, :alpha, :beta)
-        head === :NormalIDGLM && push!(rhs.args, 0.7)
+        rhs = head === :normal ? :(Normal.(alpha .+ X * beta, 0.7)) :
+            head === :bernoulli ? :(BernoulliLogit.(alpha .+ X * beta)) :
+            :(Poisson.(exp.(alpha .+ X * beta)))
         ast = quote
             X = hcat(x1, x2)
             alpha ~ Normal(0, 1)
             beta[axes(X, 2)] .~ Normal.(0, 1)
-            y ~ $rhs
+            y .~ $rhs
         end
         bound = bind_data(lower_rkppl(ast, data; conditioned=keys(data)), data)
         built = build_kernel(bound)
@@ -137,8 +138,8 @@ end
             out = logpdf(Normal(), p.alpha) + sum(logpdf.(Normal(), p.beta))
             for i in eachindex(y)
                 ismissing(y[i]) && continue
-                family = head === :NormalIDGLM ? Normal(eta[i], 0.7) :
-                    head === :BernoulliLogitGLM ? Bernoulli(1/(1 + exp(-eta[i]))) : Poisson(exp(eta[i]))
+                family = head === :normal ? Normal(eta[i], 0.7) :
+                    head === :bernoulli ? Bernoulli(1/(1 + exp(-eta[i]))) : Poisson(exp(eta[i]))
                 out += logpdf(family, y[i])
             end
             out
