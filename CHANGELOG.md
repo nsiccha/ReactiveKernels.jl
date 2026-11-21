@@ -16,6 +16,13 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.361
+
+- `jax_source` translates the reduced factors `F.R` and `Matrix(F.Q)` of
+  `F = qr(A)` for dense real matrices. A kernel can construct
+  `LowerTriangular(A)` or `UpperTriangular(A)`, solve with either factor,
+  and compute the Euclidean norm of a real vector.
+
 ## 0.1.360
 
 The JAX exporter can trace indexed event values through pointwise operations, reshapes, gathers and reductions. ReactiveKernelsPPL uses this translation to evaluate the rows selected by a runtime partition label.

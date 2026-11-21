@@ -147,6 +147,7 @@ const _MATRIX_CORE_TESTS = (
     "test_jax_static_guards.jl",
     "test_jax_static_fields.jl",
     "test_jax_cholesky.jl",
+    "test_jax_qr.jl",
     "test_jax_module_doc.jl",
     "test_jax_shared.jl",
     "test_jax_ode_unloaded.jl",

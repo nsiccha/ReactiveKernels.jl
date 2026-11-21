@@ -30,13 +30,8 @@ mode), as metadata reports.
 Julia; `jax.grad` gives `(y, x, 1)`. Integer `fma` and `muladd` are
 `x * y + z`. Subnormals follow the backend.
 
-`rk_cholesky_lower(A)` uses JAX's lower Cholesky factorization, reading only
-the lower triangle, including when unused upper entries are nonfinite.
-It checks for square input and positive pivots, with runtime checks masked
-by the enclosing branch or plate. Empty factors and padded leading square
-blocks are supported. `L \ b` for a `LowerTriangular` factor uses a triangular
-solve; `diag(L)` reads its diagonal. Data-only factorizations and solves run
-in `prepare_data`. Arithmetic follows the module's `float_type`.
+For `qr(A)`, `rk_cholesky_lower(A)` and `L \ b`, see
+[factorizations and triangular solves](jax-translations.md#Factorizations-and-triangular-solves).
 `diagm(v)` also constructs a diagonal matrix, and source loops or
 comprehensions over `axes(A, d)` retain iteration along that dimension.
 Prepared matrix cells retain their rank and row lengths, including in empty
