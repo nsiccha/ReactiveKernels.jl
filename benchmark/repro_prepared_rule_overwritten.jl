@@ -10,42 +10,51 @@
 # unchanged, and copies it otherwise (snag `native-reverse-r-b8de62b9`).
 #
 # The script prints the bytes per call at two sizes of the vector, and checks
-# the derivatives, for four callers:
+# the derivatives, for five callers:
 # - `direct`: Enzyme on a function that sums two rule calls;
 # - `prepared`: a prepared RK program whose plate cells hold `sum(row(...))`;
 # - `stored`: the same program with cells that hold the rule's vector itself;
 # - `pullback`: a prepared pullback (`prepare_ad_pullback`) of the rule's
-#   vector, one `ad_pullback` per call.
+#   vector, one `ad_pullback` per call;
+# - `pullback_indexed`: the same pullback over `IndexedGeometry`, the same
+#   numbers beside a `Dict`.
 #
-# Recorded on a Linux fleet host, 2026-11-20: Julia 1.10.12, ReactiveKernels
-# 0.1.351, Enzyme dogfood `b862f996` with libEnzyme `400c1bdc` (repairs
-# `overwritten_reachable_data` and `unexposed_storage_barriers` present).
-# Bytes per call at n = 1,024 and 65,536:
+# Recorded on a Linux fleet host, 2026-11-21: Julia 1.10.12, ReactiveKernels
+# 0.1.353, Enzyme dogfood `484b27a4` with libEnzyme `400c1bdc` (repairs
+# `overwritten_reachable_data`, `unexposed_storage_barriers` and
+# `later_pointer_stores` present). Bytes per call at n = 1,024 and 65,536:
 #
-#     direct   320 / 320
-#     prepared 1,376 / 1,376
-#     stored   1,568 / 1,568
-#     pullback 8,560 / 524,576
+#     direct           320 / 320
+#     prepared         1,376 / 1,376
+#     stored           1,568 / 1,568
+#     pullback         240 / 240
+#     pullback_indexed 9,648 / 525,664
 #
-# A probe of the rule's Enzyme config shows why `pullback` grows with `n`.
-# `overwritten` is `(false, false, false, false)` for the first three callers
-# and `(false, true, false, false)` for `pullback`: Enzyme marks the struct
-# (the rule's first argument) as possibly overwritten, so the adapter copies
-# all `n` numbers on every call. With Enzyme's reverse mode a prepared
-# pullback keeps the port's value for `ad_value_and_pullback`:
-# `_ADSeededCall{true}` stores it into a `Ref` the preparation passes in
-# (`box[] = values`, src/ad.jl). `Enzyme.API.printperf!(true)` names that store
-# as the write that follows the rule call. With `ad_retains_primal_sweep`
-# overridden to `false` for this backend (a diagnostic only, so no value is
-# kept), the flag is `false` and a pullback takes 736 / 1,040 B. A BRM GMRF
-# coefficient row read through `prepare_ad_pullback` has this shape: 15.5 MB
-# per row Jacobian at 4,096 states. Snag `native-reverse-r-b8de62b9` reported
-# this case to Enzyme after `rule-overwritten-cc607ba7` landed.
+# A probe of the rule's Enzyme config (`EnzymeRules.overwritten`) shows why
+# `pullback_indexed` grows with `n`. The flag is `(false, false, false, false)`
+# for the first four callers and `(false, true, false, false)` for
+# `pullback_indexed`: Enzyme marks the struct (the rule's first argument) as
+# possibly overwritten, so the adapter copies all `n` numbers on every call.
+# With Enzyme's reverse mode a prepared pullback keeps the port's value for
+# `ad_value_and_pullback`: `_ADSeededCall{true}` stores it into a `Ref` the
+# preparation passes in (`box[] = values`, src/ad.jl). That store is the only
+# write after the rule call, and it stores a pointer. `later_pointer_stores`
+# keeps the flag `false` after stores of pointers alone unless the argument
+# leads to mutable memory that holds a pointer. A `Dict` is such memory: its
+# fields are pointers, so the flag correctly stays `true` until Enzyme can show
+# which object each later write targets (Enzyme todo `1kcy4qm`). A
+# BayesianRegressionModels GMRF coefficient row read through
+# `prepare_ad_pullback` has the `pullback_indexed` shape, since its rule's
+# footprint holds a `Dict`: on the same build it takes 1,438,416 B per row
+# Jacobian at 64 stations and 15,550,304 B at 1,024.
 #
-# Before libEnzyme `400c1bdc` (dogfood `8a381501`, libEnzyme `05ce259c`),
-# `stored` copied too: 18,208 / 1,050,240 B. The program's store of the rule's
-# vector into plate storage it had allocated counted as a write the rule cannot
-# see (Enzyme snag `rule-overwritten-cc607ba7`).
+# Earlier builds:
+# - dogfood `b862f996` (libEnzyme `400c1bdc`, without `later_pointer_stores`):
+#   `pullback` 8,560 / 524,576 B (Enzyme snag `rule-overwritten-53a3ec5c`);
+# - dogfood `8a381501` (libEnzyme `05ce259c`): `stored` copied too,
+#   18,208 / 1,050,240 B. The program's store of the rule's vector into plate
+#   storage it had allocated counted as a write the rule cannot see (Enzyme
+#   snag `rule-overwritten-cc607ba7`).
 module PreparedRuleOverwritten
 using ReactiveKernels, Test
 using ReactiveKernels.DifferentiationInterface: AutoEnzyme
@@ -53,6 +62,12 @@ import Enzyme
 
 struct Geometry
     values::Vector{Float64}
+end
+# The same numbers beside a `Dict`, as BRM's GMRF footprint holds one: a
+# `Dict`'s fields are pointers, so a later store of a pointer could replace them.
+struct IndexedGeometry
+    values::Vector{Float64}
+    position::Dict{Int, Int}
 end
 row_value(g, i, x) = [g.values[i] * x, g.values[i + 1] * x]
 row_slope(g, i, bar) = g.values[i] * bar[1] + g.values[i + 1] * bar[2]
@@ -115,13 +130,15 @@ repair(name) = isdefined(Enzyme, :has_dogfood_repair) && Enzyme.has_dogfood_repa
 
 @testset "a derivative rule over a struct input, direct and in a prepared program" begin
     println("REPAIRS ", (; overwritten_reachable_data = repair(:overwritten_reachable_data),
-        unexposed_storage_barriers = repair(:unexposed_storage_barriers)))
+        unexposed_storage_barriers = repair(:unexposed_storage_barriers),
+        later_pointer_stores = repair(:later_pointer_stores)))
     @test Enzyme.autodiff(Enzyme.Reverse, Enzyme.Const(direct), Enzyme.Active,
         Enzyme.Const(Geometry([1.0, 2.0, 3.0, 4.0])), Enzyme.Active(2.0))[1][2] == 10.0
     for n in (1_024, 65_536)
         g = Geometry(collect(1.0:n))
         println("RULE_BYTES ", (; n, direct = direct_bytes(g), prepared = prepared_bytes(g),
-            stored = prepared_bytes(g, stored_spec), pullback = pullback_bytes(g)))
+            stored = prepared_bytes(g, stored_spec), pullback = pullback_bytes(g),
+            pullback_indexed = pullback_bytes(IndexedGeometry(g.values, Dict(1 => 1)))))
     end
 end
 end
