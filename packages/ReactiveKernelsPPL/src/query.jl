@@ -1178,12 +1178,7 @@ function _query_observations(built, plan::StructuralPlan, observations)
         alg = Base.Sort.MergeSort))
 end
 
-# Each observation's cell plate (its per-index totals when the loop observes
-# one array per index), one `plate_cell` value per plate at the shared position
-# port, and their sum when there are several, in the order of `names`.
-function _cell_query_spec(built, plan::StructuralPlan, names; locality = nothing)
-    locality in (nothing, :error, :warn, :ignore) || throw(ContractValidationError(
-        "[query] locality must be :error, :warn, :ignore or nothing; got $(repr(locality))"))
+function _observation_plates(built, plan, names)
     body, fields = _program_pointwise(built, plan)
     pointwise = Dict{Symbol,Any}(fields)
     assigned = Set{Symbol}()
@@ -1193,8 +1188,7 @@ function _cell_query_spec(built, plan::StructuralPlan, names; locality = nothing
         Meta.isexpr(lhs, :(::), 2) && (lhs = lhs.args[1])
         lhs isa Symbol && push!(assigned, lhs)
     end
-    spec = built.spec
-    cells = Symbol[]
+    nodes = Dict{Symbol,Symbol}()
     for name in names
         haskey(pointwise, name) || throw(ContractValidationError(
             "[query] `$name` is not an observation of this model; its " *
@@ -1204,6 +1198,22 @@ function _cell_query_spec(built, plan::StructuralPlan, names; locality = nothing
             "[query] observation `$name` has no pointwise plate, so it has no cells"))
         totals = Symbol(node, :_totals)
         node = totals in assigned ? totals : node
+        nodes[name] = node
+    end
+    nodes
+end
+
+# Each observation's cell plate (its per-index totals when the loop observes
+# one array per index), one `plate_cell` value per plate at the shared position
+# port, and their sum when there are several, in the order of `names`.
+function _cell_query_spec(built, plan::StructuralPlan, names; locality = nothing)
+    locality in (nothing, :error, :warn, :ignore) || throw(ContractValidationError(
+        "[query] locality must be :error, :warn, :ignore or nothing; got $(repr(locality))"))
+    plates = _observation_plates(built, plan, names)
+    spec = built.spec
+    cells = Symbol[]
+    for name in names
+        node = plates[name]
         cell = Symbol(:_ppl_cell_, node)
         spec = try
             plate_cell(spec, node; index = _CELL_PORT, name = cell, locality)
@@ -1969,29 +1979,9 @@ function _partition_query_spec(built, plan::StructuralPlan, names, keys_by_name;
                                plan_constant = ())
     locality in (nothing, :error, :warn, :ignore) || throw(ContractValidationError(
         "[query] locality must be :error, :warn, :ignore or nothing; got $(repr(locality))"))
-    body, fields = _program_pointwise(built, plan)
-    pointwise = Dict{Symbol,Any}(fields)
-    assigned = Set{Symbol}()
-    for st in body
-        Meta.isexpr(st, :(=), 2) || continue
-        lhs = st.args[1]
-        Meta.isexpr(lhs, :(::), 2) && (lhs = lhs.args[1])
-        lhs isa Symbol && push!(assigned, lhs)
-    end
-    plates = Symbol[]
-    keys_by_plate = Dict{Symbol,Symbol}()
-    for name in names
-        haskey(pointwise, name) || throw(ContractValidationError(
-            "[query] `$name` is not an observation of this model; its " *
-            "observations are $(join(sort!(collect(keys(pointwise))), ", "))"))
-        node = pointwise[name]
-        node isa Symbol || throw(ContractValidationError(
-            "[query] observation `$name` has no pointwise plate, so it has no cells"))
-        totals = Symbol(node, :_totals)
-        node = totals in assigned ? totals : node
-        push!(plates, node)
-        keys_by_plate[node] = keys_by_name[name]
-    end
+    nodes = _observation_plates(built, plan, names)
+    plates = Symbol[nodes[name] for name in names]
+    keys_by_plate = Dict(nodes[name] => keys_by_name[name] for name in names)
     # When every key holds each label once, a partition is one cell of each
     # plate (one subject's cell of a plate over subjects): RK then runs it at
     # one row, so the values it reads there need no one-element arrays.

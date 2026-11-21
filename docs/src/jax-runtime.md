@@ -30,6 +30,19 @@ and [platform configuration](https://docs.jax.dev/en/latest/config_options.html#
 gradients, device placement, invalid-input rejection and missing-GPU failure
 with a CUDA-enabled JAX installation.
 
+## Selected station or subject densities
+
+For station or subject minibatches, use `jax_source(built, bound, observations;
+by, partitioned, global_factors, unit_factors, expected_layout)`. Write
+`out.source` and send `out.partition_data` with the model data. In Python,
+`q = model.prepare_partition(p, partition_data)` takes the result of
+`p = model.prepare_data(**raw)`. `model.global_log_density(u, **q)` sums the
+shared events. `model.unit_log_density(u, label, **q)` sums that label's
+observations and assigned prior and Jacobian events at its own full packed
+point. Both support `jax.jit`, `jax.vmap` and reverse differentiation.
+A complete assignment at one point reconstructs `model.log_density(u, **p)`.
+An unsupported indexed primitive or effect raises during tracing.
+
 ## Chains under `vmap`
 
 A sampler that advances several chains as one batch, `jax.vmap` over its

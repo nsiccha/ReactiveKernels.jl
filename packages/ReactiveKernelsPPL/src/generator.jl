@@ -159,10 +159,14 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     def = ReactiveKernels._within_kernel_names(name) do
         Base.invokelatest(_kernel_expr_latest, plan, layout; name)
     end
+    def = _finish_kernel_expr(plan, def)
+    return isempty(plan.marginalized_integers) ? def : _integer_marginal_program(plan, def)
+end
+
+function _finish_kernel_expr(plan, def)
     def = _elide_named_location_aliases(plan, def)
     def = _pointwise_arithmetic_plates(plan, def)
-    def = _name_plate_cells(def, _location_value_aliases(plan, def))
-    return isempty(plan.marginalized_integers) ? def : _integer_marginal_program(plan, def)
+    _name_plate_cells(def, _location_value_aliases(plan, def))
 end
 
 function _kernel_expr_latest(plan::StructuralPlan, layout::LayoutTable;

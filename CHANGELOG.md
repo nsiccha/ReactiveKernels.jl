@@ -16,6 +16,10 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.360
+
+The JAX exporter can trace indexed event values through pointwise operations, reshapes, gathers and reductions. ReactiveKernelsPPL uses this translation to evaluate the rows selected by a runtime partition label.
+
 ## 0.1.359
 
 - JAX index expressions such as `row[2:end]` read the logical length of a
