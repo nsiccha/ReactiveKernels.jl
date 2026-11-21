@@ -16,6 +16,17 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.356
+
+- `prepare_nonallocating` reuses the array a `@traceable` helper creates with
+  `zeros` or `ones` (`zeros(Float64, K, K)`, `ones(n)`) and then fills by
+  indexed stores. Those stores, and the stores of the `copy(A)` updates of
+  0.1.337, may now use scalar locals (`i, j, w = 1, 2, 1.0`, or a temporary
+  inside the loop), `if` branches, `+=`-style updates and scalar arithmetic
+  such as `sqrt`, `exp`, `log`, `^` and comparisons. A changed size, or an argument that aliases the previous
+  result, gets a fresh array. Native Enzyme Reverse through such a helper
+  gives the ordinary program's gradient and allocates nothing for it.
+
 ## 0.1.355
 
 - On a CUDA device, a `jax_source` module whose ODE right-hand side branches

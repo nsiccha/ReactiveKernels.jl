@@ -46,6 +46,52 @@ const NA_AD_BACKEND = AutoEnzyme(mode = Enzyme.Reverse)
     end
 end
 
+# A traceable helper that fills a fresh `zeros` array by indexed stores keeps
+# one buffer in the non-allocating program; the reverse pass through it gives
+# the ordinary program's gradient and allocates nothing.
+@traceable function naad_running_factor(z, K, P)
+    out = zeros(Float64, K, K)
+    out[1, 1] = 1.0
+    i, j, w = 1, 2, 1.0
+    for p in 1:P
+        out[j, i] = z[p] * w
+        w = w * sqrt(1 - z[p]^2)
+        if i + 1 < j
+            i = i + 1
+        else
+            out[j, j] = w
+            i, j, w = 1, j + 1, 1.0
+        end
+    end
+    out
+end
+
+@testset "reverse through a fill-and-store traceable helper" begin
+    spec = @kernel naad_fill_factor(z::Vector{Float64}, K::Int, P::Int) = begin
+        F = naad_running_factor(z, K, P)
+        score = sum(F .* F) + 3.0 * F[K, 1]
+    end
+    z = [0.3, -0.2, 0.5]
+    plain = prepare(spec; have = (:z, :K, :P), want = :score)
+    buffered = prepare_nonallocating(plain, z, 3, 3)
+    @test any(op -> op isa ReactiveKernels._FillForUpdate, buffered.callables)
+    expected = prepare_ad(plain, NA_AD_BACKEND, z, 3, 3; active = :z)
+    actual = prepare_ad(buffered, NA_AD_BACKEND, z, 3, 3; active = :z)
+    grad, reference = similar(z), similar(z)
+    for point in (z, [-0.6, 0.1, 0.45], z)
+        value, _ = ad_value_and_gradient!(actual, grad, point, 3, 3)
+        oracle, _ = ad_value_and_gradient!(expected, reference, point, 3, 3)
+        @test value == oracle
+        @test grad ≈ reference
+    end
+    # Behind a function barrier, so the preparation's type is known where it
+    # is called.
+    warm_bytes(prep, g, x) = (ad_value_and_gradient!(prep, g, x, 3, 3);
+                              @allocated ad_value_and_gradient!(prep, g, x, 3, 3))
+    @test warm_bytes(actual, grad, z) == 0
+    @test warm_bytes(actual, grad, [-0.6, 0.1, 0.45]) == 0
+end
+
 # NA gradients stay size-invariant on every Julia version, bounds checks on.
 # Registered Enzyme on Julia 1.12+ with `--check-bounds=yes` taped the shadow
 # of a cached buffer's `Memory` pointer once per element when a loop stored

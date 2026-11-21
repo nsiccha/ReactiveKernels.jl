@@ -138,6 +138,24 @@ struct _CopyForUpdate end
 _fill_constructor_value(::_FillConstructorStep{typeof(zeros)}) = 0.0
 _fill_constructor_value(::_FillConstructorStep{typeof(ones)}) = 1.0
 
+# A fresh `Float64` `zeros`/`ones` array of `N` dimensions that a `@traceable`
+# helper then fills with indexed stores. The first `N` operands are its
+# dimensions. The rest are the helper's other arguments, which the stores may
+# read: as for `_CopyForUpdate`, they let the destination driver refuse a
+# previous result passed back as one of them.
+struct _FillForUpdate{F,N}
+    f::F
+end
+_FillForUpdate(f::F, ::Val{N}) where {F,N} = _FillForUpdate{F,N}(f)
+# The first `N` operands as `Int` dimensions, by constant field index: a
+# closure indexing the mixed operand tuple at run time boxes each read.
+@generated _fill_update_dims(::Val{N}, args::Tuple) where {N} =
+    Expr(:tuple, (:(Int(getfield(args, $i))) for i in 1:N)...)
+@inline (op::_FillForUpdate{F,N})(args::Vararg{Any,M}) where {F,N,M} =
+    op.f(Float64, _fill_update_dims(Val(N), args)...)
+_fill_constructor_value(::_FillForUpdate{typeof(zeros)}) = 0.0
+_fill_constructor_value(::_FillForUpdate{typeof(ones)}) = 1.0
+
 # --- step program accumulator ----------------------------------------------
 
 mutable struct _StepProgram
@@ -744,13 +762,54 @@ function _update_callee(mod, callee, bindings)
     haskey(bindings, root) ? nothing : _nonalloc_resolve_function(mod, callee)
 end
 
+# The functions an update may call: index arithmetic and scalar math, none of
+# which keeps or writes its arguments.
+const _TRACED_UPDATE_CALLS = (eachindex, axes, firstindex, lastindex, length,
+    size, (:), +, -, *, /, ^, div, rem, mod, min, max, abs, abs2, sqrt, exp,
+    log, log1p, expm1, tanh, muladd, fma, ifelse, zero, one, !,
+    <, <=, >, >=, ==, !=)
+
+# The scalar locals an update assigns (`i, j, w = 1, 2, 1.0`, or a temporary
+# `t = z[p]` inside its loop): each is translated to one fresh name. The
+# translated stores keep the helper's statements, loops and branches as they
+# are, only renamed, so each local has the helper's scope (the whole update,
+# or one loop body) and its value at every use; a read before the first
+# assignment fails, as in the helper. `nothing` when a name would shadow a
+# formal, a static parameter or the destination.
+function _traced_update_locals(statements, bindings, target)
+    names = Symbol[]
+    function scan(ex)
+        ex isa Expr || return true
+        # A loop's iteration variable is bound by the loop itself.
+        Meta.isexpr(ex, :for, 2) && return scan(ex.args[2])
+        if ex.head in (:(=), :(+=), :(-=), :(*=)) && length(ex.args) == 2
+            lhs = first(ex.args)
+            assigned = lhs isa Symbol ? (lhs,) :
+                Meta.isexpr(lhs, :tuple) && all(a -> a isa Symbol, lhs.args) ?
+                Tuple(lhs.args) : ()
+            for name in assigned
+                (name === target || haskey(bindings, name)) && return false
+                name in names || push!(names, name)
+            end
+            return scan(ex.args[2])
+        end
+        all(scan, ex.args)
+    end
+    all(scan, statements) ? names : nothing
+end
+
 # Translate only reads of the visible operands and writes to the private
-# copy. Preserve the loop's lexical binding, iteration order and bounds checks.
-function _traced_update_expr(ex, mod, bindings, target)
+# copy or to the update's scalar locals (`assignable`, their translated
+# names). Preserve the loop's lexical binding, iteration order and bounds
+# checks. An integer power keeps the `literal_pow` Julia lowers `x^2` to.
+function _traced_update_expr(ex, mod, bindings, target,
+                             assignable::Set{Symbol} = Set{Symbol}())
     ex isa Symbol && return get(bindings, ex, nothing)
     ex isa Union{Number,LineNumberNode} && return ex
     ex isa Expr || return nothing
-    lower(arg) = _traced_update_expr(arg, mod, bindings, target)
+    lower(arg) = _traced_update_expr(arg, mod, bindings, target, assignable)
+    local_name(name) = name isa Symbol &&
+        get(bindings, name, nothing) in assignable
     if Meta.isexpr(ex, :for, 2)
         iter, body = ex.args
         Meta.isexpr(iter, :(=), 2) || return nothing
@@ -760,26 +819,83 @@ function _traced_update_expr(ex, mod, bindings, target)
         range === nothing && return nothing
         index = gensym(name)
         locals = merge(bindings, Dict(name => index))
-        store = _traced_update_expr(body, mod, locals, target)
+        store = _traced_update_expr(body, mod, locals, target, assignable)
         store === nothing && return nothing
         return Expr(:for, Expr(:(=), index, range), store)
     elseif ex.head === :call
         resolved = _update_callee(mod, first(ex.args), bindings)
         resolved === nothing && return nothing
         f, ref = resolved
-        f in (eachindex, axes, firstindex, lastindex, length, size, (:),
-              +, -, *, div, rem, min, max) || return nothing
+        f in _TRACED_UPDATE_CALLS || return nothing
         args = map(lower, ex.args[2:end])
         any(isnothing, args) && return nothing
+        if f === (^) && length(args) == 2 && ex.args[3] isa Integer &&
+           !(ex.args[3] isa Bool)
+            return Expr(:call, GlobalRef(Base, :literal_pow), ref, args[1],
+                        Expr(:call, GlobalRef(Base, :Val), ex.args[3]))
+        end
         return Expr(:call, ref, args...)
-    elseif Meta.isexpr(ex, :(=), 2)
+    elseif ex.head in (:(=), :(+=), :(-=), :(*=)) && length(ex.args) == 2
         lhs = first(ex.args)
-        Meta.isexpr(lhs, :ref) && first(lhs.args) === target || return nothing
-    elseif ex.head !== :block && ex.head !== :ref
+        if Meta.isexpr(lhs, :ref)
+            first(lhs.args) === target || return nothing
+        elseif ex.head === :(=) && Meta.isexpr(lhs, :tuple)
+            all(local_name, lhs.args) || return nothing
+        else
+            local_name(lhs) || return nothing
+        end
+    elseif !(ex.head in (:block, :ref, :tuple, :if, :elseif, :&&, :||))
         return nothing
     end
     args = map(lower, ex.args)
     any(isnothing, args) ? nothing : Expr(ex.head, args...)
+end
+
+# The step that gives an update its private array, from the helper's first
+# statement: `copy(A)` of a dense argument (`_CopyForUpdate`), or a `Float64`
+# `zeros`/`ones` of integer dimensions (`_FillForUpdate`), written with or
+# without the element type. `(op, T, operands, operand types)`, or `nothing`
+# for any other first statement. The operands end with every other argument,
+# which the stores may read.
+function _update_initial_step(ctx, f, types, source, resolved, call_args, bindings)
+    init = first(resolved)
+    if init === copy && length(call_args) == 1
+        array = only(call_args)
+        T = get(ctx.argtypes, array, Any)
+        T <: Array && isconcretetype(T) && _static_type(f, types...) === T ||
+            return nothing
+        which(copy, Tuple{T}) === which(copy, Tuple{Array}) || return nothing
+        others = filter(!=(array), first(source))
+        return (_CopyForUpdate(), T, Any[ctx.argmap[array], (ctx.argmap[n] for n in others)...],
+                Any[T, (ctx.argtypes[n] for n in others)...])
+    end
+    (init === zeros || init === ones) && !isempty(call_args) || return nothing
+    dims = call_args
+    if !(first(dims) isa Integer || haskey(ctx.argmap, first(dims)))
+        element = _update_callee(ctx.mod, first(dims), bindings)
+        element !== nothing && first(element) === Float64 || return nothing
+        dims = dims[2:end]
+    end
+    isempty(dims) && return nothing
+    operands, argtypes = Any[], Any[]
+    for d in dims
+        if d isa Integer && !(d isa Bool)
+            push!(operands, d)
+            push!(argtypes, typeof(d))
+        elseif d isa Symbol && haskey(ctx.argmap, d) &&
+               get(ctx.argtypes, d, Any) <: Integer
+            push!(operands, ctx.argmap[d])
+            push!(argtypes, ctx.argtypes[d])
+        else
+            return nothing
+        end
+    end
+    T = Array{Float64,length(dims)}
+    _static_type(f, types...) === T || return nothing
+    others = first(source)
+    (_FillForUpdate(init, Val(length(dims))), T,
+     Any[operands..., (ctx.argmap[n] for n in others)...],
+     Any[argtypes..., (ctx.argtypes[n] for n in others)...])
 end
 
 function _decompose_copy_update!(ctx, statements, result, f, types, source)
@@ -788,31 +904,37 @@ function _decompose_copy_update!(ctx, statements, result, f, types, source)
     init = first(statements)
     Meta.isexpr(init, :(=), 2) && init.args[1] === result || return nothing
     call = init.args[2]
-    Meta.isexpr(call, :call, 2) || return nothing
-    callee, array = call.args
+    Meta.isexpr(call, :call) && length(call.args) >= 2 || return nothing
     # A static parameter can shadow a global function just as a formal can.
     bindings = copy(ctx.argmap)
     for name in (length(source) >= 5 ? keys(source[5]) : ())
         bindings[name] = nothing
     end
-    resolved = _update_callee(ctx.mod, callee, bindings)
-    resolved !== nothing && first(resolved) === copy || return nothing
-    T = get(ctx.argtypes, array, Any)
-    T <: Array && isconcretetype(T) && _static_type(f, types...) === T || return nothing
-    which(copy, Tuple{T}) === which(copy, Tuple{Array}) || return nothing
+    resolved = _update_callee(ctx.mod, first(call.args), bindings)
+    resolved === nothing && return nothing
+    initial = _update_initial_step(ctx, f, types, source, resolved,
+                                   call.args[2:end], bindings)
+    initial === nothing && return nothing
+    op, T, operands, argtypes = initial
     # All storage the update can read is visible to the runtime alias check.
     all(t -> (t <: Number && isbitstype(t)) ||
              (t <: StridedArray{<:Number} && isbitstype(eltype(t))), values(ctx.argtypes)) ||
         return nothing
-    others = filter(!=(array), first(source))
-    op = _CopyForUpdate()
-    _nonalloc_destination(ctx.cache_apply, op, T, (T, (ctx.argtypes[n] for n in others)...)) ||
-        return nothing
+    _nonalloc_destination(ctx.cache_apply, op, T, Tuple(argtypes)) || return nothing
+    updates = statements[2:end]
+    locals = _traced_update_locals(updates, bindings, result)
+    locals === nothing && return nothing
     dest = gensym(:updated)
     bindings[result] = dest
-    stores = _traced_update_expr(Expr(:block, statements[2:end]...), ctx.mod, bindings, result)
+    assignable = Set{Symbol}()
+    for name in locals
+        bindings[name] = gensym(name)
+        push!(assignable, bindings[name])
+    end
+    stores = _traced_update_expr(Expr(:block, updates...), ctx.mod, bindings,
+                                 result, assignable)
     stores === nothing && return nothing
-    tmp = _emit_step!(ctx, op, T, ctx.argmap[array], (ctx.argmap[n] for n in others)...)
+    tmp = _emit_step!(ctx, op, T, operands...)
     push!(ctx.stmts, Expr(:(=), dest, tmp), stores)
     (dest, T)
 end
