@@ -581,9 +581,8 @@ function _expand_cell_joint_latents(st, taken, data::Set{Symbol}, mod::Module,
             :(Flat.())))
         geometry_expr = Expr(:call, ref(:sampling_geometry), call.args[1],
             Expr(:tuple, (_sampling_ast_literal(a) for a in call.args[2:end])...), Expr(:tuple))
+        block = fresh(Symbol(prefix, :_block))
         function endpoint(f, edge)
-            # A view: constructing it reads no coordinates (`_ppl_cell_blocks`).
-            block = Expr(:call, GlobalRef(Base, :view), site, :($blocks[$pos]))
             graph = _sampling_graph_call(g, edge, geometry_expr,
                 Any[block, :($shapes[$pos]), positional...], keywords)
             graph === nothing && return _external_endpoint_call(ref(f),
@@ -592,6 +591,9 @@ function _expand_cell_joint_latents(st, taken, data::Set{Symbol}, mod::Module,
         end
         push!(cells, Expr(:(=), pos, Expr(:call, ref(:_ppl_cell_scan_position), domain, ivar)))
         push!(locals, pos => Expr(:call, ref(:_ppl_cell_scan_position), domain, ivar))
+        # Keep the view visible to footprint analysis when an endpoint is an
+        # ordinary Julia call. Both endpoints receive only this cell's block.
+        push!(cells, Expr(:(=), block, Expr(:call, GlobalRef(Base, :view), site, :($blocks[$pos]))))
         # The composed transform has the same shape check as the numerical
         # endpoint. Keep the checked value in the dependency chain.
         if g.constrain isa _SamplingGraphEndpoint
