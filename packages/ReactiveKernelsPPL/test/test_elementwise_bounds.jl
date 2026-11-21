@@ -18,14 +18,13 @@ _coords(built, u, name) = (e = only(filter(e -> e.name === name, built.layout.en
 # independent oracle `want(u, built, data)` (explicit transforms and Jacobians,
 # not the layout's host functions) and its finite differences, and the
 # bound data are unchanged.
-function _elementwise_check(source, datasets, values_of, want; conditioned = (),
-        same_program = true)
+function _elementwise_check(source, datasets, values_of, want; conditioned = ())
     plan = lower_rkppl(source, first(datasets); conditioned)
     bound = [bind_data(plan, d) for d in datasets]
     builds = build_kernel.(bound)
     programs = [Base.remove_linenums!(kernel_expr(b, built.layout))
         for (b, built) in zip(bound, builds)]
-    same_program && @test all(==(first(programs)), programs)
+    @test all(==(first(programs)), programs)
     for (b, built, d) in zip(bound, builds, datasets)
         before = deepcopy(d)
         values = values_of(d)
@@ -284,10 +283,7 @@ end
                 x[i] ~ $wrapper(Normal(0, 2), lo[i], hi[i])
                 y[i] ~ Normal(x[i], 1)
             end
-        end, datasets, d -> (x = inside.(d.lo, d.hi),), want; conditioned = (:y,),
-            # A plate over a response's rows packs a literal range per binding,
-            # bounds or not (`view(unconstrained, 1:4)`): a separate limitation.
-            same_program = false)
+        end, datasets, d -> (x = inside.(d.lo, d.hi),), want; conditioned = (:y,))
     end
 end
 

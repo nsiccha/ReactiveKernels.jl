@@ -1206,6 +1206,7 @@ function _lower_rkppl_once(ast, input_data::Set{Symbol}, mod::Module;
     # vector path, which a package adding `lastindex` invalidates).
     data::Set{Symbol} = input_data
     ast = _fold_literal_positions(ast)
+    ast, nested_broadcasts = _expand_nested_plates(ast, data)
     # A `@scan` carried array that is observed data observes its entries
     # (`observed_scan.jl`); the rewrite is an ordinary program.
     ast = Expr(:block, _expand_observed_scans(ast.args, data)...)
@@ -1879,6 +1880,7 @@ function _lower_rkppl_once(ast, input_data::Set{Symbol}, mod::Module;
             if k in indexed_observations || k in indexed_external),
         named_values, factors = factor_params, cell_priors, cell_latents,
         cell_geometries)
+    isempty(nested_broadcasts) || (plan = _with(plan; nested_broadcasts))
     _confirm_whole_value_data(plan, rawdata; whole)
     validate_structure(plan)
     return plan
@@ -7992,7 +7994,9 @@ function _submodel_substitution(sm::RKPPLSubmodel, stmts, ret, callargs,
         if nm in argset
             v = submap[nm]
             observed = !(nm in defined)
-            (observed && v isa Symbol && v in data) || _sfail(
+            indexed_data = ns.indexed !== nothing && Meta.isexpr(v, :ref, 2) &&
+                v.args[1] in data && v.args[2] === ns.indexed
+            (observed && (v in data || indexed_data)) || _sfail(
                 "submodel `$(sm.name)`: `$nm` is both an argument and a " *
                 "local — rename the local" *
                 (observed ? " (a body may observe an argument with `~`/`.~` " *
@@ -8270,7 +8274,7 @@ function _expand_cell_submodel(colref::Expr, callexpr::Expr, ivar::Symbol,
     # A sized dotted draw keeps its axes through substitution. The cell
     # latent pass packs the declared shape at each index.
     for st in stmts
-        (st isa Expr && (_is_cell_scan_block(st) ||
+        (st isa Expr && (_is_cell_scan_block(st) || _plate_loop(st) !== nothing ||
             (_is_broadcast_sample(st) && _cell_sized_lhs(_stmt_lhs(st)) &&
                 _stmt_lhs(st).args[1] isa Symbol && _is_cell_latent_object(st.args[3])) ||
             (_is_sample(st) || _is_broadcast_sample(st) ||
@@ -8279,10 +8283,12 @@ function _expand_cell_submodel(colref::Expr, callexpr::Expr, ivar::Symbol,
             "submodel `$(sm.name)` is called per cell (`$col[$ivar] ~ " *
             "$(sm.name)(...)`), so its body holds what a cell holds: `~`/`=` " *
             "statements over bare names, elementwise priors with `1:n` axes, " *
-            "and `@scan` blocks; unsupported statement: `$(repr(st))`")
+            "and `@scan` or `@plate` blocks; unsupported statement: `$(repr(st))`")
     end
     scans = filter(_is_cell_scan_block, stmts)
-    lines = filter(!_is_cell_scan_block, stmts)
+    plate_scoped = Set{Symbol}()
+    stmts = [_scope_cell_plate(st, used.used, plate_scoped) for st in stmts]
+    lines = filter(st -> !_is_cell_scan_block(st) && _plate_loop(st) === nothing, stmts)
     # A returned carried array of a body `@scan` is the cell's per-index
     # array `col[i]`, written `col[i][t]` as in the hand-written cell scan:
     # observed in place on a data column, the latent trajectory otherwise.
@@ -8347,11 +8353,13 @@ function _expand_cell_submodel(colref::Expr, callexpr::Expr, ivar::Symbol,
     # Scan-scoped names keep a bare private spelling, as in a hand-written
     # cell scan; they are not per-index values, so the scope does not
     # expose them (`col[i].t` names no local).
-    for nm in scoped
+    for nm in union(scoped, plate_scoped)
         haskey(scope.locals, nm) || continue
         submap[nm] = pop!(scope.locals, nm)
     end
-    out = Any[_hsubst(st, submap) for st in stmts]
+    body_names = union(argset, Set{Symbol}(keys(submap)))
+    out = Any[_hsubst(_plate_loop(st) === nothing ? st :
+        _resolve_submodel_stmt(st, sm, body_names; observes=argset), submap) for st in stmts]
     # Compound-return latent: bind `col[i]` to the substituted return value.
     (slot === nothing || latent_stream) && !scan_return &&
         push!(out, Expr(:(=), colref, _hsubst(ret, submap)))

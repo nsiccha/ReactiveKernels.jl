@@ -1150,7 +1150,24 @@ struct StructuralPlan
     documentation::Vector{RKPPLDocumentation}
     # Finite integer declarations integrated out by the generated graph.
     marginalized_integers::Vector{Symbol}
+    # Dotted observations inside a second explicitly authored plate.
+    nested_broadcasts::Set{Symbol}
 end
+
+StructuralPlan(responses, predictors, population_priors, parameters,
+    assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+    scans, vector_parameters, matrices, array_parameters, submodel_scopes,
+    conditioned, indexed_observations, external_observations,
+    cell_broadcasts, named_values, factors, cell_priors, frozen::FrozenValues,
+    cell_latents::Dict{Symbol,Tuple{Symbol,Symbol}},
+    cell_geometries::Dict{Symbol,CellGeometry}, data_values::Union{Nothing,_BindingData},
+    documentation::Vector{RKPPLDocumentation}, marginalized_integers::Vector{Symbol}) =
+    StructuralPlan(responses, predictors, population_priors, parameters,
+        assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+        scans, vector_parameters, matrices, array_parameters, submodel_scopes,
+        conditioned, indexed_observations, external_observations,
+        cell_broadcasts, named_values, factors, cell_priors, frozen, cell_latents,
+        cell_geometries, data_values, documentation, marginalized_integers, Set{Symbol}())
 
 StructuralPlan(responses, predictors, population_priors, parameters,
     assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
@@ -1862,7 +1879,7 @@ const _MULTI_AXIS_SLOTS = (:responses, :predictors, :population_priors,
     :matrices,
     :array_parameters, :indexed_observations, :external_observations,
     :cell_broadcasts, :named_values, :factors, :cell_priors, :frozen,
-    :cell_latents, :cell_geometries, :data_values, :documentation, :marginalized_integers)
+    :cell_latents, :cell_geometries, :data_values, :documentation, :marginalized_integers, :nested_broadcasts)
 
 # Observation-shaped values and their data dependencies. Parameters sized
 # by levels or coefficient width are shared values, so their priors do not
@@ -3788,7 +3805,7 @@ end
 # level codes `_ppl_codes(g, h)` of column `g` on `levels(h)`.
 _is_plate_column_expr(ex) = ex isa Expr && ex.head === :do &&
     length(ex.args) == 2 && ex.args[1] isa Expr && ex.args[1].head === :call &&
-    !isempty(ex.args[1].args) && ex.args[1].args[1] === :plate
+    !isempty(ex.args[1].args) && ex.args[1].args[1] in (:plate, GlobalRef(ReactiveKernels, :plate))
 
 # Level plate columns are array values with a declared level axis. Keep
 # that provenance in the first input until the generator binds the axis.
@@ -6611,8 +6628,11 @@ function _validate_response_data(plan::StructuralPlan)
         # them all (a partial observation is refused), so every entry the
         # cells observe is checked, however many entries a cell holds.
         r.range isa Expr && _selected_response_column(plan, r)
-        _validate_response_data(_with(checked; range = nothing),
-            _cell_broadcast_entries(plan, r))
+        entries = _cell_broadcast_entries(plan, r)
+        if r.response in plan.nested_broadcasts && _cell_broadcast_response(entries, r)
+            entries = _cell_broadcast_entries(entries, r)
+        end
+        _validate_response_data(_with(checked; range = nothing), entries)
     end
     return nothing
 end
@@ -6656,6 +6676,15 @@ _holds_arrays(col) = col isa AbstractArray && !(eltype(col) <: Number) &&
 # An absent value has no elements to read (a frozen `Vector{String}` input):
 # its element type alone says.
 _holds_arrays(col::_AbsentArray) = eltype(col) <: AbstractArray
+
+# A subject's dotted observation may broadcast over readings or act on a
+# scalar. Concrete column types distinguish those cases even for empty plates.
+function _nested_array_entries(groups)
+    entry = eltype(eltype(groups))
+    entry <: AbstractArray && return true
+    entry <: Number && return false
+    return any(group -> !isempty(group) && _holds_arrays(group), groups)
+end
 
 # Data a cell-broadcast response reads per index hold that index's array.
 _cell_broadcast_operand(plan::StructuralPlan, c::Symbol) =
@@ -7810,6 +7839,7 @@ _binder_symbols!(out::Set{Symbol}, b::Expr) =
 _binder_symbols!(out::Set{Symbol}, b) = out
 
 function _expr_value_symbols(ex, out::Set{Symbol} = Set{Symbol}())
+    _is_plate_column_expr(ex) && return union!(out, _plate_column_reads(ex))
     if ex isa Symbol
         push!(out, ex)
     elseif ex isa Expr
@@ -8248,7 +8278,7 @@ function _uncached_model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Sym
                 p.family === :external && p.name in plan.conditioned && continue
                 delete!(free, p.name)
             end
-        elseif f in (:external_observations, :cell_broadcasts, :factors, :conditioned)
+        elseif f in (:external_observations, :cell_broadcasts, :nested_broadcasts, :factors, :conditioned)
             continue
         elseif f === :vector_parameters
             for p in plan.vector_parameters
@@ -9338,14 +9368,24 @@ function _bind_data_latest(input_plan::StructuralPlan, columns::AbstractDict{Sym
     return bound
 end
 
-# Supply `_plate_extent_input` for each latent plate whose prior inputs
-# select through it: the same cell count that sizes the latent itself.
+# A response may be absent when replaying a fit. Bind its plate extent
+# once so the parameter unpacker can still read the size at run time.
+function _plate_observation_extent(plan, p)
+    range = p.range
+    source = range isa Symbol ? range :
+        Meta.isexpr(range, :call) && range.args[1] in (:eachindex, :axes) ?
+            range.args[2] : nothing
+    return source isa Symbol && (source in plan.conditioned ||
+        any(r -> r.response === source, plan.responses))
+end
+
+# Supply the size used by the packed coordinates and by per-cell prior inputs.
 function _bind_plate_extents!(plan::StructuralPlan, columns)
     reads = _definition_value_reads(plan)
     inputs = Set{Symbol}()
     for p in plan.plate_parameters
         input = _plate_extent_input(p.name)
-        input in reads || continue
+        (input in reads || _plate_observation_extent(plan, p)) || continue
         haskey(columns, input) && _fail(p.label, "internal input $input " *
             "is the latent's cell count — drop it from bind_data")
         columns[input] = _plate_rows(plan, p)
