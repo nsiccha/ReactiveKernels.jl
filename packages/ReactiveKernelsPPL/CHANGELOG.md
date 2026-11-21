@@ -16,7 +16,7 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.250
+## 0.1.252
 
 - **Breaking:** the fused GLM statements `y ~ NormalIDGLM(X, alpha, beta,
   sigma)`, `y ~ BernoulliLogitGLM(X, alpha, beta)` and `y ~ PoissonLogGLM(X,
@@ -36,6 +36,16 @@ are recorded in the git history only.
   as in `y .~ Normal.(alpha .+ X * beta, sigma)`. The rebinding builds the
   matrix again from its columns. Before, it was refused with `column X is
   computed by the model (X = hcat(...)) — drop it from bind_data`.
+
+## 0.1.250
+
+- A submodel called in a plate can build an indexed fitted value and observe
+  readings in an inner subject plate. Each endpoint keeps its own parameters.
+  Pointwise densities follow the endpoint, subject and reading axes, including
+  subjects with no readings. A named scale or degrees of freedom can be
+  shared or supplied separately for each endpoint.
+- Latent parameters indexed over an observed response read their packed
+  length from the binding. One generated program serves different row counts.
 
 ## 0.1.249
 
