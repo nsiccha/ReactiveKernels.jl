@@ -7768,9 +7768,23 @@ function _eval_plate_cell(ex, cell, read, label)
     return _eval_value_expr(ex, read, label)
 end
 
+_contains_plate_column(ex) = ex isa Expr &&
+    (_is_plate_column_expr(ex) || any(_contains_plate_column, ex.args))
+
 # A data-only plate column at binding: the cell, once per index, over the
 # zipped inputs (`plate(lanes...) do args...; cell; end`).
 function _eval_plate_column(ex, lookup, label)
+    # A nested plate can have no subjects at one endpoint, or no endpoints.
+    # Evaluate its authored graph with typed data inputs. The interpreter
+    # below cannot infer the element type of an empty cell from its AST.
+    if _contains_plate_column(ex.args[2])
+        names = sort!(collect(_plate_column_reads(ex)))
+        result = _cell_scan_fresh!(Set(names), :_ppl_bound_cells)
+        signature = Expr(:call, :_ppl_bound_plate, names...)
+        body = Expr(:block, Expr(:(=), result, ex), Expr(:return, result))
+        spec = _eval_kernel_def(Expr(:(=), signature, body))
+        return Base.invokelatest(spec, map(lookup, names)...)
+    end
     call, lam = ex.args
     lanes = Any[_eval_value_expr(a, lookup, label) for a in call.args[2:end]]
     zipped = filter(l -> !(l isa Base.RefValue), lanes)
