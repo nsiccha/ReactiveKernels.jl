@@ -10017,11 +10017,14 @@ outputs(p::Plan) = Tuple(p.want)
 
 """
     code_expr(spec_or_plan_or_kernel) -> Expr
+    code_expr(scheduled_reader) -> NamedTuple
 
 The generated Julia `Expr` before RGF compilation. A `KernelSpec` or `Graph`
 is planned at its default boundary unless `have`/`want` are given. A `Plan`
 is lowered to its generated expression; a prepared kernel returns its stored
 expression. Useful for asserting that unused operations are literally absent.
+A scheduled reader returns the expressions for its shared prefix and chunk
+worker as `(; prefix, worker)`, with `nothing` for an absent prefix.
 """
 code_expr(p::Plan) = lower(p)
 code_expr(k::PreparedKernel) = k.ast

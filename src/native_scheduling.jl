@@ -9,18 +9,18 @@ an upper bound. Available threads and chunks cap each runtime call. Supply
 positive integers for these hints and choose values by measuring your
 workload.
 
-During package-image generation, a nonempty scheduled call precompiles the
-serial driver for its argument types and exercises the worker code even on a
-single Julia thread. Two sample positions suffice even when they fit in one
-chunk. Set `workers=1` to exercise just the serial path.
+One job runs its worker on the calling task. During package-image generation,
+two sample positions can exercise worker tasks even on one Julia thread and
+even when both positions fit in one chunk. With `workers=1`, the workload
+exercises the same worker inline.
 
 For calls using several position workers, materialized data-only prefix plates
 also use the worker budget. Their cells share equal-input results within the
 call; changing data between calls recomputes the prefix. Scalar dependencies,
 reductions and scans retain their native order.
 
-Ordinary batching stays serial. The schedule applies to native primal calls;
-an owning batch retains its ordinary serial compiler path. Per-position AD uses
+Ordinary batching stays serial. The schedule applies to native primal calls.
+Per-position AD uses
 the scalar kernel with `prepare_ad` and `replica`, independently of this hint.
 """
 struct NativeScheduling
@@ -160,15 +160,15 @@ _scheduled_slice(x::AbstractArray, range) =
     view(x, ntuple(_ -> Colon(), ndims(x) - 1)..., range)
 _scheduled_slice(x::Union{Tuple,NamedTuple}, range) = map(y -> _scheduled_slice(y, range), x)
 
-# The serial driver, the prefix kernel and the workers are untyped fields. Each
-# is called once per call or per chunk, and their types grow with the graph
+# Keep the scalar, prefix and worker types out of the scheduler's type.
+# Their types grow with the graph
 # (hundreds of thousands of characters for a composed simulation graph): every
 # type built around them, this struct, the workers' vector and the spawned
 # tasks' closures among them, cost seconds of compilation, so a scheduled
 # reader compiled several times longer than its serial driver (snag
 # nativescheduling-51b0fbf9).
 struct _ScheduledBatchedKernel{Reuse,S,B,BT,PS,N}
-    serial::Any
+    scalar::PreparedKernel
     prefix::Any
     workers::Vector{Any}
     caches::NTuple{N,Base.RefValue{Any}}
@@ -177,7 +177,8 @@ end
 
 _batch_output_mode(kernel, ::Val{false}) = kernel
 _batch_output_mode(kernel, ::Val{true}) = _borrowed_batch(kernel)
-_position_schedule(kernel, ::Nothing, mode) = _batch_output_mode(kernel, mode)
+_position_schedule(kernel, batched, ::Nothing, mode) =
+    _batch_output_mode(replica_graph(kernel; batched), mode)
 
 # The boundary of the workers' residual driver, which the scheduler lowers from
 # the residual plan alone: a scalar kernel and an owning driver around it would
@@ -207,9 +208,13 @@ end
 _scheduled_workers(@nospecialize(residual), schedule::NativeScheduling) =
     _scheduled_workers(residual, _scheduled_worker_count(schedule))
 
-function _position_schedule(@nospecialize(kernel::GraphReplicatedKernel),
+function _position_schedule(@nospecialize(kernel::PreparedKernel), @nospecialize(batched),
                             schedule::NativeScheduling, mode::Val{Reuse}) where {Reuse}
-    batched = batched_ports(kernel)
+    boundary = inputs(kernel)
+    indices = _replica_batch_indices(boundary, batched)
+    batched = Tuple(boundary[i].name for i in indices)
+    _replicated_graph_plan(kernel.plan) || throw(ArgumentError(
+        "scalar kernel requires the complete-callable replica fallback"))
     analysis = _replicated_dependency_analysis(kernel.plan, batched)
     parts = _replicated_parts(kernel.plan, analysis)
     prefix = _scheduled_prefix(parts.prefix)
@@ -224,32 +229,32 @@ function _position_schedule(@nospecialize(kernel::GraphReplicatedKernel),
     end
     prefix_sources = Tuple(only(findall(==(canon_id(graph, value.id)), input_ids))
                            for value in parts.prefix.have)
-    serial = _batch_output_mode(kernel, mode)
     nout = length(outputs(kernel))
     _ScheduledBatchedKernel{Reuse,Tuple(sources),analysis.positions,analysis.input_types,
-                           prefix_sources,nout}(serial, prefix,
+                           prefix_sources,nout}(kernel, prefix,
                            _scheduled_workers(residual, schedule),
                            _borrowed_batch_caches(nout), schedule)
 end
 
-_scheduled_copy_serial(kernel::GraphReplicatedKernel) = kernel
-_scheduled_copy_serial(kernel::BorrowedBatchedKernel) = copy(kernel)
 function Base.copy(k::_ScheduledBatchedKernel{R,S,B,BT,PS,N}) where {R,S,B,BT,PS,N}
     workers = Vector{Any}(undef, length(k.workers))
     for index in eachindex(workers)
         workers[index] = copy(k.workers[index])
     end
     _ScheduledBatchedKernel{R,S,B,BT,PS,N}(
-        _scheduled_copy_serial(k.serial), k.prefix, workers,
+        k.scalar, k.prefix, workers,
         _borrowed_batch_caches(N), k.schedule)
 end
 
-inputs(k::_ScheduledBatchedKernel) = inputs(k.serial)
-outputs(k::_ScheduledBatchedKernel) = outputs(k.serial)
-plan(k::_ScheduledBatchedKernel) = plan(k.serial)
-code_expr(k::_ScheduledBatchedKernel) = code_expr(k.serial)
-batched_ports(k::_ScheduledBatchedKernel) = batched_ports(k.serial)
-scalar_kernel(k::_ScheduledBatchedKernel) = scalar_kernel(k.serial)
+inputs(k::_ScheduledBatchedKernel) = inputs(k.scalar)
+outputs(k::_ScheduledBatchedKernel) = outputs(k.scalar)
+plan(k::_ScheduledBatchedKernel) = k.scalar.plan
+code_expr(k::_ScheduledBatchedKernel) =
+    (; prefix=isnothing(k.prefix) ? nothing : code_expr(k.prefix),
+       worker=code_expr(first(k.workers)))
+batched_ports(k::_ScheduledBatchedKernel{R,S,B}) where {R,S,B} =
+    Tuple(inputs(k)[i].name for i in B)
+scalar_kernel(k::_ScheduledBatchedKernel) = k.scalar
 
 @generated function _scheduled_worker_args(::_ScheduledBatchedKernel{R,S,B}, args, shared, range) where {R,S,B}
     values = map(S) do index
@@ -313,29 +318,17 @@ end
 _scheduled_first_range(job::UnitRange{Int}, chunk_size) =
     first(job):min(last(job), first(job) + chunk_size - 1)
 
-# The worker workload below bypasses the serial driver used by one-job reads.
-# With many input ports its splatted call to the generated function dispatches
-# at runtime, so compiling the driver alone can leave that callee out of the image.
-Base.@nospecializeinfer function _precompile_scheduled_serial(@nospecialize(serial),
-                                                               @nospecialize(args))
-    types = map(Core.Typeof, args)
-    precompile(serial, types)
-    tables = (typeof(serial.constants), typeof(serial.callables))
-    if serial isa BorrowedBatchedKernel
-        tables = (tables..., typeof(serial.caches))
-    end
-    precompile(serial.native, (tables..., types...))
-    nothing
-end
-
 function (k::_ScheduledBatchedKernel{Reuse,S,B,BT,PS,N})(args...) where {Reuse,S,B,BT,PS,N}
     length(args) == length(inputs(k)) || throw(MethodError(k, args))
     count = _replicated_validate_axes(args, Val(B), BT)
+    if iszero(count)
+        empty_outputs = map(v -> _replicated_output(valtype(v), 0), outputs(k))
+        return N == 1 ? only(empty_outputs) : empty_outputs
+    end
     budget = _scheduled_worker_count(k.schedule)
     jobs = min(budget, cld(count, k.schedule.chunk_size))
-    if ccall(:jl_generating_output, Cint, ()) != 0 && count > 0 &&
+    if ccall(:jl_generating_output, Cint, ()) != 0 &&
             getfield(k.schedule, :workers) !== 1
-        _precompile_scheduled_serial(k.serial, args)
         # compilecache may have one physical thread and just one chunk of
         # samples. Run the production tasks on disjoint positions, using
         # call-local workers so an image-held reader keeps no virtual pool.
@@ -343,18 +336,42 @@ function (k::_ScheduledBatchedKernel{Reuse,S,B,BT,PS,N})(args...) where {Reuse,S
         workers = _scheduled_workers(first(k.workers), jobs)
         return _run_scheduled(k, args, count, workers, jobs, max(budget, 2))
     end
-    jobs <= 1 && return k.serial(args...)
     # A reader prepared in a package image can load with more Julia threads.
     while length(k.workers) < jobs
         push!(k.workers, copy(first(k.workers)))
     end
-    _run_scheduled(k, args, count, k.workers, jobs, budget)
+    _run_scheduled(k, args, count, k.workers, jobs, jobs == 1 ? 1 : budget)
+end
+
+function _scheduled_outputs(k::_ScheduledBatchedKernel{Reuse,S,B,BT,PS,N}, first_chunk,
+                            count, args) where {Reuse,S,B,BT,PS,N}
+    ntuple(i -> _scheduled_output!(k.caches[i], first_chunk[i], count, args, Val(Reuse)), N)
+end
+
+function _scheduled_store_job!(k, workers, index, args, shared, job, first_chunk, result)
+    chunk_size = k.schedule.chunk_size
+    first_range = _scheduled_first_range(job, chunk_size)
+    _scheduled_store!(result, first_chunk, first_range)
+    for low in last(first_range)+1:chunk_size:last(job)
+        range = low:min(last(job), low + chunk_size - 1)
+        chunk = _scheduled_chunk(k, workers, index, args, shared, range)
+        _scheduled_store!(result, chunk, range)
+    end
+    nothing
 end
 
 function _run_scheduled(k::_ScheduledBatchedKernel{Reuse,S,B,BT,PS,N},
                         args, count, workers, jobs, budget) where {Reuse,S,B,BT,PS,N}
     shared = _scheduled_shared(k, args, budget)
     chunk_size = k.schedule.chunk_size
+    if budget == 1
+        job = 1:count
+        first_chunk = _scheduled_chunk(k, workers, 1, args, shared,
+                                       _scheduled_first_range(job, chunk_size))
+        result = _scheduled_outputs(k, first_chunk, count, args)
+        _scheduled_store_job!(k, workers, 1, args, shared, job, first_chunk, result)
+        return N == 1 ? only(result) : result
+    end
     ranges = [fld((i - 1) * count, jobs) + 1:fld(i * count, jobs) for i in 1:jobs]
     # Every job's first chunk runs in its own task: computed on the calling
     # thread before any task started, the first job's chunk left the other
@@ -367,18 +384,10 @@ function _run_scheduled(k::_ScheduledBatchedKernel{Reuse,S,B,BT,PS,N},
         Threads.@spawn firsts[index] = _scheduled_chunk(k, workers, index, args, shared,
             _scheduled_first_range(ranges[index], chunk_size))
     end
-    result = ntuple(i -> _scheduled_output!(k.caches[i], firsts[1][i], count, args, Val(Reuse)), N)
+    result = _scheduled_outputs(k, firsts[1], count, args)
     @sync for index in 1:jobs
-        Threads.@spawn begin
-            job = ranges[index]
-            first_range = _scheduled_first_range(job, chunk_size)
-            _scheduled_store!(result, firsts[index], first_range)
-            for low in last(first_range)+1:chunk_size:last(job)
-                range = low:min(last(job), low + chunk_size - 1)
-                chunk = _scheduled_chunk(k, workers, index, args, shared, range)
-                _scheduled_store!(result, chunk, range)
-            end
-        end
+        Threads.@spawn _scheduled_store_job!(k, workers, index, args, shared,
+                                             ranges[index], firsts[index], result)
     end
     N == 1 ? only(result) : result
 end

@@ -143,9 +143,8 @@ end
     # and a body with plate programs prepares it where the cell work starts.
     # Each scheduled chunk is a function of its own, which read that prepared
     # argument as an unbound name: `UndefVarError: ##plate_prepared#k` whenever
-    # a reader with two or more workers entered the prefix. The suite runs on one thread, where a
-    # reader never enters the prefix, so the prefix is also called directly
-    # with each worker budget.
+    # a reader with two or more workers entered the prefix. Exercise each
+    # prefix budget directly as well, including on single-threaded test runs.
     @kernel scheduled_prefix_prepared(position, data, omega2, width) = begin
         weights = plate(data, omega2, width) do x, o, w
             o * exp(-0.5 * (w * x)^2)

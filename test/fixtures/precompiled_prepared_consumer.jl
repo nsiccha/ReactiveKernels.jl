@@ -58,8 +58,8 @@ const SERIAL_WARMUP = ONE_WORKER([2.0, 3.0], [4.0, 5.0])
 const TWO_WORKERS = scheduled(NativeScheduling(; chunk_size=2, workers=2))
 const SINGLE_WARMUP = TWO_WORKERS([2.0], [4.0])
 
-# This graph belongs exclusively to the staged workload. Its wide serial
-# driver can dispatch to the generated function even after driver precompilation.
+# This wide graph belongs exclusively to the staged workload. The trace
+# checks the worker and its generated function across several batch sizes.
 const STAGED_OFFSETS = ntuple(Float64, 80)
 const STAGED_SUM = let graph = Graph()
     ports = ntuple(i -> value!(graph, Symbol(:term, i), Float64), length(STAGED_OFFSETS) + 1)

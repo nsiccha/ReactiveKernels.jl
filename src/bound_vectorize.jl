@@ -1,10 +1,8 @@
 # Position batching of a rebound kernel (`vectorize(prepare(g; bound = …))`).
 #
-# `vectorize` lowers and compiles a position driver for its scalar kernel: the
-# owning `GraphReplicatedKernel`, and with `reuse=true` and a
-# `NativeScheduling` the borrowed driver, the shared prefix kernel and the
-# per-worker residual driver as well. That is several lowerings and
-# compilations of the whole graph per call, independent of the bound values
+# `vectorize` lowers the position driver for a scalar kernel. Scheduled readers
+# lower the shared prefix and the per-worker residual. Repeating these lowerings
+# for each design costs time independently of the bound values
 # (snag rebinding-a-comp-d03576ab: 400–440 ms and 134 MB of the 490–520 ms
 # needed to bind and vectorize each design of a large composed simulation
 # graph, 4.5–4.9 ms in all once kept). Every binding of one bound template (`_BoundTemplate`,
@@ -61,11 +59,10 @@ struct _RebindPrepared
     signature::Type
 end
 
-# A scheduled batch: its serial driver, its prefix and one empty residual
-# instance that every worker copies (it reads no constant).
+# A scheduled batch keeps its prefix and one empty residual instance that
+# every worker copies (it reads no constant).
 struct _RebindScheduled
     type::DataType   # the exact `_ScheduledBatchedKernel` type
-    serial::Union{_RebindReplicated,_RebindBorrowed}
     prefix::Union{Nothing,_RebindPrepared}
     residual::BorrowedBatchedKernel
 end
@@ -91,7 +88,7 @@ _holds_constant(@nospecialize(table), constants::Vector{Any}) =
 
 _vectorize(::Nothing, kernel::PreparedKernel, @nospecialize(batched), reuse::Bool,
            @nospecialize(schedule)) =
-    _position_schedule(replica_graph(kernel; batched), schedule, Val(reuse))
+    _position_schedule(kernel, batched, schedule, Val(reuse))
 
 function _vectorize(vectorizations::_BoundVectorizations,
                     @nospecialize(kernel::PreparedKernel), @nospecialize(batched),
@@ -151,15 +148,13 @@ end
 function _rebind_template(@nospecialize(product::_ScheduledBatchedKernel),
                           @nospecialize(kernel::PreparedKernel),
                           constants::_RebindConstants)
-    serial = _rebind_template(product.serial, kernel, constants)
-    serial === nothing && return nothing
     prefix = product.prefix === nothing ? nothing :
              _rebind_prefix(product.prefix, constants)
     product.prefix === nothing || prefix !== nothing || return nothing
     residual = first(product.workers)
     _holds_constant(residual.constants, constants.values) && return nothing
     _holds_constant(plan(residual).recipes, constants.recipes) && return nothing
-    _RebindScheduled(typeof(product), serial, prefix, copy(residual))
+    _RebindScheduled(typeof(product), prefix, copy(residual))
 end
 
 # --- rebuilding it around another binding's constants -----------------------
@@ -192,11 +187,10 @@ end
 
 function _rebound(kept::_RebindScheduled, @nospecialize(kernel::PreparedKernel),
                   constants::_RebindConstants, schedule::NativeScheduling)
-    serial = _rebound(kept.serial, kernel, constants, schedule)
     prefix = kept.prefix === nothing ? nothing :
              _rebound(kept.prefix, kernel, constants, schedule)
     caches = _borrowed_batch_caches(length(outputs(kernel)))
-    _kernel_new_instance(kept.type, (serial, prefix, _scheduled_workers(kept.residual, schedule),
+    _kernel_new_instance(kept.type, (kernel, prefix, _scheduled_workers(kept.residual, schedule),
                                      caches, schedule))
 end
 
