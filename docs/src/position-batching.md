@@ -65,14 +65,24 @@ Batching requires pure recipes. Hidden mutation or state carried from one positi
 
 The [bound-regression example](bound-regression.md) develops the same input and output selection without a batch axis.
 
+## Scheduling and inspecting a reader
+
+A scheduled reader computes the shared part of the graph once, then evaluates
+each chunk with the same worker. A batch that fits in one chunk runs on the
+calling task. With `workers=1`, that task runs every chunk in order. Switching
+batch sizes reuses the compiled worker for the same input types.
+
+`code_expr(reader)` returns a named tuple for a scheduled reader. Its
+`.prefix` field holds the generated expression for the shared computation,
+or `nothing` when there is none. Its `.worker` field holds the generated
+expression that evaluates each chunk.
+
 ## Warming scheduled reads in a package image
 
 Call the scheduled reader with representative inputs in the consuming package's
 precompile workload. For example, a read with two positions and
 `NativeScheduling(; chunk_size=8)` runs the shared prefix and gives one
 position to each of two worker tasks, even on a single-threaded image builder.
-The same call precompiles the serial driver and its generated function for
-the input types it receives. After loading, a batch that fits in one chunk
-can use this code even if the workload ran every batch on worker tasks.
-An explicit `workers=1` warms the serial driver. Empty batches also follow
-the serial path.
+After loading, a one-chunk batch uses the same worker inline. An explicit
+`workers=1` warms the inline call. Empty batches construct their results
+from the declared output types.

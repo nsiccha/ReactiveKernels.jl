@@ -6100,8 +6100,11 @@ workers=...)` explicitly opts in. The scheduler computes shared-only work once,
 then distributes runtime position ranges among independent borrowed workers.
 Each worker retains at most `chunk_size` positions and copies completed chunks
 into the final stacked result. The result still spans the whole batch. Hints
-are caller-selected: there is no automatic cost threshold. Empty batches and
-one-worker calls use the ordinary serial driver. Scheduled instances, including
+are caller-selected: there is no automatic cost threshold. One job runs on
+the calling task. Empty batches use the declared output types. For a scheduled
+reader, `code_expr(reader)` returns `(; prefix, worker)`, the generated Julia
+expressions. The prefix is `nothing` when there is no shared computation.
+Scheduled instances, including
 owning ones, retain worker buffers and are not reentrant; use `copy(template)`
 per concurrent caller. Copies share computation and start with empty buffers.
 Scheduling applies to native primal evaluation; prepare scalar AD with `scalar_kernel` and

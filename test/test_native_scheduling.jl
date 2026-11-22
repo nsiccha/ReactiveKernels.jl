@@ -52,8 +52,11 @@ end
     @test inputs(scheduled) == inputs(serial)
     @test outputs(scheduled) == outputs(serial)
     @test batched_ports(scheduled) == (:position,)
-    @test scalar_kernel(scheduled) === scalar_kernel(_scheduled_raw(scheduled).serial)
-    @test code_expr(scheduled) === code_expr(_scheduled_raw(scheduled).serial)
+    raw = _scheduled_raw(scheduled)
+    @test scalar_kernel(scheduled) === raw.scalar
+    @test plan(raw) === raw.scalar.plan
+    @test code_expr(scheduled) === (; prefix=code_expr(raw.prefix),
+                                      worker=code_expr(first(raw.workers)))
     @test length(_scheduled_raw(scheduled).workers) == min(4, Threads.nthreads())
     for n in (1, 7, 19, 32), m in (0, 1, 13)
         positions = (; initial=collect(1.0:n), rate=fill(0.25, n),
@@ -94,6 +97,7 @@ end
         result::Float64 = x * x
     end
     empty_batch = vectorize(scheduled_empty; batched=:x, schedule)
+    @test code_expr(empty_batch).prefix === nothing
     @test empty_batch(Float64[]) == Float64[]
     @test empty_batch([2.0]) == [4.0]
 end
@@ -108,7 +112,7 @@ end
     for reuse in (false, true)
         raw = _scheduled_raw(vectorize(scheduled_response; batched=:position, schedule, reuse))
         name = string(typeof(raw))
-        @test !occursin(string(typeof(raw.serial)), name)
+        @test !occursin(string(typeof(raw.scalar)), name)
         @test !occursin(string(typeof(raw.prefix)), name)
         @test !occursin(string(typeof(first(raw.workers))), name)
         @test raw.workers isa Vector{Any}
@@ -171,7 +175,6 @@ end
         @test r.workers !== raw.workers
         @test all(isnothing(slot[]) for worker in r.workers for slot in worker.caches)
         @test all(isnothing(slot[]) for slot in r.caches)
-        @test all(isnothing(slot[]) for slot in r.serial.caches)
         @test all(r.workers[i].native === raw.workers[i].native for i in eachindex(r.workers))
     end
     results = fetch.([Threads.@spawn reader(positions; offset=Float64(i))
@@ -210,6 +213,31 @@ end
     @test response(records, [0.0, 1.0]) == response(trees, [0.0, 1.0])
 end
 
+_scheduled_task_probe(x, caller) = current_task() === caller ? x : -x
+
+@testset "one scheduled job uses the same worker on the calling task" begin
+    @kernel scheduled_inline(x::Int, caller) = begin
+        result::Int = _scheduled_task_probe(x, caller)
+    end
+    for workers in (1, 4), reuse in (false, true)
+        reader = vectorize(scheduled_inline; batched=:x, reuse,
+                           schedule=NativeScheduling(; chunk_size=2, workers))
+        raw = _scheduled_raw(reader)
+        worker = first(raw.workers)
+        caller = current_task()
+        @test reader(Int[], caller) == Int[]
+        @test all(slot -> isnothing(slot[]), worker.caches)
+        @test reader([1, 2], caller) == [1, 2]
+        @test worker.caches[1][] == [1, 2]
+        values = collect(1:18)
+        expected = min(workers, Threads.nthreads()) == 1 ? values : -values
+        @test reader(values, caller) == expected
+        @test length(worker.caches[1][]) <= 2
+        @test reader([3], caller) == [3]
+        @test worker.caches[1][] == [3]
+    end
+end
+
 @testset "scheduled lazy branches, task joins and scalar AD authority" begin
     schedule = NativeScheduling(chunk_size=2, workers=4)
     @kernel scheduled_lazy(x::Float64) = begin
@@ -231,6 +259,7 @@ end
     good = collect(1:19)
     data = collect(1.0:19)
     @test lookup(good, data) == data
+    @test_throws BoundsError lookup([0], data)
     # A call with several jobs runs every chunk in a task, the first job's
     # first chunk included, so any failing chunk reaches the caller after the
     # join, inside a CompositeException.

@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.362
+
+- Scheduled reads use the same compiled worker for small and large batches.
+  A single job runs on the calling task, including with `workers=1`.
+  **Breaking:** `code_expr(reader)` for a scheduled reader returns a named
+  tuple. Use `.worker` to inspect the generated chunk expression and
+  `.prefix` for the shared expression (`nothing` when absent).
+
 ## 0.1.361
 
 - `jax_source` translates the reduced factors `F.R` and `Matrix(F.Q)` of

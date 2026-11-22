@@ -88,8 +88,8 @@ using ReactiveKernels, Test
                                     stdout = stdout, stderr = stderr))
         @test setup_ok
         setup_ok || return
-        # A small stage takes the serial path after load. A larger one uses
-        # workers. A new input type is a positive control for the trace.
+        # Small and large stages call the same worker after load. A new
+        # input type is a positive control for the trace.
         if Base.JLOptions().use_pkgimages != 0 && Base.JLOptions().code_coverage == 0
             staged = """
                 using PrecompiledPreparedConsumer
@@ -137,11 +137,10 @@ using ReactiveKernels, Test
             const RK = ReactiveKernels
             const D = ImportedPreparedConsumer
             # In the one-thread image, two positions fill one ordinary chunk.
-            # Only a scheduled execution publishes into the scheduler's cache.
             raw(r) = r isa RK._KernelSignatureCallable ? r.target : r
             @test C.SCHEDULED_WARMUP == C.SERIAL_WARMUP == [32.0 48.0; 50.0 75.0]
             @test only(raw(C.SCHEDULED).caches)[] === C.SCHEDULED_WARMUP
-            @test only(raw(C.ONE_WORKER).caches)[] === nothing
+            @test only(raw(C.ONE_WORKER).caches)[] === C.SERIAL_WARMUP
             @test only(raw(C.TWO_WORKERS).caches)[] === C.SINGLE_WARMUP
             @test C.SINGLE_WARMUP == fill(32.0, 1, 1)
             @test length(raw(C.SCHEDULED).workers) == 1
@@ -155,12 +154,12 @@ using ReactiveKernels, Test
                 result = reader(draws, data)
                 @test result == abs2.(data) .* transpose(draws)
                 @test length(raw(reader).workers) == Threads.nthreads()
-                @test all(w -> any(slot -> slot[] !== nothing, w.caches) == (Threads.nthreads() > 1),
-                          raw(reader).workers)
+                @test all(w -> any(slot -> slot[] !== nothing, w.caches), raw(reader).workers)
                 @test reader(draws .+ 1, data) === result
             end
-            @test C.ONE_WORKER(draws, data) == abs2.(data) .* transpose(draws)
-            @test only(raw(C.ONE_WORKER).caches)[] === nothing
+            inline_result = C.ONE_WORKER(draws, data)
+            @test inline_result == abs2.(data) .* transpose(draws)
+            @test only(raw(C.ONE_WORKER).caches)[] === inline_result
             @test C.TWO_WORKERS(draws, data) == abs2.(data) .* transpose(draws)
             @test length(raw(C.TWO_WORKERS).workers) == min(2, Threads.nthreads())
             here = RK._VALUE_NAMESPACE[]
