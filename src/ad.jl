@@ -2378,7 +2378,10 @@ function _prepare_ad_operator(op::Val{O}, kernel::_ADKernel, resolver,
     values = _uninferred_values(kernel, map(Core.Typeof, resolved))
     # Each generated plate rule the program installs leaves its site record
     # with this preparation, which reads it below (`_pr_verified_preparation`).
+    # A marked call's refusal is recorded in `refused` while this preparation
+    # evaluates the operator.
     marks = _PlateRuleMark[]
+    refused = Ref(false)
     call, point, contexts, active_selector, external_values = _pr_collecting_marks(marks) do
         _ad_call(kernel, resolved, active; scalar_output = _ad_operator_scalar_output(op),
                  retain, _ad_operator_seeding(op, seeds, backend)...)
@@ -2389,8 +2392,9 @@ function _prepare_ad_operator(op::Val{O}, kernel::_ADKernel, resolver,
         _level_code_findings(_type_stability_level(), call,
                              _ad_call_argument_types(point, contexts)),
         _type_stability())
-    preparation = _ad_operator_preparation(
-        op, call, backend, point, seeds, contexts)
+    preparation = _pr_recording_refusals(refused) do
+        _ad_operator_preparation(op, call, backend, point, seeds, contexts)
+    end
     position = _ad_plan_position(kernel)
     position === nothing ||
         (resolver = _ADPlanBoxing{position,typeof(resolver)}(resolver))
@@ -2400,8 +2404,10 @@ function _prepare_ad_operator(op::Val{O}, kernel::_ADKernel, resolver,
         active_selector,typeof(kernel),typeof(resolver),typeof(call),
         typeof(backend),typeof(preparation),typeof(external_values),O,typeof(storage),
     }, (kernel, resolver, call, backend, preparation, external_values, storage))::PreparedADOperator
-    evaluated = _ad_check_derivative(op, prepared, point, seeds, contexts, warm)
-    _pr_verified_preparation(op, prepared, point, seeds, contexts, evaluated, marks) do
+    evaluated = _pr_recording_refusals(refused) do
+        _ad_check_derivative(op, prepared, point, seeds, contexts, warm)
+    end
+    _pr_verified_preparation(op, prepared, point, seeds, contexts, evaluated, marks, refused) do
         with_plate_reverse(false) do
             _prepare_ad_operator(op, kernel, requested_resolver, requested, seeds, args,
                                  kwargs, active; retain, warm)

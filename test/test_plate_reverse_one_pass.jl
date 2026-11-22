@@ -630,19 +630,25 @@ end
     slot.declined = true
     @test verified(true) === :ordinary
     @test verified(false, (DI.Constant(1.0),)) === :prepared
-    # A program without AD caches leaves a mark per rule call instead.
-    mark = RK._PlateRuleMark(false)
+    # A program without AD caches marks each rule call instead, and a refusal
+    # is recorded for the preparation while it evaluates.
+    refused = Ref(false)
     marked(evaluated) = RK._pr_verified_preparation(
         () -> :ordinary, Val(:gradient), :prepared, nothing, (), (DI.Constant(1.0),),
-        evaluated, [mark])
+        evaluated, [RK._PlateRuleMark()], refused)
     @test marked(true) === :prepared
-    mark.declined = true
+    refused[] = true
     @test marked(true) === :ordinary
+    # Without a marked call there is nothing to check.
+    @test RK._pr_verified_preparation(() -> :ordinary, Val(:gradient), :prepared, nothing, (),
+        (DI.Constant(1.0),), true, RK._PlateRuleMark[], refused) === :prepared
 end
 
 # A mark is the site record of a rule call in a program without AD caches. It
-# selects no schedule that needs an owned tape, and the adapter sets it when
-# the backend annotates the call in a way the rule does not cover.
+# selects no schedule that needs an owned tape and holds no state: every
+# preparation of a program runs the same compiled code. When the backend
+# annotates the call in a way the rule does not cover, the adapter records
+# that for the preparation that is evaluating, each time.
 gathered_call(rule, z, index, s, site) = rule(view(z, index), s, site)
 @testset "a rule call without a tape slot records the backend's refusal" begin
     ast = program([:(s * v1)])
@@ -654,7 +660,7 @@ gathered_call(rule, z, index, s, site) = rule(view(z, index), s, site)
     joint = RK._PlateSumRule{(2,),(1,),typeof(primal),typeof(both),true}(primal, both)
     z = [0.3cos(i) for i in 1:7]
     index = [mod1(3i, 7) for i in 1:600]
-    mark = RK._PlateRuleMark(false)
+    mark = RK._PlateRuleMark()
     @test RK._pr_rule_target(covered, (view(z, index), 0.6, mark)) isa
         RK._PlateSumRuleOnePass{(2,),(1,),typeof(covered),true}
     # Shared cell work pays for a tape only in owned storage.
@@ -662,16 +668,33 @@ gathered_call(rule, z, index, s, site) = rule(view(z, index), s, site)
     @test RK._pr_rule_target(joint, ([0.2, -0.3], 0.6, RK._PlateTapeSlot())) isa
         RK._PlateSumRuleOnePass
     expected_z = [0.6count(==(j), index) for j in 1:7]
-    for (rule, refused) in ((covered, false), (partial, true))
-        site = RK._PlateRuleMark(false)
+    differentiate(rule, dz) = Enzyme.autodiff(Enzyme.ReverseWithPrimal, gathered_call,
+        Enzyme.Active, Enzyme.Const(rule), Enzyme.Duplicated(z, dz), Enzyme.Const(index),
+        Enzyme.Active(0.6), Enzyme.Const(RK._PlateRuleMark()))
+    # Two preparations in turn: the second runs the code the first compiled,
+    # and has its own record.
+    for (rule, refused) in ((covered, false), (partial, true)), preparation in 1:2
+        record = Ref(false)
         dz = zero(z)
-        derivatives, value = Enzyme.autodiff(Enzyme.ReverseWithPrimal, gathered_call,
-            Enzyme.Active, Enzyme.Const(rule), Enzyme.Duplicated(z, dz), Enzyme.Const(index),
-            Enzyme.Active(0.6), Enzyme.Const(site))
+        derivatives, value = RK._pr_recording_refusals(() -> differentiate(rule, dz), record)
         @test value ≈ 0.6sum(z[index])
         @test dz ≈ expected_z
         @test derivatives[4] ≈ sum(z[index])
-        @test site.declined == refused
+        @test record[] == refused
     end
+    # A preparation inside another's evaluation records for itself.
+    outer, inner = Ref(false), Ref(false)
+    RK._pr_recording_refusals(outer) do
+        RK._pr_recording_refusals(() -> differentiate(partial, zero(z)), inner)
+        @test inner[] && !outer[]
+        differentiate(covered, zero(z))
+        @test !outer[]
+        differentiate(partial, zero(z))
+    end
+    @test outer[]
+    # Outside a preparation the general path still gives the gradient.
+    dz = zero(z)
+    derivatives, value = differentiate(partial, dz)
+    @test value ≈ 0.6sum(z[index]) && dz ≈ expected_z && derivatives[4] ≈ sum(z[index])
 end
 end

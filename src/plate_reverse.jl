@@ -3075,31 +3075,44 @@ end
 @inline _pr_mark_declined!(slot::_PlateTapeSlot) = (slot.declined = true; nothing)
 @inline _pr_mark_declined!(::Nothing) = nothing
 
-# The record of one rule call site in a program that owns no AD caches (an
-# allocating kernel's): only whether the backend's adapter refused the call.
-# The program holds it as a literal and passes it as the call's last operand,
-# where a non-allocating program passes its tape slot. It leases no tape: the
-# compiled program may be shared, so each call allocates its own, and setting
-# the flag is the only write (to `true`, from any caller).
-mutable struct _PlateRuleMark
-    declined::Bool
-end
+# The mark of one rule call site in a program that owns no AD caches (an
+# allocating kernel's). The program passes it as the call's last operand,
+# where a non-allocating program passes its tape slot: it says that a
+# preparation checks the call, and it leases no tape, so each call allocates
+# its own. It holds no state. A program is compiled once for its content and
+# every preparation of it runs that code, so nothing the program holds as a
+# literal can belong to one preparation; a refused call is recorded for the
+# preparation that is evaluating instead (`_pr_recording_refusals`).
+struct _PlateRuleMark end
 # The trailing operand of a rule call that is no operand of its program.
 const _PlateRuleSite = Union{_PlateTapeSlot,_PlateRuleMark}
-@inline _pr_mark_declined!(mark::_PlateRuleMark) = (mark.declined = true; nothing)
 
-# The marks of the preparation in progress. `_prepare_ad_operator` collects
-# them while it builds the differentiated program and reads them after one
-# evaluation (`_pr_verified_preparation`). Outside such a preparation there is
+# Whether the backend's adapter refused a marked rule call while `f` ran, in
+# this task: `refused` is set by each such call. A preparation runs its own
+# evaluations this way (`_prepare_ad_operator`, `_pr_verified_preparation`).
+# Outside one a refusal is recorded nowhere.
+const _PR_REFUSAL_SCOPE = :ReactiveKernels_plate_reverse_refusal
+_pr_recording_refusals(f, refused::Base.RefValue{Bool}) =
+    task_local_storage(f, _PR_REFUSAL_SCOPE, refused)
+function _pr_mark_declined!(::_PlateRuleMark)
+    refused = get(task_local_storage(), _PR_REFUSAL_SCOPE, nothing)
+    refused === nothing || ((refused::Base.RefValue{Bool})[] = true)
+    nothing
+end
+
+# The marks of the preparation in progress: one per rule call its program
+# makes without a tape slot. `_prepare_ad_operator` collects them while it
+# builds the differentiated program, so it knows whether there is such a call
+# to check (`_pr_verified_preparation`). Outside such a preparation there is
 # no collector, and no rule is installed: a rule call exists only where a
 # preparation verifies it.
 const _PR_MARKS_SCOPE = :ReactiveKernels_plate_reverse_marks
 _pr_marks() = get(task_local_storage(), _PR_MARKS_SCOPE, nothing)::Union{Nothing,Vector{_PlateRuleMark}}
 _pr_collecting_marks(f, marks::Vector{_PlateRuleMark}) =
     task_local_storage(f, _PR_MARKS_SCOPE, marks)
-# A fresh mark for one rule call, known to the preparation in progress.
+# The mark of one rule call, counted by the preparation in progress.
 function _pr_rule_mark!(marks::Vector{_PlateRuleMark})
-    mark = _PlateRuleMark(false)
+    mark = _PlateRuleMark()
     push!(marks, mark)
     mark
 end
@@ -3127,11 +3140,14 @@ _pr_tape_slots!(found::Vector{_PlateTapeSlot}, value) = found
 # plate, so `ordinary()` then prepares the operator again with the plates
 # inline, exactly as without the generated reverse. `evaluated` says the
 # preparation already ran the operator once (`warm`, or the derivative check).
-# Every rule call has a site record: a tape slot among the contexts, or one of
-# `marks` in a program that owns no AD caches.
+# Every rule call has a site record. A tape slot among the contexts keeps its
+# own refusal. A program that owns no AD caches marks its calls (`marks`), and
+# their refusals are recorded in `refused` while this preparation evaluates
+# (`_pr_recording_refusals`): the caller runs its own evaluations that way.
 function _pr_verified_preparation(ordinary, op::Val, prepared, point, seeds, contexts,
                                   evaluated::Bool,
-                                  marks::Vector{_PlateRuleMark} = _PlateRuleMark[])
+                                  marks::Vector{_PlateRuleMark} = _PlateRuleMark[],
+                                  refused::Base.RefValue{Bool} = Ref(false))
     slots = _pr_tape_slots!(_PlateTapeSlot[], contexts)
     isempty(slots) && isempty(marks) && return prepared
     if !evaluated
@@ -3140,15 +3156,16 @@ function _pr_verified_preparation(ordinary, op::Val, prepared, point, seeds, con
         # outside the codegen lock a first call would hold (`_ad_warm!`).
         Base.code_typed(f, Tuple{map(Core.Typeof, args)...})
         try
-            Base.invokelatest(f, args...)
+            _pr_recording_refusals(refused) do
+                Base.invokelatest(f, args...)
+            end
         catch err
             err isa InterruptException && rethrow()
             # The program throws at its exemplar, as it will for the caller:
             # there is nothing to verify at this point.
         end
     end
-    any(slot -> slot.declined, slots) || any(mark -> mark.declined, marks) ?
-        ordinary() : prepared
+    any(slot -> slot.declined, slots) || refused[] ? ordinary() : prepared
 end
 @inline function _pr_take_tape!(slot::_PlateTapeSlot, n::Int)
     tape = slot.tape

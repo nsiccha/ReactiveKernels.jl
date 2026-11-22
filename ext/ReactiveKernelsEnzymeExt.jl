@@ -982,9 +982,10 @@ end
 # backend sees the call (`_pr_target_expr`). Only the backend knows how it
 # annotates each operand. A call it annotates in a way the tape does not cover
 # (an operand it treats as active that the rule does not differentiate, a
-# batched reverse) runs the program, takes the general path below and marks
-# its tape slot. A preparation reads that mark after one evaluation at its
-# exemplar and then prepares the plates inline (`_pr_verified_preparation`).
+# batched reverse) runs the program, takes the general path below and records
+# the refusal: in the call's tape slot, or for the preparation that is
+# evaluating a marked call. A preparation reads that after one evaluation at
+# its exemplar and then prepares the plates inline (`_pr_verified_preparation`).
 using ReactiveKernels: _PlateSumRuleOnePass, _pr_gather_value,
     _pr_scalar_positions, _pr_batched_positions, _pr_tape_layout, _CellArray, _PlateTapeSlot,
     _pr_take_tape!, _pr_return_tape!, _pr_projections, _pr_ragged_buffer, _PRRaggedBuffer,

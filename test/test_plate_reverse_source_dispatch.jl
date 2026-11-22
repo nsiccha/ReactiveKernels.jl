@@ -57,7 +57,23 @@ end
             body = RK._pr_collecting_marks(marks) do
                 with_plate_reverse(() -> RK._ad_inline_plate_programs(k, (2,)).ast, true)
             end
-            @test length(marks) == 1 && !only(marks).declined
+            @test length(marks) == 1
+            # A second preparation of the kernel runs the same compiled
+            # program, so the program holds nothing of one preparation: its
+            # mark has no state.
+            again = RK._pr_collecting_marks(RK._PlateRuleMark[]) do
+                with_plate_reverse(() -> RK._ad_inline_plate_programs(k, (2,)), true)
+            end
+            first_program = RK._pr_collecting_marks(RK._PlateRuleMark[]) do
+                with_plate_reverse(() -> RK._ad_inline_plate_programs(k, (2,)), true)
+            end
+            @test typeof(again.f) === typeof(first_program.f)
+            sites = Any[]
+            RK._index_run_visit(again.ast) do ex
+                Meta.isexpr(ex, :call) && ex.args[1] isa RK._PlateSumRule && push!(sites, ex.args[end])
+            end
+            @test sites == [RK._PlateRuleMark()]
+            @test Base.issingletontype(RK._PlateRuleMark)
             # Outside a preparation the plates stay inline.
             inline = with_plate_reverse(() -> RK._ad_inline_plate_programs(k, (2,)).ast, true)
             unverified = Ref(0)
