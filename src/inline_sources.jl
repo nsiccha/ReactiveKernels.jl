@@ -138,10 +138,12 @@ function _inline_source_form(r::Recipe, callargs, slot::Int)
     # that method returns a matrix. Either end of a real-valued recipe
     # therefore identifies the scalar call, including a composed endpoint
     # whose local input has lost its type but whose output is still typed.
+    # The scalar call is `_native_scalar_exp`, which the passes that read
+    # this statement know as `exp` of a number.
     if Meta.isexpr(native, :call, 2) && native.args[1] == GlobalRef(@__MODULE__, :_native_exp) &&
             length(params) == 1 && native.args[2] === only(params) &&
             (valtype(only(r.inputs)) <: Real || length(r.outputs) == 1 && valtype(only(r.outputs)) <: Real)
-        native = Expr(:call, GlobalRef(Base, :exp), only(params))
+        native = Expr(:call, GlobalRef(@__MODULE__, :_native_scalar_exp), only(params))
     end
     _kernel_source_native_scope(native) && return nothing
     body = try

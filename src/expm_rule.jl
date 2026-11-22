@@ -19,6 +19,14 @@ using LinearAlgebra: exp
 
 @inline _native_exp(args...) = exp(args...)
 @inline _native_exp(A::Matrix{Float64}) = rk_expm(A)
+# Julia compiles `exp` of a machine float as a call, and a call in a summed
+# plate's `@simd` loop keeps the whole loop scalar. `_native_scalar_exp` is the
+# scalar exponential with Base's method inlined at its call, so that loop
+# vectorizes; a native program's float `exp` is that call. Enzyme's compiler
+# keeps `exp` a call whatever the call site requests, so ordinary reverse
+# still applies Enzyme's own rule for it.
+@inline _native_scalar_exp(x) = @inline exp(x)
+@inline _native_exp(x::Union{Float32,Float64}) = _native_scalar_exp(x)
 
 # Both derivative branches are one augmented-matrix exponential plus
 # top-right-block extraction: the JVP is the Frechet derivative

@@ -3947,7 +3947,7 @@ const _JAX_ELEMENTWISE = Dict{Any,String}(
     LogExpFunctions.log1mexp => "_rk_log1mexp",
     LogExpFunctions.loglogistic => "jax.nn.log_sigmoid",
     LogExpFunctions.log1mlogistic => "_rk_log1mlogistic",
-    _native_exp => "jnp.exp",
+    _native_exp => "jnp.exp", _native_scalar_exp => "jnp.exp",
     sinpi => "_rk_sinpi", cospi => "_rk_cospi",
 )
 # LogExpFunctions functions that only some of its supported versions define.
