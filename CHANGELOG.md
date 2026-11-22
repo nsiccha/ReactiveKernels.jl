@@ -18,14 +18,14 @@ are recorded in the git history only.
 
 ## 0.1.367
 
-- `rk_ode_rk45_tol` and `rk_ode_bdf_tol` prepare without a type-stability
-  finding at the default `type_stability_level = :all`, so
-  `type_stability = :error` no longer refuses a program that calls them. The
-  adapter passes each algorithm's default step-size controller unresolved
-  (DP5's `PIController`, FBDF's `BDFController`); the solver resolves it to the
-  same settings, so every step and result is unchanged. Left to its default,
-  OrdinaryDiffEqCore had resolved the controller against an untyped placeholder
-  list in `_ode_init`.
+- Preparing a program that calls `rk_ode_rk45_tol` reports no type-stability
+  finding in the solver's code at the default `type_stability_level = :all`,
+  so `prepare` with `type_stability = :error` no longer refuses it. The
+  adapter passes DP5's default step-size controller unresolved, and the
+  solver resolves it to the same settings, so every step and result is
+  unchanged. Left to its default, OrdinaryDiffEqCore had resolved the
+  controller against an untyped placeholder list in `_ode_init`.
+  `rk_ode_bdf_tol` is unchanged.
 
 ## 0.1.366
 

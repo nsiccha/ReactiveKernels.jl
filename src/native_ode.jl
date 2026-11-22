@@ -131,8 +131,9 @@ function _native_ode_tol end
 function _native_ode_steps_to_outputs end
 
 # The step-size controller the adapter passes with an entry's algorithm: that
-# algorithm's own default, unresolved. Each solver extension defines it for its
-# algorithm; the SciML extension explains why.
+# algorithm's own default controller, unresolved, or `nothing` for the solver's
+# default. Each solver extension defines it for its algorithm; the SciML
+# extension explains why.
 function _native_ode_controller end
 
 # Without its solver package an entry's call throws, naming what to load (a
