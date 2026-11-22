@@ -227,11 +227,9 @@ function _density_coordinates(s::_DensitySite, plan, layout)
     _density_coordinates(e, s.count, plan)
 end
 
-# A hash of every element of a binding's data, recursively: equal for data that
-# is `isequal`, and different, but for a 64-bit collision, after any in-place
-# change of an entry. Julia's own `hash` of a large array reads only some of its
-# elements, so it cannot detect every change.
-_binding_fingerprint(x) = _fingerprint(x, UInt(0x9d46c6de), IdDict{Any,Nothing}())
+# Read every entry: Julia's own `hash` samples large arrays. Each traversal
+# gets a fresh identity table for visited records and categorical pool hashes.
+_binding_fingerprint(x) = _fingerprint(x, UInt(0x9d46c6de), IdDict{Any,UInt}())
 _fingerprint(x::Union{Number,AbstractString,Symbol,Nothing,Missing,Type}, h::UInt, _) = hash(x, h)
 function _fingerprint(x::AbstractArray, h::UInt, seen)
     h = hash(typeof(x), hash(size(x), h))
@@ -262,7 +260,7 @@ function _fingerprint(x, h::UInt, seen)
     # identity, not its fields again.
     if ismutable(x)
         haskey(seen, x) && return hash(objectid(x), h)
-        seen[x] = nothing
+        seen[x] = 0
     end
     for i in 1:nfields(x)
         h = isdefined(x, i) ? _fingerprint(getfield(x, i), h, seen) : hash(i, h)
