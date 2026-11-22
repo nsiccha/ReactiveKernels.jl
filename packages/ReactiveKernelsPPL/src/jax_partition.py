@@ -27,7 +27,9 @@ def prepare_partition(prepared, partition_data):
         owners = np.asarray(source, dtype=np.int64)
         if owners.ndim != 1 or np.any((owners < 0) | (owners > len(labels) + 1)):
             raise ValueError("invalid partition ownership vector")
-        shape = jax.eval_shape(lambda u: fn(u, **prepared), point).shape
+        # Selected reads never run the event's checks of the data: run them
+        # once here, over all of its cells.
+        shape = _rk_check_event_data(fn, point, prepared).out_avals[0].shape
         if owners.size != int(np.prod(shape, dtype=np.int64)):
             raise ValueError("ownership length does not match event shape at " + fn.__name__)
         shared = np.flatnonzero(owners == 1)

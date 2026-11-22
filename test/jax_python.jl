@@ -5,7 +5,12 @@
 #     python -m venv jaxenv && jaxenv/bin/pip install "jax[cpu]"
 #     RK_JAX_PYTHON=$PWD/jaxenv/bin/python julia --project=. test/test_jax_source.jl
 
-const RK_JAX_PYTHON = get(ENV, "RK_JAX_PYTHON", "")
+#
+# The variable is a path or a command name on `PATH` (`kb-jax-python`), which
+# is resolved to its path: a name that resolves to no file skips the checks.
+const RK_JAX_PYTHON = let python = get(ENV, "RK_JAX_PYTHON", "")
+    isempty(python) ? python : something(Sys.which(python), python)
+end
 rk_jax_available() = !isempty(RK_JAX_PYTHON) && isfile(RK_JAX_PYTHON)
 
 # A ragged input (one vector per group) crosses as its padded array and
