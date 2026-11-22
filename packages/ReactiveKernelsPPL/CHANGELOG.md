@@ -16,6 +16,13 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.255
+
+Density-factor selections can be reused by `prepare_query` and partitioned
+`jax_source` when a new binding reconstructs the same categorical data in a
+fresh pool. The binding check includes all entries, declared levels in order,
+ordered status, array type and shape.
+
 ## 0.1.254
 
 - **Breaking:** the fused GLM statements `y ~ NormalIDGLM(X, alpha, beta,
