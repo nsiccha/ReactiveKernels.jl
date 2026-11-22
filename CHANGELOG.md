@@ -25,15 +25,15 @@ are recorded in the git history only.
   - A likelihood that a data-bound branch partitions (a count likelihood's
     zero and positive rows) reads its group effects through a composed
     gather. Each part now takes the grouped one pass with one buffer entry
-    per group. A grouped Poisson gradient took 0.60 of ordinary Enzyme's time
-    and 1.06 of a hand-written gradient's; before, the rule did not engage.
+    per group. A grouped Poisson gradient took 0.59 of ordinary Enzyme's time
+    and 1.08 of a hand-written gradient's; before, the rule did not engage.
   - Several gathered operands, such as two crossed grouping factors, keep
     ordinary arithmetic under one range check. Before, every cell took the
-    separate-exponent quotient: 9.9 times ordinary Enzyme on a crossed
-    Gaussian model, now 0.67.
+    separate-exponent quotient: ten times ordinary Enzyme on a crossed
+    Gaussian model, now 0.68.
   - Quotient partials use plain arithmetic while their products stay in the
     normal range, with the same bits, and the separate-exponent form outside
-    it. A grouped negative-binomial gradient went from 1.11 to 0.78 of
+    it. A grouped negative-binomial gradient went from 1.09 to 0.80 of
     ordinary Enzyme.
   - A cell that selects with `ifelse` on a predicate over active values is
     differentiated. Before, the plate was refused.
@@ -42,7 +42,7 @@ are recorded in the git history only.
     `Float64` range. Before, any value outside 2⁻⁴⁰ to 2⁴⁰ selected the
     separate-exponent sweep. A grouped Gaussian whose response and scale are
     multiplied by 10¹³ or 10⁻¹³ now takes the time it takes at unit scale
-    (0.97 and 1.17 µs against 0.98) instead of 9 µs.
+    (1.08 and 0.97 µs against 1.00) instead of 38 µs.
   - The program chooses the schedule from operand types and sizes before the
     backend sees the call, and the one-pass reverse no longer depends on
     operands staying unchanged after the primal. Every prepared operator
