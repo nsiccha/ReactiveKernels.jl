@@ -16,6 +16,17 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.368
+
+- Preparing a program that calls `rk_ode_rk45_tol` reports no type-stability
+  finding in the solver's code at the default `type_stability_level = :all`,
+  so `prepare` with `type_stability = :error` no longer refuses it. The
+  adapter passes DP5's default step-size controller unresolved, and the
+  solver resolves it to the same settings, so every step and result is
+  unchanged. Left to its default, OrdinaryDiffEqCore had resolved the
+  controller against an untyped placeholder list in `_ode_init`.
+  `rk_ode_bdf_tol` is unchanged.
+
 ## 0.1.367
 
 - A `float_type = Float32` JAX module solves `rk_ode_rk45_tol` and

@@ -1,6 +1,7 @@
 module ReactiveKernelsSciMLODEExt
 
-import ReactiveKernels: _native_ode_tol, _native_ode_steps_to_outputs, ODESolveFailure
+import ReactiveKernels: _native_ode_tol, _native_ode_steps_to_outputs,
+    _native_ode_controller, ODESolveFailure
 using SciMLBase
 using SciMLSensitivity: ForwardDiffSensitivity
 
@@ -35,7 +36,7 @@ SciMLBase.allows_arbitrary_number_types(budget::OutputBudget) =
 
 function SciMLBase.__solve(prob::ODEProblem, budget::OutputBudget; kwargs...)
     stops = _native_ode_steps_to_outputs(budget.alg) ? budget.times : ()
-    integrator = SciMLBase.__init(prob, budget.alg; tstops = stops, kwargs...)
+    integrator = SciMLBase.__init(prob, budget; tstops = stops, kwargs...)
     for output in budget.times
         previous = integrator.stats.naccept
         while integrator.t < output
@@ -50,8 +51,19 @@ function SciMLBase.__solve(prob::ODEProblem, budget::OutputBudget; kwargs...)
     solve!(integrator)
     integrator.sol
 end
+# The entry's step-size controller (`_native_ode_controller`). DP5's is its
+# default controller passed unresolved, so the solver resolves it once, as it
+# sets up the integrator, against the concretely typed list of discontinuity
+# problems it builds there. Its `default_controller` would resolve the same
+# controller first against an untyped placeholder list (`IntervalNonlinearProblem[]`,
+# OrdinaryDiffEqCore 4.10 to at least 4.20), then replace it: no step changes,
+# but the placeholder made every preparation at the default
+# `type_stability_level = :all` report OrdinaryDiffEqCore's `_ode_init`, and
+# `type_stability = :error` refuse it (snag preparing-the-de-e74275a6). FBDF
+# keeps the solver's default; its extension says why.
 SciMLBase.__init(prob::ODEProblem, budget::OutputBudget; kwargs...) =
-    SciMLBase.__init(prob, budget.alg; kwargs...)
+    SciMLBase.__init(prob, budget.alg; controller = _native_ode_controller(budget.alg),
+        kwargs...)
 
 # A solve the method cannot complete from valid inputs is a numerical failure
 # (`ReactiveKernels.ODESolveFailure`), distinct from invalid input and from
