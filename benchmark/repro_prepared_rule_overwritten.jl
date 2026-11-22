@@ -19,42 +19,60 @@
 # - `pullback_indexed`: the same pullback over `IndexedGeometry`, the same
 #   numbers beside a `Dict`.
 #
-# Recorded on a Linux fleet host, 2026-11-21: Julia 1.10.12, ReactiveKernels
-# 0.1.353, Enzyme dogfood `484b27a4` with libEnzyme `400c1bdc` (repairs
-# `overwritten_reachable_data`, `unexposed_storage_barriers` and
-# `later_pointer_stores` present). Bytes per call at n = 1,024 and 65,536:
+# Recorded on a Linux fleet host, 2026-11-22: ReactiveKernels 0.1.369, Enzyme
+# dogfood `0997a2c7` with libEnzyme `24b44443` (repairs
+# `overwritten_reachable_data`, `unexposed_storage_barriers`,
+# `later_pointer_stores` and `later_store_targets` present). Bytes per call at
+# n = 1,024 and 65,536:
 #
-#     direct           320 / 320
-#     prepared         1,376 / 1,376
-#     stored           1,568 / 1,568
-#     pullback         240 / 240
-#     pullback_indexed 9,648 / 525,664
+#                      Julia 1.10.12    Julia 1.12.7 and 1.13.1
+#     direct           320 / 320        320 / 320
+#     prepared         1,376 / 1,376    17,680 / 1,049,872
+#     stored           1,568 / 1,568    17,872 / 1,050,064
+#     pullback         240 / 240        224 / 224
+#     pullback_indexed 256 / 256        224 / 224
 #
-# A probe of the rule's Enzyme config (`EnzymeRules.overwritten`) shows why
-# `pullback_indexed` grows with `n`. The flag is `(false, false, false, false)`
-# for the first four callers and `(false, true, false, false)` for
-# `pullback_indexed`: Enzyme marks the struct (the rule's first argument) as
-# possibly overwritten, so the adapter copies all `n` numbers on every call.
-# With Enzyme's reverse mode a prepared pullback keeps the port's value for
-# `ad_value_and_pullback`: `_ADSeededCall{true}` stores it into a `Ref` the
-# preparation passes in (`box[] = values`, src/ad.jl). That store is the only
-# write after the rule call, and it stores a pointer. `later_pointer_stores`
-# keeps the flag `false` after stores of pointers alone unless the argument
-# leads to mutable memory that holds a pointer. A `Dict` is such memory: its
-# fields are pointers, so the flag correctly stays `true` until Enzyme can show
-# which object each later write targets (Enzyme todo `1kcy4qm`). A
-# BayesianRegressionModels GMRF coefficient row read through
+# A caller's bytes grow with `n` when Enzyme marks the struct (the rule's
+# first argument) as possibly overwritten: the adapter then copies all `n`
+# numbers on every call. A probe of the rule's Enzyme config
+# (`EnzymeRules.overwritten`) reads `(false, false, false, false)` in every
+# compile of the rule on Julia 1.10.12. On Julia 1.12.7 and 1.13.1 it also
+# reads `(false, true, false, false)` in compiles over `Geometry`, and
+# `prepared` and `stored` grow with `n`.
+#
+# A prepared program writes after the rule's call, where the rule cannot see.
+# Each repair lets Enzyme show that one such write misses the struct's data:
+# - A plate stores each result into cell storage the program allocated.
+#   `unexposed_storage_barriers` (libEnzyme `400c1bdc`, Enzyme snag
+#   `rule-overwritten-cc607ba7`) covers that store on Julia 1.10 only. From
+#   Julia 1.11 an array keeps its elements in a `Memory`, and libEnzyme does
+#   not trace a store into it back to the allocation, so `prepared` and
+#   `stored` still copy there.
+# - With Enzyme's reverse mode a prepared pullback keeps the port's value for
+#   `ad_value_and_pullback`: `_ADSeededCall{true}` stores it into a `Ref` the
+#   preparation passes in (`box[] = values`, src/ad.jl). That store is the
+#   only write after the rule call, and it stores a pointer.
+#   `later_pointer_stores` (dogfood `484b27a4`, Enzyme snag
+#   `rule-overwritten-53a3ec5c`) keeps the flag `false` after stores of
+#   pointers alone, on Julia 1.10, unless the struct leads to mutable memory
+#   that holds a pointer. A `Dict` is such memory, and from Julia 1.11 so is
+#   an `Array`. `later_store_targets` (Enzyme todo `1kcy4qm`) finds the object
+#   each later store targets and keeps the flag `false` when the struct
+#   cannot reach that object, as it cannot reach the pullback's `Ref`.
+#
+# A BayesianRegressionModels GMRF coefficient row read through
 # `prepare_ad_pullback` has the `pullback_indexed` shape, since its rule's
-# footprint holds a `Dict`: on the same build it takes 1,438,416 B per row
-# Jacobian at 64 stations and 15,550,304 B at 1,024.
+# footprint holds a `Dict`. The Enzyme lane measured its row Jacobian on Julia
+# 1.10.12 at 64 and 1,024 stations: 470,816 B and 471,040 B with
+# `later_store_targets`, 1,396,832 B and 15,508,400 B without it.
 #
-# Earlier builds:
+# Earlier builds, Julia 1.10.12:
+# - dogfood `484b27a4` (libEnzyme `400c1bdc`, without `later_store_targets`):
+#   `pullback_indexed` 9,648 / 525,664 B;
 # - dogfood `b862f996` (libEnzyme `400c1bdc`, without `later_pointer_stores`):
-#   `pullback` 8,560 / 524,576 B (Enzyme snag `rule-overwritten-53a3ec5c`);
+#   `pullback` 8,560 / 524,576 B;
 # - dogfood `8a381501` (libEnzyme `05ce259c`): `stored` copied too,
-#   18,208 / 1,050,240 B. The program's store of the rule's vector into plate
-#   storage it had allocated counted as a write the rule cannot see (Enzyme
-#   snag `rule-overwritten-cc607ba7`).
+#   18,208 / 1,050,240 B.
 module PreparedRuleOverwritten
 using ReactiveKernels, Test
 using ReactiveKernels.DifferentiationInterface: AutoEnzyme
