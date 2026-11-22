@@ -96,6 +96,28 @@ function jax_ode_case(n)
     return (; doses, times)
 end
 
+@kernel jax_ode_precision(k::Float64, rt::Float64, ts::Vector{Float64}) = begin
+    total = k > 0 ? sum(rk_ode_rk45_tol(_jax_ode_elimination, [1.0], 0.0, ts, rt, 1e-7, 1000, k)) : 0.0
+    return total
+end
+
+@testset "runtime ODE relative tolerance in the solve precision" begin
+    if _JAX_ODE_PYTHON
+        mktempdir() do dir
+            for T in (Float32, Float64)
+                source = jax_source(jax_ode_precision; have = (:k, :rt, :ts), want = :total, float_type = T)
+                write(joinpath(dir, "model.py"), source)
+                # Separate processes exercise each module with its intended JAX dtype.
+                driver = joinpath(@__DIR__, "jax_ode_precision.py")
+                @test success(addenv(`$RK_JAX_PYTHON -B $driver $dir`,
+                                     "JAX_ENABLE_X64" => (T === Float64 ? "1" : "0")))
+            end
+        end
+    else
+        @test_skip false
+    end
+end
+
 @testset "jax_source solves rk_ode_rk45_tol and rk_ode_bdf_tol with diffrax" begin
     backend = AutoEnzyme(; mode = Enzyme.Reverse)
     source = jax_source(jax_ode_cells; have = (:u, :doses, :times), want = :total)

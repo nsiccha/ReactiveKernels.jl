@@ -16,6 +16,13 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.364
+
+- A JAX ODE module warns once when an active Float32 solve requests a positive
+  relative tolerance below Float32 epsilon. The message reports the tolerance
+  and how to select Float64 or relax the target. The solver uses the requested
+  relative and absolute tolerances.
+
 ## 0.1.363
 
 - Scheduled reads use the same compiled worker for small and large batches.

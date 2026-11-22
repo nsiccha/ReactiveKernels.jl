@@ -886,7 +886,37 @@ def _rk_ode_mode():
     return "cuda" if jax.default_backend() == "gpu" else "diffrax"
 
 
-def _rk_ode_solve(solver, rhs, y0, t0, ts, n, reltol, abstol, maxsteps, args):
+_rk_warned_ode_rtol = False
+
+
+def _rk_warn_ode_rtol(reltol):
+    global _rk_warned_ode_rtol
+    if not _rk_warned_ode_rtol:
+        _rk_warned_ode_rtol = True
+        _warnings.warn(
+            f"The ODE requested reltol={np.float32(reltol)!s} below Float32 epsilon (1.19e-7). "
+            "Error control can take extra steps. For tighter relative accuracy use a Float64 "
+            "export with JAX x64 enabled, or choose a looser reltol if the model permits it.",
+            RuntimeWarning)
+
+
+@jax.custom_batching.custom_vmap
+def _rk_check_ode_rtol(reltol):
+    def report(v):
+        jax.debug.callback(_rk_warn_ode_rtol, v)
+    jax.lax.cond(reltol < jnp.finfo(jnp.float32).eps, report, lambda v: None, reltol)
+    return ()
+
+
+@_rk_check_ode_rtol.def_vmap
+def _rk_check_ode_rtol_batch(size, batched, reltol):
+    # Report one offending value across all nested plate and chain axes.
+    if size:
+        _rk_check_ode_rtol(jnp.min(reltol))
+    return (), ()
+
+
+def _rk_ode_solve(solver, rhs, y0, t0, ts, n, reltol, abstol, maxsteps, args, active=True):
     # ReactiveKernels' rk_ode_rk45_tol / rk_ode_bdf_tol: integrate
     # dy/dt = rhs(t, y, args) from t0, returning the state at each of the
     # first n output times (rows) and a status.
@@ -908,6 +938,9 @@ def _rk_ode_solve(solver, rhs, y0, t0, ts, n, reltol, abstol, maxsteps, args):
     # whose rows are padding.
     last = jnp.where(n > 0, ts[jnp.maximum(n, 1) - 1], t0 + 1)
     ok = valid & (n > 0)
+    if dtype == jnp.float32:
+        requested_rtol = jnp.where(active & ok & (reltol > 0), reltol, jnp.inf)
+        _rk_check_ode_rtol(jax.lax.stop_gradient(requested_rtol))
     last = jnp.where(ok, last, t0 + 1)
     ts = jnp.where(requested & ok, ts, last)
     # A step this short no longer advances time controllably: diffrax steps
@@ -1013,9 +1046,12 @@ function _jax_ode_call(ctx::_JaxContext, f, args::Vector{_PyVal})
     passed = [a for a in extra if !_jax_ode_closed(a)]
     solution = _jax_fresh(ctx, :solution)
     status = _jax_fresh(ctx, :status)
+    call_args = ["_RK" * _jax_ode_solver(f) * "()", fun, y0.code, t0.code, ts.code, n,
+                 rt.code, at.code, mx.code, _jax_tuple_code(passed)]
+    active = _jax_active_condition(ctx)
+    active === nothing || push!(call_args, "active=" * active)
     _jax_emit!(ctx, solution * ", " * status * " = " * helper * "(" *
-               join(["_RK" * _jax_ode_solver(f) * "()", fun, y0.code, t0.code, ts.code, n, rt.code, at.code,
-                     mx.code, _jax_tuple_code(passed)], ", ") * ")")
+               join(call_args, ", ") * ")")
     label = string(name, " (", _jax_ode_solver(f), ")")
     # Invalid inputs raise, as natively (`ArgumentError`); an exceeded budget
     # or a failed solve is a numerical failure (`ODESolveFailure` natively),
