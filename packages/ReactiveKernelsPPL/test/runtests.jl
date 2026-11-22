@@ -53,6 +53,7 @@ const _PPL_TEST_FILES = (
     "test_density_factor_preparation.jl",
     "test_density_factor_overlay_views.jl",
     "test_jax_source.jl",
+    "test_jax_partition.jl",
     "test_jax_world_age.jl",
     "test_integer_jax.jl",
     "test_integer_marginal_jax.jl",

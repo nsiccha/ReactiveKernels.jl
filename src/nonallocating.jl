@@ -659,18 +659,9 @@ function _decompose_call_resolved(ctx::_FusedDecomposition, callee, f, fref,
         return (Expr(:call, fref, args...), T)
     end
     T isa Type || return nothing
-    # `vcat(a, v)` with a number beside dense vectors, as a model stacks an
-    # intercept on its coefficients (`[alpha; beta]`): Base's `vcat` step
-    # reuses a destination for array operands only, so the result would be
-    # allocated on each call. The native body's `vcat` fills a destination
-    # from numbers too, as `_decompose_vcat_numbers` uses it for
-    # `vcat([a], v)`.
-    column_vcat = T <: Vector && isbitstype(eltype(T)) &&
-        all(t -> t isa Type && t <: _NativeColumnOperand, types)
-    f === Base.vcat && column_vcat && any(t -> t <: Number, types) &&
-        _static_type(_native_vcat, types...) === T &&
-        return (_emit_step!(ctx, _ConcatenateStep(_native_vcat), T, args...), T)
-    (f === Base.vcat || f === Base.hcat || (f === _native_vcat && column_vcat)) &&
+    (f === Base.vcat || f === Base.hcat ||
+     (f === _native_vcat && T <: Vector && isbitstype(eltype(T)) &&
+      all(t -> t isa Type && t <: _NativeColumnOperand, types))) &&
         return (_emit_step!(ctx, _ConcatenateStep(f), T, args...), T)
     if (f === Base.zeros || f === Base.ones) && !isempty(types) &&
        all(t -> t isa Type && t <: Integer, types)
