@@ -571,6 +571,13 @@ const crossed = @rkppl begin
 end
 end
 
+# The warm allocation of one gradient, measured behind a function barrier. At
+# the testset's untyped call site the call is dispatched dynamically, and
+# Julia 1.10 counts its boxed result (32 bytes, with the generated reverse on
+# or off).
+warm_gradient_bytes(q, g, u) = (sampler_value_and_gradient!(q, g, u);
+    @allocated sampler_value_and_gradient!(q, g, u))
+
 @testset "grouped one pass on a partitioned count likelihood and on crossed groups" begin
     backend = AutoEnzyme(; mode = Enzyme.Reverse)
     n, J, J2 = 600, 20, 7
@@ -605,7 +612,8 @@ end
         # A likelihood's tape holds its groups and a few shared scalars, never its rows.
         @test count(slot -> J <= length(slot.tape) < n ÷ 4, slots) == grouped
         @test !any(slot -> slot.declined, slots)
-        @test (@allocated sampler_value_and_gradient!(on, g, u)) == 0
+        @test warm_gradient_bytes(on, g, u) == 0
+        @test warm_gradient_bytes(off, g, u) == 0
     end
 end
 
