@@ -178,3 +178,72 @@ end
         end
     end
 end
+
+# A typed program's scheduled prefix is prepared with the code audit
+# (`type_stability_level = :rk` or `:all`). The launcher of a prefix plate's
+# cells, `_scheduled_prefix_cells`, reads the call's worker budget from
+# task-local storage and dispatches the cells at run time: RK's scheduling
+# boundary, which the audit does not enter. It enters the cells the launcher
+# dispatches instead, so a scheduled reader prepares under
+# `type_stability = :error` and a client function its cells call is still
+# audited (snag native-schedulin-e0fbbc74: every such reader was refused for
+# the launcher's own code).
+scheduled_prefix_twice(x::Vector{Float64}) = 2 .* x
+const _scheduled_prefix_factor = Ref{Any}(2.0)
+scheduled_prefix_hidden(x::Vector{Float64}) = (x .* _scheduled_prefix_factor[])::Vector{Float64}
+
+# Two prefix plates, each its own plate program; equal rows share their calls,
+# across chunks for `doubled` and within one table for the reduced `sums`.
+@kernel scheduled_prefix_typed(position::Float64, data::Vector{Vector{Float64}}) = begin
+    doubled = plate(data) do x
+        scheduled_prefix_twice(x)
+    end
+    sums = plate(data) do x
+        sum(scheduled_prefix_twice(x))
+    end
+    result = position * (sum(sum.(doubled)) + sum(sums))
+end
+
+@kernel scheduled_prefix_dynamic_cell(position::Float64, data::Vector{Vector{Float64}}) = begin
+    prefix = plate(data) do x
+        scheduled_prefix_hidden(x)
+    end
+    result = position * sum(sum.(prefix))
+end
+
+@testset "scheduled prefixes prepare under type_stability = :error" begin
+    checked(f, level) = ReactiveKernels._with_type_stability(f, :error, level)
+    schedule = NativeScheduling(chunk_size=1, workers=4)
+    positions = [1.0, 2.0, 3.0]
+    data = [fill(Float64(i % 3), 2) for i in 1:7]
+    expected = positions .* (2 * sum(sum(2 .* x) for x in data))
+    for level in (:rk, :all)
+        scheduled = checked(level) do
+            vectorize(prepare(scheduled_prefix_typed); batched=:position, schedule,
+                      reuse=true)
+        end
+        @test scheduled(positions, data) ≈ expected
+    end
+
+    # At `:all` the audit reports the run-time dispatch of a client function
+    # that the scheduled cells call, reached through the launcher, and nothing
+    # of the launcher itself.
+    scalar = prepare(scheduled_prefix_dynamic_cell; type_stability_level=:values)
+    e = try
+        checked(() -> vectorize(scalar; batched=:position, schedule), :all)
+        nothing
+    catch err
+        err
+    end
+    @test e isa TypeInstabilityError
+    message = e isa TypeInstabilityError ? join(e.messages, "\n") : ""
+    @test e isa TypeInstabilityError && length(e.messages) == 1
+    @test occursin("scheduled_prefix_hidden @", message)
+    @test occursin("is a call dispatched at run time", message)
+    @test occursin("`invoke _scheduled_prefix_cells(", message)
+    @test !occursin("_scheduled_prefix_cells @", message)
+    @test !occursin("task_local_storage", message)
+    # `:rk` leaves a client function to its author.
+    reader = checked(() -> vectorize(scalar; batched=:position, schedule), :rk)
+    @test reader(positions, data) ≈ positions .* sum(sum(2 .* x) for x in data)
+end

@@ -4535,22 +4535,28 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
                            readonly_slices))
     # Each call that cells with equal arguments share (shared_cell_calls.jl)
     # keeps its table in a local the cell loop carries: `nothing` until the
-    # first cell that keys it, one table per evaluation of this plate.
+    # first cell that keys it, one table per evaluation of this plate. The
+    # tables start the plate's own execution (below), so an extracted plate
+    # program binds them itself rather than receiving and returning them: a
+    # returned `Union{Nothing,_SharedTable}` made the program's result tuple
+    # abstract (snag native-schedulin-e0fbbc74).
     shares = Dict{Int,Symbol}()
+    share_tables = Expr[]
     for recipe in inner.recipes
         recipe.op isa _SharedCall || continue
         shares[recipe.id] = gensym(:shared_call_table)
-        push!(body.args, Expr(:(=), shares[recipe.id], parallel_cells ?
+        push!(share_tables, Expr(:(=), shares[recipe.id], parallel_cells ?
             Expr(:call, GlobalRef(@__MODULE__, :_ConcurrentSharedTable)) : nothing))
     end
     if nested !== nothing
         for id in nested.shares
             haskey(shares, id) && continue
             shares[id] = gensym(:shared_call_table)
-            push!(body.args, Expr(:(=), shares[id], parallel_cells ?
+            push!(share_tables, Expr(:(=), shares[id], parallel_cells ?
                 Expr(:call, GlobalRef(@__MODULE__, :_ConcurrentSharedTable)) : nothing))
         end
     end
+    cells || append!(body.args, share_tables)
     function lower_recipe!(block, recipe_index, args, out, operation, looped)
         # `getfield`, not `.`: the cell is `Any`, and a property read would
         # compile once per plate's record type.
@@ -4816,7 +4822,7 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         # A lane arm's ready flag and cached values live for exactly this
         # execution of the loop. Initialize them inside the extracted plate
         # so its caller receives only values consumed after the loop.
-        execution = Expr(:block, declarations..., invariants.args...)
+        execution = Expr(:block, share_tables..., declarations..., invariants.args...)
         # The batched tiles of a plate of products (plate_batching.jl), for
         # the plain cell loop only: a strip refill, lane slots, cell tables,
         # scheduled groups, branch arms, scan slices, shared calls, nested
