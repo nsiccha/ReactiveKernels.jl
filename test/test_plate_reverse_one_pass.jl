@@ -440,9 +440,12 @@ end
     @test !slot.declined
 end
 
-# Several gathered operands certify their value ranges together, so a cell
-# that divides by a shared scale keeps its ordinary arithmetic.
-@testset "range certificate over several gathers" begin
+# Several gathered operands are measured together, so a cell that divides by
+# a shared scale keeps its ordinary arithmetic.
+ranges_fit(cells, reads, shadows, targets) = RK._pr_within_range(
+    RK._pr_storage_exponents(RK._PR_NO_EXPONENTS, cells, reads, shadows), targets)
+
+@testset "exponent ranges over several gathers" begin
     n = 200
     z, w = [0.3cos(i) for i in 1:9], [0.2sin(i) + 1 for i in 1:5]
     g, h = [mod1(2i, 9) for i in 1:n], [mod1(3i, 5) for i in 1:n]
@@ -450,20 +453,42 @@ end
     cells = Base.OneTo(n)
     sz, sw = zeros(9), zeros(5)
     reads = (view(z, g), view(w, h), x)
-    @test RK._pr_bounded_storage(cells, reads, (view(sz, g), view(sw, h)))
+    shadows = (view(sz, g), view(sw, h))
+    measured(r = reads, s = shadows, c = cells) =
+        RK._pr_storage_exponents(RK._PR_NO_EXPONENTS, c, r, s)
+    # A Gaussian residual over a shared scale: three factors, one divisor.
+    targets = ((3, 1, 110),)
+    @test RK._pr_plain_storage(cells, reads, shadows)
+    @test RK._pr_within_range(measured(), targets)
     lanes = collect(1:2:n)
     half = Base.OneTo(length(lanes))
     lane_reads = (RK._lane_view(view(z, g), lanes), RK._lane_view(view(w, h), lanes), x[lanes])
-    @test RK._pr_bounded_storage(half, lane_reads,
-        (RK._pr_regather(sz, lane_reads[1]), RK._pr_regather(sw, lane_reads[2])))
-    # A shadow that shares storage with an operand, or a value out of range.
-    @test !RK._pr_bounded_storage(cells, reads, (view(z, g), view(sw, h)))
-    @test !RK._pr_bounded_storage(cells, reads, (view(sz, g), view(w, h)))
-    z[4] = 1e300
-    @test !RK._pr_bounded_storage(cells, reads, (view(sz, g), view(sw, h)))
+    lane_shadows = (RK._pr_regather(sz, lane_reads[1]), RK._pr_regather(sw, lane_reads[2]))
+    @test RK._pr_within_range(measured(lane_reads, lane_shadows, half), targets)
+    # A shadow that shares storage with an operand.
+    @test !RK._pr_plain_storage(cells, reads, (view(z, g), view(sw, h)))
+    @test measured(reads, (view(sz, g), view(w, h))) == RK._PR_BAD_EXPONENTS
+    @test !RK._pr_within_range(measured(reads, (view(sz, g), view(w, h))), targets)
+    # The measured exponents are charged against the float range: a unit of
+    # 1e13 or 1e-13 fits, a value near the range's end, a subnormal one and
+    # one that is not finite do not. A zero is no magnitude at all.
+    for value in (1e13, 1e-13, 3e-17, 0.0)
+        z[4] = value
+        @test RK._pr_within_range(measured(), targets)
+    end
+    for value in (1e300, 1e-300, 5e-324, Inf, NaN)
+        z[4] = value
+        @test !RK._pr_within_range(measured(), targets)
+    end
     z[4] = 0.25
-    @test RK._pr_bounded_storage(cells, reads, (view(sz, g), view(sw, h)))
-    @test (@allocated RK._pr_bounded_storage(cells, reads, (view(sz, g), view(sw, h)))) == 0
+    low, high = measured()
+    @test low == RK._pr_low_exponent(minimum(abs, filter(!iszero, vcat(z, w, x))))
+    @test high == RK._pr_high_exponent(maximum(abs, vcat(z, w, x)))
+    @test RK._pr_exponents(0.0) == RK._PR_NO_EXPONENTS
+    @test RK._pr_scalar_exponents((2.0, 0, true, 0.5)) == (RK._pr_low_exponent(0.5), RK._pr_high_exponent(2.0))
+    @test RK._pr_scalar_exponents((2.0, big"1.0")) == RK._PR_BAD_EXPONENTS
+    @test ranges_fit(cells, reads, shadows, targets)
+    @test (@allocated ranges_fit(cells, reads, shadows, targets)) == 0
 end
 
 # In the normal range the plain quotients have the bits of the separate-exponent

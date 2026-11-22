@@ -2087,33 +2087,61 @@ end
 end
 
 # Certify the range of floating-point operands using only plain, disjoint
-# storage. Gathered values are bounded by scanning their parent once.
-@inline function _pr_bounded_scalar(x)
-    x isa Union{Float64,Base.BitInteger,Bool} &&
-        (iszero(x) || 0x1p-40 <= abs(float(x)) <= 0x1p40)
-end
+# storage. What is measured is the range of binary exponents of the nonzero
+# values a sweep can read: `(low, high)`, biased exponent fields. A subnormal
+# value gives `low == 0` and a value that is not finite `high == 0x7ff`; both
+# fail every certificate. `low > high` means no nonzero value was seen.
+# Gathered values are measured by scanning their storage once.
+const _PRExponents = Tuple{UInt64,UInt64}
+const _PR_NO_EXPONENTS = (UInt64(0x7ff), UInt64(0))
+const _PR_BAD_EXPONENTS = (UInt64(0), UInt64(0x7ff))
+@inline _pr_merge_exponents(a::_PRExponents, b::_PRExponents) = (min(a[1], b[1]), max(a[2], b[2]))
+@inline _pr_low_exponent(x::Float64) = (bits = reinterpret(UInt64, abs(x));
+    ifelse(iszero(bits), UInt64(0x7ff), bits >> 52))
+@inline _pr_high_exponent(x::Float64) = reinterpret(UInt64, abs(x)) >> 52
+@inline _pr_exponents(x::Float64) = (_pr_low_exponent(x), _pr_high_exponent(x))
+@inline _pr_exponents(x::Union{Base.BitInteger,Bool}) = _pr_exponents(Float64(x))
+_pr_exponents(x) = _PR_BAD_EXPONENTS
 @inline _pr_bound_storage(x) = x
 @inline _pr_bound_storage(x::Base.Broadcast.Extruded) = x.x
-_pr_bounded_vector(x) = false
-# A gather is bounded by its storage, scanned once: every entry a cell can
-# read is one of them. A partition's composed gather reads the same storage.
-@inline _pr_bounded_vector(x::_PRPlainGather) = _pr_bounded_vector(parent(x))
-@inline function _pr_range_delta(x::Float64)
-    bits = reinterpret(UInt64, abs(x))
-    ifelse(iszero(bits), zero(UInt64), bits - reinterpret(UInt64, 0x1p-40))
-end
-function _pr_bounded_vector(x::_PRPlainVector{Float64})
-    lo = reinterpret(UInt64, 0x1p-40)
-    hi = reinterpret(UInt64, 0x1p40)
-    bound = zero(UInt64)
+# A gather is measured by its storage: every entry a cell can read is one of
+# them. A partition's composed gather reads the same storage.
+@inline _pr_exponents(x::_PRPlainGather) = _pr_exponents(parent(x))
+function _pr_exponents(x::_PRPlainVector{Float64})
+    low, high = _PR_NO_EXPONENTS
     @inbounds @simd for i in eachindex(x)
-        bound = max(bound, _pr_range_delta(x[i]))
+        low = min(low, _pr_low_exponent(x[i]))
+        high = max(high, _pr_high_exponent(x[i]))
     end
-    bound <= hi - lo
+    (low, high)
 end
-_pr_bounded_vectors(::Tuple{}) = true
-@inline function _pr_bounded_vectors(xs::Tuple)
-    _pr_bounded_vector(first(xs)) && _pr_bounded_vectors(Base.tail(xs))
+@inline _pr_all_exponents(range::_PRExponents, ::Tuple{}) = range
+@inline _pr_all_exponents(range::_PRExponents, xs::Tuple) =
+    _pr_all_exponents(_pr_merge_exponents(range, _pr_exponents(first(xs))), Base.tail(xs))
+@inline _pr_scalar_exponents(xs::Tuple) = _pr_all_exponents(_PR_NO_EXPONENTS, xs)
+# Whether the sweep's shared-reciprocal arithmetic is exact to rounding for
+# nonzero leaves with exponents in `range`. Every nonzero leaf then has a
+# magnitude in [2^-down, 2^up]. A target with `(n, d, s)` multiplies `n` leaves,
+# divides by `d` and carries `s` bits of slack (`_pr_quotient_bounds!`), so its
+# magnitude lies within `n * up + d * down + s` bits above one and
+# `n * down + d * up + s` bits below. The sweep squares a target, scales it by
+# up to three shared factors over a divisor and sums it over at most an Int's
+# worth of cells (63 bits). Both totals stay within 903 of the 1022 bits a
+# `Float64` has on either side of one.
+@inline _pr_targets_fit(up::Int, down::Int, ::Tuple{}) =
+    3up + down + 63 <= 903 && 3down + up <= 903
+@inline function _pr_targets_fit(up::Int, down::Int, targets::Tuple)
+    n, d, s = first(targets)
+    2 * (n * up + d * down + s) + 3up + down + 63 <= 903 &&
+        2 * (n * down + d * up + s) + 3down + up <= 903 &&
+        _pr_targets_fit(up, down, Base.tail(targets))
+end
+@inline function _pr_within_range(range::_PRExponents, targets::Tuple)
+    low, high = range
+    (low > 0) & (high < 0x7ff) || return false
+    up = max(0, Int(high) - 1022)
+    down = max(0, 1023 - Int(low))
+    _pr_targets_fit(up, down, targets)
 end
 # Several gathered operands, or a partition's composed gather. Each shadow
 # is one of the adapter's buffers or a caller's shadow, gathered over storage
@@ -2152,52 +2180,78 @@ _pr_bounded_gather(cells, shadow, operands, ::Tuple{}) = false
     _pr_separate_gather(cells, first(xs), shadow, operands) ||
         _pr_bounded_gather(cells, shadow, operands, Base.tail(xs))
 end
-@inline function _pr_bounded_storage(cells, reads::Tuple, shadows::Tuple)
-    operands = map(_pr_bound_storage, reads)
-    safe = _pr_dense_reverse_cells(cells, operands, shadows) ||
+# Whether the operands a sweep reads and the shadows it writes are plain,
+# disjoint storage, so that no write of the loop changes a measured value.
+@inline function _pr_plain_storage(cells, operands::Tuple, shadows::Tuple)
+    _pr_dense_reverse_cells(cells, operands, shadows) ||
         (length(shadows) == 1 && _pr_bounded_gather(cells, only(shadows), operands, operands)) ||
         _pr_separate_storage(cells, operands, shadows)
-    safe && _pr_bounded_vectors(operands)
+end
+# The exponents of everything a sweep reads, beside those already in `range`.
+@inline function _pr_storage_exponents(range::_PRExponents, cells, reads::Tuple, shadows::Tuple)
+    operands = map(_pr_bound_storage, reads)
+    _pr_plain_storage(cells, operands, shadows) || return _PR_BAD_EXPONENTS
+    _pr_all_exponents(range, operands)
 end
 
-# Given nonzero leaves in [2^-40,2^40], bound the magnitude of every
-# nonzero target in bits. Addition can cancel to one unit in the last
-# place of its smaller operand. Multiplication and division add bounds.
+# For every target of the sweep's shared-reciprocal arithmetic, how its
+# magnitude follows from the leaves': `(n, d, s)`, the leaves it multiplies,
+# the leaves it divides by, and bits of slack. A leaf (an outer value or a
+# read) is one factor. A literal has its own magnitude as slack. A product
+# adds both parts and one bit, a quotient exchanges the divisor's parts, and a
+# sum can cancel to one unit in the last place of its smaller operand (53
+# bits). `_pr_within_range` charges these against the exponents measured at
+# each call. Returns `nothing` when a target is not such arithmetic, or when
+# even leaves within 40 bits of one would not fit.
 function _pr_quotient_bounds!(q, stmts, st, external, invariant)
     defs = Dict{Symbol,Any}()
     for s in stmts
         s isa Union{_PRCall,_PRAlias} || continue
-        (haskey(defs, s.lhs) || s.lhs in external) && return false
+        (haskey(defs, s.lhs) || s.lhs in external) && return nothing
         # Only inspect storage ahead of calls whose target is known to be pure.
         # A local callable is checked against the value used during preparation.
         if s isa _PRCall && s.fref isa Expr
-            return false
+            return nothing
         end
         defs[s.lhs] = s
     end
-    bounds = Dict{Symbol,Int}()
+    unproved = (0, 0, 1_000_000)
+    bounds = Dict{Symbol,NTuple{3,Int}}()
     function bound(x)
-        x isa Symbol || return _pr_bounded_scalar(x) ? 40 : 1000
+        if !(x isa Symbol)
+            x isa Union{Float64,Base.BitInteger,Bool} || return unproved
+            value = float(x)
+            iszero(value) && return (0, 0, 0)
+            isfinite(value) && !issubnormal(value) || return unproved
+            return (0, 0, abs(exponent(value)) + 1)
+        end
         if x in external || x in invariant
             push!(q.shared, x)
-            return 40
+            return (1, 0, 0)
         end
         get!(bounds, x) do
             s = get(defs, x, nothing)
             s isa _PRAlias && return bound(s.rhs)
-            s isa _PRCall || return 1000
-            _pr_is_read(s, st) && return 40
-            s.f in (+, -) && length(s.args) in (1, 2) && return maximum(bound, s.args) + 53
-            if length(s.args) == 2 && (s.f in (*, _native_mul) ||
-                                       (s.f === (/) && s.args[2] in q.divisors))
-                return min(1000, sum(bound, s.args) + 1)
+            s isa _PRCall || return unproved
+            _pr_is_read(s, st) && return (1, 0, 0)
+            if s.f in (+, -) && length(s.args) in (1, 2)
+                parts = map(bound, s.args)
+                return (maximum(p -> p[1], parts), maximum(p -> p[2], parts),
+                        maximum(p -> p[3], parts) + 53)
             end
-            1000
+            if length(s.args) == 2 && s.f in (*, _native_mul)
+                a, b = bound(s.args[1]), bound(s.args[2])
+                return (a[1] + b[1], a[2] + b[2], a[3] + b[3] + 1)
+            end
+            if length(s.args) == 2 && s.f === (/) && s.args[2] in q.divisors
+                a, b = bound(s.args[1]), bound(s.args[2])
+                return (a[1] + b[2], a[2] + b[1], a[3] + b[3] + 1)
+            end
+            unproved
         end
     end
-    # Squaring uses at most 680 bits, three shared factors and division
-    # another 160, and an Int-sized reduction at most 63.
-    all(x -> bound(x) <= 340, q.targets)
+    targets = unique!(NTuple{3,Int}[bound(x) for x in q.targets])
+    _pr_targets_fit(40, 40, Tuple(targets)) ? targets : nothing
 end
 
 # Range checks can share the gather loop's reads on long consecutive runs.
@@ -2207,7 +2261,7 @@ end
 @inline function _pr_check_in_gather(cells, value, shadow, operands)
     value isa _PRSpanGather && length(parent(value)) >= 128 &&
         _pr_span_possible(cells, value, shadow, operands) &&
-        all(x -> eltype(x) === Float64, operands) && _pr_bounded_vector(parent(value))
+        all(x -> eltype(x) === Float64, operands)
 end
 
 function _pr_checked_reads(stmts, st, linear, written)
@@ -2229,23 +2283,26 @@ function _pr_checked_reads(stmts, st, linear, written)
     reads
 end
 
+# The checked sweep measures the exponents of its own reads, beside those of
+# `range` (the scalars and the gather's storage, measured above the loop), and
+# repeats itself in the separate-exponent form if they do not fit.
 function _pr_checked_loop(ordinary, exceptional, visible, reads, check, shadow,
-                          coefficients, value_pre, normal)
-    bound = gensym(:range_delta)
+                          coefficients, value_pre, normal, range, targets)
+    low, high = gensym(:low_exponent), gensym(:high_exponent)
     inspected = _index_run_replace(ordinary) do node
         if Meta.isexpr(node, :(=), 2) && node.args[1] in reads
             lhs = node.args[1]
-            return Expr(:block, node, :($bound = max($bound,
-                $(GlobalRef(@__MODULE__, :_pr_range_delta))($lhs))))
+            return Expr(:block, node,
+                :($low = min($low, $(GlobalRef(@__MODULE__, :_pr_low_exponent))($lhs))),
+                :($high = max($high, $(GlobalRef(@__MODULE__, :_pr_high_exponent))($lhs))))
         end
         node
     end
-    limit = reinterpret(UInt64, 0x1p40) - reinterpret(UInt64, 0x1p-40)
     quote
         if $check
-            $bound = zero(UInt64)
-            $(_pr_quotient_loop(inspected, union(visible, [bound])))
-            if $bound > $limit
+            ($low, $high) = $range
+            $(_pr_quotient_loop(inspected, union(visible, [low, high])))
+            if !$(GlobalRef(@__MODULE__, :_pr_within_range))(($low, $high), $targets)
                 fill!(parent($shadow), 0.0)
                 $normal = false
                 $(coefficients...)
@@ -2446,6 +2503,7 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState, indexed:
                      end)
         end
         certificate = false
+        measure = Any[]
         if !isempty(q.divisors)
             function specialize(body, arm)
                 _index_run_replace(body) do node
@@ -2458,22 +2516,25 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState, indexed:
                 end
             end
             scalars = isempty(cuts) ? _pr_vectorized_cell_scalars(inloop, st, linear) : nothing
-            bounded = scalars !== nothing &&
-                _pr_quotient_bounds!(q, inloop, st, scalars, inv2)
-            if bounded
+            proved = scalars === nothing ? nothing : _pr_quotient_bounds!(q, inloop, st, scalars, inv2)
+            if proved !== nothing
                 written = unique(st.prepared[r] for r in read_operands if haskey(st.shadow, st.prepared[r]))
                 shadows = map(p -> st.shadow[p], written)
                 checked = unique(vcat(q.shared, q.divisors))
-                certificate = :(Base.all($(GlobalRef(@__MODULE__, :_pr_vector_scalar)), ($(scalars...),)) &&
-                                Base.all($(GlobalRef(@__MODULE__, :_pr_bounded_scalar)), ($(checked...),)) &&
-                                !Base.any(iszero, ($(unique(q.divisors)...),)) &&
-                                $(GlobalRef(@__MODULE__, :_pr_bounded_storage))($cells,
-                                    ($(read_operands...),), ($(shadows...),)))
+                targets = Expr(:tuple, (Expr(:tuple, t...) for t in proved)...)
+                measured = gensym(:exponents)
+                measure = Any[:($measured = $(GlobalRef(@__MODULE__, :_pr_scalar_exponents))(($(checked...),)))]
+                structure = :(Base.all($(GlobalRef(@__MODULE__, :_pr_vector_scalar)), ($(scalars...),)) &&
+                              !Base.any(iszero, ($(unique(q.divisors)...),)))
                 for s in inloop
                     if s isa _PRCall && s.fref isa Symbol
-                        certificate = :($(s.fref) === $(QuoteNode(s.f)) && $certificate)
+                        structure = :($(s.fref) === $(QuoteNode(s.f)) && $structure)
                     end
                 end
+                storage = :($(GlobalRef(@__MODULE__, :_pr_within_range))(
+                    $(GlobalRef(@__MODULE__, :_pr_storage_exponents))(
+                        $measured, $cells, ($(read_operands...),), ($(shadows...),)), $targets))
+                certificate = :($structure && $storage)
                 ordinary = specialize(loop, 2)
                 exceptional = specialize(plain_loop, 3)
                 if !indexed
@@ -2492,21 +2553,21 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState, indexed:
                     if reads === nothing || isempty(reads)
                         ordinary = _pr_quotient_loop(ordinary, visible)
                     else
+                        # The checked sweep measures its dense reads itself.
+                        # Above the loop only the gather's storage is scanned.
                         check = gensym(:check_in_gather)
-                        certificate = _index_run_replace(certificate) do node
-                            if !(Meta.isexpr(node, :call) &&
-                                    first(node.args) == GlobalRef(@__MODULE__, :_pr_bounded_storage))
-                                return node
-                            end
-                            quote
-                                $check = $_PR_WANT_VALUE isa Val{true} &&
-                                    $(GlobalRef(@__MODULE__, :_pr_check_in_gather))(
-                                        $cells, $(only(written)), $(only(shadows)), ($(read_operands...),))
-                                $check || $node
-                            end
-                        end
+                        gathered, owned = only(written), only(shadows)
+                        merged = Expr(:call, GlobalRef(@__MODULE__, :_pr_merge_exponents), measured,
+                            Expr(:call, GlobalRef(@__MODULE__, :_pr_exponents), :(parent($gathered))))
+                        push!(measure,
+                            :($check = $_PR_WANT_VALUE isa Val{true} &&
+                                $(GlobalRef(@__MODULE__, :_pr_check_in_gather))(
+                                    $cells, $gathered, $owned, ($(read_operands...),))),
+                            :($check && ($measured = $merged)))
+                        certificate = :($structure && ($check ?
+                            $(GlobalRef(@__MODULE__, :_pr_within_range))($measured, $targets) : $storage))
                         ordinary = _pr_checked_loop(ordinary, exceptional, visible, reads,
-                            check, only(shadows), coefficients, value_pre, q.normal)
+                            check, only(shadows), coefficients, value_pre, q.normal, measured, targets)
                     end
                 end
                 loop = Expr(:if, q.normal, ordinary, exceptional)
@@ -2514,7 +2575,7 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState, indexed:
                 loop = specialize(plain_loop, 3)
             end
         end
-        isempty(q.divisors) || pushfirst!(coefficients, :($(q.normal) = $certificate))
+        isempty(q.divisors) || pushfirst!(coefficients, measure..., :($(q.normal) = $certificate))
         quote
             $(forward_pre...)
             $(init...)
