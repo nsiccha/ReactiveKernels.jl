@@ -16,6 +16,15 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.256
+
+`prepare_partition` of a partitioned `jax_source` module runs each event's
+runtime checks of the data once, over all cells, and raises when the binding
+fails one, as `log_density` does. `unit_log_density` and
+`global_log_density` now evaluate models whose events contain runtime checks,
+such as the shape check of a joint cell latent and the pivot check of a
+Cholesky factor, instead of refusing them. Requires ReactiveKernels 0.1.369.
+
 ## 0.1.255
 
 Density-factor selections can be reused by `prepare_query` and partitioned

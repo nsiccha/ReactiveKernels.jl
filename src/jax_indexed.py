@@ -2,6 +2,7 @@
 # requested output positions through the traced array operations. JAX still
 # executes and differentiates the numerical primitives themselves.
 from contextlib import contextmanager
+import math
 import numpy as np
 from jax.extend import core as _rk_core
 
@@ -43,18 +44,119 @@ def _rk_spread(k, n):
     return k if _rk_static_index(k) else jnp.reshape(k, k.shape + (1,) * n)
 
 
+def _rk_point_dependence(jaxpr, reads):
+    """Whether each variable of `jaxpr` depends on the packed point, given
+    whether each of its inputs does."""
+    dependent = dict(zip(jaxpr.invars, reads))
+    dependent.update((v, False) for v in jaxpr.constvars)
+    for eq in jaxpr.eqns:
+        flag = any(dependent[v] for v in eq.invars if not isinstance(v, _rk_core.Literal))
+        dependent.update((v, flag) for v in eq.outvars)
+    return dependent
+
+
+def _rk_input_dependence(eq, dependent):
+    return [not isinstance(v, _rk_core.Literal) and dependent[v] for v in eq.invars]
+
+
+def _rk_runs_effect(eq, dependent, mode):
+    """Whether `eq` holds an effect that runs in this mode: 'data' runs the
+    effects that read no parameter, 'point' those that do, 'all' every one.
+    An effect under a condition on the point depends on the point."""
+    if not eq.effects:
+        return False
+    reads = _rk_input_dependence(eq, dependent)
+    if eq.primitive.name == 'cond':
+        if reads[0]:
+            return mode != 'data'
+        return any(_rk_has_effect(b, reads[1:], mode) for b in eq.params['branches'])
+    if eq.primitive.name in ('jit', 'pjit'):
+        return _rk_has_effect(eq.params['jaxpr'], reads, mode)
+    return mode == 'all' or any(reads) == (mode == 'point')
+
+
+def _rk_has_effect(closed, reads, mode):
+    dependent = _rk_point_dependence(closed.jaxpr, reads)
+    return any(_rk_runs_effect(eq, dependent, mode) for eq in closed.jaxpr.eqns)
+
+
+def _rk_run_effects(closed, args, reads, mode, wanted=None):
+    """Run the effects of a traced event, such as its runtime checks, over the
+    whole event, evaluating only what they (and the `wanted` outputs) need.
+
+    A selected read pulls requested rows of the event's value, so it never
+    reaches an equation without outputs. A check of the data has the same
+    outcome at every point: prepare_partition runs those once (mode 'data',
+    the point's entry of `args` is None). Each selected read runs the checks
+    that read the point (mode 'point'), as the full density runs every check
+    at each evaluation. `reads` says which inputs depend on the point.
+    Returns the outputs, None where not wanted.
+    """
+    jaxpr = closed.jaxpr
+    dependent = _rk_point_dependence(jaxpr, reads)
+    wanted = [False] * len(jaxpr.outvars) if wanted is None else wanted
+    needed = {v for v, w in zip(jaxpr.outvars, wanted) if w and not isinstance(v, _rk_core.Literal)}
+    equations = []
+    for eq in reversed(jaxpr.eqns):
+        runs = _rk_runs_effect(eq, dependent, mode)
+        if runs or any(v in needed for v in eq.outvars):
+            equations.append((eq, runs))
+            needed.update(v for v in eq.invars if not isinstance(v, _rk_core.Literal))
+    env = dict(zip(jaxpr.constvars, closed.consts))
+    env.update(zip(jaxpr.invars, args))
+    read = lambda v: v.val if isinstance(v, _rk_core.Literal) else env.get(v)
+    for eq, runs in reversed(equations):
+        name, values = eq.primitive.name, [read(v) for v in eq.invars]
+        inner = _rk_input_dependence(eq, dependent)
+        outputs = [v in needed for v in eq.outvars]
+        if runs and name == 'cond':
+            branches = eq.params['branches']
+            arm_mode = 'all' if inner[0] else mode
+            def arm(branch):
+                return lambda: _rk_run_effects(branch, values[1:], inner[1:], arm_mode, outputs)
+            if mode == 'data':
+                # The data are concrete here: run the arm the condition takes.
+                results = arm(branches[int(np.clip(values[0], 0, len(branches) - 1))])()
+            else:
+                results = jax.lax.switch(values[0], [arm(b) for b in branches])
+        elif runs and name in ('jit', 'pjit'):
+            results = _rk_run_effects(eq.params['jaxpr'], values, inner, mode, outputs)
+        elif mode == 'data' and any(inner):
+            # Needs the point, which preparation does not have.
+            results = [None] * len(eq.outvars)
+        else:
+            results = eq.primitive.bind(*values, **eq.primitive.get_bind_params(eq.params))
+            results = results if eq.primitive.multiple_results else [results]
+        env.update(zip(eq.outvars, results))
+    return [read(v) if w else None for v, w in zip(jaxpr.outvars, wanted)]
+
+
+def _rk_event_trace(fn, point, prepared):
+    """The event's trace with the data as inputs, the data's leaves, and
+    which inputs depend on the point."""
+    closed = jax.make_jaxpr(lambda u, data: fn(u, **data))(point, prepared)
+    data = jax.tree.leaves(prepared)
+    return closed, data, [True] + [False] * len(data)
+
+
+def _rk_check_event_data(fn, point, prepared):
+    """Run the event's checks of the data once, at their values in `prepared`."""
+    closed, data, reads = _rk_event_trace(fn, point, prepared)
+    _rk_run_effects(closed, [None] + [jnp.asarray(v) for v in data], reads, 'data')
+    return closed
+
+
 class _RKIndexedGraph:
     """Propagate requested output coordinates to input leaves while tracing.
 
     read() handles arbitrary gathered coordinates. region() retains regular
     slices, including the entire coupled input of a joint prior or transform.
     Neither path substitutes a dense evaluation for an unknown operation.
+    An equation that has no output, such as a runtime check, is never pulled:
+    _rk_run_effects runs those.
     """
     def __init__(self, closed, inputs, regions=None, parent=None):
         graph = closed.jaxpr
-        if graph.effects:
-            raise NotImplementedError("indexed JAX evaluation needs an effect-aware row rule for " +
-                                      str(graph.effects))
         self.parent = parent
         self.inputs = dict(zip(graph.invars, inputs))
         self.regions = dict(zip(graph.invars, inputs if regions is None else regions))
@@ -78,11 +180,32 @@ class _RKIndexedGraph:
         if key not in self.cache:
             if var in self.inputs:
                 value = self.inputs[var](index)
+            elif index and math.prod(_rk_lane_shape(index)) > math.prod(var.aval.shape) > 0:
+                # More requested entries than the value has, as when many
+                # rows read one shared factor: compute each distinct one once.
+                value = self.distinct(var, index)
             else:
                 eq, j = self.producers[var]
                 value = self.evaluate(eq, j, index)
             self.cache[key] = (index, value)
         return self.cache[key][1]
+
+    def distinct(self, var, index):
+        """Read the distinct requested entries of a computed value once each.
+
+        Only requested entries are computed: an unrequested one may be
+        invalid, such as a padded row, and its derivative must not enter.
+        """
+        shape, lane_shape = var.aval.shape, _rk_lane_shape(index)
+        flat = 0
+        for k, n in zip(index, shape):
+            flat = flat * n + jnp.asarray(k)
+        flat = jnp.broadcast_to(flat, lane_shape).ravel()
+        # The fill of a short result is the smallest requested entry.
+        unique, inverse = jnp.unique(flat, size=math.prod(shape), return_inverse=True)
+        eq, j = self.producers[var]
+        values = jnp.broadcast_to(self.evaluate(eq, j, _rk_unravel(unique, shape)), unique.shape)
+        return jnp.reshape(values[jnp.ravel(inverse)], lane_shape)
 
     def nested(self, eq):
         return self.child(eq.params['jaxpr'], eq.invars)
@@ -116,6 +239,15 @@ class _RKIndexedGraph:
             return run
         return jax.lax.switch(self.read(eq.invars[0], ()),
                               [arm(branch) for branch in eq.params['branches']])
+
+    def whole(self, eq):
+        """All outputs of an operation that couples all of its inputs, computed once."""
+        key = ('whole', id(eq))
+        if key not in self.cache:
+            values = eq.primitive.bind(*(self.region(v, tuple(range(n) for n in v.aval.shape))
+                                         for v in eq.invars), **eq.primitive.get_bind_params(eq.params))
+            self.cache[key] = (eq, values if eq.primitive.multiple_results else [values])
+        return self.cache[key][1]
 
     def region(self, var, axes):
         """Read a rectangular part of a joint event, retaining its coupled operations."""
@@ -243,7 +375,17 @@ class _RKIndexedGraph:
                     if at < width:
                         return arg(j, index[:axis] + (at,) + index[axis+1:])
                     at -= width
-            raise NotImplementedError("indexed JAX concatenation needs a statically selected field")
+            # Read every part at the requested positions it could hold, and
+            # keep the one that holds each.
+            lane_shape, result, offset = _rk_lane_shape(index), None, 0
+            for j, v in enumerate(args):
+                width = v.aval.shape[axis]
+                if width:
+                    local = jnp.clip(at - offset, 0, width - 1)
+                    part = jnp.broadcast_to(arg(j, index[:axis] + (local,) + index[axis+1:]), lane_shape)
+                    result = part if result is None else jnp.where(at >= offset, part, result)
+                offset += width
+            return result
         if name == 'gather':
             dims = p['dimension_numbers']
             indices = tuple(i for j, i in enumerate(index) if j not in dims.offset_dims)
@@ -282,6 +424,43 @@ class _RKIndexedGraph:
             contract = tuple(range(len(batch), len(batch) + len(widths)))
             dims = ((contract, contract), (batch, batch))
             return eq.primitive.bind(*operands, **dict(p, dimension_numbers=dims))
+        if name in _RK_CUMULATIVE:
+            # Scan the whole axis at each requested position's other
+            # coordinates, then pick the position.
+            axis, n = p['axis'], shape[p['axis']]
+            lane_shape = _rk_lane_shape(index)
+            coords = tuple(jnp.arange(n) if d == axis else _rk_spread(k, 1) for d, k in enumerate(index))
+            values = jnp.broadcast_to(arg(0, coords), lane_shape + (n,))
+            scanned = eq.primitive.bind(values, **dict(p, axis=len(lane_shape)))
+            at = jnp.broadcast_to(index[axis], lane_shape)
+            return jnp.take_along_axis(scanned, at[..., None], axis=-1)[..., 0]
+        if name == 'cholesky':
+            # A factor couples its two trailing axes. Factor each requested
+            # matrix of the batch whole, once, then pick the requested entries.
+            lane_shape = _rk_lane_shape(index)
+            rank, n, dims = len(lane_shape), shape[-1], shape[:-2]
+            batch = [jnp.reshape(b, (1,) * (rank - jnp.ndim(b)) + jnp.shape(b))
+                     for b in index[:-2]]
+            square = (jnp.arange(n).reshape(n, 1), jnp.arange(n).reshape(1, n))
+            requested = jnp.broadcast_shapes(*(jnp.shape(b) for b in batch)) if batch else ()
+            if math.prod(requested) > math.prod(dims):
+                # More requested matrices than the batch has: factor each
+                # distinct one once.
+                flat = 0
+                for b, m in zip(batch, dims):
+                    flat = flat * m + b
+                flat = jnp.broadcast_to(flat, requested).ravel()
+                unique, inverse = jnp.unique(flat, size=math.prod(dims), return_inverse=True)
+                matrices = jnp.broadcast_to(
+                    arg(0, tuple(_rk_spread(c, 2) for c in _rk_unravel(unique, dims)) + square),
+                    unique.shape + (n, n))
+                factors = eq.primitive.bind(matrices, **p)[jnp.ravel(inverse).reshape(requested)]
+            else:
+                factors = eq.primitive.bind(arg(0, tuple(_rk_spread(b, 2) for b in batch) + square), **p)
+            selected = factors.shape[:-2]
+            lead = tuple(0 if m == 1 else jnp.arange(m).reshape((1,) * d + (m,) + (1,) * (rank - d - 1))
+                         for d, m in enumerate(selected))
+            return jnp.broadcast_to(factors[lead + tuple(index[-2:])], lane_shape)
         if name in _RK_REDUCTIONS:
             axes = tuple(sorted(p['axes']))
             widths = tuple(args[0].aval.shape[d] for d in axes)
@@ -305,7 +484,19 @@ class _RKIndexedGraph:
                 operands.append(arg(j, coords))
             operands = jnp.broadcast_arrays(*operands)
             return eq.primitive.bind(*operands, **p)
+        if name in _RK_WHOLE:
+            # A loop's carry or a scatter's writes couple every entry.
+            value = self.whole(eq)[output]
+            return value[index] if index else value
         raise NotImplementedError("indexed JAX evaluation needs a row rule for " + name)
+
+
+_RK_CUMULATIVE = {'cumsum', 'cumprod', 'cummax', 'cummin', 'cumlogsumexp'}
+
+
+# Evaluated whole when any entry is read: a loop inside a plate's cell is
+# evaluated for every cell of the event.
+_RK_WHOLE = {'scan', 'while', 'scatter', 'scatter-add', 'scatter-mul', 'scatter-min', 'scatter-max'}
 
 
 _RK_REDUCTIONS = {'reduce_sum', 'reduce_max', 'reduce_min', 'reduce_prod', 'reduce_or', 'reduce_and'}
@@ -325,15 +516,20 @@ _RK_POINTWISE = {
 def _rk_strict_batch(fn):
     # A vmapped cond predicates both arms. Preserve a ragged row guard across
     # vmap in both passes, using the pullback JAX generates from the same body.
+    # Only the first argument, the packed point, is differentiated. The
+    # residuals are that pullback's, the selected rows' values: the data never
+    # pass through as residuals or dense zero cotangents.
     sequential = jax.custom_batching.sequential_vmap
-    result = jax.custom_vjp(sequential(fn))
-    def forward(*args):
-        return fn(*args), args
-    def backward(args, seed):
-        _, pullback = jax.vjp(fn, *args)
-        return pullback(seed)
-    result.defvjp(sequential(forward), sequential(backward))
-    return result
+    def batched(*args):
+        others = len(args) - 1
+        def forward(point, *rest):
+            return jax.vjp(lambda p: fn(p, *rest), point)
+        def backward(pullback, seed):
+            return (*pullback(seed), *([None] * others))
+        result = jax.custom_vjp(sequential(fn))
+        result.defvjp(sequential(forward), sequential(backward))
+        return result(*args)
+    return batched
 
 
 def _rk_has_cond(closed):
@@ -346,9 +542,15 @@ def _rk_has_cond(closed):
 
 
 def _rk_read_event(fn, u, row, prepared):
-    closed = jax.make_jaxpr(lambda point, data: fn(point, **data))(u, prepared)
+    # The event's checks of the data ran once in prepare_partition. Those
+    # that read the point run here, over the whole event.
+    closed, _, reads = _rk_event_trace(fn, u, prepared)
+    checks = _rk_has_effect(closed, reads, 'point')
     def selected(point, index, data):
-        inputs = [_RKIndexedGraph.leaf(v) for v in jax.tree.leaves((point, data))]
+        leaves = jax.tree.leaves((point, data))
+        if checks:
+            _rk_run_effects(closed, leaves, reads, 'point')
+        inputs = [_RKIndexedGraph.leaf(v) for v in leaves]
         return _rk_selected(_RKIndexedGraph(closed, inputs), index)
     if _rk_has_cond(closed):
         return _rk_strict_batch(selected)(u, row, prepared)

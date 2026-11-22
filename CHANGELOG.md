@@ -16,18 +16,55 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.367
+## 0.1.370
 
 - A summed plate whose cells call `exp` on a number runs as vector code.
   Julia compiles `exp` of a machine float as a call, and that call kept the
   plate's summed loop scalar. A native program now inlines Base's method
   where it calls `exp` on a `Float64` or `Float32`. The density of a Poisson
-  regression with 3,000 rows, `y .~ Poisson.(exp.(log_lambda))`, takes 3.7 µs
-  where it took 13.7 µs. A total can differ in its last digits, because the
+  regression with 3,000 rows, `y .~ Poisson.(exp.(log_lambda))`, takes about
+  4 µs where it took about 13 µs. A total can differ in its last digits, because the
   vector loop adds the cells in another order. Ordinary Enzyme Reverse still
   applies its own rule for `exp`, so gradients are unchanged. Generated code
   shows a statement that is one scalar `exp` as
   `ReactiveKernels._native_scalar_exp(x)` where it showed `Base.exp(x)`.
+
+## 0.1.369
+
+- Indexed JAX density events evaluate events that contain runtime checks.
+  Checks that read only data run once, through `_rk_check_event_data`. Checks
+  that read the parameters run over the whole event at each selected read,
+  including checks under a condition on the parameters.
+- Selected rows can read Cholesky factors of a batch of matrices, cumulative
+  sums and products at gathered positions, and a concatenation at a traced
+  position. They read the entire output of a loop or a scatter.
+- A selected read computes each distinct entry it requests once, such as a
+  factor shared by many rows, and still never computes an entry it does not
+  request. The derivative of a read under a condition keeps only the selected
+  rows' residuals, without the data or dense zero cotangents for them. At 149
+  stations of the clustered ODL model, one station's value and gradient take
+  2.4 ms against 102 ms for the full density. Batches grow linearly.
+
+## 0.1.368
+
+- Preparing a program that calls `rk_ode_rk45_tol` reports no type-stability
+  finding in the solver's code at the default `type_stability_level = :all`,
+  so `prepare` with `type_stability = :error` no longer refuses it. The
+  adapter passes DP5's default step-size controller unresolved, and the
+  solver resolves it to the same settings, so every step and result is
+  unchanged. Left to its default, OrdinaryDiffEqCore had resolved the
+  controller against an untyped placeholder list in `_ode_init`.
+  `rk_ode_bdf_tol` is unchanged.
+
+## 0.1.367
+
+- A `float_type = Float32` JAX module solves `rk_ode_rk45_tol` and
+  `rk_ode_bdf_tol` in float32 whether JAX's 64-bit mode is on or off, with
+  diffrax and in the per-lane CUDA kernel. Before, with 64-bit mode on (as in
+  a process that loads a float64 module, such as a ReactiveKernelMethods
+  bundle), the diffrax solve's times, state and solution were float64, so a
+  lazy branch on the solution failed with `cond branches must have equal
+  output types`, and the per-lane kernel's step-size control was float64.
 
 ## 0.1.366
 

@@ -428,7 +428,9 @@ def _rk_lane_dot(ws, xs):
 def _rk_lane_rms(xs):
     if len(xs) == 1:
         return jnp.abs(xs[0])
-    return jnp.sqrt(_functools.reduce(lambda a, b: a + b, [x * x for x in xs])) / np.sqrt(len(xs))
+    # A Python float, weakly typed: a NumPy float64 would make float32 lanes float64
+    # under 64-bit mode.
+    return jnp.sqrt(_functools.reduce(lambda a, b: a + b, [x * x for x in xs])) / float(np.sqrt(len(xs)))
 
 
 def _rk_lane_any(m):
@@ -919,8 +921,9 @@ def _rk_check_ode_rtol_batch(size, batched, reltol):
 def _rk_ode_solve(solver, rhs, y0, t0, ts, n, reltol, abstol, maxsteps, args, active=True):
     # ReactiveKernels' rk_ode_rk45_tol / rk_ode_bdf_tol: integrate
     # dy/dt = rhs(t, y, args) from t0, returning the state at each of the
-    # first n output times (rows) and a status.
-    dtype = jnp.result_type(float)
+    # first n output times (rows) and a status. The solve's times, state and
+    # outputs are the module's float type (`_jax_ode_solve_source`).
+    dtype = jnp.float64
     cap = 2 ** 31 - 1
     if isinstance(maxsteps, int):
         maxsteps = min(maxsteps, cap)
@@ -939,7 +942,7 @@ def _rk_ode_solve(solver, rhs, y0, t0, ts, n, reltol, abstol, maxsteps, args, ac
     last = jnp.where(n > 0, ts[jnp.maximum(n, 1) - 1], t0 + 1)
     ok = valid & (n > 0)
     if dtype == jnp.float32:
-        requested_rtol = jnp.where(active & ok & (reltol > 0), reltol, jnp.inf)
+        requested_rtol = jnp.where(active & ok & (reltol > 0), reltol, jnp.inf).astype(dtype)
         _rk_check_ode_rtol(jax.lax.stop_gradient(requested_rtol))
     last = jnp.where(ok, last, t0 + 1)
     ts = jnp.where(requested & ok, ts, last)
@@ -1005,6 +1008,14 @@ def _rk_ode_solve(solver, rhs, y0, t0, ts, n, reltol, abstol, maxsteps, args, ac
     return ys, jnp.where(n > 0, status, 0)
 """
 
+# `_rk_ode_solve` of this module: it solves in the module's float type, never
+# in JAX's default float, which is float64 whenever 64-bit mode is on, even in
+# a float32 module (another module, or this one's `fma` helper, turned it on).
+# Its float64 times and state would make the solution float64 (snag
+# evaluating-the-l-662ff8c9).
+_jax_ode_solve_source() = _jax_float_type() === Float64 ? _JAX_ODE_SOLVE :
+    replace(_JAX_ODE_SOLVE, "    dtype = jnp.float64\n" => "    dtype = jnp." * _jax_float_name() * "\n")
+
 _jax_ode_solver(::typeof(rk_ode_rk45_tol)) = "Dopri5"
 _jax_ode_solver(::typeof(rk_ode_bdf_tol)) = "Kvaerno5"
 
@@ -1039,7 +1050,7 @@ function _jax_ode_call(ctx::_JaxContext, f, args::Vector{_PyVal})
     end
     mx.T isa Type && mx.T <: Integer ||
         _jax_error("`", name, "`'s maxsteps is a `", mx.T, "`", _jax_where(ctx))
-    helper = _jax_helper!(ctx, "_rk_ode_solve", _JAX_ODE_SOLVE)
+    helper = _jax_helper!(ctx, "_rk_ode_solve", _jax_ode_solve_source())
     ts = _jax_bind!(ctx, :ts, ts)
     n = isempty(ts.extent) ? ts.code * ".shape[0]" : ts.extent
     fun = _jax_ode_rhs!(ctx, _jax_function_of(rhs), extra)

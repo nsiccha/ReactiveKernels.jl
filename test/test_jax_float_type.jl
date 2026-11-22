@@ -104,3 +104,63 @@ end
         @test r.x64 && !r.f64 && r.dtype == "float32" && r.value == 6
     end
 end
+
+# An ODE solve per plate cell whose solution meets a float32 value in a lazy
+# branch, as a likelihood guarded by its scale does. With 64-bit mode on, a
+# solve in JAX's default float made the solution float64 and the branch's arms
+# disagree (`cond branches must have equal output types`; snag
+# evaluating-the-l-662ff8c9, Portfolio's Friberg model in an RKM bundle).
+_jax_float_absorption(t, y, ka, k) = [-ka * y[1], ka * y[1] - k * y[2]]
+@kernel jax_float_ode(u::Vector{Float64}, doses::Vector{Float64},
+                      times::Vector{Vector{Float64}}) = begin
+    ka = exp(u[1])
+    k = exp(u[2])
+    sigma = exp(u[3])
+    values = plate(doses, times) do d, ts
+        sol = rk_ode_rk45_tol(_jax_float_absorption, [d, 0.0], 0.0, ts, 1e-6, 1e-6, 10^4, ka, k)
+        level = sum(sol[:, 2])
+        sigma > 0 ? -0.5 * ((log(level) - log(d)) / sigma)^2 - log(sigma) : -Inf
+    end
+    total = sum(values)
+    return total
+end
+
+@testset "jax_source: a float32 module's ODE solve is float32 in either mode" begin
+    have = (:u, :doses, :times)
+    src32 = jax_source(jax_float_ode; have, want = :total, float_type = Float32)
+    src64 = jax_source(jax_float_ode; have, want = :total)
+    # The solve's dtype is the module's float type, not JAX's default float.
+    @test occursin("\n    dtype = jnp.float32\n", string(src32))
+    @test occursin("\n    dtype = jnp.float64\n", string(src64))
+    @test !occursin("result_type(float)", string(src32))
+    @test !occursin("jax_enable_x64", string(src32))
+    if rk_jax_available() && success(`$RK_JAX_PYTHON -c "import diffrax"`)
+        args = ([0.2, -0.7, -1.0], [100.0, 80.0, 120.0],
+                [[0.5, 1.0, 2.0], [0.5, 3.0], [1.0, 2.0, 4.0, 8.0]])
+        # The float64 module, imported first, turns 64-bit mode on. diffrax's
+        # Dopri5 dense output itself multiplies its stages by a NumPy float64
+        # coefficient vector and rounds the product to the state's dtype
+        # (`FourthOrderPolynomialInterpolation`), so this trace holds float64
+        # there (`r.f64`); the values and gradient are float32.
+        r = rk_jax_float32(src32, src64, :kernel, args)
+        @test r.x64
+        @test r.dtype == "float32" && r.grad_dtype == "float32"
+        @test r.value ≈ r.reference rtol = 1e-5
+        @test r.grad ≈ r.reference_grad rtol = 1e-3
+        alone = rk_jax_float32(src32, nothing, :kernel, args)
+        @test !alone.x64 && alone.dtype == "float32"
+        @test alone.value ≈ r.value rtol = 1e-6
+        # The per-lane CUDA path, in Pallas' interpreter on this backend: its
+        # steps are the module's own, with no float64 anywhere.
+        if success(`$RK_JAX_PYTHON -c "from jax.experimental import pallas"`)
+            lanes = withenv(() -> rk_jax_float32(src32, src64, :kernel, args),
+                            "RK_JAX_ODE_KERNEL" => "interpret")
+            @test lanes.x64 && !lanes.f64
+            @test lanes.dtype == "float32" && lanes.grad_dtype == "float32"
+            @test lanes.value ≈ r.value rtol = 1e-5
+            @test lanes.grad ≈ r.grad rtol = 1e-3
+        end
+    else
+        @test_skip false
+    end
+end

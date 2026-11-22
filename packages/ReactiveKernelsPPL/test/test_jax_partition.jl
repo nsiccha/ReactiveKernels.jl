@@ -76,6 +76,9 @@ include(joinpath(pkgdir(ReactiveKernels), "test", "jax_python.jl"))
                 global_reference = $(_rk_py_input(native(global_query, first(points))))
                 full_reference = $(_rk_py_input(native(sampler, first(points))))
                 """)
+            # The runtime check every emitted module uses, for hand-written events.
+            write(joinpath(dir, "checks.py"), "import jax\nimport jax.numpy as jnp\n" *
+                ReactiveKernels._JAX_CHECK)
             cp(joinpath(@__DIR__, "jax_partition.py"), joinpath(dir, "run.py"))
             @test success(pipeline(`$RK_JAX_PYTHON $(joinpath(dir, "run.py"))`;
                 stdout = stdout, stderr = stderr))
