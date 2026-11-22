@@ -1398,23 +1398,38 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
         end
         return _PyVal(_py_atom(x.code) * "[" * join(parts, ", ") * "]", T, false, gather.extent)
     end
-    v = _PyVal(_py_atom(x.code) * "[" * join(parts, ", ") * "]", T, false,
-               target ? "" : _jax_gather_extent(ctx, values, kept))
+    v = _jax_gather_result(ctx, x, parts, T, values, kept; target)
     # An entry of a prepared integer array keeps where it comes from, so a
     # loop over a range it ends has a static number of steps.
     kept == 0 && !target ? _jax_with_origin(v, _jax_selected_origin(x, T, join(parts, ", "))) : v
 end
-# The extent of a gather: the lengths of its index vector, when that is padded
-# (a ragged row, or a range to a data length), since the gathered entries are
-# padded as the index is and reductions of them mask the rest. A padded index
-# beside another kept dimension would pad an inner axis, which nothing masks.
-function _jax_gather_extent(ctx::_JaxContext, values, kept::Int)
-    padded = [v for v in values if v !== nothing && _jax_is_array(v.T) && !isempty(v.extent)]
-    isempty(padded) && return ""
-    kept == 1 || _jax_error("a gather by a padded (ragged) index vector or a `Bool` mask ",
-                            "beside another kept dimension has no JAX translation",
-                            _jax_where(ctx))
-    only(padded).extent
+# The index vector determines how many rows of the gathered array are valid.
+# A single advanced index beside basic slices keeps its axis. Multiple array
+# indices would select pairs in JAX, whereas Julia selects their product.
+function _jax_gather_result(ctx::_JaxContext, x::_PyVal, parts, T, values, kept::Int; target=false)
+    source = _py_atom(x.code)
+    code = source * "[" * join(parts, ", ") * "]"
+    target && return _PyVal(code, T)
+    array_index(v) = v !== nothing && _jax_is_array(v.T)
+    k = findfirst(v -> array_index(v) && !isempty(v.extent), values)
+    k === nothing && return _PyVal(code, T)
+    extent = values[k].extent
+    kept == 1 && return _PyVal(code, T, false, extent)
+    k == 1 && count(array_index, values) == 1 ||
+        _jax_error("a non-leading padded index or multiple array indices ",
+                   "beside another kept dimension have no JAX translation", _jax_where(ctx))
+    # Raw padded storage can have a positive capacity even if every group is
+    # empty. In that case there is no source row to read for a padding slot.
+    empty_shape = source * "[:0, " * join(parts[2:end], ", ") * "].shape[1:]"
+    width = _py_atom(values[k].code) * ".shape[0]"
+    empty_rows = function()
+        _jax_call(ctx, _runtime_check, [_PyVal(extent * " == 0", Bool),
+            _PyVal(repr("BoundsError: cannot gather rows from an empty axis"), BoundsError)])
+        _PyVal("jnp.zeros((" * width * ",) + " * empty_shape * ", dtype=" * source * ".dtype)", T)
+    end
+    result = _jax_conditional(ctx, _PyVal(source * ".shape[0] == 0", Bool, true),
+                              empty_rows, () -> _PyVal(code, T))
+    _PyVal(result.code, T, false, extent, "", 1)
 end
 
 # A literal colon or a written range `a:b`, which `_jax_index_part` slices
@@ -4506,6 +4521,44 @@ function _jax_traceable_or_lowered(ctx::_JaxContext, f, args::Vector{_PyVal})
                "author it as a kernel")
 end
 
+# Contract at the logical length. Two views with that length may have been
+# padded to different physical widths. Mask both sides before multiplication
+# so unused entries contribute neither values nor cotangents.
+const _JAX_PADDED_CONTRACTION = """
+def _rk_padded_matmul(a, b, n):
+    width = min(a.shape[-1], b.shape[0])
+    valid = jnp.arange(width) < n
+    left = jnp.where(valid, a[..., :width], 0)
+    right = jnp.where(valid if b.ndim == 1 else valid[:, None], b[:width], 0)
+    return left @ right
+"""
+function _jax_padded_matmul(ctx, args)
+    a, b = args
+    left_axes, right_axes = _jax_padded_axes(a), _jax_padded_axes(b)
+    ((!isempty(a.extent) && iszero(left_axes)) || (!isempty(b.extent) && iszero(right_axes))) &&
+        _jax_error("matrix multiplication with unknown padded axes", _jax_where(ctx))
+    row = !iszero(left_axes & 1)
+    col = !iszero(right_axes & 2)
+    row && col && a.extent != b.extent &&
+        _jax_error("matrix multiplication with independently padded output axes", _jax_where(ctx))
+    # Julia treats a left vector as a column and a right adjoint vector as a
+    # row. JAX can use the one-dimensional storage of the other two cases.
+    left = a.T <: AbstractVector ? _py_atom(a.code) * "[:, None]" : a.code
+    right = _jax_adjoint_vector(b.T) ? _py_atom(b.code) * "[None, :]" : b.code
+    if !iszero(left_axes & 2) || !iszero(right_axes & 1)
+        n = iszero(left_axes & 2) ? _PyVal(_py_atom(left) * ".shape[-1]", Int, true) : _PyVal(a.extent, Int)
+        m = iszero(right_axes & 1) ? _PyVal(_py_atom(right) * ".shape[0]", Int, true) : _PyVal(b.extent, Int)
+        n.code == m.code || _jax_call(ctx, _runtime_check, [_jax_call(ctx, ==, [n, m]),
+            _PyVal(repr("matrix multiplication: incompatible dimensions"), DimensionMismatch)])
+        name = _jax_helper!(ctx, "_rk_padded_matmul", _JAX_PADDED_CONTRACTION)
+        code = name * "(" * left * ", " * right * ", " * n.code * ")"
+    else
+        code = _py_infix("@", [left, right])
+    end
+    v = _jax_result(*, args, code)
+    _PyVal(v.code, v.T, v.static, row ? a.extent : col ? b.extent : "", "", Int(row) | Int(col) << 1)
+end
+
 # Julia's `*` on arrays is the matrix product.
 function _jax_function_call(ctx::_JaxContext, ::typeof(*), args::Vector{_PyVal})
     length(args) == 2 || return _jax_call(ctx, *, [_jax_call(ctx, *, args[1:2]); args[3:end]])
@@ -4519,9 +4572,10 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(*), args::Vector{_PyVal})
             # Padded as `a .* b` is: `a` along the rows, `b` along the columns.
             return _PyVal(v.code, v.T, v.static, v.extent, v.limit, _jax_padded_union(args))
         end
+        (!isempty(a.extent) || !isempty(b.extent)) && return _jax_padded_matmul(ctx, args)
         return _jax_result(*, args, _py_infix("@", [a.code, b.code]))
     end
-    _jax_result(*, args, _py_infix("*", [a.code, b.code]))
+    _jax_elementwise_result(*, args, _py_infix("*", [a.code, b.code]))
 end
 function _jax_function_call(ctx::_JaxContext, ::typeof(_native_exp), args::Vector{_PyVal})
     x = only(args)
@@ -4770,15 +4824,29 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(permutedims), args::Vecto
     R = _jax_rank(x.T)
     E = _jax_eltype(x.T)
     if length(args) == 1
-        R == 1 && return _PyVal(_py_atom(x.code) * "[None, :]", Matrix{E})
-        R == 2 && return _PyVal("jnp.transpose(" * x.code * ")", Matrix{E})
+        R == 1 && return _PyVal(_py_atom(x.code) * "[None, :]", Matrix{E}, false, x.extent,
+                                "", isempty(x.extent) ? 0 : 2)
+        if R == 2
+            source = _jax_adjoint_vector(x.T) ? _py_atom(x.code) * "[None, :]" : x.code
+            m = _jax_padded_axes(x)
+            return _PyVal("jnp.transpose(" * source * ")", Matrix{E}, false, x.extent, "",
+                          (m & 1) << 1 | (m & 2) >> 1)
+        end
         _jax_error("`permutedims` of a rank-", R, " array without a permutation", _jax_where(ctx))
     end
     perm = args[2]
     _jax_known(ctx, perm) && perm.T isa Type && perm.T <: NTuple{R,Integer} ||
         _jax_error("`permutedims` by a permutation that is not a static tuple", _jax_where(ctx))
     axes = "tuple(a - 1 for a in " * perm.code * ")"
-    _PyVal("jnp.transpose(" * x.code * ", " * axes * ")", Array{E,R})
+    source = _jax_adjoint_vector(x.T) ? _py_atom(x.code) * "[None, :]" : x.code
+    code = "jnp.transpose(" * source * ", " * axes * ")"
+    isempty(x.extent) && return _PyVal(code, Array{E,R})
+    padded = _jax_padded_axes(x)
+    padded == (1 << R) - 1 && return _PyVal(code, Array{E,R}, false, x.extent, "", padded)
+    order = _jax_integer_tuple_literals(perm)
+    order === nothing && _jax_error("reordering padded axes needs a literal permutation", _jax_where(ctx))
+    permuted = sum(((padded >> (k - 1)) & 1) << (i - 1) for (i, k) in enumerate(order))
+    _PyVal(code, Array{E,R}, false, x.extent, "", permuted)
 end
 # `eachrow(M)` / `eachcol(M)`: a matrix's slices, one per entry, as a plate's
 # collection. The slices are the matrix's leading axis (rows) or its
@@ -5689,6 +5757,10 @@ function _jax_call_keywords(ctx::_JaxContext, ::typeof(repeat), args::Vector{_Py
                     i === nothing ? nothing : _jax_repeat_counts(ctx, last(kw[i])))
     _jax_repeat(ctx, only(args), counts(:inner), counts(:outer))
 end
+function _jax_integer_tuple_literals(v::_PyVal)
+    m = match(r"^\(\s*(-?[0-9]+(?:\s*,\s*-?[0-9]+)*)\s*,?\s*\)$", v.code)
+    m === nothing ? nothing : parse.(Int, strip.(split(m.captures[1], ',')))
+end
 # The counts of an `inner` or `outer` keyword: `nothing` (not given), one
 # integer, or a tuple of them.
 function _jax_repeat_counts(ctx::_JaxContext, v::_PyVal)
@@ -5697,9 +5769,8 @@ function _jax_repeat_counts(ctx::_JaxContext, v::_PyVal)
     v.T isa Type && v.T <: Tuple && isconcretetype(v.T) ||
         _jax_error("`repeat` with counts of type `", v.T, "`", _jax_where(ctx))
     # A literal tuple (`inner = (1, 2)`) gives its literal counts.
-    m = match(r"^\(\s*(-?[0-9]+(?:\s*,\s*-?[0-9]+)*)\s*,?\s*\)$", v.code)
-    m === nothing || return _PyVal[_jax_literal(parse(Int, strip(c)))
-                                   for c in split(m.captures[1], ',')]
+    values = _jax_integer_tuple_literals(v)
+    values === nothing || return _jax_literal.(values)
     _jax_dimension_values([v])
 end
 function _jax_repeat(ctx::_JaxContext, x::_PyVal, inner::Union{Nothing,Vector{_PyVal}},
@@ -5792,7 +5863,7 @@ function _jax_index_values(ctx::_JaxContext, x::_PyVal, indices::Vector{_PyVal})
         isempty(x.extent) && _jax_error("a ragged array without its lengths", _jax_where(ctx))
         return _PyVal(code, T, false, x.extent * "[" * join(parts, ", ") * "]", "", kept == 0 ? 1 : 0)
     end
-    _PyVal(code, T, false, _jax_gather_extent(ctx, gathered, kept))
+    _jax_gather_result(ctx, x, parts, T, gathered, kept)
 end
 
 # A range value, `a:b`: the array of its elements. JAX arrays have static
@@ -8779,7 +8850,7 @@ def pad_ragged(arrays: list, rank=None) -> tuple:
     tail = rows[0].shape[1:] if rows else (1,) * (rank - 1)
     if any(r.ndim != rank or r.shape[1:] != tail for r in rows):
         raise ValueError("ragged cells need their declared rank and common trailing dimensions")
-    kinds = [r.dtype for r in rows if r.shape[0] > 0]
+    kinds = [r.dtype for r in rows if r.shape[0] > 0] or [r.dtype for r in rows]
     dtype = np.result_type(*kinds) if kinds else np.float64
     rows = [r.astype(dtype) for r in rows]
     lengths = np.asarray([r.shape[0] for r in rows], dtype=np.int64)

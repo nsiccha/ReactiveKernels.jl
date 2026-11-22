@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.366
+
+- JAX kernels can gather matrix rows with a ragged integer index or a leading
+  Boolean mask. Reductions and matrix products use each group's selected rows,
+  including repeated indices and empty selections.
+
 ## 0.1.365
 
 - Indexed JAX density events can read selected rows of a conditional when
