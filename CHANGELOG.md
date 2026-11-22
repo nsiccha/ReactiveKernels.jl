@@ -26,8 +26,10 @@ are recorded in the git history only.
   prepared non-allocating program materializes by itself. On a CPU with
   AVX-512 the density of a Bernoulli-logit regression with 3,000 rows,
   `y .~ BernoulliLogit.(logit_p)`, takes about 6 µs where it took about
-  37 µs, and binomial and ordered-logistic densities take a quarter to a
-  third of their time. Gradients take the same time or less. The swap applies
+  38 µs under Julia 1.13 (10 µs from 42 µs under Julia 1.10), and binomial
+  and ordered-logistic densities take between a quarter and two fifths of
+  their time. Their gradients take about 30% less; the Bernoulli gradient
+  takes the same. The swap applies
   where the running process compiles that loop into vectors of at least four
   doubles (AVX2 or AVX-512, where the softplus itself is 1.4 to 6 times
   faster); elsewhere a program runs the code it ran before. A softplus in such a loop can differ from `rk_log1pexp` in its last
