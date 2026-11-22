@@ -16,6 +16,17 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.367
+
+- `rk_ode_rk45_tol` and `rk_ode_bdf_tol` prepare without a type-stability
+  finding at the default `type_stability_level = :all`, so
+  `type_stability = :error` no longer refuses a program that calls them. The
+  adapter passes each algorithm's default step-size controller unresolved
+  (DP5's `PIController`, FBDF's `BDFController`); the solver resolves it to the
+  same settings, so every step and result is unchanged. Left to its default,
+  OrdinaryDiffEqCore had resolved the controller against an untyped placeholder
+  list in `_ode_init`.
+
 ## 0.1.366
 
 - JAX kernels can gather matrix rows with a ragged integer index or a leading
