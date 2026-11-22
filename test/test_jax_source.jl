@@ -760,12 +760,36 @@ end
     total = sum(lp)
     return total
 end
-# A gather through a ragged row beside a whole axis would pad an inner axis.
+# Keep the design columns when each group selects its own rows.
 @kernel jax_gather_matrix_rows(M::Matrix{Float64}, R::Vector{Vector{Int}}, b::Vector{Float64}) = begin
     lp = plate(R, Ref(M), Ref(b)) do r, Ms, bs
         sum(Ms[r, :] * bs)
     end
     total = sum(lp)
+    return total
+end
+@kernel jax_gather_matrix_contractions(M::Matrix{Float64}, R::Vector{Vector{Int}}, b::Vector{Float64}) = begin
+    lp = plate(R, Ref(M), Ref(b)) do r, Ms, bs
+        X = view(Ms, r, :)
+        w = Ms[r, 1] .+ X * bs
+        sum(abs2, X) + sum(X' * w) + sum(w' * X) + sum(permutedims(X) * w) +
+            sum(permutedims(X, (2, 1)) * w)
+    end
+    total = sum(lp)
+    return total
+end
+@kernel jax_gather_matrix_columns(M::Matrix{Float64}, R::Vector{Vector{Int}}) = begin
+    terms = plate(R, Ref(M)) do r, Ms
+        sum(Ms[:, r])
+    end
+    total = sum(terms)
+    return total
+end
+@kernel jax_gather_matrix_cartesian(M::Matrix{Float64}, R::Vector{Vector{Int}}) = begin
+    terms = plate(R, Ref(M)) do r, Ms
+        sum(Ms[r, r])
+    end
+    total = sum(terms)
     return total
 end
 # A broadcast `isequal` on the host: its generated scalar helper must not
@@ -1312,10 +1336,11 @@ end
     # refused: Julia itself rejects two `:` dimensions (`DimensionMismatch`).
     @test_throws DimensionMismatch prepare(jax_two_colons; have = (:x,), want = :total)([1.0, 2.0])
     @test_throws "more than one `Colon`" jax_source(jax_two_colons; have = (:x,), want = :total)
-    # refused: a gather through a ragged row beside a whole axis pads an inner
-    # axis that no reduction masks (its JAX value used to sum the padding).
-    @test_throws "beside another kept dimension" jax_source(jax_gather_matrix_rows;
-        have = (:b, :M, :R), want = :total)
+    # Column gathers need their extent on the second axis. Two row vectors
+    # need Julia's Cartesian product, even when both are the same vector.
+    for k in (jax_gather_matrix_columns, jax_gather_matrix_cartesian)
+        @test_throws "beside another kept dimension" jax_source(k; have = (:M, :R), want = :total)
+    end
     # refused: a scan over a range whose start is computed from a parameter
     # has no static length; it used to emit a `jnp.arange` of a traced value,
     # which JAX rejects when it traces the module.
@@ -2279,6 +2304,42 @@ end
             r = rk_jax_evaluate(src, "kernel", (0.7, Y); grad = true, prepare = prep)
             @test r.value ≈ native(0.7, Y) rtol = 1e-12
             @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), Y), [0.7])) rtol = 1e-6
+        end
+    end
+end
+
+@testset "jax_source: leading ragged matrix gathers" begin
+    M = [0.2 1.1; -0.6 0.4; 2.3 -1.2; 0.9 1.5]
+    b = [0.7, -1.3]
+    rows = [[3, 1, 3], Int[], [4]]
+    larger = [[2, 4], [1], [2, 3, 3, 1], Int[], [4]]
+    for k in (jax_gather_matrix_rows, jax_gather_matrix_contractions)
+        have = (:M, :R, :b)
+        native = prepare(k; have, want = :total)
+        plain = jax_source(k; have, want = :total)
+        prepared = jax_source(k; have, want = :total, data = (; R = rows, b))
+        @test string(prepared) == string(jax_source(k; have, want = :total, data = (; R = larger, b)))
+        if rk_jax_available()
+            for R in (rows, larger, [Int[], Int[]])
+                expected = native(M, R, b)
+                grad = rk_fd_gradient(u -> native(reshape(u, size(M)), R, b), vec(M))
+                for (src, mode) in ((plain, false), (prepared, :arguments))
+                    result = rk_jax_evaluate(src, "kernel", (M, R, b); grad = true, prepare = mode)
+                    @test result.value ≈ expected rtol = 1e-12 atol = 1e-12
+                    @test vec(reduce(hcat, result.grad)') ≈ grad rtol = 1e-6 atol = 1e-8
+                end
+            end
+            if k === jax_gather_matrix_rows
+                for (src, mode) in ((plain, false), (prepared, :arguments))
+                    M0 = zeros(0, size(M, 2))
+                    result = rk_jax_evaluate(src, "kernel", (M0, [Int[]], b); grad = true, prepare = mode)
+                    @test result.value == native(M0, [Int[]], b) == 0
+                    @test isempty(result.grad)
+                    @test_throws "cannot gather rows from an empty axis" rk_jax_evaluate(src, "kernel", (M0, [[1]], b); prepare = mode)
+                end
+            end
+        else
+            @test_skip false
         end
     end
 end

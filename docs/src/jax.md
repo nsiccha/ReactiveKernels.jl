@@ -39,6 +39,12 @@ plates. Ragged cells can vary along their first axis; trailing dimensions
 must agree because the representation carries one extent per cell.
 For raw empty matrix lists, call `pad_ragged([], rank=2)`.
 
+For a ragged row index `r`, `M[r, :]` and `view(M, r, :)` keep every column.
+`sum(M[r, :] * b)` counts each selected row, including repeats. In
+`M[r, :]' * w` the contraction uses only the valid rows. A ragged column
+index beside a kept axis and two array indices including a ragged one
+remain unsupported.
+
 Plate cells can return numerical tuples or named records, including nested
 records and numeric array fields. Later plates can read those fields directly,
 such as `r.prior + sum(r.pointwise.y)`. The emitted representation stacks each

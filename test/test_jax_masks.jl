@@ -115,12 +115,16 @@ end
                             data = (; table = vcat(table, table, table))))
     device = jax_source(jax_mask_device; have = (:x, :present), want = :total)
     @test occursin("jnp.nonzero(", string(device))
-    @test_throws "beside another kept dimension" jax_source(jax_mask_beside;
-        have = (:x, :present), want = :total)
+    masked_rows = jax_source(jax_mask_beside; have = (:x, :present), want = :total)
     @test_throws "invalid index" jax_source(jax_mask_scalar; have = (:x, :b), want = :total)
     if !rk_jax_available()
         @test_skip false
     else
+        for mask in ([true, false, true, false, false], falses(size(table, 1)))
+            result = rk_jax_evaluate(masked_rows, "kernel", (table, mask); grad = true)
+            @test result.value == sum(table[mask, :])
+            @test reduce(hcat, result.grad)' == repeat(mask, 1, size(table, 2))
+        end
         for (k, have, data, args) in host
             f = prepare(k; have, want = :total)
             src = jax_source(k; have, want = :total, data)
