@@ -16,6 +16,34 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.370
+
+- The opt-in generated reverse of summed plates (`with_plate_reverse`, the
+  `plate_reverse` preference) takes its one pass on more programs, and where
+  it engaged at a loss it no longer does. Measured through the public
+  non-allocating sampler on Julia 1.13.1 with Enzyme dogfood, 2,000 rows:
+  - A likelihood that a data-bound branch partitions (a count likelihood's
+    zero and positive rows) reads its group effects through a composed
+    gather. Each part now takes the grouped one pass with one buffer entry
+    per group. A grouped Poisson gradient took 0.60 of ordinary Enzyme's time
+    and 1.06 of a hand-written gradient's; before, the rule did not engage.
+  - Several gathered operands, such as two crossed grouping factors, keep
+    ordinary arithmetic under one range check. Before, every cell took the
+    separate-exponent quotient: 9.9 times ordinary Enzyme on a crossed
+    Gaussian model, now 0.67.
+  - Quotient partials use plain arithmetic while their products stay in the
+    normal range, with the same bits, and the separate-exponent form outside
+    it. A grouped negative-binomial gradient went from 1.11 to 0.78 of
+    ordinary Enzyme.
+  - A cell that selects with `ifelse` on a predicate over active values is
+    differentiated. Before, the plate was refused.
+  - The program chooses the schedule from operand types and sizes before the
+    backend sees the call, and the one-pass reverse no longer depends on
+    operands staying unchanged after the primal. A preparation that owns its
+    AD caches evaluates once at its exemplar. If the backend refused a rule
+    call there, the preparation differentiates the plates inline, as without
+    the generated reverse, so no later evaluation pays for a refused rule.
+
 ## 0.1.369
 
 - Indexed JAX density events evaluate events that contain runtime checks.

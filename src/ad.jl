@@ -2370,6 +2370,7 @@ function _prepare_ad_operator(op::Val{O}, kernel::_ADKernel, resolver,
     _ad_require_backend_packages(requested)
     _ad_require_retaining_backend(requested, retain)
     backend = _ad_prepared_backend(op, requested)
+    requested_resolver = resolver
     resolved = _ad_resolve(resolver, args, kwargs)
     # The exemplars type the program exactly as the derivative will see it.
     values = _uninferred_values(kernel, map(Core.Typeof, resolved))
@@ -2393,8 +2394,13 @@ function _prepare_ad_operator(op::Val{O}, kernel::_ADKernel, resolver,
         active_selector,typeof(kernel),typeof(resolver),typeof(call),
         typeof(backend),typeof(preparation),typeof(external_values),O,typeof(storage),
     }, (kernel, resolver, call, backend, preparation, external_values, storage))::PreparedADOperator
-    _ad_check_derivative(op, prepared, point, seeds, contexts, warm)
-    prepared
+    evaluated = _ad_check_derivative(op, prepared, point, seeds, contexts, warm)
+    _pr_verified_preparation(op, prepared, point, seeds, contexts, evaluated) do
+        with_plate_reverse(false) do
+            _prepare_ad_operator(op, kernel, requested_resolver, requested, seeds, args,
+                                 kwargs, active; retain, warm)
+        end
+    end
 end
 
 # `warm = true` compiles the prepared gradient for the exemplar's argument
