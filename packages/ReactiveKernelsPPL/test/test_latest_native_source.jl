@@ -46,8 +46,6 @@ function _latest_source_fresh_model()
     model = Core.eval(mod, :generated_regression)
     plan = model(; X) | (; y)
     sources = ReactiveKernelsDistributionKernels.DistributionKernelSources
-    @test ReactiveKernelsPPL.PPLGeneratedModels.normal_id_glm_lpdf(X, zeros(2), 1.0, y) ≈
-          sources.normal_id_glm_lpdf(X, zeros(2), 1.0, y)
     @test sources._half_normal_logpdf_on_support(1.0, 10.0) ≈
           logpdf(Normal(0.0, 10.0), 1.0) + log(2)
     built = build_kernel(plan)

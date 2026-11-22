@@ -313,7 +313,7 @@ const _PPL_TEST_FILES = (
     "test_predictive_draws.jl",
     "test_absent_plate_shapes.jl",
     "test_discrete_latents.jl",
-    "test_glm_object_values.jl",
+    "test_design_product_values.jl",
     "test_native_plain_plate_emission.jl",
     "test_pointwise_arithmetic_emission.jl",
     "test_value_metadata.jl",

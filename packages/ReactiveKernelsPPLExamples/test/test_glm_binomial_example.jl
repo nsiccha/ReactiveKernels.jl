@@ -1,5 +1,5 @@
 using ReactiveKernelsPPLExamples.GLMBinomialExample
-using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, binomial_logit_glm
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal, binomial
 using LogExpFunctions: logistic, log1pexp
 using SpecialFunctions: loggamma
 using MutatingFunctions
@@ -34,13 +34,11 @@ end
     reference = _glm_binomial_reference(q, year, counts, totals)
 
     @testset "authored on the current baseline surface" begin
-        @test occursin("binomial_logit_glm(X, beta, totals).pointwise(counts)",
-            GLM_BINOMIAL_SOURCE)
+        @test occursin("binomial(; n = nt, logit = lp).logpdf(c)", GLM_BINOMIAL_SOURCE)
         @test occursin("normal(0.0, 100.0).logpdf", GLM_BINOMIAL_SOURCE)
         @test occursin("X = hcat(ones(length(year))", GLM_BINOMIAL_SOURCE)
-        @test !occursin("plate(", GLM_BINOMIAL_SOURCE)
         @test !occursin("struct ", GLM_BINOMIAL_SOURCE)
-        @test artifact.glm_object === binomial_logit_glm
+        @test artifact.likelihood_object === binomial
 
     end
 

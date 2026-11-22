@@ -298,11 +298,11 @@ end
                 _ao_eval(prepare_query(built, fit, :sampler), u) rtol = 1e-12
         end
     end
-    # A censored GLM object and a censored response holding one array per index.
+    # A censored design-product response and a censored response holding one array per index.
     others = (
         (quote
             a ~ Normal(0, 1); b[axes(Xd, 2)] .~ Normal.(0, 1); s ~ Exponential(1)
-            y ~ censored(NormalIDGLM(Xd, a, b, s), lo, Inf)
+            y .~ censored.(Normal.(a .+ Xd * b, s), lo, Inf)
         end, Dict{Symbol,Any}(:Xd => hcat(X, X .^ 2), :y => Y, :lo => fill(-0.5, 8)),
             Dict{Symbol,Any}(:Xd => hcat(X, X .^ 2)[rows, :], :lo => fill(-0.5, 4))),
         (quote

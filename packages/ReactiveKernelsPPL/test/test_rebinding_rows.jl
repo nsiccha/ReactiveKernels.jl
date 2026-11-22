@@ -124,12 +124,12 @@ function _rr_case(kind)
         counts = n -> [mod(3i, 4) + (n == 6) for i in 1:n]
         bind = n -> m() | (; y = counts(n))
         lik = (nt, n) -> sum(logpdf.(Poisson(exp(nt.a)), counts(n)))
-    elseif kind === :glm
+    elseif kind === :design_product
         m = @rkppl begin
             X = hcat(x1, x2)
             alpha ~ Normal(0, 1)
             beta[axes(X, 2)] .~ Normal.(0, 1)
-            y ~ NormalIDGLM(X, alpha, beta, 0.7)
+            y .~ Normal.(alpha .+ X * beta, 0.7)
         end
         bind = n -> m(; x1 = _rr_x(n), x2 = _rr_x(n) .^ 2) | (; y = _rr_y(n))
         lik = (nt, n) -> sum(logpdf.(Normal.(nt.alpha .+ hcat(_rr_x(n), _rr_x(n) .^ 2) * nt.beta,
@@ -254,7 +254,7 @@ end
 
 @testset "a built graph evaluates other row counts: designs, offsets and families" begin
     for kind in (:affine, :scalar_offset, :design, :design_intercept_column,
-            :factor, :log_rate, :glm, :ranged, :missing,
+            :factor, :log_rate, :design_product, :ranged, :missing,
             :kernel_location_and_scale, :plate)
         @testset "$kind" begin
             _rr_check(kind)
@@ -266,7 +266,7 @@ end
 @testset "a built graph rebinds empty observation domains in either direction" begin
     for kind in (:function_location, :scalar_location, :expression_location,
             :affine, :scalar_offset, :design, :design_intercept_column,
-            :log_rate, :glm, :ranged, :plate, :ragged, :ordinal)
+            :log_rate, :design_product, :ranged, :plate, :ragged, :ordinal)
         @testset "$kind" begin
             _rr_check(kind; fit = 6, new = 0)
             _rr_check(kind; fit = 0, new = 6)

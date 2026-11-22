@@ -175,9 +175,7 @@ function _wrap_evidence!(r, plan, pre, inputs, base;
         return Expr(:if, base.args[1], guarded, base.args[3])
     end
     family = r.family === MixtureFam ? something(r.mixture_family, GaussianFam) :
-        r.family === NormalIDGLMFam ? GaussianFam :
-        r.family === BernoulliLogitGLMFam ? BernoulliLogitFam :
-        r.family === PoissonLogGLMFam ? PoissonLogFam : r.family
+        r.family
     discrete = _evidence_discrete(family)
     # An emitter that supplies both log-space endpoints needs no
     # probability-space ones; the cells read only the log endpoints.

@@ -17,7 +17,7 @@ let d = _posteriordb_data("GLM_Poisson_Data-GLM_Poisson_model")
 end
 
 const GLM_POISSON_SOURCE = raw"""
-using ReactiveKernelsDistributionKernels.DistributionKernelSources: poisson_log_glm
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: poisson
 using LogExpFunctions: logistic, log1pexp
 
 @kernel model(unconstrained::Vector{Float64},
@@ -52,11 +52,13 @@ using LogExpFunctions: logistic, log1pexp
     log_jacobian::Float64 = jac_alpha + jac_beta1 + jac_beta2 + jac_beta3
 
     # Likelihood: count ~ Poisson_log(X·β). The design matrix X (cubic basis
-    # over year, built in the preamble and bound as data) and the coefficient
-    # vector splice into the explicit-math GLM object through one fused
-    # endpoint application — no predictor or likelihood plates.
+    # over year, built in the preamble and bound as data) times the coefficient
+    # vector is the log rate, and each count reads its own log rate.
     beta::Vector{Float64} = [alpha, beta1, beta2, beta3]
-    pointwise = poisson_log_glm(X, beta).pointwise(counts)
+    log_lambda = X * beta
+    pointwise = plate(counts, log_lambda) do c, ll
+        poisson(; log_rate = ll).logpdf(c)
+    end
     likelihood::Float64 = sum(pointwise)
 
     # Implicit uniform priors over the box contribute only a constant, which Stan
@@ -100,7 +102,7 @@ docs_example = (;
     kernel = density_kernel,
     output,
     requested_nodes,
-    glm_object = poisson_log_glm,
+    likelihood_object = poisson,
 )
 """
 
@@ -126,8 +128,8 @@ end
 Build the posteriordb `GLM_Poisson_model` (a Poisson-log cubic-trend GLM) as a
 declarative `ReactiveKernels.KernelSpec`. The bounded-uniform Stan priors are
 scaled-logit interval transforms with their exact `lub_constrain` Jacobian; the
-Poisson-log likelihood splices the explicit-math `poisson_log_glm` object over
-the bound design matrix (cubic basis over year). The transform Jacobian,
+Poisson-log likelihood is a plate of `poisson` laws over the log rates
+`X * beta` of the bound design matrix (cubic basis over year). The transform Jacobian,
 pointwise log-likelihood, likelihood reduction, constrained and unconstrained
 densities, unconstrained posterior, and the generated-quantity rates `lambda`
 are separate named nodes, and the constrained parameters are a plain NamedTuple.

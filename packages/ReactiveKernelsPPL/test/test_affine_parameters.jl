@@ -230,7 +230,7 @@ end
         alpha ~ Normal(0, 2)
         b[axes(X, 2)] .~ StudentT.(3, 0, 2)
         sigma ~ Exponential(1)
-        y ~ NormalIDGLM(X, alpha, b, sigma)
+        y .~ Normal.(alpha .+ X * b, sigma)
         q = sum(b .^ 2)
     end; x, y)
     @test isempty(glm.population_priors)

@@ -1,8 +1,7 @@
 module BernoulliSharedSoftplusTests
 using Test, ReactiveKernels, ReactiveKernelsDistributionKernels
 using DifferentiationInterface: AutoEnzyme
-using ReactiveKernelsDistributionKernels.DistributionKernelSources: bernoulli, bernoulli_logit_glm
-using LogExpFunctions: log1pexp, logistic
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: bernoulli
 import Enzyme
 
 @testset "Bernoulli shared primitive preserves both input routes" begin
@@ -31,16 +30,5 @@ import Enzyme
     @test ad_value_and_gradient(direct_ad,false,0.0)==(0.0,-1.0)
     @test direct(false,1.0)==-Inf
     @test direct(true,0.0)==-Inf
-
-    # Whole-vector GLM uses the same primitive in its signed-margin formula.
-    glm=prepare(bernoulli_logit_glm.logpdf;have=(:y,:X,:beta),want=:logpdf)
-    X=[1.0 -2.0; 1.0 0.0; 1.0 3.0]; y=[0,1,1]; beta=[.2,-.3]
-    glm_ad=prepare_ad(glm,backend,y,X,beta;active=:beta)
-    for b in (beta,[0.0,1000.0])
-        v,g=ad_value_and_gradient(glm_ad,y,X,b)
-        eta=X*b
-        @test v ≈ sum(-log1pexp.((1 .- 2 .* y).*eta))
-        @test g ≈ X'*(y .- logistic.(eta))
-    end
 end
 end

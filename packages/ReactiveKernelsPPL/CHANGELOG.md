@@ -16,6 +16,27 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.254
+
+- **Breaking:** the fused GLM statements `y ~ NormalIDGLM(X, alpha, beta,
+  sigma)`, `y ~ BernoulliLogitGLM(X, alpha, beta)` and `y ~ PoissonLogGLM(X,
+  alpha, beta)` are removed. Lowering refuses them and names the statement to
+  write: `y .~ Normal.(alpha .+ X * beta, sigma)`,
+  `y .~ BernoulliLogit.(alpha .+ X * beta)` or
+  `y .~ Poisson.(exp.(alpha .+ X * beta))`. A model states its per-observation
+  likelihood, and the lowering of that statement carries the efficient
+  computation.
+- **Breaking:** `LikelihoodSpec` no longer has the `glm_alpha` and `glm_beta`
+  fields or keywords, and the families `NormalIDGLMFam`,
+  `BernoulliLogitGLMFam` and `PoissonLogGLMFam` are gone. A hand-built plan
+  uses `GaussianFam`, `BernoulliLogitFam` or `PoissonLogFam` with a predictor.
+  The all-fields positional constructors take two arguments fewer.
+- `condition(plan; y = ...)` and `plan | (; y = ...)` rebind a bound plan
+  whose model computes a design matrix (`X = hcat(x1, x2)`) read as a value,
+  as in `y .~ Normal.(alpha .+ X * beta, sigma)`. The rebinding builds the
+  matrix again from its columns. Before, it was refused with `column X is
+  computed by the model (X = hcat(...)) — drop it from bind_data`.
+
 ## 0.1.253
 
 Requires ReactiveKernels 0.1.360.

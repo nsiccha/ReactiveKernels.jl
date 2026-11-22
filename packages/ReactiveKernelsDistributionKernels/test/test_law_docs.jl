@@ -43,7 +43,6 @@ _explicit_formals(law, endpoint) = Tuple(last(_signature(law, endpoint)))
 _primary(law) = :logpdf in RK.kernel_endpoint_names(law) ? :logpdf :
     first(RK.kernel_endpoint_names(law))
 
-_X = [1.0 0.4; 1.0 -1.2; 1.0 0.7]
 _L = Matrix(cholesky(Symmetric([1.0 0.3 -0.2; 0.3 1.0 0.1; -0.2 0.1 1.0])).L)
 _Σ = [1.4 0.3 0.1; 0.3 0.8 -0.2; 0.1 -0.2 1.1]
 _zi(count_law, zi) =
@@ -178,14 +177,6 @@ const CASES = Dict{Symbol,Any}(
     :dirichlet_multinomial => (params = (6, [0.2, 0.5, 0.3]),
         doc = "Distributions.DirichletMultinomial(n, alpha)", xs = [[2, 3, 1], [0, 6, 0]],
         ref = (n, a, y) -> D.logpdf(D.DirichletMultinomial(n, a), y)),
-    :bernoulli_logit_glm => (params = (_X, [0.3, -0.8]), doc = "Distributions.Bernoulli",
-        xs = [[1, 0, 1]],
-        ref = (X, b, y) -> sum(D.logpdf.(D.Bernoulli.(_logistic.(X * b)), y))),
-    :poisson_log_glm => (params = (_X, [0.3, -0.8]), doc = "Distributions.Poisson",
-        xs = [[0, 3, 1]], ref = (X, b, y) -> sum(D.logpdf.(D.Poisson.(exp.(X * b)), y))),
-    :normal_id_glm => (params = (_X, [0.3, -0.8], 1.3), doc = "Distributions.Normal",
-        xs = [[0.2, -1.1, 0.9]],
-        ref = (X, b, s, y) -> sum(D.logpdf.(D.Normal.(X * b, s), y))),
 )
 
 # The two truncated-moment objects have no density; their endpoints are the

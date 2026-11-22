@@ -398,11 +398,6 @@ struct DerivativeRule{Name,N,Inputs,Primal,Forward,Reverse,Staged,PO,FO,RO,SO,LO
     lane::LO
 end
 
-# A rule's operations are source records and prepared regions, callable from
-# any world: the rule a latest-world caller uses is the rule itself (the name
-# remains for ReactiveKernelsPPL's GLM rule).
-_kernel_latest_rule(rule::DerivativeRule) = rule
-
 _rule_result(::DerivativeRule{Name,N,Inputs,Primal,Forward,Reverse,Staged,PO,FO,RO,SO,LO,
                               Result}) where {Name,N,Inputs,Primal,Forward,Reverse,
                                               Staged,PO,FO,RO,SO,LO,Result} = Result
@@ -424,81 +419,6 @@ _rule_result(::DerivativeRule{Name,N,Inputs,Primal,Forward,Reverse,Staged,PO,FO,
     end
     _promote_op_body(K)
 end
-
-# Give a capture-free array-producing recipe the same destination steps it
-# would receive in the outer kernel. Use the executable source of the cut.
-function _decompose_rule_array!(ops, caches, body, offset, cache_apply, op, args, types, T)
-    T isa DataType && isconcretetype(T) && T <: Array || return nothing
-    op isa Union{_KernelSource,_KernelSplit,_KernelReduction} || return nothing
-    record = _source_record(op)
-    record === nothing && return nothing
-    record.companion !== nothing && isempty(record.captures) || return nothing
-    program = _native_generated_function(record.companion)
-    ex = _program_expression(program)
-    params = _source_params(record, length(args))
-    params !== nothing && Meta.isexpr(ex, :->, 2) || return nothing
-    rhs = _lane_strip_lines(ex.args[2])
-    # A source companion binds its captures in a let, empty for this record.
-    if Meta.isexpr(rhs, :let, 2) && Meta.isexpr(rhs.args[1], :block, 0)
-        rhs = rhs.args[2]
-    end
-    inner = _FusedDecomposition(parentmodule(typeof(program).parameters[3]),
-        Dict{Symbol,Any}(zip(params, args)), Dict{Symbol,Any}(zip(params, types)),
-        Any[], Any[], Any[], offset + length(ops), cache_apply)
-    d = _decompose(inner, rhs, false)
-    d !== nothing && d[2] === T && !isempty(inner.ops) || return nothing
-    append!(ops, inner.ops)
-    append!(caches, inner.caches)
-    append!(body, inner.stmts)
-    d[1]
-end
-
-# A scalar rule's intermediate arrays die at the end of its primal cut.
-# Give each call site its own slots. The staged derivative still calls the
-# original rule, including its activity selection and retained residuals.
-function _decompose_traceable(ctx::_FusedDecomposition,
-        rule::DerivativeRule{Name,N,Inputs,Primal}, args, types) where {Name,N,Inputs,Primal}
-    result = _rule_result(rule)
-    result !== nothing && all(t -> t isa Type, types) &&
-        Tuple{types...} === result.parameters[1] && result.parameters[2] <: Real &&
-        isbitstype(result.parameters[2]) ||
-        return nothing
-    names, steps, output = Primal
-    output isa Symbol && all(s -> first(s) isa Symbol, steps) || return nothing
-    ops, caches, body = Any[rule], Any[nothing], Any[]
-    offset = ctx.offset + length(ctx.ops)
-    rule_ref = Expr(:ref, _CALLABLES_ARG, offset + 1)
-    inputs = [gensym(:rule_input) for _ in args]
-    values = Dict{Symbol,Any}(zip(names, inputs))
-    inferred = Dict{Symbol,Any}(zip(names, types))
-    for (name, i, operands) in steps
-        callargs = Any[x isa Symbol ? values[x] : x for x in operands]
-        argtypes = Any[x isa Symbol ? inferred[x] : typeof(x) for x in operands]
-        op = rule.primal_ops[i]
-        T = _static_type(op, argtypes...)
-        value = _decompose_rule_array!(ops, caches, body, offset, ctx.cache_apply,
-                                       op, callargs, argtypes, T)
-        if value === nothing
-            callable = :(getfield(getfield($rule_ref, :primal_ops), $i))
-            value = Expr(:call, callable, callargs...)
-        end
-        inferred[name] = T
-        values[name] = gensym(name)
-        push!(body, Expr(:(=), values[name], value))
-    end
-    length(ops) > 1 || return nothing
-    append!(ctx.ops, ops)
-    append!(ctx.caches, caches)
-    for (input, arg) in zip(inputs, args)
-        push!(ctx.stmts, Expr(:(=), input, arg))
-    end
-    push!(body, values[output])
-    call = Expr(:call, rule_ref, inputs...)
-    (Expr(:if, Expr(:call, GlobalRef(@__MODULE__, :_differentiate_rule)),
-        call, Expr(:block, body...)), result.parameters[2])
-end
-
-@inline _differentiate_rule() = EnzymeCore.within_autodiff()
 
 # A position residual calls the rule's primal cut through its lane kernel
 # (`_lane_call`), so the cut's plates, scans and dotted calls reuse their

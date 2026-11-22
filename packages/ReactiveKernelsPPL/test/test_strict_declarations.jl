@@ -65,17 +65,6 @@ end
     @test occursin("`b[axes(X, 2)] .~ Normal.(0, 1)`", sprint(showerror, err))
 end
 
-@testset "strict declarations: undeclared GLM-object beta" begin
-    err = _strict_err(() -> lower_rkppl(quote
-            X = hcat(x1, x2)
-            alpha ~ Normal(0, 10)
-            y ~ NormalIDGLM(X, alpha, beta, 1.0)
-        end, (:y, :x1, :x2); conditioned = (:y, :x1, :x2)))
-    # refused: every coefficient needs a declaration (P6, 05oe96l).
-    @test err isa SurfaceLoweringError
-    @test occursin("`beta[axes(X, 2)] .~ Normal.(0, 1)`", sprint(showerror, err))
-end
-
 @testset "strict declarations: computed coefficient predictor" begin
     err = _strict_err(() -> lower_rkppl(quote
             raw ~ Normal(0, 1)

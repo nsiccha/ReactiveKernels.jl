@@ -142,7 +142,7 @@ end
         X = hcat(x)
         alpha ~ Normal(0, 2)
         b[axes(X, 2)] .~ Normal.(0, 1)
-        y ~ NormalIDGLM(X, alpha, b, 1.0)
+        y .~ Normal.(alpha .+ X * b, 1.0)
     end, cols, (p, l, nt, u) -> nt.alpha .+ cols.x .* only(nt.b);
         slots = (:matrices, :array_parameters))
     result = _ma_check(quote

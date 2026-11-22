@@ -251,8 +251,7 @@ end
 # path the program never takes. Mutable containers keep `deepcopy`, whose memo
 # follows their identity. (Whether Enzyme emits a rule into the derivative or
 # calls it natively depends on Julia's inlining of the rule, so these tests
-# read the compiled code itself; RKPPL's `test_glm_object_values.jl` checks a
-# derivative the report sees.)
+# read the compiled code itself.)
 function retention_llvm(f, types)
     io = IOBuffer()
     code_llvm(io, f, types; debuginfo = :none)

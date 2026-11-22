@@ -355,13 +355,13 @@ const _QD_NORMAL_GLM = quote
     y .~ Normal.(X * beta .+ eta[g], sigma)
 end
 
-# The NormalIDGLM family evaluates its density through the authored
-# `normal_id_glm_lpdf` derivative rule.
-const _QD_NORMAL_RULE = quote
+# The same regression without grouped effects, located at an intercept plus
+# the design product.
+const _QD_NORMAL_INTERCEPT = quote
     alpha ~ Normal(0, 1)
     beta[axes(X, 2)] .~ Normal.(0, 1)
     sigma ~ Exponential(1)
-    y ~ NormalIDGLM(X, alpha, beta, sigma)
+    y .~ Normal.(alpha .+ X * beta, sigma)
 end
 
 const _QD_POISSON_GLM = quote
@@ -405,7 +405,7 @@ _qd_poisson_third(A, u, v) = -(A' * (exp.(A * u) .* (A * v) .^ 2))
     cases = (
         (_QD_NORMAL_GLM, Dict(:y => _QD_Y, :X => _QD_X, :g => _QD_G),
             (; grouped = true), :normal),
-        (_QD_NORMAL_RULE, Dict(:y => _QD_Y, :X => _QD_X),
+        (_QD_NORMAL_INTERCEPT, Dict(:y => _QD_Y, :X => _QD_X),
             (; grouped = false, intercept = true), :normal),
         (_QD_POISSON_GLM, Dict(:y => _QD_COUNTS, :X => _QD_X, :g => _QD_G),
             (; grouped = true), :poisson))

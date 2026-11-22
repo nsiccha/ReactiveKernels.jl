@@ -197,7 +197,7 @@ bound per element (`elementwise`). `dims` is
 the axes of a declared array, including an LKJ factor (empty for legacy
 scalar/block entries)."""
 struct LayoutEntry
-    kind::Symbol # :coefficient | :sampled | :scan | :plate | :vector | :cholesky_corr | :glm | :array
+    kind::Symbol # :coefficient | :sampled | :scan | :plate | :vector | :cholesky_corr | :array
     predictor::Union{Nothing,Symbol}
     name::Symbol # block name (`mu_coef`), parameter name, or scan-state name
     labels::Vector{Symbol} # per-coordinate labels (length == size)
@@ -512,27 +512,6 @@ function assign_layout(plan::StructuralPlan)
                     run.hi))
             offset += length(run.labels)
         end
-    end
-    # GLM-object coefficient vectors: one contiguous identity block per
-    # response matrix (Normal priors on the real line). Width is static
-    # from the intercept-free matrix; a beta shared across responses must
-    # agree on width.
-    glm_widths = Dict{Symbol,Int}()
-    for r in plan.responses
-        _is_glm_family(r.family) && _glm_coefficient_block(plan, r) || continue
-        m = _find_matrix(plan, r.predictor)
-        K = count(c -> c !== nothing, m.columns)
-        if haskey(glm_widths, r.glm_beta)
-            glm_widths[r.glm_beta] == K || throw(ContractValidationError(
-                "[layout] GLM coefficient vector $(r.glm_beta) sizes $K " *
-                "under $(r.label) but $(glm_widths[r.glm_beta]) elsewhere"))
-            continue
-        end
-        glm_widths[r.glm_beta] = K
-        push!(entries,
-            LayoutEntry(:glm, nothing, r.glm_beta, [r.glm_beta], offset, K,
-                :identity, NaN, NaN))
-        offset += K
     end
     for p in plan.parameters
         p.name in plan.conditioned && continue
@@ -1123,8 +1102,7 @@ function coordinate_names(layout::LayoutTable)
             for label in e.labels
                 push!(names, Symbol(_draw_name(layout, e.predictor) * "." * string(label)))
             end
-        elseif e.kind === :plate ||
-               e.kind === :glm
+        elseif e.kind === :plate
             for i in 1:e.size
                 push!(names, Symbol(_draw_name(layout, e.name) * "." * string(i)))
             end
@@ -1451,8 +1429,7 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real}, discrete::Nam
             p in seen_coef && continue
             push!(seen_coef, p)
             push!(pairs, p => _constrain_coefficient(coef_groups[p], u))
-        elseif e.kind === :plate ||
-               e.kind === :glm
+        elseif e.kind === :plate
             v = _entry_eltype(e, T)[_constrain_elt(e, convert(T, x), k) for (k, x) in enumerate(seg)]
             push!(pairs, e.name => v)
         elseif e.kind === :scan
@@ -1553,16 +1530,13 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
                 end
                 pos += e2.size
             end
-        elseif e.kind === :plate ||
-               e.kind === :glm
-            what = e.kind === :plate ? "plate parameter" :
-                "GLM coefficient vector"
+        elseif e.kind === :plate
             haskey(nt, e.name) || throw(
-                ContractValidationError("[layout] missing $what $(e.name)"),
+                ContractValidationError("[layout] missing plate parameter $(e.name)"),
             )
             v = nt[e.name]
             length(v) == e.size || throw(
-                ContractValidationError("[layout] $what $(e.name) length mismatch"),
+                ContractValidationError("[layout] plate parameter $(e.name) length mismatch"),
             )
             for (k, x) in enumerate(v)
                 u[e.offset + k - 1] = _unconstrain_elt(e, convert(T, x), k)
@@ -2065,7 +2039,7 @@ _reads_positions(e::LayoutEntry) = e.kind === :cholesky_corr ?
     !isempty(e.dims) && !_is_lkj_stack(e.transform) :
     e.kind === :vector ? e.transform !== :exp :
     e.kind === :array ? !_is_lkj_stack(e.transform) :
-    e.kind in (:plate, :glm, :coefficient, :scan, :external, :external_plate)
+    e.kind in (:plate, :coefficient, :scan, :external, :external_plate)
 
 _scan_read_length(plan::StructuralPlan, s::ScanSpec, T::Int) =
     s.hi isa Symbol && get(plan.columns, s.hi, nothing) isa Integer ? s.hi : T
@@ -2366,9 +2340,7 @@ function transform_statements(e::LayoutEntry; path = (e.name,))
                 $(_interval_unconstrain(e.lo, e.hi, e.name; dot = true))),
         ]
     end
-    if e.kind === :plate ||
-       e.kind === :glm
-        # Plate and GLM vectors share this transform.
+    if e.kind === :plate
         return _plate_transform_statements(e)
     end
     if e.kind === :vector
@@ -2441,7 +2413,7 @@ end
 # hand-kept broadcast. `constrain` yields the constrained cell vector; a
 # companion `logjac` plate supplies the per-cell Jacobian this block's
 # `jacobian_term` sums (pruned by have→want when the Jacobian is not wanted).
-# A real-support block (per-cell latents, elementwise arrays, GLM vectors) is
+# A real-support block (per-cell latents, elementwise arrays) is
 # its packed coordinates, read in place with no transform or Jacobian.
 function _plate_transform_statements(e::LayoutEntry)
     range = _entry_range(e)
@@ -2783,13 +2755,12 @@ function jacobian_term(e::LayoutEntry)
         e.size < 1 && return nothing
         return _vector_simplex_logjac(e)
     end
-    if e.kind === :plate ||
-       e.kind === :glm
+    if e.kind === :plate
         # Interval/upper plates hand-roll the per-cell Jacobian sum
         # (parameterized bounds, no companion `logjac` plate); every registry
         # transform sums its companion `logjac` plate from
-        # `_plate_transform_statements`. GLM vectors use the same shape.
-        # Missing companion plates must fail explicitly.
+        # `_plate_transform_statements`. Missing companion plates must fail
+        # explicitly.
         e.transform === :interval &&
             return _interval_logjac(e.lo, e.hi, _entry_view(e); dot = true,
                 elementwise = any(e.elementwise))

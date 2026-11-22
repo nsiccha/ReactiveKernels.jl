@@ -149,16 +149,17 @@ _na_density_bytes(q, u) = (q(u); q(u); @allocated q(u))
 _na_gradient_bytes(q, g, u) = (sampler_value_and_gradient!(q, g, u);
     sampler_value_and_gradient!(q, g, u); @allocated sampler_value_and_gradient!(q, g, u))
 
-@testset "NormalIDGLM reuses coefficient and residual storage" begin
+@testset "a concatenated coefficient vector reuses its storage" begin
     regression = @rkppl begin
         intercept ~ Flat()
         beta[axes(X, 2)] .~ Flat()
-        y ~ NormalIDGLM(X, intercept, beta, 1.0)
+        coefficients = [intercept; beta]
+        y .~ Normal.(design * coefficients, 1.0)
     end
     for n in (5, 61)
         X = [cos(i + j) for i in 1:n, j in 1:3]
         y = sin.(1:n)
-        plan = regression(; X) | (; y)
+        plan = regression(; X, design = hcat(ones(n), X)) | (; y)
         built = build_kernel(plan)
         u = [0.1, -0.3, 0.5, 0.2]
         q = prepare_sampler(built, plan, u; backend = NA_SAMPLER_BACKEND)

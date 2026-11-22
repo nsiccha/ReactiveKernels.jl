@@ -329,6 +329,9 @@ function condition(plan::StructuralPlan; kwargs...)
         plan.vector_parameters, plan.plate_parameters) for p in ps)
     computed = _bound_module_data_names(plan)
     union!(computed, _derived_response_names(plan))
+    # A value matrix (`X = hcat(x1, x2)`) is bound under its own name; the
+    # rebinding builds it again from its columns.
+    union!(computed, _value_design_matrix_names(plan))
     columns = Dict{Symbol,ColumnData}(k => v for (k,v) in plan.columns if k ∉ computed)
     # Bound response storage is numeric. Restore its host-side missing entries
     # before rebinding so replacement data gets a fresh presence mask, while
@@ -800,10 +803,6 @@ function _conditioned_declarations(ast, names)
         lhs = _stmt_lhs(st)
         name = _merge_stem(lhs)
         name in names || continue
-        # Whole-data GLM `~` declares a response, not a parameter. Like a
-        # broadcast response, its observed value keeps its observation axis
-        # instead of becoming an internal conditioned-parameter input.
-        _is_glm_call(last(st.args)) && continue
         # A caller-owned law observing a definition reads that value, so the
         # definition is never a conditioned input (`_partition_statements`).
         _is_sample(st) && lhs isa Symbol && haskey(definitions, lhs) &&
@@ -1212,7 +1211,7 @@ function _lower_rkppl_once(ast, input_data::Set{Symbol}, mod::Module;
     ast = Expr(:block, _expand_observed_scans(ast.args, data)...)
     ast = _observation_call_definitions(ast, data, mod)
     ast = _gathered_value_definitions(ast, data, mod)
-    sample, factors, det, plate_ctx, plate_specs, scans, joints, glms, cell_broadcasts,
+    sample, factors, det, plate_ctx, plate_specs, scans, joints, cell_broadcasts,
         cell_priors, cell_latents, cell_geometries =
         _partition_statements(ast, data; array_entries, mod)
     sample, factors = _vector_density_factors(sample, factors, det, data,
@@ -1268,7 +1267,7 @@ function _lower_rkppl_once(ast, input_data::Set{Symbol}, mod::Module;
     # `in_model`): it lowers as data, computed once by `bind_data`, which
     # checks its length or row count. Read whole, it stays model-level.
     rawdata = data
-    sample, det, matrix_values = _route_hcat_values(sample, det, data, glms;
+    sample, det, matrix_values = _route_hcat_values(sample, det, data;
         resolve = a -> _resolve_module_calls(a, mod, model_names, "matrix value"))
     aligned = _aligned_module_data(sample, det, data)
     aligned_defs = Pair{Symbol,Any}[p for p in det if first(p) in aligned]
@@ -1324,7 +1323,7 @@ function _lower_rkppl_once(ast, input_data::Set{Symbol}, mod::Module;
     # matrix `X`: its definition leaves `det`, its name joins `data`, and
     # `bind_data` builds it from its columns (`_value_design_matrices`).
     caller_data = data
-    value_mats = _hcat_value_reads(det, detmap, sample, data, glms,
+    value_mats = _hcat_value_reads(det, detmap, sample, data,
         union(dirichlet_names, ordered_names),
         union(plate_names, Set{Symbol}(st for s in scans for st in s.states)))
     value_mat_defs = Pair{Symbol,Any}[p for p in det if first(p) in value_mats]
@@ -1520,13 +1519,11 @@ function _lower_rkppl_once(ast, input_data::Set{Symbol}, mod::Module;
     declared_names = Set(s.lhs for s in declarations)
     declared_params, declared_syms, declared_vectors, declared_arrays =
         _lower_parameters(declarations,
-            Dict{Symbol,Vector{Tuple{Symbol,Symbol,Int}}}(), ctx,
-            Dict{Symbol,Tuple{Symbol,Symbol}}())
+            Dict{Symbol,Vector{Tuple{Symbol,Symbol,Int}}}(), ctx)
     responses = LikelihoodSpec[]
     external_observations = SampledParameter[]
     predictors = PredictorSpec[]
     coefuse = Dict{Symbol,Vector{Tuple{Symbol,Symbol,Int}}}()
-    glmuse = Dict{Symbol,Tuple{Symbol,Symbol}}()
     for s in sample
         # Declared arrays lower with the parameters.
         s.dims !== nothing && continue
@@ -1585,13 +1582,6 @@ function _lower_rkppl_once(ast, input_data::Set{Symbol}, mod::Module;
             _lower_joint_response(j, ctx, predictors, pred_idx,
                 coefuse))
     end
-    # GLM-object responses lower after the joints (no predictor
-    # interning — the object owns eta; coefficient recording goes to
-    # the separate GLM-use table, before coefficient priors resolve).
-    for g in glms
-        push!(responses,
-            _lower_glm_response(g, sample, prior_names, ctx, coefuse, glmuse))
-    end
     _check_coefficient_uses(coefuse, ctx)
     for c in ctx.scan_coefs
         haskey(coefuse, c) && _check_owned_coefficient(c, ctx, "$c is both a " *
@@ -1612,14 +1602,9 @@ function _lower_rkppl_once(ast, input_data::Set{Symbol}, mod::Module;
         Set{Symbol}(nm for (nm, _) in det if detshape[nm] === :scalar))
     priors, levelmaps = _lower_coefficient_priors(sample, coefuse, predictors,
         ctx.matrices, hyper_names, ctx)
-    for (beta, (label, X)) in glmuse
-        beta in ordinary_parameters && continue
-        append!(priors, _lower_glm_beta_priors(label, beta, X, sample,
-            ctx.matrices, hyper_names))
-    end
     params, paramsyms, dirichlets, arrays =
         _lower_parameters([s for s in sample if s.lhs ∉ declared_names],
-            owned_coefs, ctx, glmuse)
+            owned_coefs, ctx)
     prepend!(params, declared_params)
     union!(paramsyms, declared_syms)
     prepend!(dirichlets, declared_vectors)
@@ -1714,15 +1699,10 @@ function _lower_rkppl_once(ast, input_data::Set{Symbol}, mod::Module;
     for p in predictors, t in p.terms
         union!(needed, t.columns)
     end
-    # A GLM object reads its arguments whole, by name, and so do categorical
-    # logit slices their matrix.
+    # Categorical logit slices read their matrix whole, by name.
     for r in responses
         _categorical_logit_slices(r) && !haskey(ctx.matrices, r.predictor) &&
             push!(needed, r.predictor)
-        _is_glm_family(r.family) || continue
-        for nm in (r.predictor, r.glm_alpha, r.glm_beta, r.scale)
-            nm isa Symbol && !haskey(ctx.matrices, nm) && push!(needed, nm)
-        end
     end
     for observation in external_observations
         push!(needed, observation.name)
@@ -3511,10 +3491,7 @@ function _observation_call_definitions(ast::Expr, data::Set{Symbol},
             if any(in(data), observed) ||
                     (_is_broadcast_sample(st) && any(in(defined), observed))
                 stem = first(sort!(collect(observed)))
-                rhs = _glm_argument_names(st.args[3]) do value, role
-                    name!(value, stem, role)
-                end
-                rhs = _categorical_logit_slice_names(rhs) do value, role
+                rhs = _categorical_logit_slice_names(st.args[3]) do value, role
                     name!(value, stem, role)
                 end
                 rhs = _map_rhs_arguments(rhs; mod) do value, head, position, nargs
@@ -3559,30 +3536,6 @@ function _categorical_logit_slice_names(name, rhs)
     slices = only(args)
     return rebuild(Any[Expr(:call, slices.args[1],
         name(slices.args[2], :logits))])
-end
-
-# A GLM object reads each argument whole, so an inline argument is its
-# named definition (`y_design`, `y_intercept`, `y_coefficients`,
-# `y_scale`), including inside an evidence wrapper. Names and numbers stay.
-function _glm_argument_names(name, rhs)
-    rhs isa Expr && rhs.head === :call && !isempty(rhs.args) || return rhs
-    head = _rhs_head_symbol(rhs.args[1])
-    if head in (:truncated, :censored, :interval_censored) && length(rhs.args) >= 2
-        return Expr(:call, rhs.args[1], _glm_argument_names(name, rhs.args[2]),
-            rhs.args[3:end]...)
-    end
-    head in _GLM_HEADS || return rhs
-    args = rhs.args[2:end]
-    nargs = count(a -> !Meta.isexpr(a, :parameters), args)
-    position = 0
-    out = Any[]
-    for a in args
-        Meta.isexpr(a, :parameters) && (push!(out, a); continue)
-        position += 1
-        push!(out, a isa Expr ?
-            name(a, _argument_role(head, position, nargs)) : a)
-    end
-    return Expr(:call, rhs.args[1], out...)
 end
 
 # A whole argument's role: its keyword's name, or its positional role.
@@ -3955,7 +3908,6 @@ function _partition_statements(ast::Expr, data::Set{Symbol};
     det = Pair{Symbol,Any}[]
     scans = ScanSpec[]
     joints = JointSampleStmt[]
-    glms = GLMSampleStmt[]
     level_bindings = Dict{Symbol,Tuple{Symbol,Any}}()
     seen = Set{Symbol}()
     seelines = Dict{Symbol,Int}()
@@ -4057,17 +4009,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol};
                 push!(joints, j)
                 continue
             end
-            if !bc && _is_glm_call(st.args[3])
-                g = _parse_glm_stmt(st, line, data)
-                _claim!(seen, seelines, g.response, line)
-                push!(glms, g)
-                continue
-            end
-            if bc && _is_glm_call(st.args[3])
-                _sfail("GLM-object heads use whole-data `~`, not `.~` " *
-                       "(`$(st.args[3].args[1])(X, alpha, beta)` — the " *
-                       "object owns eta over the whole column)")
-            end
+            _refuse_fused_glm_statement(st.args[2], st.args[3])
             counts = _multinomial_rows_lhs(st.args[2], bc, data)
             if counts !== nothing
                 for c in counts
@@ -4184,7 +4126,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol};
             _reject_statement(st)
         end
     end
-    return sample, factors, det, plate_ctx, plate_params, scans, joints, glms, cell_broadcasts,
+    return sample, factors, det, plate_ctx, plate_params, scans, joints, cell_broadcasts,
         cell_priors, cell_latents, cell_geometries
 end
 
@@ -4376,17 +4318,10 @@ end
 
 # Keep the affine column-table recipe only for its supported construction
 # and consumers. Every other hcat keeps Base's ordinary value semantics.
-function _ordinary_hcat_values(sample, det, data, glms)
+function _ordinary_hcat_values(sample, det, data)
     detmap = Dict{Symbol,Any}(det)
     mats = Set{Symbol}(nm for (nm, rhs) in det if _is_hcat_call(rhs))
     params = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data)
-    # A GLM object reads its design matrix whole. An `hcat` of bare data or
-    # derived columns keeps the fused design-matrix recipe; any other
-    # `hcat` (an intercept `ones(length(x))` column, a parameter column)
-    # is an ordinary matrix value the object reads by name.
-    glm_mats = Set{Symbol}(g.matrix for g in glms if g.matrix in mats &&
-        _glm_design_hcat(detmap[g.matrix], params))
-    setdiff!(mats, glm_mats)
     generic = Set{Symbol}()
     isempty(mats) && return generic
     coefvec = Set{Symbol}(s.lhs for s in sample
@@ -4415,7 +4350,7 @@ function _ordinary_hcat_values(sample, det, data, glms)
         end
     end
     legacy = intersect(pure, _hcat_value_reads(det, detmap, sample, data,
-        glms, arrays, Set{Symbol}(); is_hcat = _is_hcat_call))
+        arrays, Set{Symbol}(); is_hcat = _is_hcat_call))
     used = Set{Symbol}()
     function walk(ex; whole = false)
         if ex isa Symbol
@@ -4464,17 +4399,8 @@ function _ordinary_hcat_values(sample, det, data, glms)
         s.lhs in mats && push!(generic, s.lhs)
     end
     union!(generic, setdiff(mats, used))
-    # The GLM reads these whole, as values.
-    for g in glms
-        g.matrix in mats && push!(generic, g.matrix)
-    end
     return generic
 end
-
-# An `hcat` the GLM design-matrix recipe builds: bare columns, none of
-# them a sampled value.
-_glm_design_hcat(rhs, params) = length(rhs.args) > 1 &&
-    all(a -> a isa Symbol && a ∉ params, rhs.args[2:end])
 
 function _resolve_hcat_values(ex; keep = false, resolve = identity)
     ex isa Expr || return ex
@@ -4488,8 +4414,8 @@ function _resolve_hcat_values(ex; keep = false, resolve = identity)
     return Expr(ex.head, Any[_resolve_hcat_values(a; resolve) for a in ex.args]...)
 end
 
-function _route_hcat_values(sample, det, data, glms; resolve = identity)
-    generic = _ordinary_hcat_values(sample, det, data, glms)
+function _route_hcat_values(sample, det, data; resolve = identity)
+    generic = _ordinary_hcat_values(sample, det, data)
     det = Pair{Symbol,Any}[nm => _resolve_hcat_values(rhs;
         keep = _is_hcat_call(rhs) && nm ∉ generic, resolve) for (nm, rhs) in det]
     sample = SampleStmt[SampleStmt(s.lhs, _resolve_hcat_values(s.rhs; resolve),
@@ -4519,14 +4445,10 @@ end
 # use (`mu = X`, `a .+ X`, `X * s` with `s` a scalar, `X` as a location or
 # scale) keeps the design-matrix route and its refusal.
 
-# The `hcat` definitions of `det` the program reads as values. GLM
-# response matrices stay design matrices (their families read them).
-function _hcat_value_reads(det, detmap, sample, data, glms,
+# The `hcat` definitions of `det` the program reads as values.
+function _hcat_value_reads(det, detmap, sample, data,
         simplexes::Set{Symbol}, aligned::Set{Symbol}; is_hcat = _is_hcat_def)
     mats = Set{Symbol}(nm for (nm, rhs) in det if is_hcat(rhs))
-    for g in glms
-        delete!(mats, g.matrix)
-    end
     out = Set{Symbol}()
     isempty(mats) && return out
     coefvec = Dict{Symbol,Symbol}(s.lhs => s.matrix for s in sample
@@ -7149,66 +7071,44 @@ struct JointSampleStmt
     line::Int
 end
 
-"""One whole-data GLM-object statement
-(`y ~ NormalIDGLM(X, alpha, beta, sigma)`): the response column, the
-head family, and the values the object reads whole: the design matrix,
-the scalar intercept (a name or a literal number), the coefficient
-vector and the Normal sigma (a name or a literal number, `nothing`
-otherwise). Inline arguments arrive as their named definitions
-(`_observation_call_definitions`). Plain `~` only — the object owns eta
-over the whole column, never broadcasts."""
-struct GLMSampleStmt
-    response::Symbol
-    head::Symbol
-    matrix::Symbol
-    alpha::Union{Symbol,Float64}
-    beta::Symbol
-    sigma::Any
-    line::Int
-    wrapper::Union{Nothing,Expr}
+# RKPPL once accepted three fused GLM statements:
+# `y ~ NormalIDGLM(X, alpha, beta, sigma)`, `y ~ BernoulliLogitGLM(X, alpha,
+# beta)` and `y ~ PoissonLogGLM(X, alpha, beta)`. They are refused: a model
+# states its per-observation likelihood, and the lowering of that statement
+# carries the efficient computation (user decision
+# `ReactiveKernels:posteriordb-perf/decisions/2026-11-20T15-12-50-852-02qiqax`).
+const _REMOVED_GLM_HEADS = (:NormalIDGLM, :BernoulliLogitGLM, :PoissonLogGLM)
+
+# The removed head `rhs` applies, in call or dotted form and inside an
+# evidence wrapper, with the wrapper it sits in; `nothing` otherwise.
+function _removed_glm_call(rhs, wrapper = nothing)
+    rhs isa Expr && !isempty(rhs.args) || return nothing
+    dotted = _is_dotted_call(rhs)
+    (dotted || rhs.head === :call) || return nothing
+    head = _rhs_head_symbol(rhs.args[1])
+    args = Any[a for a in (dotted ? rhs.args[2].args : rhs.args[2:end])
+        if !Meta.isexpr(a, :parameters)]
+    head in _REMOVED_GLM_HEADS && return (; head, args, wrapper)
+    head in (:weighted, :truncated, :censored, :interval_censored) &&
+        !isempty(args) || return nothing
+    return _removed_glm_call(args[1], head)
 end
 
-const _GLM_HEADS = (:NormalIDGLM, :BernoulliLogitGLM, :PoissonLogGLM)
-
-function _glm_distribution(rhs)
-    rhs isa Expr && rhs.head === :call && !isempty(rhs.args) || return rhs
-    first(rhs.args) in (:truncated, :censored, :interval_censored) &&
-        length(rhs.args) >= 2 && return rhs.args[2]
-    return rhs
-end
-_is_glm_call(rhs) = (dist = _glm_distribution(rhs); dist isa Expr &&
-    dist.head === :call && !isempty(dist.args) && first(dist.args) in _GLM_HEADS)
-
-function _parse_glm_stmt(st::Expr, line::Int, data::Set{Symbol})
-    lhs, raw = st.args[2], st.args[3]
-    rhs = _glm_distribution(raw)
-    head = rhs.args[1]
-    lhs isa Symbol || _sfail("`$head` left-hand side must be a bare " *
-                             "data column, got $(repr(lhs))")
-    lhs in data || _sfail("`$head` responds over data — $lhs is not " *
-                          "a data column")
-    args = _plain_args(rhs, "`$head`")
-    want = head === :NormalIDGLM ? 4 : 3
-    usage = head === :NormalIDGLM ? "`$head(X, alpha, beta, sigma)`" :
-        "`$head(X, alpha, beta)`"
-    length(args) == want || _sfail("response $lhs: `$head` takes " *
-                                   "$usage, got $(length(args)) arguments")
-    X, alpha, beta = args[1], args[2], args[3]
-    X isa Symbol || _sfail("response $lhs: `$head` design matrix " *
-                           "must be a matrix value, got $(repr(X))")
-    (alpha isa Symbol || alpha isa Real) || _sfail("response $lhs: " *
-        "`$head` intercept must be a scalar value, got $(repr(alpha))")
-    alpha isa Real && (alpha = Float64(alpha))
-    beta isa Symbol || _sfail("response $lhs: `$head` coefficients " *
-                              "must be a vector value, got $(repr(beta))")
-    sigma = nothing
-    if head === :NormalIDGLM
-        sigma = args[4]
-        (sigma isa Symbol || sigma isa Real) || _sfail(
-            "response $lhs: `$head` sigma must be a parameter name or " *
-            "a positive literal, got $(repr(sigma))")
-    end
-    return GLMSampleStmt(lhs, head, X, alpha, beta, sigma, line, raw === rhs ? nothing : raw)
+function _refuse_fused_glm_statement(lhs, rhs)
+    found = _removed_glm_call(rhs)
+    found === nothing && return nothing
+    head, args = found.head, found.args
+    X, alpha, beta = length(args) >= 3 ? args[1:3] : (:X, :alpha, :beta)
+    eta = alpha isa Real && iszero(alpha) ? :($X * $beta) : :($alpha .+ $X * $beta)
+    sigma = length(args) >= 4 ? args[4] : :sigma
+    law = head === :NormalIDGLM ? :(Normal.($eta, $sigma)) :
+        head === :BernoulliLogitGLM ? :(BernoulliLogit.($eta)) :
+        :(Poisson.(exp.($eta)))
+    inside = found.wrapper === nothing ? "" :
+        " inside the dotted `$(found.wrapper).(...)` wrapper"
+    _sfail("response $lhs: `$head` is not an RKPPL statement (the fused " *
+           "GLM statements were removed). " *
+           "State the per-observation likelihood$inside: `$lhs .~ $law`")
 end
 
 _is_doc_macro(m) =
@@ -9161,8 +9061,8 @@ end
 # slice holds the K−1 non-reference logits, class 1 the zero reference,
 # exactly as the positional `CategoricalLogit.(eta_2, …, eta_K)` reads its
 # arguments. K is the slice length + 1 when the model runs, so one program
-# serves every class count. The response reads `E` whole, by name (the
-# GLM-object precedent); an inline matrix expression is one named value.
+# serves every class count. The response reads `E` whole, by name; an
+# inline matrix expression is one named value.
 function _lower_categorical_logit_slices(lhs, slices, range, weights,
         evidence, label, ctx)
     axis = slices.args[1] === :eachrow ? :rows : :cols
@@ -9398,97 +9298,6 @@ function _lower_joint_response(j::JointSampleStmt, ctx, predictors, pred_idx,
         label, nothing, nothing; extra_responses = j.outcomes[2:end],
         extra_predictors = pnames[2:end], factor_scales = scales,
         factor_corr = corr)
-end
-
-function _lower_glm_response(g::GLMSampleStmt, sample, prior_names::Set{Symbol},
-        ctx, coefuse, glmuse::Dict{Symbol,Tuple{Symbol,Symbol}})
-    fam, link = g.head === :NormalIDGLM ? (NormalIDGLMFam, IdentityLink) :
-        g.head === :BernoulliLogitGLM ? (BernoulliLogitGLMFam, LogitLink) :
-        (PoissonLogGLMFam, LogLink)
-    label = Symbol(g.response, "_resp")
-    # The object reads each argument whole: data, a definition or a sampled
-    # value. A bare-column `hcat` keeps its fused design-matrix recipe.
-    known(nm) = nm in ctx.taken
-    m = get(ctx.matrices, g.matrix, nothing)
-    m === nothing && !known(g.matrix) && _sfail(
-        "response $(g.response): `$(g.head)` design matrix $(g.matrix) " *
-        "is undefined — bind it as data or define it " *
-        "(`$(g.matrix) = hcat(...)`)")
-    for (nm, role) in ((g.alpha, "intercept"), (g.beta, "coefficients"))
-        nm isa Symbol || continue
-        haskey(coefuse, nm) && nm ∉ ctx.ordinary_parameters && _sfail(
-            "response $(g.response): `$(g.head)` $role $nm is also a " *
-            "predictor coefficient — one use per name")
-    end
-    g.alpha isa Symbol && !known(g.alpha) && _sfail(
-        "response $(g.response): `$(g.head)` intercept $(g.alpha) " *
-        "needs a prior statement (`$(g.alpha) ~ Normal(0, 10)`)")
-    g.alpha isa Symbol && (g.alpha in ctx.vector_params ||
-        haskey(ctx.array_dims, g.alpha) ||
-        get(ctx.detshape, g.alpha, :scalar) in (:vector, :matrix)) && _sfail(
-        "response $(g.response): `$(g.head)` intercept $(g.alpha) is " *
-        "an array; the object takes one scalar intercept (a " *
-        "per-observation intercept is not built yet)")
-    if g.beta in prior_names && g.beta ∉ ctx.ordinary_parameters
-        # An unsized broadcast prior takes its size from the matrix.
-        for s in sample
-            s.lhs === g.beta || continue
-            if s.matrix === nothing
-                _sfail("response $(g.response): `$(g.head)` coefficient " *
-                       "vector $(g.beta) needs a broadcast prior " *
-                       "(`$(g.beta)[axes($(g.matrix), 2)] .~ Normal.(...)`)")
-            end
-            s.matrix === g.matrix || _sfail(
-                "response $(g.response): `$(g.head)` coefficient prior " *
-                "sizes $(s.matrix), not the response matrix $(g.matrix)")
-        end
-        glmuse[g.beta] = (label, g.matrix)
-    elseif !known(g.beta)
-        _undeclared_vector(g.beta, g.matrix, label)
-    end
-    sigma = g.sigma
-    if sigma isa Symbol
-        known(sigma) || _sfail(
-            "response $(g.response): `$(g.head)` sigma $sigma needs " *
-            "a prior statement or a positive literal")
-        haskey(coefuse, sigma) && sigma ∉ ctx.ordinary_parameters && _sfail(
-            "response $(g.response): `$(g.head)` sigma $sigma is also " *
-            "a predictor coefficient — one use per name")
-    end
-    m === nothing || push!(ctx.matrices_used, g.matrix)
-    ev = g.wrapper === nothing ? ResponseEvidence(:none, nothing, nothing) :
-        first(_peel_evidence(g.response, g.wrapper, ctx))
-    return LikelihoodSpec(fam, link, g.response, g.matrix, sigma, nothing,
-        ev, label, nothing, nothing;
-        glm_alpha = g.alpha, glm_beta = g.beta)
-end
-
-# A GLM coefficient vector: K per-element PopulationPriors over the
-# response matrix columns, addressed by response label. An unstated
-# vector fails (`_undeclared_vector` — strict declarations, decision
-# 05oe96l). Stated vectors take `b[axes(X, 2)] .~ Normal.(loc,
-# scale)` with scalar (shared) or length-K literal-vector
-# (per-element) args — Normal-only (non-Normal betas use the
-# decomposed predictor form).
-function _lower_glm_beta_priors(label::Symbol, beta::Symbol, X::Symbol,
-        sample, matrices::Dict{Symbol,DesignMatrix}, hyper_names::Set{Symbol})
-    m = get(matrices, X, nothing)
-    m === nothing && _sfail("internal: GLM prior over unknown matrix $X")
-    cols = Symbol[c for c in m.columns if c !== nothing]
-    K = length(cols)
-    stated = nothing
-    for s in sample
-        s.lhs === beta || continue
-        stated = s
-    end
-    stated === nothing && _undeclared_vector(beta, X, label)
-    fam, locs, scales, _ =
-        _coefficient_matrix_prior(beta, stated.rhs, label, K, hyper_names)
-    fam === :normal || _sfail("response $label: GLM-object beta vectors " *
-                              "are Normal-only (got `$fam`) — write the " *
-                              "decomposed predictor form for other families")
-    return PopulationPrior[PopulationPrior(label, c, l, sc)
-        for (c, l, sc) in zip(cols, locs, scales)]
 end
 
 # `.~` takes a dotted distribution object (`Normal.(mu, sigma)`); convert
@@ -13060,7 +12869,7 @@ const _SCALAR_PRIOR_HEADS = union(Set{Symbol}(keys(_PARAM_FAMILIES)),
 const _HOIST_FAMILIES = union(Set{Symbol}(keys(_PARAM_FAMILIES)),
     Set{Symbol}(keys(_COEF_FAMILIES)), Set{Symbol}((:HalfNormal, :HalfCauchy)))
 
-function _lower_parameters(sample, coefuse, ctx, glmuse)
+function _lower_parameters(sample, coefuse, ctx)
     params = SampledParameter[]
     syms = Set{Symbol}()
     vectors = VectorParameter[]
@@ -13122,7 +12931,6 @@ function _lower_parameters(sample, coefuse, ctx, glmuse)
             continue
         end
         haskey(coefuse, s.lhs) && continue
-        haskey(glmuse, s.lhs) && s.lhs ∉ ctx.ordinary_parameters && continue
         # Sized declarations are ordinary array parameters.
         if s.levels !== nothing
             gcol, sub = s.levels

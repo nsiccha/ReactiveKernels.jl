@@ -768,7 +768,6 @@ include("test_zero_inflated_binomial_logit_zi.jl")
     @test occursin("@kernel beta_binomial", BETA_BINOMIAL_KERNEL_SOURCE)
 end
 
-include("test_glm.jl")
 include("test_bernoulli_shared_softplus.jl")
 include("test_binomial_logit_kernel.jl")
 include("test_student_kernel.jl")

@@ -1,5 +1,5 @@
 using ReactiveKernelsPPLExamples.GLMPoissonExample
-using ReactiveKernelsDistributionKernels.DistributionKernelSources: poisson_log_glm
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: poisson
 using LogExpFunctions: logistic, log1pexp
 using SpecialFunctions: loggamma
 using MutatingFunctions
@@ -39,13 +39,11 @@ end
     reference = _glm_poisson_reference(q, year, counts)
 
     @testset "authored on the current baseline surface" begin
-        @test occursin("poisson_log_glm(X, beta).pointwise(counts)",
-            GLM_POISSON_SOURCE)
+        @test occursin("poisson(; log_rate = ll).logpdf(c)", GLM_POISSON_SOURCE)
         @test occursin("logistic(u_alpha)", GLM_POISSON_SOURCE)
         @test occursin("X = hcat(ones(length(year))", GLM_POISSON_SOURCE)
-        @test !occursin("plate(", GLM_POISSON_SOURCE)
         @test !occursin("struct ", GLM_POISSON_SOURCE)
-        @test artifact.glm_object === poisson_log_glm
+        @test artifact.likelihood_object === poisson
 
     end
 

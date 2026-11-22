@@ -13,7 +13,7 @@ import SpecialFunctions
 # activity-selected cuts of the same graph — no backend-specific derivative
 # code anywhere, and no rule on a function this package does not own
 # (CONTRIBUTING.md, "Derivative rules come from one mathematical
-# graph, never by hand"). Every distribution and GLM source calls THESE names,
+# graph, never by hand"). Every distribution source calls THESE names,
 # never SpecialFunctions' directly.
 @kernel loggamma_graph(x::Float64) = begin
     y::Float64 = SpecialFunctions.loggamma(x)
@@ -131,12 +131,6 @@ export beta_binomial
 export inverse_gamma, dirichlet, lkj_corr_cholesky, zero_inflated_poisson
 export negative_binomial
 export weibull, zero_inflated_binomial, zero_inflated_binomial_logit_zi
-export BERNOULLI_LOGIT_GLM_KERNEL_SOURCE, BERNOULLI_LOGIT_GLM_SOURCE
-export bernoulli_logit_glm
-export POISSON_LOG_GLM_KERNEL_SOURCE, POISSON_LOG_GLM_SOURCE
-export poisson_log_glm
-export NORMAL_ID_GLM_KERNEL_SOURCE, NORMAL_ID_GLM_SOURCE
-export normal_id_glm
 export NORMAL_LOGDENSITY_SOURCE, CAUCHY_LOGDENSITY_SOURCE
 export NORMAL_LOGDENSITY, CAUCHY_LOGDENSITY, LAPLACE_LOGDENSITY
 export BERNOULLI_SOURCE, LOGNORMAL_SOURCE
@@ -3047,9 +3041,5 @@ docs_example = (;
     plate_output,
 )
 """
-
-# GLM objects last: their sources evaluate through _evaluate_source_bindings
-# (defined above) and call the _glm_* likelihoods (included at the top).
-include("glm_kernel_sources.jl")
 
 end # module DistributionKernelSources
