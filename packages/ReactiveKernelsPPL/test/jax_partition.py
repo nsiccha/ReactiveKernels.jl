@@ -69,6 +69,50 @@ val, grad = jax.jit(jax.value_and_grad(selected))(jnp.array([1., 2.]))
 np.testing.assert_allclose(grad, [7., 10.])
 np.testing.assert_allclose(val, 27.)
 
+# Both arms produce matrices of the same shape. A selected read needs only
+# a scalar from the broadcast arm and a row-by-column grid from the other.
+def conditional_events(u, *, design):
+    cells = jax.lax.cond(u[0] > 0,
+                         lambda: jnp.sqrt(u[0]) * design,
+                         lambda: jnp.broadcast_to(u[0] ** 2, design.shape))
+    return jnp.sum(cells, axis=1)
+
+
+conditional_data = dict(design=jnp.arange(18.).reshape(6, 3))
+points = jnp.array([[1.], [-2.], [4.]])
+
+
+def selected_conditional(u, row):
+    return model._rk_read_event(conditional_events, u, row, conditional_data).sum()
+
+
+def full_conditional(u, row):
+    return conditional_events(u, **conditional_data)[row].sum()
+
+
+batch_conditional = jax.jit(jax.vmap(jax.value_and_grad(selected_conditional)))
+for rows in (jnp.array([3, 0, 3]), jnp.array([[3], [0], [3]]),
+             jnp.array([[3, 1], [0, 0], [3, 1]]), jnp.empty((3, 0), dtype=int)):
+    values, grads = batch_conditional(points, rows)
+    for i, (u, row) in enumerate(zip(points, rows)):
+        value, grad = jax.value_and_grad(full_conditional)(u, row)
+        np.testing.assert_allclose(values[i], value)
+        np.testing.assert_allclose(grads[i], grad)
+
+# The bounded transform uses softplus. At a tie in its underlying logaddexp,
+# differentiating the expanded primal can lose JAX's custom derivative.
+def softplus_events(u):
+    return model._rk_softplus(u)
+
+
+rows = jnp.array([2, 0, 2])
+u = jnp.array([0., -1., 1.5])
+selected = lambda x: model._rk_read_event(softplus_events, x, rows, {}).sum()
+eager = lambda x: jax.nn.softplus(x[rows]).sum()
+for transform in (jax.grad, jax.hessian):
+    np.testing.assert_allclose(jax.jit(transform(selected))(u), transform(eager)(u),
+                               rtol=1e-12, atol=1e-12)
+
 # All observation rows can disappear on a new binding. The same module
 # still evaluates the assigned prior-only events and the empty unit.
 empty = dict(inputs.raw, y=np.array([], dtype=float), group=np.array([], dtype=int))

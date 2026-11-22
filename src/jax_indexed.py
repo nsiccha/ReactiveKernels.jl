@@ -6,12 +6,25 @@ import numpy as np
 from jax.extend import core as _rk_core
 
 
+# Keep these generated unary elementwise helpers visible as calls in the
+# event trace. Reapplying the callable to selected inputs retains JAX's
+# registered derivatives, including the custom rule inside softplus.
+_RK_UNARY_CALLS = {name: globals()[name] for name in ('_rk_softplus', '_rk_log1mlogistic')
+                   if name in globals()}
+for _name, _fn in _RK_UNARY_CALLS.items():
+    globals()[_name] = jax.jit(_fn)
+
+
 def _rk_coordinates(index, shape):
     return tuple(0 if n == 1 else k for k, n in zip(index, shape))
 
 
 def _rk_child_index(index, dims):
     return tuple(index[i] for i in dims)
+
+
+def _rk_lane_shape(index):
+    return jnp.broadcast_shapes(*(jnp.shape(i) for i in index))
 
 
 def _rk_unravel(flat, shape):
@@ -124,6 +137,9 @@ class _RKIndexedGraph:
         if name == 'cond':
             return self.conditional(eq, output, lambda g, v: g.region(v, axes))
         if name in ('jit', 'pjit'):
+            fn = _RK_UNARY_CALLS.get(p['name'])
+            if fn is not None:
+                return fn(self.region(args[0], axes))
             nested = self.nested(eq)
             return nested.region(nested.outputs[output], axes)
         if name == 'slice':
@@ -181,8 +197,15 @@ class _RKIndexedGraph:
             return self.read(args[i], coords)
 
         if name == 'cond':
-            return self.conditional(eq, output, lambda g, v: g.read(v, index))
+            # A broadcast arm can supply the requested coordinates with a
+            # scalar or a smaller grid. The switch must join equal shapes.
+            lane_shape = _rk_lane_shape(index)
+            return self.conditional(eq, output,
+                                    lambda g, v: jnp.broadcast_to(g.read(v, index), lane_shape))
         if name in ('jit', 'pjit'):
+            fn = _RK_UNARY_CALLS.get(p['name'])
+            if fn is not None:
+                return fn(arg(0, index))
             nested = self.nested(eq)
             return nested.read(nested.outputs[output], index)
         if name == 'broadcast_in_dim':
@@ -238,7 +261,7 @@ class _RKIndexedGraph:
                                 else s + next(offsets) for d, s in enumerate(starts)))
         if name == 'dot_general':
             contractions, batches = p['dimension_numbers']
-            lane_shape = jnp.broadcast_shapes(*(jnp.shape(i) for i in index))
+            lane_shape = _rk_lane_shape(index)
             widths = tuple(args[0].aval.shape[d] for d in contractions[0])
             grids = jnp.ix_(*(jnp.arange(n) for n in widths)) if widths else ()
             field = len(batches[0])
@@ -263,7 +286,7 @@ class _RKIndexedGraph:
             axes = tuple(sorted(p['axes']))
             widths = tuple(args[0].aval.shape[d] for d in axes)
             m = len(axes)
-            lane_shape = jnp.broadcast_shapes(*(jnp.shape(i) for i in index))
+            lane_shape = _rk_lane_shape(index)
             coordinates = []
             kept = iter(index)
             for d in range(len(args[0].aval.shape)):
