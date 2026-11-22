@@ -420,6 +420,40 @@ end
     end
 end
 
+# A Normal-like cell, `-0.5 * (v / s)^2`: its value sums the squared quotient
+# and so does the partial of the shared divisor. The bounded sweep keeps one
+# sum for both; the exceptional sweep, whose partial sum carries an exponent,
+# still adds the value's own.
+@testset "the value reads the bounded sweep's sum of the same term" begin
+    divop, mulop, powop = GlobalRef(Base, :/), GlobalRef(Base, :*), GlobalRef(Base, :^)
+    density = Expr(:call, mulop, -0.5, Expr(:call, powop, Expr(:call, divop, :v1, :s), 2))
+    ast = program([density])
+    rexpr, _, _ = RK._pr_program_reverse(ast, [:x, :s], RK, Dict{Symbol,Any}())
+    loops = RK._PlateProgram[]
+    function collect_loops!(ex)
+        ex isa RK._PlateProgram && push!(loops, ex)
+        ex isa Expr && foreach(collect_loops!, ex.args)
+        nothing
+    end
+    collect_loops!(rexpr)
+    value_sums(p) = length(collect(eachmatch(r"_pr_value\d+ = _pr_value\d+ \+", string(p.ast))))
+    bounded = filter(p -> occursin("shared_inverse", string(p.ast)), loops)
+    wide = filter(p -> !occursin("shared_inverse", string(p.ast)), loops)
+    @test !isempty(bounded) && all(p -> value_sums(p) == 0, bounded)
+    @test !isempty(wide) && all(p -> value_sums(p) >= 1, wide)
+    primal, sweep = RK.compile(ast), RK.compile(rexpr)
+    # Ordinary values take the bounded sweep, the second set the exceptional one.
+    for (x, s) in (([0.3, -1.2, 2.5, 0.0], 0.7), ([3e160, -1e160, 2e160], 1e155), (Float64[], 1.3))
+        for seed in (1.0, -0.4)
+            value, ds = sweep(x, s, seed, Val(true), zero(x))
+            _, ds2 = sweep(x, s, seed, Val(false), zero(x))
+            @test value ≈ primal(x, s) rtol = 1e-13 atol = 0
+            @test ds ≈ ds2 rtol = 1e-12 atol = 0
+            @test ds ≈ seed * sum(abs2, x ./ s; init = 0.0) / s rtol = 1e-12 atol = 0
+        end
+    end
+end
+
 # The schedule is chosen on operand types before the backend sees the call:
 # an operand class the adapter has no buffer or cotangent for stays inline.
 @testset "operand classes without a one-pass buffer keep the plate inline" begin

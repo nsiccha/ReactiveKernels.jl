@@ -1906,11 +1906,86 @@ function _pr_value_terms(stmts, invariant::Set{Symbol}, cellvars::Set{Symbol}, r
     terms
 end
 
+# A canonical form of a cell value, for telling whether two sums add the same
+# term: aliases resolved, a product as an unordered pair, a square as a
+# product. `bound` holds the bindings of the block being read (`t = a * b`),
+# and a value that the bounded and the exceptional sweep compute differently
+# (`if normal; a; else; b; end`) is read as the bounded sweep's. Anything else
+# compares by name, and an expression that is not a product equals nothing.
+function _pr_summand_key(x, defs::Dict{Symbol,Any}, bound::Dict{Symbol,Any}, normal = nothing)
+    key(y) = _pr_summand_key(y, defs, bound, normal)
+    x isa Real && !(x isa Bool) && return Float64(x)
+    if x isa Symbol
+        haskey(bound, x) && return key(bound[x])
+        d = get(defs, x, nothing)
+        d isa _PRAlias && return key(d.rhs)
+        if d isa _PRCall && length(d.args) == 2
+            (d.f === Base.:* || d.f === _native_mul) &&
+                return _pr_product_key(key(d.args[1]), key(d.args[2]))
+            if d.f === Base.:^ && d.args[2] === 2
+                k = key(d.args[1])
+                return _pr_product_key(k, k)
+            end
+        end
+        return x
+    end
+    normal !== nothing && Meta.isexpr(x, :if, 3) && x.args[1] === normal && return key(x.args[2])
+    if Meta.isexpr(x, :call, 3)
+        f = x.args[1]
+        f isa GlobalRef && isdefined(f.mod, f.name) && (f = getglobal(f.mod, f.name))
+        (f === :* || f === Base.:* || f === _native_mul) &&
+            return _pr_product_key(key(x.args[2]), key(x.args[3]))
+    end
+    gensym(:unshared)
+end
+_pr_product_key(a, b) = repr(a) <= repr(b) ? (:*, a, b) : (:*, b, a)
+
+# The partial sums that the bounded arm of a quotient contribution adds once
+# per cell (`if normal; t = …; S = S + t; else … end`, `_pr_quotient_contribution!`),
+# by the canonical form of their summand. `sums` names the sweep's partial
+# sums. A sum the cell adds to more than once is no single term's sum.
+function _pr_normal_sums(stmts, reverse, normal, sums)
+    defs = Dict{Symbol,Any}(s.lhs => s for s in stmts if s isa Union{_PRAlias,_PRCall})
+    updates = Dict{Symbol,Int}()
+    function count_updates(node)
+        node isa Expr || return
+        if Meta.isexpr(node, :(=), 2) && node.args[1] isa Symbol && node.args[1] in sums
+            updates[node.args[1]] = get(updates, node.args[1], 0) + 1
+        end
+        foreach(count_updates, node.args)
+    end
+    foreach(count_updates, reverse)
+    found = Dict{Any,Symbol}()
+    for node in reverse
+        Meta.isexpr(node, :if, 3) && node.args[1] === normal &&
+            Meta.isexpr(node.args[2], :block) || continue
+        bound = Dict{Symbol,Any}()
+        for stmt in node.args[2].args
+            Meta.isexpr(stmt, :(=), 2) && stmt.args[1] isa Symbol || continue
+            lhs, rhs = stmt.args
+            if lhs in sums
+                get(updates, lhs, 0) == 1 && Meta.isexpr(rhs, :call, 3) && rhs.args[1] === :+ &&
+                    rhs.args[2] === lhs || continue
+                get!(found, _pr_summand_key(rhs.args[3], defs, bound, normal), lhs)
+            else
+                bound[lhs] = rhs
+            end
+        end
+    end
+    defs, found
+end
+
 # The statements that add the cell values into `total`: above the loop, in it
-# and after it, each only when the sweep wants the value.
+# and after it, each only when the sweep wants the value. Where the bounded
+# sweep (`normal`) already keeps a partial sum of the same term for a shared
+# adjoint, such as the squared residual of a Normal cell for its scale, the
+# value reads that sum and adds its own only in the exceptional sweep.
 function _pr_value_accumulation(stmts, invariant, cellvars, result, total, add, ncells,
-                                st::_PRProgramState)
+                                st::_PRProgramState; reverse = Any[], normal = nothing,
+                                sums = Set{Symbol}())
     want = :($_PR_WANT_VALUE isa Val{true})
+    defs, shared = normal === nothing ? (Dict{Symbol,Any}(), Dict{Any,Symbol}()) :
+        _pr_normal_sums(stmts, reverse, normal, sums)
     coef(num, inv) = isempty(inv) ? num :
         num == 1.0 ? Expr(:call, GlobalRef(Base, :*), inv...) :
         Expr(:call, GlobalRef(Base, :*), num, inv...)
@@ -1923,8 +1998,16 @@ function _pr_value_accumulation(stmts, invariant, cellvars, result, total, add, 
             st.counter += 1
             s = Symbol(:_pr_value, st.counter)
             push!(pre, :($s = 0.0))
-            push!(inloop, :($want && ($s = $s + $var)))
-            push!(parts, :($(coef(num, inv)) * $s))
+            update = :($want && ($s = $s + $var))
+            twin = isempty(shared) ? nothing :
+                get(shared, _pr_summand_key(var, defs, Dict{Symbol,Any}()), nothing)
+            if twin === nothing
+                push!(inloop, update)
+                push!(parts, :($(coef(num, inv)) * $s))
+            else
+                push!(inloop, Expr(:if, normal, Expr(:block), update))
+                push!(parts, :($(coef(num, inv)) * ($normal ? $twin : $s)))
+            end
         end
     end
     isempty(constant) || push!(parts, :($ncells * $(Expr(:call, GlobalRef(Base, :+), 0.0, constant...))))
@@ -2417,6 +2500,7 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState, indexed:
         q = (normal = gensym(:bounded_quotients), targets = Any[], shared = Any[], divisors = Any[],
              sums = Dict{Symbol,Symbol}())
         flush = Any[]
+        partial_sums = Set{Symbol}()
         if result isa Symbol && result in active
             shared = Set{Symbol}(s for s in st.outer if !(s in st.totals))
             union!(shared, hoisted_active)
@@ -2433,6 +2517,7 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState, indexed:
             st.joint_cell_cut |= !isempty(cuts)
             _pr_flush_counts!(fc)
             coefficients, flush = fc.pre, fc.post
+            union!(partial_sums, Base.values(fc.sums))
             _pr_reverse_exprs!(after, hoisted, active, copy(defined); touched = st.touched, cuts)
         end
         # Select joint cuts from the reverse's actual uses before emitting the
@@ -2458,7 +2543,8 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState, indexed:
         # (`_PR_WANT_VALUE`): its invariant terms once, `ncells` times, after
         # the loop, and one partial sum per cell-varying term in it.
         value_pre, value_in, value_post = _pr_value_accumulation(
-            inloop, inv2, cellvars, result, total, acc.args[1], ncells, st)
+            inloop, inv2, cellvars, result, total, acc.args[1], ncells, st;
+            reverse, normal = isempty(q.divisors) ? nothing : q.normal, sums = partial_sums)
         direct_in, read_operands = _pr_direct_reads(inloop, st)
         cellbody = Expr(:block, forward_in..., value_in..., reverse...)
         plain_loop = :(@inbounds for $linear in $cells
