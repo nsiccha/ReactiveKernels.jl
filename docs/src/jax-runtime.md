@@ -41,7 +41,23 @@ shared events. `model.unit_log_density(u, label, **q)` sums that label's
 observations and assigned prior and Jacobian events at its own full packed
 point. Both support `jax.jit`, `jax.vmap` and reverse differentiation.
 A complete assignment at one point reconstructs `model.log_density(u, **p)`.
-An unsupported indexed primitive or effect raises during tracing.
+An unsupported indexed primitive raises during tracing.
+
+A selected read evaluates the requested rows of each event, so it never
+reaches a runtime check, which has no output. A check that reads only data,
+such as a cell's length, has the same outcome at every point:
+`prepare_partition` runs it once over all cells and raises if it fails. A
+check that reads the parameters, such as the pivots of a factor, runs over
+the whole event at every selected read of that event, as `log_density` runs
+every check at each evaluation. A check under a condition on the
+parameters runs where that condition takes its arm.
+
+Selected rows read coupled values whole: each selected matrix of a batch of
+Cholesky factors, the whole axis of a cumulative sum, and the entire output
+of a loop or a scatter. These costs do not grow with the number of units
+when the values are shared, such as an LKJ factor or the coherence factors
+of an HSGP basis. A check, loop or scatter inside a unit's own cell is
+evaluated for every cell of the event at each read.
 
 ## Chains under `vmap`
 

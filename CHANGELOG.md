@@ -16,6 +16,16 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.367
+
+- Indexed JAX density events evaluate events that contain runtime checks.
+  Checks that read only data run once, through `_rk_check_event_data`. Checks
+  that read the parameters run over the whole event at each selected read,
+  including checks under a condition on the parameters.
+- Selected rows can read Cholesky factors of a batch of matrices, cumulative
+  sums and products at gathered positions, and a concatenation at a traced
+  position. They read the entire output of a loop or a scatter.
+
 ## 0.1.366
 
 - JAX kernels can gather matrix rows with a ragged integer index or a leading
