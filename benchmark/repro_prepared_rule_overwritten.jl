@@ -131,7 +131,8 @@ repair(name) = isdefined(Enzyme, :has_dogfood_repair) && Enzyme.has_dogfood_repa
 @testset "a derivative rule over a struct input, direct and in a prepared program" begin
     println("REPAIRS ", (; overwritten_reachable_data = repair(:overwritten_reachable_data),
         unexposed_storage_barriers = repair(:unexposed_storage_barriers),
-        later_pointer_stores = repair(:later_pointer_stores)))
+        later_pointer_stores = repair(:later_pointer_stores),
+        later_store_targets = repair(:later_store_targets)))
     @test Enzyme.autodiff(Enzyme.Reverse, Enzyme.Const(direct), Enzyme.Active,
         Enzyme.Const(Geometry([1.0, 2.0, 3.0, 4.0])), Enzyme.Active(2.0))[1][2] == 10.0
     for n in (1_024, 65_536)
