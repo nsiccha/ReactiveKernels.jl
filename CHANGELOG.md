@@ -16,6 +16,35 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.371
+
+- A softplus in a loop the compiler can turn into vector code is computed
+  with vector arithmetic. That covers a summed plate whose cell calls
+  `rk_log1pexp` or `LogExpFunctions.log1pexp` on a `Float64` beside
+  straight-line arithmetic only (`+`, `-`, `*`, `/`, `ifelse`, `max`, `min`,
+  `abs`, comparisons, a scalar `exp`), and a broadcast of either that a
+  prepared non-allocating program materializes by itself. On a CPU with
+  AVX-512 the density of a Bernoulli-logit regression with 3,000 rows,
+  `y .~ BernoulliLogit.(logit_p)`, takes about 6 µs where it took about
+  37 µs, and binomial and ordered-logistic densities take a quarter to a
+  third of their time. Gradients take the same time or less. The swap applies
+  where a vector holds at least four doubles (AVX2 or AVX-512, where the
+  softplus itself is 1.4 to 6 times faster); other CPUs run the code they ran
+  before. A softplus in such a loop can differ from `rk_log1pexp` in its last
+  digit, so a density and the value returned with a gradient can differ by
+  one unit in the last place per cell. Generated code shows the call as
+  `ReactiveKernels._vector_rk_log1pexp(x)` or
+  `ReactiveKernels._vector_log1pexp(x)`.
+- Everything else runs as before: a plate that keeps its cells; a cell that
+  runs a scan, reads an array by index, branches, or calls any other function
+  (Base's `log`, say); a softplus fused into a larger broadcast;
+  `sum(log1pexp, x)`; a hand-written `log1p(exp(x))`. One call that stays
+  scalar keeps the whole loop scalar, and there the vector softplus would
+  take twice as long as the one it replaces.
+- New dependencies: SLEEFPirates 0.6.46, for its `log1p`, and
+  VectorizationBase 0.21.74, for the CPU's vector width. Together they bring
+  13 packages and add about 0.75 s to loading ReactiveKernels.
+
 ## 0.1.370
 
 - A summed plate whose cells call `exp` on a number runs as vector code.

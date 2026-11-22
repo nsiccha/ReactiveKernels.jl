@@ -196,6 +196,11 @@ function _pr_flatten!(stmts::Vector{Any}, ex, ctx::_PRCtx)
         return _pr_flatten!(stmts, Expr(:call, GlobalRef(Core, :getfield), ex.args...), ctx)
     elseif Meta.isexpr(ex, :call)
         f, fref = _pr_resolve_lenient(ex.args[1], ctx)
+        # A cell value is a `Float64` here, for which a vector softplus call
+        # is the owned rule with its authored partial.
+        if f === _vector_rk_log1pexp || f === _vector_log1pexp
+            f, fref = _vector_softplus, GlobalRef(@__MODULE__, :_vector_softplus)
+        end
         expanded = _pr_expand_stable_helper(f, ex.args[2:end], ctx)
         expanded === nothing || return _pr_flatten!(stmts, expanded, ctx)
         args = Any[_pr_flatten!(stmts, a, ctx) for a in ex.args[2:end]]

@@ -102,7 +102,9 @@ _indexed_table(array) = Array{eltype(array)}(undef, size(array))
 function _indexed_formula(source, argument)
     source === argument && return :input
     source isa Expr && source.head === :call && length(source.args) == 2 || return nothing
-    f = _cell_array_function(source.args[1])
+    # A summed plate's cell calls the vector twin of a softplus; a table of
+    # it holds the softplus itself.
+    f = _vector_softplus_source(_cell_array_function(source.args[1]))
     name = f === (-) ? :- : f === log ? :log : f === log1p ? :log1p :
         f === exp ? :exp : f === LogExpFunctions.log1pexp ? :log1pexp : nothing
     name === nothing && return nothing

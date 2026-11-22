@@ -4797,9 +4797,22 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         isempty(released) && all(r -> !r.effectful, inner.recipes)
     if summed
         linear = gensym(:plate_linear)
+        # The compiler can turn this loop into vector code when its cell is
+        # straight-line arithmetic (`_vector_safe_cell`), and a softplus in
+        # such a cell is the vector softplus (shared_softplus.jl). A scan, a
+        # table carried from one cell to the next, or one call that keeps the
+        # loop scalar runs the cells one at a time, where the source's
+        # softplus is the faster one. A cell that is one call names its
+        # function by table position (`__callables__[k]`).
+        vector_cells = isempty(slotted) && isempty(table_entries) && isempty(shares) &&
+            !any(r -> r.op isa _AuthoredScanOp, inner.recipes)
+        table_function(callee) = (k = _callable_slot(callee);
+            k === nothing || !(k in eachindex(runtime_ops)) ? nothing : Some(runtime_ops[k]))
+        cell_statements = vector_cells && _vector_safe_cell(loopbody, table_function) ?
+            _vector_softplus_calls(loopbody, table_function) : loopbody
         simd_body = Expr(:block,
             Expr(:(=), index, Expr(:call, GlobalRef(Base, :CartesianIndex), linear)),
-            loopbody.args...)
+            cell_statements.args...)
         simd_loop = Expr(:for, Expr(:(=), linear,
             Expr(:call, GlobalRef(@__MODULE__, :_plate_simd_cells), output_axes)),
             simd_body)

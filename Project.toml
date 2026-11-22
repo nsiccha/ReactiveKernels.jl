@@ -1,7 +1,7 @@
 name = "ReactiveKernels"
 uuid = "78e9f072-d36b-4c73-b7a3-751b0eb26cf9"
 authors = ["Nikolas Siccha <nikolassiccha@gmail.com>"]
-version = "0.1.370"
+version = "0.1.371"
 
 [deps]
 DiffRules = "b552c78f-8df3-52c6-915a-8e097449b14b"
@@ -16,6 +16,8 @@ Preferences = "21216c6a-2e73-6563-6e65-726566657250"
 Profile = "9abbd945-dff8-562f-b5e8-e1ebf5ef1b79"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 RuntimeGeneratedFunctions = "7e49a35a-f44a-4d26-94aa-eba1b4ca6b47"
+SLEEFPirates = "476501e8-09a2-5ece-8869-fb82de89a1fa"
+VectorizationBase = "3d5dd08c-fd9d-11e8-17fa-ed2836048c2f"
 
 [weakdeps]
 ChainRulesCore = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
@@ -64,12 +66,14 @@ PrecompileTools = "1.2"
 Preferences = "1"
 Profile = "1"
 RuntimeGeneratedFunctions = "0.5"
+SLEEFPirates = "0.6.46"
 # Core does not use SciMLBase; current BDF and sensitivity weakdeps require 3.x.
 SciMLBase = "2.150, 3.46"
 SciMLSensitivity = "7.119"
 SpecialFunctions = "2"
 StableRNGs = "1"
 StaticArrays = "1"
+VectorizationBase = "0.21.74"
 Statistics = "1"
 julia = "1.10"
 

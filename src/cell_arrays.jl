@@ -187,7 +187,8 @@ _cell_array_operand(x::Base.Broadcast.Broadcasted) =
 end
 _cell_total_function(f) = f === (+) || f === (-) || f === (*) || f === (/) ||
     f === exp || f === abs || f === abs2 || f === identity ||
-    f === LogExpFunctions.logistic || f === LogExpFunctions.log1pexp
+    f === LogExpFunctions.logistic || f === LogExpFunctions.log1pexp ||
+    f === _vector_log1pexp || f === _vector_rk_log1pexp
 
 @inline function _cell_array_hcat(args...)
     if !isempty(args) && all(_cell_array_operand, args) &&
