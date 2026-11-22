@@ -6,6 +6,15 @@ import numpy as np
 from jax.extend import core as _rk_core
 
 
+# Keep these generated unary elementwise helpers visible as calls in the
+# event trace. Reapplying the callable to selected inputs retains JAX's
+# registered derivatives, including the custom rule inside softplus.
+_RK_UNARY_CALLS = {name: globals()[name] for name in ('_rk_softplus', '_rk_log1mlogistic')
+                   if name in globals()}
+for _name, _fn in _RK_UNARY_CALLS.items():
+    globals()[_name] = jax.jit(_fn)
+
+
 def _rk_coordinates(index, shape):
     return tuple(0 if n == 1 else k for k, n in zip(index, shape))
 
@@ -128,6 +137,9 @@ class _RKIndexedGraph:
         if name == 'cond':
             return self.conditional(eq, output, lambda g, v: g.region(v, axes))
         if name in ('jit', 'pjit'):
+            fn = _RK_UNARY_CALLS.get(p['name'])
+            if fn is not None:
+                return fn(self.region(args[0], axes))
             nested = self.nested(eq)
             return nested.region(nested.outputs[output], axes)
         if name == 'slice':
@@ -191,6 +203,9 @@ class _RKIndexedGraph:
             return self.conditional(eq, output,
                                     lambda g, v: jnp.broadcast_to(g.read(v, index), lane_shape))
         if name in ('jit', 'pjit'):
+            fn = _RK_UNARY_CALLS.get(p['name'])
+            if fn is not None:
+                return fn(arg(0, index))
             nested = self.nested(eq)
             return nested.read(nested.outputs[output], index)
         if name == 'broadcast_in_dim':

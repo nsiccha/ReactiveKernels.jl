@@ -99,6 +99,20 @@ for rows in (jnp.array([3, 0, 3]), jnp.array([[3], [0], [3]]),
         np.testing.assert_allclose(values[i], value)
         np.testing.assert_allclose(grads[i], grad)
 
+# The bounded transform uses softplus. At a tie in its underlying logaddexp,
+# differentiating the expanded primal can lose JAX's custom derivative.
+def softplus_events(u):
+    return model._rk_softplus(u)
+
+
+rows = jnp.array([2, 0, 2])
+u = jnp.array([0., -1., 1.5])
+selected = lambda x: model._rk_read_event(softplus_events, x, rows, {}).sum()
+eager = lambda x: jax.nn.softplus(x[rows]).sum()
+for transform in (jax.grad, jax.hessian):
+    np.testing.assert_allclose(jax.jit(transform(selected))(u), transform(eager)(u),
+                               rtol=1e-12, atol=1e-12)
+
 # All observation rows can disappear on a new binding. The same module
 # still evaluates the assigned prior-only events and the empty unit.
 empty = dict(inputs.raw, y=np.array([], dtype=float), group=np.array([], dtype=int))

@@ -3926,7 +3926,7 @@ const _JAX_ELEMENTWISE = Dict{Any,String}(
     _tie_exact_logaddexp => "_rk_logaddexp",
     LogExpFunctions.logistic => "jax.nn.sigmoid",
     LogExpFunctions.logit => "jsp.logit",
-    LogExpFunctions.log1pexp => "jax.nn.softplus",
+    LogExpFunctions.log1pexp => "_rk_softplus",
     LogExpFunctions.xlogy => "jsp.xlogy",
     LogExpFunctions.xlog1py => "jsp.xlog1py",
     LogExpFunctions.log1mexp => "_rk_log1mexp",
@@ -3951,6 +3951,10 @@ const _JAX_BINARY_NAMES = Dict{Any,String}(atan => "jnp.arctan2", hypot => "jnp.
 # Small helpers the emitted module defines when it uses them: stable forms of
 # LogExpFunctions functions whose `jax.numpy` spelling is not one call.
 const _JAX_PRELUDE = Dict{String,String}(
+    "_rk_softplus" => """
+def _rk_softplus(x):
+    return jax.nn.softplus(x)
+""",
     "_rk_log1mlogistic" => """
 def _rk_log1mlogistic(x):
     # log(1 - logistic(x)) (LogExpFunctions.log1mlogistic).

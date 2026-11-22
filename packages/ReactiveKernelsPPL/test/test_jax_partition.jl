@@ -5,6 +5,7 @@ include(joinpath(pkgdir(ReactiveKernels), "test", "jax_python.jl"))
     model = @rkppl begin
         location ~ Normal(0.3, 1.7)
         z[1:K] .~ LogNormal.(location, 0.9)
+        bounded[1:K] .~ Beta(2.0, 3.0)
         joint ~ Dirichlet(alpha)
         y .~ Normal.(z[group], 0.7)
     end
@@ -16,7 +17,8 @@ include(joinpath(pkgdir(ReactiveKernels), "test", "jax_python.jl"))
     original, built = build_kernel(plan), build_kernel(bound)
     catalogue = density_factors(original, plan)
     shared = select_factors(catalogue; site = :location)
-    units = Dict(i => select_factors(catalogue; site = :z, entries = j)
+    units = Dict(i => select_factors(catalogue,
+            [f for f in catalogue if f.site in (:z, :bounded) && f.entry == j])
         for (j, i) in enumerate([10, 21, 42]))
     units[-5] = select_factors(catalogue; site = :joint)
     units[99] = select_factors(catalogue, [])

@@ -21,6 +21,7 @@ are recorded in the git history only.
 - Indexed JAX density events can read selected rows of a conditional when
   one arm broadcasts a scalar and the other computes an array. Batched
   values and gradients retain the requested row order and multiplicity.
+  Indexed bounded-parameter Jacobians also retain JAX's softplus derivatives.
 
 ## 0.1.362
 
