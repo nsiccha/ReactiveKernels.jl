@@ -988,14 +988,15 @@ end
 using ReactiveKernels: _PlateSumRuleOnePass, _pr_gather_value,
     _pr_scalar_positions, _pr_batched_positions, _pr_tape_layout, _CellArray, _PlateTapeSlot,
     _pr_take_tape!, _pr_return_tape!, _pr_projections, _pr_ragged_buffer, _PRRaggedBuffer,
-    _pr_group_view, _pr_gather_root, _pr_regather, _pr_mark_declined!
+    _pr_group_view, _pr_gather_root, _pr_regather, _pr_mark_declined!, _PlateRuleSite
 
-# A one-pass call made by a preparation that owns AD caches ends with its tape
-# slot (`_PlateTapeSlot`, src/plate_reverse.jl), which is no operand of the
-# program. `_pr_operand_args` are the program operands' annotations, `_pr_slot`
-# the slot (or `nothing`), and `_pr_with_slot` appends the slot's empty
-# cotangent to a reverse return built for the operands.
-_pr_slotted(::Type{<:Annotation{_PlateTapeSlot}}) = true
+# A one-pass call installed by a preparation ends with its site record
+# (src/plate_reverse.jl), which is no operand of the program: the tape slot of
+# a preparation that owns AD caches (`_PlateTapeSlot`), or a mark
+# (`_PlateRuleMark`). `_pr_operand_args` are the program operands' annotations,
+# `_pr_slot` the record (or `nothing`), and `_pr_with_slot` appends the record's
+# empty cotangent to a reverse return built for the operands.
+_pr_slotted(::Type{<:Annotation{<:_PlateRuleSite}}) = true
 _pr_slotted(::Type) = false
 _pr_slotted_args(types) = !isempty(types) && _pr_slotted(types[end])
 @generated function _pr_operand_args(args::Tuple)

@@ -45,10 +45,14 @@ are recorded in the git history only.
     (0.97 and 1.17 µs against 0.98) instead of 9 µs.
   - The program chooses the schedule from operand types and sizes before the
     backend sees the call, and the one-pass reverse no longer depends on
-    operands staying unchanged after the primal. A preparation that owns its
-    AD caches evaluates once at its exemplar. If the backend refused a rule
-    call there, the preparation differentiates the plates inline, as without
-    the generated reverse, so no later evaluation pays for a refused rule.
+    operands staying unchanged after the primal. Every prepared operator
+    (`prepare_ad` and its relatives, over allocating and non-allocating
+    kernels) evaluates once at its exemplar. If the backend refused a rule
+    call there, the operator is prepared again with the plates inline, as
+    without the generated reverse, so no later evaluation pays for a refused
+    rule. A plate whose call cannot be checked this way keeps no rule: the
+    one-shot forms (`ad_gradient(kernel, backend, ...)`) and a call at the
+    operand limit differentiate the plate inline.
 
 ## 0.1.369
 

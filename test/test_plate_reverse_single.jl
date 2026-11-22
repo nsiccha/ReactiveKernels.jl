@@ -40,9 +40,12 @@ function programs!(found, ex)
     ex isa Expr && foreach(a -> programs!(found, a), ex.args)
     found
 end
-ad_ast(k::PreparedKernel, args) = RK._ad_inline_plate_programs(k, (1, 2)).ast
+# The AD body as a preparation builds it: generated rules are installed only
+# for a preparation, which collects their site records.
+preparing(f) = RK._pr_collecting_marks(f, RK._PlateRuleMark[])
+ad_ast(k::PreparedKernel, args) = preparing(() -> RK._ad_inline_plate_programs(k, (1, 2)).ast)
 ad_ast(k::NonAllocatingKernel, args) =
-    RK._program_expression(first(RK._ad_na_program(k, (1, 2), args)))
+    preparing(() -> RK._program_expression(first(RK._ad_na_program(k, (1, 2), args))))
 
 @testset "rule fallback retains native direct reads" begin
     backend = AutoEnzyme(; mode = Enzyme.Reverse)

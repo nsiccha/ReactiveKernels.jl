@@ -52,7 +52,19 @@ end
         if flag
             @test last(only(plate_reverse_report(k, 2))) == "rule"
             rules = RK._PlateSumRule[]
-            body = with_plate_reverse(() -> RK._ad_inline_plate_programs(k, (2,)).ast, true)
+            # Rules are installed for a preparation, which collects their marks.
+            marks = RK._PlateRuleMark[]
+            body = RK._pr_collecting_marks(marks) do
+                with_plate_reverse(() -> RK._ad_inline_plate_programs(k, (2,)).ast, true)
+            end
+            @test length(marks) == 1 && !only(marks).declined
+            # Outside a preparation the plates stay inline.
+            inline = with_plate_reverse(() -> RK._ad_inline_plate_programs(k, (2,)).ast, true)
+            unverified = Ref(0)
+            RK._index_run_visit(inline) do ex
+                Meta.isexpr(ex, :call) && ex.args[1] isa RK._PlateSumRule && (unverified[] += 1)
+            end
+            @test unverified[] == 0
             RK._index_run_visit(body) do ex
                 Meta.isexpr(ex, :call) && ex.args[1] isa RK._PlateSumRule && push!(rules, ex.args[1])
             end

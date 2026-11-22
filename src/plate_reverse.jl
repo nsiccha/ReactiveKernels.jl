@@ -3075,6 +3075,35 @@ end
 @inline _pr_mark_declined!(slot::_PlateTapeSlot) = (slot.declined = true; nothing)
 @inline _pr_mark_declined!(::Nothing) = nothing
 
+# The record of one rule call site in a program that owns no AD caches (an
+# allocating kernel's): only whether the backend's adapter refused the call.
+# The program holds it as a literal and passes it as the call's last operand,
+# where a non-allocating program passes its tape slot. It leases no tape: the
+# compiled program may be shared, so each call allocates its own, and setting
+# the flag is the only write (to `true`, from any caller).
+mutable struct _PlateRuleMark
+    declined::Bool
+end
+# The trailing operand of a rule call that is no operand of its program.
+const _PlateRuleSite = Union{_PlateTapeSlot,_PlateRuleMark}
+@inline _pr_mark_declined!(mark::_PlateRuleMark) = (mark.declined = true; nothing)
+
+# The marks of the preparation in progress. `_prepare_ad_operator` collects
+# them while it builds the differentiated program and reads them after one
+# evaluation (`_pr_verified_preparation`). Outside such a preparation there is
+# no collector, and no rule is installed: a rule call exists only where a
+# preparation verifies it.
+const _PR_MARKS_SCOPE = :ReactiveKernels_plate_reverse_marks
+_pr_marks() = get(task_local_storage(), _PR_MARKS_SCOPE, nothing)::Union{Nothing,Vector{_PlateRuleMark}}
+_pr_collecting_marks(f, marks::Vector{_PlateRuleMark}) =
+    task_local_storage(f, _PR_MARKS_SCOPE, marks)
+# A fresh mark for one rule call, known to the preparation in progress.
+function _pr_rule_mark!(marks::Vector{_PlateRuleMark})
+    mark = _PlateRuleMark(false)
+    push!(marks, mark)
+    mark
+end
+
 # The tape slots among a preparation's AD contexts: one per rule call, in the
 # cache table the backend shadows.
 _pr_tape_slots!(found::Vector{_PlateTapeSlot}, slot::_PlateTapeSlot) = push!(found, slot)
@@ -3098,10 +3127,13 @@ _pr_tape_slots!(found::Vector{_PlateTapeSlot}, value) = found
 # plate, so `ordinary()` then prepares the operator again with the plates
 # inline, exactly as without the generated reverse. `evaluated` says the
 # preparation already ran the operator once (`warm`, or the derivative check).
+# Every rule call has a site record: a tape slot among the contexts, or one of
+# `marks` in a program that owns no AD caches.
 function _pr_verified_preparation(ordinary, op::Val, prepared, point, seeds, contexts,
-                                  evaluated::Bool)
+                                  evaluated::Bool,
+                                  marks::Vector{_PlateRuleMark} = _PlateRuleMark[])
     slots = _pr_tape_slots!(_PlateTapeSlot[], contexts)
-    isempty(slots) && return prepared
+    isempty(slots) && isempty(marks) && return prepared
     if !evaluated
         f, args = _ad_operator_evaluation(op, prepared, point, seeds, contexts)
         # Infer first: the backend builds its derivative during inference,
@@ -3115,7 +3147,8 @@ function _pr_verified_preparation(ordinary, op::Val, prepared, point, seeds, con
             # there is nothing to verify at this point.
         end
     end
-    any(slot -> slot.declined, slots) ? ordinary() : prepared
+    any(slot -> slot.declined, slots) || any(mark -> mark.declined, marks) ?
+        ordinary() : prepared
 end
 @inline function _pr_take_tape!(slot::_PlateTapeSlot, n::Int)
     tape = slot.tape
@@ -3123,9 +3156,9 @@ end
     slot.tape = slot.empty
     fill!(tape, 0.0)
 end
-@inline _pr_take_tape!(::Nothing, n::Int) = zeros(Float64, n)
+@inline _pr_take_tape!(::Union{Nothing,_PlateRuleMark}, n::Int) = zeros(Float64, n)
 @inline _pr_return_tape!(slot::_PlateTapeSlot, tape::Vector{Float64}) = (slot.tape = tape; nothing)
-@inline _pr_return_tape!(::Nothing, tape::Vector{Float64}) = nothing
+@inline _pr_return_tape!(::Union{Nothing,_PlateRuleMark}, tape::Vector{Float64}) = nothing
 
 # The operand classes a one-pass tape holds a buffer for, on types alone:
 # `Float64` vectors, views of them, tuples of `Float64`, and the rows of a
@@ -3180,12 +3213,15 @@ function _pr_target_expr(S, B, types, joint, make, one_pass = make)
         end
     end
 end
+# Whether a call's last operand is its site record (a tape slot or a mark),
+# which is no operand of the program.
+_pr_sited(types) = !isempty(types) && types[end] <: _PlateRuleSite
 # The call itself, made in each branch: a target chosen by size and then called
-# would be a union of the two wrappers, boxed in the primal. A trailing tape
-# slot is not an operand of the program: only the one-pass call takes it on.
+# would be a union of the two wrappers, boxed in the primal. A trailing site
+# record is not an operand of the program: only the one-pass call takes it on.
 function _pr_rule_expr(S, B, types, joint, dispatch, projections)
-    slotted = !isempty(types) && types[end] === _PlateTapeSlot
-    count = length(types) - slotted
+    sited = _pr_sited(types)
+    count = length(types) - sited
     operands = Any[:(getfield(args, $i)) for i in 1:count]
     if !_pr_group_projections_cover(projections, types)
         dispatch === :_pr_rule_applies && return false
@@ -3199,7 +3235,7 @@ function _pr_rule_expr(S, B, types, joint, dispatch, projections)
         for i in inputs
             operands[i] = :(only(getfield(args, $i).broadcast.args))
         end
-        slotted && push!(operands, :(getfield(args, $(count + 1))))
+        sited && push!(operands, :(getfield(args, $(count + 1))))
         return :($dispatch(_pr_exp_rule(rule, Val($inputs), Val($shadows), $shapes),
                            ($(operands...),)))
     end
@@ -3207,14 +3243,14 @@ function _pr_rule_expr(S, B, types, joint, dispatch, projections)
     dispatch === :_pr_rule_applies &&
         return _pr_target_expr(S, B, types, joint, _ -> false, _ -> true)
     call = target -> Expr(:call, target, operands...)
-    one_pass = slotted ?
+    one_pass = sited ?
         (target -> Expr(:call, target, operands..., :(getfield(args, $(count + 1))))) : call
     _pr_target_expr(S, B, types, joint, call, one_pass)
 end
 function _pr_source_checked_expr(S, B, types, joint, dispatch, projections, checked)
     body = _pr_rule_expr(S, B, types, joint, dispatch, projections)
     checked || return body
-    count = length(types) - (!isempty(types) && types[end] === _PlateTapeSlot)
+    count = length(types) - _pr_sited(types)
     operands = Any[:(getfield(args, $i)) for i in 1:count]
     primal = :(getfield(rule, :program))
     fallback = dispatch === :_pr_rule_target ? primal :
@@ -3265,10 +3301,10 @@ for count in 0:_PLATE_CALL_MAX_ARGUMENTS
         _pr_rule_call(rule, ($(arguments...),))
     @eval @inline (call::_PlateSumRuleOnePass)($(typed...)) where {$(types...)} =
         getfield(getfield(call, :rule), :program)($(arguments...))
-    # With its tape slot, which the program does not take.
+    # With its site record, which the program does not take.
     count < _PLATE_CALL_MAX_ARGUMENTS &&
         @eval @inline (call::_PlateSumRuleOnePass)(
-                $(typed...), slot::_PlateTapeSlot) where {$(types...)} =
+                $(typed...), site::_PlateRuleSite) where {$(types...)} =
             getfield(getfield(call, :rule), :program)($(arguments...))
 end
 _pr_scalar_positions(::_PlateSumRule{S}) where {S} = S
@@ -3298,8 +3334,14 @@ A prepared gradient differentiates each eligible summed plate program with a
 reverse generated from its own code; every other plate is differentiated by
 the backend as before. This also applies to non-allocating kernels after
 their cache activity and ownership rewrite. [`plate_reverse_report`](@ref)
-reports static eligibility; backend operand annotations can still require
-the ordinary reverse at execution.
+reports static eligibility.
+
+The generated reverse is installed by prepared operators ([`prepare_ad`](@ref)
+and the samplers built on it). Each one evaluates once at its exemplar; if the
+backend annotated a rule call in a way the generated reverse does not cover,
+the operator is prepared again with every plate inline, as without this
+option, so no later evaluation pays for a refused rule. The one-shot forms
+(`ad_gradient(kernel, backend, ...)`) differentiate the plates inline.
 
 Include kernel preparation in this scope as well as AD preparation. Native
 optimizations chosen while the rule is disabled can produce forms outside
@@ -3445,11 +3487,16 @@ end
 # of a fresh `_PlateTapeSlot` for one rule call: every rule gets one, because
 # whether a call takes one pass depends on operand types and sizes that only
 # the call knows, and a plate of shared scalars alone keeps its cotangents
-# there too.
+# there too. A caller without AD caches gives each rule call a mark of the
+# preparation in progress (`_pr_marks`). Either is the call's site record,
+# which its preparation reads after one evaluation. A plate whose call cannot
+# carry one (no preparation collects marks, or the call is at the operand
+# limit) stays inline.
 function _pr_inline_plate_programs(ast::Expr, kernel, active_ports; tape_slot = nothing)
     outer_active = _pr_body_activity(ast.args[2], Set{Symbol}(active_ports))
     lazy = _pr_lazy_cell_arrays(ast.args[2])
     report = Any[]
+    marks = tape_slot === nothing ? _pr_marks() : nothing
     function replace(node)
         if node isa Expr && node.head === :(=) && node.args[2] isa Expr &&
                 node.args[2].head === :call && first(node.args[2].args) isa _PlateProgram
@@ -3457,9 +3504,10 @@ function _pr_inline_plate_programs(ast::Expr, kernel, active_ports; tape_slot = 
             push!(report, (node.args[1], rule === nothing ? info : "rule"))
             rule === nothing && return node
             operands = node.args[2].args[2:end]
-            if tape_slot !== nothing && length(operands) < _PLATE_CALL_MAX_ARGUMENTS
-                operands = Any[operands..., tape_slot()]
-            end
+            (tape_slot !== nothing || marks !== nothing) &&
+                length(operands) < _PLATE_CALL_MAX_ARGUMENTS || return node
+            site = tape_slot !== nothing ? tape_slot() : _pr_rule_mark!(marks)
+            operands = Any[operands..., site]
             called = Expr(:(=), node.args[1], Expr(:call, rule, operands...))
             # The else arm keeps the program call, which is inlined below.
             return Expr(:if, Expr(:call, GlobalRef(@__MODULE__, :_pr_rule_applies), rule,
@@ -3489,10 +3537,12 @@ _pr_active_ports(kernel::NonAllocatingKernel, I) = begin
 end
 
 # The AD kernel (`_ad_inline_plate_programs`) for active selector `I`: with the
-# generated plate reverse enabled, each eligible plate program a rule.
+# generated plate reverse enabled, each eligible plate program a rule. Rules
+# are installed only for a preparation that verifies them (`_pr_marks`): a
+# one-shot derivative differentiates the plates inline.
 Base.@nospecializeinfer function _ad_inline_plate_programs(
         @nospecialize(kernel::PreparedKernel), I)
-    _plate_reverse_enabled() && _has_plate_programs(kernel.ast) ||
+    _plate_reverse_enabled() && _pr_marks() !== nothing && _has_plate_programs(kernel.ast) ||
         return _ad_inline_plate_programs(kernel)
     ast, _ = _pr_inline_plate_programs(kernel.ast, kernel, _pr_active_ports(kernel, I))
     native = compile(ast)
@@ -3512,7 +3562,8 @@ Accepts a `PreparedKernel` or `NonAllocatingKernel`. This is a static report,
 independent of whether the preference is enabled; cache rewrites and backend
 operand annotations can affect the rule used by a prepared gradient. A call of
 an eligible plate takes its rule only where a one-pass schedule applies to
-the call's operands, and runs inline otherwise.
+the call's operands, and runs inline otherwise. A prepared operator whose
+backend refused a rule call at its exemplar runs every plate inline.
 Single-plate programs are listed even when ordinary native execution inlines
 them.
 """

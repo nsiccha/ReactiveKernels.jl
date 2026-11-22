@@ -930,8 +930,10 @@ function _ad_na_program(kernel::NonAllocatingKernel, active_selector,
                         exemplars::Tuple)
     # Cache activity and ownership are analyzed with the whole program in
     # scope. Retain each plate's region so its generated reverse can be
-    # installed after the cache rewrite, using the rewritten operands.
-    plate_reverse = _plate_reverse_enabled()
+    # installed after the cache rewrite, using the rewritten operands. Rules
+    # are installed only for a preparation that verifies them (`_pr_marks`):
+    # a one-shot derivative differentiates the plates inline.
+    plate_reverse = _plate_reverse_enabled() && _pr_marks() !== nothing
     # The bindings of one bound template share their step program's AST
     # (`_NonallocTemplate`); a later one seeds its own caches into the program
     # an earlier one rewrote and compiled, when they seeded alike.
@@ -2374,9 +2376,13 @@ function _prepare_ad_operator(op::Val{O}, kernel::_ADKernel, resolver,
     resolved = _ad_resolve(resolver, args, kwargs)
     # The exemplars type the program exactly as the derivative will see it.
     values = _uninferred_values(kernel, map(Core.Typeof, resolved))
-    call, point, contexts, active_selector, external_values = _ad_call(
-        kernel, resolved, active; scalar_output = _ad_operator_scalar_output(op),
-        retain, _ad_operator_seeding(op, seeds, backend)...)
+    # Each generated plate rule the program installs leaves its site record
+    # with this preparation, which reads it below (`_pr_verified_preparation`).
+    marks = _PlateRuleMark[]
+    call, point, contexts, active_selector, external_values = _pr_collecting_marks(marks) do
+        _ad_call(kernel, resolved, active; scalar_output = _ad_operator_scalar_output(op),
+                 retain, _ad_operator_seeding(op, seeds, backend)...)
+    end
     # The backend differentiates `call`: its code is what the level audits.
     _report_type_stability(
         values,
@@ -2395,7 +2401,7 @@ function _prepare_ad_operator(op::Val{O}, kernel::_ADKernel, resolver,
         typeof(backend),typeof(preparation),typeof(external_values),O,typeof(storage),
     }, (kernel, resolver, call, backend, preparation, external_values, storage))::PreparedADOperator
     evaluated = _ad_check_derivative(op, prepared, point, seeds, contexts, warm)
-    _pr_verified_preparation(op, prepared, point, seeds, contexts, evaluated) do
+    _pr_verified_preparation(op, prepared, point, seeds, contexts, evaluated, marks) do
         with_plate_reverse(false) do
             _prepare_ad_operator(op, kernel, requested_resolver, requested, seeds, args,
                                  kwargs, active; retain, warm)

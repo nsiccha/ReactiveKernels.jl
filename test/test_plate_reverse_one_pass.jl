@@ -284,7 +284,10 @@ end
     for enabled in (false, true)
         q, shape = with_plate_reverse(enabled) do
             k = prepare_nonallocating(gathered_fanout, z0, groups0, 0.6)
-            ast = RK._program_expression(first(RK._ad_na_program(k, (1,), (z0, groups0, 0.6))))
+            # The program a preparation builds: rules are installed for one.
+            ast = RK._program_expression(first(RK._pr_collecting_marks(RK._PlateRuleMark[]) do
+                RK._ad_na_program(k, (1,), (z0, groups0, 0.6))
+            end))
             prepare_ad(k, backend, z0, groups0, 0.6; active = :z), structure(ast)
         end
         for (n, J) in ((0, 5), (40, 8), (200, 30), (200, 250), (2000, 71)), s in (-0.6, 0.0, 0.6)
@@ -300,7 +303,9 @@ end
         with_plate_reverse(enabled) do
             groups = [mod1(7i, 29) for i in 1:2000]
             k = prepare_nonallocating(gathered_fanout, z0, groups, 0.6)
-            ast = RK._program_expression(first(RK._ad_na_program(k, (1,), (z0, groups, 0.6))))
+            ast = RK._program_expression(first(RK._pr_collecting_marks(RK._PlateRuleMark[]) do
+                RK._ad_na_program(k, (1,), (z0, groups, 0.6))
+            end))
             @test structure(ast) == shape
         end
     end
@@ -617,5 +622,48 @@ end
     slot.declined = true
     @test verified(true) === :ordinary
     @test verified(false, (DI.Constant(1.0),)) === :prepared
+    # A program without AD caches leaves a mark per rule call instead.
+    mark = RK._PlateRuleMark(false)
+    marked(evaluated) = RK._pr_verified_preparation(
+        () -> :ordinary, Val(:gradient), :prepared, nothing, (), (DI.Constant(1.0),),
+        evaluated, [mark])
+    @test marked(true) === :prepared
+    mark.declined = true
+    @test marked(true) === :ordinary
+end
+
+# A mark is the site record of a rule call in a program without AD caches. It
+# selects no schedule that needs an owned tape, and the adapter sets it when
+# the backend annotates the call in a way the rule does not cover.
+gathered_call(rule, z, index, s, site) = rule(view(z, index), s, site)
+@testset "a rule call without a tape slot records the backend's refusal" begin
+    ast = program([:(s * v1)])
+    primal = RK.compile(ast)
+    sweep(active) = RK.compile(first(RK._pr_program_reverse(ast, active, RK, Dict{Symbol,Any}())))
+    both, only_x = sweep([:x, :s]), sweep([:x])
+    covered = RK._PlateSumRule{(2,),(1,),typeof(primal),typeof(both)}(primal, both)
+    partial = RK._PlateSumRule{(),(1,),typeof(primal),typeof(only_x)}(primal, only_x)
+    joint = RK._PlateSumRule{(2,),(1,),typeof(primal),typeof(both),true}(primal, both)
+    z = [0.3cos(i) for i in 1:7]
+    index = [mod1(3i, 7) for i in 1:600]
+    mark = RK._PlateRuleMark(false)
+    @test RK._pr_rule_target(covered, (view(z, index), 0.6, mark)) isa
+        RK._PlateSumRuleOnePass{(2,),(1,),typeof(covered),true}
+    # Shared cell work pays for a tape only in owned storage.
+    @test RK._pr_rule_target(joint, ([0.2, -0.3], 0.6, mark)) === primal
+    @test RK._pr_rule_target(joint, ([0.2, -0.3], 0.6, RK._PlateTapeSlot())) isa
+        RK._PlateSumRuleOnePass
+    expected_z = [0.6count(==(j), index) for j in 1:7]
+    for (rule, refused) in ((covered, false), (partial, true))
+        site = RK._PlateRuleMark(false)
+        dz = zero(z)
+        derivatives, value = Enzyme.autodiff(Enzyme.ReverseWithPrimal, gathered_call,
+            Enzyme.Active, Enzyme.Const(rule), Enzyme.Duplicated(z, dz), Enzyme.Const(index),
+            Enzyme.Active(0.6), Enzyme.Const(site))
+        @test value ≈ 0.6sum(z[index])
+        @test dz ≈ expected_z
+        @test derivatives[4] ≈ sum(z[index])
+        @test site.declined == refused
+    end
 end
 end
