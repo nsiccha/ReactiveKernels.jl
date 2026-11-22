@@ -25,6 +25,12 @@ are recorded in the git history only.
 - Selected rows can read Cholesky factors of a batch of matrices, cumulative
   sums and products at gathered positions, and a concatenation at a traced
   position. They read the entire output of a loop or a scatter.
+- A selected read computes each distinct entry it requests once, such as a
+  factor shared by many rows, and still never computes an entry it does not
+  request. The derivative of a read under a condition keeps only the selected
+  rows' residuals, without the data or dense zero cotangents for them. At 149
+  stations of the clustered ODL model, one station's value and gradient take
+  2.4 ms against 102 ms for the full density. Batches grow linearly.
 
 ## 0.1.366
 

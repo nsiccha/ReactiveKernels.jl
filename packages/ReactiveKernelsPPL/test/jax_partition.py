@@ -258,3 +258,56 @@ for events, data, u, rows in cases:
     expected, expected_grad = jax.value_and_grad(full)(u)
     np.testing.assert_allclose(value, expected, rtol=1e-12)
     np.testing.assert_allclose(grad, expected_grad, rtol=1e-12, atol=1e-14)
+
+
+# Costs of a read. Under a condition, its derivative keeps only the selected
+# rows' residuals: no array of the data's size, as residual or zero
+# cotangent. Many rows that read one shared factor factor it once.
+def outputs(closed):
+    for eq in closed.jaxpr.eqns:
+        yield eq
+        for sub in ('jaxpr', 'branches', 'call', 'fun_jaxpr', 'body_jaxpr', 'cond_jaxpr'):
+            inner = eq.params.get(sub)
+            for c in (inner if isinstance(inner, (list, tuple)) else [inner] if inner is not None else []):
+                if hasattr(c, 'jaxpr'):
+                    yield from outputs(c)
+
+
+def largest(closed):
+    return max(int(np.prod(v.aval.shape)) for eq in outputs(closed) for v in eq.outvars
+               if hasattr(v.aval, 'shape'))
+
+
+def guarded_rows(u, *, design):
+    return jax.lax.cond(u[0] > 0, lambda: design @ jnp.exp(u), lambda: design @ u)
+
+
+wide = dict(design=jnp.ones((5000, 3)))
+read_guarded = lambda u: model._rk_read_event(guarded_rows, u, jnp.array([7, 11]), wide).sum()
+assert largest(jax.make_jaxpr(jax.value_and_grad(read_guarded))(jnp.ones(3))) < 100
+np.testing.assert_allclose(jax.grad(read_guarded)(jnp.ones(3)), 2 * np.exp(np.ones(3)))
+
+
+def shared_factor_events(u, *, group):
+    # One factor per group, as an HSGP basis cell's coherence; each row reads
+    # its own group's, through a gather of data.
+    def basis(b):
+        coherence = jnp.eye(3) + jnp.exp(u[0] + 0.1 * b) * jnp.ones((3, 3))
+        return jnp.linalg.cholesky(coherence) @ u[1:4]
+    return jax.vmap(basis)(jnp.arange(5))[group].sum(axis=1) * u[0]
+
+
+def factored(n):
+    # Entries of every Cholesky factor one read of n rows computes.
+    levels = dict(group=jnp.arange(n) % 5)
+    rows = jnp.arange(n)
+    read_shared = lambda u: model._rk_read_event(shared_factor_events, u, rows, levels).sum()
+    full_shared = lambda u: shared_factor_events(u, **levels)[rows].sum()
+    u = jnp.array([0.3, 0.5, -0.2, 0.7])
+    for transform in (lambda f: f, jax.grad):
+        np.testing.assert_allclose(jax.jit(transform(read_shared))(u), transform(full_shared)(u), rtol=1e-12)
+    return sum(int(np.prod(eq.outvars[0].aval.shape)) for eq in outputs(jax.make_jaxpr(read_shared)(u))
+               if eq.primitive.name == 'cholesky')
+
+
+assert factored(30) == factored(300) == 45, (factored(30), factored(300))

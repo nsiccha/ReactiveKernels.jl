@@ -2,6 +2,7 @@
 # requested output positions through the traced array operations. JAX still
 # executes and differentiates the numerical primitives themselves.
 from contextlib import contextmanager
+import math
 import numpy as np
 from jax.extend import core as _rk_core
 
@@ -179,11 +180,32 @@ class _RKIndexedGraph:
         if key not in self.cache:
             if var in self.inputs:
                 value = self.inputs[var](index)
+            elif index and math.prod(_rk_lane_shape(index)) > math.prod(var.aval.shape) > 0:
+                # More requested entries than the value has, as when many
+                # rows read one shared factor: compute each distinct one once.
+                value = self.distinct(var, index)
             else:
                 eq, j = self.producers[var]
                 value = self.evaluate(eq, j, index)
             self.cache[key] = (index, value)
         return self.cache[key][1]
+
+    def distinct(self, var, index):
+        """Read the distinct requested entries of a computed value once each.
+
+        Only requested entries are computed: an unrequested one may be
+        invalid, such as a padded row, and its derivative must not enter.
+        """
+        shape, lane_shape = var.aval.shape, _rk_lane_shape(index)
+        flat = 0
+        for k, n in zip(index, shape):
+            flat = flat * n + jnp.asarray(k)
+        flat = jnp.broadcast_to(flat, lane_shape).ravel()
+        # The fill of a short result is the smallest requested entry.
+        unique, inverse = jnp.unique(flat, size=math.prod(shape), return_inverse=True)
+        eq, j = self.producers[var]
+        values = jnp.broadcast_to(self.evaluate(eq, j, _rk_unravel(unique, shape)), unique.shape)
+        return jnp.reshape(values[jnp.ravel(inverse)], lane_shape)
 
     def nested(self, eq):
         return self.child(eq.params['jaxpr'], eq.invars)
@@ -413,16 +435,28 @@ class _RKIndexedGraph:
             at = jnp.broadcast_to(index[axis], lane_shape)
             return jnp.take_along_axis(scanned, at[..., None], axis=-1)[..., 0]
         if name == 'cholesky':
-            # A factor couples its two trailing axes. Factor each selected
-            # matrix of the batch whole (one per distinct batch coordinate
-            # shape, before broadcasting), then pick the requested entries.
+            # A factor couples its two trailing axes. Factor each requested
+            # matrix of the batch whole, once, then pick the requested entries.
             lane_shape = _rk_lane_shape(index)
-            rank, n = len(lane_shape), shape[-1]
+            rank, n, dims = len(lane_shape), shape[-1], shape[:-2]
             batch = [jnp.reshape(b, (1,) * (rank - jnp.ndim(b)) + jnp.shape(b))
                      for b in index[:-2]]
-            matrices = arg(0, tuple(_rk_spread(b, 2) for b in batch) +
-                           (jnp.arange(n).reshape(n, 1), jnp.arange(n).reshape(1, n)))
-            factors = eq.primitive.bind(matrices, **p)
+            square = (jnp.arange(n).reshape(n, 1), jnp.arange(n).reshape(1, n))
+            requested = jnp.broadcast_shapes(*(jnp.shape(b) for b in batch)) if batch else ()
+            if math.prod(requested) > math.prod(dims):
+                # More requested matrices than the batch has: factor each
+                # distinct one once.
+                flat = 0
+                for b, m in zip(batch, dims):
+                    flat = flat * m + b
+                flat = jnp.broadcast_to(flat, requested).ravel()
+                unique, inverse = jnp.unique(flat, size=math.prod(dims), return_inverse=True)
+                matrices = jnp.broadcast_to(
+                    arg(0, tuple(_rk_spread(c, 2) for c in _rk_unravel(unique, dims)) + square),
+                    unique.shape + (n, n))
+                factors = eq.primitive.bind(matrices, **p)[jnp.ravel(inverse).reshape(requested)]
+            else:
+                factors = eq.primitive.bind(arg(0, tuple(_rk_spread(b, 2) for b in batch) + square), **p)
             selected = factors.shape[:-2]
             lead = tuple(0 if m == 1 else jnp.arange(m).reshape((1,) * d + (m,) + (1,) * (rank - d - 1))
                          for d, m in enumerate(selected))
@@ -482,15 +516,20 @@ _RK_POINTWISE = {
 def _rk_strict_batch(fn):
     # A vmapped cond predicates both arms. Preserve a ragged row guard across
     # vmap in both passes, using the pullback JAX generates from the same body.
+    # Only the first argument, the packed point, is differentiated. The
+    # residuals are that pullback's, the selected rows' values: the data never
+    # pass through as residuals or dense zero cotangents.
     sequential = jax.custom_batching.sequential_vmap
-    result = jax.custom_vjp(sequential(fn))
-    def forward(*args):
-        return fn(*args), args
-    def backward(args, seed):
-        _, pullback = jax.vjp(fn, *args)
-        return pullback(seed)
-    result.defvjp(sequential(forward), sequential(backward))
-    return result
+    def batched(*args):
+        others = len(args) - 1
+        def forward(point, *rest):
+            return jax.vjp(lambda p: fn(p, *rest), point)
+        def backward(pullback, seed):
+            return (*pullback(seed), *([None] * others))
+        result = jax.custom_vjp(sequential(fn))
+        result.defvjp(sequential(forward), sequential(backward))
+        return result(*args)
+    return batched
 
 
 def _rk_has_cond(closed):

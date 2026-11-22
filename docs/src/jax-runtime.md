@@ -57,7 +57,10 @@ Cholesky factors, the whole axis of a cumulative sum, and the entire output
 of a loop or a scatter. These costs do not grow with the number of units
 when the values are shared, such as an LKJ factor or the coherence factors
 of an HSGP basis. A check, loop or scatter inside a unit's own cell is
-evaluated for every cell of the event at each read.
+evaluated for every cell of the event at each read. A read computes each
+distinct entry it requests once, so many rows that read one shared factor
+compute it once, and an entry it does not request is never computed. The
+derivative of a selected read keeps only the selected rows' residuals.
 
 ## Chains under `vmap`
 
