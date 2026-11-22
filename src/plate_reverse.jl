@@ -1114,6 +1114,8 @@ mutable struct _PRProgramState
     groups::IdDict{Expr,_PRAdditiveGroup}
     group_shadows::IdDict{Expr,Expr}
     group_scatters::IdDict{Expr,Expr}
+    bound::Vector{Symbol}             # parameters that read the constants table
+    sited::Bool                       # the reverse reads its call's site record
 end
 
 # How many reads of each batched parameter one call of the program can make,
@@ -1860,6 +1862,10 @@ end
 # tapes factor it, logical tapes accumulate in cell order, and the two-pass
 # schedule compiles the reduction away.
 const _PR_WANT_VALUE = :_pr_want_value
+# The site record of the rule call a reverse runs for (`_PlateRuleSite`, or
+# `nothing`): the last parameter of a reverse that keeps a bound operand's
+# measured exponents there (`_pr_cached_exponents`), and of no other.
+const _PR_SITE = :_pr_site
 
 # The cell's value `result` as affine terms `(num, inv, var)` over the cell's
 # top-level statements: `num · ∏ inv · var`, `inv` invariant atoms and `var` a
@@ -2282,6 +2288,25 @@ end
     _pr_all_exponents(range, operands)
 end
 
+# The same with a site record. `ordinals` has one entry per read: zero for an
+# operand measured at this call, else the position of its parameter among the
+# reverse's reads of the constants table, whose exponents the site keeps.
+@inline function _pr_storage_exponents(range::_PRExponents, cells, reads::Tuple, shadows::Tuple,
+                                       site, ordinals::Tuple)
+    operands = map(_pr_bound_storage, reads)
+    _pr_plain_storage(cells, operands, shadows) || return _PR_BAD_EXPONENTS
+    _pr_site_exponents(range, operands, site, ordinals)
+end
+@inline _pr_site_exponents(range::_PRExponents, ::Tuple{}, site, ::Tuple{}) = range
+@inline _pr_site_exponents(range::_PRExponents, xs::Tuple, site, ordinals::Tuple) =
+    _pr_site_exponents(
+        _pr_merge_exponents(range, _pr_operand_exponents(site, first(ordinals), first(xs))),
+        Base.tail(xs), site, Base.tail(ordinals))
+@inline _pr_operand_exponents(site, k::Int, x) =
+    k == 0 ? _pr_exponents(x) : _pr_cached_exponents(site, k, x)
+# Without a tape slot there is nowhere to keep them: measured at each call.
+@inline _pr_cached_exponents(site, k::Int, x) = _pr_exponents(x)
+
 # For every target of the sweep's shared-reciprocal arithmetic, how its
 # magnitude follows from the leaves': `(n, d, s)`, the leaves it multiplies,
 # the leaves it divides by, and bits of slack. A leaf (an outer value or a
@@ -2355,12 +2380,19 @@ end
 function _pr_checked_reads(stmts, st, linear, written)
     indices = Set([linear])
     reads = Set{Symbol}()
+    constant_reads = Symbol[]
     for s in stmts
         if s isa _PRAlias
             s.rhs in indices && push!(indices, s.lhs)
         elseif _pr_is_read(s, st)
             s.args[2] in indices || return nothing
-            st.prepared[s.args[1]] === written || push!(reads, s.lhs)
+            operand = s.args[1]
+            if st.prepared[operand] === written
+            elseif st.prepared[operand] in st.bound
+                operand in constant_reads || push!(constant_reads, operand)
+            else
+                push!(reads, s.lhs)
+            end
         elseif s isa _PRCall && s.f === Base.CartesianIndex && s.args == [linear]
             push!(indices, s.lhs)
         elseif !(s isa _PRCall && (s.f in (+, -, *, /, _native_mul, abs, abs2) ||
@@ -2368,7 +2400,7 @@ function _pr_checked_reads(stmts, st, linear, written)
             return nothing
         end
     end
-    reads
+    reads, constant_reads
 end
 
 # The checked sweep measures the exponents of its own reads, beside those of
@@ -2622,9 +2654,24 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState, indexed:
                         structure = :($(s.fref) === $(QuoteNode(s.f)) && $structure)
                     end
                 end
-                storage = :($(GlobalRef(@__MODULE__, :_pr_within_range))(
-                    $(GlobalRef(@__MODULE__, :_pr_storage_exponents))(
-                        $measured, $cells, ($(read_operands...),), ($(shadows...),)), $targets))
+                # A read of the constants table has the same entries at
+                # every call: its exponents are measured once for the site.
+                ordinal(r) = something(findfirst(==(st.prepared[r]), st.bound), 0)
+                ordinals = map(ordinal, read_operands)
+                cached_exponents = (k, operand) -> Expr(:call,
+                    GlobalRef(@__MODULE__, :_pr_cached_exponents), _PR_SITE, k,
+                    Expr(:call, GlobalRef(@__MODULE__, :_pr_bound_storage), operand))
+                storage = if all(iszero, ordinals)
+                    :($(GlobalRef(@__MODULE__, :_pr_within_range))(
+                        $(GlobalRef(@__MODULE__, :_pr_storage_exponents))(
+                            $measured, $cells, ($(read_operands...),), ($(shadows...),)), $targets))
+                else
+                    st.sited = true
+                    :($(GlobalRef(@__MODULE__, :_pr_within_range))(
+                        $(GlobalRef(@__MODULE__, :_pr_storage_exponents))(
+                            $measured, $cells, ($(read_operands...),), ($(shadows...),),
+                            $_PR_SITE, ($(ordinals...),)), $targets))
+                end
                 certificate = :($structure && $storage)
                 ordinary = specialize(loop, 2)
                 exceptional = specialize(plain_loop, 3)
@@ -2637,19 +2684,27 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState, indexed:
                         union!(visible, first.(writes))
                     end
                     exceptional = _pr_quotient_loop(exceptional, visible)
-                    reads = if raw && length(st.shadow) == length(written) == 1 &&
+                    checked_reads = if raw && length(st.shadow) == length(written) == 1 &&
                             get(st.reads, only(written), 0) == 1
                         _pr_checked_reads(inloop, st, linear, only(written))
                     end
-                    if reads === nothing || isempty(reads)
+                    if checked_reads === nothing || all(isempty, checked_reads)
                         ordinary = _pr_quotient_loop(ordinary, visible)
                     else
                         # The checked sweep measures its dense reads itself.
-                        # Above the loop only the gather's storage is scanned.
+                        # Above the loop only the gather's storage is scanned,
+                        # and a read of the constants table has its exponents
+                        # from the site.
+                        reads, constant_reads = checked_reads
                         check = gensym(:check_in_gather)
                         gathered, owned = only(written), only(shadows)
                         merged = Expr(:call, GlobalRef(@__MODULE__, :_pr_merge_exponents), measured,
                             Expr(:call, GlobalRef(@__MODULE__, :_pr_exponents), :(parent($gathered))))
+                        for operand in constant_reads
+                            st.sited = true
+                            merged = Expr(:call, GlobalRef(@__MODULE__, :_pr_merge_exponents), merged,
+                                          cached_exponents(ordinal(operand), operand))
+                        end
                         push!(measure,
                             :($check = $_PR_WANT_VALUE isa Val{true} &&
                                 $(GlobalRef(@__MODULE__, :_pr_check_in_gather))(
@@ -2657,8 +2712,11 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState, indexed:
                             :($check && ($measured = $merged)))
                         certificate = :($structure && ($check ?
                             $(GlobalRef(@__MODULE__, :_pr_within_range))($measured, $targets) : $storage))
-                        ordinary = _pr_checked_loop(ordinary, exceptional, visible, reads,
-                            check, only(shadows), coefficients, value_pre, q.normal, measured, targets)
+                        # With every dense read measured above the loop the
+                        # sweep inspects nothing.
+                        ordinary = isempty(reads) ? _pr_quotient_loop(ordinary, visible) :
+                            _pr_checked_loop(ordinary, exceptional, visible, reads,
+                                check, only(shadows), coefficients, value_pre, q.normal, measured, targets)
                     end
                 end
                 loop = Expr(:if, q.normal, ordinary, exceptional)
@@ -2913,7 +2971,8 @@ function _pr_factored_source(ast)
     end
 end
 
-function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict{Symbol,Any})
+function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict{Symbol,Any},
+                             bound::Vector{Symbol} = Symbol[])
     Meta.isexpr(ast, :function, 2) && Meta.isexpr(ast.args[1], :tuple) ||
         _pr_fail("not a plate program")
     params = Symbol[p for p in ast.args[1].args]
@@ -3014,16 +3073,19 @@ function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict
     # Several groups may contribute to the same entry. Scaling a whole shadow
     # after each group's loop would also rescale earlier groups' contributions.
     isempty(groups) || empty!(counts)
+    # The site record is one more argument of the reverse's call.
+    length(params) + length(batched) + 3 <= _PLATE_CALL_MAX_ARGUMENTS || (bound = Symbol[])
     st = _PRProgramState(mod, values, active, prepared, shadow, totals, output,
                          Set{Symbol}(), 0, outer, counts, initializers, false, false,
-                         groups, group_shadows, scatters)
+                         groups, group_shadows, scatters, bound, false)
     new_body = _pr_program_block(stmts, st, keys(index_runs))
     # Every outer adjoint starts at zero; every total's adjoint is the seed.
     init = Any[:($(_pr_bar(a)) = 0.0) for a in sort!(collect(outer)) if !(a in totals)]
     seeds = Any[:($(_pr_bar(t)) = $seed) for t in sort!(collect(totals))]
     checks = Any[:($(GlobalRef(@__MODULE__, :_pr_check_shadow))($(shadow[p]), $p)) for p in batched]
     fexpr = Expr(:function,
-        Expr(:tuple, params..., seed, _PR_WANT_VALUE, (shadow[p] for p in batched)...),
+        Expr(:tuple, params..., seed, _PR_WANT_VALUE, (shadow[p] for p in batched)...,
+             (st.sited ? (_PR_SITE,) : ())...),
         Expr(:block, checks..., init..., seeds..., new_body...,
              Expr(:tuple, output, (_pr_bar(p) for p in scalar)...)))
     # What a cell shares between its value and its partials, for the schedule
@@ -3158,10 +3220,36 @@ mutable struct _PlateTapeSlot
     # here. The schedule is chosen on operand types and sizes before the
     # backend sees the call; its own annotations can still refuse it.
     declined::Bool
+    # The measured exponents (low, high) of each operand the call reads from
+    # its program's constants table, by ordinal (`_pr_cached_exponents`).
+    exponents::Vector{UInt64}
 end
 function _PlateTapeSlot()
     empty = Float64[]
-    _PlateTapeSlot(empty, empty, false)
+    _PlateTapeSlot(empty, empty, false, UInt64[])
+end
+# A constants-table entry is bound data or a value derived from data alone. A
+# slot belongs to one preparation, whose table does not change, so each such
+# operand is scanned at the slot's first call and never again. A mark is a
+# literal of a program that bindings may share, and keeps nothing.
+const _PR_UNMEASURED = typemax(UInt64)
+@inline function _pr_cached_exponents(slot::_PlateTapeSlot, k::Int, x)
+    kept = slot.exponents
+    if 2k <= length(kept)
+        low = @inbounds kept[2k - 1]
+        low == _PR_UNMEASURED || return (low, @inbounds kept[2k])
+    end
+    _pr_measure_exponents!(slot, k, x)
+end
+@noinline function _pr_measure_exponents!(slot::_PlateTapeSlot, k::Int, x)
+    low, high = _pr_exponents(x)
+    kept = slot.exponents
+    while length(kept) < 2k
+        push!(kept, _PR_UNMEASURED)
+    end
+    kept[2k - 1] = low
+    kept[2k] = high
+    (low, high)
 end
 @inline _pr_mark_declined!(slot::_PlateTapeSlot) = (slot.declined = true; nothing)
 @inline _pr_mark_declined!(::Nothing) = nothing
@@ -3324,6 +3412,14 @@ end
 # Whether a call's last operand is its site record (a tape slot or a mark),
 # which is no operand of the program.
 _pr_sited(types) = !isempty(types) && types[end] <: _PlateRuleSite
+# Whether a reverse program takes its call's site record as a last argument
+# (`_PR_SITE`), from the parameter names its compiled type carries.
+_pr_sited_reverse(::Type) = false
+_pr_sited_reverse(::Type{<:_PlateCall{F}}) where {F} = _pr_sited_reverse(F)
+_pr_sited_reverse(::Type{<:RuntimeGeneratedFunctions.RuntimeGeneratedFunction{names}}) where {names} =
+    names isa Tuple && !isempty(names) && last(names) === _PR_SITE
+_pr_sited_reverse(::Type{<:_PrecompileWarmFunction{F}}) where {F} = _pr_sited_reverse(F)
+_pr_sited_reverse(::Type{<:_PRExpProgram{I,J,F}}) where {I,J,F} = _pr_sited_reverse(F)
 # The call itself, made in each branch: a target chosen by size and then called
 # would be a union of the two wrappers, boxed in the primal. A trailing site
 # record is not an operand of the program: only the one-pass call takes it on.
@@ -3355,7 +3451,8 @@ function _pr_rule_expr(S, B, types, joint, dispatch, projections)
         (target -> Expr(:call, target, operands..., :(getfield(args, $(count + 1))))) : call
     _pr_target_expr(S, B, types, joint, call, one_pass)
 end
-function _pr_source_checked_expr(S, B, types, joint, dispatch, projections, checked)
+function _pr_source_checked_expr(S, B, types, joint, dispatch, projections, checked,
+                                 sited_reverse::Bool = false)
     body = _pr_rule_expr(S, B, types, joint, dispatch, projections)
     checked || return body
     count = length(types) - _pr_sited(types)
@@ -3368,8 +3465,9 @@ function _pr_source_checked_expr(S, B, types, joint, dispatch, projections, chec
     # is a type query; no cells, shadows or numeric inputs are evaluated.
     shadows = fill(Nothing, length(B))
     inputs = Any[types[i] for i in 1:count]
+    site = sited_reverse ? (Nothing,) : ()
     proof(want) = :(_promote_op(getfield(rule, :reverse), $(inputs...), Float64,
-                                $(Val{want}), $(shadows...)))
+                                $(Val{want}), $(shadows...), $(site...)))
     quote
         if _pr_proved_tuple($(proof(true))) && _pr_proved_tuple($(proof(false)))
             $body
@@ -3380,14 +3478,14 @@ function _pr_source_checked_expr(S, B, types, joint, dispatch, projections, chec
 end
 @inline _pr_proved_tuple(T) = T !== Union{} && T <: Tuple
 @generated _pr_rule_target(rule::_PlateSumRule{S,B,P,R,J,G,C}, args::Tuple) where {S,B,P,R,J,G,C} =
-    _pr_source_checked_expr(S, B, args.parameters, J, :_pr_rule_target, G, C)
+    _pr_source_checked_expr(S, B, args.parameters, J, :_pr_rule_target, G, C, _pr_sited_reverse(R))
 @generated _pr_rule_call(rule::_PlateSumRule{S,B,P,R,J,G,C}, args::Tuple) where {S,B,P,R,J,G,C} =
-    _pr_source_checked_expr(S, B, args.parameters, J, :_pr_rule_call, G, C)
+    _pr_source_checked_expr(S, B, args.parameters, J, :_pr_rule_call, G, C, _pr_sited_reverse(R))
 # Whether this call takes a one-pass schedule, from its operand types and
 # sizes alone. A call that does not runs the plate inline, where the backend
 # differentiates the optimized program exactly as it does without a rule.
 @generated _pr_rule_applies(rule::_PlateSumRule{S,B,P,R,J,G,C}, args::Tuple) where {S,B,P,R,J,G,C} =
-    _pr_source_checked_expr(S, B, args.parameters, J, :_pr_rule_applies, G, C)
+    _pr_source_checked_expr(S, B, args.parameters, J, :_pr_rule_applies, G, C, _pr_sited_reverse(R))
 _pr_projections(::Type{<:_PlateSumRule{S,B,P,R,J,G}}) where {S,B,P,R,J,G} = G
 @generated _pr_rule_target(rule::_PRGroupBroadcastRule{I,F}, args::Tuple) where {I,F} =
     _pr_group_broadcast_expr(I, _pr_projections(F), args.parameters, :_pr_rule_target)
@@ -3485,6 +3583,19 @@ function _pr_body_activity(body, active::Set{Symbol})
     active
 end
 
+# The names a body binds once to an entry of its constants table and never
+# writes: bound data and values derived from data alone, which are the same
+# at every call of one preparation.
+function _pr_constant_names(body)
+    pairs = _pr_dataflow!(Pair{Symbol,Any}[], body)
+    writes = Dict{Symbol,Int}()
+    for (lhs, _) in pairs
+        writes[lhs] = get(writes, lhs, 0) + 1
+    end
+    Set{Symbol}(lhs for (lhs, rhs) in pairs if writes[lhs] == 1 &&
+        Meta.isexpr(rhs, :ref, 2) && rhs.args[1] === _CONSTANTS_ARG && rhs.args[2] isa Integer)
+end
+
 # The value of a program argument that reads a table: `__callables__[k]`.
 function _pr_table_value(arg, kernel)
     Meta.isexpr(arg, :ref, 2) && arg.args[2] isa Integer || return nothing
@@ -3541,8 +3652,9 @@ function _pr_lazy_cell_arrays(body)
     lazy
 end
 
-function _pr_compile_sum_rule(ast, active_params, values)
-    rexpr, scalar, batched, joint, projections = _pr_program_reverse(ast, active_params, @__MODULE__, values)
+function _pr_compile_sum_rule(ast, active_params, values, bound::Vector{Symbol} = Symbol[])
+    rexpr, scalar, batched, joint, projections =
+        _pr_program_reverse(ast, active_params, @__MODULE__, values, bound)
     params = ast.args[1].args
     S = Tuple(findfirst(==(p), params) for p in scalar)
     B = Tuple(findfirst(==(p), params) for p in batched)
@@ -3554,23 +3666,30 @@ function _pr_compile_sum_rule(ast, active_params, values)
 end
 
 function _pr_rule_for(call::Expr, outer_active::Set{Symbol}, kernel,
-                      lazy::Set{Symbol} = Set{Symbol}())
+                      lazy::Set{Symbol} = Set{Symbol}(),
+                      constants::Union{Nothing,Set{Symbol}} = nothing)
     program = first(call.args)::_PlateProgram
     params = Symbol[p for p in program.ast.args[1].args]
     args = call.args[2:end]
     values = Dict{Symbol,Any}()
     active_params = Symbol[]
+    # The parameters that read the constants table, when the call's site
+    # record can keep what is measured of them (`constants` given).
+    bound = Symbol[]
     for (p, a) in zip(params, args)
         tv = _pr_table_value(a, kernel)
         if tv !== nothing
             values[p] = tv[2]
+            constants !== nothing && a.args[1] === _CONSTANTS_ARG && push!(bound, p)
         elseif a isa Symbol && a in outer_active
             push!(active_params, p)
+        elseif a isa Symbol && constants !== nothing && a in constants
+            push!(bound, p)
         end
     end
     isempty(active_params) && return nothing, "no active operand"
     try
-        rule, rexpr, projections = _pr_compile_sum_rule(program.ast, active_params, values)
+        rule, rexpr, projections = _pr_compile_sum_rule(program.ast, active_params, values, bound)
         positions = Tuple(i for i in _pr_batched_positions(rule) if args[i] in lazy)
         isempty(positions) && return rule, rexpr
         for i in positions
@@ -3580,7 +3699,7 @@ function _pr_rule_for(call::Expr, outer_active::Set{Symbol}, kernel,
         length(args) + 2length(positions) <= _PLATE_CALL_MAX_ARGUMENTS ||
             _pr_fail("the expanded group broadcast exceeds the plate call's operand limit")
         ast, shared = _pr_expand_group_reads(program.ast, positions)
-        expanded, info, _ = _pr_compile_sum_rule(ast, [active_params; shared], values)
+        expanded, info, _ = _pr_compile_sum_rule(ast, [active_params; shared], values, bound)
         return _PRGroupBroadcastRule{positions,typeof(rule),typeof(expanded)}(rule, expanded), info
     catch err
         err isa _PRIneligible || rethrow()
@@ -3605,10 +3724,13 @@ function _pr_inline_plate_programs(ast::Expr, kernel, active_ports; tape_slot = 
     lazy = _pr_lazy_cell_arrays(ast.args[2])
     report = Any[]
     marks = tape_slot === nothing ? _pr_marks() : nothing
+    # A tape slot belongs to one preparation and can keep what a rule measures
+    # of its constants; a mark cannot (`_pr_cached_exponents`).
+    constants = tape_slot === nothing ? nothing : _pr_constant_names(ast.args[2])
     function replace(node)
         if node isa Expr && node.head === :(=) && node.args[2] isa Expr &&
                 node.args[2].head === :call && first(node.args[2].args) isa _PlateProgram
-            rule, info = _pr_rule_for(node.args[2], outer_active, kernel, lazy)
+            rule, info = _pr_rule_for(node.args[2], outer_active, kernel, lazy, constants)
             push!(report, (node.args[1], rule === nothing ? info : "rule"))
             rule === nothing && return node
             operands = node.args[2].args[2:end]

@@ -989,7 +989,8 @@ end
 using ReactiveKernels: _PlateSumRuleOnePass, _pr_gather_value,
     _pr_scalar_positions, _pr_batched_positions, _pr_tape_layout, _CellArray, _PlateTapeSlot,
     _pr_take_tape!, _pr_return_tape!, _pr_projections, _pr_ragged_buffer, _PRRaggedBuffer,
-    _pr_group_view, _pr_gather_root, _pr_regather, _pr_mark_declined!, _PlateRuleSite
+    _pr_group_view, _pr_gather_root, _pr_regather, _pr_mark_declined!, _PlateRuleSite,
+    _pr_sited_reverse
 
 # A one-pass call installed by a preparation ends with its site record
 # (src/plate_reverse.jl), which is no operand of the program: the tape slot of
@@ -1049,7 +1050,12 @@ function EnzymeRules.augmented_primal(
                          Val(_pr_projections(typeof(r))))
         tape = _pr_take_tape!(_pr_slot(annotations),
                               _pr_buffer_length(layout, Val(B), args) + length(S))
-        swept = r.reverse(values..., 1.0, layout, _pr_tape_buffers(layout, Val(B), args, tape)...)
+        buffers = _pr_tape_buffers(layout, Val(B), args, tape)
+        # A reverse that keeps measurements of its bound operands takes the
+        # call's site record, where they live.
+        swept = _pr_sited_reverse(typeof(r.reverse)) ?
+            r.reverse(values..., 1.0, layout, buffers..., _pr_slot(annotations)) :
+            r.reverse(values..., 1.0, layout, buffers...)
         _pr_store_cotangents!(tape, Base.tail(swept))
         return AugmentedReturn(needs_primal(config) ? first(swept) : nothing, nothing, tape)
     end
@@ -1345,7 +1351,9 @@ function _pr_rule_reverse(config::RevConfig, r::R, dret, tape,
     if W == 1
         ȳ = dret isa Active ? dret.val : dret
         shadows = _pr_shadows(Val(B), args, Val(1), 1)
-        cot = Base.tail(r.reverse(operands..., ȳ, Val(false), shadows...))
+        cot = Base.tail(_pr_sited_reverse(typeof(r.reverse)) ?
+            r.reverse(operands..., ȳ, Val(false), shadows..., nothing) :
+            r.reverse(operands..., ȳ, Val(false), shadows...))
         return _pr_reverse_return(Val(S), args, cot, Val(B), shadows)
     end
     # The lanes' own names: a closure assigning the `ȳ` and `shadows` of the
@@ -1354,7 +1362,9 @@ function _pr_rule_reverse(config::RevConfig, r::R, dret, tape,
     lanes = ntuple(Val(W)) do w
         lane_ȳ = dret.val[w]
         lane_shadows = _pr_shadows(Val(B), args, Val(W), w)
-        Base.tail(r.reverse(operands..., lane_ȳ, Val(false), lane_shadows...))
+        Base.tail(_pr_sited_reverse(typeof(r.reverse)) ?
+            r.reverse(operands..., lane_ȳ, Val(false), lane_shadows..., nothing) :
+            r.reverse(operands..., lane_ȳ, Val(false), lane_shadows...))
     end
     # Active scalars of a batched call take one cotangent per lane.
     ntuple(Val(N)) do i

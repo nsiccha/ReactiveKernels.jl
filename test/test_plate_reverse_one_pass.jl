@@ -651,6 +651,62 @@ warm_gradient_bytes(q, g, u) = (sampler_value_and_gradient!(q, g, u);
     end
 end
 
+# The crossed likelihood divides by its shared scale, so its sweep certifies
+# the exponent range of what it reads. The covariate and the responses are
+# bound data, the same at every call of one preparation: their ranges are
+# measured at its first call and kept in the rule call's tape slot. Another
+# binding has a preparation and a slot of its own.
+@testset "bound data's exponent range is measured once per preparation" begin
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    n, J, J2 = 600, 20, 7
+    group = [mod1(7i, J) for i in 1:n]
+    group2 = [mod1(5i + i ÷ 9, J2) for i in 1:n]
+    x = [0.3 * cos(i) for i in 1:n]
+    responses = [0.5 * sin(i) + 0.1 * group[i] / J for i in 1:n]
+    # The names are the function's own: an assignment to a name of the
+    # testset would rebind that one.
+    function prepared(y)
+        local plan = ScheduleModels.crossed(; group, group2, J, J2, x) | (; y)
+        local built = build_kernel(plan)
+        local point = [0.1 * sin(i) for i in 1:built.layout.total]
+        local ordinary = with_plate_reverse(false) do
+            prepare_sampler(built, plan, point; backend, nonallocating = true)
+        end
+        local generated = with_plate_reverse(true) do
+            prepare_sampler(built, plan, point; backend, nonallocating = true)
+        end
+        generated, ordinary, point
+    end
+    kept(q) = [copy(slot.exponents) for caches in RK._ad_owned_storage(q.ad)
+               if caches isa Tuple for slot in caches
+               if slot isa RK._PlateTapeSlot && !isempty(slot.exponents)]
+    records(r) = Set(zip(r[1:2:end], r[2:2:end]))
+    agrees(on, off, point) = begin
+        g1, g0 = similar(point), similar(point)
+        v1, _ = sampler_value_and_gradient!(on, g1, point)
+        v0, _ = sampler_value_and_gradient!(off, g0, point)
+        isapprox(v1, v0; rtol = 1e-12) && isapprox(g1, g0; rtol = 1e-10, atol = 1e-12)
+    end
+
+    on, off, u = prepared(responses)
+    @test agrees(on, off, u)
+    # Only the likelihood reads bound floating-point data.
+    first_call = kept(on)
+    @test length(first_call) == 1
+    @test records(only(first_call)) == Set([RK._pr_exponents(x), RK._pr_exponents(responses)])
+    @test agrees(on, off, u .+ 0.3) && agrees(on, off, u .- 0.2)
+    @test kept(on) == first_call
+    g = similar(u)
+    @test warm_gradient_bytes(on, g, u) == 0
+
+    # Responses of another magnitude take the exceptional sweep.
+    large = 1e120 .* responses
+    wide, wide_off, u = prepared(large)
+    @test agrees(wide, wide_off, u) && agrees(wide, wide_off, u .+ 0.3)
+    @test records(only(kept(wide))) == Set([RK._pr_exponents(x), RK._pr_exponents(large)])
+    @test kept(on) == first_call
+end
+
 # A rule the backend refuses is found at preparation, and the preparation is
 # made again with the plates inline.
 @testset "a refused rule call makes the preparation ordinary" begin
