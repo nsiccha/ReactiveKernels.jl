@@ -16,6 +16,16 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.367
+
+- A `float_type = Float32` JAX module solves `rk_ode_rk45_tol` and
+  `rk_ode_bdf_tol` in float32 whether JAX's 64-bit mode is on or off, with
+  diffrax and in the per-lane CUDA kernel. Before, with 64-bit mode on (as in
+  a process that loads a float64 module, such as a ReactiveKernelMethods
+  bundle), the diffrax solve's times, state and solution were float64, so a
+  lazy branch on the solution failed with `cond branches must have equal
+  output types`, and the per-lane kernel's step-size control was float64.
+
 ## 0.1.366
 
 - JAX kernels can gather matrix rows with a ragged integer index or a leading
