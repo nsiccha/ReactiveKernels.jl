@@ -87,6 +87,8 @@ function __init__()
     @lock _MODULE_GENERATIONS_LOCK empty!(_MODULE_GENERATIONS)
     # Programs that package images loaded from now on compiled (`compile`).
     push!(Base.package_callbacks, _register_image_programs)
+    # This process measures its own vector width (shared_softplus.jl).
+    _VECTOR_DOUBLES[] = 0
     # This process reads its own project's type-stability preferences.
     foreach(_clear_preference!, _TYPE_STABILITY_PREFERENCES)
     # and its own `simplify` and `bound_statistics` preferences

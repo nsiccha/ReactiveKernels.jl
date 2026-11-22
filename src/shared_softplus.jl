@@ -93,9 +93,31 @@ const _vector_softplus = scalar_derivative_rule(_vector_softplus_graph;
 @inline _vector_log1pexp(x::Float64) = _vector_softplus(x)
 @inline _vector_log1pexp(x) = LogExpFunctions.log1pexp(x)
 
-# How many `Float64` one vector of this process's code holds: 8 with AVX-512,
-# 4 with AVX2, 2 with SSE2 or NEON.
-_vector_doubles() = Int(VectorizationBase.pick_vector_width(Float64))
+# The loop whose compiled form `_vector_doubles` reads: a sum over the vector
+# softplus, as a summed plate's cell loop runs it.
+function _vector_softplus_probe(x::Vector{Float64})
+    total = 0.0
+    @inbounds @simd for i in eachindex(x)
+        total += _vector_softplus_value(x[i])
+    end
+    total
+end
+
+# How many `Float64` one vector holds in the code this process compiles for a
+# sum over the vector softplus: 8 with AVX-512, 4 with AVX2, 2 with SSE2 or
+# NEON, 1 where the loop stays scalar. It is read once per process from the
+# compiled loop itself, so it follows the CPU target Julia was started with
+# (`-C`), which a query of the host's CPU does not. 0 means not read yet
+# (`__init__` resets it: an image must not carry another process's answer).
+const _VECTOR_DOUBLES = Ref(0)
+function _vector_doubles()
+    doubles = _VECTOR_DOUBLES[]
+    doubles == 0 || return doubles
+    io = IOBuffer()
+    InteractiveUtils.code_llvm(io, _vector_softplus_probe, Tuple{Vector{Float64}}; debuginfo = :none)
+    widths = (parse(Int, m.captures[1]) for m in eachmatch(r"<(\d+) x double>", String(take!(io))))
+    _VECTOR_DOUBLES[] = maximum(widths; init = 1)
+end
 
 # The vector softplus costs about twice the scalar one a cell, so it pays off
 # only where a vector holds at least four cells: per cell of a summed loop,

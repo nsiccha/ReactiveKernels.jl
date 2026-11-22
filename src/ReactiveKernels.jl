@@ -28,7 +28,7 @@ import Preferences
 import Profile
 import DiffRules
 import SLEEFPirates
-import VectorizationBase
+import InteractiveUtils
 using PrecompileTools: @setup_workload, @compile_workload
 RuntimeGeneratedFunctions.init(@__MODULE__)
 

@@ -175,6 +175,10 @@ _ulps(a, b) = a == b ? 0.0 : abs(a - b) / eps(abs(b))
     @test twin(log1pexp, 2) === nothing && twin(rk_log1pexp, 2) === nothing
     @test twin(log1pexp, 4) === :_vector_log1pexp && twin(rk_log1pexp, 8) === :_vector_rk_log1pexp
     @test twin(exp, 8) === nothing && twin(logistic, 8) === nothing
+    # The width is read from the loop this process compiles, not from the CPU.
+    compiled = maximum((parse(Int, m.captures[1]) for m in eachmatch(r"<(\d+) x double>", _loop_llvm(vector_sum)));
+                       init = 1)
+    @test ReactiveKernels._vector_doubles() == compiled
     wide = ReactiveKernels._vector_doubles() >= ReactiveKernels._VECTOR_SOFTPLUS_DOUBLES
     @test twin(log1pexp) === (wide ? :_vector_log1pexp : nothing)
 

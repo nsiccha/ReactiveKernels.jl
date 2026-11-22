@@ -28,9 +28,9 @@ are recorded in the git history only.
   `y .~ BernoulliLogit.(logit_p)`, takes about 6 µs where it took about
   37 µs, and binomial and ordered-logistic densities take a quarter to a
   third of their time. Gradients take the same time or less. The swap applies
-  where a vector holds at least four doubles (AVX2 or AVX-512, where the
-  softplus itself is 1.4 to 6 times faster); other CPUs run the code they ran
-  before. A softplus in such a loop can differ from `rk_log1pexp` in its last
+  where the running process compiles that loop into vectors of at least four
+  doubles (AVX2 or AVX-512, where the softplus itself is 1.4 to 6 times
+  faster); elsewhere a program runs the code it ran before. A softplus in such a loop can differ from `rk_log1pexp` in its last
   digit, so a density and the value returned with a gradient can differ by
   one unit in the last place per cell. Generated code shows the call as
   `ReactiveKernels._vector_rk_log1pexp(x)` or
@@ -41,9 +41,10 @@ are recorded in the git history only.
   `sum(log1pexp, x)`; a hand-written `log1p(exp(x))`. One call that stays
   scalar keeps the whole loop scalar, and there the vector softplus would
   take twice as long as the one it replaces.
-- New dependencies: SLEEFPirates 0.6.46, for its `log1p`, and
-  VectorizationBase 0.21.74, for the CPU's vector width. Together they bring
-  13 packages and add about 0.75 s to loading ReactiveKernels.
+- New dependency: SLEEFPirates 0.6.46, for its `log1p`. It brings 13
+  packages and adds about 0.75 s to loading ReactiveKernels. The standard
+  library InteractiveUtils is now loaded too, to read the compiled loop's
+  vector width.
 
 ## 0.1.370
 
