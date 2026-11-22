@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.363
+
+- Indexed JAX density events can read selected rows of a conditional when
+  one arm broadcasts a scalar and the other computes an array. Batched
+  values and gradients retain the requested row order and multiplicity.
+
 ## 0.1.362
 
 - JAX export supports dense real symmetric eigenpairs and eigenvalues, including

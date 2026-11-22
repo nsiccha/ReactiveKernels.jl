@@ -14,6 +14,10 @@ def _rk_child_index(index, dims):
     return tuple(index[i] for i in dims)
 
 
+def _rk_lane_shape(index):
+    return jnp.broadcast_shapes(*(jnp.shape(i) for i in index))
+
+
 def _rk_unravel(flat, shape):
     parts = []
     for size in reversed(shape):
@@ -181,7 +185,11 @@ class _RKIndexedGraph:
             return self.read(args[i], coords)
 
         if name == 'cond':
-            return self.conditional(eq, output, lambda g, v: g.read(v, index))
+            # A broadcast arm can supply the requested coordinates with a
+            # scalar or a smaller grid. The switch must join equal shapes.
+            lane_shape = _rk_lane_shape(index)
+            return self.conditional(eq, output,
+                                    lambda g, v: jnp.broadcast_to(g.read(v, index), lane_shape))
         if name in ('jit', 'pjit'):
             nested = self.nested(eq)
             return nested.read(nested.outputs[output], index)
@@ -238,7 +246,7 @@ class _RKIndexedGraph:
                                 else s + next(offsets) for d, s in enumerate(starts)))
         if name == 'dot_general':
             contractions, batches = p['dimension_numbers']
-            lane_shape = jnp.broadcast_shapes(*(jnp.shape(i) for i in index))
+            lane_shape = _rk_lane_shape(index)
             widths = tuple(args[0].aval.shape[d] for d in contractions[0])
             grids = jnp.ix_(*(jnp.arange(n) for n in widths)) if widths else ()
             field = len(batches[0])
@@ -263,7 +271,7 @@ class _RKIndexedGraph:
             axes = tuple(sorted(p['axes']))
             widths = tuple(args[0].aval.shape[d] for d in axes)
             m = len(axes)
-            lane_shape = jnp.broadcast_shapes(*(jnp.shape(i) for i in index))
+            lane_shape = _rk_lane_shape(index)
             coordinates = []
             kept = iter(index)
             for d in range(len(args[0].aval.shape)):
