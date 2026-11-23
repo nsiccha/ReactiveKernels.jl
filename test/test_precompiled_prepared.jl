@@ -309,6 +309,47 @@ using ReactiveKernels, Test
                 stdout = stdout, stderr = stderr))
         end
 
+        # A system image restores every package it holds before any
+        # `__init__` runs and runs no package callback for them, so the image's
+        # tables are registered by ReactiveKernels' `__init__` from the modules
+        # already loaded (snag image-programs-u-6f8857e6). Load the consumer
+        # without the callback, as a system image does: a preparation then
+        # compiles the image's program again, until the loaded tables are
+        # registered as `__init__` registers them.
+        restored = """
+            using Test, ReactiveKernels
+            const RK = ReactiveKernels
+            filter!(f -> f !== RK._register_image_programs, Base.package_callbacks)
+            using PrecompiledPreparedConsumer
+            const C = PrecompiledPreparedConsumer
+            @test C.WAS_PRECOMPILED
+            table = getglobal(C, RK._IMAGE_PROGRAMS)
+            registered() = count(t -> t === table, @atomic RK._LOADED_IMAGE_PROGRAMS.tables)
+            owner(f) = parentmodule(typeof(
+                RK._native_generated_function(f)).parameters[2])
+            fresh() = prepare_batched(C.trajectory; have = C.HAVE,
+                                      batched = :position, want = C.WANT)
+            args = ([1.0 2.0; 0.0 0.0], 0.0, [0.5, 1.0], [3.0, 4.0])
+            @test registered() == 0
+            unregistered = fresh()
+            @test owner(unregistered.native) === RK
+            RK._register_loaded_image_programs()
+            @test registered() == 1
+            # Registering again, or from a package callback, adds no copy.
+            RK._register_loaded_image_programs()
+            RK._register_image_programs(Base.PkgId(C))
+            @test registered() == 1
+            reused = fresh()
+            @test owner(reused.native) === C
+            @test typeof(reused.native) ===
+                typeof(RK._native_generated_function(C.BATCH.native))
+            @test reused(args...) == unregistered(args...) == C.BATCH(args...)
+            println("RESTORED_IMAGE_PROGRAMS_PASS")
+            """
+        @test success(pipeline(
+            `$julia --startup-file=no --check-bounds=yes --project=$env -e $restored`;
+            stdout = stdout, stderr = stderr))
+
         # A loaded nested-plate law composed into the cells of a plate authored
         # after load. The loading process's count does not include the image's
         # allocations, so it reaches the identities of the law's nested cells.

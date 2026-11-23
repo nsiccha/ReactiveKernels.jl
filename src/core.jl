@@ -85,7 +85,9 @@ function __init__()
     # The module generations an image generated (`_module_generation`) name
     # that process's module objects.
     @lock _MODULE_GENERATIONS_LOCK empty!(_MODULE_GENERATIONS)
-    # Programs that package images loaded from now on compiled (`compile`).
+    # Programs that package images compiled (`compile`): those already loaded,
+    # which in a system image are all the image holds, and those loaded later.
+    _register_loaded_image_programs()
     push!(Base.package_callbacks, _register_image_programs)
     # This process reads its own project's type-stability preferences.
     foreach(_clear_preference!, _TYPE_STABILITY_PREFERENCES)
