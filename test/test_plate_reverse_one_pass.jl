@@ -424,6 +424,39 @@ end
 # and so does the partial of the shared divisor. The bounded sweep keeps one
 # sum for both; the exceptional sweep, whose partial sum carries an exponent,
 # still adds the value's own.
+# Whether a loop's partial sums or shadow additions read a quotient by a
+# shared divisor (`x * shared_inverse`), directly, through an alias or through a
+# cell temporary of the reverse (`_pr_f…`).
+function reverse_reads_quotient(ast)
+    defs = Dict{Symbol,Vector{Any}}()
+    reverse_exprs = Any[]
+    function visit(ex)
+        ex isa Expr || return
+        if ex.head === :(=) && ex.args[1] isa Symbol
+            push!(get!(defs, ex.args[1], Any[]), ex.args[2])
+            startswith(string(ex.args[1]), "_pr_sum") && push!(reverse_exprs, ex.args[2])
+        elseif ex.head === :call && occursin("_pr_shadow_add!", string(ex.args[1]))
+            append!(reverse_exprs, ex.args[2:end])
+        end
+        foreach(visit, ex.args)
+    end
+    visit(ast)
+    quotients = Set{Symbol}(k for (k, vs) in defs
+                            if any(v -> Meta.isexpr(v, :call) && occursin("shared_inverse", string(v)), vs))
+    grown = true
+    while grown
+        grown = false
+        for (k, vs) in defs
+            (k in quotients || !any(v -> v isa Symbol && v in quotients, vs)) && continue
+            push!(quotients, k); grown = true
+        end
+    end
+    reads(e) = e isa Symbol ? (e in quotients ||
+        startswith(string(e), "_pr_f") && any(reads, get(defs, e, Any[]))) :
+        e isa Expr && any(reads, e.args)
+    any(reads, reverse_exprs)
+end
+
 @testset "the value reads the bounded sweep's sum of the same term" begin
     divop, mulop, powop = GlobalRef(Base, :/), GlobalRef(Base, :*), GlobalRef(Base, :^)
     density = Expr(:call, mulop, -0.5, Expr(:call, powop, Expr(:call, divop, :v1, :s), 2))
@@ -441,6 +474,19 @@ end
     wide = filter(p -> !occursin("shared_inverse", string(p.ast)), loops)
     @test !isempty(bounded) && all(p -> value_sums(p) == 0, bounded)
     @test !isempty(wide) && all(p -> value_sums(p) >= 1, wide)
+    # The bounded sweep sums and scatters the quotient's numerator: its partial
+    # sums and shadow additions read no value of `v1 * shared_inverse`, whose
+    # reciprocal is in the coefficients above the loop instead.
+    @test all(p -> !reverse_reads_quotient(p.ast), bounded)
+    ratios = Any[]
+    function collect_ratios!(ex)
+        ex isa RK._PlateProgram && return collect_ratios!(ex.ast)
+        ex isa Expr || return
+        ex.head === :(=) && startswith(string(ex.args[1]), "_pr_ratio") && push!(ratios, ex.args[2])
+        foreach(collect_ratios!, ex.args)
+    end
+    collect_ratios!(rexpr)
+    @test any(r -> occursin("shared_inverse", string(r)), ratios)
     primal, sweep = RK.compile(ast), RK.compile(rexpr)
     # Ordinary values take the bounded sweep, the second set the exceptional one.
     for (x, s) in (([0.3, -1.2, 2.5, 0.0], 0.7), ([3e160, -1e160, 2e160], 1e155), (Float64[], 1.3))

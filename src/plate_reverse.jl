@@ -1553,12 +1553,33 @@ function _pr_factored_quotient!(out, fc, terms, partial, toplevel, q)
     value = :($(GlobalRef(@__MODULE__, :_pr_quotient))(($(factors...),), $d))
     if toplevel && length(shared) <= 3 && all(x -> x isa Union{Symbol,Number}, shared) &&
             _pr_is_invariant(fc, d, true)
-        scale = get!(fc.coefs, (:quotient, Tuple(shared), d)) do
+        # A factor that is itself a bounded quotient (`z = x / σ`, computed
+        # as `x * r`) enters the cell's product as its numerator, and its
+        # reciprocal joins the coefficient: the sweep then sums and scatters
+        # `x` as a hand-written loop sums the unscaled residual, and `z` is
+        # not formed for the reverse. The range check still charges `z`
+        # squared, which covers the reciprocals the coefficient now carries
+        # (`_pr_targets_fit`).
+        recips = Symbol[]
+        numerator(x) = if x isa Symbol && haskey(q.fast, x)
+            numer, divisor = q.fast[x]
+            push!(recips, q.inverses[divisor])
+            numer
+        else
+            x
+        end
+        fv = v === nothing ? nothing : numerator(v)
+        fn = n === 1 ? 1 : numerator(n)
+        scale = get!(fc.coefs, (:quotient, Tuple(shared), d, Tuple(recips))) do
             k = _pr_fresh!(fc, :ratio)
-            push!(fc.pre, :($k = $(q.normal) ? Base.prod(($(shared...),)) / $d : 1.0))
+            ratio = :(Base.prod(($(shared...),)) / $d)
+            for r in recips
+                ratio = :($ratio * $r)
+            end
+            push!(fc.pre, :($k = $(q.normal) ? $ratio : 1.0))
             k
         end
-        fast = v === nothing ? n : n === 1 ? v : :($v * $n)
+        fast = fv === nothing ? fn : fn === 1 ? fv : :($fv * $fn)
         v === nothing || push!(q.targets, v)
         n === 1 || push!(q.targets, n)
         append!(q.shared, shared)
@@ -1916,10 +1937,14 @@ end
 # term: aliases resolved, a product as an unordered pair, a square as a
 # product. `bound` holds the bindings of the block being read (`t = a * b`),
 # and a value that the bounded and the exceptional sweep compute differently
-# (`if normal; a; else; b; end`) is read as the bounded sweep's. Anything else
-# compares by name, and an expression that is not a product equals nothing.
-function _pr_summand_key(x, defs::Dict{Symbol,Any}, bound::Dict{Symbol,Any}, normal = nothing)
-    key(y) = _pr_summand_key(y, defs, bound, normal)
+# (`if normal; a; else; b; end`) is read as the bounded sweep's. A quotient by
+# an invariant divisor (`fast`, the bounded sweep's `x * r`) is its
+# numerator's form over that divisor, `(:/, form, divisors)`, with the
+# divisors of a product collected outside it. Anything else compares by name,
+# and an expression that is not a product equals nothing.
+function _pr_summand_key(x, defs::Dict{Symbol,Any}, bound::Dict{Symbol,Any}, normal = nothing,
+                         fast = nothing)
+    key(y) = _pr_summand_key(y, defs, bound, normal, fast)
     x isa Real && !(x isa Bool) && return Float64(x)
     if x isa Symbol
         haskey(bound, x) && return key(bound[x])
@@ -1931,6 +1956,11 @@ function _pr_summand_key(x, defs::Dict{Symbol,Any}, bound::Dict{Symbol,Any}, nor
             if d.f === Base.:^ && d.args[2] === 2
                 k = key(d.args[1])
                 return _pr_product_key(k, k)
+            end
+            if d.f === Base.:/ && fast !== nothing && haskey(fast, x)
+                numer, divisor = fast[x]
+                base, divisors = _pr_key_parts(key(numer))
+                return (:/, base, (divisors..., divisor))
             end
         end
         return x
@@ -1944,13 +1974,19 @@ function _pr_summand_key(x, defs::Dict{Symbol,Any}, bound::Dict{Symbol,Any}, nor
     end
     gensym(:unshared)
 end
-_pr_product_key(a, b) = repr(a) <= repr(b) ? (:*, a, b) : (:*, b, a)
+function _pr_product_key(a, b)
+    (ba, da), (bb, db) = _pr_key_parts(a), _pr_key_parts(b)
+    base = repr(ba) <= repr(bb) ? (:*, ba, bb) : (:*, bb, ba)
+    isempty(da) && isempty(db) && return base
+    (:/, base, Tuple(sort!(Any[da..., db...]; by = repr)))
+end
+_pr_key_parts(k) = k isa Tuple && length(k) == 3 && k[1] === :/ ? (k[2], k[3]) : (k, ())
 
 # The partial sums that the bounded arm of a quotient contribution adds once
 # per cell (`if normal; t = …; S = S + t; else … end`, `_pr_quotient_contribution!`),
 # by the canonical form of their summand. `sums` names the sweep's partial
 # sums. A sum the cell adds to more than once is no single term's sum.
-function _pr_normal_sums(stmts, reverse, normal, sums)
+function _pr_normal_sums(stmts, reverse, normal, sums, fast = nothing)
     defs = Dict{Symbol,Any}(s.lhs => s for s in stmts if s isa Union{_PRAlias,_PRCall})
     updates = Dict{Symbol,Int}()
     function count_updates(node)
@@ -1972,7 +2008,7 @@ function _pr_normal_sums(stmts, reverse, normal, sums)
             if lhs in sums
                 get(updates, lhs, 0) == 1 && Meta.isexpr(rhs, :call, 3) && rhs.args[1] === :+ &&
                     rhs.args[2] === lhs || continue
-                get!(found, _pr_summand_key(rhs.args[3], defs, bound, normal), lhs)
+                get!(found, _pr_summand_key(rhs.args[3], defs, bound, normal, fast), lhs)
             else
                 bound[lhs] = rhs
             end
@@ -1985,13 +2021,25 @@ end
 # and after it, each only when the sweep wants the value. Where the bounded
 # sweep (`normal`) already keeps a partial sum of the same term for a shared
 # adjoint, such as the squared residual of a Normal cell for its scale, the
-# value reads that sum and adds its own only in the exceptional sweep.
+# value reads that sum and adds its own only in the exceptional sweep. A value
+# term that is that sum's summand over invariant divisors (the squared
+# standardized residual, where the sweep sums the squared residual) reads the
+# sum times their reciprocals (`quotients`, the sweep's `q`).
 function _pr_value_accumulation(stmts, invariant, cellvars, result, total, add, ncells,
                                 st::_PRProgramState; reverse = Any[], normal = nothing,
-                                sums = Set{Symbol}())
+                                sums = Set{Symbol}(), quotients = nothing)
     want = :($_PR_WANT_VALUE isa Val{true})
+    fast = quotients === nothing ? nothing : quotients.fast
     defs, shared = normal === nothing ? (Dict{Symbol,Any}(), Dict{Any,Symbol}()) :
-        _pr_normal_sums(stmts, reverse, normal, sums)
+        _pr_normal_sums(stmts, reverse, normal, sums, fast)
+    function twin_of(var)
+        isempty(shared) && return nothing
+        k = _pr_summand_key(var, defs, Dict{Symbol,Any}(), nothing, fast)
+        haskey(shared, k) && return shared[k]
+        base, divisors = _pr_key_parts(k)
+        (isempty(divisors) || !haskey(shared, base)) && return nothing
+        Expr(:call, GlobalRef(Base, :*), shared[base], (quotients.inverses[d] for d in divisors)...)
+    end
     coef(num, inv) = isempty(inv) ? num :
         num == 1.0 ? Expr(:call, GlobalRef(Base, :*), inv...) :
         Expr(:call, GlobalRef(Base, :*), num, inv...)
@@ -2005,8 +2053,7 @@ function _pr_value_accumulation(stmts, invariant, cellvars, result, total, add, 
             s = Symbol(:_pr_value, st.counter)
             push!(pre, :($s = 0.0))
             update = :($want && ($s = $s + $var))
-            twin = isempty(shared) ? nothing :
-                get(shared, _pr_summand_key(var, defs, Dict{Symbol,Any}()), nothing)
+            twin = twin_of(var)
             if twin === nothing
                 push!(inloop, update)
                 push!(parts, :($(coef(num, inv)) * $s))
@@ -2530,14 +2577,39 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState, indexed:
         ncells = Symbol(:_pr_ncells, st.counter)
         coefficients = Any[]
         q = (normal = gensym(:bounded_quotients), targets = Any[], shared = Any[], divisors = Any[],
-             sums = Dict{Symbol,Symbol}())
+             sums = Dict{Symbol,Symbol}(), fast = Dict{Symbol,Tuple{Any,Any}}(),
+             inverses = Dict{Any,Symbol}())
+        # In the bounded sweep a cell quotient by an invariant divisor is its
+        # numerator times the divisor's reciprocal, computed once above the loop.
+        # `q.fast` maps the quotient, and every alias of it, to its numerator and
+        # divisor, so the reverse can move that reciprocal into the coefficients
+        # it scales its sums by after the loop (`_pr_factored_quotient!`).
+        fast_divisions = Dict{Symbol,Expr}()
+        for s in inloop
+            if s isa _PRAlias
+                s.rhs isa Symbol && haskey(q.fast, s.rhs) && (q.fast[s.lhs] = q.fast[s.rhs])
+                continue
+            end
+            s isa _PRCall && s.f === Base.:/ && length(s.args) == 2 || continue
+            x, d = s.args
+            d isa Symbol && d in cellvars && !(d in inv2) && continue
+            push!(q.targets, x)
+            push!(q.divisors, d)
+            r = get!(q.inverses, d) do
+                r = gensym(:shared_inverse)
+                push!(coefficients, :($r = $(q.normal) ? inv($d) : 0.0))
+                r
+            end
+            fast_divisions[s.lhs] = :($x * $r)
+            q.fast[s.lhs] = (x, d)
+        end
         flush = Any[]
         partial_sums = Set{Symbol}()
         if result isa Symbol && result in active
             shared = Set{Symbol}(s for s in st.outer if !(s in st.totals))
             union!(shared, hoisted_active)
             fc = _PRFactored(st, cellvars, inv2, shared, active, linear, ncells,
-                             Any[], Any[], Dict{Any,Any}(), Dict{Any,Symbol}(), Dict{Any,Any}(),
+                             coefficients, Any[], Dict{Any,Any}(), Dict{Any,Symbol}(), Dict{Any,Any}(),
                              _pr_single_reads(inloop, st, active), Dict{Symbol,Vector{Any}}())
             # The cell density's adjoint is the total's (the seed), the same
             # at every cell.
@@ -2555,28 +2627,14 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState, indexed:
         # Select joint cuts from the reverse's actual uses before emitting the
         # forward. Hoisted calls stay above the loop; branch-local calls stay lazy.
         forward_pre = _pr_forward_exprs(hoisted, cuts)
-        fast_divisions = Dict{Symbol,Expr}()
-        inverses = Dict{Any,Symbol}()
-        for s in inloop
-            s isa _PRCall && s.f === Base.:/ && length(s.args) == 2 || continue
-            x, d = s.args
-            d isa Symbol && d in cellvars && !(d in inv2) && continue
-            push!(q.targets, x)
-            push!(q.divisors, d)
-            r = get!(inverses, d) do
-                r = gensym(:shared_inverse)
-                push!(coefficients, :($r = $(q.normal) ? inv($d) : 0.0))
-                r
-            end
-            fast_divisions[s.lhs] = :($x * $r)
-        end
         forward_in = _pr_forward_exprs(inloop, cuts)
         # The cell's value, for a sweep that also returns the plate's total
         # (`_PR_WANT_VALUE`): its invariant terms once, `ncells` times, after
         # the loop, and one partial sum per cell-varying term in it.
         value_pre, value_in, value_post = _pr_value_accumulation(
             inloop, inv2, cellvars, result, total, acc.args[1], ncells, st;
-            reverse, normal = isempty(q.divisors) ? nothing : q.normal, sums = partial_sums)
+            reverse, normal = isempty(q.divisors) ? nothing : q.normal, sums = partial_sums,
+            quotients = q)
         direct_in, read_operands = _pr_direct_reads(inloop, st)
         cellbody = Expr(:block, forward_in..., value_in..., reverse...)
         plain_loop = :(@inbounds for $linear in $cells
