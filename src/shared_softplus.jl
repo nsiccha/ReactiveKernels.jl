@@ -44,3 +44,169 @@ value/partial recipe.
 """
 const rk_log1pexp = scalar_derivative_rule(rk_log1pexp_graph;
     primal=:value, partials=(x=:partial,), name=:rk_log1pexp)
+
+# ------------------------------------------------ the softplus of a vector loop
+#
+# Base's `log1p` chooses among range branches, so a loop that calls it stays
+# scalar. SLEEFPirates' `log1p` is straight-line arithmetic: a loop over it runs
+# as vector code, at about 1.7 ns a cell where the recipes above take about
+# 8 ns. Called one number at a time it takes about twice as long as Base's,
+# and one other call that keeps a loop scalar (Base's `log`, say) makes a cell
+# with it twice as slow as before. So only a loop whose every call the
+# compiler can vectorize calls it: a summed plate's cells
+# (`_vector_safe_cell`) and a broadcast materialized by itself
+# (`_vector_safe_broadcast`). Everywhere else `rk_log1pexp` and
+# `LogExpFunctions.log1pexp` run as written.
+@_record_source @inline _vector_log1p(q::Float64) = SLEEFPirates.log1p(q)
+
+# `exp(-abs(x))` cannot overflow, and both tails follow from it without a
+# branch. For `x >= 34`, `exp(-x) < 2^-48 <= eps(x) / 2`, so the sum rounds to
+# `x`. For very negative `x` the first term is zero and `log1p` of a number
+# below `2^-53` is that number, `exp(x)`. `max(x, 0)` is one half of this
+# identity for `log(1 + exp(x))`, which is smooth at zero with derivative
+# `logistic(x)`. The exponential is Base's, inlined where it is called
+# (`_native_scalar_exp`).
+@_record_source @inline _vector_softplus_value(x::Float64) =
+    max(x, 0.0) + _vector_log1p(_native_scalar_exp(-abs(x)))
+
+# The value alone comes from the vector recipe. A derivative cut keeps Base's
+# `exp` and `log1p` and the partial `rk_log1pexp_graph` authors: the loops that
+# run a cut are not vector loops.
+@kernel _vector_softplus_graph(x::Float64) = begin
+    value::Float64 = _vector_softplus_value(x)
+    q::Float64 = exp(-abs(x))
+    (value, partial::Float64) = (max(x, 0.0) + log1p(q), ifelse(x >= 0, 1.0, q) / (1 + q))
+    return value, partial
+end
+
+# `log(1 + exp(x))` of a `Float64` inside a vector loop. Its value agrees with
+# `rk_log1pexp(x)` to one unit in the last place, and a derivative cut returns
+# `rk_log1pexp`'s value and partial bit for bit.
+const _vector_softplus = scalar_derivative_rule(_vector_softplus_graph;
+    primal=:value, partials=(x=:partial,), name=:_vector_softplus)
+
+# What a vector loop calls where its source calls `rk_log1pexp` or
+# `LogExpFunctions.log1pexp`: the vector softplus for a `Float64`, the source's
+# own function for any other argument.
+@inline _vector_rk_log1pexp(x::Float64) = _vector_softplus(x)
+@inline _vector_rk_log1pexp(x) = rk_log1pexp(x)
+@inline _vector_log1pexp(x::Float64) = _vector_softplus(x)
+@inline _vector_log1pexp(x) = LogExpFunctions.log1pexp(x)
+
+# The loop whose compiled form `_vector_doubles` reads: a sum over the vector
+# softplus, as a summed plate's cell loop runs it.
+function _vector_softplus_probe(x::Vector{Float64})
+    total = 0.0
+    @inbounds @simd for i in eachindex(x)
+        total += _vector_softplus_value(x[i])
+    end
+    total
+end
+
+# How many `Float64` one vector holds in the code this process compiles for a
+# sum over the vector softplus: 8 with AVX-512, 4 with AVX2, 2 with SSE2 or
+# NEON, 1 where the loop stays scalar. It is read once per process from the
+# compiled loop itself, so it follows the CPU target Julia was started with
+# (`-C`), which a query of the host's CPU does not. 0 means not read yet
+# (`__init__` resets it: an image must not carry another process's answer).
+const _VECTOR_DOUBLES = Ref(0)
+function _vector_doubles()
+    doubles = _VECTOR_DOUBLES[]
+    doubles == 0 || return doubles
+    io = IOBuffer()
+    InteractiveUtils.code_llvm(io, _vector_softplus_probe, Tuple{Vector{Float64}}; debuginfo = :none)
+    widths = (parse(Int, m.captures[1]) for m in eachmatch(r"<(\d+) x double>", String(take!(io))))
+    _VECTOR_DOUBLES[] = maximum(widths; init = 1)
+end
+
+# The vector softplus costs about twice the scalar one a cell, so it pays off
+# only where a vector holds at least four cells: per cell of a summed loop,
+# 1.8 ns against 11.7 ns with eight (Zen 5) and 5.3 ns against 9.6 ns with
+# four (Zen 3). With two it would be level at best, so those loops keep the
+# source's softplus.
+const _VECTOR_SOFTPLUS_DOUBLES = 4
+
+# The vector twin of a softplus where a vector holds `doubles` cells (this
+# process's CPU unless given), or `nothing`.
+_vector_softplus_twin(f, doubles = _vector_doubles()) = doubles < _VECTOR_SOFTPLUS_DOUBLES ? nothing :
+    f === rk_log1pexp ? :_vector_rk_log1pexp :
+    f === LogExpFunctions.log1pexp ? :_vector_log1pexp : nothing
+
+# The softplus a vector-loop call stands for: `LogExpFunctions.log1pexp` for
+# either twin, for the passes that read a cell by the function it computes.
+_vector_softplus_source(f) =
+    f === _vector_rk_log1pexp || f === _vector_log1pexp ? LogExpFunctions.log1pexp : f
+
+# Calls that leave a loop straight-line arithmetic: the compiler turns a loop
+# of these into vector code. Anything else may keep the loop scalar, where the
+# vector softplus is the slower one, so a function is added here only with a
+# measurement of a loop that calls it.
+_vector_safe_function(f) = f === (+) || f === (-) || f === (*) || f === (/) ||
+    f === _native_mul || f === _native_scalar_exp ||
+    f === abs || f === abs2 || f === max || f === min || f === ifelse || f === muladd ||
+    f === float || f === identity || f === Float64 ||
+    f === (<) || f === (<=) || f === (>) || f === (>=) || f === (==) || f === (!=) ||
+    f === (!) || f === (&) || f === (|) || f === xor ||
+    f === Base.CartesianIndex || f === Base.Broadcast._broadcast_getindex ||
+    f === _plate_read || f === _plate_total_add ||
+    f === rk_log1pexp || f === LogExpFunctions.log1pexp ||
+    f === _vector_rk_log1pexp || f === _vector_log1pexp
+
+# Whether a summed plate's cell `ex` is straight-line arithmetic: assignments
+# and calls of `_vector_safe_function`s, with no lazy branch, loop or indexed
+# read of its own (a constant's table read aside). `callable(callee)` answers
+# the function a callee that is not a global names, or `nothing`.
+function _vector_safe_cell(ex, callable = Returns(nothing))
+    ex isa Expr || return true
+    head = ex.head
+    head in (:quote, :inert, :meta, :inbounds, :boundscheck, :loopinfo, :line) && return true
+    if head === :call
+        isempty(ex.args) && return false
+        value = _vector_callee_value(ex.args[1])
+        value === nothing && (value = callable(ex.args[1]))
+        value === nothing && return false
+        _vector_safe_function(something(value)) || return false
+        return all(arg -> _vector_safe_cell(arg, callable), @view ex.args[2:end])
+    elseif head === :ref
+        return length(ex.args) == 2 && ex.args[1] === _CONSTANTS_ARG
+    elseif head in (:block, :(=), :local, :let, :tuple, :(::))
+        return all(arg -> _vector_safe_cell(arg, callable), ex.args)
+    end
+    false
+end
+
+# Whether a broadcast of a softplus over operands of these types is vector
+# code once materialized: each operand is an array or a number, or a lazy
+# broadcast of `_vector_safe_function`s over such operands.
+_vector_safe_broadcast(types) = all(_vector_safe_operand, types)
+_vector_safe_operand(T) = T isa Type && (T <: Union{Number,AbstractArray{<:Number}} ||
+    T isa DataType && T <: Base.Broadcast.Broadcasted && length(T.parameters) == 4 &&
+    _vector_safe_broadcast_function(T.parameters[3]) &&
+    T.parameters[4] isa DataType && T.parameters[4] <: Tuple &&
+    all(_vector_safe_operand, T.parameters[4].parameters))
+_vector_safe_broadcast_function(F) = F isa DataType && isdefined(F, :instance) &&
+    _vector_safe_function(F.instance)
+
+# The function a callee expression names, when it is a global that is bound.
+function _vector_callee_value(callee)
+    callee isa GlobalRef && isdefined(callee.mod, callee.name) &&
+        return Some(getglobal(callee.mod, callee.name))
+    callee isa Function && return Some(callee)
+    nothing
+end
+
+# `ex` with each softplus call replaced by its vector twin. `ex` is code a
+# vector loop runs: a summed plate's cell. `callable(callee)` answers the
+# function a callee that is not a global names, or `nothing`.
+function _vector_softplus_calls(ex, callable = Returns(nothing))
+    ex isa Expr || return ex
+    ex.head in (:quote, :inert, :meta, :macrocall) && return ex
+    args = Any[_vector_softplus_calls(arg, callable) for arg in ex.args]
+    if ex.head === :call && !isempty(args)
+        value = _vector_callee_value(ex.args[1])
+        value === nothing && (value = callable(ex.args[1]))
+        twin = value === nothing ? nothing : _vector_softplus_twin(something(value))
+        twin === nothing || (args[1] = GlobalRef(@__MODULE__, twin))
+    end
+    Expr(ex.head, args...)
+end

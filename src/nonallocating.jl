@@ -1133,6 +1133,15 @@ function _decompose_broadcast(ctx::_FusedDecomposition, f, fref::GlobalRef,
         push!(args, d[1])
         push!(types, d[2])
     end
+    # A softplus broadcast that is materialized by itself, over arrays or
+    # vector-safe arithmetic of arrays, is a vector loop: it applies the
+    # vector softplus (shared_softplus.jl). Fused into a larger broadcast it
+    # keeps the source's, since that loop may hold a call that stays scalar.
+    twin = allow_lazy_broadcast ? nothing : _vector_softplus_twin(f)
+    if twin !== nothing && _vector_safe_broadcast(types)
+        f = getglobal(@__MODULE__, twin)
+        fref = GlobalRef(@__MODULE__, twin)
+    end
     bc = Expr(:call, GlobalRef(Base.Broadcast, :broadcasted),
               fref, args...)
     BT = _static_type(Base.Broadcast.broadcasted, typeof(f), types...)

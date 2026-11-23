@@ -89,6 +89,8 @@ function __init__()
     # which in a system image are all the image holds, and those loaded later.
     _register_loaded_image_programs()
     push!(Base.package_callbacks, _register_image_programs)
+    # This process measures its own vector width (shared_softplus.jl).
+    _VECTOR_DOUBLES[] = 0
     # This process reads its own project's type-stability preferences.
     foreach(_clear_preference!, _TYPE_STABILITY_PREFERENCES)
     # and its own `simplify` and `bound_statistics` preferences
