@@ -16,6 +16,17 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.370
+
+- A program that a package image compiled is reused at run time when the
+  package image is part of a system image (PackageCompiler's
+  `create_sysimage`), as it already was when the package image is loaded on
+  its own. Before, ReactiveKernels registered a package's programs only from
+  a package callback, which Julia never runs for a package a system image
+  holds, so every such program was compiled again on first use.
+  `__init__` now also registers the programs of the packages already loaded
+  when it runs.
+
 ## 0.1.369
 
 - Indexed JAX density events evaluate events that contain runtime checks.

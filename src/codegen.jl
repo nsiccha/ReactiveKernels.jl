@@ -7864,7 +7864,8 @@ Global names in the lowered body still resolve in `ReactiveKernels`. The
 callable does not hold the expression; the cache retains it for
 `RuntimeGeneratedFunctions.get_expression`. A program that a loaded package
 image compiled returns that image's generated function, with the code the
-image compiled for it.
+image compiled for it. This holds as well for a package image that a system
+image holds.
 """
 compile(ast::Expr) =
     _compile(ast, @__MODULE__, GlobalRef(@__MODULE__, Symbol("@_native_context")))
@@ -8557,18 +8558,36 @@ Base.@nospecializeinfer function _image_shared_closure(@nospecialize(key), home:
     nothing
 end
 
-# A `Base.package_callbacks` entry, installed by `__init__`: registers the
-# programs table of each package image loaded after ReactiveKernels.
-function _register_image_programs(package::Base.PkgId)
-    mod = Base.root_module(package)
+# Registers the programs table of the root module `mod`, if it holds one that
+# is not registered yet.
+function _register_image_programs(mod::Module)
     isdefined(mod, _IMAGE_PROGRAMS) || return nothing
-    # A module that later replaces one of the image's is not served its programs.
-    _first_module_generations!(mod)
     table = getglobal(mod, _IMAGE_PROGRAMS)::_ImagePrograms
     @lock _LOADED_IMAGE_PROGRAMS.lock begin
         tables = @atomic :acquire _LOADED_IMAGE_PROGRAMS.tables
+        any(t -> t === table, tables) && return nothing
+        # A module that later replaces one of the image's is not served its programs.
+        _first_module_generations!(mod)
         @atomic :release _LOADED_IMAGE_PROGRAMS.tables = push!(copy(tables), table)
     end
+    nothing
+end
+
+# A `Base.package_callbacks` entry, installed by `__init__`: registers the
+# programs table of each package loaded after ReactiveKernels.
+_register_image_programs(package::Base.PkgId) =
+    _register_image_programs(Base.root_module(package))
+
+# Called by `__init__`: registers, in load order, the tables of the modules
+# loaded before it ran. Julia restores every module a system image holds before
+# it runs any `__init__`, and never runs package callbacks for them, so this is
+# the only registration those modules get. The registry is rebuilt rather than
+# kept: `__init__` has just reset the module generations that registration seeds.
+function _register_loaded_image_programs()
+    @lock _LOADED_IMAGE_PROGRAMS.lock begin
+        @atomic :release _LOADED_IMAGE_PROGRAMS.tables = _ImagePrograms[]
+    end
+    foreach(_register_image_programs, Base.loaded_modules_array())
     nothing
 end
 
