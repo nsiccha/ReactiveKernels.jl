@@ -3550,22 +3550,29 @@ function _pr_source_checked_expr(S, B, types, joint, dispatch, projections, chec
     end
 end
 @inline _pr_proved_tuple(T) = T !== Union{} && T <: Tuple
+# The schedule choice and the call it makes are inlined into the rule's
+# callable, as the call was before the choice grew: the backend then sees the
+# one-pass call (or the program) at the rule call site itself, with the
+# activity of the caller's own operands.
+_pr_inlined(body) = Expr(:block, Expr(:meta, :inline), body)
 @generated _pr_rule_target(rule::_PlateSumRule{S,B,P,R,J,G,C}, args::Tuple) where {S,B,P,R,J,G,C} =
     _pr_source_checked_expr(S, B, args.parameters, J, :_pr_rule_target, G, C, _pr_sited_reverse(R))
 @generated _pr_rule_call(rule::_PlateSumRule{S,B,P,R,J,G,C}, args::Tuple) where {S,B,P,R,J,G,C} =
-    _pr_source_checked_expr(S, B, args.parameters, J, :_pr_rule_call, G, C, _pr_sited_reverse(R))
+    _pr_inlined(_pr_source_checked_expr(S, B, args.parameters, J, :_pr_rule_call, G, C,
+                                        _pr_sited_reverse(R)))
 # Whether this call takes a one-pass schedule, from its operand types and
 # sizes alone. A call that does not runs the plate inline, where the backend
 # differentiates the optimized program exactly as it does without a rule.
 @generated _pr_rule_applies(rule::_PlateSumRule{S,B,P,R,J,G,C}, args::Tuple) where {S,B,P,R,J,G,C} =
-    _pr_source_checked_expr(S, B, args.parameters, J, :_pr_rule_applies, G, C, _pr_sited_reverse(R))
+    _pr_inlined(_pr_source_checked_expr(S, B, args.parameters, J, :_pr_rule_applies, G, C,
+                                        _pr_sited_reverse(R)))
 _pr_projections(::Type{<:_PlateSumRule{S,B,P,R,J,G}}) where {S,B,P,R,J,G} = G
 @generated _pr_rule_target(rule::_PRGroupBroadcastRule{I,F}, args::Tuple) where {I,F} =
     _pr_group_broadcast_expr(I, _pr_projections(F), args.parameters, :_pr_rule_target)
 @generated _pr_rule_call(rule::_PRGroupBroadcastRule{I,F}, args::Tuple) where {I,F} =
-    _pr_group_broadcast_expr(I, _pr_projections(F), args.parameters, :_pr_rule_call)
+    _pr_inlined(_pr_group_broadcast_expr(I, _pr_projections(F), args.parameters, :_pr_rule_call))
 @generated _pr_rule_applies(rule::_PRGroupBroadcastRule{I,F}, args::Tuple) where {I,F} =
-    _pr_group_broadcast_expr(I, _pr_projections(F), args.parameters, :_pr_rule_applies)
+    _pr_inlined(_pr_group_broadcast_expr(I, _pr_projections(F), args.parameters, :_pr_rule_applies))
 # One method per operand count, each operand's type a parameter of its own:
 # Julia does not otherwise specialize on a `Function` operand it only passes on
 # (the program's callables), and the call would dispatch dynamically
