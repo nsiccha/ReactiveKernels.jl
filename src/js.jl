@@ -2391,7 +2391,8 @@ function _js_function_call(ir::_JsIR, f::Function, args, T)
         end
         return _js_rt(join(pieces, " + "), String;
                       prec = _JS_ADD)
-    elseif f === _native_exp && length(args) == 1 && _js_isnumber(args[1])
+    elseif (f === _native_exp || f === _native_scalar_exp) && length(args) == 1 &&
+            _js_isnumber(args[1])
         return _js_call!(ir, exp, Any[args[1]], T)
     elseif f === _native_mul && all(a -> _js_isnumber(a), args)
         return _js_call!(ir, *, Any[args...], T)

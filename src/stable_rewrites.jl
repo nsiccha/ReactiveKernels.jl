@@ -75,8 +75,8 @@
 # fallbacks spell exactly the authored composition, so a type without a stable
 # method (a matrix, an interval, a custom number) runs the literal program.
 
-const _RwExp = Union{typeof(exp),typeof(_native_exp)}
-const _RwNonNegative = Union{typeof(exp),typeof(_native_exp),typeof(abs),typeof(abs2),
+const _RwExp = Union{typeof(exp),typeof(_native_exp),typeof(_native_scalar_exp)}
+const _RwNonNegative = Union{_RwExp,typeof(abs),typeof(abs2),
                              typeof(LogExpFunctions.logistic)}
 
 # The float type the authored arithmetic over these operands produces.
@@ -338,12 +338,13 @@ end
 function _rw_ref(f)
     f === exp && return GlobalRef(Base, :exp)
     f === _native_exp && return GlobalRef(@__MODULE__, :_native_exp)
+    f === _native_scalar_exp && return GlobalRef(@__MODULE__, :_native_scalar_exp)
     f === LogExpFunctions.logistic && return GlobalRef(LogExpFunctions, :logistic)
     f === abs && return GlobalRef(Base, :abs)
     f === abs2 && return GlobalRef(Base, :abs2)
     nothing
 end
-_rw_is_exp(f) = f === exp || f === _native_exp
+_rw_is_exp(f) = f === exp || f === _native_exp || f === _native_scalar_exp
 _rw_helper(name::Symbol) = GlobalRef(@__MODULE__, name)
 
 # A literal one, as authored source spells it.
@@ -1055,8 +1056,7 @@ function _rw_rules(ex::Expr, ctx::_RwContext, env)
     g === log && return _rw_rule_log(outer, ctx, env)
     g === log1p && return _rw_rule_log1p(outer, ctx, env)
     g === LogExpFunctions.logit && return _rw_rule_logit(outer, ctx, env)
-    g === exp && return _rw_rule_exp(outer, ctx, env)
-    g === _native_exp && return _rw_rule_exp(outer, ctx, env)
+    _rw_is_exp(g) && return _rw_rule_exp(outer, ctx, env)
     g === (-) && return _rw_rule_minus(outer, ctx, env)
     g === inv && return _rw_rule_inv(outer, ctx, env)
     g === (/) && return _rw_rule_div(outer, ctx, env)

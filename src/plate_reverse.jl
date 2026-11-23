@@ -322,7 +322,7 @@ const _PR_NONDIFF = Set{Any}(Any[Base.:<, Base.:>, Base.:<=, Base.:>=, Base.:(==
 # Calls whose partials are better spelled through their own result `y` than by
 # DiffRules' recomputation (`exp′(x) = exp(x)` would call `exp` twice).
 function _pr_result_partials(f, y, args)
-    f === Base.exp && return Any[y]
+    (f === Base.exp || f === _native_scalar_exp) && return Any[y]
     f === Base.expm1 && return Any[:($y + 1.0)]
     f === Base.sqrt && return Any[:(0.5 / $y)]
     f === Base.:- && length(args) == 1 && return Any[-1.0]

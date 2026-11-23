@@ -16,6 +16,19 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.371
+
+- A summed plate whose cells call `exp` on a number runs as vector code.
+  Julia compiles `exp` of a machine float as a call, and that call kept the
+  plate's summed loop scalar. A native program now inlines Base's method
+  where it calls `exp` on a `Float64` or `Float32`. The density of a Poisson
+  regression with 3,000 rows, `y .~ Poisson.(exp.(log_lambda))`, takes about
+  4 µs where it took about 13 µs. A total can differ in its last digits, because the
+  vector loop adds the cells in another order. Ordinary Enzyme Reverse still
+  applies its own rule for `exp`, so gradients are unchanged. Generated code
+  shows a statement that is one scalar `exp` as
+  `ReactiveKernels._native_scalar_exp(x)` where it showed `Base.exp(x)`.
+
 ## 0.1.370
 
 - A program that a package image compiled is reused at run time when the

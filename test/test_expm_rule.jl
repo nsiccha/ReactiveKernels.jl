@@ -102,6 +102,7 @@ end
 
 module NativeExpmTests
 using ReactiveKernels, DifferentiationInterface, Enzyme, Test
+using InteractiveUtils: code_llvm
 using LinearAlgebra: Diagonal, diag
 const exp_alias = Base.exp
 const _parent = parentmodule(@__MODULE__)
@@ -172,6 +173,49 @@ end
     total = sum(values)
     return total
 end
+# Summed plates over a scalar exponential: the whole cell, one term of it, and
+# the typed statement of a law, as a count law computes its rate.
+@kernel rate_law(log_rate::Float64) = begin
+    rate::Float64 = exp(log_rate)
+    logkernel(observed::Float64)::Float64 = observed * log_rate - rate
+end
+@kernel rate_total(y::Vector{Float64}, eta::Vector{Float64}) = begin
+    cells = plate(y, eta) do yi, ei
+        rate_law(ei).logkernel(yi)
+    end
+    total::Float64 = sum(cells)
+    return total
+end
+@kernel exp_total(x::Vector{Float64}) = begin
+    cells = plate(x) do xi
+        exp(xi)
+    end
+    total::Float64 = sum(cells)
+    return total
+end
+@kernel count_total(y::Vector{Float64}, eta::Vector{Float64}) = begin
+    cells = plate(y, eta) do yi, ei
+        yi * ei - exp(ei)
+    end
+    total::Float64 = sum(cells)
+    return total
+end
+function called_sum(x)
+    s = zero(eltype(x))
+    @inbounds @simd for i in eachindex(x)
+        s += exp(x[i])
+    end
+    s
+end
+function native_sum(x)
+    s = zero(eltype(x))
+    @inbounds @simd for i in eachindex(x)
+        s += ReactiveKernels._native_exp(x[i])
+    end
+    s
+end
+_loop_llvm(f, T) = sprint(io -> code_llvm(io, f, Tuple{Vector{T}}; debuginfo = :none))
+_calls_exp(llvm) = occursin(r"call [^\n]*@j_exp", llvm)
 
 @testset "authored matrix exp uses the generated rule in ordinary Enzyme" begin
     backend = AutoEnzyme(; mode = Enzyme.Reverse)
@@ -222,6 +266,58 @@ end
           GlobalRef(ReactiveKernels, :_native_exp)
     @test native(:(exp(A)), :A, :exp).args[1] === :exp
     @test native(:(Base.exp(A)), :A, :Base).args[1] == :(Base.exp)
+end
+
+@testset "a scalar float exp is inlined where a native program calls it" begin
+    # Base's method and values, edges included; other numbers keep Base's own.
+    for T in (Float64, Float32)
+        for x in T[0.3, -2.5, 0.0, -0.0, 88.0, 710.0, -746.0, -Inf, Inf, NaN,
+                   floatmin(T), -floatmax(T)]
+            @test ReactiveKernels._native_exp(x) === exp(x)
+            @test ReactiveKernels._native_scalar_exp(x) === exp(x)
+        end
+    end
+    @test ReactiveKernels._native_exp(1) === exp(1)
+    @test ReactiveKernels._native_exp(big"0.3") == exp(big"0.3")
+    @test ReactiveKernels._native_exp(0.3 + 0.1im) == exp(0.3 + 0.1im)
+
+    # Julia compiles `exp` in a summed loop as a call (the control). Through
+    # the native helper the loop holds none, which is what lets it vectorize.
+    for T in (Float64, Float32)
+        @test _calls_exp(_loop_llvm(called_sum, T))
+        @test !_calls_exp(_loop_llvm(native_sum, T))
+    end
+
+    # A typed statement that is one scalar `exp` is the scalar call. The
+    # generated plate reverse reads it as `exp` of a number and takes its rule.
+    r = prepare(rate_total)
+    @test occursin("_native_scalar_exp", string(code_expr(r)))
+    @test last(only(plate_reverse_report(r, 2))) == "rule"
+
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    k = prepare(exp_total)
+    c = prepare(count_total)
+    for n in (0, 1, 7, 513)
+        x = [0.3 * sin(i) + 0.1 * i / (n + 1) for i in 1:n]
+        y = [Float64(mod(3i, 5)) for i in 1:n]
+        # The vector loop adds its cells in another order.
+        @test k(x) ≈ sum(exp, x; init = 0.0) rtol = 1e-14
+        value, gradient = ad_value_and_gradient(prepare_ad(k, backend, x; active = :x), x)
+        @test value ≈ sum(exp, x; init = 0.0) rtol = 1e-14
+        @test gradient ≈ exp.(x) rtol = 1e-14
+        expected = sum(y .* x .- exp.(x); init = 0.0)
+        for program in (c, r)
+            @test program(y, x) ≈ expected rtol = 1e-13 atol = 1e-13
+            value, gradient = ad_value_and_gradient(
+                prepare_ad(program, backend, y, x; active = :eta), y, x)
+            @test value ≈ expected rtol = 1e-13 atol = 1e-13
+            @test gradient ≈ y .- exp.(x) rtol = 1e-14
+        end
+    end
+    # Rows at the edges of `exp` give what Base's method gives.
+    @test k([0.0, -Inf, -746.0]) == 1.0
+    @test k([0.0, 710.0]) == Inf
+    @test isnan(k([0.5, NaN]))
 end
 
 @testset "ordinary Reverse through matrix exp in a lazy scan branch" begin
