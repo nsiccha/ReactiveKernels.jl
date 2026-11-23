@@ -1658,6 +1658,21 @@ function _pr_factored_sweep!(out, fc::_PRFactored, stmts, adj, mutable, toplevel
                     _pr_quotient_contribution!(out, fc, adj, mutable, a, terms, p, toplevel, q)
                     continue
                 end
+                # An arm of `ifelse` takes the cotangent where the condition
+                # selects it and zero elsewhere: a select, not a product with 1
+                # or 0, so the two arms' contributions fold (`c ? -d : d` for
+                # `ifelse(c, -x, x)`), and a cell cotangent that is not finite
+                # stays out of the arm not taken. A coefficient that is not
+                # finite (the seed) still multiplies both.
+                if s.f === Base.ifelse && k in (2, 3) && !_pr_is_invariant(fc, s.args[1], toplevel)
+                    c = s.args[1]
+                    pick(v) = k == 2 ? :($(GlobalRef(Base, :ifelse))($c, $v, 0.0)) :
+                                       :($(GlobalRef(Base, :ifelse))($c, 0.0, $v))
+                    new = _PRTerm[_PRTerm(t.num, t.inv,
+                        _pr_bind!(out, fc, pick(t.var === nothing ? 1.0 : t.var))) for t in terms]
+                    _pr_contribute!(out, fc, adj, mutable, a, new, toplevel)
+                    continue
+                end
                 num, inv, vars = _pr_split_partial(fc, p, toplevel)
                 # A shared value's partial that is a gathered read: its sum over
                 # the cells can run per group, through the read's own scatter

@@ -624,6 +624,29 @@ end
         @test dx ≈ seed .* slope .* s
         @test ds ≈ seed * sum(slope .* x)
     end
+    # Each arm takes the cotangent through a select, not a product with 1 or 0,
+    # so a sign flip `ifelse(c, -x, x)` folds to one select.
+    function unit_selects(ex)
+        ex isa RK._PlateProgram && return unit_selects(ex.ast)
+        ex isa Expr || return 0
+        own = Meta.isexpr(ex, :if, 3) && Set(ex.args[2:3]) == Set([0.0, 1.0])
+        own + sum(unit_selects, ex.args; init = 0)
+    end
+    @test unit_selects(rexpr) == 0
+    flip = :($(GlobalRef(Base, :ifelse))(v1 > 0, -(s * v1), s * v1))
+    gate = :($(GlobalRef(Base, :ifelse))(v1 > 0, s * v1, 0.0))
+    for (cell, slope) in ((flip, v -> v > 0 ? -1.0 : 1.0), (gate, v -> v > 0 ? 1.0 : 0.0))
+        rexpr = first(RK._pr_program_reverse(program([cell]), [:x, :s], RK, Dict{Symbol,Any}()))
+        @test unit_selects(rexpr) == 0
+        sweep = RK.compile(rexpr)
+        for seed in (1.0, -0.6), want in (false, true)
+            dx = zeros(length(x))
+            value, ds = sweep(x, s, seed, Val(want), dx)
+            want && @test value ≈ sum(slope.(x) .* s .* x)
+            @test dx ≈ seed .* slope.(x) .* s
+            @test ds ≈ seed * sum(slope.(x) .* x)
+        end
+    end
 end
 
 # A partitioned count likelihood and two crossed groupings: each grouped plate
