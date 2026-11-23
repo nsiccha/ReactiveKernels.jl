@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.374
+
+- Indexed JAX density events can read a value produced by
+  `jax.lax.platform_dependent`. When the device selects one implementation
+  for the whole batch, `vmap` can batch both the selected rows and their
+  gradients. If a branch depends on the individual point, each lane still
+  executes only its selected arm, including when a loop carry supplies the
+  branch condition.
+
 ## 0.1.373
 
 - In a native summed plate, a straight-line cell can use a vector logarithm
