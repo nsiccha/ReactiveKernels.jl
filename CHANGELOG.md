@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.373
+
+- In a native summed plate, a straight-line cell can use a vector logarithm
+  for a sum of Float64 exponentials, including the shifted normalizer of a
+  positional categorical likelihood. Preparation applies stable rewrites
+  first, so a two-term log-add-exp retains its overflow-safe evaluation.
+  The vector logarithm can differ from Base by a last-place rounding step.
+  Ordinary reverse mode uses the Base logarithm and its reciprocal partial.
+
 ## 0.1.372
 
 - A softplus in a loop the compiler can turn into vector code is computed

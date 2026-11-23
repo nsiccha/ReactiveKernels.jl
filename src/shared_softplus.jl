@@ -156,7 +156,7 @@ _vector_safe_function(f) = f === (+) || f === (-) || f === (*) || f === (/) ||
 # and calls of `_vector_safe_function`s, with no lazy branch, loop or indexed
 # read of its own (a constant's table read aside). `callable(callee)` answers
 # the function a callee that is not a global names, or `nothing`.
-function _vector_safe_cell(ex, callable = Returns(nothing))
+function _vector_safe_cell(ex, callable = Returns(nothing), safe_function = _vector_safe_function)
     ex isa Expr || return true
     head = ex.head
     head in (:quote, :inert, :meta, :inbounds, :boundscheck, :loopinfo, :line) && return true
@@ -165,12 +165,12 @@ function _vector_safe_cell(ex, callable = Returns(nothing))
         value = _vector_callee_value(ex.args[1])
         value === nothing && (value = callable(ex.args[1]))
         value === nothing && return false
-        _vector_safe_function(something(value)) || return false
-        return all(arg -> _vector_safe_cell(arg, callable), @view ex.args[2:end])
+        safe_function(something(value)) || return false
+        return all(arg -> _vector_safe_cell(arg, callable, safe_function), @view ex.args[2:end])
     elseif head === :ref
         return length(ex.args) == 2 && ex.args[1] === _CONSTANTS_ARG
     elseif head in (:block, :(=), :local, :let, :tuple, :(::))
-        return all(arg -> _vector_safe_cell(arg, callable), ex.args)
+        return all(arg -> _vector_safe_cell(arg, callable, safe_function), ex.args)
     end
     false
 end

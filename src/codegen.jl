@@ -9936,7 +9936,7 @@ function _prepare_plan_body(p::Plan; passes = (), bound = (), on_error = nothing
     # The stable rewrites (`stable_rewrites.jl`) read the body while its plate
     # loops are still inline, so a cell's term can read the value a
     # transformation outside the plate was computed from.
-    _simplify() && (native_ast = _stable_rewrites(native_ast, recipes))
+    _simplify() && (native_ast = _stable_rewrites(native_ast, recipes; vectorize_cells = true))
     isempty(passes) || (native_ast = transform(native_ast, passes...))
     # Each top-level plate loop in a function of its own (`_PlateProgram`).
     native_ast = _extract_plate_programs(native_ast)

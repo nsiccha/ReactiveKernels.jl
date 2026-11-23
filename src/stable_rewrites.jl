@@ -306,6 +306,7 @@ struct _RwContext
     hoisted::Bool               # a loop never reads a definition from outside it
     loops::Vector{_RwLoop}      # the plate loops around the site; a barrier for any other
     parts::Bool                 # a kernel's parameter part may be computed once (native)
+    vectorize_cells::Bool       # native preparation, after stable cell rewrites
 end
 
 # A loop or branch the walk is inside, where nothing can be computed once
@@ -853,13 +854,13 @@ function _rw_plate_loop(ex::Expr)
         replace = rewritten -> Expr(:if, ex.args[1],
             _rw_with_cell(ex.args[2], index, rewritten[1]),
             _rw_with_cell(ex.args[3], index, rewritten[2]))
-        return (; axes, index, bodies = Any[grouped, flat], replace)
+        return (; axes, index, bodies = Any[grouped, flat], simd = true, replace)
     end
     simd = _index_run_simd_plate(ex)
     if simd !== nothing
         axes, index, body = simd
         replace = rewritten -> _rw_with_cell(ex, index, only(rewritten))
-        return (; axes, index, bodies = Any[body], replace)
+        return (; axes, index, bodies = Any[body], simd = true, replace)
     end
     ex.head === :for && length(ex.args) == 2 || return nothing
     binding = ex.args[1]
@@ -868,7 +869,7 @@ function _rw_plate_loop(ex::Expr)
     _index_run_call(domain, GlobalRef(@__MODULE__, :_plate_cells), 1) || return nothing
     indices = domain.args[2]
     _index_run_call(indices, GlobalRef(Base, :CartesianIndices), 1) || return nothing
-    (; axes = indices.args[2], index = binding.args[1], bodies = Any[ex.args[2]],
+    (; axes = indices.args[2], index = binding.args[1], bodies = Any[ex.args[2]], simd = false,
        replace = rewritten -> Expr(:for, binding, only(rewritten)))
 end
 
@@ -928,9 +929,12 @@ function _rw_plate_expr(ex, plate, ctx, env)
     rewritten = Any[_rw_expr(body,
                              _RwContext(ctx.recipes, _rw_cell_counts(body, ctx.counts),
                                         ctx.params, ctx.reads, ctx.hoisted, ctx.loops,
-                                        ctx.parts),
+                                        ctx.parts, ctx.vectorize_cells),
                              copy(inner)) for body in plate.bodies]
     pop!(ctx.loops)
+    if ctx.vectorize_cells && plate.simd
+        map!(_vectorize_cell_logs, rewritten, rewritten)
+    end
     result = plate.replace(rewritten)
     isempty(loop.prelude) && return result
     has_cells = Expr(:call, GlobalRef(Base, :!), Expr(:call, GlobalRef(Base, :isempty),
@@ -1369,7 +1373,7 @@ rewritten only where its call runs once, through its declared one-call form
 """
 function _stable_rewrites(ast::Expr, recipes::Tuple,
                           definitions::Dict{Symbol,Any} = Dict{Symbol,Any}();
-                          hoisted::Bool = false, parts::Bool = true)
+                          hoisted::Bool = false, parts::Bool = true, vectorize_cells::Bool = false)
     ast.head in (:function, :->) && length(ast.args) == 2 &&
         ast.args[1] isa Expr && ast.args[1].head === :tuple || return ast
     counts = _rw_count!(Dict{Symbol,Int}(), ast.args[2])
@@ -1379,7 +1383,7 @@ function _stable_rewrites(ast::Expr, recipes::Tuple,
                arg isa Expr && arg.head === :(::) && arg.args[1] isa Symbol ? arg.args[1] : nothing
         name === nothing || get(counts, name, 0) == 0 && push!(params, name)
     end
-    ctx = _RwContext(recipes, counts, params, Ref(0), hoisted, _RwLoop[], parts)
+    ctx = _RwContext(recipes, counts, params, Ref(0), hoisted, _RwLoop[], parts, vectorize_cells)
     body = _rw_expr(ast.args[2], ctx, copy(definitions))
     body isa Expr && body.head === :block || return ast
     body == ast.args[2] && return ast
