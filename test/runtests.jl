@@ -50,6 +50,7 @@ const _MATRIX_CORE_TESTS = (
     "test_manual_derivative_rule_example.jl",
     "test_derivative_rules.jl",
     "test_shared_softplus.jl",
+    "test_vector_log.jl",
     "test_derivative_rule_multioutput.jl",
     "test_derivative_rule_joint_planning.jl",
     "test_derivative_rule_snapshots.jl",

@@ -145,9 +145,9 @@ function _index_run_visit(f,x)
     f(x)
     foreach(a->_index_run_visit(f,a),x.args)
 end
-function _index_run_replace(f,x)
+function _index_run_replace(f,x,opaque_heads=(:quote,:inert))
     x isa Expr || return x
-    x.head in (:quote,:inert) && return x
+    x.head in opaque_heads && return x
     y=f(x)
     y===x || return y
     # An untouched subtree is returned as is, so a flat schedule's body is not
@@ -156,7 +156,7 @@ function _index_run_replace(f,x)
     replaced=Vector{Any}(undef,length(args))
     changed=false
     for (i,a) in enumerate(args)
-        b=_index_run_replace(f,a)
+        b=_index_run_replace(f,a,opaque_heads)
         b===a || (changed=true)
         replaced[i]=b
     end
