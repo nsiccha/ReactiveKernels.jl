@@ -311,3 +311,57 @@ def factored(n):
 
 
 assert factored(30) == factored(300) == 45, (factored(30), factored(300))
+
+
+# A check can use a platform-specific implementation. All lanes select the
+# same device, even when each station supplies a different point and row.
+def platform_events(u, *, scale):
+    pivot = jax.lax.platform_dependent(u[1], cpu=lambda x: x, default=lambda x: x + 0.)
+    checks._rk_check(pivot > 0, "nonpositive pivot")
+    return scale * u[0]
+
+
+def mapped_read(event):
+    def selected(u, row):
+        return model._rk_read_event(event, u, row, guarded).sum()
+    return jax.vmap(jax.value_and_grad(selected))
+
+
+read_platform = mapped_read(platform_events)
+for n in (0, 3, 17):
+    points = jnp.ones((n, 2))
+    rows = jnp.arange(n) % len(guarded['scale'])
+    values, grads = jax.jit(read_platform)(points, rows)
+    expected = guarded['scale'][rows]
+    np.testing.assert_allclose(values, expected)
+    np.testing.assert_allclose(grads, jnp.stack((expected, jnp.zeros_like(expected)), axis=1))
+    assert not any(eq.primitive.name == 'scan'
+                   for eq in outputs(jax.make_jaxpr(read_platform)(points, rows)))
+raises(lambda: jax.jit(read_platform)(jnp.array([[1., 1.], [1., -1.]]), jnp.array([0, 1])),
+       "nonpositive pivot")
+
+
+# The first loop guard is shared. On its second trip the carry can select
+# different arms, and only the active lane may execute the callback.
+def loop_events(u, *, scale):
+    def step(i, flag):
+        def active():
+            checks._rk_check(u[0] > 0, "invalid active lane")
+        jax.lax.cond(flag, active, lambda: None)
+        return u[0] > -2.
+    jax.lax.fori_loop(0, 2, step, False)
+    return scale * u[0]
+
+
+def platform_and_loop(u, *, scale):
+    return jax.lax.platform_dependent(u, cpu=lambda x: loop_events(x, scale=scale),
+                                      default=lambda x: loop_events(x, scale=scale) + 0.)
+
+
+for event in (loop_events, platform_and_loop):
+    loop_batch = jax.jit(mapped_read(event))
+    values, grads = loop_batch(jnp.array([[2., 1.], [-3., 1.]]), jnp.array([0, 2]))
+    np.testing.assert_allclose(values, [2., -9.])
+    np.testing.assert_allclose(grads, [[1., 0.], [3., 0.]])
+    raises(lambda: loop_batch(jnp.array([[2., 1.], [-1., 1.]]), jnp.array([0, 2])),
+           "invalid active lane")

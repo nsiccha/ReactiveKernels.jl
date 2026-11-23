@@ -328,6 +328,9 @@ class _RKIndexedGraph:
         def arg(i, coords):
             return self.read(args[i], coords)
 
+        if name == 'platform_index':
+            # The device selector is a scalar with no inputs.
+            return eq.primitive.bind(**p)
         if name == 'cond':
             # A broadcast arm can supply the requested coordinates with a
             # scalar or a smaller grid. The switch must join equal shapes.
@@ -532,13 +535,81 @@ def _rk_strict_batch(fn):
     return batched
 
 
-def _rk_has_cond(closed):
-    for eq in closed.jaxpr.eqns:
-        if eq.primitive.name == 'cond':
-            return True
-        if eq.primitive.name in ('jit', 'pjit') and _rk_has_cond(eq.params['jaxpr']):
-            return True
+def _rk_scan_control(eq, reads):
+    # JAX's partial evaluator propagates input dependence across iterations.
+    # A carry can first depend on a lane after the initial iteration.
+    from jax.interpreters.partial_eval import partial_eval_jaxpr_nounits
+    params = eq.params
+    def scan(*args):
+        return eq.primitive.bind(*args, **eq.primitive.get_bind_params(params))
+    inputs = [jax.ShapeDtypeStruct(v.aval.shape, v.aval.dtype) for v in eq.invars]
+    try:
+        _, _, outputs, _ = partial_eval_jaxpr_nounits(jax.make_jaxpr(scan)(*inputs),
+                                                      reads, instantiate=False)
+    except NotImplementedError:
+        return True, ()
+    if 'ft_in' in params:
+        consts, carry, _ = params['ft_in'].update(reads).unpack()
+        begin, end = len(consts), len(consts) + len(carry)
+    else:
+        begin = params['num_consts']
+        end = begin + params['num_carry']
+    carry = [initial or final for initial, final in zip(reads[begin:end], outputs)]
+    body_inputs = reads[:begin] + carry + reads[end:]
+    guard, _ = _rk_batch_control(params['jaxpr'], body_inputs)
+    return guard, carry + outputs[len(carry):]
+
+
+def _rk_batch_control(closed, varying):
+    """Can a selected read take different branches in different lanes?
+
+    A platform switch has a shared selector even when its operands vary.
+    Inspect its arms and nested loops before allowing JAX to batch the read.
+    The second result tracks lane-dependent outputs for the enclosing call.
+    """
+    graph = getattr(closed, 'jaxpr', closed)
+    flags = dict(zip(graph.invars, varying))
+    flags.update((v, True) for v in graph.constvars)
+    for eq in graph.eqns:
+        name, p = eq.primitive.name, eq.params
+        reads = _rk_input_dependence(eq, flags)
+        out = [any(reads)] * len(eq.outvars)
+        if name == 'cond':
+            if 'branches_platforms' not in p and reads[0]:
+                return True, ()
+            arms = [_rk_batch_control(branch, reads[1:]) for branch in p['branches']]
+            if any(guard for guard, _ in arms):
+                return True, ()
+            out = list(map(any, zip(*(values for _, values in arms))))
+        elif name in ('jit', 'pjit'):
+            guard, out = _rk_batch_control(p['jaxpr'], reads)
+            if guard:
+                return True, ()
+        elif name == 'scan':
+            guard, out = _rk_scan_control(eq, reads)
+            if guard:
+                return True, ()
+        elif name == 'while' or (not reads and name not in ('platform_index', 'iota')):
+            return True, ()
+        elif _rk_params_have_cond(p):
+            # An unfamiliar higher-order primitive owns its batching rule.
+            return True, ()
+        flags.update(zip(eq.outvars, out))
+    return False, [not isinstance(v, _rk_core.Literal) and flags[v] for v in graph.outvars]
+
+
+def _rk_params_have_cond(params):
+    for param in params.values():
+        for sub in param if isinstance(param, (tuple, list)) else (param,):
+            graph = getattr(sub, 'jaxpr', sub)
+            if hasattr(graph, 'eqns') and _rk_has_cond(graph):
+                return True
     return False
+
+
+def _rk_has_cond(closed):
+    graph = getattr(closed, 'jaxpr', closed)
+    return any(eq.primitive.name == 'cond' or _rk_params_have_cond(eq.params) for eq in graph.eqns)
 
 
 def _rk_read_event(fn, u, row, prepared):
@@ -552,7 +623,7 @@ def _rk_read_event(fn, u, row, prepared):
             _rk_run_effects(closed, leaves, reads, 'point')
         inputs = [_RKIndexedGraph.leaf(v) for v in leaves]
         return _rk_selected(_RKIndexedGraph(closed, inputs), index)
-    if _rk_has_cond(closed):
+    if _rk_has_cond(closed) and _rk_batch_control(closed, [True] * len(closed.jaxpr.invars))[0]:
         return _rk_strict_batch(selected)(u, row, prepared)
     return selected(u, row, prepared)
 
