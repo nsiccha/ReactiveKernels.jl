@@ -16,6 +16,13 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.381
+
+- Exported JAX RK45 solves control local error in the state and its
+  sensitivities to the initial state and floating-point RHS inputs. This
+  also applies to value-only calls and can increase their cost and step count.
+  Regenerate an exported module to pick up the change.
+
 ## 0.1.380
 
 - A scheduled prefix plate can capture more than 32 operands under
