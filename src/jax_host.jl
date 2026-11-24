@@ -1934,6 +1934,26 @@ jax.tree_util.register_pytree_node(StaticInt, lambda s: ((), int(s)), lambda v, 
 # array without entries gives 0 (no range over its entries runs) and a span
 # of -1 (no steps).
 const _JAX_PREPARED_BOUNDS = Dict{Symbol,Tuple{String,String}}(
+    :broadcast_total => ("_rk_broadcast_total", """
+def _rk_broadcast_total(*operands):
+    # One vector of row lengths and an optional one-based row selector per
+    # operand. Defer an invalid selection or shape to the flatten's checked
+    # branch: preparing shared data must also work when that branch is idle.
+    result = None
+    for lengths, indices in zip(operands[::2], operands[1::2]):
+        if indices is not None:
+            if np.any(indices < 1) or np.any(indices > lengths.size):
+                return StaticInt(-1)
+            lengths = lengths[indices - 1]
+        if result is None:
+            result = lengths
+        else:
+            if result.shape != lengths.shape or np.any(
+                    (result != lengths) & (result != 1) & (lengths != 1)):
+                return StaticInt(-1)
+            result = np.where(result == 1, lengths, result)
+    return StaticInt(int(np.sum(result, dtype=np.int64)))
+"""),
     :min => ("_rk_bound_min", """
 def _rk_bound_min(a):
     \"\"\"The least entry of a prepared integer array, static (0 without entries).\"\"\"
@@ -1981,7 +2001,7 @@ function _jax_prepare_bounds_lines(mod::_JaxModule, lines::Vector{String}, bound
     push!(out, "    " * result * " = " * last_line[length("    return ")+1:end])
     for (name, kind, keys) in bounds
         push!(out, "    " * result * "[\"" * name * "\"] = " * first(_JAX_PREPARED_BOUNDS[kind]) * "(" *
-                   join((result * "[\"" * k * "\"]" for k in keys), ", ") * ")")
+                   join((isempty(k) ? "None" : result * "[\"" * k * "\"]" for k in keys), ", ") * ")")
     end
     push!(out, "    return " * result)
     out
