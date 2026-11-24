@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.380
+
+- A scheduled prefix plate can capture more than 32 operands under
+  `type_stability = :error`. Inline and threaded chunks pass those operands
+  to the generated cell loop in one tuple. The audit follows the same call.
+
 ## 0.1.379
 
 - Native Enzyme preparation checks each opt-in summed-plate rule at the
