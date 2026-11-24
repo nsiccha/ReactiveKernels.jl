@@ -852,6 +852,18 @@ gathered_call(rule, z, index, s, site) = rule(view(z, index), s, site)
         @test dz ≈ expected_z && derivatives[4] ≈ sum(z[index])
         @test isempty(RK._pr_checking_sites(() -> differentiate(partial, zero(z)), sites))
     end
+    # Force the second site's active scalar outside its tape. This refusal
+    # does not depend on the compiler proving an operand constant.
+    pair(covered, partial, z, index, s) =
+        gathered_call(covered, z, index, s, RK._PlateRuleMark(3)) +
+        gathered_call(partial, z, index, s, RK._PlateRuleMark(8))
+    sites = RK._PRSites(RK._PlateRuleMark.([3, 8]), nothing, nothing)
+    remaining = RK._pr_checking_sites(sites) do
+        Enzyme.autodiff(Enzyme.ReverseWithPrimal, pair, Enzyme.Active,
+            Enzyme.Const(covered), Enzyme.Const(partial), Enzyme.Duplicated(z, zero(z)),
+            Enzyme.Const(index), Enzyme.Active(0.6))
+    end
+    @test remaining == Dict(3 => Any)
     # Outside a preparation the general path still gives the gradient.
     dz = zero(z)
     derivatives, value = differentiate(partial, dz)

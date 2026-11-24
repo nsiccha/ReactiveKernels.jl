@@ -143,8 +143,8 @@ end
     end
 end
 
-# Both gathers depend on q in the source. Enzyme can prove that the entries
-# of the second root are constant, so its grouped rule declines the call.
+# Both gathers depend on q in the source. When Enzyme proves the entries of
+# the second root constant, its grouped rule declines the call.
 @kernel constant_entries(q::Vector{Float64}, s::Float64, idx::Vector{Int}) = begin
     live = ReactiveKernels._readonly_gather(q, idx)
     fixed = fill(0.25, length(q))
@@ -165,11 +165,29 @@ end
     kernel = prepare(constant_entries; have=(:q, :s, :idx), want=:total, exemplars=(q, s, idx))
     backend = AutoEnzyme(; mode=Enzyme.Reverse)
     @test count(r -> last(r) == "rule", plate_reverse_report(kernel, (1, 2))) == 2
+    # Ask the loaded Enzyme about the original two-site derivative. Its
+    # activity analysis of fill(0.25, length(q)) differs between LLVM versions.
+    args = (q, s, idx)
+    trial, sites = with_plate_reverse() do
+        RK._pr_prepared_call(nothing, true) do
+            RK._ad_call(kernel, args, (:q, :s))
+        end
+    end
+    @test [mark.ordinal for mark in sites.marks] == [1, 2]
+    call, point, contexts = trial
+    native = RK._ad_prepared_backend(Val(:gradient), backend)
+    accepted = RK._pr_checking_sites(sites) do
+        prep = RK._ad_operator_preparation(Val(:gradient), call, native, point, (), contexts)
+        DifferentiationInterface.value_and_gradient(call, prep, native, point, contexts...)
+        :both
+    end
+    @test accepted === :both || collect(keys(accepted)) == [1]
+    expected_count = accepted === :both ? 2 : 1
     for warm in (false, true)
         prepared = with_plate_reverse() do
             prepare_ad(kernel, backend, q, s, idx; active=(:q, :s), warm)
         end
-        @test site_count(prepared) == 1
+        @test site_count(prepared) == expected_count
         for ids in (idx, idx[1:7], reverse(idx))
             value, (dq, ds) = ad_value_and_gradient(prepared, q, s, ids)
             @test value ≈ sum(sin(s * q[i]) + cos(0.25s) for i in ids)
