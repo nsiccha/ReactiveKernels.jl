@@ -54,6 +54,23 @@ def check(mode):
     np.testing.assert_allclose(fd, 1., atol=2e-6)
     assert solve(q, jnp.array([])) == 0
 
+    def vector_total(p):
+        def field(t, state, args):
+            return jnp.sum(args[0]) / args[0].size - state
+
+        states, status = model._rk_ode_solve(
+            model._RKDopri5(), field, jnp.zeros(1), 0., t, 1,
+            1e-6, 1e-7, 10000, (p,))
+        return states.sum(), status
+
+    p = jnp.zeros(7)
+    (value, status), g = jax.jit(jax.value_and_grad(vector_total, has_aux=True))(p)
+    assert status == 0 and value == 0
+    np.testing.assert_allclose(g, np.full(7, 1 / 7), atol=2e-6)
+
+    values, (dq, dt) = jax.vmap(grad, in_axes=(0, None))(jnp.zeros((0, 3)), t)
+    assert (values.shape, dq.shape, dt.shape) == ((0,), (0, 3), (0, 1))
+
     # The scalar-to-vector RHS must keep an authored derivative at the
     # removable singularity on both the checkpointed and forward paths.
     for op in (identity, reverse_identity):
@@ -74,3 +91,5 @@ def check(mode):
 check("off")
 if model._pl is not None:
     check("interpret")
+    if jax.default_backend() == "gpu":
+        check("auto")

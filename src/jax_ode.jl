@@ -516,20 +516,13 @@ def _rk_coupled_system(rhs, t0, y0, args):
 def _rk_diffrax_control(rhs, y0, values):
     floats = tuple(i for i, v in enumerate(values) if jnp.issubdtype(jnp.result_type(v), jnp.inexact))
     size = y0.size
-    directions = size + sum(int(np.size(values[i])) for i in floats)
-    index = jnp.arange(directions)[:, None]
-
-    def seed(first, n, dtype):
-        return (index == first + jnp.arange(n)).astype(dtype)
-
-    init = jnp.concatenate((y0[None, :], seed(0, size, y0.dtype)))
-    seeds = []
-    first = size
-    for i in floats:
-        shape = jnp.shape(values[i])
-        n = int(np.prod(shape))
-        seeds.append(seed(first, n, jnp.result_type(values[i])).reshape((directions,) + shape))
-        first += n
+    nparams = sum(values[i].size for i in floats)
+    identity = jnp.eye(size, dtype=y0.dtype)
+    init = jnp.concatenate((y0[None, :], identity, jnp.zeros((nparams, size), y0.dtype)))
+    array_inputs = any(values[i].ndim for i in floats)
+    if not array_inputs:
+        index = jnp.arange(size + nparams)
+        seeds = tuple((index == size + j).astype(values[i].dtype) for j, i in enumerate(floats))
 
     def augmented(t, state, values):
         def field(y, params):
@@ -538,8 +531,18 @@ def _rk_diffrax_control(rhs, y0, values):
                 args[i] = p
             return rhs(t, y, tuple(args))
 
-        ydot, sdot = _rk_field_with_sensitivities(field, state[0], tuple(values[i] for i in floats),
-                                                  state[1:], tuple(seeds))
+        params = tuple(values[i] for i in floats)
+        if array_inputs:
+            # Each variation obeys s' = J_y s + J_p dp. Seeding the output
+            # components gives J_p without a square, data-sized input basis.
+            ydot, pull = jax.vjp(field, state[0], params)
+            jy, jp = jax.vmap(pull)(identity)
+            forcing = jnp.concatenate((jnp.zeros_like(identity),
+                                       *(v.reshape(size, v.size // size).T for v in jp)))
+            sdot = jnp.matmul(state[1:], jy.T, precision=jax.lax.Precision.HIGHEST)
+            sdot = jax.lax.stop_gradient(sdot + forcing.astype(y0.dtype))
+        else:
+            ydot, sdot = _rk_field_with_sensitivities(field, state[0], params, state[1:], seeds)
         return jnp.concatenate((ydot[None, :], sdot))
 
     return augmented, init
@@ -770,6 +773,9 @@ def _rk_lane_call(spec, rows, xd, xf, xi):
     L = int(np.prod(lead)) if lead else 1
     S, W, BL = spec.S, spec.W, _RK_LANES
     K = len(rows)
+    if L == 0:
+        out = (jnp.empty(lead + (W, S), spec.dtype), jnp.empty(lead, jnp.int32))
+        return out + (jnp.empty(lead + (W, S, K), spec.dtype),) if K else out
     KP = _rk_pow2(K) if K else 0
     Lp = -(-L // BL) * BL
     take = jnp.minimum(jnp.arange(Lp), L - 1)
