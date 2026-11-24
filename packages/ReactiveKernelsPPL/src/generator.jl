@@ -16,7 +16,24 @@ include("evidence.jl")
 
 
 """
-    build_kernel(plan) -> (; spec, layout, program)
+    KernelBuildCache()
+
+Own the reusable instructions for `build_kernel(bound; cache)`. A package can
+keep this handle in its workload image and use it again after loading. Each
+call assigns the current layout and returns an independently editable graph.
+Direct positional calls over distinct named ports splice the supplied child
+or bind the named Julia function on each build. Quoted arrays and unsupported
+call forms use ordinary construction. The handle holds the last eligible
+assembly program. A consumer can release or evict it by dropping the handle.
+"""
+mutable struct KernelBuildCache
+    const lock::ReentrantLock
+    entry::Union{Nothing,NamedTuple}
+end
+KernelBuildCache() = KernelBuildCache(ReentrantLock(), nothing)
+
+"""
+    build_kernel(plan; cache=nothing) -> (; spec, layout, program)
 
 Validate, assign layout, emit, and evaluate a self-contained `@kernel`
 program for `plan`. `spec` is the `KernelSpec` (callable after `prepare`
@@ -45,14 +62,20 @@ uses its own boundary: `prepare` it and call it through [`prepare_query`](@ref) 
 [`prepare_sampler`](@ref) (which carry the `Base.invokelatest` world-age
 barrier) or wrap those calls in `Base.invokelatest` yourself.
 """
-build_kernel(plan::StructuralPlan) = Base.invokelatest(_build_kernel_latest, plan)
+build_kernel(plan::StructuralPlan; cache::Union{KernelBuildCache,Nothing}=nothing) =
+    Base.invokelatest(_build_kernel_latest, plan, cache)
 
-function _build_kernel_latest(plan::StructuralPlan)
+function _build_kernel_latest(plan::StructuralPlan, cache=nothing)
     validate_plan(plan)
     isbound(plan) || throw(ContractValidationError(
         "[generator] build_kernel requires a bound plan (bind_data first)"))
     layout = assign_layout(plan)
     def = kernel_expr(plan, layout)
+    if cache !== nothing
+        spec = _cached_build_spec(cache, def)
+        _register_packed_check!(spec, layout)
+        return (; spec, layout, program = _program_identity(def))
+    end
     owner = _structural_cache(plan).model_builds.value
     # A package-image workload prepares its example in that image's evaluation
     # module. Keep the example graph out of the model's runtime lookup.
@@ -76,7 +99,7 @@ _build_literal(x::Number) = isprimitivetype(typeof(x)) || x isa Bool
 _build_literal(x::Module) = _build_module(x)
 _build_literal(x::Union{DataType,UnionAll}) = _build_module(parentmodule(x))
 
-function _build_binding(globals, ref::GlobalRef)
+function _build_binding(globals, ref::GlobalRef, literal=_build_literal)
     haskey(globals, ref) && return true
     _build_module(ref.mod) || return false
     # Local ports/variables need no global binding. Record that absence too:
@@ -91,7 +114,7 @@ function _build_binding(globals, ref::GlobalRef)
         else
             # Distribution objects reconstruct their endpoints from frozen snapshots.
             value isa Union{KernelObjectSpec,ReactiveKernels._KernelObjectSkeleton} ||
-                _build_literal(value)
+                literal(value)
         end
         safe || return false
     end
@@ -104,6 +127,116 @@ _build_source!(globals, x::GlobalRef) = _build_binding(globals, x)
 _build_source!(globals, x::Symbol) = _build_binding(globals, GlobalRef(PPLGeneratedModels, x))
 _build_source!(globals, x::QuoteNode) = _build_source!(globals, x.value)
 _build_source!(globals, x::Expr) = all(a -> _build_source!(globals, a), x.args)
+
+# Stage only complete direct calls over named ports. More involved authored
+# code still goes through the ordinary builder, which owns its lowering.
+function _build_call(rhs, index)
+    Meta.isexpr(rhs, :call) && length(rhs.args) >= 2 || return nothing
+    ref = first(rhs.args)
+    ref isa GlobalRef && !_build_module(ref.mod) && isdefined(ref.mod, ref.name) || return nothing
+    args = rhs.args[2:end]
+    all(x -> x isa Symbol, args) && allunique(args) || return nothing
+    f = getglobal(ref.mod, ref.name)
+    if f isa KernelSpec
+        f.call_signature isa ReactiveKernels._KernelEndpointCallSignature && return nothing
+        ReactiveKernels._kernel_inline_signature_supported(f.call_signature) || return nothing
+        ins, outs = Tuple(ReactiveKernels.valtype(v) for v in inputs(f)), Tuple(ReactiveKernels.valtype(v) for v in outputs(f))
+        length(ins) == length(args) && all(_build_type, ins) && all(_build_type, outs) ||
+            return nothing
+    elseif f isa Function && isconst(ref.mod, ref.name) &&
+            (Base.issingletontype(typeof(f)) ||
+             ReactiveKernels._native_generated_function(f) isa ReactiveKernels.RuntimeGeneratedFunction)
+        ins, outs = ntuple(_ -> Any, length(args)), (Any,)
+    else
+        return nothing
+    end
+    (; slot=ReactiveKernels._KernelBuildCall(index, Tuple(args), ins, outs), f)
+end
+
+# A parameterized package type can itself hold a private type or a value.
+function _build_type(T)
+    T === Union{} && return true
+    T isa UnionAll && return _build_type(T.var) && _build_type(T.body)
+    T isa TypeVar && return _build_type(T.lb) && _build_type(T.ub)
+    T isa Union && return _build_type(T.a) && _build_type(T.b)
+    T isa DataType && _build_module(parentmodule(T)) || return false
+    all(p -> p isa Symbol || p isa Int || _build_type(p), T.parameters)
+end
+
+function _build_template(def)
+    body = def.args[2]
+    statements = Any[]
+    calls = Tuple{Expr,Any}[]
+    for stmt in body.args
+        call = Meta.isexpr(stmt, :(=), 2) ? _build_call(stmt.args[2], length(calls)+1) : nothing
+        if call !== nothing
+            rhs = stmt.args[2]
+            push!(calls, (rhs, call.f))
+            stmt = Expr(:(=), stmt.args[1],
+                        Expr(:call, ReactiveKernels._build_call_expr(call.slot), rhs.args[2:end]...))
+        end
+        push!(statements, stmt)
+    end
+    Expr(:(=), def.args[1], Expr(:block, statements...)), calls
+end
+
+# Only package code, safe literal types and generated boundary descriptions
+# may reach the stored constructor. Check the source before expanding it.
+_stage_literal(x) = _build_literal(x)
+_stage_literal(x::Number) = _build_literal(x) && _build_type(typeof(x))
+_stage_literal(T::Type) = _build_type(T)
+
+function _stage_source!(globals, ref::GlobalRef)
+    _build_binding(globals, ref, _stage_literal) || return false
+    binding = globals[ref]
+    binding === nothing && return true
+    value = something(binding)
+    owner = if value isa Union{KernelObjectSpec,ReactiveKernels._KernelObjectSkeleton}
+        DistributionKernelSources
+    elseif value isa ReactiveKernels.DerivativeRule
+        ReactiveKernels
+    else
+        return true
+    end
+    # A caller can install bindings in the evaluation module. Only the
+    # library's own named rules and distribution objects can be stored.
+    ReactiveKernels._global_value(owner, ref.name) === binding
+end
+_stage_source!(globals, x::Symbol) = _stage_source!(globals, GlobalRef(PPLGeneratedModels, x))
+_stage_source!(globals, x) = _stage_literal(x)
+_stage_source!(globals, x::Union{DataType,UnionAll}) = _build_type(x)
+_stage_source!(globals, x::QuoteNode) = _stage_source!(globals, x.value)
+_stage_source!(globals, x::Expr) = all(a -> _stage_source!(globals, a), x.args)
+_stage_source!(globals, x::ReactiveKernels._KernelBuildCall) =
+    all(a -> a isa Symbol, x.arguments) && all(_build_type, x.inputs) && all(_build_type, x.outputs)
+
+function _cached_build_spec(cache, def)
+    template, calls = _build_template(def)
+    entry = lock(cache.lock) do
+        entry = cache.entry
+        if entry !== nothing && _same_program(entry.definition, template) &&
+                all(p -> ReactiveKernels._global_value(p.first.mod, p.first.name) === p.second,
+                    entry.globals)
+            return entry
+        end
+        globals = Dict{GlobalRef,Any}()
+        _stage_source!(globals, template) || return nothing
+        constructor = try
+            ReactiveKernels._stage_build(PPLGeneratedModels, template, length(calls))
+        catch err
+            err isa ReactiveKernels._UnsupportedConstructor || rethrow()
+            return nothing
+        end
+        cache.entry = (; definition=ReactiveKernels._deepcopy_code(template, IdDict()), globals, constructor)
+    end
+    entry === nothing && return _eval_kernel_def(def)
+    try
+        ReactiveKernels._replay_build(entry.constructor, PPLGeneratedModels, calls)
+    catch err
+        err isa ReactiveKernels._UnsupportedConstructor || rethrow()
+        _eval_kernel_def(def)
+    end
+end
 
 function _model_build_spec(owner::_ModelBuilds, def, layout)
     lock(owner.lock) do

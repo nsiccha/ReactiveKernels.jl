@@ -131,4 +131,125 @@ end
     @test isempty(cache.thunks)
 end
 
+vocabulary(x) = sort(unique(x))
+const LEVEL_MODEL = quote
+    classes = vocabulary(group_fit)
+    coef[levels(classes)] .~ Normal.(0, 1)
+    mu = coef[group]
+    y .~ Normal.(mu, 1)
+end
+
+@noinline function build_levels(cache, groups; source=LEVEL_MODEL, check=true)
+    train = (; group=groups, group_fit=groups, y=Float64.(groups))
+    design = (; group=[2, 1], y=[2., 4.])
+    lower(d; kwargs...) = lower_rkppl(source, d; mod=(@__MODULE__), conditioned=(:y,), kwargs...)
+    fit = frozen_values(bind_data(lower(train), train), :classes)
+    plan = bind_data(lower(design; frozen=fit), design)
+    # bind_data's structural-analysis table sweeps dead lowering owners
+    # periodically. Give construction a separate copy to measure what the
+    # build handle itself can keep alive after the caller drops its plan.
+    check || (plan = deepcopy(plan))
+    cached = build_kernel(plan; cache)
+    if check
+        fresh = build_kernel(plan)
+        u = zeros(cached.layout.total)
+        @test cached.layout.total == length(unique(groups)) + (source !== LEVEL_MODEL)
+        @test cached.program == fresh.program
+        target = prepare_query(cached, plan, :sampler)
+        @test Base.invokelatest(target, u) ≈ Base.invokelatest(prepare_query(fresh, plan, :sampler), u)
+        @test_throws PPL.ContractValidationError Base.invokelatest(target, zeros(length(u)+1))
+    end
+    (; levels=WeakRef(plan.frozen.values.classes), design=WeakRef(plan.columns[:y]), graph=WeakRef(cached.spec.graph))
+end
+
+@testset "an explicit constructor uses each frozen layout and releases the fit" begin
+    cache = KernelBuildCache()
+    build_levels(cache, [1, 2, 1])
+    first_entry = cache.entry
+    @test first_entry !== nothing
+    build_levels(cache, [1, 2, 3])
+    # This particular program reads the fitted width from a graph input.
+    @test cache.entry === first_entry
+    extended = copy(LEVEL_MODEL)
+    push!(extended.args, :(extra ~ Normal(0, 1)))
+    build_levels(cache, [1, 2, 3]; source=extended)
+    @test cache.entry !== first_entry
+    @test any(a.run === b.run for a in first_entry.constructor.steps,
+              b in cache.entry.constructor.steps)
+
+    refs = build_levels(cache, [4, 2, 1]; check=false)
+    GC.gc(true)
+    @test refs.levels.value === nothing
+    @test refs.design.value === nothing
+    @test refs.graph.value === nothing
+end
+
+@testset "one constructor splices independent generated helper namespaces" begin
+    cache = KernelBuildCache()
+    cases = fresh_plan.((1., -2., 3.))
+    first_build = build_kernel(cases[1].plan; cache)
+    entry = cache.entry
+    @test entry !== nothing
+    others = fetch.([Threads.@spawn build_kernel(c.plan; cache) for c in cases[2:end]])
+    @test cache.entry === entry
+    builds = [first_build; others]
+    for (built, c, shift) in zip(builds, cases, (1., -2., 3.))
+        target = prepare_query(built, c.plan, :sampler)
+        @test Base.invokelatest(target, [0.5]) ≈ -log(2pi) - (0.5^2 + (0.5+shift)^2)/2
+    end
+    old = kernel_revision(first_build.spec)
+    value!(first_build.spec.graph, :additional, Float64)
+    @test old != kernel_revision(first_build.spec)
+    @test all(v -> v.name !== :additional, values(others[1].spec.graph.values))
+end
+
+@testset "generated native calls get the code of the current namespace" begin
+    cache = KernelBuildCache()
+    source = quote
+        a ~ Normal(0, 1)
+        mu = adjustment(a)
+        y ~ Normal(mu, 1)
+    end
+    entry = nothing
+    for shift in (1., 4.)
+        mod = Module(gensym(:NativeFit))
+        generated = RK.compile(:(x -> x + $shift))
+        Core.eval(mod, :(const adjustment = $generated))
+        data = (; y=0.)
+        plan = bind_data(lower_rkppl(source, data; mod, conditioned=(:y,)), data)
+        built = build_kernel(plan; cache)
+        @test cache.entry !== nothing
+        entry === nothing || @test cache.entry === entry
+        entry = cache.entry
+        target = prepare_query(built, plan, :sampler)
+        @test Base.invokelatest(target, [0.5]) ≈ -log(2pi) - (0.5^2 + (0.5+shift)^2)/2
+    end
+end
+
+@testset "a fitted closure keeps its ordinary build behavior" begin
+    cache = KernelBuildCache()
+    mod = Module(gensym(:FittedCapture))
+    bias = [1.]
+    f = let bias=bias
+        x -> x + only(bias)
+    end
+    @test !PPL._build_type(Vector{T} where T<:typeof(f))
+    @test PPL._build_type(Union{Nothing,Vector{T}} where T)
+    Core.eval(mod, :(const adjustment = $f))
+    source = quote
+        a ~ Normal(0, 1)
+        mu = adjustment(a)
+        y ~ Normal(mu, 1)
+    end
+    data = (; y=0.)
+    for shift in (1., 3.)
+        bias[1] = shift
+        plan = bind_data(lower_rkppl(source, data; mod, conditioned=(:y,)), data)
+        built = build_kernel(plan; cache)
+        @test cache.entry === nothing
+        @test Base.invokelatest(prepare_query(built, plan, :sampler), [0.]) ≈
+            -log(2pi) - shift^2/2
+    end
+end
+
 end

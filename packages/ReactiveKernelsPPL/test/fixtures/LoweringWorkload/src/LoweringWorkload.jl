@@ -27,8 +27,37 @@ end
 lower(design, frozen; cache=CACHE) =
     lower_rkppl(SOURCE, design; mod=DEFINITIONS, conditioned=(:y,), frozen, cache)
 
+@kernel clipped(x::Float64) = begin
+    z::Float64 = x + 1
+    return z
+end
+const CHILD_REVISION = kernel_revision(clipped)
+adjust(x) = 2x
+center(xs) = sum(xs) / length(xs)
+const BUILDS = KernelBuildCache()
+const SUBMODEL_BUILDS = KernelBuildCache()
+const CHILD_MODEL = quote
+    avg = center(x_fit)
+    a ~ Normal(avg, 1)
+    offset = clipped(a)
+    shift = adjust(offset)
+    mu = shift .+ x
+    y .~ Normal.(mu, 1)
+end
+
+function child_plan(xs, design)
+    train = (; x=xs, x_fit=xs, y=copy(xs))
+    lower(d; kwargs...) = lower_rkppl(CHILD_MODEL, d; mod=@__MODULE__, conditioned=(:y,), kwargs...)
+    fit = frozen_values(bind_data(lower(train), train), :avg)
+    bind_data(lower(design; frozen=fit), design)
+end
+
 # Only the cache and program definitions survive the workload.
 if IN_IMAGE
-    lower((; x=[1., 0.], y=zeros(2)), fitted([0., 1., 2.]))
+    let design = (; x=[1., 0.], y=zeros(2))
+        submodel = bind_data(lower(design, fitted([0., 1., 2.])), design)
+        build_kernel(submodel; cache=SUBMODEL_BUILDS)
+        build_kernel(child_plan([0., 1., 2.], design); cache=BUILDS)
+    end
 end
 end
