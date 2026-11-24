@@ -1,10 +1,10 @@
 # JAX translation of the native ODE bridges `rk_ode_rk45_tol` and
 # `rk_ode_bdf_tol` (`native_ode.jl`): adaptive diffrax integration with the
 # caller's tolerances and per-output step budget, outputs from the solver's
-# dense interpolant, and reverse-mode derivatives of the discrete solve
-# (diffrax's `RecursiveCheckpointAdjoint`), so a gradient's accuracy follows
-# the caller's tolerances as the native forward sensitivities' does. A module
-# imports diffrax only when it solves an ODE.
+# dense interpolant, and derivatives of the discrete solve. RK45 integrates
+# first variations for the initial state and RHS inputs. Diffrax uses a
+# checkpointed pullback for active times and stiff solves. A module imports
+# diffrax only when it solves an ODE.
 
 # `_RKOutputBudget` counts accepted steps toward the first requested output
 # after the time a step starts at, and fails a solve whose count for one
@@ -70,8 +70,26 @@ class _RKFiniteTrial:
                 dense, state, diffrax.RESULTS.where(finite, result, diffrax.RESULTS.nonfinite))
 
 
+def _rk_dopri_dense(y0, k0, k1, end, mid):
+    # Build the quartic from stage increments. Expanding y0 into its three
+    # higher coefficients loses precision in both the value and its derivative.
+    return (2 * (k1 - k0) - 8 * end + 16 * mid,
+            5 * k0 - 3 * k1 + 14 * end - 32 * mid,
+            k1 - 4 * k0 - 5 * end + 16 * mid, k0, y0)
+
+
+class _RKDopriInterpolation(diffrax.Dopri5.interpolation_cls):
+    def __init__(self, *, t0, t1, y0, y1, k):
+        self.t0, self.t1 = t0, t1
+        def increment(weights):
+            return jnp.tensordot(jnp.asarray(weights, y0.dtype), k, axes=1, precision=jax.lax.Precision.HIGHEST)
+        self.coeffs = jnp.stack(_rk_dopri_dense(y0, k[0], k[-1], increment(diffrax.Dopri5.tableau.b_sol),
+                                                increment(self.c_mid)))
+
+
 class _RKDopri5(_RKFiniteTrial, diffrax.Dopri5):
     unguarded = diffrax.Dopri5
+    interpolation_cls = _RKDopriInterpolation
 
 
 class _RKKvaerno5(_RKFiniteTrial, diffrax.Kvaerno5):
@@ -476,12 +494,11 @@ def _rk_pow2(n):
     return 1 << max(0, int(n - 1).bit_length())
 
 
-def _rk_field_with_sensitivities(field, y, params, dy, dp):
-    # Each row is one first variation. Only its value feeds error control.
-    # The ordinary derivative of the state still flows through the original RHS.
+def _rk_field_with_sensitivities(field, y, params, dy, dp, control_only=True):
+    # Each row is one first variation through the authored right-hand side.
     value, push = jax.linearize(field, y, params)
     slopes = jax.vmap(push)(dy, dp)
-    return value, jax.tree.map(jax.lax.stop_gradient, slopes)
+    return value, jax.tree.map(jax.lax.stop_gradient, slopes) if control_only else slopes
 
 
 def _rk_coupled_system(rhs, t0, y0, args):
@@ -513,7 +530,7 @@ def _rk_coupled_system(rhs, t0, y0, args):
     return flat_rhs, values
 
 
-def _rk_diffrax_control(rhs, y0, values):
+def _rk_diffrax_control(rhs, y0, values, control_only=True):
     floats = tuple(i for i, v in enumerate(values) if jnp.issubdtype(jnp.result_type(v), jnp.inexact))
     size = y0.size
     nparams = sum(values[i].size for i in floats)
@@ -540,9 +557,11 @@ def _rk_diffrax_control(rhs, y0, values):
             forcing = jnp.concatenate((jnp.zeros_like(identity),
                                        *(v.reshape(size, v.size // size).T for v in jp)))
             sdot = jnp.matmul(state[1:], jy.T, precision=jax.lax.Precision.HIGHEST)
-            sdot = jax.lax.stop_gradient(sdot + forcing.astype(y0.dtype))
+            sdot = sdot + forcing.astype(y0.dtype)
+            if control_only:
+                sdot = jax.lax.stop_gradient(sdot)
         else:
-            ydot, sdot = _rk_field_with_sensitivities(field, state[0], params, state[1:], seeds)
+            ydot, sdot = _rk_field_with_sensitivities(field, state[0], params, state[1:], seeds, control_only)
         return jnp.concatenate((ydot[None, :], sdot))
 
     return augmented, init
@@ -678,13 +697,12 @@ def _rk_lane_kernel(spec, rows):
             tnext_new = jnp.where(next_t1 > floor, tclip, next_t1)
             code = jnp.where(~keep & ((tnext_new >= tnext) | (tnext_new <= tprev)), _RK_FAILED, code)
             # dense output over the step just taken
-            ymid = [y[s] + _rk_lane_dot(_RK_DOPRI5_MID, [kj[s] for kj in k]) for s in range(S)]
             dense = []
             for s in range(S):
-                a0, a1, km = y[s], y1[s], ymid[s]
-                g0, g1 = k[0][s], k[-1][s]
-                dense.append((2 * (g1 - g0) - 8 * (a1 + a0) + 16 * km, 5 * g0 - 3 * g1 + 18 * a0 + 14 * a1 - 32 * km,
-                              g1 - 4 * g0 - 11 * a0 - 5 * a1 + 16 * km, g0, a0))
+                stages = [kj[s] for kj in k]
+                end = _rk_lane_dot(_RK_DOPRI5_A[-1], stages[:-1])
+                mid = _rk_lane_dot(_RK_DOPRI5_MID, stages)
+                dense.append(_rk_dopri_dense(y[s], stages[0], stages[-1], end, mid))
             ys = [jnp.where(keep, a, b) for a, b in zip(y1, y)]
             fs = [jnp.where(keep, a, b) for a, b in zip(f1, f0)]
             new = (tprev_new, tnext_new, ys[:S], fs[:S])
@@ -1039,15 +1057,92 @@ def _rk_check_ode_rtol_batch(size, batched, reltol):
     return (), ()
 
 
-def _rk_diffrax_system(solver, rhs, y0, args, ts, rtol, atol, dtmin):
+def _rk_diffrax_system(solver, rhs, y0, args, ts, rtol, atol, dtmin, columns=()):
     if isinstance(solver, _RKDopri5):
-        rhs, y0 = _rk_diffrax_control(rhs, y0, args)
+        rhs, y0 = _rk_diffrax_control(rhs, y0, args, control_only=not columns)
         pid = diffrax.PIDController(rtol=rtol, atol=atol, norm=_rk_control_norm)
-        saveat = diffrax.SaveAt(ts=ts, fn=lambda t, y, p: y[0])
+        def save(t, y, args):
+            if columns:
+                return jnp.concatenate((y[:1], *(y[rows] for rows in columns)))
+            return y[0]
+        saveat = diffrax.SaveAt(ts=ts, fn=save)
     else:
         pid = diffrax.PIDController(rtol=rtol, atol=atol, dtmin=dtmin, force_dtmin=False)
         saveat = diffrax.SaveAt(ts=ts)
     return diffrax.ODETerm(rhs), y0, pid, saveat
+
+
+def _rk_dopri_outputs(inputs, times, rhs, solver, setup, columns=()):
+    y0, args = inputs
+    t0, last, ts = times
+    rtol, atol, dt0, limit = setup
+    term, initial, pid, saveat = _rk_diffrax_system(solver, rhs, y0, args, ts, rtol, atol, None, columns)
+    sol = diffrax.diffeqsolve(
+        term, solver, t0, last, dt0, initial, args=args, saveat=saveat,
+        stepsize_controller=_RKOutputBudget(pid, ts, limit, False),
+        max_steps=2 ** 31 - 1, adjoint=diffrax.RecursiveCheckpointAdjoint(checkpoints=64), throw=False)
+    code = jnp.where(sol.result == diffrax.RESULTS.successful, _RK_OK,
+                     jnp.where(sol.result == diffrax.RESULTS.max_steps_reached, _RK_BUDGET, _RK_FAILED))
+    ys, partials = (sol.ys[:, 0], sol.ys[:, 1:]) if columns else (sol.ys, None)
+    return ys, (partials, code.astype(jnp.int32))
+
+
+@eqx.filter_custom_vjp
+def _rk_dopri_solve(diff, rhs, solver, setup):
+    ys, (_, code) = _rk_dopri_outputs(*diff, rhs, solver, setup)
+    return ys, code
+
+
+@_rk_dopri_solve.def_fwd
+def _rk_dopri_solve_fwd(perturbed, diff, rhs, solver, setup):
+    inputs, times = diff
+    y0, args = inputs
+    (py0, pargs), ptimes = perturbed
+    # Track every direction for error control, but save only the columns
+    # the caller needs. The first row of the augmented state is the value.
+    columns = []
+    start = 1
+    for active, value in zip((py0,) + pargs, (y0,) + args):
+        if jnp.issubdtype(value.dtype, jnp.inexact):
+            if active:
+                columns.append(slice(start, start + value.size))
+            start += value.size
+
+    def outputs(times):
+        return _rk_dopri_outputs(inputs, times, rhs, solver, setup, columns)
+
+    if any(ptimes):
+        # Time derivatives include endpoint clipping and dense interpolation.
+        ys, pull, (partials, code) = jax.vjp(outputs, times, has_aux=True)
+    else:
+        ys, (partials, code) = outputs(times)
+        pull = None
+    return (ys, code), (partials, pull)
+
+
+@_rk_dopri_solve.def_bwd
+def _rk_dopri_solve_bwd(residual, grad_obj, perturbed, diff, rhs, solver, setup):
+    gys = grad_obj[0]
+    if gys is None:
+        return jax.tree.map(lambda _: None, diff)
+    partials, pull = residual
+    (y0, args), times = diff
+    (py0, pargs), ptimes = perturbed
+    if partials is not None:
+        # A late near-equilibrium step can amplify the reverse cotangent.
+        # Contract the forward variations already integrated on that mesh.
+        g = jnp.einsum("ws,wks->k", gys, partials, precision=jax.lax.Precision.HIGHEST)
+    grads = []
+    start = 0
+    for active, value in zip((py0,) + pargs, (y0,) + args):
+        if active:
+            end = start + value.size
+            grads.append(g[start:end].reshape(value.shape).astype(value.dtype))
+            start = end
+        else:
+            grads.append(None)
+    gt = pull(gys)[0] if pull is not None else (None,) * len(times)
+    return (grads[0], tuple(grads[1:])), tuple(v if active else None for v, active in zip(gt, ptimes))
 
 
 def _rk_ode_solve(solver, rhs, y0, t0, ts, n, reltol, abstol, maxsteps, args, active=True):
@@ -1088,13 +1183,16 @@ def _rk_ode_solve(solver, rhs, y0, t0, ts, n, reltol, abstol, maxsteps, args, ac
     coupled = isinstance(solver, _RKDopri5)
     dt0 = None
     if coupled:
+        # The PID stops derivatives through the error-based step-size factor.
+        rtol, atol = jax.lax.stop_gradient((rtol, atol))
         rhs, args = _rk_coupled_system(rhs, t0, y0, args)
         origin = jax.lax.stop_gradient(t0)
         dt0 = jnp.maximum(jnp.asarray(0.01, dtype), jnp.nextafter(origin, jnp.inf) - origin)
 
     def diffrax_path():
-        # RK45 has already lifted every capture into args for its controller.
-        field = rhs if coupled else eqx.filter_closure_convert(rhs, t0, y0, args)
+        if coupled:
+            return _rk_dopri_solve(((y0, args), (t0, last, ts)), rhs, solver, (rtol, atol, dt0, limit))
+        field = eqx.filter_closure_convert(rhs, t0, y0, args)
         term, initial, pid, saveat = _rk_diffrax_system(solver, field, y0, args, ts, rtol, atol, dtmin)
 
         def outputs(method, check_trials=False):
@@ -1107,14 +1205,9 @@ def _rk_ode_solve(solver, rhs, y0, t0, ts, n, reltol, abstol, maxsteps, args, ac
         def plain_outputs():
             return outputs(solver.unguarded(), check_trials=True)
 
-        if coupled:
-            # Guard trials in the integration that produces the values. A
-            # separate status probe can take different steps after rounding.
-            ys, result = outputs(solver)
-        else:
-            _, probe_result = plain_outputs()
-            all_finite = eqx.internal.unvmap_all(probe_result == diffrax.RESULTS.successful)
-            ys, result = jax.lax.cond(all_finite, plain_outputs, lambda: outputs(solver))
+        _, probe_result = plain_outputs()
+        all_finite = eqx.internal.unvmap_all(probe_result == diffrax.RESULTS.successful)
+        ys, result = jax.lax.cond(all_finite, plain_outputs, lambda: outputs(solver))
         return ys, jnp.where(result == diffrax.RESULTS.successful, _RK_OK,
                              jnp.where(result == diffrax.RESULTS.max_steps_reached, _RK_BUDGET, _RK_FAILED)).astype(jnp.int32)
 

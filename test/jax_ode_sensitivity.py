@@ -54,18 +54,30 @@ def check(mode):
     np.testing.assert_allclose(fd, 1., atol=2e-6)
     assert solve(q, jnp.array([])) == 0
 
-    def vector_total(p):
+    if mode == "off" and q.dtype == jnp.float32:
+        # Meshes differ across nearby starting points. In the long equilibrium
+        # tail the checkpointed parameter contributions can cancel by 3e-4.
+        start = jnp.linspace(-.05, .17, 80)
+        qs = jnp.stack([-.2 + 1e-4 * start, .7 + 1e-3 * start, start], axis=1)
+        times = jnp.stack([.5 + .003 * start, 1 + .003 * start, 3 + .003 * start, 250 + start], axis=1)
+        _, (dq, _) = jax.jit(jax.vmap(jax.value_and_grad(model.kernel, (0, 1))))(qs, times)
+        _, (want, _) = jax.vmap(analytic)(qs, times)
+        np.testing.assert_allclose(dq, want, atol=1e-5)
+
+    def vector_total(p, rtol, atol):
         def field(t, state, args):
             return jnp.sum(args[0]) / args[0].size - state
 
         states, status = model._rk_ode_solve(
             model._RKDopri5(), field, jnp.zeros(1), 0., t, 1,
-            1e-6, 1e-7, 10000, (p,))
+            rtol, atol, 10000, (p,))
         return states.sum(), status
 
     p = jnp.zeros(7)
-    (value, status), g = jax.jit(jax.value_and_grad(vector_total, has_aux=True))(p)
+    vector_grad = jax.jit(jax.value_and_grad(vector_total, (0, 1, 2), has_aux=True))
+    (value, status), (g, dr, da) = vector_grad(p, 1e-6, 1e-7)
     assert status == 0 and value == 0
+    assert dr == 0 and da == 0
     np.testing.assert_allclose(g, np.full(7, 1 / 7), atol=2e-6)
 
     values, (dq, dt) = jax.vmap(grad, in_axes=(0, None))(jnp.zeros((0, 3)), t)

@@ -19,8 +19,10 @@ are recorded in the git history only.
 ## 0.1.381
 
 - Exported JAX RK45 solves control local error in the state and its
-  sensitivities to the initial state and floating-point RHS inputs. This
-  also applies to value-only calls and can increase their cost and step count.
+  sensitivities to the initial state and floating-point RHS inputs.
+  Gradients use those forward sensitivities to avoid cancellation near an
+  equilibrium. Value-only calls also track them, which can increase their
+  cost and step count.
   Regenerate an exported module to pick up the change.
 
 ## 0.1.380
