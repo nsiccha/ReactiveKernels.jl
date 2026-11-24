@@ -16,6 +16,12 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.258
+
+`prepare_cell_factors` keeps a gathered sum in the outer likelihood when
+computing its row labels requires the sampled point. This preserves checks
+such as validating the indices against the length of a sampled vector.
+
 ## 0.1.257
 
 `prepare_partition` can group the coefficient rows that a unit's common
