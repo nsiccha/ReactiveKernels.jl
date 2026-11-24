@@ -240,8 +240,8 @@ function _pr_expand_group_reads(ast, positions)
 end
 
 function _pr_group_broadcast_expr(positions, projections, types, dispatch)
-    slotted = !isempty(types) && types[end] === _PlateTapeSlot
-    count = length(types) - slotted
+    sited = _pr_sited(types)
+    count = length(types) - sited
     original = :($dispatch(rule.original, args))
     all(i -> types[i] <: _PRScalarPlusVector, positions) || return original
     for p in projections
@@ -259,8 +259,11 @@ function _pr_group_broadcast_expr(positions, projections, types, dispatch)
         push!(leaves, :(Val(typeof($cells))))
     end
     append!(leaves, (:(getfield(getfield(args, $i).broadcast.args, 1)) for i in positions))
-    slotted && length(leaves) < _PLATE_CALL_MAX_ARGUMENTS &&
+    # The expanded call keeps its site record, or the original call is made.
+    if sited
+        length(leaves) < _PLATE_CALL_MAX_ARGUMENTS || return original
         push!(leaves, :(getfield(args, $(count + 1))))
+    end
     condition = foldl((a, b) -> :($a && $b), checks)
     :($condition ? $dispatch(rule.expanded, ($(leaves...),)) : $original)
 end

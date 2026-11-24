@@ -253,7 +253,7 @@ end
 
 # Check the derivative native Enzyme compiles for `prepared` with the settings
 # of the preparation in progress, or warm it (`warm = true`, a gradient only)
-# where nothing is checked.
+# where nothing is checked. Returns whether it evaluated the operator.
 function _ad_check_derivative(op::Val, prepared, point, seeds, contexts, warm::Bool)
     level, allocations = _type_stability_level(), _ad_allocations()
     if (level === :all || allocations !== :ignore) &&
@@ -263,7 +263,7 @@ function _ad_check_derivative(op::Val, prepared, point, seeds, contexts, warm::B
             report = _ad_evaluation_report(reporter, op, prepared, point, seeds, contexts)
             _report_derivative(report, typeof(prepared.call),
                                level === :all ? _type_stability() : :ignore, allocations)
-            return nothing
+            return true
         end
         (_type_stability() === :error || allocations !== :ignore) &&
             @warn "ReactiveKernels does not check the derivative native Enzyme " *
@@ -273,7 +273,7 @@ function _ad_check_derivative(op::Val, prepared, point, seeds, contexts, warm::B
                   :derivative_unchecked
     end
     warm && _ad_warm!(prepared, point, contexts)
-    nothing
+    warm
 end
 
 # Evaluate the operator once inside the report. Inferring the evaluation first

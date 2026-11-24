@@ -46,15 +46,18 @@ function _napr_structure(x::Expr)
      (x.head in (:for, :while)) + sum(last, children; init = 0))
 end
 
+# The AD body as a preparation builds it: generated rules are installed only
+# for a preparation, which collects their site records.
+_napr_preparing(f) = ReactiveKernels._pr_collecting_marks(f, ReactiveKernels._PlateRuleMark[])
 function _napr_installed(k::NonAllocatingKernel, u, enabled)
     with_plate_reverse(enabled) do
-        f, _, _, _, _ = ReactiveKernels._ad_na_program(k, 1, (u,))
+        f, _, _, _, _ = _napr_preparing(() -> ReactiveKernels._ad_na_program(k, 1, (u,)))
         _napr_rule_count(ReactiveKernels._program_expression(f))
     end
 end
 function _napr_installed(k::PreparedKernel, u, enabled)
     with_plate_reverse(enabled) do
-        _napr_rule_count(ReactiveKernels._ad_inline_plate_programs(k, 1).ast)
+        _napr_rule_count(_napr_preparing(() -> ReactiveKernels._ad_inline_plate_programs(k, 1).ast))
     end
 end
 
@@ -99,10 +102,12 @@ end
                 end
                 if n != 0
                     ast = with_plate_reverse(enabled) do
-                        q.kernel isa NonAllocatingKernel ?
-                            ReactiveKernels._program_expression(first(
-                                ReactiveKernels._ad_na_program(q.kernel, 1, (u,)))) :
-                            ReactiveKernels._ad_inline_plate_programs(q.kernel, 1).ast
+                        _napr_preparing() do
+                            q.kernel isa NonAllocatingKernel ?
+                                ReactiveKernels._program_expression(first(
+                                    ReactiveKernels._ad_na_program(q.kernel, 1, (u,)))) :
+                                ReactiveKernels._ad_inline_plate_programs(q.kernel, 1).ast
+                        end
                     end
                     structure = _napr_structure(ast)
                     @test last(structure) > 0

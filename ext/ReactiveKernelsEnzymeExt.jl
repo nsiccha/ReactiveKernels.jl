@@ -970,34 +970,34 @@ end
 
 
 # ------------------------------------------------ generated plate reverse ----
-# `_PlateSumRuleBody` and `_PlateSumRuleOnePass` (src/plate_reverse.jl): the
-# storage-compatible calls of a summed plate program (`_PlateSumRule`, their
-# `rule`) with a reverse generated from its own code. The generated sweep runs
-# the cells once and returns the value and the scalar operands' cotangents,
-# adding each batched operand's cotangent into a shadow. Two schedules use it:
+# The augmented primal of a selected one-pass call computes the value and
+# unit-seed partials together. The reverse scales the buffered partials by its
+# seed and adds them into the shadows' storage. It reads the tape and no
+# operand entry, so operands the caller overwrites after the primal do not
+# matter. A buffer has one entry per entry of its operand's storage: a gather,
+# or a partition's composed gather, scatters into a slice as long as the
+# gathered storage, and any other operand into one as long as itself.
 #
-# - Two passes (`_PlateSumRuleBody`): the augmented primal runs the program;
-#   the reverse pass runs the sweep with the seed straight into the shadows.
-# - One pass (`_PlateSumRuleOnePass`): the augmented primal computes the value
-#   and unit-seed partials together. The reverse scales the buffered partials
-#   by its seed. Grouped tapes aggregate gathered gradients into their parents.
-#   Logical tapes retain one partial per operand entry, using storage leased
-#   from the preparation. Unsupported annotations take the two-pass route.
-#
-# A call whose activity the generated reverse does not take runs the program
-# and differentiates it with Enzyme's ordinary reverse instead.
-
-using ReactiveKernels: _PlateSumRuleBody, _PlateSumRuleOnePass, _pr_gather_value,
+# The program chooses the schedule on operand types and sizes before the
+# backend sees the call (`_pr_target_expr`). Only the backend knows how it
+# annotates each operand. A call it annotates in a way the tape does not cover
+# (an operand it treats as active that the rule does not differentiate, a
+# batched reverse) runs the program, takes the general path below and records
+# the refusal: in the call's tape slot, or for the preparation that is
+# evaluating a marked call. A preparation reads that after one evaluation at
+# its exemplar and then prepares the plates inline (`_pr_verified_preparation`).
+using ReactiveKernels: _PlateSumRuleOnePass, _pr_gather_value,
     _pr_scalar_positions, _pr_batched_positions, _pr_tape_layout, _CellArray, _PlateTapeSlot,
     _pr_take_tape!, _pr_return_tape!, _pr_projections, _pr_ragged_buffer, _PRRaggedBuffer,
-    _pr_group_view
+    _pr_group_view, _pr_gather_root, _pr_regather, _pr_mark_declined!, _PlateRuleSite
 
-# A one-pass call made by a preparation that owns AD caches ends with its tape
-# slot (`_PlateTapeSlot`, src/plate_reverse.jl), which is no operand of the
-# program. `_pr_operand_args` are the program operands' annotations, `_pr_slot`
-# the slot (or `nothing`), and `_pr_with_slot` appends the slot's empty
-# cotangent to a reverse return built for the operands.
-_pr_slotted(::Type{<:Annotation{_PlateTapeSlot}}) = true
+# A one-pass call installed by a preparation ends with its site record
+# (src/plate_reverse.jl), which is no operand of the program: the tape slot of
+# a preparation that owns AD caches (`_PlateTapeSlot`), or a mark
+# (`_PlateRuleMark`). `_pr_operand_args` are the program operands' annotations,
+# `_pr_slot` the record (or `nothing`), and `_pr_with_slot` appends the record's
+# empty cotangent to a reverse return built for the operands.
+_pr_slotted(::Type{<:Annotation{<:_PlateRuleSite}}) = true
 _pr_slotted(::Type) = false
 _pr_slotted_args(types) = !isempty(types) && _pr_slotted(types[end])
 @generated function _pr_operand_args(args::Tuple)
@@ -1026,18 +1026,6 @@ function _index_run_refusal()
     isdefined(Enzyme, :has_dogfood_repair) &&
         Enzyme.has_dogfood_repair(:unchanged_custom_rule_roots) && return nothing
     _INDEX_RUN_ROOTS_REFUSAL
-end
-
-function EnzymeRules.augmented_primal(
-        config::RevConfig, rule::Const{<:_PlateSumRuleBody}, ::Type{RT},
-        args::Vararg{Annotation,N}) where {RT,N}
-    values = _pr_values(args)
-    primal = rule.val(values...)
-    if RT <: Const || all(a -> a isa Const, args)
-        return AugmentedReturn(needs_primal(config) ? primal : nothing, nothing, nothing)
-    end
-    tape = _pr_tape(Val(overwritten(config)), values)
-    AugmentedReturn(needs_primal(config) ? primal : nothing, nothing, tape)
 end
 
 # The one-pass tape is one `Vector{Float64}` holding the batched operands'
@@ -1069,15 +1057,16 @@ function EnzymeRules.augmented_primal(
     if RT <: Const || all(a -> a isa Const, args)
         return AugmentedReturn(needs_primal(config) ? primal : nothing, nothing, nothing)
     end
+    _pr_mark_declined!(_pr_slot(annotations))
     tape = _pr_tape(Val(overwritten(config)), values)
     AugmentedReturn(needs_primal(config) ? primal : nothing, nothing, tape)
 end
 
 # Whether a one-pass call can take the vector tape, on types alone: at least
 # one batched operand is a gathered `Float64` view (`_pr_gather_value`) and every
-# other is constant, every active scalar is a `Float64`, and no array operand
-# may be overwritten before the reverse pass (which, in two passes, reads the
-# operands themselves).
+# other is constant, and every active scalar is a `Float64`. The reverse pass
+# reads the tape and the shadows' storage and no operand entry, so operands
+# the caller overwrites after the primal do not matter.
 @generated function _pr_one_pass(::Val{true}, ::Val{S}, ::Val{B}, ::Val{O}, args::Tuple, ::Val) where {S,B,O}
     gathered = false
     for b in B
@@ -1091,15 +1080,12 @@ end
         T = args.parameters[s]
         T <: Const || T <: Active{Float64} || return :(false)
     end
-    for (i, T) in enumerate(args.parameters)
-        O[i + 1] && !(T <: Active) && !(T.parameters[1] <: Number) && return :(false)
-    end
     :(true)
 end
 
-# A logical buffer has one partial per operand entry. Contents of dense
-# inputs may change after the sweep. An indirect view, however, needs its
-# index map again when the reverse scatters into the shadow.
+# A logical buffer has one partial per entry of the operand's storage: a
+# gather scatters into it during the sweep, as it does in the grouped layout,
+# so the reverse reads no index and no operand entry here either.
 @generated function _pr_one_pass(::Val{:logical}, ::Val{S}, ::Val{B}, ::Val{O},
                                  args::Tuple, ::Val{G}) where {S,B,O,G}
     for b in B
@@ -1119,14 +1105,14 @@ end
                 continue
             end
         end
-        V <: SubArray{Float64,1,<:AbstractVector} && !O[b + 1] || return :(false)
+        V <: SubArray{Float64,1,<:AbstractVector} || return :(false)
     end
     all(s -> args.parameters[s] <: Union{Const,Active{Float64}}, S) ? :(true) : :(false)
 end
 
-_pr_buffer_size(::Val{true}, a) = length(parent(a.dval))
+_pr_buffer_size(::Val{true}, a) = length(_pr_gather_root(a.dval))
 _pr_buffer_size(::Val{:logical}, a::Active) = length(a.val)
-_pr_buffer_size(::Val{:logical}, a::Union{Duplicated,DuplicatedNoNeed}) = length(a.dval)
+_pr_buffer_size(::Val{:logical}, a::Union{Duplicated,DuplicatedNoNeed}) = length(_pr_gather_root(a.dval))
 const _PRRaggedOperand = Union{Duplicated{Vector{Vector{Float64}}},DuplicatedNoNeed{Vector{Vector{Float64}}}}
 _pr_buffer_size(::Val{:logical}, a::_PRRaggedOperand) =
     length(a.dval) + 1 + sum(length, a.dval; init = 0)
@@ -1135,11 +1121,17 @@ _pr_buffer_size(::Val{:logical}, a::_PRRaggedOperand) =
                 if !(args.parameters[b] <: Const)]
     Expr(:call, :+, 0, terms...)
 end
-# Each active batched operand gets a disjoint slice. A grouped buffer uses
-# the operand's own indices and retains its slice as its parent for
-# `_pr_gather_dot`. Logical buffers address their slices in cell order.
-@inline _pr_buffer_view(::Val{true}, a, slice) = Base.SubArray(slice, parentindices(a.val))
+# Each active batched operand gets a disjoint slice with one entry per entry
+# of its storage. A gather's buffer uses the operand's own indices over that
+# slice, in both layouts, and retains the slice as its root for
+# `_pr_gather_dot`. Every other buffer is addressed in cell order.
+@inline _pr_buffer_view(::Val{true}, a, slice) = _pr_regather(slice, a.val)
 @inline _pr_buffer_view(::Val{:logical}, a, slice) = slice
+@inline _pr_buffer_view(::Val{:logical}, a::Union{Duplicated,DuplicatedNoNeed}, slice) =
+    _pr_entry_buffer(slice, a.val)
+@inline _pr_entry_buffer(slice, x) = slice
+@inline _pr_entry_buffer(slice, x::SubArray) =
+    _pr_gather_value(typeof(x)) ? _pr_regather(slice, x) : slice
 @inline _pr_buffer_view(::Val{:logical}, a::_PRRaggedOperand, slice) =
     _pr_ragged_buffer(slice, a.dval)
 @generated function _pr_tape_buffers(layout::Val, ::Val{B}, args::Tuple, tape::Vector{Float64}) where {B}
@@ -1178,8 +1170,8 @@ end
 @inline _pr_scaled_shadow(layout, arg, ::Nothing, ȳ) = nothing
 @inline _pr_scaled_shadow(::Val{:logical}, arg::Active{T}, buffer::SubArray, ȳ) where {T<:Tuple} =
     ntuple(k -> ȳ * @inbounds(buffer[k]), Val(fieldcount(T)))
-@inline _pr_buffer_storage(::Val{true}, x) = parent(x)
-@inline _pr_buffer_storage(::Val{:logical}, x) = x
+@inline _pr_buffer_storage(::Val{true}, x) = _pr_gather_root(x)
+@inline _pr_buffer_storage(::Val{:logical}, x) = _pr_gather_root(x)
 @inline function _pr_scaled_shadow(::Val{:logical}, arg::_PRRaggedOperand, buffer::_PRRaggedBuffer, ȳ)
     for i in eachindex(arg.dval)
         row = arg.dval[i]
@@ -1319,7 +1311,7 @@ function _pr_ordinary_reverse(program::F, ȳ, tape, args::Tuple) where {F}
 end
 
 function EnzymeRules.reverse(
-        config::RevConfig, rule::Const{<:Union{_PlateSumRuleBody,_PlateSumRuleOnePass}},
+        config::RevConfig, rule::Const{<:_PlateSumRuleOnePass},
         dret, tape, annotations::Vararg{Annotation,N}) where {N}
     args = _pr_operand_args(annotations)
     r = rule.val.rule

@@ -28,9 +28,12 @@ function structure(x::Expr)
     (1 + sum(first, children; init = 0),
      (x.head in (:for, :while)) + sum(last, children; init = 0))
 end
-ad_ast(k::PreparedKernel, args) = RK._ad_inline_plate_programs(k, (1, 3)).ast
+# The AD body as a preparation builds it: generated rules are installed only
+# for a preparation, which collects their site records.
+preparing(f) = RK._pr_collecting_marks(f, RK._PlateRuleMark[])
+ad_ast(k::PreparedKernel, args) = preparing(() -> RK._ad_inline_plate_programs(k, (1, 3)).ast)
 ad_ast(k::NonAllocatingKernel, args) =
-    RK._program_expression(first(RK._ad_na_program(k, (1, 3), args)))
+    preparing(() -> RK._program_expression(first(RK._ad_na_program(k, (1, 3), args))))
 
 @testset "plate reverse preserves native direct reads at either preparation stage" begin
     backend = AutoEnzyme(; mode = Enzyme.Reverse)

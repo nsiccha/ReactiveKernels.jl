@@ -234,7 +234,10 @@ end
             k = prepare(grouped_loss)
             if on
                 @test last(only(plate_reverse_report(k, (2, 3, 4)))) == "rule"
-                count, depth, _ = structure(RK._ad_inline_plate_programs(k, (2, 3, 4)).ast)
+                # The body a preparation builds: rules are installed for one.
+                count, depth, _ = structure(RK._pr_collecting_marks(RK._PlateRuleMark[]) do
+                    RK._ad_inline_plate_programs(k, (2, 3, 4)).ast
+                end)
                 @test count >= depth >= 2
             end
             prepare_ad(k, backend, args...; active)
@@ -266,7 +269,9 @@ end
         shapes = map((args, large)) do inputs
             k = prepare(grouped_loss; exemplars = inputs)
             @test last(only(plate_reverse_report(k, (2, 3, 4)))) == "rule"
-            structure(RK._ad_inline_plate_programs(k, (2, 3, 4)).ast)
+            structure(RK._pr_collecting_marks(RK._PlateRuleMark[]) do
+                RK._ad_inline_plate_programs(k, (2, 3, 4)).ast
+            end)
         end
         @test shapes[1] == shapes[2]
         for indices in (groups, [Int[], [2, 1], [3, 3], [2]])

@@ -92,7 +92,7 @@ end
     @test length(slot.tape) == length(original) + 1
 end
 
-@testset "a sparse gather tapes its entries and adds repeated gradients" begin
+@testset "a sparse gather tapes its storage and adds repeated gradients" begin
     ast = split_program()
     rexpr, _, _ = RK._pr_program_reverse(ast, [:x, :s], RK, Dict{Symbol,Any}())
     primal, sweep = RK.compile(ast), RK.compile(rexpr)
@@ -114,6 +114,8 @@ end
     @test value == 1.5sum(x)
     @test dx == expected
     @test cot[2] == -2.0sum(x)
-    @test length(slot.tape) == length(idx) + 1
+    # One partial per entry of the gathered storage: the sweep scatters into
+    # it, so the reverse reads no index and no operand entry.
+    @test length(slot.tape) == length(parent_values) + 1
 end
 end

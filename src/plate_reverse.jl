@@ -363,6 +363,11 @@ function _pr_result_partials(f, y, args)
     return nothing
 end
 
+# An argument that selects a value and carries no derivative of its own: the
+# condition of `ifelse`. A predicate over active values (`logit > 0`) is such a
+# condition, so its dependence on them is no reason to refuse the cell.
+_pr_inert_argument(f, k::Int) = f === Base.ifelse && k == 1
+
 const _PR_DIFFRULE_MODULES = (:Base, :SpecialFunctions, :LogExpFunctions, :NaNMath)
 
 # The module symbol and name DiffRules registers `f` under, if any.
@@ -544,6 +549,32 @@ end
 end
 _pr_wide_quotient(factors, d) = prod(Base.front(factors); init = 1) * (last(factors) / d)
 
+# The same quotients in plain arithmetic, for operands whose products stay in
+# the normal range. A product that neither overflows nor loses bits to
+# underflow is exact to rounding, and scaling by powers of two changes no
+# rounding, so these return the bits of the separate-exponent forms (a
+# subnormal quotient is rounded once here and twice there). A zero operand
+# gives the same signed zero. Anything else takes the wide form: a product
+# that overflowed, one that underflowed from nonzero operands, a value that is
+# not finite, or a scalar type other than `Float64`.
+@inline _pr_in_range(t::Float64) = floatmin(Float64) <= abs(t) <= floatmax(Float64)
+@inline _pr_plain_product(acc::Float64, ok::Bool, ::Tuple{}) = (acc, ok)
+@inline function _pr_plain_product(acc::Float64, ok::Bool, factors::Tuple)
+    f = Float64(first(factors))
+    t = acc * f
+    _pr_plain_product(t, ok & (_pr_in_range(t) | (iszero(t) & (iszero(acc) | iszero(f)))),
+                      Base.tail(factors))
+end
+@inline _pr_plain_scalars(::Tuple{}) = true
+@inline _pr_plain_scalars(xs::Tuple) =
+    first(xs) isa Union{Float64,Base.BitInteger,Bool} && _pr_plain_scalars(Base.tail(xs))
+@inline function _pr_quotient(factors::Tuple, d)
+    _pr_plain_scalars(factors) && d isa Union{Float64,Base.BitInteger,Bool} ||
+        return _pr_wide_quotient(factors, d)
+    t, ok = _pr_plain_product(Float64(first(factors)), true, Base.tail(factors))
+    ok ? t / Float64(d) : _pr_wide_quotient(factors, d)
+end
+
 # Several incoming cotangent terms can cancel. Add their normalized
 # products before contracting the quotient partial, even when an individual
 # term exceeds the scalar type's exponent range.
@@ -573,13 +604,52 @@ end
 function _pr_accumulate_quotient(acc, terms, n, d)
     (_pr_parts_value(acc) + sum(prod, terms) * (n / d), 0)
 end
-_pr_sum_quotient(terms, n, d) = _pr_parts_value(_pr_accumulate_quotient((0.0, 0), terms, n, d))
+# The sum of the terms' products, each in plain arithmetic, and whether every
+# product and the sum stayed exact to rounding.
+@inline _pr_plain_terms(sum::Float64, ok::Bool, ::Tuple{}) = (sum, ok)
+@inline function _pr_plain_terms(sum::Float64, ok::Bool, terms::Tuple)
+    factors = first(terms)
+    _pr_plain_scalars(factors) || return (sum, false)
+    t, fine = _pr_plain_product(Float64(first(factors)), true, Base.tail(factors))
+    s = sum + t
+    _pr_plain_terms(s, ok & fine & isfinite(s), Base.tail(terms))
+end
+# One row's quotient partial `sum(products) * n / d`, or `nothing` outside
+# plain range.
+@inline function _pr_plain_partial(terms::Tuple, n, d)
+    n isa Union{Float64,Base.BitInteger,Bool} && d isa Union{Float64,Base.BitInteger,Bool} ||
+        return nothing
+    s, ok = _pr_plain_terms(0.0, true, terms)
+    ok || return nothing
+    nf = Float64(n)
+    t = s * nf
+    _pr_in_range(t) | (iszero(t) & (iszero(s) | iszero(nf))) || return nothing
+    t / Float64(d)
+end
+@inline function _pr_sum_quotient(terms, n, d)
+    plain = _pr_plain_partial(terms, n, d)
+    plain === nothing ? _pr_parts_value(_pr_accumulate_quotient((0.0, 0), terms, n, d)) : plain
+end
+# A shared cotangent's running sum keeps a zero exponent while every row's
+# partial and the sum are plain; the first row outside that range, or a sum
+# that already carries an exponent, continues in the separate-exponent form.
+@inline function _pr_add_quotient(acc::Tuple{Float64,Int}, terms, n, d)
+    if iszero(last(acc))
+        plain = _pr_plain_partial(terms, n, d)
+        if plain !== nothing && isfinite(plain)
+            total = first(acc) + plain
+            isfinite(total) && return (total, 0)
+        end
+    end
+    _pr_accumulate_quotient(acc, terms, n, d)
+end
+@inline _pr_add_quotient(acc, terms, n, d) = _pr_accumulate_quotient(acc, terms, n, d)
 
 function _pr_partial_product(cotangent, partial, quotient)
     if quotient
         _, n, d = partial.args
         n === 1 && return :($cotangent / $d)
-        return :($(GlobalRef(@__MODULE__, :_pr_wide_quotient))(($cotangent, $n), $d))
+        return :($(GlobalRef(@__MODULE__, :_pr_quotient))(($cotangent, $n), $d))
     end
     partial == 1.0 ? cotangent : :($cotangent * $partial)
 end
@@ -606,8 +676,9 @@ function _pr_reverse_exprs!(out, stmts, active::Set{Symbol}, defined::Set{Symbol
             partials = _pr_call_partials(s, active, cuts)
             partials === nothing && _pr_fail("no derivative for `$(s.fref)`")
             ybar = _pr_bar(s.lhs)
-            for (a, p) in zip(s.args, partials)
+            for (k, (a, p)) in enumerate(zip(s.args, partials))
                 a isa Symbol && a in active || continue
+                p === nothing && _pr_inert_argument(s.f, k) && continue
                 p === nothing && _pr_fail("`$(s.fref)` has no derivative in an active argument")
                 _pr_accumulate!(out, defined, a, _pr_partial_product(ybar, p, s.f === Base.:/ && length(s.args) == 2); touched)
             end
@@ -1039,6 +1110,7 @@ mutable struct _PRProgramState
     reads::Dict{Symbol,Int}           # batched parameter => its reads in the program
     arm_initializers::Dict{Symbol,Vector{Pair{Symbol,Any}}}
     joint_cell_cut::Bool
+    shared_cell_work::Bool
     groups::IdDict{Expr,_PRAdditiveGroup}
     group_shadows::IdDict{Expr,Expr}
     group_scatters::IdDict{Expr,Expr}
@@ -1476,7 +1548,7 @@ function _pr_factored_quotient!(out, fc, terms, partial, toplevel, q)
     v = t.var
     v === nothing || push!(factors, v)
     n === 1 || push!(factors, n)
-    value = :($(GlobalRef(@__MODULE__, :_pr_wide_quotient))(($(factors...),), $d))
+    value = :($(GlobalRef(@__MODULE__, :_pr_quotient))(($(factors...),), $d))
     if toplevel && length(shared) <= 3 && all(x -> x isa Union{Symbol,Number}, shared) &&
             _pr_is_invariant(fc, d, true)
         scale = get!(fc.coefs, (:quotient, Tuple(shared), d)) do
@@ -1516,7 +1588,7 @@ function _pr_quotient_contribution!(out, fc, adj, mutable, a, terms, p, toplevel
     push!(fc.st.touched, a)
     _, n, d = p.args
     products = _pr_quotient_products(terms)
-    wide = :($state = $(GlobalRef(@__MODULE__, :_pr_accumulate_quotient))(
+    wide = :($state = $(GlobalRef(@__MODULE__, :_pr_add_quotient))(
         $state, ($(products...),), $n, $d))
     if isempty(scaled.inv)
         push!(out, wide)
@@ -1550,8 +1622,14 @@ function _pr_factored_sweep!(out, fc::_PRFactored, stmts, adj, mutable, toplevel
             terms === nothing && continue
             partials = _pr_call_partials(s, active, cuts; cellvars = fc.cellvars)
             partials === nothing && _pr_fail("no derivative for `$(s.fref)`")
-            for (a, p) in zip(s.args, partials)
+            # Ordinary AD already has the joint rule for an owned scalar.
+            # A source cut, or an exponential reused by its slope, can save
+            # work across the two sweeps even with a full-size row buffer.
+            st.shared_cell_work |= s.f === exp || s.f === expm1 ||
+                (haskey(cuts, s.lhs) && !(s.f isa ScalarDerivativeRule))
+            for (k, (a, p)) in enumerate(zip(s.args, partials))
                 a isa Symbol && a in active || continue
+                p === nothing && _pr_inert_argument(s.f, k) && continue
                 p === nothing && _pr_fail("`$(s.fref)` has no derivative in an active argument")
                 if s.f === Base.:/ && length(s.args) == 2
                     _pr_quotient_contribution!(out, fc, adj, mutable, a, terms, p, toplevel, q)
@@ -1691,7 +1769,7 @@ end
 # builds it from the operand's own indices).
 @inline _pr_gather_dot(A::Base.Broadcast.Extruded, buffer) = _pr_gather_dot(A.x, buffer)
 function _pr_gather_dot(x::SubArray, buffer::SubArray)
-    p = parent(x); q = parent(buffer)
+    p = _pr_gather_root(x); q = _pr_gather_root(buffer)
     acc = zero(eltype(p)) * zero(eltype(q))
     @inbounds for j in eachindex(p, q)
         acc += p[j] * q[j]
@@ -1714,7 +1792,7 @@ _pr_gather_dot(x, buffer) = throw(ArgumentError(
 # gathered buffer through its parent, each entry once however often the index
 # vector repeats it.
 _pr_scale_buffer!(::Nothing, k) = nothing
-_pr_scale_buffer!(buffer::SubArray, k) = _pr_scale_owned!(parent(buffer), k)
+_pr_scale_buffer!(buffer::SubArray, k) = _pr_scale_owned!(_pr_gather_root(buffer), k)
 _pr_scale_buffer!(buffer::Array, k) = _pr_scale_owned!(buffer, k)
 function _pr_scale_owned!(q, k)
     @inbounds for j in eachindex(q)
@@ -1863,6 +1941,9 @@ end
 # and write addressed by the loop can be checked for overlap.
 const _PRSpanParent = Union{Vector{Float64},SubArray{Float64,1,Vector{Float64},Tuple{UnitRange{Int}},true}}
 const _PRSpanGather = SubArray{Float64,1,<:_PRSpanParent,Tuple{Vector{Int}}}
+# A gather through one index vector, of plain storage or of another gather:
+# `_pr_plain_gather` follows the composition down to its storage.
+const _PRPlainGather = SubArray{Float64,1,<:AbstractVector{Float64},Tuple{Vector{Int}}}
 # DenseArray is extensible, and a StridedVector can have a user-defined
 # parent or index range whose getindex reads other storage.
 const _PRPlainIndex = Union{Int,UnitRange{Int},Base.Slice{Base.OneTo{Int}},Base.OneTo{Int}}
@@ -2011,82 +2092,171 @@ end
 end
 
 # Certify the range of floating-point operands using only plain, disjoint
-# storage. Gathered values are bounded by scanning their parent once.
-@inline function _pr_bounded_scalar(x)
-    x isa Union{Float64,Base.BitInteger,Bool} &&
-        (iszero(x) || 0x1p-40 <= abs(float(x)) <= 0x1p40)
-end
+# storage. What is measured is the range of binary exponents of the nonzero
+# values a sweep can read: `(low, high)`, biased exponent fields. A subnormal
+# value gives `low == 0` and a value that is not finite `high == 0x7ff`; both
+# fail every certificate. `low > high` means no nonzero value was seen.
+# Gathered values are measured by scanning their storage once.
+const _PRExponents = Tuple{UInt64,UInt64}
+const _PR_NO_EXPONENTS = (UInt64(0x7ff), UInt64(0))
+const _PR_BAD_EXPONENTS = (UInt64(0), UInt64(0x7ff))
+@inline _pr_merge_exponents(a::_PRExponents, b::_PRExponents) = (min(a[1], b[1]), max(a[2], b[2]))
+@inline _pr_low_exponent(x::Float64) = (bits = reinterpret(UInt64, abs(x));
+    ifelse(iszero(bits), UInt64(0x7ff), bits >> 52))
+@inline _pr_high_exponent(x::Float64) = reinterpret(UInt64, abs(x)) >> 52
+@inline _pr_exponents(x::Float64) = (_pr_low_exponent(x), _pr_high_exponent(x))
+@inline _pr_exponents(x::Union{Base.BitInteger,Bool}) = _pr_exponents(Float64(x))
+_pr_exponents(x) = _PR_BAD_EXPONENTS
 @inline _pr_bound_storage(x) = x
 @inline _pr_bound_storage(x::Base.Broadcast.Extruded) = x.x
-_pr_bounded_vector(x) = false
-@inline _pr_bounded_vector(x::_PRSpanGather) = _pr_bounded_vector(parent(x))
-@inline function _pr_range_delta(x::Float64)
-    bits = reinterpret(UInt64, abs(x))
-    ifelse(iszero(bits), zero(UInt64), bits - reinterpret(UInt64, 0x1p-40))
-end
-function _pr_bounded_vector(x::_PRPlainVector{Float64})
-    lo = reinterpret(UInt64, 0x1p-40)
-    hi = reinterpret(UInt64, 0x1p40)
-    bound = zero(UInt64)
+# A gather is measured by its storage: every entry a cell can read is one of
+# them. A partition's composed gather reads the same storage.
+@inline _pr_exponents(x::_PRPlainGather) = _pr_exponents(parent(x))
+function _pr_exponents(x::_PRPlainVector{Float64})
+    low, high = _PR_NO_EXPONENTS
     @inbounds @simd for i in eachindex(x)
-        bound = max(bound, _pr_range_delta(x[i]))
+        low = min(low, _pr_low_exponent(x[i]))
+        high = max(high, _pr_high_exponent(x[i]))
     end
-    bound <= hi - lo
+    (low, high)
 end
-_pr_bounded_vectors(::Tuple{}) = true
-@inline function _pr_bounded_vectors(xs::Tuple)
-    _pr_bounded_vector(first(xs)) && _pr_bounded_vectors(Base.tail(xs))
+@inline _pr_all_exponents(range::_PRExponents, ::Tuple{}) = range
+@inline _pr_all_exponents(range::_PRExponents, xs::Tuple) =
+    _pr_all_exponents(_pr_merge_exponents(range, _pr_exponents(first(xs))), Base.tail(xs))
+@inline _pr_scalar_exponents(xs::Tuple) = _pr_all_exponents(_PR_NO_EXPONENTS, xs)
+# Whether the sweep's shared-reciprocal arithmetic is exact to rounding for
+# nonzero leaves with exponents in `range`. Every nonzero leaf then has a
+# magnitude in [2^-down, 2^up]. A target with `(n, d, s)` multiplies `n` leaves,
+# divides by `d` and carries `s` bits of slack (`_pr_quotient_bounds!`), so its
+# magnitude lies within `n * up + d * down + s` bits above one and
+# `n * down + d * up + s` bits below. The sweep squares a target, scales it by
+# up to three shared factors over a divisor and sums it over at most an Int's
+# worth of cells (63 bits). Both totals stay within 903 of the 1022 bits a
+# `Float64` has on either side of one.
+@inline _pr_targets_fit(up::Int, down::Int, ::Tuple{}) =
+    3up + down + 63 <= 903 && 3down + up <= 903
+@inline function _pr_targets_fit(up::Int, down::Int, targets::Tuple)
+    n, d, s = first(targets)
+    2 * (n * up + d * down + s) + 3up + down + 63 <= 903 &&
+        2 * (n * down + d * up + s) + 3down + up <= 903 &&
+        _pr_targets_fit(up, down, Base.tail(targets))
 end
+@inline function _pr_within_range(range::_PRExponents, targets::Tuple)
+    low, high = range
+    (low > 0) & (high < 0x7ff) || return false
+    up = max(0, Int(high) - 1022)
+    down = max(0, 1023 - Int(low))
+    _pr_targets_fit(up, down, targets)
+end
+# Several gathered operands, or a partition's composed gather. Each shadow
+# is one of the adapter's buffers or a caller's shadow, gathered over storage
+# of its own; the sweep reads operands and adds into those shadows only. With
+# plain storage on both sides, and no shadow sharing memory with anything the
+# sweep reads (an operand's entries or an index vector), no write of the loop
+# can change a value its bounds were certified for.
+_pr_plain_gather(x) = false
+@inline _pr_plain_gather(x::_PRSpanParent) = true
+@inline _pr_plain_gather(x::_PRPlainGather) = _pr_plain_gather(parent(x))
+@inline _pr_clear_of(storage, x::_PRSpanParent) = !_contiguous_storage_overlaps(storage, x)
+@inline _pr_clear_of(storage, x::_PRPlainGather) =
+    !_contiguous_storage_overlaps(storage, only(parentindices(x))) && _pr_clear_of(storage, parent(x))
+@inline _pr_clear_of(storage, x) = _pr_contiguous_vector(x) && !_contiguous_storage_overlaps(storage, x)
+@inline _pr_cell_storage(x::_PRPlainGather, cells) = length(x) == length(cells) && _pr_plain_gather(x)
+@inline _pr_cell_storage(x, cells) = _pr_contiguous_vector(x) && axes(x) == (cells,)
+# Unrolled over the operand tuples: a closure over mixed operand types would
+# box its captures on every call.
+@inline _pr_cell_storages(::Tuple{}, cells) = true
+@inline _pr_cell_storages(operands::Tuple, cells) =
+    _pr_cell_storage(first(operands), cells) && _pr_cell_storages(Base.tail(operands), cells)
+@inline _pr_all_clear_of(storage, ::Tuple{}) = true
+@inline _pr_all_clear_of(storage, operands::Tuple) =
+    _pr_clear_of(storage, first(operands)) && _pr_all_clear_of(storage, Base.tail(operands))
+@inline _pr_shadow_clear(shadow::Nothing, operands::Tuple) = true
+@inline _pr_shadow_clear(shadow, operands::Tuple) =
+    _pr_plain_gather(shadow) && _pr_all_clear_of(_pr_gather_root(shadow), operands)
+@inline _pr_shadows_clear(::Tuple{}, operands::Tuple) = true
+@inline _pr_shadows_clear(shadows::Tuple, operands::Tuple) =
+    _pr_shadow_clear(first(shadows), operands) && _pr_shadows_clear(Base.tail(shadows), operands)
+@inline _pr_separate_storage(cells, operands::Tuple, shadows::Tuple) =
+    cells isa Base.OneTo{Int} && _pr_cell_storages(operands, cells) &&
+        _pr_shadows_clear(shadows, operands)
 _pr_bounded_gather(cells, shadow, operands, ::Tuple{}) = false
 @inline function _pr_bounded_gather(cells, shadow, operands, xs::Tuple)
     _pr_separate_gather(cells, first(xs), shadow, operands) ||
         _pr_bounded_gather(cells, shadow, operands, Base.tail(xs))
 end
-@inline function _pr_bounded_storage(cells, reads::Tuple, shadows::Tuple)
+# Whether the operands a sweep reads and the shadows it writes are plain,
+# disjoint storage, so that no write of the loop changes a measured value.
+@inline function _pr_plain_storage(cells, operands::Tuple, shadows::Tuple)
+    _pr_dense_reverse_cells(cells, operands, shadows) ||
+        (length(shadows) == 1 && _pr_bounded_gather(cells, only(shadows), operands, operands)) ||
+        _pr_separate_storage(cells, operands, shadows)
+end
+# The exponents of everything a sweep reads, beside those already in `range`.
+@inline function _pr_storage_exponents(range::_PRExponents, cells, reads::Tuple, shadows::Tuple)
     operands = map(_pr_bound_storage, reads)
-    safe = _pr_dense_reverse_cells(cells, operands, shadows) ||
-        (length(shadows) == 1 && _pr_bounded_gather(cells, only(shadows), operands, operands))
-    safe && _pr_bounded_vectors(operands)
+    _pr_plain_storage(cells, operands, shadows) || return _PR_BAD_EXPONENTS
+    _pr_all_exponents(range, operands)
 end
 
-# Given nonzero leaves in [2^-40,2^40], bound the magnitude of every
-# nonzero target in bits. Addition can cancel to one unit in the last
-# place of its smaller operand. Multiplication and division add bounds.
+# For every target of the sweep's shared-reciprocal arithmetic, how its
+# magnitude follows from the leaves': `(n, d, s)`, the leaves it multiplies,
+# the leaves it divides by, and bits of slack. A leaf (an outer value or a
+# read) is one factor. A literal has its own magnitude as slack. A product
+# adds both parts and one bit, a quotient exchanges the divisor's parts, and a
+# sum can cancel to one unit in the last place of its smaller operand (53
+# bits). `_pr_within_range` charges these against the exponents measured at
+# each call. Returns `nothing` when a target is not such arithmetic, or when
+# even leaves within 40 bits of one would not fit.
 function _pr_quotient_bounds!(q, stmts, st, external, invariant)
     defs = Dict{Symbol,Any}()
     for s in stmts
         s isa Union{_PRCall,_PRAlias} || continue
-        (haskey(defs, s.lhs) || s.lhs in external) && return false
+        (haskey(defs, s.lhs) || s.lhs in external) && return nothing
         # Only inspect storage ahead of calls whose target is known to be pure.
         # A local callable is checked against the value used during preparation.
         if s isa _PRCall && s.fref isa Expr
-            return false
+            return nothing
         end
         defs[s.lhs] = s
     end
-    bounds = Dict{Symbol,Int}()
+    unproved = (0, 0, 1_000_000)
+    bounds = Dict{Symbol,NTuple{3,Int}}()
     function bound(x)
-        x isa Symbol || return _pr_bounded_scalar(x) ? 40 : 1000
+        if !(x isa Symbol)
+            x isa Union{Float64,Base.BitInteger,Bool} || return unproved
+            value = float(x)
+            iszero(value) && return (0, 0, 0)
+            isfinite(value) && !issubnormal(value) || return unproved
+            return (0, 0, abs(exponent(value)) + 1)
+        end
         if x in external || x in invariant
             push!(q.shared, x)
-            return 40
+            return (1, 0, 0)
         end
         get!(bounds, x) do
             s = get(defs, x, nothing)
             s isa _PRAlias && return bound(s.rhs)
-            s isa _PRCall || return 1000
-            _pr_is_read(s, st) && return 40
-            s.f in (+, -) && length(s.args) in (1, 2) && return maximum(bound, s.args) + 53
-            if length(s.args) == 2 && (s.f in (*, _native_mul) ||
-                                       (s.f === (/) && s.args[2] in q.divisors))
-                return min(1000, sum(bound, s.args) + 1)
+            s isa _PRCall || return unproved
+            _pr_is_read(s, st) && return (1, 0, 0)
+            if s.f in (+, -) && length(s.args) in (1, 2)
+                parts = map(bound, s.args)
+                return (maximum(p -> p[1], parts), maximum(p -> p[2], parts),
+                        maximum(p -> p[3], parts) + 53)
             end
-            1000
+            if length(s.args) == 2 && s.f in (*, _native_mul)
+                a, b = bound(s.args[1]), bound(s.args[2])
+                return (a[1] + b[1], a[2] + b[2], a[3] + b[3] + 1)
+            end
+            if length(s.args) == 2 && s.f === (/) && s.args[2] in q.divisors
+                a, b = bound(s.args[1]), bound(s.args[2])
+                return (a[1] + b[2], a[2] + b[1], a[3] + b[3] + 1)
+            end
+            unproved
         end
     end
-    # Squaring uses at most 680 bits, three shared factors and division
-    # another 160, and an Int-sized reduction at most 63.
-    all(x -> bound(x) <= 340, q.targets)
+    targets = unique!(NTuple{3,Int}[bound(x) for x in q.targets])
+    _pr_targets_fit(40, 40, Tuple(targets)) ? targets : nothing
 end
 
 # Range checks can share the gather loop's reads on long consecutive runs.
@@ -2096,7 +2266,7 @@ end
 @inline function _pr_check_in_gather(cells, value, shadow, operands)
     value isa _PRSpanGather && length(parent(value)) >= 128 &&
         _pr_span_possible(cells, value, shadow, operands) &&
-        all(x -> eltype(x) === Float64, operands) && _pr_bounded_vector(parent(value))
+        all(x -> eltype(x) === Float64, operands)
 end
 
 function _pr_checked_reads(stmts, st, linear, written)
@@ -2118,23 +2288,26 @@ function _pr_checked_reads(stmts, st, linear, written)
     reads
 end
 
+# The checked sweep measures the exponents of its own reads, beside those of
+# `range` (the scalars and the gather's storage, measured above the loop), and
+# repeats itself in the separate-exponent form if they do not fit.
 function _pr_checked_loop(ordinary, exceptional, visible, reads, check, shadow,
-                          coefficients, value_pre, normal)
-    bound = gensym(:range_delta)
+                          coefficients, value_pre, normal, range, targets)
+    low, high = gensym(:low_exponent), gensym(:high_exponent)
     inspected = _index_run_replace(ordinary) do node
         if Meta.isexpr(node, :(=), 2) && node.args[1] in reads
             lhs = node.args[1]
-            return Expr(:block, node, :($bound = max($bound,
-                $(GlobalRef(@__MODULE__, :_pr_range_delta))($lhs))))
+            return Expr(:block, node,
+                :($low = min($low, $(GlobalRef(@__MODULE__, :_pr_low_exponent))($lhs))),
+                :($high = max($high, $(GlobalRef(@__MODULE__, :_pr_high_exponent))($lhs))))
         end
         node
     end
-    limit = reinterpret(UInt64, 0x1p40) - reinterpret(UInt64, 0x1p-40)
     quote
         if $check
-            $bound = zero(UInt64)
-            $(_pr_quotient_loop(inspected, union(visible, [bound])))
-            if $bound > $limit
+            ($low, $high) = $range
+            $(_pr_quotient_loop(inspected, union(visible, [low, high])))
+            if !$(GlobalRef(@__MODULE__, :_pr_within_range))(($low, $high), $targets)
                 fill!(parent($shadow), 0.0)
                 $normal = false
                 $(coefficients...)
@@ -2335,6 +2508,7 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState, indexed:
                      end)
         end
         certificate = false
+        measure = Any[]
         if !isempty(q.divisors)
             function specialize(body, arm)
                 _index_run_replace(body) do node
@@ -2347,22 +2521,25 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState, indexed:
                 end
             end
             scalars = isempty(cuts) ? _pr_vectorized_cell_scalars(inloop, st, linear) : nothing
-            bounded = scalars !== nothing &&
-                _pr_quotient_bounds!(q, inloop, st, scalars, inv2)
-            if bounded
+            proved = scalars === nothing ? nothing : _pr_quotient_bounds!(q, inloop, st, scalars, inv2)
+            if proved !== nothing
                 written = unique(st.prepared[r] for r in read_operands if haskey(st.shadow, st.prepared[r]))
                 shadows = map(p -> st.shadow[p], written)
                 checked = unique(vcat(q.shared, q.divisors))
-                certificate = :(Base.all($(GlobalRef(@__MODULE__, :_pr_vector_scalar)), ($(scalars...),)) &&
-                                Base.all($(GlobalRef(@__MODULE__, :_pr_bounded_scalar)), ($(checked...),)) &&
-                                !Base.any(iszero, ($(unique(q.divisors)...),)) &&
-                                $(GlobalRef(@__MODULE__, :_pr_bounded_storage))($cells,
-                                    ($(read_operands...),), ($(shadows...),)))
+                targets = Expr(:tuple, (Expr(:tuple, t...) for t in proved)...)
+                measured = gensym(:exponents)
+                measure = Any[:($measured = $(GlobalRef(@__MODULE__, :_pr_scalar_exponents))(($(checked...),)))]
+                structure = :(Base.all($(GlobalRef(@__MODULE__, :_pr_vector_scalar)), ($(scalars...),)) &&
+                              !Base.any(iszero, ($(unique(q.divisors)...),)))
                 for s in inloop
                     if s isa _PRCall && s.fref isa Symbol
-                        certificate = :($(s.fref) === $(QuoteNode(s.f)) && $certificate)
+                        structure = :($(s.fref) === $(QuoteNode(s.f)) && $structure)
                     end
                 end
+                storage = :($(GlobalRef(@__MODULE__, :_pr_within_range))(
+                    $(GlobalRef(@__MODULE__, :_pr_storage_exponents))(
+                        $measured, $cells, ($(read_operands...),), ($(shadows...),)), $targets))
+                certificate = :($structure && $storage)
                 ordinary = specialize(loop, 2)
                 exceptional = specialize(plain_loop, 3)
                 if !indexed
@@ -2381,21 +2558,21 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState, indexed:
                     if reads === nothing || isempty(reads)
                         ordinary = _pr_quotient_loop(ordinary, visible)
                     else
+                        # The checked sweep measures its dense reads itself.
+                        # Above the loop only the gather's storage is scanned.
                         check = gensym(:check_in_gather)
-                        certificate = _index_run_replace(certificate) do node
-                            if !(Meta.isexpr(node, :call) &&
-                                    first(node.args) == GlobalRef(@__MODULE__, :_pr_bounded_storage))
-                                return node
-                            end
-                            quote
-                                $check = $_PR_WANT_VALUE isa Val{true} &&
-                                    $(GlobalRef(@__MODULE__, :_pr_check_in_gather))(
-                                        $cells, $(only(written)), $(only(shadows)), ($(read_operands...),))
-                                $check || $node
-                            end
-                        end
+                        gathered, owned = only(written), only(shadows)
+                        merged = Expr(:call, GlobalRef(@__MODULE__, :_pr_merge_exponents), measured,
+                            Expr(:call, GlobalRef(@__MODULE__, :_pr_exponents), :(parent($gathered))))
+                        push!(measure,
+                            :($check = $_PR_WANT_VALUE isa Val{true} &&
+                                $(GlobalRef(@__MODULE__, :_pr_check_in_gather))(
+                                    $cells, $gathered, $owned, ($(read_operands...),))),
+                            :($check && ($measured = $merged)))
+                        certificate = :($structure && ($check ?
+                            $(GlobalRef(@__MODULE__, :_pr_within_range))($measured, $targets) : $storage))
                         ordinary = _pr_checked_loop(ordinary, exceptional, visible, reads,
-                            check, only(shadows), coefficients, value_pre, q.normal)
+                            check, only(shadows), coefficients, value_pre, q.normal, measured, targets)
                     end
                 end
                 loop = Expr(:if, q.normal, ordinary, exceptional)
@@ -2403,7 +2580,7 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState, indexed:
                 loop = specialize(plain_loop, 3)
             end
         end
-        isempty(q.divisors) || pushfirst!(coefficients, :($(q.normal) = $certificate))
+        isempty(q.divisors) || pushfirst!(coefficients, measure..., :($(q.normal) = $certificate))
         quote
             $(forward_pre...)
             $(init...)
@@ -2752,7 +2929,8 @@ function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict
     # after each group's loop would also rescale earlier groups' contributions.
     isempty(groups) || empty!(counts)
     st = _PRProgramState(mod, values, active, prepared, shadow, totals, output,
-                         Set{Symbol}(), 0, outer, counts, initializers, false, groups, group_shadows, scatters)
+                         Set{Symbol}(), 0, outer, counts, initializers, false, false,
+                         groups, group_shadows, scatters)
     new_body = _pr_program_block(stmts, st, keys(index_runs))
     # Every outer adjoint starts at zero; every total's adjoint is the seed.
     init = Any[:($(_pr_bar(a)) = 0.0) for a in sort!(collect(outer)) if !(a in totals)]
@@ -2762,7 +2940,15 @@ function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict
         Expr(:tuple, params..., seed, _PR_WANT_VALUE, (shadow[p] for p in batched)...),
         Expr(:block, checks..., init..., seeds..., new_body...,
              Expr(:tuple, output, (_pr_bar(p) for p in scalar)...)))
-    _pr_index_run_schedule(fexpr, index_runs, prepared, shadow, params, batched), scalar, batched, st.joint_cell_cut, projections
+    # What a cell shares between its value and its partials, for the schedule
+    # choice (`_pr_target_expr`): `true` for work the backend's two sweeps
+    # would repeat, `:owned` for the joint cut of an owned scalar rule, which
+    # the backend shares itself in a flat loop. In a nested total the backend
+    # tapes that rule's partials per group, so one flat owned tape pays there
+    # too.
+    reuse = st.shared_cell_work || (st.joint_cell_cut && !isempty(groups)) ? true :
+            st.joint_cell_cut ? :owned : false
+    _pr_index_run_schedule(fexpr, index_runs, prepared, shadow, params, batched), scalar, batched, reuse, projections
 end
 
 include("plate_reverse_runs.jl")
@@ -2838,16 +3024,10 @@ end
     _PlateSumRule{S,B,typeof(p),typeof(r),true}(p, r)
 end
 
-# Attach the backend rule only after checking the operands' storage types.
-# For a lazy cell array the reverse must know how to write into its backing
-# storage. Otherwise ordinary AD sees the program before constructing shadows.
-struct _PlateSumRuleBody{S,B,R} <: Function
-    rule::R
-end
 # The augmented primal sweeps once. A grouped tape holds partials per parent
 # entry of an indirect view. A logical tape holds partials per operand entry,
-# including each entry of an active tuple. Select the layout at the call site
-# so the two-pass target keeps its empty tape on small arithmetic plates.
+# including each entry of an active tuple. The caller selects the layout
+# before Enzyme differentiates the call.
 struct _PlateSumRuleOnePass{S,B,R,Layout} <: Function
     rule::R
 end
@@ -2864,6 +3044,17 @@ const _PR_ONE_PASS_MIN_CELLS = 128
 _pr_gather_value(::Type) = false
 _pr_gather_value(::Type{<:SubArray{Float64,1,<:AbstractVector,<:Tuple{AbstractVector{<:Integer}}}}) = true
 _pr_gather_value(::Type{<:SubArray{Float64,1,<:AbstractVector,<:Tuple{AbstractUnitRange{<:Integer}}}}) = false
+# The storage a gather's entries live in. A lane partition of a gathered
+# operand (`_lane_view`) is a view of that view: its indices compose, and both
+# address the entries of the innermost gather's parent. One-pass buffers,
+# their scaling and their products with the operand are per entry of that
+# storage, so a partition's lanes share the groups of the whole plate.
+@inline _pr_gather_root(x) = x
+@inline _pr_gather_root(x::SubArray) =
+    _pr_gather_value(typeof(x)) ? _pr_gather_root(parent(x)) : x
+# The same composition of index vectors over another root (a tape slice).
+@inline _pr_regather(root, x::SubArray) = Base.SubArray(
+    _pr_gather_value(typeof(parent(x))) ? _pr_regather(root, parent(x)) : root, parentindices(x))
 
 # Owned storage for the one-pass tape of one rule call site. A preparation that
 # owns AD caches (`_ad_na_program`) keeps one slot per generated rule there and
@@ -2877,10 +3068,109 @@ _pr_gather_value(::Type{<:SubArray{Float64,1,<:AbstractVector,<:Tuple{AbstractUn
 mutable struct _PlateTapeSlot
     tape::Vector{Float64}
     empty::Vector{Float64}
+    # A backend adapter that could not take the one pass at this site says so
+    # here. The schedule is chosen on operand types and sizes before the
+    # backend sees the call; its own annotations can still refuse it.
+    declined::Bool
 end
 function _PlateTapeSlot()
     empty = Float64[]
-    _PlateTapeSlot(empty, empty)
+    _PlateTapeSlot(empty, empty, false)
+end
+@inline _pr_mark_declined!(slot::_PlateTapeSlot) = (slot.declined = true; nothing)
+@inline _pr_mark_declined!(::Nothing) = nothing
+
+# The mark of one rule call site in a program that owns no AD caches (an
+# allocating kernel's). The program passes it as the call's last operand,
+# where a non-allocating program passes its tape slot: it says that a
+# preparation checks the call, and it leases no tape, so each call allocates
+# its own. It holds no state. A program is compiled once for its content and
+# every preparation of it runs that code, so nothing the program holds as a
+# literal can belong to one preparation; a refused call is recorded for the
+# preparation that is evaluating instead (`_pr_recording_refusals`).
+struct _PlateRuleMark end
+# The trailing operand of a rule call that is no operand of its program.
+const _PlateRuleSite = Union{_PlateTapeSlot,_PlateRuleMark}
+
+# Whether the backend's adapter refused a marked rule call while `f` ran, in
+# this task: `refused` is set by each such call. A preparation runs its own
+# evaluations this way (`_prepare_ad_operator`, `_pr_verified_preparation`).
+# Outside one a refusal is recorded nowhere.
+const _PR_REFUSAL_SCOPE = :ReactiveKernels_plate_reverse_refusal
+_pr_recording_refusals(f, refused::Base.RefValue{Bool}) =
+    task_local_storage(f, _PR_REFUSAL_SCOPE, refused)
+function _pr_mark_declined!(::_PlateRuleMark)
+    refused = get(task_local_storage(), _PR_REFUSAL_SCOPE, nothing)
+    refused === nothing || ((refused::Base.RefValue{Bool})[] = true)
+    nothing
+end
+
+# The marks of the preparation in progress: one per rule call its program
+# makes without a tape slot. `_prepare_ad_operator` collects them while it
+# builds the differentiated program, so it knows whether there is such a call
+# to check (`_pr_verified_preparation`). Outside such a preparation there is
+# no collector, and no rule is installed: a rule call exists only where a
+# preparation verifies it.
+const _PR_MARKS_SCOPE = :ReactiveKernels_plate_reverse_marks
+_pr_marks() = get(task_local_storage(), _PR_MARKS_SCOPE, nothing)::Union{Nothing,Vector{_PlateRuleMark}}
+_pr_collecting_marks(f, marks::Vector{_PlateRuleMark}) =
+    task_local_storage(f, _PR_MARKS_SCOPE, marks)
+# The mark of one rule call, counted by the preparation in progress.
+function _pr_rule_mark!(marks::Vector{_PlateRuleMark})
+    mark = _PlateRuleMark()
+    push!(marks, mark)
+    mark
+end
+
+# The tape slots among a preparation's AD contexts: one per rule call, in the
+# cache table the backend shadows.
+_pr_tape_slots!(found::Vector{_PlateTapeSlot}, slot::_PlateTapeSlot) = push!(found, slot)
+function _pr_tape_slots!(found::Vector{_PlateTapeSlot}, values::Tuple)
+    for value in values
+        _pr_tape_slots!(found, value)
+    end
+    found
+end
+_pr_tape_slots!(found::Vector{_PlateTapeSlot}, context::DifferentiationInterface.Context) =
+    _pr_tape_slots!(found, DifferentiationInterface.unwrap(context))
+_pr_tape_slots!(found::Vector{_PlateTapeSlot}, value) = found
+
+# A generated plate rule is verified where it is installed. The schedule is
+# chosen on operand types and sizes, which the program knows; the backend's
+# own annotations of the call (an operand it treats as active that the rule
+# does not differentiate) are known only once it compiles the derivative. One
+# evaluation at the exemplar shows whether its adapter took every rule call it
+# reached. A refused call would run the adapter's general path on every
+# evaluation, which costs more than the backend's own reverse of the inline
+# plate, so `ordinary()` then prepares the operator again with the plates
+# inline, exactly as without the generated reverse. `evaluated` says the
+# preparation already ran the operator once (`warm`, or the derivative check).
+# Every rule call has a site record. A tape slot among the contexts keeps its
+# own refusal. A program that owns no AD caches marks its calls (`marks`), and
+# their refusals are recorded in `refused` while this preparation evaluates
+# (`_pr_recording_refusals`): the caller runs its own evaluations that way.
+function _pr_verified_preparation(ordinary, op::Val, prepared, point, seeds, contexts,
+                                  evaluated::Bool,
+                                  marks::Vector{_PlateRuleMark} = _PlateRuleMark[],
+                                  refused::Base.RefValue{Bool} = Ref(false))
+    slots = _pr_tape_slots!(_PlateTapeSlot[], contexts)
+    isempty(slots) && isempty(marks) && return prepared
+    if !evaluated
+        f, args = _ad_operator_evaluation(op, prepared, point, seeds, contexts)
+        # Infer first: the backend builds its derivative during inference,
+        # outside the codegen lock a first call would hold (`_ad_warm!`).
+        Base.code_typed(f, Tuple{map(Core.Typeof, args)...})
+        try
+            _pr_recording_refusals(refused) do
+                Base.invokelatest(f, args...)
+            end
+        catch err
+            err isa InterruptException && rethrow()
+            # The program throws at its exemplar, as it will for the caller:
+            # there is nothing to verify at this point.
+        end
+    end
+    any(slot -> slot.declined, slots) || refused[] ? ordinary() : prepared
 end
 @inline function _pr_take_tape!(slot::_PlateTapeSlot, n::Int)
     tape = slot.tape
@@ -2888,42 +3178,72 @@ end
     slot.tape = slot.empty
     fill!(tape, 0.0)
 end
-@inline _pr_take_tape!(::Nothing, n::Int) = zeros(Float64, n)
+@inline _pr_take_tape!(::Union{Nothing,_PlateRuleMark}, n::Int) = zeros(Float64, n)
 @inline _pr_return_tape!(slot::_PlateTapeSlot, tape::Vector{Float64}) = (slot.tape = tape; nothing)
-@inline _pr_return_tape!(::Nothing, tape::Vector{Float64}) = nothing
+@inline _pr_return_tape!(::Union{Nothing,_PlateRuleMark}, tape::Vector{Float64}) = nothing
+
+# The operand classes a one-pass tape holds a buffer for, on types alone:
+# `Float64` vectors, views of them, tuples of `Float64`, and the rows of a
+# ragged group (whose projections `_pr_group_projections_cover` checks).
+_pr_buffer_operand(::Type) = false
+_pr_buffer_operand(::Type{Vector{Float64}}) = true
+_pr_buffer_operand(::Type{<:SubArray{Float64,1,<:AbstractVector}}) = true
+_pr_buffer_operand(::Type{<:Tuple{Vararg{Float64}}}) = true
+_pr_buffer_operand(::Type{Vector{Vector{Float64}}}) = true
+# A gathered operand's buffer has one entry per entry of the storage its
+# indices address. A plate that reads a few entries of a long vector would
+# clear and scale all of it on every call: such a call stays inline.
+const _PR_MAX_ROOT_PER_CELL = 8
 
 # The target of a call with operands of types `types`, as an expression in
 # `rule` and `args` that `make` turns into the result (the target itself, or
-# its call): the program for a remaining lazy cell array, else the two-pass body, or the
-# one-pass call when its operand sizes or reusable joint cut justify a tape.
+# its call): the one-pass call where a schedule applies, else the program,
+# which the caller runs inline. The choice is made here, on operand types and
+# sizes: a call that takes the rule has only operands its adapter covers.
 function _pr_target_expr(S, B, types, joint, make, one_pass = make)
-    any(b -> types[b] <: _CellArray, B) &&
-        return make(:(getfield(rule, :program)))
-    # A joint scalar cut already produced both the cell value and its
-    # partials. Reuse them within a prepared call. Tuples also use this
-    # schedule so their temporary cotangents live in the preparation's tape.
-    buffered = !isempty(types) && types[end] === _PlateTapeSlot &&
-               (joint || any(b -> types[b] <: Tuple{Vararg{Float64}}, B))
-    body = buffered ? one_pass(:(_PlateSumRuleOnePass{$S,$B,typeof(rule),:logical}(rule))) :
-                      make(:(getfield(rule, :program)))
+    inline = make(:(getfield(rule, :program)))
+    any(b -> types[b] <: _CellArray, B) && return inline
+    all(s -> types[s] <: Union{Float64,Integer}, S) &&
+        all(b -> _pr_buffer_operand(types[b]), B) || return inline
+    slotted = !isempty(types) && types[end] === _PlateTapeSlot
+    tuples = any(b -> types[b] <: Tuple, B)
     gathered = [b for b in B if _pr_gather_value(types[b])]
-    isempty(gathered) && return body
-    buffers = Expr(:call, :+, (:(length(parent(getfield(args, $b)))) for b in gathered)...)
+    rows = any(b -> !(b in gathered) && !(types[b] <: Tuple), B)
+    # Cell work the backend's two sweeps would repeat pays for a tape in owned
+    # storage. A buffer per row needs work the backend's own scalar rules do
+    # not already share (`joint === true`). Buffers per group entry and plain
+    # scalar cotangents cost little, so any shared work pays for them.
+    reuse = slotted && (joint !== false || tuples)
+    logical = slotted && (joint === true || tuples)
+    by_entry = one_pass(:(_PlateSumRuleOnePass{$S,$B,typeof(rule),:logical}(rule)))
+    isempty(gathered) && return (rows ? logical : reuse) ? by_entry : inline
+    buffers = Expr(:call, :+, (:(length(_pr_gather_root(getfield(args, $b)))) for b in gathered)...)
+    cells = :(length(getfield(args, $(first(gathered)))))
+    if rows
+        logical || return inline
+        return :($buffers <= _PR_MAX_ROOT_PER_CELL * $cells ? $by_entry : $inline)
+    end
     quote
-        cells = length(getfield(args, $(first(gathered))))
-        if ($buffered || cells >= _PR_ONE_PASS_MIN_CELLS) && $buffers < cells
+        cells = $cells
+        buffers = $buffers
+        if ($reuse || cells >= _PR_ONE_PASS_MIN_CELLS) && buffers < cells
             $(one_pass(:(_PlateSumRuleOnePass{$S,$B,typeof(rule),true}(rule))))
+        elseif $logical && buffers <= _PR_MAX_ROOT_PER_CELL * cells
+            $by_entry
         else
-            $body
+            $inline
         end
     end
 end
+# Whether a call's last operand is its site record (a tape slot or a mark),
+# which is no operand of the program.
+_pr_sited(types) = !isempty(types) && types[end] <: _PlateRuleSite
 # The call itself, made in each branch: a target chosen by size and then called
-# would be a union of the two wrappers, boxed in the primal. A trailing tape
-# slot is not an operand of the program: only the one-pass call takes it on.
+# would be a union of the two wrappers, boxed in the primal. A trailing site
+# record is not an operand of the program: only the one-pass call takes it on.
 function _pr_rule_expr(S, B, types, joint, dispatch, projections)
-    slotted = !isempty(types) && types[end] === _PlateTapeSlot
-    count = length(types) - slotted
+    sited = _pr_sited(types)
+    count = length(types) - sited
     operands = Any[:(getfield(args, $i)) for i in 1:count]
     if !_pr_group_projections_cover(projections, types)
         dispatch === :_pr_rule_applies && return false
@@ -2937,7 +3257,7 @@ function _pr_rule_expr(S, B, types, joint, dispatch, projections)
         for i in inputs
             operands[i] = :(only(getfield(args, $i).broadcast.args))
         end
-        slotted && push!(operands, :(getfield(args, $(count + 1))))
+        sited && push!(operands, :(getfield(args, $(count + 1))))
         return :($dispatch(_pr_exp_rule(rule, Val($inputs), Val($shadows), $shapes),
                            ($(operands...),)))
     end
@@ -2945,14 +3265,14 @@ function _pr_rule_expr(S, B, types, joint, dispatch, projections)
     dispatch === :_pr_rule_applies &&
         return _pr_target_expr(S, B, types, joint, _ -> false, _ -> true)
     call = target -> Expr(:call, target, operands...)
-    one_pass = slotted ?
+    one_pass = sited ?
         (target -> Expr(:call, target, operands..., :(getfield(args, $(count + 1))))) : call
     _pr_target_expr(S, B, types, joint, call, one_pass)
 end
 function _pr_source_checked_expr(S, B, types, joint, dispatch, projections, checked)
     body = _pr_rule_expr(S, B, types, joint, dispatch, projections)
     checked || return body
-    count = length(types) - (!isempty(types) && types[end] === _PlateTapeSlot)
+    count = length(types) - _pr_sited(types)
     operands = Any[:(getfield(args, $i)) for i in 1:count]
     primal = :(getfield(rule, :program))
     fallback = dispatch === :_pr_rule_target ? primal :
@@ -3001,14 +3321,12 @@ for count in 0:_PLATE_CALL_MAX_ARGUMENTS
         _pr_rule_call(rule, ($(arguments...),))
     @eval @inline (rule::_PRGroupBroadcastRule)($(typed...)) where {$(types...)} =
         _pr_rule_call(rule, ($(arguments...),))
-    @eval @inline (call::_PlateSumRuleBody)($(typed...)) where {$(types...)} =
-        getfield(getfield(call, :rule), :program)($(arguments...))
     @eval @inline (call::_PlateSumRuleOnePass)($(typed...)) where {$(types...)} =
         getfield(getfield(call, :rule), :program)($(arguments...))
-    # With its tape slot, which the program does not take.
+    # With its site record, which the program does not take.
     count < _PLATE_CALL_MAX_ARGUMENTS &&
         @eval @inline (call::_PlateSumRuleOnePass)(
-                $(typed...), slot::_PlateTapeSlot) where {$(types...)} =
+                $(typed...), site::_PlateRuleSite) where {$(types...)} =
             getfield(getfield(call, :rule), :program)($(arguments...))
 end
 _pr_scalar_positions(::_PlateSumRule{S}) where {S} = S
@@ -3038,8 +3356,14 @@ A prepared gradient differentiates each eligible summed plate program with a
 reverse generated from its own code; every other plate is differentiated by
 the backend as before. This also applies to non-allocating kernels after
 their cache activity and ownership rewrite. [`plate_reverse_report`](@ref)
-reports static eligibility; backend operand annotations can still require
-the ordinary reverse at execution.
+reports static eligibility.
+
+The generated reverse is installed by prepared operators ([`prepare_ad`](@ref)
+and the samplers built on it). Each one evaluates once at its exemplar; if the
+backend annotated a rule call in a way the generated reverse does not cover,
+the operator is prepared again with every plate inline, as without this
+option, so no later evaluation pays for a refused rule. The one-shot forms
+(`ad_gradient(kernel, backend, ...)`) differentiate the plates inline.
 
 Include kernel preparation in this scope as well as AD preparation. Native
 optimizations chosen while the rule is disabled can produce forms outside
@@ -3182,13 +3506,19 @@ end
 # other program inline, as `_inline_plate_programs` inlines them, and the
 # report of each program: `(result, "rule" or the reason it falls back)`.
 # `tape_slot`, when the caller owns AD caches, returns the operand expression
-# of a fresh `_PlateTapeSlot` for one rule call: every rule with a batched
-# operand gets one, because whether a call takes one pass depends on operand
-# types and sizes that only the call knows.
+# of a fresh `_PlateTapeSlot` for one rule call: every rule gets one, because
+# whether a call takes one pass depends on operand types and sizes that only
+# the call knows, and a plate of shared scalars alone keeps its cotangents
+# there too. A caller without AD caches gives each rule call a mark of the
+# preparation in progress (`_pr_marks`). Either is the call's site record,
+# which its preparation reads after one evaluation. A plate whose call cannot
+# carry one (no preparation collects marks, or the call is at the operand
+# limit) stays inline.
 function _pr_inline_plate_programs(ast::Expr, kernel, active_ports; tape_slot = nothing)
     outer_active = _pr_body_activity(ast.args[2], Set{Symbol}(active_ports))
     lazy = _pr_lazy_cell_arrays(ast.args[2])
     report = Any[]
+    marks = tape_slot === nothing ? _pr_marks() : nothing
     function replace(node)
         if node isa Expr && node.head === :(=) && node.args[2] isa Expr &&
                 node.args[2].head === :call && first(node.args[2].args) isa _PlateProgram
@@ -3196,10 +3526,10 @@ function _pr_inline_plate_programs(ast::Expr, kernel, active_ports; tape_slot = 
             push!(report, (node.args[1], rule === nothing ? info : "rule"))
             rule === nothing && return node
             operands = node.args[2].args[2:end]
-            if tape_slot !== nothing && !isempty(_pr_batched_positions(rule)) &&
-                    length(operands) < _PLATE_CALL_MAX_ARGUMENTS
-                operands = Any[operands..., tape_slot()]
-            end
+            (tape_slot !== nothing || marks !== nothing) &&
+                length(operands) < _PLATE_CALL_MAX_ARGUMENTS || return node
+            site = tape_slot !== nothing ? tape_slot() : _pr_rule_mark!(marks)
+            operands = Any[operands..., site]
             called = Expr(:(=), node.args[1], Expr(:call, rule, operands...))
             # The else arm keeps the program call, which is inlined below.
             return Expr(:if, Expr(:call, GlobalRef(@__MODULE__, :_pr_rule_applies), rule,
@@ -3229,10 +3559,12 @@ _pr_active_ports(kernel::NonAllocatingKernel, I) = begin
 end
 
 # The AD kernel (`_ad_inline_plate_programs`) for active selector `I`: with the
-# generated plate reverse enabled, each eligible plate program a rule.
+# generated plate reverse enabled, each eligible plate program a rule. Rules
+# are installed only for a preparation that verifies them (`_pr_marks`): a
+# one-shot derivative differentiates the plates inline.
 Base.@nospecializeinfer function _ad_inline_plate_programs(
         @nospecialize(kernel::PreparedKernel), I)
-    _plate_reverse_enabled() && _has_plate_programs(kernel.ast) ||
+    _plate_reverse_enabled() && _pr_marks() !== nothing && _has_plate_programs(kernel.ast) ||
         return _ad_inline_plate_programs(kernel)
     ast, _ = _pr_inline_plate_programs(kernel.ast, kernel, _pr_active_ports(kernel, I))
     native = compile(ast)
@@ -3252,7 +3584,8 @@ Accepts a `PreparedKernel` or `NonAllocatingKernel`. This is a static report,
 independent of whether the preference is enabled; cache rewrites and backend
 operand annotations can affect the rule used by a prepared gradient. A call of
 an eligible plate takes its rule only where a one-pass schedule applies to
-the call's operands, and runs inline otherwise.
+the call's operands, and runs inline otherwise. A prepared operator whose
+backend refused a rule call at its exemplar runs every plate inline.
 Single-plate programs are listed even when ordinary native execution inlines
 them.
 """
