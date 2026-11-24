@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.379
+
+- Native Enzyme preparation checks each opt-in summed-plate rule at the
+  exemplar. A skipped plate, an unchecked schedule or a rule Enzyme declines
+  uses the ordinary inline derivative. Other plates can keep their checked
+  schedules. If the exemplar throws during verification, all plates use
+  ordinary differentiation. The visit recorder runs only during preparation.
+
 ## 0.1.378
 
 - The generated reverse of a summed plate shares an accumulator when the

@@ -3324,7 +3324,6 @@ end
     kept[2k] = high
     (low, high)
 end
-@inline _pr_mark_declined!(slot::_PlateTapeSlot) = (slot.declined = true; nothing)
 @inline _pr_mark_declined!(::Nothing) = nothing
 
 # The mark of one rule call site in a program that owns no AD caches (an
@@ -3334,90 +3333,127 @@ end
 # its own. It holds no state. A program is compiled once for its content and
 # every preparation of it runs that code, so nothing the program holds as a
 # literal can belong to one preparation; a refused call is recorded for the
-# preparation that is evaluating instead (`_pr_recording_refusals`).
-struct _PlateRuleMark end
+# preparation that is evaluating instead (`_pr_checking_sites`).
+struct _PlateRuleMark
+    ordinal::Int
+end
+_PlateRuleMark() = _PlateRuleMark(1)
 # The trailing operand of a rule call that is no operand of its program.
 const _PlateRuleSite = Union{_PlateTapeSlot,_PlateRuleMark}
 
-# Whether the backend's adapter refused a marked rule call while `f` ran, in
-# this task: `refused` is set by each such call. A preparation runs its own
-# evaluations this way (`_prepare_ad_operator`, `_pr_verified_preparation`).
-# Outside one a refusal is recorded nowhere.
+# A refusal ends the trial derivative before it enters the general reverse.
+# In particular, registered Enzyme on Julia 1.13 can lose the roots of a
+# constant gathered operand when that reverse reads it from the tape.
+struct _PRDeclined <: Exception
+    site::_PlateRuleSite
+end
 const _PR_REFUSAL_SCOPE = :ReactiveKernels_plate_reverse_refusal
-_pr_recording_refusals(f, refused::Base.RefValue{Bool}) =
-    task_local_storage(f, _PR_REFUSAL_SCOPE, refused)
-function _pr_mark_declined!(::_PlateRuleMark)
-    refused = get(task_local_storage(), _PR_REFUSAL_SCOPE, nothing)
-    refused === nothing || ((refused::Base.RefValue{Bool})[] = true)
+@noinline function _pr_mark_declined!(site::_PlateRuleSite)
+    site isa _PlateTapeSlot && (site.declined = true)
+    get(task_local_storage(), _PR_REFUSAL_SCOPE, false) && throw(_PRDeclined(site))
     nothing
 end
 
-# The marks of the preparation in progress: one per rule call its program
-# makes without a tape slot. `_prepare_ad_operator` collects them while it
-# builds the differentiated program, so it knows whether there is such a call
-# to check (`_pr_verified_preparation`). Outside such a preparation there is
-# no collector, and no rule is installed: a rule call exists only where a
-# preparation verifies it.
+# Site numbers follow the structural plate walk, including candidates omitted
+# on a retry. The clean program carries the ordinal and allowed signature
+# types. The mutable records belong to each preparation.
+struct _PRSites
+    marks::Vector{_PlateRuleMark}
+    allowed::Union{Nothing,Dict{Int,Type}}
+    selected::Union{Nothing,Vector{Type}}
+    slots::Vector{Pair{Int,_PlateTapeSlot}}
+end
+_PRSites(marks, allowed, selected) =
+    _PRSites(marks, allowed, selected, Pair{Int,_PlateTapeSlot}[])
+
 const _PR_MARKS_SCOPE = :ReactiveKernels_plate_reverse_marks
-_pr_marks() = get(task_local_storage(), _PR_MARKS_SCOPE, nothing)::Union{Nothing,Vector{_PlateRuleMark}}
+_pr_marks() = get(task_local_storage(), _PR_MARKS_SCOPE, nothing)::Union{Nothing,_PRSites}
+_pr_collecting_marks(f, sites::_PRSites) = task_local_storage(f, _PR_MARKS_SCOPE, sites)
 _pr_collecting_marks(f, marks::Vector{_PlateRuleMark}) =
-    task_local_storage(f, _PR_MARKS_SCOPE, marks)
-# The mark of one rule call, counted by the preparation in progress.
-function _pr_rule_mark!(marks::Vector{_PlateRuleMark})
-    mark = _PlateRuleMark()
-    push!(marks, mark)
-    mark
+    _pr_collecting_marks(f, _PRSites(marks, nothing, nothing))
+
+# A change of size can switch a reached site between the grouped and logical
+# tapes. Their backend activity requirements differ. Record the concrete call
+# signature on the selected arm of the native probe. On the same arm in the
+# clean program both types are already known, so membership folds to a Bool.
+struct _PRObserveSchedule
+    selected::Vector{Type}
+    ordinal::Int
+end
+@inline _pr_schedule_matches(::Type{Allowed}, ::T, ::A) where {Allowed,T,A} =
+    Tuple{T,A} <: Allowed
+function _pr_schedule_matches(probe::_PRObserveSchedule, ::T, ::A) where {T,A}
+    old = probe.selected[probe.ordinal]
+    probe.selected[probe.ordinal] = Union{old,Tuple{T,A}}
+    true
 end
 
-# The tape slots among a preparation's AD contexts: one per rule call, in the
-# cache table the backend shadows.
-_pr_tape_slots!(found::Vector{_PlateTapeSlot}, slot::_PlateTapeSlot) = push!(found, slot)
-function _pr_tape_slots!(found::Vector{_PlateTapeSlot}, values::Tuple)
-    for value in values
-        _pr_tape_slots!(found, value)
-    end
-    found
-end
-_pr_tape_slots!(found::Vector{_PlateTapeSlot}, context::DifferentiationInterface.Context) =
-    _pr_tape_slots!(found, DifferentiationInterface.unwrap(context))
-_pr_tape_slots!(found::Vector{_PlateTapeSlot}, value) = found
-
-# A generated plate rule is verified where it is installed. The schedule is
-# chosen on operand types and sizes, which the program knows; the backend's
-# own annotations of the call (an operand it treats as active that the rule
-# does not differentiate) are known only once it compiles the derivative. One
-# evaluation at the exemplar shows whether its adapter took every rule call it
-# reached. A refused call would run the adapter's general path on every
-# evaluation, which costs more than the backend's own reverse of the inline
-# plate, so `ordinary()` then prepares the operator again with the plates
-# inline, exactly as without the generated reverse. `evaluated` says the
-# preparation already ran the operator once (`warm`, or the derivative check).
-# Every rule call has a site record. A tape slot among the contexts keeps its
-# own refusal. A program that owns no AD caches marks its calls (`marks`), and
-# their refusals are recorded in `refused` while this preparation evaluates
-# (`_pr_recording_refusals`): the caller runs its own evaluations that way.
-function _pr_verified_preparation(ordinary, op::Val, prepared, point, seeds, contexts,
-                                  evaluated::Bool,
-                                  marks::Vector{_PlateRuleMark} = _PlateRuleMark[],
-                                  refused::Base.RefValue{Bool} = Ref(false))
-    slots = _pr_tape_slots!(_PlateTapeSlot[], contexts)
-    isempty(slots) && isempty(marks) && return prepared
-    if !evaluated
-        f, args = _ad_operator_evaluation(op, prepared, point, seeds, contexts)
-        # Infer first: the backend builds its derivative during inference,
-        # outside the codegen lock a first call would hold (`_ad_warm!`).
-        Base.code_typed(f, Tuple{map(Core.Typeof, args)...})
+function _pr_prepared_call(build, allowed, check_visits)
+    _plate_reverse_enabled() || return build(), nothing
+    if allowed === nothing && check_visits
+        selected = Type[]
+        probe = _PRSites(_PlateRuleMark[], nothing, selected)
+        candidate = _pr_collecting_marks(build, probe)
+        isempty(probe.marks) && return candidate, nothing
+        call, point, contexts = candidate
+        fill!(selected, Union{})
         try
-            _pr_recording_refusals(refused) do
-                Base.invokelatest(f, args...)
-            end
+            Base.invokelatest(call, point, map(DifferentiationInterface.unwrap, contexts)...)
         catch err
             err isa InterruptException && rethrow()
-            # The program throws at its exemplar, as it will for the caller:
-            # there is nothing to verify at this point.
+            @warn "The native plate-rule check threw at the exemplar. Preparing the plates inline." exception = err
+            fill!(selected, Union{})
+        end
+        allowed = Dict{Int,Type}(i => types for (i, types) in pairs(selected) if types !== Union{})
+        isempty(allowed) && return with_plate_reverse(build, false), nothing
+    end
+    sites = _PRSites(_PlateRuleMark[], allowed, nothing)
+    _pr_collecting_marks(build, sites), sites
+end
+
+# The recorder crosses the native call as an ordinary operand. Keeping it out
+# of program literals lets simultaneous preparations reuse the compiled probe.
+function _pr_probe_callables(callables, sites)
+    sites.selected === nothing || isempty(sites.marks) ? callables :
+        (callables..., sites.selected)
+end
+
+# A successful trial returns the prepared operator. A refused trial returns
+# the sites to rebuild, then the new derivative is checked from the start.
+# Only a refusal reads the verifier's task-local flag.
+function _pr_checking_sites(f, sites)
+    (sites === nothing || isempty(sites.marks)) && return f()
+    try
+        task_local_storage(f, _PR_REFUSAL_SCOPE, true)
+    catch err
+        err isa _PRDeclined || rethrow()
+        ordinal = if err.site isa _PlateRuleMark
+            err.site.ordinal
+        else
+            i = findfirst(pair -> last(pair) === err.site, sites.slots)
+            i === nothing ? nothing : first(sites.slots[i])
+        end
+        any(m -> m.ordinal === ordinal, sites.marks) || return Dict{Int,Type}()
+        Dict{Int,Type}(m.ordinal => (sites.allowed === nothing ? Any : sites.allowed[m.ordinal])
+                       for m in sites.marks if m.ordinal != ordinal)
+    end
+end
+
+function _pr_verified_preparation(op, prepared, point, seeds, contexts, evaluated, sites)
+    (sites === nothing || isempty(sites.marks)) && return prepared
+    if evaluated === nothing
+        f, args = _ad_operator_evaluation(op, prepared, point, seeds, contexts)
+        Base.code_typed(f, Tuple{map(Core.Typeof, args)...})
+        evaluated = try
+            Base.invokelatest(f, args...)
+            true
+        catch err
+            err isa Union{InterruptException,_PRDeclined} && rethrow()
+            @warn "The derivative threw while verifying plate rules at the exemplar. Preparing the plates inline." exception = err
+            false
         end
     end
-    any(slot -> slot.declined, slots) || refused[] ? ordinary() : prepared
+    evaluated ? prepared : Dict{Int,Type}()
 end
 @inline function _pr_take_tape!(slot::_PlateTapeSlot, n::Int)
     tape = slot.tape
@@ -3513,12 +3549,14 @@ function _pr_rule_expr(S, B, types, joint, dispatch, projections)
             operands[i] = :(only(getfield(args, $i).broadcast.args))
         end
         sited && push!(operands, :(getfield(args, $(count + 1))))
+        extra = dispatch === :_pr_rule_applies ? (:check,) : ()
         return :($dispatch(_pr_exp_rule(rule, Val($inputs), Val($shadows), $shapes),
-                           ($(operands...),)))
+                           ($(operands...),), $(extra...)))
     end
     dispatch === :_pr_rule_target && return _pr_target_expr(S, B, types, joint, identity)
     dispatch === :_pr_rule_applies &&
-        return _pr_target_expr(S, B, types, joint, _ -> false, _ -> true)
+        return _pr_target_expr(S, B, types, joint, _ -> false,
+                               target -> :(_pr_schedule_matches(check, $target, args)))
     call = target -> Expr(:call, target, operands...)
     one_pass = sited ?
         (target -> Expr(:call, target, operands..., :(getfield(args, $(count + 1))))) : call
@@ -3563,7 +3601,8 @@ _pr_inlined(body) = Expr(:block, Expr(:meta, :inline), body)
 # Whether this call takes a one-pass schedule, from its operand types and
 # sizes alone. A call that does not runs the plate inline, where the backend
 # differentiates the optimized program exactly as it does without a rule.
-@generated _pr_rule_applies(rule::_PlateSumRule{S,B,P,R,J,G,C}, args::Tuple) where {S,B,P,R,J,G,C} =
+@inline _pr_rule_applies(rule, args::Tuple) = _pr_rule_applies(rule, args, Any)
+@generated _pr_rule_applies(rule::_PlateSumRule{S,B,P,R,J,G,C}, args::Tuple, check::K) where {S,B,P,R,J,G,C,K} =
     _pr_inlined(_pr_source_checked_expr(S, B, args.parameters, J, :_pr_rule_applies, G, C,
                                         _pr_sited_reverse(R)))
 _pr_projections(::Type{<:_PlateSumRule{S,B,P,R,J,G}}) where {S,B,P,R,J,G} = G
@@ -3571,7 +3610,7 @@ _pr_projections(::Type{<:_PlateSumRule{S,B,P,R,J,G}}) where {S,B,P,R,J,G} = G
     _pr_group_broadcast_expr(I, _pr_projections(F), args.parameters, :_pr_rule_target)
 @generated _pr_rule_call(rule::_PRGroupBroadcastRule{I,F}, args::Tuple) where {I,F} =
     _pr_inlined(_pr_group_broadcast_expr(I, _pr_projections(F), args.parameters, :_pr_rule_call))
-@generated _pr_rule_applies(rule::_PRGroupBroadcastRule{I,F}, args::Tuple) where {I,F} =
+@generated _pr_rule_applies(rule::_PRGroupBroadcastRule{I,F}, args::Tuple, check::K) where {I,F,K} =
     _pr_inlined(_pr_group_broadcast_expr(I, _pr_projections(F), args.parameters, :_pr_rule_applies))
 # One method per operand count, each operand's type a parameter of its own:
 # Julia does not otherwise specialize on a `Function` operand it only passes on
@@ -3623,10 +3662,13 @@ their cache activity and ownership rewrite. [`plate_reverse_report`](@ref)
 reports static eligibility.
 
 The generated reverse is installed by prepared operators ([`prepare_ad`](@ref)
-and the samplers built on it). Each one evaluates once at its exemplar; if the
-backend annotated a rule call in a way the generated reverse does not cover,
-the operator is prepared again with every plate inline, as without this
-option, so no later evaluation pays for a refused rule. The one-shot forms
+and the samplers built on it). For native Enzyme, preparation runs a separate
+primal at the exemplar to find the sites that select a generated schedule.
+It then checks the derivative. Skipped sites, sites that selected inline
+execution and calls the backend declined use ordinary differentiation.
+Other sites keep their generated reverse for the checked schedules and operand
+types. A later size that selects an unchecked layout uses ordinary AD. An exemplar
+at which verification throws leaves the plates inline. The one-shot forms
 (`ad_gradient(kernel, backend, ...)`) differentiate the plates inline.
 
 Include kernel preparation in this scope as well as AD preparation. Native
@@ -3803,25 +3845,38 @@ function _pr_inline_plate_programs(ast::Expr, kernel, active_ports; tape_slot = 
     outer_active = _pr_body_activity(ast.args[2], Set{Symbol}(active_ports))
     lazy = _pr_lazy_cell_arrays(ast.args[2])
     report = Any[]
-    marks = tape_slot === nothing ? _pr_marks() : nothing
+    sites = _pr_marks()
+    ordinal = Ref(0)
     # A tape slot belongs to one preparation and can keep what a rule measures
     # of its constants; a mark cannot (`_pr_cached_exponents`).
     constants = tape_slot === nothing ? nothing : _pr_constant_names(ast.args[2])
     function replace(node)
         if node isa Expr && node.head === :(=) && node.args[2] isa Expr &&
                 node.args[2].head === :call && first(node.args[2].args) isa _PlateProgram
+            ordinal[] += 1
+            if sites !== nothing && sites.selected !== nothing
+                push!(sites.selected, Union{})
+            end
             rule, info = _pr_rule_for(node.args[2], outer_active, kernel, lazy, constants)
             push!(report, (node.args[1], rule === nothing ? info : "rule"))
             rule === nothing && return node
             operands = node.args[2].args[2:end]
-            (tape_slot !== nothing || marks !== nothing) &&
+            sites !== nothing &&
                 length(operands) < _PLATE_CALL_MAX_ARGUMENTS || return node
-            site = tape_slot !== nothing ? tape_slot() : _pr_rule_mark!(marks)
+            allowed = sites.allowed === nothing ? Any : get(sites.allowed, ordinal[], Union{})
+            allowed === Union{} && return node
+            mark = _PlateRuleMark(ordinal[])
+            push!(sites.marks, mark)
+            site = tape_slot !== nothing ? tape_slot(mark) : mark
             operands = Any[operands..., site]
             called = Expr(:(=), node.args[1], Expr(:call, rule, operands...))
             # The else arm keeps the program call, which is inlined below.
-            return Expr(:if, Expr(:call, GlobalRef(@__MODULE__, :_pr_rule_applies), rule,
-                                  Expr(:tuple, operands...)), called, node)
+            check = sites.selected === nothing ? allowed :
+                Expr(:call, GlobalRef(@__MODULE__, :_PRObserveSchedule),
+                     Expr(:ref, _CALLABLES_ARG, length(kernel.callables) + 1), mark.ordinal)
+            condition = Expr(:call, GlobalRef(@__MODULE__, :_pr_rule_applies), rule,
+                             Expr(:tuple, operands...), check)
+            return Expr(:if, condition, called, node)
         elseif node isa Expr && node.head !== :quote
             return Expr(node.head, Any[replace(a) for a in node.args]...)
         end
@@ -3857,7 +3912,8 @@ Base.@nospecializeinfer function _ad_inline_plate_programs(
     ast, _ = _pr_inline_plate_programs(kernel.ast, kernel, _pr_active_ports(kernel, I))
     native = compile(ast)
     f = kernel.f isa _ArrayFunction ? _ArrayFunction(native) : native
-    _executed_prepared_kernel(f, kernel.constants, kernel.callables, kernel.inputs,
+    ops = _pr_probe_callables(kernel.callables, _pr_marks())
+    _executed_prepared_kernel(f, kernel.constants, ops, kernel.inputs,
         kernel.outputs, kernel.plan, ast, kernel.lowered_recipes,
         _exact_signature(kernel), kernel.rebinding)
 end
@@ -3872,8 +3928,8 @@ Accepts a `PreparedKernel` or `NonAllocatingKernel`. This is a static report,
 independent of whether the preference is enabled; cache rewrites and backend
 operand annotations can affect the rule used by a prepared gradient. A call of
 an eligible plate takes its rule only where a one-pass schedule applies to
-the call's operands, and runs inline otherwise. A prepared operator whose
-backend refused a rule call at its exemplar runs every plate inline.
+the call's operands, and runs inline otherwise. Native Enzyme preparation
+checks schedule selection and backend refusals separately for each site.
 Single-plate programs are listed even when ordinary native execution inlines
 them.
 """
