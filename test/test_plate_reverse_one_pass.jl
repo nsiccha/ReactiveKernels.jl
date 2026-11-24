@@ -420,6 +420,86 @@ end
     end
 end
 
+# A Normal-like cell, `-0.5 * (v / s)^2`: its value sums the squared quotient
+# and so does the partial of the shared divisor. The bounded sweep keeps one
+# sum for both; the exceptional sweep, whose partial sum carries an exponent,
+# still adds the value's own.
+# Whether a loop's partial sums or shadow additions read a quotient by a
+# shared divisor (`x * shared_inverse`), directly, through an alias or through a
+# cell temporary of the reverse (`_pr_f…`).
+function reverse_reads_quotient(ast)
+    defs = Dict{Symbol,Vector{Any}}()
+    reverse_exprs = Any[]
+    function visit(ex)
+        ex isa Expr || return
+        if ex.head === :(=) && ex.args[1] isa Symbol
+            push!(get!(defs, ex.args[1], Any[]), ex.args[2])
+            startswith(string(ex.args[1]), "_pr_sum") && push!(reverse_exprs, ex.args[2])
+        elseif ex.head === :call && occursin("_pr_shadow_add!", string(ex.args[1]))
+            append!(reverse_exprs, ex.args[2:end])
+        end
+        foreach(visit, ex.args)
+    end
+    visit(ast)
+    quotients = Set{Symbol}(k for (k, vs) in defs
+                            if any(v -> Meta.isexpr(v, :call) && occursin("shared_inverse", string(v)), vs))
+    grown = true
+    while grown
+        grown = false
+        for (k, vs) in defs
+            (k in quotients || !any(v -> v isa Symbol && v in quotients, vs)) && continue
+            push!(quotients, k); grown = true
+        end
+    end
+    reads(e) = e isa Symbol ? (e in quotients ||
+        startswith(string(e), "_pr_f") && any(reads, get(defs, e, Any[]))) :
+        e isa Expr && any(reads, e.args)
+    any(reads, reverse_exprs)
+end
+
+@testset "the value reads the bounded sweep's sum of the same term" begin
+    divop, mulop, powop = GlobalRef(Base, :/), GlobalRef(Base, :*), GlobalRef(Base, :^)
+    density = Expr(:call, mulop, -0.5, Expr(:call, powop, Expr(:call, divop, :v1, :s), 2))
+    ast = program([density])
+    rexpr, _, _ = RK._pr_program_reverse(ast, [:x, :s], RK, Dict{Symbol,Any}())
+    loops = RK._PlateProgram[]
+    function collect_loops!(ex)
+        ex isa RK._PlateProgram && push!(loops, ex)
+        ex isa Expr && foreach(collect_loops!, ex.args)
+        nothing
+    end
+    collect_loops!(rexpr)
+    value_sums(p) = length(collect(eachmatch(r"_pr_value\d+ = _pr_value\d+ \+", string(p.ast))))
+    bounded = filter(p -> occursin("shared_inverse", string(p.ast)), loops)
+    wide = filter(p -> !occursin("shared_inverse", string(p.ast)), loops)
+    @test !isempty(bounded) && all(p -> value_sums(p) == 0, bounded)
+    @test !isempty(wide) && all(p -> value_sums(p) >= 1, wide)
+    # The bounded sweep sums and scatters the quotient's numerator: its partial
+    # sums and shadow additions read no value of `v1 * shared_inverse`, whose
+    # reciprocal is in the coefficients above the loop instead.
+    @test all(p -> !reverse_reads_quotient(p.ast), bounded)
+    ratios = Any[]
+    function collect_ratios!(ex)
+        ex isa RK._PlateProgram && return collect_ratios!(ex.ast)
+        ex isa Expr || return
+        ex.head === :(=) && startswith(string(ex.args[1]), "_pr_ratio") && push!(ratios, ex.args[2])
+        foreach(collect_ratios!, ex.args)
+    end
+    collect_ratios!(rexpr)
+    @test any(r -> occursin("shared_inverse", string(r)), ratios)
+    primal, sweep = RK.compile(ast), RK.compile(rexpr)
+    # Ordinary values take the bounded sweep, the second set the exceptional one.
+    for (x, s) in (([0.3, -1.2, 2.5, 0.0], 0.7), ([3e160, -1e160, 2e160], 1e155), (Float64[], 1.3))
+        for seed in (1.0, -0.4)
+            value, ds = sweep(x, s, seed, Val(true), zero(x))
+            _, ds2 = sweep(x, s, seed, Val(false), zero(x))
+            @test value ≈ primal(x, s) rtol = 1e-13 atol = 0
+            @test ds ≈ ds2 rtol = 1e-12 atol = 0
+            @test ds ≈ seed * sum(abs2, x ./ s; init = 0.0) / s rtol = 1e-12 atol = 0
+        end
+    end
+end
+
 # The schedule is chosen on operand types before the backend sees the call:
 # an operand class the adapter has no buffer or cotangent for stays inline.
 @testset "operand classes without a one-pass buffer keep the plate inline" begin
@@ -544,6 +624,29 @@ end
         @test dx ≈ seed .* slope .* s
         @test ds ≈ seed * sum(slope .* x)
     end
+    # Each arm takes the cotangent through a select, not a product with 1 or 0,
+    # so a sign flip `ifelse(c, -x, x)` folds to one select.
+    function unit_selects(ex)
+        ex isa RK._PlateProgram && return unit_selects(ex.ast)
+        ex isa Expr || return 0
+        own = Meta.isexpr(ex, :if, 3) && Set(ex.args[2:3]) == Set([0.0, 1.0])
+        own + sum(unit_selects, ex.args; init = 0)
+    end
+    @test unit_selects(rexpr) == 0
+    flip = :($(GlobalRef(Base, :ifelse))(v1 > 0, -(s * v1), s * v1))
+    gate = :($(GlobalRef(Base, :ifelse))(v1 > 0, s * v1, 0.0))
+    for (cell, slope) in ((flip, v -> v > 0 ? -1.0 : 1.0), (gate, v -> v > 0 ? 1.0 : 0.0))
+        rexpr = first(RK._pr_program_reverse(program([cell]), [:x, :s], RK, Dict{Symbol,Any}()))
+        @test unit_selects(rexpr) == 0
+        sweep = RK.compile(rexpr)
+        for seed in (1.0, -0.6), want in (false, true)
+            dx = zeros(length(x))
+            value, ds = sweep(x, s, seed, Val(want), dx)
+            want && @test value ≈ sum(slope.(x) .* s .* x)
+            @test dx ≈ seed .* slope.(x) .* s
+            @test ds ≈ seed * sum(slope.(x) .* x)
+        end
+    end
 end
 
 # A partitioned count likelihood and two crossed groupings: each grouped plate
@@ -615,6 +718,62 @@ warm_gradient_bytes(q, g, u) = (sampler_value_and_gradient!(q, g, u);
         @test warm_gradient_bytes(on, g, u) == 0
         @test warm_gradient_bytes(off, g, u) == 0
     end
+end
+
+# The crossed likelihood divides by its shared scale, so its sweep certifies
+# the exponent range of what it reads. The covariate and the responses are
+# bound data, the same at every call of one preparation: their ranges are
+# measured at its first call and kept in the rule call's tape slot. Another
+# binding has a preparation and a slot of its own.
+@testset "bound data's exponent range is measured once per preparation" begin
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    n, J, J2 = 600, 20, 7
+    group = [mod1(7i, J) for i in 1:n]
+    group2 = [mod1(5i + i ÷ 9, J2) for i in 1:n]
+    x = [0.3 * cos(i) for i in 1:n]
+    responses = [0.5 * sin(i) + 0.1 * group[i] / J for i in 1:n]
+    # The names are the function's own: an assignment to a name of the
+    # testset would rebind that one.
+    function prepared(y)
+        local plan = ScheduleModels.crossed(; group, group2, J, J2, x) | (; y)
+        local built = build_kernel(plan)
+        local point = [0.1 * sin(i) for i in 1:built.layout.total]
+        local ordinary = with_plate_reverse(false) do
+            prepare_sampler(built, plan, point; backend, nonallocating = true)
+        end
+        local generated = with_plate_reverse(true) do
+            prepare_sampler(built, plan, point; backend, nonallocating = true)
+        end
+        generated, ordinary, point
+    end
+    kept(q) = [copy(slot.exponents) for caches in RK._ad_owned_storage(q.ad)
+               if caches isa Tuple for slot in caches
+               if slot isa RK._PlateTapeSlot && !isempty(slot.exponents)]
+    records(r) = Set(zip(r[1:2:end], r[2:2:end]))
+    agrees(on, off, point) = begin
+        g1, g0 = similar(point), similar(point)
+        v1, _ = sampler_value_and_gradient!(on, g1, point)
+        v0, _ = sampler_value_and_gradient!(off, g0, point)
+        isapprox(v1, v0; rtol = 1e-12) && isapprox(g1, g0; rtol = 1e-10, atol = 1e-12)
+    end
+
+    on, off, u = prepared(responses)
+    @test agrees(on, off, u)
+    # Only the likelihood reads bound floating-point data.
+    first_call = kept(on)
+    @test length(first_call) == 1
+    @test records(only(first_call)) == Set([RK._pr_exponents(x), RK._pr_exponents(responses)])
+    @test agrees(on, off, u .+ 0.3) && agrees(on, off, u .- 0.2)
+    @test kept(on) == first_call
+    g = similar(u)
+    @test warm_gradient_bytes(on, g, u) == 0
+
+    # Responses of another magnitude take the exceptional sweep.
+    large = 1e120 .* responses
+    wide, wide_off, u = prepared(large)
+    @test agrees(wide, wide_off, u) && agrees(wide, wide_off, u .+ 0.3)
+    @test records(only(kept(wide))) == Set([RK._pr_exponents(x), RK._pr_exponents(large)])
+    @test kept(on) == first_call
 end
 
 # A rule the backend refuses is found at preparation, and the preparation is

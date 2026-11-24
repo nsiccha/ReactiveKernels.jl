@@ -1114,6 +1114,8 @@ mutable struct _PRProgramState
     groups::IdDict{Expr,_PRAdditiveGroup}
     group_shadows::IdDict{Expr,Expr}
     group_scatters::IdDict{Expr,Expr}
+    bound::Vector{Symbol}             # parameters that read the constants table
+    sited::Bool                       # the reverse reads its call's site record
 end
 
 # How many reads of each batched parameter one call of the program can make,
@@ -1551,12 +1553,33 @@ function _pr_factored_quotient!(out, fc, terms, partial, toplevel, q)
     value = :($(GlobalRef(@__MODULE__, :_pr_quotient))(($(factors...),), $d))
     if toplevel && length(shared) <= 3 && all(x -> x isa Union{Symbol,Number}, shared) &&
             _pr_is_invariant(fc, d, true)
-        scale = get!(fc.coefs, (:quotient, Tuple(shared), d)) do
+        # A factor that is itself a bounded quotient (`z = x / σ`, computed
+        # as `x * r`) enters the cell's product as its numerator, and its
+        # reciprocal joins the coefficient: the sweep then sums and scatters
+        # `x` as a hand-written loop sums the unscaled residual, and `z` is
+        # not formed for the reverse. The range check still charges `z`
+        # squared, which covers the reciprocals the coefficient now carries
+        # (`_pr_targets_fit`).
+        recips = Symbol[]
+        numerator(x) = if x isa Symbol && haskey(q.fast, x)
+            numer, divisor = q.fast[x]
+            push!(recips, q.inverses[divisor])
+            numer
+        else
+            x
+        end
+        fv = v === nothing ? nothing : numerator(v)
+        fn = n === 1 ? 1 : numerator(n)
+        scale = get!(fc.coefs, (:quotient, Tuple(shared), d, Tuple(recips))) do
             k = _pr_fresh!(fc, :ratio)
-            push!(fc.pre, :($k = $(q.normal) ? Base.prod(($(shared...),)) / $d : 1.0))
+            ratio = :(Base.prod(($(shared...),)) / $d)
+            for r in recips
+                ratio = :($ratio * $r)
+            end
+            push!(fc.pre, :($k = $(q.normal) ? $ratio : 1.0))
             k
         end
-        fast = v === nothing ? n : n === 1 ? v : :($v * $n)
+        fast = fv === nothing ? fn : fn === 1 ? fv : :($fv * $fn)
         v === nothing || push!(q.targets, v)
         n === 1 || push!(q.targets, n)
         append!(q.shared, shared)
@@ -1633,6 +1656,21 @@ function _pr_factored_sweep!(out, fc::_PRFactored, stmts, adj, mutable, toplevel
                 p === nothing && _pr_fail("`$(s.fref)` has no derivative in an active argument")
                 if s.f === Base.:/ && length(s.args) == 2
                     _pr_quotient_contribution!(out, fc, adj, mutable, a, terms, p, toplevel, q)
+                    continue
+                end
+                # An arm of `ifelse` takes the cotangent where the condition
+                # selects it and zero elsewhere: a select, not a product with 1
+                # or 0, so the two arms' contributions fold (`c ? -d : d` for
+                # `ifelse(c, -x, x)`), and a cell cotangent that is not finite
+                # stays out of the arm not taken. A coefficient that is not
+                # finite (the seed) still multiplies both.
+                if s.f === Base.ifelse && k in (2, 3) && !_pr_is_invariant(fc, s.args[1], toplevel)
+                    c = s.args[1]
+                    pick(v) = k == 2 ? :($(GlobalRef(Base, :ifelse))($c, $v, 0.0)) :
+                                       :($(GlobalRef(Base, :ifelse))($c, 0.0, $v))
+                    new = _PRTerm[_PRTerm(t.num, t.inv,
+                        _pr_bind!(out, fc, pick(t.var === nothing ? 1.0 : t.var))) for t in terms]
+                    _pr_contribute!(out, fc, adj, mutable, a, new, toplevel)
                     continue
                 end
                 num, inv, vars = _pr_split_partial(fc, p, toplevel)
@@ -1860,6 +1898,10 @@ end
 # tapes factor it, logical tapes accumulate in cell order, and the two-pass
 # schedule compiles the reduction away.
 const _PR_WANT_VALUE = :_pr_want_value
+# The site record of the rule call a reverse runs for (`_PlateRuleSite`, or
+# `nothing`): the last parameter of a reverse that keeps a bound operand's
+# measured exponents there (`_pr_cached_exponents`), and of no other.
+const _PR_SITE = :_pr_site
 
 # The cell's value `result` as affine terms `(num, inv, var)` over the cell's
 # top-level statements: `num · ∏ inv · var`, `inv` invariant atoms and `var` a
@@ -1906,11 +1948,113 @@ function _pr_value_terms(stmts, invariant::Set{Symbol}, cellvars::Set{Symbol}, r
     terms
 end
 
+# A canonical form of a cell value, for telling whether two sums add the same
+# term: aliases resolved, a product as an unordered pair, a square as a
+# product. `bound` holds the bindings of the block being read (`t = a * b`),
+# and a value that the bounded and the exceptional sweep compute differently
+# (`if normal; a; else; b; end`) is read as the bounded sweep's. A quotient by
+# an invariant divisor (`fast`, the bounded sweep's `x * r`) is its
+# numerator's form over that divisor, `(:/, form, divisors)`, with the
+# divisors of a product collected outside it. Anything else compares by name,
+# and an expression that is not a product equals nothing.
+function _pr_summand_key(x, defs::Dict{Symbol,Any}, bound::Dict{Symbol,Any}, normal = nothing,
+                         fast = nothing)
+    key(y) = _pr_summand_key(y, defs, bound, normal, fast)
+    x isa Real && !(x isa Bool) && return Float64(x)
+    if x isa Symbol
+        haskey(bound, x) && return key(bound[x])
+        d = get(defs, x, nothing)
+        d isa _PRAlias && return key(d.rhs)
+        if d isa _PRCall && length(d.args) == 2
+            (d.f === Base.:* || d.f === _native_mul) &&
+                return _pr_product_key(key(d.args[1]), key(d.args[2]))
+            if d.f === Base.:^ && d.args[2] === 2
+                k = key(d.args[1])
+                return _pr_product_key(k, k)
+            end
+            if d.f === Base.:/ && fast !== nothing && haskey(fast, x)
+                numer, divisor = fast[x]
+                base, divisors = _pr_key_parts(key(numer))
+                return (:/, base, (divisors..., divisor))
+            end
+        end
+        return x
+    end
+    normal !== nothing && Meta.isexpr(x, :if, 3) && x.args[1] === normal && return key(x.args[2])
+    if Meta.isexpr(x, :call, 3)
+        f = x.args[1]
+        f isa GlobalRef && isdefined(f.mod, f.name) && (f = getglobal(f.mod, f.name))
+        (f === :* || f === Base.:* || f === _native_mul) &&
+            return _pr_product_key(key(x.args[2]), key(x.args[3]))
+    end
+    gensym(:unshared)
+end
+function _pr_product_key(a, b)
+    (ba, da), (bb, db) = _pr_key_parts(a), _pr_key_parts(b)
+    base = repr(ba) <= repr(bb) ? (:*, ba, bb) : (:*, bb, ba)
+    isempty(da) && isempty(db) && return base
+    (:/, base, Tuple(sort!(Any[da..., db...]; by = repr)))
+end
+_pr_key_parts(k) = k isa Tuple && length(k) == 3 && k[1] === :/ ? (k[2], k[3]) : (k, ())
+
+# The partial sums that the bounded arm of a quotient contribution adds once
+# per cell (`if normal; t = …; S = S + t; else … end`, `_pr_quotient_contribution!`),
+# by the canonical form of their summand. `sums` names the sweep's partial
+# sums. A sum the cell adds to more than once is no single term's sum.
+function _pr_normal_sums(stmts, reverse, normal, sums, fast = nothing)
+    defs = Dict{Symbol,Any}(s.lhs => s for s in stmts if s isa Union{_PRAlias,_PRCall})
+    updates = Dict{Symbol,Int}()
+    function count_updates(node)
+        node isa Expr || return
+        if Meta.isexpr(node, :(=), 2) && node.args[1] isa Symbol && node.args[1] in sums
+            updates[node.args[1]] = get(updates, node.args[1], 0) + 1
+        end
+        foreach(count_updates, node.args)
+    end
+    foreach(count_updates, reverse)
+    found = Dict{Any,Symbol}()
+    for node in reverse
+        Meta.isexpr(node, :if, 3) && node.args[1] === normal &&
+            Meta.isexpr(node.args[2], :block) || continue
+        bound = Dict{Symbol,Any}()
+        for stmt in node.args[2].args
+            Meta.isexpr(stmt, :(=), 2) && stmt.args[1] isa Symbol || continue
+            lhs, rhs = stmt.args
+            if lhs in sums
+                get(updates, lhs, 0) == 1 && Meta.isexpr(rhs, :call, 3) && rhs.args[1] === :+ &&
+                    rhs.args[2] === lhs || continue
+                get!(found, _pr_summand_key(rhs.args[3], defs, bound, normal, fast), lhs)
+            else
+                bound[lhs] = rhs
+            end
+        end
+    end
+    defs, found
+end
+
 # The statements that add the cell values into `total`: above the loop, in it
-# and after it, each only when the sweep wants the value.
+# and after it, each only when the sweep wants the value. Where the bounded
+# sweep (`normal`) already keeps a partial sum of the same term for a shared
+# adjoint, such as the squared residual of a Normal cell for its scale, the
+# value reads that sum and adds its own only in the exceptional sweep. A value
+# term that is that sum's summand over invariant divisors (the squared
+# standardized residual, where the sweep sums the squared residual) reads the
+# sum times their reciprocals (`quotients`, the sweep's `q`).
 function _pr_value_accumulation(stmts, invariant, cellvars, result, total, add, ncells,
-                                st::_PRProgramState)
+                                st::_PRProgramState; reverse = Any[], normal = nothing,
+                                sums = Set{Symbol}(), quotients = nothing)
     want = :($_PR_WANT_VALUE isa Val{true})
+    fast = quotients === nothing ? nothing : quotients.fast
+    defs, shared = normal === nothing ? (Dict{Symbol,Any}(), Dict{Any,Symbol}()) :
+        _pr_normal_sums(stmts, reverse, normal, sums, fast)
+    function twin_of(var)
+        isempty(shared) && return nothing
+        k = _pr_summand_key(var, defs, Dict{Symbol,Any}(), nothing, fast)
+        haskey(shared, k) && return shared[k]
+        base, divisors = _pr_key_parts(k)
+        (isempty(divisors) || !haskey(shared, base)) && return nothing
+        Expr(:call, GlobalRef(Base, :*), shared[base], (quotients.inverses[d] for d in divisors)...)
+    end
     coef(num, inv) = isempty(inv) ? num :
         num == 1.0 ? Expr(:call, GlobalRef(Base, :*), inv...) :
         Expr(:call, GlobalRef(Base, :*), num, inv...)
@@ -1923,8 +2067,15 @@ function _pr_value_accumulation(stmts, invariant, cellvars, result, total, add, 
             st.counter += 1
             s = Symbol(:_pr_value, st.counter)
             push!(pre, :($s = 0.0))
-            push!(inloop, :($want && ($s = $s + $var)))
-            push!(parts, :($(coef(num, inv)) * $s))
+            update = :($want && ($s = $s + $var))
+            twin = twin_of(var)
+            if twin === nothing
+                push!(inloop, update)
+                push!(parts, :($(coef(num, inv)) * $s))
+            else
+                push!(inloop, Expr(:if, normal, Expr(:block), update))
+                push!(parts, :($(coef(num, inv)) * ($normal ? $twin : $s)))
+            end
         end
     end
     isempty(constant) || push!(parts, :($ncells * $(Expr(:call, GlobalRef(Base, :+), 0.0, constant...))))
@@ -2199,6 +2350,25 @@ end
     _pr_all_exponents(range, operands)
 end
 
+# The same with a site record. `ordinals` has one entry per read: zero for an
+# operand measured at this call, else the position of its parameter among the
+# reverse's reads of the constants table, whose exponents the site keeps.
+@inline function _pr_storage_exponents(range::_PRExponents, cells, reads::Tuple, shadows::Tuple,
+                                       site, ordinals::Tuple)
+    operands = map(_pr_bound_storage, reads)
+    _pr_plain_storage(cells, operands, shadows) || return _PR_BAD_EXPONENTS
+    _pr_site_exponents(range, operands, site, ordinals)
+end
+@inline _pr_site_exponents(range::_PRExponents, ::Tuple{}, site, ::Tuple{}) = range
+@inline _pr_site_exponents(range::_PRExponents, xs::Tuple, site, ordinals::Tuple) =
+    _pr_site_exponents(
+        _pr_merge_exponents(range, _pr_operand_exponents(site, first(ordinals), first(xs))),
+        Base.tail(xs), site, Base.tail(ordinals))
+@inline _pr_operand_exponents(site, k::Int, x) =
+    k == 0 ? _pr_exponents(x) : _pr_cached_exponents(site, k, x)
+# Without a tape slot there is nowhere to keep them: measured at each call.
+@inline _pr_cached_exponents(site, k::Int, x) = _pr_exponents(x)
+
 # For every target of the sweep's shared-reciprocal arithmetic, how its
 # magnitude follows from the leaves': `(n, d, s)`, the leaves it multiplies,
 # the leaves it divides by, and bits of slack. A leaf (an outer value or a
@@ -2272,12 +2442,19 @@ end
 function _pr_checked_reads(stmts, st, linear, written)
     indices = Set([linear])
     reads = Set{Symbol}()
+    constant_reads = Symbol[]
     for s in stmts
         if s isa _PRAlias
             s.rhs in indices && push!(indices, s.lhs)
         elseif _pr_is_read(s, st)
             s.args[2] in indices || return nothing
-            st.prepared[s.args[1]] === written || push!(reads, s.lhs)
+            operand = s.args[1]
+            if st.prepared[operand] === written
+            elseif st.prepared[operand] in st.bound
+                operand in constant_reads || push!(constant_reads, operand)
+            else
+                push!(reads, s.lhs)
+            end
         elseif s isa _PRCall && s.f === Base.CartesianIndex && s.args == [linear]
             push!(indices, s.lhs)
         elseif !(s isa _PRCall && (s.f in (+, -, *, /, _native_mul, abs, abs2) ||
@@ -2285,7 +2462,7 @@ function _pr_checked_reads(stmts, st, linear, written)
             return nothing
         end
     end
-    reads
+    reads, constant_reads
 end
 
 # The checked sweep measures the exponents of its own reads, beside those of
@@ -2415,13 +2592,39 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState, indexed:
         ncells = Symbol(:_pr_ncells, st.counter)
         coefficients = Any[]
         q = (normal = gensym(:bounded_quotients), targets = Any[], shared = Any[], divisors = Any[],
-             sums = Dict{Symbol,Symbol}())
+             sums = Dict{Symbol,Symbol}(), fast = Dict{Symbol,Tuple{Any,Any}}(),
+             inverses = Dict{Any,Symbol}())
+        # In the bounded sweep a cell quotient by an invariant divisor is its
+        # numerator times the divisor's reciprocal, computed once above the loop.
+        # `q.fast` maps the quotient, and every alias of it, to its numerator and
+        # divisor, so the reverse can move that reciprocal into the coefficients
+        # it scales its sums by after the loop (`_pr_factored_quotient!`).
+        fast_divisions = Dict{Symbol,Expr}()
+        for s in inloop
+            if s isa _PRAlias
+                s.rhs isa Symbol && haskey(q.fast, s.rhs) && (q.fast[s.lhs] = q.fast[s.rhs])
+                continue
+            end
+            s isa _PRCall && s.f === Base.:/ && length(s.args) == 2 || continue
+            x, d = s.args
+            d isa Symbol && d in cellvars && !(d in inv2) && continue
+            push!(q.targets, x)
+            push!(q.divisors, d)
+            r = get!(q.inverses, d) do
+                r = gensym(:shared_inverse)
+                push!(coefficients, :($r = $(q.normal) ? inv($d) : 0.0))
+                r
+            end
+            fast_divisions[s.lhs] = :($x * $r)
+            q.fast[s.lhs] = (x, d)
+        end
         flush = Any[]
+        partial_sums = Set{Symbol}()
         if result isa Symbol && result in active
             shared = Set{Symbol}(s for s in st.outer if !(s in st.totals))
             union!(shared, hoisted_active)
             fc = _PRFactored(st, cellvars, inv2, shared, active, linear, ncells,
-                             Any[], Any[], Dict{Any,Any}(), Dict{Any,Symbol}(), Dict{Any,Any}(),
+                             coefficients, Any[], Dict{Any,Any}(), Dict{Any,Symbol}(), Dict{Any,Any}(),
                              _pr_single_reads(inloop, st, active), Dict{Symbol,Vector{Any}}())
             # The cell density's adjoint is the total's (the seed), the same
             # at every cell.
@@ -2433,32 +2636,20 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState, indexed:
             st.joint_cell_cut |= !isempty(cuts)
             _pr_flush_counts!(fc)
             coefficients, flush = fc.pre, fc.post
+            union!(partial_sums, Base.values(fc.sums))
             _pr_reverse_exprs!(after, hoisted, active, copy(defined); touched = st.touched, cuts)
         end
         # Select joint cuts from the reverse's actual uses before emitting the
         # forward. Hoisted calls stay above the loop; branch-local calls stay lazy.
         forward_pre = _pr_forward_exprs(hoisted, cuts)
-        fast_divisions = Dict{Symbol,Expr}()
-        inverses = Dict{Any,Symbol}()
-        for s in inloop
-            s isa _PRCall && s.f === Base.:/ && length(s.args) == 2 || continue
-            x, d = s.args
-            d isa Symbol && d in cellvars && !(d in inv2) && continue
-            push!(q.targets, x)
-            push!(q.divisors, d)
-            r = get!(inverses, d) do
-                r = gensym(:shared_inverse)
-                push!(coefficients, :($r = $(q.normal) ? inv($d) : 0.0))
-                r
-            end
-            fast_divisions[s.lhs] = :($x * $r)
-        end
         forward_in = _pr_forward_exprs(inloop, cuts)
         # The cell's value, for a sweep that also returns the plate's total
         # (`_PR_WANT_VALUE`): its invariant terms once, `ncells` times, after
         # the loop, and one partial sum per cell-varying term in it.
         value_pre, value_in, value_post = _pr_value_accumulation(
-            inloop, inv2, cellvars, result, total, acc.args[1], ncells, st)
+            inloop, inv2, cellvars, result, total, acc.args[1], ncells, st;
+            reverse, normal = isempty(q.divisors) ? nothing : q.normal, sums = partial_sums,
+            quotients = q)
         direct_in, read_operands = _pr_direct_reads(inloop, st)
         cellbody = Expr(:block, forward_in..., value_in..., reverse...)
         plain_loop = :(@inbounds for $linear in $cells
@@ -2536,9 +2727,24 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState, indexed:
                         structure = :($(s.fref) === $(QuoteNode(s.f)) && $structure)
                     end
                 end
-                storage = :($(GlobalRef(@__MODULE__, :_pr_within_range))(
-                    $(GlobalRef(@__MODULE__, :_pr_storage_exponents))(
-                        $measured, $cells, ($(read_operands...),), ($(shadows...),)), $targets))
+                # A read of the constants table has the same entries at
+                # every call: its exponents are measured once for the site.
+                ordinal(r) = something(findfirst(==(st.prepared[r]), st.bound), 0)
+                ordinals = map(ordinal, read_operands)
+                cached_exponents = (k, operand) -> Expr(:call,
+                    GlobalRef(@__MODULE__, :_pr_cached_exponents), _PR_SITE, k,
+                    Expr(:call, GlobalRef(@__MODULE__, :_pr_bound_storage), operand))
+                storage = if all(iszero, ordinals)
+                    :($(GlobalRef(@__MODULE__, :_pr_within_range))(
+                        $(GlobalRef(@__MODULE__, :_pr_storage_exponents))(
+                            $measured, $cells, ($(read_operands...),), ($(shadows...),)), $targets))
+                else
+                    st.sited = true
+                    :($(GlobalRef(@__MODULE__, :_pr_within_range))(
+                        $(GlobalRef(@__MODULE__, :_pr_storage_exponents))(
+                            $measured, $cells, ($(read_operands...),), ($(shadows...),),
+                            $_PR_SITE, ($(ordinals...),)), $targets))
+                end
                 certificate = :($structure && $storage)
                 ordinary = specialize(loop, 2)
                 exceptional = specialize(plain_loop, 3)
@@ -2551,19 +2757,27 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState, indexed:
                         union!(visible, first.(writes))
                     end
                     exceptional = _pr_quotient_loop(exceptional, visible)
-                    reads = if raw && length(st.shadow) == length(written) == 1 &&
+                    checked_reads = if raw && length(st.shadow) == length(written) == 1 &&
                             get(st.reads, only(written), 0) == 1
                         _pr_checked_reads(inloop, st, linear, only(written))
                     end
-                    if reads === nothing || isempty(reads)
+                    if checked_reads === nothing || all(isempty, checked_reads)
                         ordinary = _pr_quotient_loop(ordinary, visible)
                     else
                         # The checked sweep measures its dense reads itself.
-                        # Above the loop only the gather's storage is scanned.
+                        # Above the loop only the gather's storage is scanned,
+                        # and a read of the constants table has its exponents
+                        # from the site.
+                        reads, constant_reads = checked_reads
                         check = gensym(:check_in_gather)
                         gathered, owned = only(written), only(shadows)
                         merged = Expr(:call, GlobalRef(@__MODULE__, :_pr_merge_exponents), measured,
                             Expr(:call, GlobalRef(@__MODULE__, :_pr_exponents), :(parent($gathered))))
+                        for operand in constant_reads
+                            st.sited = true
+                            merged = Expr(:call, GlobalRef(@__MODULE__, :_pr_merge_exponents), merged,
+                                          cached_exponents(ordinal(operand), operand))
+                        end
                         push!(measure,
                             :($check = $_PR_WANT_VALUE isa Val{true} &&
                                 $(GlobalRef(@__MODULE__, :_pr_check_in_gather))(
@@ -2571,8 +2785,11 @@ function _pr_fused_loop(range, linear, cell::Expr, st::_PRProgramState, indexed:
                             :($check && ($measured = $merged)))
                         certificate = :($structure && ($check ?
                             $(GlobalRef(@__MODULE__, :_pr_within_range))($measured, $targets) : $storage))
-                        ordinary = _pr_checked_loop(ordinary, exceptional, visible, reads,
-                            check, only(shadows), coefficients, value_pre, q.normal, measured, targets)
+                        # With every dense read measured above the loop the
+                        # sweep inspects nothing.
+                        ordinary = isempty(reads) ? _pr_quotient_loop(ordinary, visible) :
+                            _pr_checked_loop(ordinary, exceptional, visible, reads,
+                                check, only(shadows), coefficients, value_pre, q.normal, measured, targets)
                     end
                 end
                 loop = Expr(:if, q.normal, ordinary, exceptional)
@@ -2827,7 +3044,8 @@ function _pr_factored_source(ast)
     end
 end
 
-function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict{Symbol,Any})
+function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict{Symbol,Any},
+                             bound::Vector{Symbol} = Symbol[])
     Meta.isexpr(ast, :function, 2) && Meta.isexpr(ast.args[1], :tuple) ||
         _pr_fail("not a plate program")
     params = Symbol[p for p in ast.args[1].args]
@@ -2928,16 +3146,19 @@ function _pr_program_reverse(ast::Expr, active_params, mod::Module, values::Dict
     # Several groups may contribute to the same entry. Scaling a whole shadow
     # after each group's loop would also rescale earlier groups' contributions.
     isempty(groups) || empty!(counts)
+    # The site record is one more argument of the reverse's call.
+    length(params) + length(batched) + 3 <= _PLATE_CALL_MAX_ARGUMENTS || (bound = Symbol[])
     st = _PRProgramState(mod, values, active, prepared, shadow, totals, output,
                          Set{Symbol}(), 0, outer, counts, initializers, false, false,
-                         groups, group_shadows, scatters)
+                         groups, group_shadows, scatters, bound, false)
     new_body = _pr_program_block(stmts, st, keys(index_runs))
     # Every outer adjoint starts at zero; every total's adjoint is the seed.
     init = Any[:($(_pr_bar(a)) = 0.0) for a in sort!(collect(outer)) if !(a in totals)]
     seeds = Any[:($(_pr_bar(t)) = $seed) for t in sort!(collect(totals))]
     checks = Any[:($(GlobalRef(@__MODULE__, :_pr_check_shadow))($(shadow[p]), $p)) for p in batched]
     fexpr = Expr(:function,
-        Expr(:tuple, params..., seed, _PR_WANT_VALUE, (shadow[p] for p in batched)...),
+        Expr(:tuple, params..., seed, _PR_WANT_VALUE, (shadow[p] for p in batched)...,
+             (st.sited ? (_PR_SITE,) : ())...),
         Expr(:block, checks..., init..., seeds..., new_body...,
              Expr(:tuple, output, (_pr_bar(p) for p in scalar)...)))
     # What a cell shares between its value and its partials, for the schedule
@@ -3072,10 +3293,36 @@ mutable struct _PlateTapeSlot
     # here. The schedule is chosen on operand types and sizes before the
     # backend sees the call; its own annotations can still refuse it.
     declined::Bool
+    # The measured exponents (low, high) of each operand the call reads from
+    # its program's constants table, by ordinal (`_pr_cached_exponents`).
+    exponents::Vector{UInt64}
 end
 function _PlateTapeSlot()
     empty = Float64[]
-    _PlateTapeSlot(empty, empty, false)
+    _PlateTapeSlot(empty, empty, false, UInt64[])
+end
+# A constants-table entry is bound data or a value derived from data alone. A
+# slot belongs to one preparation, whose table does not change, so each such
+# operand is scanned at the slot's first call and never again. A mark is a
+# literal of a program that bindings may share, and keeps nothing.
+const _PR_UNMEASURED = typemax(UInt64)
+@inline function _pr_cached_exponents(slot::_PlateTapeSlot, k::Int, x)
+    kept = slot.exponents
+    if 2k <= length(kept)
+        low = @inbounds kept[2k - 1]
+        low == _PR_UNMEASURED || return (low, @inbounds kept[2k])
+    end
+    _pr_measure_exponents!(slot, k, x)
+end
+@noinline function _pr_measure_exponents!(slot::_PlateTapeSlot, k::Int, x)
+    low, high = _pr_exponents(x)
+    kept = slot.exponents
+    while length(kept) < 2k
+        push!(kept, _PR_UNMEASURED)
+    end
+    kept[2k - 1] = low
+    kept[2k] = high
+    (low, high)
 end
 @inline _pr_mark_declined!(slot::_PlateTapeSlot) = (slot.declined = true; nothing)
 @inline _pr_mark_declined!(::Nothing) = nothing
@@ -3238,6 +3485,14 @@ end
 # Whether a call's last operand is its site record (a tape slot or a mark),
 # which is no operand of the program.
 _pr_sited(types) = !isempty(types) && types[end] <: _PlateRuleSite
+# Whether a reverse program takes its call's site record as a last argument
+# (`_PR_SITE`), from the parameter names its compiled type carries.
+_pr_sited_reverse(::Type) = false
+_pr_sited_reverse(::Type{<:_PlateCall{F}}) where {F} = _pr_sited_reverse(F)
+_pr_sited_reverse(::Type{<:RuntimeGeneratedFunctions.RuntimeGeneratedFunction{names}}) where {names} =
+    names isa Tuple && !isempty(names) && last(names) === _PR_SITE
+_pr_sited_reverse(::Type{<:_PrecompileWarmFunction{F}}) where {F} = _pr_sited_reverse(F)
+_pr_sited_reverse(::Type{<:_PRExpProgram{I,J,F}}) where {I,J,F} = _pr_sited_reverse(F)
 # The call itself, made in each branch: a target chosen by size and then called
 # would be a union of the two wrappers, boxed in the primal. A trailing site
 # record is not an operand of the program: only the one-pass call takes it on.
@@ -3269,7 +3524,8 @@ function _pr_rule_expr(S, B, types, joint, dispatch, projections)
         (target -> Expr(:call, target, operands..., :(getfield(args, $(count + 1))))) : call
     _pr_target_expr(S, B, types, joint, call, one_pass)
 end
-function _pr_source_checked_expr(S, B, types, joint, dispatch, projections, checked)
+function _pr_source_checked_expr(S, B, types, joint, dispatch, projections, checked,
+                                 sited_reverse::Bool = false)
     body = _pr_rule_expr(S, B, types, joint, dispatch, projections)
     checked || return body
     count = length(types) - _pr_sited(types)
@@ -3282,8 +3538,9 @@ function _pr_source_checked_expr(S, B, types, joint, dispatch, projections, chec
     # is a type query; no cells, shadows or numeric inputs are evaluated.
     shadows = fill(Nothing, length(B))
     inputs = Any[types[i] for i in 1:count]
+    site = sited_reverse ? (Nothing,) : ()
     proof(want) = :(_promote_op(getfield(rule, :reverse), $(inputs...), Float64,
-                                $(Val{want}), $(shadows...)))
+                                $(Val{want}), $(shadows...), $(site...)))
     quote
         if _pr_proved_tuple($(proof(true))) && _pr_proved_tuple($(proof(false)))
             $body
@@ -3293,22 +3550,29 @@ function _pr_source_checked_expr(S, B, types, joint, dispatch, projections, chec
     end
 end
 @inline _pr_proved_tuple(T) = T !== Union{} && T <: Tuple
+# The schedule choice and the call it makes are inlined into the rule's
+# callable, as the call was before the choice grew: the backend then sees the
+# one-pass call (or the program) at the rule call site itself, with the
+# activity of the caller's own operands.
+_pr_inlined(body) = Expr(:block, Expr(:meta, :inline), body)
 @generated _pr_rule_target(rule::_PlateSumRule{S,B,P,R,J,G,C}, args::Tuple) where {S,B,P,R,J,G,C} =
-    _pr_source_checked_expr(S, B, args.parameters, J, :_pr_rule_target, G, C)
+    _pr_source_checked_expr(S, B, args.parameters, J, :_pr_rule_target, G, C, _pr_sited_reverse(R))
 @generated _pr_rule_call(rule::_PlateSumRule{S,B,P,R,J,G,C}, args::Tuple) where {S,B,P,R,J,G,C} =
-    _pr_source_checked_expr(S, B, args.parameters, J, :_pr_rule_call, G, C)
+    _pr_inlined(_pr_source_checked_expr(S, B, args.parameters, J, :_pr_rule_call, G, C,
+                                        _pr_sited_reverse(R)))
 # Whether this call takes a one-pass schedule, from its operand types and
 # sizes alone. A call that does not runs the plate inline, where the backend
 # differentiates the optimized program exactly as it does without a rule.
 @generated _pr_rule_applies(rule::_PlateSumRule{S,B,P,R,J,G,C}, args::Tuple) where {S,B,P,R,J,G,C} =
-    _pr_source_checked_expr(S, B, args.parameters, J, :_pr_rule_applies, G, C)
+    _pr_inlined(_pr_source_checked_expr(S, B, args.parameters, J, :_pr_rule_applies, G, C,
+                                        _pr_sited_reverse(R)))
 _pr_projections(::Type{<:_PlateSumRule{S,B,P,R,J,G}}) where {S,B,P,R,J,G} = G
 @generated _pr_rule_target(rule::_PRGroupBroadcastRule{I,F}, args::Tuple) where {I,F} =
     _pr_group_broadcast_expr(I, _pr_projections(F), args.parameters, :_pr_rule_target)
 @generated _pr_rule_call(rule::_PRGroupBroadcastRule{I,F}, args::Tuple) where {I,F} =
-    _pr_group_broadcast_expr(I, _pr_projections(F), args.parameters, :_pr_rule_call)
+    _pr_inlined(_pr_group_broadcast_expr(I, _pr_projections(F), args.parameters, :_pr_rule_call))
 @generated _pr_rule_applies(rule::_PRGroupBroadcastRule{I,F}, args::Tuple) where {I,F} =
-    _pr_group_broadcast_expr(I, _pr_projections(F), args.parameters, :_pr_rule_applies)
+    _pr_inlined(_pr_group_broadcast_expr(I, _pr_projections(F), args.parameters, :_pr_rule_applies))
 # One method per operand count, each operand's type a parameter of its own:
 # Julia does not otherwise specialize on a `Function` operand it only passes on
 # (the program's callables), and the call would dispatch dynamically
@@ -3399,6 +3663,19 @@ function _pr_body_activity(body, active::Set{Symbol})
     active
 end
 
+# The names a body binds once to an entry of its constants table and never
+# writes: bound data and values derived from data alone, which are the same
+# at every call of one preparation.
+function _pr_constant_names(body)
+    pairs = _pr_dataflow!(Pair{Symbol,Any}[], body)
+    writes = Dict{Symbol,Int}()
+    for (lhs, _) in pairs
+        writes[lhs] = get(writes, lhs, 0) + 1
+    end
+    Set{Symbol}(lhs for (lhs, rhs) in pairs if writes[lhs] == 1 &&
+        Meta.isexpr(rhs, :ref, 2) && rhs.args[1] === _CONSTANTS_ARG && rhs.args[2] isa Integer)
+end
+
 # The value of a program argument that reads a table: `__callables__[k]`.
 function _pr_table_value(arg, kernel)
     Meta.isexpr(arg, :ref, 2) && arg.args[2] isa Integer || return nothing
@@ -3455,8 +3732,9 @@ function _pr_lazy_cell_arrays(body)
     lazy
 end
 
-function _pr_compile_sum_rule(ast, active_params, values)
-    rexpr, scalar, batched, joint, projections = _pr_program_reverse(ast, active_params, @__MODULE__, values)
+function _pr_compile_sum_rule(ast, active_params, values, bound::Vector{Symbol} = Symbol[])
+    rexpr, scalar, batched, joint, projections =
+        _pr_program_reverse(ast, active_params, @__MODULE__, values, bound)
     params = ast.args[1].args
     S = Tuple(findfirst(==(p), params) for p in scalar)
     B = Tuple(findfirst(==(p), params) for p in batched)
@@ -3468,23 +3746,30 @@ function _pr_compile_sum_rule(ast, active_params, values)
 end
 
 function _pr_rule_for(call::Expr, outer_active::Set{Symbol}, kernel,
-                      lazy::Set{Symbol} = Set{Symbol}())
+                      lazy::Set{Symbol} = Set{Symbol}(),
+                      constants::Union{Nothing,Set{Symbol}} = nothing)
     program = first(call.args)::_PlateProgram
     params = Symbol[p for p in program.ast.args[1].args]
     args = call.args[2:end]
     values = Dict{Symbol,Any}()
     active_params = Symbol[]
+    # The parameters that read the constants table, when the call's site
+    # record can keep what is measured of them (`constants` given).
+    bound = Symbol[]
     for (p, a) in zip(params, args)
         tv = _pr_table_value(a, kernel)
         if tv !== nothing
             values[p] = tv[2]
+            constants !== nothing && a.args[1] === _CONSTANTS_ARG && push!(bound, p)
         elseif a isa Symbol && a in outer_active
             push!(active_params, p)
+        elseif a isa Symbol && constants !== nothing && a in constants
+            push!(bound, p)
         end
     end
     isempty(active_params) && return nothing, "no active operand"
     try
-        rule, rexpr, projections = _pr_compile_sum_rule(program.ast, active_params, values)
+        rule, rexpr, projections = _pr_compile_sum_rule(program.ast, active_params, values, bound)
         positions = Tuple(i for i in _pr_batched_positions(rule) if args[i] in lazy)
         isempty(positions) && return rule, rexpr
         for i in positions
@@ -3494,7 +3779,7 @@ function _pr_rule_for(call::Expr, outer_active::Set{Symbol}, kernel,
         length(args) + 2length(positions) <= _PLATE_CALL_MAX_ARGUMENTS ||
             _pr_fail("the expanded group broadcast exceeds the plate call's operand limit")
         ast, shared = _pr_expand_group_reads(program.ast, positions)
-        expanded, info, _ = _pr_compile_sum_rule(ast, [active_params; shared], values)
+        expanded, info, _ = _pr_compile_sum_rule(ast, [active_params; shared], values, bound)
         return _PRGroupBroadcastRule{positions,typeof(rule),typeof(expanded)}(rule, expanded), info
     catch err
         err isa _PRIneligible || rethrow()
@@ -3519,10 +3804,13 @@ function _pr_inline_plate_programs(ast::Expr, kernel, active_ports; tape_slot = 
     lazy = _pr_lazy_cell_arrays(ast.args[2])
     report = Any[]
     marks = tape_slot === nothing ? _pr_marks() : nothing
+    # A tape slot belongs to one preparation and can keep what a rule measures
+    # of its constants; a mark cannot (`_pr_cached_exponents`).
+    constants = tape_slot === nothing ? nothing : _pr_constant_names(ast.args[2])
     function replace(node)
         if node isa Expr && node.head === :(=) && node.args[2] isa Expr &&
                 node.args[2].head === :call && first(node.args[2].args) isa _PlateProgram
-            rule, info = _pr_rule_for(node.args[2], outer_active, kernel, lazy)
+            rule, info = _pr_rule_for(node.args[2], outer_active, kernel, lazy, constants)
             push!(report, (node.args[1], rule === nothing ? info : "rule"))
             rule === nothing && return node
             operands = node.args[2].args[2:end]

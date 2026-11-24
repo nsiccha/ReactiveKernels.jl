@@ -613,6 +613,76 @@ end
     end
 end
 
+# A dense read of the program's constants table has the same entries at every
+# call of one preparation. The reverse compiled for such a call takes the
+# call's site record as its last argument: a tape slot keeps the read's
+# measured exponents from its first call, and the sweep inspects no read.
+@testset "a bound read's exponents are measured once for its tape slot" begin
+    read = GlobalRef(RK, :_plate_read)
+    ast = direct_program(; raw = :x)
+    append!(ast.args[1].args, (:weights, :d))
+    ast = RK._index_run_replace(ast) do node
+        Meta.isexpr(node, :(=), 2) && node.args[1] === :term || return node
+        :(term = (v + $read(weights, index)) / d)
+    end
+    plain = first(RK._pr_program_reverse(ast, [:x, :d], RK, Dict{Symbol,Any}()))
+    bound = first(RK._pr_program_reverse(ast, [:x, :d], RK, Dict{Symbol,Any}(), [:weights]))
+    @test last(plain.args[1].args) !== RK._PR_SITE
+    @test last(bound.args[1].args) === RK._PR_SITE
+    # The reverse with the loop programs it calls.
+    function text(expr)
+        parts = String[]
+        visit(ex) = ex isa RK._PlateProgram ? (push!(parts, string(ex.ast)); visit(ex.ast)) :
+                    ex isa Expr ? foreach(visit, ex.args) : nothing
+        push!(parts, string(expr))
+        visit(expr)
+        join(parts, '\n')
+    end
+    @test occursin("_pr_low_exponent", text(plain))
+    @test !occursin("_pr_cached_exponents", text(plain))
+    @test !occursin("_pr_low_exponent", text(bound))
+    @test occursin("_pr_cached_exponents", text(bound))
+    sweep = RK.compile(bound)
+    @test RK._pr_sited_reverse(typeof(RK._PlateCall(sweep)))
+    @test !RK._pr_sited_reverse(typeof(RK._PlateCall(RK.compile(plain))))
+
+    z = zeros(256)
+    indices = repeat(collect(eachindex(z)), 4)
+    gradient = zeros(length(z))
+    x, shadow = view(z, indices), view(gradient, indices)
+    @test RK._pr_check_in_gather(axes(x, 1), x, shadow, (x, ones(length(indices))))
+    d = 0x1.77ee5e8d806e2p-1
+    # Each set of weights is another binding, with a preparation and slot of
+    # its own. The second set takes the exceptional sweep.
+    for last_weight in (1.0, 0x1.77ee5e8d806e2p+1023)
+        weights = ones(length(indices))
+        weights[end] = last_weight
+        slot = RK._PlateTapeSlot()
+        for site in (slot, slot, nothing, RK._PlateRuleMark()), want in (true, false)
+            existing = want ? 0.0 : 0.25
+            fill!(gradient, existing)
+            value, ds = sweep(x, weights, d, 1.0, Val(want), shadow, site)
+            quotients = weights ./ d
+            want && @test value ≈ sum(quotients)
+            @test ds ≈ Float64(-sum(BigFloat.(quotients)) / BigFloat(d))
+            @test all(≈(4 / d + existing), gradient)
+        end
+        @test slot.exponents == collect(RK._pr_exponents(weights))
+        # The slot's record is read, never measured again; without a slot
+        # every call measures.
+        other = [0x1p-900]
+        @test RK._pr_cached_exponents(slot, 1, other) == RK._pr_exponents(weights)
+        @test RK._pr_cached_exponents(nothing, 1, other) == RK._pr_exponents(other)
+        @test RK._pr_cached_exponents(RK._PlateRuleMark(), 1, other) == RK._pr_exponents(other)
+    end
+    # A second bound read has the next record.
+    slot = RK._PlateTapeSlot()
+    @test RK._pr_cached_exponents(slot, 2, [4.0, 0.0, -0.25]) == RK._pr_exponents([0.25, 4.0])
+    @test slot.exponents[1:2] == [RK._PR_UNMEASURED, RK._PR_UNMEASURED]
+    @test RK._pr_cached_exponents(slot, 1, [8.0]) == RK._pr_exponents(8.0)
+    @test RK._pr_cached_exponents(slot, 2, [1.0]) == RK._pr_exponents([0.25, 4.0])
+end
+
 @testset "grouped spans preserve inactive direct-read indices" begin
     ast = direct_program()
     push!(ast.args[1].args, :weights)
