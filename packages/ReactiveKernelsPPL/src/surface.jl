@@ -1193,7 +1193,20 @@ function _ordinary_sampling(s)
          rhs.args[1] in (:truncated, :restricted)) || _external_rhs(rhs)
 end
 
-function _lower_rkppl_once(ast, input_data::Set{Symbol}, mod::Module;
+function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module; kwargs...)
+    ast = _fold_literal_positions(ast)
+    ast, nested_broadcasts = _expand_nested_plates(ast, data)
+    # A `@scan` carried array that is observed data observes its entries
+    # (`observed_scan.jl`); the rewrite is an ordinary program.
+    ast = Expr(:block, _expand_observed_scans(ast.args, data)...)
+    ast = _observation_call_definitions(ast, data, mod)
+    ast = _gathered_value_definitions(ast, data, mod)
+    # Predictor replanning reuses the expanded program. The rewritten cells
+    # no longer carry the syntax that distinguishes nested dotted observations.
+    return _plan_rkppl(ast, nested_broadcasts, data, mod; kwargs...)
+end
+
+function _plan_rkppl(ast, nested_broadcasts::Set{Symbol}, input_data::Set{Symbol}, mod::Module;
         submodel_scopes::Vector{SubmodelScope} = SubmodelScope[],
         conditioned::Set{Symbol} = Set{Symbol}(),
         value_defs::Set{Symbol} = Set{Symbol}(),
@@ -1204,13 +1217,6 @@ function _lower_rkppl_once(ast, input_data::Set{Symbol}, mod::Module;
     # declared, its uses stay typed (an untyped `union(data, …)` takes Base's
     # vector path, which a package adding `lastindex` invalidates).
     data::Set{Symbol} = input_data
-    ast = _fold_literal_positions(ast)
-    ast, nested_broadcasts = _expand_nested_plates(ast, data)
-    # A `@scan` carried array that is observed data observes its entries
-    # (`observed_scan.jl`); the rewrite is an ordinary program.
-    ast = Expr(:block, _expand_observed_scans(ast.args, data)...)
-    ast = _observation_call_definitions(ast, data, mod)
-    ast = _gathered_value_definitions(ast, data, mod)
     sample, factors, det, plate_ctx, plate_specs, scans, joints, cell_broadcasts,
         cell_priors, cell_latents, cell_geometries =
         _partition_statements(ast, data; array_entries, mod)
@@ -1738,7 +1744,7 @@ function _lower_rkppl_once(ast, input_data::Set{Symbol}, mod::Module;
     retained = setdiff(intersect(kept, Set(p.name for p in predictors)),
         value_defs)
     if !isempty(retained)
-        return _lower_rkppl_once(ast, input_data, mod;
+        return _plan_rkppl(ast, nested_broadcasts, input_data, mod;
             submodel_scopes, conditioned, value_defs = union(value_defs, retained),
             shared_defs, array_entries, observing)
     end
@@ -1752,7 +1758,7 @@ function _lower_rkppl_once(ast, input_data::Set{Symbol}, mod::Module;
     whole = Set{Symbol}(nm for nm in ctx.whole_values
         if nm ∉ value_defs && _mentions_symbol(ast, nm))
     if !isempty(whole)
-        return _lower_rkppl_once(ast, input_data, mod;
+        return _plan_rkppl(ast, nested_broadcasts, input_data, mod;
             submodel_scopes, conditioned, value_defs = union(value_defs, whole),
             shared_defs, array_entries, observing)
     end
@@ -1766,7 +1772,7 @@ function _lower_rkppl_once(ast, input_data::Set{Symbol}, mod::Module;
     if !isempty(shared)
         columns = Set{Symbol}(nm for nm in shared
             if get(ctx.detshape, nm, :scalar) === :vector)
-        return _lower_rkppl_once(ast, input_data, mod;
+        return _plan_rkppl(ast, nested_broadcasts, input_data, mod;
             submodel_scopes, conditioned,
             value_defs = union(value_defs, columns),
             shared_defs = union(shared_defs, setdiff(shared, columns)), array_entries,
