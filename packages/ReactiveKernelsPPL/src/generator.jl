@@ -99,14 +99,17 @@ _build_literal(x::Number) = isprimitivetype(typeof(x)) || x isa Bool
 _build_literal(x::Module) = _build_module(x)
 _build_literal(x::Union{DataType,UnionAll}) = _build_module(parentmodule(x))
 
-function _build_binding(globals, ref::GlobalRef, literal=_build_literal)
-    haskey(globals, ref) && return true
-    _build_module(ref.mod) || return false
+_build_binding(globals, ref::GlobalRef) =
+    _build_binding(globals, ref, ref.mod, ref.name, _build_literal)
+
+function _build_binding(globals, key, mod, name, literal)
+    haskey(globals, key) && return true
+    _build_module(mod) || return false
     # Local ports/variables need no global binding. Record that absence too:
     # a subsequent build resolves the same syntax in its current world.
-    binding = ReactiveKernels._global_value(ref.mod, ref.name)
+    binding = ReactiveKernels._global_value(mod, name)
     if binding !== nothing
-        ReactiveKernels._global_isconst(ref.mod, ref.name) || return false
+        ReactiveKernels._global_isconst(mod, name) || return false
         value = something(binding)
         safe = if value isa Function
             _build_module(parentmodule(typeof(value))) &&
@@ -118,7 +121,7 @@ function _build_binding(globals, ref::GlobalRef, literal=_build_literal)
         end
         safe || return false
     end
-    globals[ref] = binding
+    globals[key] = binding
     return true
 end
 
@@ -186,9 +189,13 @@ _stage_literal(x) = _build_literal(x)
 _stage_literal(x::Number) = _build_literal(x) && _build_type(typeof(x))
 _stage_literal(T::Type) = _build_type(T)
 
-function _stage_source!(globals, ref::GlobalRef)
-    _build_binding(globals, ref, _stage_literal) || return false
-    binding = globals[ref]
+# A GlobalRef to a name with no binding can contain a Julia Core.Binding
+# allocated in a closed package during the workload. Julia cannot serialize
+# that binding. Store the lookup, including an absent name, by module and name.
+function _stage_global!(globals, mod, name)
+    key = (mod, name)
+    _build_binding(globals, key, mod, name, _stage_literal) || return false
+    binding = globals[key]
     binding === nothing && return true
     value = something(binding)
     owner = if value isa Union{KernelObjectSpec,ReactiveKernels._KernelObjectSkeleton}
@@ -200,9 +207,10 @@ function _stage_source!(globals, ref::GlobalRef)
     end
     # A caller can install bindings in the evaluation module. Only the
     # library's own named rules and distribution objects can be stored.
-    ReactiveKernels._global_value(owner, ref.name) === binding
+    ReactiveKernels._global_value(owner, name) === binding
 end
-_stage_source!(globals, x::Symbol) = _stage_source!(globals, GlobalRef(PPLGeneratedModels, x))
+_stage_source!(globals, ref::GlobalRef) = _stage_global!(globals, ref.mod, ref.name)
+_stage_source!(globals, x::Symbol) = _stage_global!(globals, PPLGeneratedModels, x)
 _stage_source!(globals, x) = _stage_literal(x)
 _stage_source!(globals, x::Union{DataType,UnionAll}) = _build_type(x)
 _stage_source!(globals, x::QuoteNode) = _stage_source!(globals, x.value)
@@ -215,11 +223,11 @@ function _cached_build_spec(cache, def)
     entry = lock(cache.lock) do
         entry = cache.entry
         if entry !== nothing && _same_program(entry.definition, template) &&
-                all(p -> ReactiveKernels._global_value(p.first.mod, p.first.name) === p.second,
+                all(p -> ReactiveKernels._global_value(p.first...) === p.second,
                     entry.globals)
             return entry
         end
-        globals = Dict{GlobalRef,Any}()
+        globals = Dict{Tuple{Module,Symbol},Any}()
         _stage_source!(globals, template) || return nothing
         constructor = try
             ReactiveKernels._stage_build(PPLGeneratedModels, template, length(calls))
