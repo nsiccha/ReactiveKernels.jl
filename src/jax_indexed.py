@@ -36,6 +36,38 @@ def _rk_unravel(flat, shape):
     return tuple(reversed(parts))
 
 
+def _rk_requested_slots(index, shape):
+    """Index a table by the requested flat coordinates, without sorting them.
+
+    Used only when the table is smaller than the request. Inactive slots
+    read the first requested entry so an invalid, unselected input cannot
+    enter the value or its pullback.
+    """
+    flat = 0
+    for k, n in zip(index, shape):
+        flat = flat * n + jnp.asarray(k)
+    size = math.prod(shape)
+    flat = jnp.broadcast_to(flat, _rk_lane_shape(index))
+    keys = flat.ravel()
+    # Repeated keys write the same coordinate to the same slot.
+    slots = jnp.full(size, keys[0], dtype=keys.dtype).at[keys].set(keys)
+    return slots, flat
+
+
+def _rk_independent_axis(shape, index):
+    """Find a repeated row coordinate broadcast against an independent grid."""
+    lanes = _rk_lane_shape(index)
+    axes = [tuple(d for d, n in enumerate(jnp.shape(k), len(lanes) - jnp.ndim(k)) if n > 1)
+            for k in index]
+    for axis, varying in enumerate(axes):
+        if len(varying) == 1:
+            lane, = varying
+            others = [dims for i, dims in enumerate(axes) if i != axis]
+            if lanes[lane] > shape[axis] and any(others) and all(lane not in dims for dims in others):
+                return axis, lane
+    return None
+
+
 def _rk_static_index(x):
     return isinstance(x, (int, np.integer))
 
@@ -155,9 +187,12 @@ class _RKIndexedGraph:
     An equation that has no output, such as a runtime check, is never pulled:
     _rk_run_effects runs those.
     """
-    def __init__(self, closed, inputs, regions=None, parent=None):
+    def __init__(self, closed, inputs, regions=None, parent=None, first_axis=None):
         graph = closed.jaxpr
         self.parent = parent
+        # Preparation and evaluation visit the same graph in the same order.
+        # Its children share the one planned read, including inside jit calls.
+        self.first_axis = parent.first_axis if parent is not None else ([first_axis] if first_axis else [])
         self.inputs = dict(zip(graph.invars, inputs))
         self.regions = dict(zip(graph.invars, inputs if regions is None else regions))
         for var, value in zip(graph.constvars, closed.consts):
@@ -196,16 +231,27 @@ class _RKIndexedGraph:
         Only requested entries are computed: an unrequested one may be
         invalid, such as a padded row, and its derivative must not enter.
         """
-        shape, lane_shape = var.aval.shape, _rk_lane_shape(index)
-        flat = 0
-        for k, n in zip(index, shape):
-            flat = flat * n + jnp.asarray(k)
-        flat = jnp.broadcast_to(flat, lane_shape).ravel()
-        # The fill of a short result is the smallest requested entry.
-        unique, inverse = jnp.unique(flat, size=math.prod(shape), return_inverse=True)
+        shape = var.aval.shape
+        if self.first_axis:
+            axes = _rk_independent_axis(shape, index)
+            if axes is not None:
+                axis, lane = axes
+                plan = self.first_axis.pop()(index[axis])
+                if plan is not None:
+                    keys, inverse = plan
+                    lanes = _rk_lane_shape(index)
+                    grid = [1] * len(lanes)
+                    grid[lane] = keys.size
+                    compact = index[:axis] + (keys.reshape(grid),) + index[axis + 1:]
+                    eq, output = self.producers[var]
+                    values = jnp.broadcast_to(self.evaluate(eq, output, compact), _rk_lane_shape(compact))
+                    if keys.size == 1:
+                        return jnp.broadcast_to(values, lanes)
+                    return jnp.take(values, inverse, axis=lane, mode='clip')
+        slots, requested = _rk_requested_slots(index, shape)
         eq, j = self.producers[var]
-        values = jnp.broadcast_to(self.evaluate(eq, j, _rk_unravel(unique, shape)), unique.shape)
-        return jnp.reshape(values[jnp.ravel(inverse)], lane_shape)
+        values = jnp.broadcast_to(self.evaluate(eq, j, _rk_unravel(slots, shape)), slots.shape)
+        return values[requested]
 
     def nested(self, eq):
         return self.child(eq.params['jaxpr'], eq.invars)
@@ -449,15 +495,11 @@ class _RKIndexedGraph:
             if math.prod(requested) > math.prod(dims):
                 # More requested matrices than the batch has: factor each
                 # distinct one once.
-                flat = 0
-                for b, m in zip(batch, dims):
-                    flat = flat * m + b
-                flat = jnp.broadcast_to(flat, requested).ravel()
-                unique, inverse = jnp.unique(flat, size=math.prod(dims), return_inverse=True)
+                slots, entries = _rk_requested_slots(batch, dims)
                 matrices = jnp.broadcast_to(
-                    arg(0, tuple(_rk_spread(c, 2) for c in _rk_unravel(unique, dims)) + square),
-                    unique.shape + (n, n))
-                factors = eq.primitive.bind(matrices, **p)[jnp.ravel(inverse).reshape(requested)]
+                    arg(0, tuple(_rk_spread(c, 2) for c in _rk_unravel(slots, dims)) + square),
+                    slots.shape + (n, n))
+                factors = eq.primitive.bind(matrices, **p)[entries]
             else:
                 factors = eq.primitive.bind(arg(0, tuple(_rk_spread(b, 2) for b in batch) + square), **p)
             selected = factors.shape[:-2]
@@ -612,7 +654,47 @@ def _rk_has_cond(closed):
     return any(eq.primitive.name == 'cond' or _rk_params_have_cond(eq.params) for eq in graph.eqns)
 
 
-def _rk_read_event(fn, u, row, prepared):
+def _rk_prepare_axis(closed, point, prepared, rows, offsets, common):
+    """Plan the first oversized Cartesian row gather in the common rows.
+
+    Trace its row coordinates with the point and data as separate inputs.
+    Only a point-independent index can be shared by all draws at a unit.
+    Conditional reads retain their ordinary branch-local indexing.
+    """
+    if not common or closed.effects or _rk_has_cond(closed):
+        return ()
+
+    def coordinates(u, row, data):
+        found = []
+        inputs = [_RKIndexedGraph.leaf(v) for v in jax.tree.leaves((u, data))]
+        _rk_selected(_RKIndexedGraph(closed, inputs, first_axis=found.append), row)
+        return tuple(map(jnp.ravel, found))
+
+    prototype = jax.ShapeDtypeStruct((common,), rows.dtype)
+    try:
+        trace = jax.make_jaxpr(coordinates)(point, prototype, prepared)
+    except NotImplementedError:
+        # The ordinary reader reports unsupported operations when called.
+        return ()
+    if not trace.jaxpr.outvars:
+        return ()
+    source, = trace.jaxpr.outvars
+    reads = [True, False] + [False] * len(jax.tree.leaves(prepared))
+    if not isinstance(source, _rk_core.Literal) and _rk_point_dependence(trace.jaxpr, reads)[source]:
+        return ()
+    def unit_indices(selected, data):
+        return _rk_run_effects(trace, [None, selected, *jax.tree.leaves(data)], reads, 'data', [True])[0]
+    selected = rows[offsets[:-1, None] + np.arange(common)]
+    indices = np.asarray(jax.vmap(unit_indices, in_axes=(0, None))(selected, prepared))
+    distinct = [np.unique(row, return_inverse=True) for row in indices]
+    width = max(keys.size for keys, _ in distinct)
+    keys = np.stack([np.pad(k, (0, width - k.size), mode='edge') for k, _ in distinct])
+    # A singleton row broadcasts directly. No per-observation inverse is needed.
+    inverse = np.stack([inv for _, inv in distinct]) if width > 1 else np.empty((len(keys), 0), dtype=int)
+    return keys, inverse
+
+
+def _rk_read_event(fn, u, row, prepared, axis_plan=()):
     # The event's checks of the data ran once in prepare_partition. Those
     # that read the point run here, over the whole event.
     closed, _, reads = _rk_event_trace(fn, u, prepared)
@@ -622,7 +704,8 @@ def _rk_read_event(fn, u, row, prepared):
         if checks:
             _rk_run_effects(closed, leaves, reads, 'point')
         inputs = [_RKIndexedGraph.leaf(v) for v in leaves]
-        return _rk_selected(_RKIndexedGraph(closed, inputs), index)
+        graph = _RKIndexedGraph(closed, inputs, first_axis=(lambda _: axis_plan) if axis_plan else None)
+        return _rk_selected(graph, index)
     if _rk_has_cond(closed) and _rk_batch_control(closed, [True] * len(closed.jaxpr.invars))[0]:
         return _rk_strict_batch(selected)(u, row, prepared)
     return selected(u, row, prepared)
