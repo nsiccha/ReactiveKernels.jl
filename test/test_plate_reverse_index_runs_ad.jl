@@ -165,13 +165,17 @@ end
     kernel = prepare(constant_entries; have=(:q, :s, :idx), want=:total, exemplars=(q, s, idx))
     backend = AutoEnzyme(; mode=Enzyme.Reverse)
     @test count(r -> last(r) == "rule", plate_reverse_report(kernel, (1, 2))) == 2
-    prepared = with_plate_reverse(() -> prepare_ad(kernel, backend, q, s, idx; active=(:q, :s)), true)
-    @test site_count(prepared) == 1
-    for ids in (idx, idx[1:7], reverse(idx))
-        value, (dq, ds) = ad_value_and_gradient(prepared, q, s, ids)
-        @test value ≈ sum(sin(s * q[i]) + cos(0.25s) for i in ids)
-        @test dq ≈ [count(==(j), ids) * s * cos(s * q[j]) for j in eachindex(q)]
-        @test ds ≈ sum(q[i] * cos(s * q[i]) - 0.25sin(0.25s) for i in ids)
+    for warm in (false, true)
+        prepared = with_plate_reverse() do
+            prepare_ad(kernel, backend, q, s, idx; active=(:q, :s), warm)
+        end
+        @test site_count(prepared) == 1
+        for ids in (idx, idx[1:7], reverse(idx))
+            value, (dq, ds) = ad_value_and_gradient(prepared, q, s, ids)
+            @test value ≈ sum(sin(s * q[i]) + cos(0.25s) for i in ids)
+            @test dq ≈ [count(==(j), ids) * s * cos(s * q[j]) for j in eachindex(q)]
+            @test ds ≈ sum(q[i] * cos(s * q[i]) - 0.25sin(0.25s) for i in ids)
+        end
     end
 end
 
