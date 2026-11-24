@@ -54,6 +54,8 @@ The reverse mask uses original input positions. A bit for a data-only input is i
 
 Under Enzyme reverse mode, the adapter keeps what the reverse branch reads between the two passes. It reads an input in place when Enzyme proves that nothing writes it before the reverse pass and the result cannot expose it: the result is a plain-bits value such as a number, or an array of numbers whose memory does not overlap the input's. Otherwise it copies the input once per call. Enzyme proves this for an array passed directly, unless the caller writes, after the call, to memory Enzyme cannot show is apart from it, such as an output array it also received. For arrays held inside a value such as a struct, tuple or view, Enzyme dogfood with the `overwritten_reachable_data` repair is required (`Enzyme.has_dogfood_repair(:overwritten_reachable_data)`). Without that repair, such arrays are copied on every reverse call, so the cost grows with their length.
 
+A prepared program writes after the rule's call: a plate stores each result in its cells, and a prepared pullback keeps the port's value. Two further dogfood repairs let Enzyme show that those writes miss the input. With `unexposed_storage_barriers`, a plate reads the input in place on Julia 1.10. With `later_store_targets`, a prepared pullback reads it in place on Julia 1.10, 1.12 and 1.13, also when the input holds a `Dict`. A plate on Julia 1.12 and 1.13 still copies the input on each call. `benchmark/repro_prepared_rule_overwritten.jl` prints the bytes per call for each case.
+
 `jax_source` generates `custom_jvp` adapters for scalar rules from these same
 activity-selected graph cuts. Joint value/partials recipes are shared across
 calls and activity patterns. General rules generate their forward and staged
