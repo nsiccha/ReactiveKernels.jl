@@ -16,6 +16,18 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.376
+
+- The generated reverse of a summed plate shares an accumulator when the
+  value and a partial derivative sum the same term.
+- A prepared rule keeps the exponent range of each bound operand in its
+  tape slot. Live operands are checked at evaluation.
+- When the range check permits it, a shared reciprocal moves outside the
+  row loop, so a crossed Gaussian sweep accumulates its unscaled residual.
+- A cell's `ifelse` selects the cotangent of the taken arm directly.
+- The generated rule call is inlined into its callable. This restores the
+  split reverse through a constant tape slot with registered Enzyme.
+
 ## 0.1.375
 
 - The opt-in generated reverse of summed plates (`with_plate_reverse`, the
