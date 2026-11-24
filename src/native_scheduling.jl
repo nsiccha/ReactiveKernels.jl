@@ -69,7 +69,7 @@ function _scheduled_prefix_cells(@nospecialize(f), @nospecialize(args), domain)
     jobs == 0 && return nothing
     # A singleton sample can still warm the task that a larger domain uses.
     if jobs == 1 && (workers == 1 || ccall(:jl_generating_output, Cint, ()) == 0)
-        return f(args..., domain, 1:count)
+        return f(args, domain, 1:count)
     end
     captured = Ref{Any}((f, args, domain))
     @sync for worker in 1:jobs
@@ -81,7 +81,7 @@ end
 
 function _scheduled_prefix_range(captured, range)
     f, args, domain = captured
-    f(args..., domain, range)
+    f(args, domain, range)
     nothing
 end
 
@@ -89,14 +89,14 @@ end
 # read and its run-time dispatch of the cells' function are the scheduling
 # boundary, paid once per call of the plate, and `@nospecialize` keeps it one
 # method instance for every prefix program. The audit enters, in its place,
-# the call it makes, `f(args..., domain, range)`, for the operand types the
+# the call it makes, `f(args, domain, range)`, for the operand types the
 # prepared program passes (`_code_boundary_calls`, `type_stability_audit.jl`).
 # Operands of a non-concrete type are themselves findings of the caller; there
 # is then no call to audit.
 function _code_boundary_calls(::Type{typeof(_scheduled_prefix_cells)}, ci, statement)
     F, A, D = map(x -> _code_argument_type(ci, x), statement.args[3:5])
     all(isconcretetype, (F, A, D)) && A <: Tuple || return ()
-    (Tuple{F, A.parameters..., D, UnitRange{Int}},)
+    (Tuple{F, A, D, UnitRange{Int}},)
 end
 
 # Extract the native loop, retaining its hoisted values and operation tables.
@@ -132,7 +132,13 @@ function _scheduled_prefix_loop!(runtime_ops, runtime_recipes, body, invariants,
     assigned = _local_symbols!(Set{Symbol}(), chunk)
     captures = sort!(collect(union(intersect(setdiff(used, assigned), bound),
                                     intersect(used, Set(values(shares))))); by=string)
-    ast = Expr(:function, Expr(:tuple, captures..., domain, range), chunk)
+    # Pass the existing capture tuple intact. Splatting it into a generated
+    # function leaves a run-time dispatch in its entry when the plate is wide.
+    packed = gensym(:captures)
+    unpack = [:($name = $(GlobalRef(Core, :getfield))($packed, $i))
+              for (i, name) in enumerate(captures)]
+    ast = Expr(:function, Expr(:tuple, packed, domain, range),
+               Expr(:block, unpack..., chunk))
     native = compile(ast)
     push!(runtime_ops, native)
     # This is executable table metadata, not an added graph recipe.

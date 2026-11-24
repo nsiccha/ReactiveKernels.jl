@@ -247,3 +247,29 @@ end
     reader = checked(() -> vectorize(scalar; batched=:position, schedule), :rk)
     @test reader(positions, data) ≈ positions .* sum(sum(2 .* x) for x in data)
 end
+
+# Each column contributes a distinct capture to the generated cell loop.
+let columns = [Symbol(:column, i) for i in 1:34],
+    cells = [Symbol(:cell, i) for i in eachindex(columns)]
+    ports = [:($column::Vector{Float64}) for column in columns]
+    total = foldl((left, right) -> :($left + $right), cells)
+    @eval @kernel scheduled_prefix_wide(position::Float64, $(ports...)) = begin
+        prefix = plate($(columns...)) do $(cells...)
+            $total
+        end
+        result = position .* prefix
+    end
+end
+
+@testset "wide scheduled prefix cells" begin
+    schedule = NativeScheduling(chunk_size=1, workers=4)
+    for level in (:rk, :all)
+        reader = ReactiveKernels._with_type_stability(:error, level) do
+            vectorize(prepare(scheduled_prefix_wide); batched=:position, schedule, reuse=true)
+        end
+        for n in (0, 1, 7), positions in ([2.0], [1.0, 2.0, 3.0, 4.0])
+            columns = ntuple(j -> [Float64(10j + i) for i in 1:n], 34)
+            @test reader(positions, columns...) == sum(columns) .* transpose(positions)
+        end
+    end
+end
