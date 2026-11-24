@@ -16,6 +16,10 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.381
+
+- Compare `kernel_revision(child)` before reusing a parent that spliced a supplied child. The revision tracks graph edits and public port bindings.
+
 ## 0.1.380
 
 - A scheduled prefix plate can capture more than 32 operands under

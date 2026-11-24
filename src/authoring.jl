@@ -74,6 +74,9 @@ function _kernel_source_hash(x::Expr, names, h::UInt)
     h
 end
 
+# A parent can record its child's identity without retaining its graph.
+mutable struct _KernelSpecIdentity end
+
 """
     KernelSpec
 
@@ -96,11 +99,31 @@ struct KernelSpec{S}
     have_names::Vector{Symbol}
     want_names::Vector{Symbol}
     call_signature::S
+    _revision_identity::_KernelSpecIdentity
+    KernelSpec{S}(g, p, order, have, want, signature) where {S} =
+        new(g, p, order, have, want, signature, _KernelSpecIdentity())
 end
+KernelSpec(g, p, order, have, want, signature::S) where {S} =
+    KernelSpec{S}(g, p, order, have, want, signature)
 
 KernelSpec(graph::Graph, ports::Dict{Symbol,Value}, port_order::Vector{Symbol},
            have_names::Vector{Symbol}, want_names::Vector{Symbol}) =
     KernelSpec(graph, ports, port_order, have_names, want_names, nothing)
+
+"""
+    kernel_revision(child::KernelSpec)
+
+Record the child used to construct a parent kernel. Compare the saved result
+with `kernel_revision(child)` using `==` before reusing the parent. A fresh
+child, a graph edit through the graph API, a port remapping, or a change to
+the order or default boundary invalidates the comparison. The revision holds
+only the child's identity token, graph version, names and value identities.
+"""
+function kernel_revision(child::KernelSpec)
+    (; identity=getfield(child, :_revision_identity), version=child.graph.version,
+       ports=Dict(name => value.id for (name, value) in child.ports),
+       order=copy(child.port_order), have=copy(child.have_names), want=copy(child.want_names))
+end
 
 """
     input_check!(spec::KernelSpec, input::Symbol, f, args...) -> spec
@@ -280,14 +303,15 @@ Base.keys(spec::KernelSpec) = Tuple(spec.port_order)
 Base.haskey(spec::KernelSpec, name::Symbol) = haskey(spec.ports, name)
 
 function Base.getproperty(spec::KernelSpec, name::Symbol)
-    name in fieldnames(KernelSpec) && return getfield(spec, name)
+    name !== :_revision_identity && name in fieldnames(KernelSpec) && return getfield(spec, name)
     ports = getfield(spec, :ports)
     haskey(ports, name) && return ports[name]
     getfield(spec, name)
 end
 
 function Base.propertynames(spec::KernelSpec, private::Bool = false)
-    names = (fieldnames(KernelSpec)..., spec.port_order...)
+    fields = private ? fieldnames(KernelSpec) : Base.front(fieldnames(KernelSpec))
+    names = (fields..., spec.port_order...)
     Tuple(unique(names))
 end
 
@@ -2221,7 +2245,7 @@ function _kernel_constructed_endpoint(ex::Expr, mod, locals, nested_specs, local
                     nested_specs[generated] = _kernel_new_instance(
                         KernelSpec{typeof(retargeted)},
                         (endpoint.graph, endpoint.ports, endpoint.port_order,
-                         endpoint.have_names, endpoint.want_names, retargeted))::KernelSpec
+                         endpoint.have_names, endpoint.want_names, retargeted, _KernelSpecIdentity()))::KernelSpec
                     return Expr(:call, generated, endpoint_ports...),
                            valtype(only(outputs(endpoint)))
                 end

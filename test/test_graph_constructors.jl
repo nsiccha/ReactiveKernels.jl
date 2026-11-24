@@ -33,4 +33,33 @@ end
     @test !occursin("graph_source", string(code_expr(f)))
     @test any(r -> occursin(".+", string(r.source)), plan(model).recipes)
 end
+@noinline function child_revision_only()
+    child = deepcopy(piece)
+    kernel_revision(child), WeakRef(child.graph)
+end
+
+@testset "a parent can check the revision of its supplied child" begin
+    child = deepcopy(piece)
+    saved = kernel_revision(child)
+    @test saved == kernel_revision(child)
+    @test saved != kernel_revision(deepcopy(child))
+    version = child.graph.version
+    child.ports[:shifted] = child.ports[:x]
+    @test child.graph.version == version
+    @test saved != kernel_revision(child)
+    changed = kernel_revision(child)
+    reverse!(child.port_order)
+    @test changed != kernel_revision(child)
+    changed = kernel_revision(child)
+    push!(child.want_names, :x)
+    @test changed != kernel_revision(child)
+    changed = kernel_revision(child)
+    value!(child.graph, :added, Int)
+    @test changed != kernel_revision(child)
+    stamp, graph = child_revision_only()
+    GC.gc(true)
+    @test graph.value === nothing
+    @test stamp != saved
+end
+
 end
