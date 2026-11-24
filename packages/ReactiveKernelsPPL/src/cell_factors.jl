@@ -78,9 +78,18 @@ function prepare_cell_factors(built, plan::StructuralPlan, observation::Symbol;
         rows === nothing || push!(gathered, (; s..., positions = rows))
     end
     innermost, enclosing = ReactiveKernels._cell_factor_nesting(factors.spec, gathered)
-    # Removing the packed point proves the row query is data-defined.
     rowhave = Tuple(n for n in factors.spec.have_names if n !== :unconstrained &&
                     n ∉ _cell_frontier_names(shared))
+    if !isempty(innermost)
+        # Row queries receive the cell index and bound data. Keep a sum in
+        # the outer if its row labels cannot be produced from those inputs.
+        # Check after nesting so this cannot promote a sum that reads it.
+        g = factors.spec.graph
+        id(v) = ReactiveKernels.canon_id(g, v.id)
+        inputs = Set(id(factors.spec[n]) for n in rowhave)
+        _, available = ReactiveKernels._executable_prefix(g, collect(eachindex(g.recipes)), inputs)
+        filter!(s -> id(s.positions) in available, innermost)
+    end
     reductions = map(innermost) do s
         kernel = Base.invokelatest(_prepare_cached, plan, factors.spec; have = rowhave,
             want = s.positions, bound = factor_bound, on_error)
