@@ -1,4 +1,5 @@
 import inspect
+from unittest.mock import patch
 
 import jax
 import jax.numpy as jnp
@@ -365,3 +366,106 @@ for event in (loop_events, platform_and_loop):
     np.testing.assert_allclose(grads, [[1., 0.], [3., 0.]])
     raises(lambda: loop_batch(jnp.array([[2., 1.], [-1., 1.]]), jnp.array([0, 2])),
            "invalid active lane")
+
+
+# A repeated request can leave holes in the table of scalar entries or
+# matrix factors. An inactive negative root or indefinite matrix must
+# contribute neither a value nor a derivative. Change the selected rows
+# without recompiling so that the holes move with the input.
+def check_repeated(fn, points, requests, reference):
+    read = lambda u, rows: model._rk_read_event(fn, u, rows, {}).sum()
+    actual = jax.jit(jax.value_and_grad(read))
+    for point, rows in zip(points, requests):
+        value, grad = actual(point, rows)
+        expected, expected_grad = jax.value_and_grad(reference)(point, rows)
+        np.testing.assert_allclose(value, expected)
+        np.testing.assert_allclose(grad, expected_grad, atol=1e-12)
+
+
+requests = [jnp.array([2, 0, 2, 2, 0]), jnp.array([1, 2, 1, 2, 1])]
+diagonals = [jnp.array([4., -1., 9.]), jnp.array([-1., 4., 9.])]
+check_repeated(jnp.sqrt, diagonals, requests, lambda u, rows: jnp.sqrt(u[rows]).sum())
+# Flat event indices 0..2 select the first diagonal entry of each 2x2
+# matrix (Julia's column-major event ordering).
+matrices = [d[:, None, None] * jnp.eye(2) for d in diagonals]
+check_repeated(jnp.linalg.cholesky, matrices, requests,
+               lambda u, rows: jnp.linalg.cholesky(u[rows])[:, 0, 0].sum())
+
+
+# Common observations gather coefficient rows and contract them against
+# independent feature columns. Keep the ragged tail out of this row plan.
+def design_event(u, *, group, design):
+    return jnp.sum(jnp.sqrt(u.reshape(4, 3))[group] * design, axis=1)
+
+
+def point_index_event(u, *, group, design):
+    return design_event(u, group=jnp.where(u[-1] > 0, group, 2 - group), design=design)
+
+
+def check_row_plan(groups, width, event=design_event):
+    u = jnp.array([1., 2., 3., 4., 5., 6., 7., 8., 9., -1., -2., -3.])
+    data = dict(group=jnp.asarray(groups), design=jnp.arange(len(groups) * 3.).reshape(-1, 3) / 7)
+    rows, offsets, common = np.arange(len(groups)), np.array([0, 7, len(groups)]), 6
+    closed, _, _ = model._rk_event_trace(event, u, data)
+    plan = model._rk_prepare_axis(closed, u, data, rows, offsets, common)
+    if width:
+        assert plan[0].shape == (2, width)
+    else:
+        assert plan == ()
+
+    def selected(point, row, table):
+        return model._rk_read_event(event, point, row, data, table).sum()
+    def reference(point, row):
+        group = data['group'][row]
+        if event is point_index_event:
+            group = jnp.where(point[-1] > 0, group, 2 - group)
+        return (jnp.sqrt(point.reshape(4, 3)[group]) * data['design'][row]).sum()
+
+    selected_rows = rows[offsets[:-1, None] + np.arange(common)]
+    actual = jax.jit(jax.vmap(jax.value_and_grad(selected), in_axes=(None, 0, 0)))
+    expected = jax.vmap(jax.value_and_grad(reference), in_axes=(None, 0))
+    for point in (u, u.at[-1].set(1.)):
+        value, gradient = actual(point, selected_rows, plan)
+        v, g = expected(point, selected_rows)
+        np.testing.assert_allclose(value, v)
+        np.testing.assert_allclose(gradient, g, atol=1e-11)
+
+
+check_row_plan([1, 1, 1, 1, 1, 1, 0, 2, 2, 2, 2, 2, 2], 1)
+check_row_plan([1, 0, 1, 0, 2, 1, 0, 2, 2, 0, 2, 0, 2], 3)
+check_row_plan([1, 1, 1, 1, 1, 1, 0, 2, 2, 2, 2, 2, 2], 0, point_index_event)
+
+
+# One atomic event per station can itself gather many observations. Its
+# public read should reuse one row, with the same trace as the grid grows.
+def station_event(u, *, group, design):
+    basis = jnp.sqrt(u.reshape(4, 3))[group]
+    return (basis * design).sum(axis=(1, 2))
+
+
+def check_station_event(n):
+    u = jnp.array([1., 2., 3., 4., 5., 6., 7., 8., 9., -1., -2., -3.])
+    group = np.broadcast_to(np.array([[2], [1]]), (2, n))
+    design = np.arange(2 * n * 3.).reshape(2, n, 3) / 7
+    owners = dict(labels=[5, 10], owners=[[2, 3]])
+    with patch.multiple(model, _RK_EVENTS=(station_event,), dimension=lambda _: len(u)):
+        bound = model.prepare_partition(dict(group=group, design=design), owners)
+        keys, inverse = bound['read_plans'][0]
+        np.testing.assert_array_equal(keys, [[2], [1]])
+        assert inverse.size == 0
+
+        def selected(point, label, prepared):
+            return model.unit_log_density(point, label, **prepared)
+
+        result = jax.value_and_grad(selected)
+        compiled = jax.jit(result)
+        for i, label in enumerate(owners['labels']):
+            value, grad = compiled(u, label, bound)
+            reference = lambda x: (jnp.sqrt(x.reshape(4, 3)[group[i]]) * design[i]).sum()
+            expected, expected_grad = jax.value_and_grad(reference)(u)
+            np.testing.assert_allclose(value, expected)
+            np.testing.assert_allclose(grad, expected_grad, atol=1e-10)
+        return len(list(outputs(jax.make_jaxpr(result)(u, 5, bound))))
+
+
+assert check_station_event(30) == check_station_event(300)

@@ -16,6 +16,13 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.375
+
+- Indexed JAX events can reuse a data-dependent row lookup across draws.
+  An observation grid that reads a single coefficient row for a station
+  evaluates that row once and broadcasts it across the observations.
+  Dynamic repeated indices use a direct lookup table.
+
 ## 0.1.374
 
 - Indexed JAX density events can read a value produced by

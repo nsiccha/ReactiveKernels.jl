@@ -22,14 +22,15 @@ def prepare_partition(prepared, partition_data):
             return np.asarray(value)
         prepared = dict(prepared, discrete=state(partition_data["discrete"]))
     point = jax.ShapeDtypeStruct((dimension(prepared),), _RK_DENSITY_TYPE)
-    sites = []
+    sites, read_plans = [], []
     for fn, source in zip(_RK_EVENTS, partition_data["owners"]):
         owners = np.asarray(source, dtype=np.int64)
         if owners.ndim != 1 or np.any((owners < 0) | (owners > len(labels) + 1)):
             raise ValueError("invalid partition ownership vector")
         # Selected reads never run the event's checks of the data: run them
         # once here, over all of its cells.
-        shape = _rk_check_event_data(fn, point, prepared).out_avals[0].shape
+        closed = _rk_check_event_data(fn, point, prepared)
+        shape = closed.out_avals[0].shape
         if owners.size != int(np.prod(shape, dtype=np.int64)):
             raise ValueError("ownership length does not match event shape at " + fn.__name__)
         shared = np.flatnonzero(owners == 1)
@@ -40,7 +41,8 @@ def prepare_partition(prepared, partition_data):
         common = int(counts.min()) if counts.size else 0
         span = int(counts.max()) if counts.size else 0
         sites.append((shared, rows, offsets, _RKRowWidths((common, span))))
-    return dict(prepared=prepared, labels=labels, sites=tuple(sites))
+        read_plans.append(_rk_prepare_axis(closed, point, prepared, rows, offsets, common))
+    return dict(prepared=prepared, labels=labels, sites=tuple(sites), read_plans=tuple(read_plans))
 
 
 def _rk_partition_point(unconstrained, prepared):
@@ -50,7 +52,7 @@ def _rk_partition_point(unconstrained, prepared):
     return point
 
 
-def global_log_density(unconstrained, *, prepared, labels, sites):
+def global_log_density(unconstrained, *, prepared, labels, sites, read_plans=()):
     """Sum the globally assigned prior and coordinate-Jacobian events."""
     point = _rk_partition_point(unconstrained, prepared)
     result = jnp.zeros((), dtype=point.dtype)
@@ -72,7 +74,7 @@ def _rk_valid_label_batch(size, mapped, valid):
     return _rk_valid_labels(jnp.all(valid)), False
 
 
-def unit_log_density(unconstrained, label, *, prepared, labels, sites):
+def unit_log_density(unconstrained, label, *, prepared, labels, sites, read_plans=()):
     """Sum the selected observations and local prior/Jacobian events at one packed point."""
     point = _rk_partition_point(unconstrained, prepared)
     if not labels.size:
@@ -89,7 +91,7 @@ def unit_log_density(unconstrained, label, *, prepared, labels, sites):
         jax.debug.callback(invalid)
         return jnp.zeros((), dtype=point.dtype)
     return jax.lax.cond(_rk_valid_labels(exists),
-                        lambda: _rk_unit_bucket(point, bucket, prepared, sites), missing)
+                        lambda: _rk_unit_bucket(point, bucket, prepared, sites, read_plans), missing)
 
 
 def _rk_ragged_sum(fn, common, span):
@@ -105,16 +107,17 @@ def _rk_ragged_sum(fn, common, span):
     return _rk_strict_batch(ragged_sum)
 
 
-def _rk_unit_bucket(point, bucket, prepared, sites):
+def _rk_unit_bucket(point, bucket, prepared, sites, read_plans=()):
     result = jnp.zeros((), dtype=point.dtype)
-    for fn, (_, rows, offsets, (common, span)) in zip(_RK_EVENTS, sites):
+    for i, (fn, (_, rows, offsets, (common, span))) in enumerate(zip(_RK_EVENTS, sites)):
         if not rows.size:
             continue
         rows, offsets = jnp.asarray(rows), jnp.asarray(offsets)
         first = offsets[bucket]
         if common:
             selected = rows[first + jnp.arange(common)]
-            result = result + jnp.sum(_rk_read_event(fn, point, selected, prepared))
+            plan = tuple(jnp.asarray(x)[bucket] for x in read_plans[i]) if read_plans else ()
+            result = result + jnp.sum(_rk_read_event(fn, point, selected, prepared, plan))
         if common < span:
             evaluate = _rk_ragged_sum(fn, common, span)
             result = result + evaluate(point, first, offsets[bucket + 1], rows, prepared)
