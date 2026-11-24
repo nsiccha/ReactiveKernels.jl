@@ -16,6 +16,13 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.258
+
+A dotted observation inside a repeated submodel now retains its inner
+broadcast when another response uses a fitted predictor. Both responses
+can bind ragged readings. A custom log density receives each reading with
+its corresponding scalar arguments.
+
 ## 0.1.257
 
 `prepare_partition` can group the coefficient rows that a unit's common
