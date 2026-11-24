@@ -110,7 +110,8 @@ class _RKOutputBudget(diffrax.AbstractAdaptiveStepSizeController):
     def init(self, terms, t0, t1, y0, dt0, args, func, error_order):
         t, state = self.inner.init(terms, t0, t1, y0, dt0, args, func, error_order)
         target = jnp.searchsorted(self.ts, t0, side="right")
-        return t, (state, jnp.zeros((), dtype=target.dtype), target, t0)
+        previous_end = t0 if self.inner.dtmin is None else None
+        return t, (state, jnp.zeros((), dtype=target.dtype), target, previous_end)
 
     def adapt_step_size(self, t0, t1, y0, y1_candidate, args, y_error, error_order,
                         controller_state):
@@ -125,17 +126,20 @@ class _RKOutputBudget(diffrax.AbstractAdaptiveStepSizeController):
         result = diffrax.RESULTS.where(count > self.limit, diffrax.RESULTS.max_steps_reached,
                                        result)
         # A non-finite starting state or unusable next step cannot advance.
-        unusable = ~jnp.isfinite(next_t1 - next_t0) | (next_t1 <= next_t0)
-        # Diffrax clips near the final time after this controller returns.
-        # If that repeats a rejected interval, another retry cannot change it.
-        unusable |= ~keep & (t1 == previous_end)
-        unstable = ~jnp.all(jnp.isfinite(y0)) | ((next_t0 < self.ts[-1]) & unusable)
+        unusable = ~jnp.isfinite(next_t1 - next_t0)
+        if previous_end is not None:
+            # Diffrax clips near the final time after this controller returns.
+            # If that repeats a rejected interval, another retry cannot change it.
+            unusable = (next_t0 < self.ts[-1]) & (unusable | (next_t1 <= next_t0) |
+                                                  (~keep & (t1 == previous_end)))
+            previous_end = t1
+        unstable = ~jnp.all(jnp.isfinite(y0)) | unusable
         if self.check_trials:
             # Even a rejected infinite error can leave the solve successful
             # but poison its reverse pass. Inspect attempted steps here.
             unstable |= ~jnp.all(jnp.isfinite(y1_candidate)) | ~jnp.all(jnp.isfinite(y_error))
         result = diffrax.RESULTS.where(unstable, diffrax.RESULTS.nonfinite, result)
-        return keep, next_t0, next_t1, jump, (state, count, now, t1), result
+        return keep, next_t0, next_t1, jump, (state, count, now, previous_end), result
 
 
 # ==== per-lane ODE solves on CUDA (snag jax-ode-solve-gp-d427eb5a) ====
