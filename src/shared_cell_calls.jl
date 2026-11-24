@@ -177,7 +177,7 @@ _ConcurrentSharedTable() = _ConcurrentSharedTable(ReentrantLock(), nothing)
 mutable struct _SharedPending{T}
     ready::Base.Event
     value::Union{Nothing,Some{T}}
-    error::Any
+    error::Union{Nothing,Some{Any}}
 end
 _SharedPending{T}() where {T} = _SharedPending{T}(Base.Event(), nothing, nothing)
 
@@ -194,7 +194,7 @@ _SharedPending{T}() where {T} = _SharedPending{T}(Base.Event(), nothing, nothing
         try
             pending.value = Some{T}(c.f(args...))
         catch error
-            pending.error = Some(error)
+            pending.error = Some{Any}(error)
         finally
             notify(pending.ready)
         end
@@ -209,18 +209,36 @@ function _shared_reserve!(slot::_ConcurrentSharedTable, objects::O, key::K,
                           ::Type{T}) where {O,K,T}
     lock(slot.lock)
     try
-        table = _shared_table(slot.table, O, K, _SharedPending{T})
+        table = _concurrent_shared_table(slot, O, K, _SharedPending{T})
         table === nothing && return (nothing, false)
-        slot.table = table
-        owner = false
+        # A `Ref`, not a reassigned local: a closure would box that local.
+        owner = Ref(false)
         pending = _shared_result(table, objects, key, ()) do
-            owner = true
+            owner[] = true
             _SharedPending{T}()
         end
-        (pending, owner)
+        (pending, owner[])
     finally
         unlock(slot.lock)
     end
+end
+
+# The slot's table for keys `O` and `K` and pending results `P`: created by the
+# first cell that keys the call, `nothing` for a cell whose arguments have other
+# types than that cell's. The generated body creates the slot before any cell
+# has run, so it cannot type the table, and the slot holds it untyped. This
+# read is the one untyped value of a scheduled prefix's cells
+# (`_CODE_FINDINGS_JUSTIFIED`); it is made under the lock that every shared
+# cell takes anyway, and what it returns is typed.
+function _concurrent_shared_table(slot::_ConcurrentSharedTable, ::Type{O}, ::Type{K},
+                                  ::Type{P}) where {O,K,P}
+    current = slot.table
+    if current === nothing
+        table = _SharedTable(Dict{O,P}(), Dict{K,P}())
+        slot.table = table
+        return table
+    end
+    current isa _SharedTable{O,K,P} ? current : nothing
 end
 
 # The parameter of a cell lowering that holds recipe `id`'s table, or `nothing`

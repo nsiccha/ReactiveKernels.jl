@@ -17,7 +17,9 @@
 # instability and is reported as `:root`. Statements inlined from a call chain
 # in `_CODE_FINDINGS_JUSTIFIED` are exempt; each entry carries its
 # justification. So are the statements of an expansion of Julia's logging
-# macros (`_code_logging`). A finding records where its statement was written
+# macros (`_code_logging`). The audit does not enter a deliberate dynamic
+# boundary of RK's own; it audits the call the boundary makes instead
+# (`_code_boundary_calls`). A finding records where its statement was written
 # (`_code_frames`): after inlining, its method alone does not say. It also
 # records the calls through which the audit reached that method from the
 # audited call (`_CodeCall`): a callee's own frames do not say which statement
@@ -76,10 +78,29 @@ const _CODE_FINDINGS_MAX_UNION = 4
 # RK-introduced residue that stays, with the reason it stays (decision
 # `1hui2qi`: fix every site or justify it explicitly). Each entry is a call
 # chain; a statement whose inlining chain contains all of its names, in any
-# order, is exempt. None is exempt now: the one former entry, the Julia 1.12+
-# `hasmethod` → `to_tuple_type` loop of the guarded source call, is gone since
-# its method query is `Core._hasmethod` on the complete signature.
-const _CODE_FINDINGS_JUSTIFIED = ()
+# order, is exempt. A former entry, the Julia 1.12+ `hasmethod` →
+# `to_tuple_type` loop of the guarded source call, is gone since its method
+# query is `Core._hasmethod` on the complete signature.
+#
+# - `_concurrent_shared_table` (shared_cell_calls.jl): the table that a
+#   scheduled prefix's chunks share for one shared call. The generated body
+#   creates its slot before any cell has typed the call's arguments, so the
+#   slot holds the table untyped, and each shared cell reads it once, under the
+#   lock it takes anyway; the read returns the typed table.
+const _CODE_FINDINGS_JUSTIFIED = ((:_concurrent_shared_table,),)
+
+# RK's deliberate dynamic boundaries: functions of RK's own that a prepared
+# program calls with concretely typed operands, and that hand those operands on
+# to a call they dispatch at run time, once per call of the program, never per
+# value. The one boundary is the launcher of a prefix plate's scheduled cells
+# (`_scheduled_prefix_cells`, `native_scheduling.jl`). Its own body is not the
+# program's code: its run-time dispatch is the boundary itself. What it
+# dispatches to is the program's code, so the audit enters that instead, for
+# the operand types the program's statement passes. For an `invoke` statement
+# of `ci` that calls a function of type `F`, `_code_boundary_calls` returns the
+# signatures of the calls the boundary makes, or `nothing` if `F` is not a
+# boundary; each boundary defines its method beside its own definition.
+_code_boundary_calls(@nospecialize(F), ci, statement) = nothing
 
 _code_widen(@nospecialize(T)) = Core.Compiler.widenconst(T)
 
@@ -338,10 +359,13 @@ function _code_audit!(found, seen, @nospecialize(tt), where, recurse,
             mi = statement isa Expr && statement.head === :invoke ?
                 _code_method_instance(statement) : nothing
             callee = mi === nothing ? nothing : mi.def
-            recursing = callee isa Method && recurse(callee)
+            boundary = callee isa Method ?
+                _code_boundary_calls(Base.unwrap_unionall(mi.specTypes).parameters[1],
+                                     ci, statement) : nothing
+            recursing = boundary === nothing && callee isa Method && recurse(callee)
             # The exemptions read the statement's debug info, so only for a
             # statement the audit would report or enter.
-            unstable || dynamic || recursing || continue
+            unstable || dynamic || recursing || boundary !== nothing || continue
             frames = _code_frames(ci, i)
             (_code_justified(frames) || _code_logging(frames)) && continue
             if unstable
@@ -356,6 +380,13 @@ function _code_audit!(found, seen, @nospecialize(tt), where, recurse,
                                                  calls))
             recursing && _code_audit!(found, seen, mi.specTypes, _code_label(callee), recurse,
                                       [calls; _code_call(ci, statement, mi, where, frames)])
+            if boundary !== nothing
+                through = [calls; _code_call(ci, statement, mi, where, frames)]
+                for target in boundary
+                    _code_audit!(found, seen, target, _code_label(which(target)), recurse,
+                                 through)
+                end
+            end
         end
     end
     found

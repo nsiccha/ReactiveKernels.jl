@@ -85,6 +85,20 @@ function _scheduled_prefix_range(captured, range)
     nothing
 end
 
+# The type-stability audit does not enter the launcher. Its task-local budget
+# read and its run-time dispatch of the cells' function are the scheduling
+# boundary, paid once per call of the plate, and `@nospecialize` keeps it one
+# method instance for every prefix program. The audit enters, in its place,
+# the call it makes, `f(args..., domain, range)`, for the operand types the
+# prepared program passes (`_code_boundary_calls`, `type_stability_audit.jl`).
+# Operands of a non-concrete type are themselves findings of the caller; there
+# is then no call to audit.
+function _code_boundary_calls(::Type{typeof(_scheduled_prefix_cells)}, ci, statement)
+    F, A, D = map(x -> _code_argument_type(ci, x), statement.args[3:5])
+    all(isconcretetype, (F, A, D)) && A <: Tuple || return ()
+    (Tuple{F, A.parameters..., D, UnitRange{Int}},)
+end
+
 # Extract the native loop, retaining its hoisted values and operation tables.
 # Each chunk owns its coordinate cache; cells write disjoint output indices.
 # `deferred` holds the preparation of the arguments only the cells read, which

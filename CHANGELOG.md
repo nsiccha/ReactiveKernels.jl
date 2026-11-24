@@ -16,6 +16,25 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.377
+
+- A reader that `vectorize` or `prepare_batched` builds with
+  `schedule = NativeScheduling(...)` prepares under `type_stability = :error`
+  when its program has concretely typed inputs and a data-only prefix plate.
+  The code audit (`type_stability_level = :rk` or `:all`) no longer reports
+  the launcher that runs a prefix plate's cells across worker tasks. That
+  launcher reads the call's worker budget from task-local storage and
+  dispatches the cells at run time, once per call of the plate. The audit
+  checks the cells it dispatches instead, with the operand types the
+  prepared program passes, so at `:all` a client function those cells call
+  is still reported. Under the default `type_stability = :warn` the same
+  reader no longer logs that warning.
+- The table through which a scheduled prefix's cells share a call's result
+  is type stable, apart from one read of its untyped slot under its lock,
+  which the audit lists as justified. A reduced prefix plate whose cells
+  share a call no longer returns that call's table from its plate program,
+  whose result type was not concrete.
+
 ## 0.1.376
 
 - Indexed JAX events can reuse a data-dependent row lookup across draws.
