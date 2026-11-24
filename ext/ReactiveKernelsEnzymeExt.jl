@@ -982,10 +982,9 @@ end
 # backend sees the call (`_pr_target_expr`). Only the backend knows how it
 # annotates each operand. A call it annotates in a way the tape does not cover
 # (an operand it treats as active that the rule does not differentiate, a
-# batched reverse) runs the program, takes the general path below and records
-# the refusal: in the call's tape slot, or for the preparation that is
-# evaluating a marked call. A preparation reads that after one evaluation at
-# its exemplar and prepares the refused sites inline (`_pr_verified_preparation`).
+# batched reverse) stops the preparation's trial evaluation at that site.
+# Preparation retries with the site inline (`_pr_checking_sites`). Outside
+# a trial, a refused call uses the general reverse below.
 using ReactiveKernels: _PlateSumRuleOnePass, _pr_gather_value,
     _pr_scalar_positions, _pr_batched_positions, _pr_tape_layout, _CellArray, _PlateTapeSlot,
     _pr_take_tape!, _pr_return_tape!, _pr_projections, _pr_ragged_buffer, _PRRaggedBuffer,

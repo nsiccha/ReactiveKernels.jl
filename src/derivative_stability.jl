@@ -287,7 +287,7 @@ function _ad_evaluation_report(reporter, op, prepared, point, seeds, contexts)
         try
             Base.invokelatest(f, args...)
         catch err
-            err isa InterruptException && rethrow()
+            err isa Union{InterruptException,_PRDeclined} && rethrow()
             _ADEvaluationFailure(err)
         end
     end

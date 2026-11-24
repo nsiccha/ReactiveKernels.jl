@@ -3324,7 +3324,6 @@ end
     kept[2k] = high
     (low, high)
 end
-@inline _pr_mark_declined!(slot::_PlateTapeSlot) = (slot.declined = true; nothing)
 @inline _pr_mark_declined!(::Nothing) = nothing
 
 # The mark of one rule call site in a program that owns no AD caches (an
@@ -3334,7 +3333,7 @@ end
 # its own. It holds no state. A program is compiled once for its content and
 # every preparation of it runs that code, so nothing the program holds as a
 # literal can belong to one preparation; a refused call is recorded for the
-# preparation that is evaluating instead (`_pr_recording_refusals`).
+# preparation that is evaluating instead (`_pr_checking_sites`).
 struct _PlateRuleMark
     ordinal::Int
 end
@@ -3342,16 +3341,16 @@ _PlateRuleMark() = _PlateRuleMark(1)
 # The trailing operand of a rule call that is no operand of its program.
 const _PlateRuleSite = Union{_PlateTapeSlot,_PlateRuleMark}
 
-# Whether the backend's adapter refused a marked rule call while `f` ran, in
-# this task: `refused` is set by each such call. A preparation runs its own
-# evaluations this way (`_prepare_ad_operator`, `_pr_verified_preparation`).
-# Outside one a refusal is recorded nowhere.
+# A refusal ends the trial derivative before it enters the general reverse.
+# In particular, registered Enzyme on Julia 1.13 can lose the roots of a
+# constant gathered operand when that reverse reads it from the tape.
+struct _PRDeclined <: Exception
+    site::_PlateRuleSite
+end
 const _PR_REFUSAL_SCOPE = :ReactiveKernels_plate_reverse_refusal
-_pr_recording_refusals(f, refused::BitSet) =
-    task_local_storage(f, _PR_REFUSAL_SCOPE, refused)
-function _pr_mark_declined!(mark::_PlateRuleMark)
-    refused = get(task_local_storage(), _PR_REFUSAL_SCOPE, nothing)
-    refused === nothing || push!(refused::BitSet, mark.ordinal)
+@noinline function _pr_mark_declined!(site::_PlateRuleSite)
+    site isa _PlateTapeSlot && (site.declined = true)
+    get(task_local_storage(), _PR_REFUSAL_SCOPE, false) && throw(_PRDeclined(site))
     nothing
 end
 
@@ -3419,33 +3418,42 @@ function _pr_probe_callables(callables, sites)
         (callables..., sites.selected)
 end
 
-# The native program establishes which sites selected a generated schedule.
-# Only the backend knows whether its annotations permit the rule. Retry with
-# each refused site inline. A failed evaluation verifies no remaining sites.
-function _pr_verified_preparation(rebuild, op::Val, prepared, point, seeds, contexts,
-                                  evaluated, sites, refused::BitSet)
+# A successful trial returns the prepared operator. A refused trial returns
+# the sites to rebuild, then the new derivative is checked from the start.
+# Only a refusal reads the verifier's task-local flag.
+function _pr_checking_sites(f, sites)
+    (sites === nothing || isempty(sites.marks)) && return f()
+    try
+        task_local_storage(f, _PR_REFUSAL_SCOPE, true)
+    catch err
+        err isa _PRDeclined || rethrow()
+        ordinal = if err.site isa _PlateRuleMark
+            err.site.ordinal
+        else
+            i = findfirst(pair -> last(pair) === err.site, sites.slots)
+            i === nothing ? nothing : first(sites.slots[i])
+        end
+        any(m -> m.ordinal === ordinal, sites.marks) || return Dict{Int,Type}()
+        Dict{Int,Type}(m.ordinal => (sites.allowed === nothing ? Any : sites.allowed[m.ordinal])
+                       for m in sites.marks if m.ordinal != ordinal)
+    end
+end
+
+function _pr_verified_preparation(op, prepared, point, seeds, contexts, evaluated, sites)
     (sites === nothing || isempty(sites.marks)) && return prepared
     if evaluated === nothing
         f, args = _ad_operator_evaluation(op, prepared, point, seeds, contexts)
         Base.code_typed(f, Tuple{map(Core.Typeof, args)...})
-        evaluated = _pr_recording_refusals(refused) do
-            try
-                Base.invokelatest(f, args...)
-                true
-            catch err
-                err isa InterruptException && rethrow()
-                @warn "The derivative threw while verifying plate rules at the exemplar. Preparing the plates inline." exception = err
-                false
-            end
+        evaluated = try
+            Base.invokelatest(f, args...)
+            true
+        catch err
+            err isa Union{InterruptException,_PRDeclined} && rethrow()
+            @warn "The derivative threw while verifying plate rules at the exemplar. Preparing the plates inline." exception = err
+            false
         end
     end
-    evaluated || return rebuild(Dict{Int,Type}())
-    for (ordinal, slot) in sites.slots
-        slot.declined && push!(refused, ordinal)
-    end
-    isempty(refused) && return prepared
-    rebuild(Dict{Int,Type}(m.ordinal => (sites.allowed === nothing ? Any : sites.allowed[m.ordinal])
-                           for m in sites.marks if !(m.ordinal in refused)))
+    evaluated ? prepared : Dict{Int,Type}()
 end
 @inline function _pr_take_tape!(slot::_PlateTapeSlot, n::Int)
     tape = slot.tape

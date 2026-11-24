@@ -778,22 +778,14 @@ end
 
 # Slot and mark refusals identify the individual sites to drop on a retry.
 @testset "a refused rule is removed independently of another site" begin
-    DI = RK.DifferentiationInterface
     marks = RK._PlateRuleMark.(1:2)
     sites = RK._PRSites(marks, Dict{Int,Type}(1 => Any, 2 => Any), nothing)
-    slots = (RK._PlateTapeSlot(), RK._PlateTapeSlot())
-    append!(sites.slots, [1 => slots[1], 2 => slots[2]])
-    contexts = (DI.Constant(1.0), DI.Cache((nothing, slots...)))
-    verified(evaluated, c, refused = BitSet()) = RK._pr_verified_preparation(
-        identity, Val(:gradient), :prepared, nothing, (), c, evaluated, sites, refused)
-    @test verified(true, contexts) === :prepared
-    slots[2].declined = true
-    @test verified(true, contexts) == Dict(1 => Any)
-    slots[1].declined = true
-    @test isempty(verified(true, contexts))
-    slots[1].declined = slots[2].declined = false
-    @test verified(true, (), BitSet([1])) == Dict(2 => Any)
-    @test isempty(verified(false, ()))
+    slot = RK._PlateTapeSlot()
+    push!(sites.slots, 2 => slot)
+    @test RK._pr_checking_sites(() -> :prepared, sites) === :prepared
+    @test RK._pr_checking_sites(() -> RK._pr_mark_declined!(slot), sites) == Dict(1 => Any)
+    @test RK._pr_checking_sites(() -> RK._pr_mark_declined!(marks[1]), sites) == Dict(2 => Any)
+    @test isempty(RK._pr_verified_preparation(Val(:gradient), :prepared, nothing, (), (), false, sites))
 end
 
 # A mark is the site record of a rule call in a program without AD caches. It
@@ -831,11 +823,20 @@ gathered_call(rule, z, index, s, site) = rule(view(z, index), s, site)
         @test RK._pr_rule_applies(joint, operands(ids))
         @test RK._pr_rule_applies(joint, operands(ids), only(selected)) == accepts
         slot.declined = false
-        ds, v = Enzyme.autodiff(Enzyme.ReverseWithPrimal, gathered_call, Enzyme.Active,
-            Enzyme.Const(joint), Enzyme.Const(z), Enzyme.Const(ids), Enzyme.Active(0.6),
-            Enzyme.Const(slot))
+        sites = RK._PRSites([mark], nothing, nothing)
+        push!(sites.slots, mark.ordinal => slot)
+        result = RK._pr_checking_sites(sites) do
+            Enzyme.autodiff(Enzyme.ReverseWithPrimal, gathered_call, Enzyme.Active,
+                Enzyme.Const(joint), Enzyme.Const(z), Enzyme.Const(ids), Enzyme.Active(0.6),
+                Enzyme.Const(slot))
+        end
         @test slot.declined == !accepts
-        @test v ≈ 0.6sum(z[ids]) && ds[4] ≈ sum(z[ids])
+        if accepts
+            ds, v = result
+            @test v ≈ 0.6sum(z[ids]) && ds[4] ≈ sum(z[ids])
+        else
+            @test result == Dict{Int,Type}()
+        end
     end
     expected_z = [0.6count(==(j), index) for j in 1:7]
     differentiate(rule, dz) = Enzyme.autodiff(Enzyme.ReverseWithPrimal, gathered_call,
@@ -843,25 +844,14 @@ gathered_call(rule, z, index, s, site) = rule(view(z, index), s, site)
         Enzyme.Active(0.6), Enzyme.Const(RK._PlateRuleMark()))
     # Two preparations in turn: the second runs the code the first compiled,
     # and has its own record.
-    for (rule, refused) in ((covered, false), (partial, true)), preparation in 1:2
-        record = BitSet()
+    sites = RK._PRSites([mark], nothing, nothing)
+    for preparation in 1:2
         dz = zero(z)
-        derivatives, value = RK._pr_recording_refusals(() -> differentiate(rule, dz), record)
+        derivatives, value = RK._pr_checking_sites(() -> differentiate(covered, dz), sites)
         @test value ≈ 0.6sum(z[index])
-        @test dz ≈ expected_z
-        @test derivatives[4] ≈ sum(z[index])
-        @test record == (refused ? BitSet([1]) : BitSet())
+        @test dz ≈ expected_z && derivatives[4] ≈ sum(z[index])
+        @test isempty(RK._pr_checking_sites(() -> differentiate(partial, zero(z)), sites))
     end
-    # A preparation inside another's evaluation records for itself.
-    outer, inner = BitSet(), BitSet()
-    RK._pr_recording_refusals(outer) do
-        RK._pr_recording_refusals(() -> differentiate(partial, zero(z)), inner)
-        @test inner == BitSet([1]) && isempty(outer)
-        differentiate(covered, zero(z))
-        @test isempty(outer)
-        differentiate(partial, zero(z))
-    end
-    @test outer == BitSet([1])
     # Outside a preparation the general path still gives the gradient.
     dz = zero(z)
     derivatives, value = differentiate(partial, dz)
