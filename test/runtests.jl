@@ -157,6 +157,7 @@ const _MATRIX_CORE_TESTS = (
     "test_jax_specialfunctions.jl",
     "test_jax_statistics.jl",
     "test_jax_search.jl",
+    "test_jax_argmax.jl",
     "test_jax_permutations.jl",
     "test_jax_repeat.jl",
     "test_jax_scalar_rules.jl",

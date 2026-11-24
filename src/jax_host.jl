@@ -1355,17 +1355,6 @@ def _rk_isequal(a, b):
 # `searchsortedfirst` agree with Julia's on every value. Integer and string
 # arrays are their own keys.
 const _HOST_ORDER = Dict{Symbol,Pair{String,String}}(
-    :key => "_rk_order_key_np" => """
-def _rk_order_key_np(x):
-    # Julia's isless order of an array as sortable keys: a float is an integer
-    # key, -0.0 before 0.0 and every NaN last, equal for values isequal treats
-    # as equal. Integer and string arrays are their own keys.
-    x = np.asarray(x)
-    if x.dtype.kind != "f":
-        return x
-    bits = np.where(np.isnan(x), np.nan, x).astype(np.float64).view(np.int64)
-    return np.where(bits < 0, bits ^ np.int64(0x7FFFFFFFFFFFFFFF), bits)
-""",
     :sort => "_rk_sort_np" => """
 def _rk_sort_np(x):
     # Julia's sort of a vector: ascending in isless order, equal values in
@@ -1444,6 +1433,10 @@ const _HOST_ORDER_KEYS = Dict(:sort => (:key, :sort), :unique => (:key, :unique)
 function _host_order_helper!(ctx::_JaxContext, which::Symbol)
     name = ""
     for k in _HOST_ORDER_KEYS[which]
+        if k === :key
+            _host_helper!(ctx, "_rk_order_key", _JAX_ORDER_KEY)
+            continue
+        end
         name, text = _HOST_ORDER[k]
         key = (:helper, name)
         haskey(ctx.mod.helper_names, key) && continue
