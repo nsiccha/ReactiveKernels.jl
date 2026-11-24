@@ -199,18 +199,17 @@ end
     check!(other, other_destination, q, 1.4, idx, x)
 end
 
-@testset "a call that takes two passes leaves its slot empty" begin
+@testset "a plate inline at preparation needs no slot" begin
     q = [.1, -.4, .3]
     prepared, idx, x = prepare_case(24, 8, true)
-    slot = only(tape_slots(prepared))
+    @test isempty(tape_slots(prepared))
     destination = (fill(71., 3), Ref(81.))
     for (point, scale) in ((q, 1.2), ([-.8, .6, 1.2], .7))
         check!(prepared, destination, point, scale, idx, x)
-        @test isempty(slot.tape)
     end
     allocated(prepared, destination, q, 1.2)
     bytes = allocated(prepared, destination, q, 1.2)
-    @info "warm two-pass gradient with an unused slot" bytes
+    @info "warm inline gradient" bytes
     @test bytes == 0
 end
 

@@ -985,7 +985,7 @@ end
 # batched reverse) runs the program, takes the general path below and records
 # the refusal: in the call's tape slot, or for the preparation that is
 # evaluating a marked call. A preparation reads that after one evaluation at
-# its exemplar and then prepares the plates inline (`_pr_verified_preparation`).
+# its exemplar and prepares the refused sites inline (`_pr_verified_preparation`).
 using ReactiveKernels: _PlateSumRuleOnePass, _pr_gather_value,
     _pr_scalar_positions, _pr_batched_positions, _pr_tape_layout, _CellArray, _PlateTapeSlot,
     _pr_take_tape!, _pr_return_tape!, _pr_projections, _pr_ragged_buffer, _PRRaggedBuffer,

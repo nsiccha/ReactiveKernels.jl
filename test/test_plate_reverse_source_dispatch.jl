@@ -73,7 +73,7 @@ end
                 Meta.isexpr(ex, :call) && ex.args[1] isa RK._PlateSumRule && push!(sites, ex.args[end])
             end
             @test sites == [RK._PlateRuleMark()]
-            @test Base.issingletontype(RK._PlateRuleMark)
+            @test isbitstype(RK._PlateRuleMark)
             # Outside a preparation the plates stay inline.
             inline = with_plate_reverse(() -> RK._ad_inline_plate_programs(k, (2,)).ast, true)
             unverified = Ref(0)

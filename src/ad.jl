@@ -998,12 +998,19 @@ function _ad_na_program(kernel::NonAllocatingKernel, active_selector,
     if plate_reverse
         # Each generated rule's one-pass tape slot follows the step caches in
         # the cache table, so the backend owns and shadows it with them.
-        slots = Ref(0)
+        slots = _PlateTapeSlot[]
+        sites = _pr_marks()
+        function tape_slot(mark)
+            slot = _PlateTapeSlot()
+            push!(slots, slot)
+            push!(sites.slots, mark.ordinal => slot)
+            Expr(:ref, _CACHES_ARG, length(caches) + length(slots))
+        end
         rewritten = first(_pr_inline_plate_programs(_extract_plate_programs(rewritten),
             (; constants = ad_constants, callables = ops),
-            have_syms[collect(_ad_selector_indices(active_selector))];
-            tape_slot = () -> Expr(:ref, _CACHES_ARG, length(caches) + (slots[] += 1))))
-        ad_caches = (ad_caches..., ntuple(_ -> _PlateTapeSlot(), slots[])...)
+            have_syms[collect(_ad_selector_indices(active_selector))]; tape_slot))
+        ad_caches = (ad_caches..., slots...)
+        ops = _pr_probe_callables(ops, sites)
     end
     f = compile(rewritten)
     program = programs === nothing ? nothing :
@@ -2368,7 +2375,8 @@ _ad_prepared_backend(::Val, backend::DifferentiationInterface.SecondOrder) =
 function _prepare_ad_operator(op::Val{O}, kernel::_ADKernel, resolver,
                               requested::DifferentiationInterface.AbstractADType,
                               seeds::Tuple, args::Tuple, kwargs::NamedTuple,
-                              active; retain::Tuple = (), warm::Bool = false) where {O}
+                              active; retain::Tuple = (), warm::Bool = false,
+                              allowed_sites = nothing) where {O}
     _ad_require_backend_packages(requested)
     _ad_require_retaining_backend(requested, retain)
     backend = _ad_prepared_backend(op, requested)
@@ -2376,16 +2384,12 @@ function _prepare_ad_operator(op::Val{O}, kernel::_ADKernel, resolver,
     resolved = _ad_resolve(resolver, args, kwargs)
     # The exemplars type the program exactly as the derivative will see it.
     values = _uninferred_values(kernel, map(Core.Typeof, resolved))
-    # Each generated plate rule the program installs leaves its site record
-    # with this preparation, which reads it below (`_pr_verified_preparation`).
-    # A marked call's refusal is recorded in `refused` while this preparation
-    # evaluates the operator.
-    marks = _PlateRuleMark[]
-    refused = Ref(false)
-    call, point, contexts, active_selector, external_values = _pr_collecting_marks(marks) do
+    candidate, sites = _pr_prepared_call(allowed_sites, _ad_native_enzyme(backend)) do
         _ad_call(kernel, resolved, active; scalar_output = _ad_operator_scalar_output(op),
                  retain, _ad_operator_seeding(op, seeds, backend)...)
     end
+    call, point, contexts, active_selector, external_values = candidate
+    refused = BitSet()
     # The backend differentiates `call`: its code is what the level audits.
     _report_type_stability(
         values,
@@ -2407,10 +2411,10 @@ function _prepare_ad_operator(op::Val{O}, kernel::_ADKernel, resolver,
     evaluated = _pr_recording_refusals(refused) do
         _ad_check_derivative(op, prepared, point, seeds, contexts, warm)
     end
-    _pr_verified_preparation(op, prepared, point, seeds, contexts, evaluated, marks, refused) do
-        with_plate_reverse(false) do
+    _pr_verified_preparation(op, prepared, point, seeds, contexts, evaluated, sites, refused) do allowed
+        with_plate_reverse(!isempty(allowed)) do
             _prepare_ad_operator(op, kernel, requested_resolver, requested, seeds, args,
-                                 kwargs, active; retain, warm)
+                                 kwargs, active; retain, warm, allowed_sites = allowed)
         end
     end
 end
@@ -2450,14 +2454,15 @@ end
 function _ad_warm_evaluation(evaluate)
     try
         evaluate()
+        true
     catch err
         err isa InterruptException && rethrow()
         @warn "`warm = true` evaluates the gradient once at the exemplar to " *
               "compile it, and the program threw there. The preparation is " *
               "kept: whatever that evaluation did not reach compiles at its " *
               "first call instead." exception = err
+        false
     end
-    nothing
 end
 
 # Only a gradient retains further WANT values from its primal sweep.

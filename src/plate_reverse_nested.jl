@@ -242,7 +242,8 @@ end
 function _pr_group_broadcast_expr(positions, projections, types, dispatch)
     sited = _pr_sited(types)
     count = length(types) - sited
-    original = :($dispatch(rule.original, args))
+    extra = dispatch === :_pr_rule_applies ? (:check,) : ()
+    original = :($dispatch(rule.original, args, $(extra...)))
     all(i -> types[i] <: _PRScalarPlusVector, positions) || return original
     for p in projections
         p.parent in positions || continue
@@ -265,5 +266,5 @@ function _pr_group_broadcast_expr(positions, projections, types, dispatch)
         push!(leaves, :(getfield(args, $(count + 1))))
     end
     condition = foldl((a, b) -> :($a && $b), checks)
-    :($condition ? $dispatch(rule.expanded, ($(leaves...),)) : $original)
+    :($condition ? $dispatch(rule.expanded, ($(leaves...),), $(extra...)) : $original)
 end

@@ -776,31 +776,24 @@ end
     @test kept(on) == first_call
 end
 
-# A rule the backend refuses is found at preparation, and the preparation is
-# made again with the plates inline.
-@testset "a refused rule call makes the preparation ordinary" begin
+# Slot and mark refusals identify the individual sites to drop on a retry.
+@testset "a refused rule is removed independently of another site" begin
     DI = RK.DifferentiationInterface
-    slot = RK._PlateTapeSlot()
-    contexts = (DI.Constant(1.0), DI.Cache((nothing, slot)))
-    @test RK._pr_tape_slots!(RK._PlateTapeSlot[], contexts) == [slot]
-    verified(evaluated, c = contexts) = RK._pr_verified_preparation(
-        () -> :ordinary, Val(:gradient), :prepared, nothing, (), c, evaluated)
-    @test verified(true) === :prepared
-    slot.declined = true
-    @test verified(true) === :ordinary
-    @test verified(false, (DI.Constant(1.0),)) === :prepared
-    # A program without AD caches marks each rule call instead, and a refusal
-    # is recorded for the preparation while it evaluates.
-    refused = Ref(false)
-    marked(evaluated) = RK._pr_verified_preparation(
-        () -> :ordinary, Val(:gradient), :prepared, nothing, (), (DI.Constant(1.0),),
-        evaluated, [RK._PlateRuleMark()], refused)
-    @test marked(true) === :prepared
-    refused[] = true
-    @test marked(true) === :ordinary
-    # Without a marked call there is nothing to check.
-    @test RK._pr_verified_preparation(() -> :ordinary, Val(:gradient), :prepared, nothing, (),
-        (DI.Constant(1.0),), true, RK._PlateRuleMark[], refused) === :prepared
+    marks = RK._PlateRuleMark.(1:2)
+    sites = RK._PRSites(marks, Dict{Int,Type}(1 => Any, 2 => Any), nothing)
+    slots = (RK._PlateTapeSlot(), RK._PlateTapeSlot())
+    append!(sites.slots, [1 => slots[1], 2 => slots[2]])
+    contexts = (DI.Constant(1.0), DI.Cache((nothing, slots...)))
+    verified(evaluated, c, refused = BitSet()) = RK._pr_verified_preparation(
+        identity, Val(:gradient), :prepared, nothing, (), c, evaluated, sites, refused)
+    @test verified(true, contexts) === :prepared
+    slots[2].declined = true
+    @test verified(true, contexts) == Dict(1 => Any)
+    slots[1].declined = true
+    @test isempty(verified(true, contexts))
+    slots[1].declined = slots[2].declined = false
+    @test verified(true, (), BitSet([1])) == Dict(2 => Any)
+    @test isempty(verified(false, ()))
 end
 
 # A mark is the site record of a rule call in a program without AD caches. It
@@ -826,6 +819,24 @@ gathered_call(rule, z, index, s, site) = rule(view(z, index), s, site)
     @test RK._pr_rule_target(joint, ([0.2, -0.3], 0.6, mark)) === primal
     @test RK._pr_rule_target(joint, ([0.2, -0.3], 0.6, RK._PlateTapeSlot())) isa
         RK._PlateSumRuleOnePass
+    # The same operand types can select a different tape after a size change.
+    # A constant gathered root is covered by the logical tape with an active
+    # scalar, but Enzyme refuses the grouped tape in that activity pattern.
+    slot = RK._PlateTapeSlot()
+    selected = Type[Union{}]
+    small, large = index[1:2], index
+    operands(ids) = (view(z, ids), 0.6, slot)
+    @test RK._pr_rule_applies(joint, operands(small), RK._PRObserveSchedule(selected, 1))
+    for (ids, accepts) in ((small, true), (large, false), (small, true))
+        @test RK._pr_rule_applies(joint, operands(ids))
+        @test RK._pr_rule_applies(joint, operands(ids), only(selected)) == accepts
+        slot.declined = false
+        ds, v = Enzyme.autodiff(Enzyme.ReverseWithPrimal, gathered_call, Enzyme.Active,
+            Enzyme.Const(joint), Enzyme.Const(z), Enzyme.Const(ids), Enzyme.Active(0.6),
+            Enzyme.Const(slot))
+        @test slot.declined == !accepts
+        @test v ≈ 0.6sum(z[ids]) && ds[4] ≈ sum(z[ids])
+    end
     expected_z = [0.6count(==(j), index) for j in 1:7]
     differentiate(rule, dz) = Enzyme.autodiff(Enzyme.ReverseWithPrimal, gathered_call,
         Enzyme.Active, Enzyme.Const(rule), Enzyme.Duplicated(z, dz), Enzyme.Const(index),
@@ -833,24 +844,24 @@ gathered_call(rule, z, index, s, site) = rule(view(z, index), s, site)
     # Two preparations in turn: the second runs the code the first compiled,
     # and has its own record.
     for (rule, refused) in ((covered, false), (partial, true)), preparation in 1:2
-        record = Ref(false)
+        record = BitSet()
         dz = zero(z)
         derivatives, value = RK._pr_recording_refusals(() -> differentiate(rule, dz), record)
         @test value ≈ 0.6sum(z[index])
         @test dz ≈ expected_z
         @test derivatives[4] ≈ sum(z[index])
-        @test record[] == refused
+        @test record == (refused ? BitSet([1]) : BitSet())
     end
     # A preparation inside another's evaluation records for itself.
-    outer, inner = Ref(false), Ref(false)
+    outer, inner = BitSet(), BitSet()
     RK._pr_recording_refusals(outer) do
         RK._pr_recording_refusals(() -> differentiate(partial, zero(z)), inner)
-        @test inner[] && !outer[]
+        @test inner == BitSet([1]) && isempty(outer)
         differentiate(covered, zero(z))
-        @test !outer[]
+        @test isempty(outer)
         differentiate(partial, zero(z))
     end
-    @test outer[]
+    @test outer == BitSet([1])
     # Outside a preparation the general path still gives the gradient.
     dz = zero(z)
     derivatives, value = differentiate(partial, dz)
