@@ -282,6 +282,21 @@ end
     end
 end
 
+@testset "replaying a nested child releases the previous fitted inputs" begin
+    cache = KernelBuildCache()
+    source = copy(LEVEL_MODEL)
+    push!(source.args, :(extra ~ truncated(Normal(0, 1), 0.2, 2.0)))
+    build_levels(cache, [1, 2, 1]; source)
+    entry = cache.entry
+    @test entry !== nothing
+    refs = build_levels(cache, [4, 2, 1]; source, check=false)
+    @test cache.entry === entry
+    GC.gc(true)
+    @test refs.levels.value === nothing
+    @test refs.design.value === nothing
+    @test refs.graph.value === nothing
+end
+
 @testset "scaled correlated coefficients retain graph assembly" begin
     check_constructor(quote
         b[1:2, 1:2] .~ Normal.(0, 1)

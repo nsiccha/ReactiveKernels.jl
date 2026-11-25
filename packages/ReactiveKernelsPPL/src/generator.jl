@@ -239,7 +239,7 @@ function _current_build_source!(globals, ref::GlobalRef)
     binding = ReactiveKernels._global_value(ref.mod, ref.name)
     binding === nothing && return false
     value = something(binding)
-    value isa Union{KernelSpec,ReactiveKernels.DerivativeRule} ||
+    value isa Union{KernelSpec,ReactiveKernels.DerivativeRule,ReactiveKernels.ScalarDerivativeRule} ||
         (value isa Function && Base.issingletontype(typeof(value)) &&
          ReactiveKernels._global_isconst(ref.mod, ref.name))
 end
