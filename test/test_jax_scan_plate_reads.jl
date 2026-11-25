@@ -52,6 +52,93 @@ end
     total
 end
 
+@traceable jax_scan_score(row, state) = row[1] * state + row[2] - row[1]
+
+@kernel jax_scan_checked_step(a::Float64, keys::Vector{Float64}, order::Vector{Int}) = begin
+    entries = plate(keys) do key
+        (key, a * key)
+    end
+    path = scan(order, Ref(entries); init = 0.0) do state, index, rows
+        row = rows[index]
+        next = state + jax_checked_entry(row[2], row[1])
+        (next, next)
+    end
+    total = sum(path)
+    total
+end
+
+@kernel jax_scan_record_table(a::Float64, keys::Vector{Float64},
+                              orders::Vector{Vector{Int}}) = begin
+    entries = plate(keys) do key
+        (key, a * key)
+    end
+    totals = plate(orders, Ref(entries)) do order, table
+        path = scan(order, Ref(table); init = 0.0) do state, index, rows
+            next = if index > 0
+                jax_scan_score(rows[index], state)
+            else
+                state - a
+            end
+            (next, next)
+        end
+        sum(path)
+    end
+    total = sum(totals)
+    total
+end
+
+@testset "Ordinary JAX reverse of a scan over a shared record table" begin
+    checked = jax_source(jax_scan_checked_step; have = (:a, :keys, :order), want = :total)
+    @test !occursin("@_rk_table_scan_step", string(checked))
+    have = (:a, :keys, :orders)
+    native = prepare(jax_scan_record_table; have, want = :total)
+    src = jax_source(jax_scan_record_table; have, want = :total, data = (:keys, :orders))
+    @test occursin("@_rk_table_scan_step", string(src))
+    @test occursin(r"record_entry\w* = \(", string(src))
+    if rk_jax_available()
+        for orders in ([[1, 0, 2, 1], [2], Int[]], [zeros(Int, 9)], [Int[]], Vector{Int}[])
+            keys = [0.25, -0.5]
+            r = rk_jax_evaluate(src, "kernel", (0.6, keys, orders); prepare = :arguments, grad = true)
+            @test r.value ≈ native(0.6, keys, orders)
+            # The recurrence is affine in a, including its inactive arm.
+            @test r.grad ≈ native(1.0, keys, orders) - native(0.0, keys, orders)
+        end
+        mktempdir() do dir
+            write(joinpath(dir, "model.py"), src)
+            write(joinpath(dir, "trace.py"), raw"""
+import jax
+import numpy as np
+import model
+
+def steps(jaxpr):
+    for eq in getattr(jaxpr, "jaxpr", jaxpr).eqns:
+        if eq.primitive.name == "scan" and not eq.params["reverse"]:
+            yield eq
+        for param in eq.params.values():
+            for child in param if isinstance(param, (tuple, list)) else (param,):
+                if hasattr(child, "jaxpr") or hasattr(child, "eqns"):
+                    yield from steps(child)
+
+def tape(n):
+    data = model.prepare_data(keys=np.linspace(0.1, 0.9, n),
+                              orders=[np.arange(1, n+1), np.array([0, 1])])
+    grad = jax.grad(lambda a: model.kernel(a, **data))
+    scan, = (s for s in steps(jax.make_jaxpr(grad)(0.6)) if s.params["length"] == n)
+    return sum(v.aval.size for v in scan.outvars)
+
+enabled = model._rk_table_scan_step
+for n in (13, 37):
+    model._rk_table_scan_step = enabled
+    compact = tape(n)
+    model._rk_table_scan_step = lambda step: step
+    ordinary = tape(n)
+    assert compact < ordinary, (n, compact, ordinary)
+""")
+            @test success(Cmd(`$RK_JAX_PYTHON $(joinpath(dir, "trace.py"))`; dir))
+        end
+    end
+end
+
 @testset "JAX scan reads one numeric plate cell at the requested index" begin
     have = (:a, :labels, :visits)
     native = prepare(jax_scan_plate_reads; have, want = :total)
