@@ -101,6 +101,34 @@ end
     return total
 end
 
+_jax_ode_relaxation(t, y, p) = [p - y[1]]
+@kernel jax_ode_equilibrium(q::Vector{Float64}, ts::Vector{Float64}) = begin
+    sol = rk_ode_rk45_tol(_jax_ode_relaxation, [q[1]], q[3], ts, 1e-7, 1e-8, 10000, q[2])
+    total = sum(sol)
+    return total
+end
+
+@testset "RK45 controls the response to perturbations at equilibrium" begin
+    q, ts = zeros(3), [100.0]
+    query = prepare(jax_ode_equilibrium; have = (:q, :ts), want = :total)
+    @test query(q, ts) == 0
+    @test gradient(x -> query(x, ts), AutoEnzyme(; mode = Enzyme.Reverse), q) ≈ [0, 1, 0] atol = 1e-6
+    if _JAX_ODE_PYTHON
+        mktempdir() do dir
+            for T in (Float32, Float64)
+                write(joinpath(dir, "model.py"), jax_source(jax_ode_equilibrium;
+                    have = (:q, :ts), want = :total, float_type = T))
+                driver = joinpath(@__DIR__, "jax_ode_sensitivity.py")
+                cmd = addenv(`$RK_JAX_PYTHON -B $driver $dir`,
+                             "JAX_ENABLE_X64" => (T === Float64 ? "1" : "0"))
+                @test run(cmd).exitcode == 0
+            end
+        end
+    else
+        @test_skip false
+    end
+end
+
 @testset "runtime ODE relative tolerance in the solve precision" begin
     if _JAX_ODE_PYTHON
         mktempdir() do dir

@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.382
+
+- Exported JAX RK45 solves control local error in the state and its
+  sensitivities to the initial state and floating-point RHS inputs.
+  Gradients use those forward sensitivities to avoid cancellation near an
+  equilibrium. Value-only calls also track them, which can increase their
+  cost and step count.
+  Regenerate an exported module to pick up the change.
+
 ## 0.1.381
 
 - `jax_source` supports `reduce(vcat, cells)` when a cell broadcasts
