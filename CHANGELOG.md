@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.385
+
+- `jax_source` uses the device integer type for the padding and initial
+  values of whole-array `minimum` and `maximum`. Float32 modules can
+  reduce prepared integer rows with JAX's 64-bit mode on or off.
+
 ## 0.1.384
 
 - Compare `kernel_revision(child)` before reusing a parent that spliced a supplied child. The revision tracks graph edits and public port bindings.

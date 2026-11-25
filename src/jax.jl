@@ -5005,6 +5005,32 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(argmax), args::Vector{_Py
     ctx.traced_branches > 0 && (index = _py_conditional(index, "len(" * x.code * ")", "1"))
     _jax_typed_result(Int, [x], index)
 end
+# Use the integer width JAX actually gives the operand. iinfo returns a
+# Python int, so type the bound too: an unsigned maximum can exceed the
+# largest signed integer JAX accepts as a Python scalar.
+function _jax_integer_extremum(ctx, f, name, x)
+    x = _jax_bind!(ctx, :entries, x)
+    E = _jax_eltype(x.T)
+    neutral = if E === Bool
+        f === maximum ? "False" : "True"
+    else
+        dtype = _jax_fresh(ctx, :dtype)
+        _jax_emit!(ctx, dtype * " = jnp.result_type(" * x.code * ")")
+        field = f === maximum ? "min" : "max"
+        _jax_bind!(ctx, :identity, _PyVal("$dtype.type(jnp.iinfo($dtype).$field)", E, true)).code
+    end
+    operand = _jax_padded_reduced(ctx, f, x, neutral)
+    if x.origin isa _JaxOrigin
+        # A reduction of prepared entries is bounded by the same dataset's
+        # extremes, including when x is one row of ragged data.
+        n = _jax_function_call(ctx, length, [x])
+        _jax_call(ctx, _runtime_check, [_jax_call(ctx, >, [n, _jax_literal(0)]),
+            _PyVal(repr("reducing over an empty collection is not allowed"), ArgumentError)])
+        return _PyVal(name * "(" * operand * ", initial=" * neutral * ")", E,
+                      isempty(x.extent) && x.static, "", _jax_entry_bound(ctx, x.origin, true))
+    end
+    _PyVal(name * "(" * operand * ")", E)
+end
 for (f, name, neutral) in ((prod, "jnp.prod", "1.0"), (maximum, "jnp.max", "-jnp.inf"),
                            (minimum, "jnp.min", "jnp.inf"))
     @eval function _jax_function_call(ctx::_JaxContext, ::typeof($f), args::Vector{_PyVal})
@@ -5015,22 +5041,12 @@ for (f, name, neutral) in ((prod, "jnp.prod", "1.0"), (maximum, "jnp.max", "-jnp
             throw(_CellHostNeeded(o.plate, o.recipe, JAXEmissionError(
                 "an integer reduction needs prepared entry bounds" * _jax_where(ctx))))
         end
-        v = isempty(x.extent) ? _jax_result($f, args, $name * "(" * _jax_collection_code(x) * ")") :
-            _PyVal($name * "(" * _jax_padded_reduced(ctx, $f, x,
-                eltype(x.T) <: Integer && $f !== prod ?
-                    string($f === maximum ? typemin(eltype(x.T)) : typemax(eltype(x.T))) : $neutral) *
-                ")", eltype(x.T))
-        # A reduction of prepared integer entries is bounded by the same
-        # dataset's extremes, including when x is one row of ragged data.
-        if $f !== prod && v.T isa Type && v.T <: Integer && x.origin isa _JaxOrigin
-            n = _jax_function_call(ctx, length, [x])
-            _jax_call(ctx, _runtime_check, [_jax_call(ctx, >, [n, _jax_literal(0)]),
-                _PyVal(repr("reducing over an empty collection is not allowed"), ArgumentError)])
-            neutral = string($f === maximum ? typemin(v.T) : typemax(v.T))
-            code = $name * "(" * _jax_padded_reduced(ctx, $f, x, neutral) * ", initial=" * neutral * ")"
-            v = _PyVal(code, v.T, v.static, "", _jax_entry_bound(ctx, x.origin, true))
+        if $f !== prod && x.T isa Type && _jax_eltype(x.T) <: Integer &&
+                (!isempty(x.extent) || x.origin isa _JaxOrigin)
+            return _jax_integer_extremum(ctx, $f, $name, x)
         end
-        v
+        isempty(x.extent) && return _jax_result($f, args, $name * "(" * _jax_collection_code(x) * ")")
+        _PyVal($name * "(" * _jax_padded_reduced(ctx, $f, x, $neutral) * ")", eltype(x.T))
     end
 end
 # `div(a, b)` of integers truncates toward zero, as Julia's does (lowered
