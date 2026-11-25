@@ -1,4 +1,4 @@
-using LoweringWorkload, ReactiveKernelsPPL, DifferentiationInterface, Enzyme, Test
+using LoweringWorkload, ReactiveKernels, ReactiveKernelsPPL, DifferentiationInterface, Enzyme, Test
 const W = LoweringWorkload
 @test W.IN_IMAGE
 @test !ReactiveKernelsPPL._lowering_named_module(W.DEFINITIONS)
@@ -9,6 +9,8 @@ entry = only(values(W.CACHE.entries))
 fit = W.fitted([9., 10., 11., 12., 13.])
 @test fit.values.center == 11.0
 programs = Expr[]
+submodel_entry = W.SUBMODEL_BUILDS.entry
+@test submodel_entry !== nothing
 for design in ((; x=[2., -1., 3., 0.], y=[1., 0., -0.2, 0.4]),
                (; x=[4., 2.], y=[0.2, 0.3]))
     # Mark the image entry in this test process. Only an actual hit can copy
@@ -21,7 +23,8 @@ for design in ((; x=[2., -1., 3., 0.], y=[1., 0., -0.2, 0.4]),
     @test plan.frozen === fit
     @test !isempty(plan.submodel_scopes)
     bound = bind_data(plan, design)
-    built = build_kernel(bound)
+    built = build_kernel(bound; cache=W.SUBMODEL_BUILDS)
+    @test W.SUBMODEL_BUILDS.entry === submodel_entry
     fresh = bind_data(W.lower(design, fit; cache=nothing), design)
     @test built.program == build_kernel(fresh).program
     push!(programs, built.program)
@@ -41,3 +44,34 @@ for design in ((; x=[2., -1., 3., 0.], y=[1., 0., -0.2, 0.4]),
     @test all(p -> !isempty(p.responses), plans[2:end])
 end
 @test allequal(programs)
+
+@testset "package-image constructor binds each fitted child's current graph" begin
+    entry = W.BUILDS.entry
+    @test entry !== nothing
+    data = (; x=[3., 1., 2.], y=[2., 4., 1.])
+    plan = W.child_plan([7., 9.], data)
+    original = build_kernel(plan; cache=W.BUILDS)
+    @test W.BUILDS.entry === entry
+    child = W.clipped
+    saved = kernel_revision(child)
+    @test saved == W.CHILD_REVISION
+    old = child.ports[:z]
+    try
+        child.ports[:z] = child.ports[:x]
+        @test kernel_revision(child) != saved
+        edited = build_kernel(plan; cache=W.BUILDS)
+        @test W.BUILDS.entry === entry
+        @test original.spec.graph !== edited.spec.graph
+        for (built, increment) in ((original, 1.), (edited, 0.))
+            u = [0.5]
+            sampler = prepare_sampler(built, plan, u; backend=AutoEnzyme(; mode=Enzyme.Reverse))
+            value, gradient = sampler_value_and_gradient!(sampler, similar(u), u)
+            residual = data.y .- (data.x .+ 2*(only(u)+increment))
+            @test value ≈ -0.5 * (4log(2pi) + (only(u)-8)^2 + sum(abs2, residual))
+            @test only(gradient) ≈ 8 - only(u) + 2sum(residual)
+        end
+    finally
+        child.ports[:z] = old
+    end
+    @test kernel_revision(child) == saved
+end

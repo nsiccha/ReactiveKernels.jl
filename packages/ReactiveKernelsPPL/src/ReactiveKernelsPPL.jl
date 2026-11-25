@@ -63,7 +63,7 @@ export FrozenValues, frozen_values, LoweringCache
 export admitted_families, admitted_terms, admitted_functions, admitted_elementwise
 export supports_term
 export block_name
-export build_kernel, kernel_expr
+export build_kernel, kernel_expr, KernelBuildCache
 export jax_source
 export model_view, RKPPLModelView
 export DesignShape, DesignBlock, design_shape, coefficient_priors

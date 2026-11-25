@@ -380,7 +380,7 @@ _bound_plan(m::RKPPLModel) = _bound_plan(m())
 _bound_plan(m::RKPPLBoundModel) = bind_data(m)
 _bound_plan(plan::StructuralPlan) = plan
 
-build_kernel(m::_PlanSource) = build_kernel(_bound_plan(m))
+build_kernel(m::_PlanSource; kwargs...) = build_kernel(_bound_plan(m); kwargs...)
 kernel_expr(m::_PlanSource, layout::LayoutTable; kwargs...) =
     kernel_expr(_bound_plan(m), layout; kwargs...)
 assign_layout(m::_PlanSource) = assign_layout(_bound_plan(m))
