@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.389
+
+- `jax_source(...; data, plate_layout = :groups)` emits a module whose plates
+  over prepared ragged rows can run in groups of units of similar length.
+  The module's `prepare_plate_layout(prepared, groups, sequential)` chooses
+  the layout after `prepare_data`, and `GROUPED_PLATES` names the plates.
+  Every layout returns the plate's values and ordinary derivatives. The
+  default `plate_layout = :padded` emits the same module as before.
+
 ## 0.1.388
 
 - Regenerated JAX modules skip a guarded matrix exponential and its reverse

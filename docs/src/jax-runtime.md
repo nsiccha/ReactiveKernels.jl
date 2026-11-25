@@ -61,6 +61,42 @@ distinct entry it requests once, so many rows that read one shared factor
 compute it once, and an entry it does not request is never computed. The
 derivative of a selected read keeps only the selected rows' residuals.
 
+## Plate layouts
+
+A plate over units with ragged rows (subjects with their own event
+schedules) is one `jax.vmap` of its cell, so every unit is stored and computed
+at the longest unit's length. When the lengths differ widely, most of that
+work, and of what reverse mode stores for each step of a scan, is padding.
+
+`jax_source(...; data, plate_layout = :groups)` emits a module whose caller
+chooses how such plates run, after `prepare_data` and without regenerating it:
+
+```python
+prepared = module.prepare_data(**raw)
+chosen = module.prepare_plate_layout(prepared, groups=4)
+value, gradient = jax.value_and_grad(module.kernel)(u, **chosen)
+```
+
+`prepare_plate_layout(prepared, groups, sequential=False)` sorts each plate's
+units by length and splits them into at most `groups` groups that minimize
+the padded size. Each group runs as one `jax.vmap` over rows cut to its
+longest unit, or with `sequential=True` as one `jax.lax.map`, its units one
+after another. The groups' values are joined in the plate's order and padded
+to the plate's own shapes. `groups=1` without `sequential` is the plate as
+without the option, and `prepare_data`'s own result selects it.
+
+Every layout calls the plate's own cell, so values and ordinary derivatives
+are the plate's. The layouts differ in cost: more groups move fewer bytes and
+store less per chain, and run more loop rounds in sequence. Which is fastest
+depends on the device, the model and the number of chains, so time the
+candidates there rather than choosing by rule.
+
+`GROUPED_PLATES` names the plates that take a layout, each with the prepared
+row lengths that group its units. A plate qualifies when it maps a prepared
+ragged vector of numeric rows; rows a cell reads from a shared array by its
+index keep the stored width. The number of groups is the caller's argument:
+a trace holds one copy of the plate per group, whatever the data's lengths.
+
 ## Chains under `vmap`
 
 When a run-time branch calls the matrix exponential on a traced matrix, the

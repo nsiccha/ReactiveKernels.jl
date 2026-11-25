@@ -8503,11 +8503,17 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
             _JaxPlateCell(cell, args, axes .== "0", axis_ids)
     end
     axes_text = "(" * join(axes, ", ") * (length(axes) == 1 ? ",)" : ")")
-    call = cell
-    for _ in 1:R
-        call = "jax.vmap(" * call * ", in_axes=" * axes_text * ")"
+    # A plate over prepared ragged rows can run in the layout the prepared
+    # data choose (`jax_layout.jl`); without one it is this `jax.vmap`.
+    call = R == 1 ? _jax_layout_call(ctx, cell, axes_text, args,
+                                     _jax_layout_arguments(ctx, inputs, mapped, ragged)) : nothing
+    if call === nothing
+        call = cell
+        for _ in 1:R
+            call = "jax.vmap(" * call * ", in_axes=" * axes_text * ")"
+        end
+        call *= "(" * join(args, ", ") * ")"
     end
-    call *= "(" * join(args, ", ") * ")"
     # vmap traces its cell even with no mapped entries. An indexed read in
     # that body can then fail on an empty shared array although Julia runs
     # no cells. Shape tests are known to the backend while tracing; branch
@@ -9174,6 +9180,14 @@ The module's floats stay float32 where another module turned x64 on. Its results
 float32 rounding: compare it with the `Float64` module of the same program at
 a tolerance relative to `eps(Float32)` and the size of the value.
 
+`plate_layout = :groups` (with `data`) emits a module whose caller chooses
+how plates over prepared ragged rows run: `prepare_plate_layout(prepared,
+groups, sequential)` in the module sorts each such plate's units by length and
+splits them into groups, each run at its own longest length side by side or
+one unit after another. Every layout returns the plate's values and ordinary
+derivatives; `GROUPED_PLATES` names the plates. The default `:padded` emits
+each plate as one `jax.vmap` over all units.
+
 The translation keeps the program's structure. A plate is `jax.vmap` of its
 cell, a scan is `jax.lax.scan` of its step, a lazy branch is `jax.lax.cond`
 of its arms, and nothing is unrolled per element. Arrays keep Julia's
@@ -9206,7 +9220,7 @@ jax_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
            definitions = nothing, definitions_module::Module = Main, keep = (),
            function_docs = NamedTuple(), float_type = Float64,
            source_regions = _JaxSourceRegion[], module_docstring = nothing,
-           rejecting = ()) = _translate_in_latest_world(JAXSource) do
+           rejecting = (), plate_layout = :padded) = _translate_in_latest_world(JAXSource) do
     docstring = _jax_module_docstring(doc, module_docstring)
     functions === nothing && want === nothing && (want = _KERNEL_DEFAULT_BOUNDARY)
     if functions === nothing
@@ -9226,20 +9240,24 @@ jax_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
     plans = [fname => (plan(spec; have, want = _jax_want_names(w)), w)
              for (fname, w) in pairs(functions)]
     _jax_with_float_type(float_type) do
-        _jax_module_source(plans, types, constants, docstring; data, definitions,
-                           definitions_module, keep, function_docs, source_regions, rejecting)
+        _jax_with_plate_layout(plate_layout, data) do
+            _jax_module_source(plans, types, constants, docstring; data, definitions,
+                               definitions_module, keep, function_docs, source_regions, rejecting)
+        end
     end
 end
 
 jax_source(p::Plan; types = nothing, name = :kernel, constants = NamedTuple(),
            doc = nothing, data = nothing, definitions = nothing,
            definitions_module::Module = Main, keep = (), function_docs = NamedTuple(),
-           float_type = Float64) =
+           float_type = Float64, plate_layout = :padded) =
     _translate_in_latest_world(JAXSource) do
         _jax_with_float_type(float_type) do
-            _jax_module_source([Symbol(name) => (p, Tuple(v.name for v in p.want))],
-                               types, constants, _jax_module_docstring(doc, nothing);
-                               data, definitions, definitions_module, keep, function_docs)
+            _jax_with_plate_layout(plate_layout, data) do
+                _jax_module_source([Symbol(name) => (p, Tuple(v.name for v in p.want))],
+                                   types, constants, _jax_module_docstring(doc, nothing);
+                                   data, definitions, definitions_module, keep, function_docs)
+            end
         end
     end
 
@@ -9687,6 +9705,17 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
             PREPARED = [n => (dtype = _jax_dtype_name(T), ndim = _jax_meta_rank(T),
                               ragged = _jax_ragged(T))
                         for (n, T) in zip(prepared_names, prepared_types)])
+    plates = _jax_layout_plates(mod)
+    if !isempty(plates)
+        # The plates whose layout `prepare_plate_layout` chooses, each with the
+        # prepared row lengths that group its units.
+        _jax_module_helper!(mod, "_rk_length_groups", _JAX_LENGTH_GROUPS)
+        push!(bodies, rstrip(_JAX_PREPARE_PLATE_LAYOUT))
+        push!(functions, JAXFunction("prepare_plate_layout",
+            Pair{String,Any}["prepared" => Dict, "groups" => Int, "sequential" => Bool],
+            Pair{String,Any}["prepared" => Dict]))
+        meta = merge(meta, (GROUPED_PLATES = [name => Tuple(keys) for (name, keys) in plates],))
+    end
     defs === nothing && return meta
     # With definitions, `DATA` describes `prepare_data`'s own parameters, and
     # `UNTRANSLATED` the definitions it takes as inputs (none when every
@@ -10020,6 +10049,10 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
             for ((pn, _), local_name) in zip(inputs[keyword_from+1:end], input_locals[keyword_from+1:end])
                 push!(lines, "    " * local_name * " = prepared[\"" * pn * "\"]")
             end
+            # The plates' layout (`prepare_plate_layout`), absent from `prepare_data`'s
+            # own result: every plate then runs as one batch.
+            occursin(r"\b_rk_plate_layout\b", body) &&
+                push!(lines, "    _rk_plate_layout = prepared.get(\"_rk_plate_layout\", {})")
         end
     else
         lines = String["def " * name * "(" * join(params, ", ") * "):"]
