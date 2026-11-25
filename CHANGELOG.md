@@ -16,6 +16,13 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.383
+
+- `jax_source` translates `argmax(x)` on numeric vectors to a one-based
+  integer index. Ties select the first maximum, including the first NaN.
+  Positive zero sorts above negative zero. An empty vector raises when the
+  reduction is evaluated.
+
 ## 0.1.382
 
 - Exported JAX RK45 solves control local error in the state and its

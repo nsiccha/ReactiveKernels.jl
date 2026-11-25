@@ -3017,10 +3017,8 @@ end
 # A conditional: a static condition is a Python conditional, decided while JAX
 # traces; any other is `jax.lax.cond`, whose arms JAX traces both of.
 #
-# An arm of a static condition may raise: the condition is a fact of the
-# shapes and literals, so its arm raises exactly when every run of it would.
-# Inside a data-dependent branch it raises while JAX traces that branch, even
-# where the native program would not take it.
+# A shape check may raise while tracing only if no enclosing data-dependent
+# branch guards it. Inside such a branch the throw uses the enclosing guard.
 function _jax_conditional(ctx::_JaxContext, condition::_PyVal, then_build, else_build)
     ctx.host === nothing || return _host_conditional(ctx, condition, then_build, else_build)
     # A condition known while emitting (`n === nothing` on a singleton) takes
@@ -3034,7 +3032,7 @@ function _jax_conditional(ctx::_JaxContext, condition::_PyVal, then_build, else_
         end
     end
     traced = ctx.traced_branches
-    ctx.traced_branches = condition.static ? 0 : traced + 1
+    condition.static || (ctx.traced_branches += 1)
     effects = _JAX_EFFECTS[]
     then_built, else_built = try
         condition.static ? (_jax_arm_function(ctx, :then_arm, then_build),
@@ -4972,6 +4970,40 @@ function _jax_tuple_sum(ctx::_JaxContext, g, t::_PyVal, init)
     end
     total === nothing && _jax_error("`sum` of an empty tuple without `init`", _jax_where(ctx))
     total
+end
+# Julia's isless order as sortable integer keys, shared with host preparation.
+# Use the float's actual width so float32 modules work with x64 disabled.
+const _JAX_ORDER_KEY = """
+def _rk_order_key(x):
+    x = jnp.asarray(x)
+    if x.dtype.kind != "f":
+        return x
+    bits = x.view(f"i{x.dtype.itemsize}")
+    mask = jnp.iinfo(bits.dtype).max
+    keys = jnp.where(bits < 0, bits ^ mask, bits)
+    return jnp.where(jnp.isnan(x), mask, keys)
+"""
+
+function _jax_function_call(ctx::_JaxContext, ::typeof(argmax), args::Vector{_PyVal})
+    length(args) == 1 && _jax_rank(args[1].T) == 1 && eltype(args[1].T) <: _JaxBranchReal ||
+        return _jax_traceable_or_lowered(ctx, argmax, args)
+    x = _jax_bind!(ctx, :values, only(args))
+    n = _jax_function_call(ctx, length, [x])
+    _jax_call(ctx, _runtime_check, [_jax_call(ctx, >, [n, _jax_literal(0)]),
+        _PyVal(repr("argmax of an empty vector is undefined"), ArgumentError)])
+
+    # Padding follows the valid prefix. Repeating its first value cannot
+    # change the first maximum, even when every valid value is -Inf or NaN.
+    keys = _jax_padded_reduced(ctx, argmax, x, x.code * "[0]")
+    if !(eltype(x.T) <: Integer)
+        helper = _jax_known(ctx, x) ? _host_helper! : _jax_helper!
+        keys = helper(ctx, "_rk_order_key", _JAX_ORDER_KEY) * "(" * keys * ")"
+    end
+    # JAX traces inactive arms too. Avoid staging argmax on a zero-width
+    # buffer there; the check above raises if the empty reduction is taken.
+    index = "jnp.argmax(" * keys * ") + 1"
+    ctx.traced_branches > 0 && (index = _py_conditional(index, "len(" * x.code * ")", "1"))
+    _jax_typed_result(Int, [x], index)
 end
 for (f, name, neutral) in ((prod, "jnp.prod", "1.0"), (maximum, "jnp.max", "-jnp.inf"),
                            (minimum, "jnp.min", "jnp.inf"))

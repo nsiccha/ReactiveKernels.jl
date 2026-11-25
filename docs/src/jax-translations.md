@@ -42,6 +42,15 @@ triangle and retain their authored derivative rules. A dynamically padded
 matrix cannot be passed to the eigensolver because the padding would
 contribute additional eigenvalues.
 
+## Index of a vector maximum
+
+Use `grid[argmax(signal)]` to select the grid entry at the first maximum of a
+nonempty real vector. `argmax` returns a one-based integer index in both
+device code and host preparation. The grid can be in any order. For example,
+`signal = [1.0, 4.0, 4.0]` selects the second grid entry. As in Julia, the
+first NaN wins and positive zero sorts above negative zero. An evaluated
+`argmax` on an empty vector raises an error.
+
 ## Statistics reductions
 
 With Statistics loaded (`ReactiveKernelsStatisticsExt`, RK 0.1.262), `mean(x)`, `mean(f, x)`, `var(x)` and `std(x)` translate, with the keywords `dims` (one integer known while JAX traces, or `:`), and for `var` and `std` also `corrected` (a literal `true` or `false`) and `mean`. Each is the core `sum`, `length` and `size` translation it composes, `sum(x) / length(x)` and `sum(abs2.(x .- m)) / (n - corrected)`, so a padded row or a `dims` reduction reads only its valid entries and `prepare_data` takes NumPy's spelling. Over `dims` the reduced axis keeps length one, as in Julia. An empty argument, or one entry with `corrected`, gives Julia's NaN. Before, Statistics' own methods, which branch, were refused as "the function `_mean` has loops or branches".
