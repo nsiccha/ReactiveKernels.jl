@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.381
+
+- `jax_source` supports `reduce(vcat, cells)` when a cell broadcasts
+  independently sized prepared rows. `prepare_data` counts the selected
+  entries after singleton expansion, including repeated and empty rows.
+
 ## 0.1.380
 
 - A scheduled prefix plate can capture more than 32 operands under

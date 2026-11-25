@@ -27,7 +27,7 @@ end
 # Walk nested call/branch jaxprs too: a short outer trace alone would miss
 # data-sized expansion in a reachable body.
 trace_inventory(src, data::NamedTuple) = trace_inventory(src, (0.4, data.x, data.R, data.S))
-function trace_inventory(src, args::Tuple)
+function trace_inventory(src, args::Tuple; reverse = false)
     mktempdir() do dir
         write(joinpath(dir, "model.py"), src)
         write(joinpath(dir, "args.py"), _rk_jax_args(args, src))
@@ -53,10 +53,11 @@ def visit(value):
         for item in value.values(): visit(item)
     elif isinstance(value, (tuple, list)):
         for item in value: visit(item)
-visit(jax.make_jaxpr(model.total)(ARGS[0], **prepared))
+f = jax.value_and_grad(model.total) if sys.argv[3] == "true" else model.total
+visit(jax.make_jaxpr(f)(ARGS[0], **prepared))
 print(json.dumps(counts, sort_keys=True))
 """)
-        read(`$RK_JAX_PYTHON $driver $(joinpath(dir, "model.py")) $(joinpath(dir, "args.py"))`, String)
+        read(`$RK_JAX_PYTHON $driver $(joinpath(dir, "model.py")) $(joinpath(dir, "args.py")) $reverse`, String)
     end
 end
 
@@ -113,6 +114,72 @@ end
 # The helper is translated from its authored body, as BRM's `values` recipe is.
 @traceable flatten_cells(cells) = isempty(cells) ? Float64[] : reduce(vcat, cells)
 @traceable prepend_scalar(a, row) = vcat(a, row)
+
+@kernel broadcast_rows(a::Float64, picks::Vector{Int},
+                       X::Vector{Vector{Float64}}, Y::Vector{Vector{Float64}}) = begin
+    records = plate(picks, Ref(X), Ref(Y)) do i, xs, ys
+        (a, (a .* xs[i]) .* ys[i])
+    end
+    rows = plate(records) do record
+        retained_second(record)
+    end
+    flat = flatten_cells(rows)
+    total = sum(abs2, flat)
+end
+
+@traceable row_product(x, y) = x .* y
+@kernel mapped_broadcast(a::Float64, X::Vector{Vector{Float64}}, Y::Vector{Vector{Float64}}) = begin
+    rows = plate(X, Y) do x, y
+        row_product(a .* x, y)
+    end
+    total = a > 0 ? sum(flatten_cells(rows)) : 0.0
+end
+
+@testset "flattening broadcast rows uses the selected lengths of every operand" begin
+    # Neither operand supplies the flat size: singleton expansion changes
+    # sides between groups; repeated, reordered and omitted rows count as read.
+    data = [(; picks = [2, 1, 2], X = [[2.], [1., 3., 4.], [9.]], Y = [[5., 6.], [4.], [9.]]),
+            (; picks = [2, 1, 3], X = [[2.], Float64[], [3.]], Y = [Float64[], [4.], [5.]]),
+            (; picks = Int[], X = Vector{Float64}[], Y = Vector{Float64}[]),
+            (; picks = collect(17:-1:1),
+               X = [isodd(i) ? Float64[i] : collect(1.0:7) for i in 1:17],
+               Y = [isodd(i) ? collect(1.0:(i % 6)) : Float64[i] for i in 1:17])]
+    have = (:a, :picks, :X, :Y)
+    functions = (flat = :flat, total = :total)
+    src = jax_source(broadcast_rows; have, functions, data = first(data))
+    @test src.text == jax_source(broadcast_rows; have, functions, data = last(data)).text
+    @test occursin("jax.vmap(", src.text)
+    if rk_jax_available()
+        native = prepare(broadcast_rows; have, want = :total)
+        for reverse in (false, true)
+            @test trace_inventory(src, (0.5, values(first(data))...); reverse) ==
+                  trace_inventory(src, (0.5, values(last(data))...); reverse)
+        end
+        for d in data
+            a = 0.5
+            args = (a, values(d)...)
+            expected = Float64[v for i in d.picks for v in (a .* d.X[i]) .* d.Y[i]]
+            result = rk_jax_evaluate(src, :flat, args; prepare = :arguments)
+            @test result.value == expected
+            result = rk_jax_evaluate(src, :total, args; grad = true, prepare = :arguments)
+            @test result.value ≈ native(args...)
+            derivative = Enzyme.autodiff(Enzyme.Reverse, native, Enzyme.Active, Enzyme.Active(a),
+                                         map(Enzyme.Const, Base.tail(args))...)[1][1]
+            @test result.grad ≈ derivative
+        end
+        d = first(data)
+        mapped = jax_source(mapped_broadcast; have = (:a, :X, :Y), want = :total,
+                            name = :total, data = (:X, :Y))
+        @test rk_jax_evaluate(mapped, :total, (0.5, d.X, d.Y); prepare = :arguments).value ≈
+              sum(sum((0.5 .* x) .* y) for (x, y) in zip(d.X, d.Y))
+        @test rk_jax_evaluate(mapped, :total, (-0.5, d.X, d.Y); prepare = :arguments).value == 0
+        bad = ([[1., 2.]], [[1., 2., 3.]])
+        @test_throws "reduce(vcat, cells)" rk_jax_evaluate(mapped, :total, (0.5, bad...);
+                                                           prepare = :arguments)
+    else
+        @test_skip "RK_JAX_PYTHON not set"
+    end
+end
 
 # A record field and a separate plate pass different per-row prefixes to
 # the same helper. A prefix survives an empty tail.
