@@ -105,6 +105,55 @@ end
     end
 end
 
+# A parameter-dependent helper keeps the integer reductions on the device.
+@traceable function jax_weighted_extrema(a, row)
+    isempty(row) && return zero(a)
+    a * maximum(row) + a * a * minimum(row)
+end
+@kernel jax_ragged_extrema(a::Float64, rows) = begin
+    weights = plate(rows) do row
+        jax_weighted_extrema(a, row)
+    end
+    total = sum(weights)
+    return total
+end
+
+@testset "jax_source: padded integer extrema in both JAX precision modes" begin
+    have = (:a, :rows)
+    native = prepare(jax_ragged_extrema; have, want = :total)
+    for rows in ([[-9, -4], [7], Int[]], [UInt64[9, 4], UInt64[7], UInt64[]],
+                 [Bool[true, false], Bool[true], Bool[]])
+        types = (; a = Float64, rows = typeof(rows))
+        options = (; have, want = :total, types)
+        src = jax_source(jax_ragged_extrema; options..., data = (; rows), float_type = Float32)
+        # A larger exemplar changes the padded width, never the emitted body.
+        larger = [repeat(row, 5) for row in rows]
+        @test string(src) == string(jax_source(jax_ragged_extrema; options...,
+            data = (; rows = larger), float_type = Float32))
+        if rk_jax_available()
+            ref = jax_source(jax_ragged_extrema; options..., data = (; rows))
+            for reference in (nothing, ref)
+                r = rk_jax_float32(src, reference, :kernel, (2.0, rows); prepare = true)
+                @test r.x64 == (reference !== nothing)
+                @test r.dtype == r.grad_dtype == "float32"
+                @test r.value == native(2.0, rows)
+                @test r.grad == sum(maximum(row) + 4 * minimum(row) for row in rows if !isempty(row))
+            end
+            if eltype(eltype(rows)) === Int
+                # With x64 on, neither a 32-bit upper nor lower bound is neutral here.
+                wide = [[-(2^40)], [2^40, 2^41]]
+                @test rk_jax_float32(src, ref, :kernel, (2.0, wide); prepare = true).value ==
+                    native(2.0, wide)
+                # Without prepare_data the ragged mask has no reduction initial.
+                plain = jax_source(jax_ragged_extrema; options..., float_type = Float32)
+                @test rk_jax_float32(plain, nothing, :kernel, (2.0, rows)).value == native(2.0, rows)
+            end
+        else
+            @test_skip rk_jax_available()
+        end
+    end
+end
+
 # An ODE solve per plate cell whose solution meets a float32 value in a lazy
 # branch, as a likelihood guarded by its scale does. With 64-bit mode on, a
 # solve in JAX's default float made the solution float64 and the branch's arms
