@@ -4400,7 +4400,8 @@ function _jax_call_positional(ctx::_JaxContext, f::Function, args::Vector{_PyVal
         v = _jax_scalar_or_elementwise(ctx, f, args)
         v === nothing || return _jax_shifted_limit(f, args, v)
     end
-    _jax_history_index_result(f, args, _jax_function_call(ctx, f, args))
+    result = _jax_function_call(ctx, f, args)
+    _jax_history_index_result(f, args, _jax_guard_matrix_exp(ctx, args, result))
 end
 
 # `j ± c` of an integer `j` with a static bound and a static integer `c`
@@ -4611,6 +4612,46 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(*), args::Vector{_PyVal})
     end
     _jax_elementwise_result(*, args, _py_infix("*", [a.code, b.code]))
 end
+const _JAX_ANY_ACTIVE = raw"""
+@jax.custom_batching.custom_vmap
+def _rk_any_active(active):
+    return jnp.any(active)
+
+@_rk_any_active.def_vmap
+def _rk_any_active_batch(axis_size, in_batched, active):
+    # Re-enter the reduction so enclosing maps also contribute their flags.
+    return _rk_any_active(active), False
+"""
+const _JAX_GUARDED_EXPM = raw"""
+@jax.checkpoint
+def _rk_guarded_expm(matrix, active):
+    # Reverse AD can recompute the selected exponential from the matrix and flag.
+    def evaluate(x):
+        # A mixed batch evaluates expm at zero on its inactive lanes.
+        return jax.scipy.linalg.expm(jnp.where(active, x, jnp.zeros_like(x)))
+
+    def identity(x):
+        dtype = jax.eval_shape(jax.scipy.linalg.expm, x).dtype
+        return jnp.broadcast_to(jnp.eye(x.shape[-1], dtype=dtype), x.shape)
+
+    return jax.lax.cond(_rk_any_active(active), evaluate, identity, matrix)
+"""
+
+# Whole-call extensions return a Python expression. Recognize the exact
+# backend call with its original operand, including mappings owned by other
+# packages. A surrounding expression can have different domain or effects.
+function _jax_guard_matrix_exp(ctx, args, result)
+    (ctx.host === nothing && !result.static && !isempty(_JAX_GUARDS) &&
+     length(args) == 1 && startswith(result.code, "jax.scipy.linalg.expm(")) || return result
+    x = only(args)
+    result.code == "jax.scipy.linalg.expm(" * x.code * ")" || return result
+    _jax_helper!(ctx, "_rk_any_active", _JAX_ANY_ACTIVE)
+    helper = _jax_helper!(ctx, "_rk_guarded_expm", _JAX_GUARDED_EXPM)
+    code = helper * "(" * x.code * ", " * _jax_active_condition(ctx) * ")"
+    _PyVal(code, result.T, result.static, result.extent, result.limit,
+           result.padded, result.origin, result.field_extents)
+end
+
 function _jax_function_call(ctx::_JaxContext, ::typeof(_native_exp), args::Vector{_PyVal})
     x = only(args)
     _jax_is_array(x.T) && ndims(x.T) == 2 ||
