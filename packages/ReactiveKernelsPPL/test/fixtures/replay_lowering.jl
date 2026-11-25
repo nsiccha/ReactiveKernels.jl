@@ -63,12 +63,18 @@ end
         @test W.BUILDS.entry === entry
         @test original.spec.graph !== edited.spec.graph
         for (built, increment) in ((original, 1.), (edited, 0.))
-            u = [0.5]
+            @test coordinate_names(built.layout) == [:a, :s]
+            a, logscale = 0.5, 0.3
+            u = [a, logscale]
             sampler = prepare_sampler(built, plan, u; backend=AutoEnzyme(; mode=Enzyme.Reverse))
             value, gradient = sampler_value_and_gradient!(sampler, similar(u), u)
-            residual = data.y .- (data.x .+ 2*(only(u)+increment))
-            @test value ≈ -0.5 * (4log(2pi) + (only(u)-8)^2 + sum(abs2, residual))
-            @test only(gradient) ≈ 8 - only(u) + 2sum(residual)
+            scale = exp(logscale)
+            residual = data.y .- (data.x .+ 2*(a+increment))
+            chisq = sum(abs2, residual) / scale^2
+            n = length(residual)
+            @test value ≈ -0.5 * ((n+1)*log(2pi) + (a-8)^2 + chisq) -
+                n*logscale - scale + logscale
+            @test gradient ≈ [8 - a + 2sum(residual)/scale^2, chisq - n - scale + 1]
         end
     finally
         child.ports[:z] = old

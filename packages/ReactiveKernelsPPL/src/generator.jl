@@ -21,6 +21,7 @@ include("evidence.jl")
 Own the reusable instructions for `build_kernel(bound; cache)`. A package can
 keep this handle in its workload image and use it again after loading. Each
 call assigns the current layout and returns an independently editable graph.
+Assembly can include the package's distribution and parameter-transform endpoints.
 Direct positional calls over distinct named ports splice the supplied child
 or bind the named Julia function on each build. Quoted arrays and unsupported
 call forms use ordinary construction. The handle holds the last eligible
@@ -198,16 +199,15 @@ function _stage_global!(globals, mod, name)
     binding = globals[key]
     binding === nothing && return true
     value = something(binding)
-    owner = if value isa Union{KernelObjectSpec,ReactiveKernels._KernelObjectSkeleton}
-        DistributionKernelSources
+    # Callers can add bindings to the evaluation module. Match the object
+    # against its library binding before retaining its endpoint templates.
+    if value isa Union{KernelObjectSpec,ReactiveKernels._KernelObjectSkeleton}
+        return ReactiveKernels._global_value(DistributionKernelSources, name) === binding ||
+            ReactiveKernels._global_value(@__MODULE__, name) === binding
     elseif value isa ReactiveKernels.DerivativeRule
-        ReactiveKernels
-    else
-        return true
+        return ReactiveKernels._global_value(ReactiveKernels, name) === binding
     end
-    # A caller can install bindings in the evaluation module. Only the
-    # library's own named rules and distribution objects can be stored.
-    ReactiveKernels._global_value(owner, name) === binding
+    true
 end
 _stage_source!(globals, ref::GlobalRef) = _stage_global!(globals, ref.mod, ref.name)
 _stage_source!(globals, x::Symbol) = _stage_global!(globals, PPLGeneratedModels, x)
