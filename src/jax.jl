@@ -385,6 +385,16 @@ struct _JaxFlatRows
     prefix::Int
 end
 
+# A one-dimensional plate with a pure numeric cell. A scan over the same
+# operation axis can call this cell at a requested index, keeping small shared
+# tables outside the scan without expanding their gathered entries over time.
+struct _JaxPlateCell
+    name::String
+    args::Vector{String}
+    mapped::BitVector
+    axis_inputs::Vector{ValueId}
+end
+
 # One Python function body under construction. `links` maps an input of a
 # nested plan (a branch arm's, a plate cell's unmapped argument) to the
 # `(plan, value)` of the enclosing plan it is the same value as, so the
@@ -411,8 +421,12 @@ mutable struct _JaxScope
     prepared_keys::Dict{String,String}
     selected_lengths::Dict{String,Tuple{String,String}}
     carried::Set{Symbol}
+    plates::Dict{ValueId,_JaxPlateCell}
+    # Branches and scalar helpers retain the current step's indexed reads.
+    # A nested data loop gets its own scope to avoid repeating a cell there.
+    scan_reads::Dict{String,_JaxPlateCell}
 end
-_JaxScope(parent::Union{Nothing,_JaxScope} = nothing) =
+_JaxScope(parent::Union{Nothing,_JaxScope} = nothing; same_step::Bool = false) =
     _JaxScope(String[], 1, parent === nothing ? Set{String}() : copy(parent.used),
               Dict{ValueId,_PyVal}(), parent, Dict{ValueId,Any}(), Dict{ValueId,Symbol}(),
               parent === nothing ? Dict{Symbol,Symbol}() : parent.named_hints,
@@ -420,7 +434,8 @@ _JaxScope(parent::Union{Nothing,_JaxScope} = nothing) =
               parent === nothing ? Dict{String,Tuple{Int,String}}() : copy(parent.prefixed_extents),
               parent === nothing ? Dict{String,String}() : parent.prepared_keys,
               Dict{String,Tuple{String,String}}(),
-              Set{Symbol}())
+              Set{Symbol}(), Dict{ValueId,_JaxPlateCell}(),
+              same_step ? parent.scan_reads : Dict{String,_JaxPlateCell}())
 # The `flat_positions` entry of the lengths of cells that each fill their stored
 # rows: a plate's cells returning vectors whose length the cell's own expression
 # fixes (`vcat(a, b)` of scalars), or matrices of a fixed shape. Every stored
@@ -1307,6 +1322,13 @@ end
 # `target` reads the position only, so its gather carries no extent.
 function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
     _jax_slots(x) && return _jax_slots_index(ctx, x, indices)
+    if !target && length(indices) == 1 && haskey(ctx.scope.scan_reads, x.code) &&
+       !_jax_written_slice(only(indices))
+        i = _jax_bound_expr(ctx, x, 1, only(indices))
+        read = _jax_scan_plate_read(ctx, x, i)
+        read === nothing || return read
+        indices = [i]
+    end
     if !target && x.origin isa _JaxHistoryLayout
         read = _jax_history_read!(ctx, x, indices)
         read === nothing || return read
@@ -3471,7 +3493,7 @@ _jax_typeof(v::_PyVal) = v.T isa Type ? v.T : Any
 # Translate an arm's body `build` in a scope of its own.
 function _jax_arm_function(ctx::_JaxContext, hint, build)
     outer = ctx.scope
-    inner = _JaxScope(outer)
+    inner = _JaxScope(outer; same_step = true)
     inner.indent = outer.indent + 1
     saved_locals = copy(ctx.locals)
     ctx.scope = inner
@@ -5842,6 +5864,10 @@ end
 # or a `Bool` mask).
 function _jax_index_values(ctx::_JaxContext, x::_PyVal, indices::Vector{_PyVal})
     _jax_slots(x) && return _jax_slots_index(ctx, x, indices)
+    if length(indices) == 1
+        read = _jax_scan_plate_read(ctx, x, only(indices))
+        read === nothing || return read
+    end
     _jax_is_array(x.T) && length(indices) == ndims(x.T) ||
         _jax_error("a gather from `", x.T, "`", _jax_where(ctx))
     parts = String[]
@@ -7184,7 +7210,8 @@ function _jax_named_function!(ctx, f, names, inputs, source_module, emit, origin
     # Integer provenance and history access proofs refer to the surrounding
     # loop/scan. Keep those helpers lexically nested so the scan can still
     # resolve its access placeholders and prove a bounded history carry.
-    contextual = any(_jax_contextual_value, inputs)
+    # A helper reading a plate cell also closes over that cell's operands.
+    contextual = any(a -> _jax_contextual_value(a) || haskey(ctx.scope.scan_reads, a.code), inputs)
     key = (:authored_function, objectid(f), Tuple(names),
            Tuple((a.T, a.static, !isempty(a.extent), !isempty(a.limit), a.padded, a.origin,
                   Tuple(!isempty(e) for e in a.field_extents),
@@ -7193,7 +7220,7 @@ function _jax_named_function!(ctx, f, names, inputs, source_module, emit, origin
            contextual ? (ctx.scope, Tuple((a.code, a.extent, a.limit) for a in inputs),
                          Tuple(last.(copy(_JAX_GUARDS)))) : nothing)
     cached = get(ctx.mod.helper_names, key, nothing)
-    scope = _JaxScope(contextual ? ctx.scope : nothing)
+    scope = _JaxScope(contextual ? ctx.scope : nothing; same_step = contextual)
     params, passed = String[], String[]
     arguments = contextual ? inputs :
         [_jax_function_input!(ctx, scope, params, passed, n, a) for (n, a) in zip(names, inputs)]
@@ -8368,6 +8395,18 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
         push!(axes, "0")
         push!(args, foldl((a, b) -> "jnp.logical_and(" * a * ", " * b * ")", masks))
     end
+    # Keep the ordinary mapped value available for slices and whole-array
+    # consumers. Only a scalar read by a scan on a common axis uses the cell.
+    # A partitioned plate emits the same cell recipe on several subsets.
+    # Its assembled result uses the original indices, not a subset's indices.
+    if ctx.recipe === recipe && R == 1 &&
+       (E <: Number || _jax_numeric_tuple(E) || _jax_numeric_namedtuple(E)) && !only(with_length) &&
+       all(i -> !mapped[i] || eltype(inputs[i].T) <: Number, eachindex(inputs)) &&
+       !recipe.effectful && !any(r -> r.effectful, body.recipes) && _JAX_EFFECTS[] == effects_before
+        axis_ids = ValueId[canon_id(p.graph, v.id) for (v, maps) in zip(recipe.inputs, mapped) if maps]
+        ctx.scope.plates[canon_id(p.graph, only(recipe.outputs).id)] =
+            _JaxPlateCell(cell, args, axes .== "0", axis_ids)
+    end
     axes_text = "(" * join(axes, ", ") * (length(axes) == 1 ? ",)" : ")")
     call = cell
     for _ in 1:R
@@ -8584,6 +8623,18 @@ _jax_numeric_tuple(@nospecialize(T)) = T isa Type && T <: Tuple && isconcretetyp
 _jax_unref(@nospecialize(T)) = T isa Type && T <: Base.RefValue ? eltype(T) : T
 _jax_unref_val(v::_PyVal) = v
 
+function _jax_scan_plate_read(ctx, x, i)
+    cell = get(ctx.scope.scan_reads, x.code, nothing)
+    cell === nothing && return nothing
+    i.T isa Type && i.T <: Integer && i.T !== Bool || return nothing
+    at = _jax_minus_one(_jax_bind!(ctx, :cell_index, i))
+    args = [mapped ? _py_atom(arg) * "[" * at * "]" : arg
+            for (arg, mapped) in zip(cell.args, cell.mapped)]
+    call = cell.name * "(" * join(args, ", ") * ")"
+    # vmap turns scalar literals returned by a cell into array leaves too.
+    _jax_bind!(ctx, :plate_entry, _PyVal("jax.tree_util.tree_map(jnp.asarray, " * call * ")", eltype(x.T)))
+end
+
 # A scan: the step as a function of the carry and one element of each
 # sequence, run by `jax.lax.scan`. Shared operands are read by the step's
 # closure.
@@ -8617,8 +8668,13 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
         inner.values[canon_id(body.graph, have[1 + k].id)] =
             _jax_scan_element(name, inputs[i], entry_position)
     end
+    sequence_ids = Set(canon_id(p.graph, recipe.inputs[i].id) for i in iterated)
     for (k, i) in enumerate(shared)
         inner.values[canon_id(body.graph, have[1 + length(iterated) + k].id)] = inputs[i]
+        cell = get(outer.plates, canon_id(p.graph, recipe.inputs[i].id), nothing)
+        if cell !== nothing && !isdisjoint(sequence_ids, cell.axis_inputs)
+            inner.scan_reads[inputs[i].code] = cell
+        end
     end
     # A sequence padded past a data-dependent length (a group's range, run to
     # its static limit) is scanned to the limit: past the length the carry
