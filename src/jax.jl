@@ -248,11 +248,10 @@ end
 # `_rk_broadcast_length(...)` of their extents (sorted, so every combination
 # of the same rows reads alike and combines again by string equality), an
 # expression of their extents, valid wherever they are. Lengths Julia
-# refuses to broadcast (two lengths other than one differ) are not checked:
-# a check is a host callback in every evaluation (several times the cost of
-# a small model's gradient), and a padded row broadcast against an unpadded
-# array is not checked either. Operands padding different axes by different
-# extents (`x .* s'`) would need an extent per axis: they are returned as
+# refuses to broadcast (two lengths other than one differ) are unchecked,
+# as for a padded row broadcast against an unpadded array. Operands padding
+# different axes by different extents (`x .* s'`) would need an extent per
+# axis: they are returned as
 # they are, so a broadcast of them records no padded axes and a reduction of
 # it raises.
 const _JAX_BROADCAST_LENGTH = """
@@ -3252,9 +3251,8 @@ function _jax_call_positional(ctx::_JaxContext, ::typeof(throw), args::Vector{_P
 end
 _jax_exception_message(e::_PyVal) =
     e.T isa Type && e.T <: Exception && e.code != "None" ? e.code : repr(string(e.T))
-# A domain check (`_runtime_check(valid, error)`), retained at execution: a
-# check decided while tracing raises then; any other is a host callback that
-# raises when JAX runs it, which `jax.jit`, `vmap` and `grad` keep. Under a
+# A domain check (`_runtime_check(valid, error)`) decided while tracing
+# raises then. An ordinary runtime check calls the host on failure. Under a
 # data-dependent condition the check holds where the condition does not:
 # JAX evaluates both arms of a vmapped condition, and a padded loop's padded
 # steps, so an unmasked check would fail for lanes that never take it.
@@ -3266,17 +3264,20 @@ def _rk_check(valid, message):
         import numpy as np
         if not np.all(v):
             raise ValueError(message)
-    # A plate checks all active lanes with one callback. Re-entering checked
+    # A plate checks all active lanes together. Re-entering checked
     # batches outer vmap axes too; an empty axis executes no checks.
     @jax.custom_batching.custom_vmap
     def checked(v):
-        jax.debug.callback(check, v)
+        # Keep a successful check on the device, including inside scans.
+        jax.lax.cond(jnp.all(v), lambda: None, lambda: jax.debug.callback(check, v))
         return ()
     @checked.def_vmap
     def checked_batch(axis_size, in_batched, v):
         if axis_size:
             checked(jnp.all(v))
         return (), ()
+    # Indexed reads may batch this call: every lane shares its failure guard.
+    checked_batch._rk_checks_all_lanes = True
     checked(valid)
 """
 function _jax_call_positional(ctx::_JaxContext, ::typeof(_runtime_check), args::Vector{_PyVal})

@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.386
+
+- Ordinary runtime checks in `jax_source` evaluate the active lanes on the
+  device and call Python on failure. Valid batched gradients can run through
+  checked loop steps without a Python callback at every iteration.
+
 ## 0.1.385
 
 - `jax_source` uses the device integer type for the padding and initial

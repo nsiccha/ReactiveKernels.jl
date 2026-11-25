@@ -92,6 +92,33 @@ end
                         jax.effects_barrier()
                         assert np.all(np.isfinite(result))
                         assert len(callbacks) <= 1, len(callbacks)
+                # A check inside a scan used to call Python at every step,
+                # even after batching the chains and compiling the gradient.
+                prepared = m.prepare_data(xs=[np.array([-2.0, 1.0])])
+                def trajectory(a, offsets):
+                    def step(total, offset):
+                        return total + m.kernel(a + offset, **prepared), None
+                    return jax.lax.scan(step, 0.0, offsets)[0]
+
+                evaluate = jax.jit(jax.vmap(jax.value_and_grad(trajectory), in_axes=(0, None)))
+                starts = jnp.array([1., 2.])
+                offsets = jnp.arange(8.)
+                for delta in (0., 0.5):
+                    callbacks.clear()
+                    v, g = jax.block_until_ready(evaluate(starts + delta, offsets))
+                    jax.effects_barrier()
+                    z = np.asarray(starts + delta)[:, None] + np.asarray(offsets)
+                    np.testing.assert_allclose(v, (z*z - 2*z).sum(axis=1))
+                    np.testing.assert_allclose(g, (2*z - 2).sum(axis=1))
+                    assert len(callbacks) <= 1, len(callbacks)
+                # Only the second chain fails, and only on the last step.
+                try:
+                    jax.block_until_ready(evaluate(starts[::-1], offsets.at[-1].set(-1.)))
+                    jax.effects_barrier()
+                except Exception as e:
+                    assert 'checked input must be positive' in str(e), str(e)
+                else:
+                    raise AssertionError('invalid step in a batched gradient did not fail')
                 # Padded zeros and inactive negative lanes above must not
                 # fail; an active zero must still raise the original error.
                 bad = m.prepare_data(xs=[np.array([0.0])])
