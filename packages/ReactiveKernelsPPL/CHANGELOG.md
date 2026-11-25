@@ -16,6 +16,14 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.262
+
+`KernelBuildCache` reuses graph assembly for finite-interval parameters and
+nested calls to imported numerical functions, including the matrix transpose
+in correlated effects and the cumulative sum in monotonic effects. For child
+kernels inside plates and helpers with computed arguments, each build expands
+the current calls and can reuse the resulting assembly instructions.
+
 ## 0.1.261
 
 `KernelBuildCache` now reuses graph assembly for models that call RKPPL's
