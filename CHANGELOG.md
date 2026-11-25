@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.388
+
+- Regenerated JAX modules skip a guarded matrix exponential and its reverse
+  pass when every lane in a `vmap` batch skips the call. Mixed batches keep
+  the exponential available for each lane that selects it.
+
 ## 0.1.387
 
 Graph generators can reuse compiled assembly instructions while supplying the

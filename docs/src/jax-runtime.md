@@ -63,6 +63,13 @@ derivative of a selected read keeps only the selected rows' residuals.
 
 ## Chains under `vmap`
 
+When a run-time branch calls the matrix exponential on a traced matrix, the
+exported density tests whether any chain or plate cell selects it. If every lane skips it,
+`jax.vmap(jax.value_and_grad(density))` skips both the exponential and its
+reverse pass. In a mixed batch, JAX evaluates the exponential in a batch,
+using zero matrices for inactive lanes. The original branch selects each
+lane's result. Reverse AD can recompute the exponential from its input matrix.
+
 A sampler that advances several chains as one batch, `jax.vmap` over its
 transition (BlackJAX's NUTS, for example), runs each of its while loops until
 the last chain is done. JAX runs a batched loop's body for every lane and keeps

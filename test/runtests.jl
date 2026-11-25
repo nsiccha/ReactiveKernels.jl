@@ -171,6 +171,7 @@ const _MATRIX_CORE_TESTS = (
     "test_jax_lane_partition.jl",
     "test_jax_flat_provenance.jl",
     "test_jax_translations.jl",
+    "test_jax_guarded_expm.jl",
     "test_jax_elementwise.jl",
     "test_jax_captured_records.jl",
     "test_jax_tuple_writes.jl",
