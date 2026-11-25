@@ -633,7 +633,8 @@ def _rk_batch_control(closed, varying):
                 return True, ()
         elif name == 'while' or (not reads and name not in ('platform_index', 'iota')):
             return True, ()
-        elif _rk_params_have_cond(p):
+        elif _rk_params_have_cond(p) and not getattr(p.get('rule'), '_rk_checks_all_lanes', False):
+            # _rk_check reduces across the mapped lanes before branching.
             # An unfamiliar higher-order primitive owns its batching rule.
             return True, ()
         flags.update(zip(eq.outvars, out))

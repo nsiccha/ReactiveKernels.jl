@@ -75,7 +75,7 @@ def main():
         return
 
     cases = [
-        ("cuda-only", "cuda", "failed to find a local CPU device"),
+        ("cuda-only", "cuda", None),
         ("cuda-cpu", "cuda,cpu", None),
         ("invalid", "cuda,cpu", "expected nonnegative input"),
         ("no-gpu", "cuda,cpu", "Unable to initialize backend 'cuda'"),
