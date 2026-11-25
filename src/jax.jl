@@ -1358,11 +1358,16 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
         element = all(k -> parts[k].T == fieldtype(E, k), 1:fieldcount(E))
         number = findfirst(k -> fieldtype(E, k) <: Number, 1:fieldcount(E))
         # One record of a vector whose fields have their own lengths keeps them.
-        element && _jax_field_lengths(x) &&
-            return _PyVal(_jax_tuple_code(parts), E, false, _jax_tuple_extent(parts), "",
-                          _jax_tuple_fields(parts))
-        return _PyVal(_jax_tuple_code(parts), element ? E : Array{E,ndims(first(parts).T)}, false,
-                      element || number === nothing ? "" : parts[number].extent)
+        if element
+            row = _jax_field_lengths(x) ?
+                _PyVal(_jax_tuple_code(parts), E, false, _jax_tuple_extent(parts), "",
+                       _jax_tuple_fields(parts)) : _PyVal(_jax_tuple_code(parts), E)
+            # Contextual helpers close over arguments. Capture the row at its
+            # Julia read so each use in the helper shares the same gathers.
+            return ctx.host === nothing ? _jax_bind!(ctx, :record_entry, row) : row
+        end
+        return _PyVal(_jax_tuple_code(parts), Array{E,ndims(first(parts).T)}, false,
+                      number === nothing ? "" : parts[number].extent)
     end
     N = ndims(x.T)
     # Linear indexing reads the array in Julia's column-major order. A `Bool`
@@ -8684,6 +8689,23 @@ function _jax_scan_plate_read(ctx, x, i)
     _jax_bind!(ctx, :plate_entry, _PyVal("jax.tree_util.tree_map(jnp.asarray, " * call * ")", eltype(x.T)))
 end
 
+const _JAX_TABLE_SCAN_STEP = raw"""
+def _rk_table_scan_step(step):
+    # A batched conditional on a table read broadcasts its predicate over
+    # the table. Rebuild addressing, masks and scalar arithmetic from the
+    # step inputs in reverse; factorizations and other costly results can
+    # still be saved by JAX.
+    replay = frozenset(("broadcast_in_dim", "squeeze", "reshape", "transpose",
+                        "stop_gradient", "gather", "dynamic_slice", "slice",
+                        "select_n", "add", "sub", "mul", "neg", "eq",
+                        "convert_element_type", "lt", "le"))
+
+    def save(primitive, *args, **params):
+        return primitive.name not in replay
+
+    return jax.checkpoint(step, prevent_cse=False, policy=save)
+"""
+
 # A scan: the step as a function of the carry and one element of each
 # sequence, run by `jax.lax.scan`. Shared operands are read by the step's
 # closure.
@@ -8734,6 +8756,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     position = isempty(extent) ? "" : _jax_identifier(inner.used, :position)
     isempty(position) || push!(unpack, position)
     recipe_saved = ctx.recipe
+    effects_before = _JAX_EFFECTS[]
     ctx.scope = inner
     wants = try
         isempty(unpack) || _jax_emit!(ctx, join(unpack, ", ") * (length(unpack) == 1 ? "," : "") *
@@ -8754,6 +8777,11 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
             "jnp.where(" * live * ", " * wants[1].code * ", " * carry * ")" :
             "jax.tree_util.tree_map(lambda new, old: jnp.where(" * live * ", new, old), " *
             wants[1].code * ", " * carry * ")"
+    end
+    if any(i -> _jax_columns(inputs[i].T), shared) && !recipe.effectful &&
+       !any(r -> r.effectful, body.recipes) && _JAX_EFFECTS[] == effects_before
+        decorator = _jax_helper!(ctx, "_rk_table_scan_step", _JAX_TABLE_SCAN_STEP)
+        _jax_emit!(ctx, "@" * decorator)
     end
     push!(outer.lines, "    "^outer.indent * "def " * step * "(" * carry * ", " * xs * "):")
     append!(outer.lines, inner.lines)
