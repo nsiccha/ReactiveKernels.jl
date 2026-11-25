@@ -39,10 +39,11 @@ const SUBMODEL_BUILDS = KernelBuildCache()
 const CHILD_MODEL = quote
     avg = center(x_fit)
     a ~ Normal(avg, 1)
+    s ~ Exponential(1)
     offset = clipped(a)
     shift = adjust(offset)
     mu = shift .+ x
-    y .~ Normal.(mu, 1)
+    y .~ Normal.(mu, s)
 end
 
 function child_plan(xs, design)

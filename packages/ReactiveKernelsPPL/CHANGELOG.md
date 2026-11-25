@@ -16,6 +16,12 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.261
+
+`KernelBuildCache` now reuses graph assembly for models that call RKPPL's
+positive or unit-interval bijector, including regressions with a sampled
+positive scale.
+
 ## 0.1.260
 
 - A caller-owned `KernelBuildCache()` can stage graph assembly for `build_kernel(bound; cache)` across independent fits and package-image workloads. Each build uses its current layout and bindings and has fresh editable ports.

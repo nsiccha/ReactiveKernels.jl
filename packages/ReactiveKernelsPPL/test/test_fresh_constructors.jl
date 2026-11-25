@@ -226,6 +226,29 @@ end
     end
 end
 
+@testset "a unit-interval parameter reuses its graph constructor" begin
+    model = @rkppl begin
+        p ~ Beta(2, 3)
+        y ~ Bernoulli(p)
+    end
+    plan = model() | (; y=true)
+    cache = KernelBuildCache()
+    first = build_kernel(plan; cache)
+    entry = cache.entry
+    @test entry !== nothing
+    second = build_kernel(plan; cache)
+    @test cache.entry === entry
+    @test second.spec.graph !== first.spec.graph
+    staged = prepare_query(second, plan, :sampler)
+    fresh = prepare_query(build_kernel(plan), plan, :sampler)
+    for u in ([-1.0], [0.5])
+        p = 1 / (1 + exp(-only(u)))
+        density = Base.invokelatest(staged, u)
+        @test density ≈ log(12) + 3log(p) + 3log1p(-p)
+        @test density ≈ Base.invokelatest(fresh, u)
+    end
+end
+
 @testset "a fitted closure keeps its ordinary build behavior" begin
     cache = KernelBuildCache()
     mod = Module(gensym(:FittedCapture))
