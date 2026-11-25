@@ -39,7 +39,7 @@ function _constructor_call(callee)
     startswith(name, "_kernel_") || startswith(name, "_Kernel")
 end
 
-function _constructor_form(@nospecialize(x), inputs, locals, mod, stage_sources=false)
+function _constructor_form(@nospecialize(x), inputs, locals, mod, stage_sources=false, scope=nothing)
     x isa LineNumberNode && return x
     x === _CONSTRUCTOR_ARGUMENT && throw(_UnsupportedConstructor())
     x isa Symbol && return x
@@ -52,7 +52,8 @@ function _constructor_form(@nospecialize(x), inputs, locals, mod, stage_sources=
                     _constructor_input!(inputs, x.mod), _constructor_input!(inputs, x.name))
     end
     x isa Expr || return _constructor_input!(inputs, x)
-    _kernel_is_group_call(x) && return _constructor_form(x.args[1].args[2], inputs, locals, mod, stage_sources)
+    _kernel_is_group_call(x) &&
+        return _constructor_form(x.args[1].args[2], inputs, locals, mod, stage_sources, scope)
     if Meta.isexpr(x, :call, 4) && x.args[1] === GlobalRef(@__MODULE__, :_kernel_source_function)
         f, source, quoted_scope = x.args[2], x.args[3], x.args[4]
         if Meta.isexpr(f, :->, 2) && source isa QuoteNode && isequal(f, source.value) &&
@@ -63,16 +64,18 @@ function _constructor_form(@nospecialize(x), inputs, locals, mod, stage_sources=
                 # Compile the closed leaf once. Each replay creates its own recipe.
                 return _constructor_input!(inputs, _kernel_source_function(nothing, f, mod))
             end
-            return Expr(:call, GlobalRef(@__MODULE__, :_constructor_source),
-                        _constructor_input!(inputs, f), mod)
+            source_input = _constructor_input!(inputs, f)
+            eval_mod = scope === nothing ? mod : _constructor_input!(inputs, scope)
+            return Expr(:call, GlobalRef(@__MODULE__, :_constructor_source), source_input, eval_mod)
         end
     end
     if x.head === :->
         _kernel_mentions_any(x, locals) && throw(_UnsupportedConstructor())
         stage_sources && throw(_UnsupportedConstructor())
-        return Expr(:call, GlobalRef(Core, :eval), mod, _constructor_input!(inputs, x))
+        eval_mod = scope === nothing ? mod : _constructor_input!(inputs, scope)
+        return Expr(:call, GlobalRef(Core, :eval), eval_mod, _constructor_input!(inputs, x))
     elseif Meta.isexpr(x, :., 2) && x.args[2] isa QuoteNode && x.args[2].value isa Symbol
-        return Expr(:., _constructor_form(x.args[1], inputs, locals, mod, stage_sources), x.args[2])
+        return Expr(:., _constructor_form(x.args[1], inputs, locals, mod, stage_sources, scope), x.args[2])
     elseif x.head === :call
         _constructor_call(first(x.args)) || throw(_UnsupportedConstructor())
     elseif x.head === :(=)
@@ -86,7 +89,7 @@ function _constructor_form(@nospecialize(x), inputs, locals, mod, stage_sources=
     # lowering. Decide eligibility before executing any instructions.
     x.head in (:let, :block, :(=), :ref, :call, :curly, :vect, :tuple, :parameters,
                :kw, :(...), :if, :&&, :||) || throw(_UnsupportedConstructor())
-    Expr(x.head, Any[_constructor_form(a, inputs, locals, mod, stage_sources) for a in x.args]...)
+    Expr(x.head, Any[_constructor_form(a, inputs, locals, mod, stage_sources, scope) for a in x.args]...)
 end
 
 function _kernel_eval_definition(cache::_KernelConstructors, definition::Expr)
@@ -259,6 +262,19 @@ function _stage_build(mod, definition, count)
     _BuildConstructor(steps, local_count, operands, dynamic)
 end
 
+# Expansion of a nested child (e.g. a call inside a plate) reads the child's
+# actual graph. Repeat that expansion, but share the instructions for
+# assembling its result. All source records, modules, values and types from
+# this invocation travel in operands. Only the instruction form is reusable.
+function _current_build_form(mod, definition)
+    construction = _kernel_definition_construction(mod, definition)
+    locals = _kernel_construction_locals!(Set{Symbol}(), construction)
+    operands = Any[]
+    scope = _kernel_eval_module(mod, construction)
+    form = _constructor_form(construction, operands, locals, mod, false, scope)
+    form, operands
+end
+
 function _current_build_operation(mod, rhs, @nospecialize(f))
     f isa KernelSpec && return f
     deps = Symbol[rhs.args[2:end]...]
@@ -278,9 +294,13 @@ function _replay_build(entry::_BuildConstructor, mod, calls)
         rhs, f = calls[slot.index]
         args[i] = slot.source ? rhs : _current_build_operation(mod, rhs, f)
     end
-    frame = Vector{Any}(undef, entry.local_count)
+    _run_build_steps(entry.steps, entry.local_count, args)
+end
+
+function _run_build_steps(steps, local_count, args)
+    frame = Vector{Any}(undef, local_count)
     result = nothing
-    for step in entry.steps
+    for step in steps
         result = Base.invokelatest(step.run, frame, view(args, step.indices))
     end
     result::KernelSpec

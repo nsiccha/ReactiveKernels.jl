@@ -36,6 +36,18 @@ adjust(x) = 2x
 center(xs) = sum(xs) / length(xs)
 const BUILDS = KernelBuildCache()
 const SUBMODEL_BUILDS = KernelBuildCache()
+const INTERVAL_BUILDS = KernelBuildCache()
+function interval_plan(data)
+    source = quote
+        p ~ Uniform(lo, hi)
+        sums = cumsum(vcat(p, p))
+        @plate for i in eachindex(group)
+            mu[i] = clipped(sums[group[i]])
+        end
+        y .~ Normal.(mu, 1)
+    end
+    bind_data(lower_rkppl(source, data; mod=@__MODULE__, conditioned=(:y,)), data)
+end
 const CHILD_MODEL = quote
     avg = center(x_fit)
     a ~ Normal(avg, 1)
@@ -59,6 +71,8 @@ if IN_IMAGE
         submodel = bind_data(lower(design, fitted([0., 1., 2.])), design)
         build_kernel(submodel; cache=SUBMODEL_BUILDS)
         build_kernel(child_plan([0., 1., 2.], design); cache=BUILDS)
+        data = (; lo=0., hi=1., group=[1, 2], y=[0.1, 0.2])
+        build_kernel(interval_plan(data); cache=INTERVAL_BUILDS)
     end
 end
 end

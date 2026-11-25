@@ -45,6 +45,33 @@ for design in ((; x=[2., -1., 3., 0.], y=[1., 0., -0.2, 0.4]),
 end
 @test allequal(programs)
 
+@testset "an image constructor reuses nested numerical calls with new bounds" begin
+    entry = W.INTERVAL_BUILDS.entry
+    @test entry !== nothing
+    plan = W.interval_plan((; lo=-2., hi=3., group=[2, 1, 2], y=[1., 0., -1.]))
+    built = build_kernel(plan; cache=W.INTERVAL_BUILDS)
+    @test W.INTERVAL_BUILDS.entry === entry
+    staged = prepare_query(built, plan, :sampler)
+    fresh = prepare_query(build_kernel(plan), plan, :sampler)
+    for u in ([-0.6], [0.4])
+        @test Base.invokelatest(staged, u) ≈ Base.invokelatest(fresh, u)
+    end
+    u = [0.4]
+    before = Base.invokelatest(staged, u)
+    old = W.clipped.ports[:z]
+    try
+        W.clipped.ports[:z] = W.clipped.ports[:x]
+        edited = build_kernel(plan; cache=W.INTERVAL_BUILDS)
+        actual = Base.invokelatest(prepare_query(edited, plan, :sampler), u)
+        reference = Base.invokelatest(prepare_query(build_kernel(plan), plan, :sampler), u)
+        @test actual ≈ reference
+        @test actual != before
+        @test Base.invokelatest(prepare_query(built, plan, :sampler), u) ≈ before
+    finally
+        W.clipped.ports[:z] = old
+    end
+end
+
 @testset "package-image constructor binds each fitted child's current graph" begin
     entry = W.BUILDS.entry
     @test entry !== nothing

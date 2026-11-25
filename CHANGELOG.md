@@ -16,6 +16,11 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.386
+
+Graph generators can reuse compiled assembly instructions while supplying the
+operands of the current expansion, including a child graph used in a plate.
+
 ## 0.1.385
 
 - `jax_source` uses the device integer type for the padding and initial

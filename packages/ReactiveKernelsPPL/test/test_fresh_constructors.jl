@@ -249,6 +249,82 @@ end
     end
 end
 
+function check_constructor(source, designs)
+    cache = KernelBuildCache()
+    for data in designs
+        plan = bind_data(lower_rkppl(source, data; mod=@__MODULE__, conditioned=(:y,)), data)
+        first = build_kernel(plan; cache)
+        entry = cache.entry
+        @test entry !== nothing
+        second = build_kernel(plan; cache)
+        @test cache.entry === entry
+        @test first.spec.graph !== second.spec.graph
+        reference = build_kernel(plan)
+        queries = map(m -> prepare_query(m, plan, :sampler), (first, second, reference))
+        for v in (-0.3, 0.4)
+            u = fill(v, reference.layout.total)
+            a, b, r = map(q -> Base.invokelatest(q, u), queries)
+            @test a ≈ r
+            @test b ≈ r
+        end
+    end
+end
+
+@testset "finite interval constructors use the current bound data" begin
+    designs = ((; y=[0.2, -0.1, 0.3], lower=0.4, upper=2.0),
+               (; y=[0.5, 1.2], lower=-1.5, upper=0.75))
+    for prior in (:(Uniform(0, 1)), :(Uniform(0.3, 2)), :(Uniform(lower, upper)),
+                  :(truncated(Normal(0, 1), lower, upper)))
+        check_constructor(quote
+            p ~ $prior
+            y .~ Normal.(p, 1)
+        end, designs)
+    end
+end
+
+@testset "scaled correlated coefficients retain graph assembly" begin
+    check_constructor(quote
+        b[1:2, 1:2] .~ Normal.(0, 1)
+        L ~ LKJCholesky(2, 2.0)
+        s[1:2] .~ LogNormal.(0, 1)
+        v = b * transpose(s .* L)
+        mu = v[g, 1] .+ x .* v[g, 2]
+        y .~ Normal.(mu, 1)
+    end, ((; g=[1, 2, 1], x=[1., 0., 2.], y=[0., 1., 0.5]),))
+end
+
+@testset "monotonic effects retain nested numerical calls" begin
+    check_constructor(quote
+        w ~ Dirichlet(alpha)
+        v = cumsum(vcat(0.0, w))
+        mu = v[r]
+        y .~ Normal.(mu, 1)
+    end, ((; alpha=[2., 3.], r=[1, 3, 2], y=[0.2, 0.75, 0.6]),))
+end
+
+@testset "nested numerical calls use the current model's binding" begin
+    cache = KernelBuildCache()
+    source = quote
+        a ~ Normal(0, 1)
+        mu = 2 * adjust(a)
+        y ~ Normal(mu, 1)
+    end
+    entries = []
+    for f in (sin, sin, cos)
+        mod = Module(gensym(:Numerics))
+        Core.eval(mod, :(const adjust = $f))
+        data = (; y=1.5)
+        plan = bind_data(lower_rkppl(source, data; mod, conditioned=(:y,)), data)
+        built = build_kernel(plan; cache)
+        @test cache.entry !== nothing
+        push!(entries, cache.entry)
+        query = prepare_query(built, plan, :sampler)
+        a = 0.3
+        @test Base.invokelatest(query, [a]) ≈ -log(2pi) - (a^2 + (data.y - 2f(a))^2)/2
+    end
+    @test entries[1] === entries[2]
+end
+
 @testset "a fitted closure keeps its ordinary build behavior" begin
     cache = KernelBuildCache()
     mod = Module(gensym(:FittedCapture))
