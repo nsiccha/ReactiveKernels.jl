@@ -165,7 +165,7 @@ and inverse must enforce it. Endpoints are ordinary pure Julia callables:
 `logjac(u, shape, args...)`. The first returns the constrained value, the second
 a packed vector, and the third the log absolute Jacobian. Host and kernel
 execution call these same endpoints. `coordinate_names`, when supplied, has
-one Symbol per packed coordinate. Draw generation is outside this contract.
+one Symbol per packed coordinate. Draw generation uses [`sampling_draw`](@ref).
 
 Endpoints may also be function-shaped `@kernel` graphs. The descriptor prepares
 their host callables once; generated transforms compose the graph when every
@@ -209,8 +209,7 @@ end
 Return `ParameterGeometry` for parameter use of an external RHS. This is a
 structural method: its arguments are the authored Julia expressions, not active
 parameter values. It must not evaluate the constructor or statistical arguments.
-Observed use does not call this method. A future generated-only role can use the
-same RHS without acquiring a sampler layout or invoking these transforms.
+Observed and generated-only uses of the RHS do not call this method.
 """
 function sampling_geometry(constructor, args, shape)
     throw(ArgumentError("sampling RHS $constructor needs sampling_geometry for parameter use"))

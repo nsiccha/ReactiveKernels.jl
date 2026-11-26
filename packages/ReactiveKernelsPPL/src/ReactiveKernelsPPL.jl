@@ -57,6 +57,7 @@ export PopulationPrior, SampledParameter, PlateParameter, VectorParameter, Assig
 export LevelMap
 export DesignMatrix
 export StructuralPlan, SubmodelScope
+export prepare_prior, prepare_generated, sampling_draw
 export ContractValidationError, validate_plan, validate_structure, validate_data
 export topological_order, isbound, bind_data, COLUMN_ROLES
 export FrozenValues, frozen_values, LoweringCache
@@ -173,6 +174,7 @@ include("display.jl")
 include("distribution_defaults.jl")
 include("lowering_cache.jl")
 include("surface.jl")
+include("generation.jl")
 include("scan.jl")
 include("cell_scan.jl")
 include("cell_latent.jl")
