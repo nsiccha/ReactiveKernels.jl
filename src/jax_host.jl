@@ -1947,6 +1947,49 @@ jax.tree_util.register_pytree_node(StaticInt, lambda s: ((), int(s)), lambda v, 
 # entries (`_jax_trip_bound`): `prepare_data` returns them with the data. An
 # array without entries gives 0 (no range over its entries runs) and a span
 # of -1 (no steps).
+const _JAX_MAP_SCHEDULE = ("_rk_map_schedule", """
+def _rk_map_schedule(*operands, padded=False):
+    if padded:
+        operands, bound_columns = operands[::2], operands[1::2]
+    lengths = tuple(x[0] if isinstance(x, tuple) else x for x in operands)
+    if any(x is None for x in lengths):
+        return None
+    try:
+        shapes = np.broadcast_arrays(*lengths)
+    except ValueError:
+        return None
+    counts = shapes[0]
+    for other in shapes[1:]:
+        if np.any((counts != other) & (counts != 1) & (other != 1)):
+            return None
+        counts = np.where(counts == 1, other, counts)
+    offsets = np.concatenate(([0], np.cumsum(counts, dtype=np.int64)))
+    tags = np.repeat(np.arange(len(counts), dtype=np.int64), counts)
+    starts = offsets[:-1]
+    local = np.arange(len(tags), dtype=np.int64) - starts[tags]
+    indices = []
+    for raw, sizes in zip(lengths, shapes):
+        if np.array_equal(raw, counts):
+            indices.append(None)
+        elif padded:
+            row = np.zeros_like(tags) if len(raw) == 1 else tags
+            column = np.where(sizes[tags] == 1, 0, local)
+            indices.append((row, column))
+        else:
+            base = np.cumsum(raw) - raw
+            base = np.broadcast_to(base, counts.shape)
+            indices.append(base[tags] + np.where(sizes[tags] == 1, 0, local))
+    if padded:
+        # Bound observation columns are gathered once here. Computed columns
+        # use the same coordinates when the model runs.
+        bound = []
+        for value, selection in zip(bound_columns, indices):
+            row, col = (tags, local) if selection is None else selection
+            bound.append(None if value is None else value[row, col])
+        return counts, tags, local, tuple(indices), tuple(bound)
+    return counts, offsets, StaticInt(int(counts.max(initial=0))), tags, tuple(indices)
+""")
+
 const _JAX_PREPARED_BOUNDS = Dict{Symbol,Tuple{String,String}}(
     :row_layout => ("_rk_prepare_row_layout", """
 def _rk_prepare_row_layout(*operands):
@@ -1973,34 +2016,8 @@ def _rk_prepare_row_layout(*operands):
     offsets = np.concatenate((np.zeros(1, dtype=np.int64), np.cumsum(counts, dtype=np.int64)))
     return counts, offsets, StaticInt(int(counts.max(initial=0))), StaticInt(int(offsets[-1]))
 """),
-    :map_rows => ("_rk_map_schedule", """
-def _rk_map_schedule(*operands):
-    lengths = tuple(x[0] if isinstance(x, tuple) else x for x in operands)
-    if any(x is None for x in lengths):
-        return None
-    try:
-        shapes = np.broadcast_arrays(*lengths)
-    except ValueError:
-        return None
-    counts = shapes[0]
-    for other in shapes[1:]:
-        if np.any((counts != other) & (counts != 1) & (other != 1)):
-            return None
-        counts = np.where(counts == 1, other, counts)
-    offsets = np.concatenate(([0], np.cumsum(counts, dtype=np.int64)))
-    tags = np.repeat(np.arange(len(counts), dtype=np.int64), counts)
-    starts = offsets[:-1]
-    indices = []
-    for raw, sizes in zip(lengths, shapes):
-        if np.array_equal(raw, counts):
-            indices.append(None)
-        else:
-            base = np.cumsum(raw) - raw
-            base = np.broadcast_to(base, counts.shape)
-            local = np.arange(len(tags)) - starts[tags]
-            indices.append(base[tags] + np.where(sizes[tags] == 1, 0, local))
-    return counts, offsets, StaticInt(int(counts.max(initial=0))), tags, tuple(indices)
-"""),
+    :map_rows => _JAX_MAP_SCHEDULE,
+    :padded_map_rows => _JAX_MAP_SCHEDULE,
     :scan_rows => ("_rk_scan_schedule", """
 def _rk_scan_schedule(*lengths):
     # The sign marks a fresh carry; empty rows generate no events. Leave the
@@ -2170,6 +2187,7 @@ function _jax_prepare_bounds_lines(mod::_JaxModule, lines::Vector{String}, bound
         args = [isempty(k) ? "None" : result * "[\"" * k * "\"]" for k in keys]
         # The final match-count operand is the comparison's integer literal.
         kind === :match_count && (args[end] = last(keys))
+        kind === :padded_map_rows && push!(args, "padded=True")
         if mod.layout === :chains && kind in (:min, :max, :span)
             _jax_module_helper!(mod, "_RKChainRows", _JAX_CHAIN_ROWS)
             if kind === :span
