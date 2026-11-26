@@ -684,6 +684,9 @@ function _host_iterable(ctx::_JaxContext, iter)
             foreach(v -> _jax_python_value(ctx, v), (lo, step, hi))
             stop = "(" * hi.code * ") + (1 if " * step.code * " > 0 else -1)"
             return "range(" * lo.code * ", " * stop * ", " * step.code * ")", Int
+        elseif f === eachindex && length(args) > 1
+            n = _jax_eachindex_length(ctx, [_host_raw(ctx, a) for a in args])
+            return "range(1, " * _jax_plus_one(n) * ")", Int
         elseif (f === eachindex || f === keys || f === values || f === pairs) && length(args) == 1
             x = _host_raw(ctx, args[1])
             f in (eachindex, keys) || _jax_python_value(ctx, x)

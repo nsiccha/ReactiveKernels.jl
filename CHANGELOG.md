@@ -16,11 +16,18 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.393
+## 0.1.394
 
 - JAX data preparation preserves the rank of a shared table when the same
   plate also prepares per-cell rows. Shared ragged tables retain one length
   per input row.
+
+## 0.1.393
+
+- `jax_source` supports `eachindex(a, b, ...)` over one-based vectors in
+  numerical kernels and data preparation. It checks all logical lengths,
+  including the lengths of padded rows, before iterating. Comprehensions
+  over these indices also work inside ordinary Julia helper functions.
 
 ## 0.1.392
 

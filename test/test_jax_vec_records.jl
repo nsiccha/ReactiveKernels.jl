@@ -153,7 +153,8 @@ end
 
 @testset "jax_source: vec and reshape of arrays of plate records" begin
     dense = [(2, [0.2, 0.7]), (0, [1.5]), (3, [0.3, -0.1, 1.5])]
-    rows = [(1, [[0.2, 0.7], [0.3], [0.1, -0.3, 0.5]]), (0, [[1.0], [2.0, 3.0]])]
+    rows = [(1, [[0.2, 0.7], [0.3], [0.1, -0.3, 0.5]]), (0, [[1.0], [2.0, 3.0]]),
+            (2, [Float64[], [2.0]])]
     for f in FLATTENS
         for kind in (:vector_field, :scalar_field, :nested_fields)
             jax_vec_parity(getfield(@__MODULE__, Symbol(:jax_, kind, :_, f)), (:x, :m, :y), dense)
