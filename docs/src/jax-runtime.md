@@ -24,7 +24,7 @@ synchronization costs. `prepare_data` also runs on the host.
 To inspect a checked gradient before execution, pass a GPU-placed input to
 `jax.jit(jax.value_and_grad(loss)).lower(x).compile()`. The result exposes
 optimized HLO (the compiler's program) through `as_text()` and its memory
-plan through `memory_analysis()`. With JAX `0.12.0.1.dev20261116+a67d713e1`,
+plan through `memory_analysis()`. With JAX 0.12.0.1,
 a recorded CUDA topology can compile a callback-free gradient offline. If the
 gradient contains `jax.debug.callback`, lowering requires a live GPU backend.
 Label offline figures as compiler estimates for the recorded target.
