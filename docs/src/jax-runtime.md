@@ -91,6 +91,24 @@ store less per chain, and run more loop rounds in sequence. Which is fastest
 depends on the device, the model and the number of chains, so time the
 candidates there rather than choosing by rule.
 
+`select_plate_layout(prepared, make_step, chains=None)` runs that timing. The
+caller supplies `make_step(prepared)`, or `make_step(prepared, count)` with
+`chains`, returning a function that runs its own work once: one batched
+gradient, or one sampler step over all chains, so the sampler's memory and
+cost are measured too. Each candidate is compiled, run and timed; with
+`chains` they are compared by time per chain. A candidate the device has no
+memory for is recorded and its larger chain counts are skipped. The result is
+the prepared data with the fastest layout and a report of every run:
+
+```python
+def make_step(data, count):
+    gradient = jax.jit(jax.vmap(jax.value_and_grad(lambda u: module.kernel(u, **data))))
+    positions = starts[:count]
+    return lambda: gradient(positions)
+
+chosen, report = module.select_plate_layout(prepared, make_step, chains=(256, 1024, 4096))
+```
+
 `GROUPED_PLATES` names the plates that take a layout, each with the prepared
 row lengths that group its units. A plate qualifies when it maps a prepared
 ragged vector of numeric rows; rows a cell reads from a shared array by its

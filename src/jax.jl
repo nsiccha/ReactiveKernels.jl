@@ -9714,6 +9714,11 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
         push!(functions, JAXFunction("prepare_plate_layout",
             Pair{String,Any}["prepared" => Dict, "groups" => Int, "sequential" => Bool],
             Pair{String,Any}["prepared" => Dict]))
+        push!(bodies, rstrip(_JAX_SELECT_PLATE_LAYOUT))
+        push!(functions, JAXFunction("select_plate_layout",
+            Pair{String,Any}["prepared" => Dict, "make_step" => Any, "chains" => Any,
+                             "candidates" => Any, "repeats" => Int],
+            Pair{String,Any}["prepared" => Dict, "report" => Vector{Any}]))
         meta = merge(meta, (GROUPED_PLATES = [name => Tuple(keys) for (name, keys) in plates],))
     end
     defs === nothing && return meta

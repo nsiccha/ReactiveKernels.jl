@@ -23,7 +23,10 @@ are recorded in the git history only.
   The module's `prepare_plate_layout(prepared, groups, sequential)` chooses
   the layout after `prepare_data`, and `GROUPED_PLATES` names the plates.
   Every layout returns the plate's values and ordinary derivatives. The
-  default `plate_layout = :padded` emits the same module as before.
+  module's `select_plate_layout(prepared, make_step, chains)` times candidate
+  layouts and chain counts with the caller's own step and returns the
+  fastest. The default `plate_layout = :padded` emits the same module as
+  before.
 
 ## 0.1.388
 

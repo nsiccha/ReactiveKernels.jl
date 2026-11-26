@@ -141,6 +141,69 @@ def prepare_plate_layout(prepared: dict, groups: int = 1, sequential: bool = Fal
     return {**prepared, "_rk_plate_layout": layout}
 """
 
+# The reference tuner: which layout is fastest is a property of the device,
+# the model and the chain count, so it is measured where the module runs. The
+# caller supplies the work to time (its own batched step), so a sampler's
+# memory and cost are part of the measurement.
+const _JAX_SELECT_PLATE_LAYOUT = raw"""
+def select_plate_layout(prepared: dict, make_step: Any, chains: Any = None,
+                        candidates: Any = None, repeats: int = 3) -> tuple:
+    \"\"\"Time candidate plate layouts on this device and return the fastest.
+
+    `make_step(prepared)` returns a function of no arguments that runs the work
+    to time once, for example one batched gradient or one sampler step over
+    all chains. With `chains` (an increasing sequence of chain counts) it is
+    called as `make_step(prepared, count)` and candidates are compared by time
+    per chain, so the result also names the chain count to run. `candidates`
+    are `(groups, sequential)` pairs, by default 1 to 16 groups, side by side
+    and one after another. Each candidate is run once to compile and then
+    `repeats` times; its time is the shortest.
+
+    A candidate the device has no memory for is recorded with its error and,
+    with `chains`, its larger counts are skipped. Any other error is raised.
+
+    Returns `(prepared, report)`: the prepared data with the fastest layout,
+    and one `dict` per run with `groups`, `sequential`, `chains`, `seconds`
+    and `error`, the fastest first.
+    \"\"\"
+    import time
+    if candidates is None:
+        candidates = [(groups, sequential) for groups in (1, 2, 4, 8, 16)
+                      for sequential in (False, True)]
+    report = []
+    seen = []
+    for groups, sequential in candidates:
+        chosen = prepare_plate_layout(prepared, groups, sequential)
+        # Fewer distinct lengths than groups give the layout of a smaller count.
+        key = [None if layout is None else
+               (tuple(len(members) for members in layout[0]), layout[2], layout[3])
+               for layout in chosen["_rk_plate_layout"].values()]
+        if key in seen:
+            continue
+        seen.append(key)
+        for count in (None,) if chains is None else chains:
+            row = {"groups": groups, "sequential": sequential, "chains": count,
+                   "seconds": float("inf"), "error": None}
+            report.append(row)
+            try:
+                step = make_step(chosen) if count is None else make_step(chosen, count)
+                jax.block_until_ready(step())
+                for _ in range(repeats):
+                    start = time.perf_counter()
+                    jax.block_until_ready(step())
+                    row["seconds"] = min(row["seconds"], time.perf_counter() - start)
+            except Exception as error:
+                if "RESOURCE_EXHAUSTED" not in str(error) and not isinstance(error, MemoryError):
+                    raise
+                row["error"] = str(error)
+                break
+    cost = lambda row: row["seconds"] / (row["chains"] or 1)
+    report.sort(key=cost)
+    if not report or report[0]["error"] is not None:
+        raise RuntimeError("select_plate_layout: no candidate ran on this device")
+    return prepare_plate_layout(prepared, report[0]["groups"], report[0]["sequential"]), report
+"""
+
 # The plate arguments whose rows a group cuts to its width: each mapped ragged
 # vector of numeric rows whose lengths are prepared data, as its position
 # among the plate call's arguments and the prepared key of its lengths.

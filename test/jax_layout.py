@@ -93,3 +93,53 @@ for module, make in ((walk, walk_data), (rows, rows_data)):
     short, long = make(1), make(5)
     assert traced(module, short, 1) == traced(module, long, 1) == 1
     assert traced(module, short, 3) == traced(module, long, 3) == 3
+
+
+# The tuner times the caller's own work for each candidate and chain count,
+# and returns the fastest layout with every run it made.
+def make_step(data, count):
+    gradient = batched(walk, data)
+    at = jnp.linspace(-1.0, 1.0, count)
+    return lambda: gradient(at)
+
+
+data = walk_data()
+best, report = walk.select_plate_layout(data, make_step, chains=(2, 4),
+                                        candidates=[(1, False), (3, False), (3, True)],
+                                        repeats=2)
+assert [(row["groups"], row["sequential"], row["chains"]) for row in report] and len(report) == 6
+assert all(row["error"] is None and row["seconds"] < float("inf") for row in report)
+cost = [row["seconds"] / row["chains"] for row in report]
+assert cost == sorted(cost)
+chosen = walk.prepare_plate_layout(data, report[0]["groups"], report[0]["sequential"])
+assert set(best) == set(chosen)
+np.testing.assert_allclose(batched(walk, best)(positions)[0], batched(walk, data)(positions)[0],
+                           rtol=1e-12)
+
+
+# A candidate without memory is recorded and its larger counts are skipped;
+# any other failure is the caller's to see.
+def scarce(data, count):
+    if data["_rk_plate_layout"]["totals_cell"] is None and count > 2:
+        raise RuntimeError("RESOURCE_EXHAUSTED: out of memory")
+    return make_step(data, count)
+
+
+_, report = walk.select_plate_layout(data, scarce, chains=(2, 4, 8),
+                                     candidates=[(1, False), (3, False)], repeats=1)
+padded = [row for row in report if row["groups"] == 1]
+assert [row["chains"] for row in padded if row["error"] is None] == [2]
+assert [row["chains"] for row in padded if row["error"] is not None] == [4]
+assert report[0]["groups"] == 3
+
+
+def broken(data, count):
+    raise ValueError("not a memory error")
+
+
+try:
+    walk.select_plate_layout(data, broken, chains=(2,))
+except ValueError:
+    pass
+else:
+    raise AssertionError("an error other than memory exhaustion must be raised")

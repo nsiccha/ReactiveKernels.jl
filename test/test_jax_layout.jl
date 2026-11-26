@@ -57,7 +57,8 @@ layout_rows(scale) = [[0.3 * sin(i + t) for t in 1:scale*n] for (i, n) in enumer
     walk = jax_source(jax_layout_walk; have, want = :total, data, plate_layout = :groups)
     @test occursin("GROUPED_PLATES = {\"totals_cell\": (\"orders_lengths\", \"weights_lengths\")}",
                    string(walk))
-    @test [f.name for f in walk.functions] == ["prepare_data", "kernel", "prepare_plate_layout"]
+    @test [f.name for f in walk.functions] ==
+        ["prepare_data", "kernel", "prepare_plate_layout", "select_plate_layout"]
     rows = jax_source(jax_layout_rows; have = (:a, :xs), want = :total, data = (:xs,),
                       plate_layout = :groups)
     # The second plate maps computed rows beside the prepared ones: both
