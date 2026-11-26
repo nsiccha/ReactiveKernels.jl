@@ -214,16 +214,50 @@ _position_plate_bytes(kernel, args...) =
                     _position_plate_bytes(scalar, positions[:, 1], shifts, n))
     for reuse in (false, true)
         batch = vectorize(per_position_plate; batched = :position, reuse)
-        expression = code_expr(batch)
-        # The first position supplies the output shape. Its plate and the
-        # remaining positions' plate share one emitted body.
-        @test count("_authored_plate_marker", string(expression)) == 1
-        @test batch(positions[:, 1:1], shifts, n) == expected[:, 1:1]
         @test batch(positions, shifts, n) == expected
-        @test code_expr(batch) === expression
         bytes = _position_plate_bytes(batch, positions, shifts, n)
         # Per position: the scalar kernel's own arrays plus the stacked output.
         @test bytes <= 2 * size(positions, 2) * scalar_bytes
+    end
+end
+
+@testset "position readers share plate functions across output cuts" begin
+    @kernel function position_plates(p::Vector{Float64}, t::Vector{Int})
+        left = plate(t) do x
+            exp(-p[1] * x)
+        end
+        right = plate(t) do x
+            sin(p[2] + x)
+        end
+        observed = left isa SubArray
+        return left, right, observed
+    end
+
+    function plate_functions(reader)
+        types = Set{DataType}()
+        function visit(node)
+            if node isa ReactiveKernels._PlateProgram
+                node.always_inline || push!(types, typeof(ReactiveKernels.compile(node.ast)))
+            elseif node isa Expr && node.head !== :quote
+                foreach(visit, node.args)
+            end
+        end
+        visit(code_expr(reader))
+        types
+    end
+
+    full = vectorize(prepare(position_plates); batched = :p, reuse = true)
+    pair = vectorize(prepare(position_plates; want = (:left, :right)); batched = :p, reuse = true)
+    programs = plate_functions(full)
+    @test length(programs) == 2
+    @test plate_functions(pair) == programs
+    for width in (1, 4), t in (Int[], [2], [2, 4, 7])
+        p = reshape(collect(range(0.1, 0.9; length = 2 * width)), 2, width)
+        left, right, observed = full(p, t)
+        @test left ≈ [exp(-p[1, i] * x) for x in t, i in axes(p, 2)]
+        @test right ≈ [sin(p[2, i] + x) for x in t, i in axes(p, 2)]
+        @test observed == (axes(p, 2) .!= 1)
+        @test pair(p, t) == (left, right)
     end
 end
 

@@ -5726,10 +5726,10 @@ end
 # `ast` with each marked plate block (`_PlateBlock`) a call of its own
 # `_PlateProgram`, or its statements inline where it rebinds a name the rest of
 # the body binds.
-function _extract_plate_programs(ast::Expr)
+function _extract_plate_programs(ast::Expr, captures = ())
     ast.head in (:function, :->) && length(ast.args) == 2 &&
         ast.args[1] isa Expr && ast.args[1].head === :tuple || return ast
-    parameters = Set{Symbol}()
+    parameters = Set{Symbol}(captures)
     for arg in ast.args[1].args
         name = _program_parameter(arg)
         name === nothing || push!(parameters, name)
@@ -6641,9 +6641,9 @@ function _lower_with_ops_collecting(p::Plan;
                     input_type_hints = hints)
             else
                 # A plate program of its own (`_extract_plate_programs`) where
-                # the body is compiled whole and keeps no cell tables.
-                own_program = plate_programs && cells === nothing &&
-                    get(task_local_storage(), _CELL_TABLES, nothing) === nothing
+                # the body is compiled whole. A position residual passes any
+                # cell scratch the plate reads as arguments of that program.
+                own_program = plate_programs && cells === nothing
                 plate_body = own_program ? Expr(:block) : body
                 readonly_slices = Set{Int}()
                 if exemplar_types !== nothing && _readonly_slice_candidate(r)
@@ -7458,9 +7458,15 @@ end
 # (`log(s)` per position of a shared `s = exp(a)`) is computed as written.
 function _replicated_part_ast(part::Plan; recycle = Pair{ValueId,Symbol}[],
                               cell_slots = nothing, cell_tables = nothing)
+    residual = cell_tables !== nothing
     ast, constants, callables, recipes = _lower_with_ops(_lowering_plan(part);
-        declare = true, recycle, cell_slots, cell_tables)
+        declare = true, recycle, cell_slots, cell_tables, plate_programs = residual)
     _simplify() && (ast = _stable_rewrites(ast, recipes))
+    if residual
+        # The position driver binds these scratch slots outside the residual.
+        # Each extracted plate takes the ones it reads as ordinary arguments.
+        ast = _extract_plate_programs(ast, Iterators.flatten((cell_slots, cell_tables)))
+    end
     ast, constants, callables, recipes
 end
 
@@ -7547,6 +7553,9 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
 
     # One per-position block: project the batched ports into their lanes, then
     # the spliced residual body binds one fresh local per WANT.
+    # `_embedded_statements` renames every residual local, so the
+    # first-position block and the loop body are independent copies of the
+    # same scalar program.
     function position_block!(destination, replica_index, want_vars, recycled)
         callargs = Any[]
         for v in parts.residual.have
@@ -7649,35 +7658,54 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
             Expr(:call, Expr(:curly, GlobalRef(Base, :RefValue), GlobalRef(Core, :Any)),
                  GlobalRef(Core, :nothing))))
     end
-    output_vars = Dict(canon_id(g, v.id) => gensym(Symbol(v.name, :_batched))
-                       for v in p.want)
-    position = gensym(:replica_index)
-    first_position = gensym(:first_position)
-    is_first = Expr(:call, GlobalRef(Base, :(==)), position, 1)
-    values_at_position = Any[gensym(Symbol(v.name, :_position)) for v in p.want]
-    reference_cells = gensym(:reference_cells)
-    push!(body.args, Expr(:local, values(output_vars)..., recycle_vars..., reference_cells))
-
-    step = Expr(:block)
-    recycled = Any[]
+    # Source recipes can fall back to arbitrary Julia methods, which may
+    # return an input. Only their destination-producing methods may put an
+    # array in the slot. Plates and scans also accept a direct output column.
+    first_recycled = Any[]
     for (lane, k) in zip(recycle_vars, recycle_wants)
         if k in column_wants
-            v = p.want[k]
-            initial = reuse ? Expr(:call, GlobalRef(@__MODULE__, :_replicated_recycled),
-                                   slot(nout + nhave + k), valtype(v)) : nothing
-            later = :(let column = $(GlobalRef(@__MODULE__, :_replicated_output_lane))(
-                    $(output_vars[canon_id(g, v.id)]), $(valtype(v)), $position)
-                column === nothing ? $lane : column
-            end)
-            push!(recycled, Expr(:if, first_position, initial, later))
+            push!(first_recycled, reuse ? :($(GlobalRef(@__MODULE__, :_replicated_recycled))(
+                $(slot(nout + nhave + k)), $(valtype(p.want[k])))) : nothing)
         else
-            # A source recipe may return an input. Its destination method owns
-            # the slot and decides which results are safe to recycle.
             storage = reuse ? slot(nout + nhave + k) : :(Ref{Any}(nothing))
             push!(body.args, :($lane = $storage))
-            push!(recycled, lane)
+            push!(first_recycled, lane)
         end
     end
+
+    output_vars = Dict(canon_id(g, v.id) => gensym(Symbol(v.name, :_batched))
+                       for v in p.want)
+    first_index = gensym(:replica_index)
+    first_vars = Any[gensym(Symbol(v.name, :_first)) for v in p.want]
+    push!(body.args, :($first_index = 1))
+    position_block!(body, first_index, first_vars, first_recycled)
+    for (lane, k) in zip(recycle_vars, recycle_wants)
+        k in column_wants || continue
+        push!(body.args, :($lane = $(first_vars[k])))
+    end
+    for (output_index, v) in enumerate(p.want)
+        cid = canon_id(g, v.id)
+        value = first_vars[output_index]
+        # A later scalar recipe can dispatch on the concrete column view
+        # produced by a plate or scan (including the type of its parent).
+        observed_column = output_index in column_wants && any(parts.residual.recipes) do r
+            any(input -> canon_id(g, input.id) == cid, r.inputs)
+        end
+        allocation = reuse ?
+            Expr(:call, GlobalRef(@__MODULE__,
+                 observed_column ? :_replicated_observed_output! : :_replicated_output!),
+                 Expr(:ref, :__output_caches__, output_index), value, :replica_count) :
+            Expr(:call, GlobalRef(@__MODULE__, :_replicated_output), value, :replica_count)
+        push!(body.args, Expr(:(=), output_vars[cid], allocation))
+        push!(body.args,
+              Expr(:call, GlobalRef(@__MODULE__, :_replicated_store!),
+                   output_vars[cid], first_index, value))
+    end
+
+    rest_body = Expr(:block)
+    reference_cells = gensym(:reference_cells)
+    push!(body.args, :($reference_cells = $(GlobalRef(@__MODULE__, :_replicated_reference_cells))(
+        $(Expr(:tuple, first_vars...)))))
     fresh = Expr(:block)
     local_slots = Any[residual_slots...]
     for (lane, k) in zip(recycle_vars, recycle_wants)
@@ -7690,56 +7718,27 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
         lane === nothing || push!(fresh.args, :($lane = $(GlobalRef(@__MODULE__, :_replicated_lane))(
             $(nm(v)), $(valtype(v)))))
     end
-    if !isempty(fresh.args)
-        push!(step.args, :(if !$first_position && $reference_cells
-            $fresh
-        end))
-    end
-    position_block!(step, position, values_at_position, recycled)
-
-    initialize = Expr(:block)
-    push!(initialize.args, :($reference_cells = $(GlobalRef(@__MODULE__, :_replicated_reference_cells))(
-        $(Expr(:tuple, values_at_position...)))))
-    for (lane, k) in zip(recycle_vars, recycle_wants)
-        k in column_wants || continue
-        push!(initialize.args, :($lane = $(values_at_position[k])))
-    end
-    separate_first = false
+    isempty(fresh.args) || push!(rest_body.args, Expr(:if, reference_cells, fresh))
+    rest_vars = Any[gensym(Symbol(v.name, :_position)) for v in p.want]
+    rest_recycled = Any[k in column_wants ?
+        :(let column = $(GlobalRef(@__MODULE__, :_replicated_output_lane))(
+            $(output_vars[canon_id(g, p.want[k].id)]), $(valtype(p.want[k])), replica_index)
+            column === nothing ? $lane : column
+        end) : lane for (lane, k) in zip(recycle_vars, recycle_wants)]
+    position_block!(rest_body, :replica_index, rest_vars, rest_recycled)
     for (output_index, v) in enumerate(p.want)
-        cid = canon_id(g, v.id)
-        value = values_at_position[output_index]
-        # A later scalar recipe can dispatch on the concrete column view
-        # produced by a plate or scan (including the type of its parent).
-        observed_column = output_index in column_wants && any(parts.residual.recipes) do r
-            any(input -> canon_id(g, input.id) == cid, r.inputs)
-        end
-        separate_first |= output_index in column_wants && typeintersect(valtype(v), SubArray) !== Union{}
-        allocation = reuse ?
-            Expr(:call, GlobalRef(@__MODULE__,
-                 observed_column ? :_replicated_observed_output! : :_replicated_output!),
-                 slot(output_index), value, :replica_count) :
-            Expr(:call, GlobalRef(@__MODULE__, :_replicated_output), value, :replica_count)
-        push!(initialize.args, Expr(:(=), output_vars[cid], allocation))
+        push!(rest_body.args,
+              Expr(:call, GlobalRef(@__MODULE__, :_replicated_store!),
+                   output_vars[canon_id(g, v.id)], :replica_index,
+                   rest_vars[output_index]))
     end
-    push!(step.args, Expr(:if, first_position, initialize))
-    for (output_index, v) in enumerate(p.want)
-        push!(step.args, Expr(:call, GlobalRef(@__MODULE__, :_replicated_store!),
-                              output_vars[canon_id(g, v.id)], position,
-                              values_at_position[output_index]))
-    end
-    # A plate or scan can write to a dense buffer first and a column view
-    # later. Keep their writes type-specialized for ordinary reverse mode.
-    if separate_first
-        push!(body.args, Expr(:(=), position, 1))
-        first_step = _substitute_symbols(step, Dict(first_position => true))
-        push!(body.args, Expr(:let, Expr(:block), first_step))
-        step = _substitute_symbols(step, Dict(first_position => false))
-        pushfirst!(step.args, Expr(:if, is_first, Expr(:continue)))
-    else
-        pushfirst!(step.args, Expr(:(=), first_position, is_first))
-    end
-    push!(body.args, Expr(:for, Expr(:(=), position,
-        Expr(:call, GlobalRef(Base, :OneTo), :replica_count)), step))
+    # Keep the first lane as scratch across calls, never a view of an escaped
+    # output. All later positions use it or their own destination column.
+    push!(body.args, Expr(:for,
+        Expr(:(=), :replica_index,
+             Expr(:call, GlobalRef(Base, :OneTo), :replica_count)),
+        Expr(:if, Expr(:call, GlobalRef(Base, :(==)), :replica_index, 1),
+             Expr(:block, Expr(:continue)), rest_body)))
     if reuse
         for (lane, k) in zip(recycle_vars, recycle_wants)
             k in column_wants || continue
