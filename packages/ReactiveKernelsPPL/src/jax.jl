@@ -841,6 +841,18 @@ function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
 end
 
 function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        f::typeof(_ppl_lkj_weights), args::Vector{ReactiveKernels._PyVal})
+    (ctx.host !== nothing || !all(a -> a.static, args)) &&
+        return ReactiveKernels._jax_traceable_or_lowered(ctx, f, args)
+    # A submodel can build the weights inside log_density. Both dimensions
+    # are available to Python here, so run the authored recipe on the host
+    # while tracing instead of recording its triangular loops on the device.
+    names, body, mod, inputs = ReactiveKernels._jax_traceable_body(ctx, f, args)
+    weights = ReactiveKernels._host_function_call(ctx, f, names, body, mod, args, inputs)
+    ReactiveKernels._PyVal("jnp.asarray(" * weights.code * ")", weights.T)
+end
+
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
         f::typeof(_ppl_lkj_logjac), args::Vector{ReactiveKernels._PyVal})
     ctx.host !== nothing && return ReactiveKernels._jax_traceable_or_lowered(ctx, f, args)
     z, weights = (ReactiveKernels._py_atom(v.code) for v in args)
