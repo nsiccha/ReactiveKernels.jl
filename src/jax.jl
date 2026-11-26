@@ -6133,8 +6133,10 @@ function _jax_eachindex_length(ctx::_JaxContext, args)
     types = [a.T for a in args]
     !isempty(args) && all(T -> _jax_rank(T) == 1, types) ||
         _jax_error("`eachindex` of ", types, _jax_where(ctx))
-    if length(args) > 1 && !(_jax_return_type(eachindex, types) <: Base.OneTo)
-        _jax_error("`eachindex` without a one-based linear index domain for ", types, _jax_where(ctx))
+    if length(args) > 1
+        domain = _jax_return_type(eachindex, types)
+        domain !== Union{} && domain <: Base.OneTo ||
+            _jax_error("`eachindex` without a one-based linear index domain for ", types, _jax_where(ctx))
     end
     lengths = map(args) do x
         ctx.host === nothing ? _jax_function_call(ctx, size, [x, _jax_literal(1)]) : _host_length(ctx, x)
@@ -6182,6 +6184,22 @@ function _jax_axis(ctx::_JaxContext, x::_PyVal, dim::Int)
 end
 function _jax_function_call(ctx::_JaxContext, ::typeof(collect), args::Vector{_PyVal})
     x = only(args)
+    if x.T isa _JaxAggregate && x.T.T <: Base.Generator
+        f, indices = x.T.fields
+        # A lowered comprehension stores the closure and its index domain in
+        # a Generator. Reuse the source comprehension's host iteration and
+        # masked device mapping, with the same captured runtime values.
+        fun, stop = gensym(:element), gensym(:stop)
+        saved = ctx.locals
+        ctx.locals = copy(saved)
+        try
+            ctx.locals[fun] = f
+            ctx.locals[stop] = _jax_function_call(ctx, length, [indices])
+            return _jax_expr(ctx, :([$fun(i) for i in 1:$stop]))
+        finally
+            ctx.locals = saved
+        end
+    end
     ctx.host !== nothing && x.T isa Type && x.T <: Iterators.ProductIterator &&
         return _host_collect_product(ctx, x)
     if ctx.host !== nothing && x.T isa Type && x.T <: Base.Iterators.Zip
@@ -6287,6 +6305,16 @@ function _jax_call_positional(ctx::_JaxContext, J::LinearAlgebra.UniformScaling,
     code = np * "eye(" * size * dtype * ")"
     J.λ == true || (code = _py_infix("*", [_jax_literal(J.λ).code, code]))
     _PyVal(code, typeof(J(1)), false, extent, "", isempty(extent) ? 0 : 3)
+end
+
+# An ordinary Julia helper lowers a comprehension over eachindex to
+# collect(Generator(f, indices)). The generator itself evaluates no element.
+function _jax_call_positional(ctx::_JaxContext, ::Type{Base.Generator}, args::Vector{_PyVal})
+    length(args) == 2 && args[2].T isa Type && args[2].T <: Base.OneTo ||
+        _jax_error("constructing a generator over this iterator", _jax_where(ctx))
+    f, indices = args
+    T = Base.Generator{indices.T,_jax_argument_type(f)}
+    _PyVal("<generator>", _JaxAggregate(T, args))
 end
 
 # Fixed arguments are captured runtime values, just as in anonymous closures.
@@ -8109,6 +8137,11 @@ function _jax_call_positional(ctx::_JaxContext,
     if ctx.host !== nothing && f === getindex && x.T isa Type && x.T <: AbstractDict
         length(args) == 2 || _jax_error("a dictionary key of several indices", _jax_where(ctx))
         return _PyVal(_py_atom(x.code) * "[" * args[2].code * "]", Base.valtype(x.T), true)
+    end
+    if ctx.host !== nothing && f === getindex && _jax_is_array(x.T) &&
+       length(args) == 2 && args[2].T isa Type && args[2].T <: Integer
+        result = _host_index(ctx, x, args[2:end])
+        result === nothing || return result
     end
     if x.T isa _JaxCallable && x.T.f isa _JaxClosure && f === getfield
         closure = x.T.f

@@ -3,8 +3,15 @@ module JAXEachindexTests
 using ReactiveKernels, Test
 include("jax_python.jl")
 
-@traceable pick_entries(table, groups, rows) =
+pick_entries(table, groups, rows) =
     [table[groups[i]][rows[i]] for i in eachindex(groups, rows)]
+
+@kernel function observed_total(values::Vector{Vector{Float64}}, groups::Vector{Int},
+                                rows::Vector{Int})
+    reads = pick_entries(values, groups, rows)
+    total = sum(abs2, reads)
+    return total
+end
 
 @kernel function indexed_gather(x::Vector{Float64}, table::Vector{Vector{Int}},
                                 groups::Vector{Int}, rows::Vector{Int})
@@ -75,6 +82,20 @@ end
             end
             @test_throws "all inputs to eachindex must have the same indices" rk_jax_evaluate(
                 src, name, (x, table, [1], [1, 2]); prepare = prep)
+        end
+        # Differentiate the captured ragged values themselves. Repeated
+        # positions accumulate and empty rows retain zero derivatives.
+        values = [[1.5, -0.5], Float64[], [2.0]]
+        ports = (:values, :groups, :rows)
+        observed = jax_source(observed_total; have = ports, want = :total)
+        native_total = prepare(observed_total; have = ports, want = :total)
+        stored, _ = rk_jax_pad(values)
+        for (groups, rows) in (([1, 3, 1], [2, 1, 2]), ([1, 3], [1, 1]), (Int[], Int[]))
+            got = rk_jax_evaluate(observed, :kernel, (values, groups, rows); grad = :joint)
+            @test got.value == got.joint_value == native_total(values, groups, rows)
+            expected = [[2 * stored[g, r] * count(==((g, r)), zip(groups, rows))
+                         for r in axes(stored, 2)] for g in axes(stored, 1)]
+            @test got.grad == expected
         end
     end
 

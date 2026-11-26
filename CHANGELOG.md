@@ -20,7 +20,8 @@ are recorded in the git history only.
 
 - `jax_source` supports `eachindex(a, b, ...)` over one-based vectors in
   numerical kernels and data preparation. It checks all logical lengths,
-  including the lengths of padded rows, before iterating.
+  including the lengths of padded rows, before iterating. Comprehensions
+  over these indices also work inside ordinary Julia helper functions.
 
 ## 0.1.392
 
