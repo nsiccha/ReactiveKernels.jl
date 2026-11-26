@@ -22,18 +22,26 @@ class _RKChainRows:
         offsets = jnp.asarray(self.offsets)
         values = jnp.asarray(self.values)
         start = offsets[i]
-        return _RKChainRow(offsets[i + 1] - start, self.max_length, values.dtype,
-                           lambda j: values[start + j])
+        return _RKChainRow.from_array(values, start, offsets[i + 1] - start, self.max_length)
 
 
 class _RKChainRow:
     """An indexed row inside a traced cell. Its capacity bounds local storage."""
 
-    def __init__(self, length, capacity, dtype, read):
+    def __init__(self, length, capacity, dtype, read, gather=None):
         self.length = length
         self.shape = (capacity,)
         self.dtype = dtype
         self.read = read
+        # An array-backed read can gather several positions and fill missing
+        # entries with zero. An arbitrary cell must only run on real entries.
+        self.gather = gather
+
+    @classmethod
+    def from_array(cls, values, start, length, capacity):
+        def gather(i):
+            return _rk_gather_valid(values, start + i, (i >= 0) & (i < length))
+        return cls(length, capacity, values.dtype, lambda i: values[start + i], gather)
 
     def __getitem__(self, i):
         return self.read(i)
@@ -165,10 +173,27 @@ def _rk_valid_indices(indices, count, length):
     return jnp.all((jnp.arange(ids.shape[0]) >= count) | ((ids >= 1) & (ids <= length)))
 
 
+def _rk_gather_valid(values, positions, valid):
+    if not values.shape[0]:
+        return jnp.zeros(positions.shape + values.shape[1:], dtype=values.dtype)
+    positions = jnp.where(valid, positions, values.shape[0])
+    return values.at[positions].get(mode="fill", fill_value=0)
+
+
 def _rk_row_gather(source, indices, length):
     if isinstance(indices, _RKChainRow):
+        gather = None
+        if indices.gather is not None and (not isinstance(source, _RKChainRow) or source.gather is not None):
+            def gather(i):
+                # Use an index dtype wide enough for the source length and
+                # the one-past-the-end fill index, even for e.g. Int8 data.
+                ids = indices.gather(i).astype(int)
+                valid = (ids >= 1) & (ids <= length)
+                if isinstance(source, _RKChainRow):
+                    return source.gather(jnp.where(valid, ids - 1, source.shape[0]))
+                return _rk_gather_valid(jnp.asarray(source), ids - 1, valid)
         return _RKChainRow(indices.length, indices.shape[0], source.dtype,
-                           lambda i: _rk_row_entry(source, indices[i], length))
+                           lambda i: _rk_row_entry(source, indices[i], length), gather)
     if not source.shape[0]:
         return jnp.zeros(indices.shape, dtype=source.dtype)
     return _rk_row_entry(source, indices, length)
@@ -191,6 +216,8 @@ def _rk_vcat_tail(row):
         return row
     if not row.shape[0]:
         return jnp.empty(0, dtype=row.dtype)
+    if row.gather is not None:
+        return row.gather(jnp.arange(row.shape[0]))
     zero = jnp.zeros((), dtype=row.dtype)
     def read(i):
         return jax.lax.cond(i < row.length, lambda: row[i], lambda: zero)
@@ -267,6 +294,11 @@ def _rk_collect_rows(cell, args, mapped, layouts, dtypes):
                 counts, offsets, width, total = spec
                 if width and total == n * width and not isinstance(value, _RKChainRow):
                     buffer = jax.lax.dynamic_update_slice_in_dim(buffer, value[:width], i * width, 0)
+                elif 0 < width <= value.shape[0] and (not isinstance(value, _RKChainRow) or value.gather is not None):
+                    positions = jnp.arange(width)
+                    items = value.gather(positions) if isinstance(value, _RKChainRow) else value[positions]
+                    destinations = jnp.where(positions < counts[i], offsets[i] + positions, total)
+                    buffer = buffer.at[destinations].set(items, mode="drop")
                 elif width:
                     start = offsets[i]
                     def write(j, dest):
@@ -434,4 +466,4 @@ def _rk_local_scan(step, seed, columns, length, dtypes):
         buffers = while_loop(lambda state: state[0] < length, advance, (0, seed, buffers),
                              kind="checkpointed", checkpoints=max(1, capacity.bit_length()),
                              buffers=lambda state: state[2])[2]
-    return jax.tree.map(lambda b: _RKChainRow(length, capacity, b.dtype, lambda i: b[i]), buffers)
+    return jax.tree.map(lambda b: _RKChainRow.from_array(b, 0, length, capacity), buffers)

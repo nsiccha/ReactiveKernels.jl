@@ -60,6 +60,17 @@ function _jax_chain_output(ctx, v, cell_scope, params, args, axes, field_lengths
     (layout, _jax_dtype(eltype(T)), [layout])
 end
 
+# These comparisons inspect only axis lengths and share one failure. Keep
+# their check at the operation so earlier errors and untaken guards keep
+# their ordinary behavior.
+function _jax_chain_check_axes!(ctx, counts, extent; broadcast)
+    length(counts) > 1 || return
+    checks = broadcast ? ["(($n == 1) | ($n == $extent))" for n in counts] :
+                         ["($n == $(first(counts)))" for n in Iterators.drop(counts, 1)]
+    _jax_call(ctx, _runtime_check, [_PyVal(join(checks, " & "), Bool),
+        _PyVal(repr("DimensionMismatch: incompatible row axes"), DimensionMismatch)])
+end
+
 # Keep an elementwise expression on a packed row indexed until another
 # recipe consumes it. The same generated function also accepts regular rows.
 function _jax_chain_broadcast(ctx, f, args; broadcast = true)
@@ -87,12 +98,7 @@ function _jax_chain_broadcast(ctx, f, args; broadcast = true)
     counts = unique(filter(!=("None"), lengths))
     extent = length(counts) == 1 ? only(counts) : _jax_broadcast_extent(ctx, counts)
     if length(counts) > 1 && !(broadcast && _jax_prefix_axes_guard!(ctx, extent))
-        for n in counts
-            valid = broadcast ? "((" * n * " == 1) | (" * n * " == " * extent * "))" :
-                                "(" * n * " == " * first(counts) * ")"
-            _jax_call(ctx, _runtime_check, [_PyVal(valid, Bool),
-                _PyVal(repr("DimensionMismatch: incompatible row axes"), DimensionMismatch)])
-        end
+        _jax_chain_check_axes!(ctx, counts, extent; broadcast)
     end
     call = "_rk_row_broadcast(lambda " * join(names, ", ") * ": " * expr.code * ", " *
            _jax_chain_tuple([a.code for a in args]) * ", " * _jax_chain_tuple(lengths) *
