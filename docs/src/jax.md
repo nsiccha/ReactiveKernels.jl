@@ -35,9 +35,22 @@ For `qr(A)`, `rk_cholesky_lower(A)` and `L \ b`, see
 `diagm(v)` also constructs a diagonal matrix, and source loops or
 comprehensions over `axes(A, d)` retain iteration along that dimension.
 Prepared matrix cells retain their rank and row lengths, including in empty
-plates. Ragged cells can vary along their first axis; trailing dimensions
+plates. Matrix cells can vary along their first axis; trailing dimensions
 must agree because the representation carries one extent per cell.
 For raw empty matrix lists, call `pad_ragged([], rank=2)`.
+
+For `x::Vector{Vector{Vector{Int}}}` and other numerical vectors nested
+three deep, `values, lengths = pad_ragged(x, nested=True)` pads both inner
+axes. Pass `values, lengths` to the direct function. Unpacking
+`group_lengths, row_lengths = lengths` gives the number of rows in each
+group and the number of entries in each row. For example, `[[], [[]]]` has
+group lengths `[0, 1]`. The second group contains one empty row.
+With bound data, `prepare_data(x=x)` supplies the pair under `x_lengths`.
+A group can concatenate its rows with `reduce(vcat, rows)`. When a traced
+index selects a group, the selected vector's length can vary within one
+compiled function. Use a named WANT such as `(; flat = :flat)` to get
+`flat` and `flat_lengths` under JIT. A plain vector is trimmed in eager
+execution and requires its logical length to fill its storage under JIT.
 
 For a ragged row index `r`, `M[r, :]` and `view(M, r, :)` keep every column.
 `sum(M[r, :] * b)` counts each selected row, including repeats. In

@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.393
+
+Generated JAX functions accept groups of ragged numerical rows. The padded
+values travel with one lengths argument containing the group counts and
+the per-row lengths. `prepare_data` constructs both arrays from the raw input.
+
 ## 0.1.392
 
 - Indexed JAX event reads can differentiate a subset of packed coordinates against a shared reference point.
