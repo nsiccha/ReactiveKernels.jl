@@ -18,7 +18,7 @@
 # "Data-dependent iteration").
 
 const _JAX_LAYOUT_KEY = :reactivekernels_jax_plate_layout
-const _JAX_LAYOUTS = (:padded, :groups)
+const _JAX_LAYOUTS = (:padded, :groups, :chains)
 _jax_plate_layout() = get(task_local_storage(), _JAX_LAYOUT_KEY, :padded)::Symbol
 # The layout of a `jax_source` call that names none: `:padded`, unless the
 # task asks for layouts wherever there are data (the test suite's differential
@@ -28,9 +28,9 @@ function _jax_with_plate_layout(f, layout, data)
     layout === nothing && (layout = data === nothing ? :padded :
         get(task_local_storage(), _JAX_LAYOUT_DEFAULT_KEY, :padded)::Symbol)
     layout in _JAX_LAYOUTS || throw(ArgumentError(
-        "jax_source: `plate_layout` is `:padded` or `:groups`; got `$(repr(layout))`"))
+        "jax_source: `plate_layout` is `:padded`, `:groups`, or `:chains`; got `$(repr(layout))`"))
     # Groups follow the prepared lengths of a plate's rows.
-    layout === :padded || data !== nothing || throw(ArgumentError(
+    layout !== :groups || data !== nothing || throw(ArgumentError(
         "jax_source: `plate_layout = :groups` groups plates by their prepared row lengths, so it needs `data`"))
     task_local_storage(f, _JAX_LAYOUT_KEY, layout)
 end

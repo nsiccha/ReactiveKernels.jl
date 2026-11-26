@@ -45,7 +45,8 @@ def _rk_scan_rows(table, index, requested, length):
     return jax.tree_util.tree_map(gather, table), acceptable
 """
 
-function _jax_scan_row_inputs!(ctx, inner, rows, unpack, seqs, width, extent, pure)
+function _jax_scan_row_inputs!(ctx, inner, rows, unpack, seqs, width, extent, pure;
+                               sequence = v -> _jax_scan_sequence(v, width), gather_rows = nothing)
     isempty(rows.reads) && return
     body = join(inner.lines, "\n")
     tokens = Set(m.match for m in eachmatch(_JAX_HISTORY_TOKENS, body))
@@ -56,14 +57,14 @@ function _jax_scan_row_inputs!(ctx, inner, rows, unpack, seqs, width, extent, pu
         sites = filter(r -> (r.table.code, r.index) == group, reads)
         r = first(sites)
         pure || continue
-        index = _jax_scan_sequence(rows.sequences[r.index], width)
+        index = sequence(rows.sequences[r.index])
         guards = unique(s.guard for s in sites)
         # A pure plate cell used by both arms already has a pointwise
         # lowering that avoids materializing its source table.
         length(guards) > 1 && haskey(inner.scan_reads, r.table.code) && continue
         masks = map(guards) do g
             replace(g, _JAX_HISTORY_TOKENS => word -> haskey(rows.sequences, word) ?
-                    _py_atom(_jax_scan_sequence(rows.sequences[word], width)) : word)
+                    _py_atom(sequence(rows.sequences[word])) : word)
         end
         guard = foldl((a, b) -> "jnp.logical_or(" * a * ", " * b * ")", masks)
         if !isempty(extent)
@@ -74,8 +75,9 @@ function _jax_scan_row_inputs!(ctx, inner, rows, unpack, seqs, width, extent, pu
         limit = isempty(axis) ? _py_atom(_jax_mapped_array(r.table)) * ".shape[0]" : axis
         gather = _jax_helper!(ctx, "_rk_scan_rows", _JAX_SCAN_ROWS)
         values, valid = _jax_fresh(ctx, :scan_rows), _jax_fresh(ctx, :valid_rows)
-        _jax_emit!(ctx, values * ", " * valid * " = " * gather * "(" * r.table.code *
-                        ", " * index * ", " * guard * ", " * limit * ")")
+        call = gather_rows === nothing ? gather * "(" * join((r.table.code, index, guard, limit), ", ") * ")" :
+               gather_rows(gather, r.table, index, guard, limit)
+        _jax_emit!(ctx, values * ", " * valid * " = " * call)
         push!(checks, valid)
         push!(seqs, values)
         input = r.token

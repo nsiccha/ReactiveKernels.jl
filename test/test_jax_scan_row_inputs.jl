@@ -58,8 +58,12 @@ end
 @testset "A one-arm scan read takes the requested rows as step inputs" begin
     have = (:a, :bases, :types, :orders)
     src = jax_source(jax_guarded_scan_rows; have, want = :total, data = (:bases, :types, :orders))
+    packed = jax_source(jax_guarded_scan_rows; have, want = :total, data = (:bases, :types, :orders),
+                        plate_layout = :chains)
     native = prepare(jax_guarded_scan_rows; have, want = :total)
     @test occursin("_rk_scan_rows(", string(src))
+    @test occursin(" = _rk_event_table_rows(_rk_scan_rows, ", string(packed))
+    @test occursin(" = _rk_scan_events(", string(packed))
     checked_have = (:a, :kinds, :visits, :table)
     checked = jax_source(jax_scan_row_order; have = checked_have, want = :total)
     @test !occursin("_rk_scan_rows(", string(checked))
@@ -73,8 +77,8 @@ end
                      ([Float64[]], [[2, 2]], [[0, 7]]),
                      ([Float64[]], [Int[]], [Int[]]),
                      (Vector{Float64}[], Vector{Int}[], Vector{Int}[]))
-            for a in (0.65, -0.7)
-                r = rk_jax_evaluate(src, "kernel", (a, data...); prepare = :arguments, grad = true)
+            for a in (0.65, -0.7), layout in (src, packed)
+                r = rk_jax_evaluate(layout, "kernel", (a, data...); prepare = :arguments, grad = true)
                 @test r.value ≈ native(a, data...)
                 # The recurrence and readout are affine in a.
                 @test r.grad ≈ native(1.0, data...) - native(0.0, data...)
@@ -83,6 +87,7 @@ end
         for data in (([Float64[]], [[3]], [[1]]), ([[1.0], [1.0, 2.0]], [[3], [2]], [[2], [1]]))
             @test_throws BoundsError native(0.5, data...)
             @test_throws "BoundsError" rk_jax_evaluate(src, "kernel", (0.5, data...); prepare = :arguments)
+            @test_throws "BoundsError" rk_jax_evaluate(packed, "kernel", (0.5, data...); prepare = :arguments)
         end
         @test_throws "checked scan operation" rk_jax_evaluate(checked, "kernel", (0.5, [-1, 3], [1, 2], [1.0]))
         args = ([0.5, -0.3], [2, 3, 2], [1, 2, 1], [99, 1, 0], [99, 2, -1])

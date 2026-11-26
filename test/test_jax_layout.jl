@@ -92,7 +92,7 @@ layout_rows(scale) = [[0.3 * sin(i + t) for t in 1:scale*n] for (i, n) in enumer
                                                     want = :total, data = (:units, :xs))))
     @test_throws ArgumentError jax_source(jax_layout_walk; have, want = :total, plate_layout = :groups)
     @test_throws ArgumentError jax_source(jax_layout_walk; have, want = :total, data,
-                                          plate_layout = :chains)
+                                          plate_layout = :unknown)
     if rk_jax_available()
         native_walk = prepare(jax_layout_walk; have, want = :total)
         native_rows = prepare(jax_layout_rows; have = (:a, :xs), want = :total)
