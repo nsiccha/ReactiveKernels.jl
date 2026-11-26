@@ -149,7 +149,7 @@ end
     @test length(schedule) == 3
     @test all(unit -> unit.region !== nothing, schedule)
     src = ReactiveKernels._jax_module_source([:kernel => (p, (:a, :c))],
-        (Float64,), NamedTuple(), nothing; source_regions = regions)
+        (Float64,), NamedTuple(), "Interleaved regions."; source_regions = regions)
     @test count(r"(?m)^def outer\w*\(", src.text) == 2
     @test count(r"(?m)^def middle\w*\(", src.text) == 1
     if rk_jax_available()
@@ -357,7 +357,8 @@ end
         structure(text) = [count(pattern, text) for pattern in
             (r"(?m)^\s*def ", "jax.vmap(", "jax.lax.cond(", "jax.lax.fori_loop(")]
         @test all(src -> structure(src.text) == structure(first(sources).text), sources)
-        @test count(r"(?m)^def jax_tuple_identity\w*\(", first(sources).text) == 1
+        # The named helper can close over the caller’s independent field extents.
+        @test count(r"(?m)^[ \t]*def jax_tuple_identity\w*\(", first(sources).text) == 1
         if rk_jax_available()
             for data in cases
                 args = (0.4, data.x, data.R, data.S)
