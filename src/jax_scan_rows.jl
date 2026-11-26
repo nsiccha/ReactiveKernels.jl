@@ -12,6 +12,12 @@ function _jax_scan_row_guard(scope, table, index)
     rows === nothing && return nothing
     table.code in rows.tables && haskey(rows.sequences, index.code) || return nothing
     step = scope.parent
+    # The live-step conditional would capture a whole table even for a read
+    # made at step scope. Supply that requested row alongside the guarded ones.
+    if rows.padded && (step === nothing || step.scan_rows !== rows) &&
+       !any(g -> _jax_scope_within(first(g), scope), _JAX_GUARDS)
+        return "True"
+    end
     step !== nothing && step.scan_rows === rows || return nothing
     step.parent !== nothing && step.parent.scan_rows === rows && return nothing
     # Only a direct branch in this step. A nested short circuit, helper, or
@@ -47,21 +53,22 @@ def _rk_scan_rows(table, index, requested, length):
 
 function _jax_scan_row_inputs!(ctx, inner, rows, unpack, seqs, width, extent, pure;
                                sequence = v -> _jax_scan_sequence(v, width), gather_rows = nothing)
-    isempty(rows.reads) && return
+    isempty(rows.reads) && return false
     body = join(inner.lines, "\n")
     tokens = Set(m.match for m in eachmatch(_JAX_HISTORY_TOKENS, body))
     reads = filter(r -> r.token in tokens, rows.reads)
     replacements = Dict(r.token => r.fallback for r in reads)
     checks = String[]
+    guarded = any(r -> r.guard != "True", reads)
     for group in unique((r.table.code, r.index) for r in reads)
         sites = filter(r -> (r.table.code, r.index) == group, reads)
         r = first(sites)
-        pure || continue
+        pure && guarded || continue
         index = sequence(rows.sequences[r.index])
         guards = unique(s.guard for s in sites)
         # A pure plate cell used by both arms already has a pointwise
         # lowering that avoids materializing its source table.
-        length(guards) > 1 && haskey(inner.scan_reads, r.table.code) && continue
+        length(guards) > 1 && !("True" in guards) && haskey(inner.scan_reads, r.table.code) && continue
         masks = map(guards) do g
             replace(g, _JAX_HISTORY_TOKENS => word -> haskey(rows.sequences, word) ?
                     _py_atom(sequence(rows.sequences[word])) : word)
@@ -92,4 +99,5 @@ function _jax_scan_row_inputs!(ctx, inner, rows, unpack, seqs, width, extent, pu
     end
     inner.lines .= [replace(line, _JAX_HISTORY_TOKENS => word -> get(replacements, word, word))
                     for line in inner.lines]
+    !isempty(checks)
 end
