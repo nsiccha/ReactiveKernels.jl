@@ -8784,6 +8784,15 @@ def _rk_serial_map(f, in_axes=None, row_dtypes=None, broadcast=False, counts=Non
             raise ValueError("plate arguments have different mapped sizes")
         else:
             size = sizes[0]
+        if size == 0 and in_axes is None:
+            # Map the empty operands directly. An index-based map would trace a
+            # read of element zero even though there is no cell to execute.
+            def empty_operand(a):
+                if isinstance(a, _RKChainRows):
+                    return jnp.empty((0, a.max_length) + a.values.shape[1:], dtype=a.values.dtype)
+                return _rk_row_values(a)
+            empty = jax.tree.map(empty_operand, args, is_leaf=lambda a: isinstance(a, _RKChainRows))
+            return jax.lax.map(lambda values: f(*values), empty)
         if logical:
             return _rk_if_nonempty(length > 0, lambda: jax.lax.map(cell, jnp.arange(size)))
         return jax.lax.map(cell, jnp.arange(size))

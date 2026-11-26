@@ -21,10 +21,8 @@ Call `jax.block_until_ready(result)` and `jax.effects_barrier()` when checking
 completion and callback errors. Executed callbacks incur transfer and
 synchronization costs. `prepare_data` also runs on the host.
 
-To inspect a checked gradient before execution, pass a GPU-placed input to
-`jax.jit(jax.value_and_grad(loss)).lower(x).compile()`. The result exposes
-optimized HLO (the compiler's program) through `as_text()` and its memory
-plan through `memory_analysis()`. With JAX 0.12.0.1,
+To inspect a checked gradient, pass a GPU input to
+`jax.jit(jax.value_and_grad(loss)).lower(x).compile()`. Read optimized HLO with `as_text()` and the memory plan with `memory_analysis()`. With JAX 0.12.0.1,
 a recorded CUDA topology can compile a callback-free gradient offline. If the
 gradient contains `jax.debug.callback`, lowering requires a live GPU backend.
 Label offline figures as compiler estimates for the recorded target.
@@ -81,7 +79,7 @@ distinct entry it requests once, so many rows that read one shared factor
 compute it once, and an entry it does not request is never computed. The
 derivative of a selected read keeps only the selected rows' residuals.
 
-For ragged event schedules, [JAX plate layouts](jax-plate-layouts.md) describes how to group subjects and time batched gradients on the target device.
+For ragged events, see [grouping subjects and timing batched gradients](jax-plate-layouts.md).
 
 ## Chains under `vmap`
 

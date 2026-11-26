@@ -128,8 +128,10 @@ end
             end
             @test first(cases)[3] == 4.0
             write(joinpath(dir, "cases.py"), "import numpy as np\ncases = " * _rk_py_input(cases))
+            write(joinpath(dir, "chains_records.py"), jax_source(record_groups; have, functions,
+                  data = (; batches, base), plate_layout = :chains))
             driver = joinpath(@__DIR__, "jax_tuple_groups.py")
-            @test success(pipeline(`$RK_JAX_PYTHON $driver $dir`; stdout, stderr))
+            @test success(pipeline(`$RK_JAX_PYTHON $driver $dir --chains`; stdout, stderr))
         end
     else
         @test_skip "RK_JAX_PYTHON not set"
