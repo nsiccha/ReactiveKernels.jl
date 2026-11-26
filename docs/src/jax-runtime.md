@@ -6,22 +6,30 @@ This guide continues [JAX source](jax.md): runtime checks on accelerators, chain
 
 Ordinary runtime checks reduce the active lanes' predicates on the numerical
 device. If a check fails, `jax.debug.callback` reports its error on the host.
-A module that uses `checkify` for numerical failures checks the accumulated
-error on the host at the function boundary. Set `JAX_PLATFORMS=cuda,cpu` for
-CUDA execution so JAX has a CPU device whenever it runs a callback.
+A module using `checkify` checks accumulated numerical errors on the host
+at the function boundary. Set `JAX_PLATFORMS=cuda,cpu` for CUDA execution
+with host callbacks.
 
-An explicit platform list makes CUDA initialization mandatory and CUDA the
-default; it does not silently fall back to CPU if CUDA initialization fails.
-For a GPU-required consumer, select `gpu = jax.devices("gpu")[0]`, place
-numerical inputs with `jax.device_put(value, gpu)`, and verify result and
-gradient arrays with `array.devices() == {gpu}`. Evaluate inside
-`with jax.default_device(gpu):` so newly created constants use that device too.
+This platform list requires successful CUDA initialization and makes CUDA the
+default. Select `gpu = jax.devices("gpu")[0]`, place inputs with
+`jax.device_put(value, gpu)`, and verify result and gradient placement with
+`array.devices() == {gpu}`. Use `with jax.default_device(gpu):` for new constants.
 Numerical function results, including constant terms and numeric leaves of
 tuple/dict results, are JAX arrays with the emitted dtype. `prepare_data`,
 `dimension`, `parameters` and module metadata remain host values.
 Call `jax.block_until_ready(result)` and `jax.effects_barrier()` when checking
 completion and callback errors. Executed callbacks incur transfer and
 synchronization costs. `prepare_data` also runs on the host.
+
+To inspect a checked gradient before execution, pass a GPU-placed input to
+`jax.jit(jax.value_and_grad(loss)).lower(x).compile()`. The result exposes
+optimized HLO (the compiler's program) through `as_text()` and its memory
+plan through `memory_analysis()`. With JAX `0.12.0.1.dev20261116+a67d713e1`,
+a recorded CUDA topology can compile a callback-free gradient offline. If the
+gradient contains `jax.debug.callback`, lowering requires a live GPU backend.
+Label offline figures as compiler estimates for the recorded target.
+See [JAX ahead-of-time compilation](https://docs.jax.dev/en/latest/aot.html)
+and the [ReactiveKernels issue tracker](https://github.com/nsiccha/ReactiveKernels.jl/issues?q=is%3Aissue+in%3Atitle+%22checked+CUDA+gradients%22+%22offline+JAX+topology%22).
 
 See JAX's [callback semantics](https://docs.jax.dev/en/latest/external-callbacks.html)
 and [platform configuration](https://docs.jax.dev/en/latest/config_options.html#platforms).
