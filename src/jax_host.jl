@@ -2109,12 +2109,13 @@ _host_column_dtype(@nospecialize(F)) = _host_dtype(F isa Type && F <: AbstractAr
 # The cell recipes of a plate that `prepare_data` computes: `plan` (HAVE the
 # plate's data inputs it reads, in order; WANT the values the rest of the
 # cell reads), each input passed whole (`Ref`) or iterated, whether it runs
-# per cell (it reads an iterated input) or once, the plate recipe's id, and
-# the ids of the cell recipes split off (`targets`).
+# per cell or once, the output positions that stay shared, the plate recipe's
+# id, and the ids of the cell recipes split off (`targets`).
 struct _JaxCellPrefix
     plan::Plan
     atomic::Vector{Bool}
     percell::Bool
+    shared_outputs::Vector{Int}
     plate::Int
     targets::Vector{Int}
 end
@@ -2196,14 +2197,26 @@ function _jax_cell_split(g::Graph, r::Recipe, dependent::Set{ValueId}, hoisted::
     atomic = Bool[i in atomic_inputs for i in inputs]
     percell = !all(atomic)
     plan = _partial_subplan(body, Value[body.have[i] for i in inputs], frontier, computed)
+    # Some results of a mapped prefix can still be functions of shared
+    # inputs alone. The residual cell must receive those at their own rank.
+    shared_outputs = if percell
+        shared_inputs = Set{ValueId}(canon_id(cg, body.have[i].id) for i in inputs
+                                     if i in atomic_inputs || valtype(r.inputs[i]) <: Number)
+        effects = Set{Int}(x.id for x in computed if x.effectful)
+        _, _, invariant = _partial_split(plan, shared_inputs, effects)
+        findall(v -> canon_id(cg, v.id) in invariant, frontier)
+    else
+        collect(eachindex(frontier))
+    end
     values = Value[Value(v.name, Any) for v in frontier]
     prefix = Recipe(_jax_cell_prefix_id(r.id), Tuple(r.inputs[i] for i in inputs),
                     Tuple(values),
-                    _JaxCellPrefix(plan, atomic, percell, r.id, Int[x.id for x in targets]),
+                    _JaxCellPrefix(plan, atomic, percell, shared_outputs, r.id,
+                                   Int[x.id for x in targets]),
                     0.0, nothing, false)
     cell = _partial_subplan(body, Value[body.have; frontier], body.want, rest)
     kernel = (; plan = cell)
-    added = percell ? () : Tuple(length(r.inputs) .+ eachindex(values))
+    added = Tuple(length(r.inputs) .+ shared_outputs)
     plate = Recipe(r.id, (r.inputs..., values...), r.outputs,
                    _AuthoredPlateOp{typeof(kernel),(atomic_inputs..., added...)}(
                        kernel, op.axis_checks),
@@ -2228,9 +2241,23 @@ function _jax_partial_constants(p::Plan, owned::Set{ValueId}, residual::Vector{R
     constants
 end
 
+# Keep an unvisited cell's prepared signature without evaluating its recipes.
+function _jax_unvisited_shared(ctx, @nospecialize(T))
+    T <: Number && return "np.zeros((), dtype=" * _host_dtype(T) * ")"
+    if T <: AbstractArray
+        shape = "(" * "0, "^ndims(T) * ")"
+        return "np.empty(" * shape * ", dtype=" * _host_dtype(eltype(T)) * ")"
+    end
+    if T <: Union{Tuple,NamedTuple} && isconcretetype(T)
+        parts = [_jax_unvisited_shared(ctx, fieldtype(T, i)) for i in 1:fieldcount(T)]
+        return "(" * join(parts, ", ") * (length(parts) == 1 ? ",)" : ")")
+    end
+    _jax_error("a shared cell value of type ", T, " on an empty plate", _jax_where(ctx))
+end
+
 # A plate cell's data-only recipes in `prepare_data`: a function of them,
-# called on each cell's data (or once, when they read no iterated input),
-# and each of its values for every cell as a list.
+# called on each cell's data (or once, when they read no iterated input).
+# Only results that vary by cell acquire a leading plate axis.
 function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe, op::_JaxCellPrefix, inputs)
     ctx.host === nothing && _jax_error("a plate cell's data-only recipes outside `prepare_data`",
                                        _jax_where(ctx))
@@ -2268,12 +2295,19 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe, op::_JaxCellPref
     sources = [inputs[i].code for i in eachindex(inputs) if mapped[i]]
     iterable = length(sources) == 1 ? only(sources) : "zip(" * join(sources, ", ") * ")"
     each = "[" * call * " for " * join(targets, ", ") * " in " * iterable * "]"
-    n == 1 && return [_host_collected(each, _jax_typeof(only(wants)))]
+    n == 1 && isempty(op.shared_outputs) && return [_host_collected(each, _jax_typeof(only(wants)))]
     rows = _jax_bind!(ctx, :cell_data, _PyVal(each, Any, true))
     row = _jax_fresh(ctx, :row)
-    [_host_collected("[" * row * "[" * string(j - 1) * "] for " * row * " in " * rows.code * "]",
-                     _jax_typeof(wants[j]))
-     for j in 1:n]
+    map(eachindex(wants)) do j
+        T = _jax_typeof(wants[j])
+        field = n == 1 ? "" : "[" * string(j - 1) * "]"
+        if j in op.shared_outputs
+            empty = _jax_unvisited_shared(ctx, T)
+            _PyVal("(" * rows.code * "[0]" * field * " if " * rows.code * " else " * empty * ")", T, true)
+        else
+            _host_collected("[" * row * field * " for " * row * " in " * rows.code * "]", T)
+        end
+    end
 end
 
 # The cell recipes split off by `op` that its host translation's error `e`
