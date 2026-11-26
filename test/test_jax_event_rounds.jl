@@ -51,16 +51,20 @@ import jax
 import model, sums
 def check(rows, expected, slope, starts, expected_sum, slope_sum):
     data = model.prepare_data(rows)
-    indexed, streams, restore = next(value for name,value in data.items() if name.startswith("_rk_event_rounds_"))
-    phases = indexed or streams
-    assert len(indexed) <= 2 and len(streams) <= 8 and not (indexed and streams)
-    assert sum(x.shape[0] for x in phases) == max(map(len, rows), default=0)
-    assert sum(x.size for x in phases) == sum(map(len, rows))
-    if len(rows) == 20:
-        assert indexed and not streams
+    phases, restore = next(value for name,value in data.items() if name.startswith("_rk_event_rounds_"))
+    assert sum(pos.shape[0] for pos, _ in phases) == max(map(len, rows), default=0)
+    assert sum(pos.size for pos, _ in phases) == sum(map(len, rows))
     if phases:
-        order = np.concatenate([x.ravel() for x in phases])
+        longest = max(map(len, rows))
+        assert len(phases) == 1 + bool(sum(map(len, rows)) % longest)
+        order = np.concatenate([pos.ravel() for pos, _ in phases])
         np.testing.assert_array_equal(order[restore], np.arange(len(order)))
+        # Each subject advances in order even when it moves between lanes.
+        for steps in np.split(restore, np.cumsum(list(map(len, rows)))[:-1]):
+            assert np.all(np.diff(steps) > 0)
+        if len(rows) == 20:
+            transfers = np.concatenate([actions.ravel() for _, actions in phases])
+            assert np.count_nonzero(transfers < 0) == np.count_nonzero(transfers > 0) > 0
     def score(q, prepared):
         return model.kernel(q, **prepared)
     trace = jax.make_jaxpr(score)(0.45, data)

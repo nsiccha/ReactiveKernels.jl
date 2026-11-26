@@ -63,9 +63,9 @@ caller's group limit.
 
 
 `plate_layout = :rounds` packs independent subjects’ recurrent events into
-streams that advance in a few fixed-width segments. If the stream lengths
-would require more than eight segments, a two-segment schedule selects
-subjects by index. Each subject advances in its original order.
+at most two fixed-width scans. The first can run one more subject per round than the
+second. A subject that crosses between lanes carries its state across the
+boundary and advances in its original order.
 Every true event is visited once and the longest subject sets the number of
 rounds. Empty subjects keep their original initial-state semantics. A scan
 with observable checks keeps its serial execution order. Compare the
