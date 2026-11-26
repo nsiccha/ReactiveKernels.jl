@@ -1,5 +1,29 @@
 _jax_chain_tuple(xs) = "(" * join(xs, ", ") * (isempty(xs) ? ")" : ",)")
 _jax_chain_bool(x) = x ? "True" : "False"
+
+# The physical array can continue into another subject. Validate the Julia
+# index against the logical length even where the physical gather would fit.
+function _jax_chain_entry(ctx, table, index)
+    _jax_helper!(ctx, "_RKChainRows", _JAX_CHAIN_ROWS)
+    elem = eltype(table.T)
+    code = "_rk_row_entry(" * join((table.code, index.code, table.extent), ", ") * ")"
+    entry = _PyVal(code, elem)
+    if _jax_number_fields(elem)
+        at_entry = isempty(ctx.scope.lines) && !any(g -> first(g) === ctx.scope, _JAX_GUARDS)
+        entry = _jax_bind!(ctx, :record_entry, entry)
+        at_entry && (ctx.scope.first_record = (; name = entry.code, expression = code))
+    end
+    at = _py_atom(index.code)
+    valid = "((" * at * " >= 1) & (" * at * " <= " * _py_atom(table.extent) * "))"
+    _jax_masked_check(ctx, _PyVal(valid, Bool), repr("BoundsError: index outside subject row"))
+    rows = ctx.scope.scan_rows
+    if rows !== nothing && rows.direct_bounds !== nothing && table.code in rows.tables &&
+       haskey(rows.sequences, index.code) && (ctx.scope.parent === nothing || ctx.scope.parent.scan_rows !== rows) &&
+       !any(g -> _jax_scope_within(first(g), ctx.scope), _JAX_GUARDS)
+        push!(rows.direct_bounds, (last(ctx.scope.lines), table.code, index.code))
+    end
+    entry
+end
 _jax_prepared_aux_type(kind) = kind in (:row_layout, :map_rows) ? Tuple : kind === :scan_rows ? Vector{Int} : Int
 function _jax_chain_dtypes(T)
     T <: Number && return _jax_dtype(T)
@@ -203,7 +227,8 @@ end
 # Associate the authored step's scalar index and predicate with whole event
 # columns. The common scan lowering decides which guarded reads can move.
 function _jax_chain_step_tables!(scope, plan, inputs)
-    rows = _JaxScanRowInputs(Set{String}(), Dict{String,_PyVal}(), _JaxScanRowRead[])
+    rows = _JaxScanRowInputs(Set{String}(), Dict{String,_PyVal}(), _JaxScanRowRead[],
+                             Tuple{String,String,String}[])
     scope.scan_rows = rows
     param(i) = scope.values[canon_id(plan.graph, plan.have[i].id)]
     for (i, column) in enumerate(inputs.columns)
@@ -225,6 +250,21 @@ function _jax_chain_step_reads!(ctx, scope, names, inputs, tables)
         limit = isempty(source.extent) ? "None" : source.extent
         "_rk_event_table_rows(" * join((gather, source.code, index, guard, limit,
                                        inputs.tags, _jax_chain_bool(mapped)), ", ") * ")"
+    end
+    if !inputs.checked[]
+        # A direct index supplied by the schedule can be checked once before
+        # the pure scan. Keep other checks at their original execution site.
+        direct = scope.scan_rows.direct_bounds
+        lines = Set(first.(direct))
+        filter!(line -> !(line in lines), scope.lines)
+        for (_, table, index) in unique(direct)
+            source, mapped = tables[table]
+            limit = isempty(source.extent) ? "None" : source.extent
+            ix = scope.scan_rows.sequences[index].code
+            args = (source.code, ix, limit, inputs.tags, _jax_chain_bool(mapped))
+            valid = "jnp.all(_rk_event_indices(" * join(args, ", ") * ")[1])"
+            _jax_masked_check(ctx, _PyVal(valid, Bool), repr("BoundsError: index outside subject row"))
+        end
     end
     _jax_scan_row_inputs!(ctx, scope, scope.scan_rows, names, inputs.values, nothing, "",
                           !inputs.checked[]; gather_rows)

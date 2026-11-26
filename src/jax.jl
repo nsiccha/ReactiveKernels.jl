@@ -406,7 +406,9 @@ struct _JaxScanRowInputs
     tables::Set{String}
     sequences::Dict{String,_PyVal}
     reads::Vector{_JaxScanRowRead}
+    direct_bounds::Union{Nothing,Vector{Tuple{String,String,String}}}
 end
+_JaxScanRowInputs(tables, sequences, reads) = _JaxScanRowInputs(tables, sequences, reads, nothing)
 
 # One Python function body under construction. `links` maps an input of a
 # nested plan (a branch arm's, a plate cell's unmapped argument) to the
@@ -1360,6 +1362,14 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
         v = _host_index(ctx, x, indices)
         v === nothing || return v
     end
+    if ctx.mod.layout === :chains && ctx.host === nothing && !target && !isempty(x.extent) &&
+       x.T isa Type && x.T <: AbstractVector && !_jax_field_lengths(x) &&
+       (eltype(x.T) <: Number || _jax_number_fields(eltype(x.T))) &&
+       length(indices) == 1 && !_jax_written_slice(only(indices))
+        i = _jax_bound_expr(ctx, x, 1, only(indices))
+        i.T isa Type && i.T <: Integer && i.T !== Bool && return _jax_chain_entry(ctx, x, i)
+        indices = [i]
+    end
     if _jax_is_tuple(x.T)
         length(indices) == 1 || _jax_error("a tuple needs one integer index", _jax_where(ctx))
         i = only(indices) === :end ? _jax_literal(fieldcount(x.T)) : _jax_expr(ctx, only(indices))
@@ -1446,9 +1456,14 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
     if ctx.host === nothing && ctx.mod.layout === :chains && !target && length(values) == 1 &&
        x.T <: AbstractVector{<:Number}
         i = only(values)
-        if i !== nothing && i.T <: AbstractVector{<:Integer} && !_jax_logical(i.T) && !isempty(i.extent)
+        if i !== nothing && i.T <: AbstractVector{<:Integer} && !_jax_logical(i.T) &&
+           (!isempty(i.extent) || !isempty(x.extent))
             _jax_helper!(ctx, "_RKChainRows", _JAX_CHAIN_ROWS)
-            return _PyVal("_rk_row_gather(" * x.code * ", " * i.code * ")", T, false, i.extent)
+            row_length = isempty(x.extent) ? _py_atom(x.code) * ".shape[0]" : x.extent
+            nindices = isempty(i.extent) ? _py_atom(i.code) * ".shape[0]" : i.extent
+            valid = "_rk_valid_indices(" * join((i.code, nindices, row_length), ", ") * ")"
+            _jax_masked_check(ctx, _PyVal(valid, Bool), repr("BoundsError: index outside subject row"))
+            return _PyVal("_rk_row_gather(" * join((x.code, i.code, row_length), ", ") * ")", T, false, i.extent)
         end
     end
     if _jax_ragged(x.T) && !_jax_outer_rows(x)
@@ -8449,7 +8464,7 @@ function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
         ctx.recipe = recipe
     end
     if event_inputs !== nothing
-        event_inputs.checked[] = !event_inputs.pure || _JAX_EFFECTS[] != effects
+        event_inputs.checked[] = !event_inputs.pure || _JAX_EFFECTS[] != effects + length(inner.scan_rows.direct_bounds)
         _jax_chain_step_reads!(ctx, inner, names, event_inputs, tables)
     end
     returned = String[]
