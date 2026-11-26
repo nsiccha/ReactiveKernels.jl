@@ -5,6 +5,8 @@ import Enzyme, DifferentiationInterface as DI
 module DrawFixtures
 using ReactiveKernelsPPL
 using Random
+shift_location(a) = a + 1
+
 struct Shift{T}
     lower::T
 end
@@ -34,6 +36,35 @@ ReactiveKernelsPPL.sampling_fragment(::typeof(foreign)) = fragment
     inner ~ foreign(mu)
     return inner
 end
+end
+
+@testset "bound plan copies resolve draw code in the model module and own their data" begin
+    data = (; y=[2., 3.])
+    source = quote
+        a ~ Normal(0, 1)
+        mu = shift_location(a)
+        y .~ Normal.(mu, 1)
+        @generate total = shift_location(a) + sum(y)
+    end
+    plan = bind_data(lower_rkppl(source, data; mod=DrawFixtures, conditioned=(:y,)), data)
+    # Each chain also holds a reference to the same observations as its plan.
+    original = (; plan, y=plan.columns[:y])
+    left, right = deepcopy(original), deepcopy(original)
+    @test left.plan.draw_source.generated !== plan.draw_source.generated
+    left.y[1] = 5.
+    right.y[2] = 7.
+
+    a = 0.5
+    for (chain, expected_y) in ((original, [2., 3.]), (left, [5., 3.]), (right, [2., 7.]))
+        @test chain.y === chain.plan.columns[:y]
+        @test chain.y == expected_y
+        @test chain.plan.draw_source.mod === DrawFixtures
+        generated = prepare_generated(chain.plan)((; a), Xoshiro(7))
+        @test generated.total == (a + 1) + sum(expected_y)
+        density = prepare_query(build_kernel(chain.plan), chain.plan, :sampler)
+        @test Base.invokelatest(density, [a]) ≈
+            logpdf(Normal(), a) + sum(logpdf.(Normal(a + 1, 1), expected_y))
+    end
 end
 
 @testset "joint prior uses a single realization of each ancestral site" begin

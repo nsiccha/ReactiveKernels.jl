@@ -207,7 +207,7 @@ end
 
 # A captured program's module is the namespace its source resolves in, which a
 # copy shares; `deepcopy` itself refuses a module.
-for T in (RKPPLModel, RKPPLSubmodel)
+for T in (RKPPLModel, RKPPLSubmodel, _DrawSource)
     @eval Base.deepcopy_internal(x::$T, stackdict::IdDict) =
         ReactiveKernels._deepcopy_code_fields(x, stackdict)
 end
