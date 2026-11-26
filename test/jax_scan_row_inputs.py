@@ -48,6 +48,9 @@ weak = jnp.broadcast_to(jnp.asarray(1.0), (2,))
 strong = jnp.ones(2, dtype=weak.dtype)
 assert weak.weak_type and not strong.weak_type
 assert isinstance(model._rk_pack_record((weak, strong)), tuple)
+selected, valid = model._rk_scan_rows(weak, jnp.array([1, 0]), jnp.array([True, False]), 2)
+assert valid and selected.weak_type
+np.testing.assert_array_equal(selected, [1.0, 0.0])
 
 
 def residual_count(width):

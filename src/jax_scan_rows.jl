@@ -37,8 +37,8 @@ end
 
 const _JAX_SCAN_ROWS = raw"""
 def _rk_scan_rows(table, index, requested, length):
-    # Indices are one-based. A masked gather fills inactive positions and
-    # its transpose drops their cotangents. No table row serves as padding.
+    # Indices are one-based. Route inactive reads to a constant row so
+    # their cotangents never reach the table.
     leaf = jax.tree_util.tree_leaves(table)[0]
     size = leaf.shape[0]
     valid = (index >= 1) & (index <= length) & (index <= size)
@@ -47,7 +47,8 @@ def _rk_scan_rows(table, index, requested, length):
     def gather(column):
         if column.shape[0] == 0:
             return jnp.zeros(index.shape + column.shape[1:], dtype=column.dtype)
-        return jnp.take(column, at, axis=0, mode="fill", fill_value=0)
+        sentinel = jnp.zeros_like(column, shape=(1,) + column.shape[1:])
+        return jnp.take(jnp.concatenate((column, sentinel), axis=0), at, axis=0, mode="clip")
     return jax.tree_util.tree_map(gather, table), acceptable
 """
 
