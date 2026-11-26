@@ -9,6 +9,7 @@ import numpy as np
 module = runpy.run_path(sys.argv[1])
 tail = module["_rk_vcat_tail"]
 row_gather = module["_rk_row_gather"]
+row_sum = module["_rk_chain_sum"]
 Rows = module["_RKChainRows"]
 Row = module["_RKChainRow"]
 
@@ -41,6 +42,17 @@ for width in (4, 23):
     ops = list(equations(jax.make_jaxpr(grad)(data, 0)))
     assert all(op.params["length"] != width for op in ops if op.primitive.name == "scan")
     traces.append(sum(op.primitive.name == "gather" for op in ops))
+
+    def total(x, subject, count):
+        return row_sum(row_gather(x, indices[subject], x.shape[0]), count)
+
+    summed = jax.jit(jax.value_and_grad(total))
+    value, grad = summed(data, 0, 1)
+    np.testing.assert_array_equal([value, *grad], [-3, 0, 1])
+    value, grad = summed(data, 1, 0)
+    np.testing.assert_array_equal([value, *grad], [0, 0, 0])
+    ops = list(equations(jax.make_jaxpr(summed)(data, 0, 1)))
+    assert all(op.primitive.name not in ("scan", "while") for op in ops)
 
 # Growing the row must not replicate its indexed reads in the trace.
 assert traces[0] == traces[1]

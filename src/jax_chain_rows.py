@@ -437,6 +437,9 @@ def _rk_scan_events(step, seed, columns, row_tags, shared, mapped, seed_mapped, 
 
 def _rk_chain_sum(row, count):
     if isinstance(row, _RKChainRow):
+        if row.gather is not None:
+            positions = jnp.arange(row.shape[0])
+            return jnp.sum(row.gather(jnp.where(positions < count, positions, row.shape[0])), axis=0)
         init = jnp.sum(jnp.empty(0, dtype=row.dtype))
         return _rk_chain_fori(0, count, lambda i, total: total + row[i], init, row.shape[0])
     return jnp.sum(jnp.where(jnp.arange(row.shape[0]) < count, row, 0))
