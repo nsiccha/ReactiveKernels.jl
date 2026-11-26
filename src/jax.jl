@@ -6305,23 +6305,64 @@ _jax_function_of(v::_PyVal) = v.T isa _JaxCallable ? v.T.f :
     v.T isa Type && v.T <: Function && Base.issingletontype(v.T) ?
     v.T.instance : _jax_error("`", v.code, "` is not a function")
 
-# A dotted call `f.(args...)`: Julia broadcasting, which aligns leading
-# dimensions, as NumPy broadcasting, which aligns trailing ones, by giving every
-# lower-rank array operand trailing singleton axes up to the result's rank.
+# A row can have storage but no elements. A reduction's mask is too late
+# to protect the derivative of an element function at an invalid fill value.
+# Trace the result shape without executing the function on that row.
+const _JAX_IF_NONEMPTY = """
+def _rk_if_nonempty(active, compute):
+    def empty():
+        return jax.tree_util.tree_map(lambda s: jnp.zeros(s.shape, s.dtype),
+                                      jax.eval_shape(compute))
+    return jax.lax.cond(active, compute, empty)
+"""
+
+function _jax_nonempty_condition(args)
+    lengths = unique(a.extent for a in args if !_jax_ragged(a.T) && _jax_padded_axes(a) != 0)
+    join(("(" * n * " > 0)" for n in lengths), " & ")
+end
+
+function _jax_if_nonempty(ctx, condition, compute)
+    helper = _jax_helper!(ctx, "_rk_if_nonempty", _JAX_IF_NONEMPTY)
+    helper * "(" * condition * ", " * compute * ")"
+end
+
+# A dotted call `f.(args...)`: Julia broadcasting aligns leading dimensions.
+# Add trailing singleton axes in the body, where NumPy broadcasts the operands.
 function _jax_broadcast(ctx::_JaxContext, f, args::Vector{_PyVal})
+    meta = _jax_common_extent(ctx, args)
+    condition = ctx.host === nothing ? _jax_nonempty_condition(meta) : ""
+    isempty(condition) && return _jax_broadcast_body(ctx, f, args, meta)
+    # A gathered row is already an operand. Capture it in the branch, so
+    # batching the condition does not broadcast the table it came from.
+    meta = [_jax_is_array(a.T) ? _jax_bind!(ctx, :row_operand, a) : a for a in meta]
+    condition = _jax_bind!(ctx, :has_entries, _PyVal(condition, Bool)).code
+    ctx.traced_branches += 1
+    arm = try
+        _jax_with_guard(ctx.scope, condition) do
+            _jax_arm_function(ctx, :row_broadcast, () -> _jax_broadcast_body(ctx, f, args, meta))
+        end
+    finally
+        ctx.traced_branches -= 1
+    end
+    code = _jax_if_nonempty(ctx, condition, _jax_emit_arm!(ctx, arm).callable)
+    v = arm.value
+    _jax_bind!(ctx, :row_values, _PyVal(code, v.T, false, v.extent, v.limit, v.padded,
+                                        v.origin, v.field_extents))
+end
+
+function _jax_broadcast_body(ctx::_JaxContext, f, args::Vector{_PyVal}, meta)
     R = maximum((_jax_rank(a.T) for a in args); init = 0)
     referenced = [a.T isa _JaxAggregate && a.T.T <: Ref for a in args]
     values = [ref ? only(a.T.fields) : a for (a, ref) in zip(args, referenced)]
     # A numeric type broadcast over a value converts it, `Float64.(x)`.
     if f isa Type && f <: Number && length(args) == 1 && !any(referenced)
-        x = only(args)
+        x = only(meta)
         return _PyVal("jnp.asarray(" * x.code * ", dtype=" * _jax_dtype(f) * ")",
                       R == 0 ? f : Array{f,R}, false, x.extent, "", _jax_padded_like(x))
     end
     # The result's extent and padded axes: rows padded by different lengths
     # along the same axes take Julia's broadcast length (`_jax_common_extent`),
     # and are read at one stored width.
-    meta = _jax_common_extent(ctx, args)
     values = [ref || m.code == a.code ? a :
               _PyVal(m.code, a.T, a.static, a.extent, a.limit, a.padded, a.origin, a.field_extents)
               for (a, m, ref) in zip(values, meta, referenced)]
@@ -6389,6 +6430,12 @@ function _jax_broadcast(ctx::_JaxContext, f, args::Vector{_PyVal})
     end
     # Any other scalar function: a module-level function translated once over
     # scalar arguments, vectorized over the operands.
+    # A scalar helper with checks needs the enclosing row's activity. The
+    # local element function can close over it and pass it to the helper.
+    if R > 0 && ctx.host === nothing && !isempty(_JAX_GUARDS)
+        code, E = _jax_captured_broadcast(ctx, f, scalars, padded, referenced)
+        return _PyVal(code, Array{E,R}, false, _jax_extent(meta), "", _jax_broadcast_padded(meta, R))
+    end
     name = _jax_scalar_function!(ctx, f, eltypes)
     # NumPy's `vectorize` needs the result type for empty arrays.
     ctx.host === nothing || return _PyVal("np.vectorize(" * name * ", otypes=[" *
@@ -6430,10 +6477,10 @@ end
 # A dotted literal power in lowered code, `broadcasted(literal_pow, ^, x,
 # Val(n))` (`x .^ 2` in a plain helper): the elementwise power, as
 # `literal_pow` of a scalar is.
-function _jax_broadcast(ctx::_JaxContext, f::typeof(Base.literal_pow), args::Vector{_PyVal})
+function _jax_broadcast_body(ctx::_JaxContext, f::typeof(Base.literal_pow), args::Vector{_PyVal}, meta)
     length(args) == 3 && args[3].T isa Type && args[3].T <: Val ||
         _jax_error("broadcasting `", f, "`", _jax_where(ctx))
-    x, n = args[2], args[3].T.parameters[1]
+    x, n = meta[2], args[3].T.parameters[1]
     R = _jax_rank(x.T)
     E = _jax_return_type(^, Any[_jax_eltype(x.T), typeof(n)])
     _PyVal(_py_infix("**", [x.code, string(n)]), R == 0 ? E : Array{E,R}, false,
@@ -8448,7 +8495,8 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
                                                                 origins = cell_origins,
                                                                 fields = cell_fields,
                                                                 active_cells = masked)
-    if masked && any(v -> v.origin isa _JaxDenseRows, inputs[padded])
+    guard_each_cell = masked && any(v -> v.origin isa _JaxDenseRows, inputs[padded])
+    if guard_each_cell
         cell = _jax_slots_active_cell(ctx, cell, cell_params)
     end
     # A check cannot be run on padding unless its valid cells are known.
@@ -8508,6 +8556,10 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
         call = "jax.vmap(" * call * ", in_axes=" * axes_text * ")"
     end
     call *= "(" * join(args, ", ") * ")"
+    if masked && !guard_each_cell
+        condition = _jax_nonempty_condition(axis_inputs[padded])
+        isempty(condition) || (call = _jax_if_nonempty(ctx, condition, "lambda: " * call))
+    end
     # vmap traces its cell even with no mapped entries. An indexed read in
     # that body can then fail on an empty shared array although Julia runs
     # no cells. Shape tests are known to the backend while tracing; branch
