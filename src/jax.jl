@@ -1666,11 +1666,13 @@ function _jax_index_part(ctx::_JaxContext, x::_PyVal, dim::Int, index; target::B
     # with a mask of them, and refuses a single one, as Julia does.
     i.T === Bool && _jax_bool_index_error(ctx, index)
     _jax_logical(i.T) && return _jax_mask_part(ctx, x, i; target)
-    _jax_is_scalar(i.T) && i.T <: Integer && return (_jax_minus_one(i), 0, i)
+    if _jax_is_scalar(i.T) && i.T <: Integer
+        return (ctx.host === nothing ? _jax_minus_one(i) : _host_position(ctx, i), 0, i)
+    end
     if _jax_is_array(i.T) && eltype(i.T) <: Integer
         ndims(i.T) == 1 || _jax_error("a gather by a rank-", ndims(i.T), " index array",
                                       _jax_where(ctx))
-        return (_py_infix("-", [i.code, "1"]), 1, i)
+        return (ctx.host === nothing ? _py_infix("-", [i.code, "1"]) : _host_position(ctx, i), 1, i)
     end
     if i.T isa Type && i.T <: AbstractUnitRange
         m = match(r"^jnp\.arange\((.*), (.*)\)$", i.code)
@@ -10022,8 +10024,6 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
                  for (fname, (p, w)) in plans]
         ports = union(ports, (v.name for v in values))
     end
-    split = _jax_prepare_split(plans, ports, excluded; keep, cells, host_constants,
-                               layout = mod.layout, cell_reasons = mod.cell_reasons)
     p1 = first(plans).second[1]
     # Raw data enters host code, so its types need not be concrete (a column
     # with missing values); the functions' inputs must be.
@@ -10033,6 +10033,8 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
             types isa NamedTuple && haskey(types, v.name) ? types[v.name] :
             types isa Tuple && k <= length(types) ? types[k] : valtype(v)
     end
+    split = _jax_prepare_split(plans, ports, excluded; have_types, keep, cells, host_constants,
+                               layout = mod.layout, cell_reasons = mod.cell_reasons)
     for v in split.remaining
         _concrete_value_type(have_types[v.name]) || throw(ArgumentError(
             "jax_source: the HAVE value `$(v.name)` has type `$(have_types[v.name])`; pass a " *
