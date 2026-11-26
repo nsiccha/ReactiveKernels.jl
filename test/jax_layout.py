@@ -1,5 +1,7 @@
 """Every layout of a plate over prepared ragged rows gives the plate's values."""
 import math
+from pathlib import Path
+import runpy
 import sys
 
 import jax
@@ -208,3 +210,11 @@ except ValueError:
     pass
 else:
     raise AssertionError("an error other than memory exhaustion must be raised")
+
+
+example = Path(__file__).resolve().parents[1] / "examples" / "jax_plate_layout.py"
+tune_gradient = runpy.run_path(str(example))["tune_gradient"]
+raw = {"xs": [np.array([1.0, 2.0]), np.array([3.0])]}
+chosen, report = tune_gradient(rows, raw, positions, (2, 4))
+assert report[0]["chains"] in (2, 4)
+np.testing.assert_allclose(rows.kernel(0.6, **chosen), rows.kernel(0.6, **rows.prepare_data(**raw)))
