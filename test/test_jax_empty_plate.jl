@@ -14,11 +14,12 @@ end
                 (Float64[], [Int[], Int[]]),
                 (Float64[], Vector{Int}[]))
     srcs = [jax_source(ragged_gather; want = :total, data = (; rows)) for (_, rows) in datasets]
+    chain = jax_source(ragged_gather; want = :total, data = (:rows,), layout = :chains)
     @test all(s -> s.text == first(srcs).text, srcs)
     native = prepare(ragged_gather; want = :total)
     if rk_jax_available()
-        for (x, rows) in datasets
-            result = rk_jax_evaluate(first(srcs), :kernel, (x, rows);
+        for src in (first(srcs), chain), (x, rows) in datasets
+            result = rk_jax_evaluate(src, :kernel, (x, rows);
                                      grad = true, prepare = :arguments)
             @test result.value ≈ native(x, rows)
             @test result.grad ≈ Float64[sum(count(==(i), row) for row in rows; init = 0)

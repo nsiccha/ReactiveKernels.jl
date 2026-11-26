@@ -16,6 +16,12 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.263
+
+- Model export accepts `jax_source(built, plan; layout = :chains)` for
+  samplers that batch independent chains. Python callers use the existing
+  `prepare_data` and `log_density` entry points.
+
 ## 0.1.262
 
 `KernelBuildCache` reuses graph assembly for finite-interval parameters and

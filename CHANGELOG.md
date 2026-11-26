@@ -16,6 +16,13 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.389
+
+- `jax_source(...; layout = :chains)` prepares variable-length vector rows in
+  contiguous storage with row offsets. Eligible subject scans run over the
+  actual events in row order. A caller can batch independent evaluations of
+  the generated function with `jax.vmap`.
+
 ## 0.1.388
 
 - Regenerated JAX modules skip a guarded matrix exponential and its reverse
