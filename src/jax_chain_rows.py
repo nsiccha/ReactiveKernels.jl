@@ -88,17 +88,23 @@ def _rk_row_values(row):
     return row
 
 
-def _rk_event_table_rows(gather, table, index, requested, length, tags, mapped):
-    """Translate local indices to packed offsets before the common masked gather."""
+def _rk_row_entry(table, index, length):
+    def read(column):
+        if not column.shape[0]:
+            return jnp.zeros((), dtype=column.dtype)
+        return jnp.where((index >= 1) & (index <= length), column[index - 1], 0)
+    return jax.tree.map(read, table)
+
+
+def _rk_event_indices(table, index, length, tags, mapped):
+    """Locate an event's entry within its own subject's table."""
     packed = lambda a: isinstance(a, _RKChainRows)
     first = jax.tree.leaves(table, is_leaf=packed)[0]
     if tags is None:
-        def empty(column):
-            values = column.values if packed(column) else column
-            return jnp.zeros(index.shape, dtype=values.dtype)
-        return jax.tree.map(empty, table, is_leaf=packed), jnp.asarray(True)
+        return jnp.zeros_like(index), jnp.ones_like(index, dtype=bool)
     if not mapped:
-        return gather(table, index, requested, first.shape[0] if length is None else length)
+        size = first.shape[0] if length is None else length
+        return index, (index >= 1) & (index <= size)
     row = jnp.zeros_like(index) if first.shape[0] == 1 else jnp.abs(tags) - 1
     if packed(first):
         start = first.offsets[row]
@@ -108,9 +114,19 @@ def _rk_event_table_rows(gather, table, index, requested, length, tags, mapped):
         start = row * size
     if length is not None:
         size = jnp.minimum(size, length[row])
-    flat = jax.tree.map(_rk_flat_values, table, is_leaf=packed)
-    at = jnp.where((index >= 1) & (index <= size), start + index, 0)
-    return gather(flat, at, requested, _rk_flat_count(first))
+    return start + index, (index >= 1) & (index <= size)
+
+
+def _rk_event_table_rows(gather, table, index, requested, length, tags, mapped):
+    """Translate local indices to packed offsets before the common masked gather."""
+    if tags is None:
+        def empty(column):
+            values = column.values if isinstance(column, _RKChainRows) else column
+            return jnp.zeros(index.shape, dtype=values.dtype)
+        return jax.tree.map(empty, table, is_leaf=lambda x: isinstance(x, _RKChainRows)), jnp.asarray(True)
+    at, valid = _rk_event_indices(table, index, length, tags, mapped)
+    flat = jax.tree.map(_rk_flat_values, table, is_leaf=lambda x: isinstance(x, _RKChainRows)) if mapped else table
+    return gather(flat, jnp.where(valid, at, 0), requested, jax.tree.leaves(flat)[0].shape[0])
 
 
 def _rk_join_rows(rows, lengths, total):
@@ -152,11 +168,18 @@ def _rk_select_subject(column, i):
     return jax.tree.map(lambda a: a[0 if a.shape[0] == 1 else i], column, is_leaf=lambda a: isinstance(a, _RKChainRows))
 
 
-def _rk_row_gather(source, indices):
+def _rk_valid_indices(indices, count, length):
+    ids = _rk_row_values(indices)
+    return jnp.all((jnp.arange(ids.shape[0]) >= count) | ((ids >= 1) & (ids <= length)))
+
+
+def _rk_row_gather(source, indices, length):
     if isinstance(indices, _RKChainRow):
         return _RKChainRow(indices.length, indices.shape[0], source.dtype,
-                           lambda i: source[indices[i] - 1])
-    return source[indices - 1]
+                           lambda i: _rk_row_entry(source, indices[i], length))
+    if not source.shape[0]:
+        return jnp.zeros(indices.shape, dtype=source.dtype)
+    return _rk_row_entry(source, indices, length)
 
 
 def _rk_prepend(initial, history):

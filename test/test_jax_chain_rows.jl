@@ -120,6 +120,29 @@ end
     return total
 end
 
+@kernel function jax_indexed_scale(a::Float64, subjects::Vector{Int}, counts::Vector{Vector{Int}})
+    scaled = plate(subjects, Ref(counts), Ref(a)) do i, rows, scale
+        scale ./ sqrt.(rows[i])
+    end
+    joined = reduce(vcat, scaled)
+    total = sum(joined)
+    return total
+end
+
+@testset "An empty selected row contributes no value or derivative" begin
+    have = (:a, :subjects, :counts)
+    src = jax_source(jax_indexed_scale; have, want = :total, data = (:subjects, :counts), plate_layout = :chains)
+    ref = prepare(jax_indexed_scale; have, want = :total)
+    if rk_jax_available()
+        for rows in ([[1,4], Int[], [9]], [Int[], Int[]], Vector{Int}[])
+            subjects = collect(eachindex(rows))
+            r = rk_jax_evaluate(src, "kernel", (2.0, subjects, rows); prepare = :arguments, grad = true)
+            @test r.value ≈ ref(2.0, subjects, rows)
+            @test r.grad ≈ ref(1.0, subjects, rows)
+        end
+    end
+end
+
 @kernel function jax_subject_reads(a::Float64, events::Vector{Vector{Int}},
                                    visits::Vector{Vector{Int}})
     subjects = plate(events, visits, Ref(a)) do row, reads, scale
@@ -182,6 +205,11 @@ end
             r = rk_jax_evaluate(src, "kernel", (0.3, events, visits); prepare = :arguments, grad = true)
             @test r.value ≈ native(0.3, events, visits)
             @test r.grad ≈ native(1.0, events, visits)
+        end
+        for (events, visits) in (([[1], [2,3]], [[2], Int[]]), ([Int[], [2]], [[1], Int[]]),
+                                 ([[1], [2]], [Int[], [0]]))
+            @test_throws BoundsError native(0.3, events, visits)
+            @test_throws "BoundsError" rk_jax_evaluate(src, "kernel", (0.3, events, visits); prepare = :arguments)
         end
     end
 end

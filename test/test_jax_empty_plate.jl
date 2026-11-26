@@ -30,6 +30,11 @@ end
         @test_throws BoundsError native(Float64[], [[1]])
         @test_throws ErrorException rk_jax_evaluate(first(srcs), :kernel,
             (Float64[], [[1]]); prepare = :arguments)
+        for (values, indices) in ((Float64[], [[1]]), ([1.0, 2.0], [[2], [3,1]]),
+                                  ([1.0], [Int[], [0]]))
+            @test_throws BoundsError native(values, indices)
+            @test_throws "BoundsError" rk_jax_evaluate(chain, :kernel, (values, indices); prepare = :arguments)
+        end
     else
         @test_skip "RK_JAX_PYTHON not set"
     end
