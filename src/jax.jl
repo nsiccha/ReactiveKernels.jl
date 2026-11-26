@@ -8607,6 +8607,8 @@ def _rk_serial_map(f, in_axes=None, row_dtypes=None, broadcast=False, counts=Non
             raise ValueError("plate arguments have different mapped sizes")
         else:
             size = sizes[0]
+        if logical:
+            return _rk_if_nonempty(length > 0, lambda: jax.lax.map(cell, jnp.arange(size)))
         return jax.lax.map(cell, jnp.arange(size))
     return run
 """
@@ -8758,6 +8760,9 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
             push!(chain_counts, count)
             ragged[i] && push!(chain_counts, mapped[i] ? count : "None")
         end
+        # A packed row visits its logical entries in _rk_local_scan. A dense
+        # operand with counts uses the same empty-domain guard inside the mapper.
+        _jax_helper!(ctx, "_rk_if_nonempty", _JAX_IF_NONEMPTY)
         logical = unique(filter(!=("None"), chain_counts))
         # Runtime row lengths determine singleton broadcasting and the number
         # of visits. The cell's final argument is its activity at that index.
@@ -8841,7 +8846,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
             empty!(row_layouts)
         end
     end
-    if masked && !guard_each_cell
+    if masked && !guard_each_cell && isempty(chain_counts)
         condition = _jax_nonempty_condition(axis_inputs[padded])
         isempty(condition) || (call = _jax_if_nonempty(ctx, condition, "lambda: " * call))
     end
