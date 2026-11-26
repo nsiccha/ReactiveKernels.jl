@@ -19,9 +19,11 @@ class _RKChainRows:
         return (self.offsets.shape[0] - 1,)
 
     def __getitem__(self, i):
-        start = self.offsets[i]
-        return _RKChainRow(self.offsets[i + 1] - start, self.max_length, self.values.dtype,
-                           lambda j: self.values[start + j])
+        offsets = jnp.asarray(self.offsets)
+        values = jnp.asarray(self.values)
+        start = offsets[i]
+        return _RKChainRow(offsets[i + 1] - start, self.max_length, values.dtype,
+                           lambda j: values[start + j])
 
 
 class _RKChainRow:
@@ -55,13 +57,6 @@ def _rk_pack_rows(rows, dtype=None, rank=1):
     offsets[0] = 0
     np.cumsum(counts, out=offsets[1:])
     return _RKChainRows(np.concatenate(rows), offsets, int(counts.max())), counts
-
-
-def _rk_plate_rows(*sources):
-    sizes = [len(source) for source in sources]
-    n, = np.broadcast_shapes(*[(size,) for size in sizes])
-    return (tuple(source[0 if size == 1 else i] for source, size in zip(sources, sizes))
-            for i in range(n))
 
 
 def _rk_device_rows(rows, dtype=None):

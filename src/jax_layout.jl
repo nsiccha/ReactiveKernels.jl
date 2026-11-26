@@ -78,6 +78,7 @@ def _rk_length_groups(lengths, groups, sequential):
     # `None`: a row whose lengths are not prepared data; it keeps its width.
     slots = [n is not None for n in lengths]
     lengths = [np.asarray(n, dtype=np.int64) for n in lengths if n is not None]
+    lengths = np.broadcast_arrays(*lengths) if lengths else []
     count = lengths[0].shape[0] if lengths else 0
     if count == 0 or (int(groups) <= 1 and not sequential):
         return None

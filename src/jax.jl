@@ -263,6 +263,12 @@ def _rk_broadcast_length(*lengths):
         n = jnp.where(n == 1, m, n)
     return n
 """
+const _JAX_BROADCAST_CELL_AXIS = """
+def _rk_broadcast_cell_axis(value, shape):
+    def widen(x):
+        return x if x.shape[:1] == shape else jnp.broadcast_to(x, shape + x.shape[1:])
+    return jax.tree.map(widen, value)
+"""
 const _JAX_SAME_WIDTH = """
 def _rk_same_width(rows, lengths):
     # Padded rows whose stored widths differ: each is widened to the widest,
@@ -8740,7 +8746,23 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     axes_text = "(" * join(axes, ", ") * (length(axes) == 1 ? ",)" : ")")
     # A plate over prepared ragged rows can run in the layout the prepared
     # data choose (`jax_layout.jl`); without one it is this `jax.vmap`.
-    call = R == 1 ? _jax_layout_call(ctx, cell, axes_text, args,
+    shapes = [_py_atom(_jax_mapped_array(v)) * ".shape[:" * string(R) * "]"
+              for (i, v) in enumerate(inputs) if mapped[i]]
+    call_args = args
+    if R == 1 && length(shapes) > 1 &&
+       hasproperty(op.kernel, :host_domain) && op.kernel.host_domain
+        # A prepared table spans the complete broadcast domain. Other inputs
+        # can still be singletons, including when that domain is empty.
+        shape = _jax_fresh(ctx, :cell_shape)
+        _jax_emit!(ctx, shape * " = np.broadcast_shapes(" * join(shapes, ", ") * ")")
+        if ctx.mod.layout !== :chains
+            widen = _jax_helper!(ctx, "_rk_broadcast_cell_axis", _JAX_BROADCAST_CELL_AXIS)
+            call_args = [axis == "0" ? widen * "(" * arg * ", " * shape * ")" : arg
+                         for (arg, axis) in zip(args, axes)]
+        end
+        shapes = [shape]
+    end
+    call = R == 1 ? _jax_layout_call(ctx, cell, axes_text, call_args,
                                      _jax_layout_arguments(ctx, inputs, mapped, ragged),
                                      rows_at, rows) : nothing
     if call === nothing
@@ -8753,7 +8775,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
             isempty(chain_counts) || (kw *= ", counts=" * _jax_chain_tuple(chain_counts))
             call = mapper * "(" * call * ", in_axes=" * axes_text * kw * ")"
         end
-        call *= "(" * join(args, ", ") * ")"
+        call *= "(" * join(call_args, ", ") * ")"
     end
     row_layouts = Dict{String,String}()
     if ctx.mod.layout === :chains && R == 1 && only(with_length)
@@ -8778,8 +8800,6 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     # Scan outputs with tuple-valued cells are stored column by column, and
     # a tuple-valued plate's values field by field; their first column (or
     # field) carries the mapped shape.
-    shapes = [_py_atom(_jax_mapped_array(v)) * ".shape[:" * string(R) * "]"
-              for (i, v) in enumerate(inputs) if mapped[i]]
     empty = "0 in " * first(shapes)
     for shape in shapes[2:end]
         empty *= " and " * shape * " == " * first(shapes)
@@ -10401,12 +10421,18 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
             # The static bounds of prepared arrays the body reads (ranges over
             # their entries), which `prepare_data` returns with the data.
             body = join(scope.lines, "\n")
+            schedules = Set{String}()
             for (bn, kind, _) in _jax_prepared_bounds(mod)
                 occursin(Regex("\\b" * bn * "\\b"), body) || continue
                 push!(inputs, bn => _jax_prepared_aux_type(kind)); push!(input_locals, bn)
+                kind in (:row_layout, :map_rows, :scan_rows) && push!(schedules, bn)
             end
             for ((pn, _), local_name) in zip(inputs[keyword_from+1:end], input_locals[keyword_from+1:end])
-                push!(lines, "    " * local_name * " = prepared[\"" * pn * "\"]")
+                value = "prepared[\"" * pn * "\"]"
+                # Closed-over host arrays have to support traced indexing as
+                # well. StaticInt has no pytree leaves, so sizes stay static.
+                pn in schedules && (value = "jax.tree.map(jnp.asarray, " * value * ")")
+                push!(lines, "    " * local_name * " = " * value)
             end
             # The plates' layout (`prepare_plate_layout`), absent from `prepare_data`'s
             # own result: every plate then runs as one batch.
