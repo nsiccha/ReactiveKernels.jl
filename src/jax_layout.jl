@@ -41,28 +41,29 @@ end
 # of units times widths, which the split minimizes exactly over the cuts
 # between different lengths (thinned to 256 when there are more).
 const _JAX_LENGTH_GROUPS = raw"""
+@jax.tree_util.register_pytree_node_class
 class PlateLayout:
     \"\"\"One plate's layout among the prepared data (`prepare_plate_layout`).
 
     `units` holds each group's units (0-based), `order` restores the plate's
     cells from the groups' joined values, `widths` holds each group's width
     per row argument, and `sequential` says whether a group's units run one
-    after another. `jax.jit` treats a layout as static, so the functions jit
-    with the prepared data as arguments; another layout traces them again.
+    after another. The permutations are array arguments to a jitted function.
+    Its group shapes and choice of sequential execution determine the trace.
     \"\"\"
 
     def __init__(self, units, order, widths, sequential):
-        self.units = tuple(np.asarray(u, dtype=np.int64) for u in units)
-        self.order = np.asarray(order, dtype=np.int64)
+        self.units = tuple(units)
+        self.order = order
         self.widths = tuple(tuple(w) for w in widths)
         self.sequential = bool(sequential)
-        self._key = (tuple(u.tobytes() for u in self.units), self.widths, self.sequential)
 
-    def __hash__(self):
-        return hash(self._key)
+    def tree_flatten(self):
+        return (self.units, self.order), (self.widths, self.sequential)
 
-    def __eq__(self, other):
-        return isinstance(other, PlateLayout) and self._key == other._key
+    @classmethod
+    def tree_unflatten(cls, metadata, arrays):
+        return cls(*arrays, *metadata)
 
     def __repr__(self):
         return "PlateLayout(%s units in groups of %s, widths %s%s)" % (
@@ -70,14 +71,9 @@ class PlateLayout:
             ", sequential" if self.sequential else "")
 
 
-jax.tree_util.register_pytree_node(PlateLayout, lambda layout: ((), layout), lambda layout, _: layout)
-
-
 def _rk_length_groups(lengths, groups, sequential):
     # One plate's layout, or `None` for the plate as one batch.
-    # `None`: a row whose lengths are not prepared data; it keeps its width.
-    slots = [n is not None for n in lengths]
-    lengths = [np.asarray(n, dtype=np.int64) for n in lengths if n is not None]
+    lengths = [np.asarray(n, dtype=np.int64) for n in lengths]
     lengths = np.broadcast_arrays(*lengths) if lengths else []
     count = lengths[0].shape[0] if lengths else 0
     if count == 0 or (int(groups) <= 1 and not sequential):
@@ -116,10 +112,7 @@ def _rk_length_groups(lengths, groups, sequential):
         # Units of one length: the plate as one batch.
         return None
     # A group of empty rows keeps one stored entry, as an empty column does.
-    widths = []
-    for u in units:
-        known = iter(max(1, int(n[u].max())) for n in lengths)
-        widths.append(tuple(next(known) if slot else None for slot in slots))
+    widths = [tuple(max(1, int(n[u].max())) for n in lengths) for u in units]
     order = np.argsort(np.concatenate(units), kind="stable")
     return PlateLayout(units, order, widths, sequential)
 """
@@ -185,15 +178,20 @@ def prepare_plate_layout(prepared: dict, groups: int = 1, sequential: bool = Fal
     Call the other functions with the result: `f(u, **prepare_plate_layout(prepared, 4))`.
     \"\"\"
     def lengths(entry):
-        # A mapped argument's row lengths, or those of the rows a cell reads
-        # at its unit's index (1-based), or none that are prepared data.
-        if entry is None or isinstance(entry, str):
-            return None if entry is None else prepared[entry]
+        if isinstance(entry, str):
+            return prepared[entry]
         rows, index = entry
-        return np.asarray(prepared[rows])[np.asarray(prepared[index]) - 1]
+        sizes, index = np.asarray(prepared[rows]), np.asarray(prepared[index])
+        # Leave an invalid gather to the model's own checked branch.
+        if np.any(index < 1) or np.any(index > len(sizes)):
+            return None
+        return sizes[index - 1]
 
-    layout = {plate: _rk_length_groups([lengths(entry) for entry in entries], groups, sequential)
-              for plate, entries in GROUPED_PLATES.items()}
+    layout = {}
+    for plate, entries in GROUPED_PLATES.items():
+        sizes = [lengths(entry) for entry in entries]
+        layout[plate] = (None if any(n is None for n in sizes) else
+                         _rk_length_groups(sizes, groups, sequential))
     return {**prepared, "_rk_plate_layout": layout}
 """
 
@@ -227,14 +225,18 @@ def select_plate_layout(prepared: dict, make_step: Any, chains: Any = None,
         candidates = [(groups, sequential) for groups in (1, 2, 4, 8, 16)
                       for sequential in (False, True)]
     report = []
-    seen = []
+    seen = set()
     for groups, sequential in candidates:
         chosen = prepare_plate_layout(prepared, groups, sequential)
         # Fewer distinct lengths than groups give the layout of a smaller count.
-        key = list(chosen["_rk_plate_layout"].values())
+        # For this binding the stable sort order is fixed. Group sizes
+        # determine the cuts into that order, hence the members and widths.
+        key = tuple(None if layout is None else
+                    (tuple(u.size for u in layout.units), layout.sequential)
+                    for layout in chosen["_rk_plate_layout"].values())
         if key in seen:
             continue
-        seen.append(key)
+        seen.add(key)
         for count in (None,) if chains is None else chains:
             row = {"groups": groups, "sequential": sequential, "chains": count,
                    "seconds": float("inf"), "error": None}
@@ -249,6 +251,7 @@ def select_plate_layout(prepared: dict, make_step: Any, chains: Any = None,
             except Exception as error:
                 if "RESOURCE_EXHAUSTED" not in str(error) and not isinstance(error, MemoryError):
                     raise
+                row["seconds"] = float("inf")
                 row["error"] = str(error)
                 break
     cost = lambda row: row["seconds"] / (row["chains"] or 1)
@@ -259,16 +262,20 @@ def select_plate_layout(prepared: dict, make_step: Any, chains: Any = None,
 """
 
 # The plate arguments whose rows a group cuts to its width: each mapped ragged
-# vector of numeric rows whose lengths are prepared data, as its position
-# among the plate call's arguments and the prepared key of its lengths.
+# vector of numeric rows, as its argument position and the prepared lengths
+# that describe it. A missing key keeps the whole plate at its stored widths.
 function _jax_layout_arguments(ctx::_JaxContext, inputs, mapped, ragged)
-    found = Tuple{Int,String}[]
+    found = Tuple{Int,Union{Nothing,String,Tuple{String,String}}}[]
     position = 0
     for (i, v) in enumerate(inputs)
         if ragged[i]
-            key = get(ctx.scope.prepared_keys, v.extent, nothing)
-            key !== nothing && mapped[i] && _jax_ragged(v.T) && !_jax_tuple_valued(v.T) &&
-                eltype(eltype(v.T)) <: Number && push!(found, (position, key))
+            if mapped[i] && _jax_ragged(v.T) && !_jax_tuple_valued(v.T) && eltype(eltype(v.T)) <: Number
+                key = get(ctx.scope.prepared_keys, v.extent, nothing)
+                if key === nothing
+                    key = get(ctx.mod.helper_names, (:layout_lengths, ctx.scope, v.extent), nothing)
+                end
+                push!(found, (position, key))
+            end
             position += 2
         else
             position += 1
@@ -277,20 +284,16 @@ function _jax_layout_arguments(ctx::_JaxContext, inputs, mapped, ragged)
     found
 end
 
-# The cell's row reads (`_JaxScope.row_widths`) as the prepared data name them:
-# for a read of a shared prepared ragged array at the plate's own mapped
-# prepared index, the keys of the rows' lengths and of that index; `nothing`
-# for any other read, which keeps its stored width.
-function _jax_layout_rows(ctx::_JaxContext, cell_scope::_JaxScope, params, args, axes)
-    map(cell_scope.row_widths) do (lengths, selector)
-        i = findfirst(==(lengths), params)
-        j = findfirst(==(selector), params)
-        (i === nothing || j === nothing || max(i, j) > length(args)) && return nothing
-        axes[i] == "None" && axes[j] == "0" || return nothing
-        rows = get(ctx.scope.prepared_keys, args[i], nothing)
-        index = get(ctx.scope.prepared_keys, args[j], nothing)
-        rows === nothing || index === nothing ? nothing : (rows, index)
-    end
+# A read of a shared prepared ragged array at a mapped prepared index,
+# expressed in the prepared data's keys.
+function _jax_layout_row(ctx::_JaxContext, (lengths, selector), params, args, axes)
+    i = findfirst(==(lengths), params)
+    j = findfirst(==(selector), params)
+    (i === nothing || j === nothing || max(i, j) > length(args)) && return nothing
+    axes[i] == "None" && axes[j] == "0" || return nothing
+    rows = get(ctx.scope.prepared_keys, args[i], nothing)
+    index = get(ctx.scope.prepared_keys, args[j], nothing)
+    rows === nothing || index === nothing ? nothing : (rows, index)
 end
 
 # The plate's call in the layout the prepared data choose, or `nothing` for a
@@ -300,6 +303,10 @@ function _jax_layout_call(ctx::_JaxContext, cell::AbstractString, axes_text::Abs
                           args, padded, rows_at, rows)
     _jax_plate_layout() === :groups && (!isempty(padded) || any(!isnothing, rows)) ||
         return nothing
+    # An untracked row may be zipped with a known row by a nested plate.
+    # Cutting just its partner would give the inner vmap different widths.
+    any(p -> last(p) === nothing, padded) && return nothing
+    any(isnothing, rows) && return nothing
     plates = get!(() -> Pair{String,Vector{Any}}[], ctx.mod.helper_names, :layout_plates)
     entries = Any[[key for (_, key) in padded]; rows]
     # One name per distinct plate: a plate emitted for several functions keeps

@@ -8695,7 +8695,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
         end
     end
     # The widths of the cell's row reads: none for the plate as one batch.
-    rows = _jax_layout_rows(ctx, cell_scope, cell_params, args, axes)
+    rows = [_jax_layout_row(ctx, read, cell_params, args, axes) for read in cell_scope.row_widths]
     if !isempty(cell_scope.row_widths)
         push!(axes, "None")
         push!(args, "(" * "None, "^length(cell_scope.row_widths) * ")")
@@ -8827,7 +8827,14 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
                 return lengths
             end
         end
-        something(outer(extent), lengths)
+        result = something(outer(extent), lengths)
+        # The next plate can trim a computed row when its length came from
+        # an indexed prepared row, even though its values depend on parameters.
+        if _jax_plate_layout() === :groups && haskey(cell_scope.selected_lengths, extent)
+            key = _jax_layout_row(ctx, cell_scope.selected_lengths[extent], cell_params, args, axes)
+            key === nothing || (ctx.mod.helper_names[(:layout_lengths, ctx.scope, result)] = key)
+        end
+        result
     end
     # A stored leaf carries the mapped shape; empty fields beside it need none.
     if _jax_numeric_record(E) && _jax_record_leaf(want.code, E) !== nothing
@@ -10175,7 +10182,9 @@ function _jax_functions!(mod, bodies, functions, plans, types;
         producer = merge((p.producer for (_, (p, _)) in group)...)
         selected = unique(Int[r.id for (_, (p, _)) in group for r in p.recipes])
         recipes = Dict(r.id => r for (_, (p, _)) in group for r in p.recipes)
-        order = _topo(g, selected, Set(canon_id(g, v.id) for v in first_plan.have))
+        # A prepared cell prefix can replace inputs on the emitted recipe
+        # without changing the original graph or its recipe id.
+        order = _topo(g, selected, Set(canon_id(g, v.id) for v in first_plan.have); recipes)
         order === nothing && error("compatible JAX plans have no joint execution order")
         all_wants = unique(v -> canon_id(g, v.id), Value[v for (_, (q, _)) in group for v in q.want])
         checks = unique(InputCheck[c for (_, (q, _)) in group for c in q.checks])

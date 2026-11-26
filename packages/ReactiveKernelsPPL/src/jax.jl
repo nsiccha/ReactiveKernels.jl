@@ -28,6 +28,11 @@ parameters, then the prepared data. Its functions:
   `constrain(layout, u)` nests them, and the value of a submodel call `e` whose
   name holds other values is under `return` there: `constrain(u, **p)["e"]["return"]`.
 
+`plate_layout = :groups` lets the Python caller group a plate's prepared
+ragged rows by length. In a module with eligible plates, pass
+`prepare_plate_layout(prepared, groups=4)` to the density functions in place
+of `prepared`.
+
 For independent chains, `plate_layout = :chains` selects sequential plate evaluation
 and packed variable-length vector rows at export time. Prepare the data once
 and batch gradients over the unconstrained parameter vectors, for example
