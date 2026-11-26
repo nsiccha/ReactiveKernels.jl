@@ -42,3 +42,17 @@ execution and requires its logical length to fill its storage under JIT.
 ## Local helpers
 
 A local named helper with plain positional arguments (`add!(i, value) = push!(out, i * value)`) reads the locals of the code that defines it and writes their collections. It reads their values at each call, so a local reassigned before the call is read as reassigned. A helper that rebinds a captured local, has typed arguments or several methods, or is passed to a recorded helper while it captures locals, raises `JAXEmissionError`. Helpers that write their arguments in place are described in [JAX helpers and submodels](jax-helpers.md).
+
+## Ragged row sums
+
+When each row of a numerical plate sums an inner plate, `prepare_data` can
+group entries across rows by conditions on the bound data. It records row and
+column positions for the actual entries. The compiled function evaluates the
+selected arms and sums the values in their original rows. Shared scalar
+parameters and unresolved comparisons stay in the compiled function.
+The compiled function can batch straight-line arithmetic across a group.
+When a live condition guards that arithmetic, all visits and mapped chains
+must select the same arm to take the parallel path. Mixed decisions use
+the scalar cell. The same emitted module serves different row lengths and
+branch decisions. Changing the number of entries in a group can trigger
+recompilation by JAX.

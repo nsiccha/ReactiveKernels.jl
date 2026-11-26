@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.403
+
+- Prepared JAX modules can group the entries of a ragged plate by a
+  data-dependent branch when each outer cell sums its inner plate. Changing
+  the number of entries taking an arm can trigger JAX recompilation.
+
 ## 0.1.402
 
 - Prepared JAX modules expose `bind_gradient` for batched values and gradients.

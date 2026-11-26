@@ -101,6 +101,12 @@ struct _JaxLanePrefix
     inputs::Vector{Int}
     atomic::Vector{Bool}
     plate::Int
+    ragged::Bool
+end
+
+struct _JaxRaggedSum
+    ports::Vector{Int} # inner HAVE positions in the outer plate
+    bound::Vector{Int} # outer axes included in the prepared domain
 end
 
 # The plate partitioned: the original recipe and its operation, the branch
@@ -111,6 +117,7 @@ struct _JaxLanePlate{O}
     plate::O
     nodes::Vector{Any}
     patterns::Vector{Vector{Pair{Int,Bool}}}
+    nested::Union{Nothing,_JaxRaggedSum}
 end
 
 const _JAX_LANE_PREFIX_BASE = -(Int(1) << 41)
@@ -271,8 +278,8 @@ end
 
 # Plate recipe `r` partitioned by its cell's data conditions: `(; prefix,
 # plate)`, the `prepare_data` recipe of the patterns' cell positions and the
-# plate reading them, or `nothing` (no data condition; a plate other than a
-# rank-one plate of numbers over unpadded vectors; too many patterns).
+# plate reading them, or `nothing` for unsupported shapes or conditions.
+# The cell either produces a scalar or sums an inner plate of scalars.
 # `dependent` holds the canonical ids in `g` of the values computed from data.
 function _jax_lane_partition(g::Graph, r::Recipe, dependent::Set{ValueId})
     op = r.op
@@ -281,12 +288,19 @@ function _jax_lane_partition(g::Graph, r::Recipe, dependent::Set{ValueId})
     atomic_inputs = typeof(op).parameters[2]
     length(body.have) == length(r.inputs) && length(r.outputs) == 1 &&
         length(body.want) == 1 || return nothing
-    # Graph types may be unknown (`Any`); the functions check the arguments'
-    # and the cells' types before they partition (`_jax_lane_emittable`).
+    # Graph types may be unknown (`Any`); emission checks the argument
+    # and cell types when they are known.
     T = valtype(only(r.outputs))
     T === Any || T isa Type && T <: AbstractVector && eltype(T) <: Number || return nothing
     cg = body.graph
     port_of = Dict{ValueId,Int}(canon_id(cg, v.id) => i for (i, v) in enumerate(body.have))
+    nested = _jax_ragged_sum_ports(body, op, port_of)
+    if nested !== nothing
+        body = first(body.recipes).op.kernel.plan
+        cg = body.graph
+        port_of = Dict(canon_id(cg, v.id) => i for (v, i) in zip(body.have, nested))
+        atomic_inputs = _jax_ragged_atomic(op, nested)
+    end
     # Each argument is shared (passed whole: a `Ref`, or a number), a lane
     # vector (its entries are the cells, which a pattern gathers), or of a
     # type the graph does not know, which the functions check.
@@ -295,22 +309,22 @@ function _jax_lane_partition(g::Graph, r::Recipe, dependent::Set{ValueId})
     for (i, v) in enumerate(r.inputs)
         V = valtype(v)
         shared = i in atomic_inputs || V isa Type && V <: Number
-        shared || V === Any || V isa Type && V <: AbstractVector && eltype(V) <: Number ||
-            return nothing
+        if !shared && V !== Any
+            supported = nested === nothing ? V isa Type && V <: AbstractVector && eltype(V) <: Number :
+                                             _jax_lane_row_type(V)
+            supported || return nothing
+        end
         canon_id(g, v.id) in dependent || continue
         push!(data_ports, i)
         shared || push!(lane_ports, i)
     end
     isempty(lane_ports) && return nothing
     points = Tuple{Any,_JaxLaneCondition}[]
-    for x in body.recipes
-        x.effectful && return nothing
-        _jax_lane_points!(points, x, cg, port_of, data_ports)
-    end
+    sources = Any[]
+    _jax_lane_sources!(points, sources, body, port_of, data_ports, nested !== nothing) || return nothing
     isempty(points) && return nothing
     # A condition read in two places would be decided in both.
     length(unique(objectid ∘ first, points)) == length(points) || return nothing
-    sources = Any[x.source for x in body.recipes if x.op isa _KernelSourceOp && _has_source(x)]
     patterns = _jax_lane_patterns(sources, points)
     patterns === nothing && return nothing
     # Conditions no pattern decides are not computed.
@@ -321,17 +335,24 @@ function _jax_lane_partition(g::Graph, r::Recipe, dependent::Set{ValueId})
     # The plate inputs the conditions read, and at least one mapped one, whose
     # entries are the cells.
     read = sort!(unique(p for c in conditions for p in c.ports if p != 0))
-    any(in(lane_ports), read) || (read = sort!(unique([read; first(lane_ports)])))
+    if nested !== nothing
+        read = sort!(union(read, lane_ports))
+    elseif !any(in(lane_ports), read)
+        push!(read, first(lane_ports))
+        sort!(read)
+    end
     stem = _jax_stable_name(first(r.outputs).name)
     lanes = [Value(Symbol(stem, :_lanes_, j), Vector{Int}) for j in eachindex(patterns)]
-    order = Value(Symbol(stem, :_lane_order), Vector{Int})
+    layout = nested === nothing ? (:_lane_order,) : (:_lane_rows, :_lane_columns, :_row_lengths)
+    extra = [Value(Symbol(stem, suffix), Vector{Int}) for suffix in layout]
     prefix = Recipe(_jax_lane_prefix_id(r.id), Tuple(r.inputs[i] for i in read),
-                    Tuple([lanes; order]),
+                    Tuple([lanes; extra]),
                     _JaxLanePrefix(conditions, patterns, read, Bool[i in atomic_inputs for i in read],
-                                   r.id),
+                                   r.id, nested !== nothing),
                     0.0, nothing, false)
-    plate = Recipe(r.id, (r.inputs..., lanes..., order), r.outputs,
-                   _JaxLanePlate(r, op, Any[c.node for c in conditions], patterns),
+    plate = Recipe(r.id, (r.inputs..., lanes..., extra...), r.outputs,
+                   _JaxLanePlate(r, op, Any[c.node for c in conditions], patterns,
+                                 nested === nothing ? nothing : _JaxRaggedSum(nested, lane_ports)),
                    r.cost, r.cse_key, r.effectful, r.source)
     (; prefix, plate)
 end
@@ -347,7 +368,12 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe, op::_JaxLanePref
     any(mapped) && all(i -> !mapped[i] || _jax_rank(inputs[i].T) == 1, eachindex(inputs)) ||
         _jax_error("a lane partition reads no vector of the plate's cells", _jax_where(ctx))
     params = Symbol[Symbol(:lane_input_, i) for i in eachindex(inputs)]
-    types = Any[mapped[i] ? eltype(v.T) : _jax_unref(v.T) for (i, v) in enumerate(inputs)]
+    if op.ragged
+        all(i -> mapped[i] ? _jax_lane_row_type(inputs[i].T) : _jax_unref(inputs[i].T) <: Number,
+            eachindex(inputs)) || _jax_error("ragged lane conditions need scalar entries", _jax_where(ctx))
+    end
+    types = Any[mapped[i] ? (op.ragged ? eltype(eltype(v.T)) : eltype(v.T)) :
+                            _jax_unref(v.T) for (i, v) in enumerate(inputs)]
     position = Dict(port => k for (k, port) in enumerate(op.inputs))
     fname, _ = _host_nested_function!(ctx, :lane_conditions, params, types, () -> begin
         codes = String[]
@@ -360,6 +386,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe, op::_JaxLanePref
         end
         _PyVal("(" * join(codes, ", ") * ",)", NTuple{length(codes),Bool}, true)
     end)
+    op.ragged && return _jax_ragged_lane_prefix(ctx, op, inputs, mapped, fname)
     targets, args, sources = String[], String[], String[]
     for (i, v) in enumerate(inputs)
         if !mapped[i]
@@ -374,16 +401,18 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe, op::_JaxLanePref
     rows = _jax_bind!(ctx, :lane_conditions, _PyVal("np.asarray([" * fname * "(" *
         join(args, ", ") * ") for " * join(targets, ", ") * " in " * iterable *
         "], dtype=bool).reshape((-1, " * string(k) * "))", Matrix{Bool}, true))
-    lanes = _PyVal[]
-    for pattern in op.patterns
-        mask = join([(v ? "" : "~") * rows.code * "[:, " * string(c - 1) * "]" for (c, v) in pattern],
-                    " & ")
-        push!(lanes, _jax_bind!(ctx, :lanes,
-            _PyVal("np.flatnonzero(" * mask * ")", Vector{Int}, true)))
-    end
+    lanes = _jax_lane_indices(ctx, rows, op.patterns)
     order = _PyVal("np.argsort(np.concatenate((" * join((l.code for l in lanes), ", ") *
                    ",)), kind=\"stable\")", Vector{Int}, true)
     [lanes; order]
+end
+
+function _jax_lane_indices(ctx, rows, patterns)
+    map(patterns) do pattern
+        mask = join([(v ? "" : "~") * rows.code * "[:, " * string(c - 1) * "]" for (c, v) in pattern],
+                    " & ")
+        _jax_bind!(ctx, :lanes, _PyVal("np.flatnonzero(" * mask * ")", Vector{Int}, true))
+    end
 end
 
 # The functions: one plate per pattern over its cells, each translated with
@@ -398,6 +427,7 @@ _jax_lane_number_vector(v::_PyVal) = _jax_is_array(v.T) && _jax_rank(v.T) == 1 &
     eltype(v.T) isa Type && eltype(v.T) <: Number && isempty(v.extent)
 function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe, op::_JaxLanePlate, inputs)
     ctx.host === nothing || _jax_error("a partitioned plate in `prepare_data`", _jax_where(ctx))
+    op.nested === nothing || return _jax_ragged_lane_sum(ctx, p, op, inputs)
     k = length(op.patterns)
     n = length(inputs) - k - 1
     base, lanes, order = inputs[1:n], inputs[n+1:n+k], inputs[end]
@@ -430,3 +460,5 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe, op::_JaxLanePlat
     end
     [_PyVal("jnp.concatenate((" * join(parts, ", ") * ",))[" * order.code * "]", Vector{E})]
 end
+
+include("jax_ragged_lanes.jl")
