@@ -4,7 +4,7 @@ Use `jax_source` to emit a Python module for a supported graph boundary. Julia p
 
 ## Emitted function
 
-This build executes the emitter and prints its complete result. The documentation environment has no Python JAX, so the emitted Python is not executed here.
+This example runs the Julia emitter and prints the resulting Python module.
 
 ```@example jax
 using ReactiveKernels
@@ -20,7 +20,7 @@ print(source)
 
 Input annotations tell the emitter each port's rank. For untyped ports, supply the corresponding `types` keyword. The emitted input order follows the selected input boundary.
 
-The module docstring starts with the generated line shown above. The `doc` keyword adds the author's description of the program after it: a string, or a binding's docstring as `@doc(NAME)`. A docstring written above `const NAME = …` belongs to the binding, not to the value `jax_source` receives, so the caller passes it. For a PPL model, `jax_source(built, bound; doc)` places it before the generated `Data:` and `Model documentation:` lists. Docstrings keep their text as written, backslashes and quotes included.
+After the generated first line, `doc` adds a description verbatim, including backslashes and quotes. Pass a string or `@doc(NAME)` for the docstring attached to a `const NAME = …` binding. For probabilistic models, `jax_source(built, bound; doc)` places it before the generated `Data:` and `Model documentation:` lists.
 
 Typed `Float32` values keep `float32`, also in `prepare_data`; other floats
 take `jax_source`'s `float_type` (`Float64`, or `Float32` without JAX's 64-bit
@@ -95,6 +95,14 @@ The functions take the prepared data as `prepare_data` returns them, host NumPy 
 A dotted cell latent, `v[i] .~ D.(args…)` with a length per index that data decide, has its dimensions, packed offsets, block table and argument entries computed in `prepare_data` when its arguments read data, scalar parameters or a shared array; an argument that reads a sampled array at the index, or an array of rank 2 or more at each index, raises `JAXEmissionError` for now.
 
 Translation errors identify an unsupported operation instead of substituting a different computation. JAX compilation, device placement and differentiation belong to the Python consumer.
+
+## Re-emitting a built model
+
+Load Revise before the development packages. After emitter-method edits, run
+`Revise.revise(edited_package; force=false)`, then `ReactiveKernelsPPL.jax_source(built, bound)`.
+Retain both objects across edits. Rebuild them after construction or binding
+changes. `benchmark/jax_emitter_iteration.jl` times repeated emission and
+compares the module and bound inputs with a fresh process.
 
 ## Further JAX guides
 
