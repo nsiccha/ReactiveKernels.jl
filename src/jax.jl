@@ -1418,10 +1418,15 @@ def _rk_pack_record(columns):
 
 const _JAX_RECORD_AT = raw"""
 def _rk_record_at(columns, at):
-    table = _rk_pack_record(columns)
-    if isinstance(table, tuple):
-        return tuple(c[at] for c in table)
-    return tuple(table[at])
+    # A scalar consumer may use only some fields. Separate reads let JAX
+    # discard the other columns before forming the reverse scatter updates.
+    def read(column):
+        # NumPy columns need device indexing when at is traced. A packed
+        # ragged view supplies its own scalar lookup.
+        if isinstance(column, np.ndarray):
+            column = jnp.asarray(column)
+        return column[at]
+    return tuple(read(column) for column in columns)
 """
 
 function _jax_bind_record_entry(ctx, row)
@@ -1487,7 +1492,6 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
            length(indices) == 1 && !_jax_written_slice(only(indices))
             i = _jax_bound_expr(ctx, _jax_column(x, 1), 1, only(indices))
             if i.T isa Type && i.T <: Integer && i.T !== Bool
-                _jax_helper!(ctx, "_rk_pack_record", _JAX_PACK_RECORD)
                 read = _jax_helper!(ctx, "_rk_record_at", _JAX_RECORD_AT)
                 row = _PyVal(read * "(" * x.code * ", " * _jax_minus_one(i) * ")", E)
                 return _jax_bind_record_entry(ctx, row)
