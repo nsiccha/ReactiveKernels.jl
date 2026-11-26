@@ -1278,11 +1278,16 @@ function _jax_record_field(x::_PyVal, k::Integer)
     field = x.origin.fields[k]
     # Field extents in the original cell use that cell's local names. Project
     # the returned lengths tree instead when the record has crossed a scope.
-    _PyVal(code, T, x.static, extent, "", field.padded, field.origin)
+    parts = _jax_group_rows(field) ? _jax_length_pair(extent) : ()
+    _PyVal(code, T, x.static, extent, "", field.padded, field.origin, parts)
 end
 
-_jax_numeric_record(T) = _jax_is_tuple(T) &&
-    all(F -> F <: Number || F <: AbstractArray{<:Number} || _jax_numeric_record(F), fieldtypes(T))
+function _jax_numeric_record(v::_PyVal)
+    T = v.T
+    _jax_is_tuple(T) && return all(k -> _jax_numeric_record(_jax_record_field(v, k)), 1:fieldcount(T))
+    T <: Number || T <: AbstractArray{<:Number} ||
+        T <: AbstractVector{<:AbstractVector{<:Number}} && !_jax_slots(v)
+end
 
 # Empty fields carry no array leaf. Find a stored field over the fixed schema.
 function _jax_record_leaf(code, T)
@@ -1863,7 +1868,8 @@ function _jax_expr(ctx::_JaxContext, ::Val{:do}, ex)
             push!(params_code, lengths); push!(args_code, _jax_row_lengths(c))
             padded = _jax_ragged(c.T) ? 1 : _jax_padded_fields(c)
             levels = _jax_nested_rows(c.T) ? _jax_length_pair(lengths) : ()
-            push!(elements, _PyVal(element, eltype(c.T), false, lengths, "", padded, nothing, levels))
+            origin = c.origin isa _JaxRecordLayout ? _JaxRecordLayout(c.origin.fields, "", 0) : nothing
+            push!(elements, _PyVal(element, eltype(c.T), false, lengths, "", padded, origin, levels))
         else
             push!(elements, _PyVal(element, eltype(c.T)))
         end
@@ -8742,7 +8748,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
         something(outer(extent), lengths)
     end
     # A stored leaf carries the mapped shape; empty fields beside it need none.
-    if _jax_numeric_record(E) && _jax_record_leaf(want.code, E) !== nothing
+    if _jax_is_tuple(E) && _jax_numeric_record(want) && _jax_record_leaf(want.code, E) !== nothing
         empty_value = _jax_empty_record(want, first(shapes))
         only(with_length) && (empty_value = "(" * empty_value * ", " *
             _jax_empty_record(want, first(shapes); lengths = true) * ")")
@@ -8845,6 +8851,15 @@ function _jax_empty_record(v::_PyVal, shape::String; lengths::Bool = false)
     if _jax_is_tuple(T)
         return _jax_tuple_code([_PyVal(_jax_empty_record(_jax_record_field(v, k), shape; lengths), Any)
                                 for k in 1:fieldcount(T)])
+    end
+    if T <: AbstractVector{<:AbstractVector{<:Number}}
+        if !lengths
+            return "jnp.zeros(" * shape * " + (0, 0), dtype=" * _jax_dtype(eltype(eltype(T))) * ")"
+        end
+        count = "jnp.zeros(" * shape * ", dtype=" * _jax_dtype(Int) * ")"
+        _jax_outer_rows(v) && return count
+        rows = "jnp.zeros(" * shape * " + (0,), dtype=" * _jax_dtype(Int) * ")"
+        return _jax_group_rows(v) ? "(" * count * ", " * rows * ")" : rows
     end
     inner = !lengths && T <: AbstractArray ?
         " + (" * join(fill("0", ndims(T)), ", ") * ",)" : ""

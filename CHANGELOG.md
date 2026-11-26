@@ -21,6 +21,8 @@ are recorded in the git history only.
 Generated JAX functions accept groups of ragged numerical rows. The padded
 values travel with one lengths argument containing the group counts and
 the per-row lengths. `prepare_data` constructs both arrays from the raw input.
+Plate cells can return those groups in tuple fields. Projecting a field
+keeps its row count and each row's length.
 
 ## 0.1.392
 

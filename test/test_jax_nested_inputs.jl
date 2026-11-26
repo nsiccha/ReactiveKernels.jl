@@ -46,6 +46,19 @@ end
     score = a * sum(x[1][1])
 end
 
+@kernel record_groups(gain::Float64, batches::Vector{Vector{Vector{Float64}}}, base::Vector{Float64}) = begin
+    cells = plate(batches, Ref(base), Ref(gain)) do rows, b, g
+        (g .* b, rows)
+    end
+    terms = plate(cells) do cell
+        sum(cell[1]) + sum(cell[2][1])
+    end
+    score = sum(terms)
+    counts = map(cells) do cell
+        length(cell[2])
+    end
+end
+
 @testset "independent group and row lengths" begin
     data = [
         [[[2, 4], Int[]], [[3]], Vector{Int}[]],
@@ -82,6 +95,37 @@ end
                   join(map(_rk_py_input, cases), ", ") * "]\n")
             @test success(pipeline(`$RK_JAX_PYTHON $(joinpath(@__DIR__, "jax_nested_inputs.py")) $dir`;
                                    stdout, stderr))
+        end
+    else
+        @test_skip "RK_JAX_PYTHON not set"
+    end
+end
+
+@testset "groups of ragged rows in a plate's tuple field" begin
+    gain = 2.0
+    base = [0.5, 1.5]
+    batches = [[[1.0, 2.0], Float64[]], [[3.0]]]
+    larger = [[collect(1.0:j) for j in 0:i] for i in 1:9]
+    have = (:gain, :batches, :base)
+    functions = (; score = :score, details = (; cells = :cells, counts = :counts))
+    bound(x) = jax_source(record_groups; have, functions, data = (; batches = x, base))
+    src = bound(batches)
+    @test src.text == bound(larger).text
+    f = prepare(record_groups; have, want = :score)
+    @test f(gain, batches, base) == 14.0
+    if rk_jax_available()
+        mktempdir() do dir
+            write(joinpath(dir, "bound.py"), src)
+            write(joinpath(dir, "direct.py"), jax_source(record_groups; have, functions))
+            cases = map((batches, [[Float64[]]], Vector{Vector{Float64}}[], larger)) do x
+                grad = Enzyme.autodiff(Enzyme.Reverse, f, Enzyme.Active,
+                                       Enzyme.Active(gain), Enzyme.Const(x), Enzyme.Const(base))[1][1]
+                (x, f(gain, x, base), grad)
+            end
+            @test first(cases)[3] == 4.0
+            write(joinpath(dir, "cases.py"), "import numpy as np\ncases = " * _rk_py_input(cases))
+            driver = joinpath(@__DIR__, "jax_tuple_groups.py")
+            @test success(pipeline(`$RK_JAX_PYTHON $driver $dir`; stdout, stderr))
         end
     else
         @test_skip "RK_JAX_PYTHON not set"

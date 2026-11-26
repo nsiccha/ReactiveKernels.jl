@@ -39,19 +39,6 @@ plates. Matrix cells can vary along their first axis; trailing dimensions
 must agree because the representation carries one extent per cell.
 For raw empty matrix lists, call `pad_ragged([], rank=2)`.
 
-For `x::Vector{Vector{Vector{Int}}}` and other numerical vectors nested
-three deep, `values, lengths = pad_ragged(x, nested=True)` pads both inner
-axes. Pass `values, lengths` to the direct function. Unpacking
-`group_lengths, row_lengths = lengths` gives the number of rows in each
-group and the number of entries in each row. For example, `[[], [[]]]` has
-group lengths `[0, 1]`. The second group contains one empty row.
-With bound data, `prepare_data(x=x)` supplies the pair under `x_lengths`.
-A group can concatenate its rows with `reduce(vcat, rows)`. When a traced
-index selects a group, the selected vector's length can vary within one
-compiled function. Use a named WANT such as `(; flat = :flat)` to get
-`flat` and `flat_lengths` under JIT. A plain vector is trimmed in eager
-execution and requires its logical length to fill its storage under JIT.
-
 For a ragged row index `r`, `M[r, :]` and `view(M, r, :)` keep every column.
 `sum(M[r, :] * b)` counts each selected row, including repeats. In
 `M[r, :]' * w` the contraction uses only the valid rows. A ragged column
@@ -59,7 +46,7 @@ index beside a kept axis and two array indices including a ragged one
 remain unsupported.
 
 Plate cells can return numerical tuples or named records, including nested
-records and numeric array fields. Later plates can read those fields directly,
+records, numeric arrays and [ragged row groups](jax-host.md#Groups-of-ragged-rows). Later plates can read those fields directly,
 such as `r.prior + sum(r.pointwise.y)`. The emitted representation stacks each
 leaf along the mapped axes and keeps ragged field lengths separate from the
 record array's valid extent. Cartesian axes retain Julia's order, also through
