@@ -221,9 +221,9 @@ end
 end
 # Counted `while` loops to a padded row's length (snag
 # jax-source-of-an-6bfaf24a: the stage loop of stopping-ratio ordinal evidence
-# over thresholds computed in a plate cell). Each takes lazy steps to the
-# row's static limit, which `jax.grad` reverses; a `while_loop` to the row's
-# length only goes forward. A step past the length runs no body: there
+# over thresholds computed in a plate cell). The value loop stops at the
+# logical end and reverse AD uses a guarded scan to the row's capacity.
+# A step past the length runs no body: there
 # `log(length(r) - i)` would be `log` of zero or less, and its value and
 # derivative would reach the result. Each leaves `i` where the `while` does,
 # and stops at the data-dependent `k` inside the row through `ifelse`.
@@ -292,12 +292,12 @@ _jax_ranges_want(k) = k === jax_ranges_plate ? :total : :result
     for k in JAX_RANGES_KERNELS
         src = jax_source(k; have, want = _jax_ranges_want(k), data = (; starts, stops))
         text = string(src)
-        # A static number of steps, so the loop is a scan `jax.grad` reverses.
+        # Each dynamic range retains a prepared capacity for reverse AD.
         @test occursin("_rk_prepared[\"_rk_", text)
-        @test !occursin("while_loop", text)
+        @test !occursin("= jax.lax.while_loop(", text)
     end
     loop = jax_source(jax_ranges_loop; have, want = :result, data = (; starts, stops))
-    @test occursin("jax.lax.fori_loop(0, max(_rk_span_starts_stops + 1, 0), ", string(loop))
+    @test occursin("_rk_prefix_fori(0, max(_rk_span_starts_stops + 1, 0), ", string(loop))
     prepare_data = first(loop.functions)
     @test prepare_data.name == "prepare_data"
     @test first.(prepare_data.outputs) == ["starts", "stops", "_rk_span_starts_stops"]
@@ -397,7 +397,7 @@ end
     @test occursin("max(2 * _rk_max_n + 1 - 1 + 1, 0)", scaled)
     @test occursin("-2 * _rk_max_n", scaled)
     @test occursin("max(K * _rk_max_n, K * _rk_min_n)", scaled)
-    @test !occursin("while_loop", scaled)
+    @test !occursin("= jax.lax.while_loop(", scaled)
     records = string(jax_source(jax_ranges_scaled_records; have = (:x, :starts, :stops),
                                 want = :total, data = (; starts = [2, 4], stops = [3, 4])))
     @test occursin("jnp.arange(max(2 * _rk_span_starts_stops - (0 - 1) + 1, 0))", records)
@@ -445,9 +445,9 @@ end
 @testset "jax_source: counted while loops to a padded row's length" begin
     have = (:x, :R, :k)
     text = string(jax_source(jax_ranges_counted_rows; have, want = :total))
-    # Both loops are scans of lazy steps to the row's static limit.
-    @test !occursin("while_loop", text)
-    @test count(r"jax\.lax\.fori_loop\(0, max\([^\n]*shape\[0\][^\n]*, 0\), ", text) == 2
+    # Both logical loops have a bounded scan available to reverse AD.
+    @test !occursin("= jax.lax.while_loop(", text)
+    @test count(r"_rk_prefix_fori\(0, max\([^\n]*shape\[0\][^\n]*, 0\), ", text) == 2
     @test count("jax.lax.cond(kept", text) == 2
     shrinking = string(jax_source(jax_ranges_shrinking_limits; have = (:a, :R), want = :total))
     @test count("jax.lax.while_loop(", shrinking) == 2

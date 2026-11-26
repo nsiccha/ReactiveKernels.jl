@@ -2394,7 +2394,7 @@ function _jax_expr(ctx::_JaxContext, ::Val{:while}, ex)
     # A continue may skip the counter update, so that loop is not counted.
     body = _jax_continue_body(ex.args[2])
     counted = body === ex.args[2] ? _jax_counted_while(ctx, ex) : nothing
-    counted === nothing || return _jax_counted_for(ctx, counted...)
+    counted === nothing || return _jax_device_for(ctx, counted...)
     exited = _jax_break_loop(ctx, ex)
     exited === nothing || return exited
     condition_ex = ex.args[1]
@@ -2483,26 +2483,9 @@ function _jax_counted_while(ctx::_JaxContext, ex)
     _jax_typeof(hi) <: Integer || return nothing
     hi.static || lo.static && !isempty(hi.limit) || return nothing
     k = gensym(i)
-    (Expr(:for, :($k = $i:$last_ex), Expr(:block, :($i = $k), statements...)), lo, hi)
-end
-# The `for` of a counted `while` from `lo` to `hi`: to a padded length (`hi`
-# data with a static limit) it is `_jax_padded_for`.
-function _jax_counted_for(ctx::_JaxContext, loop::Expr, lo::_PyVal, hi::_PyVal)
-    hi.static && return _jax_expr(ctx, loop)
-    binding, body = loop.args
-    _jax_padded_for(ctx, binding.args[1], body, lo, hi)
+    Expr(:for, :($k = $i:$last_ex), Expr(:block, :($i = $k), statements...)), (lo, hi)
 end
 
-# A loop from a static `lo` to a padded length `hi` (data with a static
-# limit, `_jax_padded_stop`) takes `_jax_stepped_for`'s steps up to the
-# limit: lazy branches that do not run the body past `hi` (CONTRIBUTING.md,
-# "Lazy branches"), so a value the body would compute at a step Julia never
-# runs reaches neither the result nor `jax.grad`. Those steps keep the whole
-# carry, so a padded array keeps its entries past its length as they
-# entered; afterwards each such slot repeats the array's last valid entry,
-# the padding every padded value holds (`_jax_loop_carried`).
-_jax_padded_for(ctx::_JaxContext, var, body, lo::_PyVal, hi::_PyVal) =
-    _jax_stepped_for(ctx, var, body, lo, hi, _jax_trip_bound(ctx, lo, hi))
 # `x`, a padded array, with each slot past its extent along its padded axes
 # holding the last valid entry along that axis (the first, when there is
 # none): the padding a padded value holds (`_PyVal`'s `extent`). An array
@@ -2528,48 +2511,53 @@ function _jax_repeat_last_valid(ctx::_JaxContext, x::_PyVal)
     x
 end
 
-# Loops. A `for` over a range is `jax.lax.fori_loop` over a function of the
-# index and the carry, the outer locals the body assigns (an indexed write
-# assigns its array). The range's bounds are static, so the loop lowers to a
-# scan that `jax.grad` differentiates. A data-dependent upper bound with a
-# static limit (a padded group vector's length) takes lazy steps to the limit
-# (`_jax_padded_for`). Ends that are data with a static number of steps
-# (`_jax_loop_range`) run those steps from the first element; past the last
-# element a step repeats the last (as padding does) and keeps the whole
-# carry, arrays included, unchanged. A loop over a collection's elements
-# (`v in xs`, `(i, v) in enumerate(xs)`) is the loop over its positions
-# (`_jax_collection_for`).
+# A range loop carries the outer locals the body updates, including indexed
+# writes. An early exit or a data-dependent extent can stop its value loop.
+# The same guarded body has a bounded scan representation for ordinary AD.
+# Iteration over a collection binds its elements from the current position.
 function _jax_expr(ctx::_JaxContext, ::Val{:for}, ex)
     ctx.host === nothing || return _host_for(ctx, ex)
-    exited = _jax_break_loop(ctx, ex)
+    _jax_device_for(ctx, ex)
+end
+
+function _jax_device_for(ctx, ex, bounds = nothing)
+    exited = _jax_break_loop(ctx, ex, bounds)
     exited === nothing || return exited
     binding, body = ex.args
-    body = _jax_continue_body(body)
+    _jax_for(ctx, binding, _jax_continue_body(body), nothing, bounds)
+end
+
+function _jax_for(ctx, binding, body, running, bounds)
     binding isa Expr && binding.head === :(=) && length(binding.args) == 2 ||
         _jax_error("the loop binding `", binding, "` has no JAX translation", _jax_where(ctx))
     target, iter = binding.args
-    target isa Symbol && _jax_is_range_form(ctx, iter) ||
-        return _jax_collection_for(ctx, binding, body)
-    _jax_range_for(ctx, target, body, _jax_range_ends(ctx, iter)...)
+    if target isa Symbol && _jax_is_range_form(ctx, iter)
+        ends = bounds === nothing ? _jax_range_ends(ctx, iter) : bounds
+        return _jax_range_for(ctx, target, body, ends...; running)
+    end
+    _jax_with_loop_element(ctx, binding) do var, n
+        _jax_range_for(ctx, var, body, _jax_literal(1), n; running)
+    end
 end
 
 # A loop from `lo` to `hi` binding `var` (a name, or a collection's element
 # targets, `_JaxLoopElement`) at each index.
-function _jax_range_for(ctx::_JaxContext, var, body, lo::_PyVal, hi::_PyVal)
-    if var isa Symbol && lo.static && lo.code == "1" && hi.static
+function _jax_range_for(ctx::_JaxContext, var, body, lo::_PyVal, hi::_PyVal; running = nothing)
+    if running === nothing && var isa Symbol && lo.static && lo.code == "1" && hi.static
         copied = _jax_prefix_store(ctx, var, body, hi)
         copied === nothing || return copied
         mapped = _jax_signed_map(ctx, var, body, lo, hi)
         mapped === nothing || return mapped
     end
-    _jax_sequential_range(ctx, var, body, lo, hi)
+    _jax_sequential_range(ctx, var, body, lo, hi; running)
 end
-function _jax_sequential_range(ctx::_JaxContext, var, body, lo::_PyVal, hi::_PyVal)
+function _jax_sequential_range(ctx::_JaxContext, var, body, lo::_PyVal, hi::_PyVal; running = nothing)
     exact = ctx.mod.layout === :chains && _jax_padded_stop(lo, hi)
     if !exact
-        _jax_padded_stop(lo, hi) && return _jax_padded_for(ctx, var, body, lo, hi)
+        _jax_padded_stop(lo, hi) && return _jax_stepped_for(ctx, var, body, lo, hi,
+                                                            _jax_trip_bound(ctx, lo, hi); running)
         lo, hi, _, steps = _jax_loop_range(ctx, lo, hi; dynamic = true)
-        isempty(steps) || return _jax_stepped_for(ctx, var, body, lo, hi, steps)
+        isempty(steps) || return _jax_stepped_for(ctx, var, body, lo, hi, steps; running)
     end
     assigned = _jax_carried_names!(ctx, Set{Symbol}(), body)
     _jax_slot_aliases!(ctx, assigned)
@@ -2611,10 +2599,13 @@ function _jax_sequential_range(ctx::_JaxContext, var, body, lo::_PyVal, hi::_PyV
     init = _jax_initial_carry(ctx, initial, nonempty)
     result = _jax_fresh(ctx, :loop_carry)
     args = join((lo.code, _jax_plus_one(hi), fname, init), ", ")
-    if exact
+    call = if exact
         _jax_helper!(ctx, "_RKChainRows", _JAX_CHAIN_ROWS)
+        slot = running === nothing ? "" : ", " * string(_jax_running_slot(carried, running))
+        "_rk_chain_fori(" * args * ", " * hi.limit * slot * ")"
+    else
+        _jax_fori_call(ctx, args, carried, running)
     end
-    call = exact ? "_rk_chain_fori(" * args * ", " * hi.limit * ")" : "jax.lax.fori_loop(" * args * ")"
     _jax_emit_unless_empty!(ctx, result, call, init, nonempty)
     for (k, (n, v)) in enumerate(zip(carried, initial))
         ctx.locals[n] = _jax_loop_carried(ctx, result, k, v)
@@ -2661,12 +2652,6 @@ function _jax_bind_targets!(ctx::_JaxContext, target, element)
     nothing
 end
 
-function _jax_collection_for(ctx::_JaxContext, binding::Expr, body)
-    _jax_with_loop_element(ctx, binding) do var, n
-        _jax_range_for(ctx, var, body, _jax_literal(1), n)
-    end
-end
-
 # `f(var, n)` of the targets of `binding`, a loop over a collection, and its
 # number of elements: the elements are bound from the position,
 # `_JaxLoopElement`. Collections computed for it are bound before `f` runs
@@ -2686,7 +2671,7 @@ end
 # The number of elements `iter` iterates and its element at `position`, as
 # source: `enumerate` pairs the position with its iterator's element, `zip`
 # runs to its shortest iterator (a padded length's limit the least of the
-# limits, as `_jax_padded_for` takes it), and any other iterator is a vector,
+# limits, as for any padded range), and any other iterator is a vector,
 # read at the position.
 function _jax_loop_element(ctx::_JaxContext, binding, iter, position::Symbol,
                            temporaries::Vector{Symbol})
@@ -2753,9 +2738,9 @@ function _jax_continue_body(body, break_flag = nothing)
 end
 
 # An exit belongs to its nearest loop. The existing continuation transform
-# skips the rest of the current iteration; a carried Boolean skips later
-# iterations. A bounded for remains a scan, including for ordinary reverse AD.
-function _jax_break_loop(ctx, ex)
+# skips the rest of the current iteration. The for loop's carried Boolean
+# also tells the runtime when to stop advancing its index.
+function _jax_break_loop(ctx, ex, bounds = nothing)
     function has_break(body)
         body isa Expr || return false
         body.head in (:for, :while, :->, :function, :quote, :inert) && return false
@@ -2766,16 +2751,26 @@ function _jax_break_loop(ctx, ex)
     running = gensym(:running)
     ctx.locals[running] = _jax_literal(true)
     body = _jax_continue_body(body, running)
-    loop = if ex.head === :for
-        Expr(:for, ex.args[1], Expr(:if, running, body))
-    else
-        Expr(:while, Expr(:if, running, ex.args[1], false), body)
-    end
     try
-        _jax_expr(ctx, loop)
+        if ex.head === :for
+            return _jax_for(ctx, ex.args[1], Expr(:if, running, body), running, bounds)
+        end
+        _jax_expr(ctx, Expr(:while, Expr(:if, running, ex.args[1], false), body))
     finally
         delete!(ctx.locals, running)
     end
+end
+
+Base.include_dependency(joinpath(@__DIR__, "jax_prefix_loop.py"))
+const _JAX_PREFIX_FORI = read(joinpath(@__DIR__, "jax_prefix_loop.py"), String)
+
+_jax_running_slot(carried, running) = (findfirst(==(running), carried)::Int) - 1
+
+function _jax_fori_call(ctx, args, carried, running; last_step = nothing)
+    isnothing(running) && isnothing(last_step) && return "jax.lax.fori_loop(" * args * ")"
+    _jax_helper!(ctx, "_rk_prefix_fori", _JAX_PREFIX_FORI)
+    slot = isnothing(running) ? "None" : string(_jax_running_slot(carried, running))
+    "_rk_prefix_fori(" * args * ", " * slot * ", " * something(last_step, "None") * ")"
 end
 
 # A `for` over a range whose ends are data, `lo:hi`, taking a static number
@@ -2787,7 +2782,7 @@ end
 # (a plate cell) JAX runs both arms and selects, reading the untaken one's
 # inputs through `stop_gradient`, so a non-finite value there reaches neither.
 function _jax_stepped_for(ctx::_JaxContext, var, body, lo::_PyVal, hi::_PyVal,
-                          steps::AbstractString)
+                          steps::AbstractString; running = nothing)
     assigned = _jax_carried_names!(ctx, Set{Symbol}(), body)
     _jax_slot_aliases!(ctx, assigned)
     targets = _jax_loop_targets(var)
@@ -2849,8 +2844,8 @@ function _jax_stepped_for(ctx::_JaxContext, var, body, lo::_PyVal, hi::_PyVal,
     nonempty = _jax_nonempty("1", steps)
     init = _jax_initial_carry(ctx, initial, nonempty)
     result = _jax_fresh(ctx, :loop_carry)
-    _jax_emit_unless_empty!(ctx, result, "jax.lax.fori_loop(0, " * steps * ", " * fname * ", " *
-                            init * ")", init, nonempty)
+    args = join(("0", steps, fname, init), ", ")
+    _jax_emit_unless_empty!(ctx, result, _jax_fori_call(ctx, args, carried, running; last_step = reach.code), init, nonempty)
     for (k, (n, v)) in enumerate(zip(carried, initial))
         ctx.locals[n] = _jax_loop_carried(ctx, result, k, v)
     end
@@ -3033,7 +3028,7 @@ _jax_target_parts(target::Expr) =
 #   those up to `last`; `first` and `last` are bound to names.
 _jax_loop_range(ctx::_JaxContext, iter) = _jax_loop_range(ctx, _jax_range_ends(ctx, iter)...)
 # A stop that is a padded group's length: data with a static limit, from a
-# static start (a `for` takes `_jax_padded_for`'s lazy steps to the limit).
+# static start (a `for` can use the logical prefix up to this limit).
 _jax_padded_stop(lo::_PyVal, hi::_PyVal) = lo.static && !hi.static && !isempty(hi.limit)
 
 # The translated ends `(first, last)` of a loop range.

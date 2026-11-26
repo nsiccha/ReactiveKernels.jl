@@ -124,7 +124,7 @@ end
         @test occursin("jax.lax.scan", string(src))
         @test occursin("jax.lax.fori_loop", string(src))
         @test occursin("_rk_bound_max", string(src))
-        @test !occursin("jax.lax.while_loop", string(src))
+        @test !occursin("= jax.lax.while_loop(", string(src))
     end
     pairs = jax_source(jax_scan_bound_pairs; have = (:a, :starts, :stops), want = :total,
                        data = (; starts = [[2, 8], [4]], stops = [[3, 7], [6]]))
