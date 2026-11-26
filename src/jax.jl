@@ -2060,6 +2060,7 @@ function _jax_indexed_values(ctx::_JaxContext, body, var, condition, hint, lo::_
     # so a later step's reads reach neither value nor derivative (as a
     # stepped `for`, `_jax_stepped_for`).
     stepped = !isempty(steps)
+    masked = stepped || !isempty(bound)
     reach = stepped ? _jax_bind!(ctx, :reach, _PyVal(_py_infix("-", [hi.code, lo.code]), Int)) :
         nothing
     index = _jax_fresh(ctx, stepped ? :step : _jax_loop_hint(var))
@@ -2069,14 +2070,16 @@ function _jax_indexed_values(ctx::_JaxContext, body, var, condition, hint, lo::_
     push!(inner.used, index)
     saved = copy(ctx.locals)
     ctx.scope = inner
-    run = stepped ? _JaxScope(inner) : inner
+    run = masked ? _JaxScope(inner) : inner
     returned = try
-        if stepped
+        if masked
             kept = _jax_fresh(ctx, :kept)
-            _jax_emit!(ctx, kept * " = " * _py_infix("<=", [index, reach.code]))
+            _jax_emit!(ctx, kept * " = " * _py_infix("<=", [index, stepped ? reach.code : bound]))
             run_name = _jax_fresh(ctx, :element_body)
             run.indent = inner.indent + 1
             ctx.scope = run
+        end
+        if stepped
             element_index = _jax_fresh(ctx, _jax_loop_hint(var))
             _jax_emit!(ctx, element_index * " = jnp.minimum(" * _py_infix("+", [lo.code, index]) *
                             ", " * hi.code * ")")
@@ -2087,9 +2090,8 @@ function _jax_indexed_values(ctx::_JaxContext, body, var, condition, hint, lo::_
                                                                    lo, hi));
                          (_jax_expr(ctx, body),
                           condition === nothing ? nothing : _jax_expr(ctx, condition)))
-        guard = stepped ? kept : isempty(bound) ? "" : index * " <= " * bound
-        value, keep = isempty(guard) ? element() : _jax_with_guard(element, run, guard)
-        if stepped
+        value, keep = masked ? _jax_with_guard(element, run, kept) : element()
+        if masked
             E = _jax_typeof(value)
             E <: Number || _jax_error("a generator whose elements are `", E, "`", _jax_where(ctx))
             # Both arms return the element's type, and a filter's `Bool`.
@@ -2116,7 +2118,6 @@ function _jax_indexed_values(ctx::_JaxContext, body, var, condition, hint, lo::_
     # The range is bound only when a mask reads it: a data-dependent bound or
     # end compares each index with it.
     range = "jnp.arange(" * (stepped ? steps : lo.code * ", " * _jax_plus_one(hi)) * ")"
-    masked = stepped || !isempty(bound)
     indices = masked ? _jax_bind!(ctx, stepped ? :steps : :indices, _PyVal(range, Vector{Int})).code :
         range
     mapped = "jax.vmap(" * f * ")(" * indices * ")"
@@ -2187,7 +2188,7 @@ function _jax_expr(ctx::_JaxContext, ::Val{:comprehension}, ex)
     end
     # A range with a data-dependent end: the vector is padded to its static
     # length, and its length is the number of the range's elements.
-    _PyVal(values.code, values.T, false, count)
+    _jax_repeat_last_valid(ctx, _PyVal(values.code, values.T, false, count))
 end
 
 # A typed comprehension `T[f(x) for x in xs]`: the comprehension, its
@@ -2871,11 +2872,14 @@ _jax_padded_stop(lo::_PyVal, hi::_PyVal) = lo.static && !hi.static && !isempty(h
 function _jax_range_ends(ctx::_JaxContext, iter)
     if iter isa Expr && iter.head === :call && iter.args[1] === :(:) && length(iter.args) == 3
         lo, hi = _jax_expr(ctx, iter.args[2]), _jax_expr(ctx, iter.args[3])
+    elseif iter isa Expr && iter.head === :call && _jax_resolve(ctx, iter.args[1]) === eachindex
+        lo = _jax_literal(1)
+        hi = _jax_eachindex_length(ctx, [_jax_expr(ctx, a) for a in iter.args[2:end]])
     elseif iter isa Expr && iter.head === :call && length(iter.args) >= 2 &&
-           _jax_resolve(ctx, iter.args[1]) in (eachindex, axes)
+           _jax_resolve(ctx, iter.args[1]) === axes
         x = _jax_expr(ctx, iter.args[2])
         lo = _jax_literal(1)
-        if _jax_resolve(ctx, iter.args[1]) === axes && length(iter.args) == 3
+        if length(iter.args) == 3
             hi = _jax_function_call(ctx, size, [x, _jax_expr(ctx, iter.args[3])])
         else
             _jax_rank(x.T) == 1 || _jax_error("a loop over the indices of a `", x.T, "`",
@@ -6123,10 +6127,42 @@ function _jax_call_positional(ctx::_JaxContext, ::Colon, args::Vector{_PyVal})
 end
 _jax_plus_one(b::_PyVal) = match(r"^-?[0-9]+$", b.code) === nothing ?
     _py_infix("+", [b.code, "1"]) : string(parse(Int, b.code) + 1)
-_jax_function_call(ctx::_JaxContext, ::typeof(eachindex), args::Vector{_PyVal}) =
-    length(args) == 1 && _jax_is_array(args[1].T) && ndims(args[1].T) == 1 ?
-    _jax_axis(ctx, args[1], 1) :
-    _jax_error("`eachindex` of `", args[1].T, "`", _jax_where(ctx))
+# For one-based vectors, equality of the logical lengths is equality of the
+# index domains. A ragged row's capacity is only the static bound for JAX.
+function _jax_eachindex_length(ctx::_JaxContext, args)
+    types = [a.T for a in args]
+    !isempty(args) && all(T -> _jax_rank(T) == 1, types) ||
+        _jax_error("`eachindex` of ", types, _jax_where(ctx))
+    if length(args) > 1
+        domain = _jax_return_type(eachindex, types)
+        domain !== Union{} && domain <: Base.OneTo ||
+            _jax_error("`eachindex` without a one-based linear index domain for ", types, _jax_where(ctx))
+    end
+    lengths = map(args) do x
+        ctx.host === nothing ? _jax_function_call(ctx, size, [x, _jax_literal(1)]) : _host_length(ctx, x)
+    end
+    n = first(lengths)
+    length(lengths) == 1 && return n
+    for other in Iterators.drop(lengths, 1)
+        valid = _jax_call(ctx, ==, [n, other])
+        _jax_call(ctx, _runtime_check, [valid,
+            _PyVal(repr("DimensionMismatch: all inputs to eachindex must have the same indices"),
+                   DimensionMismatch)])
+    end
+    # A traced but untaken branch may have mismatched shapes, even an empty
+    # second storage axis. Only trace reads that fit every operand's storage.
+    # For equal logical axes their common length fits all these capacities.
+    ctx.host !== nothing && return n
+    widths = unique(l.static ? l.code : l.limit for l in lengths)
+    capacity = length(widths) == 1 ? only(widths) : "min(" * join(widths, ", ") * ")"
+    all(l -> l.static, lengths) ? _PyVal(capacity, Int, true) :
+        _PyVal(n.code, Int, false, "", capacity)
+end
+function _jax_function_call(ctx::_JaxContext, ::typeof(eachindex), args::Vector{_PyVal})
+    n = _jax_eachindex_length(ctx, args)
+    capacity = n.static ? n.code : n.limit
+    _PyVal("jnp.arange(1, " * capacity * " + 1)", Base.OneTo{Int}, false, n.static ? "" : n.code)
+end
 function _jax_function_call(ctx::_JaxContext, ::typeof(axes), args::Vector{_PyVal})
     # On the host, `axes(x)` is the tuple of its ranges (`_host_axes`).
     ctx.host === nothing || length(args) != 1 || return _host_axes(ctx, only(args))
@@ -6148,6 +6184,22 @@ function _jax_axis(ctx::_JaxContext, x::_PyVal, dim::Int)
 end
 function _jax_function_call(ctx::_JaxContext, ::typeof(collect), args::Vector{_PyVal})
     x = only(args)
+    if x.T isa _JaxAggregate && x.T.T <: Base.Generator
+        f, indices = x.T.fields
+        # A lowered comprehension stores the closure and its index domain in
+        # a Generator. Reuse the source comprehension's host iteration and
+        # masked device mapping, with the same captured runtime values.
+        fun, stop = gensym(:element), gensym(:stop)
+        saved = ctx.locals
+        ctx.locals = copy(saved)
+        try
+            ctx.locals[fun] = f
+            ctx.locals[stop] = _jax_function_call(ctx, length, [indices])
+            return _jax_expr(ctx, :([$fun(i) for i in 1:$stop]))
+        finally
+            ctx.locals = saved
+        end
+    end
     ctx.host !== nothing && x.T isa Type && x.T <: Iterators.ProductIterator &&
         return _host_collect_product(ctx, x)
     if ctx.host !== nothing && x.T isa Type && x.T <: Base.Iterators.Zip
@@ -6155,7 +6207,7 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(collect), args::Vector{_P
         return _host_collected("list(" * iterable * ")", E)
     end
     x.T isa Type && x.T <: AbstractRange &&
-        return _PyVal(x.code, Vector{eltype(x.T)})
+        return _PyVal(x.code, Vector{eltype(x.T)}, x.static, x.extent)
     _jax_is_array(x.T) || _jax_error("`collect` of `", x.T, "`", _jax_where(ctx))
     _PyVal(x.code, Array{eltype(x.T),ndims(x.T)})
 end
@@ -6253,6 +6305,16 @@ function _jax_call_positional(ctx::_JaxContext, J::LinearAlgebra.UniformScaling,
     code = np * "eye(" * size * dtype * ")"
     J.λ == true || (code = _py_infix("*", [_jax_literal(J.λ).code, code]))
     _PyVal(code, typeof(J(1)), false, extent, "", isempty(extent) ? 0 : 3)
+end
+
+# An ordinary Julia helper lowers a comprehension over eachindex to
+# collect(Generator(f, indices)). The generator itself evaluates no element.
+function _jax_call_positional(ctx::_JaxContext, ::Type{Base.Generator}, args::Vector{_PyVal})
+    length(args) == 2 && args[2].T isa Type && args[2].T <: Base.OneTo ||
+        _jax_error("constructing a generator over this iterator", _jax_where(ctx))
+    f, indices = args
+    T = Base.Generator{indices.T,_jax_argument_type(f)}
+    _PyVal("<generator>", _JaxAggregate(T, args))
 end
 
 # Fixed arguments are captured runtime values, just as in anonymous closures.
@@ -8075,6 +8137,11 @@ function _jax_call_positional(ctx::_JaxContext,
     if ctx.host !== nothing && f === getindex && x.T isa Type && x.T <: AbstractDict
         length(args) == 2 || _jax_error("a dictionary key of several indices", _jax_where(ctx))
         return _PyVal(_py_atom(x.code) * "[" * args[2].code * "]", Base.valtype(x.T), true)
+    end
+    if ctx.host !== nothing && f === getindex && _jax_is_array(x.T) &&
+       length(args) == 2 && args[2].T isa Type && args[2].T <: Integer
+        result = _host_index(ctx, x, args[2:end])
+        result === nothing || return result
     end
     if x.T isa _JaxCallable && x.T.f isa _JaxClosure && f === getfield
         closure = x.T.f
