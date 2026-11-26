@@ -20,9 +20,15 @@ function _jax_ragged_sum_ports(body, op, port_of)
     sort(unique(ports)) == collect(1:length(body.have)) || return nothing
     inner_body = inner.op.kernel.plan
     length(inner_body.have) == length(ports) && length(inner_body.want) == 1 || return nothing
-    outer_atomic, inner_atomic = typeof(op).parameters[2], typeof(inner.op).parameters[2]
-    all(i -> (i in inner_atomic) == (ports[i] in outer_atomic), eachindex(ports)) || return nothing
     ports
+end
+
+# A scalar has no broadcast axis. Either plate may capture it while the
+# other passes it explicitly. Emission checks that every port shared at
+# either level is actually a scalar.
+function _jax_ragged_atomic(op, ports)
+    inner = first(op.kernel.plan.recipes).op
+    union(Int[typeof(op).parameters[2]...], (ports[i] for i in typeof(inner).parameters[2]))
 end
 
 # A branch with separate arm plans binds their inputs by name. Inspect those
@@ -134,7 +140,7 @@ function _jax_ragged_lane_sum(ctx, p, op, inputs)
     n = length(op.recipe.inputs)
     base = inputs[1:n]
     whole() = _jax_recipe(ctx, p, op.recipe, op.plate, base)
-    atomic = typeof(op.plate).parameters[2]
+    atomic = _jax_ragged_atomic(op.plate, op.nested.ports)
     mapped = [!(i in atomic) && _jax_is_array(v.T) for (i, v) in enumerate(base)]
     any(mapped) || return whole()
     for (v, per_row) in zip(base, mapped)

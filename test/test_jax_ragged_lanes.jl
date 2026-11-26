@@ -5,11 +5,11 @@ include("jax_python.jl")
 @kernel weighted_rows(w::Float64, x::Vector{Vector{Float64}},
                       mode::Vector{Vector{Float64}}) = begin
     totals = plate(x, mode) do row, flags
-        values = plate(row, flags) do v, m
+        values = plate(row, flags, w) do v, m, weight
             if m > 0 && v <= log(m)
-                m == 1 ? exp(w * v) : exp(-w * v)
+                m == 1 ? exp(weight * v) : exp(-weight * v)
             else
-                w + v
+                weight + v
             end
         end
         sum(values)

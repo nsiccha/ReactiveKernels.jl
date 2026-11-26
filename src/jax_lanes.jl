@@ -299,6 +299,7 @@ function _jax_lane_partition(g::Graph, r::Recipe, dependent::Set{ValueId})
         body = first(body.recipes).op.kernel.plan
         cg = body.graph
         port_of = Dict(canon_id(cg, v.id) => i for (v, i) in zip(body.have, nested))
+        atomic_inputs = _jax_ragged_atomic(op, nested)
     end
     # Each argument is shared (passed whole: a `Ref`, or a number), a lane
     # vector (its entries are the cells, which a pattern gathers), or of a
