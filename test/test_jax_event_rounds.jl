@@ -14,14 +14,32 @@ include("jax_python.jl")
     return total
 end
 
+@kernel function summed_states(a::Float64, rows::Vector{Vector{Float64}}, starts::Vector{Float64})
+    cells = plate(rows, starts, Ref(a)) do row, seed, scale
+        states = scan(row, Ref(scale); init = seed, include_init = true) do carry, value, c
+            next = c * carry + value
+            (next, next)
+        end
+        sum(states)
+    end
+    total = sum(cells)
+    return total
+end
+
 @testset "Parallel event rounds retain subject order and empty initial states" begin
     have = (:a, :rows)
     src = jax_source(terminal_state; have, data = (:rows,), want = :total, plate_layout = :rounds)
     @test occursin("= _rk_round_scan(", src.text)
     if rk_jax_available()
+        summed_have = (:a, :rows, :starts)
+        summed = jax_source(summed_states; have=summed_have, data=(:rows, :starts),
+                            want=:total, plate_layout=:rounds)
+        @test occursin("= _rk_round_scan(", summed.text)
+        native_sum = prepare(summed_states; have=summed_have, want=:total)
         native = prepare(terminal_state; have, want = :total)
         mktempdir() do dir
             write(joinpath(dir, "model.py"), src)
+            write(joinpath(dir, "sums.py"), summed)
             cases = ([Float64[], [1.5, 4.0], [-2.0]], [Float64[], Float64[]],
                      Vector{Float64}[], [[0.4, 1.0], [-0.2, 0.7]],
                      [collect(range(-1.0, 1.0; length = i % 11 + 2)) for i in 1:27],
@@ -30,8 +48,8 @@ end
                 write(io, """
 import numpy as np
 import jax
-import model
-def check(rows, expected, slope):
+import model, sums
+def check(rows, expected, slope, starts, expected_sum, slope_sum):
     data = model.prepare_data(rows)
     indexed, streams, restore = next(value for name,value in data.items() if name.startswith("_rk_event_rounds_"))
     phases = indexed or streams
@@ -51,6 +69,9 @@ def check(rows, expected, slope):
         assert len(scans) == len(phases), (len(scans), len(phases))
     actual = jax.jit(jax.value_and_grad(score))(0.45, data)
     np.testing.assert_allclose(actual, (expected, slope))
+    inputs = sums.prepare_data(rows=rows, starts=np.asarray(starts, dtype=float))
+    summed = jax.jit(jax.value_and_grad(lambda q: sums.kernel(q, **inputs)))(0.45)
+    np.testing.assert_allclose(summed, (expected_sum, slope_sum))
 """)
                 for rows in cases
                     a = 0.45
@@ -61,7 +82,17 @@ def check(rows, expected, slope):
                         end
                         derivative
                     end
-                    println(io, "check(", _rk_py_input(rows), ", ", native(a, rows), ", ", gradient, ")")
+                    starts = [sin(i) for i in eachindex(rows)]
+                    dsum = sum(zip(rows, starts); init = 0.0) do (row, seed)
+                        value, derivative, accum = seed, 0.0, 0.0
+                        for y in row
+                            value, derivative = value*a + y, derivative*a + value
+                            accum += derivative
+                        end
+                        accum
+                    end
+                    println(io, "check(", join((_rk_py_input(rows), native(a, rows), gradient,
+                            _rk_py_input(starts), native_sum(a, rows, starts), dsum), ", "), ")")
                 end
             end
             @test success(pipeline(Cmd(`$RK_JAX_PYTHON $(joinpath(dir,"check.py"))`; dir), stderr=stderr))

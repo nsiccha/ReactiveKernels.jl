@@ -158,17 +158,37 @@ end
     # A runtime check in such a function runs where its own conditions hold.
     @test occursin("_rk_check(", string(jax_source(JAXScalarRuleTests.plain_roots;
                                                    have=(:u,:x), want=:total)))
-    # refused: a check is masked by the data conditions it runs under, since
-    # vmap runs an untaken arm (reactivekernels-use §4j); a shared function
-    # cannot read its caller's condition, so under a data branch its check
-    # would raise on the lanes that branch discards.
-    @test_throws ReactiveKernels.JAXEmissionError jax_source(
-        JAXScalarRuleTests.guarded_roots; have=(:u,:x), want=:total)
-    # refused for the same reason when the branch reuses the function an
-    # unconditional call site already emitted.
-    @test_throws ReactiveKernels.JAXEmissionError jax_source(
-        JAXScalarRuleTests.mixed_roots; have=(:u,:x), want=:total)
+    # A checked scalar broadcast inside a branch takes the enclosing lane's
+    # activity, even if another call site uses the same helper unconditionally.
+    guarded = jax_source(JAXScalarRuleTests.guarded_roots; have=(:u,:x), want=:total)
+    mixed = jax_source(JAXScalarRuleTests.mixed_roots; have=(:u,:x), want=:total)
     if rk_jax_available()
+        mktempdir() do dir
+            write(joinpath(dir, "guarded.py"), guarded)
+            write(joinpath(dir, "mixed.py"), mixed)
+            write(joinpath(dir, "branches.py"), raw"""
+import jax
+import numpy as np
+import guarded, mixed
+
+u = np.array([[-1., -1.], [2., 2.]])
+x = np.array([[-1., -4.], [4., 9.]])
+batch = jax.jit(jax.vmap(jax.value_and_grad(guarded.kernel, argnums=1)))
+v, g = batch(u, x)
+np.testing.assert_allclose(v, [0., 5.])
+np.testing.assert_allclose(g, [[0., 0.], [0.25, 1/6]])
+positive = np.abs(x)
+np.testing.assert_allclose(jax.jit(jax.vmap(mixed.kernel))(u, positive), [-3., 15.])
+for f, q in ((guarded.kernel, -u), (mixed.kernel, u)):
+    try:
+        jax.block_until_ready(jax.jit(jax.vmap(f))(q, x))
+    except Exception as err:
+        assert "negative" in str(err), err
+    else:
+        raise AssertionError("the active negative square root must fail")
+""")
+            @test success(Cmd(`$RK_JAX_PYTHON $(joinpath(dir, "branches.py"))`; dir))
+        end
         native = prepare(JAXScalarRuleTests.guarded_fraction; have=(:u,), want=:value)
         for u in ([1.5, 0.5, 0.3], [2.5, 1.5, 0.8], [0.7, 3.0, 0.55])
             got = rk_jax_evaluate(rule, "kernel", (u,); grad=true)
