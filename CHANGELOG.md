@@ -28,6 +28,11 @@ are recorded in the git history only.
   fastest. The default `plate_layout = :padded` emits the same module as
   before.
 
+- `jax_source(...; plate_layout = :chains)` prepares variable-length vector rows in
+  contiguous storage with row offsets. Eligible subject scans run over the
+  actual events in row order. A caller can batch independent evaluations of
+  the generated function with `jax.vmap`.
+
 ## 0.1.388
 
 - Regenerated JAX modules skip a guarded matrix exponential and its reverse
