@@ -169,6 +169,7 @@ const _MATRIX_CORE_TESTS = (
     "test_jax_permutations.jl",
     "test_jax_repeat.jl",
     "test_jax_scalar_rules.jl",
+    "test_jax_guarded_scalars.jl",
     "test_jax_shared_softplus.jl",
     "test_jax_join.jl",
     "test_jax_allocations.jl",

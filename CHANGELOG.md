@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.400
+
+- A generated JAX plate can share a guarded scalar derivative rule and its
+  selected partials across cells with the same unmapped operands. Each cell
+  keeps its support test and its own contribution to the derivative.
+
 ## 0.1.399
 
 - Native borrowed position readers reuse dense outputs at the two most recent
