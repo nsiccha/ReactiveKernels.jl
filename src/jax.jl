@@ -425,6 +425,9 @@ mutable struct _JaxScope
     # Branches and scalar helpers retain the current step's indexed reads.
     # A nested data loop gets its own scope to avoid repeating a cell there.
     scan_reads::Dict{String,_JaxPlateCell}
+    # A record gather at entry to this scope, before any statements. A
+    # conditional can share it if both of its arms start with the same read.
+    first_record::Union{Nothing,@NamedTuple{name::String, expression::String}}
 end
 _JaxScope(parent::Union{Nothing,_JaxScope} = nothing; same_step::Bool = false) =
     _JaxScope(String[], 1, parent === nothing ? Set{String}() : copy(parent.used),
@@ -436,7 +439,7 @@ _JaxScope(parent::Union{Nothing,_JaxScope} = nothing; same_step::Bool = false) =
               parent === nothing ? Dict{String,String}() : copy(parent.chain_layouts),
               Dict{String,Tuple{String,String}}(),
               Set{Symbol}(), Dict{ValueId,_JaxPlateCell}(),
-              same_step ? parent.scan_reads : Dict{String,_JaxPlateCell}())
+              same_step ? parent.scan_reads : Dict{String,_JaxPlateCell}(), nothing)
 # The `flat_positions` entry of the lengths of cells that each fill their stored
 # rows: a plate's cells returning vectors whose length the cell's own expression
 # fixes (`vcat(a, b)` of scalars), or matrices of a fixed shape. Every stored
@@ -1367,7 +1370,15 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
                        _jax_tuple_fields(parts)) : _PyVal(_jax_tuple_code(parts), E)
             # Contextual helpers close over arguments. Capture the row at its
             # Julia read so each use in the helper shares the same gathers.
-            return ctx.host === nothing ? _jax_bind!(ctx, :record_entry, row) : row
+            ctx.host === nothing || return row
+            # A short-circuit operand can have an extra guard in the very
+            # same scope. Its read is conditional even at scope entry.
+            at_entry = isempty(ctx.scope.lines) && !any(g -> first(g) === ctx.scope, _JAX_GUARDS)
+            entry = _jax_bind!(ctx, :record_entry, row)
+            if at_entry && entry.code != row.code
+                ctx.scope.first_record = (; name = entry.code, expression = row.code)
+            end
+            return entry
         end
         return _PyVal(_jax_tuple_code(parts), Array{E,ndims(first(parts).T)}, false,
                       number === nothing ? "" : parts[number].extent)
@@ -3049,6 +3060,32 @@ struct _JaxArm
     value::_PyVal
 end
 
+# A batched cond broadcasts its captured operands across lanes. For two
+# arms starting with the same row read, capture the row instead of its
+# columns. The same row must be reached directly from each arm's entry.
+function _jax_share_branch_record!(ctx, condition, arms)
+    reads = map(arms) do arm
+        scope = arm.scope
+        read = scope.first_record
+        (read === nothing || isempty(scope.lines)) && return nothing
+        # Some translations roll their emitted statements back.
+        assignment = "    "^scope.indent * read.name * " = " * read.expression
+        first(scope.lines) == assignment ? read : nothing
+    end
+    a, b = reads
+    (a === nothing || b === nothing || a.expression != b.expression) && return condition
+    # Preserve the evaluation order even when computing the predicate can
+    # raise. Both arms would next evaluate precisely this gather.
+    predicate = _jax_bind!(ctx, :condition, condition)
+    _jax_emit!(ctx, a.name * " = " * a.expression)
+    for arm in arms
+        popfirst!(arm.scope.lines)
+        arm.scope.first_record = nothing
+    end
+    a.name == b.name || _jax_emit!(ctx, b.name * " = " * a.name)
+    predicate
+end
+
 # An emitted arm: what `jax.lax.cond` takes (`callable`: a nested function's
 # name, or `lambda: <expression>` for an arm without statements) and the code
 # that evaluates it in place (`call`), with its value's type and staticness.
@@ -3089,6 +3126,9 @@ function _jax_conditional(ctx::_JaxContext, condition::_PyVal, then_build, else_
                              ctx.scope, "jnp.logical_not(" * condition.code * ")"))
     finally
         ctx.traced_branches = traced
+    end
+    if !condition.static
+        condition = _jax_share_branch_record!(ctx, condition, (then_built, else_built))
     end
     A, B = then_built.value.T, else_built.value.T
     T = A === Union{} ? B : B === Union{} ? A :
