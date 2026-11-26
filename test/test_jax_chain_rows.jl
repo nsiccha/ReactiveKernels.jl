@@ -134,12 +134,15 @@ end
     src = jax_source(jax_indexed_scale; have, want = :total, data = (:subjects, :counts), plate_layout = :chains)
     ref = prepare(jax_indexed_scale; have, want = :total)
     if rk_jax_available()
-        for rows in ([[1,4], Int[], [9]], [Int[], Int[]], Vector{Int}[])
+        for rows in ([[1,4], Int[], [9]], [Int[], Int[]])
             subjects = collect(eachindex(rows))
             r = rk_jax_evaluate(src, "kernel", (2.0, subjects, rows); prepare = :arguments, grad = true)
             @test r.value ≈ ref(2.0, subjects, rows)
             @test r.grad ≈ ref(1.0, subjects, rows)
         end
+        @test_throws MethodError ref(2.0, Int[], Vector{Int}[])
+        @test_throws "reducing over an empty collection" rk_jax_evaluate(
+            src, "kernel", (2.0, Int[], Vector{Int}[]); prepare = :arguments, grad = true)
     end
 end
 

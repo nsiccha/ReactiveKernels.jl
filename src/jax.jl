@@ -5844,11 +5844,16 @@ function _jax_call_positional(ctx::_JaxContext, ::typeof(reduce), args::Vector{_
     E = eltype(eltype(T))
     ctx.host === nothing || return _PyVal("np.concatenate([np.atleast_1d(r) for r in " *
         x.code * "])", Vector{E}, true)
+    # Julia's uninitialized reduction needs a first row, even when each
+    # existing row has zero entries. The number of rows is a static shape.
+    cells = _jax_bind!(ctx, :cells, x)
+    _jax_call(ctx, _runtime_check, [_PyVal(_py_atom(cells.code) * ".shape[0] > 0", Bool, true),
+        _PyVal(repr("reduce(vcat, cells): reducing over an empty collection is not allowed"), ArgumentError)])
     flat = isempty(x.extent) ? _JAX_FULL_ROWS : _jax_flat_positions(ctx, x.extent)
-    flat == _JAX_FULL_ROWS && return _PyVal("jnp.reshape(" * x.code * ", (-1,))", Vector{E})
+    flat == _JAX_FULL_ROWS && return _PyVal("jnp.reshape(" * cells.code * ", (-1,))", Vector{E})
     flat === nothing && _jax_error("flattening a ragged value whose lengths are not those of a ",
         "prepared ragged input (`prepare_data`) has no JAX translation", _jax_where(ctx))
-    padded = _jax_bind!(ctx, :cells, x)
+    padded = cells
     lengths = _jax_bind!(ctx, :lengths, _PyVal(x.extent, Vector{Int}))
     mask = "(jnp.arange(" * padded.code * ".shape[1])[None, :] < " * lengths.code * "[:, None])"
     total = flat.total
