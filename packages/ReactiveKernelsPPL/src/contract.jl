@@ -1092,6 +1092,17 @@ struct _BindingData
 end
 _BindingData() = _BindingData(ReentrantLock(), Dict{Symbol,Any}(), IdDict{Any,Any}())
 
+# The expanded author program is used only by native random queries. Density
+# planning, row counts and the numerical build cache do not read this field.
+struct _DrawSource
+    model::Expr
+    generated::Expr
+    mod::Module
+    inputs::Set{Symbol}
+    observed::Set{Symbol}
+    scopes::Vector{SubmodelScope}
+end
+
 """
     StructuralPlan(responses, predictors, population_priors, parameters,
                    assignments, derived, columns, n_obs)
@@ -1175,7 +1186,21 @@ struct StructuralPlan
     marginalized_integers::Vector{Symbol}
     # Dotted observations inside a second explicitly authored plate.
     nested_broadcasts::Set{Symbol}
+    draw_source::Union{Nothing,_DrawSource}
 end
+
+# Full positional constructor used by existing programmatic plans.
+StructuralPlan(responses, predictors, population_priors, parameters, assignments,
+    derived, columns, n_obs, roles, levelmaps, plate_parameters, scans, vector_parameters,
+    matrices, array_parameters, submodel_scopes, conditioned, indexed_observations,
+    external_observations, cell_broadcasts, named_values, factors, cell_priors, frozen,
+    cell_latents, cell_geometries, data_values, documentation, marginalized_integers,
+    nested_broadcasts) = StructuralPlan(responses, predictors, population_priors,
+        parameters, assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+        scans, vector_parameters, matrices, array_parameters, submodel_scopes, conditioned,
+        indexed_observations, external_observations, cell_broadcasts, named_values, factors,
+        cell_priors, frozen, cell_latents, cell_geometries, data_values, documentation,
+        marginalized_integers, nested_broadcasts, nothing)
 
 StructuralPlan(responses, predictors, population_priors, parameters,
     assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
@@ -1904,7 +1929,7 @@ const _MULTI_AXIS_SLOTS = (:responses, :predictors, :population_priors,
     :matrices,
     :array_parameters, :indexed_observations, :external_observations,
     :cell_broadcasts, :named_values, :factors, :cell_priors, :frozen,
-    :cell_latents, :cell_geometries, :data_values, :documentation, :marginalized_integers, :nested_broadcasts)
+    :cell_latents, :cell_geometries, :data_values, :draw_source, :documentation, :marginalized_integers, :nested_broadcasts)
 
 # Observation-shaped values and their data dependencies. Parameters sized
 # by levels or coefficient width are shared values, so their priors do not
@@ -2279,7 +2304,7 @@ function _read_only_by_selection(plan::StructuralPlan, name::Symbol)
     end
     for f in fieldnames(StructuralPlan)
         f in (:columns, :roles, :n_obs, :submodel_scopes, :responses,
-            :indexed_observations, :cell_broadcasts, :frozen, :data_values, :documentation) && continue
+            :indexed_observations, :cell_broadcasts, :frozen, :data_values, :draw_source, :documentation) && continue
         visit(getfield(plan, f))
     end
     for r in plan.responses, f in fieldnames(LikelihoodSpec)
@@ -3102,7 +3127,7 @@ function _uncached_label_only_columns(plan::StructuralPlan)
     end
     for f in fieldnames(StructuralPlan)
         f in (:columns, :roles, :n_obs, :submodel_scopes, :cell_broadcasts,
-            :frozen, :data_values, :documentation) && continue
+            :frozen, :data_values, :draw_source, :documentation) && continue
         visit(getfield(plan, f))
     end
     return setdiff!(labels, numeric)
@@ -7995,7 +8020,7 @@ function _preparation_data_names(plan, nodes, raw, onlydata, names;
     free = Set{Symbol}(keys(nodes))
     for f in fieldnames(StructuralPlan)
         f in (:assignments, :derived, :columns, :submodel_scopes,
-            :cell_broadcasts, :factors, :conditioned, :frozen, :data_values, :documentation) && continue
+            :cell_broadcasts, :factors, :conditioned, :frozen, :data_values, :draw_source, :documentation) && continue
         _drop_held_names!(free, getfield(plan, f))
     end
     # Whole-value classification exempts `axes(M, d)` from observation
@@ -8052,7 +8077,7 @@ function _uncached_model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Sym
     unused = Set{Symbol}(raw)
     for f in fieldnames(StructuralPlan)
         f in (:columns, :n_obs, :roles, :submodel_scopes, :cell_broadcasts,
-            :frozen, :data_values, :documentation) && continue
+            :frozen, :data_values, :draw_source, :documentation) && continue
         _drop_held_names!(unused, getfield(plan, f))
     end
     defs = Pair{Symbol,Any}[a.name => a.expr for a in plan.assignments]
@@ -8156,7 +8181,7 @@ function _uncached_model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Sym
     named = copy(free)
     for f in fieldnames(StructuralPlan)
         f in (:assignments, :derived, :columns, :n_obs, :roles,
-            :submodel_scopes, :frozen, :data_values, :documentation) && continue
+            :submodel_scopes, :frozen, :data_values, :draw_source, :documentation) && continue
         if f === :parameters
             for p in plan.parameters
                 p.family === :external && p.name in plan.conditioned && continue
@@ -8491,7 +8516,7 @@ function _uncached_bound_value_inputs(plan::StructuralPlan)
     found = Set{Symbol}()
     seen = Base.IdSet{Any}()
     for f in fieldnames(StructuralPlan)
-        f in (:columns, :submodel_scopes, :frozen, :data_values, :documentation) && continue
+        f in (:columns, :submodel_scopes, :frozen, :data_values, :draw_source, :documentation) && continue
         _collect_bound_value_inputs!(found, getfield(plan, f), seen)
     end
     return found

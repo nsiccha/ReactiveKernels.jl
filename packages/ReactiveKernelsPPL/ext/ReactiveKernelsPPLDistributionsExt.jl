@@ -14,6 +14,43 @@ ReactiveKernelsPPL._predictive_mixture(components::AbstractVector, weights::Abst
 ReactiveKernelsPPL.sampling_logdensity(d::Distributions.Distribution, value) =
     Distributions.logpdf(d, value)
 
+ReactiveKernelsPPL.sampling_draw(rng, d::Distributions.Distribution) = rand(rng, d)
+
+# Unqualified RKPPL constructors use the surface's distribution semantics.
+# A qualified external constructor remains a call to its author's binding.
+for head in (:Normal, :LogNormal, :Cauchy, :Exponential, :Gamma, :Beta,
+        :InverseGamma, :TDist, :Laplace, :Logistic, :Uniform, :Weibull,
+        :Bernoulli, :Binomial, :Categorical, :DiscreteUniform, :Dirichlet,
+        :MvNormal, :truncated)
+    @eval ReactiveKernelsPPL._generation_constructor(::Val{$(QuoteNode(head))}) =
+        Distributions.$head
+end
+_half_normal(s) = Distributions.truncated(Distributions.Normal(0, s), 0, Inf)
+_half_cauchy(s) = Distributions.truncated(Distributions.Cauchy(0, s), 0, Inf)
+_student_t(nu, mu, sigma) = mu + sigma * Distributions.TDist(nu)
+ReactiveKernelsPPL._generation_constructor(::Val{:Ordered}) = Distributions.JointOrderStatistics
+ReactiveKernelsPPL._generation_constructor(::Val{:HalfNormal}) = _half_normal
+ReactiveKernelsPPL._generation_constructor(::Val{:HalfCauchy}) = _half_cauchy
+ReactiveKernelsPPL._generation_constructor(::Val{:StudentT}) = _student_t
+
+# RKPPL's constrained LKJ value is the requested triangular factor matrix.
+struct _FactorLaw{D}
+    law::D
+end
+_lkj_factor(k, eta, uplo='L') = _FactorLaw(Distributions.LKJCholesky(k, eta, uplo))
+ReactiveKernelsPPL._generation_constructor(::Val{:LKJCholesky}) = _lkj_factor
+function ReactiveKernelsPPL.sampling_draw(rng, d::_FactorLaw)
+    F = rand(rng, d.law)
+    return Matrix(d.law.uplo == 'L' ? F.L : F.U)
+end
+
+function _mvnormal_cholesky(mu, L)
+    ReactiveKernelsPPL._cholesky_factor_logdet(L, length(mu))
+    return Distributions.MvNormal(mu, L * L')
+end
+ReactiveKernelsPPL._generation_constructor(::Val{:MvNormalCholesky}) =
+    _mvnormal_cholesky
+
 # Structural mappings consume authored arguments without evaluating them.
 # Defaults and Gamma's scale parameter follow the resolved Julia constructor.
 _graph_call(name, args...) = Expr(:call, GlobalRef(DistributionKernelSources, name), args...)

@@ -16,6 +16,12 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.265
+
+- Added native joint prior draws with `prepare_prior` and generated-only
+  declarations with `@generate` and `prepare_generated`. Caller-owned
+  sampling RHS types can define `sampling_draw(rng, law)`.
+
 ## 0.1.264
 
 - Partitioned JAX modules export `prepare_unit_coordinates` and

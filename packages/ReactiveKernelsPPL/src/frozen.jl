@@ -173,7 +173,7 @@ _live_names(plan::StructuralPlan, given::Set{Symbol}, inputs::Set{Symbol}) =
         free = copy(candidates)
         for f in fieldnames(StructuralPlan)
             f in (:assignments, :derived, :columns, :roles, :n_obs,
-                :submodel_scopes, :frozen, :data_values, :documentation) && continue
+                :submodel_scopes, :frozen, :data_values, :draw_source, :documentation) && continue
             _drop_held_names!(free, getfield(plan, f))
         end
         live = setdiff(candidates, free)
