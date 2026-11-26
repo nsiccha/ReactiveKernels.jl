@@ -1,7 +1,9 @@
 def _rk_round_scan(schedule, step, seed, columns, tags, shared, mapped, seed_mapped,
                    dtype, reduction, include_seed, decorate, gathered):
     """Advance independent subjects together at the prepared event positions."""
-    phases, restore = schedule
+    indexed, streams, restore = schedule
+    phases = streams or indexed
+    direct = bool(streams)
     first = columns[0]
     nrows = first.shape[0]
     flat = tuple(_rk_flat_values(column) for column in columns)
@@ -12,6 +14,7 @@ def _rk_round_scan(schedule, step, seed, columns, tags, shared, mapped, seed_map
         # A regular singleton event row was broadcast to cover the other
         # subject operands. Its rectangular schedule depends only on the shapes.
         width = first.shape[1]
+        direct = True
         phases = (jnp.arange(nrows * width).reshape(nrows, width).T,)
         restore = jnp.arange(nrows * width).reshape(width, nrows).T.reshape(-1)
 
@@ -22,7 +25,15 @@ def _rk_round_scan(schedule, step, seed, columns, tags, shared, mapped, seed_map
     summed = reduction == "sum"
     zero = jnp.sum(jnp.empty(0, dtype=dtype)) if summed else 0
     empty = carries if include_seed else jnp.broadcast_to(zero, (nrows,))
-    state = (carries, empty if summed else ())
+    if direct:
+        # A lane can finish one subject and immediately start another. Its
+        # first event selects the new seed; completed streams drop at the
+        # next segment boundary.
+        seed0 = jax.tree.map(lambda x: jnp.broadcast_to(x, (phases[0].shape[1],) + jnp.shape(x)),
+                             (initial(0), zero if summed else ()))
+        state = seed0
+    else:
+        state = carries, empty if summed else ()
 
     def advance(carry, row, entries, selected):
         args = (_rk_select_subject(x, row) if use_row else x
@@ -31,7 +42,18 @@ def _rk_round_scan(schedule, step, seed, columns, tags, shared, mapped, seed_map
 
     def run_round(state, event):
         previous, totals = state
-        owners, entries, selected = event
+        row_tags, entries, selected = event
+        owners = jnp.abs(row_tags) - 1
+        if direct:
+            def restart(tag, prior, row):
+                return jax.tree.map(lambda new, old: jnp.where(tag < 0, new, old), initial(row), prior)
+            active = jax.vmap(restart)(row_tags, previous, owners)
+            updated, values = jax.vmap(advance)(active, owners, entries, selected)
+            if summed:
+                reset = jax.vmap(initial)(owners) if include_seed else zero
+                totals = jnp.where(row_tags < 0, reset, totals) + values
+                return (updated, totals), totals
+            return (updated, totals), values
         active = jax.tree.map(lambda x: x[owners], previous)
         updated, values = jax.vmap(advance)(active, owners, entries, selected)
         previous = jax.tree.map(lambda old, new: old.at[owners].set(new, unique_indices=True),
@@ -42,20 +64,22 @@ def _rk_round_scan(schedule, step, seed, columns, tags, shared, mapped, seed_map
         return (previous, totals), values
 
     run = run_round if decorate is None else decorate(run_round)
-    events = (jnp.abs(tags) - 1, flat, gathered)
+    events = (tags, flat, gathered)
     chunks = []
     for positions in phases:
+        if direct:
+            state = jax.tree.map(lambda x: x[:positions.shape[1]], state)
         operands = jax.tree.map(lambda x: x[positions], events)
         state, result = jax.lax.scan(run, state, operands)
-        if not summed:
+        if direct or not summed:
             chunks.append(jax.tree.map(lambda x: x.reshape((-1,) + x.shape[2:]), result))
-    if summed:
+    if summed and not direct:
         return state[1]
     def original_order(*parts):
         joined = parts[0] if len(parts) == 1 else jnp.concatenate(parts)
         return joined[restore]
     values = jax.tree.map(original_order, *chunks)
-    if reduction == "last":
+    if reduction:
         if isinstance(first, _RKChainRows):
             offsets = jnp.asarray(first.offsets)
             ends, lengths = offsets[1:], jnp.diff(offsets)

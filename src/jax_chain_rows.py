@@ -279,7 +279,7 @@ def _rk_subject_axes(columns, extra, tags):
     return columns, tags
 
 
-def _rk_map_rows(cell, args, axes, layout, dtypes, sum_rows, domains):
+def _rk_map_rows(cell, args, axes, layout, dtypes, sum_rows, domains, vector_read=False):
     first = args[axes.index("event")]
     if layout is None:
         if sum_rows:
@@ -308,7 +308,12 @@ def _rk_map_rows(cell, args, axes, layout, dtypes, sum_rows, domains):
             it = iter(items)
             return cell(*(next(it) if axis == "event" else _rk_select_subject(x, row) if axis == "row" else x
                           for x, axis in zip(args, axes)))
-        if sum_rows:
+        if vector_read:
+            values = jax.vmap(apply)((tags, *events))
+            if sum_rows:
+                dtype = jnp.sum(jnp.empty(0, dtype=dtypes)).dtype
+                return jax.ops.segment_sum(values.astype(dtype), tags, size, indices_are_sorted=True)
+        elif sum_rows:
             zero = jnp.sum(jnp.empty(0, dtype=dtypes))
             def step(subtotal, arg):
                 start, items = arg
@@ -318,7 +323,8 @@ def _rk_map_rows(cell, args, axes, layout, dtypes, sum_rows, domains):
             _, sums = jax.lax.scan(step, zero, (first_in_row, (tags, *events)))
             ends = offsets[1:] if n == size else (jnp.arange(size) + 1) * int(width)
             return jnp.where(counts > 0, sums[jnp.maximum(ends - 1, 0)], zero)
-        values = jax.lax.map(apply, (tags, *events))
+        else:
+            values = jax.lax.map(apply, (tags, *events))
     elif sum_rows:
         return jnp.zeros(size, dtype=jnp.sum(jnp.empty(0, dtype=dtypes)).dtype)
     else:

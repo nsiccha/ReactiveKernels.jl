@@ -24,7 +24,8 @@ end
             write(joinpath(dir, "model.py"), src)
             cases = ([Float64[], [1.5, 4.0], [-2.0]], [Float64[], Float64[]],
                      Vector{Float64}[], [[0.4, 1.0], [-0.2, 0.7]],
-                     [collect(range(-1.0, 1.0; length = i % 11 + 2)) for i in 1:27])
+                     [collect(range(-1.0, 1.0; length = i % 11 + 2)) for i in 1:27],
+                     [collect(range(-1.0, 1.0; length = i)) for i in 51:70])
             open(joinpath(dir, "check.py"), "w") do io
                 write(io, """
 import numpy as np
@@ -32,15 +33,22 @@ import jax
 import model
 def check(rows, expected, slope):
     data = model.prepare_data(rows)
-    phases, restore = next(value for name,value in data.items() if name.startswith("_rk_event_rounds_"))
-    assert len(phases) <= 2
+    indexed, streams, restore = next(value for name,value in data.items() if name.startswith("_rk_event_rounds_"))
+    phases = indexed or streams
+    assert len(indexed) <= 2 and len(streams) <= 8 and not (indexed and streams)
     assert sum(x.shape[0] for x in phases) == max(map(len, rows), default=0)
     assert sum(x.size for x in phases) == sum(map(len, rows))
+    if len(rows) == 20:
+        assert indexed and not streams
     if phases:
         order = np.concatenate([x.ravel() for x in phases])
         np.testing.assert_array_equal(order[restore], np.arange(len(order)))
     def score(q, prepared):
         return model.kernel(q, **prepared)
+    trace = jax.make_jaxpr(score)(0.45, data)
+    if phases:
+        scans = [eq for eq in trace.jaxpr.eqns if eq.primitive.name == 'scan']
+        assert len(scans) == len(phases), (len(scans), len(phases))
     actual = jax.jit(jax.value_and_grad(score))(0.45, data)
     np.testing.assert_allclose(actual, (expected, slope))
 """)
@@ -60,4 +68,42 @@ def check(rows, expected, slope):
         end
     end
 end
+
+@kernel function jax_selected_history(scale::Float64, events::Vector{Vector{Int}},
+                                      indices::Vector{Vector{Int}}, fields::Vector{Vector{Int}})
+    totals = plate(events, indices, fields, Ref(scale)) do ev, visits, selectors, x
+        history = scan(ev, Ref(x); init = 0.0) do state, amount, a
+            next = state + amount * a
+            (next, (next, -2next))
+        end
+        selected = plate(visits, selectors, Ref(history)) do j, k, path
+            k == 1 ? path[j][1] : path[j][2]
+        end
+        sum(selected)
+    end
+    total = sum(totals)
+    return total
+end
+
+@testset "Independent fields of a completed history are gathered together" begin
+    have = (:scale, :events, :indices, :fields)
+    src = jax_source(jax_selected_history; have, want = :total, data = Base.tail(have), plate_layout = :rounds)
+    @test occursin(", vector_read=True)", string(src))
+    native = prepare(jax_selected_history; have, want = :total)
+    if rk_jax_available()
+        for args in (([[2, 3], Int[], [7]], [[2, 1, 2], Int[], [1]], [[2, 1, 1], Int[], [0]]),
+                     ([[1, 2], [3, 4]], [[2, 1], [1, 2]], [[1]]),
+                     ([Int[], Int[]], [Int[], Int[]], [Int[], Int[]]))
+            result = rk_jax_evaluate(src, "kernel", (0.71, args...); prepare = :arguments, grad = true)
+            @test result.value ≈ native(0.71, args...)
+            @test result.grad ≈ native(1.0, args...)
+        end
+        for j in (0, 2), k in (1, 2)
+            args = ([[1], [2, 3]], [[j], Int[]], [[k], Int[]])
+            @test_throws BoundsError native(0.71, args...)
+            @test_throws "BoundsError" rk_jax_evaluate(src, "kernel", (0.71, args...); prepare = :arguments)
+        end
+    end
+end
+
 end
