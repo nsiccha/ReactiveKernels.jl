@@ -481,6 +481,9 @@ mutable struct _JaxScope
     # A record gather at entry to this scope, before any statements. A
     # conditional can share it if both of its arms start with the same read.
     first_record::Union{Nothing,@NamedTuple{name::String, expression::String}}
+    # Cell inputs that a guarded scalar expression may read before its branch.
+    scalar_parameters::Union{Nothing,Set{Symbol}}
+    conditional_arm::Bool
 end
 _JaxScope(parent::Union{Nothing,_JaxScope} = nothing; same_step::Bool = false) =
     _JaxScope(String[], 1, parent === nothing ? Set{String}() : copy(parent.used),
@@ -494,7 +497,7 @@ _JaxScope(parent::Union{Nothing,_JaxScope} = nothing; same_step::Bool = false) =
               Set{Symbol}(), Dict{ValueId,_JaxPlateCell}(),
               same_step ? parent.scan_reads : Dict{String,_JaxPlateCell}(),
               "", Tuple{String,String}[],
-              same_step ? parent.scan_rows : nothing, nothing, nothing)
+              same_step ? parent.scan_rows : nothing, nothing, nothing, nothing, false)
 # The `flat_positions` entry of the lengths of cells that each fill their stored
 # rows: a plate's cells returning vectors whose length the cell's own expression
 # fixes (`vcat(a, b)` of scalars), or matrices of a fixed shape. Every stored
@@ -3298,9 +3301,9 @@ function _jax_conditional(ctx::_JaxContext, condition::_PyVal, then_build, else_
     then_built, else_built = try
         condition.static ? (_jax_arm_function(ctx, :then_arm, then_build),
                             _jax_arm_function(ctx, :else_arm, else_build)) :
-            (_jax_with_guard(() -> _jax_arm_function(ctx, :then_arm, then_build),
+            (_jax_with_guard(() -> _jax_arm_function(ctx, :then_arm, then_build; conditional_arm = true),
                              ctx.scope, condition.code),
-             _jax_with_guard(() -> _jax_arm_function(ctx, :else_arm, else_build),
+             _jax_with_guard(() -> _jax_arm_function(ctx, :else_arm, else_build; conditional_arm = true),
                              ctx.scope, "jnp.logical_not(" * condition.code * ")"))
     finally
         ctx.traced_branches = traced
@@ -3733,9 +3736,10 @@ _jax_expr(ctx::_JaxContext, ::Val{:elseif}, ex) = _jax_expr(ctx, Val(:if),
 _jax_typeof(v::_PyVal) = v.T isa Type ? v.T : Any
 
 # Translate an arm's body `build` in a scope of its own.
-function _jax_arm_function(ctx::_JaxContext, hint, build)
+function _jax_arm_function(ctx::_JaxContext, hint, build; conditional_arm = false)
     outer = ctx.scope
     inner = _JaxScope(outer; same_step = true)
+    inner.conditional_arm = conditional_arm
     inner.indent = outer.indent + 1
     saved_locals = copy(ctx.locals)
     ctx.scope = inner
@@ -7069,30 +7073,42 @@ function _jax_scalar_rule(ctx::_JaxContext,
                 calls[m] = (cutname, outputs)
             end
         end
-        jvp = _jax_private_identifier(ctx.mod.used, Symbol(name, "_jvp"))
-        lines = ["def " * jvp * "(primals, tangents):",
-                 "    active = tuple(not isinstance(t, jax.custom_derivatives.SymbolicZero) for t in tangents)",
-                 "    mask = sum((1 << i) for i, a in enumerate(active) if a)",
-                 "    if mask == 0:",
-                 "        value = " * name * "(*primals)",
-                 "        return value, jnp.zeros_like(value)"]
-        for mask in eachindex(Cuts)
-            cutname, outputs = calls[mask]
-            ret = Cuts[mask][3]
-            indices = [i for i in 1:N if (mask >> (i - 1)) & 1 == 1]
-            terms = ["values[" * string(findfirst(==(ret[k + 1]), outputs) - 1) *
-                     "] * tangents[" * string(i - 1) * "]" for (k, i) in enumerate(indices)]
-            append!(lines, ["    if mask == " * string(mask) * ":",
-                "        values = " * cutname * "(*primals)",
-                "        return values[" * string(findfirst(==(ret[1]), outputs) - 1) *
-                "], " * join(terms, " + ")])
-        end
-        push!(lines, name * ".defjvp(" * jvp * ", symbolic_zeros=True)")
-        push!(ctx.mod.helpers, join(lines, "\n"))
+        ctx.mod.helper_names[(:scalar_cuts, name)] = calls
+        _jax_scalar_jvp!(ctx, name, N, Cuts, calls)
     end
     _jax_shared_guard_check(ctx, name)
-    _jax_bind!(ctx, :value,
-        _PyVal(name * "(" * _jax_args(args) * ")", _jax_return_type(rule, collect(types))))
+    value = _PyVal(name * "(" * _jax_args(args) * ")", _jax_return_type(rule, collect(types)))
+    shared = _jax_guarded_scalar(ctx, name, args, value, N, Cuts)
+    shared === nothing ? _jax_bind!(ctx, :value, value) : shared
+end
+
+function _jax_scalar_jvp!(ctx, name, N, Cuts, calls; guarded = false)
+    jvp = _jax_private_identifier(ctx.mod.used, Symbol(name, "_jvp"))
+    lines = ["def " * jvp * "(primals, tangents):"]
+    if guarded
+        push!(lines, "    selected, demand, *args = primals", "    tangents = tangents[2:]")
+    end
+    append!(lines, [
+        "    active = tuple(not isinstance(t, jax.custom_derivatives.SymbolicZero) for t in tangents)",
+        "    mask = sum((1 << i) for i, a in enumerate(active) if a)",
+        "    if mask == 0:",
+        "        value = " * name * "(*primals)",
+        "        return value, jnp.zeros_like(value)"])
+    for mask in eachindex(Cuts)
+        cutname, outputs = calls[mask]
+        ret = Cuts[mask][3]
+        indices = [i for i in 1:N if (mask >> (i - 1)) & 1 == 1]
+        terms = ["values[" * string(findfirst(==(ret[k + 1]), outputs) - 1) *
+                 "] * tangents[" * string(i - 1) * "]" for (k, i) in enumerate(indices)]
+        call = guarded ? _jax_selected_cut!(ctx, cutname) * "(selected, demand, *args)" :
+                         cutname * "(*primals)"
+        append!(lines, ["    if mask == " * string(mask) * ":",
+            "        values = " * call,
+            "        return values[" * string(findfirst(==(ret[1]), outputs) - 1) *
+            "], " * join(terms, " + ")])
+    end
+    push!(lines, name * ".defjvp(" * jvp * ", symbolic_zeros=True)")
+    push!(ctx.mod.helpers, join(lines, "\n"))
 end
 
 # A prepared kernel called as a function (a distribution endpoint a helper
@@ -8748,6 +8764,11 @@ function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
     tables = event_inputs === nothing ? nothing : _jax_chain_step_tables!(inner, p, event_inputs)
     effects = _JAX_EFFECTS[]
     recipe = ctx.recipe
+    if recipe isa Recipe && recipe.op isa _AuthoredPlateOp
+        inner.scalar_parameters = Set(Symbol(v.code) for v in values(inner.values)
+                                      if v.T isa Type && v.T <: Real)
+        active_cells && push!(inner.scalar_parameters, Symbol(active))
+    end
     ctx.scope = inner
     wants = try
         if active_cells
