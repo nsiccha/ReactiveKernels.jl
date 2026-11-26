@@ -1926,7 +1926,17 @@ jax.tree_util.register_pytree_node(StaticInt, lambda s: ((), int(s)), lambda v, 
 # entries (`_jax_trip_bound`): `prepare_data` returns them with the data. An
 # array without entries gives 0 (no range over its entries runs) and a span
 # of -1 (no steps).
+_jax_prepared_aux_type(kind) = kind === :sign_groups ? Tuple : Int
+
 const _JAX_PREPARED_BOUNDS = Dict{Symbol,Tuple{String,String}}(
+    :sign_groups => ("_rk_sign_groups", """
+def _rk_sign_groups(values):
+    x = np.asarray(values)
+    pos = np.flatnonzero(x > 0)
+    neg = np.flatnonzero(x < 0)
+    other = np.flatnonzero(~((x > 0) | (x < 0)))
+    return pos, neg, other, np.argsort(np.concatenate((pos, neg, other)))
+"""),
     :broadcast_total => ("_rk_broadcast_total", """
 def _rk_broadcast_total(*operands):
     # One vector of row lengths and an optional one-based row selector per
