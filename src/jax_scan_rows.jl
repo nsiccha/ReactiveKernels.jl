@@ -46,9 +46,14 @@ def _rk_scan_rows(table, index, requested, length):
     at = jnp.where(requested & valid, index - 1, size)
     def gather(column):
         if column.shape[0] == 0:
-            return jnp.zeros(index.shape, dtype=column.dtype)
+            return jnp.zeros(index.shape + column.shape[1:], dtype=column.dtype)
         return jnp.take(column, at, axis=0, mode="fill", fill_value=0)
     return jax.tree_util.tree_map(gather, table), acceptable
+"""
+
+const _JAX_SCAN_RECORD_ROWS = raw"""
+def _rk_scan_record_rows(table, index, requested, length):
+    return _rk_scan_rows(_rk_pack_record(table), index, requested, length)
 """
 
 function _jax_scan_row_inputs!(ctx, inner, rows, unpack, seqs, width, extent, pure;
@@ -81,6 +86,12 @@ function _jax_scan_row_inputs!(ctx, inner, rows, unpack, seqs, width, extent, pu
         axis = r.table.origin isa _JaxRecordLayout ? r.table.origin.axis_extent : r.table.extent
         limit = isempty(axis) ? _py_atom(_jax_mapped_array(r.table)) * ".shape[0]" : axis
         gather = _jax_helper!(ctx, "_rk_scan_rows", _JAX_SCAN_ROWS)
+        E = eltype(r.table.T)
+        packed = _jax_uniform_record(E)
+        if packed
+            _jax_helper!(ctx, "_rk_pack_record", _JAX_PACK_RECORD)
+            gather = _jax_helper!(ctx, "_rk_scan_record_rows", _JAX_SCAN_RECORD_ROWS)
+        end
         values, valid = _jax_fresh(ctx, :scan_rows), _jax_fresh(ctx, :valid_rows)
         call = gather_rows === nothing ? gather * "(" * join((r.table.code, index, guard, limit), ", ") * ")" :
                gather_rows(gather, r.table, index, guard, limit)
@@ -90,7 +101,9 @@ function _jax_scan_row_inputs!(ctx, inner, rows, unpack, seqs, width, extent, pu
         input = r.token
         push!(unpack, input)
         for site in sites
-            replacements[site.token] = input
+            # Keep one array through the gather and scan. Expose the original
+            # tuple structure only once the step receives its single row.
+            replacements[site.token] = packed ? "tuple(" * input * ")" : input
         end
     end
     if !isempty(checks)

@@ -95,7 +95,7 @@ end
     native = prepare(jax_scan_record_table; have, want = :total)
     src = jax_source(jax_scan_record_table; have, want = :total, data = (:keys, :orders))
     @test occursin("@_rk_table_scan_step", string(src))
-    @test occursin(r"record_entry\w* = \(", string(src))
+    @test occursin(r"record_entry\w* = _rk_record_at\(", string(src))
     if rk_jax_available()
         for orders in ([[1, 0, 2, 1], [2], Int[]], [zeros(Int, 9)], [Int[]], Vector{Int}[])
             keys = [0.25, -0.5]

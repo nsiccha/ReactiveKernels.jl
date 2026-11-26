@@ -77,15 +77,15 @@ end
     packed = jax_source(jax_guarded_scan_rows; have, want = :total, data = (:bases, :types, :orders),
                         plate_layout = :chains)
     native = prepare(jax_guarded_scan_rows; have, want = :total)
-    @test occursin("_rk_scan_rows(", string(src))
-    @test occursin(" = _rk_event_table_rows(_rk_scan_rows, ", string(packed))
+    @test occursin(" = _rk_scan_record_rows(", string(src))
+    @test occursin(" = _rk_event_table_rows(_rk_scan_record_rows, ", string(packed))
     @test occursin(" = _rk_scan_events(", string(packed))
     checked_have = (:a, :kinds, :visits, :table)
     checked = jax_source(jax_scan_row_order; have = checked_have, want = :total)
     @test !occursin("_rk_scan_rows(", string(checked))
     captured_have = (:a, :xs, :kinds, :steps, :spans, :visits)
     captured = jax_source(jax_scan_two_tables; have = captured_have, want = :total)
-    @test count(" = _rk_scan_rows(", string(captured)) == 2
+    @test count(" = _rk_scan_record_rows(", string(captured)) == 2
     ref = prepare(jax_scan_two_tables; have = captured_have, want = :total)
     if rk_jax_available()
         scale_have = (:scale, :bases, :kinds, :visits, :weights)

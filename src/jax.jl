@@ -1349,6 +1349,42 @@ function _jax_unit_indices!(ctx::_JaxContext, indices, what::AbstractString)
     end
 end
 
+_jax_uniform_record(E) = E isa Type && E <: Union{Tuple,NamedTuple} && isconcretetype(E) &&
+    fieldcount(E) > 1 && fieldtype(E, 1) <: Number && allequal(fieldtypes(E))
+
+const _JAX_PACK_RECORD = raw"""
+def _rk_pack_record(columns):
+    # Some callers supply columns at their own precision, or packed ragged
+    # views. Their original column reads preserve each value's dtype/layout.
+    first = columns[0]
+    if getattr(first, "ndim", None) == 1 and all(
+        getattr(c, "ndim", None) == 1 and c.dtype == first.dtype and c.shape == first.shape
+        for c in columns
+    ):
+        return jnp.stack(columns, axis=-1)
+    return columns
+"""
+
+const _JAX_RECORD_AT = raw"""
+def _rk_record_at(columns, at):
+    table = _rk_pack_record(columns)
+    if isinstance(table, tuple):
+        return tuple(c[at] for c in table)
+    return tuple(table[at])
+"""
+
+function _jax_bind_record_entry(ctx, row)
+    ctx.host === nothing || return row
+    # A short circuit can add a guard in the same scope. Only a first,
+    # unconditional read can be shared by both arms.
+    at_entry = isempty(ctx.scope.lines) && !any(g -> first(g) === ctx.scope, _JAX_GUARDS)
+    entry = _jax_bind!(ctx, :record_entry, row)
+    if at_entry && entry.code != row.code
+        ctx.scope.first_record = (; name = entry.code, expression = row.code)
+    end
+    entry
+end
+
 # Index `x` with Julia indices `indices` (source expressions). An assignment
 # `target` reads the position only, so its gather carries no extent.
 function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
@@ -1396,6 +1432,17 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
     # except for a named scan's outputs, which are stacked as columns too.
     if _jax_columns(x.T) && (ctx.host === nothing || eltype(x.T) <: NamedTuple)
         E = eltype(x.T)
+        if ctx.host === nothing && !target && x.T <: AbstractVector && _jax_uniform_record(E) &&
+           length(indices) == 1 && !_jax_written_slice(only(indices))
+            i = _jax_bound_expr(ctx, _jax_column(x, 1), 1, only(indices))
+            if i.T isa Type && i.T <: Integer && i.T !== Bool
+                _jax_helper!(ctx, "_rk_pack_record", _JAX_PACK_RECORD)
+                read = _jax_helper!(ctx, "_rk_record_at", _JAX_RECORD_AT)
+                row = _PyVal(read * "(" * x.code * ", " * _jax_minus_one(i) * ")", E)
+                return _jax_bind_record_entry(ctx, row)
+            end
+            indices = [i]
+        end
         parts = [_jax_index(ctx, _jax_column(x, k), indices) for k in 1:fieldcount(E)]
         # An element reads each field's value; a slice, each field's column.
         element = all(k -> parts[k].T == fieldtype(E, k), 1:fieldcount(E))
@@ -1407,15 +1454,7 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
                        _jax_tuple_fields(parts)) : _PyVal(_jax_tuple_code(parts), E)
             # Contextual helpers close over arguments. Capture the row at its
             # Julia read so each use in the helper shares the same gathers.
-            ctx.host === nothing || return row
-            # A short-circuit operand can have an extra guard in the very
-            # same scope. Its read is conditional even at scope entry.
-            at_entry = isempty(ctx.scope.lines) && !any(g -> first(g) === ctx.scope, _JAX_GUARDS)
-            entry = _jax_bind!(ctx, :record_entry, row)
-            if at_entry && entry.code != row.code
-                ctx.scope.first_record = (; name = entry.code, expression = row.code)
-            end
-            return entry
+            return _jax_bind_record_entry(ctx, row)
         end
         return _PyVal(_jax_tuple_code(parts), Array{E,ndims(first(parts).T)}, false,
                       number === nothing ? "" : parts[number].extent)
@@ -9033,7 +9072,7 @@ def _rk_table_scan_step(step):
     # the table. Rebuild addressing, masks and scalar arithmetic from the
     # step inputs in reverse; factorizations and other costly results can
     # still be saved by JAX.
-    replay = frozenset(("broadcast_in_dim", "squeeze", "reshape", "transpose",
+    replay = frozenset(("broadcast_in_dim", "squeeze", "reshape", "transpose", "stack", "unstack",
                         "stop_gradient", "gather", "dynamic_slice", "slice",
                         "select_n", "add", "sub", "mul", "neg", "eq",
                         "convert_element_type", "lt", "le"))
