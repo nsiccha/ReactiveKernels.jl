@@ -7594,7 +7594,8 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
     output_vars = Dict(canon_id(g, v.id) => gensym(Symbol(v.name, :_batched))
                        for v in p.want)
     position = gensym(:replica_index)
-    first_position = Expr(:call, GlobalRef(Base, :(==)), position, 1)
+    first_position = gensym(:first_position)
+    is_first = Expr(:call, GlobalRef(Base, :(==)), position, 1)
     values_at_position = Any[gensym(Symbol(v.name, :_position)) for v in p.want]
     push!(body.args, Expr(:local, values(output_vars)..., recycle_vars...))
 
@@ -7654,6 +7655,25 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
         push!(step.args, Expr(:call, GlobalRef(@__MODULE__, :_replicated_store!),
                               output_vars[canon_id(g, v.id)], position,
                               values_at_position[output_index]))
+    end
+    # A scan or plate may give subsequent recipes a dense first result and
+    # a view for each later position. Keep those concrete specializations
+    # separate when the requested result is also consumed inside the cut.
+    observed_columns = any(column_wants) do k
+        v = p.want[k]
+        cid = canon_id(g, v.id)
+        typeintersect(valtype(v), SubArray) !== Union{} && any(parts.residual.recipes) do r
+            any(input -> canon_id(g, input.id) == cid, r.inputs)
+        end
+    end
+    if observed_columns
+        push!(body.args, Expr(:(=), position, 1))
+        first_step = _substitute_symbols(step, Dict(first_position => true))
+        push!(body.args, Expr(:let, Expr(:block), first_step))
+        step = _substitute_symbols(step, Dict(first_position => false))
+        pushfirst!(step.args, Expr(:if, is_first, Expr(:continue)))
+    else
+        pushfirst!(step.args, Expr(:(=), first_position, is_first))
     end
     push!(body.args, Expr(:for, Expr(:(=), position,
         Expr(:call, GlobalRef(Base, :OneTo), :replica_count)), step))
