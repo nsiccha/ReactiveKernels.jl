@@ -7387,6 +7387,24 @@ end
     output
 end
 
+# Stacking copies an array's elements. A user-defined numeric element can
+# itself retain an input lane or an intermediate. Only such results require
+# fresh scratch for the next position.
+_replicated_reference_cells(x::Number) = !isbitstype(typeof(x))
+_replicated_reference_cells(x::AbstractArray) = !isbitstype(eltype(x))
+_replicated_reference_cells(x::NamedTuple) = _replicated_reference_cells(values(x))
+_replicated_reference_cells(::Tuple{}) = false
+@inline _replicated_reference_cells(x::Tuple) =
+    _replicated_reference_cells(first(x)) || _replicated_reference_cells(Base.tail(x))
+_replicated_reference_cells(x) = false
+
+function _discard_batch_scratch!(slots::Tuple)
+    for slot in slots
+        slot isa Base.RefValue{Any} && (slot[] = nothing)
+    end
+    nothing
+end
+
 """
     lower_replicated(p::Plan; batched, reuse = false) -> Expr
 
@@ -7678,6 +7696,22 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
     end
 
     rest_body = Expr(:block)
+    reference_cells = gensym(:reference_cells)
+    push!(body.args, :($reference_cells = $(GlobalRef(@__MODULE__, :_replicated_reference_cells))(
+        $(Expr(:tuple, first_vars...)))))
+    fresh = Expr(:block)
+    local_slots = Any[residual_slots...]
+    for (lane, k) in zip(recycle_vars, recycle_wants)
+        k in column_wants ? push!(fresh.args, :($lane = nothing)) : push!(local_slots, lane)
+    end
+    isempty(local_slots) || push!(fresh.args, Expr(:call, GlobalRef(@__MODULE__, :_discard_batch_scratch!),
+                                                  Expr(:tuple, local_slots...)))
+    for v in p.have
+        lane = get(lane_vars, canon_id(g, v.id), nothing)
+        lane === nothing || push!(fresh.args, :($lane = $(GlobalRef(@__MODULE__, :_replicated_lane))(
+            $(nm(v)), $(valtype(v)))))
+    end
+    isempty(fresh.args) || push!(rest_body.args, Expr(:if, reference_cells, fresh))
     rest_vars = Any[gensym(Symbol(v.name, :_position)) for v in p.want]
     rest_recycled = Any[k in column_wants ?
         :(let column = $(GlobalRef(@__MODULE__, :_replicated_output_lane))(
@@ -7703,6 +7737,8 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
             k in column_wants || continue
             push!(body.args, :($(slot(nout + nhave + k))[] = $lane))
         end
+        push!(body.args, :($reference_cells &&
+            $(GlobalRef(@__MODULE__, :_discard_batch_scratch!))(__output_caches__)))
     end
     retval = length(p.want) == 1 ? only(values(output_vars)) :
              Expr(:tuple, (output_vars[canon_id(g, v.id)] for v in p.want)...)
@@ -9356,7 +9392,7 @@ end
 # are records (`_lane_cell_take!`, snag lane-cell-take-e-45c66e49). An element
 # type with no values (`Union{}`) holds no array.
 _replicated_type_may_contain_array(::Type) = true
-_replicated_type_may_contain_array(::Type{<:Number}) = false
+_replicated_type_may_contain_array(::Type{T}) where {T<:Number} = !isbitstype(T)
 _replicated_type_may_contain_array(::Type{Union{}}) = false
 function _replicated_type_may_contain_array(::Type{T}) where {T<:Union{Tuple,NamedTuple}}
     isconcretetype(T) || return true
@@ -9381,6 +9417,8 @@ end
 _replicated_alias(cache::AbstractArray, arg::NamedTuple) =
     _replicated_alias(cache, values(arg))
 _replicated_alias(cache::AbstractArray, arg::Tuple) = _replicated_alias_any(cache, arg)
+_replicated_alias(cache::AbstractArray, arg::Number) =
+    !isbitstype(typeof(arg)) && _into_aliases(cache, arg)
 _replicated_alias(cache, arg) = false
 @generated function _replicated_alias_any(cache, items::Tuple)
     foldr((i, rest) -> :(_replicated_alias(cache, getfield(items, $i)) || $rest),

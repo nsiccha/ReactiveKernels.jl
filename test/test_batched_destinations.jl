@@ -40,6 +40,13 @@ Base.:*(::IdentityFactor, x::Vector{Float64}) = x
 @kernel scale_once(p, x) = begin
     result = p * x
 end
+struct BoxedResult <: Number
+    data::Vector{Float64}
+end
+@kernel boxed_product(p, x) = begin
+    y = p * x
+    result = BoxedResult(y)
+end
 
 function allocated_pair(reader, full, tail, x)
     reader(full, x)
@@ -180,6 +187,22 @@ end
         @test bytes < sizeof(dst) ÷ 2
         @test dst == x .* transpose(p)
         @test all(iszero, bank[1,:])
+    end
+end
+
+@testset "numeric results that hold a vector retain its contents" begin
+    for schedule in (nothing, NativeScheduling(chunk_size=1, workers=2))
+        for reuse in (false, true)
+            k = vectorize(boxed_product; batched=:p, schedule, reuse)
+            p, x = [2., 3.], [3.]
+            @test map(v -> v.data, k(p,x)) == [[6.], [9.]]
+            w = prepare_into(k)
+            a, b = Vector{BoxedResult}(undef,2), Vector{BoxedResult}(undef,2)
+            @test w(a,p,x) === a
+            @test w(b,p,[5.]) === b
+            @test map(v -> v.data, a) == [[6.], [9.]]
+            @test map(v -> v.data, b) == [[10.], [15.]]
+        end
     end
 end
 

@@ -1392,7 +1392,7 @@ end
 # arrays loop, so the walk allocates nothing (`any` with a closure over a
 # heterogeneous tuple boxed every item).
 _lane_may_reference(result, @nospecialize(buffer)) = true
-_lane_may_reference(::Number, @nospecialize(buffer)) = false
+_lane_may_reference(value::Number, @nospecialize(buffer)) = !isbitstype(typeof(value))
 function _lane_may_reference(result::AbstractArray, @nospecialize(buffer))
     buffer isa _LaneCalleeState && return _lane_state_may_reference(result, buffer)
     _lane_mightalias(result, buffer) && return true

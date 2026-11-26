@@ -495,9 +495,10 @@ function (w::_IntoBatchWriter)(dst, args...)
     destinations = n == 1 ? (dst,) : dst
     destinations isa Tuple && length(destinations) == n ||
         throw(ArgumentError("provide one destination per wanted output in reader order"))
-    # A custom copyto! may retain its source. Give it fresh scratch, as for a
-    # recursive or concurrent invocation of the same writer.
-    exclusive = all(d -> d isa _IntoDense, leaves) && !EnzymeCore.within_autodiff() &&
+    # A custom copyto! or a numeric element that holds an array may retain
+    # the source. Give it fresh scratch, as for an overlapping invocation.
+    exclusive = all(d -> d isa _IntoDense && isbitstype(eltype(d)), leaves) &&
+        !EnzymeCore.within_autodiff() &&
         (@atomicreplace :acquire w.busy false => true).success
     k = exclusive ? w.reader : copy(w.template)
     try

@@ -97,16 +97,18 @@ cell_bytes(f::F, args...) where {F} = (f(args...); minimum(@allocated(f(args...)
     # A borrowed read allocates only the two opaque `decay` vectors of each
     # group, never the cell's plates, scan, dotted calls, slice or series (the
     # summing plate composes into the group cell, so the series stays in it):
-    # its bytes per group and position stay at that floor at any group or
-    # position count. Before the cell slots it was about 2 KB.
+    # its incremental bytes per group and position stay at that floor.
+    # The call also prepares lookup tables for the shared design once.
     reader = copy(population_reader(:total; reuse = true))
     floor_bytes = 2 * (41 * sizeof(Float64) + 64)
-    per_cell = map(((8, 4), (32, 4), (32, 16))) do (groups, positions)
-        cell_bytes(reader, population_inputs(groups, positions; times = 40)...) /
-            (groups * positions)
+    per_extra_cell = map((8, 32)) do groups
+        theta, shared... = population_inputs(groups, 16; times = 40)
+        small = cell_bytes(reader, theta[:, 1:4], shared...)
+        large = cell_bytes(reader, theta, shared...)
+        @test max(small / (4 * groups), large / (16 * groups)) < floor_bytes + 256
+        (large - small) / (12 * groups)
     end
-    @test maximum(per_cell) < floor_bytes + 256
-    @test maximum(per_cell) - minimum(per_cell) < 64
+    @test maximum(per_extra_cell) - minimum(per_extra_cell) < 64
 end
 
 # Each group's stored series is its own, never overwritten by the next group
