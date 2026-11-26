@@ -85,6 +85,10 @@ Write `out.source` as usual. Pass `out.partition_data` alongside the matching
 model data. In Python, `q = prepare_partition(prepare_data(**raw), partition_data)`
 prepares the two targets `global_log_density(u, **q)` and
 `unit_log_density(u, label, **q)`. Both take the full packed point.
+To vary selected coordinates, call
+`c = prepare_unit_coordinates(q, reference, shared_indices, local_indices_by_label)`.
+`unit_log_density_parts(shared_values, local_values, label, **c)` then takes values
+in the supplied index order. Indices are zero-based and local rows follow `q["labels"]`.
 """
 function ReactiveKernels.jax_source(built::NamedTuple, plan::StructuralPlan, observations;
         by, partitioned = (), global_factors::FactorSelection, unit_factors,
@@ -113,8 +117,11 @@ function _jax_partition_module(built, plan, observations; by, partitioned,
     base = Base.invokelatest(_jax_module_of, merge(built, (; spec)), plan;
         values, doc, float_type, events)::ReactiveKernels.JAXSource
     event_tuple = "(" * join(string.(keys(events)), ", ") * (isempty(events) ? ")" : ",)")
-    arguments = ["prepared" => Dict, "labels" => Vector{Int}, "sites" => Tuple]
-    point = "unconstrained" => Vector{float_type}
+    indices = Vector{Int}
+    values_type = Vector{float_type}
+    arguments = ["prepared" => Dict, "labels" => indices, "sites" => Tuple]
+    plans = "read_plans" => Tuple
+    point = "unconstrained" => values_type
     source = ReactiveKernels.JAXSource(base.text * "\n" * ReactiveKernels._JAX_INDEXED *
         "\n_RK_EVENTS = " * event_tuple * "\n_RK_DENSITY_TYPE = jnp." *
         ReactiveKernels._jax_dtype_name(float_type) * "\n" * _JAX_PARTITION,
@@ -122,9 +129,16 @@ function _jax_partition_module(built, plan, observations; by, partitioned,
          ReactiveKernels.JAXFunction("prepare_partition",
             ["prepared" => Dict, "partition_data" => Dict], ["partition" => Dict]);
          ReactiveKernels.JAXFunction("global_log_density",
-            [point; arguments], ["score" => float_type]);
+            [point; arguments; plans], ["score" => float_type]);
          ReactiveKernels.JAXFunction("unit_log_density",
-            [point; "label" => Int; arguments],
+            [point; "label" => Int; arguments; plans],
+            ["score" => float_type]);
+         ReactiveKernels.JAXFunction("prepare_unit_coordinates",
+            ["partition" => Dict, "reference" => values_type, "shared_indices" => indices,
+             "local_indices_by_label" => AbstractArray], ["binding" => Dict]);
+         ReactiveKernels.JAXFunction("unit_log_density_parts",
+            ["shared_values" => values_type; "local_values" => values_type; "label" => Int;
+             arguments; "coordinates" => Tuple; plans],
             ["score" => float_type])], base.prepared)
     discrete = get(global_factors.catalogue.plan.frozen.values, :_ppl_discrete, nothing)
     state = discrete === nothing ? (;) : (; discrete)

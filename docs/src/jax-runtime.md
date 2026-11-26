@@ -42,6 +42,18 @@ point. Both support `jax.jit`, `jax.vmap` and reverse differentiation.
 A complete assignment at one point reconstructs `model.log_density(u, **p)`.
 An unsupported indexed primitive raises during tracing.
 
+Bind zero-based packed indices once with
+`c = model.prepare_unit_coordinates(q, reference, shared_indices, local_indices_by_label)`.
+Supply one local index vector per label in `q["labels"]` order. Vectors may
+differ in length or be empty. Each coordinate can occur once within a unit.
+Omitted coordinates use the reference value.
+
+Call `model.unit_log_density_parts(shared_values, local_values, label, **c)`.
+Wrapping this function with `jax.value_and_grad(..., argnums=(0, 1))` returns
+the score and both gradients in input order. Under `vmap`, share `c` across
+draws. Point-dependent checks use the substituted values. Checks and coupled
+operations that consume a whole array can still require work over that array.
+
 A selected read evaluates the requested rows of each event, so it never
 reaches a runtime check, which has no output. A check that reads only data,
 such as a cell's length, has the same outcome at every point:

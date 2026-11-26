@@ -16,13 +16,18 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
-## 0.1.263
+## 0.1.265
 
-- Model export accepts `jax_source(built, plan; plate_layout = :chains)` for
-  samplers that batch independent chains. Python callers use the existing
-  `prepare_data` and `log_density` entry points.
-- With `plate_layout = :groups`, an exported model with eligible ragged
-  plates exposes `prepare_plate_layout` and `select_plate_layout`.
+- Model export forwards the chosen ragged plate layout to the JAX emitter.
+  A grouped export provides prepared layouts and device timing for the caller's
+  own step at its candidate batch widths.
+
+## 0.1.264
+
+- Partitioned JAX modules export `prepare_unit_coordinates` and
+  `unit_log_density_parts` for scoring a unit from shared and local values.
+
+## 0.1.263
 
 `prepare_partition` in generated JAX modules selects repeated row reads by
 the number of distinct coordinates needed per unit. Adding unrelated table

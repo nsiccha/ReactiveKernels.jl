@@ -29,6 +29,26 @@ reverse = compiled(inputs.points[::-1], inputs.labels[::-1], q)
 np.testing.assert_allclose(reverse[0], values[::-1])
 assert len(traces) == 1
 
+# Exercise the public compact call at the same points as the native Julia
+# queries. Each local row has its own order, including for the empty unit.
+shared = np.array([2, 0])
+remaining = np.setdiff1d(np.arange(inputs.points.shape[1]), shared)
+local_rows = [np.roll(remaining, k) for k in range(len(q["labels"]))]
+rows = np.array(local_rows)[np.searchsorted(q["labels"], inputs.labels)]
+compact = model.prepare_unit_coordinates(q, inputs.points[0], shared, local_rows)
+
+
+def parts(g, z, label, binding):
+    return model.unit_log_density_parts(g, z, label, **binding)
+
+
+compact_batch = jax.jit(jax.vmap(jax.value_and_grad(parts, (0, 1)), (0, 0, 0, None)))
+v, (dg, dz) = compact_batch(inputs.points[:, shared], np.take_along_axis(inputs.points, rows, axis=1),
+                           inputs.labels, compact)
+np.testing.assert_allclose(v, values, atol=1e-10)
+np.testing.assert_allclose(dg, gradients[:, shared], atol=1e-10)
+np.testing.assert_allclose(dz, np.take_along_axis(gradients, rows, axis=1), atol=1e-10)
+
 point = inputs.points[0]
 global_term = lambda u: model.global_log_density(u, **q)
 def reconstructed(u):
@@ -123,6 +143,11 @@ scores = jax.jit(jax.vmap(lambda label: model.unit_log_density(point, label, **q
 np.testing.assert_allclose(scores[-1], 0.)
 np.testing.assert_allclose(model.global_log_density(point, **q0) + scores.sum(),
                            model.log_density(point, **p0), atol=1e-10)
+fixed = model.prepare_unit_coordinates(q0, point, [], [[] for _ in scores])
+fixed_scores, (dg, dz) = compact_batch(np.empty((len(scores), 0)), np.empty((len(scores), 0)),
+                                       q0["labels"], fixed)
+np.testing.assert_allclose(fixed_scores, scores, atol=1e-10)
+assert dg.shape == dz.shape == (len(scores), 0)
 
 
 try:
@@ -168,6 +193,25 @@ def raises(f, message):
     else:
         raise AssertionError("accepted a failing check: " + message)
 
+
+# Different unit widths share one binding. Rebinding the omitted coordinates
+# supplies a different reference without changing the active values.
+ragged = [np.array([3, 2]), [], [3], [2, 1], []]
+one_compact = jax.jit(jax.value_and_grad(parts, (0, 1)))
+one_dense = jax.jit(jax.value_and_grad(lambda u, label, binding: model.unit_log_density(u, label, **binding)))
+for base in (inputs.points[0], inputs.points[-1]):
+    binding = model.prepare_unit_coordinates(q, base, [0], ragged)
+    for label, local in zip(q["labels"], ragged):
+        idx = np.array([0, *local])
+        u = base.copy()
+        u[idx] = inputs.points[2, idx]
+        v, g = one_dense(u, label, q)
+        value, (dg, dz) = one_compact(u[idx[:1]], u[idx[1:]], label, binding)
+        np.testing.assert_allclose(value, v)
+        np.testing.assert_allclose(np.r_[dg, dz], g[idx], atol=1e-10)
+raises(lambda: jax.jit(parts)(point[:1], point[:1], q["labels"][1], binding), "coordinate count")
+raises(lambda: model.prepare_unit_coordinates(q, point, [0], [[0]] * len(ragged)), "one value")
+raises(lambda: model.prepare_unit_coordinates(q, point, [len(point)], ragged), "outside")
 
 good = dict(lengths=jnp.array([2, 2, 2]), scale=jnp.array([1., 2., 3.]))
 bad = dict(good, lengths=jnp.array([2, 3, 2]))
@@ -216,6 +260,17 @@ for i in range(len(rows)):
     np.testing.assert_allclose(grads[i], grad, rtol=1e-12)
 raises(lambda: jax.jit(jax.vmap(selected_guarded))(jnp.array([[-20., 1.]]), jnp.array([0])),
        "the guarded parameter is below -10")
+
+with patch.multiple(model, _RK_EVENTS=(guarded_events,), dimension=lambda _: 2):
+    partition = model.prepare_partition(guarded, dict(labels=[3, 5], owners=[[2, 3, 2]]))
+    binding = model.prepare_unit_coordinates(partition, [-20., 0.], [], [[1], [1]])
+    # The guard reads a varying value. Its inactive arm must skip a failing
+    # check on the omitted coordinate, including in the ragged tail under AD.
+    v, (_, dz) = compact_batch(np.empty((2, 0)), np.array([[-1.], [-2.]]), np.array([3, 5]), binding)
+    np.testing.assert_allclose(v, [-4., -4.])
+    np.testing.assert_allclose(dz, [[4.], [2.]])
+    raises(lambda: compact_batch(np.empty((2, 0)), np.array([[-1.], [1.]]),
+                                 np.array([3, 5]), binding), "guarded parameter is below -10")
 
 
 # Operations the selected rows read at gathered coordinates, each compared
@@ -516,3 +571,58 @@ def check_station_event(n, table_rows):
 assert check_station_event(30, 4) == check_station_event(300, 4)
 check_station_event(30, 30)
 check_station_event(30, 300)
+
+
+def compact_station_trace(n):
+    def event(u, *, group, design):
+        coefficients = u[1:].reshape(-1, 3)[group]
+        return jnp.sum(jnp.exp(coefficients) * design, axis=1) + u[0]
+
+    group = np.repeat(np.arange(n), 9)
+    data = dict(group=group, design=np.tile(np.array([0.3, 0.5, -0.8]), (len(group), 1)))
+    owners = dict(labels=np.arange(n), owners=[group + 2])
+    base = np.linspace(-0.2, 0.3, 1 + 3*n)
+    local = 1 + np.arange(3*n).reshape(n, 3)[:, [2, 0]]
+    with patch.multiple(model, _RK_EVENTS=(event,), dimension=lambda _: len(base)):
+        binding = model.prepare_unit_coordinates(model.prepare_partition(data, owners), base, [0], local)
+        labels = np.array([n-1, 0, n-1, 1, 0])
+        g = np.arange(5.)[:, None]
+        z = np.arange(10.).reshape(5, 2) / 12
+        trace = jax.make_jaxpr(compact_batch)(g, z, labels, binding)
+        eqs = list(outputs(trace))
+        for eq in eqs:
+            for var in eq.outvars:
+                shape = var.aval.shape
+                assert not (len(labels) in shape and (n in shape or len(base) in shape)), shape
+        scores, (dg, dz) = compact_batch(g, z, labels, binding)
+        coef = base[1:].reshape(n, 3)[labels].copy()
+        coef[:, [2, 0]] = z
+        terms = 9 * np.exp(coef) * data["design"][0]
+        np.testing.assert_allclose(scores, terms.sum(axis=1) + 9*g[:, 0])
+        np.testing.assert_allclose(dg, 9)
+        np.testing.assert_allclose(dz, terms[:, [2, 0]])
+        return sum(eq.primitive.name == "exp" for eq in eqs)
+
+
+small_body = compact_station_trace(7)
+assert compact_station_trace(31) <= small_body
+
+
+def checked_subset(u):
+    checks._rk_check(u[-1] > 0, "fixed coordinate must be positive")
+    return u[:2] ** 2
+
+
+base = np.ones(1021)
+with patch.multiple(model, _RK_EVENTS=(checked_subset,), dimension=lambda _: base.size):
+    partition = model.prepare_partition({}, dict(labels=[5], owners=[[2, 2]]))
+    binding = model.prepare_unit_coordinates(partition, base, [], [[1]])
+    actual = one_compact(np.empty(0), np.array([3.]), 5, binding)
+    np.testing.assert_allclose(actual[0], 10.)
+    np.testing.assert_allclose(actual[1][1], [6.])
+    trace = jax.make_jaxpr(compact_batch)(np.empty((3, 0)), np.ones((3, 1)), np.full(3, 5), binding)
+    for eq in outputs(trace):
+        for var in eq.outvars:
+            assert not (base.size in var.aval.shape and 3 in var.aval.shape)
+    negative = model.prepare_unit_coordinates(partition, -base, [], [[1]])
+    raises(lambda: one_compact(np.empty(0), np.array([3.]), 5, negative), "fixed coordinate must be positive")

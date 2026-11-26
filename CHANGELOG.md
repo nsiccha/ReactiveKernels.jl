@@ -16,38 +16,37 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.389
+## 0.1.393
 
-- JAX data preparation now builds fixed integer-vector tables inside plates
-  for each supported layout when the data determine the plate domain. Empty
-  domains skip the cell, and singleton inputs follow Julia broadcasting.
+- JAX exports accept grouped, sequential and round-based layouts for ragged plates.
+  A grouped module can time the caller's compiled step on its device at the requested
+  chain counts. Prepared input tables retain the integer type of the bound port.
+- The padded layout can schedule an eligible subject recurrence over its real events,
+  batch independent interval and offset records, and reduce eligible observation
+  rows over the observations present. The generated function supports ordinary
+  JAX forward and reverse differentiation.
 
-- `jax_source(...; data, plate_layout = :groups)` emits a module whose plates
-  over prepared ragged rows can run in groups of units of similar length.
-  The module's `prepare_plate_layout(prepared, groups, sequential)` chooses
-  the layout after `prepare_data`, and `GROUPED_PLATES` names the plates.
-  Every layout returns the plate's values and ordinary derivatives. The
-  module's `select_plate_layout(prepared, make_step, chains)` times candidate
-  layouts and chain counts with the caller's own step and returns the
-  fastest. The default `plate_layout = :padded` emits the same module as
-  before.
+## 0.1.392
 
-- `jax_source(...; plate_layout = :chains)` prepares variable-length vector rows in
-  contiguous storage with row offsets. Eligible subject scans run over the
-  actual events in row order. A caller can batch independent evaluations of
-  the generated function with `jax.vmap`.
+- Indexed JAX event reads can differentiate a subset of packed coordinates against a shared reference point.
+
+## 0.1.391
+
+- Partitioned JAX reads can prepare distinct row coordinates for a unit
+  even when the source table is larger than the request. The indexed
+  reader reuses point-independent rows in their original observation order.
+
+## 0.1.390
 
 - JAX data preparation can group independent indexed updates by a prepared
   input's positive, negative and remaining entries. The generated function
   maps the selected numerical arm over each group and restores the input order.
 
+## 0.1.389
+
 - A JAX broadcast or plate over an empty padded row contributes zero to a
   masked sum and its gradient, including when a real entry would be used
   as a denominator or the argument of a logarithm.
-
-- Partitioned JAX reads can prepare distinct row coordinates for a unit
-  even when the source table is larger than the request. The indexed
-  reader reuses point-independent rows in their original observation order.
 
 ## 0.1.388
 
