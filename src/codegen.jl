@@ -7433,8 +7433,9 @@ function _replicated_parts(p::Plan, analysis)
     constants = _partial_constants(p, prefix_owned, residual)
     have_ids = Set(canon_id(g, v.id) for v in p.have)
     prefix_want = Value[v for v in constants if !(canon_id(g, v.id) in have_ids)]
+    residual_plan = _partial_subplan(p, vcat(mapped_have, constants), p.want, residual)
     (; plan = p, prefix = _partial_subplan(p, shared_have, prefix_want, prefix),
-       residual = _partial_subplan(p, vcat(mapped_have, constants), p.want, residual))
+       residual = _lane_fuse_gathered_sums(residual_plan))
 end
 
 # Lower one part as `prepare` lowers a scalar kernel, stable rewrites included
