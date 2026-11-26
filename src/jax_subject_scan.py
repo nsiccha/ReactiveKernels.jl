@@ -1,5 +1,12 @@
 def _rk_subject_scan(step, seed, sequences, shared, schedule, tables, reads, decorate):
     """Read each subject's lookup tables at the prepared real events of its scan."""
+    if schedule is None:
+        # The caller already gathered full columns. Checkpoint the two-argument
+        # step with its subject values closed over, as in the padded recurrence.
+        return jax.lax.scan(decorate(lambda c, row: step(c, row, *shared)), seed, sequences)[1]
+
+    tables = tuple(_rk_pack_record(table) for table in tables)
+
     def gather(table, batched, owners, indices):
         def field(x, per_subject):
             shape = x.shape[1:] if per_subject else x.shape

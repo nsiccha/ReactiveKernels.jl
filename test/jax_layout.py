@@ -3,6 +3,7 @@ import math
 from pathlib import Path
 import runpy
 import sys
+from unittest.mock import patch
 
 import jax
 import jax.numpy as jnp
@@ -198,7 +199,34 @@ _, report = walk.select_plate_layout(data, scarce, chains=(2, 4, 8),
 padded = [row for row in report if row["groups"] == 1]
 assert len(padded) == 1 and padded[0]["chains"] == 2 and padded[0]["error"] is not None
 assert math.isinf(padded[0]["seconds"])
+assert len(padded[0]["samples_seconds"]) == 1 and padded[0]["median_seconds"] is None
 assert report[0]["groups"] == 3 and report[-1] is padded[0]
+
+# Time spent in an eager builder and waiting for its first device result
+# belongs to setup. Subsequent waits contribute to calibration and latency.
+class Clock:
+    elapsed = 0
+
+    def build(self, data, count):
+        self.elapsed += 11
+        if count == 4:
+            raise MemoryError("builder exhausted memory")
+        return lambda: self
+
+    def block_until_ready(self):
+        self.elapsed += 3
+        return self
+
+
+clock = Clock()
+with patch("time.perf_counter", lambda: clock.elapsed):
+    _, timed = walk.select_plate_layout(data, clock.build, chains=(2, 4),
+                                        candidates=[(1, False)], repeats=2, calls=lambda n: 5)
+success, failure = timed
+assert success["setup_seconds"] == 14 and success["calibration_seconds"] == 20
+assert success["samples_seconds"] == [3, 3] and success["fit_seconds"] == 15
+assert failure["error"] and failure["setup_seconds"] == failure["calibration_seconds"] == 11
+assert failure["samples_seconds"] == []
 
 
 def broken(data, count):
@@ -235,6 +263,7 @@ selected, prepared_fit, count, fits = tune_sampler(modules, raw, positions, iter
                                                   10, 80, 2, groups=(1,), repeats=2)
 assert {(r["variant"], r["chains"]) for r in fits} == {(v, n) for v in modules for n in (2, 4)}
 assert [r["fit_seconds"] for r in fits] == sorted(r["fit_seconds"] for r in fits)
+assert all(r["median_seconds"] == np.median(r["samples_seconds"]) == r["seconds"] for r in fits)
 assert all(r["fit_seconds"] == r["seconds"] * (10 + 160 / r["chains"]) for r in fits)
 assert selected is modules[fits[0]["variant"]] and count == fits[0]["chains"]
 np.testing.assert_allclose(selected.log_density(0.6, **prepared_fit), rows.kernel(0.6, **chosen))

@@ -5,6 +5,21 @@ schedules) is one `jax.vmap` of its cell, so every unit is stored and computed
 at the longest unit's length. When the lengths differ widely, most of that
 work, and of what reverse mode stores for each step of a scan, is padding.
 
+An ordinary `plate_layout = :padded` export that schedules guarded table reads
+across subjects also supplies a choice of walks. After preparing the data, call
+`chosen, timings = module.select_plate_layout(prepared, make_step, chains=[64])`.
+Use `make_step(chosen, 64)()` to repeat the winning batch. The builder
+`make_step(data, count)` returns a zero-argument gradient or sampler step.
+The first timing row names the winning `variant`. Each successful row gives
+the chain count, the blocked warm calls in `samples_seconds`, and their
+median in `median_seconds`. The `"padded"` walk gathers records before scanning each
+subject up to the common row width. The `"events"` walk schedules reads at real
+events wherever the scan supports it. `prepare_data` uses the latter by default.
+To repeat a particular walk, call
+`module.prepare_plate_layout(prepared, subject_walk="padded")` or pass
+`subject_walk="events"`. Neither call times the model. The selected data can
+be passed as arguments to a jitted function or captured by a closure.
+
 `jax_source(...; data, plate_layout = :groups)` emits a module whose caller
 chooses how such plates run. After `prepared = module.prepare_data(**raw)`,
 use `chosen = module.prepare_plate_layout(prepared, groups=4)` and pass
@@ -39,7 +54,9 @@ table. Pass `**dense` to the numerical function. Use `"compact"` to request
 the tiled computation. Both choices apply to every eligible read in that
 module and can be made again after preparing different data. The tuner times
 both when their prepared bounds differ, including on a padded export. The
-winning row's `guarded_reads` field records the mode to replay.
+winning row's `guarded_reads` field records the mode to replay. To compare
+subject walks at a fixed guarded-read mode, pass `guarded_reads="compact"`
+or `guarded_reads="dense"` to `select_plate_layout`.
 
 The example also compares separately exported sampler modules in a mapping
 keyed by layout name. Supply identical raw inputs and at least as many
@@ -51,6 +68,13 @@ draw count and mean gradients per draw. An application can pass its own
 `calls(count)` to `select_plate_layout` to reflect its adaptation schedule.
 A grouped export with no ragged plates still measures each candidate chain
 count once.
+
+Each row also gives two elapsed wall times in seconds. `setup_seconds` starts
+just before the tuner calls the builder and ends when the first result is
+ready. It includes any eager compilation or cache loading the builder does.
+`calibration_seconds` covers that setup and all timed repetitions for the
+row. A memory failure ends its interval at the failed attempt. The tuner
+ranks successful rows by warm performance.
 
 ```@example jax_plate_runtime
 using ReactiveKernels, Markdown # hide

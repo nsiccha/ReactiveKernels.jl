@@ -9469,7 +9469,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     local_rows = ctx.mod.layout === :chains && !isempty(extent)
     lengths_key = pure && !isempty(padded_inputs) && first(iterated) == first(padded_inputs) ?
         _jax_subject_scan_lengths(ctx, inputs[first(iterated)]) : nothing
-    direct_reads = lengths_key === nothing ? nothing : Tuple{Int,String}[]
+    subject_rows = lengths_key === nothing ? nothing : (lengths = lengths_key, reads = Tuple{Int,String}[])
     base_count = length(seqs)
     gathered = if local_rows && !isempty(scan_rows.reads)
         _jax_helper!(ctx, "_RKChainRows", _JAX_CHAIN_ROWS)
@@ -9478,9 +9478,9 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
             table.code * "), " * join((index, mask, limit), ", ") * ")"
         _jax_scan_row_inputs!(ctx, inner, scan_rows, unpack, seqs, width, extent, pure; sequence, gather_rows)
     else
-        _jax_scan_row_inputs!(ctx, inner, scan_rows, unpack, seqs, width, extent, pure; direct_reads)
+        _jax_scan_row_inputs!(ctx, inner, scan_rows, unpack, seqs, width, extent, pure; subject_rows)
     end
-    subject_scan = direct_reads !== nothing && !isempty(direct_reads)
+    subject_scan = subject_rows !== nothing && !isempty(subject_rows.reads)
     shared_names = String[]
     if subject_scan
         push!(shared_names, extent)
@@ -9532,10 +9532,10 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
            sequences * ")[1]"
     if subject_scan
         schedule = _jax_subject_scan_schedule!(ctx, lengths_key)
-        names = unique(last.(direct_reads))
-        tables = _jax_chain_tuple(["_rk_pack_record(" * n * ")" for n in names])
+        names = unique(last.(subject_rows.reads))
+        tables = _jax_chain_tuple(names)
         reads = _jax_chain_tuple(["(" * string(i) * ", " * string(findfirst(==(t), names) - 1) * ")"
-                                  for (i, t) in direct_reads])
+                                  for (i, t) in subject_rows.reads])
         helper = _jax_helper!(ctx, "_rk_subject_scan", _JAX_SUBJECT_SCAN)
         decorate = _jax_helper!(ctx, "_rk_table_scan_step", _JAX_TABLE_SCAN_STEP)
         call = helper * "(" * join((step, _jax_scan_init(ctx, inputs[1]).code, sequences,
@@ -9919,8 +9919,10 @@ how plates over prepared ragged rows run: `prepare_plate_layout(prepared,
 groups, sequential)` in the module sorts each such plate's units by length and
 splits them into groups, each run at its own longest length side by side or
 one unit after another. Every layout returns the plate's values and ordinary
-derivatives; `GROUPED_PLATES` names the plates. The default `:padded` emits
-each plate as one `jax.vmap` over all units.
+derivatives; `GROUPED_PLATES` names the plates. An ordinary `:padded` export
+with eligible subject scans can time the padded and real-event walks with
+`select_plate_layout(prepared, make_step, chains=[count])`. Untuned calls
+use the real-event schedule where eligible.
 
 The translation keeps the program's structure. A plate is `jax.vmap` of its
 cell, a scan is `jax.lax.scan` of its step, a lazy branch is `jax.lax.cond`
@@ -10241,6 +10243,8 @@ function _jax_module_text(plans, types, constants, docstring::String, prepare;
         end
         padded = layout === :chains ? filter(_jax_nested_rows, ragged) : ragged
         isempty(padded) || pushfirst!(mod.helpers, rstrip(_jax_pad_ragged_source(padded)))
+    else
+        _jax_layout_functions!(mod, bodies, functions, constant_lines)
     end
     lines = String[_jax_docstring(docstring, "")]
     header = rstrip(_jax_needs_x64(mod) ? _JAX_HEADER : replace(_JAX_HEADER, _JAX_X64_LINE => ""))
@@ -10471,34 +10475,6 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
     meta = (INPUTS = Tuple(first(io) for io in functions[2].inputs),
             PREPARED = [n => _jax_input_metadata(T)
                         for (n, T) in zip(prepared_names, prepared_types)])
-    reads = [(name, keys[1], keys[2], parse(BigInt, keys[3]))
-             for (name, kind, keys) in bounds if kind === :match_count]
-    if !isempty(reads)
-        push!(bodies, rstrip(replace(_JAX_PREPARE_GUARDED_READS,
-            "@read_bounds@" => _jax_py_literal(Tuple(reads)))))
-        push!(functions, JAXFunction("prepare_guarded_reads",
-            Pair{String,Any}["prepared" => Dict, "mode" => String], Pair{String,Any}["prepared" => Dict]))
-    end
-    plates = _jax_layout_plates(mod)
-    if mod.layout === :groups
-        # The plates whose layout `prepare_plate_layout` chooses, each with the
-        # prepared row lengths that group its units.
-        isempty(plates) || _jax_module_helper!(mod, "_rk_length_groups", _JAX_LENGTH_GROUPS)
-        push!(bodies, rstrip(_JAX_PREPARE_PLATE_LAYOUT))
-        push!(functions, JAXFunction("prepare_plate_layout",
-            Pair{String,Any}["prepared" => Dict, "groups" => Int, "sequential" => Bool],
-            Pair{String,Any}["prepared" => Dict]))
-        meta = merge(meta, (GROUPED_PLATES = Pair{String,Tuple}[name => Tuple(keys) for (name, keys) in plates],))
-    end
-    if mod.layout === :groups || !isempty(reads)
-        push!(bodies, rstrip(replace(_JAX_SELECT_PLATE_LAYOUT,
-            "@prepare_groups@" => (mod.layout === :groups ? "prepare_plate_layout" : "None"),
-            "@prepare_reads@" => (isempty(reads) ? "None" : "prepare_guarded_reads"))))
-        push!(functions, JAXFunction("select_plate_layout",
-            Pair{String,Any}["prepared" => Dict, "make_step" => Any, "chains" => Any,
-                             "candidates" => Any, "repeats" => Int, "alternatives" => Any, "calls" => Any],
-            Pair{String,Any}["prepared" => Dict, "report" => Vector{Any}]))
-    end
     defs === nothing && return meta
     # With definitions, `DATA` describes `prepare_data`'s own parameters, and
     # `UNTRANSLATED` the definitions it takes as inputs (none when every
