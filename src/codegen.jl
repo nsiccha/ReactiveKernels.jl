@@ -2869,8 +2869,11 @@ end
 # above the loop), and the iterator and gather source read invariants only.
 # The types are checked when the body is compiled (`_plate_reduction_ready`);
 # otherwise the ordinary cell loop runs.
-function _plate_reduction_plan(inner::Plan, inner_kernel, dependencies,
-                               root_positions, atomic, callvalues, pointwise_lhs)
+# The generated cell function is part of the kernel's type. This planner
+# only reads its callables table after it has found a candidate reduction.
+Base.@nospecializeinfer function _plate_reduction_plan(
+        inner::Plan, @nospecialize(inner_kernel), dependencies,
+        root_positions, atomic, callvalues, pointwise_lhs)
     pointwise_lhs === nothing && return nothing
     graph = inner.graph
     want = canon_id(graph, only(inner.want).id)
@@ -3212,8 +3215,10 @@ end
 # reader's dynamic roots include the scan's, so that is correct wherever it
 # sits; it adds no evaluations when both groups have the same roots, or when
 # both are dynamic groups evaluated at every coordinate (`unconditional`).
-# Neither may be a lane branch.
-function _plate_scan_slice_pairs(inner::Plan, groups, lane_arms, unconditional)
+# Neither may be a lane branch. The predicate captures the plate's arguments.
+# Keeping its type out of inference lets other plates reuse this planner.
+Base.@nospecializeinfer function _plate_scan_slice_pairs(
+        inner::Plan, groups, lane_arms, @nospecialize(unconditional))
     roots_of = Dict{Int,Any}()
     for (roots, recipe_indices) in groups, recipe_index in recipe_indices
         roots_of[recipe_index] = roots
