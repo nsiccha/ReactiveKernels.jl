@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.389
+
+- Partitioned JAX reads can prepare distinct row coordinates for a unit
+  even when the source table is larger than the request. The indexed
+  reader reuses point-independent rows in their original observation order.
+
 ## 0.1.388
 
 - Regenerated JAX modules skip a guarded matrix exponential and its reverse

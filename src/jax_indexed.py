@@ -2,6 +2,7 @@
 # requested output positions through the traced array operations. JAX still
 # executes and differentiates the numerical primitives themselves.
 from contextlib import contextmanager
+from itertools import count
 import math
 import numpy as np
 from jax.extend import core as _rk_core
@@ -54,8 +55,8 @@ def _rk_requested_slots(index, shape):
     return slots, flat
 
 
-def _rk_independent_axis(shape, index):
-    """Find a repeated row coordinate broadcast against an independent grid."""
+def _rk_independent_axes(index):
+    """Coordinates varying along a single lane, independent of the other coordinates."""
     lanes = _rk_lane_shape(index)
     axes = [tuple(d for d, n in enumerate(jnp.shape(k), len(lanes) - jnp.ndim(k)) if n > 1)
             for k in index]
@@ -63,9 +64,8 @@ def _rk_independent_axis(shape, index):
         if len(varying) == 1:
             lane, = varying
             others = [dims for i, dims in enumerate(axes) if i != axis]
-            if lanes[lane] > shape[axis] and any(others) and all(lane not in dims for dims in others):
-                return axis, lane
-    return None
+            if any(others) and all(lane not in dims for dims in others):
+                yield axis, lane
 
 
 def _rk_static_index(x):
@@ -187,12 +187,13 @@ class _RKIndexedGraph:
     An equation that has no output, such as a runtime check, is never pulled:
     _rk_run_effects runs those.
     """
-    def __init__(self, closed, inputs, regions=None, parent=None, first_axis=None):
+    def __init__(self, closed, inputs, regions=None, parent=None, visit_axis=None, oversized_only=False):
         graph = closed.jaxpr
         self.parent = parent
         # Preparation and evaluation visit the same graph in the same order.
         # Its children share the one planned read, including inside jit calls.
-        self.first_axis = parent.first_axis if parent is not None else ([first_axis] if first_axis else [])
+        self.visit_axis = parent.visit_axis if parent is not None else visit_axis
+        self.oversized_only = parent.oversized_only if parent is not None else oversized_only
         self.inputs = dict(zip(graph.invars, inputs))
         self.regions = dict(zip(graph.invars, inputs if regions is None else regions))
         for var, value in zip(graph.constvars, closed.consts):
@@ -215,42 +216,36 @@ class _RKIndexedGraph:
         if key not in self.cache:
             if var in self.inputs:
                 value = self.inputs[var](index)
-            elif index and math.prod(_rk_lane_shape(index)) > math.prod(var.aval.shape) > 0:
-                # More requested entries than the value has, as when many
-                # rows read one shared factor: compute each distinct one once.
-                value = self.distinct(var, index)
             else:
-                eq, j = self.producers[var]
-                value = self.evaluate(eq, j, index)
+                value = self.computed(var, index)
             self.cache[key] = (index, value)
         return self.cache[key][1]
 
-    def distinct(self, var, index):
-        """Read the distinct requested entries of a computed value once each.
-
-        Only requested entries are computed: an unrequested one may be
-        invalid, such as a padded row, and its derivative must not enter.
-        """
+    def computed(self, var, index):
         shape = var.aval.shape
-        if self.first_axis:
-            axes = _rk_independent_axis(shape, index)
-            if axes is not None:
-                axis, lane = axes
-                plan = self.first_axis.pop()(index[axis])
+        lanes = _rk_lane_shape(index)
+        oversized = math.prod(lanes) > math.prod(shape) > 0
+        eq, output = self.producers[var]
+        if self.visit_axis is not None and 0 not in lanes and (oversized or not self.oversized_only):
+            for axis, lane in _rk_independent_axes(index):
+                if self.oversized_only and lanes[lane] <= shape[axis]:
+                    continue
+                plan = self.visit_axis(index[axis])
                 if plan is not None:
                     keys, inverse = plan
-                    lanes = _rk_lane_shape(index)
                     grid = [1] * len(lanes)
                     grid[lane] = keys.size
                     compact = index[:axis] + (keys.reshape(grid),) + index[axis + 1:]
-                    eq, output = self.producers[var]
                     values = jnp.broadcast_to(self.evaluate(eq, output, compact), _rk_lane_shape(compact))
                     if keys.size == 1:
                         return jnp.broadcast_to(values, lanes)
                     return jnp.take(values, inverse, axis=lane, mode='clip')
+        if not oversized:
+            return self.evaluate(eq, output, index)
+        # The ordinary reader uses table-sized slots only when they are smaller
+        # than the request. Unused slots repeat a valid requested coordinate.
         slots, requested = _rk_requested_slots(index, shape)
-        eq, j = self.producers[var]
-        values = jnp.broadcast_to(self.evaluate(eq, j, _rk_unravel(slots, shape)), slots.shape)
+        values = jnp.broadcast_to(self.evaluate(eq, output, _rk_unravel(slots, shape)), slots.shape)
         return values[requested]
 
     def nested(self, eq):
@@ -655,8 +650,8 @@ def _rk_has_cond(closed):
     return any(eq.primitive.name == 'cond' or _rk_params_have_cond(eq.params) for eq in graph.eqns)
 
 
-def _rk_prepare_axis(closed, point, prepared, rows, offsets, common):
-    """Plan the first oversized Cartesian row gather in the common rows.
+def _rk_prepare_axis(closed, point, prepared, rows, offsets, common, *, by_reuse=False):
+    """Plan a repeated, independently broadcast coordinate in the common rows.
 
     Trace its row coordinates with the point and data as separate inputs.
     Only a point-independent index can be shared by all draws at a unit.
@@ -667,9 +662,12 @@ def _rk_prepare_axis(closed, point, prepared, rows, offsets, common):
 
     def coordinates(u, row, data):
         found = []
+        def visit(k):
+            if by_reuse or not found:
+                found.append(k)
         inputs = [_RKIndexedGraph.leaf(v) for v in jax.tree.leaves((u, data))]
-        _rk_selected(_RKIndexedGraph(closed, inputs, first_axis=found.append), row)
-        return tuple(map(jnp.ravel, found))
+        _rk_selected(_RKIndexedGraph(closed, inputs, visit_axis=visit, oversized_only=not by_reuse), row)
+        return tuple(found)
 
     prototype = jax.ShapeDtypeStruct((common,), rows.dtype)
     try:
@@ -679,20 +677,42 @@ def _rk_prepare_axis(closed, point, prepared, rows, offsets, common):
         return ()
     if not trace.jaxpr.outvars:
         return ()
-    source, = trace.jaxpr.outvars
-    reads = [True, False] + [False] * len(jax.tree.leaves(prepared))
-    if not isinstance(source, _rk_core.Literal) and _rk_point_dependence(trace.jaxpr, reads)[source]:
-        return ()
-    def unit_indices(selected, data):
-        return _rk_run_effects(trace, [None, selected, *jax.tree.leaves(data)], reads, 'data', [True])[0]
+    data_reads = [False] * len(jax.tree.leaves(prepared))
+    reads = [True, False, *data_reads]
+    dependent = _rk_point_dependence(trace.jaxpr, reads)
+    per_unit = _rk_point_dependence(trace.jaxpr, [False, True, *data_reads])
     selected = rows[offsets[:-1, None] + np.arange(common)]
-    indices = np.asarray(jax.vmap(unit_indices, in_axes=(0, None))(selected, prepared))
-    distinct = [np.unique(row, return_inverse=True) for row in indices]
-    width = max(keys.size for keys, _ in distinct)
-    keys = np.stack([np.pad(k, (0, width - k.size), mode='edge') for k, _ in distinct])
-    # A singleton row broadcasts directly. No per-observation inverse is needed.
-    inverse = np.stack([inv for _, inv in distinct]) if width > 1 else np.empty((len(keys), 0), dtype=int)
-    return keys, inverse
+    seen = set()
+    for site, source in enumerate(trace.jaxpr.outvars):
+        literal = isinstance(source, _rk_core.Literal)
+        if id(source) in seen or (not literal and dependent[source]):
+            continue
+        seen.add(id(source))
+        wanted = [v is source for v in trace.jaxpr.outvars]
+        def unit_indices(row, data):
+            values = _rk_run_effects(trace, [None, row, *jax.tree.leaves(data)], reads, 'data', wanted)
+            return jnp.ravel(values[site])
+        # Test a shared feature grid just once, independently of the unit count.
+        if literal or not per_unit[source]:
+            indices = np.asarray(unit_indices(selected[0], prepared))[None, :]
+        else:
+            indices = np.asarray(jax.vmap(unit_indices, in_axes=(0, None))(selected, prepared))
+        if np.all(indices == indices[:, :1]):
+            keys = indices[:, :1].copy()
+            inverse = np.empty((len(keys), 0), dtype=int)
+        else:
+            distinct = [np.unique(row, return_inverse=True) for row in indices]
+            width = max(k.size for k, _ in distinct)
+            # All units use the same static width. A full-width unit leaves
+            # nothing to save, even if some other unit contains duplicates.
+            if by_reuse and width == indices.shape[1]:
+                continue
+            keys = np.stack([np.pad(k, (0, width - k.size), mode='edge') for k, _ in distinct])
+            inverse = np.stack([inv for _, inv in distinct])
+        keys = np.broadcast_to(keys, (len(selected), keys.shape[1]))
+        inverse = np.broadcast_to(inverse, (len(selected), inverse.shape[1]))
+        return {site: (keys, inverse)} if by_reuse else (keys, inverse)
+    return ()
 
 
 def _rk_read_event(fn, u, row, prepared, axis_plan=()):
@@ -705,7 +725,15 @@ def _rk_read_event(fn, u, row, prepared, axis_plan=()):
         if checks:
             _rk_run_effects(closed, leaves, reads, 'point')
         inputs = [_RKIndexedGraph.leaf(v) for v in leaves]
-        graph = _RKIndexedGraph(closed, inputs, first_axis=(lambda _: axis_plan) if axis_plan else None)
+        # A dictionary identifies the visit in the common-row trace. A pair
+        # from an older partition targets its first oversized Cartesian read.
+        numbered = isinstance(axis_plan, dict)
+        plans = axis_plan if numbered else {0: axis_plan}
+        visits = count()
+        def visit(_):
+            return plans.get(next(visits))
+        graph = _RKIndexedGraph(closed, inputs, visit_axis=visit if axis_plan else None,
+                                oversized_only=not numbered)
         return _rk_selected(graph, index)
     if _rk_has_cond(closed) and _rk_batch_control(closed, [True] * len(closed.jaxpr.invars))[0]:
         return _rk_strict_batch(selected)(u, row, prepared)

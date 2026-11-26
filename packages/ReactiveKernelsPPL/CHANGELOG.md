@@ -16,6 +16,12 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.263
+
+`prepare_partition` in generated JAX modules selects repeated row reads by
+the number of distinct coordinates needed per unit. Adding unrelated table
+rows preserves that reuse on the full-point `unit_log_density` interface.
+
 ## 0.1.262
 
 `KernelBuildCache` reuses graph assembly for finite-interval parameters and
