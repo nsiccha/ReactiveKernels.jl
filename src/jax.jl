@@ -424,6 +424,11 @@ mutable struct _JaxScope
     # Branches and scalar helpers retain the current step's indexed reads.
     # A nested data loop gets its own scope to avoid repeating a cell there.
     scan_reads::Dict{String,_JaxPlateCell}
+    # A plate cell emitted with plate layouts (`jax_layout.jl`): the name of
+    # its argument holding the widths its row reads are cut to, and each such
+    # read's lengths and selector as the cell names them.
+    row_width_param::String
+    row_widths::Vector{Tuple{String,String}}
 end
 _JaxScope(parent::Union{Nothing,_JaxScope} = nothing; same_step::Bool = false) =
     _JaxScope(String[], 1, parent === nothing ? Set{String}() : copy(parent.used),
@@ -434,7 +439,8 @@ _JaxScope(parent::Union{Nothing,_JaxScope} = nothing; same_step::Bool = false) =
               parent === nothing ? Dict{String,String}() : parent.prepared_keys,
               Dict{String,Tuple{String,String}}(),
               Set{Symbol}(), Dict{ValueId,_JaxPlateCell}(),
-              same_step ? parent.scan_reads : Dict{String,_JaxPlateCell}())
+              same_step ? parent.scan_reads : Dict{String,_JaxPlateCell}(),
+              "", Tuple{String,String}[])
 # The `flat_positions` entry of the lengths of cells that each fill their stored
 # rows: a plate's cells returning vectors whose length the cell's own expression
 # fixes (`vcat(a, b)` of scalars), or matrices of a fixed shape. Every stored
@@ -1418,7 +1424,16 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
         if length(values) == 1 && kept == 0 && !target && only(values) !== nothing
             ctx.scope.selected_lengths[extent] = (x.extent, only(values).code)
         end
-        return _PyVal(_py_atom(x.code) * "[" * join(parts, ", ") * "]", T, false,
+        row = _py_atom(x.code) * "[" * join(parts, ", ") * "]"
+        # One numeric row in a plate cell that takes a layout: cut to the
+        # width its plate's group gives this read (`None`: the stored width).
+        if ctx.host === nothing && !isempty(ctx.scope.row_width_param) && length(values) == 1 &&
+           kept == 0 && !target && only(values) !== nothing && T <: AbstractVector{<:Number}
+            push!(ctx.scope.row_widths, (x.extent, only(values).code))
+            row *= "[:" * ctx.scope.row_width_param * "[" *
+                   string(length(ctx.scope.row_widths) - 1) * "]]"
+        end
+        return _PyVal(row, T, false,
                       extent, "", kept == 0 ? 1 : 0,
                       kept == 0 && !target ? _jax_selected_origin(x, T, join(parts, ", ")) : nothing)
     end
@@ -8314,11 +8329,12 @@ function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
                              links = fill(nothing, length(p.have)),
                              origins = fill(nothing, length(p.have)),
                              fields = fill(0, length(p.have)),
-                             active_cells::Bool = false)
+                             active_cells::Bool = false, row_widths::Bool = false)
     name = _jax_fresh(ctx, hint)
     outer = ctx.scope
     inner = _JaxScope(outer)
     inner.indent = outer.indent + 1
+    row_widths && (inner.row_width_param = _jax_identifier(inner.used, :row_widths))
     names = String[]
     for (i, v) in enumerate(p.have)
         hint = get(inner.named_hints, v.name, v.name)
@@ -8353,6 +8369,10 @@ function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
         push!(returned, w.code)
         isempty(w.extent) || push!(returned, w.extent)
     end
+    # The widths of the cell's row reads are its last argument before the
+    # activity flag, and only a cell that reads a row takes them.
+    isempty(inner.row_widths) ||
+        insert!(names, length(names) + (active_cells ? 0 : 1), inner.row_width_param)
     push!(outer.lines, "    "^outer.indent * "def " * name * "(" * join(names, ", ") * "):")
     append!(outer.lines, inner.lines)
     push!(outer.lines, "    "^inner.indent * "return " * (length(returned) == 1 ?
@@ -8447,7 +8467,8 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
                                                                 links = cell_links,
                                                                 origins = cell_origins,
                                                                 fields = cell_fields,
-                                                                active_cells = masked)
+                                                                active_cells = masked,
+                                                                row_widths = R == 1 && _jax_plate_layout() === :groups)
     if masked && any(v -> v.origin isa _JaxDenseRows, inputs[padded])
         cell = _jax_slots_active_cell(ctx, cell, cell_params)
     end
@@ -8479,6 +8500,13 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
             end
         end
     end
+    # The widths of the cell's row reads: none for the plate as one batch.
+    rows = _jax_layout_rows(ctx, cell_scope, cell_params, args, axes)
+    if !isempty(cell_scope.row_widths)
+        push!(axes, "None")
+        push!(args, "(" * "None, "^length(cell_scope.row_widths) * ")")
+    end
+    rows_at = isempty(cell_scope.row_widths) ? nothing : length(args) - 1
     if masked
         # Padding is storage, not a native cell. Include its activity in
         # runtime-check guards before batching those checks across lanes.
@@ -8506,7 +8534,8 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     # A plate over prepared ragged rows can run in the layout the prepared
     # data choose (`jax_layout.jl`); without one it is this `jax.vmap`.
     call = R == 1 ? _jax_layout_call(ctx, cell, axes_text, args,
-                                     _jax_layout_arguments(ctx, inputs, mapped, ragged)) : nothing
+                                     _jax_layout_arguments(ctx, inputs, mapped, ragged),
+                                     rows_at, rows) : nothing
     if call === nothing
         call = cell
         for _ in 1:R
@@ -9220,7 +9249,7 @@ jax_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
            definitions = nothing, definitions_module::Module = Main, keep = (),
            function_docs = NamedTuple(), float_type = Float64,
            source_regions = _JaxSourceRegion[], module_docstring = nothing,
-           rejecting = (), plate_layout = :padded) = _translate_in_latest_world(JAXSource) do
+           rejecting = (), plate_layout = nothing) = _translate_in_latest_world(JAXSource) do
     docstring = _jax_module_docstring(doc, module_docstring)
     functions === nothing && want === nothing && (want = _KERNEL_DEFAULT_BOUNDARY)
     if functions === nothing
@@ -9250,7 +9279,7 @@ end
 jax_source(p::Plan; types = nothing, name = :kernel, constants = NamedTuple(),
            doc = nothing, data = nothing, definitions = nothing,
            definitions_module::Module = Main, keep = (), function_docs = NamedTuple(),
-           float_type = Float64, plate_layout = :padded) =
+           float_type = Float64, plate_layout = nothing) =
     _translate_in_latest_world(JAXSource) do
         _jax_with_float_type(float_type) do
             _jax_with_plate_layout(plate_layout, data) do

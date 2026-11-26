@@ -39,8 +39,25 @@ end
     total
 end
 
+# A plate over unit indices whose cell reads its unit's row from a shared
+# ragged array: the row is cut to its group's width where it is read.
+@kernel jax_layout_index(a::Float64, units::Vector{Int}, xs::Vector{Vector{Float64}}) = begin
+    sums = plate(units, Ref(xs)) do i, rows
+        x = rows[i]
+        path = scan(x; init = 0.0) do state, value
+            next = a * state + value
+            (next, next)
+        end
+        sum(path .* x)
+    end
+    total = sum(sums)
+    total
+end
+
 # The data of `jax_layout.py`, by the same formulas.
 const LENGTHS = [3, 1, 0, 7, 40, 2, 2, 0, 11, 5]
+# Units that repeat rows, skip some, and are not in the rows' order.
+const LAYOUT_UNITS = [5, 1, 1, 9, 3, 10, 4, 4, 2, 8, 5, 6]
 layout_orders(scale) = [[1 + (i + t) % 2 for t in 1:scale*n] for (i, n) in enumerate(LENGTHS)]
 layout_weights(scale) = [[0.1 * t - 0.05 * i for t in 1:scale*((n + i) % 4)]
                          for (i, n) in enumerate(LENGTHS)]
@@ -64,20 +81,32 @@ layout_rows(scale) = [[0.3 * sin(i + t) for t in 1:scale*n] for (i, n) in enumer
     # The second plate maps computed rows beside the prepared ones: both
     # plates take a layout from the prepared lengths.
     @test occursin("\"paths_cell\": (\"xs_lengths\",)", string(rows))
+    index = jax_source(jax_layout_index; have = (:a, :units, :xs), want = :total,
+                       data = (:units, :xs), plate_layout = :groups)
+    # A row read at the plate's own index is grouped by the lengths of the
+    # rows the units select.
+    @test occursin("GROUPED_PLATES = {\"sums_cell\": ((\"xs_lengths\", \"units\"),)}",
+                   string(index))
+    @test occursin(r"rows\w*\[i - 1\]\[:row_widths\[0\]\]", string(index))
+    @test !occursin("row_widths", string(jax_source(jax_layout_index; have = (:a, :units, :xs),
+                                                    want = :total, data = (:units, :xs))))
     @test_throws ArgumentError jax_source(jax_layout_walk; have, want = :total, plate_layout = :groups)
     @test_throws ArgumentError jax_source(jax_layout_walk; have, want = :total, data,
                                           plate_layout = :chains)
     if rk_jax_available()
         native_walk = prepare(jax_layout_walk; have, want = :total)
         native_rows = prepare(jax_layout_rows; have = (:a, :xs), want = :total)
+        native_index = prepare(jax_layout_index; have = (:a, :units, :xs), want = :total)
         keys = [0.25, -0.5]
         mktempdir() do dir
             write(joinpath(dir, "walk.py"), walk)
             write(joinpath(dir, "rows.py"), rows)
+            write(joinpath(dir, "index.py"), index)
             script = joinpath(@__DIR__, "jax_layout.py")
             expected = (native_walk(0.6, keys, layout_orders(1), layout_weights(1)),
-                        native_rows(0.6, layout_rows(1)))
-            @test success(`$RK_JAX_PYTHON $script $dir $(expected[1]) $(expected[2])`)
+                        native_rows(0.6, layout_rows(1)),
+                        native_index(0.6, LAYOUT_UNITS, layout_rows(1)))
+            @test success(`$RK_JAX_PYTHON $script $dir $(expected[1]) $(expected[2]) $(expected[3])`)
         end
     else
         @test_skip false

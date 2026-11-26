@@ -67,6 +67,14 @@ end
 
 const _RK_JAX_DRIVER = raw"""
 import importlib.util, math, sys
+import os
+def _rk_forced_layout(module, prepared):
+    # `RK_JAX_PLATE_GROUPS=<n>`: run a module emitted with plate layouts in
+    # grouped plates, to compare every such test with its native values.
+    groups = os.environ.get("RK_JAX_PLATE_GROUPS")
+    if groups and hasattr(module, "prepare_plate_layout"):
+        return module.prepare_plate_layout(prepared, abs(int(groups)), int(groups) < 0)
+    return prepared
 import numpy as np
 spec = importlib.util.spec_from_file_location("rk_module", sys.argv[1])
 module = importlib.util.module_from_spec(spec)
@@ -77,6 +85,7 @@ f = getattr(module, sys.argv[3])
 first, rest = ARGS[0], ARGS[1:]
 if sys.argv[5] in ("prepare", "arguments"):
     prepared = module.prepare_data(**raw_data(rest))
+    prepared = _rk_forced_layout(module, prepared)
     call = lambda u: f(u, **prepared)
 else:
     call = lambda u: f(u, *rest)
@@ -151,6 +160,14 @@ function rk_jax_evaluate(src::JAXSource, name, args; grad::Union{Bool,Symbol} = 
 end
 const _RK_JAX_FLOAT32_DRIVER = raw"""
 import importlib.util, math, sys
+import os
+def _rk_forced_layout(module, prepared):
+    # `RK_JAX_PLATE_GROUPS=<n>`: run a module emitted with plate layouts in
+    # grouped plates, to compare every such test with its native values.
+    groups = os.environ.get("RK_JAX_PLATE_GROUPS")
+    if groups and hasattr(module, "prepare_plate_layout"):
+        return module.prepare_plate_layout(prepared, abs(int(groups)), int(groups) < 0)
+    return prepared
 import numpy as np
 def load(path, tag):
     spec = importlib.util.spec_from_file_location(tag, path)
@@ -175,6 +192,7 @@ def caller(m, cast):
     first, rest = ARGS[0], ARGS[1:]
     if prepare:
         p = m.prepare_data(**raw_data(rest))
+        p = _rk_forced_layout(m, p)
         return (single(first) if cast else first), (lambda u: f(u, **p))
     rest = [single(a) for a in rest] if cast else rest
     return (single(first) if cast else first), (lambda u: f(u, *rest))
@@ -255,12 +273,21 @@ end
 
 const _RK_JAX_LAYOUT_DRIVER = raw"""
 import importlib.util, sys
+import os
+def _rk_forced_layout(module, prepared):
+    # `RK_JAX_PLATE_GROUPS=<n>`: run a module emitted with plate layouts in
+    # grouped plates, to compare every such test with its native values.
+    groups = os.environ.get("RK_JAX_PLATE_GROUPS")
+    if groups and hasattr(module, "prepare_plate_layout"):
+        return module.prepare_plate_layout(prepared, abs(int(groups)), int(groups) < 0)
+    return prepared
 import numpy as np
 spec = importlib.util.spec_from_file_location("rk_module", sys.argv[1])
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 exec(open(sys.argv[2]).read())
 prepared = module.prepare_data(**raw_data(ARGS))
+prepared = _rk_forced_layout(module, prepared)
 params = module.parameters(prepared)
 print("(dimension = %d, parameters = Dict(%s))" % (module.dimension(prepared), ", ".join(
     '"%s" => (start = %d, stop = %d, dims = (%s))' % (k, v["start"], v["stop"],

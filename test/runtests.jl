@@ -20,6 +20,13 @@ end
 using ReactiveKernels
 using Test
 
+# `RK_JAX_PLATE_GROUPS=<n>` emits every `jax_source` module that has data with
+# plate layouts and runs it in `n` groups (`jax_python.jl`; negative: units one
+# after another), a differential run of the suite's parity checks. Tests of
+# the emitted text itself expect the default emission and fail in that run.
+haskey(ENV, "RK_JAX_PLATE_GROUPS") &&
+    task_local_storage(:reactivekernels_jax_plate_layout_default, :groups)
+
 const _MATRIX_CORE_TESTS = (
     "test_runtests_selector.jl",
     "test_changelog.jl",
