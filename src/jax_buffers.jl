@@ -170,11 +170,14 @@ end
 # argument's gradient (for example, a * log(0)). Guard the cell itself.
 # Abstract shape evaluation performs no numerical cell work, and closing
 # over its arguments keeps prepared StaticInts static during that trace.
-function _jax_slots_active_cell(ctx, cell, params)
+function _jax_slots_active_cell(ctx, cell, params, bindings = ())
     name = _jax_fresh(ctx, :active_rows_cell)
-    call = cell * "(" * join(params, ", ") * ")"
+    call = cell * "(" * join(Iterators.flatten((params, first.(bindings))), ", ") * ")"
     guarded = _jax_if_nonempty(ctx, last(params), "lambda: " * call)
     _jax_emit!(ctx, "def " * name * "(" * join(params, ", ") * "):")
+    for (row, gather) in bindings
+        _jax_emit!(ctx, "    " * row * " = " * gather)
+    end
     _jax_emit!(ctx, "    return " * guarded)
     name
 end
