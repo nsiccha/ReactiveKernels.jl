@@ -221,6 +221,7 @@ const _MATRIX_CORE_TESTS = (
     "test_jax_rule_host.jl",
     "test_jax_value_ports.jl",
     "test_jax_comprehension_names.jl",
+    "test_jax_eachindex.jl",
     "test_jax_padded_broadcasts.jl",
     "test_jax_masks.jl",
     "test_jax_padded_ranges.jl",

@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.393
+## 0.1.394
 
 - Native borrowed position readers reuse dense outputs at the two most recent
   nonempty batch widths and reuse lane storage for ordinary numeric
@@ -24,6 +24,13 @@ are recorded in the git history only.
   shared design computations, including `stack` of dense numeric vectors
   along dimension one or two. `prepare_into(reader)` accepts caller-owned stacked
   outputs, including disjoint views of one matrix.
+
+## 0.1.393
+
+- `jax_source` supports `eachindex(a, b, ...)` over one-based vectors in
+  numerical kernels and data preparation. It checks all logical lengths,
+  including the lengths of padded rows, before iterating. Comprehensions
+  over these indices also work inside ordinary Julia helper functions.
 
 ## 0.1.392
 
