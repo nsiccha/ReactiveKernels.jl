@@ -547,6 +547,7 @@ function _jax_chain_scan_body(ctx, p, recipe, body, inputs, mapped, pos, guards)
     scan = body.recipes[pos]
     op = scan.op
     _scan_has_history(op) && return nothing
+    before = _JAX_EFFECTS[]
     include_seed = _scan_includes_init(op)
     id(v) = canon_id(body.graph, v.id)
     history = id(only(scan.outputs))
@@ -657,7 +658,14 @@ function _jax_chain_scan_body(ctx, p, recipe, body, inputs, mapped, pos, guards)
         push!(cellports, only(scan.outputs))
         push!(inputs, result)
         push!(mapped, true)
-        return _jax_chain_epilogue(ctx, p, recipe, body, tail, cellports, inputs, mapped)
+        # A check of the prefix or the step (a direct index's bounds, checked
+        # once before the scan) runs ahead of every subject's suffix. Keep
+        # subject order when the suffix can raise a competing error too; the
+        # caller then discards this scope.
+        prefix_checked = _JAX_EFFECTS[] != before
+        suffix_start = _JAX_EFFECTS[]
+        result = _jax_chain_epilogue(ctx, p, recipe, body, tail, cellports, inputs, mapped)
+        return prefix_checked && _JAX_EFFECTS[] != suffix_start ? nothing : result
     end
     isempty(reduction) && return [_PyVal(call, Vector{Vector{E}}, false, first(columns).extent)]
     T = reduction == "sum" ? _jax_return_type(sum, Any[Vector{E}]) : E

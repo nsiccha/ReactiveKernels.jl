@@ -331,3 +331,67 @@ end
         @test_skip "RK_JAX_PYTHON not set"
     end
 end
+
+@traceable function jax_checked_event_weight(weights, x)
+    size(weights, 1) == 2 || throw(DimensionMismatch("two weight rows required"))
+    weights[1, 1] * x
+end
+
+@kernel function jax_subject_weighted_history(gain::Float64, weights::Matrix{Float64},
+                        samples::Vector{Vector{Float64}}, indices::Vector{Vector{Int}},
+                        visits::Vector{Vector{Int}}, kinds::Vector{Vector{Int}})
+    results = plate(samples, indices, visits, kinds, Ref(weights), Ref(gain)) do events, steps, obs, flags, w, a
+        entries = plate(events, Ref(w), Ref(a)) do x, t, g
+            jax_checked_event_weight(t, g * x)
+        end
+        history = scan(steps, Ref(entries); init = 0.0) do carry, i, row
+            n = carry + row[i]
+            (n, (n, -n))
+        end
+        readings = plate(obs, flags, Ref(history)) do j, flag, states
+            j == -99 ? error("observation failed") : flag == 1 && j > 0 ? states[j][1] : 0.0
+        end
+        (readings, entries)
+    end
+    scores = plate(results) do subject
+        sum(subject[1]) + sum(subject[2])
+    end
+    total = sum(scores)
+    return total
+end
+
+@testset "A checked subject table, scan and readout keep Julia's failure order" begin
+    have = (:gain, :weights, :samples, :indices, :visits, :kinds)
+    native = prepare(jax_subject_weighted_history; have, want = :total)
+    src = jax_source(jax_subject_weighted_history; have, want = :total, data = Base.tail(have),
+                     plate_layout = :chains)
+    if rk_jax_available()
+        w = reshape([2.0, 1.0], 2, 1)
+        args = (w, [[1.0, 2.0], Float64[], [3.0]], [[2, 1], Int[], [1]], [[2, 2, 0], [-7], [1]], [[1], [0], [1]])
+        r = rk_jax_evaluate(src, "kernel", (0.5, args...); prepare = :arguments, grad = true)
+        @test r.value == native(0.5, args...)
+        @test r.grad == native(1.0, args...)
+        for (steps, obs, kind, emitted) in (([[1], [2]], [[-99], [1]], ErrorException, "error threw"),
+                                             ([[2], [1]], [[1], [-99]], BoundsError, "BoundsError"))
+            bad = (0.5, w, [[1.0], [2.0]], steps, obs, [[1], [1]])
+            @test_throws kind native(bad...)
+            @test_throws emitted rk_jax_evaluate(src, "kernel", bad; prepare = :arguments)
+        end
+        # The second subject's incompatible observation axes must not mask
+        # a failure in the first subject's readout.
+        competing = (0.5, w, [[1.0], [2.0]], [[1], [1]], [[-99], [1, 1]], [[1], [1, 1, 1]])
+        @test_throws ErrorException native(competing...)
+        @test_throws "error threw" rk_jax_evaluate(src, "kernel", competing; prepare = :arguments)
+        # Otherwise the first incompatible subject reports its own lengths.
+        for mismatched in ((0.5, w, [[1.0], [2.0]], [[1], [1]], [[1], [1, 1]], [[1], [1, 1, 1]]),
+                           (0.5, w, [[1.0], [2.0]], [[1], [1]], [[1, 1], [-99]], [[1, 1, 1], [1]]))
+            @test_throws DimensionMismatch native(mismatched...)
+            @test_throws "DimensionMismatch" rk_jax_evaluate(src, "kernel", mismatched; prepare = :arguments)
+        end
+        bad_shape = (0.5, zeros(3, 1), args[2:end]...)
+        @test_throws DimensionMismatch native(bad_shape...)
+        @test_throws "two weight rows required" rk_jax_evaluate(src, "kernel", bad_shape; prepare = :arguments)
+    else
+        @test_skip "RK_JAX_PYTHON not set"
+    end
+end

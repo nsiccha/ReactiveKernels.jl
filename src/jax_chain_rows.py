@@ -261,15 +261,17 @@ def _rk_wrap_column(values, first):
     return values.reshape(first.shape[:2] + values.shape[1:])
 
 
-def _rk_collect_rows(cell, args, mapped, layouts, dtypes):
+def _rk_collect_rows(cell, args, mapped, layouts, dtypes, report=None):
     """Write variable-size outputs from each subject into their packed columns."""
     types, schema = jax.tree.flatten(dtypes)
     layout = schema.flatten_up_to(layouts)
     sources = [leaf for arg, axis in zip(args, mapped) if axis == 0
                for leaf in jax.tree.leaves(arg, is_leaf=lambda a: isinstance(a, _RKChainRows))]
     n, = np.broadcast_shapes(*[(x.shape[0],) for x in sources])
-    # Invalid input to an untaken branch has no rows to evaluate. The
-    # generated call's guard reports an invalid layout if execution takes it.
+    # A prepared layout is None when some subject's result lengths are
+    # incompatible, and its output has no rows to write. Invalid input to an
+    # untaken branch is never evaluated. Otherwise the generated `report`
+    # checks the layout after the subjects' own checks (below).
     empty = (jnp.zeros(n, dtype=int), jnp.zeros(n + 1, dtype=int), 0, 0)
     def output_layout(spec):
         if spec is False or spec is None:
@@ -308,6 +310,18 @@ def _rk_collect_rows(cell, args, mapped, layouts, dtypes):
         return tuple(out)
     if n and all(spec is not None for spec in schema.flatten_up_to(layouts)):
         storage = jax.lax.fori_loop(0, n, jax.checkpoint(run_subject), storage)
+    elif n and report is not None:
+        # Julia fails at the first incompatible subject, or at an earlier
+        # subject's own failure. Each cell checks its lengths, so evaluate
+        # every subject in order. The check `report` receives depends on the
+        # completed subject count, so it fails only after the loop. The
+        # barrier keeps XLA from deriving that count from the trip count,
+        # which would fold the check and run it before any cell.
+        def checked_subject(i, state):
+            buffers, done = state
+            return jax.checkpoint(run_subject)(i, buffers), jax.lax.optimization_barrier(done + 1)
+        storage, done = jax.lax.fori_loop(0, n, checked_subject, (storage, 0))
+        report(done < n)
     values, lengths = [], []
     for buf, spec in zip(storage, layout):
         if spec is False:
