@@ -6,13 +6,12 @@ _jax_chain_bool(x) = x ? "True" : "False"
 function _jax_chain_entry(ctx, table, index)
     _jax_helper!(ctx, "_RKChainRows", _JAX_CHAIN_ROWS)
     elem = eltype(table.T)
-    code = "_rk_row_entry(" * join((table.code, index.code, table.extent), ", ") * ")"
+    packed = _jax_uniform_record(elem)
+    source = packed ? _jax_helper!(ctx, "_rk_pack_record", _JAX_PACK_RECORD) * "(" * table.code * ")" : table.code
+    code = "_rk_row_entry(" * join((source, index.code, table.extent), ", ") * ")"
+    packed && (code = "tuple(" * code * ")")
     entry = _PyVal(code, elem)
-    if _jax_number_fields(elem)
-        at_entry = isempty(ctx.scope.lines) && !any(g -> first(g) === ctx.scope, _JAX_GUARDS)
-        entry = _jax_bind!(ctx, :record_entry, entry)
-        at_entry && (ctx.scope.first_record = (; name = entry.code, expression = code))
-    end
+    _jax_number_fields(elem) && (entry = _jax_bind_record_entry(ctx, entry))
     at = _py_atom(index.code)
     valid = "((" * at * " >= 1) & (" * at * " <= " * _py_atom(table.extent) * "))"
     _jax_masked_check(ctx, _PyVal(valid, Bool), repr("BoundsError: index outside subject row"))

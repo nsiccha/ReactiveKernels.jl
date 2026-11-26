@@ -86,7 +86,7 @@ def _rk_row_values(row):
 def _rk_row_entry(table, index, length):
     def read(column):
         if not column.shape[0]:
-            return jnp.zeros((), dtype=column.dtype)
+            return jnp.zeros(column.shape[1:], dtype=column.dtype)
         return jnp.where((index >= 1) & (index <= length), column[index - 1], 0)
     return jax.tree.map(read, table)
 
@@ -114,13 +114,10 @@ def _rk_event_indices(table, index, length, tags, mapped):
 
 def _rk_event_table_rows(gather, table, index, requested, length, tags, mapped):
     """Translate local indices to packed offsets before the common masked gather."""
-    if tags is None:
-        def empty(column):
-            values = column.values if isinstance(column, _RKChainRows) else column
-            return jnp.zeros(index.shape, dtype=values.dtype)
-        return jax.tree.map(empty, table, is_leaf=lambda x: isinstance(x, _RKChainRows)), jnp.asarray(True)
-    at, valid = _rk_event_indices(table, index, length, tags, mapped)
     flat = jax.tree.map(_rk_flat_values, table, is_leaf=lambda x: isinstance(x, _RKChainRows)) if mapped else table
+    if tags is None:
+        return gather(flat, index, jnp.zeros_like(index, dtype=bool), 0)
+    at, valid = _rk_event_indices(table, index, length, tags, mapped)
     return gather(flat, jnp.where(valid, at, 0), requested, jax.tree.leaves(flat)[0].shape[0])
 
 
