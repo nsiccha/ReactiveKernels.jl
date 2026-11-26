@@ -5,9 +5,78 @@ _jax_map_statements(x) = x isa Expr && x.head === :block ?
     [a for a in x.args if !(a isa LineNumberNode)] : Any[x]
 _jax_map_assignment(x) = Meta.isexpr(x, :(=), 2)
 
+# A local may own an array across branches and iterations. Verify its whole
+# lexical lifetime: the constructor binds it once, indexed writes keep it
+# local, and only the function result can publish it. A reshape, closure,
+# alias, argument to another call or rebinding makes the proof fail.
+function _jax_private_matrix_uses(ex, name, constructor; top=true, tail=true)
+    !_kernel_mentions(ex, name) && return true
+    ex === name && return tail
+    ex isa Expr || return false
+    if ex.head === :block
+        statements = _jax_map_statements(ex)
+        return all(enumerate(statements)) do (i, st)
+            _jax_private_matrix_uses(st, name, constructor; top, tail=tail && i == length(statements))
+        end
+    elseif ex.head === :return
+        return ex.args == [name]
+    elseif ex.head === :for || ex.head === :if
+        return !_kernel_mentions(first(ex.args), name) &&
+            all(st -> _jax_private_matrix_uses(st, name, constructor; top=false, tail=false),
+                ex.args[2:end])
+    elseif _jax_map_assignment(ex)
+        lhs, rhs = ex.args
+        lhs === name && return top && rhs === constructor && !_kernel_mentions(rhs, name)
+        return Meta.isexpr(lhs, :ref) && first(lhs.args) === name &&
+            !any(i -> _kernel_mentions(i, name), lhs.args[2:end]) && !_kernel_mentions(rhs, name)
+    end
+    false
+end
+
+# These Base methods allocate new storage. Check the resolved method and
+# operand types, including through a Julia helper whose entire lowered body
+# forwards its arguments to such a constructor.
+function _jax_dense_constructor(f, types)
+    (f === fill || f === zeros || f === ones) || return false
+    dims = f === fill ? types[2:end] : types
+    length(dims) == 2 && all(==(Int), dims) || return false
+    f === fill && !(first(types) <: _JaxBranchReal && isprimitivetype(first(types))) && return false
+    which(f, Tuple{types...}).module === Base
+end
+
+function _jax_record_private_matrix!(ctx, name, constructor, f, values)
+    frame = _jax_frame()
+    frame !== nothing && frame.function_body && ctx.scope === frame.scope &&
+        frame.lets == 0 && !(name in frame.names) && !haskey(ctx.locals, name) &&
+        _jax_private_matrix_uses(frame.source, name, constructor) || return
+    types = _jax_argument_type.(values)
+    all(t -> t isa Type && isconcretetype(t), types) || return
+    if !_jax_dense_constructor(f, types)
+        f isa Function && Base.issingletontype(typeof(f)) || return
+        infos = try
+            _jax_lowered_code(f, types)
+        catch
+            return
+        end
+        length(infos) == 1 || return
+        code = only(infos).code
+        length(code) == 2 || return
+        call, ret = code
+        ret isa Core.ReturnNode && isdefined(ret, :val) && ret.val === Core.SSAValue(1) &&
+            Meta.isexpr(call, :call) || return
+        callee = first(call.args)
+        callee isa GlobalRef && isdefined(callee.mod, callee.name) && isconst(callee.mod, callee.name) || return
+        operands = call.args[2:end]
+        all(x -> x isa Core.SlotNumber && 2 <= x.id <= length(types) + 1, operands) || return
+        _jax_dense_constructor(getglobal(callee.mod, callee.name),
+                               [types[x.id - 1] for x in operands]) || return
+    end
+    push!(frame.private_matrices, name)
+end
+
 function _jax_plain_copy_array(ctx, value)
     value !== nothing && value.T isa Type && value.T <: Array &&
-        eltype(value.T) <: _JaxBranchReal && isprimitivetype(eltype(value.T)) &&
+        eltype(value.T) <: _JaxBranchReal &&
         isempty(value.extent) && !_jax_slots(value) && !(value.origin isa _JaxRowView ||
         value.origin isa _JaxRowShape && (value.origin.stored || _jax_borrowed_buffer(ctx, value)))
 end
@@ -32,7 +101,7 @@ function _jax_record_matrix_reshape!(ctx, alias, ex, parent)
     frame = _jax_frame()
     frame !== nothing && ctx.scope === frame.scope && !haskey(ctx.locals, alias) || return
     array = get(ctx.locals, parent, nothing)
-    _jax_plain_copy_array(ctx, array) || return
+    _jax_plain_copy_array(ctx, array) && isprimitivetype(eltype(array.T)) || return
     statements = _jax_map_statements(frame.source)
     at = findfirst(st -> _jax_map_assignment(st) && st.args[1] === alias && st.args[2] === ex, statements)
     at === nothing && return
@@ -54,6 +123,18 @@ function _jax_read_reshaped_matrix(ctx, name, value)
            ".shape, order=\"F\")", value.T)
 end
 
+function _jax_check_copy_row!(ctx, row, dest)
+    rows = dest.code * ".shape[0]"
+    interval = _jax_static_integer_bounds(row)
+    if interval !== nothing
+        lo, hi = interval
+        _jax_emit!(ctx, "if not (1 <= " * lo * " and " * hi * " <= " * rows * "):")
+        ctx.scope.indent += 1
+    end
+    valid = _PyVal("((" * row.code * " >= 1) & (" * row.code * " <= " * rows * "))", Bool)
+    _jax_masked_check(ctx, valid, repr("BoundsError: row exceeds array dimensions"))
+    interval === nothing || (ctx.scope.indent -= 1)
+end
 # Resolve the authored comparison through the normal scalar emitter. A wrapper
 # can implement Base's comparison too. Only a single pure comparison of the
 # entry against zero qualifies, including the semantics of unordered values.
@@ -207,13 +288,13 @@ function _jax_signed_map(ctx, i, body, lo, hi)
     _PyVal("None", Nothing, true)
 end
 
-# Copy an aligned prefix of a dense array, or fill its diagonal. The only
-# source addresses in a copy are the corresponding destination coordinates.
-# Overlapping shifted reads, conversion, and row views use ordinary emission.
+# Copy an aligned prefix, fill a diagonal, or copy a vector into one row of
+# a privately allocated matrix. Match the store before emitting any code.
 function _jax_prefix_store(ctx, var, body, hi)
     hi.T isa Type && hi.T <: Integer && hi.T !== Bool || return nothing
     vars = Symbol[var]
     stops = String[hi.code]
+    shape_width = false
     statements = _jax_map_statements(body)
     length(statements) == 1 || return nothing
     store = only(statements)
@@ -222,10 +303,14 @@ function _jax_prefix_store(ctx, var, body, hi)
         Meta.isexpr(binding, :(=), 2) || return nothing
         index, range = binding.args
         index isa Symbol && index !== var && Meta.isexpr(range, :call, 3) &&
-            range.args[1] === :(:) && range.args[2] === 1 &&
-            range.args[3] isa Int || return nothing
+            range.args[1] === :(:) && range.args[2] === 1 || return nothing
+        stop = range.args[3]
+        stop === var && return nothing
+        width = stop isa Int ? _jax_literal(stop) : get(ctx.locals, stop, nothing)
+        width !== nothing && width.static && width.T === Int || return nothing
+        shape_width = !(stop isa Int)
         push!(vars, index)
-        push!(stops, string(range.args[3]))
+        push!(stops, width.code)
         statements = _jax_map_statements(inner)
         length(statements) == 1 || return nothing
         store = only(statements)
@@ -235,11 +320,12 @@ function _jax_prefix_store(ctx, var, body, hi)
     Meta.isexpr(lhs, :ref) && first(lhs.args) isa Symbol || return nothing
     name, indices = lhs.args[1], lhs.args[2:end]
     dest = get(ctx.locals, name, nothing)
-    plain(v) = v !== nothing && v.T isa Type && v.T <: Array &&
-        eltype(v.T) <: _JaxBranchReal && !_jax_slots(v) && isempty(v.extent) &&
-        !(v.origin isa _JaxRowView || v.origin isa _JaxRowShape &&
-          (v.origin.stored || _jax_borrowed_buffer(ctx, v)))
-    plain(dest) && ndims(dest.T) == length(indices) || return nothing
+    _jax_plain_copy_array(ctx, dest) && ndims(dest.T) == length(indices) || return nothing
+    frame = _jax_frame()
+    private = frame !== nothing && name in frame.private_matrices &&
+        hi.T === Int && isprimitivetype(eltype(dest.T))
+    shape_width && !private && return nothing
+    row = nothing
     diagonal = length(vars) == 1 && indices == [var, var] &&
         rhs isa Number && typeof(rhs) === eltype(dest.T)
     if diagonal
@@ -249,16 +335,26 @@ function _jax_prefix_store(ctx, var, body, hi)
         selection = positions * ", " * positions
         value = _jax_literal(rhs).code
     else
-        indices == vars && Meta.isexpr(rhs, :ref) && rhs.args[2:end] == indices ||
-            return nothing
-        frame = _jax_frame()
+        Meta.isexpr(rhs, :ref) && rhs.args[2:end] == vars || return nothing
+        source = first(rhs.args)
+        source isa Symbol && !(source in vars) || return nothing
         # Reads through this reshape must see writes to its parent in order.
-        frame !== nothing && haskey(frame.matrix_reshape_sources, rhs.args[1]) && return nothing
-        src = get(ctx.locals, rhs.args[1], nothing)
-        plain(src) && ndims(src.T) == length(vars) && eltype(src.T) === eltype(dest.T) ||
-            return nothing
-        bounds = [stop * " <= " * v.code * ".shape[" * string(ax - 1) * "]"
-                  for (ax, stop) in enumerate(stops) for v in (dest, src)]
+        frame !== nothing && haskey(frame.matrix_reshape_sources, source) && return nothing
+        src = get(ctx.locals, source, nothing)
+        _jax_plain_copy_array(ctx, src) && ndims(src.T) == length(vars) &&
+            eltype(src.T) === eltype(dest.T) || return nothing
+        if indices == vars
+            bounds = [stop * " <= " * v.code * ".shape[" * string(ax - 1) * "]"
+                      for (ax, stop) in enumerate(stops) for v in (dest, src)]
+        else
+            private && length(vars) == 1 && length(indices) == 2 &&
+                indices[2] === var && indices[1] !== var || return nothing
+            at = first(indices)
+            row = at isa Int ? _jax_literal(at) : get(ctx.locals, at, nothing)
+            row !== nothing && row.T === Int || return nothing
+            bounds = [hi.code * " <= " * dest.code * ".shape[1]",
+                      hi.code * " <= " * src.code * ".shape[0]", dest.code * ".shape[0] > 0"]
+        end
         selection = join((":" * stop for stop in stops), ", ")
         value = src.code * "[" * selection * "]"
     end
@@ -268,7 +364,7 @@ function _jax_prefix_store(ctx, var, body, hi)
     result = _jax_fresh(ctx, :block)
     _jax_emit!(ctx, "if " * join((stop * " <= 0" for stop in stops), " or ") * ":")
     _jax_emit!(ctx, "    " * result * " = " * dest.code)
-    if !diagonal && length(vars) > 1
+    if !diagonal && !private && length(vars) > 1
         # Reshapes can share storage with a different leading dimension. Such
         # a copy can read a preceding store as the authored rows advance.
         _jax_emit!(ctx, "elif " * dest.code * ".shape[0] != " * src.code * ".shape[0] and " * join(bounds, " and ") * ":")
@@ -278,7 +374,16 @@ function _jax_prefix_store(ctx, var, body, hi)
         ctx.scope.indent -= 1
     end
     _jax_emit!(ctx, "elif " * join(bounds, " and ") * ":")
-    _jax_emit!(ctx, "    " * result * " = " * dest.code * ".at[" * selection * "].set(" * value * ")")
+    if row === nothing
+        _jax_emit!(ctx, "    " * result * " = " * dest.code * ".at[" * selection * "].set(" * value * ")")
+    else
+        ctx.scope.indent += 1
+        _jax_check_copy_row!(ctx, row, dest)
+        offset = _jax_minus_one(row)
+        _jax_emit!(ctx, result * " = jax.lax.dynamic_update_slice(" * dest.code * ", " *
+            src.code * "[None, :" * hi.code * "], (" * offset * ", jnp.zeros_like(" * offset * ")))")
+        ctx.scope.indent -= 1
+    end
     _jax_emit!(ctx, "else:")
     ctx.scope.indent += 1
     _jax_masked_check(ctx, _PyVal("False", Bool), repr("BoundsError: block exceeds array dimensions"))

@@ -3892,10 +3892,12 @@ function _jax_expr(ctx::_JaxContext, ::Val{:call}, ex)
         _jax_call(ctx, f, values, kw)
     end
     if ctx.host === nothing && ctx.target !== nothing && first(ctx.target) === ex &&
-       (f === reshape || f === vec) && isempty(kw) && result.T isa Type &&
-       result.T <: Union{Vector,Matrix} &&
-       !isempty(positional) && first(positional) isa Symbol
-        _jax_record_matrix_reshape!(ctx, last(ctx.target), ex, first(positional))
+       isempty(kw) && result.T isa Type && result.T <: Union{Vector,Matrix}
+        if (f === reshape || f === vec) && !isempty(positional) && first(positional) isa Symbol
+            _jax_record_matrix_reshape!(ctx, last(ctx.target), ex, first(positional))
+        elseif result.T <: Matrix
+            _jax_record_private_matrix!(ctx, last(ctx.target), ex, f, values)
+        end
     end
     result
 end
@@ -7425,11 +7427,12 @@ mutable struct _JaxFrame
     detached::Dict{Symbol,_PyVal}
     ambiguous::Set{Symbol}
     lets::Int
+    private_matrices::Set{Symbol}
     matrix_reshape_sources::Dict{Symbol,Symbol}
 end
 _JaxFrame(scope, names, function_body, source, locals) =
     _JaxFrame(scope, names, function_body, source, locals, Set{Symbol}(),
-              Dict{Symbol,_PyVal}(), Set{Symbol}(), 0, Dict{Symbol,Symbol}())
+              Dict{Symbol,_PyVal}(), Set{Symbol}(), 0, Set{Symbol}(), Dict{Symbol,Symbol}())
 _jax_frame() = (frames = _jax_frames(); isempty(frames) ? nothing : last(frames))
 # A function body's argument rebound by name: Julia's writes until here
 # reached the caller's array, and later ones reach the new value.
