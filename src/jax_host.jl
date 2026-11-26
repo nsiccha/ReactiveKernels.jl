@@ -1263,6 +1263,26 @@ function _host_length(ctx::_JaxContext, x::_PyVal)
     _PyVal("len(" * x.code * ")", Int, true)
 end
 
+# Python and NumPy accept negative positions. Check the Julia lower bound
+# before subtracting one, at the point the selected read or store executes.
+const _HOST_POSITION = raw"""
+def _rk_host_position(i):
+    if np.isscalar(i):
+        i = int(i)
+        if i >= 1:
+            return i - 1
+    else:
+        i = np.asarray(i)
+        if not np.any(i < 1):
+            return i - 1
+    raise IndexError("BoundsError: array indices must be positive")
+"""
+function _host_position(ctx::_JaxContext, i::_PyVal)
+    occursin(r"^[1-9][0-9]*$", i.code) && return _jax_minus_one(i)
+    f = _jax_helper!(ctx, "_rk_host_position", _HOST_POSITION)
+    f * "(" * i.code * ")"
+end
+
 # `x[i]` of a dictionary, a list or a ragged list of arrays; `nothing` for an
 # array, which indexes as JAX's does.
 function _host_index(ctx::_JaxContext, x::_PyVal, indices)
@@ -1280,7 +1300,7 @@ function _host_index(ctx::_JaxContext, x::_PyVal, indices)
     i = _jax_bound_expr(ctx, x, 1, indices[1])
     i.T === Bool && _jax_bool_index_error(ctx, indices[1])
     i.T isa Type && i.T <: Integer &&
-        return _PyVal(_py_atom(x.code) * "[" * _jax_minus_one(i) * "]", E, true)
+        return _PyVal(_py_atom(x.code) * "[" * _host_position(ctx, i) * "]", E, true)
     _jax_is_array(i.T) || i.T isa Type && i.T <: AbstractRange ||
         _jax_error("the index of type `", i.T, "` into a list", _jax_where(ctx))
     if _jax_logical(i.T)
@@ -1293,7 +1313,8 @@ function _host_index(ctx::_JaxContext, x::_PyVal, indices)
                                i.code * ", strict=True) if " * keep * "]", E)
     end
     k = _jax_fresh(ctx, :k)
-    _host_collected("[" * _py_atom(x.code) * "[" * k * " - 1] for " * k * " in " * i.code * "]", E)
+    _host_collected("[" * _py_atom(x.code) * "[" * k * "] for " * k * " in " *
+                    _host_position(ctx, i) * "]", E)
 end
 
 # A Julia type called as a constructor; `nothing` where JAX's translation serves.
@@ -2262,7 +2283,7 @@ end
 # recipe of their values and the plate reading them as inputs, or `nothing`
 # when none of them reads only the plate's data inputs (those whose canonical
 # id in `g` is in `dependent`).
-function _jax_cell_split(g::Graph, r::Recipe, dependent::Set{ValueId}, hoisted::Set{Int};
+function _jax_cell_split(g::Graph, r::Recipe, dependent::Set{ValueId}, hoisted::Set{Int}, mapped;
                          compact::Bool = false, complete_domain::Bool = false)
     op = r.op
     body = op.kernel.plan
@@ -2311,17 +2332,16 @@ function _jax_cell_split(g::Graph, r::Recipe, dependent::Set{ValueId}, hoisted::
     read = Set{ValueId}(canon_id(cg, v.id) for x in computed for v in x.inputs)
     # An otherwise unused bound axis can broadcast a singleton or make the
     # whole plate empty. Include it when preparation owns the complete domain.
-    mapped(i) = !(i in atomic_inputs) && !(valtype(r.inputs[i]) <: Number)
     inputs = Int[i for i in eachindex(data) if data[i] && canon_id(cg, body.have[i].id) in read]
-    percell = any(mapped, inputs)
+    percell = any(i -> mapped[i], inputs)
     if complete_domain && percell
         inputs = Int[i for i in eachindex(data) if data[i] &&
-                     (canon_id(cg, body.have[i].id) in read || mapped(i))]
+                     (canon_id(cg, body.have[i].id) in read || mapped[i])]
     end
     # An invariant prefix still belongs to the plate. The remaining mapped
     # operands establish whether any cell visits it, without adding a batch
     # dimension to the value supplied to those cells.
-    domain = complete_domain && !percell ? Int[i for i in eachindex(data) if data[i] && mapped(i)] : Int[]
+    domain = complete_domain && !percell ? Int[i for i in eachindex(data) if data[i] && mapped[i]] : Int[]
     atomic = Bool[i in atomic_inputs for i in inputs]
     plan = _partial_subplan(body, Value[body.have[i] for i in inputs], frontier, computed)
     values = Value[Value(v.name, Any) for v in frontier]
@@ -2546,7 +2566,7 @@ data alone (in an order that computes each after its inputs), the boundary
 values the functions read from them, and each function's residual plan over
 its remaining ports followed by those values.
 """
-function _jax_prepare_split(plans, data_ports, excluded::Set{Int} = Set{Int}(); keep = (),
+function _jax_prepare_split(plans, data_ports, excluded::Set{Int} = Set{Int}(); have_types, keep = (),
                             cells = Dict{Int,Set{Int}}(), host_constants = Set{Int}(),
                             layout = :default, cell_reasons = Dict{Tuple{Int,Int},JAXEmissionError}())
     p1 = first(plans).second[1]
@@ -2590,6 +2610,10 @@ function _jax_prepare_split(plans, data_ports, excluded::Set{Int} = Set{Int}(); 
             foreach(v -> push!(needed, canon_id(g, v.id)), r.inputs)
         end
         residual = [reverse!(kept); residual]
+        # Generated models can declare a port as Any and supply its concrete
+        # type at the emission boundary. Follow bound producers as well: a
+        # plate can capture an index table computed from another data port.
+        outer = nothing
         # A plate whose cell has data-only recipes the functions cannot
         # compute: `prepare_data` computes them for every cell (a recipe after
         # the producers of the plate's data inputs, which `pre` holds), and the
@@ -2598,8 +2622,19 @@ function _jax_prepare_split(plans, data_ports, excluded::Set{Int} = Set{Int}(); 
             r.op isa _AuthoredPlateOp || continue
             _jax_cell_prefix_id(r.id) in excluded && continue
             atomic = typeof(r.op).parameters[2]
-            complete_domain = all(i -> i in atomic || valtype(r.inputs[i]) <: Number ||
-                                         canon_id(g, r.inputs[i].id) in dependent,
+            if outer === nothing
+                port_types = Dict(canon_id(g, v.id) => have_types[v.name] for v in p.have)
+                outer = _bound_shape_context(p, port_types)
+            end
+            input_types = map(r.inputs) do input
+                cid = canon_id(g, input.id)
+                T = get(outer.types, cid) do
+                    cid in dependent ? _bound_shape_type(outer, input) : valtype(input)
+                end
+                T === Union{} ? Any : T
+            end
+            mapped = [!(i in atomic) && !(input_types[i] <: Number) for i in eachindex(r.inputs)]
+            complete_domain = all(i -> !mapped[i] || canon_id(g, r.inputs[i].id) in dependent,
                                          eachindex(r.inputs))
             if complete_domain
                 # Follow the data-dependent cut inside the cell as well. A
@@ -2611,10 +2646,8 @@ function _jax_prepare_split(plans, data_ports, excluded::Set{Int} = Set{Int}(); 
                 refused = Set{Int}(id for ((plate, id), _) in cell_reasons if plate == r.id)
                 pre_cell, _, _ = _partial_split(body, bound, refused)
                 types = Dict{ValueId,Any}()
-                for (i, (port, input)) in enumerate(zip(body.have, r.inputs))
-                    T = valtype(input)
-                    types[canon_id(body.graph, port.id)] =
-                        i in atomic || T <: Number ? _jax_unref(T) : eltype(T)
+                for (port, T, iterated) in zip(body.have, input_types, mapped)
+                    types[canon_id(body.graph, port.id)] = iterated ? eltype(T) : _jax_unref(T)
                 end
                 for producer in pre_cell
                     ins = [canon_id(body.graph, v.id) for v in producer.inputs]
@@ -2631,7 +2664,7 @@ function _jax_prepare_split(plans, data_ports, excluded::Set{Int} = Set{Int}(); 
                 end
             end
             haskey(cells, r.id) || continue
-            rewrite = get!(() -> _jax_cell_split(g, r, dependent, cells[r.id]; compact = complete_domain || layout === :chains, complete_domain), rewrites, r.id)
+            rewrite = get!(() -> _jax_cell_split(g, r, dependent, cells[r.id], mapped; compact = complete_domain || layout === :chains, complete_domain), rewrites, r.id)
             rewrite === nothing && continue
             pre = [pre; rewrite.prefix]
             residual[k] = rewrite.plate

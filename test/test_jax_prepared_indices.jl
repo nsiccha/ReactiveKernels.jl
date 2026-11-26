@@ -31,6 +31,39 @@ end
     return total
 end
 
+@kernel function gathered_indexed_rows(a, rows, order)
+    cells = plate(eachindex(order), Ref(order), Ref(rows), Ref(a)) do i, selection, all_rows, x
+        indices = positive_positions(all_rows[selection[i]])
+        x * sum(indices)
+    end
+    total = sum(cells)
+    return total
+end
+
+@testset "Captured index tables use the types supplied at binding" begin
+    have = (:a, :rows, :order)
+    rows = [[2, 0, 3], [-999], Int[]]
+    order = [3, 1, 1]
+    native = prepare(gathered_indexed_rows; have, want = :total)
+    for layout in (:padded, :groups, :chains)
+        src = jax_source(gathered_indexed_rows; have, want = :total, data = (; rows, order),
+                         types = (; a = Float64), plate_layout = layout)
+        @test occursin("def _positive_positions_np(", string(src))
+        @test !occursin("positive_positions", last(split(string(src), "def kernel(")))
+        rk_jax_available() || continue
+        for selection in (order, [1], Int[])
+            args = (0.75, rows, selection)
+            result = rk_jax_evaluate(src, :kernel, args; grad = true, prepare = :arguments)
+            @test result.value ≈ native(args...)
+            @test result.grad ≈ native(1.0, rows, selection)
+        end
+        @test_throws ErrorException rk_jax_evaluate(src, :kernel, (0.75, rows, [2]);
+                                                    prepare = :arguments)
+        @test_throws ErrorException rk_jax_evaluate(src, :kernel, (0.75, rows, [0]);
+                                                    prepare = :arguments)
+    end
+end
+
 @testset "A shared prepared table is evaluated only on an inhabited plate" begin
     have = (:a, :codes, :offsets)
     native = prepare(shared_indexed_rows; have, want = :total)
