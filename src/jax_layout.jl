@@ -203,64 +203,94 @@ def prepare_plate_layout(prepared: dict, groups: int = 1, sequential: bool = Fal
 # memory and cost are part of the measurement.
 const _JAX_SELECT_PLATE_LAYOUT = raw"""
 def select_plate_layout(prepared: dict, make_step: Any, chains: Any = None,
-                        candidates: Any = None, repeats: int = 3) -> tuple:
-    \"\"\"Time candidate plate layouts on this device and return the fastest.
+                        candidates: Any = None, repeats: int = 3, *,
+                        alternatives: Any = None, calls: Any = None) -> tuple:
+    \"\"\"Time layouts on the device and return the chosen prepared data and timings.
 
-    `make_step(prepared)` returns a function of no arguments that runs the work
-    to time once, for example one batched gradient or one sampler step over
-    all chains. With `chains` (an increasing sequence of chain counts) it is
-    called as `make_step(prepared, count)` and candidates are compared by time
-    per chain, so the result also names the chain count to run. `candidates`
-    are `(groups, sequential)` pairs, by default 1 to 16 groups, side by side
-    and one after another. Each candidate is run once to compile and then
-    `repeats` times; its time is the shortest.
+    A builder `make_step(data, count)` returns a zero-argument callable for one
+    gradient batch or sampler step at that chain count. Omit `chains` for a
+    single workload and a builder taking only the data. The grouped module
+    tries the `(groups, sequential)` pairs in `candidates`. An optional
+    `alternatives` mapping names other emitted layouts. Each value is a pair
+    `(prepared_data, builder)` for that module.
 
-    A candidate the device has no memory for is recorded with its error and,
-    with `chains`, its larger counts are skipped. Any other error is raised.
+    The first call warms the executable. With `calls(count)`, rank by the
+    median warm time multiplied by the number of calls the fit requires at
+    that count. Otherwise rank by the shortest warm time per chain. An
+    allocation failure skips the larger chain counts for that layout.
 
-    Returns `(prepared, report)`: the prepared data with the fastest layout,
-    and one `dict` per run with `groups`, `sequential`, `chains`, `seconds`
-    and `error`, the fastest first.
+    The first row in the report names the chosen variant and chain count.
+    Each row records seconds per call and any memory error. When `calls` is
+    supplied it also records the projected fit duration in seconds.
     \"\"\"
+    import operator
     import time
+    if repeats < 1:
+        raise ValueError("repeats must be positive")
+    counts = (None,) if chains is None else sorted({operator.index(n) for n in chains})
+    if chains is not None and any(n <= 0 for n in counts):
+        raise ValueError("chain counts must be positive")
+    if calls is not None and chains is None:
+        raise ValueError("calls(count) requires chain counts")
+    if alternatives is None:
+        alternatives = {}
+    if "groups" in alternatives:
+        raise ValueError("groups names the grouped module")
     if candidates is None:
         candidates = [(groups, sequential) for groups in (1, 2, 4, 8, 16)
                       for sequential in (False, True)]
+
+    def variants():
+        seen = set()
+        for groups, sequential in candidates:
+            chosen = prepare_plate_layout(prepared, groups, sequential)
+            # Group sizes fix the cuts into this dataset's stable subject order.
+            key = tuple(None if layout is None else
+                        (tuple(u.size for u in layout.units), layout.sequential)
+                        for layout in chosen["_rk_plate_layout"].values())
+            if key not in seen:
+                seen.add(key)
+                yield "groups", groups, sequential, chosen, make_step
+        for name, (chosen, builder) in alternatives.items():
+            yield name, None, None, chosen, builder
+
     report = []
-    seen = set()
-    for groups, sequential in candidates:
-        chosen = prepare_plate_layout(prepared, groups, sequential)
-        # Fewer distinct lengths than groups give the layout of a smaller count.
-        # For this binding the stable sort order is fixed. Group sizes
-        # determine the cuts into that order, hence the members and widths.
-        key = tuple(None if layout is None else
-                    (tuple(u.size for u in layout.units), layout.sequential)
-                    for layout in chosen["_rk_plate_layout"].values())
-        if key in seen:
-            continue
-        seen.add(key)
-        for count in (None,) if chains is None else chains:
-            row = {"groups": groups, "sequential": sequential, "chains": count,
-                   "seconds": float("inf"), "error": None}
+    work = {} if calls is None else {n: float(calls(n)) for n in counts}
+    if any(not np.isfinite(n) or n <= 0 for n in work.values()):
+        raise ValueError("the projected number of calls must be finite and positive")
+    for name, groups, sequential, chosen, builder in variants():
+        for count in counts:
+            row = {"variant": name, "groups": groups, "sequential": sequential,
+                   "chains": count, "seconds": float("inf"), "error": None}
+            if calls is not None:
+                row["fit_seconds"] = float("inf")
             report.append(row)
+            step = None
             try:
-                step = make_step(chosen) if count is None else make_step(chosen, count)
+                step = builder(chosen) if count is None else builder(chosen, count)
                 jax.block_until_ready(step())
+                samples = []
                 for _ in range(repeats):
                     start = time.perf_counter()
                     jax.block_until_ready(step())
-                    row["seconds"] = min(row["seconds"], time.perf_counter() - start)
+                    samples.append(time.perf_counter() - start)
+                row["seconds"] = min(samples) if calls is None else float(np.median(samples))
+                if calls is not None:
+                    row["fit_seconds"] = row["seconds"] * work[count]
             except Exception as error:
                 if "RESOURCE_EXHAUSTED" not in str(error) and not isinstance(error, MemoryError):
                     raise
-                row["seconds"] = float("inf")
                 row["error"] = str(error)
                 break
-    cost = lambda row: row["seconds"] / (row["chains"] or 1)
-    report.sort(key=cost)
+    report.sort(key=lambda row: row.get("fit_seconds", row["seconds"] / (row["chains"] or 1)))
     if not report or report[0]["error"] is not None:
         raise RuntimeError("select_plate_layout: no candidate ran on this device")
-    return prepare_plate_layout(prepared, report[0]["groups"], report[0]["sequential"]), report
+    best = report[0]
+    if best["variant"] == "groups":
+        chosen = prepare_plate_layout(prepared, best["groups"], best["sequential"])
+    else:
+        chosen = alternatives[best["variant"]][0]
+    return chosen, report
 """
 
 # The plate arguments whose rows a group cuts to its width: each mapped ragged

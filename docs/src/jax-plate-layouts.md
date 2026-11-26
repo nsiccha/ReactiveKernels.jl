@@ -31,8 +31,14 @@ cost are measured too. Each candidate is compiled, run and timed; with
 `chains` they are compared by time per chain. A candidate the device has no
 memory for is recorded and its larger chain counts are skipped. The result is
 the prepared data with the fastest layout and a report of every run.
-This example times independent chain gradients at each requested chain count.
-Supply at least that many rows of `starts`.
+The example also compares separately exported sampler modules in a mapping
+keyed by layout name. Supply identical raw inputs and at least as many
+starting positions as the largest batch. `tune_sampler` returns the module,
+prepared data, chain count and timing table. It ranks each measured width by
+the median gradient-call time multiplied by the projected calls to finish
+warmup and sampling. Its inputs are warmup gradients per chain, the total
+draw count and mean gradients per draw. An application can pass its own
+`calls(count)` to `select_plate_layout` to reflect its adaptation schedule.
 
 ```@example jax_plate_runtime
 using ReactiveKernels, Markdown # hide

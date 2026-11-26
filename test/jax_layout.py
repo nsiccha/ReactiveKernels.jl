@@ -218,3 +218,20 @@ raw = {"xs": [np.array([1.0, 2.0]), np.array([3.0])]}
 chosen, report = tune_gradient(rows, raw, positions, (2, 4))
 assert report[0]["chains"] in (2, 4)
 np.testing.assert_allclose(rows.kernel(0.6, **chosen), rows.kernel(0.6, **rows.prepare_data(**raw)))
+
+# Exercise the fit objective with separately bound modules, and a generator of
+# chain counts shared across the candidates. An initial position belongs to
+# exactly one chain in the batch that was timed.
+from types import SimpleNamespace
+tune_sampler = runpy.run_path(str(example))["tune_sampler"]
+grouped_sampler = SimpleNamespace(prepare_data=rows.prepare_data, log_density=rows.kernel,
+                                  select_plate_layout=rows.select_plate_layout)
+other_sampler = SimpleNamespace(prepare_data=rows.prepare_data, log_density=rows.kernel)
+modules = {"groups": grouped_sampler, "padded": other_sampler}
+selected, prepared_fit, count, fits = tune_sampler(modules, raw, positions, iter((4, 2)),
+                                                  10, 80, 2, groups=(1,), repeats=2)
+assert {(r["variant"], r["chains"]) for r in fits} == {(v, n) for v in modules for n in (2, 4)}
+assert [r["fit_seconds"] for r in fits] == sorted(r["fit_seconds"] for r in fits)
+assert all(r["fit_seconds"] == r["seconds"] * (10 + 160 / r["chains"]) for r in fits)
+assert selected is modules[fits[0]["variant"]] and count == fits[0]["chains"]
+np.testing.assert_allclose(selected.log_density(0.6, **prepared_fit), rows.kernel(0.6, **chosen))
