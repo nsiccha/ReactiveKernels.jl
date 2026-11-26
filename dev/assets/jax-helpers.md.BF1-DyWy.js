@@ -1,4 +1,4 @@
-import{_ as e,o as a,c as i,a6 as n}from"./chunks/framework.BTpfZnOf.js";const u=JSON.parse('{"title":"JAX helpers and submodels","description":"","frontmatter":{},"headers":[],"relativePath":"jax-helpers.md","filePath":"jax-helpers.md","lastUpdated":null}'),t={name:"jax-helpers.md"};function p(l,s,o,r,h,d){return a(),i("div",null,[...s[0]||(s[0]=[n(`<h1 id="JAX-helpers-and-submodels" tabindex="-1">JAX helpers and submodels <a class="header-anchor" href="#JAX-helpers-and-submodels" aria-label="Permalink to &quot;JAX helpers and submodels {#JAX-helpers-and-submodels}&quot;">​</a></h1><p>This guide continues <a href="./jax">JAX source</a>: how emitted modules share submodel functions, and which helpers with loops and branches translate.</p><h2 id="Named-submodels-and-shared-entries" tabindex="-1">Named submodels and shared entries <a class="header-anchor" href="#Named-submodels-and-shared-entries" aria-label="Permalink to &quot;Named submodels and shared entries {#Named-submodels-and-shared-entries}&quot;">​</a></h2><p>Repeated calls to an authored submodel share a Python function when their selected computations agree. A scoped rewrite that changes the computation gets a separate function. Each function carries the submodel&#39;s documentation. The native model retains its expanded graph, so individual locals remain queryable.</p><p>The public density functions and <code>constrain</code> call a shared model function. Their output selectors are fixed by the wrappers, allowing JAX to trace only the requested computation. Call them as before: <code>log_density(u, **prepared)</code>. The submodel functions likewise take a static <code>outputs</code> selection; their arguments and array lengths remain runtime inputs. Consecutive statements that the same outputs need share one selection block (<code>if _entry in (...):</code>, or <code>if any(name in outputs for name in (...)):</code> in a submodel function), and the checks every public function runs, such as the packed-length check, run once before the per-function returns.</p><p>A plate may use separate functions for a scalar return value and a batched density. Combined computations, such as grouped scalar priors, retain their shared graph boundary. Interleaved dependencies split a submodel into named portions that execute in the original dependency order.</p><div class="language-julia vp-adaptive-theme"><button title="Copy Code" class="copy"></button><span class="lang">julia</span><pre class="shiki shiki-themes github-light github-dark vp-code" tabindex="0"><code><span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583;">using</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8;"> ReactiveKernels, ReactiveKernelsPPL</span></span>
+import{_ as e,o as a,c as i,a6 as n}from"./chunks/framework.BTpfZnOf.js";const u=JSON.parse('{"title":"JAX helpers and submodels","description":"","frontmatter":{},"headers":[],"relativePath":"jax-helpers.md","filePath":"jax-helpers.md","lastUpdated":null}'),t={name:"jax-helpers.md"};function p(l,s,r,o,h,k){return a(),i("div",null,[...s[0]||(s[0]=[n(`<h1 id="JAX-helpers-and-submodels" tabindex="-1">JAX helpers and submodels <a class="header-anchor" href="#JAX-helpers-and-submodels" aria-label="Permalink to &quot;JAX helpers and submodels {#JAX-helpers-and-submodels}&quot;">​</a></h1><p>This guide continues <a href="./jax">JAX source</a>: how emitted modules share submodel functions, and which helpers with loops and branches translate.</p><h2 id="Named-submodels-and-shared-entries" tabindex="-1">Named submodels and shared entries <a class="header-anchor" href="#Named-submodels-and-shared-entries" aria-label="Permalink to &quot;Named submodels and shared entries {#Named-submodels-and-shared-entries}&quot;">​</a></h2><p>Repeated calls to an authored submodel share a Python function when their selected computations agree. A scoped rewrite that changes the computation gets a separate function. Each function carries the submodel&#39;s documentation. The native model retains its expanded graph, so individual locals remain queryable.</p><p>The public density functions and <code>constrain</code> call a shared model function. Their output selectors are fixed by the wrappers, allowing JAX to trace only the requested computation. Call them as before: <code>log_density(u, **prepared)</code>. The submodel functions likewise take a static <code>outputs</code> selection; their arguments and array lengths remain runtime inputs. Consecutive statements that the same outputs need share one selection block (<code>if _entry in (...):</code>, or <code>if any(name in outputs for name in (...)):</code> in a submodel function), and the checks every public function runs, such as the packed-length check, run once before the per-function returns.</p><p>A plate may use separate functions for a scalar return value and a batched density. Combined computations, such as grouped scalar priors, retain their shared graph boundary. Interleaved dependencies split a submodel into named portions that execute in the original dependency order.</p><div class="language-julia vp-adaptive-theme"><button title="Copy Code" class="copy"></button><span class="lang">julia</span><pre class="shiki shiki-themes github-light github-dark vp-code" tabindex="0"><code><span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583;">using</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8;"> ReactiveKernels, ReactiveKernelsPPL</span></span>
 <span class="line"></span>
 <span class="line"><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF;">@rkppl</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0;"> effect</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8;">(loc, scale, spread_rate, n) </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583;">=</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583;"> begin</span></span>
 <span class="line"><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF;">    &quot;Mean of the effect.&quot;</span></span>
@@ -312,6 +312,128 @@ import{_ as e,o as a,c as i,a6 as n}from"./chunks/framework.BTpfZnOf.js";const u
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    - \`b.z\`: Standardised member deviations.</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    &quot;&quot;&quot;</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    return model(&quot;constrain&quot;, unconstrained, **prepared)</span></span>
+<span class="line"></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">def bind_gradient(density, prepared, *, device=None, memory_budget_bytes=None):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    &quot;&quot;&quot;Bind a batched value-and-gradient to prepared data on one device.</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    Call the result with a floating-point array whose leading axis is chains.</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    The first call at a shape and dtype runs one feasible layout. An explicit</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    gradient.calibrate(positions, repeats=3) measures eligible layouts and</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    installs its winner for subsequent calls on this binding. It returns the</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    timing rows (empty if the module has only one layout).</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    memory_budget_bytes limits the executable&#39;s planned device buffer bytes.</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    The device allocator, other live arrays and backend overhead are separate.</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    &quot;&quot;&quot;</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    from copy import deepcopy</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    from functools import partial</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    from operator import index</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    from threading import RLock</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    if memory_budget_bytes is not None:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        memory_budget_bytes = index(memory_budget_bytes)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        if memory_budget_bytes &lt; 0:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            raise ValueError(&quot;memory_budget_bytes must be nonnegative&quot;)</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    # Calibration and execution must see the same bound values, even if the</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    # caller later edits a host array. JAX arrays already have value semantics.</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    immutable = {id(x): x for x in jax.tree_util.tree_leaves(prepared) if isinstance(x, jax.Array)}</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    data = deepcopy(prepared, immutable)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    time_layouts, layout_variants = None, None</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    programs = {}</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    lock = RLock()</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def signature(positions):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        if not hasattr(positions, &quot;dtype&quot;):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            positions = np.asarray(positions)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        if not positions.shape or positions.shape[0] == 0:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            raise ValueError(&quot;positions must have a nonempty leading chain axis&quot;)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        dtype = jax.dtypes.canonicalize_dtype(positions.dtype)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        if not jnp.issubdtype(dtype, jnp.floating):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            raise TypeError(&quot;positions must have a real floating-point dtype&quot;)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        target = device</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        if target is None:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            if isinstance(positions, jax.Array):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                devices = positions.devices()</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                if len(devices) != 1:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    raise ValueError(&quot;specify a device for sharded positions&quot;)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                target = next(iter(devices))</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            else:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                # Respect jax.default_device for host positions.</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                target = jax.config.jax_default_device</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                if target is None or isinstance(target, str):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    target = jax.local_devices(backend=target)[0]</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        return (target, tuple(positions.shape), dtype, getattr(positions, &quot;weak_type&quot;, False)), positions</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def compile_program(chosen, key):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        target, shape, dtype, weak = key</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        sharding = jax.sharding.SingleDeviceSharding(target)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        batch = jax.jit(jax.vmap(jax.value_and_grad(lambda p: density(p, **chosen))),</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                        in_shardings=sharding)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        abstract_positions = jax.ShapeDtypeStruct(shape, dtype, sharding=sharding, weak_type=weak)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        program = batch.lower(abstract_positions).compile()</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        if memory_budget_bytes is not None:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            try:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                stats = program.memory_analysis()</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            except NotImplementedError as error:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                raise MemoryError(&quot;backend cannot estimate gradient buffer bytes&quot;) from error</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            size = getattr(stats, &quot;total_allocation_bytes&quot;, None)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            if size is None or size &lt; 0:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                raise MemoryError(&quot;backend did not report planned device buffer bytes&quot;)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            if size &gt; memory_budget_bytes:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                raise MemoryError(f&quot;gradient requires {size} planned bytes, budget is {memory_budget_bytes}&quot;)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        return program</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def candidates():</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        yield data</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        if layout_variants is not None:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            for _, _, _, _, chosen, _ in layout_variants(data, None):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                if chosen is not data:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    yield chosen</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def gradient(positions):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        key, positions = signature(positions)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        with lock:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            program = programs.get(key)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            if program is None:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                failure = None</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                for chosen in candidates():</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    try:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                        program = compile_program(chosen, key)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                        result = jax.block_until_ready(program(jax.device_put(positions, key[0])))</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    except (MemoryError, jax.errors.JaxRuntimeError) as error:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                        if not isinstance(error, MemoryError) and &quot;RESOURCE_EXHAUSTED&quot; not in str(error):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                            raise</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                        failure = str(error)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                        program = None</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                        continue</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    programs[key] = program</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    return result</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                raise MemoryError(f&quot;no gradient layout fit on {key[0]}: {failure}&quot;)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        return program(jax.device_put(positions, key[0]))</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def calibrate(positions, repeats=3):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        if index(repeats) &lt; 1:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            raise ValueError(&quot;repeats must be positive&quot;)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        if time_layouts is None:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            gradient(positions)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            return []</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        key, positions = signature(positions)</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        def make_step(chosen, _count):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            program = compile_program(chosen, key)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            return partial(program, jax.device_put(positions, key[0]))</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        with lock:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            step, rows = time_layouts(data, make_step, chains=[len(positions)], candidates=None,</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                      repeats=repeats, alternatives=None, calls=lambda count: 1,</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                      guarded_reads=None, keep_step=True)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            programs[key] = step.func</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        return rows</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    gradient.calibrate = calibrate</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    return gradient</span></span>
 <span class="line"></span>
 <span class="line"></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">def dimension(prepared: dict) -&gt; int:</span></span>
