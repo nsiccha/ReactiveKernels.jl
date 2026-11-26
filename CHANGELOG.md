@@ -45,6 +45,10 @@ are recorded in the git history only.
   masked sum and its gradient, including when a real entry would be used
   as a denominator or the argument of a logarithm.
 
+- Partitioned JAX reads can prepare distinct row coordinates for a unit
+  even when the source table is larger than the request. The indexed
+  reader reuses point-independent rows in their original observation order.
+
 ## 0.1.388
 
 - Regenerated JAX modules skip a guarded matrix exponential and its reverse

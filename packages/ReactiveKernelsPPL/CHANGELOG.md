@@ -24,6 +24,10 @@ are recorded in the git history only.
 - With `plate_layout = :groups`, an exported model with eligible ragged
   plates exposes `prepare_plate_layout` and `select_plate_layout`.
 
+`prepare_partition` in generated JAX modules selects repeated row reads by
+the number of distinct coordinates needed per unit. Adding unrelated table
+rows preserves that reuse on the full-point `unit_log_density` interface.
+
 ## 0.1.262
 
 `KernelBuildCache` reuses graph assembly for finite-interval parameters and

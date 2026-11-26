@@ -395,21 +395,28 @@ check_repeated(jnp.linalg.cholesky, matrices, requests,
 # Common observations gather coefficient rows and contract them against
 # independent feature columns. Keep the ragged tail out of this row plan.
 def design_event(u, *, group, design):
-    return jnp.sum(jnp.sqrt(u.reshape(4, 3))[group] * design, axis=1)
+    return jnp.sum(jnp.sqrt(u.reshape(-1, 3))[group] * design, axis=1)
 
 
 def point_index_event(u, *, group, design):
     return design_event(u, group=jnp.where(u[-1] > 0, group, 2 - group), design=design)
 
 
-def check_row_plan(groups, width, event=design_event):
-    u = jnp.array([1., 2., 3., 4., 5., 6., 7., 8., 9., -1., -2., -3.])
+def conditional_design_event(u, *, group, design):
+    return jax.lax.cond(u[-1] > 0,
+                        lambda: design_event(u, group=2 - group, design=design),
+                        lambda: design_event(u, group=group, design=design))
+
+
+def check_row_plan(groups, width, event=design_event, table_rows=4, by_reuse=True):
+    u = jnp.arange(1., 3 * table_rows + 1).at[-3:].set(-1.)
     data = dict(group=jnp.asarray(groups), design=jnp.arange(len(groups) * 3.).reshape(-1, 3) / 7)
     rows, offsets, common = np.arange(len(groups)), np.array([0, 7, len(groups)]), 6
     closed, _, _ = model._rk_event_trace(event, u, data)
-    plan = model._rk_prepare_axis(closed, u, data, rows, offsets, common)
+    plan = model._rk_prepare_axis(closed, u, data, rows, offsets, common, by_reuse=by_reuse)
     if width:
-        assert plan[0].shape == (2, width)
+        keys, inverse = next(iter(plan.values())) if by_reuse else plan
+        assert keys.shape == (2, width)
     else:
         assert plan == ()
 
@@ -419,7 +426,9 @@ def check_row_plan(groups, width, event=design_event):
         group = data['group'][row]
         if event is point_index_event:
             group = jnp.where(point[-1] > 0, group, 2 - group)
-        return (jnp.sqrt(point.reshape(4, 3)[group]) * data['design'][row]).sum()
+        elif event is conditional_design_event:
+            group = jnp.where(point[-1] > 0, 2 - group, group)
+        return (jnp.sqrt(point.reshape(-1, 3)[group]) * data['design'][row]).sum()
 
     selected_rows = rows[offsets[:-1, None] + np.arange(common)]
     actual = jax.jit(jax.vmap(jax.value_and_grad(selected), in_axes=(None, 0, 0)))
@@ -434,23 +443,58 @@ def check_row_plan(groups, width, event=design_event):
 check_row_plan([1, 1, 1, 1, 1, 1, 0, 2, 2, 2, 2, 2, 2], 1)
 check_row_plan([1, 0, 1, 0, 2, 1, 0, 2, 2, 0, 2, 0, 2], 3)
 check_row_plan([1, 1, 1, 1, 1, 1, 0, 2, 2, 2, 2, 2, 2], 0, point_index_event)
+check_row_plan([1, 0, 1, 0, 2, 1, 0, 2, 2, 0, 2, 0, 2], 3, table_rows=40)
+check_row_plan([1, 1, 1, 1, 1, 1, 0, 2, 2, 2, 2, 2, 2], 0, point_index_event, table_rows=40)
+check_row_plan([1, 1, 1, 1, 1, 1, 0, 2, 2, 2, 2, 2, 2], 0, conditional_design_event, table_rows=40)
+check_row_plan([0, 1, 2, 3, 4, 5, 0, 5, 4, 3, 2, 1, 0], 0, table_rows=40)
+# A partition prepared by the earlier emitter stores just the two arrays.
+check_row_plan([1, 0, 1, 0, 2, 1, 0, 2, 2, 0, 2, 0, 2], 3, by_reuse=False)
+
+
+# Two reads have the same geometry. Only the second repeats, and the
+# first one's coordinates can change at evaluation. A plan must identify
+# the particular read it describes.
+def two_tables(point, *, group, design):
+    other = (jnp.arange(group.size) + (point[-1] > 0)) % 8
+    table = jnp.sqrt(point.reshape(-1, 3))
+    return ((table[other] + table[group]) * design).sum(axis=1)
+
+
+with patch.multiple(model, _RK_EVENTS=(two_tables,), dimension=lambda _: 36):
+    group = np.repeat([6, 3], 5)
+    data = dict(group=group, design=np.arange(30.).reshape(10, 3) / 7)
+    part = model.prepare_partition(data, dict(labels=[4, 8], owners=[np.repeat([2, 3], 5)]))
+    keys, _ = next(iter(part['read_plans'][0].values()))
+    np.testing.assert_array_equal(keys, [[6], [3]])
+    selected = jax.jit(jax.value_and_grad(lambda u, label: model.unit_log_density(u, label, **part)))
+    for sign in [-1., 1.]:
+        point = jnp.arange(1., 37.).at[-1].set(sign)
+        for i, label in enumerate([4, 8]):
+            rows = np.arange(5) + 5 * i
+            def reference(u):
+                table = u.reshape(-1, 3)
+                values = jnp.sqrt(table[(rows + (u[-1] > 0)) % 8]) + jnp.sqrt(table[group[rows]])
+                return (values * data['design'][rows]).sum()
+            for got, want in zip(selected(point, label), jax.value_and_grad(reference)(point)):
+                np.testing.assert_allclose(got, want, atol=1e-10)
 
 
 # One atomic event per station can itself gather many observations. Its
 # public read should reuse one row, with the same trace as the grid grows.
 def station_event(u, *, group, design):
-    basis = jnp.sqrt(u.reshape(4, 3))[group]
+    basis = jnp.sqrt(u.reshape(-1, 3))[group]
     return (basis * design).sum(axis=(1, 2))
 
 
-def check_station_event(n):
-    u = jnp.array([1., 2., 3., 4., 5., 6., 7., 8., 9., -1., -2., -3.])
-    group = np.broadcast_to(np.array([[2], [1]]), (2, n))
-    design = np.arange(2 * n * 3.).reshape(2, n, 3) / 7
-    owners = dict(labels=[5, 10], owners=[[2, 3]])
+def check_station_event(n, table_rows):
+    u = jnp.arange(1., 3 * table_rows + 1).at[9:].set(-1.)
+    group = np.broadcast_to(np.array([[2], [1], [0], [3]]), (4, n))
+    design = np.arange(4 * n * 3.).reshape(4, n, 3) / 7
+    # Unit 5 has one extra event. The unowned event reads an invalid root.
+    owners = dict(labels=[5, 10], owners=[[2, 3, 2, 0]])
     with patch.multiple(model, _RK_EVENTS=(station_event,), dimension=lambda _: len(u)):
         bound = model.prepare_partition(dict(group=group, design=design), owners)
-        keys, inverse = bound['read_plans'][0]
+        keys, inverse = next(iter(bound['read_plans'][0].values()))
         np.testing.assert_array_equal(keys, [[2], [1]])
         assert inverse.size == 0
 
@@ -461,11 +505,14 @@ def check_station_event(n):
         compiled = jax.jit(result)
         for i, label in enumerate(owners['labels']):
             value, grad = compiled(u, label, bound)
-            reference = lambda x: (jnp.sqrt(x.reshape(4, 3)[group[i]]) * design[i]).sum()
+            chosen = np.flatnonzero(np.array(owners['owners'][0]) == i + 2)
+            reference = lambda x: (jnp.sqrt(x.reshape(-1, 3)[group[chosen]]) * design[chosen]).sum()
             expected, expected_grad = jax.value_and_grad(reference)(u)
             np.testing.assert_allclose(value, expected)
             np.testing.assert_allclose(grad, expected_grad, atol=1e-10)
         return len(list(outputs(jax.make_jaxpr(result)(u, 5, bound))))
 
 
-assert check_station_event(30) == check_station_event(300)
+assert check_station_event(30, 4) == check_station_event(300, 4)
+check_station_event(30, 30)
+check_station_event(30, 300)

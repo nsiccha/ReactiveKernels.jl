@@ -41,7 +41,7 @@ def prepare_partition(prepared, partition_data):
         common = int(counts.min()) if counts.size else 0
         span = int(counts.max()) if counts.size else 0
         sites.append((shared, rows, offsets, _RKRowWidths((common, span))))
-        read_plans.append(_rk_prepare_axis(closed, point, prepared, rows, offsets, common))
+        read_plans.append(_rk_prepare_axis(closed, point, prepared, rows, offsets, common, by_reuse=True))
     return dict(prepared=prepared, labels=labels, sites=tuple(sites), read_plans=tuple(read_plans))
 
 
@@ -116,7 +116,7 @@ def _rk_unit_bucket(point, bucket, prepared, sites, read_plans=()):
         first = offsets[bucket]
         if common:
             selected = rows[first + jnp.arange(common)]
-            plan = tuple(jnp.asarray(x)[bucket] for x in read_plans[i]) if read_plans else ()
+            plan = jax.tree.map(lambda x: jnp.asarray(x)[bucket], read_plans[i]) if read_plans else ()
             result = result + jnp.sum(_rk_read_event(fn, point, selected, prepared, plan))
         if common < span:
             evaluate = _rk_ragged_sum(fn, common, span)
