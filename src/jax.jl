@@ -434,6 +434,12 @@ end
 _JaxScanRowInputs(tables, sequences, reads; padded = false, direct_bounds = nothing) =
     _JaxScanRowInputs(tables, sequences, reads, padded, direct_bounds)
 
+struct _JaxPrefixChecks
+    ports::Dict{String,Tuple{_PyVal,Bool}}
+    lengths::Dict{String,String}
+    guards::Vector{String}
+end
+
 # One Python function body under construction. `links` maps an input of a
 # nested plan (a branch arm's, a plate cell's unmapped argument) to the
 # `(plan, value)` of the enclosing plan it is the same value as, so the
@@ -471,6 +477,7 @@ mutable struct _JaxScope
     row_width_param::String
     row_widths::Vector{Tuple{String,String}}
     scan_rows::Union{Nothing,_JaxScanRowInputs}
+    prefix_checks::Union{Nothing,_JaxPrefixChecks}
     # A record gather at entry to this scope, before any statements. A
     # conditional can share it if both of its arms start with the same read.
     first_record::Union{Nothing,@NamedTuple{name::String, expression::String}}
@@ -487,7 +494,7 @@ _JaxScope(parent::Union{Nothing,_JaxScope} = nothing; same_step::Bool = false) =
               Set{Symbol}(), Dict{ValueId,_JaxPlateCell}(),
               same_step ? parent.scan_reads : Dict{String,_JaxPlateCell}(),
               "", Tuple{String,String}[],
-              same_step ? parent.scan_rows : nothing, nothing)
+              same_step ? parent.scan_rows : nothing, nothing, nothing)
 # The `flat_positions` entry of the lengths of cells that each fill their stored
 # rows: a plate's cells returning vectors whose length the cell's own expression
 # fixes (`vcat(a, b)` of scalars), or matrices of a fixed shape. Every stored
@@ -1540,7 +1547,8 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
             row_length = isempty(x.extent) ? _py_atom(x.code) * ".shape[0]" : x.extent
             nindices = isempty(i.extent) ? _py_atom(i.code) * ".shape[0]" : i.extent
             valid = "_rk_valid_indices(" * join((i.code, nindices, row_length), ", ") * ")"
-            _jax_masked_check(ctx, _PyVal(valid, Bool), repr("BoundsError: index outside subject row"))
+            _jax_prefix_index_guard!(ctx, x, i) ||
+                _jax_masked_check(ctx, _PyVal(valid, Bool), repr("BoundsError: index outside subject row"))
             return _PyVal("_rk_row_gather(" * join((x.code, i.code, row_length), ", ") * ")", T, false, i.extent)
         end
     end
@@ -8708,7 +8716,7 @@ function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
                              fields = fill(0, length(p.have)),
                              group_rows = fill(false, length(p.have)),
                              active_cells::Bool = false, row_widths::Bool = false, event_inputs = nothing,
-                             record_axes = nothing)
+                             record_axes = nothing, prefix = nothing)
     name = _jax_fresh(ctx, hint)
     outer = ctx.scope
     inner = _JaxScope(outer)
@@ -8731,6 +8739,9 @@ function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
         inner.values[canon_id(p.graph, v.id)] = _PyVal(param, types[i], statics[i], extent, "",
                                                        fields[i], origins[i], levels)
         links[i] === nothing || (inner.links[canon_id(p.graph, v.id)] = links[i])
+    end
+    if prefix !== nothing
+        inner.prefix_checks = _jax_prefix_checks(ctx, inner, p, prefix...)
     end
     active = active_cells ? _jax_identifier(inner.used, :active_cell) : ""
     active_cells && push!(names, active)
@@ -8805,6 +8816,8 @@ def _rk_serial_map(f, in_axes=None, row_dtypes=None, broadcast=False, counts=Non
             raise ValueError("plate arguments have different mapped sizes")
         else:
             size = sizes[0]
+        if size == 0 and row_dtypes is not None:
+            return jax.tree.map(lambda dt: jnp.zeros(0, dtype=dt), row_dtypes)
         if size == 0 and in_axes is None:
             # Map the empty operands directly. An index-based map would trace a
             # read of element zero even though there is no cell to execute.
@@ -8836,7 +8849,7 @@ const _JAX_CELL_POSITIONS = Ref(0)
 # argument is mapped row by row with its lengths; a padded group vector maps
 # its entries, and the plate's values are padded the same way.
 function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
-                     op::_AuthoredPlateOp{K,A}, inputs) where {K,A}
+                     op::_AuthoredPlateOp{K,A}, inputs; compact = true, prefix_guards = nothing) where {K,A}
     ctx.host === nothing || return _host_plate(ctx, recipe, op, inputs)
     inputs = [_jax_slots_rows(ctx, v) for v in inputs]
     body = op.kernel.plan
@@ -8854,7 +8867,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     length(ranks) == 1 || _jax_error("a plate over arrays of different ranks (",
         join(string.(ranks), ", "), ") has no JAX translation yet", _jax_where(ctx))
     R = only(ranks)
-    if R == 1
+    if R == 1 && compact
         result = _jax_compact_plate(ctx, p, recipe, body, inputs, mapped)
         result === nothing || return result
     end
@@ -8923,6 +8936,8 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
                                                                               _jax_group_rows(v)
                                                                               for (i, v) in enumerate(inputs)],
                                                                 active_cells = masked,
+                                                                prefix = prefix_guards === nothing ? nothing :
+                                                                    (inputs, mapped, prefix_guards),
                                                                 record_axes = R == 1 && ctx.mod.layout === :padded ?
                                                                     _jax_record_axes(ctx, body, inputs, mapped) : nothing,
                                                                 row_widths = R == 1 && _jax_plate_layout() === :groups)

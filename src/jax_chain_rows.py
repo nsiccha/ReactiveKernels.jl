@@ -199,14 +199,18 @@ def _rk_vcat_tail(row):
 
 def _rk_row_broadcast(fn, args, lengths, dtype, scalar_fn=False):
     packed = any(isinstance(x, _RKChainRow) for x in args)
+    capacities = [x.shape[0] for x, count in zip(args, lengths) if count is not None]
     if not packed and not scalar_fn:
-        return fn(*args)
+        if len(set(capacities) - {1}) <= 1:
+            return fn(*args)
+        # Incompatible physical widths cannot be combined by a dense
+        # operation at trace time. Leave their logical checks in cell order.
+        if 0 in capacities:
+            return jnp.empty(0, dtype=dtype)
     n = 1
-    capacities = []
-    for x, count in zip(args, lengths):
+    for count in lengths:
         if count is not None:
             n = jnp.where(n == 1, count, n)
-            capacities.append(x.shape[0])
     def read(i):
         return fn(*(x if count is None else x[jnp.where(count == 1, 0, i)]
                     for x, count in zip(args, lengths)))
@@ -215,6 +219,12 @@ def _rk_row_broadcast(fn, args, lengths, dtype, scalar_fn=False):
         if packed:
             return _rk_local_scan(lambda _, xs: (None, read(xs[0])), None, (jnp.arange(width),), n, dtype)
         return jax.lax.map(read, jnp.arange(width)) if width else jnp.empty(0, dtype=dtype)
+    if not packed:
+        # A valid broadcast reads only logical entries. While a failed check
+        # is pending, never index a shorter operand beyond its end.
+        valid = jnp.all(jnp.stack([(count == 1) | (count == n) for count in lengths if count is not None]))
+        return _RKChainRow(n, width, dtype, lambda i: jax.lax.cond(
+            valid, lambda: read(i), lambda: jnp.zeros((), dtype=dtype)))
     return _RKChainRow(n, width, dtype, read)
 
 

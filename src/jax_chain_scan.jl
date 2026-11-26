@@ -86,12 +86,13 @@ function _jax_chain_broadcast(ctx, f, args; broadcast = true)
                a.extent for a in args]
     counts = unique(filter(!=("None"), lengths))
     extent = length(counts) == 1 ? only(counts) : _jax_broadcast_extent(ctx, counts)
-    for n in counts
-        length(counts) == 1 && break
-        valid = broadcast ? "((" * n * " == 1) | (" * n * " == " * extent * "))" :
-                            "(" * n * " == " * first(counts) * ")"
-        _jax_call(ctx, _runtime_check, [_PyVal(valid, Bool),
-            _PyVal(repr("DimensionMismatch: incompatible row axes"), DimensionMismatch)])
+    if length(counts) > 1 && !(broadcast && _jax_prefix_axes_guard!(ctx, extent))
+        for n in counts
+            valid = broadcast ? "((" * n * " == 1) | (" * n * " == " * extent * "))" :
+                                "(" * n * " == " * first(counts) * ")"
+            _jax_call(ctx, _runtime_check, [_PyVal(valid, Bool),
+                _PyVal(repr("DimensionMismatch: incompatible row axes"), DimensionMismatch)])
+        end
     end
     call = "_rk_row_broadcast(lambda " * join(names, ", ") * ": " * expr.code * ", " *
            _jax_chain_tuple([a.code for a in args]) * ", " * _jax_chain_tuple(lengths) *
@@ -362,11 +363,55 @@ function _jax_chain_map_plate(ctx, p, recipe, body, inputs, mapped)
     checked && _JAX_EFFECTS[] != suffix_start ? nothing : result
 end
 
+function _jax_prefix_checks(ctx, inner, plan, inputs, mapped, guards)
+    ports = Dict{String,Tuple{_PyVal,Bool}}()
+    lengths = Dict{String,String}()
+    for (port, input, each) in zip(plan.have, inputs, mapped)
+        param = inner.values[canon_id(plan.graph, port.id)]
+        ports[param.code] = (input, each)
+        key = _jax_chain_key(ctx, input)
+        each && key !== nothing && !isempty(param.extent) && (lengths[param.extent] = key)
+    end
+    _JaxPrefixChecks(ports, lengths, guards)
+end
+
+# A direct bound row of indices into one shared table has the same bounds in
+# every subject. The prepared extrema cover only real entries of packed rows.
+function _jax_prefix_index_guard!(ctx, table, indices)
+    checks = ctx.scope.prefix_checks
+    checks === nothing && return false
+    table_port = get(checks.ports, table.code, nothing)
+    index_port = get(checks.ports, indices.code, nothing)
+    table_port !== nothing && !last(table_port) && isempty(table.extent) || return false
+    index_port !== nothing && last(index_port) || return false
+    origin = first(index_port).origin
+    origin isa _JaxOrigin && origin.position === nothing && isempty(origin.path) &&
+        origin.scale == "1" && origin.offset == "0" || return false
+    lo = _jax_prepared_bound!(ctx, :min, origin.key)
+    hi = _jax_prepared_bound!(ctx, :max, origin.key)
+    push!(checks.guards, lo * " >= 1", hi * " <= " * _py_atom(first(table_port).code) * ".shape[0]")
+    true
+end
+
+function _jax_prefix_axes_guard!(ctx, extent)
+    checks = ctx.scope.prefix_checks
+    checks === nothing && return false
+    counts = ctx.mod.helper_names[(:broadcast_length, extent)]
+    all(n -> haskey(checks.lengths, n), counts) || return false
+    keys = String[]
+    for n in counts
+        push!(keys, checks.lengths[n], "")
+    end
+    layout = _jax_prepared_bound!(ctx, :row_layout, keys...)
+    push!(checks.guards, layout * " is not None")
+    true
+end
+
 # Lift an ordinary dependency of a subject scan across the same subjects.
 # An otherwise shared computation stays inside the subject domain so an
 # empty population never evaluates it. A body containing another plate
 # uses its dedicated event-table lowering instead.
-function _jax_chain_prefix(ctx, p, body, r, args, mapped, domain)
+function _jax_chain_prefix(ctx, p, body, r, args, mapped, domain, guards)
     r.op isa Union{_AuthoredPlateOp,_AuthoredScanOp} && return nothing
     r.effectful && return nothing
     ports = Value[r.inputs...]
@@ -384,7 +429,7 @@ function _jax_chain_prefix(ctx, p, body, r, args, mapped, domain)
                        r.cost, r.cse_key, r.effectful, r.source)
     before = _JAX_EFFECTS[]
     ctx.recipe = synthetic
-    result = only(_jax_recipe(ctx, p, synthetic, plate, values))
+    result = only(_jax_recipe(ctx, p, synthetic, plate, values; prefix_guards = guards))
     _JAX_EFFECTS[] == before || return nothing
     _jax_full_rows(ctx, result) ? _jax_without_lengths(result) : result
 end
@@ -451,10 +496,11 @@ function _jax_compact_plate(ctx, p, recipe, body, inputs, mapped)
     draft = _JaxScope(outer)
     draft.indent = outer.indent
     effects = _JAX_EFFECTS[]
+    guards = _jax_requested_layout() === :rounds ? String[] : nothing
     ctx.scope = draft
     result = try
         pos === nothing ? _jax_chain_map_plate(ctx, p, recipe, body, inputs, mapped) :
-            _jax_chain_scan_body(ctx, p, recipe, body, inputs, mapped, pos)
+            _jax_chain_scan_body(ctx, p, recipe, body, inputs, mapped, pos, guards)
     catch e
         e isa JAXEmissionError || rethrow()
         nothing
@@ -462,18 +508,36 @@ function _jax_compact_plate(ctx, p, recipe, body, inputs, mapped)
         ctx.scope = outer
         ctx.recipe = recipe
     end
-    if result === nothing
+    guarded = guards !== nothing && !isempty(guards)
+    # A scalar result per subject has the same representation on both paths.
+    # Packed history results also need their length/field metadata to cross
+    # this branch. Keep them and any remaining effects in subject order.
+    if result === nothing || guarded && (recipe.effectful || _JAX_EFFECTS[] != effects ||
+            !isempty(only(result).extent) || !(only(result).T <: AbstractVector{<:Number}))
         _JAX_EFFECTS[] = effects
         return nothing
     end
     union!(outer.used, draft.used)
+    if guarded
+        # A lifted operand may only span a subset of the outer broadcast. Use
+        # subject order for mismatched domains or any failed prefix proof.
+        sizes = unique(_py_atom(_jax_mapped_array(v)) * ".shape[0]" for (v,m) in zip(inputs,mapped) if m)
+        length(sizes) > 1 && push!(guards, join(sizes, " == "))
+        condition = _PyVal(join(unique(guards), " and "), Bool, true)
+        fast = () -> begin
+            append!(ctx.scope.lines, ("    " * line for line in draft.lines))
+            only(result)
+        end
+        ordinary = () -> only(_jax_recipe(ctx, p, recipe, recipe.op, inputs; compact = false))
+        return [_jax_conditional(ctx, condition, fast, ordinary)]
+    end
     merge!(outer.flat_positions, draft.flat_positions)
     merge!(outer.chain_layouts, draft.chain_layouts)
     append!(outer.lines, draft.lines)
     result
 end
 
-function _jax_chain_scan_body(ctx, p, recipe, body, inputs, mapped, pos)
+function _jax_chain_scan_body(ctx, p, recipe, body, inputs, mapped, pos, guards)
     scan = body.recipes[pos]
     op = scan.op
     _scan_has_history(op) && return nothing
@@ -513,7 +577,7 @@ function _jax_chain_scan_body(ctx, p, recipe, body, inputs, mapped, pos)
         elseif invariant
             only(_jax_recipe(ctx, body, r, r.op, args))
         else
-            _jax_chain_prefix(ctx, p, body, r, args, mapped[ix], domain)
+            _jax_chain_prefix(ctx, p, body, r, args, mapped[ix], domain, guards)
         end
         value === nothing && return nothing
         push!(inputs, _jax_bind!(ctx, only(r.outputs).name, value))
