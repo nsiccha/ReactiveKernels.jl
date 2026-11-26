@@ -37,6 +37,10 @@ are recorded in the git history only.
   input's positive, negative and remaining entries. The generated function
   maps the selected numerical arm over each group and restores the input order.
 
+- A JAX broadcast or plate over an empty padded row contributes zero to a
+  masked sum and its gradient, including when a real entry would be used
+  as a denominator or the argument of a logarithm.
+
 ## 0.1.388
 
 - Regenerated JAX modules skip a guarded matrix exponential and its reverse

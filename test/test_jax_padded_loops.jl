@@ -215,6 +215,7 @@ jax_padded_loops_filled_native(a, rows) =
     src = jax_source(jax_padded_loops_filled; have = (:a, :rows), want = :total)
     native = prepare(jax_padded_loops_filled; have = (:a, :rows), want = :total)
     for rows in ([[1.0, 2.0, 3.0], [0.5], [4.0, 1.5]], [[1.0], [2.0, 3.0, 4.0, 5.0, 6.0]],
+                 [[1.0, 2.0, 3.0], Float64[], [4.0, 1.5]],
                  [collect(0.1:0.1:4.0), [0.3, 0.2]])
         value = native(0.7, rows)
         @test value ≈ jax_padded_loops_filled_native(0.7, rows)
