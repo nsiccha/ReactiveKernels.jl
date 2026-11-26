@@ -9584,6 +9584,7 @@ their docstrings; the others state what they compute. Module functions
 annotate their parameters (`ArrayLike`) and results.
 
 Choose `plate_layout = :chains` to run plate cells sequentially within an evaluation.
+Choose `plate_layout = :rounds` to batch independent subjects at the same recurrence round.
 With bound data, `prepare_data` packs variable-length vector rows by offset.
 A scan directly consumed by a supported subject reduction can walk all real
 events in one statically bounded scan. Row-local variable-length loops use

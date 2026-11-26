@@ -1997,6 +1997,29 @@ def _rk_scan_schedule(*lengths):
     owners[starts[counts != 0]] *= -1
     return owners
 """),
+    :event_rounds => ("_rk_event_rounds", """
+def _rk_event_rounds(tags):
+    if tags is None or not tags.size:
+        return (), np.empty(0, dtype=np.int64)
+    owners = np.abs(tags) - 1
+    counts = np.bincount(owners)
+    height = int(counts.max())
+    # Lay the subjects end to end around a cycle of height rounds. No subject
+    # occurs twice in a round. Assign its events to its slots in causal order.
+    subjects = np.argsort(-counts, kind="stable")
+    ordered = counts[subjects]
+    starts = np.zeros_like(counts)
+    starts[subjects] = (np.cumsum(ordered) - ordered) % height
+    wrapped = np.maximum(starts + counts - height, 0)
+    local = np.arange(len(tags)) - (np.cumsum(counts) - counts)[owners]
+    rounds = np.where(local < wrapped[owners], local, local + (starts - wrapped)[owners])
+    permutation = np.argsort(rounds, kind="stable")
+    width, wide = divmod(len(tags), height)
+    split = wide * (width + 1)
+    phases = (permutation[:split].reshape(wide, width + 1),
+              permutation[split:].reshape(height - wide, width))
+    return tuple(phase for phase in phases if phase.size), np.argsort(permutation)
+"""),
     :sign_groups => ("_rk_sign_groups", """
 def _rk_sign_groups(values):
     x = np.asarray(values)

@@ -18,8 +18,10 @@
 # "Data-dependent iteration").
 
 const _JAX_LAYOUT_KEY = :reactivekernels_jax_plate_layout
-const _JAX_LAYOUTS = (:padded, :groups, :chains)
-_jax_plate_layout() = get(task_local_storage(), _JAX_LAYOUT_KEY, :padded)::Symbol
+const _JAX_LAYOUTS = (:padded, :groups, :chains, :rounds)
+_jax_requested_layout() = get(task_local_storage(), _JAX_LAYOUT_KEY, :padded)::Symbol
+# Both packed modes use the same data representation and cell lowering.
+_jax_plate_layout() = _jax_requested_layout() === :rounds ? :chains : _jax_requested_layout()
 # The layout of a `jax_source` call that names none: `:padded`, unless the
 # task asks for layouts wherever there are data (the test suite's differential
 # run of every module through grouped plates, `test/jax_python.jl`).
@@ -28,7 +30,7 @@ function _jax_with_plate_layout(f, layout, data)
     layout === nothing && (layout = data === nothing ? :padded :
         get(task_local_storage(), _JAX_LAYOUT_DEFAULT_KEY, :padded)::Symbol)
     layout in _JAX_LAYOUTS || throw(ArgumentError(
-        "jax_source: `plate_layout` is `:padded`, `:groups`, or `:chains`; got `$(repr(layout))`"))
+        "jax_source: `plate_layout` is `:padded`, `:groups`, `:chains`, or `:rounds`; got `$(repr(layout))`"))
     # Groups follow the prepared lengths of a plate's rows.
     layout !== :groups || data !== nothing || throw(ArgumentError(
         "jax_source: `plate_layout = :groups` groups plates by their prepared row lengths, so it needs `data`"))

@@ -1,3 +1,6 @@
+Base.include_dependency(joinpath(@__DIR__, "jax_round_scan.py"))
+const _JAX_ROUND_SCAN = read(joinpath(@__DIR__, "jax_round_scan.py"), String)
+
 _jax_chain_tuple(xs) = "(" * join(xs, ", ") * (isempty(xs) ? ")" : ",)")
 _jax_chain_bool(x) = x ? "True" : "False"
 
@@ -23,7 +26,7 @@ function _jax_chain_entry(ctx, table, index)
     end
     entry
 end
-_jax_prepared_aux_type(kind) = kind in (:row_layout, :map_rows, :sign_groups) ? Tuple : kind === :scan_rows ? Vector{Int} : Int
+_jax_prepared_aux_type(kind) = kind in (:row_layout, :map_rows, :sign_groups, :event_rounds) ? Tuple : kind === :scan_rows ? Vector{Int} : Int
 function _jax_chain_dtypes(T)
     T <: Number && return _jax_dtype(T)
     _jax_number_fields(T) ? _jax_chain_tuple(_jax_dtype.(fieldtypes(T))) : nothing
@@ -406,7 +409,13 @@ function _jax_chain_scan_body(ctx, p, recipe, body, inputs, mapped, pos)
             normalized, tags_out, _jax_chain_tuple(first.(extras)),
             _jax_chain_tuple(last.(extras)), _jax_chain_bool(seed_mapped), dtypes,
             repr(reduction), _jax_chain_bool(include_seed), decorate, _jax_chain_tuple(event_inputs.values))
-    call = "_rk_scan_events(" * join(args, ", ") * ")"
+    call = if _jax_requested_layout() === :rounds && event_inputs.pure && !checked
+        schedule = _jax_prepared_bound!(ctx, :event_rounds, tags)
+        helper = _jax_helper!(ctx, "_rk_round_scan", _JAX_ROUND_SCAN)
+        helper * "(" * schedule * ", " * join(args, ", ") * ")"
+    else
+        "_rk_scan_events(" * join(args, ", ") * ")"
+    end
     if epilogue
         result = _jax_bind!(ctx, only(scan.outputs).name, _PyVal(call, Vector{Vector{E}}, false, first(columns).extent))
         push!(cellports, only(scan.outputs))
