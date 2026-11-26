@@ -96,6 +96,28 @@ design = model(; location=0.2, n=8)
 prepare_generated(design)(draws[1], Xoshiro(11)).replicate
 ```
 
+```@example prior_generation
+using ReactiveKernels: code_expr
+@rkppl calibration(center) = begin
+    offset ~ Normal(center, 1)
+    return 2 * offset
+end
+model = @rkppl begin
+    theta ~ Normal(0, 1)
+    y ~ Normal(theta, 1)
+    @generate begin
+        @plate for i in eachindex(groups)
+            value[i] ~ calibration(theta + groups[i])
+        end
+        offsets = value.offset  # retain the local draw behind each return
+    end
+end
+q = prepare_generated(model(; groups=[1.0, 3.0]) | (; y=0.7))
+draw = q([1.25], Xoshiro(17))
+@assert draw.value == 2 .* draw.offsets
+code_expr(q)
+```
+
 ## Inspection
 
 A model view combines the generated program with graph inspection. It is derived from the built model and its binding, so it describes the program used by the queries above.

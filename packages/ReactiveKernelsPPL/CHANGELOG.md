@@ -16,6 +16,12 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.267
+
+- A native `@generate` block can call a submodel per record in a `@plate`.
+  The indexed output holds the submodel's return. A generated binding such
+  as `offsets = value.offset` exposes that local from the same draws.
+
 ## 0.1.266
 
 - Model export forwards the chosen ragged plate layout to the JAX emitter.
