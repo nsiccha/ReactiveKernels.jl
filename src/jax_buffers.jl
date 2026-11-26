@@ -172,11 +172,9 @@ end
 # over its arguments keeps prepared StaticInts static during that trace.
 function _jax_slots_active_cell(ctx, cell, params)
     name = _jax_fresh(ctx, :active_rows_cell)
-    shape = _jax_fresh(ctx, :cell_shape)
     call = cell * "(" * join(params, ", ") * ")"
+    guarded = _jax_if_nonempty(ctx, last(params), "lambda: " * call)
     _jax_emit!(ctx, "def " * name * "(" * join(params, ", ") * "):")
-    _jax_emit!(ctx, "    " * shape * " = jax.eval_shape(lambda: " * call * ")")
-    _jax_emit!(ctx, "    return jax.lax.cond(" * last(params) * ", lambda: " * call *
-        ", lambda: jax.tree_util.tree_map(lambda s: jnp.zeros(s.shape, s.dtype), " * shape * "))")
+    _jax_emit!(ctx, "    return " * guarded)
     name
 end

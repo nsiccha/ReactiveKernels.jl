@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.389
+
+- A JAX broadcast or plate over an empty padded row contributes zero to a
+  masked sum and its gradient, including when a real entry would be used
+  as a denominator or the argument of a logarithm.
+
 ## 0.1.388
 
 - Regenerated JAX modules skip a guarded matrix exponential and its reverse
