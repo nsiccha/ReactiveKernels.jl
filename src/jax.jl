@@ -195,6 +195,22 @@ _PyVal(code::AbstractString, @nospecialize(T), static::Bool, extent::AbstractStr
 _jax_static(v::_PyVal) = _PyVal(v.code, v.T, true, v.extent, v.limit, v.padded, v.origin, v.field_extents)
 _jax_ragged(@nospecialize(T)) = T isa Type && T <: AbstractArray && eltype(T) isa Type &&
     eltype(T) <: AbstractArray
+_jax_nested_rows(@nospecialize(T)) = T isa Type &&
+    T <: AbstractVector{<:AbstractVector{<:AbstractVector{<:Number}}}
+function _jax_nested_eltype(@nospecialize(T))
+    E = eltype(eltype(eltype(T)))
+    _jax_dtype_name(E) == "object" && _jax_error("nested rows of unsupported JAX element type `", E, "`")
+    E
+end
+# After selecting a group, both its row count and the length of each row
+# still travel with the values. Helpers pass them as one lengths tuple.
+_jax_group_rows(v::_PyVal) = _jax_ragged(v.T) && length(v.field_extents) == 2
+_jax_length_pair(extent) = (_py_atom(extent) * "[0]", _py_atom(extent) * "[1]")
+_jax_row_lengths(v::_PyVal) = _jax_group_rows(v) ? v.field_extents[2] : v.extent
+function _jax_group_value(code, T, count, lengths, origin = nothing)
+    levels = (count, lengths)
+    _PyVal(code, T, false, "(" * join(levels, ", ") * ")", "", 0, origin, levels)
+end
 function _jax_extent(args)
     for a in args
         isempty(a.extent) || return a.extent
@@ -1278,11 +1294,16 @@ function _jax_record_field(x::_PyVal, k::Integer)
     field = x.origin.fields[k]
     # Field extents in the original cell use that cell's local names. Project
     # the returned lengths tree instead when the record has crossed a scope.
-    _PyVal(code, T, x.static, extent, "", field.padded, field.origin)
+    parts = _jax_group_rows(field) ? _jax_length_pair(extent) : ()
+    _PyVal(code, T, x.static, extent, "", field.padded, field.origin, parts)
 end
 
-_jax_numeric_record(T) = _jax_is_tuple(T) &&
-    all(F -> F <: Number || F <: AbstractArray{<:Number} || _jax_numeric_record(F), fieldtypes(T))
+function _jax_numeric_record(v::_PyVal)
+    T = v.T
+    _jax_is_tuple(T) && return all(k -> _jax_numeric_record(_jax_record_field(v, k)), 1:fieldcount(T))
+    T <: Number || T <: AbstractArray{<:Number} ||
+        T <: AbstractVector{<:AbstractVector{<:Number}} && !_jax_slots(v)
+end
 
 # Empty fields carry no array leaf. Find a stored field over the fixed schema.
 function _jax_record_leaf(code, T)
@@ -1522,23 +1543,7 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
     end
     if _jax_ragged(x.T) && !_jax_outer_rows(x)
         isempty(x.extent) && _jax_error("a ragged array without its lengths", _jax_where(ctx))
-        # One group's row and length, or several groups' rows and lengths.
-        extent = x.extent * "[" * join(parts, ", ") * "]"
-        if length(values) == 1 && kept == 0 && !target && only(values) !== nothing
-            ctx.scope.selected_lengths[extent] = (x.extent, only(values).code)
-        end
-        row = _py_atom(x.code) * "[" * join(parts, ", ") * "]"
-        # One numeric row in a plate cell that takes a layout: cut to the
-        # width its plate's group gives this read (`None`: the stored width).
-        if ctx.host === nothing && !isempty(ctx.scope.row_width_param) && length(values) == 1 &&
-           kept == 0 && !target && only(values) !== nothing && T <: AbstractVector{<:Number}
-            push!(ctx.scope.row_widths, (x.extent, only(values).code))
-            row *= "[:" * ctx.scope.row_width_param * "[" *
-                   string(length(ctx.scope.row_widths) - 1) * "]]"
-        end
-        return _PyVal(row, T, false,
-                      extent, "", kept == 0 ? 1 : 0,
-                      kept == 0 && !target ? _jax_selected_origin(x, T, join(parts, ", ")) : nothing)
+        return _jax_ragged_index(ctx, x, parts, T, values, kept; target)
     end
     if !isempty(x.extent) && kept > 0
         # A gather from a padded group vector by an index vector: the indices
@@ -1559,6 +1564,42 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
     # An entry of a prepared integer array keeps where it comes from, so a
     # loop over a range it ends has a static number of steps.
     kept == 0 && !target ? _jax_with_origin(v, _jax_selected_origin(x, T, join(parts, ", "))) : v
+end
+function _jax_ragged_index(ctx, x, parts, T, values, kept; target)
+    index = join(parts, ", ")
+    select(s) = _py_atom(s) * "[" * index * "]"
+    code = select(x.code)
+    index == ":" && return _PyVal(code, T, x.static, x.extent, x.limit, x.padded,
+                                   x.origin, x.field_extents)
+    origin = kept == 0 && !target ? _jax_selected_origin(x, T, index) : nothing
+    if _jax_nested_rows(x.T)
+        lengths = map(select, _jax_length_pair(x.extent))
+        kept == 0 && return _jax_group_value(code, T, lengths..., origin)
+        return _PyVal(code, T, false, "(" * join(lengths, ", ") * ")")
+    end
+    rows = _jax_row_lengths(x)
+    extent = select(rows)
+    if _jax_group_rows(x) && length(values) == 1 && only(values) !== nothing
+        i = only(values)
+        valid = "((" * i.code * " >= 1) & (" * i.code * " <= " * x.field_extents[1] * "))"
+        isempty(i.extent) || (valid = "jnp.logical_or(~" * _jax_mask(i) * ", " * valid * ")")
+        _jax_call(ctx, _runtime_check, [_PyVal("jnp.all(" * valid * ")", Bool),
+            _PyVal(repr("BoundsError: row index exceeds the number of rows in the group"), BoundsError)])
+    end
+    if kept == 1 && length(values) == 1 && only(values) !== nothing && !isempty(only(values).extent)
+        return _jax_group_value(code, T, only(values).extent, extent)
+    end
+    if length(values) == 1 && kept == 0 && !target && only(values) !== nothing
+        ctx.scope.selected_lengths[extent] = (rows, only(values).code)
+        # The prepared layout records the width of a numeric row read by each group.
+        if !_jax_group_rows(x) && ctx.host === nothing && !isempty(ctx.scope.row_width_param) &&
+           T <: AbstractVector{<:Number}
+            push!(ctx.scope.row_widths, (rows, only(values).code))
+            code *= "[:" * ctx.scope.row_width_param * "[" *
+                    string(length(ctx.scope.row_widths) - 1) * "]]"
+        end
+    end
+    _PyVal(code, T, false, extent, "", kept == 0 ? 1 : 0, origin)
 end
 # The index vector determines how many rows of the gathered array are valid.
 # A single advanced index beside basic slices keeps its axis. Multiple array
@@ -1744,7 +1785,7 @@ function _jax_bound_expr(ctx::_JaxContext, x::_PyVal, dim::Int, index)
     # the storage layout. Reuse it without repeating any emitted effects.
     index isa _PyVal && return index
     last_index() = ctx.host === nothing && !isempty(x.extent) && _jax_is_array(x.T) &&
-        !_jax_ragged(x.T) ? _jax_call(ctx, size, [x, _jax_literal(dim)]) :
+        (!_jax_ragged(x.T) || _jax_group_rows(x)) ? _jax_call(ctx, size, [x, _jax_literal(dim)]) :
         _PyVal(_jax_dim_code(ctx, x, dim), Int, true)
     index === :end && return last_index()
     index === :begin && return _PyVal("1", Int)
@@ -1868,6 +1909,7 @@ end
 # count), apart from lengths inside its entries: a ragged row vector's
 # lengths and a record vector's field lengths belong to each entry.
 function _jax_entry_axis_extent(c::_PyVal)
+    _jax_group_rows(c) && return c.field_extents[1]
     c.origin isa _JaxRecordLayout && _jax_is_array(c.T) && return c.origin.axis_extent
     _jax_entry_lengths(c) && return ""
     c.extent
@@ -1908,9 +1950,11 @@ function _jax_expr(ctx::_JaxContext, ::Val{:do}, ex)
         push!(params_code, element); push!(args_code, c.code)
         if w
             lengths = _jax_fresh(ctx, Symbol(n, :_lengths))
-            push!(params_code, lengths); push!(args_code, c.extent)
+            push!(params_code, lengths); push!(args_code, _jax_row_lengths(c))
             padded = _jax_ragged(c.T) ? 1 : _jax_padded_fields(c)
-            push!(elements, _PyVal(element, eltype(c.T), false, lengths, "", padded))
+            levels = _jax_nested_rows(c.T) ? _jax_length_pair(lengths) : ()
+            origin = c.origin isa _JaxRecordLayout ? _JaxRecordLayout(c.origin.fields, "", 0) : nothing
+            push!(elements, _PyVal(element, eltype(c.T), false, lengths, "", padded, origin, levels))
         else
             push!(elements, _PyVal(element, eltype(c.T)))
         end
@@ -1919,13 +1963,21 @@ function _jax_expr(ctx::_JaxContext, ::Val{:do}, ex)
     outer = ctx.scope
     inner = _JaxScope(outer)
     inner.indent = outer.indent + 1
+    group_index = findfirst(_jax_group_rows, collections)
+    active = group_index === nothing ? nothing : _jax_identifier(inner.used, :active)
+    if active !== nothing
+        group = collections[group_index]
+        push!(params_code, active)
+        push!(args_code, "jnp.arange(" * _py_atom(group.code) * ".shape[0]) < " * group.field_extents[1])
+    end
     saved = copy(ctx.locals)
     ctx.scope = inner
     result = try
         for (n, e) in zip(names, elements)
             ctx.locals[n] = e
         end
-        _jax_expr(ctx, lambda.args[2])
+        body() = _jax_expr(ctx, lambda.args[2])
+        active === nothing ? body() : _jax_with_guard(body, inner, active)
     finally
         ctx.scope = outer
         empty!(ctx.locals); merge!(ctx.locals, saved)
@@ -1947,21 +1999,24 @@ function _jax_expr(ctx::_JaxContext, ::Val{:do}, ex)
         row = _jax_is_array(E) && E <: AbstractVector && eltype(E) <: Number
         row || _jax_tuple_valued(E) && _jax_is_tuple(E) ||
             _jax_error("`map` whose elements are padded `", E, "` values", _jax_where(ctx))
-        isempty(axis) ||
+        row || isempty(axis) ||
             _jax_error("`map` over a padded collection whose elements have lengths of their own",
                        _jax_where(ctx))
         fn = _jax_element_callable!(ctx, inner, hint, params_code,
                                     "(" * result.code * ", " * result.extent * ")")
+        active === nothing || (fn = _jax_slots_active_cell(ctx, _py_atom(fn), params_code))
         values = _jax_fresh(ctx, row ? :rows : :records)
         lengths = _jax_fresh(ctx, row ? :row_lengths : :record_lengths)
         _jax_emit!(ctx, values * ", " * lengths * " = " * _jax_mapper(ctx) * "(" * fn * ")(" *
                         join(args_code, ", ") * ")")
-        row && return _PyVal(values, T, false, lengths)
+        row && return isempty(axis) ? _PyVal(values, T, false, lengths) :
+                                     _jax_group_value(values, T, axis, lengths)
         layout = result.origin isa _JaxRecordLayout ?
             _JaxRecordLayout([_jax_record_field(result, k) for k in 1:fieldcount(E)], "", 0) : nothing
         return _PyVal(values, T, false, lengths, "", _jax_padded_fields(result), layout)
     end
     fn = _jax_element_callable!(ctx, inner, hint, params_code, result.code)
+    active === nothing || (fn = _jax_slots_active_cell(ctx, _py_atom(fn), params_code))
     v = _PyVal(_jax_mapper(ctx) * "(" * fn * ")(" * join(args_code, ", ") * ")", T, false, axis)
     # Numerical arrays of one stored shape (every mapped element has the
     # shape of the others under `vmap`) stack into rows without padding: a
@@ -5635,6 +5690,8 @@ end
 function _jax_function_call(ctx::_JaxContext, ::typeof(length), args::Vector{_PyVal})
     x = only(args)
     ctx.host === nothing || return _host_length(ctx, x)
+    _jax_group_rows(x) && return _jax_integer_interval(
+        _PyVal(x.field_extents[1], Int), "0", _py_atom(x.code) * ".shape[0]")
     _jax_outer_rows(x) && return isempty(x.extent) ?
         _PyVal((_jax_slots(x) ? _jax_slot_mask(x) : _py_atom(x.code)) * ".shape[0]", Int, true) :
         _PyVal(x.extent, Int, false, "", (_jax_slots(x) ? _jax_slot_mask(x) : _py_atom(x.code)) * ".shape[0]")
@@ -5658,7 +5715,7 @@ end
 # is data has no static shape entry.
 function _jax_function_call(ctx::_JaxContext, ::typeof(size), args::Vector{_PyVal})
     x = args[1]
-    if _jax_outer_rows(x)
+    if _jax_outer_rows(x) || _jax_group_rows(x)
         n = _jax_function_call(ctx, length, [x])
         length(args) == 1 && return _PyVal("(" * n.code * ",)", Tuple{Int}, n.static)
         args[2].code == "1" && return n
@@ -5892,18 +5949,32 @@ function _jax_call_positional(ctx::_JaxContext, ::typeof(reduce), args::Vector{_
     E = eltype(eltype(T))
     ctx.host === nothing || return _PyVal("np.concatenate([np.atleast_1d(r) for r in " *
         x.code * "])", Vector{E}, true)
-    # Julia's uninitialized reduction needs a first row, even when each
-    # existing row has zero entries. The number of rows is a static shape.
-    cells = _jax_bind!(ctx, :cells, x)
-    _jax_call(ctx, _runtime_check, [_PyVal(_py_atom(cells.code) * ".shape[0] > 0", Bool, true),
+    padded = _jax_bind!(ctx, :cells, x)
+    # An uninitialized reduction needs a row even when its rows have no entries.
+    grouped = _jax_group_rows(x)
+    count = grouped ? x.field_extents[1] : _py_atom(padded.code) * ".shape[0]"
+    _jax_call(ctx, _runtime_check, [_PyVal(count * " > 0", Bool, !grouped),
         _PyVal(repr("reduce(vcat, cells): reducing over an empty collection is not allowed"), ArgumentError)])
-    flat = isempty(x.extent) ? _JAX_FULL_ROWS : _jax_flat_positions(ctx, x.extent)
-    flat == _JAX_FULL_ROWS && return _PyVal("jnp.reshape(" * cells.code * ", (-1,))", Vector{E})
-    flat === nothing && _jax_error("flattening a ragged value whose lengths are not those of a ",
+    row_lengths = _jax_row_lengths(x)
+    flat = isempty(row_lengths) ? _JAX_FULL_ROWS : _jax_flat_positions(ctx, row_lengths)
+    grouped && (flat = nothing)
+    flat == _JAX_FULL_ROWS && return _PyVal("jnp.reshape(" * padded.code * ", (-1,))", Vector{E})
+    in_cell = any(pr -> last(pr).op isa _AuthoredPlateOp, ctx.mod.path)
+    flat === nothing && !grouped && !in_cell && _jax_error("flattening a ragged value whose lengths are not those of a ",
         "prepared ragged input (`prepare_data`) has no JAX translation", _jax_where(ctx))
-    padded = cells
-    lengths = _jax_bind!(ctx, :lengths, _PyVal(x.extent, Vector{Int}))
+    if grouped
+        row_lengths = "jnp.where(jnp.arange(" * padded.code * ".shape[0]) < " *
+                      x.field_extents[1] * ", " * row_lengths * ", 0)"
+    end
+    lengths = _jax_bind!(ctx, :lengths, _PyVal(row_lengths, Vector{Int}))
     mask = "(jnp.arange(" * padded.code * ".shape[1])[None, :] < " * lengths.code * "[:, None])"
+    if flat === nothing
+        # Different cells in a vmap can produce different lengths. Gather in
+        # native concatenation order and carry the valid count out of the cell.
+        ctx.mod.helper_names[:bounded_concatenation] = true
+        return _jax_index_values(ctx, _PyVal("jnp.ravel(" * padded.code * ")", Vector{E}),
+                                  [_PyVal("jnp.ravel(" * mask * ")", Vector{Bool})])
+    end
     total = flat.total
     if flat.prefix != 0
         total *= " + " * string(flat.prefix) * " * " * padded.code * ".shape[0]"
@@ -6173,7 +6244,7 @@ function _jax_index_values(ctx::_JaxContext, x::_PyVal, indices::Vector{_PyVal})
     # dense rows are the arrays they store.
     if _jax_ragged(x.T) && !_jax_outer_rows(x)
         isempty(x.extent) && _jax_error("a ragged array without its lengths", _jax_where(ctx))
-        return _PyVal(code, T, false, x.extent * "[" * join(parts, ", ") * "]", "", kept == 0 ? 1 : 0)
+        return _jax_ragged_index(ctx, x, parts, T, gathered, kept; target=false)
     end
     _jax_gather_result(ctx, x, parts, T, gathered, kept)
 end
@@ -6280,7 +6351,9 @@ end
 # storage spans the padded width. Scans and reductions must mask that tail.
 function _jax_axis(ctx::_JaxContext, x::_PyVal, dim::Int)
     extent = ""
-    if ctx.host === nothing && !isempty(x.extent) && (!_jax_ragged(x.T) || _jax_outer_rows(x))
+    if _jax_group_rows(x) && dim == 1
+        extent = x.field_extents[1]
+    elseif ctx.host === nothing && !isempty(x.extent) && (!_jax_ragged(x.T) || _jax_outer_rows(x))
         size = _jax_padded_size(ctx, x, [_PyVal(string(dim), Int, true)])
         isempty(size.limit) || (extent = size.code)
     end
@@ -8612,6 +8685,7 @@ function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
                              links = fill(nothing, length(p.have)),
                              origins = fill(nothing, length(p.have)),
                              fields = fill(0, length(p.have)),
+                             group_rows = fill(false, length(p.have)),
                              active_cells::Bool = false, row_widths::Bool = false, event_inputs = nothing,
                              record_axes = nothing)
     name = _jax_fresh(ctx, hint)
@@ -8632,8 +8706,9 @@ function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
                 ctx.mod.helper_names[(:record_axis, inner, param, extent)] = record_axes[i]
             end
         end
+        levels = group_rows[i] ? _jax_length_pair(extent) : ()
         inner.values[canon_id(p.graph, v.id)] = _PyVal(param, types[i], statics[i], extent, "",
-                                                       fields[i], origins[i])
+                                                       fields[i], origins[i], levels)
         links[i] === nothing || (inner.links[canon_id(p.graph, v.id)] = links[i])
     end
     active = active_cells ? _jax_identifier(inner.used, :active_cell) : ""
@@ -8765,8 +8840,9 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     any(ragged[i] && mapped[i] && !_jax_tuple_valued(inputs[i].T) for i in eachindex(inputs)) && R != 1 &&
         _jax_error("a ragged plate of rank ", R, _jax_where(ctx))
     # A mapped padded group vector: the plate runs over its entries.
-    axis_inputs = [_jax_record_axis(v) for v in inputs]
-    padded = [mapped[i] && (v.origin isa _JaxRecordLayout || !ragged[i]) &&
+    axis_inputs = [_jax_group_rows(v) ? _PyVal(_jax_row_lengths(v), Vector{Int}, false, v.field_extents[1]) :
+                   _jax_record_axis(v) for v in inputs]
+    padded = [mapped[i] && (v.origin isa _JaxRecordLayout || _jax_group_rows(v) || !ragged[i]) &&
               !isempty(axis_inputs[i].extent) for (i, v) in enumerate(inputs)]
     cell_types = Any[mapped[i] ? eltype(v.T) : _jax_unref(v.T) for (i, v) in enumerate(inputs)]
     cell_extents = Bool[ragged[i] for i in eachindex(inputs)]
@@ -8813,11 +8889,15 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
                                                                 links = cell_links,
                                                                 origins = cell_origins,
                                                                 fields = cell_fields,
+                                                                group_rows = [mapped[i] ? _jax_nested_rows(v.T) :
+                                                                              _jax_group_rows(v)
+                                                                              for (i, v) in enumerate(inputs)],
                                                                 active_cells = masked,
                                                                 record_axes = R == 1 && ctx.mod.layout === :padded ?
                                                                     _jax_record_axes(ctx, body, inputs, mapped) : nothing,
                                                                 row_widths = R == 1 && _jax_plate_layout() === :groups)
-    guard_each_cell = masked && any(v -> v.origin isa _JaxDenseRows, inputs[padded])
+    guard_each_cell = masked && (any(v -> v.origin isa _JaxDenseRows, inputs[padded]) ||
+                                 any(v -> _jax_group_rows(v) || _jax_nested_rows(v.T), inputs))
     if guard_each_cell
         cell = _jax_slots_active_cell(ctx, cell, cell_params)
     end
@@ -8837,7 +8917,8 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     for (i, v) in enumerate(inputs)
         push!(axes, mapped[i] ? "0" : "None"); push!(args, v.code)
         if ragged[i]
-            push!(axes, mapped[i] ? "0" : "None"); push!(args, v.extent)
+            push!(axes, mapped[i] ? "0" : "None")
+            push!(args, mapped[i] ? _jax_row_lengths(v) : v.extent)
             if _jax_tuple_valued(v.T)
                 T = _jax_is_tuple(v.T) ? v.T : eltype(v.T)
                 for k in 1:fieldcount(T)
@@ -9009,7 +9090,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
         outer_length
     end
     # A stored leaf carries the mapped shape; empty fields beside it need none.
-    if _jax_numeric_record(E) && _jax_record_leaf(want.code, E) !== nothing
+    if _jax_is_tuple(E) && _jax_numeric_record(want) && _jax_record_leaf(want.code, E) !== nothing
         empty_value = _jax_empty_record(want, first(shapes))
         only(with_length) && (empty_value = "(" * empty_value * ", " *
             _jax_empty_record(want, first(shapes); lengths = true) * ")")
@@ -9044,12 +9125,13 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
         end
         result = _jax_fresh(ctx, :plate_value)
         lengths = _jax_fresh(ctx, :plate_lengths)
+        outer_count = _jax_extent(axis_inputs[padded])
         if only(with_length)
             _jax_emit!(ctx, result * ", " * lengths * " = " * call)
             # The cell's length in terms of the plate's arguments (an input's
             # lengths, or their gather by the plate index) keeps their link
             # to the input, whose flat positions a flattening reads.
-            return [_PyVal(result, Vector{E}, false, result_extent(want.extent, lengths))]
+            lengths = result_extent(want.extent, lengths)
         else
             _jax_emit!(ctx, result * " = " * call)
             _jax_emit!(ctx, lengths * " = jnp.full((" * result * ".shape[0],), " * result *
@@ -9059,6 +9141,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
             # fills its rows.
             ctx.scope.flat_positions[lengths] = _JAX_FULL_ROWS
         end
+        isempty(outer_count) || return [_jax_group_value(result, Vector{E}, outer_count, lengths)]
         return [_PyVal(result, Vector{E}, false, lengths)]
     end
     E <: Number || _jax_error("a plate whose cell returns `", E, "` has no JAX translation yet",
@@ -9117,6 +9200,15 @@ function _jax_empty_record(v::_PyVal, shape::AbstractString; lengths::Bool = fal
     if _jax_is_tuple(T)
         return _jax_tuple_code([_PyVal(_jax_empty_record(_jax_record_field(v, k), shape; lengths), Any)
                                 for k in 1:fieldcount(T)])
+    end
+    if T <: AbstractVector{<:AbstractVector{<:Number}}
+        if !lengths
+            return "jnp.zeros(" * shape * " + (0, 0), dtype=" * _jax_dtype(eltype(eltype(T))) * ")"
+        end
+        count = "jnp.zeros(" * shape * ", dtype=" * _jax_dtype(Int) * ")"
+        _jax_outer_rows(v) && return count
+        rows = "jnp.zeros(" * shape * " + (0,), dtype=" * _jax_dtype(Int) * ")"
+        return _jax_group_rows(v) ? "(" * count * ", " * rows * ")" : rows
     end
     inner = !lengths && T <: AbstractArray ?
         " + (" * join(fill("0", ndims(T)), ", ") * ",)" : ""
@@ -9619,18 +9711,25 @@ Base.write(path::AbstractString, src::JAXSource) = write(path, src.text)
 
 # The host-side helper that turns a ragged input (one array per group) into
 # the padded array and lengths vector the functions take.
-const _JAX_PAD_RAGGED = """
-def pad_ragged(arrays: list, rank=None) -> tuple:
+function _jax_pad_ragged_source(types)
+    nested = any(_jax_nested_rows, types)
+    option = nested ? ", *, nested=" * (all(_jax_nested_rows, types) ? "True" : "False") : ""
+    nested_doc = nested ? "\n    For groups of vectors, nested=True returns (values, (group_lengths, row_lengths))." : ""
+    leaves = unique(_jax_nested_eltype(T) for T in types if _jax_nested_rows(T))
+    dtype = length(leaves) == 1 ? _host_dtype(only(leaves)) : "None"
+    select = nested ? "    if nested:\n        return _rk_pad_nested(arrays, " * dtype * ")\n" : ""
+    source = """
+def pad_ragged(arrays: list, rank=None$option) -> tuple:
     \"\"\"Pad arrays along their first axis and return the array and lengths.
 
     Each row repeats its last entry up to the longest length, so every padded
     slot holds a valid value; the functions mask padded entries by length.
     Pass the two results as the input and its `_lengths` input.
     Trailing dimensions must agree. For an empty list of matrix cells,
-    pass `rank=2`; otherwise rank is inferred (or defaults to 1).
+    pass `rank=2`; otherwise rank is inferred (or defaults to 1).$nested_doc
     \"\"\"
     import numpy as np
-    rows = [np.asarray(a) for a in arrays]
+$(select)    rows = [np.asarray(a) for a in arrays]
     rank = rows[0].ndim if rank is None and rows else 1 if rank is None else rank
     tail = rows[0].shape[1:] if rows else (1,) * (rank - 1)
     if any(r.ndim != rank or r.shape[1:] != tail for r in rows):
@@ -9646,6 +9745,9 @@ def pad_ragged(arrays: list, rank=None) -> tuple:
         else np.zeros((0, width) + tail, dtype=dtype)
     return padded, lengths
 """
+    nested && (source = _JAX_PAD_NESTED * "\n" * source)
+    replace(source, "np.float64" => "np." * _jax_float_name())
+end
 
 const _JAX_HEADER = """
 from typing import Any
@@ -10060,15 +10162,16 @@ function _jax_module_text(plans, types, constants, docstring::String, prepare;
         cname = _jax_identifier(mod.used, key)
         push!(constant_lines, cname * " = " * _jax_py_literal(value))
     end
-    if prepare === nothing && any(f -> any(io -> _jax_ragged(last(io)), f.inputs), functions)
-        if layout === :chains
+    if prepare === nothing
+        ragged = [T for f in functions for (_, T) in f.inputs if _jax_ragged(T)]
+        if layout === :chains && any(T -> !_jax_nested_rows(T), ragged)
             _jax_module_helper!(mod, "_RKChainRows", _JAX_CHAIN_ROWS)
             push!(mod.helpers, "def pack_ragged(arrays, rank=1, dtype=None):\n" *
                 "    \"\"\"Return packed rows and their lengths for a module input.\"\"\"\n" *
                 "    return _rk_pack_rows(arrays, dtype, rank)")
-        else
-            pushfirst!(mod.helpers, rstrip(replace(_JAX_PAD_RAGGED, "np.float64" => "np." * _jax_float_name())))
         end
+        padded = layout === :chains ? filter(_jax_nested_rows, ragged) : ragged
+        isempty(padded) || pushfirst!(mod.helpers, rstrip(_jax_pad_ragged_source(padded)))
     end
     lines = String[_jax_docstring(docstring, "")]
     header = rstrip(_jax_needs_x64(mod) ? _JAX_HEADER : replace(_JAX_HEADER, _JAX_X64_LINE => ""))
@@ -10290,8 +10393,7 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
         prepared_types = Any[prepared_types; types]
     end
     meta = (INPUTS = Tuple(first(io) for io in functions[2].inputs),
-            PREPARED = [n => (dtype = _jax_dtype_name(T), ndim = _jax_meta_rank(T),
-                              ragged = _jax_ragged(T))
+            PREPARED = [n => _jax_input_metadata(T)
                         for (n, T) in zip(prepared_names, prepared_types)])
     plates = _jax_layout_plates(mod)
     if mod.layout === :groups
@@ -10313,8 +10415,7 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
     # With definitions, `DATA` describes `prepare_data`'s own parameters, and
     # `UNTRANSLATED` the definitions it takes as inputs (none when every
     # definition has a host translation).
-    merge(meta, (DATA = [n => (dtype = _jax_dtype_name(T), ndim = _jax_meta_rank(T),
-                               ragged = _jax_ragged(T))
+    merge(meta, (DATA = [n => _jax_input_metadata(T)
                          for (n, T) in zip(param_names, raw_types)],
                  UNTRANSLATED = Dict{String,String}(String(n) => untranslated[n].message
                      for (n, _) in defs if haskey(untranslated, n) &&
@@ -10437,7 +10538,7 @@ function _jax_functions!(mod, bodies, functions, plans, types;
                 end
                 wants = [_jax_returned(ctx, _jax_lookup(ctx, g, v); arrays = true) for v in q.want]
                 outputs[fname] = wants
-                _jax_emit!(ctx, "return " * _jax_result_code(w, wants))
+                _jax_emit!(ctx, "return " * _jax_result_code(ctx, w, wants; public_arrays = true))
                 ctx.scope.indent -= 1
             end
             nothing, [_jax_lookup(ctx, g, v) for v in p.want]
@@ -10508,6 +10609,10 @@ _jax_dtype_name(::Type{<:AbstractFloat}) = _jax_float_name()
 # Non-numeric values (level labels) cross as Python objects.
 _jax_dtype_name(@nospecialize(T)) = "object"
 _jax_meta_rank(@nospecialize(T)) = T isa Type && T <: AbstractArray ? ndims(T) : 0
+function _jax_input_metadata(@nospecialize(T))
+    meta = (dtype = _jax_dtype_name(T), ndim = _jax_meta_rank(T), ragged = _jax_ragged(T))
+    _jax_nested_rows(T) ? merge(meta, (; ragged_depth = 2)) : meta
+end
 
 # One function `fname` over plan `p`, returning WANT `w` in its shape.
 function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool = true,
@@ -10539,9 +10644,13 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
         if host
             # Host inputs are NumPy arrays; a ragged input is a list of them.
             scope.values[canon_id(p.graph, v.id)] = _PyVal(param, T, true)
-            _jax_ragged(T) ? _jax_emit!(ctx, param * " = [np.asarray(a) for a in " * param * "]") :
-                _jax_is_array(T) && eltype(T) <: Number &&
+            if _jax_nested_rows(T)
+                _jax_emit!(ctx, param * " = " * _host_input!(ctx, param, T))
+            elseif _jax_ragged(T)
+                _jax_emit!(ctx, param * " = [np.asarray(a) for a in " * param * "]")
+            elseif _jax_is_array(T) && eltype(T) <: Number
                 _jax_emit!(ctx, param * " = np.asarray(" * param * ")")
+            end
             continue
         end
         extent = flat = ""
@@ -10560,13 +10669,14 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
             extent = names === nothing ? _jax_identifier(scope.used, Symbol(v.name, :_lengths)) :
                 keyed ? _jax_param_name(scope.used, extent_key; stable = false) :
                 (push!(scope.used, extent_key); extent_key)
-            push!(params, extent); push!(inputs, (names === nothing ? extent : extent_key) => Vector{Int})
+            length_type = _jax_nested_rows(T) ? Tuple{Vector{Int},Matrix{Int}} : Vector{Int}
+            push!(params, extent); push!(inputs, (names === nothing ? extent : extent_key) => length_type)
             push!(input_locals, extent)
-            if mod.layout === :chains
+            if mod.layout === :chains && !_jax_nested_rows(T)
                 _jax_helper!(ctx, "_RKChainRows", _JAX_CHAIN_ROWS)
                 scope.flat_positions[extent] = _JaxFlatRows("_rk_flat_count(" * param * ")", 0)
                 keyed && (scope.prepared_keys[extent] = extent_key)
-            elseif names !== nothing
+            elseif names !== nothing && !_jax_nested_rows(T)
                 # A prepared ragged input's flat positions; their count, the
                 # total length, is the static length of its flattening.
                 flat_key = key * "_flat"
@@ -10598,9 +10708,16 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
         # Callers may pass NumPy arrays; JAX indexes only its own arrays by a
         # traced index.
         if _jax_is_array(T) && (eltype(T) <: Number || _jax_ragged(T))
-            convert = mod.layout === :chains && _jax_ragged(T) ? "_rk_device_rows" : "jnp.asarray"
-            _jax_emit!(ctx, param * " = " * convert * "(" * param * _jax_input_dtype(T) * ")")
-            isempty(extent) || _jax_emit!(ctx, extent * " = jnp.asarray(" * extent * ")")
+            dtype = _jax_nested_rows(T) ? ", dtype=" * _jax_dtype(_jax_nested_eltype(T)) :
+                                         _jax_input_dtype(T)
+            convert = mod.layout === :chains && _jax_ragged(T) && !_jax_nested_rows(T) ?
+                      "_rk_device_rows" : "jnp.asarray"
+            _jax_emit!(ctx, param * " = " * convert * "(" * param * dtype * ")")
+            if !isempty(extent)
+                convert = _jax_nested_rows(T) ? "tuple(jnp.asarray(n) for n in " * extent * ")" :
+                                                "jnp.asarray(" * extent * ")"
+                _jax_emit!(ctx, extent * " = " * convert)
+            end
             !isempty(flat) &&
                 _jax_emit!(ctx, flat * " = jnp.asarray(" * flat * ")")
         elseif _jax_columns(T)
@@ -10625,7 +10742,7 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
             _jax_plan!(ctx, p)
             values = [_jax_returned(ctx, _jax_lookup(ctx, p.graph, v); arrays = reserve && !host)
                       for v in p.want]
-            _jax_result_code(w, values), values
+            _jax_result_code(ctx, w, values; public_arrays = reserve && !host), values
         else
             emit(ctx)
         end
@@ -10672,9 +10789,27 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
     lines, JAXFunction(name, inputs, [String(v.name) => x.T for (v, x) in zip(p.want, wants)])
 end
 
-_jax_result_code(w, wants) = w isa NamedTuple ?
-    _jax_nested_dict(w, Iterators.Stateful(wants)) :
+function _jax_result_code(ctx, w, wants; public_arrays)
+    w isa NamedTuple && return _jax_nested_dict(w, Iterators.Stateful(wants))
+    nested = any(v -> _jax_nested_rows(v.T) || _jax_group_rows(v), values(ctx.scope.values))
+    if public_arrays && (nested || haskey(ctx.mod.helper_names, :bounded_concatenation))
+        wants = map(wants) do v
+            v.T isa Type && v.T <: AbstractVector{<:Number} && !isempty(v.extent) || return v
+            check = _jax_helper!(ctx, "_rk_check", _JAX_CHECK)
+            helper = _jax_helper!(ctx, "_rk_result_vector", """
+def _rk_result_vector(values, length):
+    if isinstance(length, jax.core.Tracer):
+        $check(length == values.shape[0],
+               "The requested vector has a data-dependent output size under JIT. "
+               "Request a named result to return its storage and logical length.")
+        return values
+    return values[:int(length)]
+""")
+            _PyVal(helper * "(" * v.code * ", " * v.extent * ")", v.T)
+        end
+    end
     w isa Symbol ? only(wants).code : _jax_tuple_code(wants)
+end
 
 # Python annotations of a module function's parameters and result: numbers
 # and arrays are JAX's `ArrayLike` (NumPy arrays and Python numbers too), a
@@ -10682,6 +10817,7 @@ _jax_result_code(w, wants) = w isa NamedTuple ?
 _jax_annotation(@nospecialize(T)) = T isa Type &&
     (T <: Number || T <: AbstractArray && (eltype(T) <: Number || _jax_ragged(T))) ?
     "ArrayLike" : "Any"
+_jax_annotation(::Type{Tuple{Vector{Int},Matrix{Int}}}) = "tuple[ArrayLike, ArrayLike]"
 function _jax_return_annotation(w, wants)
     w isa NamedTuple && return "dict"
     w isa Symbol || return "tuple"

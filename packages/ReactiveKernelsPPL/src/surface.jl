@@ -738,6 +738,7 @@ function _lower_model_latest(m::RKPPLModel, supplied; conditioned = keys(m.condi
     _all_symbols!(used, ast)
     ctx = _ScopeExpansion(scopes, Dict(s.binding => s for s in scopes),
         _scope_name_paths(scopes), used)
+    ast, draw_source, scopes = _draw_source(ast, m.mod, data, observing, scopes)
     expanded = RKPPLModel(ast, m.mod)
     for (path, value) in scoped_observed
         parts = Symbol.(split(String(path), '.'))
@@ -780,7 +781,7 @@ function _lower_model_latest(m::RKPPLModel, supplied; conditioned = keys(m.condi
         values[_conditioned_input(name)] = pop!(values, name)
     end
     _structural_cache(plan).model_builds = WeakRef(m.builds)
-    return _with(plan; documentation, marginalized_integers = integer_marginals), values
+    return _with(plan; draw_source, documentation, marginalized_integers = integer_marginals), values
 end
 
 lower_rkppl(m::RKPPLModel, data::NamedTuple; conditioned=keys(m.conditioned)) = first(_lower_model(m, data; conditioned))
@@ -1118,6 +1119,7 @@ function _lower_rkppl_latest(ast, data_names, scalars::Set{Symbol},
     setdiff!(data, primitive)
     union!(data, _conditioned_without_value(ast, observing, data, primitive))
     ast, scopes = _expand_submodels(ast, data, mod; with_scopes = true, documentation)
+    ast, draw_source, scopes = _draw_source(ast, mod, data, observing, scopes)
     observed_parameters = _conditioned_declarations(ast, observing)
     setdiff!(data, observed_parameters)
     _check_observed_inputs(ast, data, observing)
@@ -1133,7 +1135,7 @@ function _lower_rkppl_latest(ast, data_names, scalars::Set{Symbol},
         _cached_lowering(cache, ast, data, mod; submodel_scopes = scopes,
             conditioned = observed_parameters, array_entries, observing)
     end
-    return _with(plan; documentation)
+    return _with(plan; documentation, draw_source)
 end
 
 # A data-indexed observation is an ordinary gather followed by an
@@ -7314,7 +7316,7 @@ end
 # `@plate` / `@scan` block statements: kept raw (never trivia-unwrapped) on
 # every submodel path — their own desugar owns them.
 _is_block_macro(st) = st isa Expr && st.head === :macrocall &&
-    !isempty(st.args) && st.args[1] in (Symbol("@plate"), Symbol("@scan"))
+    !isempty(st.args) && st.args[1] in (Symbol("@plate"), Symbol("@scan"), Symbol("@generate"))
 
 mutable struct _ScopeExpansion
     scopes::Vector{SubmodelScope}
@@ -7429,7 +7431,7 @@ end
 function _expand_submodels(ast::Expr, data::Set{Symbol}, mod::Module;
         with_scopes::Bool = false, rewrites = Expr[], fixes = Dict(), bound_values = nothing,
         documentation = RKPPLDocumentation[])
-    if !any(_stmt_is_submodel_call(a, mod) || _plate_has_submodel_cell(a, mod) for a in ast.args)
+    if !any(_is_generate(a) || _stmt_is_submodel_call(a, mod) || _plate_has_submodel_cell(a, mod) for a in ast.args)
         isempty(rewrites) && isempty(fixes) || _sfail("merge scoped target matches no submodel declaration")
         return with_scopes ? (ast, SubmodelScope[]) : ast
     end
@@ -7474,7 +7476,13 @@ end
 function _expand_submodel_stmt!(out, arg, mod::Module, data::Set{Symbol},
         used::_ScopeExpansion,
         chain::Vector{RKPPLSubmodel})
-    if _stmt_is_submodel_call(arg, mod)
+    if _is_generate(arg)
+        body = Any[]
+        for child in _generated_statements(arg)
+            _expand_submodel_stmt!(body, child, mod, data, used, chain)
+        end
+        push!(out, Expr(:macrocall, Symbol("@generate"), arg.args[2], Expr(:block, body...)))
+    elseif _stmt_is_submodel_call(arg, mod)
         st = _unwrap_trivia(arg)
         sm, gen = _expand_one_submodel(st.args[2], st.args[3], mod, data,
             used, chain)
@@ -8037,7 +8045,7 @@ function _resolve_submodel_stmt(st, sm::RKPPLSubmodel, names::Set{Symbol};
         return Expr(:block, (_resolve_submodel_stmt(a, sm, names; observes)
             for a in st.args)...)
     elseif st.head === :macrocall && !isempty(st.args) &&
-            st.args[1] === Symbol("@plate")
+            st.args[1] in (Symbol("@plate"), Symbol("@generate"))
         return Expr(:macrocall, st.args[1:end-1]...,
             _resolve_submodel_stmt(st.args[end], sm, names; observes))
     elseif st.head === :for && length(st.args) == 2

@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.395
+## 0.1.396
 
 - JAX exports accept grouped, sequential and round-based layouts for ragged plates.
   A grouped module can time the caller's compiled step on its device at the requested
@@ -25,6 +25,14 @@ are recorded in the git history only.
   batch independent interval and offset records, and reduce eligible observation
   rows over the observations present. The generated function supports ordinary
   JAX forward and reverse differentiation.
+
+## 0.1.395
+
+Generated JAX functions accept groups of ragged numerical rows. The padded
+values travel with one lengths argument containing the group counts and
+the per-row lengths. `prepare_data` constructs both arrays from the raw input.
+Plate cells can return those groups in tuple fields. Projecting a field
+keeps its row count and each row's length.
 
 ## 0.1.394
 

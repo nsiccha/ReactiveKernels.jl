@@ -82,6 +82,20 @@ parameters(coordinates)
 Use `prepare_query_ad` for derivatives or `ReactiveKernels.js_source` for
 JavaScript. [`WORKFLOW_WANTS`](@ref) lists the fields and coverage.
 
+## Prior draws
+
+```@example prior_generation
+using ReactiveKernelsPPL, Random, Distributions
+model = @rkppl begin
+    a ~ Normal(location, 1)
+    @generate replicate[1:n] .~ Normal.(a, 0.5)
+end
+fit = model(; location=0.2, n=3)
+draws = prepare_prior(fit)(Xoshiro(7), 4)
+design = model(; location=0.2, n=8)
+prepare_generated(design)(draws[1], Xoshiro(11)).replicate
+```
+
 ## Inspection
 
 A model view combines the generated program with graph inspection. It is derived from the built model and its binding, so it describes the program used by the queries above.

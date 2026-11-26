@@ -11,6 +11,7 @@ const _PPL_TEST_FILES = (
     "test_changelog.jl",
     "test_parse_hygiene.jl",
     "test_host_draw_queries.jl",
+    "test_generation.jl",
     "test_contract.jl",
     "test_layout.jl",
     "test_integer_parameters.jl",
