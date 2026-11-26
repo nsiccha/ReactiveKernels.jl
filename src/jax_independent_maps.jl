@@ -9,20 +9,20 @@ _jax_map_assignment(x) = Meta.isexpr(x, :(=), 2)
 # lexical lifetime: the constructor binds it once, indexed writes keep it
 # local, and only the function result can publish it. A reshape, closure,
 # alias, argument to another call or rebinding makes the proof fail.
-function _jax_private_matrix_uses(ex, name, constructor; top=true, tail=true)
+function _jax_private_array_uses(ex, name, constructor; top=true, tail=true)
     !_kernel_mentions(ex, name) && return true
     ex === name && return tail
     ex isa Expr || return false
     if ex.head === :block
         statements = _jax_map_statements(ex)
         return all(enumerate(statements)) do (i, st)
-            _jax_private_matrix_uses(st, name, constructor; top, tail=tail && i == length(statements))
+            _jax_private_array_uses(st, name, constructor; top, tail=tail && i == length(statements))
         end
     elseif ex.head === :return
         return ex.args == [name]
     elseif ex.head === :for || ex.head === :if
         return !_kernel_mentions(first(ex.args), name) &&
-            all(st -> _jax_private_matrix_uses(st, name, constructor; top=false, tail=false),
+            all(st -> _jax_private_array_uses(st, name, constructor; top=false, tail=false),
                 ex.args[2:end])
     elseif _jax_map_assignment(ex)
         lhs, rhs = ex.args
@@ -39,16 +39,16 @@ end
 function _jax_dense_constructor(f, types)
     (f === fill || f === zeros || f === ones) || return false
     dims = f === fill ? types[2:end] : types
-    length(dims) == 2 && all(==(Int), dims) || return false
+    length(dims) in (1, 2) && all(==(Int), dims) || return false
     f === fill && !(first(types) <: _JaxBranchReal && isprimitivetype(first(types))) && return false
     which(f, Tuple{types...}).module === Base
 end
 
-function _jax_record_private_matrix!(ctx, name, constructor, f, values)
+function _jax_record_private_array!(ctx, name, constructor, f, values)
     frame = _jax_frame()
     frame !== nothing && frame.function_body && ctx.scope === frame.scope &&
         frame.lets == 0 && !(name in frame.names) && !haskey(ctx.locals, name) &&
-        _jax_private_matrix_uses(frame.source, name, constructor) || return
+        _jax_private_array_uses(frame.source, name, constructor) || return
     types = _jax_argument_type.(values)
     all(t -> t isa Type && isconcretetype(t), types) || return
     if !_jax_dense_constructor(f, types)
@@ -71,7 +71,7 @@ function _jax_record_private_matrix!(ctx, name, constructor, f, values)
         _jax_dense_constructor(getglobal(callee.mod, callee.name),
                                [types[x.id - 1] for x in operands]) || return
     end
-    push!(frame.private_matrices, name)
+    push!(frame.private_arrays, name)
 end
 
 function _jax_plain_copy_array(ctx, value)
@@ -123,18 +123,50 @@ function _jax_read_reshaped_matrix(ctx, name, value)
            ".shape, order=\"F\")", value.T)
 end
 
-function _jax_check_copy_row!(ctx, row, dest)
-    rows = dest.code * ".shape[0]"
-    interval = _jax_static_integer_bounds(row)
+function _jax_check_copy_index!(ctx, index, first, last, message)
+    interval = _jax_static_integer_bounds(index)
     if interval !== nothing
         lo, hi = interval
-        _jax_emit!(ctx, "if not (1 <= " * lo * " and " * hi * " <= " * rows * "):")
+        _jax_emit!(ctx, "if not (" * first * " <= " * lo * " and " * hi * " <= " * last * "):")
         ctx.scope.indent += 1
     end
-    valid = _PyVal("((" * row.code * " >= 1) & (" * row.code * " <= " * rows * "))", Bool)
-    _jax_masked_check(ctx, valid, repr("BoundsError: row exceeds array dimensions"))
+    valid = _PyVal("((" * index.code * " >= " * first * ") & (" * index.code * " <= " * last * "))", Bool)
+    _jax_masked_check(ctx, valid, repr(message))
     interval === nothing || (ctx.scope.indent -= 1)
 end
+
+# Recover a bound for the offset using the same primitive integer operations
+# that the scalar emitter produced. Other expressions stay inside the loop.
+function _jax_copy_integer(ctx, ex, operands)
+    ex isa Int && return _jax_literal(ex)
+    ex isa Symbol && return get(operands, ex, nothing)
+    Meta.isexpr(ex, :call) && first(ex.args) in (:+, :-, :*) || return nothing
+    args = map(x -> _jax_copy_integer(ctx, x, operands), ex.args[2:end])
+    any(isnothing, args) && return nothing
+    _jax_call(ctx, getfield(Base, first(ex.args)), _PyVal[args...])
+end
+
+function _jax_copy_offset(ctx, index, var)
+    Meta.isexpr(index, :call) && last(index.args) === var &&
+        _jax_map_scalar_expr(ctx, index, Set([var])) || return nothing
+    # Translate through the ordinary scalar dispatch, including wrappers.
+    # Only a pure sum ending in the induction variable is a contiguous copy.
+    scope = _JaxScope(ctx.scope)
+    inner = _JaxContext(ctx.mod, scope, ctx.recipe, ctx.source_module, copy(ctx.locals), ctx.captures)
+    inner.traced_branches = ctx.traced_branches
+    item = _jax_identifier(scope.used, :copy_index)
+    inner.locals[var] = _PyVal(item, Int)
+    before = _JAX_EFFECTS[]
+    result = _jax_expr(inner, index)
+    result.T === Int && isempty(scope.lines) && _JAX_EFFECTS[] == before || return nothing
+    parsed = Meta.parse(result.code; raise=false)
+    Meta.isexpr(parsed, :call) && length(parsed.args) >= 3 &&
+        first(parsed.args) === :+ && last(parsed.args) === Symbol(item) || return nothing
+    terms = parsed.args[2:end-1]
+    operands = Dict(Symbol(v.code) => v for v in values(ctx.locals) if v.T === Int)
+    _jax_copy_integer(ctx, length(terms) == 1 ? only(terms) : Expr(:call, :+, terms...), operands)
+end
+
 # Resolve the authored comparison through the normal scalar emitter. A wrapper
 # can implement Base's comparison too. Only a single pure comparison of the
 # entry against zero qualifies, including the semantics of unordered values.
@@ -288,8 +320,8 @@ function _jax_signed_map(ctx, i, body, lo, hi)
     _PyVal("None", Nothing, true)
 end
 
-# Copy an aligned prefix, fill a diagonal, or copy a vector into one row of
-# a privately allocated matrix. Match the store before emitting any code.
+# Copy an aligned prefix, fill a diagonal, or write a contiguous strip into
+# a privately allocated array. Match the store before emitting any code.
 function _jax_prefix_store(ctx, var, body, hi)
     hi.T isa Type && hi.T <: Integer && hi.T !== Bool || return nothing
     vars = Symbol[var]
@@ -322,10 +354,11 @@ function _jax_prefix_store(ctx, var, body, hi)
     dest = get(ctx.locals, name, nothing)
     _jax_plain_copy_array(ctx, dest) && ndims(dest.T) == length(indices) || return nothing
     frame = _jax_frame()
-    private = frame !== nothing && name in frame.private_matrices &&
+    private = frame !== nothing && name in frame.private_arrays &&
         hi.T === Int && isprimitivetype(eltype(dest.T))
     shape_width && !private && return nothing
     row = nothing
+    offset = nothing
     diagonal = length(vars) == 1 && indices == [var, var] &&
         rhs isa Number && typeof(rhs) === eltype(dest.T)
     if diagonal
@@ -346,6 +379,10 @@ function _jax_prefix_store(ctx, var, body, hi)
         if indices == vars
             bounds = [stop * " <= " * v.code * ".shape[" * string(ax - 1) * "]"
                       for (ax, stop) in enumerate(stops) for v in (dest, src)]
+        elseif private && length(vars) == length(indices) == 1 && source !== name
+            offset = _jax_copy_offset(ctx, only(indices), var)
+            offset === nothing && return nothing
+            bounds = [hi.code * " <= " * v.code * ".shape[0]" for v in (src, dest)]
         else
             private && length(vars) == 1 && length(indices) == 2 &&
                 indices[2] === var && indices[1] !== var || return nothing
@@ -374,11 +411,18 @@ function _jax_prefix_store(ctx, var, body, hi)
         ctx.scope.indent -= 1
     end
     _jax_emit!(ctx, "elif " * join(bounds, " and ") * ":")
-    if row === nothing
+    if offset !== nothing
+        ctx.scope.indent += 1
+        _jax_check_copy_index!(ctx, offset, "0", dest.code * ".shape[0] - " * hi.code,
+                               "BoundsError: block exceeds array dimensions")
+        _jax_emit!(ctx, result * " = jax.lax.dynamic_update_slice(" * dest.code * ", " * value *
+            ", (" * offset.code * ",))")
+        ctx.scope.indent -= 1
+    elseif row === nothing
         _jax_emit!(ctx, "    " * result * " = " * dest.code * ".at[" * selection * "].set(" * value * ")")
     else
         ctx.scope.indent += 1
-        _jax_check_copy_row!(ctx, row, dest)
+        _jax_check_copy_index!(ctx, row, "1", dest.code * ".shape[0]", "BoundsError: row exceeds array dimensions")
         offset = _jax_minus_one(row)
         _jax_emit!(ctx, result * " = jax.lax.dynamic_update_slice(" * dest.code * ", " *
             src.code * "[None, :" * hi.code * "], (" * offset * ", jnp.zeros_like(" * offset * ")))")
