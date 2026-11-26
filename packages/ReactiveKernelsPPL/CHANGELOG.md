@@ -21,6 +21,8 @@ are recorded in the git history only.
 - Model export accepts `jax_source(built, plan; plate_layout = :chains)` for
   samplers that batch independent chains. Python callers use the existing
   `prepare_data` and `log_density` entry points.
+- With `plate_layout = :groups`, an exported model with eligible ragged
+  plates exposes `prepare_plate_layout` and `select_plate_layout`.
 
 ## 0.1.262
 

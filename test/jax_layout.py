@@ -84,11 +84,33 @@ for module, data, expected in ((walk, walk_data(), float(sys.argv[2])),
             v, g = batched(module, chosen)(positions)
             np.testing.assert_allclose(v, values, rtol=1e-12, atol=1e-14)
             np.testing.assert_allclose(g, gradients, rtol=1e-12, atol=1e-14)
-    # The layout is static under `jax.jit` with the prepared data as arguments.
+    # The layout can be passed with the prepared data to a jitted function.
     chosen = module.prepare_plate_layout(data, 3)
     as_arguments = jax.jit(module.kernel)
     np.testing.assert_allclose(as_arguments(0.6, **chosen), values[0], rtol=1e-12)
     np.testing.assert_allclose(as_arguments(0.6, **data), values[0], rtol=1e-12)
+
+# A new permutation of the same group shapes reuses the trace. The row
+# values depend on their position, so reusing a stale permutation changes
+# the answer as well.
+traces = []
+
+@jax.jit
+def grouped_rows(a, prepared):
+    traces.append(1)
+    return rows.kernel(a, **prepared)
+
+
+for lengths in ([2, 4, 9], [9, 2, 4]):
+    data = rows_data(lengths=lengths)
+    chosen = rows.prepare_plate_layout(data, 2)
+    np.testing.assert_allclose(grouped_rows(0.6, chosen), rows.kernel(0.6, **data), rtol=1e-12)
+assert len(traces) == 1
+
+# A selected row can belong to a branch that will stay idle. Preparation
+# leaves its invalid selector for the program's own checked execution.
+invalid = dict(index_data(), units=np.array([1, len(LENGTHS) + 1]))
+assert index.prepare_plate_layout(invalid, 2)["_rk_plate_layout"]["sums_cell"] is None
 
 # Units of one length have one group, which is the plate as one batch.
 even = rows_data(1, [4, 4, 4])
@@ -158,14 +180,21 @@ np.testing.assert_allclose(batched(walk, best)(positions)[0], batched(walk, data
 # any other failure is the caller's to see.
 def scarce(data, count):
     if data["_rk_plate_layout"]["totals_cell"] is None:
-        raise RuntimeError("RESOURCE_EXHAUSTED: out of memory")
+        # A later repetition fails after one successful timed step.
+        remaining = iter([0, 0])
+        def step():
+            if next(remaining, None) is None:
+                raise RuntimeError("RESOURCE_EXHAUSTED: out of memory")
+            return 0
+        return step
     return make_step(data, count)
 
 
 _, report = walk.select_plate_layout(data, scarce, chains=(2, 4, 8),
-                                     candidates=[(1, False), (3, False)], repeats=1)
+                                     candidates=[(1, False), (3, False)], repeats=2)
 padded = [row for row in report if row["groups"] == 1]
 assert len(padded) == 1 and padded[0]["chains"] == 2 and padded[0]["error"] is not None
+assert math.isinf(padded[0]["seconds"])
 assert report[0]["groups"] == 3 and report[-1] is padded[0]
 
 

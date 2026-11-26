@@ -335,7 +335,7 @@ end
 # every step rescanning every remaining recipe, which made ordering quadratic.
 # A `withheld` value is never made available (`_prune_ungroundable_candidates!`).
 function _executable_prefix(g::Graph, selected::Vector{Int}, have::Set{ValueId};
-                            withheld::Union{Nothing,ValueId} = nothing)
+                            withheld::Union{Nothing,ValueId} = nothing, recipes = g.recipes)
     available = copy(have)
     missing = Dict{Int,Int}()
     waiting = Dict{ValueId,Vector{Int}}()
@@ -343,7 +343,7 @@ function _executable_prefix(g::Graph, selected::Vector{Int}, have::Set{ValueId};
     for rid in selected
         haskey(missing, rid) && continue
         count = 0
-        for input in g.recipes[rid].inputs
+        for input in recipes[rid].inputs
             cid = canon_id(g, input.id)
             cid in available && continue
             readers = get!(Vector{Int}, waiting, cid)
@@ -358,7 +358,7 @@ function _executable_prefix(g::Graph, selected::Vector{Int}, have::Set{ValueId};
     while !isempty(ready)
         rid = _heap_pop!(ready)
         push!(order, rid)
-        for output in g.recipes[rid].outputs
+        for output in recipes[rid].outputs
             cid = canon_id(g, output.id)
             cid == withheld && continue
             cid in available && continue
@@ -403,8 +403,8 @@ function _heap_pop!(heap::Vector{Int})
 end
 
 # Full-plan validation still requires every selected recipe to execute.
-function _topo(g::Graph, selected::Vector{Int}, have::Set{ValueId})
-    order, _ = _executable_prefix(g, selected, have)
+function _topo(g::Graph, selected::Vector{Int}, have::Set{ValueId}; recipes = g.recipes)
+    order, _ = _executable_prefix(g, selected, have; recipes)
     length(order) == length(selected) ? order : nothing
 end
 

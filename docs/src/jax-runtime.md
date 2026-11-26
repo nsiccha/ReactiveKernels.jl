@@ -110,14 +110,17 @@ chosen, report = module.select_plate_layout(prepared, make_step, chains=(256, 10
 ```
 
 `GROUPED_PLATES` names the plates that take a layout, each with the prepared
-row lengths that group its units. A plate qualifies when it maps a prepared
-ragged vector of numeric rows, or when its cell reads its unit's row from a
-shared prepared ragged vector at the plate's own prepared index
-(`plate(units, Ref(rows)) do i, rows; rows[i] ... end`); that read is cut to
-the group's width in the cell. Any other row keeps its stored width. A layout
-is a `PlateLayout`, static under `jax.jit`, so the functions also jit with the
-prepared data as arguments. The number of groups is the caller's argument: a
-trace holds one copy of the plate per group, whatever the data's lengths.
+row lengths that group its units. A plate can group numeric rows with
+prepared lengths, including computed rows that inherit the lengths of
+`rows[i]` from a prepared index. A cell that reads `rows[i]` directly
+can also use the selected group's width. When a mapped numeric row or a
+recorded row read has unknown lengths, the plate keeps its full widths so
+that nested operations over paired rows see compatible axes.
+A jitted function can take the prepared data as arguments. The member
+indices and the permutation that restores the output order are array inputs.
+Reordering units with the same group shapes reuses the compiled function.
+Each selected group contributes one plate body to the trace, up to the
+caller's group limit.
 
 ## Chains under `vmap`
 
