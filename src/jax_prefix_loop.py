@@ -6,6 +6,11 @@ try:
     from jax.experimental import hijax as _rk_loop_ad
 except ImportError:
     _rk_loop_ad = None
+else:
+    # HiJAX is experimental. Older releases may expose only part of this API.
+    if not all(hasattr(_rk_loop_ad, name) for name in
+               ("HiPrim", "Zero", "linearize_from_jvp", "instantiate_zeros", "vmap_rule", "unmap_avals")):
+        _rk_loop_ad = None
 
 
 if _rk_loop_ad is not None:

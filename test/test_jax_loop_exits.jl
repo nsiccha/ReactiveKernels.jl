@@ -77,6 +77,7 @@ end
             write(script, raw"""
 from functools import partial
 from unittest.mock import patch
+import importlib
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -100,8 +101,6 @@ np.testing.assert_allclose(power(x), [0.3**3, 0.5**5])
 with jax.checking_leaks():
     got = jax.grad(lambda xs: jax.vmap(powers.power)(xs).sum())(x)
 np.testing.assert_allclose(got, [3*0.3**2, 5*0.5**4])
-with patch.object(powers, "_rk_loop_ad", None):
-    np.testing.assert_allclose(jax.grad(powers.power)(0.3), 3*0.3**2)
 try:
     from jax.experimental import pallas
     from jax.experimental.pallas import triton
@@ -132,6 +131,12 @@ if exits._rk_loop_ad is not None:
         result = jax.block_until_ready(count(last))
         jax.effects_barrier()
         assert visits == indices and result[1] == sum(indices), (visits, result)
+
+# An older JAX with only part of the HiJAX API still imports this module.
+with patch.object(jax.experimental, "hijax", object(), create=True):
+    importlib.reload(powers)
+    assert powers._rk_loop_ad is None
+    np.testing.assert_allclose(jax.grad(powers.power)(0.3), 3*0.3**2)
 """)
             @test success(`$RK_JAX_PYTHON $script`)
         end
