@@ -147,3 +147,32 @@ end
         (r"(?m)^\s*def ", "jax.vmap(", "jax.lax.cond(", "jax.lax.fori_loop(")]
     @test structure(texts[1]) == structure(texts[2]) == structure(texts[3])
 end
+
+@testset "LKJ row products in a bound lower or upper sampler factor" begin
+    for (K, uplo) in ((1, 'L'), (3, 'U'), (8, 'L'))
+        model = lower_rkppl(quote
+            L ~ LKJCholesky(K, eta, $uplo)
+            y ~ Normal(sum(L .* weights), 0.7)
+        end, (:K, :eta, :weights, :y); conditioned = (:y,))
+        raw = (; K, eta = 1.5, weights = reshape(sin.(1:K^2), K, K), y = 0.3)
+        bound = bind_data(model, Dict(pairs(raw)))
+        built = build_kernel(bound)
+        u = 0.2 .* cos.(1:built.layout.total)
+        native = prepare_query(built, bound, :sampler)
+        direction = sin.(eachindex(u))
+        h = 1e-5
+        deriv = (Base.invokelatest(native, u + h * direction) -
+                 Base.invokelatest(native, u - h * direction)) / (2h)
+        for layout in (:padded, :groups)
+            src = jax_source(built, bound; plate_layout = layout)
+            @test occursin("jax.lax.scan(advance", src.text)
+            if rk_jax_available()
+                names = first.(only(f for f in src.functions if f.name == "prepare_data").inputs)
+                data = Tuple(getproperty(raw, Symbol(n)) for n in names)
+                got = rk_jax_evaluate(src, :log_density, (u, data...); grad = true, prepare = :arguments)
+                @test got.value ≈ Base.invokelatest(native, u) atol = 2e-12
+                @test sum(got.grad .* direction; init = 0.0) ≈ deriv atol = 2e-8
+            end
+        end
+    end
+end
