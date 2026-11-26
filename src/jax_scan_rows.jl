@@ -311,5 +311,8 @@ function _jax_scan_row_inputs!(ctx, inner, rows, unpack, seqs, width, extent, pu
     end
     inner.lines .= [replace(line, _JAX_HISTORY_TOKENS => word -> get(replacements, word, word))
                     for line in inner.lines]
-    !isempty(checks)
+    # A retained checked read (`_jax_scan_plate_read`) can raise in its step.
+    retained = count(r -> r.checked_fallback && replacements[r.token] == r.fallback, reads)
+    _JAX_EFFECTS[] += retained
+    retained > 0 || !isempty(checks)
 end

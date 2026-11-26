@@ -422,6 +422,7 @@ struct _JaxScanRowRead
     index::String
     guard::String
     fallback::String
+    checked_fallback::Bool
 end
 
 struct _JaxScanRowInputs
@@ -3672,6 +3673,13 @@ _jax_rejects(mod) = haskey(mod.helper_names, (:helper, "_rk_reject"))
 # instead of an error.
 function _jax_masked_check(ctx::_JaxContext, valid::Union{Nothing,_PyVal}, message::AbstractString;
                            reject::Bool = false)
+    _jax_emit!(ctx, _jax_masked_check_expr(ctx, valid, message; reject))
+    _JAX_EFFECTS[] += 1
+    nothing
+end
+# The call `_jax_masked_check` emits, as an expression.
+function _jax_masked_check_expr(ctx::_JaxContext, valid::Union{Nothing,_PyVal}, message::AbstractString;
+                                reject::Bool = false)
     guards = String[]
     for (scope, guard) in _JAX_GUARDS
         _jax_scope_within(ctx.scope, scope) || _jax_error(
@@ -3692,9 +3700,7 @@ function _jax_masked_check(ctx::_JaxContext, valid::Union{Nothing,_PyVal}, messa
     end
     name = reject ? _jax_helper!(ctx, "_rk_reject", _JAX_REJECT) :
         _jax_helper!(ctx, "_rk_check", _JAX_CHECK)
-    _jax_emit!(ctx, name * "(" * held * ", " * message * ")")
-    _JAX_EFFECTS[] += 1
-    nothing
+    name * "(" * held * ", " * message * ")"
 end
 # `jnp.logical_not` of `code`, cancelling a negation `code` already is (the
 # mask of an `else` arm, whose guard is the negated condition).
@@ -9151,12 +9157,24 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
         plan = _jax_chain_output(ctx, want, cell_scope, cell_params, args, axes, field_lengths, row_layouts)
         if plan !== nothing
             layouts, dtypes, guards = plan
-            for layout in unique(guards)
-                _jax_call(ctx, _runtime_check, [_PyVal(layout * " is not None", Bool, true),
-                    _PyVal(repr("DimensionMismatch: incompatible cell result lengths"), DimensionMismatch)])
+            message = repr("DimensionMismatch: incompatible cell result lengths")
+            report = ""
+            if isempty(guards) || ctx.host !== nothing
+                for layout in unique(guards)
+                    _jax_call(ctx, _runtime_check, [_PyVal(layout * " is not None", Bool, true),
+                        _PyVal(message, DimensionMismatch)])
+                end
+            else
+                # A missing layout means some subject's result lengths are
+                # incompatible. Julia can report an earlier subject's failure
+                # first, so the collector checks the layout after every cell.
+                # Like the static guard it replaces, this check depends only
+                # on the prepared layout and is not counted as a suffix effect.
+                report = ", report=lambda valid: " *
+                         _jax_masked_check_expr(ctx, _PyVal("valid", Bool), message)
             end
             call = "_rk_collect_rows(" * join((cell, _jax_chain_tuple(args), axes_text,
-                                                layouts, dtypes), ", ") * ")"
+                                                layouts, dtypes), ", ") * report * ")"
         else
             empty!(row_layouts)
         end
@@ -9432,7 +9450,19 @@ function _jax_scan_plate_read(ctx, x, i)
     end
     if guard !== nothing
         token = _jax_named_function(ctx, :scan_read; private = true)
-        push!(ctx.scope.scan_rows.reads, _JaxScanRowRead(token, x, i.code, guard, code))
+        rows = ctx.scope.scan_rows
+        checked = ctx.mod.layout === :chains && rows.padded && rows.direct_bounds === nothing
+        if checked
+            # A read that stays in its original step must still check the
+            # logical row. Keep its lexical branch mask with its fallback.
+            length_code = isempty(x.extent) ? _py_atom(_jax_mapped_array(x)) * ".shape[0]" : x.extent
+            valid = "((" * i.code * " >= 1) & (" * i.code * " <= " * length_code * "))"
+            check = _jax_masked_check_expr(ctx, _PyVal(valid, Bool), repr("BoundsError: index outside subject row"))
+            _jax_helper!(ctx, "_RKChainRows", _JAX_CHAIN_ROWS)
+            entry = "_rk_row_entry(" * join((x.code, i.code, length_code), ", ") * ")"
+            code = "(" * check * ", " * entry * ")[1]"
+        end
+        push!(rows.reads, _JaxScanRowRead(token, x, i.code, guard, code, checked))
         # Keep its original evaluation site if the completed step has effects.
         entry = _jax_fresh(ctx, cell !== nothing ? :plate_entry : :table_entry)
         _jax_emit!(ctx, entry * " = " * token)
