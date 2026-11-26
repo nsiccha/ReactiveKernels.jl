@@ -26,9 +26,13 @@ When each row of a numerical plate sums an inner plate, `prepare_data` can
 group entries across rows by conditions on the bound data. It records row and
 column positions for the actual entries. The compiled function evaluates the
 selected arms and sums the values in their original rows. Shared scalar
-parameters and unresolved comparisons stay in the compiled function. One
-emitted module serves different row lengths and branch decisions. Changing
-the number of entries in a group can trigger recompilation by JAX.
+parameters and unresolved comparisons stay in the compiled function.
+The compiled function can batch straight-line arithmetic across a group.
+When a live condition guards that arithmetic, all visits and mapped chains
+must select the same arm to take the parallel path. Mixed decisions use
+the scalar cell. The same emitted module serves different row lengths and
+branch decisions. Changing the number of entries in a group can trigger
+recompilation by JAX.
 
 ## Local helpers
 

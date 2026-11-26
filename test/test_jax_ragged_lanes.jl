@@ -47,6 +47,7 @@ end
             program = "import numpy as np\ncases = [" * join(arguments, ", ") * "]\n"
             write(joinpath(dir, "check.py"), program * raw"""
 import fixed, live, jax, numpy as np
+import jax.numpy as jnp
 from collections import Counter
 
 def inventory(jaxpr):
@@ -64,6 +65,29 @@ def inventory(jaxpr):
             for v in item: count(v)
     count(jaxpr)
     return result
+
+# A live guard selects a logarithm or a square root. Exercise both uniform
+# arms and a mixed group, including outer chains whose choices disagree.
+def guarded(x, center):
+    return jax.lax.cond(x > center, lambda: jnp.log(x - center),
+                        lambda: jnp.sqrt(center - x))
+
+def grouped(xs, center):
+    return live._rk_ragged_group(guarded, (xs, jnp.broadcast_to(center, xs.shape))).sum()
+
+def scalar(xs, center):
+    return jax.lax.map(lambda x: guarded(x, center), xs).sum()
+
+def density_and_derivatives(f):
+    return jax.jit(jax.vmap(jax.value_and_grad(f, (0, 1)), in_axes=(0, None)))
+
+parallel_vg, scalar_vg = map(density_and_derivatives, (grouped, scalar))
+positive = np.array([[1.5, 2., 3.], [4., 1.25, 2.25]])
+for xs in (positive, -positive, positive * [[1.], [-1.]],
+           positive * [[1., -1., 1.], [-1., 1., -1.]]):
+    for a, b in zip(jax.tree.leaves(parallel_vg(xs, 0.5)), jax.tree.leaves(scalar_vg(xs, 0.5))):
+        assert np.isfinite(a).all()
+        np.testing.assert_allclose(a, b, rtol=2e-12, atol=2e-12)
 
 for module in (fixed, live):
     vg = jax.value_and_grad(module.score)

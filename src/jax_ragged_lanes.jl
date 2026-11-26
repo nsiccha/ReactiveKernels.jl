@@ -91,6 +91,80 @@ function _jax_ragged_lane_prefix(ctx, op, inputs, mapped, condition)
     [groups; [_PyVal(s, Vector{Int}, true) for s in (rows, cols, lengths)]]
 end
 
+const _JAX_RAGGED_GROUP = raw"""
+def _rk_ragged_group(cell, operands):
+    def serial():
+        return jax.lax.map(lambda values: cell(*values), operands)
+
+    try:
+        from jax.extend.core import ClosedJaxpr, Literal, jaxpr_as_fun
+    except ImportError:
+        return serial()
+
+    # Only elementwise arithmetic can enter the parallel path. A jit call
+    # has the same proof obligation as its caller.
+    elementwise = {
+        "abs", "add", "and", "broadcast_in_dim", "convert_element_type",
+        "div", "eq", "exp", "expm1", "ge", "gt", "integer_pow", "le",
+        "log", "log1p", "lt", "max", "min", "mul", "ne", "neg", "not",
+        "or", "pow", "select_n", "sqrt", "square", "sub", "tanh",
+    }
+    def straight_line(equations):
+        for eq in equations:
+            if eq.effects:
+                return False
+            if eq.primitive.name == "jit":
+                if not straight_line(eq.params["jaxpr"].eqns):
+                    return False
+            elif eq.primitive.name not in elementwise:
+                return False
+        return True
+
+    # Each group here is nonempty. Trace the element types, including JAX's
+    # weak scalar types, with the same operands that the cell actually sees.
+    closed = jax.make_jaxpr(cell)(*(x[0] for x in operands))
+    graph = closed.jaxpr
+    equations = graph.eqns
+    if closed.effects:
+        return serial()
+    if straight_line(equations):
+        return jax.vmap(cell)(*operands)
+
+    # A common support check can surround most of the work in a group.
+    # Evaluate its original prefix on all visits. Specialize an arm only
+    # when every visit and outer mapped chain takes it.
+    branches = [k for k, eq in enumerate(equations) if eq.primitive.name == "cond"]
+    if len(branches) != 1:
+        return serial()
+    k, = branches
+    branch = equations[k]
+    arms = branch.params["branches"]
+    before, after = equations[:k], equations[k + 1:]
+    if (len(arms) != 2 or "branches_platforms" in branch.params
+            or not straight_line(before) or not straight_line(after)):
+        return serial()
+    parallel = [i for i, arm in enumerate(arms) if straight_line(arm.eqns)]
+    if not parallel:
+        return serial()
+
+    def evaluate(program):
+        f = jaxpr_as_fun(ClosedJaxpr(program, closed.consts))
+        return jax.vmap(f)(*operands)[0]
+
+    which = branch.invars[0]
+    decisions = evaluate(graph.replace(eqns=before, outvars=[which]))
+    def choose(pos):
+        if pos == len(parallel):
+            return serial()
+        i = parallel[pos]
+        literal = Literal(np.asarray(i, dtype=which.aval.dtype), which.aval)
+        fixed = branch.replace(invars=[literal, *branch.invars[1:]])
+        program = graph.replace(eqns=[*before, fixed, *after])
+        return jax.lax.cond(_rk_any_active(decisions != i),
+                            lambda: choose(pos + 1), lambda: evaluate(program))
+    return choose(0)
+"""
+
 # Prepared coordinates cover the broadcast domain of the DATA columns. A
 # live row can broadcast from one entry or expand a singleton data row. In
 # the latter case use the prepared decision of that row at every expanded
@@ -106,12 +180,12 @@ def _rk_ragged_lane_sum(cells, entries, groups, rows, cols, data_lengths, length
     def at_position(cell):
         return lambda pos: jnp.asarray(cell(*entries(pos)), dtype=dtype)
     # A zero-occupancy pattern has no reachable cell, including under switch.
-    active = [(at_position(cell), group) for cell, group in zip(cells, groups) if group.size]
+    active = [(cell, group) for cell, group in zip(cells, groups) if group.size]
     def grouped():
         values = jnp.zeros((nrow, width), dtype=dtype)
         for cell, group in active:
             r, c = rows[group], cols[group]
-            part = jax.lax.map(cell, (r, c))
+            part = _rk_ragged_group(cell, jax.vmap(entries)((r, c))).astype(dtype)
             values = values.at[r, c].set(part)
         return jnp.sum(values, axis=1)
 
@@ -124,7 +198,7 @@ def _rk_ragged_lane_sum(cells, entries, groups, rows, cols, data_lengths, length
             source = 0 if data_lengths.size == 1 else r
             pattern = patterns[source, jnp.where(data_lengths[source] == 1, 0, c)]
             return jax.lax.cond(c < lengths[r],
-                                lambda: jax.lax.switch(pattern, [cell for cell, _ in active], (r, c)),
+                                lambda: jax.lax.switch(pattern, [at_position(cell) for cell, _ in active], (r, c)),
                                 lambda: jnp.zeros((), dtype=dtype))
         terms = jax.lax.map(position, jnp.arange(nrow * width))
         return jnp.sum(terms.reshape(nrow, width), axis=1)
@@ -217,6 +291,8 @@ function _jax_ragged_lane_sum(ctx, p, op, inputs)
         valid = _PyVal("jnp.all($counts >= 0)", Bool)
         _jax_call(ctx, _runtime_check, [valid, _PyVal(repr("incompatible ragged plate axes"), DimensionMismatch)])
     end
+    _jax_helper!(ctx, "_rk_any_active", _JAX_ANY_ACTIVE)
+    _jax_helper!(ctx, "_rk_ragged_group", _JAX_RAGGED_GROUP)
     run = _jax_helper!(ctx, "_rk_ragged_lane_sum", _JAX_RAGGED_LANE_SUM)
     [_PyVal("$run((" * join(cells, ", ") * ",), $entries, ($groups,), $rows, $cols, " *
             "$bound, $counts, $widths, " * _jax_dtype(E) * ")", Vector{E})]
