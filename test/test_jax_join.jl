@@ -103,7 +103,7 @@ end
     data = (; x = [1.0, 2.0], y = [3.0, 4.0])
     prep = jax_source(jax_joined_preparation; have = prep_have, want = :result, data)
     provider = jax_source(jax_joined_preparation; have = prep_have, want = :result)
-    @test [f.name for f in prep.functions] == ["prepare_data", "kernel"]
+    @test [f.name for f in prep.functions] == rk_jax_prepared_names("kernel")
     for n in (0, 1, 19)
         x, y = collect(1.0:n), fill(2.0, n)
         @test native(x, y) == sum(x + y)

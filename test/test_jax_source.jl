@@ -1566,7 +1566,7 @@ end
     y = [1, 3, 2, 0, 3, 1]
     src = jax_source(jax_prep; have = (:theta, :g, :y), want = :total, data = (; g, y))
     text = string(src)
-    @test [f.name for f in src.functions] == ["prepare_data", "kernel"]
+    @test [f.name for f in src.functions] == rk_jax_prepared_names("kernel")
     @test first.(src.functions[1].inputs) == ["g", "y"]
     @test first(first.(src.functions[2].inputs)) == "theta"
     # The preparation is host code with real loops; the function is JAX code.
@@ -1592,7 +1592,9 @@ end
     labels_c = ["s1", "s2", "s3", "s4"]
     partition = jax_source(jax_prep_partition; have = (:a, :groups, :cells), want = :total,
                            data = (; groups = labels_g, cells = labels_c))
-    @test occursin(r"rows\w*\[i\w* - 1\]\[counts\w*\[i\w* - 1\] - 1\] = r", string(partition))
+    # The partition fills its owned nested row directly. Index conversion
+    # may check Julia's lower bound on the way to the NumPy store.
+    @test occursin(r"(?m)^ +rows\w*\[.+\]\[.*counts\w*\[.+\].*\] = r\w*$", string(partition))
     @test !occursin("_rk_deepcopy", string(partition))
     rescaled = jax_source(jax_prep_rescaled; have = (:a, :R), want = :total, data = (; R))
     @test occursin(r"rows\w* = _rk_deepcopy_np\(rows\w*\)", string(rescaled))
@@ -1881,7 +1883,7 @@ end
     device_part = split(text, "\ndef kernel")[2]
     # `prepare_data` computes them in a loop over the cells; the plate reads
     # each cell's values as ragged inputs of its own.
-    @test occursin(r"\[cell_data\w*\(element\w*\) for element\w* in X\]", host_part)
+    @test occursin(r"cell_data\w*\(element\w*, element\w*\) for element\w*, element\w* in _rk_plate_rows_np\(X, Y\)", host_part)
     @test all(n -> haskey(src.prepared, n), (:levels, :idx))
     @test occursin("\"levels_lengths\"", host_part) && occursin("\"idx_lengths\"", host_part)
     @test !occursin("_np(", device_part)
@@ -1889,7 +1891,7 @@ end
     both = jax_source(jax_cell_order; have = (:k, :X, :Y), data = (; X, Y),
                       functions = (total = :total, per = :per))
     @test count("def cell_data", string(both)) == 1
-    @test [f.name for f in both.functions] == ["prepare_data", "total", "per"]
+    @test [f.name for f in both.functions] == rk_jax_prepared_names("total", "per")
     # Over the group index, the gathered rows: the gather stays in the cell
     # (the host also computes it, for the recipes it feeds).
     x = [0.5, 1.0, 2.0, 3.0, 0.25]
@@ -2516,7 +2518,7 @@ end
 @testset "jax_source: a throw that depends on data is a masked runtime check" begin
     ternary = string(jax_source(jax_throw_ternary; have = (:x, :s), want = :total))
     @test occursin("_rk_check(s >= 0, \"scale must be nonnegative\")", ternary)
-    @test !occursin("jax.lax.cond(", ternary)
+    @test !occursin("jax.lax.cond(", last(split(ternary, "\ndef kernel(")))
     cells = string(jax_source(jax_throw_cells; have = (:x, :r, :s), want = :total))
     # The cell's check holds for lanes that take either outer arm.
     @test occursin("_rk_check(jnp.logical_not(jnp.logical_and(", cells)
@@ -2641,7 +2643,7 @@ register_source_provider!(jax_test_provider)
         device = jax_source(jax_generated_prep;
             have = (:theta, :x), want = :total)
         prep = jax_source(jax_generated_prep; have = (:theta, :x), want = :total, data = (; x))
-        @test [f.name for f in prep.functions] == ["prepare_data", "kernel"]
+        @test [f.name for f in prep.functions] == rk_jax_prepared_names("kernel")
         # The method is a host helper that `prepare_data` calls.
         text = string(prep)
         helper = split(split(text, "def _jax_test_first_at_np(")[2], "\n\n\n")[1]
@@ -2756,7 +2758,7 @@ end
     have = (:a, :x)
     x = reshape(collect(1.0:6.0), 2, 3)
     prep = jax_source(jax_dimension_prep; have, want = :result, data = (; x))
-    @test [f.name for f in prep.functions] == ["prepare_data", "kernel"]
+    @test [f.name for f in prep.functions] == rk_jax_prepared_names("kernel")
     try
         JAX_PROVIDER_MODE[] = :on
         provider = jax_source(jax_dimension_provider; have = (:a, :x, :reference), want = :result)

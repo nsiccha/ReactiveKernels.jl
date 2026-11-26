@@ -95,7 +95,7 @@ end
     native = prepare(jax_scan_record_table; have, want = :total)
     src = jax_source(jax_scan_record_table; have, want = :total, data = (:keys, :orders))
     @test occursin("@_rk_table_scan_step", string(src))
-    @test occursin(r"record_entry\w* = \(", string(src))
+    @test occursin(r"record_entry\w* = _rk_record_at\(", string(src))
     if rk_jax_available()
         for orders in ([[1, 0, 2, 1], [2], Int[]], [zeros(Int, 9)], [Int[]], Vector{Int}[])
             keys = [0.25, -0.5]
@@ -148,6 +148,9 @@ end
     visits = [[2, 4, 2, 1], [1], Int[]]
     src = emit(labels, visits)
     @test occursin(r"plate_entry\w* = .*entries_cell\(", string(src))
+    chain = jax_source(jax_scan_plate_reads; have, want = :total, data = (:labels, :visits), plate_layout = :chains)
+    @test occursin("= _rk_map_rows(", string(chain))
+    @test occursin("= _rk_scan_events(", string(chain))
     if rk_jax_available()
         for (ks, js) in ((labels, visits), (reverse(labels), reverse(visits)),
                          ([fill(2, 17)], [collect(17:-1:1)]),
@@ -157,6 +160,9 @@ end
             @test r.value ≈ native(0.7, ks, js)
             # Each recurrence is linear in a, so the native unit response is its derivative.
             @test r.grad ≈ native(1.0, ks, js)
+            packed = rk_jax_evaluate(chain, "kernel", (0.7, ks, js); prepare = :arguments, grad = true)
+            @test packed.value ≈ r.value
+            @test packed.grad ≈ r.grad
         end
         mktempdir() do dir
             write(joinpath(dir, "model.py"), src)

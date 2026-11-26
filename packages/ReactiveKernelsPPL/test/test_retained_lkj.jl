@@ -181,6 +181,14 @@ end
     @test all(allequal, values(counts))
 end
 
+@testset "Prepared LKJ weights preserve the packed Jacobian sum" begin
+    K = 15
+    P = K * (K - 1) ÷ 2
+    u = [cos(0.41i) for i in 1:P]
+    weights = ReactiveKernelsPPL._ppl_lkj_weights(K, P)
+    @test ReactiveKernelsPPL._ppl_lkj_logjac(tanh.(u), weights) == lkj_chol_logjac(u, K)
+end
+
 @testset "conditioned LKJ factors retain the same diagonal prior" begin
     for K in (1, 2, 5), eta in (1.0, 2.3)
         L = lkj_chol_constrain(fill(0.2, K * (K - 1) ÷ 2), K)

@@ -90,3 +90,47 @@ end
         end
     end
 end
+
+
+# The two plates have separate axes. The location row follows the selected
+# subject, including repeats, and each of its operands can be a singleton.
+@kernel function jax_compact_row_sums(a::Float64, y::Vector{Vector{Float64}}, order::Vector{Int},
+                                      base::Vector{Vector{Float64}}, shift::Vector{Vector{Float64}})
+    location = plate(order, Ref(base), Ref(shift), Ref(a)) do k, m, u, scale
+        scale .* m[k] .+ u[k]
+    end
+    totals = plate(y, location) do obs, loc
+        terms = plate(obs, loc, a) do value, center, offset
+            offset - abs2(value - center)
+        end
+        sum(terms)
+    end
+    total = sum(totals)
+    return total, totals
+end
+
+@testset "Prepared row sums visit the broadcast of the selected rows" begin
+    have = (:a, :y, :order, :base, :shift)
+    src = jax_source(jax_compact_row_sums; have, functions = (total = :total, per_row = :totals),
+                     data = have[2:end], plate_layout = :padded)
+    @test occursin(" = _rk_padded_row_sums(", string(src))
+    native = prepare(jax_compact_row_sums; have, want = :totals)
+    base = [[1.2], [3.0, 4.0], Float64[]]
+    shift = [[0.3, 0.2], [0.4], Float64[]]
+    if rk_jax_available()
+        for (order, y) in (([2, 1, 2, 3], [[2.0], [1.0, 2.0], [3.0, 1.0], Float64[]]),
+                           ([1, 2], [[1.0]]), ([3], [Float64[]]), (Int[], Vector{Float64}[]))
+            args = (0.7, y, order, base, shift)
+            actual = rk_jax_evaluate(src, :per_row, args; prepare = :arguments).value
+            expected = native(args...)
+            @test length(actual) == length(expected) && all(isapprox.(actual, expected))
+            joint = rk_jax_evaluate(src, :total, args; grad = :joint, prepare = :arguments)
+            @test joint.joint_value ≈ sum(expected)
+            # A quadratic has this exact derivative, including when the broadcast is empty.
+            @test joint.grad ≈ (sum(native(1.7, args[2:end]...)) -
+                                sum(native(-0.3, args[2:end]...))) / 2 atol = 1e-12
+        end
+        @test_throws ErrorException rk_jax_evaluate(src, :total,
+            (0.7, [[1.0, 2.0, 3.0]], [1], base, shift); prepare = :arguments)
+    end
+end

@@ -144,7 +144,8 @@ end
     have = (:a, :x, :S)
     sources = [jax_source(named_retained; have, want = :total, data) for data in cases]
     @test all(src -> src.text == first(sources).text, sources)
-    @test count(==("named_second_field"), pydefs(first(sources).text)) == 1
+    # This cell helper can close over its tuple and its prepared field lengths.
+    @test count(r"(?m)^[ \t]*def named_second_field\(", first(sources).text) == 1
     if rk_jax_available()
         for data in cases
             r = rk_jax_evaluate(first(sources), :kernel, (0.4, data.x, data.S);

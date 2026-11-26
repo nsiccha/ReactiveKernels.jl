@@ -5,7 +5,7 @@
 # one module serves every binding of the same program.
 
 """
-    jax_source(built, plan; values = (), doc = nothing, float_type = Float64) -> JAXSource
+    jax_source(built, plan; values = (), doc = nothing, float_type = Float64, plate_layout = nothing) -> JAXSource
 
 A Python module for the `build_kernel` output `built`, evaluating the program
 with `jax.numpy` over the sampler boundary: the packed unconstrained
@@ -27,6 +27,17 @@ parameters, then the prepared data. Its functions:
   returned once). A submodel's values are nested under its name, as native
   `constrain(layout, u)` nests them, and the value of a submodel call `e` whose
   name holds other values is under `return` there: `constrain(u, **p)["e"]["return"]`.
+
+`plate_layout = :groups` lets the Python caller group a plate's prepared
+ragged rows by length. In a module with eligible plates, pass
+`prepare_plate_layout(prepared, groups=4)` to the density functions in place
+of `prepared`.
+
+For independent chains, `plate_layout = :chains` selects sequential plate evaluation
+and packed variable-length vector rows at export time. Prepare the data once
+and batch gradients over the unconstrained parameter vectors, for example
+`jax.vmap(jax.grad(lambda u: log_density(u, **prepared)))`. Row-local
+variable-length loops use Equinox for reverse-mode differentiation.
 
 With explicit integer parameters, each function takes their named state
 between `unconstrained` and the data: `log_density(u, {"k": 2}, **prepared)`.
@@ -69,16 +80,16 @@ the program in Julia's latest world: a function that builds a model and
 translates it needs no `Base.invokelatest`.
 """
 ReactiveKernels.jax_source(built::NamedTuple, plan::StructuralPlan; values = (), doc = nothing,
-                           float_type = Float64) =
+                           float_type = Float64, plate_layout = nothing) =
     # In the latest world, as `ReactiveKernels.jax_source` translates: a
     # program built in the caller's own function call has methods its world
     # does not see.
     ReactiveKernels._translate_in_latest_world(ReactiveKernels.JAXSource) do
         ReactiveKernels._jax_with_float_type(float_type) do
-            _jax_module_of(built, plan; values, doc, float_type)
+            _jax_module_of(built, plan; values, doc, float_type, plate_layout)
         end
     end
-function _jax_module_of(built, plan; values, doc, float_type, events = (;))
+function _jax_module_of(built, plan; values, doc, float_type, plate_layout = nothing, events = (;))
     built = _binding_build(built, plan)
     isbound(plan) || throw(ContractValidationError(
         "[jax] jax_source requires a bound plan (bind_data first)"))
@@ -189,7 +200,7 @@ function _jax_module_of(built, plan; values, doc, float_type, events = (;))
         # as the native sampler targets answer -Inf; `constrain` raises.
         jax_source(built.spec; have, functions, types, constants, module_docstring = module_doc, data,
                    definitions, definitions_module = PPLGeneratedModels,
-                   keep = Tuple(sizes), function_docs, float_type,
+                   keep = Tuple(sizes), function_docs, float_type, plate_layout,
                    source_regions = _jax_submodel_regions(built, plan),
                    rejecting = (:log_density, :log_prior, :log_likelihood, :log_jacobian))
     end
@@ -795,6 +806,58 @@ def _rk_ordered_constrain(u, lo, hi):
     v = u[lo - 1:hi]
     return jnp.cumsum(jnp.concatenate([v[:1], jnp.exp(v[1:])]))
 """
+# A column advances every independent row's ordered product by one partial.
+# Prepare the triangular coordinates from the shape and pass the columns as
+# scan inputs, so the reverse sweep never scatters into z from inside a round.
+const _JAX_LKJ_ROWS = """
+def _ppl_lkj_rows(z, K):
+    row, col = np.tril_indices(K, -1)
+    grid = jnp.zeros((K, K - 1), dtype=z.dtype).at[row, col].set(z)
+    def advance(product, column):
+        partial, scale = column
+        return product * scale, product * partial
+    diagonal, columns = jax.lax.scan(advance, jnp.ones(K, dtype=z.dtype),
+                                     (grid.T, jnp.sqrt(1 - grid.T ** 2)))
+    return diagonal, jnp.pad(columns.T, ((0, 0), (0, 1)))
+"""
+
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        f::Union{typeof(_ppl_lkj_lower),typeof(_ppl_lkj_upper),typeof(_ppl_lkj_diagonal)},
+        args::Vector{ReactiveKernels._PyVal})
+    K = args[end - 1]
+    (ctx.host !== nothing || !K.static) &&
+        return ReactiveKernels._jax_traceable_or_lowered(ctx, f, args)
+    rows = ReactiveKernels._jax_helper!(ctx, "_ppl_lkj_rows", _JAX_LKJ_ROWS)
+    if f === _ppl_lkj_diagonal
+        expr = rows * "(" * args[1].code * ", " * K.code * ")[0]"
+        return ReactiveKernels._PyVal(expr, Vector{Float64})
+    end
+    name = string(nameof(f))
+    body = "def " * name * "(z, diagonal, K, P):\n" *
+           "    lower = " * rows * "(z, K)[1] + jnp.diag(jnp.asarray(diagonal).at[0].set(1.0))\n" *
+           "    return " * (f === _ppl_lkj_upper ? "lower.T" : "lower")
+    helper = ReactiveKernels._jax_helper!(ctx, name, body)
+    ReactiveKernels._PyVal(helper * "(" * ReactiveKernels._jax_args(args) * ")", Matrix{Float64})
+end
+
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        f::typeof(_ppl_lkj_logjac), args::Vector{ReactiveKernels._PyVal})
+    ctx.host !== nothing && return ReactiveKernels._jax_traceable_or_lowered(ctx, f, args)
+    z, weights = (ReactiveKernels._py_atom(v.code) for v in args)
+    ReactiveKernels._PyVal("jnp.sum(" * weights * " * jnp.log(1 - " * z * " ** 2))", Float64)
+end
+
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        f::typeof(_ppl_lkj_diagonal_logprior), args::Vector{ReactiveKernels._PyVal})
+    diagonal, K, eta = args
+    (ctx.host !== nothing || !K.static) &&
+        return ReactiveKernels._jax_traceable_or_lowered(ctx, f, args)
+    terms = "(" * K.code * " - jnp.arange(2, " * K.code * " + 1) + 2 * " *
+            ReactiveKernels._py_atom(eta.code) * " - 2) * jnp.log(" *
+            ReactiveKernels._py_atom(diagonal.code) * "[1:" * K.code * "])"
+    ReactiveKernels._PyVal("jnp.sum(" * terms * ")", Float64)
+end
+
 const _JAX_SIMPLEX = """
 def _rk_simplex_constrain_logjac(u, lo, hi):
     # RKPPL stick-breaking simplex of u[lo:hi] and its log-Jacobian.
