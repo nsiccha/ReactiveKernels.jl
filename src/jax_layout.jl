@@ -282,15 +282,11 @@ def select_plate_layout(prepared: dict, make_step: Any, chains: Any = None,
     `median_seconds` once all repeats finish. With `calls`, `fit_seconds`
     gives the projected fit duration at the measured warm latency.
     \"\"\"
-    import operator
-    import time
-    if repeats < 1:
-        raise ValueError("repeats must be positive")
-    counts = (None,) if chains is None else sorted({operator.index(n) for n in chains})
-    if chains is not None and any(n <= 0 for n in counts):
-        raise ValueError("chain counts must be positive")
-    if calls is not None and chains is None:
-        raise ValueError("calls(count) requires chain counts")
+    return @tuner@(prepared, make_step, chains, candidates, repeats, alternatives,
+                   calls, guarded_reads, keep_step=False)
+
+
+def @variants@(prepared, make_step, candidates=None, alternatives=None, guarded_reads=None):
     if alternatives is None:
         alternatives = {}
     for name in _RK_LAYOUT_NAMES:
@@ -307,19 +303,30 @@ def select_plate_layout(prepared: dict, make_step: Any, chains: Any = None,
             chosen, builder, selector = (*option, None) if len(option) == 2 else option
             yield name, None, None, chosen, builder, selector
 
-    def variants():
-        for name, groups, sequential, chosen, builder, selector in layouts():
-            if selector is None:
-                yield name, groups, sequential, None, chosen, builder
-            elif guarded_reads is not None:
-                yield name, groups, sequential, guarded_reads, selector(chosen, guarded_reads), builder
-            else:
-                compact = selector(chosen, "compact")
-                yield name, groups, sequential, "compact", compact, builder
-                dense = selector(compact, "dense")
-                if dense is not compact:
-                    yield name, groups, sequential, "dense", dense, builder
+    for name, groups, sequential, chosen, builder, selector in layouts():
+        if selector is None:
+            yield name, groups, sequential, None, chosen, builder
+        elif guarded_reads is not None:
+            yield name, groups, sequential, guarded_reads, selector(chosen, guarded_reads), builder
+        else:
+            compact = selector(chosen, "compact")
+            yield name, groups, sequential, "compact", compact, builder
+            dense = selector(compact, "dense")
+            if dense is not compact:
+                yield name, groups, sequential, "dense", dense, builder
 
+
+def @tuner@(prepared, make_step, chains, candidates, repeats, alternatives,
+            calls, guarded_reads, *, keep_step):
+    import operator
+    import time
+    if repeats < 1:
+        raise ValueError("repeats must be positive")
+    counts = (None,) if chains is None else sorted({operator.index(n) for n in chains})
+    if chains is not None and any(n <= 0 for n in counts):
+        raise ValueError("chain counts must be positive")
+    if calls is not None and chains is None:
+        raise ValueError("calls(count) requires chain counts")
     def rank(row):
         return row.get("fit_seconds", row["seconds"] / (row["chains"] or 1))
 
@@ -329,7 +336,8 @@ def select_plate_layout(prepared: dict, make_step: Any, chains: Any = None,
     work = {} if calls is None else {n: float(calls(n)) for n in counts}
     if any(not np.isfinite(n) or n <= 0 for n in work.values()):
         raise ValueError("the projected number of calls must be finite and positive")
-    for name, groups, sequential, mode, chosen, builder in variants():
+    variants = @variants@(prepared, make_step, candidates, alternatives, guarded_reads)
+    for name, groups, sequential, mode, chosen, builder in variants:
         for count in counts:
             row = {"variant": name, "groups": groups, "sequential": sequential,
                    "chains": count, "seconds": float("inf"), "error": None,
@@ -356,7 +364,8 @@ def select_plate_layout(prepared: dict, make_step: Any, chains: Any = None,
                     row["fit_seconds"] = row["seconds"] * work[count]
                 score = rank(row)
                 if best_score is None or score < best_score:
-                    best_score, best_data = score, chosen
+                    best_score = score
+                    best_data = step if keep_step else chosen
             except Exception as error:
                 if "RESOURCE_EXHAUSTED" not in str(error) and not isinstance(error, MemoryError):
                     raise
@@ -412,14 +421,30 @@ function _jax_layout_functions!(mod, bodies, functions, constants)
         return
     end
     select = _jax_identifier(mod.used, :select_plate_layout)
+    tuner = _jax_param_name(mod.used, :_rk_time_layouts; stable=false)
+    variants = _jax_param_name(mod.used, :_rk_layout_variants; stable=false)
     push!(bodies, rstrip(replace(_JAX_SELECT_PLATE_LAYOUT,
+        "@tuner@" => tuner, "@variants@" => variants,
         "select_plate_layout" => select, "@prepare_reads@" => read_selector)))
     push!(functions, JAXFunction(select,
         Pair{String,Any}["prepared" => Dict, "make_step" => Any, "chains" => Any,
                          "candidates" => Any, "repeats" => Int, "alternatives" => Any, "calls" => Any,
                          "guarded_reads" => Any],
         Pair{String,Any}["prepared" => Dict, "report" => Vector{Any}]))
-    nothing
+    (; tuner, variants)
+end
+
+Base.include_dependency(joinpath(@__DIR__, "jax_bind_gradient.py"))
+const _JAX_BIND_GRADIENT = read(joinpath(@__DIR__, "jax_bind_gradient.py"), String)
+
+function _jax_gradient_binding!(mod, bodies, functions, layout)
+    name = _jax_identifier(mod.used, :bind_gradient)
+    push!(bodies, rstrip(replace(_JAX_BIND_GRADIENT, "def bind_gradient(" => "def " * name * "(",
+        "_TIME_LAYOUTS" => (isnothing(layout) ? "None" : layout.tuner),
+        "_LAYOUT_VARIANTS" => (isnothing(layout) ? "None" : layout.variants))))
+    push!(functions, JAXFunction(name,
+        Pair{String,Any}["density" => Any, "prepared" => Dict, "device" => Any,
+                         "memory_budget_bytes" => Int], Pair{String,Any}["gradient" => Any]))
 end
 
 # The plate arguments whose rows a group cuts to its width: each mapped ragged

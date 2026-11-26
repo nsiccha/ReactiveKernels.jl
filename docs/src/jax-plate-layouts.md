@@ -38,6 +38,24 @@ per chain. The groups run in sequence, so their scan lengths add to the
 number of rounds. Time the candidates on the target device at the chain
 counts the sampler will use.
 
+For batched gradients, create `gradient = module.bind_gradient(module.log_density,
+prepared, device=device, memory_budget_bytes=budget)` and call
+`values, grads = gradient(positions)`. A scalar kernel can supply
+`module.kernel` in place of the density. Device and budget are optional.
+The binding snapshots the prepared data. Its first call at a device, shape
+and dtype tries the supplied layout and only tries alternatives if memory
+prevents execution. If `select_plate_layout` has already measured this
+workload on the same device at this width, pass its returned prepared data
+to the binder. Later batches reuse the executable with new positions.
+
+Call `gradient.calibrate(positions)` to time eligible layouts and reuse
+the fastest median for subsequent batches of that signature. Calibration
+returns per-layout timings. Make a new binding when the data or budget
+changes. The byte budget covers XLA’s reported device buffer allocation
+for the executable. Allow separate headroom for other live arrays and
+allocator overhead. A backend must supply a buffer estimate to run with a
+budget.
+
 `select_plate_layout(prepared, make_step, chains=None)` runs that timing. The
 caller supplies `make_step(prepared)`, or `make_step(prepared, count)` with
 `chains`, returning a function that runs its own work once: one batched

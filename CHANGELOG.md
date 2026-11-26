@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.402
+
+- Prepared JAX modules expose `bind_gradient` for batched values and gradients.
+  A new batch shape runs the first feasible layout. Callers can bound compiled
+  buffer bytes and explicitly calibrate a reusable binding on its device.
+
 ## 0.1.401
 
 - Padded JAX exports with eligible subject scans can time the padded and

@@ -664,11 +664,11 @@ end
     text = string(src)
     @test [f.name for f in src.functions] ==
           ["prepare_data", "log_density", "log_prior", "log_likelihood", "log_jacobian", "constrain",
-           "dimension", "parameters"]
+           "bind_gradient", "dimension", "parameters"]
     # `prepare_data` takes the raw data; the functions, the prepared inputs.
     @test first.(src.functions[1].inputs) == ["x", "y"]
     @test all(f -> first.(f.inputs) == ["unconstrained", "x", "y"], src.functions[2:6])
-    @test all(f -> first.(f.inputs) == ["prepared"], src.functions[7:8])
+    @test all(f -> first.(f.inputs) == ["prepared"], src.functions[8:9])
     @test occursin("DIMENSION = 3", text)
     @test occursin("PARAMETERS = {\"a\": {\"start\": 0, \"stop\": 1", text)
     @test occursin("\"s\": {\"start\": 2, \"stop\": 3, \"transform\": \"exp\"", text)

@@ -126,11 +126,11 @@ end
                          plate_layout = :groups)
     @test occursin(" = _rk_scan_record_rows(", string(grouped))
     named = jax_source(jax_guarded_scan_rows; have, data = (:bases, :types, :orders),
-        functions = (prepare_plate_layout = :total, select_plate_layout = :total),
+        functions = (prepare_plate_layout = :total, select_plate_layout = :total, bind_gradient = :total),
         constants = (SUBJECT_SCAN_SCHEDULES = 17,), plate_layout = :padded)
     @test named.functions[2].inputs == padded.functions[2].inputs
     @test [f.name for f in named.functions] == ["prepare_data", "prepare_plate_layout", "select_plate_layout",
-                                                "prepare_plate_layout_2", "select_plate_layout_2"]
+                                                "bind_gradient", "prepare_plate_layout_2", "select_plate_layout_2", "bind_gradient_2"]
     @test occursin("SUBJECT_SCAN_SCHEDULES = 17", named.text)
     @test occursin("for name, inputs in SUBJECT_SCAN_SCHEDULES_2.items()", named.text)
     @test occursin(" = _rk_subject_scan(", string(padded))
