@@ -145,4 +145,122 @@ end
     end
 end
 
+@kernel function prefix_residual(a::Float64, rows::Vector{Vector{Float64}},
+                                 ids::Vector{Vector{Int}}, table::Vector{Float64})
+    per = plate(rows, ids, Ref(table), Ref(a)) do row, idx, levels, coeff
+        extra = levels[idx]
+        walk = scan(row, Ref(coeff); init=0.0) do carry, x, c
+            next = carry * c + x
+            (next, next)
+        end
+        sum(walk) + sum(extra)
+    end
+    result = sum(per)
+end
+
+@kernel function prefix_amplitude(a::Float64, rows::Vector{Vector{Float64}},
+                                  ids::Vector{Vector{Int}}, table::Vector{Float64})
+    per = plate(rows, ids, Ref(table), Ref(a)) do row, idx, levels, coeff
+        amounts = row .* exp.(levels[idx])
+        walk = scan(amounts, Ref(coeff); init=0.0) do carry, x, c
+            next = carry * c + x
+            (next, next)
+        end
+        sum(walk)
+    end
+    result = sum(per)
+end
+
+@testset "A checked prefix can precede scheduled event rounds" begin
+    have = (:a, :rows, :ids, :table)
+    emit(spec; data=(:rows, :ids)) = jax_source(spec; have, data, want=:result, plate_layout=:rounds)
+    @test !occursin(" = _rk_round_scan(", emit(prefix_residual; data=(:rows,)).text)
+    a, table = 0.34, [0.3, 0.6]
+    for spec in (prefix_residual, prefix_amplitude)
+        source = emit(spec)
+        @test count(" = _rk_round_scan(", source.text) == 1
+        rk_jax_available() || continue
+        native = prepare(spec; have, want=:result)
+        mktempdir() do dir
+            write(joinpath(dir, "model.py"), source)
+            open(joinpath(dir, "check.py"), "w") do io
+                write(io, """
+import jax
+import numpy as np
+import model
+from unittest.mock import patch
+
+def scan_structure(expr):
+    if isinstance(expr, (tuple, list)):
+        return tuple(s for item in expr for s in scan_structure(item))
+    expr = getattr(expr, "jaxpr", expr)
+    found = []
+    for eq in getattr(expr, "eqns", ()):
+        nested = tuple(s for v in eq.params.values() for s in scan_structure(v))
+        if eq.primitive.name == "scan":
+            found.append(nested)
+        else:
+            found.extend(nested)
+    return tuple(found)
+
+def check(rows, ids, expected, da, dt, rounds):
+    data = model.prepare_data(rows, ids)
+    table = np.array([0.3, 0.6])
+    with patch.object(model, "_rk_round_scan", wraps=model._rk_round_scan) as batched:
+        trace = jax.make_jaxpr(model.kernel)(0.34, table, **data)
+        assert batched.call_count == rounds, (batched.call_count, rounds)
+    value, grad = jax.jit(jax.value_and_grad(model.kernel, argnums=(0, 1)))(0.34, table, **data)
+    np.testing.assert_allclose(value, expected, atol=1e-10)
+    np.testing.assert_allclose(grad[0], da, atol=1e-7)
+    np.testing.assert_allclose(grad[1], dt, atol=1e-7)
+    return scan_structure(trace)
+
+def first_error(rows, ids, table, expected):
+    data = model.prepare_data(rows, ids)
+    try:
+        jax.jit(model.kernel)(0.34, np.asarray(table), **data).block_until_ready()
+    except Exception as exc:
+        assert expected in str(exc), str(exc)
+    else:
+        raise AssertionError(expected)
+""")
+                # The first two cases have the same two schedule phases while
+                # both the number of subjects and the event count grow.
+                cases = (([[1., 3.], [], [-3.]], [[1, 2], [], [1]], 1),
+                         (repeat([[1., 3., 2., 4.], [], [-3., 2.]], 3),
+                          repeat([[1, 2, 1, 1], [], [1, 2]], 3), 1),
+                         ([[1., 3.], [], [2.]], [[1], [], [2, 1]], 1),
+                         ([[1., 3.]], [[1], [2, 1]], 0),
+                         ([], [], 0), ([[], []], [[], []], 0),
+                         ([], [[0]], 0), ([[1.]], [], 0))
+                for (k, (raw_rows, raw_ids, rounds)) in enumerate(cases)
+                    rows, ids = Vector{Vector{Float64}}(raw_rows), Vector{Vector{Int}}(raw_ids)
+                    f(x, t) = native(x, rows, ids, t)
+                    h = 1e-5
+                    da = (f(a+h, table) - f(a-h, table)) / (2h)
+                    dt = map(eachindex(table)) do i
+                        d = h .* (eachindex(table) .== i)
+                        (f(a, table+d) - f(a, table-d)) / (2h)
+                    end
+                    println(io, "trace", k, " = check(", join((_rk_py_input(rows), _rk_py_input(ids),
+                            f(a, table), da, _rk_py_input(dt), rounds), ", "), ")")
+                end
+                println(io, "assert trace1 and trace1 == trace2, (trace1, trace2)")
+                if spec === prefix_amplitude
+                    for (rows, ids, error) in (([[1., 2.], [1.]], [[1, 1, 1], [0]], DimensionMismatch),
+                                               ([[1.], [1., 2.]], [[3], [1, 1, 1]], BoundsError),
+                                               ([[1., 2.]], [[1, 1, 1]], DimensionMismatch),
+                                               ([[1., 2.]], [[0, 1, 1]], BoundsError),
+                                               ([Float64[]], [[1, 1]], DimensionMismatch))
+                        @test_throws error native(a, rows, ids, table)
+                        println(io, "first_error(", join((_rk_py_input(rows), _rk_py_input(ids),
+                                _rk_py_input(table), repr(string(error))), ", "), ")")
+                    end
+                end
+            end
+            @test success(pipeline(Cmd(`$RK_JAX_PYTHON $(joinpath(dir,"check.py"))`; dir), stderr=stderr))
+        end
+    end
+end
+
 end
