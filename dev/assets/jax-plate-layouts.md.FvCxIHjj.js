@@ -1,0 +1,59 @@
+import{_ as t,o as a,c as o,a6 as r}from"./chunks/framework.BTpfZnOf.js";const h=JSON.parse('{"title":"JAX plate layouts","description":"","frontmatter":{},"headers":[],"relativePath":"jax-plate-layouts.md","filePath":"jax-plate-layouts.md","lastUpdated":null}'),s={name:"jax-plate-layouts.md"};function n(d,e,i,u,p,c){return a(),o("div",null,[...e[0]||(e[0]=[r(`<h1 id="JAX-plate-layouts" tabindex="-1">JAX plate layouts <a class="header-anchor" href="#JAX-plate-layouts" aria-label="Permalink to &quot;JAX plate layouts {#JAX-plate-layouts}&quot;">​</a></h1><p>A plate over units with ragged rows (subjects with their own event schedules) is one <code>jax.vmap</code> of its cell, so every unit is stored and computed at the longest unit&#39;s length. When the lengths differ widely, most of that work, and of what reverse mode stores for each step of a scan, is padding.</p><p><code>jax_source(...; data, plate_layout = :groups)</code> emits a module whose caller chooses how such plates run. After <code>prepared = module.prepare_data(**raw)</code>, use <code>chosen = module.prepare_plate_layout(prepared, groups=4)</code> and pass <code>**chosen</code> to <code>jax.value_and_grad(module.kernel)</code>.</p><p><code>prepare_plate_layout(prepared, groups, sequential=False)</code> sorts each plate&#39;s units by length and splits them into at most <code>groups</code> groups that minimize the padded size. Each group runs as one <code>jax.vmap</code> over rows cut to its longest unit, or with <code>sequential=True</code> as one <code>jax.lax.map</code>, its units one after another. The groups&#39; values are joined in the plate&#39;s order and padded to the plate&#39;s own shapes. <code>groups=1</code> without <code>sequential</code> is the plate as without the option, and <code>prepare_data</code>&#39;s own result selects it.</p><p>Each layout calls the same cell. Grouping can reduce padded work and storage per chain. The groups run in sequence, so their scan lengths add to the number of rounds. Time the candidates on the target device at the chain counts the sampler will use.</p><p><code>select_plate_layout(prepared, make_step, chains=None)</code> runs that timing. The caller supplies <code>make_step(prepared)</code>, or <code>make_step(prepared, count)</code> with <code>chains</code>, returning a function that runs its own work once: one batched gradient, or one sampler step over all chains, so the sampler&#39;s memory and cost are measured too. Each candidate is compiled, run and timed; with <code>chains</code> they are compared by time per chain. A candidate the device has no memory for is recorded and its larger chain counts are skipped. The result is the prepared data with the fastest layout and a report of every run.</p><p>When a prepared scan can gather a producer&#39;s full table or compute just its requested rows, the module also emits <code>prepare_guarded_reads</code>. For example, <code>dense = module.prepare_guarded_reads(prepared, &quot;dense&quot;)</code> selects the full table. Pass <code>**dense</code> to the numerical function. Use <code>&quot;compact&quot;</code> to request the tiled computation. Both choices apply to every eligible read in that module and can be made again after preparing different data. The tuner times both when their prepared bounds differ, including on a padded export. The winning row&#39;s <code>guarded_reads</code> field records the mode to replay.</p><p>The example also compares separately exported sampler modules in a mapping keyed by layout name. Supply identical raw inputs and at least as many starting positions as the largest batch. <code>tune_sampler</code> returns the module, prepared data, chain count and timing table. It ranks each measured width by the median gradient-call time multiplied by the projected calls to finish warmup and sampling. Its inputs are warmup gradients per chain, the total draw count and mean gradients per draw. An application can pass its own <code>calls(count)</code> to <code>select_plate_layout</code> to reflect its adaptation schedule. A grouped export with no ragged plates still measures each candidate chain count once.</p><div class="vp-raw-html"><div class="markdown"><pre><code class="language-python">&quot;&quot;&quot;Choose a plate layout for a batch of scalar-kernel gradients.&quot;&quot;&quot;
+import jax
+
+
+def _chain_counts&#40;starts, requested&#41;:
+    counts &#61; tuple&#40;requested&#41;
+    if not counts or max&#40;counts&#41; &gt; len&#40;starts&#41;:
+        raise ValueError&#40;&quot;supply at least one initial position for each chain in the largest batch&quot;&#41;
+    return counts
+
+
+def tune_gradient&#40;module, raw, starts, chain_counts&#41;:
+    counts &#61; _chain_counts&#40;starts, chain_counts&#41;
+    prepared &#61; module.prepare_data&#40;**raw&#41;
+
+    def make_step&#40;data, count&#41;:
+        def gradient&#40;u&#41;:
+            return jax.value_and_grad&#40;module.kernel&#41;&#40;u, **data&#41;
+
+        batched &#61; jax.jit&#40;jax.vmap&#40;gradient&#41;&#41;
+        positions &#61; starts&#91;:count&#93;
+        return lambda: batched&#40;positions&#41;
+
+    return module.select_plate_layout&#40;prepared, make_step, chains&#61;counts&#41;
+
+
+def tune_sampler&#40;modules, raw, starts, chain_counts, warmup_gradients, draws,
+                 gradients_per_draw, *, groups&#61;&#40;1, 2, 4, 8&#41;, repeats&#61;5&#41;:
+    &quot;&quot;&quot;Compare matching sampler exports on their target device at a fixed total draw count.&quot;&quot;&quot;
+    counts &#61; _chain_counts&#40;starts, chain_counts&#41;
+
+    def builder&#40;module&#41;:
+        def make_step&#40;data, count&#41;:
+            def density&#40;u&#41;:
+                return module.log_density&#40;u, **data&#41;
+            gradient &#61; jax.jit&#40;jax.vmap&#40;jax.value_and_grad&#40;density&#41;&#41;&#41;
+            positions &#61; jax.device_put&#40;starts&#91;:count&#93;&#41;
+            return lambda: gradient&#40;positions&#41;
+        return make_step
+
+    grouped &#61; modules&#91;&quot;groups&quot;&#93;
+    alternatives &#61; &#123;&#125;
+    for name, module in modules.items&#40;&#41;:
+        if name &#33;&#61; &quot;groups&quot;:
+            option &#61; &#40;module.prepare_data&#40;**raw&#41;, builder&#40;module&#41;&#41;
+            if hasattr&#40;module, &quot;prepare_guarded_reads&quot;&#41;:
+                option &#43;&#61; &#40;module.prepare_guarded_reads,&#41;
+            alternatives&#91;name&#93; &#61; option
+    def calls&#40;count&#41;:
+        return warmup_gradients &#43; draws * gradients_per_draw / count
+
+    data, report &#61; grouped.select_plate_layout&#40;
+        grouped.prepare_data&#40;**raw&#41;, builder&#40;grouped&#41;, counts,
+        candidates&#61;&#91;&#40;n, False&#41; for n in groups&#93;, repeats&#61;repeats,
+        alternatives&#61;alternatives, calls&#61;calls&#41;
+    best &#61; report&#91;0&#93;
+    return modules&#91;best&#91;&quot;variant&quot;&#93;&#93;, data, best&#91;&quot;chains&quot;&#93;, report
+</code></pre>
+</div></div><p><code>GROUPED_PLATES</code> names the plates that take a layout, each with the prepared row lengths that group its units. A plate can group numeric rows with prepared lengths, including computed rows that inherit the lengths of <code>rows[i]</code> from a prepared index. A cell that reads <code>rows[i]</code> directly can also use the selected group&#39;s width. When a mapped numeric row or a recorded row read has unknown lengths, the plate keeps its full widths so that nested operations over paired rows see compatible axes. A jitted function can take the prepared data as arguments. The member indices and the permutation that restores the output order are array inputs. Reordering units with the same group shapes reuses the compiled function. Each selected group contributes one plate body to the trace, up to the caller&#39;s group limit.</p><p><code>plate_layout = :rounds</code> packs independent subjects’ recurrent events into at most two fixed-width scans. The first can run one more subject per round than the second. A subject that crosses between lanes carries its state across the boundary and advances in its original order. Every true event is visited once and the longest subject sets the number of rounds. Empty subjects keep their original initial-state semantics. A scan with observable checks keeps its serial execution order. Compare the resulting module against the other layouts at the chain counts of interest.</p>`,11)])])}const m=t(s,[["render",n]]);export{h as __pageData,m as default};
