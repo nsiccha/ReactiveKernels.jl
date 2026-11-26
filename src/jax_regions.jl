@@ -287,10 +287,11 @@ function _jax_region_call!(ctx, p, unit, demand, labels, selector, available, mo
     text = join(scope.lines, "\n")
     executable = replace(text, _PY_STRING => "\"\"")
     used_params = findall(n -> occursin(Regex("\\b" * n * "\\b"), executable), params)
-    bounds = [bn for (bn, _, _) in _jax_prepared_bounds(ctx.mod)
-              if occursin(Regex("\\b" * bn * "\\b"), text)]
+    required = [(bn, kind) for (bn, kind, _) in _jax_prepared_bounds(ctx.mod)
+                if occursin(Regex("\\b" * bn * "\\b"), text)]
+    bounds = first.(required)
     signature = [n * ": ArrayLike" for n in params[used_params]]
-    append!(signature, [n * ": int" for n in bounds])
+    append!(signature, [n * (_jax_prepared_aux_type(kind) === Int ? ": int" : _jax_prepared_aux_type(kind) === Tuple ? ": tuple" : ": ArrayLike") for (n, kind) in required])
     append!(signature, ["*", "outputs: tuple[str, ...]"])
     cache_key = (:source_region, region.name, Tuple(signature), text, region.doc)
     name = get(ctx.mod.helper_names, cache_key, nothing)
