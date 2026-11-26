@@ -100,8 +100,8 @@ end
         scale .* m[k] .+ u[k]
     end
     totals = plate(y, location) do obs, loc
-        terms = plate(obs, loc) do value, center
-            -abs2(value - center)
+        terms = plate(obs, loc, a) do value, center, offset
+            offset - abs2(value - center)
         end
         sum(terms)
     end

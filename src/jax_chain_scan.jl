@@ -226,10 +226,11 @@ def _rk_padded_row_sums(cell, args, axes, schedule, dtype):
 # Each field of a tuple-valued cell keeps the same packed row boundaries.
 function _jax_chain_table(ctx, recipe, args, mapped; sum_rows = false, domains = String[])
     atomic = typeof(recipe.op).parameters[2]
-    each = [i for i in eachindex(args) if !(i in atomic)]
+    padded = ctx.mod.layout === :padded
+    # A scalar positional argument broadcasts just like a captured scalar.
+    each = [i for i in eachindex(args) if !(i in atomic) && !(padded && args[i].T <: Number)]
     isempty(each) && return nothing
     all(i -> mapped[i] && args[i].T <: AbstractVector{<:AbstractVector{<:Number}}, each) || return nothing
-    padded = ctx.mod.layout === :padded
     if padded
         sum_rows && isempty(domains) && all(i -> i in each || (!mapped[i] && args[i].T <: Number),
                                             eachindex(args)) || return nothing
