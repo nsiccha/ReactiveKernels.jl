@@ -1957,6 +1957,28 @@ end
     out
 end
 
+# The Jacobian weights depend only on the number of margins. Emit them as
+# a separate data recipe so that the packed weights are prepared once.
+@traceable function _ppl_lkj_weights(K, P)
+    weights = zeros(Float64, P)
+    p = 0
+    for j in 2:K
+        for i in 1:(j - 1)
+            p += 1
+            weights[p] = (j - i + 1) / 2
+        end
+    end
+    weights
+end
+
+@traceable function _ppl_lkj_logjac(z, weights)
+    total = 0.0
+    for p in eachindex(z)
+        total += weights[p] * log(1 - z[p]^2)
+    end
+    total
+end
+
 # The rows of the factor at a cell's rows (`ReactiveKernels._cell_row_method`),
 # by the same arithmetic in the same order: column block j holds the partials
 # (j - 1)(j - 2)/2 + 1, ... and carries its running product over them from 1.
@@ -2008,6 +2030,7 @@ function _lkj_array_transform_statements(e::LayoutEntry)
     z, lj = _lkj_array_partials(L), _lkj_array_logjac(L)
     diagonal = _lkj_array_diagonal(L)
     raw = _lkj_array_raw(L)
+    weights = Symbol(:_ppl_lkj_weights_, L)
     return Expr[
         # The block is read as a statement of its own, as every other block is:
         # a read inside a larger expression has no row form, so a cell or
@@ -2022,15 +2045,8 @@ function _lkj_array_transform_statements(e::LayoutEntry)
             $(GlobalRef(@__MODULE__, :_ppl_lkj_diagonal))($z, $K, $P)),
         :($L::Matrix{Float64} = $(GlobalRef(@__MODULE__,
             _is_upper_lkj(e.transform) ? :_ppl_lkj_upper : :_ppl_lkj_lower))($z, $diagonal, $K, $P)),
-        :($lj::Float64 = let
-            total = 0.0
-            i, j = 1, 2
-            for p in 1:$P
-                total = total + ((j - i + 1) / 2) * log(1 - $z[p]^2)
-                i, j = i + 1 < j ? (i + 1, j) : (1, j + 1)
-            end
-            total
-        end),
+        :($weights::Vector{Float64} = $(GlobalRef(@__MODULE__, :_ppl_lkj_weights))($K, $P)),
+        :($lj::Float64 = $(GlobalRef(@__MODULE__, :_ppl_lkj_logjac))($z, $weights)),
     ]
 end
 
@@ -2094,6 +2110,14 @@ function _lkj_array_diagonal_terms(L::Symbol, K::Symbol, eta::Float64;
     end)
 end
 
+@traceable function _ppl_lkj_diagonal_logprior(diagonal, K, eta)
+    total = 0.0
+    for i in 2:K
+        total += (K - i + 2 * eta - 2) * log(diagonal[i])
+    end
+    total
+end
+
 function _lkj_array_diagonal_terms(L::Symbol, K::Union{Int,Symbol}, eta::Symbol;
         intrinsic_pair::Bool = false, diagonal::Union{Nothing,Symbol} = nothing)
     entry = diagonal === nothing ? :($L[i, i]) : :($diagonal[i])
@@ -2105,6 +2129,13 @@ function _lkj_array_diagonal_terms(L::Symbol, K::Union{Int,Symbol}, eta::Symbol;
         pair_entry = diagonal === nothing ? :($L[2, 2]) : :($diagonal[2])
         return :(if isfinite($eta) && $eta > 0
             (2 * $eta - 2) * log($pair_entry)
+        else
+            0.0
+        end)
+    end
+    if diagonal !== nothing
+        return :(if isfinite($eta) && $eta > 0
+            $(GlobalRef(@__MODULE__, :_ppl_lkj_diagonal_logprior))($diagonal, $K, $eta)
         else
             0.0
         end)

@@ -156,3 +156,81 @@ function _jax_signed_map(ctx, i, body, lo, hi)
     ctx.locals[out] = _PyVal(result, original.T)
     _PyVal("None", Nothing, true)
 end
+
+# Copy an aligned prefix of a dense array, or fill its diagonal. The only
+# source addresses in a copy are the corresponding destination coordinates.
+# Overlapping shifted reads, conversion, and row views use ordinary emission.
+function _jax_prefix_store(ctx, var, body, hi)
+    hi.T isa Type && hi.T <: Integer && hi.T !== Bool || return nothing
+    vars = Symbol[var]
+    stops = String[hi.code]
+    statements = _jax_map_statements(body)
+    length(statements) == 1 || return nothing
+    store = only(statements)
+    if Meta.isexpr(store, :for, 2)
+        binding, inner = store.args
+        Meta.isexpr(binding, :(=), 2) || return nothing
+        index, range = binding.args
+        index isa Symbol && index !== var && Meta.isexpr(range, :call, 3) &&
+            range.args[1] === :(:) && range.args[2] === 1 &&
+            range.args[3] isa Int || return nothing
+        push!(vars, index)
+        push!(stops, string(range.args[3]))
+        statements = _jax_map_statements(inner)
+        length(statements) == 1 || return nothing
+        store = only(statements)
+    end
+    _jax_map_assignment(store) || return nothing
+    lhs, rhs = store.args
+    Meta.isexpr(lhs, :ref) && first(lhs.args) isa Symbol || return nothing
+    name, indices = lhs.args[1], lhs.args[2:end]
+    dest = get(ctx.locals, name, nothing)
+    plain(v) = v !== nothing && v.T isa Type && v.T <: Array &&
+        eltype(v.T) <: _JaxBranchReal && !_jax_slots(v) && isempty(v.extent) &&
+        !(v.origin isa _JaxRowView || v.origin isa _JaxRowShape &&
+          (v.origin.stored || _jax_borrowed_buffer(ctx, v)))
+    plain(dest) && ndims(dest.T) == length(indices) || return nothing
+    diagonal = length(vars) == 1 && indices == [var, var] &&
+        rhs isa Number && typeof(rhs) === eltype(dest.T)
+    if diagonal
+        axes = [0, 1]
+        bounds = [hi.code * " <= " * dest.code * ".shape[" * string(ax) * "]" for ax in axes]
+        positions = "jnp.arange(" * hi.code * ")"
+        selection = positions * ", " * positions
+        value = _jax_literal(rhs).code
+    else
+        indices == vars && Meta.isexpr(rhs, :ref) && rhs.args[2:end] == indices ||
+            return nothing
+        src = get(ctx.locals, rhs.args[1], nothing)
+        plain(src) && ndims(src.T) == length(vars) && eltype(src.T) === eltype(dest.T) ||
+            return nothing
+        bounds = [stop * " <= " * v.code * ".shape[" * string(ax - 1) * "]"
+                  for (ax, stop) in enumerate(stops) for v in (dest, src)]
+        selection = join((":" * stop for stop in stops), ", ")
+        value = src.code * "[" * selection * "]"
+    end
+
+    # Python resolves shape tests at trace time. On an inactive Julia branch
+    # an impossible range must only raise when that branch is selected.
+    result = _jax_fresh(ctx, :block)
+    _jax_emit!(ctx, "if " * join((stop * " <= 0" for stop in stops), " or ") * ":")
+    _jax_emit!(ctx, "    " * result * " = " * dest.code)
+    if !diagonal && length(vars) > 1
+        # Reshapes can share storage with a different leading dimension. Such
+        # a copy can read a preceding store as the authored rows advance.
+        _jax_emit!(ctx, "elif " * dest.code * ".shape[0] != " * src.code * ".shape[0] and " * join(bounds, " and ") * ":")
+        ctx.scope.indent += 1
+        _jax_sequential_range(ctx, var, body, _jax_literal(1), hi)
+        _jax_emit!(ctx, result * " = " * ctx.locals[name].code)
+        ctx.scope.indent -= 1
+    end
+    _jax_emit!(ctx, "elif " * join(bounds, " and ") * ":")
+    _jax_emit!(ctx, "    " * result * " = " * dest.code * ".at[" * selection * "].set(" * value * ")")
+    _jax_emit!(ctx, "else:")
+    ctx.scope.indent += 1
+    _jax_masked_check(ctx, _PyVal("False", Bool), repr("BoundsError: block exceeds array dimensions"))
+    _jax_emit!(ctx, result * " = " * dest.code)
+    ctx.scope.indent -= 1
+    ctx.locals[name] = _PyVal(result, dest.T)
+    _PyVal("None", Nothing, true)
+end
