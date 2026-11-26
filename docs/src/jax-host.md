@@ -20,6 +20,25 @@ A `Bool` array index (a `BitVector` or `Vector{Bool}`, such as `table[table[:, 2
 
 A data-only vector of records whose fields include vectors of a different length in each record, such as a per-subject design a data-only plate builds, crosses to the functions with each vector field padded as a ragged input is, and `<name>_lengths`: the tuple of those fields' lengths, `None` for a number field (RK 0.1.310). Pass both from `prepare_data` to the functions with `**prepared`.
 
+## Groups of ragged rows
+
+For `x::Vector{Vector{Vector{Int}}}` and other numerical vectors nested
+three deep, `values, lengths = pad_ragged(x, nested=True)` pads both inner
+axes. Pass `values, lengths` to the direct function. Unpacking
+`group_lengths, row_lengths = lengths` gives the number of rows in each
+group and the number of entries in each row. For example, `[[], [[]]]` has
+group lengths `[0, 1]`. The second group contains one empty row.
+With bound data, `prepare_data(x=x)` supplies the pair under `x_lengths`.
+A plate can return a group of rows in a tuple or named tuple. For example,
+if a cell returns `(weights, rows)`, a subsequent plate can read
+`length(cell[2])` for the row count and `sum(cell[2][1])` for the sum of
+the first row. An existing empty first row sums to zero.
+A group can concatenate its rows with `reduce(vcat, rows)`. When a traced
+index selects a group, the selected vector's length can vary within one
+compiled function. Use a named WANT such as `(; flat = :flat)` to get
+`flat` and `flat_lengths` under JIT. A plain vector is trimmed in eager
+execution and requires its logical length to fill its storage under JIT.
+
 ## Local helpers
 
 A local named helper with plain positional arguments (`add!(i, value) = push!(out, i * value)`) reads the locals of the code that defines it and writes their collections. It reads their values at each call, so a local reassigned before the call is read as reassigned. A helper that rebinds a captured local, has typed arguments or several methods, or is passed to a recorded helper while it captures locals, raises `JAXEmissionError`. Helpers that write their arguments in place are described in [JAX helpers and submodels](jax-helpers.md).

@@ -223,6 +223,10 @@ function _jax_region_call!(ctx, p, unit, demand, labels, selector, available, mo
         scope.values[canon_id(g, v.id)] = value
         push!(argument_slots, start:length(passed))
     end
+    for (param, arg) in zip(params, passed)
+        key = get(ctx.scope.prepared_keys, arg, nothing)
+        key === nothing || (scope.prepared_keys[param] = key)
+    end
     guard = _jax_function_guard!(ctx, scope, params, passed)
     for v in values(g.values)
         scope.hints[canon_id(g, v.id)] = hint(v)

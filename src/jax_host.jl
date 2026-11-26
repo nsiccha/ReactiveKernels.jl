@@ -2036,6 +2036,34 @@ def _rk_pad_rows(rows, dtype, rank=1):
     return padded, lengths, flat
 """
 
+# Each valid row is padded once. Missing rows have length zero; the group
+# count distinguishes them from rows that exist and contain no entries.
+const _JAX_PAD_NESTED = """
+def _rk_pad_nested(groups, dtype=None):
+    groups = [[np.asarray(row, dtype=dtype) for row in group] for group in groups]
+    rows = [row for group in groups for row in group]
+    if any(row.ndim != 1 for row in rows):
+        raise ValueError("nested ragged rows must be vectors")
+    if dtype is None:
+        kinds = [row.dtype for row in rows if row.size] or [row.dtype for row in rows]
+        dtype = np.result_type(*kinds) if kinds else np.float64
+    group_lengths = np.asarray([len(group) for group in groups], dtype=np.int64)
+    count = max(1, max(map(len, groups), default=0))
+    width = max(1, max(map(len, rows), default=0))
+    values = np.zeros((len(groups), count, width), dtype=dtype)
+    row_lengths = np.zeros((len(groups), count), dtype=np.int64)
+    for g, group in enumerate(groups):
+        for i, row in enumerate(group):
+            n = len(row)
+            row_lengths[g, i] = n
+            if n:
+                values[g, i, :n] = row
+                values[g, i, n:] = row[-1]
+        if group:
+            values[g, len(group):] = values[g, len(group) - 1]
+    return values, (group_lengths, row_lengths)
+"""
+
 # A vector of records with vector fields crosses as the tuple of its
 # columns, each vector field's column padded as a ragged value is, and the
 # tuple of those fields' lengths (`_jax_record_lengths`).
@@ -2546,6 +2574,8 @@ def _rk_keyword_inputs(data, names):
 # prep(labels)`) as the tuple of its fields, each read the same way. Returns
 # the expression; a named tuple's fields are read into a local first.
 function _host_input!(ctx::_JaxContext, code::AbstractString, @nospecialize(T))
+    _jax_nested_rows(T) && return "[[np.asarray(row, dtype=" * _host_dtype(_jax_nested_eltype(T)) *
+        ") for row in group] for group in " * code * "]"
     _jax_ragged(T) && return "[np.asarray(a, dtype=" * _host_dtype(eltype(eltype(T))) *
         ") for a in " * code * "]"
     if _host_tuple_vector(T)
@@ -2676,7 +2706,14 @@ function _jax_prepare_function!(mod::_JaxModule, split, raw_types, names, types;
         Any[T === nothing ? v.T : T for (v, T) in zip(values, types)]
     entries = String[]
     for (v, T, name) in zip(values, types, names)
-        if _jax_ragged(T)
+        if _jax_nested_rows(T)
+            helper = _jax_helper!(ctx, "_rk_pad_nested", _JAX_PAD_NESTED)
+            padded = _jax_fresh(ctx, Symbol(name, :_padded))
+            lengths = _jax_fresh(ctx, Symbol(name, :_lengths))
+            _jax_emit!(ctx, padded * ", " * lengths * " = " * helper * "(" * v.code * ", " *
+                            _host_dtype(_jax_nested_eltype(T)) * ")")
+            push!(entries, repr(name) * ": " * padded, repr(name * "_lengths") * ": " * lengths)
+        elseif _jax_ragged(T)
             if !haskey(mod.helper_names, (:helper, "_rk_pad_rows"))
                 mod.helper_names[(:helper, "_rk_pad_rows")] = "_rk_pad_rows"
                 push!(mod.helpers, rstrip(_JAX_PAD_ROWS))
