@@ -242,4 +242,82 @@ end
         @test_throws "negative entry" rk_jax_evaluate(checked, :kernel, (-1., 3, [-3.]))
     end
 end
+
+@traceable function copy_window(x, offset, strip)
+    out = fill(x, length(strip) + 2)
+    if x > 0
+        for i in 1:length(strip)
+            out[offset + i] = strip[i]
+        end
+    end
+    out
+end
+
+@kernel function window_sum(x::Float64, offset::Int, strip::Vector{Float64})
+    out = copy_window(x, offset, x .* strip)
+    total = sum(out)
+    return total
+end
+
+@traceable function shifted_self_copy(x, n)
+    out = fill(x, n)
+    out[1] = 2x
+    for i in 1:n-1
+        out[1 + i] = out[i]
+    end
+    out
+end
+
+@kernel function shifted_sum(x::Float64, strip::Vector{Float64})
+    out = shifted_self_copy(x, length(strip))
+    total = sum(out)
+    return total
+end
+
+@traceable function checked_copy_index(offset, i)
+    offset < 0 && throw(DomainError(offset, "negative copy offset"))
+    offset + i
+end
+
+@traceable function checked_window(x, offset, strip)
+    out = fill(x, length(strip))
+    for i in 1:length(strip)
+        out[checked_copy_index(offset, i)] = strip[i]
+    end
+    out
+end
+
+@kernel function checked_window_sum(x::Float64, offset::Int, strip::Vector{Float64})
+    out = checked_window(x, offset, strip)
+    total = sum(out)
+    return total
+end
+
+@testset "Offset copies preserve bounds and read overlapping stores in order" begin
+    have = (:x, :offset, :strip)
+    src = jax_source(window_sum; have, want=:total)
+    native = prepare(window_sum; have, want=:total)
+    @test occursin("jax.lax.dynamic_update_slice(", string(src))
+    overlap = jax_source(shifted_sum; have=(:x, :strip), want=:total)
+    @test !occursin("jax.lax.dynamic_update_slice(", string(overlap))
+    checked = jax_source(checked_window_sum; have, want=:total)
+    @test !occursin("jax.lax.dynamic_update_slice(", string(checked))
+    if rk_jax_available()
+        for (x, at, strip) in ((0.75, 0, [3.0]), (0.75, 2, collect(1.0:17)),
+                               (0.75, -9, Float64[]), (-1.5, 99, [2.0]))
+            result = rk_jax_evaluate(src, :kernel, (x, at, strip); grad=true)
+            @test result.value ≈ native(x, at, strip)
+            @test result.grad ≈ native(x, at, strip) / x
+        end
+        for at in (-1, 3)
+            @test_throws BoundsError native(1.0, at, [1.0, 2.0])
+            @test_throws "BoundsError" rk_jax_evaluate(src, :kernel, (1.0, at, [1.0, 2.0]))
+        end
+        result = rk_jax_evaluate(overlap, :kernel, (0.5, ones(5)); grad=true)
+        @test result.value == sum(shifted_self_copy(0.5, 5)) == 5
+        @test result.grad == 10
+        @test rk_jax_evaluate(checked, :kernel, (1., -1, Float64[])).value == 0
+        @test_throws "negative copy offset" rk_jax_evaluate(checked, :kernel, (1., -1, [1.]))
+    end
+end
 end
