@@ -26,7 +26,7 @@ function _jax_chain_entry(ctx, table, index)
     end
     entry
 end
-_jax_prepared_aux_type(kind) = kind in (:row_layout, :map_rows, :sign_groups, :event_rounds) ? Tuple : kind === :scan_rows ? Vector{Int} : Int
+_jax_prepared_aux_type(kind) = kind in (:row_layout, :map_rows, :padded_map_rows, :sign_groups, :event_rounds) ? Tuple : kind === :scan_rows ? Vector{Int} : Int
 function _jax_chain_dtypes(T)
     T <: Number && return _jax_dtype(T)
     _jax_number_fields(T) ? _jax_chain_tuple(_jax_dtype.(fieldtypes(T))) : nothing
@@ -169,23 +169,104 @@ function _jax_chain_lookup_cell(p, types, each)
     lookup(r.source) !== nothing
 end
 
+# A reduced inner plate exposes the independent scalar map at both axes.
+_jax_row_sum_recipe(r) = (r.op === sum && length(r.inputs) == 1) || _plain_sum_recipe(r)
+function _jax_is_nested_sum(p)
+    length(p.recipes) == 2 || return false
+    cells, total = p.recipes
+    cells.op isa _AuthoredPlateOp && length(cells.outputs) == 1 && length(total.outputs) == 1 &&
+        _jax_row_sum_recipe(total) &&
+        canon_id(p.graph, only(total.inputs).id) == canon_id(p.graph, only(cells.outputs).id) &&
+        length(p.want) == 1 && canon_id(p.graph, only(p.want).id) == canon_id(p.graph, only(total.outputs).id)
+end
+
+function _jax_padded_row_key(ctx, v)
+    key = _jax_chain_key(ctx, v)
+    key === nothing || return key
+    for scope in _jax_scope_chain(ctx.scope)
+        sources = get(ctx.mod.helper_names, (:row_sources, scope, v.extent), nothing)
+        sources === nothing || return _jax_prepared_bound!(ctx, :row_layout, sources...)
+    end
+    nothing
+end
+
+const _JAX_PADDED_ROW_SUMS = raw"""
+def _rk_padded_row_sums(cell, args, axes, schedule, dtype):
+    # Positions are in the logical broadcast of the rows. A computed array
+    # can have a wider physical stride than a prepared array of the same rows.
+    first = args[axes.index("event")]
+    if schedule is None:
+        return jnp.zeros(first.shape[0], dtype=dtype)
+    counts, owners, columns, selections, bound_columns = schedule
+    if not owners.shape[0]:
+        return jnp.zeros(counts.shape[0], dtype=dtype)
+    operands = iter(zip(selections, bound_columns))
+    values = []
+    batch_axes = []
+    for value, axis in zip(args, axes):
+        if axis == "event":
+            selection, bound = next(operands)
+            if bound is None:
+                row, col = (owners, columns) if selection is None else selection
+                idx = row * value.shape[1] + col
+                dims = jax.lax.GatherDimensionNumbers((), (0,), (0,))
+                bound = jax.lax.gather(value.reshape(-1), idx[:, None], dims, (1,),
+                                       mode="promise_in_bounds", unique_indices=selection is None,
+                                       indices_are_sorted=selection is None)
+            values.append(bound)
+            batch_axes.append(0)
+        else:
+            values.append(value)
+            batch_axes.append(None)
+    terms = jax.vmap(cell, in_axes=tuple(batch_axes))(*values)
+    return jax.ops.segment_sum(terms.astype(dtype), owners, counts.shape[0], indices_are_sorted=True)
+"""
+
 # Build a numeric lookup table once over the real entries of all subjects.
 # Each field of a tuple-valued cell keeps the same packed row boundaries.
 function _jax_chain_table(ctx, recipe, args, mapped; sum_rows = false, domains = String[])
     atomic = typeof(recipe.op).parameters[2]
-    each = [i for i in eachindex(args) if !(i in atomic)]
+    padded = ctx.mod.layout === :padded
+    # A scalar positional argument broadcasts just like a captured scalar.
+    each = [i for i in eachindex(args) if !(i in atomic) && !(padded && args[i].T <: Number)]
     isempty(each) && return nothing
-    all(i -> mapped[i] && args[i].T <: AbstractVector{<:AbstractVector{<:Number}} &&
-        haskey(ctx.scope.prepared_keys, args[i].extent), each) || return nothing
+    all(i -> mapped[i] && args[i].T <: AbstractVector{<:AbstractVector{<:Number}}, each) || return nothing
+    if padded
+        sum_rows && isempty(domains) && all(i -> i in each || (!mapped[i] && args[i].T <: Number),
+                                            eachindex(args)) || return nothing
+    end
+    keys = [padded ? _jax_padded_row_key(ctx, args[i]) : _jax_chain_key(ctx, args[i]) for i in each]
+    any(isnothing, keys) && return nothing
     isempty(recipe.op.axis_checks) || return nothing
     types = Any[i in each ? eltype(eltype(x.T)) : mapped[i] ? eltype(x.T) : _jax_unref(x.T)
                 for (i, x) in enumerate(args)]
     extents = Bool[!(i in each) && !isempty(x.extent) for (i, x) in enumerate(args)]
+    before = _JAX_EFFECTS[]
     cell, wants, _, _, _ = _jax_plan_function!(ctx, _jax_body_hint(ctx, recipe, :cell),
                                                recipe.op.kernel.plan, types; extents)
+    # One vmap can reorder effects from different rows. Retain the ordinary
+    # traversal if a cell has an observable effect or emits a runtime check.
+    padded && (recipe.effectful || _JAX_EFFECTS[] != before ||
+               any(r -> r.effectful, recipe.op.kernel.plan.recipes)) && return nothing
     E = _jax_typeof(only(wants))
     E <: Number || _jax_number_fields(E) || return nothing
-    layout = _jax_chain_schedule(ctx, args[each]; kind = :map_rows)
+    layout = if padded
+        operands = String[]
+        for (i, lengths) in zip(each, keys)
+            data = ""
+            for scope in _jax_scope_chain(ctx.scope)
+                data = get(ctx.mod.helper_names, (:ragged_port, scope, args[i].code), "")
+                isempty(data) || break
+            end
+            push!(operands, lengths, data)
+        end
+        key = _jax_prepared_bound!(ctx, :padded_map_rows, operands...)
+        _jax_call(ctx, _runtime_check, [_PyVal(key * " is not None", Bool, true),
+            _PyVal(repr("DimensionMismatch: incompatible row axes"), DimensionMismatch)])
+        key
+    else
+        _jax_chain_schedule(ctx, args[each]; kind = :map_rows)
+    end
     axes, columns = String[], String[]
     for (i,x) in enumerate(args)
         axis = repr(i in each ? "event" : mapped[i] ? "row" : "shared")
@@ -197,6 +278,13 @@ function _jax_chain_table(ctx, recipe, args, mapped; sum_rows = false, domains =
         end
     end
     sum_rows && !(E <: Number) && return nothing
+    if padded
+        T = _jax_return_type(sum, Any[Vector{E}])
+        helper = _jax_helper!(ctx, "_rk_padded_row_sums", _JAX_PADDED_ROW_SUMS)
+        expr = helper * "(" * join((cell, _jax_chain_tuple(columns), _jax_chain_tuple(axes),
+                                     layout, _jax_dtype(T)), ", ") * ")"
+        return _PyVal(expr, Vector{T})
+    end
     dtypes = _jax_chain_dtypes(E)
     vector_read = _jax_requested_layout() === :rounds && !recipe.effectful &&
                   !any(r -> r.effectful, recipe.op.kernel.plan.recipes) &&
@@ -238,7 +326,7 @@ function _jax_chain_map_plate(ctx, p, recipe, body, inputs, mapped)
     ix = [ports[id(v)] for v in r.inputs]
     tail = body.recipes[2:end]
     readout = only(r.outputs)
-    reduce_first = !isempty(tail) && first(tail).op === sum && length(first(tail).inputs) == 1 &&
+    reduce_first = !isempty(tail) && _jax_row_sum_recipe(first(tail)) &&
                    id(only(first(tail).inputs)) == id(readout)
     # A sampler can expose a sum through several entries of a returned record.
     # Fuse the sum if its full input is dead after that point.
@@ -343,10 +431,13 @@ function _jax_chain_step_reads!(ctx, scope, names, inputs, tables)
                           !inputs.checked[]; gather_rows)
 end
 
-# A plate whose cell scans prepared rows can run as a single scan over their
-# concatenation. Keep the authored step plan, including its lazy branches.
-# An immediately reduced numerical history needs only its per-row sums.
-function _jax_chain_scan_plate(ctx, p, recipe, body, inputs, mapped)
+# A nested plate can reduce the compact broadcast of its prepared rows. In
+# a packed layout a subject scan can also visit their concatenation, keeping
+# the authored step and its lazy branches.
+function _jax_compact_plate(ctx, p, recipe, body, inputs, mapped)
+    if ctx.mod.layout !== :chains
+        ctx.mod.layout === :padded && _jax_is_nested_sum(body) || return nothing
+    end
     isempty(body.checks) && isempty(recipe.op.axis_checks) || return nothing
     pos = findfirst(r -> r.op isa _AuthoredScanOp, body.recipes)
     if pos === nothing && (isempty(body.recipes) || !(first(body.recipes).op isa _AuthoredPlateOp))
