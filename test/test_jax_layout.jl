@@ -81,15 +81,21 @@ layout_weights(scale) = [[0.1 * t - 0.05 * i for t in 1:scale*((n + i) % 4)]
                          for (i, n) in enumerate(LENGTHS)]
 layout_rows(scale) = [[0.3 * sin(i + t) for t in 1:scale*n] for (i, n) in enumerate(LENGTHS)]
 
+@kernel jax_dense_layout(a::Float64, x::Vector{Float64}) = begin
+    total = a * sum(x)
+    total
+end
+
 @testset "jax_source: layouts of a plate over prepared ragged rows" begin
     have = (:a, :keys, :orders, :weights)
     data = (:keys, :orders, :weights)
-    padded = jax_source(jax_layout_walk; have, want = :total, data)
+    padded = jax_source(jax_layout_walk; have, want = :total, data, plate_layout = :padded)
     @test !occursin("_rk_grouped_plate", string(padded))
     @test !occursin("prepare_plate_layout", string(padded))
-    @test string(padded) ==
-        string(jax_source(jax_layout_walk; have, want = :total, data, plate_layout = :padded))
     walk = jax_source(jax_layout_walk; have, want = :total, data, plate_layout = :groups)
+    default = get(task_local_storage(), :reactivekernels_jax_plate_layout_default, :padded)
+    @test string(jax_source(jax_layout_walk; have, want = :total, data)) ==
+          string(default === :groups ? walk : padded)
     @test occursin("GROUPED_PLATES = {\"totals_cell\": (\"orders_lengths\", \"weights_lengths\")}",
                    string(walk))
     @test [f.name for f in walk.functions] ==
@@ -107,7 +113,7 @@ layout_rows(scale) = [[0.3 * sin(i + t) for t in 1:scale*n] for (i, n) in enumer
                    string(index))
     @test occursin(r"rows\w*\[i - 1\]\[:row_widths\[0\]\]", string(index))
     @test !occursin("row_widths", string(jax_source(jax_layout_index; have = (:a, :units, :xs),
-                                                    want = :total, data = (:units, :xs))))
+                                                    want = :total, data = (:units, :xs), plate_layout = :padded)))
     @test_throws ArgumentError jax_source(jax_layout_walk; have, want = :total, plate_layout = :groups)
     @test_throws ArgumentError jax_source(jax_layout_walk; have, want = :total, data,
                                           plate_layout = :unknown)
@@ -120,6 +126,8 @@ layout_rows(scale) = [[0.3 * sin(i + t) for t in 1:scale*n] for (i, n) in enumer
                              data = (:keys, :orders), plate_layout = :groups)
         keys = [0.25, -0.5]
         mktempdir() do dir
+            dense = jax_source(jax_dense_layout; have=(:a, :x), want=:total, data=(:x,), plate_layout=:groups)
+            write(joinpath(dir, "dense.py"), dense)
             write(joinpath(dir, "walk.py"), walk)
             write(joinpath(dir, "rows.py"), rows)
             write(joinpath(dir, "index.py"), index)
@@ -129,7 +137,7 @@ layout_rows(scale) = [[0.3 * sin(i + t) for t in 1:scale*n] for (i, n) in enumer
                         native_rows(0.6, layout_rows(1)),
                         native_index(0.6, LAYOUT_UNITS, layout_rows(1)),
                         native_guarded(0.6, keys, layout_orders(1)))
-            @test success(`$RK_JAX_PYTHON $script $dir $(expected[1]) $(expected[2]) $(expected[3]) $(expected[4])`)
+            @test success(pipeline(`$RK_JAX_PYTHON $script $dir $(expected[1]) $(expected[2]) $(expected[3]) $(expected[4])`; stderr))
         end
     else
         @test_skip false

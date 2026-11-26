@@ -10181,10 +10181,10 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
                               ragged = _jax_ragged(T))
                         for (n, T) in zip(prepared_names, prepared_types)])
     plates = _jax_layout_plates(mod)
-    if !isempty(plates)
+    if mod.layout === :groups
         # The plates whose layout `prepare_plate_layout` chooses, each with the
         # prepared row lengths that group its units.
-        _jax_module_helper!(mod, "_rk_length_groups", _JAX_LENGTH_GROUPS)
+        isempty(plates) || _jax_module_helper!(mod, "_rk_length_groups", _JAX_LENGTH_GROUPS)
         push!(bodies, rstrip(_JAX_PREPARE_PLATE_LAYOUT))
         push!(functions, JAXFunction("prepare_plate_layout",
             Pair{String,Any}["prepared" => Dict, "groups" => Int, "sequential" => Bool],
@@ -10194,7 +10194,7 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
             Pair{String,Any}["prepared" => Dict, "make_step" => Any, "chains" => Any,
                              "candidates" => Any, "repeats" => Int, "alternatives" => Any, "calls" => Any],
             Pair{String,Any}["prepared" => Dict, "report" => Vector{Any}]))
-        meta = merge(meta, (GROUPED_PLATES = [name => Tuple(keys) for (name, keys) in plates],))
+        meta = merge(meta, (GROUPED_PLATES = Pair{String,Tuple}[name => Tuple(keys) for (name, keys) in plates],))
     end
     defs === nothing && return meta
     # With definitions, `DATA` describes `prepare_data`'s own parameters, and

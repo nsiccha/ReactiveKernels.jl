@@ -1890,7 +1890,7 @@ end
                       functions = (total = :total, per = :per))
     @test count("def cell_data", string(both)) == 1
     names = ["prepare_data", "total", "per"]
-    if haskey(ENV, "RK_JAX_PLATE_GROUPS")
+    if get(task_local_storage(), :reactivekernels_jax_plate_layout_default, :padded) === :groups
         append!(names, ["prepare_plate_layout", "select_plate_layout"])
     end
     @test [f.name for f in both.functions] == names

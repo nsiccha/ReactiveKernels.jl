@@ -39,6 +39,8 @@ the median gradient-call time multiplied by the projected calls to finish
 warmup and sampling. Its inputs are warmup gradients per chain, the total
 draw count and mean gradients per draw. An application can pass its own
 `calls(count)` to `select_plate_layout` to reflect its adaptation schedule.
+A grouped export with no ragged plates still measures each candidate chain
+count once.
 
 ```@example jax_plate_runtime
 using ReactiveKernels, Markdown # hide

@@ -10,6 +10,7 @@ import numpy as np
 
 sys.path.insert(0, sys.argv[1])
 import guarded
+import dense
 import index
 import rows
 import walk
@@ -235,3 +236,15 @@ assert [r["fit_seconds"] for r in fits] == sorted(r["fit_seconds"] for r in fits
 assert all(r["fit_seconds"] == r["seconds"] * (10 + 160 / r["chains"]) for r in fits)
 assert selected is modules[fits[0]["variant"]] and count == fits[0]["chains"]
 np.testing.assert_allclose(selected.log_density(0.6, **prepared_fit), rows.kernel(0.6, **chosen))
+
+# A dense model still has a chain count to choose. All group counts produce
+# the same layout, so the tuner measures one candidate at each batch width.
+assert dense.GROUPED_PLATES == {}
+dense_data = dense.prepare_data(x=np.array([1.5, -0.25]))
+def dense_step(data, n):
+    step = batched(dense, data)
+    return lambda: step(positions[:n])
+
+best, report = dense.select_plate_layout(dense_data, dense_step, chains=(2, 4), repeats=1)
+assert sorted(row["chains"] for row in report) == [2, 4]
+np.testing.assert_allclose(jax.grad(lambda a: dense.kernel(a, **best))(0.6), 1.25)
