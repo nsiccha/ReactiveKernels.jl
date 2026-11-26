@@ -237,20 +237,37 @@ function _jax_chain_map_plate(ctx, p, recipe, body, inputs, mapped)
     all(v -> haskey(ports, id(v)), r.inputs) || return nothing
     ix = [ports[id(v)] for v in r.inputs]
     tail = body.recipes[2:end]
-    reduced = length(tail) == 1 && only(tail).op === sum && length(only(tail).inputs) == 1 &&
-              id(only(only(tail).inputs)) == id(only(r.outputs)) &&
-              id(only(only(tail).outputs)) == id(only(body.want))
+    readout = only(r.outputs)
+    reduce_first = !isempty(tail) && first(tail).op === sum && length(first(tail).inputs) == 1 &&
+                   id(only(first(tail).inputs)) == id(readout)
+    # A sampler can expose a sum through several entries of a returned record.
+    # Fuse the sum if its full input is dead after that point.
+    reduced = reduce_first && (length(tail) == 1 ||
+        (_jax_requested_layout() === :rounds && !any(v -> id(v) == id(readout), body.want) &&
+         all(next -> all(v -> id(v) != id(readout), next.inputs), tail[2:end])))
+    remaining = reduced ? tail[2:end] : tail
+    output = reduced ? only(first(tail).outputs) : readout
     before = _JAX_EFFECTS[]
     domains = [_py_atom(_jax_mapped_array(inputs[i])) * ".shape[0]" for i in eachindex(mapped) if mapped[i] && !(i in ix)]
     values = _jax_chain_table(ctx, r, inputs[ix], mapped[ix]; sum_rows = reduced, domains)
     values === nothing && return nothing
-    if reduced || isempty(tail)
+    if isempty(remaining)
+        id(output) == id(only(body.want)) || return nothing
         return [values]
     end
-    (_JAX_EFFECTS[] != before || r.effectful) && return nothing
-    v = only(r.outputs)
-    column = _jax_bind!(ctx, v.name, values)
-    _jax_chain_epilogue(ctx, p, recipe, body, tail, [body.have; v], [inputs; column], [mapped; true])
+    r.effectful && return nothing
+    checked = _JAX_EFFECTS[] != before
+    if checked && (_jax_requested_layout() !== :rounds || any(next -> next.effectful, remaining))
+        return nothing
+    end
+    column = _jax_bind!(ctx, output.name, values)
+    suffix_start = _JAX_EFFECTS[]
+    result = _jax_chain_epilogue(ctx, p, recipe, body, remaining, [body.have; output],
+                                 [inputs; column], [mapped; true])
+    # A checked lookup may move past cells of another subject only when the
+    # suffix cannot raise a competing error. The speculative scope is discarded
+    # by the caller when this check fails.
+    checked && _JAX_EFFECTS[] != suffix_start ? nothing : result
 end
 
 # Lift an ordinary dependency of a subject scan across the same subjects.
