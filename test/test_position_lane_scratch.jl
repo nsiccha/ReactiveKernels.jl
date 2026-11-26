@@ -242,6 +242,77 @@ end
         string(code_expr(vectorize(ignoring; batched = LANE_BATCHED, reuse = true))))
 end
 
+@kernel weighted_rows(X, W, index) = begin
+    rows = W[index, :]
+    value = vec(sum(X .* rows; dims=2))
+    return value
+end
+@kernel weighted_rows_matrix(X, W, index) = begin
+    rows = W[index, :]
+    value = sum(rows .* X; dims=2)
+    return value
+end
+@kernel guarded_weighted_rows(active, X, W, index) = begin
+    value = active ? weighted_rows(X, W, index) : zeros(size(X, 1))
+    return value
+end
+
+@testset "single-use gathered rows in position reductions" begin
+    for (spec, flatten) in ((weighted_rows, true), (weighted_rows_matrix, false))
+        for reuse in (false, true)
+            reader = vectorize(prepare(spec); batched=:W, reuse)
+            source = string(code_expr(reader))
+            @test occursin("_lane_gathered_sum", source)
+            @test !occursin("_lane_getindex", source)
+            for (index, width) in (([3, 1, 3, 2], 3), (Int[], 5), ([1, 1], 0),
+                                   ([2], 25), (repeat([1, 3, 2], 11), 7))
+                W = reshape(collect(1.0:6width), 3, width, 2)
+                X = reshape(collect(1.0:length(index)*width), length(index), width)
+                result = reader(X, W, index)
+                for j in axes(W, 3)
+                    expected = sum(X .* W[index, :, j]; dims=2)
+                    @test selectdim(result, ndims(result), j) == (flatten ? vec(expected) : expected)
+                end
+            end
+            @test_throws BoundsError reader(zeros(2, 0), zeros(3, 0, 2), [1, 4])
+            @test_throws DimensionMismatch reader(ones(4, 2), ones(3, 3, 2), [3, 1, 2, 1])
+            offset = view(ones(4, 4), :, Base.IdentityUnitRange(2:4))
+            @test_throws DimensionMismatch reader(offset, ones(3, 3, 2), [3, 1, 2, 1])
+            X = Matrix{Union{Float32,Float64}}(ones(Float32, 4, 2))
+            result = reader(X, ones(Float32, 3, 2, 2), [3, 1, 2, 1])
+            @test eltype(result) === Float32 && all(==(2f0), result)
+            # Julia broadcasts a singleton row or column. Each fresh call
+            # must also observe the current indices and the current weights.
+            index = [2, 1]
+            W = reshape(ComplexF64.(1:12), 2, 3, 2)
+            X = fill(1.0im, 1, 3)
+            for j in 1:2
+                reverse!(index)
+                W .+= 2im
+                expected = sum(X .* W[index, :, j]; dims=2)
+                result = reader(X, W, index)
+                @test selectdim(result, ndims(result), j) == (flatten ? vec(expected) : expected)
+            end
+        end
+    end
+    W = reshape(collect(1.0:18), 3, 3, 2)
+    index = [3, 1, 3, 2]
+    X = ones(4, 3)
+    bound = vectorize(prepare(weighted_rows; bound=(; index)); batched=:W, reuse=true)
+    @test occursin("_lane_gathered_sum", string(code_expr(bound)))
+    expected = hcat((vec(sum(W[index, :, j]; dims=2)) for j in 1:2)...)
+    @test bound(X, W) == expected
+    scheduled = prepare_batched(weighted_rows; batched=:W, reuse=true,
+        schedule=NativeScheduling(workers=2, chunk_size=1))
+    @test scheduled(X, W, index) == expected
+    guarded = prepare_batched(guarded_weighted_rows; batched=:W)
+    @test guarded(false, X, W, [99]) == zeros(4, 2)
+    @test guarded(true, X, W, index) == expected
+    both = prepare_batched(weighted_rows; batched=:W, want=(:rows, :value))
+    @test !occursin("_lane_gathered_sum", string(code_expr(both)))
+    @test first(both(X, W, index)) == W[index, :, :]
+end
+
 @testset "scheduled workers reuse their lane slots" begin
     args = lane_inputs(60, 24)
     expected = lane_reference(:rel_min, args...)
