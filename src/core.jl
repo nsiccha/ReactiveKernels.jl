@@ -1569,8 +1569,16 @@ function _lane_stack(recycled, cells::Vector{Vector{T}}, dims::Int) where {T<:_N
             return _lane_keep!(recycled, stack(cells; dims))
         end
     end
-    for (i, cell) in enumerate(cells)
-        copyto!(selectdim(buffer, dims, i), cell)
+    if dims == 1
+        for (i, cell) in enumerate(cells)
+            @inbounds for j in eachindex(cell)
+                buffer[i, j] = cell[j]
+            end
+        end
+    else
+        for (i, cell) in enumerate(cells)
+            copyto!(buffer, (i - 1) * n + 1, cell, 1, n)
+        end
     end
     buffer
 end

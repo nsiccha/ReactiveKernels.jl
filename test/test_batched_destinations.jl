@@ -35,6 +35,12 @@ end
     total = sum(p * landscape)
 end
 
+struct IdentityFactor <: Number end
+Base.:*(::IdentityFactor, x::Vector{Float64}) = x
+@kernel scale_once(p, x) = begin
+    result = p * x
+end
+
 function allocated_pair(reader, full, tail, x)
     reader(full, x)
     reader(tail, x)
@@ -52,6 +58,8 @@ end
         scalar = prepare(graph)
         ast = code_expr(k)
         @test occursin("_lane_stack", string(ast))
+        # The second call specializes the path with populated scratch.
+        k(p, cells)
         k(p, cells)
         bytes = @allocated k(p, cells)
         @test bytes < length(cells) * sizeof(first(cells))
@@ -96,6 +104,16 @@ end
     @test k(old) == expected
     @test k(-full_input) !== old
     @test old == expected
+
+    # An ordinary multiplication method can return its input. A later
+    # numeric product must never overwrite that input as recycled scratch.
+    factors = Number[IdentityFactor(), 3.]
+    for reuse in (false, true)
+        multiply = vectorize(scale_once; batched=:p, reuse)
+        data = [2., -3.]
+        @test multiply(factors, data) == [2. 6.; -3. -9.]
+        @test data == [2., -3.]
+    end
 end
 
 @testset "batched writers use caller rows and validate overlap" begin
