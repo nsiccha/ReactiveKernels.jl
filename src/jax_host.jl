@@ -1931,6 +1931,10 @@ const _JAX_PREPARED_BOUNDS = Dict{Symbol,Tuple{String,String}}(
 def _rk_prepare_row_layout(*operands):
     counts = None
     for lengths, selector in zip(operands[::2], operands[1::2]):
+        if lengths is None:
+            return None
+        if isinstance(lengths, tuple):
+            lengths = lengths[0]
         if selector is not None:
             if np.any(selector < 1) or np.any(selector > len(lengths)):
                 return None
@@ -1948,12 +1952,42 @@ def _rk_prepare_row_layout(*operands):
     offsets = np.concatenate((np.zeros(1, dtype=np.int64), np.cumsum(counts, dtype=np.int64)))
     return counts, offsets, StaticInt(int(counts.max(initial=0))), StaticInt(int(offsets[-1]))
 """),
+    :map_rows => ("_rk_map_schedule", """
+def _rk_map_schedule(*operands):
+    lengths = tuple(x[0] if isinstance(x, tuple) else x for x in operands)
+    if any(x is None for x in lengths):
+        return None
+    try:
+        shapes = np.broadcast_arrays(*lengths)
+    except ValueError:
+        return None
+    counts = shapes[0]
+    for other in shapes[1:]:
+        if np.any((counts != other) & (counts != 1) & (other != 1)):
+            return None
+        counts = np.where(counts == 1, other, counts)
+    offsets = np.concatenate(([0], np.cumsum(counts, dtype=np.int64)))
+    tags = np.repeat(np.arange(len(counts), dtype=np.int64), counts)
+    starts = offsets[:-1]
+    indices = []
+    for raw, sizes in zip(lengths, shapes):
+        if np.array_equal(raw, counts):
+            indices.append(None)
+        else:
+            base = np.cumsum(raw) - raw
+            base = np.broadcast_to(base, counts.shape)
+            local = np.arange(len(tags)) - starts[tags]
+            indices.append(base[tags] + np.where(sizes[tags] == 1, 0, local))
+    return counts, offsets, StaticInt(int(counts.max(initial=0))), tags, tuple(indices)
+"""),
     :scan_rows => ("_rk_scan_schedule", """
 def _rk_scan_schedule(*lengths):
     # The sign marks a fresh carry; empty rows generate no events. Leave the
     # native equal-axis check to the branch which actually executes this scan.
     try:
-        counts, *rest = np.broadcast_arrays(*lengths)
+        if any(x is None for x in lengths):
+            return None
+        counts, *rest = np.broadcast_arrays(*(x[0] if isinstance(x, tuple) else x for x in lengths))
     except ValueError:
         return None
     if any(not np.array_equal(counts, other) for other in rest):
@@ -2028,7 +2062,14 @@ function _jax_prepare_bounds_lines(mod::_JaxModule, lines::Vector{String}, bound
     result = "_rk_prepared"
     out = lines[1:end-1]
     push!(out, "    " * result * " = " * last_line[length("    return ")+1:end])
-    for (name, kind, keys) in bounds
+    # A table produced by an earlier prepared map can itself feed a map
+    # or scan. Emit dependencies first even when their keys sort later.
+    pending = copy(bounds)
+    while !isempty(pending)
+        remaining = Set(first(entry) for entry in pending)
+        at = findfirst(entry -> all(k -> !(k in remaining), entry[3]), pending)
+        at === nothing && error("circular prepared layout dependencies")
+        name, kind, keys = popat!(pending, at)
         args = [isempty(k) ? "None" : result * "[\"" * k * "\"]" for k in keys]
         if mod.layout === :chains && kind in (:min, :max, :span)
             _jax_module_helper!(mod, "_RKChainRows", _JAX_CHAIN_ROWS)

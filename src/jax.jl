@@ -8412,7 +8412,7 @@ function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
                              links = fill(nothing, length(p.have)),
                              origins = fill(nothing, length(p.have)),
                              fields = fill(0, length(p.have)),
-                             active_cells::Bool = false)
+                             active_cells::Bool = false, event_inputs = nothing)
     name = _jax_fresh(ctx, hint)
     outer = ctx.scope
     inner = _JaxScope(outer)
@@ -8433,6 +8433,8 @@ function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
     end
     active = active_cells ? _jax_identifier(inner.used, :active_cell) : ""
     active_cells && push!(names, active)
+    tables = event_inputs === nothing ? nothing : _jax_chain_step_tables!(inner, p, event_inputs)
+    effects = _JAX_EFFECTS[]
     recipe = ctx.recipe
     ctx.scope = inner
     wants = try
@@ -8445,6 +8447,10 @@ function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
     finally
         ctx.scope = outer
         ctx.recipe = recipe
+    end
+    if event_inputs !== nothing
+        event_inputs.checked[] = !event_inputs.pure || _JAX_EFFECTS[] != effects
+        _jax_chain_step_reads!(ctx, inner, names, event_inputs, tables)
     end
     returned = String[]
     for w in wants
@@ -8533,7 +8539,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
         join(string.(ranks), ", "), ") has no JAX translation yet", _jax_where(ctx))
     R = only(ranks)
     if ctx.mod.layout === :chains && R == 1
-        result = _jax_chain_scan_plate(ctx, recipe, body, inputs, mapped)
+        result = _jax_chain_scan_plate(ctx, p, recipe, body, inputs, mapped)
         result === nothing || return result
     end
     # Arguments whose cell value is padded: a ragged array's rows, and the
@@ -8715,6 +8721,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
         if haskey(row_layouts, extent)
             size_key = something(outer(extent), lengths)
             ctx.scope.chain_layouts[size_key] = row_layouts[extent]
+            get!(ctx.scope.prepared_keys, size_key, row_layouts[extent])
             ctx.scope.flat_positions[size_key] = _JaxFlatRows(row_layouts[extent] * "[3]", 0)
             return size_key
         end
@@ -8823,6 +8830,9 @@ end
 # argument itself, or, for a vector of tuples (a Python tuple of stacked
 # arrays, one per field), its first nonempty field's.
 function _jax_mapped_array(v::_PyVal)
+    if _jax_ragged(v.T) && _jax_number_fields(eltype(eltype(v.T)))
+        return _py_atom(v.code) * "[0]"
+    end
     E = _jax_is_array(v.T) ? eltype(v.T) : Any
     leaf = _jax_record_leaf(v.code, E)
     leaf === nothing ? v.code : first(leaf)
@@ -9036,7 +9046,17 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     width = _jax_scan_width(ctx, inputs, iterated)
     seqs = String[_jax_scan_sequence(inputs[i], width) for i in iterated]
     isempty(position) || push!(seqs, "jnp.arange(" * _py_atom(first(seqs)) * ".shape[0])")
-    _jax_scan_row_inputs!(ctx, inner, scan_rows, unpack, seqs, width, extent, pure)
+    local_rows = ctx.mod.layout === :chains && !isempty(extent)
+    base_count = length(seqs)
+    if local_rows && !isempty(scan_rows.reads)
+        _jax_helper!(ctx, "_RKChainRows", _JAX_CHAIN_ROWS)
+        sequence = v -> _jax_scan_sequence(_PyVal("_rk_row_values(" * v.code * ")", v.T), width)
+        gather_rows = (g, table, index, mask, limit) -> g * "(jax.tree.map(_rk_row_values, " *
+            table.code * "), " * join((index, mask, limit), ", ") * ")"
+        _jax_scan_row_inputs!(ctx, inner, scan_rows, unpack, seqs, width, extent, pure; sequence, gather_rows)
+    else
+        _jax_scan_row_inputs!(ctx, inner, scan_rows, unpack, seqs, width, extent, pure)
+    end
     if any(i -> _jax_columns(inputs[i].T), shared) && pure
         decorator = _jax_helper!(ctx, "_rk_table_scan_step", _JAX_TABLE_SCAN_STEP)
         _jax_emit!(ctx, "@" * decorator)
@@ -9056,7 +9076,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
         _jax_helper!(ctx, "_RKChainRows", _JAX_CHAIN_ROWS)
         cols = [inputs[i].code for i in iterated]
         capacity = width === nothing ? _py_atom(first(cols)) * ".shape[0]" : width
-        localcols = _jax_chain_tuple([cols; "jnp.arange(" * capacity * ")"])
+        localcols = _jax_chain_tuple([cols; "jnp.arange(" * capacity * ")"; seqs[base_count+1:end]])
         localcall = "_rk_local_scan(" * join((step, _jax_scan_init(ctx, inputs[1]).code,
                                               localcols, extent, dtypes), ", ") * ")"
         call = "(" * localcall * " if any(isinstance(x, _RKChainRow) for x in " *
@@ -9336,11 +9356,11 @@ _jax_needs_x64(mod::_JaxModule) =
 
 """
     jax_source(spec::KernelSpec; have, want, types = nothing, name = :kernel,
-               float_type = Float64, layout = :default) -> JAXSource
+               float_type = Float64, plate_layout = nothing) -> JAXSource
     jax_source(spec::KernelSpec; have, functions, types = nothing, constants = (;),
-               doc = nothing, float_type = Float64, rejecting = (), layout = :default) -> JAXSource
+               doc = nothing, float_type = Float64, rejecting = (), plate_layout = nothing) -> JAXSource
     jax_source(p::Plan; types = nothing, name = :kernel, doc = nothing,
-               float_type = Float64, layout = :default) -> JAXSource
+               float_type = Float64, plate_layout = nothing) -> JAXSource
 
 Translate the program that computes `want` from `have` into a Python module
 whose function `name` takes the HAVE values, in order, and returns the WANT
@@ -9355,7 +9375,7 @@ dictionaries of these).
 their docstrings; the others state what they compute. Module functions
 annotate their parameters (`ArrayLike`) and results.
 
-Choose `layout = :chains` to run plate cells sequentially within an evaluation.
+Choose `plate_layout = :chains` to run plate cells sequentially within an evaluation.
 With bound data, `prepare_data` packs variable-length vector rows by offset.
 A scan directly consumed by a supported subject reduction can walk all real
 events in one statically bounded scan. Row-local variable-length loops use
@@ -9445,7 +9465,7 @@ jax_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
            definitions = nothing, definitions_module::Module = Main, keep = (),
            function_docs = NamedTuple(), float_type = Float64,
            source_regions = _JaxSourceRegion[], module_docstring = nothing,
-           rejecting = (), layout = :default) = _translate_in_latest_world(JAXSource) do
+           rejecting = (), plate_layout = nothing) = _translate_in_latest_world(JAXSource) do
     docstring = _jax_module_docstring(doc, module_docstring)
     functions === nothing && want === nothing && (want = _KERNEL_DEFAULT_BOUNDARY)
     if functions === nothing
@@ -9466,19 +9486,19 @@ jax_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
              for (fname, w) in pairs(functions)]
     _jax_with_float_type(float_type) do
         _jax_module_source(plans, types, constants, docstring; data, definitions,
-                           definitions_module, keep, function_docs, source_regions, rejecting, layout)
+                           definitions_module, keep, function_docs, source_regions, rejecting, layout = something(plate_layout, :default))
     end
 end
 
 jax_source(p::Plan; types = nothing, name = :kernel, constants = NamedTuple(),
            doc = nothing, data = nothing, definitions = nothing,
            definitions_module::Module = Main, keep = (), function_docs = NamedTuple(),
-           float_type = Float64, layout = :default) =
+           float_type = Float64, plate_layout = nothing) =
     _translate_in_latest_world(JAXSource) do
         _jax_with_float_type(float_type) do
             _jax_module_source([Symbol(name) => (p, Tuple(v.name for v in p.want))],
                                types, constants, _jax_module_docstring(doc, nothing);
-                               data, definitions, definitions_module, keep, function_docs, layout)
+                               data, definitions, definitions_module, keep, function_docs, layout = something(plate_layout, :default))
         end
     end
 
@@ -9533,7 +9553,8 @@ function _jax_module_source(plans, types, constants, docstring::String; data = n
                             definitions = nothing, definitions_module::Module = Main,
                             keep = (), function_docs = NamedTuple(),
                             source_regions = _JaxSourceRegion[], rejecting = (), layout = :default)
-    layout in (:default, :chains) || throw(ArgumentError("jax_source: unknown layout `$layout`; expected :default or :chains"))
+    layout === :padded && (layout = :default)
+    layout in (:default, :chains) || throw(ArgumentError("jax_source: unknown plate_layout `$layout`; expected :padded or :chains"))
     if data === nothing
         definitions === nothing || isempty(definitions) || throw(ArgumentError(
             "jax_source: `definitions` compute data values, so they need `data`"))

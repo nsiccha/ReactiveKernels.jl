@@ -18,7 +18,7 @@ are recorded in the git history only.
 
 ## 0.1.389
 
-- `jax_source(...; layout = :chains)` prepares variable-length vector rows in
+- `jax_source(...; plate_layout = :chains)` prepares variable-length vector rows in
   contiguous storage with row offsets. Eligible subject scans run over the
   actual events in row order. A caller can batch independent evaluations of
   the generated function with `jax.vmap`.

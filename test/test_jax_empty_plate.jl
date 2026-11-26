@@ -14,7 +14,7 @@ end
                 (Float64[], [Int[], Int[]]),
                 (Float64[], Vector{Int}[]))
     srcs = [jax_source(ragged_gather; want = :total, data = (; rows)) for (_, rows) in datasets]
-    chain = jax_source(ragged_gather; want = :total, data = (:rows,), layout = :chains)
+    chain = jax_source(ragged_gather; want = :total, data = (:rows,), plate_layout = :chains)
     @test all(s -> s.text == first(srcs).text, srcs)
     native = prepare(ragged_gather; want = :total)
     if rk_jax_available()

@@ -5,7 +5,7 @@
 # one module serves every binding of the same program.
 
 """
-    jax_source(built, plan; values = (), doc = nothing, float_type = Float64, layout = :default) -> JAXSource
+    jax_source(built, plan; values = (), doc = nothing, float_type = Float64, plate_layout = nothing) -> JAXSource
 
 A Python module for the `build_kernel` output `built`, evaluating the program
 with `jax.numpy` over the sampler boundary: the packed unconstrained
@@ -28,7 +28,7 @@ parameters, then the prepared data. Its functions:
   `constrain(layout, u)` nests them, and the value of a submodel call `e` whose
   name holds other values is under `return` there: `constrain(u, **p)["e"]["return"]`.
 
-For independent chains, `layout = :chains` selects sequential plate evaluation
+For independent chains, `plate_layout = :chains` selects sequential plate evaluation
 and packed variable-length vector rows at export time. Prepare the data once
 and batch gradients over the unconstrained parameter vectors, for example
 `jax.vmap(jax.grad(lambda u: log_density(u, **prepared)))`. Row-local
@@ -75,16 +75,16 @@ the program in Julia's latest world: a function that builds a model and
 translates it needs no `Base.invokelatest`.
 """
 ReactiveKernels.jax_source(built::NamedTuple, plan::StructuralPlan; values = (), doc = nothing,
-                           float_type = Float64, layout = :default) =
+                           float_type = Float64, plate_layout = nothing) =
     # In the latest world, as `ReactiveKernels.jax_source` translates: a
     # program built in the caller's own function call has methods its world
     # does not see.
     ReactiveKernels._translate_in_latest_world(ReactiveKernels.JAXSource) do
         ReactiveKernels._jax_with_float_type(float_type) do
-            _jax_module_of(built, plan; values, doc, float_type, layout)
+            _jax_module_of(built, plan; values, doc, float_type, plate_layout)
         end
     end
-function _jax_module_of(built, plan; values, doc, float_type, layout = :default, events = (;))
+function _jax_module_of(built, plan; values, doc, float_type, plate_layout = nothing, events = (;))
     built = _binding_build(built, plan)
     isbound(plan) || throw(ContractValidationError(
         "[jax] jax_source requires a bound plan (bind_data first)"))
@@ -195,7 +195,7 @@ function _jax_module_of(built, plan; values, doc, float_type, layout = :default,
         # as the native sampler targets answer -Inf; `constrain` raises.
         jax_source(built.spec; have, functions, types, constants, module_docstring = module_doc, data,
                    definitions, definitions_module = PPLGeneratedModels,
-                   keep = Tuple(sizes), function_docs, float_type, layout,
+                   keep = Tuple(sizes), function_docs, float_type, plate_layout,
                    source_regions = _jax_submodel_regions(built, plan),
                    rejecting = (:log_density, :log_prior, :log_likelihood, :log_jacobian))
     end

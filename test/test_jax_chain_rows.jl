@@ -29,8 +29,8 @@ end
 @testset "A terminal scan retains the initial state of empty rows" begin
     have = (:a, :rows)
     native = prepare(jax_terminal_rows; have, want = :total)
-    src = jax_source(jax_terminal_rows; have, want = :total, data = (:rows,), layout = :chains)
-    @test occursin("= _rk_scan_rows(", string(src))
+    src = jax_source(jax_terminal_rows; have, want = :total, data = (:rows,), plate_layout = :chains)
+    @test occursin("= _rk_scan_events(", string(src))
     if rk_jax_available()
         for rows in ([Float64[], [1.5, 4.0], [-2.0]], [Float64[], Float64[]],
                      Vector{Float64}[], [[0.4, 1.0], [-0.2, 0.7]])
@@ -62,7 +62,7 @@ end
 
 @testset "Packed plates broadcast singleton subjects and actual row lengths" begin
     have = (:a, :left, :right)
-    src = jax_source(jax_broadcast_rows; have, want = :total, data = (:left, :right), layout = :chains)
+    src = jax_source(jax_broadcast_rows; have, want = :total, data = (:left, :right), plate_layout = :chains)
     native = prepare(jax_broadcast_rows; have, want = :total)
     if rk_jax_available()
         for (l, r) in (([[1.0], [2., 3., 4.]], [[3., 2.], [5.]]),
@@ -142,7 +142,7 @@ end
 
 @testset "A subject plate publishes record fields on separate event and observation schedules" begin
     have = (:a, :events, :visits)
-    src = jax_source(jax_subject_reads; have, want = :total, data = (:events, :visits), layout = :chains)
+    src = jax_source(jax_subject_reads; have, want = :total, data = (:events, :visits), plate_layout = :chains)
     native = prepare(jax_subject_reads; have, want = :total)
     if rk_jax_available()
         for (events, visits) in (([[2,-1,3], Int[], [7]], [[3,1,3,2], Int[], [1]]),
@@ -156,7 +156,7 @@ end
 
 @testset "Variable-length plate outputs retain their packed order" begin
     have = (:a, :rows)
-    src = jax_source(jax_scaled_rows; have, want = :total, data = (:rows,), layout = :chains)
+    src = jax_source(jax_scaled_rows; have, want = :total, data = (:rows,), plate_layout = :chains)
     native = prepare(jax_scaled_rows; have, want = :total)
     @test occursin("else _rk_collect_rows(", string(src))
     if rk_jax_available()
@@ -165,7 +165,7 @@ end
             @test r.value == native(2.0, rows)
             @test r.grad == native(1.0, rows)
         end
-        exposed = jax_source(jax_scaled_rows; have, want = :joined, data = (:rows,), layout = :chains)
+        exposed = jax_source(jax_scaled_rows; have, want = :joined, data = (:rows,), plate_layout = :chains)
         rows = [[4.0], Float64[], [2.0, 7.0]]
         r = rk_jax_evaluate(exposed, "kernel", (3.0, rows); prepare = :arguments)
         @test r.value == [12.0, 6.0, 21.0]
@@ -174,7 +174,7 @@ end
 
 @testset "A second row table reads selected steps of the first row's history" begin
     have = (:a, :events, :visits)
-    src = jax_source(jax_row_read_history; have, want = :total, data = (:events, :visits), layout = :chains)
+    src = jax_source(jax_row_read_history; have, want = :total, data = (:events, :visits), plate_layout = :chains)
     native = prepare(jax_row_read_history; have, want = :total)
     if rk_jax_available()
         for (events, visits) in (([[2, -1, 3], Int[], [7]], [[3, 1, 3, 2], Int[], [1]]),
@@ -190,13 +190,13 @@ end
     have = (:a, :labels, :visits)
     labels = [Int[], [1, -1, 1], Int[], [-1], Int[]]
     visits = [Int[], [2, 3, 5], Int[], [7], Int[]]
-    emit(rows, counts) = jax_source(jax_row_trajectories; have, want = :total, layout = :chains,
+    emit(rows, counts) = jax_source(jax_row_trajectories; have, want = :total, plate_layout = :chains,
                                     data = (; labels = rows, visits = counts))
     source = emit(labels, visits)
     native = prepare(jax_row_trajectories; have, want = :total)
-    @test occursin("= _rk_scan_rows(", string(source))
+    @test occursin("= _rk_scan_events(", string(source))
     @test string(emit([repeat([1,-1], 35)], [ones(Int, 70)])) == string(source)
-    @test_throws ArgumentError jax_source(jax_row_trajectories; have, want = :total, layout = :unknown)
+    @test_throws ArgumentError jax_source(jax_row_trajectories; have, want = :total, plate_layout = :unknown)
     if rk_jax_available()
         for (ks, cs) in ((labels, visits), (reverse(labels), reverse(visits)),
                          ([[1, -1], [-1, 1]], [[3, 4], [5, 6]]),
@@ -210,10 +210,14 @@ end
                                                          prepare = :arguments)
         mktempdir() do dir
             write(joinpath(dir, "model.py"), source)
+            indexed = jax_source(jax_row_read_history; have = (:a, :events, :visits), want = :total,
+                                 data = (:events, :visits), plate_layout = :chains)
+            write(joinpath(dir, "indexed.py"), indexed)
             write(joinpath(dir, "verify.py"), raw"""
 import jax
 import numpy as np
 import model
+import indexed
 
 def scan_lengths(jaxpr):
     for eq in getattr(jaxpr, "jaxpr", jaxpr).eqns:
@@ -230,6 +234,11 @@ for n in (5, 23, 97):
     f = jax.jit(jax.vmap(jax.value_and_grad(lambda x: model.kernel(x, **data))))
     traces = list(scan_lengths(jax.make_jaxpr(f)(np.ones(7))))
     assert traces == [n + 2, n + 2], traces
+    visits = [[], [2, 1, 2], [n, 1, n], []]
+    inputs = indexed.prepare_data(events=ks, visits=visits)
+    grad = jax.vmap(jax.value_and_grad(lambda x: indexed.kernel(x, **inputs)))
+    traces = list(scan_lengths(jax.make_jaxpr(grad)(np.ones(7))))
+    assert sorted(traces) == sorted([n + 2, n + 2, 6, 6]), traces
 """)
             @test success(Cmd(`$RK_JAX_PYTHON $(joinpath(dir, "verify.py"))`; dir))
         end
@@ -241,7 +250,7 @@ end
 @testset "Fixed cell indices are prepared once in compact storage" begin
     rows = [[1, -1, 3], Int[], [4]]
     have = (:a, :codes)
-    src = jax_source(jax_row_index_sum; have, want = :total, data = (; codes = rows), layout = :chains)
+    src = jax_source(jax_row_index_sum; have, want = :total, data = (; codes = rows), plate_layout = :chains)
     hot = split(string(src), "def kernel(")[end]
     @test !occursin("jax_row_prefix", hot)
     @test !occursin("prepared[\"codes\"]", hot)

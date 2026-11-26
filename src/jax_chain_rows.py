@@ -80,6 +80,39 @@ def _rk_flat_values(rows):
     return rows.reshape((-1,) + rows.shape[2:])
 
 
+def _rk_row_values(row):
+    if isinstance(row, _RKChainRow):
+        if not row.shape[0]:
+            return jnp.empty(0, dtype=row.dtype)
+        return jax.vmap(row.read)(jnp.arange(row.shape[0]))
+    return row
+
+
+def _rk_event_table_rows(gather, table, index, requested, length, tags, mapped):
+    """Translate local indices to packed offsets before the common masked gather."""
+    packed = lambda a: isinstance(a, _RKChainRows)
+    first = jax.tree.leaves(table, is_leaf=packed)[0]
+    if tags is None:
+        def empty(column):
+            values = column.values if packed(column) else column
+            return jnp.zeros(index.shape, dtype=values.dtype)
+        return jax.tree.map(empty, table, is_leaf=packed), jnp.asarray(True)
+    if not mapped:
+        return gather(table, index, requested, first.shape[0] if length is None else length)
+    row = jnp.zeros_like(index) if first.shape[0] == 1 else jnp.abs(tags) - 1
+    if packed(first):
+        start = first.offsets[row]
+        size = first.offsets[row + 1] - start
+    else:
+        size = first.shape[1]
+        start = row * size
+    if length is not None:
+        size = jnp.minimum(size, length[row])
+    flat = jax.tree.map(_rk_flat_values, table, is_leaf=packed)
+    at = jnp.where((index >= 1) & (index <= size), start + index, 0)
+    return gather(flat, at, requested, _rk_flat_count(first))
+
+
 def _rk_join_rows(rows, lengths, total):
     if isinstance(rows, _RKChainRows) or _rk_flat_count(rows) == total:
         return _rk_flat_values(rows)
@@ -174,8 +207,14 @@ def _rk_collect_rows(cell, args, mapped, layouts, dtypes):
     # Invalid input to an untaken branch has no rows to evaluate. The
     # generated call's guard reports an invalid layout if execution takes it.
     empty = (jnp.zeros(n, dtype=int), jnp.zeros(n + 1, dtype=int), 0, 0)
-    layout = [False if spec is False else empty if spec is None else
-              (jnp.asarray(spec[0]), jnp.asarray(spec[1]), int(spec[2]), int(spec[3])) for spec in layout]
+    def output_layout(spec):
+        if spec is False or spec is None:
+            return False if spec is False else empty
+        counts, offsets, width, total = spec
+        if counts.shape[0] == 1 and n != 1:
+            return (jnp.full(n, int(width)), jnp.arange(n + 1) * int(width), int(width), n * int(width))
+        return jnp.asarray(counts), jnp.asarray(offsets), int(width), int(total)
+    layout = [output_layout(spec) for spec in layout]
     storage = tuple(jnp.zeros(n if spec is False else spec[3], dtype=dt)
                     for dt, spec in zip(types, layout))
     def run_subject(i, buffers):
@@ -225,32 +264,60 @@ def _rk_subject_axes(columns, extra, tags):
     return columns, tags
 
 
-def _rk_map_rows(cell, args, axes, tags, dtypes):
-    columns, tags = _rk_subject_axes([x for x, axis in zip(args, axes) if axis == "event"],
-                                     [x for x, axis in zip(args, axes) if axis == "row"], tags)
-    first = columns[0]
-    aligned = iter(columns)
-    arrays = tuple(_rk_flat_values(next(aligned)) if axis == "event" else x for x, axis in zip(args, axes))
-    count = _rk_flat_count(first)
-    if tags is None or count == 0:
-        values = jax.tree.map(lambda dt: jnp.zeros(count, dtype=dt), dtypes)
-    else:
+def _rk_map_rows(cell, args, axes, layout, dtypes, sum_rows, domains):
+    first = args[axes.index("event")]
+    if layout is None:
+        if sum_rows:
+            return jnp.zeros(first.shape[0], dtype=dtypes)
+        return jax.tree.map(lambda dt: _rk_wrap_column(jnp.zeros(_rk_flat_count(first), dtype=dt), first), dtypes)
+    counts, offsets, width, tags, positions = layout
+    n = counts.shape[0]
+    # Additional subject-specific shared operands can broadcast a single
+    # scheduled row across several subjects.
+    sources = jax.tree.leaves([x for x, axis in zip(args, axes) if axis == "row"],
+                              is_leaf=lambda a: isinstance(a, _RKChainRows))
+    size, = np.broadcast_shapes((n,), *[(x.shape[0],) for x in sources], *[(d,) for d in domains])
+    events = []
+    places = iter(positions)
+    for x, axis in zip(args, axes):
+        if axis == "event":
+            idx = next(places)
+            flat = _rk_flat_values(x)
+            events.append(flat if idx is None else flat[idx])
+    if size != n:
+        events = [jnp.tile(x, size) for x in events]
+        tags = jnp.repeat(jnp.arange(size), int(width))
+    if tags.shape[0]:
         def apply(event):
-            tag, *items = event
-            row = jnp.abs(tag) - 1
+            row, *items = event
             it = iter(items)
             return cell(*(next(it) if axis == "event" else _rk_select_subject(x, row) if axis == "row" else x
-                          for x, axis in zip(arrays, axes)))
-        values = jax.lax.map(apply, (tags, *(x for x, axis in zip(arrays, axes) if axis == "event")))
-    return jax.tree.map(lambda x: _rk_wrap_column(x, first), values)
+                          for x, axis in zip(args, axes)))
+        if sum_rows:
+            zero = jnp.sum(jnp.empty(0, dtype=dtypes))
+            def step(subtotal, arg):
+                start, items = arg
+                subtotal = jnp.where(start, zero, subtotal) + apply(items)
+                return subtotal, subtotal
+            first_in_row = jnp.concatenate((jnp.ones(1, dtype=bool), tags[1:] != tags[:-1]))
+            _, sums = jax.lax.scan(step, zero, (first_in_row, (tags, *events)))
+            ends = offsets[1:] if n == size else (jnp.arange(size) + 1) * int(width)
+            return jnp.where(counts > 0, sums[jnp.maximum(ends - 1, 0)], zero)
+        values = jax.lax.map(apply, (tags, *events))
+    elif sum_rows:
+        return jnp.zeros(size, dtype=jnp.sum(jnp.empty(0, dtype=dtypes)).dtype)
+    else:
+        values = jax.tree.map(lambda dt: jnp.zeros(0, dtype=dt), dtypes)
+    def wrap(x):
+        if size * int(width) == tags.shape[0]:
+            return x.reshape((size, int(width)) + x.shape[1:])
+        return _RKChainRows(x, offsets, int(width))
+    return jax.tree.map(wrap, values)
 
 
-def _rk_scan_rows(step, seed, columns, row_tags, shared, mapped, seed_mapped, dtype, reduction, include_seed):
+def _rk_scan_events(step, seed, columns, row_tags, shared, mapped, seed_mapped, dtype, reduction, include_seed,
+                    decorate, gathered):
     """Scan consecutive real events, restarting the authored carry at each nonempty row."""
-    subjects = [x for x, by_row in zip(shared, mapped) if by_row]
-    if seed_mapped:
-        subjects.append(seed)
-    columns, row_tags = _rk_subject_axes(columns, subjects, row_tags)
     first = columns[0]
     nrows = first.shape[0]
     flat = tuple(_rk_flat_values(col) for col in columns)
@@ -263,31 +330,34 @@ def _rk_scan_rows(step, seed, columns, row_tags, shared, mapped, seed_mapped, dt
         lengths = width
 
     reduce_sum = reduction == "sum"
-    zero = jnp.sum(jnp.empty(0, dtype=dtype)) if reduce_sum else jnp.zeros((), dtype=dtype)
+    zero = jnp.sum(jnp.empty(0, dtype=dtype)) if reduce_sum else 0
     empty_value = seed if include_seed else zero
     if row_tags is None or not flat[0].shape[0]:
         if reduction:
             return jnp.broadcast_to(empty_value, (nrows,))
-        return _rk_wrap_column(jnp.zeros(flat[0].shape[0], dtype=dtype), first)
+        return jax.tree.map(lambda dt: _rk_wrap_column(jnp.zeros(flat[0].shape[0], dtype=dt), first), dtype)
 
     def body(state, event):
         previous, subtotal = state
-        tag, *items = event
+        tag, items, selected = event
         row = jnp.abs(tag) - 1
         init = _rk_select_subject(seed, row) if seed_mapped else seed
         carry = jax.tree.map(lambda new, old: jnp.where(tag < 0, new, old), init, previous)
         args = (_rk_select_subject(value, row) if select else value for value, select in zip(shared, mapped))
-        carry, value = step(carry, *items, *args)
+        carry, value = step(carry, *items, *args, *selected)
         if reduce_sum:
             subtotal = jnp.where(tag < 0, init if include_seed else zero, subtotal) + value
             return (carry, subtotal), subtotal
         return (carry, subtotal), value
 
-    initial = seed[0] if seed_mapped else seed
-    _, values = jax.lax.scan(body, (initial, zero), (row_tags, *flat))
+    initial = _rk_select_subject(seed, 0) if seed_mapped else seed
+    # The selected row views are local to body. The checkpoint boundary
+    # takes only the numerical scan carry and event operands.
+    run = body if decorate is None else decorate(body)
+    _, values = jax.lax.scan(run, (initial, zero), (row_tags, flat, gathered))
     if reduction:
         return jnp.where(lengths > 0, values[jnp.maximum(ends - 1, 0)], empty_value)
-    return _rk_wrap_column(values, first)
+    return jax.tree.map(lambda v: _rk_wrap_column(v, first), values)
 
 
 def _rk_chain_sum(row, count):
@@ -309,12 +379,12 @@ def _rk_local_scan(step, seed, columns, length, dtypes):
     # Row-local histories are addressed by later operations in the same
     # subject. Allocate one bounded workspace, writing each real event once.
     from equinox.internal import while_loop
-    capacity = min(x.shape[0] for x in columns)
+    capacity = min(x.shape[0] for x in jax.tree.leaves(columns))
     buffers = jax.tree.map(lambda dt: jnp.zeros(capacity, dtype=dt), dtypes)
     if capacity:
         def advance(state):
             i, carry, stored = state
-            carry, output = step(carry, tuple(x[i] for x in columns))
+            carry, output = step(carry, jax.tree.map(lambda x: x[i], columns))
             stored = jax.tree.map(lambda b, v: b.at[i].set(v), stored, output,
                                   is_leaf=lambda b: hasattr(b, "at"))
             return i + 1, carry, stored
