@@ -219,6 +219,8 @@ raw = {"xs": [np.array([1.0, 2.0]), np.array([3.0])]}
 chosen, report = tune_gradient(rows, raw, positions, (2, 4))
 assert report[0]["chains"] in (2, 4)
 np.testing.assert_allclose(rows.kernel(0.6, **chosen), rows.kernel(0.6, **rows.prepare_data(**raw)))
+with np.testing.assert_raises_regex(ValueError, "initial position"):
+    tune_gradient(rows, raw, positions, iter((len(positions) + 1,)))
 
 # Exercise the fit objective with separately bound modules, and a generator of
 # chain counts shared across the candidates. An initial position belongs to

@@ -2,7 +2,15 @@
 import jax
 
 
+def _chain_counts(starts, requested):
+    counts = tuple(requested)
+    if not counts or max(counts) > len(starts):
+        raise ValueError("supply at least one initial position for each chain in the largest batch")
+    return counts
+
+
 def tune_gradient(module, raw, starts, chain_counts):
+    counts = _chain_counts(starts, chain_counts)
     prepared = module.prepare_data(**raw)
 
     def make_step(data, count):
@@ -13,15 +21,13 @@ def tune_gradient(module, raw, starts, chain_counts):
         positions = starts[:count]
         return lambda: batched(positions)
 
-    return module.select_plate_layout(prepared, make_step, chains=chain_counts)
+    return module.select_plate_layout(prepared, make_step, chains=counts)
 
 
 def tune_sampler(modules, raw, starts, chain_counts, warmup_gradients, draws,
                  gradients_per_draw, *, groups=(1, 2, 4, 8), repeats=5):
     """Compare matching sampler exports on their target device at a fixed total draw count."""
-    counts = tuple(chain_counts)
-    if not counts or max(counts) > len(starts):
-        raise ValueError("supply at least one initial position for each chain in the largest batch")
+    counts = _chain_counts(starts, chain_counts)
 
     def builder(module):
         def make_step(data, count):
