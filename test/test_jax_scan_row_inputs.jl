@@ -118,7 +118,10 @@ end
     packed = jax_source(jax_guarded_scan_rows; have, want = :total, data = (:bases, :types, :orders),
                         plate_layout = :chains)
     native = prepare(jax_guarded_scan_rows; have, want = :total)
-    @test occursin(" = _rk_scan_record_rows(", string(src))
+    grouped = jax_source(jax_guarded_scan_rows; have, want = :total, data = (:bases, :types, :orders),
+                         plate_layout = :groups)
+    @test occursin(" = _rk_scan_record_rows(", string(grouped))
+    @test occursin(" = _rk_subject_scan(", string(padded))
     @test occursin("_rk_record_plate(offsets_cell,", string(padded))
     @test occursin(" = _rk_event_table_rows(_rk_scan_record_rows, ", string(packed))
     @test occursin(" = _rk_scan_events(", string(packed))

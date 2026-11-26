@@ -1,3 +1,22 @@
+Base.include_dependency(joinpath(@__DIR__, "jax_subject_scan.py"))
+const _JAX_SUBJECT_SCAN = read(joinpath(@__DIR__, "jax_subject_scan.py"), String)
+
+function _jax_subject_scan_lengths(ctx, firstrow)
+    o = firstrow.origin
+    ctx.mod.layout === :padded && o isa _JaxOrigin && o.position === nothing &&
+        !isempty(o.path) && o.offset == "0" && o.scale == "1" || return nothing
+    # This exact input is mapped in order by the enclosing subject plate.
+    haskey(ctx.mod.helper_names, (:record_axis, ctx.scope, firstrow.code, firstrow.extent)) ||
+        return nothing
+    o.key * "_lengths"
+end
+
+function _jax_subject_scan_schedule!(ctx, lengths)
+    tags = _jax_prepared_bound!(ctx, :scan_rows, lengths)
+    rounds = _jax_prepared_bound!(ctx, :event_rounds, tags)
+    _jax_prepared_bound!(ctx, :subject_scan, lengths, tags, rounds)
+end
+
 function _jax_record_axes(ctx, body, inputs, mapped)
     any(r -> r.op isa _AuthoredScanOp, body.recipes) || return nothing
     map(inputs, mapped) do input, rows
@@ -104,6 +123,13 @@ function _jax_scan_row_guard(scope, table, index)
     guard
 end
 
+const _JAX_SCAN_INDEX = raw"""
+def _rk_scan_index(table, index, requested, length):
+    size = jax.tree.leaves(table)[0].shape[0]
+    valid = (index >= 1) & (index <= length) & (index <= size)
+    return jnp.where(requested & valid, index - 1, size), jnp.all(~requested | valid)
+"""
+
 const _JAX_SCAN_ROWS = raw"""
 def _rk_scan_rows(table, index, requested, length):
     # Indices are one-based. A masked gather fills inactive positions and
@@ -193,7 +219,7 @@ function _jax_compact_cell_rows(ctx, inner, rows, read, guards, extent, index, g
 end
 
 function _jax_scan_row_inputs!(ctx, inner, rows, unpack, seqs, width, extent, pure;
-                               sequence = v -> _jax_scan_sequence(v, width), gather_rows = nothing)
+                               sequence = v -> _jax_scan_sequence(v, width), gather_rows = nothing, direct_reads = nothing)
     isempty(rows.reads) && return false
     body = join(inner.lines, "\n")
     tokens = Set(m.match for m in eachmatch(_JAX_HISTORY_TOKENS, body))
@@ -234,7 +260,13 @@ function _jax_scan_row_inputs!(ctx, inner, rows, unpack, seqs, width, extent, pu
         else
             compact = packed ? _jax_compact_cell_rows(ctx, inner, rows, r, guards, extent,
                                                       index, guard, limit) : nothing
-            something(compact, gather * "(" * join((r.table.code, index, guard, limit), ", ") * ")")
+            if direct_reads !== nothing && compact === nothing && packed
+                push!(direct_reads, (length(seqs), r.table.code))
+                check = _jax_helper!(ctx, "_rk_scan_index", _JAX_SCAN_INDEX)
+                check * "(" * join((r.table.code, index, guard, limit), ", ") * ")"
+            else
+                something(compact, gather * "(" * join((r.table.code, index, guard, limit), ", ") * ")")
+            end
         end
         _jax_emit!(ctx, values * ", " * valid * " = " * call)
         push!(checks, valid)

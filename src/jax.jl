@@ -9242,6 +9242,9 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     seqs = String[_jax_scan_sequence(inputs[i], width) for i in iterated]
     isempty(position) || push!(seqs, "jnp.arange(" * _py_atom(first(seqs)) * ".shape[0])")
     local_rows = ctx.mod.layout === :chains && !isempty(extent)
+    lengths_key = pure && !isempty(padded_inputs) && first(iterated) == first(padded_inputs) ?
+        _jax_subject_scan_lengths(ctx, inputs[first(iterated)]) : nothing
+    direct_reads = lengths_key === nothing ? nothing : Tuple{Int,String}[]
     base_count = length(seqs)
     gathered = if local_rows && !isempty(scan_rows.reads)
         _jax_helper!(ctx, "_RKChainRows", _JAX_CHAIN_ROWS)
@@ -9250,13 +9253,24 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
             table.code * "), " * join((index, mask, limit), ", ") * ")"
         _jax_scan_row_inputs!(ctx, inner, scan_rows, unpack, seqs, width, extent, pure; sequence, gather_rows)
     else
-        _jax_scan_row_inputs!(ctx, inner, scan_rows, unpack, seqs, width, extent, pure)
+        _jax_scan_row_inputs!(ctx, inner, scan_rows, unpack, seqs, width, extent, pure; direct_reads)
     end
-    if any(i -> _jax_columns(inputs[i].T), shared) && pure
+    subject_scan = direct_reads !== nothing && !isempty(direct_reads)
+    shared_names = String[]
+    if subject_scan
+        push!(shared_names, extent)
+        for i in shared
+            v = inputs[i]
+            v.T isa Type && v.T <: Number && v.code in outer.used && push!(shared_names, v.code)
+        end
+        unique!(shared_names)
+    end
+    if !subject_scan && any(i -> _jax_columns(inputs[i].T), shared) && pure
         decorator = _jax_helper!(ctx, "_rk_table_scan_step", _JAX_TABLE_SCAN_STEP)
         _jax_emit!(ctx, "@" * decorator)
     end
-    push!(outer.lines, "    "^outer.indent * "def " * step * "(" * carry * ", " * xs * "):")
+    step_args = join([carry; xs; shared_names], ", ")
+    push!(outer.lines, "    "^outer.indent * "def " * step * "(" * step_args * "):")
     isempty(unpack) || push!(outer.lines, "    "^inner.indent * join(unpack, ", ") *
                             (length(unpack) == 1 ? "," : "") * " = " * xs)
     if gathered && !isempty(position)
@@ -9291,6 +9305,17 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     E = _jax_typeof(wants[2])
     call = "jax.lax.scan(" * step * ", " * _jax_scan_init(ctx, inputs[1]).code * ", " *
            sequences * ")[1]"
+    if subject_scan
+        schedule = _jax_subject_scan_schedule!(ctx, lengths_key)
+        names = unique(last.(direct_reads))
+        tables = _jax_chain_tuple(["_rk_pack_record(" * n * ")" for n in names])
+        reads = _jax_chain_tuple(["(" * string(i) * ", " * string(findfirst(==(t), names) - 1) * ")"
+                                  for (i, t) in direct_reads])
+        helper = _jax_helper!(ctx, "_rk_subject_scan", _JAX_SUBJECT_SCAN)
+        decorate = _jax_helper!(ctx, "_rk_table_scan_step", _JAX_TABLE_SCAN_STEP)
+        call = helper * "(" * join((step, _jax_scan_init(ctx, inputs[1]).code, sequences,
+                                    _jax_chain_tuple(shared_names), schedule, tables, reads, decorate), ", ") * ")"
+    end
     dtypes = ctx.mod.layout === :chains && !isempty(extent) ? _jax_chain_dtypes(E) : nothing
     if dtypes !== nothing
         _jax_helper!(ctx, "_RKChainRows", _JAX_CHAIN_ROWS)
@@ -10186,7 +10211,7 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
             push!(pending, key)
         end
     end
-    bounds = filter(b -> b[2] ∉ (:broadcast_total, :scan_rows, :row_layout, :sign_groups, :match_count, :padded_map_rows) ||
+    bounds = filter(b -> b[2] ∉ (:broadcast_total, :scan_rows, :row_layout, :sign_groups, :match_count, :padded_map_rows, :subject_scan) ||
                          b[1] in used_inputs, all_bounds)
     if !isempty(bounds)
         bodies[prepare_body] = join(_jax_prepare_bounds_lines(mod, prepare_lines, bounds), "\n")
@@ -10558,7 +10583,7 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
             for (bn, kind, _) in _jax_prepared_bounds(mod)
                 occursin(Regex("\\b" * bn * "\\b"), body) || continue
                 push!(inputs, bn => _jax_prepared_aux_type(kind)); push!(input_locals, bn)
-                kind in (:row_layout, :map_rows, :padded_map_rows, :scan_rows) && push!(schedules, bn)
+                kind in (:row_layout, :map_rows, :padded_map_rows, :scan_rows, :subject_scan) && push!(schedules, bn)
             end
             for ((pn, _), local_name) in zip(inputs[keyword_from+1:end], input_locals[keyword_from+1:end])
                 value = "prepared[\"" * pn * "\"]"
