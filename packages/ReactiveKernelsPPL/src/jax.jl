@@ -806,6 +806,58 @@ def _rk_ordered_constrain(u, lo, hi):
     v = u[lo - 1:hi]
     return jnp.cumsum(jnp.concatenate([v[:1], jnp.exp(v[1:])]))
 """
+# A column advances every independent row's ordered product by one partial.
+# Prepare the triangular coordinates from the shape and pass the columns as
+# scan inputs, so the reverse sweep never scatters into z from inside a round.
+const _JAX_LKJ_ROWS = """
+def _ppl_lkj_rows(z, K):
+    row, col = np.tril_indices(K, -1)
+    grid = jnp.zeros((K, K - 1), dtype=z.dtype).at[row, col].set(z)
+    def advance(product, column):
+        partial, scale = column
+        return product * scale, product * partial
+    diagonal, columns = jax.lax.scan(advance, jnp.ones(K, dtype=z.dtype),
+                                     (grid.T, jnp.sqrt(1 - grid.T ** 2)))
+    return diagonal, jnp.pad(columns.T, ((0, 0), (0, 1)))
+"""
+
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        f::Union{typeof(_ppl_lkj_lower),typeof(_ppl_lkj_upper),typeof(_ppl_lkj_diagonal)},
+        args::Vector{ReactiveKernels._PyVal})
+    K = args[end - 1]
+    (ctx.host !== nothing || !K.static) &&
+        return ReactiveKernels._jax_traceable_or_lowered(ctx, f, args)
+    rows = ReactiveKernels._jax_helper!(ctx, "_ppl_lkj_rows", _JAX_LKJ_ROWS)
+    if f === _ppl_lkj_diagonal
+        expr = rows * "(" * args[1].code * ", " * K.code * ")[0]"
+        return ReactiveKernels._PyVal(expr, Vector{Float64})
+    end
+    name = string(nameof(f))
+    body = "def " * name * "(z, diagonal, K, P):\n" *
+           "    lower = " * rows * "(z, K)[1] + jnp.diag(jnp.asarray(diagonal).at[0].set(1.0))\n" *
+           "    return " * (f === _ppl_lkj_upper ? "lower.T" : "lower")
+    helper = ReactiveKernels._jax_helper!(ctx, name, body)
+    ReactiveKernels._PyVal(helper * "(" * ReactiveKernels._jax_args(args) * ")", Matrix{Float64})
+end
+
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        f::typeof(_ppl_lkj_logjac), args::Vector{ReactiveKernels._PyVal})
+    ctx.host !== nothing && return ReactiveKernels._jax_traceable_or_lowered(ctx, f, args)
+    z, weights = (ReactiveKernels._py_atom(v.code) for v in args)
+    ReactiveKernels._PyVal("jnp.sum(" * weights * " * jnp.log(1 - " * z * " ** 2))", Float64)
+end
+
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        f::typeof(_ppl_lkj_diagonal_logprior), args::Vector{ReactiveKernels._PyVal})
+    diagonal, K, eta = args
+    (ctx.host !== nothing || !K.static) &&
+        return ReactiveKernels._jax_traceable_or_lowered(ctx, f, args)
+    terms = "(" * K.code * " - jnp.arange(2, " * K.code * " + 1) + 2 * " *
+            ReactiveKernels._py_atom(eta.code) * " - 2) * jnp.log(" *
+            ReactiveKernels._py_atom(diagonal.code) * "[1:" * K.code * "])"
+    ReactiveKernels._PyVal("jnp.sum(" * terms * ")", Float64)
+end
+
 const _JAX_SIMPLEX = """
 def _rk_simplex_constrain_logjac(u, lo, hi):
     # RKPPL stick-breaking simplex of u[lo:hi] and its log-Jacobian.
