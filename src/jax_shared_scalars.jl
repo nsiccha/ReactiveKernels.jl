@@ -2,6 +2,8 @@
 # operands broadcast over the condition's axes by lax.cond's batching rule.
 # Reduce demand only along axes on which every operand is shared. The
 # original conditional still selects which cells consume the result.
+# The barrier keeps the any-row reduction separate from elementwise
+# derivatives that consume the same mask.
 const _JAX_SCALAR_DEMAND = raw"""
 @jax.custom_batching.custom_vmap
 def _rk_scalar_demand(active, *parameters):
@@ -10,7 +12,7 @@ def _rk_scalar_demand(active, *parameters):
 @_rk_scalar_demand.def_vmap
 def _rk_scalar_demand_batch(size, batched, active, *parameters):
     if batched[0] and not any(batched[1:]):
-        return _rk_scalar_demand(jnp.any(active, axis=0), *parameters), False
+        return _rk_scalar_demand(jnp.any(jax.lax.optimization_barrier(active), axis=0), *parameters), False
     return active, batched[0]
 """
 
