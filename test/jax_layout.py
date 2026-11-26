@@ -142,7 +142,7 @@ np.testing.assert_allclose(batched(walk, best)(positions)[0], batched(walk, data
 # A candidate without memory is recorded and its larger counts are skipped;
 # any other failure is the caller's to see.
 def scarce(data, count):
-    if data["_rk_plate_layout"]["totals_cell"] is None and count > 2:
+    if data["_rk_plate_layout"]["totals_cell"] is None:
         raise RuntimeError("RESOURCE_EXHAUSTED: out of memory")
     return make_step(data, count)
 
@@ -150,9 +150,8 @@ def scarce(data, count):
 _, report = walk.select_plate_layout(data, scarce, chains=(2, 4, 8),
                                      candidates=[(1, False), (3, False)], repeats=1)
 padded = [row for row in report if row["groups"] == 1]
-assert [row["chains"] for row in padded if row["error"] is None] == [2]
-assert [row["chains"] for row in padded if row["error"] is not None] == [4]
-assert report[0]["groups"] == 3
+assert len(padded) == 1 and padded[0]["chains"] == 2 and padded[0]["error"] is not None
+assert report[0]["groups"] == 3 and report[-1] is padded[0]
 
 
 def broken(data, count):
