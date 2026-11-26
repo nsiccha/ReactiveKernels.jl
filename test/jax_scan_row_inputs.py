@@ -17,6 +17,47 @@ def equations(jaxpr):
                     yield from equations(child)
 
 
+def record(value, scale, active):
+    return (jnp.cos(value * scale), value + scale)
+
+for lengths in ([1, 3, 0], [2, 0, 9]):
+    width = max(lengths)
+    counts = jnp.array(lengths)
+    mask = np.arange(width) < np.array(lengths)[:, None]
+    positions = jnp.array(np.flatnonzero(mask))
+    data = jnp.where(mask, jnp.arange(mask.size, dtype=float).reshape(mask.shape), jnp.nan)
+    scales = jnp.array([0.2, -0.5, 0.3])
+
+    def evaluate(scales, counts, positions, data):
+        def row(scale, n, x):
+            return model._rk_record_plate(record, 0, n, positions.size, counts.size,
+                                          x, scale, jnp.arange(width) < n)
+        values, _ = jax.vmap(row)(scales, counts, data)
+        return jnp.sum(values.reshape(-1)[positions])
+
+    loss = jax.value_and_grad(evaluate)
+    value, grad = jax.jit(loss)(scales, counts, positions, data)
+    owner = np.repeat(np.arange(len(lengths)), lengths)
+    x = np.asarray(data)[mask]
+    points = x * np.asarray(scales)[owner]
+    np.testing.assert_allclose(value, np.cos(points).sum())
+    np.testing.assert_allclose(grad, np.bincount(owner, -x * np.sin(points), minlength=len(lengths)))
+    trace = jax.make_jaxpr(loss)(scales, counts, positions, data)
+    work = [eq.invars[0].aval.shape for eq in equations(trace) if eq.primitive.name == "cos"]
+    assert work == [(len(positions),)], work
+
+
+# Homogeneous boolean records retain their dtype on empty and short rows.
+def boolean_row(n, data):
+    return model._rk_record_plate(lambda x, active: (x > 1,), 0, n, 4, 3,
+                                  data, jnp.arange(3) < n)[0]
+
+
+truth = jax.jit(jax.vmap(boolean_row))(jnp.array([1, 3, 0]), jnp.arange(9).reshape(3, 3))
+assert truth.dtype == jnp.bool_
+np.testing.assert_array_equal(truth, [[False] * 3, [True] * 3, [False] * 3])
+
+
 # All fields share indices, including a repeated read and an invalid inactive
 # index. A wider record still has just one table gather and one transpose.
 for fields in (2, 16):

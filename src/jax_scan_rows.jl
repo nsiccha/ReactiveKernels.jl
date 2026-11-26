@@ -1,3 +1,72 @@
+function _jax_record_axes(ctx, body, inputs, mapped)
+    any(r -> r.op isa _AuthoredScanOp, body.recipes) || return nothing
+    map(inputs, mapped) do input, rows
+        rows && input.T isa Type && input.T <: AbstractVector{<:AbstractVector{<:Number}} || return nothing
+        flat = get(ctx.scope.flat_positions, input.extent, nothing)
+        (flat === nothing || flat == _JAX_FULL_ROWS || flat.prefix != 0) && return nothing
+        (flat.total, _py_atom(input.extent) * ".shape[0]")
+    end
+end
+
+# A nested plate producing records for a scan can batch its scalar cell
+# over the prepared positions of its single iterated row. Its captures stay
+# at the same point in the subject program, including preceding checks.
+function _jax_record_plate_call(ctx, p, recipe, E, inputs, mapped, cell, args)
+    ctx.mod.layout === :padded && _jax_numeric_tuple(E) && count(mapped) == 1 || return nothing
+    (recipe.effectful || any(r -> r.effectful, recipe.op.kernel.plan.recipes)) && return nothing
+    i = findfirst(mapped)
+    v = inputs[i]
+    plan = get(ctx.mod.helper_names, (:record_axis, ctx.scope, v.code, v.extent), nothing)
+    plan === nothing && return nothing
+    all(x -> x.T isa Type && (x.T <: AbstractFloat || x.T <: AbstractArray{<:AbstractFloat}),
+        inputs[.!mapped]) || return nothing
+    length(args) == length(inputs) + 1 || return nothing
+    output = canon_id(p.graph, only(recipe.outputs).id)
+    any(r -> r.op isa _AuthoredScanOp && any(x -> canon_id(p.graph, x.id) == output, r.inputs),
+        p.recipes) || return nothing
+    f = _jax_helper!(ctx, "_rk_record_plate", _JAX_RECORD_PLATE)
+    f * "(" * join([cell, string(i - 1), v.extent, plan..., args...], ", ") * ")"
+end
+
+const _JAX_RECORD_PLATE = raw"""
+def _rk_record_plate(cell, axis, length, total, subjects, *args):
+    # The final argument is the activity flag of the original mapped cell.
+    axes = tuple(0 if i == axis or i == len(args) - 1 else None for i in range(len(args)))
+    def ordinary(length, *columns):
+        return jax.vmap(cell, in_axes=axes)(*columns)
+    run = jax.custom_batching.custom_vmap(ordinary)
+    @run.def_vmap
+    def batch(n, mapped, lengths, *columns):
+        by_length, *by_row = mapped
+        width = columns[axis].shape[-1]
+        if (n != subjects or not by_length or not by_row[axis] or
+                not isinstance(total, (int, np.integer)) or total in (0, n * width)):
+            in_axes = jax.tree.map(lambda b: 0 if b else None, tuple(mapped))
+            values = jax.vmap(ordinary, in_axes=in_axes)(lengths, *columns)
+        else:
+            positions = jnp.nonzero((jnp.arange(width) < lengths[:, None]).ravel(), size=total)[0]
+            owners = positions // width
+            selected = []
+            event_axes = []
+            for x, row, col in zip(columns, by_row, axes):
+                if col == 0:
+                    selected.append(x.reshape(-1)[positions] if row else x[positions % width])
+                    event_axes.append(0)
+                else:
+                    selected.append(x[owners] if row else x)
+                    event_axes.append(0 if row else None)
+            records = jax.vmap(cell, in_axes=tuple(event_axes))(*selected)
+            offsets = jnp.cumsum(lengths) - lengths
+            rows = offsets[:, None] + jnp.minimum(jnp.arange(width), jnp.maximum(lengths[:, None] - 1, 0))
+            # A short row repeats its final entry in the padded representation.
+            def restore(field):
+                return jnp.where(lengths[:, None] > 0, jnp.take(field, rows, mode="clip"),
+                                 jnp.zeros_like(field, shape=()))
+            values = jax.tree.map(restore, records)
+        return values, jax.tree.map(lambda x: True, values)
+    return run(length, *args)
+"""
+
 # A guarded read of an already materialized numeric table. The schedule
 # supplies both the integer index and the predicate, independently of carry.
 function _jax_scan_row_table(v)

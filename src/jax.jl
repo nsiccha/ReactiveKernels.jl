@@ -8545,7 +8545,8 @@ function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
                              links = fill(nothing, length(p.have)),
                              origins = fill(nothing, length(p.have)),
                              fields = fill(0, length(p.have)),
-                             active_cells::Bool = false, row_widths::Bool = false, event_inputs = nothing)
+                             active_cells::Bool = false, row_widths::Bool = false, event_inputs = nothing,
+                             record_axes = nothing)
     name = _jax_fresh(ctx, hint)
     outer = ctx.scope
     inner = _JaxScope(outer)
@@ -8560,6 +8561,9 @@ function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
         if extents[i]
             extent = _jax_identifier(inner.used, Symbol(hint, :_n))
             push!(names, extent)
+            if record_axes !== nothing && record_axes[i] !== nothing
+                ctx.mod.helper_names[(:record_axis, inner, param, extent)] = record_axes[i]
+            end
         end
         inner.values[canon_id(p.graph, v.id)] = _PyVal(param, types[i], statics[i], extent, "",
                                                        fields[i], origins[i])
@@ -8743,6 +8747,8 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
                                                                 origins = cell_origins,
                                                                 fields = cell_fields,
                                                                 active_cells = masked,
+                                                                record_axes = R == 1 && ctx.mod.layout === :padded ?
+                                                                    _jax_record_axes(ctx, body, inputs, mapped) : nothing,
                                                                 row_widths = R == 1 && _jax_plate_layout() === :groups)
     guard_each_cell = masked && any(v -> v.origin isa _JaxDenseRows, inputs[padded])
     if guard_each_cell
@@ -8850,6 +8856,9 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     call = R == 1 ? _jax_layout_call(ctx, cell, axes_text, call_args,
                                      _jax_layout_arguments(ctx, inputs, mapped, ragged),
                                      rows_at, rows) : nothing
+    if call === nothing && R == 1 && masked && !guard_each_cell && !only(with_length)
+        call = _jax_record_plate_call(ctx, p, recipe, E, inputs, mapped, cell, call_args)
+    end
     if call === nothing
         call = cell
         mapper = _jax_mapper(ctx)
