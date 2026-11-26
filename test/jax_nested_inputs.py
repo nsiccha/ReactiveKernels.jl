@@ -96,11 +96,34 @@ np.testing.assert_allclose(flat, a * np.asarray([2, 4, 1, 5]))
 fixed_group = jax.jit(lambda scale, data: selected_bound.flat(scale, 1, **data))
 np.testing.assert_allclose(fixed_group(a, selected_bound.prepare_data(x=mixed)), a * np.asarray([2, 4, 5]))
 
-rows = [[[2, 4]], [[7, 8], [5, 6]]]
-for inputs, row_flat in ((direct_row.pad_ragged(rows), direct_row.flat), ((), prepared_row.flat)):
-    data = {} if inputs else prepared_row.prepare_data(x=rows)
-    got = jax.jit(row_flat)(a, *inputs, 1, 1, **data)
-    np.testing.assert_allclose(got, a * np.asarray([2, 4]))
+def check_inner_row(module, bound_data):
+    def row(groups, j, compiled=True):
+        f = jax.jit(module.flat) if compiled else module.flat
+        if bound_data:
+            return f(a, 1, j, **module.prepare_data(x=groups))
+        return f(a, *module.pad_ragged(groups), 1, j)
+
+    rows = [[[2, 4]], [[7, 8], [5, 6]]]
+    np.testing.assert_allclose(row(rows, 1), a * np.asarray([2, 4]))
+    try:
+        row(rows, 2).block_until_ready()
+    except Exception as error:
+        assert "BoundsError" in str(error), error
+    else:
+        raise AssertionError("the inactive row slot was selectable")
+
+    with_empty = [[[2, 4], []], [[7, 8], [5, 6]]]
+    np.testing.assert_array_equal(row(with_empty, 2, compiled=False), [])
+    try:
+        row(with_empty, 1).block_until_ready()
+    except Exception as error:
+        assert "data-dependent output size" in str(error), error
+    else:
+        raise AssertionError("the real empty row was ignored in the selectable lengths")
+
+
+check_inner_row(direct_row, False)
+check_inner_row(prepared_row, True)
 
 first = jax.jit(jax.value_and_grad(first_row.score))
 np.testing.assert_allclose(first(a, *first_row.pad_ragged([[[]]])), (0, 0))
