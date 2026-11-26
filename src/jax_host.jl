@@ -2282,10 +2282,13 @@ function _jax_cell_split(g::Graph, r::Recipe, dependent::Set{ValueId}, hoisted::
     # An otherwise unused bound axis can broadcast a singleton or make the
     # whole plate empty. Include it when preparation owns the complete domain.
     mapped(i) = !(i in atomic_inputs) && !(valtype(r.inputs[i]) <: Number)
-    inputs = Int[i for i in eachindex(data) if data[i] &&
-                 (canon_id(cg, body.have[i].id) in read || complete_domain && mapped(i))]
-    atomic = Bool[i in atomic_inputs for i in inputs]
+    inputs = Int[i for i in eachindex(data) if data[i] && canon_id(cg, body.have[i].id) in read]
     percell = any(mapped, inputs)
+    if complete_domain && percell
+        inputs = Int[i for i in eachindex(data) if data[i] &&
+                     (canon_id(cg, body.have[i].id) in read || mapped(i))]
+    end
+    atomic = Bool[i in atomic_inputs for i in inputs]
     plan = _partial_subplan(body, Value[body.have[i] for i in inputs], frontier, computed)
     values = Value[Value(v.name, Any) for v in frontier]
     prefix = Recipe(_jax_cell_prefix_id(r.id), Tuple(r.inputs[i] for i in inputs),
