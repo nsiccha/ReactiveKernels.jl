@@ -26,7 +26,7 @@ function _jax_chain_entry(ctx, table, index)
     end
     entry
 end
-_jax_prepared_aux_type(kind) = kind in (:row_layout, :map_rows, :padded_map_rows, :sign_groups, :event_rounds) ? Tuple : kind === :scan_rows ? Vector{Int} : Int
+_jax_prepared_aux_type(kind) = kind in (:row_layout, :map_rows, :padded_map_rows, :sign_groups, :event_rounds, :subject_scan) ? Tuple : kind === :scan_rows ? Vector{Int} : Int
 function _jax_chain_dtypes(T)
     T <: Number && return _jax_dtype(T)
     _jax_number_fields(T) ? _jax_chain_tuple(_jax_dtype.(fieldtypes(T))) : nothing

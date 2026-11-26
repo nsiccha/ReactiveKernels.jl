@@ -2035,6 +2035,19 @@ def _rk_scan_schedule(*lengths):
     owners[starts[counts != 0]] *= -1
     return owners
 """),
+    :subject_scan => ("_rk_subject_scan_schedule", """
+def _rk_subject_scan_schedule(lengths, tags, schedule):
+    phases, restore = schedule
+    lengths = np.asarray(lengths)
+    offsets = np.cumsum(lengths) - lengths
+    owners = np.abs(tags) - 1
+    local = np.arange(len(tags)) - offsets[owners]
+    width = int(lengths.max(initial=0))
+    columns = np.arange(width)
+    where = np.where(columns < lengths[:, None], offsets[:, None] + columns, len(tags))
+    return (tuple((owners[p], local[p], sends) for p, sends in phases),
+            np.append(restore, len(tags))[where])
+"""),
     :event_rounds => ("_rk_event_rounds", """
 def _rk_event_rounds(tags):
     if tags is None or not tags.size:
