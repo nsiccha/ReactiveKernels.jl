@@ -1050,9 +1050,11 @@ lower_rkppl(ast, data::NamedTuple; mod::Module = Main, conditioned=(),
         cache::Union{LoweringCache,Nothing} = nothing) =
     lower_rkppl(ast, Dict{Symbol,Any}(pairs(data)); mod, conditioned, frozen, cache)
 
-function lower_rkppl(ast, data::AbstractDict; mod::Module = Main, conditioned=(),
+Base.@nospecializeinfer function lower_rkppl(ast, data::AbstractDict;
+        mod::Module = Main, conditioned=(),
         frozen::Union{FrozenValues,Nothing} = nothing,
         cache::Union{LoweringCache,Nothing} = nothing)
+    @nospecialize conditioned
     frozen === nothing || (data = _with_frozen_inputs(data, frozen))
     names = Symbol[]
     scalars = Set{Symbol}()
@@ -1061,16 +1063,21 @@ function lower_rkppl(ast, data::AbstractDict; mod::Module = Main, conditioned=()
         push!(names, k)
         v isa Number && push!(scalars, k)
     end
-    return _with_frozen(_lower_rkppl(ast, names, scalars, mod; conditioned,
-        values = data, cache), frozen)
+    plan = Base.invokelatest(_lower_rkppl_latest, ast, names, scalars, mod,
+        conditioned, data, cache)::StructuralPlan
+    return _with_frozen(plan, frozen)
 end
 
-function lower_rkppl(ast, data_names; mod::Module = Main, conditioned=(),
+Base.@nospecializeinfer function lower_rkppl(ast, data_names;
+        mod::Module = Main, conditioned=(),
         frozen::Union{FrozenValues,Nothing} = nothing,
         cache::Union{LoweringCache,Nothing} = nothing)
+    @nospecialize conditioned
     names = collect(data_names)
     frozen === nothing || union!(names, keys(_with_frozen_inputs(Dict{Symbol,Any}(), frozen)))
-    return _with_frozen(_lower_rkppl(ast, names, Set{Symbol}(), mod; conditioned, cache), frozen)
+    plan = Base.invokelatest(_lower_rkppl_latest, ast, names, Set{Symbol}(), mod,
+        conditioned, nothing, cache)::StructuralPlan
+    return _with_frozen(plan, frozen)
 end
 
 # The data a lowering with `frozen` reads: `data`, plus each input the record
@@ -1095,16 +1102,17 @@ _with_frozen(plan::StructuralPlan, frozen::FrozenValues) = _with(plan; frozen)
 # What lowering names reaches types, through the ports of the kernel it generates,
 # so one source lowers to one set of names (`ReactiveKernels._kernel_gensym`; snag
 # `gensym-in-kernel-54164b85`).
-_lower_rkppl(ast, data_names, scalars::Set{Symbol}, mod::Module; conditioned=(),
-        values::Union{Nothing,AbstractDict} = nothing, cache = nothing)::StructuralPlan =
-    ReactiveKernels._within_kernel_names(ast) do
-        Base.invokelatest(_lower_rkppl_latest, ast, data_names, scalars, mod;
-            conditioned, values, cache)
+Base.@nospecializeinfer function _lower_rkppl_latest(ast, data_names, scalars::Set{Symbol},
+        mod::Module, @nospecialize(conditioned), values, cache)::StructuralPlan
+    # Keep the number of observed names out of the lowering closure's type.
+    observing = Set{Symbol}(_conditioned_names(conditioned))
+    return ReactiveKernels._within_kernel_names(ast) do
+        _lower_rkppl(ast, data_names, scalars, mod, observing, values, cache)
     end
+end
 
-function _lower_rkppl_latest(ast, data_names, scalars::Set{Symbol},
-        mod::Module; conditioned=(), values::Union{Nothing,AbstractDict} = nothing,
-        cache = nothing)::StructuralPlan
+function _lower_rkppl(ast, data_names, scalars::Set{Symbol}, mod::Module,
+        observing::Set{Symbol}, values, cache)::StructuralPlan
     data = Set{Symbol}()
     for n in data_names
         n isa Symbol || _sfail("data names must be Symbols, got $(repr(n))")
@@ -1114,7 +1122,6 @@ function _lower_rkppl_latest(ast, data_names, scalars::Set{Symbol},
         _sfail("lower_rkppl takes a `begin ... end` block AST")
     ast, documentation = _documentation_source(ast)
     ast = Expr(:block, _desugar_destructuring(ast.args)...)
-    observing = Set{Symbol}(_conditioned_names(conditioned))
     primitive = _conditioned_parameters(ast, observing, mod)
     setdiff!(data, primitive)
     union!(data, _conditioned_without_value(ast, observing, data, primitive))

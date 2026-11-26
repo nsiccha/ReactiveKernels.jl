@@ -74,8 +74,8 @@ _metadata_call(f, args; kwargs) = OutputSignatures.infer_call(f, args; kwargs)
 # keep all inputs, and no recipe is executed. A plate's shared captures do
 # not determine its output axes; only its batched arguments do. PPL stages
 # data-only definitions on this frontier before asking for output metadata.
-function _kernel_metadata_inputs(spec::KernelSpec)
-    _kernel_inline_signature_supported(spec.call_signature) || return Int[]
+Base.@nospecializeinfer function _kernel_metadata_inputs(@nospecialize(spec::KernelSpec))
+    _kernel_inline_signature_supported(getfield(spec, :call_signature)) || return Int[]
     p = plan(spec)
     cid(v) = canon_id(p.graph, v.id)
     needed = Set{ValueId}(cid(v) for v in p.want)
@@ -108,10 +108,10 @@ end
 # facts through its selected recipes without executing any of them. Partial
 # facts deliberately remain :unknown: axes alone do not certify a numerical
 # rule or authorize replacing a call with an elementwise operation.
-function _metadata_call(spec::KernelSpec, args; kwargs)
+Base.@nospecializeinfer function _metadata_call(@nospecialize(spec::KernelSpec), args; kwargs)
     OS = OutputSignatures
     unknown = OS.CallInfo(OS.ValueInfo(), :unknown, "kernel boundary is unavailable")
-    isempty(kwargs) && _kernel_inline_signature_supported(spec.call_signature) &&
+    isempty(kwargs) && _kernel_inline_signature_supported(getfield(spec, :call_signature)) &&
         length(args) == length(inputs(spec)) &&
         length(outputs(spec)) == 1 || return unknown
     p = plan(spec)

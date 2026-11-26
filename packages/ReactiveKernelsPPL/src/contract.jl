@@ -9157,7 +9157,8 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     end
 end
 
-function _bind_data_latest(input_plan::StructuralPlan, columns::AbstractDict{Symbol};
+Base.@nospecializeinfer function _bind_data_latest(input_plan::StructuralPlan,
+        @nospecialize(columns::AbstractDict{Symbol});
         roles::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}(),
         dims::AbstractDict{Symbol,<:Integer} = Dict{Symbol,Int}(),
         conditioned = input_plan.conditioned, frozen::FrozenValues = input_plan.frozen)
@@ -9261,13 +9262,14 @@ function _bind_data_latest(input_plan::StructuralPlan, columns::AbstractDict{Sym
         _materialize_module_data!(plan, columns; already = computed,
             frozen = frozen.values)
     maps = _eval_levelmaps(plan.levelmaps, columns)
-    maps = _interned(plan, (:levelmaps, map(m -> (m.predictor, m.column,
-        Tuple(m.values), m.source, m.subset), maps)...), maps)
+    # Snapshot the contents for interning without putting collection lengths in key types.
+    map_key = map(m -> (m.predictor, m.column, copy(m.values), m.source, m.subset), maps)
+    maps = _interned(plan, (:levelmaps, map_key), maps)
     responses2, vectors2 =
         _infer_leveled_sizes(plan.responses, plan.vector_parameters, columns,
             plan.predictors, _with(plan; columns = columns, n_obs = n))
-    responses2 = _interned(plan, (:responses, responses2...), responses2)
-    vectors2 = _interned(plan, (:vector_parameters, vectors2...), vectors2)
+    responses2 = _interned(plan, (:responses, copy(responses2)), responses2)
+    vectors2 = _interned(plan, (:vector_parameters, copy(vectors2)), vectors2)
     bound = _with(plan; responses = responses2, columns = columns,
         n_obs = n, roles = merged, levelmaps = maps,
         vector_parameters = vectors2, frozen = frozen)
