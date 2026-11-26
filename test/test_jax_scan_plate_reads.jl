@@ -108,8 +108,28 @@ end
             write(joinpath(dir, "model.py"), src)
             write(joinpath(dir, "trace.py"), raw"""
 import jax
+import jax.numpy as jnp
 import numpy as np
 import model
+
+# A scalar consumer of one field should allow JAX to prune the other input
+# columns. Packing the rows first makes all five columns live in this trace.
+def projected(columns, indices):
+    return jax.vmap(lambda i: model._rk_record_at(columns, i)[2])(indices).sum()
+
+for n in (7, 61):
+    columns = tuple(jnp.arange(n, dtype=float) + k for k in range(5))
+    indices = jnp.array([0, n - 1, 0])
+    value, gradient = jax.value_and_grad(projected)(columns, indices)
+    np.testing.assert_equal(float(value), n + 5)
+    host_columns = tuple(np.asarray(column) for column in columns)
+    np.testing.assert_equal(float(jax.jit(lambda i: projected(host_columns, i))(indices)), n + 5)
+    for k, column in enumerate(gradient):
+        expected = np.bincount(indices, minlength=n) if k == 2 else np.zeros(n)
+        np.testing.assert_array_equal(column, expected)
+    ir = jax.jit(projected).lower(columns, indices).compiler_ir("stablehlo")
+    main = next(f for f in ir.body.operations if f.attributes["sym_name"].value == "main")
+    assert len(main.arguments) == 2  # The selected column and the index vector.
 
 def steps(jaxpr):
     for eq in getattr(jaxpr, "jaxpr", jaxpr).eqns:
