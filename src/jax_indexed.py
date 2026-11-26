@@ -151,16 +151,25 @@ def _rk_run_effects(closed, args, reads, mode, wanted=None):
                 results = arm(branches[int(np.clip(values[0], 0, len(branches) - 1))])()
             else:
                 results = jax.lax.switch(values[0], [arm(b) for b in branches])
-        elif runs and name in ('jit', 'pjit'):
+        elif name in ('jit', 'pjit') and (runs or any(isinstance(v, _RKCoordinateReader) for v in values)):
             results = _rk_run_effects(eq.params['jaxpr'], values, inner, mode, outputs)
         elif mode == 'data' and any(inner):
             # Needs the point, which preparation does not have.
             results = [None] * len(eq.outvars)
+        elif values and isinstance(values[0], _RKCoordinateReader) and (
+                name in ('slice', 'dynamic_slice') or
+                (name == 'gather' and eq.params['mode'] in
+                 (jax.lax.GatherScatterMode.CLIP, jax.lax.GatherScatterMode.PROMISE_IN_BOUNDS))):
+            # Apply the check's exact indexing operation to positions. A check
+            # of one coordinate then reads one value, even inside a lazy arm.
+            source, *indices = values
+            keys = eq.primitive.bind(jnp.arange(source.reference.size), *indices, **eq.params)
+            results = [source((keys,))]
         else:
-            results = eq.primitive.bind(*values, **eq.primitive.get_bind_params(eq.params))
+            results = eq.primitive.bind(*map(_rk_array_operand, values), **eq.primitive.get_bind_params(eq.params))
             results = results if eq.primitive.multiple_results else [results]
         env.update(zip(eq.outvars, results))
-    return [read(v) if w else None for v, w in zip(jaxpr.outvars, wanted)]
+    return [_rk_array_operand(read(v)) if w else None for v, w in zip(jaxpr.outvars, wanted)]
 
 
 def _rk_event_trace(fn, point, prepared):
@@ -187,9 +196,10 @@ class _RKIndexedGraph:
     An equation that has no output, such as a runtime check, is never pulled:
     _rk_run_effects runs those.
     """
-    def __init__(self, closed, inputs, regions=None, parent=None, visit_axis=None, oversized_only=False):
+    def __init__(self, closed, inputs, regions=None, parent=None, visit_axis=None, oversized_only=False, compact=False):
         graph = closed.jaxpr
         self.parent = parent
+        self.compact = parent.compact if parent is not None else compact
         # Preparation and evaluation visit the same graph in the same order.
         # Its children share the one planned read, including inside jit calls.
         self.visit_axis = parent.visit_axis if parent is not None else visit_axis
@@ -240,7 +250,9 @@ class _RKIndexedGraph:
                     if keys.size == 1:
                         return jnp.broadcast_to(values, lanes)
                     return jnp.take(values, inverse, axis=lane, mode='clip')
-        if not oversized:
+        # A compact call keeps per-draw storage on requested rows, even when
+        # an intermediate table spanning all units is smaller than the request.
+        if self.compact or not oversized:
             return self.evaluate(eq, output, index)
         # The ordinary reader uses table-sized slots only when they are smaller
         # than the request. Unused slots repeat a valid requested coordinate.
@@ -487,7 +499,7 @@ class _RKIndexedGraph:
                      for b in index[:-2]]
             square = (jnp.arange(n).reshape(n, 1), jnp.arange(n).reshape(1, n))
             requested = jnp.broadcast_shapes(*(jnp.shape(b) for b in batch)) if batch else ()
-            if math.prod(requested) > math.prod(dims):
+            if not self.compact and math.prod(requested) > math.prod(dims):
                 # More requested matrices than the batch has: factor each
                 # distinct one once.
                 slots, entries = _rk_requested_slots(batch, dims)
@@ -650,7 +662,7 @@ def _rk_has_cond(closed):
     return any(eq.primitive.name == 'cond' or _rk_params_have_cond(eq.params) for eq in graph.eqns)
 
 
-def _rk_prepare_axis(closed, point, prepared, rows, offsets, common, *, by_reuse=False):
+def _rk_prepare_axis(closed, point, prepared, rows, offsets, common, *, by_reuse=False, compact=False):
     """Plan a repeated, independently broadcast coordinate in the common rows.
 
     Trace its row coordinates with the point and data as separate inputs.
@@ -666,7 +678,7 @@ def _rk_prepare_axis(closed, point, prepared, rows, offsets, common, *, by_reuse
             if by_reuse or not found:
                 found.append(k)
         inputs = [_RKIndexedGraph.leaf(v) for v in jax.tree.leaves((u, data))]
-        _rk_selected(_RKIndexedGraph(closed, inputs, visit_axis=visit, oversized_only=not by_reuse), row)
+        _rk_selected(_RKIndexedGraph(closed, inputs, visit_axis=visit, oversized_only=not by_reuse, compact=compact), row)
         return tuple(found)
 
     prototype = jax.ShapeDtypeStruct((common,), rows.dtype)
@@ -715,16 +727,45 @@ def _rk_prepare_axis(closed, point, prepared, rows, offsets, common, *, by_reuse
     return ()
 
 
-def _rk_read_event(fn, u, row, prepared, axis_plan=()):
+class _RKCoordinateReader:
+    """Look up only the packed coordinates requested by the event."""
+    def __init__(self, values, reference, shared_slots, local_keys, local_slots):
+        self.values = values
+        self.reference = reference
+        self.shared_slots = shared_slots
+        self.local_keys = local_keys
+        self.local_slots = local_slots
+
+    def __call__(self, index):
+        key, = index
+        if isinstance(key, slice):
+            key = jnp.arange(*key.indices(self.reference.size))
+        fixed = self.reference[key]
+        if not self.values.size:
+            return fixed
+        slot = self.shared_slots[key]
+        if self.local_keys.size:
+            i = jnp.minimum(jnp.searchsorted(self.local_keys, key), self.local_keys.size - 1)
+            slot = jnp.where(self.local_keys[i] == key, self.local_slots[i], slot)
+        return jnp.where(slot >= 0, self.values[jnp.maximum(slot, 0)], fixed)
+
+
+def _rk_array_operand(value):
+    return value((slice(None),)) if isinstance(value, _RKCoordinateReader) else value
+
+
+def _rk_read_event(fn, u, row, prepared, axis_plan=(), coordinates=()):
     # The event's checks of the data ran once in prepare_partition. Those
     # that read the point run here, over the whole event.
-    closed, _, reads = _rk_event_trace(fn, u, prepared)
+    prototype = jax.ShapeDtypeStruct(coordinates[0].shape, u.dtype) if coordinates else u
+    closed, _, reads = _rk_event_trace(fn, prototype, prepared)
     checks = _rk_has_effect(closed, reads, 'point')
-    def selected(point, index, data):
-        leaves = jax.tree.leaves((point, data))
+    def selected(point, index, data, mapping):
+        reader = _RKCoordinateReader(point, *mapping) if mapping else _RKIndexedGraph.leaf(point)
+        leaves = jax.tree.leaves(data)
         if checks:
-            _rk_run_effects(closed, leaves, reads, 'point')
-        inputs = [_RKIndexedGraph.leaf(v) for v in leaves]
+            _rk_run_effects(closed, [reader if mapping else point, *leaves], reads, 'point')
+        inputs = [reader, *map(_RKIndexedGraph.leaf, leaves)]
         # A dictionary identifies the visit in the common-row trace. A pair
         # from an older partition targets its first oversized Cartesian read.
         numbered = isinstance(axis_plan, dict)
@@ -733,11 +774,11 @@ def _rk_read_event(fn, u, row, prepared, axis_plan=()):
         def visit(_):
             return plans.get(next(visits))
         graph = _RKIndexedGraph(closed, inputs, visit_axis=visit if axis_plan else None,
-                                oversized_only=not numbered)
+                                oversized_only=not numbered, compact=bool(mapping))
         return _rk_selected(graph, index)
     if _rk_has_cond(closed) and _rk_batch_control(closed, [True] * len(closed.jaxpr.invars))[0]:
-        return _rk_strict_batch(selected)(u, row, prepared)
-    return selected(u, row, prepared)
+        return _rk_strict_batch(selected)(u, row, prepared, coordinates)
+    return selected(u, row, prepared, coordinates)
 
 
 def _rk_selected(graph, row):

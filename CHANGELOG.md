@@ -16,6 +16,10 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.392
+
+- Indexed JAX event reads can differentiate a subset of packed coordinates against a shared reference point.
+
 ## 0.1.391
 
 - Partitioned JAX reads can prepare distinct row coordinates for a unit
