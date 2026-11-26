@@ -116,4 +116,52 @@ end
     @test native(0.7, zeros(0, 1)) == 0.0
 end
 
+# The store to (1,2) changes the value read through the reshape at (2,2).
+@traceable function overlapping_copy(x)
+    out = fill(x, 3, 2)
+    out[3, 1] = 2x
+    alias = reshape(out, 2, 3)
+    for i in 1:2
+        for j in 1:2
+            out[i, j] = alias[i, j]
+        end
+    end
+    out
+end
+
+@kernel function alias_sum(x::Float64)
+    out = overlapping_copy(x)
+    total = sum(out)
+    return total
+end
+
+@traceable function overlapping_row(x)
+    out = fill(x, 2, 3)
+    out[1, 1] = 2x
+    strip = vec(out)
+    for j in 1:3
+        out[2, j] = strip[j]
+    end
+    out
+end
+
+@kernel function alias_row_sum(x::Float64)
+    out = overlapping_row(x)
+    total = sum(out)
+    return total
+end
+
+@testset "Overlapping reshape reads observe ordered writes" begin
+    for (model, native) in ((alias_sum, overlapping_copy), (alias_row_sum, overlapping_row))
+        src = jax_source(model; have=(:x,), want=:total)
+        @test !occursin(".at[:", string(src))
+        @test !occursin("jax.lax.dynamic_update_slice(", string(src))
+        @test occursin("fori_loop(", string(src))
+        if rk_jax_available()
+            overlap = rk_jax_evaluate(src, :kernel, (1.0,); grad=true)
+            @test overlap.value == sum(native(1.0)) == 9
+            @test overlap.grad == 9
+        end
+    end
+end
 end

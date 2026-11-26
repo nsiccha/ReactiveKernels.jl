@@ -1358,6 +1358,9 @@ function _jax_expr(ctx::_JaxContext, ::Val{:ref}, ex)
         return _PyVal("jnp.asarray([" * join((v.code for v in values), ", ") * "], dtype=" *
                       _jax_dtype(T) * ")", Vector{T})
     end
+    if ctx.host === nothing && head isa Symbol
+        x = _jax_read_reshaped_matrix(ctx, head, x)
+    end
     _jax_index(ctx, x, ex.args[2:end])
 end
 
@@ -3885,9 +3888,16 @@ function _jax_expr(ctx::_JaxContext, ::Val{:call}, ex)
     end
     values = _jax_positional_values(ctx, positional)
     kw = Pair{Symbol,_PyVal}[k => _jax_expr(ctx, v) for (k, v) in kwargs]
-    _jax_with_call_arguments(ctx, f, positional) do
+    result = _jax_with_call_arguments(ctx, f, positional) do
         _jax_call(ctx, f, values, kw)
     end
+    if ctx.host === nothing && ctx.target !== nothing && first(ctx.target) === ex &&
+       (f === reshape || f === vec) && isempty(kw) && result.T isa Type &&
+       result.T <: Union{Vector,Matrix} &&
+       !isempty(positional) && first(positional) isa Symbol
+        _jax_record_matrix_reshape!(ctx, last(ctx.target), ex, first(positional))
+    end
+    result
 end
 
 # A compiler integration may decode its own closed, quoted constructor syntax
@@ -7415,10 +7425,11 @@ mutable struct _JaxFrame
     detached::Dict{Symbol,_PyVal}
     ambiguous::Set{Symbol}
     lets::Int
+    matrix_reshape_sources::Dict{Symbol,Symbol}
 end
 _JaxFrame(scope, names, function_body, source, locals) =
     _JaxFrame(scope, names, function_body, source, locals, Set{Symbol}(),
-              Dict{Symbol,_PyVal}(), Set{Symbol}(), 0)
+              Dict{Symbol,_PyVal}(), Set{Symbol}(), 0, Dict{Symbol,Symbol}())
 _jax_frame() = (frames = _jax_frames(); isempty(frames) ? nothing : last(frames))
 # A function body's argument rebound by name: Julia's writes until here
 # reached the caller's array, and later ones reach the new value.

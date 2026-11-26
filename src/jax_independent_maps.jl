@@ -4,6 +4,56 @@
 _jax_map_statements(x) = x isa Expr && x.head === :block ?
     [a for a in x.args if !(a isa LineNumberNode)] : Any[x]
 _jax_map_assignment(x) = Meta.isexpr(x, :(=), 2)
+
+function _jax_plain_copy_array(ctx, value)
+    value !== nothing && value.T isa Type && value.T <: Array &&
+        eltype(value.T) <: _JaxBranchReal && isprimitivetype(eltype(value.T)) &&
+        isempty(value.extent) && !_jax_slots(value) && !(value.origin isa _JaxRowView ||
+        value.origin isa _JaxRowShape && (value.origin.stored || _jax_borrowed_buffer(ctx, value)))
+end
+
+# A read-only reshape of a dense array still reads later writes to its
+# parent. The sequential loop must reshape the current carry for each read,
+# even though the alias's shape was established before the loop.
+function _jax_readonly_reshape_use(ex, alias, parent)
+    ex isa Expr || return ex !== alias
+    if ex.head in (:let, :function, :->, :macrocall)
+        return !_kernel_mentions(ex, alias) && !_kernel_mentions(ex, parent)
+    elseif Meta.isexpr(ex, :ref) && first(ex.args) === alias
+        return all(a -> !_kernel_mentions(a, alias), ex.args[2:end])
+    elseif (_jax_map_assignment(ex) || haskey(_JAX_UPDATING, ex.head)) &&
+            _kernel_mentions(first(ex.args), alias)
+        return false
+    end
+    all(a -> _jax_readonly_reshape_use(a, alias, parent), ex.args)
+end
+
+function _jax_record_matrix_reshape!(ctx, alias, ex, parent)
+    frame = _jax_frame()
+    frame !== nothing && ctx.scope === frame.scope && !haskey(ctx.locals, alias) || return
+    array = get(ctx.locals, parent, nothing)
+    _jax_plain_copy_array(ctx, array) || return
+    statements = _jax_map_statements(frame.source)
+    at = findfirst(st -> _jax_map_assignment(st) && st.args[1] === alias && st.args[2] === ex, statements)
+    at === nothing && return
+    rebound, written = Set{Symbol}(), Set{Symbol}()
+    for i in at+1:length(statements)
+        st = statements[i]
+        _jax_readonly_reshape_use(st, alias, parent) || return
+        _jax_write_targets!(rebound, written, st)
+    end
+    parent in written && !(parent in rebound) && (frame.matrix_reshape_sources[alias] = parent)
+end
+
+function _jax_read_reshaped_matrix(ctx, name, value)
+    frame = _jax_frame()
+    frame === nothing && return value
+    parent = get(frame.matrix_reshape_sources, name, nothing)
+    parent === nothing && return value
+    _PyVal("jnp.reshape(" * ctx.locals[parent].code * ", " * value.code *
+           ".shape, order=\"F\")", value.T)
+end
+
 # Resolve the authored comparison through the normal scalar emitter. A wrapper
 # can implement Base's comparison too. Only a single pure comparison of the
 # entry against zero qualifies, including the semantics of unordered values.
@@ -201,6 +251,9 @@ function _jax_prefix_store(ctx, var, body, hi)
     else
         indices == vars && Meta.isexpr(rhs, :ref) && rhs.args[2:end] == indices ||
             return nothing
+        frame = _jax_frame()
+        # Reads through this reshape must see writes to its parent in order.
+        frame !== nothing && haskey(frame.matrix_reshape_sources, rhs.args[1]) && return nothing
         src = get(ctx.locals, rhs.args[1], nothing)
         plain(src) && ndims(src.T) == length(vars) && eltype(src.T) === eltype(dest.T) ||
             return nothing
