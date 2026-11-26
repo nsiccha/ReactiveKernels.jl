@@ -74,10 +74,13 @@ end
 @testset "A one-arm scan read takes the requested rows as step inputs" begin
     have = (:a, :bases, :types, :orders)
     src = jax_source(jax_guarded_scan_rows; have, want = :total, data = (:bases, :types, :orders))
+    padded = jax_source(jax_guarded_scan_rows; have, want = :total, data = (:bases, :types, :orders),
+                        plate_layout = :padded)
     packed = jax_source(jax_guarded_scan_rows; have, want = :total, data = (:bases, :types, :orders),
                         plate_layout = :chains)
     native = prepare(jax_guarded_scan_rows; have, want = :total)
     @test occursin(" = _rk_scan_record_rows(", string(src))
+    @test occursin("_rk_record_plate(offsets_cell,", string(padded))
     @test occursin(" = _rk_event_table_rows(_rk_scan_record_rows, ", string(packed))
     @test occursin(" = _rk_scan_events(", string(packed))
     checked_have = (:a, :kinds, :visits, :table)
@@ -131,7 +134,7 @@ end
             @test result.grad ≈ (ref(a + 1, args...) - ref(a - 1, args...)) / 2
         end
         mktempdir() do dir
-            write(joinpath(dir, "model.py"), src)
+            write(joinpath(dir, "model.py"), padded)
             script = joinpath(@__DIR__, "jax_scan_row_inputs.py")
             @test success(`$RK_JAX_PYTHON $script $dir`)
         end
