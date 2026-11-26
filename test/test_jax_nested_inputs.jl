@@ -81,6 +81,8 @@ end
         mktempdir() do dir
             write(joinpath(dir, "direct.py"), plain)
             write(joinpath(dir, "bound.py"), bound)
+            write(joinpath(dir, "chains.py"), jax_source(nested_rows; have, functions = outputs,
+                                                        data = (; x = first(data)), plate_layout = :chains))
             selected = (; have = (:a, :x, :i), functions = (flat = :flat, named = (; flat = :flat)))
             write(joinpath(dir, "selected.py"), jax_source(selected_group; selected...))
             write(joinpath(dir, "selected_bound.py"), jax_source(selected_group; selected..., data = (; x = first(data))))
@@ -94,6 +96,8 @@ end
             write(joinpath(dir, "cases.py"), "import numpy as np\na = $a\ncases = [" *
                   join(map(_rk_py_input, cases), ", ") * "]\n")
             @test success(pipeline(`$RK_JAX_PYTHON $(joinpath(@__DIR__, "jax_nested_inputs.py")) $dir`;
+                                   stdout, stderr))
+            @test success(pipeline(`$RK_JAX_PYTHON $(joinpath(@__DIR__, "jax_nested_chain_inputs.py")) $dir`;
                                    stdout, stderr))
         end
     else

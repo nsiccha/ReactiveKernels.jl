@@ -241,9 +241,13 @@ function _jax_chain_table(ctx, recipe, args, mapped; sum_rows = false, domains =
     types = Any[i in each ? eltype(eltype(x.T)) : mapped[i] ? eltype(x.T) : _jax_unref(x.T)
                 for (i, x) in enumerate(args)]
     extents = Bool[!(i in each) && !isempty(x.extent) for (i, x) in enumerate(args)]
+    # Selecting a subject from nested rows leaves both its row count and the
+    # vector of row lengths. The table cell indexes the latter to read a row.
+    group_rows = [extents[i] && (mapped[i] ? _jax_nested_rows(x.T) : _jax_group_rows(x))
+                  for (i, x) in enumerate(args)]
     before = _JAX_EFFECTS[]
     cell, wants, _, _, _ = _jax_plan_function!(ctx, _jax_body_hint(ctx, recipe, :cell),
-                                               recipe.op.kernel.plan, types; extents)
+                                               recipe.op.kernel.plan, types; extents, group_rows)
     # One vmap can reorder effects from different rows. Retain the ordinary
     # traversal if a cell has an observable effect or emits a runtime check.
     padded && (recipe.effectful || _JAX_EFFECTS[] != before ||
