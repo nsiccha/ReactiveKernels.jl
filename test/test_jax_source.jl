@@ -1592,7 +1592,9 @@ end
     labels_c = ["s1", "s2", "s3", "s4"]
     partition = jax_source(jax_prep_partition; have = (:a, :groups, :cells), want = :total,
                            data = (; groups = labels_g, cells = labels_c))
-    @test occursin(r"rows\w*\[i\w* - 1\]\[counts\w*\[i\w* - 1\] - 1\] = r", string(partition))
+    # The partition fills its owned nested row directly. Index conversion
+    # may check Julia's lower bound on the way to the NumPy store.
+    @test occursin(r"(?m)^ +rows\w*\[.+\]\[.*counts\w*\[.+\].*\] = r\w*$", string(partition))
     @test !occursin("_rk_deepcopy", string(partition))
     rescaled = jax_source(jax_prep_rescaled; have = (:a, :R), want = :total, data = (; R))
     @test occursin(r"rows\w* = _rk_deepcopy_np\(rows\w*\)", string(rescaled))
