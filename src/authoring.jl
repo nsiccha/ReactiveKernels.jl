@@ -1883,6 +1883,9 @@ end
 function _kernel_unspliced_call_lowering(call::Expr, spec::KernelSpec,
                                          nested_specs)
     callee = call.args[1]
+    # Inlining reads recipes from the child, whereas a staged call describes
+    # only its boundary. Expand the real child on this construction path.
+    _build_call_slot(callee) === nothing || throw(_UnsupportedConstructor())
     callee isa Symbol && haskey(nested_specs, callee) && return nothing
     signature = spec.call_signature
     signature isa _KernelEndpointCallSignature && return nothing
@@ -1963,6 +1966,8 @@ _kernel_lift_scope(lhs) = nothing
 Base.@nospecializeinfer function _kernel_lifted_call_name(@nospecialize(callee),
                                                           @nospecialize(spec::KernelSpec),
                                                           nested_specs)
+    staged = _build_call_slot(callee)
+    staged === nothing || return staged.name
     if callee isa Symbol && haskey(nested_specs, callee)
         names = getfield(spec, :want_names)
         return length(names) == 1 && !_generated_value_name(only(names)) ?

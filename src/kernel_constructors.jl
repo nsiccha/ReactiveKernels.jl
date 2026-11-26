@@ -129,7 +129,7 @@ end
 # call. The emitted splice reads this build's operation and source at replay.
 struct _KernelBuildCall
     index::Int
-    arguments::Tuple
+    name::Symbol
     inputs::Tuple
     outputs::Tuple
 end
@@ -160,28 +160,44 @@ _build_call_slot(x) = Meta.isexpr(x, :call, 2) &&
 
 struct _BuildRecipeOperand
     index::Int
-    source::Bool
 end
 
-# Require a genuine top-level splice for each staged call. Refuse a transformed
-# call (an inlined branch, plate cell or computed argument) before publishing.
+# Metadata can contain the entire authored plate, including calls inside its
+# cell. Keep their callees as slots, even when lowering lifted the arguments
+# into intermediate ports. The operation itself must have a real splice.
+struct _BuildRecipeSource
+    source::Expr
+end
+
+function _has_build_call(x)
+    x isa QuoteNode && return _has_build_call(x.value)
+    x isa Expr || return false
+    _build_call_slot(x) !== nothing || any(_has_build_call, x.args)
+end
+
+function _build_recipe_source(x, calls)
+    x isa QuoteNode && return QuoteNode(_build_recipe_source(x.value, calls))
+    x isa Expr || return x
+    slot = _build_call_slot(x)
+    slot === nothing || return first(calls[slot.index][1].args)
+    Expr(x.head, Any[_build_recipe_source(a, calls) for a in x.args]...)
+end
+
 function _bind_build_calls(x, seen)
+    x isa QuoteNode && _has_build_call(x) && throw(_UnsupportedConstructor())
     x isa Expr || return x
     if x.head === :call && length(x.args) >= 9 &&
             x.args[1] === GlobalRef(@__MODULE__, :_kernel_add!)
+        args = copy(x.args)
         slot = _build_call_slot(x.args[5])
-        if slot !== nothing && x.args[9] isa QuoteNode
-            rhs = x.args[9].value
-            if Meta.isexpr(rhs, :call) && _build_call_slot(first(rhs.args)) === slot &&
-                    Tuple(rhs.args[2:end]) == slot.arguments
-                slot.index in seen && throw(_UnsupportedConstructor())
-                push!(seen, slot.index)
-                args = copy(x.args)
-                args[5] = QuoteNode(_BuildRecipeOperand(slot.index, false))
-                args[9] = QuoteNode(_BuildRecipeOperand(slot.index, true))
-                return Expr(:call, args...)
-            end
+        if slot !== nothing
+            push!(seen, slot.index)
+            args[5] = QuoteNode(_BuildRecipeOperand(slot.index))
         end
+        if args[9] isa QuoteNode && args[9].value isa Expr && _has_build_call(args[9])
+            args[9] = QuoteNode(_BuildRecipeSource(args[9].value))
+        end
+        return Expr(:call, Any[_bind_build_calls(a, seen) for a in args]...)
     end
     _build_call_slot(x) === nothing || throw(_UnsupportedConstructor())
     Expr(x.head, Any[_bind_build_calls(a, seen) for a in x.args]...)
@@ -196,7 +212,7 @@ struct _BuildConstructor
     steps::Vector{_BuildStep}
     local_count::Int
     operands::Vector{Any}
-    dynamic::Vector{Pair{Int,_BuildRecipeOperand}}
+    dynamic::Vector{Int}
 end
 
 function _build_callable(mod, form)
@@ -249,15 +265,19 @@ function _build_steps(mod, form)
 end
 
 function _stage_build(mod, definition, count)
-    construction = _kernel_definition_construction(mod, definition)
+    construction = try
+        _kernel_definition_construction(mod, definition)
+    catch err
+        err isa LoadError && err.error isa _UnsupportedConstructor && throw(err.error)
+        rethrow()
+    end
     seen = BitSet()
     construction = _bind_build_calls(construction, seen)
     length(seen) == count || throw(_UnsupportedConstructor())
     locals = _kernel_construction_locals!(Set{Symbol}(), construction)
     operands = Any[]
     form = _constructor_form(construction, operands, locals, mod, true)
-    dynamic = Pair{Int,_BuildRecipeOperand}[i => x for (i,x) in pairs(operands)
-                                            if x isa _BuildRecipeOperand]
+    dynamic = findall(x -> x isa Union{_BuildRecipeOperand,_BuildRecipeSource}, operands)
     steps, local_count = _build_steps(mod, form)
     _BuildConstructor(steps, local_count, operands, dynamic)
 end
@@ -290,9 +310,14 @@ function _replay_build(entry::_BuildConstructor, mod, calls)
     # concurrent replay. Each returned spec owns its prepared graph.
     memo = IdDict()
     args = Any[_deepcopy_code(x, memo) for x in entry.operands]
-    for (i, slot) in entry.dynamic
-        rhs, f = calls[slot.index]
-        args[i] = slot.source ? rhs : _current_build_operation(mod, rhs, f)
+    for i in entry.dynamic
+        slot = entry.operands[i]
+        if slot isa _BuildRecipeSource
+            args[i] = _build_recipe_source(slot.source, calls)
+        else
+            rhs, f = calls[slot.index]
+            args[i] = _current_build_operation(mod, rhs, f)
+        end
     end
     _run_build_steps(entry.steps, entry.local_count, args)
 end

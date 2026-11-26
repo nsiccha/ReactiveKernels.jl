@@ -16,6 +16,14 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.267
+
+A `KernelBuildCache` hit for a model whose child kernel is called with a
+computed argument or inside a `@plate` no longer expands the program. Each
+build splices the child's current graph into fresh ports. A child in a lazy
+branch still takes the current-operands path. Requires ReactiveKernels
+0.1.405.
+
 ## 0.1.266
 
 - Model export forwards the chosen ragged plate layout to the JAX emitter.
