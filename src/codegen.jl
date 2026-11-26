@@ -7520,36 +7520,6 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
     lane_vars = Dict(canon_id(g, v.id) => gensym(Symbol(v.name, :_lane))
                      for v in parts.residual.have if mapped(canon_id(g, v.id)))
 
-    # One per-position block: project the batched ports into their lanes, then
-    # the spliced residual body binds one fresh local per WANT.
-    # `_embedded_statements` renames every residual local, so the
-    # first-position block and the loop body are independent copies of the
-    # same scalar program.
-    function position_block!(destination, replica_index, want_vars, recycled)
-        callargs = Any[]
-        for v in parts.residual.have
-            if mapped(canon_id(g, v.id))
-                projected = gensym(Symbol(v.name, :_position))
-                push!(destination.args, :($projected = $(GlobalRef(@__MODULE__,
-                    :_replicated_project!))($(lane_vars[canon_id(g, v.id)]),
-                    $(nm(v)), $replica_index)))
-                push!(callargs, projected)
-            else
-                push!(callargs, nm(v))
-            end
-        end
-        append!(callargs, recycled)
-        append!(callargs, scratch_vars)
-        for (v, variable) in zip(p.want, want_vars)
-            canon_id(g, v.id) in have_ids && continue
-            _replicated_declares(p, v) &&
-                _declare_typed_output!(destination, v, variable, declared)
-        end
-        lhs = length(want_vars) == 1 ? only(want_vars) : Expr(:tuple, want_vars...)
-        append!(destination.args,
-                _embedded_statements(residual_ast, callargs, lhs, residual_offset))
-    end
-
     argexprs = Any[_CONSTANTS_ARG, _CALLABLES_ARG]
     reuse && push!(argexprs, :__output_caches__)
     for v in p.have
@@ -7621,54 +7591,72 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
             Expr(:call, Expr(:curly, GlobalRef(Base, :RefValue), GlobalRef(Core, :Any)),
                  GlobalRef(Core, :nothing))))
     end
-    first_recycled = Any[reuse ?
-        :($(GlobalRef(@__MODULE__, :_replicated_recycled))(
-            $(slot(nout + nhave + k)), $(valtype(p.want[k])))) :
-        nothing for k in recycle_wants]
-
     output_vars = Dict(canon_id(g, v.id) => gensym(Symbol(v.name, :_batched))
                        for v in p.want)
-    first_index = gensym(:replica_index)
-    first_vars = Any[gensym(Symbol(v.name, :_first)) for v in p.want]
-    push!(body.args, :($first_index = 1))
-    position_block!(body, first_index, first_vars, first_recycled)
+    position = gensym(:replica_index)
+    first_position = Expr(:call, GlobalRef(Base, :(==)), position, 1)
+    values_at_position = Any[gensym(Symbol(v.name, :_position)) for v in p.want]
+    push!(body.args, Expr(:local, values(output_vars)..., recycle_vars...))
+
+    step = Expr(:block)
+    callargs = Any[]
+    for v in parts.residual.have
+        if mapped(canon_id(g, v.id))
+            projected = gensym(Symbol(v.name, :_position))
+            push!(step.args, :($projected = $(GlobalRef(@__MODULE__,
+                :_replicated_project!))($(lane_vars[canon_id(g, v.id)]),
+                $(nm(v)), $position)))
+            push!(callargs, projected)
+        else
+            push!(callargs, nm(v))
+        end
+    end
+    # Only the destination changes after the first position. Select it
+    # lazily because the stacked output is allocated from the first result.
     for (lane, k) in zip(recycle_vars, recycle_wants)
-        push!(body.args, :($lane = $(first_vars[k])))
+        v = p.want[k]
+        initial = reuse ? Expr(:call, GlobalRef(@__MODULE__, :_replicated_recycled),
+                               slot(nout + nhave + k), valtype(v)) : nothing
+        later = k in column_wants ?
+            :(let column = $(GlobalRef(@__MODULE__, :_replicated_output_lane))(
+                $(output_vars[canon_id(g, v.id)]), $(valtype(v)), $position)
+                column === nothing ? $lane : column
+            end) : lane
+        push!(callargs, Expr(:if, first_position, initial, later))
+    end
+    append!(callargs, scratch_vars)
+    for (v, variable) in zip(p.want, values_at_position)
+        canon_id(g, v.id) in have_ids && continue
+        _replicated_declares(p, v) &&
+            _declare_typed_output!(step, v, variable, declared)
+    end
+    lhs = length(values_at_position) == 1 ? only(values_at_position) :
+          Expr(:tuple, values_at_position...)
+    append!(step.args, _embedded_statements(residual_ast, callargs, lhs, residual_offset))
+
+    # The first result determines the output layout and provides scratch for
+    # later positions. A borrowed call retains that scratch across calls.
+    initialize = Expr(:block)
+    for (lane, k) in zip(recycle_vars, recycle_wants)
+        push!(initialize.args, :($lane = $(values_at_position[k])))
     end
     for (output_index, v) in enumerate(p.want)
         cid = canon_id(g, v.id)
-        value = first_vars[output_index]
+        value = values_at_position[output_index]
         allocation = reuse ?
             Expr(:call, GlobalRef(@__MODULE__, :_replicated_output!),
-                 Expr(:ref, :__output_caches__, output_index), value, :replica_count) :
+                 slot(output_index), value, :replica_count) :
             Expr(:call, GlobalRef(@__MODULE__, :_replicated_output), value, :replica_count)
-        push!(body.args, Expr(:(=), output_vars[cid], allocation))
-        push!(body.args,
-              Expr(:call, GlobalRef(@__MODULE__, :_replicated_store!),
-                   output_vars[cid], first_index, value))
+        push!(initialize.args, Expr(:(=), output_vars[cid], allocation))
     end
-
-    rest_body = Expr(:block)
-    rest_vars = Any[gensym(Symbol(v.name, :_position)) for v in p.want]
-    rest_recycled = Any[k in column_wants ?
-        :(let column = $(GlobalRef(@__MODULE__, :_replicated_output_lane))(
-            $(output_vars[canon_id(g, p.want[k].id)]), $(valtype(p.want[k])), replica_index)
-            column === nothing ? $lane : column
-        end) : lane for (lane, k) in zip(recycle_vars, recycle_wants)]
-    position_block!(rest_body, :replica_index, rest_vars, rest_recycled)
+    push!(step.args, Expr(:if, first_position, initialize))
     for (output_index, v) in enumerate(p.want)
-        push!(rest_body.args,
-              Expr(:call, GlobalRef(@__MODULE__, :_replicated_store!),
-                   output_vars[canon_id(g, v.id)], :replica_index,
-                   rest_vars[output_index]))
+        push!(step.args, Expr(:call, GlobalRef(@__MODULE__, :_replicated_store!),
+                              output_vars[canon_id(g, v.id)], position,
+                              values_at_position[output_index]))
     end
-    # Keep the first lane as scratch across calls, never a view of an escaped
-    # output. All later positions use it or their own destination column.
-    push!(body.args, Expr(:for,
-        Expr(:(=), :replica_index,
-             Expr(:call, GlobalRef(Base, :OneTo), :replica_count)),
-        Expr(:if, Expr(:call, GlobalRef(Base, :(==)), :replica_index, 1),
-             Expr(:block, Expr(:continue)), rest_body)))
+    push!(body.args, Expr(:for, Expr(:(=), position,
+        Expr(:call, GlobalRef(Base, :OneTo), :replica_count)), step))
     if reuse
         for (lane, k) in zip(recycle_vars, recycle_wants)
             push!(body.args, :($(slot(nout + nhave + k))[] = $lane))

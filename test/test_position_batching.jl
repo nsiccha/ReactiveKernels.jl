@@ -176,8 +176,8 @@ end
                           expression.args[2].args)
     before_loop = Expr(:block, expression.args[2].args[1:loop_index-1]...)
     loop = expression.args[2].args[loop_index]
-    @test occursin("transformed =", string(before_loop))
-    @test !occursin("transformed =", string(loop))
+    @test occursin("_authored_plate_marker", string(before_loop))
+    @test !occursin("_authored_plate_marker", string(loop))
     @test batch([2.0], [1.0, 2.0, 3.0]) == [28.0]
     @test batch(fill(2.0, 23), [1.0, 2.0, 3.0]) == fill(28.0, 23)
     @test code_expr(batch) === expression
@@ -210,7 +210,13 @@ _position_plate_bytes(kernel, args...) =
                     _position_plate_bytes(scalar, positions[:, 1], shifts, n))
     for reuse in (false, true)
         batch = vectorize(per_position_plate; batched = :position, reuse)
+        expression = code_expr(batch)
+        # The first position supplies the output shape. Its plate and the
+        # remaining positions' plate share one emitted body.
+        @test count("_authored_plate_marker", string(expression)) == 1
+        @test batch(positions[:, 1:1], shifts, n) == expected[:, 1:1]
         @test batch(positions, shifts, n) == expected
+        @test code_expr(batch) === expression
         bytes = _position_plate_bytes(batch, positions, shifts, n)
         # Per position: the scalar kernel's own arrays plus the stacked output.
         @test bytes <= 2 * size(positions, 2) * scalar_bytes
