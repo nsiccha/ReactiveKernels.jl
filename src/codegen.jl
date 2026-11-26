@@ -5726,7 +5726,7 @@ end
 # `ast` with each marked plate block (`_PlateBlock`) a call of its own
 # `_PlateProgram`, or its statements inline where it rebinds a name the rest of
 # the body binds.
-function _extract_plate_programs(ast::Expr, captures = ())
+function _extract_plate_programs(ast::Expr, captures = (); inline_single::Bool = false)
     ast.head in (:function, :->) && length(ast.args) == 2 &&
         ast.args[1] isa Expr && ast.args[1].head === :tuple || return ast
     parameters = Set{Symbol}(captures)
@@ -5808,7 +5808,9 @@ function _extract_plate_programs(ast::Expr, captures = ())
         get(replacements, node) do
             Expr(node.head, Any[replace_blocks(arg) for arg in node.args]...)
         end : node
-    Expr(ast.head, ast.args[1], replace_blocks(ast.args[2]))
+    extracted = Expr(ast.head, ast.args[1], replace_blocks(ast.args[2]))
+    inline_single && single_plate ?
+        _inline_plate_programs(extracted; expand = _inline_native_plate_program) : extracted
 end
 
 # Mutually exclusive versions of one plate do not add a second plate to a
@@ -7465,7 +7467,10 @@ function _replicated_part_ast(part::Plan; recycle = Pair{ValueId,Symbol}[],
     if residual
         # The position driver binds these scratch slots outside the residual.
         # Each extracted plate takes the ones it reads as ordinary arguments.
-        ast = _extract_plate_programs(ast, Iterators.flatten((cell_slots, cell_tables)))
+        # Expand a lone plate here, while its results still have the residual's
+        # names. Embedding then renames its assignments and their uses together.
+        ast = _extract_plate_programs(ast, Iterators.flatten((cell_slots, cell_tables));
+                                      inline_single = true)
     end
     ast, constants, callables, recipes
 end

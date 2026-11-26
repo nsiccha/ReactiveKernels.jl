@@ -117,6 +117,7 @@ bytes(f, args...) = (f(args...); minimum(@allocated(f(args...)) for _ in 1:3))
     guarded_reader = vectorize(guarded_cell; batched = :signal, reuse = true)
     @test guarded_reader(signal, weights.data, fill(-1, 5), groups, false) ==
         zeros(length(groups), size(signal, 2))
+    @test guarded_reader(signal, weights.data, indices.data, groups, true) ≈ expected
     @test_throws BoundsError guarded_reader(signal, weights.data, fill(-1, 5), groups, true)
 end
 
