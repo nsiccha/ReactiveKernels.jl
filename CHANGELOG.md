@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.394
+
+- Emitted JAX modules with eligible guarded scan reads expose
+  `prepare_guarded_reads(prepared, mode)`. Drivers can select compact or dense
+  reads. The layout tuner times both and returns the winning prepared data.
+
 ## 0.1.393
 
 - JAX exports accept grouped, sequential and round-based layouts for ragged plates.
