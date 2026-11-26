@@ -4798,20 +4798,8 @@ def _rk_any_active_batch(axis_size, in_batched, active):
     # Re-enter the reduction so enclosing maps also contribute their flags.
     return _rk_any_active(active), False
 """
-const _JAX_GUARDED_EXPM = raw"""
-@jax.checkpoint
-def _rk_guarded_expm(matrix, active):
-    # Reverse AD can recompute the selected exponential from the matrix and flag.
-    def evaluate(x):
-        # A mixed batch evaluates expm at zero on its inactive lanes.
-        return jax.scipy.linalg.expm(jnp.where(active, x, jnp.zeros_like(x)))
-
-    def identity(x):
-        dtype = jax.eval_shape(jax.scipy.linalg.expm, x).dtype
-        return jnp.broadcast_to(jnp.eye(x.shape[-1], dtype=dtype), x.shape)
-
-    return jax.lax.cond(_rk_any_active(active), evaluate, identity, matrix)
-"""
+Base.include_dependency(joinpath(@__DIR__, "jax_guarded_expm.py"))
+const _JAX_GUARDED_EXPM = read(joinpath(@__DIR__, "jax_guarded_expm.py"), String)
 
 # Whole-call extensions return a Python expression. Recognize the exact
 # backend call with its original operand, including mappings owned by other
