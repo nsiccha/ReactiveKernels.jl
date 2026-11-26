@@ -79,9 +79,13 @@ end
         selected = plate(visits, selectors, Ref(history)) do j, k, path
             k == 1 ? path[j][1] : path[j][2]
         end
-        sum(selected)
+        combined = sum(selected)
+        (combined, combined)
     end
-    total = sum(totals)
+    scores = plate(totals) do pair
+        pair[1] + pair[2]
+    end
+    total = sum(scores)
     return total
 end
 
