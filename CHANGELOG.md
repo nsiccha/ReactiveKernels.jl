@@ -33,6 +33,10 @@ are recorded in the git history only.
   actual events in row order. A caller can batch independent evaluations of
   the generated function with `jax.vmap`.
 
+- JAX data preparation can group independent indexed updates by a prepared
+  input's positive, negative and remaining entries. The generated function
+  maps the selected numerical arm over each group and restores the input order.
+
 ## 0.1.388
 
 - Regenerated JAX modules skip a guarded matrix exponential and its reverse

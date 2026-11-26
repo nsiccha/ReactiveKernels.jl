@@ -1997,6 +1997,14 @@ def _rk_scan_schedule(*lengths):
     owners[starts[counts != 0]] *= -1
     return owners
 """),
+    :sign_groups => ("_rk_sign_groups", """
+def _rk_sign_groups(values):
+    x = np.asarray(values)
+    pos = np.flatnonzero(x > 0)
+    neg = np.flatnonzero(x < 0)
+    other = np.flatnonzero(~((x > 0) | (x < 0)))
+    return pos, neg, other, np.argsort(np.concatenate((pos, neg, other)))
+"""),
     :broadcast_total => ("_rk_broadcast_total", """
 def _rk_broadcast_total(*operands):
     # One vector of row lengths and an optional one-based row selector per
