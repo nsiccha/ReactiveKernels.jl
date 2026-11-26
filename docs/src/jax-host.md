@@ -20,6 +20,10 @@ A `Bool` array index (a `BitVector` or `Vector{Bool}`, such as `table[table[:, 2
 
 A data-only vector of records whose fields include vectors of a different length in each record, such as a per-subject design a data-only plate builds, crosses to the functions with each vector field padded as a ragged input is, and `<name>_lengths`: the tuple of those fields' lengths, `None` for a number field (RK 0.1.310). Pass both from `prepare_data` to the functions with `**prepared`.
 
+## Local helpers
+
+A local named helper with plain positional arguments (`add!(i, value) = push!(out, i * value)`) reads the locals of the code that defines it and writes their collections. It reads their values at each call, so a local reassigned before the call is read as reassigned. A helper that rebinds a captured local, has typed arguments or several methods, or is passed to a recorded helper while it captures locals, raises `JAXEmissionError`. Helpers that write their arguments in place are described in [JAX helpers and submodels](jax-helpers.md).
+
 ## Ragged row sums
 
 When each row of a numerical plate sums an inner plate, `prepare_data` can
@@ -33,7 +37,3 @@ must select the same arm to take the parallel path. Mixed decisions use
 the scalar cell. The same emitted module serves different row lengths and
 branch decisions. Changing the number of entries in a group can trigger
 recompilation by JAX.
-
-## Local helpers
-
-A local named helper with plain positional arguments (`add!(i, value) = push!(out, i * value)`) reads the locals of the code that defines it and writes their collections. It reads their values at each call, so a local reassigned before the call is read as reassigned. A helper that rebinds a captured local, has typed arguments or several methods, or is passed to a recorded helper while it captures locals, raises `JAXEmissionError`. Helpers that write their arguments in place are described in [JAX helpers and submodels](jax-helpers.md).
