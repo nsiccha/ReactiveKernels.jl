@@ -21,6 +21,45 @@ end
 
 @traceable jax_apply_scan_rows(p, state, offset) = p[1] * state + offset[2]
 
+@kernel function jax_requested_scan_producer(a::Float64, kinds::Vector{Vector{Int}},
+                                              visits::Vector{Vector{Int}})
+    totals = plate(kinds, visits) do ks, js
+        offsets = plate(ks) do k
+            (a * k, -2a * k)
+        end
+        path = scan(ks, js, Ref(offsets); init = 0.0) do carry, kind, j, table
+            next = kind == 3 ? carry + table[j][2] : carry
+            (next, next)
+        end
+        sum(path)
+    end
+    total = sum(totals)
+    return total
+end
+
+@testset "A prepared scan guard batches the requested producer rows" begin
+    have = (:a, :kinds, :visits)
+    src = jax_source(jax_requested_scan_producer; have, want=:total, data=(:kinds, :visits))
+    @test occursin(" = _rk_scan_cell_rows(", string(src))
+    @test occursin(" = _rk_match_count(", string(src))
+    native = prepare(jax_requested_scan_producer; have, want=:total)
+    if rk_jax_available()
+        # A repeated visit to a different row, inactive invalid indices, an
+        # empty subject and a short subject whose final active tag is padded.
+        tiles = [[fill(3, n); fill(2, 25 - n)] for n in (0, 7, 8, 9, 16, 17)]
+        indices = [reverse(collect(eachindex(row))) for row in tiles]
+        for (ks, js) in (([[2, 3, 2, 3], [3], Int[]], [[99, 1, -1, 1], [1], Int[]]),
+                         ([[1, 2], Int[]], [[-1, 99], Int[]]),
+                         ([[3, 3]], [[2, 1]]), ([Int[]], [Int[]]), (tiles, indices))
+            r = rk_jax_evaluate(src, "kernel", (0.75, ks, js); prepare=:arguments, grad=true)
+            @test r.value ≈ native(0.75, ks, js)
+            @test r.grad ≈ native(1.0, ks, js)
+        end
+        @test_throws "BoundsError" rk_jax_evaluate(src, "kernel", (0.75, [[2, 3]], [[0, 3]]);
+                                                   prepare=:arguments)
+    end
+end
+
 @kernel function jax_guarded_scan_scale(scale::Float64, bases::Vector{Vector{Float64}},
                                         kinds::Vector{Vector{Int}}, visits::Vector{Vector{Int}},
                                         weights::Vector{Float64})

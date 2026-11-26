@@ -56,6 +56,73 @@ def _rk_scan_record_rows(table, index, requested, length):
     return _rk_scan_rows(_rk_pack_record(table), index, requested, length)
 """
 
+# Hoist a pure plate cell to the rows requested by a prepared scan guard.
+# Index the producer's mapped arguments at the actual table index. The scan
+# still receives its entries in visit order, including repeated table reads.
+const _JAX_SCAN_CELL_ROWS = raw"""
+def _rk_scan_cell_rows(cell, args, mapped, columns, index, requested, length, capacity):
+    table = _rk_pack_record(columns)
+    width = index.shape[0]
+    if capacity >= width:
+        return _rk_scan_rows(table, index, requested, length)
+    size = columns[0].shape[0]
+    valid = (index >= 1) & (index <= length) & (index <= size)
+    acceptable = jnp.all(~requested | valid)
+    empty = jax.tree.map(lambda x: jnp.zeros_like(x, shape=(width,) + x.shape[1:]), table)
+    if capacity == 0 or size == 0:
+        return empty, acceptable
+    visits = jnp.nonzero(requested & valid, size=capacity, fill_value=width)[0]
+    rows = jnp.clip(index[jnp.minimum(visits, width - 1)] - 1, 0, size - 1)
+    count = jnp.sum(requested & valid, dtype=visits.dtype)
+    zero = jax.tree.map(lambda x: jnp.zeros_like(x, shape=x.shape[1:]), table)
+    def read(row):
+        fields = cell(*(x[row] if selected else x for x, selected in zip(args, mapped)))
+        return jax.tree.map(jnp.asarray, fields) if isinstance(table, tuple) else jnp.stack(fields)
+
+    # One predicate per complete tile keeps AD from broadcasting a shared
+    # lookup table over the visit axis. Only the final partial tile needs
+    # scalar guards, including subjects with no requested cells.
+    tile_size = min(8, capacity)
+    num_tiles, padding = divmod(capacity, tile_size)
+    zero_tile = jax.tree.map(lambda x: jnp.zeros_like(x, shape=(tile_size,) + x.shape), zero)
+    def tile(block):
+        start = block * tile_size
+        selected = jax.lax.dynamic_slice_in_dim(rows, start, tile_size)
+        return jax.lax.cond(start + tile_size <= count, lambda: jax.vmap(read)(selected), lambda: zero_tile)
+    tiles = jax.lax.map(jax.checkpoint(tile), jnp.arange(num_tiles, dtype=visits.dtype))
+
+    start = count // tile_size * tile_size
+    positions = start + jnp.arange(tile_size, dtype=visits.dtype)
+    def last_visit(pos):
+        return jax.lax.cond(pos < count, lambda: read(rows[jnp.minimum(pos, capacity - 1)]), lambda: zero)
+    edge = jax.lax.map(jax.checkpoint(last_visit), positions)
+    def restore(output, full, last):
+        values = full.reshape((-1,) + last.shape[1:])
+        values = jnp.pad(values, ((0, padding),) + ((0, 0),) * (last.ndim - 1))
+        values = values.at[positions].set(last, mode="drop")
+        return output.at[visits].set(values, mode="drop")
+    return jax.tree.map(restore, empty, tiles, edge), acceptable
+"""
+
+function _jax_compact_cell_rows(ctx, inner, rows, read, guards, extent, index, guard, limit)
+    cell = get(inner.scan_reads, read.table.code, nothing)
+    cell === nothing && return nothing
+    length(guards) == 1 || return nothing
+    m = match(r"^([A-Za-z_][A-Za-z_0-9]*) == (\d+)$", only(guards))
+    m === nothing && return nothing
+    seq = rows.sequences[m.captures[1]]
+    o = seq.origin
+    o isa _JaxOrigin && o.position === nothing && o.offset == "0" && o.scale == "1" || return nothing
+    # Only exclude repeated tail padding if the scan masks that very sequence
+    # at its logical row length. Otherwise count every physical match.
+    lengths = !isempty(extent) && seq.extent == extent && !isempty(o.path) ? o.key * "_lengths" : ""
+    capacity = _jax_prepared_bound!(ctx, :match_count, o.key, lengths, String(m.captures[2]))
+    helper = _jax_helper!(ctx, "_rk_scan_cell_rows", _JAX_SCAN_CELL_ROWS)
+    mapped = _jax_chain_tuple(_jax_chain_bool.(cell.mapped))
+    helper * "(" * join((cell.name, _jax_chain_tuple(cell.args), mapped, read.table.code,
+                         index, guard, limit, capacity), ", ") * ")"
+end
+
 function _jax_scan_row_inputs!(ctx, inner, rows, unpack, seqs, width, extent, pure;
                                sequence = v -> _jax_scan_sequence(v, width), gather_rows = nothing)
     isempty(rows.reads) && return false
@@ -93,8 +160,13 @@ function _jax_scan_row_inputs!(ctx, inner, rows, unpack, seqs, width, extent, pu
             gather = _jax_helper!(ctx, "_rk_scan_record_rows", _JAX_SCAN_RECORD_ROWS)
         end
         values, valid = _jax_fresh(ctx, :scan_rows), _jax_fresh(ctx, :valid_rows)
-        call = gather_rows === nothing ? gather * "(" * join((r.table.code, index, guard, limit), ", ") * ")" :
-               gather_rows(gather, r.table, index, guard, limit)
+        call = if gather_rows !== nothing
+            gather_rows(gather, r.table, index, guard, limit)
+        else
+            compact = packed ? _jax_compact_cell_rows(ctx, inner, rows, r, guards, extent,
+                                                      index, guard, limit) : nothing
+            something(compact, gather * "(" * join((r.table.code, index, guard, limit), ", ") * ")")
+        end
         _jax_emit!(ctx, values * ", " * valid * " = " * call)
         push!(checks, valid)
         push!(seqs, values)

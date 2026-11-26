@@ -10155,7 +10155,7 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
     # A plate can return several fields, only some of which a caller flattens.
     # Prepare a broadcast size only when an emitted function actually reads it.
     used_inputs = Set(name for f in functions[prepare_function+1:end] for (name, _) in f.inputs)
-    bounds = filter(b -> b[2] ∉ (:broadcast_total, :scan_rows, :row_layout, :sign_groups) || b[1] in used_inputs,
+    bounds = filter(b -> b[2] ∉ (:broadcast_total, :scan_rows, :row_layout, :sign_groups, :match_count) || b[1] in used_inputs,
                     _jax_prepared_bounds(mod))
     if !isempty(bounds)
         bodies[prepare_body] = join(_jax_prepare_bounds_lines(mod, prepare_lines, bounds), "\n")

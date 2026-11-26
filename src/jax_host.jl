@@ -2079,6 +2079,13 @@ def _rk_event_rounds(tags):
               order[split:].reshape(height - wide, width))
     return tuple(phase for phase in phases if phase.size), (), np.argsort(order)
 """),
+    :match_count => ("_rk_match_count", """
+def _rk_match_count(values, lengths, target):
+    matches = np.asarray(values) == target
+    if lengths is not None and matches.ndim == 2:
+        matches &= np.arange(matches.shape[-1]) < np.asarray(lengths)[:, None]
+    return StaticInt(int(np.count_nonzero(matches, axis=-1).max(initial=0)))
+"""),
     :sign_groups => ("_rk_sign_groups", """
 def _rk_sign_groups(values):
     x = np.asarray(values)
@@ -2161,6 +2168,8 @@ function _jax_prepare_bounds_lines(mod::_JaxModule, lines::Vector{String}, bound
         at === nothing && error("circular prepared layout dependencies")
         name, kind, keys = popat!(pending, at)
         args = [isempty(k) ? "None" : result * "[\"" * k * "\"]" for k in keys]
+        # The final match-count operand is the comparison's integer literal.
+        kind === :match_count && (args[end] = last(keys))
         if mod.layout === :chains && kind in (:min, :max, :span)
             _jax_module_helper!(mod, "_RKChainRows", _JAX_CHAIN_ROWS)
             if kind === :span
