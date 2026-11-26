@@ -148,6 +148,39 @@ end
     @test structure(texts[1]) == structure(texts[2]) == structure(texts[3])
 end
 
+@kernel function jax_lkj_weighted_partials(u::Vector{Float64}, margins::Vector{Float64})
+    weights = ReactiveKernelsPPL._ppl_lkj_weights(length(margins), length(u))
+    total = sum(u .* weights)
+    return total
+end
+
+@testset "shape-only LKJ weights in a traced gradient" begin
+    src = jax_source(jax_lkj_weighted_partials; have=(:u, :margins), want=:total)
+    if rk_jax_available()
+        mktempdir() do dir
+            path = joinpath(dir, "weights.py")
+            write(path, src)
+            check = raw"""
+import jax, jax.numpy as jnp, numpy as np, runpy, sys
+jax.config.update("jax_enable_x64", True)
+gradient = jax.value_and_grad(runpy.run_path(sys.argv[1])["kernel"])
+for k in (1, 3, 8):
+    weights = np.array([(j-i+1)/2 for j in range(2, k+1) for i in range(1, j)])
+    u, margins = jnp.arange(weights.size, dtype=jnp.float64), jnp.zeros(k)
+    value, grad = jax.jit(gradient)(u, margins)
+    np.testing.assert_array_equal(grad, weights)
+    np.testing.assert_equal(float(value), np.dot(np.asarray(u), weights))
+    # The packed triangular weights need no device loop on each gradient call.
+    trace = str(jax.make_jaxpr(gradient)(u, margins))
+    assert "scan[" not in trace and "while[" not in trace, trace
+"""
+            @test success(`$RK_JAX_PYTHON -c $check $path`)
+        end
+    else
+        @test_skip false
+    end
+end
+
 @testset "LKJ row products in a bound lower or upper sampler factor" begin
     for (K, uplo) in ((1, 'L'), (3, 'U'), (8, 'L'))
         model = lower_rkppl(quote
