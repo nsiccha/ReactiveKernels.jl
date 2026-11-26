@@ -74,6 +74,7 @@ class PlateLayout:
 def _rk_length_groups(lengths, groups, sequential):
     # One plate's layout, or `None` for the plate as one batch.
     lengths = [np.asarray(n, dtype=np.int64) for n in lengths]
+    lengths = np.broadcast_arrays(*lengths) if lengths else []
     count = lengths[0].shape[0] if lengths else 0
     if count == 0 or (int(groups) <= 1 and not sequential):
         return None

@@ -18,6 +18,10 @@ are recorded in the git history only.
 
 ## 0.1.389
 
+- JAX data preparation now builds fixed integer-vector tables inside plates
+  for each supported layout when the data determine the plate domain. Empty
+  domains skip the cell, and singleton inputs follow Julia broadcasting.
+
 - `jax_source(...; data, plate_layout = :groups)` emits a module whose plates
   over prepared ragged rows can run in groups of units of similar length.
   The module's `prepare_plate_layout(prepared, groups, sequential)` chooses

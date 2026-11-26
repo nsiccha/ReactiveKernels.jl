@@ -2233,7 +2233,7 @@ end
 # when none of them reads only the plate's data inputs (those whose canonical
 # id in `g` is in `dependent`).
 function _jax_cell_split(g::Graph, r::Recipe, dependent::Set{ValueId}, hoisted::Set{Int};
-                         compact::Bool = false)
+                         compact::Bool = false, complete_domain::Bool = false)
     op = r.op
     body = op.kernel.plan
     atomic_inputs = typeof(op).parameters[2]
@@ -2279,10 +2279,13 @@ function _jax_cell_split(g::Graph, r::Recipe, dependent::Set{ValueId}, hoisted::
     # The plate's data inputs those recipes read: they run per cell when one
     # of them is iterated, else once, their values passed to every cell whole.
     read = Set{ValueId}(canon_id(cg, v.id) for x in computed for v in x.inputs)
-    inputs = Int[i for i in eachindex(data)
-                 if data[i] && canon_id(cg, body.have[i].id) in read]
+    # An otherwise unused bound axis can broadcast a singleton or make the
+    # whole plate empty. Include it when preparation owns the complete domain.
+    mapped(i) = !(i in atomic_inputs) && !(valtype(r.inputs[i]) <: Number)
+    inputs = Int[i for i in eachindex(data) if data[i] &&
+                 (canon_id(cg, body.have[i].id) in read || complete_domain && mapped(i))]
     atomic = Bool[i in atomic_inputs for i in inputs]
-    percell = !all(atomic)
+    percell = any(mapped, inputs)
     plan = _partial_subplan(body, Value[body.have[i] for i in inputs], frontier, computed)
     values = Value[Value(v.name, Any) for v in frontier]
     prefix = Recipe(_jax_cell_prefix_id(r.id), Tuple(r.inputs[i] for i in inputs),
@@ -2296,7 +2299,7 @@ function _jax_cell_split(g::Graph, r::Recipe, dependent::Set{ValueId}, hoisted::
                canon_id(cg, body.have[i].id) in need ||
                !(i in atomic_inputs || percell && i in inputs)]
     cell = _partial_subplan(body, Value[body.have[kept]; frontier], body.want, rest)
-    kernel = (; plan = cell)
+    kernel = (; plan = cell, host_domain = complete_domain)
     shared = Tuple(k for (k, i) in enumerate(kept) if i in atomic_inputs)
     added = percell ? () : Tuple(length(kept) .+ eachindex(values))
     plate = Recipe(r.id, (Tuple(r.inputs[i] for i in kept)..., values...), r.outputs,
@@ -2322,6 +2325,14 @@ function _jax_partial_constants(p::Plan, owned::Set{ValueId}, residual::Vector{R
     end
     constants
 end
+
+const _JAX_PLATE_ROWS = raw"""
+def _rk_plate_rows(*sources):
+    sizes = [len(source) for source in sources]
+    n, = np.broadcast_shapes(*[(size,) for size in sizes])
+    return (tuple(source[0 if size == 1 else i] for source, size in zip(sources, sizes))
+            for i in range(n))
+"""
 
 # A plate cell's data-only recipes in `prepare_data`: a function of them,
 # called on each cell's data (or once, when they read no iterated input),
@@ -2361,13 +2372,12 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe, op::_JaxCellPref
                 for j in 1:n]
     end
     sources = [inputs[i].code for i in eachindex(inputs) if mapped[i]]
-    zipper = if ctx.mod.layout === :chains && length(sources) > 1
-        _jax_module_helper!(ctx.mod, "_RKChainRows", _JAX_CHAIN_ROWS)
-        "_rk_plate_rows"
+    iterable = if length(sources) == 1
+        only(sources)
     else
-        "zip"
+        zipper = _jax_helper!(ctx, "_rk_plate_rows", _JAX_PLATE_ROWS)
+        zipper * "(" * join(sources, ", ") * ")"
     end
-    iterable = length(sources) == 1 ? only(sources) : zipper * "(" * join(sources, ", ") * ")"
     each = "[" * call * " for " * join(targets, ", ") * " in " * iterable * "]"
     n == 1 && return [_host_collected(each, _jax_typeof(only(wants)))]
     rows = _jax_bind!(ctx, :cell_data, _PyVal(each, Any, true))
@@ -2526,9 +2536,10 @@ function _jax_prepare_split(plans, data_ports, excluded::Set{Int} = Set{Int}(); 
             r.op isa _AuthoredPlateOp || continue
             _jax_cell_prefix_id(r.id) in excluded && continue
             atomic = typeof(r.op).parameters[2]
-            if layout === :chains && all(i -> i in atomic || valtype(r.inputs[i]) <: Number ||
+            complete_domain = all(i -> i in atomic || valtype(r.inputs[i]) <: Number ||
                                          canon_id(g, r.inputs[i].id) in dependent,
                                          eachindex(r.inputs))
+            if complete_domain
                 # Follow the data-dependent cut inside the cell as well. A
                 # shared structural constant belongs to the compiled program.
                 body = r.op.kernel.plan
@@ -2537,15 +2548,28 @@ function _jax_prepare_split(plans, data_ports, excluded::Set{Int} = Set{Int}(); 
                     if canon_id(g, input.id) in dependent)
                 refused = Set{Int}(id for ((plate, id), _) in cell_reasons if plate == r.id)
                 pre_cell, _, _ = _partial_split(body, bound, refused)
-                requested = get!(Set{Int}, cells, r.id)
+                types = Dict{ValueId,Any}()
+                for (i, (port, input)) in enumerate(zip(body.have, r.inputs))
+                    T = valtype(input)
+                    types[canon_id(body.graph, port.id)] =
+                        i in atomic || T <: Number ? _jax_unref(T) : eltype(T)
+                end
                 for producer in pre_cell
-                    any(v -> canon_id(body.graph, v.id) in bound, producer.inputs) || continue
-                    push!(requested, producer.id)
-                    union!(bound, (canon_id(body.graph, v.id) for v in producer.outputs))
+                    ins = [canon_id(body.graph, v.id) for v in producer.inputs]
+                    outs = [canon_id(body.graph, v.id) for v in producer.outputs]
+                    chain = layout === :chains
+                    T = chain || length(outs) != 1 ? Any :
+                        _partial_prefix_type(producer.op, Any[get(types, id, Any) for id in ins])
+                    length(outs) == 1 && (types[only(outs)] = T)
+                    any(in(bound), ins) || continue
+                    if chain || (T !== Union{} && T <: AbstractVector{<:Integer})
+                        push!(get!(Set{Int}, cells, r.id), producer.id)
+                    end
+                    union!(bound, outs)
                 end
             end
             haskey(cells, r.id) || continue
-            rewrite = get!(() -> _jax_cell_split(g, r, dependent, cells[r.id]; compact = layout === :chains), rewrites, r.id)
+            rewrite = get!(() -> _jax_cell_split(g, r, dependent, cells[r.id]; compact = complete_domain || layout === :chains, complete_domain), rewrites, r.id)
             rewrite === nothing && continue
             pre = [pre; rewrite.prefix]
             residual[k] = rewrite.plate
