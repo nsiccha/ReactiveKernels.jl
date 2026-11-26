@@ -46,13 +46,17 @@ def _rk_subject_scan(step, seed, sequences, shared, schedule, tables, reads, dec
         shared_axes = jax.tree.map(lambda b: 0 if b else None, by_shared)
         def one_round(carry, inputs):
             current, saved = carry
-            owners, positions, transfer, rows = inputs
+            owners, positions, transfer, rows, shared_rows = inputs
             def start_lane(old, reset, other):
                 return jax.vmap(lambda a, b, c, first, receive:
                                 jnp.where(first, b, jnp.where(receive, c, a)))(
                                     old, reset, other, positions == 0, transfer > 0)
             current = jax.tree.map(start_lane, current, initial(owners), saved)
-            args = jax.tree.map(lambda x, batched: x[owners] if batched else x, shared, by_shared)
+            def shared_arg(x, batched, column):
+                if column is not None:
+                    return column
+                return x[owners] if batched else x
+            args = jax.tree.map(shared_arg, shared, by_shared, shared_rows)
             current, out = jax.vmap(advance, in_axes=(0, 0, *shared_axes))(current, rows, *args)
             send = jnp.roll(transfer < 0, -1)
             saved = jax.tree.map(lambda old, new: jax.vmap(jnp.where)(
@@ -65,7 +69,11 @@ def _rk_subject_scan(step, seed, sequences, shared, schedule, tables, reads, dec
                                      xs, by_column))
             for i, table_id in reads:
                 rows[i] = gather(tables[table_id], by_table[table_id], owners, rows[i])
-            carry, out = jax.lax.scan(one_round, carry, (owners, positions, transfer, tuple(rows)))
+            # Gather one scalar per event so reverse mode can sum repeated
+            # owners outside the recurrence. Keep larger operands per subject.
+            shared_rows = jax.tree.map(lambda x, batched: x[owners] if batched and x.ndim == 1 else None,
+                                       shared, by_shared)
+            carry, out = jax.lax.scan(one_round, carry, (owners, positions, transfer, tuple(rows), shared_rows))
             chunks.append(jax.tree.map(lambda x: x.reshape((-1,) + x.shape[2:]), out))
         def restore_values(*parts):
             column = parts[0] if len(parts) == 1 else jnp.concatenate(parts)

@@ -139,3 +139,51 @@ for rounds in (150, 700):
     body_sizes.append(sizes)
 
 assert body_sizes[0] == body_sizes[1], body_sizes
+
+
+def subject_step(carry, row, n, subject, decay):
+    position, weight = row
+    next_value = carry * decay + subject["scale"] * weight + subject["terms"][0]
+    return jax.lax.cond(position < n, lambda: (next_value, next_value),
+                        lambda: (carry, jnp.zeros_like(carry)))
+
+
+def check_subject_scalars(lengths):
+    lengths = np.asarray(lengths, dtype=np.int64)
+    n = len(lengths)
+    width = int(lengths.max(initial=0))
+    tags = np.repeat(np.arange(1, n + 1), lengths)
+    schedule = model._rk_subject_scan_schedule(lengths, tags, model._rk_event_rounds(tags))
+    schedule = jax.tree.map(jnp.asarray, schedule)
+
+    def loss(scales):
+        def subject_loss(length, scale, terms):
+            rows = (jnp.arange(width), jnp.arange(1., width + 1))
+            args = (length, {"scale": scale, "terms": terms}, 0.5)
+            path = model._rk_subject_scan(subject_step, 0., rows, args, schedule, (), (), lambda f: f)
+            return path.sum()
+        terms = jnp.ones((n, 2))
+        return jax.vmap(subject_loss)(jnp.asarray(lengths), scales, terms).sum()
+
+    scales = jnp.arange(n, dtype=float)
+    value, gradient = jax.jit(jax.value_and_grad(loss))(scales)
+    expected_value, expected_gradient = 0., np.zeros(n)
+    for i, length in enumerate(lengths):
+        state, derivative = 0., 0.
+        for weight in range(1, length + 1):
+            state = state * 0.5 + i * weight + 1.
+            derivative = derivative * 0.5 + weight
+            expected_value += state
+            expected_gradient[i] += derivative
+    np.testing.assert_allclose(value, expected_value)
+    np.testing.assert_allclose(gradient, expected_gradient)
+    # Repeated owners accumulate their scalar derivatives once per phase.
+    trace = jax.make_jaxpr(jax.grad(loss))(scales)
+    for eq in equations(trace):
+        if eq.primitive.name == "scan" and eq.params["reverse"]:
+            assert not any(op.primitive.name == "scatter-add" and op.invars[0].aval.shape == (n,)
+                           for op in equations(eq.params["jaxpr"]))
+
+
+for subject_lengths in ([], [0, 0], [0, 1], [5, 4, 3, 3, 2, 1]):
+    check_subject_scalars(subject_lengths)
