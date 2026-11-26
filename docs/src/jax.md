@@ -35,7 +35,7 @@ For `qr(A)`, `rk_cholesky_lower(A)` and `L \ b`, see
 `diagm(v)` also constructs a diagonal matrix, and source loops or
 comprehensions over `axes(A, d)` retain iteration along that dimension.
 Prepared matrix cells retain their rank and row lengths, including in empty
-plates. Ragged cells can vary along their first axis; trailing dimensions
+plates. Matrix cells can vary along their first axis; trailing dimensions
 must agree because the representation carries one extent per cell.
 For raw empty matrix lists, call `pad_ragged([], rank=2)`.
 
@@ -46,7 +46,7 @@ index beside a kept axis and two array indices including a ragged one
 remain unsupported.
 
 Plate cells can return numerical tuples or named records, including nested
-records and numeric array fields. Later plates can read those fields directly,
+records, numeric arrays and [ragged row groups](jax-host.md#Groups-of-ragged-rows). Later plates can read those fields directly,
 such as `r.prior + sum(r.pointwise.y)`. The emitted representation stacks each
 leaf along the mapped axes and keeps ragged field lengths separate from the
 record array's valid extent. Cartesian axes retain Julia's order, also through

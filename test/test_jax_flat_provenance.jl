@@ -146,8 +146,12 @@ end
                Y = [isodd(i) ? collect(1.0:(i % 6)) : Float64[i] for i in 1:17])]
     have = (:a, :picks, :X, :Y)
     functions = (flat = :flat, total = :total)
-    src = jax_source(broadcast_rows; have, functions, data = first(data))
-    @test src.text == jax_source(broadcast_rows; have, functions, data = last(data)).text
+    region = ReactiveKernels._JaxSourceRegion(:combine_rows, collect(have), [:records],
+        Dict(:records => :combined), "Combine the selected rows.")
+    options = (; have, functions, source_regions = [region])
+    src = jax_source(broadcast_rows; options..., data = first(data))
+    @test occursin("def combine_rows", src.text)
+    @test src.text == jax_source(broadcast_rows; options..., data = last(data)).text
     @test occursin("jax.vmap(", src.text)
     if rk_jax_available()
         native = prepare(broadcast_rows; have, want = :total)

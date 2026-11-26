@@ -89,8 +89,29 @@ function _jax_conditional_ports(ctx, condition, a, b, T)
         _jax_static_branch!(ctx, condition, arms..., Any)
     else
         yes, no = map(arm -> _jax_emit_arm!(ctx, arm), arms)
-        _PyVal("jax.lax.cond(" * condition.code * ", " * yes.callable * ", " * no.callable * ")", Any)
+        op = layout == 1 && T isa Type && T <: AbstractVector{<:Number} ?
+             _jax_helper!(ctx, "_rk_vector_cond", _JAX_VECTOR_COND) : "jax.lax.cond"
+        _PyVal(op * "(" * condition.code * ", " * yes.callable * ", " * no.callable * ")", Any)
     end
     result = _jax_bind!(ctx, :branch, value)
     _jax_port_unpack(ctx, result.code, T, layout)
 end
+
+# The branches can have different storage widths, for example an empty
+# vector and the compacted rows of a group. Shape evaluation determines a
+# common capacity without running either numerical branch.
+const _JAX_VECTOR_COND = """
+def _rk_vector_cond(predicate, yes, no):
+    yes_width = jax.eval_shape(yes)[0].shape[0]
+    no_width = jax.eval_shape(no)[0].shape[0]
+    if yes_width == no_width:
+        return jax.lax.cond(predicate, yes, no)
+    width = max(yes_width, no_width)
+
+    def at_width(arm):
+        values, length = arm()
+        mode = "edge" if values.shape[0] else "constant"
+        return jnp.pad(values, (0, width - values.shape[0]), mode=mode), length
+
+    return jax.lax.cond(predicate, lambda: at_width(yes), lambda: at_width(no))
+"""
