@@ -185,6 +185,18 @@ def _rk_prepend(initial, history):
     return jnp.concatenate((jnp.atleast_1d(initial), history))
 
 
+def _rk_vcat_tail(row):
+    """Copy a numeric row into array storage for concatenation."""
+    if not isinstance(row, _RKChainRow):
+        return row
+    if not row.shape[0]:
+        return jnp.empty(0, dtype=row.dtype)
+    zero = jnp.zeros((), dtype=row.dtype)
+    def read(i):
+        return jax.lax.cond(i < row.length, lambda: row[i], lambda: zero)
+    return jax.lax.map(read, jnp.arange(row.shape[0]))
+
+
 def _rk_row_broadcast(fn, args, lengths, dtype, scalar_fn=False):
     packed = any(isinstance(x, _RKChainRow) for x in args)
     if not packed and not scalar_fn:
