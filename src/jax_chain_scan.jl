@@ -97,6 +97,9 @@ function _jax_chain_table(ctx, recipe, args, mapped)
     isempty(each) && return nothing
     all(i -> mapped[i] && args[i].T <: AbstractVector{<:AbstractVector{<:Number}} &&
         haskey(ctx.scope.prepared_keys, args[i].extent), each) || return nothing
+    # A multi-input table broadcasts its event axes. Only combine tables
+    # sharing their actual row lengths here. Other tables use the cell map.
+    all(i -> args[i].extent == args[first(each)].extent, each) || return nothing
     all(i -> i in each || isempty(args[i].extent), eachindex(args)) || return nothing
     isempty(recipe.op.axis_checks) || return nothing
     types = Any[i in each ? eltype(eltype(x.T)) : mapped[i] ? eltype(x.T) : _jax_unref(x.T)

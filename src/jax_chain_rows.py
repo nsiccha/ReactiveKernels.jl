@@ -116,7 +116,7 @@ def _rk_row_span(first, last):
 
 
 def _rk_select_subject(column, i):
-    return jax.tree.map(lambda a: a[i], column, is_leaf=lambda a: isinstance(a, _RKChainRows))
+    return jax.tree.map(lambda a: a[0 if a.shape[0] == 1 else i], column, is_leaf=lambda a: isinstance(a, _RKChainRows))
 
 
 def _rk_row_gather(source, indices):
@@ -212,9 +212,25 @@ def _rk_collect_rows(cell, args, mapped, layouts, dtypes):
     return schema.unflatten(values), schema.unflatten(lengths)
 
 
+def _rk_subject_axes(columns, extra, tags):
+    sources = jax.tree.leaves((columns, extra), is_leaf=lambda a: isinstance(a, _RKChainRows))
+    n, = np.broadcast_shapes(*[(a.shape[0],) for a in sources])
+    # A single-row input is regular. Broadcasting it repeats exactly its
+    # authored events. In the common case every input already has n rows.
+    if all(x.shape[0] == 1 for x in columns) and n != 1 and tags is not None:
+        width = columns[0].shape[1]
+        rows = jnp.arange(1, n + 1, dtype=tags.dtype)[:, None]
+        tags = jnp.where(jnp.arange(width) == 0, -rows, rows).reshape(-1)
+    columns = tuple(x if x.shape[0] == n else jnp.broadcast_to(x, (n,) + x.shape[1:]) for x in columns)
+    return columns, tags
+
+
 def _rk_map_rows(cell, args, axes, tags, dtypes):
-    first = args[axes.index("event")]
-    arrays = tuple(_rk_flat_values(x) if axis == "event" else x for x, axis in zip(args, axes))
+    columns, tags = _rk_subject_axes([x for x, axis in zip(args, axes) if axis == "event"],
+                                     [x for x, axis in zip(args, axes) if axis == "row"], tags)
+    first = columns[0]
+    aligned = iter(columns)
+    arrays = tuple(_rk_flat_values(next(aligned)) if axis == "event" else x for x, axis in zip(args, axes))
     count = _rk_flat_count(first)
     if tags is None or count == 0:
         values = jax.tree.map(lambda dt: jnp.zeros(count, dtype=dt), dtypes)
@@ -231,6 +247,10 @@ def _rk_map_rows(cell, args, axes, tags, dtypes):
 
 def _rk_scan_rows(step, seed, columns, row_tags, shared, mapped, seed_mapped, dtype, reduction, include_seed):
     """Scan consecutive real events, restarting the authored carry at each nonempty row."""
+    subjects = [x for x, by_row in zip(shared, mapped) if by_row]
+    if seed_mapped:
+        subjects.append(seed)
+    columns, row_tags = _rk_subject_axes(columns, subjects, row_tags)
     first = columns[0]
     nrows = first.shape[0]
     flat = tuple(_rk_flat_values(col) for col in columns)
@@ -254,7 +274,7 @@ def _rk_scan_rows(step, seed, columns, row_tags, shared, mapped, seed_mapped, dt
         previous, subtotal = state
         tag, *items = event
         row = jnp.abs(tag) - 1
-        init = seed[row] if seed_mapped else seed
+        init = _rk_select_subject(seed, row) if seed_mapped else seed
         carry = jax.tree.map(lambda new, old: jnp.where(tag < 0, new, old), init, previous)
         args = (_rk_select_subject(value, row) if select else value for value, select in zip(shared, mapped))
         carry, value = step(carry, *items, *args)

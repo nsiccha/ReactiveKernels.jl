@@ -1938,8 +1938,11 @@ def _rk_prepare_row_layout(*operands):
         if counts is None:
             counts = lengths
         else:
-            if counts.shape != lengths.shape or np.any(
-                    (counts != lengths) & (counts != 1) & (lengths != 1)):
+            try:
+                counts, lengths = np.broadcast_arrays(counts, lengths)
+            except ValueError:
+                return None
+            if np.any((counts != lengths) & (counts != 1) & (lengths != 1)):
                 return None
             counts = np.where(counts == 1, lengths, counts)
     offsets = np.concatenate((np.zeros(1, dtype=np.int64), np.cumsum(counts, dtype=np.int64)))
@@ -1949,8 +1952,11 @@ def _rk_prepare_row_layout(*operands):
 def _rk_scan_schedule(*lengths):
     # The sign marks a fresh carry; empty rows generate no events. Leave the
     # native equal-axis check to the branch which actually executes this scan.
-    counts = lengths[0]
-    if any(not np.array_equal(counts, other) for other in lengths[1:]):
+    try:
+        counts, *rest = np.broadcast_arrays(*lengths)
+    except ValueError:
+        return None
+    if any(not np.array_equal(counts, other) for other in rest):
         return None
     owners = np.repeat(np.arange(1, len(counts) + 1, dtype=np.int64), counts)
     starts = np.cumsum(counts) - counts

@@ -49,6 +49,33 @@ end
     end
 end
 
+@kernel function jax_broadcast_rows(a::Float64, left::Vector{Vector{Float64}}, right::Vector{Vector{Float64}})
+    terms = plate(left, right, Ref(a)) do l, r, scale
+        values = plate(l, r, Ref(scale)) do i, j, x
+            x*i + j
+        end
+        sum(values)
+    end
+    total = sum(terms)
+    return total
+end
+
+@testset "Packed plates broadcast singleton subjects and actual row lengths" begin
+    have = (:a, :left, :right)
+    src = jax_source(jax_broadcast_rows; have, want = :total, data = (:left, :right), layout = :chains)
+    native = prepare(jax_broadcast_rows; have, want = :total)
+    if rk_jax_available()
+        for (l, r) in (([[1.0], [2., 3., 4.]], [[3., 2.], [5.]]),
+                       ([[1.0]], [[3., 2.], [5.]]), ([[1.0], Float64[]], [Float64[], [4.]]))
+            result = rk_jax_evaluate(src, "kernel", (2.0, l, r); prepare = :arguments, grad = true)
+            @test result.value == native(2.0, l, r)
+            @test result.grad == native(1.0, l, r) - native(0.0, l, r)
+        end
+        @test_throws "DimensionMismatch" rk_jax_evaluate(src, "kernel",
+            (2.0, [[1.0], [1., 2.]], [[2., 3.], [2., 3., 4.]]); prepare = :arguments)
+    end
+end
+
 @traceable function jax_row_prefix(codes)
     indices = zeros(Int, length(codes))
     index = 0
@@ -173,6 +200,7 @@ end
     if rk_jax_available()
         for (ks, cs) in ((labels, visits), (reverse(labels), reverse(visits)),
                          ([[1, -1], [-1, 1]], [[3, 4], [5, 6]]),
+                         ([[1, -1]], [[3, 4], [5, 6]]),
                          ([Int[], Int[]], [Int[], Int[]]), (Vector{Int}[], Vector{Int}[]))
             r = rk_jax_evaluate(source, "kernel", (0.7, ks, cs); prepare = :arguments, grad = true)
             @test r.value ≈ native(0.7, ks, cs)

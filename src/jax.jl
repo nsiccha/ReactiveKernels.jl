@@ -8403,24 +8403,33 @@ end
 # In the chain layout, map only the iterated operands. Shared operands stay in
 # the closure (in particular a prepared integer used for a static shape).
 const _JAX_SERIAL_MAP = """
-def _rk_serial_map(f, in_axes=None, row_dtypes=None, broadcast=False):
+def _rk_serial_map(f, in_axes=None, row_dtypes=None, broadcast=False, counts=None):
     def run(*args):
         axes = (0,) * len(args) if in_axes is None else in_axes
         def leaves(arg):
             return jax.tree.leaves(arg, is_leaf=lambda a: isinstance(a, _RKChainRows))
         sizes = [leaf.shape[0] for arg, axis in zip(args, axes) if axis == 0 for leaf in leaves(arg)]
+        lengths = (None,) * len(args) if counts is None else counts
+        logical = [n for n in lengths if n is not None]
+        length = _rk_broadcast_length(*logical) if logical else None
         def cell(i):
-            def select(x):
-                return jax.tree.map(lambda a: a[0 if broadcast and a.shape[0] == 1 else i], x,
-                                    is_leaf=lambda a: isinstance(a, _RKChainRows))
-            return f(*(select(x) if axis == 0 else x for x, axis in zip(args, axes)))
+            def select(x, count):
+                def index(a):
+                    if not broadcast:
+                        return a[i]
+                    if count is not None:
+                        return a[jnp.where(count == 1, 0, i)]
+                    return a[0 if a.shape[0] == 1 else i]
+                return jax.tree.map(index, x, is_leaf=lambda a: isinstance(a, _RKChainRows))
+            values = tuple(select(x, n) if axis == 0 else x for x, n, axis in zip(args, lengths, axes))
+            return f(*values, i < length) if logical else f(*values)
         rows = [a for x, axis in zip(args, axes) if axis == 0 for a in leaves(x)
                 if isinstance(a, _RKChainRow)]
         if rows and row_dtypes is not None:
-            # Keep a real checked cell eager, including when a later scan
-            # only reads a subset of the lookup table.
+            width = max(sizes)
+            count = rows[0].length if length is None else length
             return _rk_local_scan(lambda unused, xs: (None, cell(xs[0])), None,
-                                  (jnp.arange(rows[0].shape[0]),), rows[0].length, row_dtypes)
+                                  (jnp.arange(width),), count, row_dtypes)
         if broadcast:
             size, = np.broadcast_shapes(*[(n,) for n in sizes])
         elif any(n != sizes[0] for n in sizes):
@@ -8561,7 +8570,26 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
             end
         end
     end
-    if masked
+    chain_counts = String[]
+    chain_extent = ""
+    if masked && ctx.mod.layout === :chains && R == 1 && !only(with_length) && _jax_chain_dtypes(E) !== nothing
+        for (i, v) in enumerate(inputs)
+            count = !mapped[i] ? "None" : padded[i] ? axis_inputs[i].extent : _py_atom(_jax_mapped_array(v)) * ".shape[0]"
+            push!(chain_counts, count)
+            ragged[i] && push!(chain_counts, mapped[i] ? count : "None")
+        end
+        logical = unique(filter(!=("None"), chain_counts))
+        # Runtime row lengths determine singleton broadcasting and the number
+        # of visits. The cell's final argument is its activity at that index.
+        chain_extent = _jax_broadcast_extent(ctx, logical)
+        if length(logical) > 1
+            for count in logical
+                valid = "((" * count * " == 1) | (" * count * " == " * chain_extent * "))"
+                _jax_call(ctx, _runtime_check, [_PyVal(valid, Bool),
+                    _PyVal(repr("DimensionMismatch: incompatible row axes"), DimensionMismatch)])
+            end
+        end
+    elseif masked
         # Padding is storage, not a native cell. Include its activity in
         # runtime-check guards before batching those checks across lanes.
         # The mask spans the `R` mapped axes of the argument's stored array
@@ -8591,6 +8619,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
         dtypes = ctx.mod.layout === :chains && R == 1 && !only(with_length) ? _jax_chain_dtypes(E) : nothing
         kw = ctx.mod.layout === :chains ? ", broadcast=True" : ""
         dtypes === nothing || (kw *= ", row_dtypes=" * dtypes)
+        isempty(chain_counts) || (kw *= ", counts=" * _jax_chain_tuple(chain_counts))
         call = mapper * "(" * call * ", in_axes=" * axes_text * kw * ")"
     end
     call *= "(" * join(args, ", ") * ")"
@@ -8704,7 +8733,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
                               _jax_where(ctx))
     call = "(jnp.zeros(" * first(shapes) * ", dtype=" * _jax_dtype(E) * ") if " *
            empty * " else " * call * ")"
-    extent = _jax_extent(axis_inputs[padded])
+    extent = isempty(chain_extent) ? _jax_extent(axis_inputs[padded]) : chain_extent
     [_PyVal(call, Array{E,R}, false, extent, "", _jax_padded_union(axis_inputs[padded]))]
 end
 # Resolve every operand of a cell broadcast to its own sequence of row
