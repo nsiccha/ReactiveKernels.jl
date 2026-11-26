@@ -144,6 +144,7 @@ const _MATRIX_CORE_TESTS = (
     "test_input_checks.jl",
     "test_authored_loops.jl",
     "test_jax_source.jl",
+    "test_jax_mixed_cell_data.jl",
     "test_jax_world_age.jl",
     "test_jax_static_guards.jl",
     "test_jax_static_fields.jl",
