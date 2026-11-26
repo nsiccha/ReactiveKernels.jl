@@ -394,6 +394,20 @@ struct _JaxPlateCell
     axis_inputs::Vector{ValueId}
 end
 
+struct _JaxScanRowRead
+    token::String
+    table::_PyVal
+    index::String
+    guard::String
+    fallback::String
+end
+
+struct _JaxScanRowInputs
+    tables::Set{String}
+    sequences::Dict{String,_PyVal}
+    reads::Vector{_JaxScanRowRead}
+end
+
 # One Python function body under construction. `links` maps an input of a
 # nested plan (a branch arm's, a plate cell's unmapped argument) to the
 # `(plan, value)` of the enclosing plan it is the same value as, so the
@@ -425,6 +439,7 @@ mutable struct _JaxScope
     # Branches and scalar helpers retain the current step's indexed reads.
     # A nested data loop gets its own scope to avoid repeating a cell there.
     scan_reads::Dict{String,_JaxPlateCell}
+    scan_rows::Union{Nothing,_JaxScanRowInputs}
     # A record gather at entry to this scope, before any statements. A
     # conditional can share it if both of its arms start with the same read.
     first_record::Union{Nothing,@NamedTuple{name::String, expression::String}}
@@ -439,7 +454,8 @@ _JaxScope(parent::Union{Nothing,_JaxScope} = nothing; same_step::Bool = false) =
               parent === nothing ? Dict{String,String}() : copy(parent.chain_layouts),
               Dict{String,Tuple{String,String}}(),
               Set{Symbol}(), Dict{ValueId,_JaxPlateCell}(),
-              same_step ? parent.scan_reads : Dict{String,_JaxPlateCell}(), nothing)
+              same_step ? parent.scan_reads : Dict{String,_JaxPlateCell}(),
+              same_step ? parent.scan_rows : nothing, nothing)
 # The `flat_positions` entry of the lengths of cells that each fill their stored
 # rows: a plate's cells returning vectors whose length the cell's own expression
 # fixes (`vcat(a, b)` of scalars), or matrices of a fixed shape. Every stored
@@ -1327,7 +1343,9 @@ end
 # `target` reads the position only, so its gather carries no extent.
 function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
     _jax_slots(x) && return _jax_slots_index(ctx, x, indices)
-    if !target && length(indices) == 1 && haskey(ctx.scope.scan_reads, x.code) &&
+    if !target && length(indices) == 1 && (haskey(ctx.scope.scan_reads, x.code) ||
+       (ctx.scope.scan_rows !== nothing && x.code in ctx.scope.scan_rows.tables &&
+        only(indices) isa Union{Symbol,_PyVal} && !isempty(_JAX_GUARDS))) &&
        !_jax_written_slice(only(indices))
         i = _jax_bound_expr(ctx, x, 1, only(indices))
         read = _jax_scan_plate_read(ctx, x, i)
@@ -8896,14 +8914,31 @@ _jax_unref_val(v::_PyVal) = v
 
 function _jax_scan_plate_read(ctx, x, i)
     cell = get(ctx.scope.scan_reads, x.code, nothing)
-    cell === nothing && return nothing
     i.T isa Type && i.T <: Integer && i.T !== Bool || return nothing
+    guard = _jax_scan_row_guard(ctx.scope, x, i)
+    (guard === nothing && cell === nothing) && return nothing
     at = _jax_minus_one(_jax_bind!(ctx, :cell_index, i))
-    args = [mapped ? _py_atom(arg) * "[" * at * "]" : arg
-            for (arg, mapped) in zip(cell.args, cell.mapped)]
-    call = cell.name * "(" * join(args, ", ") * ")"
-    # vmap turns scalar literals returned by a cell into array leaves too.
-    _jax_bind!(ctx, :plate_entry, _PyVal("jax.tree_util.tree_map(jnp.asarray, " * call * ")", eltype(x.T)))
+    E = eltype(x.T)
+    code = if cell !== nothing
+        args = [mapped ? _py_atom(arg) * "[" * at * "]" : arg
+                for (arg, mapped) in zip(cell.args, cell.mapped)]
+        # vmap turns scalar literals returned by a cell into array leaves too.
+        "jax.tree_util.tree_map(jnp.asarray, " * cell.name * "(" * join(args, ", ") * "))"
+    elseif E <: Number
+        _py_atom(x.code) * "[" * at * "]"
+    else
+        _jax_tuple_code([_PyVal(_jax_column(x, k).code * "[" * at * "]", fieldtype(E, k))
+                         for k in 1:fieldcount(E)])
+    end
+    if guard !== nothing
+        token = _jax_named_function(ctx, :scan_read; private = true)
+        push!(ctx.scope.scan_rows.reads, _JaxScanRowRead(token, x, i.code, guard, code))
+        # Keep its original evaluation site if the completed step has effects.
+        entry = _jax_fresh(ctx, cell !== nothing ? :plate_entry : :table_entry)
+        _jax_emit!(ctx, entry * " = " * token)
+        return _PyVal(entry, E)
+    end
+    _jax_bind!(ctx, :plate_entry, _PyVal(code, E))
 end
 
 const _JAX_TABLE_SCAN_STEP = raw"""
@@ -8949,15 +8984,19 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     have = body.have
     inner.values[canon_id(body.graph, have[1].id)] = _PyVal(carry, types[1])
     unpack = String[]
+    scan_rows = _JaxScanRowInputs(Set{String}(), Dict{String,_PyVal}(), _JaxScanRowRead[])
+    inner.scan_rows = scan_rows
     entry_position = string("scan ", _JAX_CELL_POSITIONS[] += 1)
     for (k, i) in enumerate(iterated)
         name = _jax_identifier(inner.used, have[1 + k].name)
         push!(unpack, name)
+        scan_rows.sequences[name] = inputs[i]
         inner.values[canon_id(body.graph, have[1 + k].id)] =
             _jax_scan_element(name, inputs[i], entry_position)
     end
     sequence_ids = Set(canon_id(p.graph, recipe.inputs[i].id) for i in iterated)
     for (k, i) in enumerate(shared)
+        _jax_scan_row_table(inputs[i]) && push!(scan_rows.tables, inputs[i].code)
         inner.values[canon_id(body.graph, have[1 + length(iterated) + k].id)] = inputs[i]
         cell = get(outer.plates, canon_id(p.graph, recipe.inputs[i].id), nothing)
         if cell !== nothing && !isdisjoint(sequence_ids, cell.axis_inputs)
@@ -8976,8 +9015,6 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     effects_before = _JAX_EFFECTS[]
     ctx.scope = inner
     wants = try
-        isempty(unpack) || _jax_emit!(ctx, join(unpack, ", ") * (length(unpack) == 1 ? "," : "") *
-                                            " = " * xs)
         _jax_plan!(ctx, body)
         [_jax_lookup(ctx, body.graph, v) for v in body.want]
     finally
@@ -8995,17 +9032,20 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
             "jax.tree_util.tree_map(lambda new, old: jnp.where(" * live * ", new, old), " *
             wants[1].code * ", " * carry * ")"
     end
-    if any(i -> _jax_columns(inputs[i].T), shared) && !recipe.effectful &&
-       !any(r -> r.effectful, body.recipes) && _JAX_EFFECTS[] == effects_before
+    pure = !recipe.effectful && !any(r -> r.effectful, body.recipes) && _JAX_EFFECTS[] == effects_before
+    width = _jax_scan_width(ctx, inputs, iterated)
+    seqs = String[_jax_scan_sequence(inputs[i], width) for i in iterated]
+    isempty(position) || push!(seqs, "jnp.arange(" * _py_atom(first(seqs)) * ".shape[0])")
+    _jax_scan_row_inputs!(ctx, inner, scan_rows, unpack, seqs, width, extent, pure)
+    if any(i -> _jax_columns(inputs[i].T), shared) && pure
         decorator = _jax_helper!(ctx, "_rk_table_scan_step", _JAX_TABLE_SCAN_STEP)
         _jax_emit!(ctx, "@" * decorator)
     end
     push!(outer.lines, "    "^outer.indent * "def " * step * "(" * carry * ", " * xs * "):")
+    isempty(unpack) || push!(outer.lines, "    "^inner.indent * join(unpack, ", ") *
+                            (length(unpack) == 1 ? "," : "") * " = " * xs)
     append!(outer.lines, inner.lines)
     push!(outer.lines, "    "^inner.indent * "return " * next_carry * ", " * wants[2].code)
-    width = _jax_scan_width(ctx, inputs, iterated)
-    seqs = String[_jax_scan_sequence(inputs[i], width) for i in iterated]
-    isempty(position) || push!(seqs, "jnp.arange(" * _py_atom(first(seqs)) * ".shape[0])")
     sequences = "(" * join(seqs, ", ") * (length(seqs) == 1 ? ",)" : ")")
     result = _jax_fresh(ctx, :scan_result)
     E = _jax_typeof(wants[2])
