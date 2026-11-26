@@ -2288,10 +2288,14 @@ function _jax_cell_split(g::Graph, r::Recipe, dependent::Set{ValueId}, hoisted::
         inputs = Int[i for i in eachindex(data) if data[i] &&
                      (canon_id(cg, body.have[i].id) in read || mapped(i))]
     end
+    # An invariant prefix still belongs to the plate. The remaining mapped
+    # operands establish whether any cell visits it, without adding a batch
+    # dimension to the value supplied to those cells.
+    domain = complete_domain && !percell ? Int[i for i in eachindex(data) if data[i] && mapped(i)] : Int[]
     atomic = Bool[i in atomic_inputs for i in inputs]
     plan = _partial_subplan(body, Value[body.have[i] for i in inputs], frontier, computed)
     values = Value[Value(v.name, Any) for v in frontier]
-    prefix = Recipe(_jax_cell_prefix_id(r.id), Tuple(r.inputs[i] for i in inputs),
+    prefix = Recipe(_jax_cell_prefix_id(r.id), Tuple(r.inputs[i] for i in (inputs..., domain...)),
                     Tuple(values),
                     _JaxCellPrefix(plan, atomic, percell, r.id, Int[x.id for x in targets]),
                     0.0, nothing, false)
@@ -2337,12 +2341,29 @@ def _rk_plate_rows(*sources):
             for i in range(n))
 """
 
+# The residual never reads a shared operand when the plate is empty, but its
+# prepared representation still has the same rank and field structure.
+function _jax_unvisited_shared(ctx, @nospecialize(T))
+    T <: Number && return "np.zeros((), dtype=" * _host_dtype(T) * ")"
+    if T <: AbstractArray
+        shape = "(" * "0, "^ndims(T) * ")"
+        return "np.empty(" * shape * ", dtype=" * _host_dtype(eltype(T)) * ")"
+    end
+    if T <: Union{Tuple,NamedTuple} && isconcretetype(T)
+        parts = [_jax_unvisited_shared(ctx, fieldtype(T, i)) for i in 1:fieldcount(T)]
+        return "(" * join(parts, ", ") * (length(parts) == 1 ? ",)" : ")")
+    end
+    _jax_error("a shared cell value of type ", T, " on an empty plate", _jax_where(ctx))
+end
+
 # A plate cell's data-only recipes in `prepare_data`: a function of them,
 # called on each cell's data (or once, when they read no iterated input),
 # and each of its values for every cell as a list.
 function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe, op::_JaxCellPrefix, inputs)
     ctx.host === nothing && _jax_error("a plate cell's data-only recipes outside `prepare_data`",
                                        _jax_where(ctx))
+    domain = inputs[length(op.plan.have) + 1:end]
+    inputs = inputs[1:length(op.plan.have)]
     inputs = [!op.atomic[i] && _jax_numeric_tuple(v.T) ?
               _PyVal("np.stack(" * v.code * ")", Vector{eltype(v.T)}, true) : v
               for (i, v) in enumerate(inputs)]
@@ -2369,6 +2390,14 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe, op::_JaxCellPref
     call = cell * "(" * join(args, ", ") * ")"
     n = length(wants)
     if !op.percell
+        if !isempty(domain)
+            shapes = [_jax_rank(v.T) == 1 ? "(len(" * v.code * "),)" : "np.shape(" * v.code * ")"
+                      for v in domain]
+            empty = [_jax_unvisited_shared(ctx, _jax_typeof(w)) for w in wants]
+            fallback = n == 1 ? only(empty) : "(" * join(empty, ", ") * ")"
+            call = "(" * call * " if 0 not in np.broadcast_shapes(" * join(shapes, ", ") *
+                   ") else " * fallback * ")"
+        end
         n == 1 && return [_PyVal(call, _jax_typeof(only(wants)), true)]
         shared = _jax_bind!(ctx, :cell_data, _PyVal(call, Any, true))
         return [_PyVal(shared.code * "[" * string(j - 1) * "]", _jax_typeof(wants[j]), true)

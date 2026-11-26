@@ -22,6 +22,33 @@ end
     return total
 end
 
+@kernel function shared_indexed_rows(a::Float64, codes::Vector{Int}, offsets::Vector{Int})
+    cells = plate(Ref(codes), offsets) do shared, offset
+        indices = positive_positions(shared)
+        a * sum(indices) + offset
+    end
+    total = sum(cells)
+    return total
+end
+
+@testset "A shared prepared table is evaluated only on an inhabited plate" begin
+    have = (:a, :codes, :offsets)
+    native = prepare(shared_indexed_rows; have, want = :total)
+    for layout in (:padded, :groups, :chains)
+        src = jax_source(shared_indexed_rows; have, data = (:codes, :offsets),
+                         want = :total, plate_layout = layout)
+        rk_jax_available() || continue
+        for (codes, offsets) in (([-999], Int[]), ([3, 0], [1, -1]))
+            args = (0.75, codes, offsets)
+            result = rk_jax_evaluate(src, :kernel, args; grad = true, prepare = :arguments)
+            @test result.value ≈ native(args...)
+            @test result.grad ≈ native(1.0, codes, offsets) - sum(offsets)
+        end
+        @test_throws ErrorException rk_jax_evaluate(src, :kernel, (0.75, [-999], [1]);
+                                                    prepare = :arguments)
+    end
+end
+
 @testset "Data-only index tables follow the plate's logical domain" begin
     have = (:a, :rows, :offsets)
     native = prepare(indexed_rows; have, want = :total)

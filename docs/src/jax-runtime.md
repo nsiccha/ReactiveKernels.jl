@@ -61,66 +61,7 @@ distinct entry it requests once, so many rows that read one shared factor
 compute it once, and an entry it does not request is never computed. The
 derivative of a selected read keeps only the selected rows' residuals.
 
-## Plate layouts
-
-A plate over units with ragged rows (subjects with their own event
-schedules) is one `jax.vmap` of its cell, so every unit is stored and computed
-at the longest unit's length. When the lengths differ widely, most of that
-work, and of what reverse mode stores for each step of a scan, is padding.
-
-`jax_source(...; data, plate_layout = :groups)` emits a module whose caller
-chooses how such plates run, after `prepare_data` and without regenerating it:
-
-```python
-prepared = module.prepare_data(**raw)
-chosen = module.prepare_plate_layout(prepared, groups=4)
-value, gradient = jax.value_and_grad(module.kernel)(u, **chosen)
-```
-
-`prepare_plate_layout(prepared, groups, sequential=False)` sorts each plate's
-units by length and splits them into at most `groups` groups that minimize
-the padded size. Each group runs as one `jax.vmap` over rows cut to its
-longest unit, or with `sequential=True` as one `jax.lax.map`, its units one
-after another. The groups' values are joined in the plate's order and padded
-to the plate's own shapes. `groups=1` without `sequential` is the plate as
-without the option, and `prepare_data`'s own result selects it.
-
-Every layout calls the plate's own cell, so values and ordinary derivatives
-are the plate's. The layouts differ in cost: more groups move fewer bytes and
-store less per chain, and run more loop rounds in sequence. Which is fastest
-depends on the device, the model and the number of chains, so time the
-candidates there rather than choosing by rule.
-
-`select_plate_layout(prepared, make_step, chains=None)` runs that timing. The
-caller supplies `make_step(prepared)`, or `make_step(prepared, count)` with
-`chains`, returning a function that runs its own work once: one batched
-gradient, or one sampler step over all chains, so the sampler's memory and
-cost are measured too. Each candidate is compiled, run and timed; with
-`chains` they are compared by time per chain. A candidate the device has no
-memory for is recorded and its larger chain counts are skipped. The result is
-the prepared data with the fastest layout and a report of every run:
-
-```python
-def make_step(data, count):
-    gradient = jax.jit(jax.vmap(jax.value_and_grad(lambda u: module.kernel(u, **data))))
-    positions = starts[:count]
-    return lambda: gradient(positions)
-
-chosen, report = module.select_plate_layout(prepared, make_step, chains=(256, 1024, 4096))
-```
-
-`GROUPED_PLATES` names the plates that take a layout, each with the prepared
-row lengths that group its units. A plate can group numeric rows with
-prepared lengths, including computed rows that inherit the lengths of
-`rows[i]` from a prepared index. A cell that reads `rows[i]` directly
-can also use the selected group's width. When a mapped numeric row or a
-recorded row read has unknown lengths, the plate keeps its full widths so
-that nested operations over paired rows see compatible axes.
-A jitted function can take the prepared data as arguments. The member
-indices and the permutation that restores the output order are array inputs.
-Reordering units with the same group shapes reuses the compiled function.
-Each selected group contributes one plate body to the trace, up to the
-caller's group limit.
+For ragged event schedules, [JAX plate layouts](jax-plate-layouts.md) describes how to group subjects and time batched gradients on the target device.
 
 ## Chains under `vmap`
 
