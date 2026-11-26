@@ -36,6 +36,17 @@ ReactiveKernelsPPL.sampling_fragment(::typeof(foreign)) = fragment
     inner ~ foreign(mu)
     return inner
 end
+
+center(x) = 2x
+positions(xs) = eachindex(xs)
+@rkppl readings(mu, xs) = begin
+    delta ~ Shift(offset)
+    offset ~ Normal(center(mu), 1)
+    @plate for j in positions(xs)
+        reading[j] = xs[j] * delta + offset
+    end
+    return reading
+end
 end
 
 @testset "bound plan copies resolve draw code in the model module and own their data" begin
@@ -157,6 +168,107 @@ end
     @test length(prepare_generated(only_gq())(Float64[], rng).x) == 2
 end
 
+@testset "generated plate submodels return values and share their local draws" begin
+    model = @rkppl begin
+        theta ~ Normal(0, 1)
+        y ~ Normal(theta, 1)
+        @generate begin
+            @plate for i in eachindex(groups)
+                value[i] ~ DrawFixtures.readings(theta + groups[i], xs[i])
+                same[i] = value[i].offset
+            end
+            offsets = value.offset
+            deltas = value.delta
+        end
+    end
+    baseline = (@rkppl begin
+        theta ~ Normal(0, 1)
+        y ~ Normal(theta, 1)
+    end)() | (; y=0.7)
+    sources = Tuple[]
+    for xs in (Vector{Float64}[], [[1., 2.], Float64[]], [[0.], [-1., 4., 2.], [8.]])
+        groups = collect(1.:length(xs))
+        p = model(; groups, xs) | (; y=0.7)
+        @test coordinate_names(assign_layout(p)) == coordinate_names(assign_layout(baseline))
+        q = prepare_generated(p)
+        cell_sources = map(cell -> ReactiveKernels._program_expression(cell.native), q.inputs.cells)
+        source = map(ex -> Base.remove_linenums!(deepcopy(ex)), (code_expr(q), cell_sources...))
+        push!(sources, source)
+        @test length(cell_sources) == 2
+        replay, cells... = map(ex -> Core.eval(@__MODULE__, Meta.parse(string(ex))), source)
+        bindings = (; data=q.inputs.data, cells=Tuple(cells))
+        @test isconcretetype(only(Base.return_types(q.program,
+            Tuple{Xoshiro,typeof(q.inputs),@NamedTuple{theta::Float64}})))
+        for u in ([1.25], [-0.5]), seed in (17, 18)
+            rng = Xoshiro(seed)
+            result = q(u, rng)
+            @test keys(result) == (:value, :same, :offsets, :deltas)
+            @test result == q((; theta=only(u)), rng)
+            @test result == Base.invokelatest(replay, copy(rng), bindings, (; theta=only(u)))
+            oracle = copy(rng)
+            for i in eachindex(groups)
+                a = rand(oracle, Normal(2 * (only(u) + groups[i]), 1))
+                b = a + randexp(oracle)
+                @test result.offsets[i] == result.same[i] == a
+                @test result.deltas[i] == b
+                @test result.value[i] == xs[i] .* b .+ a
+            end
+            @test length(result.value) == length(result.offsets) == length(groups)
+            @test eltype(result.offsets) === Float64
+            @test eltype(result.value) === Vector{Float64}
+            @test rand(rng) == rand(Xoshiro(seed))
+        end
+    end
+    @test all(==(first(sources)), sources)
+
+    # Retain both physical draws from an empty reading schedule and use
+    # them on either design without revisiting the stochastic query.
+    groups = [1., 3.]
+    generate(xs) = prepare_generated(model(; groups, xs) | (; y=0.7))([1.25], Xoshiro(17))
+    retained = generate([Float64[], Float64[]])
+    readout(xs) = [row .* b .+ a for (row, a, b) in zip(xs, retained.offsets, retained.deltas)]
+    designs = ([[1., 3.], Float64[]], [Float64[], [-1., 4., 0.]])
+    for design in reverse(designs)
+        d = generate(design)
+        @test (d.offsets, d.deltas) == (retained.offsets, retained.deltas)
+        @test d.value == readout(design)
+    end
+
+    # A direct return can share its identifier with the local that supplied it.
+    direct = @rkppl begin
+        theta ~ Normal(0, 1)
+        @generate begin
+            @plate for i in eachindex(groups)
+                result[i] ~ DrawFixtures.foreign(theta + groups[i])
+            end
+            local_b = result.b
+        end
+    end
+    groups = [1., 3.]
+    q = prepare_generated(direct(; groups))
+    oracle = Xoshiro(17)
+    expected = [1.25 + g + randexp(oracle) for g in groups]
+    @test q([1.25], Xoshiro(17)) == (; result=expected, local_b=expected)
+
+    lexical = @rkppl begin
+        theta ~ Normal(0, 1)
+        @plate for i in eachindex(y)
+            y[i] ~ Normal(theta, 1)
+        end
+        @generate begin
+            shift = theta + 1
+            @plate for i in eachindex(groups)
+                shift = groups[i] + theta
+                adjusted[i] = 2 * shift
+            end
+            after = shift
+        end
+    end
+    q = prepare_generated(lexical(; groups) | (; y=[0.7]))
+    @test q([1.25], Xoshiro(17)) ==
+        (; shift=2.25, adjusted=2 .* (groups .+ 1.25), after=2.25)
+end
+
 @testset "structured and conditioned draws" begin
     constrained = @rkppl begin
         cuts ~ Ordered(Normal(0, 1), 3)
@@ -247,5 +359,28 @@ end
         g(u, Xoshiro(1))
         g(u, Xoshiro(2))
         @test vg(p) == density
+    end
+
+    repeated = @rkppl begin
+        a ~ Normal(0,1)
+        y ~ Normal(a,1)
+        @generate begin
+            @plate for i in eachindex(xs)
+                value[i] ~ DrawFixtures.readings(a, xs[i])
+            end
+            delta = value.delta
+        end
+    end
+    observed = @rkppl begin
+        a ~ Normal(0,1)
+        y ~ Normal(a,1)
+    end
+    reference = vg(observed() | (; y=0.7))
+    @test reference[1] ≈ logpdf(Normal(), only(u)) + logpdf(Normal(only(u), 1), 0.7)
+    @test reference[2] ≈ [0.7 - 2 * only(u)]
+    for xs in (Vector{Float64}[], [[2.0], Float64[]])
+        p = repeated(; xs) | (; y=0.7)
+        prepare_generated(p)(u, Xoshiro(17))
+        @test vg(p) == reference
     end
 end

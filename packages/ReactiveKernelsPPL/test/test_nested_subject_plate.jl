@@ -55,7 +55,7 @@ end
             for (e, subjects) in pairs(d.picks)]
         residuals = [map(-, y, m) for (y, m) in zip(d.readings, fits)]
         pointwise = [[-0.5 .* (r.^2 .+ log(2pi)) for r in subjects] for subjects in residuals]
-        expected = sum_subjects.(pointwise)
+        expected = Float64[sum_subjects(p) for p in pointwise]
         query(w) = Base.invokelatest(prepare_query(built, bound, w), u)
         actual_fits = query((:fitted,))
         @test actual_fits == fits
@@ -74,7 +74,7 @@ end
         sampler = prepare_sampler(built, bound, u; backend)
         value, gradient = Base.invokelatest(sampler_value_and_gradient!, sampler, similar(u), u)
         @test value ≈ sum(expected) - 0.5 * sum(abs2.(u) .+ log(2pi))
-        scores = sum_subjects.(residuals)
+        scores = Float64[sum_subjects(r) for r in residuals]
         @test gradient ≈ [sum(scores); scores] .- u
         source = Base.remove_linenums!(deepcopy(code_expr(sampler.kernel)))
         push!(emitted, (nodes(source), loops(source)))

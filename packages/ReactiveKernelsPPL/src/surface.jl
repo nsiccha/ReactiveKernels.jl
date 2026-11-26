@@ -7475,11 +7475,11 @@ end
 # cells is rewritten cell by cell; anything else passes through.
 function _expand_submodel_stmt!(out, arg, mod::Module, data::Set{Symbol},
         used::_ScopeExpansion,
-        chain::Vector{RKPPLSubmodel})
+        chain::Vector{RKPPLSubmodel}; generated=false)
     if _is_generate(arg)
         body = Any[]
         for child in _generated_statements(arg)
-            _expand_submodel_stmt!(body, child, mod, data, used, chain)
+            _expand_submodel_stmt!(body, child, mod, data, used, chain; generated=true)
         end
         push!(out, Expr(:macrocall, Symbol("@generate"), arg.args[2], Expr(:block, body...)))
     elseif _stmt_is_submodel_call(arg, mod)
@@ -7489,10 +7489,10 @@ function _expand_submodel_stmt!(out, arg, mod::Module, data::Set{Symbol},
         inner = RKPPLSubmodel[chain; sm]
         gen = _scope_program_edits(sm, gen, st, used, data)
         for g in gen
-            _expand_submodel_stmt!(out, g, sm.mod, data, used, inner)
+            _expand_submodel_stmt!(out, g, sm.mod, data, used, inner; generated)
         end
     elseif _plate_has_submodel_cell(arg, mod)
-        push!(out, _expand_plate_cell_submodels(arg, mod, data, used, chain))
+        push!(out, _expand_plate_cell_submodels(arg, mod, data, used, chain; generated))
     else
         push!(out, arg)
     end
@@ -8036,21 +8036,25 @@ function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module,
 end
 
 function _resolve_submodel_stmt(st, sm::RKPPLSubmodel, names::Set{Symbol};
-        observes::Set{Symbol} = Set{Symbol}())
+        observes::Set{Symbol} = Set{Symbol}(), generated::Bool = false)
     st isa Expr || return st
     # Plate cell definitions execute in the submodel's defining module too.
     # Visit statement positions only: sampling heads and loop binders retain
     # their DSL spelling until the ordinary surface passes lower them.
     if st.head === :block
-        return Expr(:block, (_resolve_submodel_stmt(a, sm, names; observes)
+        return Expr(:block, (_resolve_submodel_stmt(a, sm, names; observes, generated)
             for a in st.args)...)
     elseif st.head === :macrocall && !isempty(st.args) &&
             st.args[1] in (Symbol("@plate"), Symbol("@generate"))
         return Expr(:macrocall, st.args[1:end-1]...,
-            _resolve_submodel_stmt(st.args[end], sm, names; observes))
+            _resolve_submodel_stmt(st.args[end], sm, names; observes, generated))
     elseif st.head === :for && length(st.args) == 2
-        return Expr(:for, st.args[1],
-            _resolve_submodel_stmt(st.args[2], sm, names; observes))
+        spec = st.args[1]
+        if generated && Meta.isexpr(spec, :(=), 2)
+            domain = _resolve_module_calls(spec.args[2], sm.mod, names, "submodel plate domain"; values=false)
+            spec = Expr(:(=), spec.args[1], domain)
+        end
+        return Expr(:for, spec, _resolve_submodel_stmt(st.args[2], sm, names; observes, generated))
     end
     if (_is_sample(st) || _is_broadcast_sample(st)) && _external_rhs(last(st.args)) &&
             _resolve_submodel(last(st.args), sm.mod) === nothing
@@ -8064,10 +8068,8 @@ function _resolve_submodel_stmt(st, sm::RKPPLSubmodel, names::Set{Symbol};
     end
     if (_is_sample(st) || _is_broadcast_sample(st)) &&
             !_external_rhs(st.args[3]) &&
-            any(in(observes), _sampled_lhs_names!(Set{Symbol}(), st.args[2]))
-        # A module call among an observation's values resolves here, like
-        # the definition naming it would (`_observation_call_definitions`
-        # then names it).
+            (generated || any(in(observes), _sampled_lhs_names!(Set{Symbol}(), st.args[2])))
+        # Resolve helper calls before substituting the caller's arguments.
         where = "submodel `$(sm.name)` sampling RHS `$(repr(st.args[3]))`"
         rhs = _map_rhs_values(st.args[3]) do value
             _bind_module_calls(value) do call
@@ -8140,14 +8142,14 @@ end
 # Rewrite a `@plate` block, replacing each per-cell submodel-call cell with the
 # submodel's inlined `i`-indexed cell statements; other cells pass through.
 function _expand_plate_cell_submodels(pl::Expr, mod::Module, data::Set{Symbol},
-        used::_ScopeExpansion, chain)
+        used::_ScopeExpansion, chain; generated)
     loop = pl.args[end]::Expr
     asg = loop.args[1]::Expr
     ivar = asg.args[1]::Symbol
     body = loop.args[2]::Expr
     cells = Any[]
     for c in body.args
-        _expand_cell_stmt!(cells, c, ivar, mod, data, used, chain)
+        _expand_cell_stmt!(cells, c, ivar, mod, data, used, chain; generated)
     end
     newloop = Expr(:for, asg, Expr(:block, cells...))
     return Expr(:macrocall, pl.args[1:end-1]..., newloop)
@@ -8156,16 +8158,16 @@ end
 # Expand one plate cell into `cells`, recursively (a per-cell body may call a
 # per-cell submodel in turn; it resolves in the enclosing submodel's module).
 function _expand_cell_stmt!(cells, c, ivar::Symbol, mod::Module,
-        data::Set{Symbol}, used::_ScopeExpansion, chain)
+        data::Set{Symbol}, used::_ScopeExpansion, chain; generated)
     call = _cell_submodel_call(c, ivar, mod)
     if call === nothing
         push!(cells, c)
     else
         sm, gen = _expand_cell_submodel(call[1], call[2], ivar, mod, data,
-            used, chain)
+            used, chain; generated)
         inner = RKPPLSubmodel[chain; sm]
         for g in gen
-            _expand_cell_stmt!(cells, g, ivar, sm.mod, data, used, inner)
+            _expand_cell_stmt!(cells, g, ivar, sm.mod, data, used, inner; generated)
         end
     end
     return cells
@@ -8192,7 +8194,7 @@ _is_dotted_obj(st::Expr) =
 # desugar the inlined statements flow through.
 function _expand_cell_submodel(colref::Expr, callexpr::Expr, ivar::Symbol,
                                mod::Module, data::Set{Symbol},
-                               used::_ScopeExpansion, chain)
+                               used::_ScopeExpansion, chain; generated)
     col = colref.args[1]::Symbol
     sm = _resolve_submodel(callexpr, mod)::RKPPLSubmodel
     _check_submodel_cycle(sm, chain)
@@ -8293,11 +8295,19 @@ function _expand_cell_submodel(colref::Expr, callexpr::Expr, ivar::Symbol,
         submap[nm] = pop!(scope.locals, nm)
     end
     body_names = union(argset, Set{Symbol}(keys(submap)))
-    out = Any[_hsubst(_plate_loop(st) === nothing ? st :
-        _resolve_submodel_stmt(st, sm, body_names; observes=argset), submap) for st in stmts]
+    out = Any[]
+    for st in stmts
+        if generated || _plate_loop(st) !== nothing
+            st = _resolve_submodel_stmt(st, sm, body_names; observes=argset, generated)
+        end
+        push!(out, _hsubst(st, submap))
+    end
     # Compound-return latent: bind `col[i]` to the substituted return value.
-    (slot === nothing || latent_stream) && !scan_return &&
-        push!(out, Expr(:(=), colref, _hsubst(ret, submap)))
+    if (slot === nothing || latent_stream) && !scan_return
+        value = generated ? _resolve_module_calls(ret, sm.mod, body_names,
+            "submodel `$(sm.name)` return"; values=false) : ret
+        push!(out, Expr(:(=), colref, _hsubst(value, submap)))
+    end
     return sm, out
 end
 

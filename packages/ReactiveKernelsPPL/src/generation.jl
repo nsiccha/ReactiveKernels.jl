@@ -20,7 +20,17 @@ function _draw_source(ast, mod, inputs, observed, scopes)
                 push!(fitted.args, st)
             end
         end
-        gen_names = _collect_binders!(Set{Symbol}(), generated)
+        # Only the indexed columns escape a plate. Its iteration variable
+        # and bare cell locals can have the same names as other model locals.
+        gen_names = Set{Symbol}()
+        for st in generated.args
+            loop = _plate_loop(st)
+            if loop === nothing
+                _collect_binders!(gen_names, st)
+            else
+                union!(gen_names, _draw_plate_columns(loop))
+            end
+        end
         overlap = intersect(gen_names, union(inputs, _collect_binders!(Set{Symbol}(), fitted)))
         isempty(overlap) || _sfail("@generate redefines a fitted or input name: $(first(overlap))")
         reads = intersect(gen_names, _statement_value_reads!(Set{Symbol}(), fitted))
@@ -154,22 +164,147 @@ end
 function _draw_declarations(stmts, observed; generated = false, factors = Set{Symbol}())
     defs = Dict{Symbol,Expr}()
     order = Symbol[]
+    function declare(name, st)
+        haskey(defs, name) && _sfail("joint generation needs one conditional law for `$name`; a second factor does not specify a draw")
+        defs[name] = st
+        push!(order, name)
+    end
     for st in stmts
         st isa LineNumberNode && continue
-        if _is_sample(st) || _is_broadcast_sample(st) || Meta.isexpr(st, :(=), 2)
+        loop = _plate_loop(st)
+        if generated && loop !== nothing
+            foreach(n -> declare(n, st), _draw_plate_columns(loop))
+            continue
+        elseif _is_sample(st) || _is_broadcast_sample(st) || Meta.isexpr(st, :(=), 2)
             name = _merge_stem(_stmt_lhs(st))
             name in observed && continue
             name in factors && !Meta.isexpr(st, :(=)) && continue
             if name isa Symbol
-                haskey(defs, name) && _sfail("joint generation needs one conditional law for `$name`; a second factor does not specify a draw")
-                defs[name] = st
-                push!(order, name)
+                declare(name, st)
                 continue
             end
         end
         generated && _sfail("unsupported generated declaration `$st`")
     end
     return defs, order
+end
+
+# The LHS visible outside a plate loses one cell index. A nested plate
+# writing x[i][j] first produces x[i] and the outer plate then produces x.
+function _draw_plate_columns(loop)
+    index = loop.args[1].args[1]
+    columns = Any[]
+    for st in loop.args[2].args
+        st isa LineNumberNode && continue
+        inner = _plate_loop(st)
+        targets = if inner !== nothing
+            _draw_plate_columns(inner)
+        elseif _is_sample(st) || _is_broadcast_sample(st) || Meta.isexpr(st, :(=), 2)
+            (_stmt_lhs(st),)
+        else
+            _sfail("unsupported generated plate declaration `$st`")
+        end
+        for lhs in targets
+            lhs isa Symbol && continue
+            target = Meta.isexpr(lhs, :call, 2) && first(lhs.args) in (:eachrow, :eachcol) ?
+                lhs.args[2] : lhs
+            while Meta.isexpr(target, :ref) && !(length(target.args) == 2 && target.args[2] === index)
+                target = target.args[1]
+            end
+            Meta.isexpr(target, :ref, 2) || _sfail("generated plate output `$lhs` needs its cell index `$index`")
+            push!(columns, target.args[1])
+        end
+    end
+    return unique!(columns)
+end
+
+_draw_cell_refs(ex, index, locals) = ex
+function _draw_cell_refs(ex::Expr, index, locals)
+    Meta.isexpr(ex, :ref, 2) && ex.args[2] === index && haskey(locals, ex.args[1]) &&
+        return locals[ex.args[1]]
+    ex.head === :quote && return ex
+    return Expr(ex.head, (_draw_cell_refs(a, index, locals) for a in ex.args)...)
+end
+
+_draw_rhs(st, name, mod, names, rng) = Meta.isexpr(st, :(=), 2) ?
+    _resolve_module_calls(last(st.args), mod, names, name) : _draw_site(st, name, mod, names, rng)
+
+# Construct the needed definitions in dependency order. The same traversal
+# orders top-level draws and the declarations within one repeated call.
+function _draw_lines(valueof, outputs, names; order=outputs)
+    needed = Dict{Symbol,Tuple{Any,Vector{Symbol}}}()
+    function visit(n)
+        haskey(needed, n) && return
+        value = valueof(n)
+        deps = sort!(collect(intersect(_value_symbols(value), names)); by=string)
+        needed[n] = (value, deps)
+        foreach(visit, deps)
+    end
+    foreach(visit, outputs)
+    lines = Expr[]
+    active = Set{Symbol}()
+    function emit(n)
+        n in active && _sfail("cyclic generation dependency at `$n`")
+        haskey(needed, n) || return
+        value, deps = pop!(needed, n)
+        push!(active, n)
+        foreach(emit, deps)
+        push!(lines, Expr(:(=), n, value))
+        delete!(active, n)
+    end
+    foreach(emit, order)
+    return lines
+end
+
+function _draw_records(cell, captures, indices)
+    T = ReactiveKernels._promote_op(cell, typeof(captures), eltype(indices))
+    collect(T, Base.Generator(ReactiveKernels._PackedComprehensionElement(cell, captures), indices))
+end
+
+# Draw a record in one invocation of the cell. Only columns read outside
+# this plate leave the cell. Selecting another local projects that same row.
+function _draw_plate_values(defs, declaration_order, outputs, mod, names, rng, cells)
+    expressions = Dict{Symbol,Expr}()
+    for plate in unique(defs[n] for n in declaration_order if _plate_loop(defs[n]) !== nothing)
+        loop = _plate_loop(plate)
+        index, domain = loop.args[1].args
+        columns = _draw_plate_columns(loop)
+        outside = Set(outputs)
+        for st in values(defs)
+            st === plate || union!(outside, _value_symbols(st))
+        end
+        exports = filter(in(outside), columns)
+        isempty(exports) && continue
+        locals = Dict(n => gensym(n) for n in columns)
+        cell = _draw_cell_refs(loop.args[2], index, locals)
+        cell_defs, order = _draw_declarations(cell.args, (); generated=true)
+        projected = [locals[n] for n in exports]
+        cell_names = union(names, keys(cell_defs), (index,))
+        nested = _draw_plate_values(cell_defs, order, projected, mod, cell_names, rng, cells)
+        lines = _draw_lines(projected, union(keys(cell_defs), keys(nested)); order) do n
+            haskey(nested, n) && return nested[n]
+            _draw_rhs(cell_defs[n], n, mod, cell_names, rng)
+        end
+        body = Expr(:block, lines..., Expr(:tuple, projected...))
+        reads = _closure_reads(Expr(:->, index, body))
+        captures = sort!(collect(intersect(reads, union(names, (rng,), first.(cells)))); by=string)
+        # The ordinary RK comprehension cell gives empty domains their
+        # inferred element type. Pack the captures just as wide RK cells do.
+        env = gensym(:captures)
+        bindings = [Expr(:(=), n, Expr(:ref, env, k)) for (k, n) in enumerate(captures)]
+        program = Expr(:->, Expr(:tuple, env, index), Expr(:block, bindings..., body))
+        handle = gensym(:cell)
+        push!(cells, handle => ReactiveKernels._ArrayFunction(ReactiveKernels.compile(program)))
+        indices = _resolve_module_calls(_draw_axis_expr(domain), mod, names, :plate)
+        rows = gensym(:records)
+        expressions[rows] = Expr(:call, GlobalRef(@__MODULE__, :_draw_records),
+            handle, Expr(:tuple, captures...), indices)
+        for (k, n) in enumerate(exports)
+            field = Expr(:call, Expr(:curly, GlobalRef(ReactiveKernels, :_PackIndex), k))
+            expressions[n] = Expr(:call, GlobalRef(Base, :map), field, rows)
+        end
+    end
+    return expressions
 end
 
 function _prepare_draw(plan::StructuralPlan, role::Val{R}) where {R}
@@ -189,8 +324,11 @@ function _prepare_draw(plan::StructuralPlan, role::Val{R}) where {R}
     sites = Set(e.name for e in layout.entries)
     paths = _scope_name_paths(src.scopes)
     names = _collect_binders!(union(keys(fitted), keys(gen), src.inputs, sites), src.model)
+    # A repeated submodel returning a local directly can use the same
+    # identifier for its public return and for that private local.
+    roots = Set(s.binding for s in src.scopes if length(s.path) == 1)
     outputs = prior ? [n for n in order if n in sites] :
-        [n for n in generated_order if !haskey(paths, n)]
+        [n for n in generated_order if !haskey(paths, n) || n in roots]
     if prior
         for n in sites
             haskey(fitted, n) || _sfail("prior site `$n` needs an explicit sampling declaration with a generation law")
@@ -199,42 +337,40 @@ function _prepare_draw(plan::StructuralPlan, role::Val{R}) where {R}
     rng = gensym(:rng)
     data = gensym(:inputs)
     params = gensym(:parameters)
-    lines = Expr[]
     inputs = Symbol[]
-    active = Set{Symbol}()
-    emitted = Set{Symbol}()
-    function emit(n)
-        n in emitted && return
-        n in active && _sfail("cyclic generation dependency at `$n`")
-        push!(active, n)
-        value = if !prior && n in sites
+    cells = Pair{Symbol,Any}[]
+    plates = prior ? Dict{Symbol,Expr}() :
+        _draw_plate_values(gen, generated_order, outputs, src.mod, names, rng, cells)
+    lines = _draw_lines(outputs, union(names, keys(plates))) do n
+        if haskey(plates, n)
+            plates[n]
+        elseif !prior && n in sites
             Expr(:call, GlobalRef(Base, :getproperty), params, QuoteNode(n))
         elseif n in observed || (!haskey(gen, n) && !haskey(fitted, n))
             push!(inputs, n)
             Expr(:call, GlobalRef(Base, :getproperty), data, QuoteNode(n))
         else
             st = haskey(gen, n) ? gen[n] : fitted[n]
-            if Meta.isexpr(st, :(=))
-                _resolve_module_calls(last(st.args), src.mod, names, n)
-            elseif !prior && !haskey(gen, n)
+            if !Meta.isexpr(st, :(=)) && !prior && !haskey(gen, n)
                 _sfail("generated quantity reads fitted site `$n` with no value in the supplied parameter draw")
-            else
-                _draw_site(st, n, src.mod, names, rng)
             end
+            _draw_rhs(st, n, src.mod, names, rng)
         end
-        for dep in sort!(collect(intersect(_value_symbols(value), names)); by=string)
-            emit(dep)
-        end
-        push!(lines, Expr(:(=), n, value))
-        delete!(active, n)
-        push!(emitted, n)
-        return
     end
-    foreach(emit, outputs)
     result = Expr(:tuple, Expr(:parameters, (Expr(:kw, n, n) for n in outputs)...))
-    expr = Expr(:->, Expr(:tuple, rng, data, params), Expr(:block, lines..., result))
-    program = ReactiveKernels.compile(expr)
     values = NamedTuple{Tuple(inputs)}(Tuple(_draw_input(plan, n) for n in inputs))
+    bundle = data
+    if !isempty(cells)
+        bundle = gensym(:bindings)
+        values = (; data=values, cells=Tuple(last(cell) for cell in cells))
+        pushfirst!(lines,
+            Expr(:(=), data, Expr(:., bundle, QuoteNode(:data))),
+            (Expr(:(=), first(cell), Expr(:ref, Expr(:., bundle, QuoteNode(:cells)), k))
+             for (k, cell) in enumerate(cells))...)
+    end
+    expr = Expr(:->, Expr(:tuple, rng, bundle, params), Expr(:block, lines..., result))
+    compiled = ReactiveKernels.compile(expr)
+    program = isempty(cells) ? compiled : ReactiveKernels._ArrayFunction(compiled)
     return _NativeDrawQuery{R,typeof(program),typeof(values),typeof(layout)}(program, values, layout)
 end
 
@@ -275,4 +411,7 @@ end
 (q::_NativeDrawQuery{:generated})(draw::NamedTuple, rng) =
     Base.invokelatest(q.program, copy(rng), q.inputs, _flat_draw_values(q.layout, draw))
 
-ReactiveKernels.code_expr(q::_NativeDrawQuery) = ReactiveKernels._program_expression(q.program)
+function ReactiveKernels.code_expr(q::_NativeDrawQuery)
+    f = q.program
+    return ReactiveKernels._program_expression(f isa ReactiveKernels._ArrayFunction ? f.native : f)
+end
