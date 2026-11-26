@@ -294,3 +294,32 @@ end
         end
     end
 end
+
+@kernel function jax_prefixed_gather(x::Vector{Float64}, indices::Vector{Vector{Int}})
+    scores = plate(indices, Ref(x)) do ids, values
+        row = vcat(2, values[1], values[ids])
+        length(row) + sum(row) + 3 * row[2] + 7 * last(row)
+    end
+    total = sum(scores)
+    return total
+end
+
+@testset "Prefixing a gathered chain row preserves its length, order and gradient" begin
+    have = (:x, :indices)
+    src = jax_source(jax_prefixed_gather; have, functions = (; scores = :scores, total = :total),
+                     data = (:indices,), plate_layout = :chains)
+    if rk_jax_available()
+        native = prepare(jax_prefixed_gather; have, want = :total)
+        native_scores = prepare(jax_prefixed_gather; have, want = :scores)
+        x = [-1.5, 2.0, 5.5]
+        for rows in ([[3, 3, 1], Int[], [2]], [[3], [1]], [Int[], Int[]])
+            @test rk_jax_evaluate(src, "scores", (x, rows); prepare = :arguments).value == native_scores(x, rows)
+            r = rk_jax_evaluate(src, "total", (x, rows); prepare = :arguments, grad = :joint)
+            @test r.joint_value == native(x, rows)
+            # The score is affine in x. A unit change gives the exact partial.
+            @test r.grad == [native(x .+ (eachindex(x) .== i), rows) - r.joint_value for i in eachindex(x)]
+        end
+    else
+        @test_skip "RK_JAX_PYTHON not set"
+    end
+end

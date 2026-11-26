@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.394
+
+- In JAX's `plate_layout=:chains`, `vcat` can prefix a variable-length row,
+  including an empty row. Indexed reads and gradients use the row's logical
+  length.
+
 ## 0.1.393
 
 - JAX exports accept grouped, sequential and round-based layouts for ragged plates.

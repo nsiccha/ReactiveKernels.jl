@@ -5852,15 +5852,21 @@ function _jax_record_prefix!(scope, extent, count, tail)
     scope.prefixed_extents[extent] = (count + prefix, core)
 end
 function _jax_function_call(ctx::_JaxContext, ::typeof(vcat), args::Vector{_PyVal})
-    v = _jax_result(vcat, args, "jnp.concatenate([" * join(
-        (_jax_is_array(a.T) ? a.code : "jnp.atleast_1d(" * a.code * ")" for a in args), ", ") * "])")
+    parts = String[_jax_is_array(a.T) ? a.code : "jnp.atleast_1d(" * a.code * ")" for a in args]
     padded = findall(a -> !isempty(a.extent), args)
-    isempty(padded) && return v
     # A padded vector last (a scan's steps after its seeds): the result's
     # length is the entries before it plus its own; padding elsewhere would
     # sit between valid entries.
-    padded == [length(args)] && _jax_rank(args[end].T) == 1 ||
-        _jax_error("`vcat` with a padded (ragged) value before other values", _jax_where(ctx))
+    if !isempty(padded)
+        padded == [length(args)] && _jax_rank(args[end].T) == 1 ||
+            _jax_error("`vcat` with a padded (ragged) value before other values", _jax_where(ctx))
+        if ctx.host === nothing && ctx.mod.layout === :chains
+            _jax_helper!(ctx, "_RKChainRows", _JAX_CHAIN_ROWS)
+            parts[end] = "_rk_vcat_tail(" * parts[end] * ")"
+        end
+    end
+    v = _jax_result(vcat, args, "jnp.concatenate([" * join(parts, ", ") * "])")
+    isempty(padded) && return v
     before = String[_jax_is_array(a.T) ? _py_atom(a.code) * ".shape[0]" : "1" for a in args[1:end-1]]
     tail = args[end].extent
     extent = _py_infix("+", [before; tail])
