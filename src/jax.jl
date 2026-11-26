@@ -9018,13 +9018,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
         # Runtime row lengths determine singleton broadcasting and the number
         # of visits. The cell's final argument is its activity at that index.
         chain_extent = _jax_broadcast_extent(ctx, logical)
-        if length(logical) > 1
-            for count in logical
-                valid = "((" * count * " == 1) | (" * count * " == " * chain_extent * "))"
-                _jax_call(ctx, _runtime_check, [_PyVal(valid, Bool),
-                    _PyVal(repr("DimensionMismatch: incompatible row axes"), DimensionMismatch)])
-            end
-        end
+        _jax_chain_check_axes!(ctx, logical, chain_extent; broadcast = true)
     elseif masked
         # Padding is storage, not a native cell. Include its activity in
         # runtime-check guards before batching those checks across lanes.

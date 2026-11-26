@@ -319,6 +319,14 @@ end
             # The score is affine in x. A unit change gives the exact partial.
             @test r.grad == [native(x .+ (eachindex(x) .== i), rows) - r.joint_value for i in eachindex(x)]
         end
+        bad = [[3, 3], Int[], [4]]
+        @test_throws BoundsError native(x, bad)
+        @test_throws "BoundsError" rk_jax_evaluate(src, "total", (x, bad); prepare = :arguments)
+        mktempdir() do dir
+            path = joinpath(dir, "module.py")
+            write(path, src)
+            @test success(`$RK_JAX_PYTHON $(joinpath(@__DIR__, "jax_chain_gathers.py")) $path`)
+        end
     else
         @test_skip "RK_JAX_PYTHON not set"
     end
