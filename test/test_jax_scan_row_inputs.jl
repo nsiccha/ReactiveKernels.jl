@@ -21,6 +21,22 @@ end
 
 @traceable jax_apply_scan_rows(p, state, offset) = p[1] * state + offset[2]
 
+@kernel function jax_guarded_scan_scale(scale::Float64, bases::Vector{Vector{Float64}},
+                                        kinds::Vector{Vector{Int}}, visits::Vector{Vector{Int}},
+                                        weights::Vector{Float64})
+    totals = plate(bases, kinds, visits, Ref(weights)) do base, ks, js, ws
+        path = scan(ks, js, Ref(base), Ref(ws); init = 0.0) do state, k, j, table, w
+            numerator = scale * w[k]
+            variance = k == 3 ? table[j] : 1.0
+            next = state + numerator / sqrt(variance)
+            (next, next)
+        end
+        sum(path)
+    end
+    total = sum(totals)
+    return total
+end
+
 @kernel function jax_scan_two_tables(a::Float64, xs::Vector{Float64}, kinds::Vector{Int},
                                      steps::Vector{Int}, spans::Vector{Int}, visits::Vector{Int})
     propagators = plate(xs) do x
@@ -68,6 +84,22 @@ end
     @test count(" = _rk_scan_rows(", string(captured)) == 2
     ref = prepare(jax_scan_two_tables; have = captured_have, want = :total)
     if rk_jax_available()
+        scale_have = (:scale, :bases, :kinds, :visits, :weights)
+        scaled = jax_source(jax_guarded_scan_scale; have = scale_have, want = :total,
+                            data = (:bases, :kinds, :visits, :weights))
+        scale_native = prepare(jax_guarded_scan_scale; have = scale_have, want = :total)
+        @test count(" = _rk_scan_rows(", string(scaled)) == 2
+        # Both the taken and untaken last event get repeated as physical
+        # padding. Only real events contribute even when a missing row
+        # would make arithmetic downstream of the conditional singular.
+        for args in (([[4.0], [9.0], Float64[]], [[3], [2, 3], Int[]], [[1], [999, 1], Int[]]),
+                     ([[4.0], [9.0]], [[2], [2, 3]], [[999], [-1, 1]]),
+                     ([Float64[], Float64[]], [[2], [2, 2]], [[-1], [0, 9]]))
+            weights = [0.25, 0.5, 0.75]
+            result = rk_jax_evaluate(scaled, "kernel", (2.0, args..., weights); prepare = :arguments, grad = :joint)
+            @test result.joint_value ≈ scale_native(2.0, args..., weights)
+            @test result.grad ≈ scale_native(1.0, args..., weights)
+        end
         for data in (([[0.2, -1.0, 3.1], [4.0], Float64[]],
                       [[3, 2, 3, 3], [2, 3], [2]], [[3, -9, 1, 3], [999, 1], [0]]),
                      ([Float64[]], [[2, 2]], [[0, 7]]),
