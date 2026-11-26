@@ -2445,6 +2445,8 @@ end
 # targets, `_JaxLoopElement`) at each index.
 function _jax_range_for(ctx::_JaxContext, var, body, lo::_PyVal, hi::_PyVal)
     if var isa Symbol && lo.static && lo.code == "1" && hi.static
+        copied = _jax_prefix_store(ctx, var, body, hi)
+        copied === nothing || return copied
         mapped = _jax_signed_map(ctx, var, body, lo, hi)
         mapped === nothing || return mapped
     end
