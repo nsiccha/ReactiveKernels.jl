@@ -74,11 +74,10 @@ end
     return total
 end
 
-# Kernels, whether Julia accepts an empty row (`zeros(-1)` does not), and
-# whether the cell's function is non-finite at a zero difference (`log`).
-const JAX_PADDED_RANGE_KERNELS = ((jax_range_lag, true, false), (jax_range_lag2, true, false),
-                                  (jax_range_alloc, false, false), (jax_range_log, true, true),
-                                  (jax_diff_row, true, false), (jax_diff_log, true, true))
+# Whether Julia accepts an empty row (`zeros(-1)` does not).
+const JAX_PADDED_RANGE_KERNELS = ((jax_range_lag, true), (jax_range_lag2, true),
+                                  (jax_range_alloc, false), (jax_range_log, true),
+                                  (jax_diff_row, true), (jax_diff_log, true))
 
 @testset "jax_source: shifted ranges and diff of a padded row" begin
     lag = string(jax_source(jax_range_lag; have = (:R,), want = :total))
@@ -99,19 +98,12 @@ const JAX_PADDED_RANGE_KERNELS = ((jax_range_lag, true, false), (jax_range_lag2,
             lengths = length.(R)
             stops = cumsum(lengths)
             rows(u) = [u[(stop - n + 1):stop] for (n, stop) in zip(lengths, stops)]
-            for (k, empty_ok, nonfinite_at_zero) in JAX_PADDED_RANGE_KERNELS
+            for (k, empty_ok) in JAX_PADDED_RANGE_KERNELS
                 any(isempty, R) && !empty_ok && continue
                 f = prepare(k; have = (:R,), want = :total)
                 r = rk_jax_evaluate(jax_source(k; have = (:R,), want = :total), "kernel", (R,);
                                     grad = true)
                 @test r.value ≈ f(R) rtol = 1e-12
-                # A row with no difference has no valid entry its padding could
-                # repeat: `log` of that padding gives NaN gradients through the
-                # masked sum (todo 0g8sr75, the empty-row padding convention).
-                if nonfinite_at_zero && any(n -> n <= 1, lengths)
-                    @test_broken all(isfinite, reduce(vcat, r.grad))
-                    continue
-                end
                 # Padding takes no gradient, and none is NaN.
                 @test all(isfinite, reduce(vcat, r.grad))
                 g = reduce(vcat, [row[1:n] for (row, n) in zip(r.grad, lengths)])

@@ -13,6 +13,15 @@ const RK_JAX_PYTHON = let python = get(ENV, "RK_JAX_PYTHON", "")
 end
 rk_jax_available() = !isempty(RK_JAX_PYTHON) && isfile(RK_JAX_PYTHON)
 
+# Grouped data exports add two layout entry points after the requested functions.
+function rk_jax_prepared_names(entries...)
+    names = ["prepare_data", entries...]
+    if get(task_local_storage(), :reactivekernels_jax_plate_layout_default, :padded) === :groups
+        append!(names, ["prepare_plate_layout", "select_plate_layout"])
+    end
+    names
+end
+
 # A ragged input (one vector per group) crosses as its padded array and
 # lengths, as the module's `pad_ragged` builds them. An empty row is zeros of
 # the column's element type, so an integer index column stays integer.
@@ -67,6 +76,14 @@ end
 
 const _RK_JAX_DRIVER = raw"""
 import importlib.util, math, sys
+import os
+def _rk_forced_layout(module, prepared):
+    # `RK_JAX_PLATE_GROUPS=<n>`: run a module emitted with plate layouts in
+    # grouped plates, to compare every such test with its native values.
+    groups = os.environ.get("RK_JAX_PLATE_GROUPS")
+    if groups and hasattr(module, "prepare_plate_layout"):
+        return module.prepare_plate_layout(prepared, abs(int(groups)), int(groups) < 0)
+    return prepared
 import numpy as np
 spec = importlib.util.spec_from_file_location("rk_module", sys.argv[1])
 module = importlib.util.module_from_spec(spec)
@@ -77,6 +94,7 @@ f = getattr(module, sys.argv[3])
 first, rest = ARGS[0], ARGS[1:]
 if sys.argv[5] in ("prepare", "arguments"):
     prepared = module.prepare_data(**raw_data(rest))
+    prepared = _rk_forced_layout(module, prepared)
     call = lambda u: f(u, **prepared)
 else:
     call = lambda u: f(u, *rest)
@@ -151,6 +169,14 @@ function rk_jax_evaluate(src::JAXSource, name, args; grad::Union{Bool,Symbol} = 
 end
 const _RK_JAX_FLOAT32_DRIVER = raw"""
 import importlib.util, math, sys
+import os
+def _rk_forced_layout(module, prepared):
+    # `RK_JAX_PLATE_GROUPS=<n>`: run a module emitted with plate layouts in
+    # grouped plates, to compare every such test with its native values.
+    groups = os.environ.get("RK_JAX_PLATE_GROUPS")
+    if groups and hasattr(module, "prepare_plate_layout"):
+        return module.prepare_plate_layout(prepared, abs(int(groups)), int(groups) < 0)
+    return prepared
 import numpy as np
 def load(path, tag):
     spec = importlib.util.spec_from_file_location(tag, path)
@@ -175,6 +201,7 @@ def caller(m, cast):
     first, rest = ARGS[0], ARGS[1:]
     if prepare:
         p = m.prepare_data(**raw_data(rest))
+        p = _rk_forced_layout(m, p)
         return (single(first) if cast else first), (lambda u: f(u, **p))
     rest = [single(a) for a in rest] if cast else rest
     return (single(first) if cast else first), (lambda u: f(u, *rest))
@@ -243,6 +270,8 @@ function rk_jax_float32(src32::JAXSource, reference, name, args; prepare::Bool =
     write(driver, _RK_JAX_FLOAT32_DRIVER)
     errors = joinpath(dir, "stderr.txt")
     cmd = `$RK_JAX_PYTHON $driver $module_path $reference_path $args_path $(String(name)) $(prepare ? "prepare" : "plain")`
+    # Start in 32-bit mode so the test observes which imported module enables x64.
+    cmd = addenv(cmd, "JAX_ENABLE_X64" => "0")
     output = try
         read(pipeline(cmd; stderr = errors), String)
     catch e
@@ -255,12 +284,21 @@ end
 
 const _RK_JAX_LAYOUT_DRIVER = raw"""
 import importlib.util, sys
+import os
+def _rk_forced_layout(module, prepared):
+    # `RK_JAX_PLATE_GROUPS=<n>`: run a module emitted with plate layouts in
+    # grouped plates, to compare every such test with its native values.
+    groups = os.environ.get("RK_JAX_PLATE_GROUPS")
+    if groups and hasattr(module, "prepare_plate_layout"):
+        return module.prepare_plate_layout(prepared, abs(int(groups)), int(groups) < 0)
+    return prepared
 import numpy as np
 spec = importlib.util.spec_from_file_location("rk_module", sys.argv[1])
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 exec(open(sys.argv[2]).read())
 prepared = module.prepare_data(**raw_data(ARGS))
+prepared = _rk_forced_layout(module, prepared)
 params = module.parameters(prepared)
 print("(dimension = %d, parameters = Dict(%s))" % (module.dimension(prepared), ", ".join(
     '"%s" => (start = %d, stop = %d, dims = (%s))' % (k, v["start"], v["stop"],

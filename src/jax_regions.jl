@@ -295,7 +295,7 @@ function _jax_region_call!(ctx, p, unit, demand, labels, selector, available, mo
                 if occursin(Regex("\\b" * bn * "\\b"), text)]
     bounds = first.(required)
     signature = [n * ": ArrayLike" for n in params[used_params]]
-    append!(signature, [n * (_jax_prepared_aux_type(kind) === Int ? ": int" : ": tuple") for (n, kind) in required])
+    append!(signature, [n * (_jax_prepared_aux_type(kind) === Int ? ": int" : _jax_prepared_aux_type(kind) === Tuple ? ": tuple" : ": ArrayLike") for (n, kind) in required])
     append!(signature, ["*", "outputs: tuple[str, ...]"])
     cache_key = (:source_region, region.name, Tuple(signature), text, region.doc)
     name = get(ctx.mod.helper_names, cache_key, nothing)

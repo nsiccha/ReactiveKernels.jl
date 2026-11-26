@@ -7360,7 +7360,7 @@ _replicated_passthrough_output(value::Array) = copy(value)
 _replicated_passthrough_output(value::Union{Tuple,NamedTuple}) =
     map(_replicated_passthrough_output, value)
 _replicated_passthrough_reuse(cache, value) = _replicated_passthrough_output(value)
-@inline function _replicated_passthrough_reuse(cache, value::Array)
+@inline function _replicated_passthrough_reuse(cache, value::Array{T,N})::Array{T,N} where {T,N}
     cache isa typeof(value) && size(cache) == size(value) ?
         copyto!(cache, value) : _replicated_passthrough_output(value)
 end
@@ -7373,16 +7373,11 @@ end
     K == L || return _replicated_passthrough_output(value)
     map(_replicated_passthrough_reuse, cache, value)
 end
-@inline function _replicated_passthrough_output!(slot, value)
-    output = _replicated_passthrough_reuse(slot[], value)
+@inline function _replicated_passthrough_output!(slot, value, count)
+    output = _replicated_passthrough_reuse(_batch_buffer!(slot, count), value)
     slot[] = output
     # Mapping may concretize explicitly abstract NamedTuple fields, just as
     # ordinary projection/stacking does. Its result need not have input's type.
-    output
-end
-@inline function _replicated_passthrough_output!(slot, value::Array{T,N}) where {T,N}
-    output = _replicated_passthrough_reuse(slot[], value)::Array{T,N}
-    slot[] = output
     output
 end
 @inline function _replicated_fill!(output, value, count)
@@ -7390,6 +7385,24 @@ end
         _replicated_store!(output, index, value)
     end
     output
+end
+
+# Stacking copies an array's elements. A user-defined numeric element can
+# itself retain an input lane or an intermediate. Only such results require
+# fresh scratch for the next position.
+_replicated_reference_cells(x::Number) = !isbitstype(typeof(x))
+_replicated_reference_cells(x::AbstractArray) = !isbitstype(eltype(x))
+_replicated_reference_cells(x::NamedTuple) = _replicated_reference_cells(values(x))
+_replicated_reference_cells(::Tuple{}) = false
+@inline _replicated_reference_cells(x::Tuple) =
+    _replicated_reference_cells(first(x)) || _replicated_reference_cells(Base.tail(x))
+_replicated_reference_cells(x) = false
+
+function _discard_batch_scratch!(slots::Tuple)
+    for slot in slots
+        slot isa Base.RefValue{Any} && (slot[] = nothing)
+    end
+    nothing
 end
 
 """
@@ -7470,10 +7483,22 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
     have_ids = Set(canon_id(g, v.id) for v in p.have)
     declared = Set{Symbol}()
 
+    # Shared design values are recomputed on every call. A borrowed serial
+    # reader can reuse their storage just as it reuses a position's scratch.
+    prefix_recycle = Pair{ValueId,Symbol}[]
+    prefix_slots = Symbol[]
+    if reuse && !isempty(parts.prefix.want)
+        for v in _lane_slot_values(parts.prefix, have_ids)
+            name = gensym(Symbol(v.name, :_prefix))
+            push!(prefix_recycle, canon_id(g, v.id) => name)
+            push!(prefix_slots, name)
+        end
+    end
     prefix_ast, prefix_constants, prefix_callables = if isempty(parts.prefix.want)
         nothing, (), ()
     else
-        ast, constants, callables, _ = _replicated_part_ast(parts.prefix)
+        ast, constants, callables, _ = _replicated_part_ast(parts.prefix;
+            recycle=prefix_recycle, cell_slots=reuse ? prefix_slots : nothing)
         ast, constants, callables
     end
     # A WANT whose residual producer has a destination form (an authored plate
@@ -7520,6 +7545,33 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
     lane_vars = Dict(canon_id(g, v.id) => gensym(Symbol(v.name, :_lane))
                      for v in parts.residual.have if mapped(canon_id(g, v.id)))
 
+    # One per-position block: project the batched ports into their lanes, then
+    # the spliced residual body binds one fresh local per WANT.
+    function position_block!(destination, replica_index, want_vars, recycled)
+        callargs = Any[]
+        for v in parts.residual.have
+            if mapped(canon_id(g, v.id))
+                projected = gensym(Symbol(v.name, :_position))
+                push!(destination.args, :($projected = $(GlobalRef(@__MODULE__,
+                    :_replicated_project!))($(lane_vars[canon_id(g, v.id)]),
+                    $(nm(v)), $replica_index)))
+                push!(callargs, projected)
+            else
+                push!(callargs, nm(v))
+            end
+        end
+        append!(callargs, recycled)
+        append!(callargs, scratch_vars)
+        for (v, variable) in zip(p.want, want_vars)
+            canon_id(g, v.id) in have_ids && continue
+            _replicated_declares(p, v) &&
+                _declare_typed_output!(destination, v, variable, declared)
+        end
+        lhs = length(want_vars) == 1 ? only(want_vars) : Expr(:tuple, want_vars...)
+        append!(destination.args,
+                _embedded_statements(residual_ast, callargs, lhs, residual_offset))
+    end
+
     argexprs = Any[_CONSTANTS_ARG, _CALLABLES_ARG]
     reuse && push!(argexprs, :__output_caches__)
     for v in p.have
@@ -7545,7 +7597,7 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
             value = nm(v)
             if mapped(canon_id(g, v.id))
                 reuse ? Expr(:call, GlobalRef(@__MODULE__, :_replicated_passthrough_output!),
-                             Expr(:ref, :__output_caches__, output_index), value) :
+                             Expr(:ref, :__output_caches__, output_index), value, :replica_count) :
                         Expr(:call, GlobalRef(@__MODULE__, :_replicated_passthrough_output), value)
             else
                 allocation = reuse ?
@@ -7560,7 +7612,13 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
                              Expr(:tuple, passthrough_outputs...)
         push!(body.args, Expr(:if, compatible, Expr(:return, passthrough_result)))
     end
+    slot(index) = Expr(:ref, :__output_caches__, index)
+    residual_slots = [scratch_vars; cell_slots; cell_tables]
+    prefix_start = 2 * nout + nhave + length(residual_slots)
     if prefix_ast !== nothing
+        for (index, name) in enumerate(prefix_slots)
+            push!(body.args, Expr(:(=), name, slot(prefix_start + index)))
+        end
         prefix_names = Any[nm(v) for v in parts.prefix.want]
         for v in parts.prefix.want
             _replicated_declares(p, v) &&
@@ -7568,15 +7626,15 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
         end
         lhs = length(prefix_names) == 1 ? only(prefix_names) :
               Expr(:tuple, prefix_names...)
-        append!(body.args, _embedded_statements(
-            prefix_ast, Any[nm(v) for v in parts.prefix.have], lhs, 0))
+        arguments = Any[nm(v) for v in parts.prefix.have]
+        append!(arguments, last.(prefix_recycle))
+        append!(body.args, _embedded_statements(prefix_ast, arguments, lhs, 0))
     end
 
     # Borrowed cache slots: the stacked outputs, then one lane per HAVE port,
     # then one recycled buffer per WANT, then one slot per intermediate
     # (`_borrowed_batch`). An owning call keeps its intermediate
     # slots for that call only.
-    slot(index) = Expr(:ref, :__output_caches__, index)
     for (position, v) in enumerate(p.have)
         lane = get(lane_vars, canon_id(g, v.id), nothing)
         lane === nothing && continue
@@ -7586,7 +7644,7 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
             Expr(:call, GlobalRef(@__MODULE__, :_replicated_lane), nm(v), valtype(v))
         push!(body.args, Expr(:(=), lane, allocation))
     end
-    for (index, scratch) in enumerate([scratch_vars; cell_slots; cell_tables])
+    for (index, scratch) in enumerate(residual_slots)
         push!(body.args, Expr(:(=), scratch, reuse ? slot(2 * nout + nhave + index) :
             Expr(:call, Expr(:curly, GlobalRef(Base, :RefValue), GlobalRef(Core, :Any)),
                  GlobalRef(Core, :nothing))))
@@ -7597,55 +7655,68 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
     first_position = gensym(:first_position)
     is_first = Expr(:call, GlobalRef(Base, :(==)), position, 1)
     values_at_position = Any[gensym(Symbol(v.name, :_position)) for v in p.want]
-    push!(body.args, Expr(:local, values(output_vars)..., recycle_vars...))
+    reference_cells = gensym(:reference_cells)
+    push!(body.args, Expr(:local, values(output_vars)..., recycle_vars..., reference_cells))
 
     step = Expr(:block)
-    callargs = Any[]
-    for v in parts.residual.have
-        if mapped(canon_id(g, v.id))
-            projected = gensym(Symbol(v.name, :_position))
-            push!(step.args, :($projected = $(GlobalRef(@__MODULE__,
-                :_replicated_project!))($(lane_vars[canon_id(g, v.id)]),
-                $(nm(v)), $position)))
-            push!(callargs, projected)
+    recycled = Any[]
+    for (lane, k) in zip(recycle_vars, recycle_wants)
+        if k in column_wants
+            v = p.want[k]
+            initial = reuse ? Expr(:call, GlobalRef(@__MODULE__, :_replicated_recycled),
+                                   slot(nout + nhave + k), valtype(v)) : nothing
+            later = :(let column = $(GlobalRef(@__MODULE__, :_replicated_output_lane))(
+                    $(output_vars[canon_id(g, v.id)]), $(valtype(v)), $position)
+                column === nothing ? $lane : column
+            end)
+            push!(recycled, Expr(:if, first_position, initial, later))
         else
-            push!(callargs, nm(v))
+            # A source recipe may return an input. Its destination method owns
+            # the slot and decides which results are safe to recycle.
+            storage = reuse ? slot(nout + nhave + k) : :(Ref{Any}(nothing))
+            push!(body.args, :($lane = $storage))
+            push!(recycled, lane)
         end
     end
-    # Only the destination changes after the first position. Select it
-    # lazily because the stacked output is allocated from the first result.
+    fresh = Expr(:block)
+    local_slots = Any[residual_slots...]
     for (lane, k) in zip(recycle_vars, recycle_wants)
-        v = p.want[k]
-        initial = reuse ? Expr(:call, GlobalRef(@__MODULE__, :_replicated_recycled),
-                               slot(nout + nhave + k), valtype(v)) : nothing
-        later = k in column_wants ?
-            :(let column = $(GlobalRef(@__MODULE__, :_replicated_output_lane))(
-                $(output_vars[canon_id(g, v.id)]), $(valtype(v)), $position)
-                column === nothing ? $lane : column
-            end) : lane
-        push!(callargs, Expr(:if, first_position, initial, later))
+        k in column_wants ? push!(fresh.args, :($lane = nothing)) : push!(local_slots, lane)
     end
-    append!(callargs, scratch_vars)
-    for (v, variable) in zip(p.want, values_at_position)
-        canon_id(g, v.id) in have_ids && continue
-        _replicated_declares(p, v) &&
-            _declare_typed_output!(step, v, variable, declared)
+    isempty(local_slots) || push!(fresh.args, Expr(:call, GlobalRef(@__MODULE__, :_discard_batch_scratch!),
+                                                  Expr(:tuple, local_slots...)))
+    for v in p.have
+        lane = get(lane_vars, canon_id(g, v.id), nothing)
+        lane === nothing || push!(fresh.args, :($lane = $(GlobalRef(@__MODULE__, :_replicated_lane))(
+            $(nm(v)), $(valtype(v)))))
     end
-    lhs = length(values_at_position) == 1 ? only(values_at_position) :
-          Expr(:tuple, values_at_position...)
-    append!(step.args, _embedded_statements(residual_ast, callargs, lhs, residual_offset))
+    if !isempty(fresh.args)
+        push!(step.args, :(if !$first_position && $reference_cells
+            $fresh
+        end))
+    end
+    position_block!(step, position, values_at_position, recycled)
 
-    # The first result determines the output layout and provides scratch for
-    # later positions. A borrowed call retains that scratch across calls.
     initialize = Expr(:block)
+    push!(initialize.args, :($reference_cells = $(GlobalRef(@__MODULE__, :_replicated_reference_cells))(
+        $(Expr(:tuple, values_at_position...)))))
     for (lane, k) in zip(recycle_vars, recycle_wants)
+        k in column_wants || continue
         push!(initialize.args, :($lane = $(values_at_position[k])))
     end
+    separate_first = false
     for (output_index, v) in enumerate(p.want)
         cid = canon_id(g, v.id)
         value = values_at_position[output_index]
+        # A later scalar recipe can dispatch on the concrete column view
+        # produced by a plate or scan (including the type of its parent).
+        observed_column = output_index in column_wants && any(parts.residual.recipes) do r
+            any(input -> canon_id(g, input.id) == cid, r.inputs)
+        end
+        separate_first |= observed_column && typeintersect(valtype(v), SubArray) !== Union{}
         allocation = reuse ?
-            Expr(:call, GlobalRef(@__MODULE__, :_replicated_output!),
+            Expr(:call, GlobalRef(@__MODULE__,
+                 observed_column ? :_replicated_observed_output! : :_replicated_output!),
                  slot(output_index), value, :replica_count) :
             Expr(:call, GlobalRef(@__MODULE__, :_replicated_output), value, :replica_count)
         push!(initialize.args, Expr(:(=), output_vars[cid], allocation))
@@ -7656,17 +7727,9 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
                               output_vars[canon_id(g, v.id)], position,
                               values_at_position[output_index]))
     end
-    # A scan or plate may give subsequent recipes a dense first result and
-    # a view for each later position. Keep those concrete specializations
-    # separate when the requested result is also consumed inside the cut.
-    observed_columns = any(column_wants) do k
-        v = p.want[k]
-        cid = canon_id(g, v.id)
-        typeintersect(valtype(v), SubArray) !== Union{} && any(parts.residual.recipes) do r
-            any(input -> canon_id(g, input.id) == cid, r.inputs)
-        end
-    end
-    if observed_columns
+    # Keep concrete specializations for consumers that can see a dense
+    # first result and a view at later positions.
+    if separate_first
         push!(body.args, Expr(:(=), position, 1))
         first_step = _substitute_symbols(step, Dict(first_position => true))
         push!(body.args, Expr(:let, Expr(:block), first_step))
@@ -7679,8 +7742,11 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
         Expr(:call, GlobalRef(Base, :OneTo), :replica_count)), step))
     if reuse
         for (lane, k) in zip(recycle_vars, recycle_wants)
+            k in column_wants || continue
             push!(body.args, :($(slot(nout + nhave + k))[] = $lane))
         end
+        push!(body.args, :($reference_cells &&
+            $(GlobalRef(@__MODULE__, :_discard_batch_scratch!))(__output_caches__)))
     end
     retval = length(p.want) == 1 ? only(values(output_vars)) :
              Expr(:tuple, (output_vars[canon_id(g, v.id)] for v in p.want)...)
@@ -7688,7 +7754,7 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
     ast = Expr(:function, Expr(:tuple, argexprs...), body)
     ast, (prefix_constants..., residual_constants...),
     _native_table(ast, (prefix_callables..., residual_callables...)),
-    2 * nout + nhave + length(scratch_vars) + length(cell_slots) + length(cell_tables)
+    prefix_start + length(prefix_slots)
 end
 
 # Destination-form producers of a position value: authored plates and scans,
@@ -9317,11 +9383,12 @@ end
     # so nested native records stay concrete before the retained position loop.
     destination = _replicated_destination_type(V)
     quote
-        output = _replicated_reuse(slot[], value, count)
+        output = _replicated_reuse(_batch_buffer!(slot, count), value, count)
         slot[] = output
         output::$destination
     end
 end
+@inline _replicated_observed_output!(slot, value, count) = _replicated_output!(slot, value, count)
 
 # An array of concrete numeric records cannot hide an array that aliases an
 # output. Keep the outer-array check, and walk elements when their type leaves
@@ -9333,7 +9400,7 @@ end
 # are records (`_lane_cell_take!`, snag lane-cell-take-e-45c66e49). An element
 # type with no values (`Union{}`) holds no array.
 _replicated_type_may_contain_array(::Type) = true
-_replicated_type_may_contain_array(::Type{<:Number}) = false
+_replicated_type_may_contain_array(::Type{T}) where {T<:Number} = !isbitstype(T)
 _replicated_type_may_contain_array(::Type{Union{}}) = false
 function _replicated_type_may_contain_array(::Type{T}) where {T<:Union{Tuple,NamedTuple}}
     isconcretetype(T) || return true
@@ -9358,6 +9425,8 @@ end
 _replicated_alias(cache::AbstractArray, arg::NamedTuple) =
     _replicated_alias(cache, values(arg))
 _replicated_alias(cache::AbstractArray, arg::Tuple) = _replicated_alias_any(cache, arg)
+_replicated_alias(cache::AbstractArray, arg::Number) =
+    !isbitstype(typeof(arg)) && _into_aliases(cache, arg)
 _replicated_alias(cache, arg) = false
 @generated function _replicated_alias_any(cache, items::Tuple)
     foldr((i, rest) -> :(_replicated_alias(cache, getfield(items, $i)) || $rest),
@@ -9383,7 +9452,34 @@ end
 # One slot per stacked output, then one input lane per HAVE port, one recycled
 # lane buffer per WANT and one slot per position intermediate with a
 # destination form; `_lower_replicated_with_ops` returns the count.
-_borrowed_batch_caches(count::Int) = ntuple(_ -> Ref{Any}(nothing), count)
+mutable struct _BatchOutputSlot
+    width::Int
+    buffer::Any
+    other_width::Int
+    other::Any
+end
+_BatchOutputSlot() = _BatchOutputSlot(-1, nothing, -1, nothing)
+Base.getindex(slot::_BatchOutputSlot) = slot.buffer
+Base.setindex!(slot::_BatchOutputSlot, buffer) = (slot.buffer = buffer)
+
+@inline function _batch_buffer!(slot::_BatchOutputSlot, count)
+    if slot.width != count
+        next = slot.other_width == count ? slot.other : nothing
+        slot.other_width, slot.other = slot.width, slot.buffer
+        slot.width, slot.buffer = count, next
+    end
+    slot.buffer
+end
+
+@inline function _detach_batch_inputs!(slot::_BatchOutputSlot, args)
+    _replicated_aliases(slot.buffer, args) && (slot.buffer = nothing)
+    _replicated_aliases(slot.other, args) && (slot.other = nothing)
+    nothing
+end
+
+_borrowed_batch_caches(count::Int, outputs::Int) =
+    (ntuple(_ -> _BatchOutputSlot(), outputs)...,
+     ntuple(_ -> Ref{Any}(nothing), count - outputs)...)
 Base.@nospecializeinfer _borrowed_batch(@nospecialize(target::GraphReplicatedKernel)) =
     _borrowed_batch(target, getfield(target, :plan)::Plan, batched_ports(target))
 # `target` answers `inputs`, `outputs` and `plan` for the borrowed driver of `p`.
@@ -9391,7 +9487,7 @@ Base.@nospecializeinfer function _borrowed_batch(@nospecialize(target), p::Plan,
                                                  @nospecialize(batched))
     ast, constants, callables, slot_count = _lower_replicated_with_ops(p; batched, reuse=true)
     native = compile(ast)
-    caches = _borrowed_batch_caches(slot_count)
+    caches = _borrowed_batch_caches(slot_count, length(p.want))
     T = BorrowedBatchedKernel{typeof(target),typeof(native),typeof(constants),
                               typeof(callables),typeof(caches)}
     _kernel_new_instance(T, (target, native, constants, callables, caches, ast))
@@ -9403,7 +9499,8 @@ end
 Base.@nospecializeinfer Base.copy(@nospecialize(kernel::BorrowedBatchedKernel)) =
     _kernel_new_instance(typeof(kernel), (getfield(kernel, :target), getfield(kernel, :native),
         getfield(kernel, :constants), getfield(kernel, :callables),
-        _borrowed_batch_caches(length(getfield(kernel, :caches))), getfield(kernel, :ast)))
+        _borrowed_batch_caches(length(getfield(kernel, :caches)), length(outputs(kernel))),
+        getfield(kernel, :ast)))
 
 @inline function (kernel::BorrowedBatchedKernel)(args::Vararg{Any,N}) where {N}
     length(args) == length(inputs(kernel)) || throw(MethodError(kernel, args))
@@ -9411,8 +9508,7 @@ Base.@nospecializeinfer Base.copy(@nospecialize(kernel::BorrowedBatchedKernel)) 
         # A caller may feed an earlier borrowed output into the next call.
         # Detach in that case so no input is modified through an output alias.
         # The lane slots after the outputs never leave the call.
-        slot = kernel.caches[index]
-        _replicated_aliases(slot[], args) && (slot[] = nothing)
+        _detach_batch_inputs!(kernel.caches[index], args)
     end
     kernel.native(kernel.constants, kernel.callables, kernel.caches, args...)
 end

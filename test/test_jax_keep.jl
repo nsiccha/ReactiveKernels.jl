@@ -16,7 +16,7 @@ end
     @test all(s -> haskey(s.prepared, :n), sources)
     @test all(s -> s.prepared[:n] == s.prepared[:alias], sources)
     @test all(s -> s.text == first(sources).text, sources)
-    @test [f.name for f in first(sources).functions] == ["prepare_data", "kernel"]
+    @test [f.name for f in first(sources).functions] == rk_jax_prepared_names("kernel")
     # The same operation through the Plan entry point retains the same metadata.
     planned = jax_source(plan(metadata; want = :total); data = (; x = [1.0]), keep = (:n, :alias))
     @test planned.prepared == first(sources).prepared

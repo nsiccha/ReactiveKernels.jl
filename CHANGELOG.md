@@ -16,6 +16,37 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.399
+
+- Native borrowed position readers reuse dense outputs at the two most recent
+  nonempty batch widths and reuse lane storage for ordinary numeric
+  scalar–array products. Serial readers also reuse storage for eligible
+  shared design computations, including `stack` of dense numeric vectors
+  along dimension one or two. `prepare_into(reader)` accepts caller-owned stacked
+  outputs, including disjoint views of one matrix.
+
+## 0.1.398
+
+- Emitted JAX modules with eligible guarded scan reads expose
+  `prepare_guarded_reads(prepared, mode)`. Drivers can select compact or dense
+  reads. The layout tuner times both and returns the winning prepared data.
+
+## 0.1.397
+
+- In JAX's `plate_layout=:chains`, `vcat` can prefix a variable-length row,
+  including an empty row. Indexed reads and gradients use the row's logical
+  length.
+
+## 0.1.396
+
+- JAX exports accept grouped, sequential and round-based layouts for ragged plates.
+  A grouped module can time the caller's compiled step on its device at the requested
+  chain counts. Prepared input tables retain the integer type of the bound port.
+- The padded layout can schedule an eligible subject recurrence over its real events,
+  batch independent interval and offset records, and reduce eligible observation
+  rows over the observations present. The generated function supports ordinary
+  JAX forward and reverse differentiation.
+
 ## 0.1.395
 
 Generated JAX functions accept groups of ragged numerical rows. The padded

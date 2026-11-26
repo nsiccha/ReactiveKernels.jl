@@ -1392,7 +1392,7 @@ end
 # arrays loop, so the walk allocates nothing (`any` with a closure over a
 # heterogeneous tuple boxed every item).
 _lane_may_reference(result, @nospecialize(buffer)) = true
-_lane_may_reference(::Number, @nospecialize(buffer)) = false
+_lane_may_reference(value::Number, @nospecialize(buffer)) = !isbitstype(typeof(value))
 function _lane_may_reference(result::AbstractArray, @nospecialize(buffer))
     buffer isa _LaneCalleeState && return _lane_state_may_reference(result, buffer)
     _lane_mightalias(result, buffer) && return true
@@ -1488,6 +1488,20 @@ end
     copyto!(buffer, ready)
 end
 
+# Base's scalar multiplication on dense numeric arrays is an elementwise
+# product. Other operand pairs keep their original multiplication method.
+const _LaneNumericArray = Union{Array{<:_NativeBroadcastNumber},
+    SubArray{<:_NativeBroadcastNumber,<:Any,<:Array}}
+@inline _lane_mul(recycled, a, b) = _native_mul(a, b)
+@inline function _lane_mul(recycled, a::_NativeBroadcastNumber, b::_LaneNumericArray)
+    ndims(b) == 0 && return _native_mul(a, b)
+    _lane_broadcast(recycled, _native_broadcasted(*, a, b))
+end
+@inline function _lane_mul(recycled, a::_LaneNumericArray, b::_NativeBroadcastNumber)
+    ndims(a) == 0 && return _native_mul(a, b)
+    _lane_broadcast(recycled, _native_broadcasted(*, a, b))
+end
+
 const _LaneIndex = Union{Integer,AbstractRange{<:Integer},Colon,AbstractVector{<:Integer}}
 @inline _lane_getindex(recycled, A, I...) = A[I...]
 # A dense array or a view of one: its non-scalar `getindex` is a fresh
@@ -1539,6 +1553,34 @@ end
         Base.mightalias(cell, buffer) && return _lane_keep!(recycled, reduce(vcat, A))
     end
     Base._typed_vcat!(buffer, A)
+end
+
+# Base.stack of dense numeric vectors inserts a new axis for the cells.
+# Base handles the first allocation, empty inputs and incompatible shapes.
+@inline _lane_stack(recycled, cells, dims) = stack(cells; dims)
+function _lane_stack(recycled, cells::Vector{Vector{T}}, dims::Int) where {T<:_NativeBroadcastNumber}
+    isempty(cells) && return stack(cells; dims)
+    n = length(first(cells))
+    shape = dims == 1 ? (length(cells), n) : (n, length(cells))
+    buffer = _lane_reuse(recycled, T, map(Base.OneTo, shape))
+    buffer === nothing && return _lane_keep!(recycled, stack(cells; dims))
+    for cell in cells
+        if length(cell) != n || Base.mightalias(cell, buffer)
+            return _lane_keep!(recycled, stack(cells; dims))
+        end
+    end
+    if dims == 1
+        for (i, cell) in enumerate(cells)
+            @inbounds for j in eachindex(cell)
+                buffer[i, j] = cell[j]
+            end
+        end
+    else
+        for (i, cell) in enumerate(cells)
+            copyto!(buffer, (i - 1) * n + 1, cell, 1, n)
+        end
+    end
+    buffer
 end
 
 # `vcat(args...)` of the native body (`_native_vcat`), nested in a position

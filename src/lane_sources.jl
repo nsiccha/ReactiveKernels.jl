@@ -283,6 +283,9 @@ _lane_materialize_call(node) = node isa Expr && node.head === :call &&
     length(node.args) == 2 &&
     node.args[1] == _lane_source_ref(:_native_broadcast_materialize)
 
+_lane_mul_call(node) = Meta.isexpr(node, :call, 3) &&
+    node.args[1] == _lane_source_ref(:_native_mul)
+
 # A lazy dotted call of the native body, `_native_broadcasted(f, operands...)`
 # (`_kernel_native_broadcasts`): only ever materialized whole.
 _lane_broadcasted_call(node) = node isa Expr && node.head === :call &&
@@ -366,13 +369,13 @@ function _lane_source_node(ctx::_LaneSourceContext, node, ends)
         slot = gensym(:lane_nested)
         push!(ctx.nested, slot)
         return Expr(:call, _lane_source_ref(:_lane_reduce_vcat), slot, cells)
-    elseif head === :call && ctx.nested !== nothing && _lane_vcat_call(node)
-        # And a nested `vcat` of numbers and dense vectors (`_lane_vcat`).
+    elseif head === :call && ctx.nested !== nothing && (_lane_vcat_call(node) || _lane_mul_call(node))
         operands = _lane_source_operands(ctx, node, ends)
         operands === nothing && return nothing
         slot = gensym(:lane_nested)
         push!(ctx.nested, slot)
-        return Expr(:call, _lane_source_ref(:_lane_vcat), slot, operands...)
+        destination = _lane_mul_call(node) ? :_lane_mul : :_lane_vcat
+        return Expr(:call, _lane_source_ref(destination), slot, operands...)
     elseif head in (:<:, :>:) && length(node.args) == 2
         # Julia lowers `a <: b` to a call of the `<:` its module resolves. The
         # one-operand form is a bound in a type application, outside the grammar.
@@ -504,6 +507,14 @@ function _lane_destination(ctx::_LaneSourceContext, node, recycled,
         lazy = _lane_source_node(ctx, node.args[2], nothing)
         lazy === nothing && return nothing
         return (Expr(:call, _lane_source_ref(:_lane_broadcast), recycled, lazy), true)
+    elseif _lane_mul_call(node)
+        operands = _lane_source_operands(ctx, node, nothing)
+        operands === nothing && return nothing
+        return (Expr(:call, _lane_source_ref(:_lane_mul), recycled, operands...), true)
+    elseif (dims = _lane_stack_dim(ctx, node)) !== nothing
+        cells = _lane_source_node(ctx, node.args[3], nothing)
+        cells === nothing && return nothing
+        return (Expr(:call, _lane_source_ref(:_lane_stack), recycled, cells, dims), true)
     elseif node.head === :ref && length(node.args) >= 2
         slices === false && return plain()
         expr = _lane_index_destination(ctx, node, recycled, nothing)
@@ -588,6 +599,17 @@ end
 # spelling of Base's `vcat` or `[a; b]`), without keywords or splats.
 _lane_vcat_call(node) = _lane_plain_call(node) &&
     node.args[1] == _lane_source_ref(:_native_vcat)
+
+function _lane_stack_dim(ctx, node)
+    Meta.isexpr(node, :call, 3) && _lane_binding(ctx, first(node.args)) === Base.stack ||
+        return nothing
+    params = node.args[2]
+    Meta.isexpr(params, :parameters, 1) || return nothing
+    kw = only(params.args)
+    Meta.isexpr(kw, :kw, 2) && first(kw.args) === :dims || return nothing
+    dims = last(kw.args)
+    dims isa Int && dims in (1, 2) ? dims : nothing
+end
 
 # The rewritten operands of a call node, or `nothing` outside the grammar.
 function _lane_source_operands(ctx::_LaneSourceContext, node, ends)

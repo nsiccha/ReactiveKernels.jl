@@ -6142,12 +6142,16 @@ graph and compiled callable with fresh empty buffer slots, without planning,
 lowering or code generation, even when the template was already called.
 Keyword/default signatures are preserved. Bound data and computation metadata
 remain shared and read-only; previous outputs are neither shared nor copied.
-One instance can serve sequential batches; it is not reentrant. Shape/type changes
-reseed buffers, and buffers aliasing this call's inputs detach. This reuses final
-outputs and the native lane buffers: batched dense array inputs and the
-position values produced by authored plates and scans, top-level dotted calls
-and array slices, including those values inside a plate's cells other than
-each cell's result. Other scalar recipes may still allocate intermediates.
+Use one instance per concurrent caller. The reader keeps compatible dense outputs
+for the two most recent nonempty batch widths, so a full chunk and a short tail
+can alternate after warm-up. New element types or leading shapes require new
+buffers. Buffers that overlap an input detach. Native lane scratch is shared
+across widths for dense array inputs, authored plates and scans, top-level dotted
+calls, numeric scalar–array products and array slices. Plate cells also reuse
+eligible intermediate values. Serial readers also reuse buffers for eligible
+shared computations, including `stack(cells; dims=1)` and `dims=2` for dense
+numeric vectors. Shared inputs are read afresh on every call.
+Use [`prepare_into`](@ref) to supply the final storage on each call.
 
 To bind shared values, lift `prepare(spec; have, want, bound=(; shared...))` with
 `vectorize`. Rebinding new values to the same ports and vectorizing again

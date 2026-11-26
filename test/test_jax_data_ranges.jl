@@ -301,16 +301,12 @@ _jax_ranges_want(k) = k === jax_ranges_plate ? :total : :result
     prepare_data = first(loop.functions)
     @test prepare_data.name == "prepare_data"
     @test first.(prepare_data.outputs) == ["starts", "stops", "_rk_span_starts_stops"]
-    @test "_rk_span_starts_stops" in first.(last(loop.functions).inputs)
+    entry = only(f for f in loop.functions if f.name == "kernel")
+    @test "_rk_span_starts_stops" in first.(entry.inputs)
     open_ends = string(jax_source(jax_ranges_open; have, want = :result, data = (; starts, stops)))
     @test occursin("_rk_bound_min(_rk_prepared[\"starts\"])", open_ends)
     @test occursin("_rk_bound_max(_rk_prepared[\"stops\"])", open_ends)
 
-    # Without the data the ends are traced inputs, with no static bound.
-    @test_throws "Ends that are entries of integer arrays of the prepared data" jax_source(
-        jax_ranges_loop; have, want = :result)
-    @test_throws "a loop whose first index depends on data" jax_source(jax_ranges_free;
-        have = (:x, :first), want = :result)
     # A prepared start is static.
     @test occursin("jax.lax.fori_loop(first, ", string(jax_source(jax_ranges_free;
         have = (:x, :first), want = :result, data = (; first = 2))))
@@ -318,6 +314,17 @@ _jax_ranges_want(k) = k === jax_ranges_plate ? :total : :result
     if !rk_jax_available()
         @test_skip false
     else
+        # A primal can use traced endpoints directly. The prepared variants
+        # below also have the bounded iteration that reverse mode needs.
+        dynamic = jax_source(jax_ranges_loop; have, want = :result)
+        native = prepare(jax_ranges_loop; have, want = :result)
+        for (s, e) in ((starts, stops), ([4], [2]))
+            @test rk_jax_evaluate(dynamic, :kernel, (x, s, e)).value ≈ native(x, s, e)
+        end
+        dynamic_start = jax_source(jax_ranges_free; have = (:x, :first), want = :result)
+        for start in (3, length(x) + 1)
+            @test rk_jax_evaluate(dynamic_start, :kernel, (x, start)).value ≈ sum(x[start:end])
+        end
         datasets = [(starts, stops), ([3, 5, 2], [2, 4, 1]), ([1, 5, 3], [1, 5, 3]),
                     (Int[], Int[])]
         for k in JAX_RANGES_KERNELS, (s, e) in datasets
@@ -384,8 +391,9 @@ end
     n, K = [1, 4, 0, 2], 3
     scaled = string(jax_source(jax_ranges_scaled; have = (:x, :n, :K), want = :result,
                                data = (; n, K)))
-    # The static bounds are the same functions of the prepared extremes.
-    @test occursin("max(2 * _rk_max_n - 1 + 1, 0)", scaled)
+    # The prefix slice uses x's physical width and the row's logical length.
+    # The other ranges use the prepared extremes.
+    @test occursin(r"prefix_stop\w* = 2 \* n\[r - 1\]", scaled)
     @test occursin("max(2 * _rk_max_n + 1 - 1 + 1, 0)", scaled)
     @test occursin("-2 * _rk_max_n", scaled)
     @test occursin("max(K * _rk_max_n, K * _rk_min_n)", scaled)

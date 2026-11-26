@@ -42,6 +42,10 @@ end
     flat = groups[i]
 end
 
+@kernel selected_row(a::Float64, x::Vector{Vector{Vector{Int}}}, i::Int, j::Int) = begin
+    flat = a .* x[i][j]
+end
+
 @kernel first_row(a::Float64, x::Vector{Vector{Vector{Int}}}) = begin
     score = a * sum(x[1][1])
 end
@@ -81,9 +85,14 @@ end
         mktempdir() do dir
             write(joinpath(dir, "direct.py"), plain)
             write(joinpath(dir, "bound.py"), bound)
+            write(joinpath(dir, "chains.py"), jax_source(nested_rows; have, functions = outputs,
+                                                        data = (; x = first(data)), plate_layout = :chains))
             selected = (; have = (:a, :x, :i), functions = (flat = :flat, named = (; flat = :flat)))
             write(joinpath(dir, "selected.py"), jax_source(selected_group; selected...))
             write(joinpath(dir, "selected_bound.py"), jax_source(selected_group; selected..., data = (; x = first(data))))
+            row_want = (; have = (:a, :x, :i, :j), want = :flat, name = :flat)
+            write(joinpath(dir, "direct_row.py"), jax_source(selected_row; row_want...))
+            write(joinpath(dir, "prepared_row.py"), jax_source(selected_row; row_want..., data = (; x = first(data))))
             write(joinpath(dir, "first_row.py"), jax_source(first_row; have, want = :score, name = :score))
             a = 0.7
             cases = map(data) do x
@@ -94,6 +103,8 @@ end
             write(joinpath(dir, "cases.py"), "import numpy as np\na = $a\ncases = [" *
                   join(map(_rk_py_input, cases), ", ") * "]\n")
             @test success(pipeline(`$RK_JAX_PYTHON $(joinpath(@__DIR__, "jax_nested_inputs.py")) $dir`;
+                                   stdout, stderr))
+            @test success(pipeline(`$RK_JAX_PYTHON $(joinpath(@__DIR__, "jax_nested_chain_inputs.py")) $dir`;
                                    stdout, stderr))
         end
     else
@@ -124,8 +135,10 @@ end
             end
             @test first(cases)[3] == 4.0
             write(joinpath(dir, "cases.py"), "import numpy as np\ncases = " * _rk_py_input(cases))
+            write(joinpath(dir, "chains_records.py"), jax_source(record_groups; have, functions,
+                  data = (; batches, base), plate_layout = :chains))
             driver = joinpath(@__DIR__, "jax_tuple_groups.py")
-            @test success(pipeline(`$RK_JAX_PYTHON $driver $dir`; stdout, stderr))
+            @test success(pipeline(`$RK_JAX_PYTHON $driver $dir --chains`; stdout, stderr))
         end
     else
         @test_skip "RK_JAX_PYTHON not set"

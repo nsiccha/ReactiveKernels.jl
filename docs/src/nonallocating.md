@@ -36,6 +36,8 @@ The interface selects the same mathematical recipes as ordinary preparation. It 
 Use [`prepare_into`](@ref) when the caller already owns the output storage.
 Pass the destination first on every call. One writer can advance two
 alternating arrays while the caller controls when each is overwritten.
+For a native position reader, the destination can be a tree of arrays.
+See [Writing into a result matrix](position-batching.md#Writing-into-a-result-matrix).
 
 ```@example buffers
 @kernel center_vector(x) = begin

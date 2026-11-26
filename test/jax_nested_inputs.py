@@ -7,6 +7,8 @@ import numpy as np
 sys.path.insert(0, sys.argv[1])
 import bound
 import direct
+import direct_row
+import prepared_row
 import first_row
 import selected
 import selected_bound
@@ -85,9 +87,43 @@ mixed = [[[2, 4], [], [5]], [], [[3]]]
 check_selected(selected, selected.pad_ragged(mixed), {})
 check_selected(selected_bound, (), selected_bound.prepare_data(x=mixed))
 
-values, lengths = selected.pad_ragged([[[2, 4], [1, 5]], [[9, 3], [8, 1]]])
+rectangular = [[[2, 4], [1, 5]], [[9, 3], [8, 1]]]
+values, lengths = selected.pad_ragged(rectangular)
 flat = jax.jit(selected.flat)(a, values, lengths, 1)
 np.testing.assert_allclose(flat, a * np.asarray([2, 4, 1, 5]))
+flat = jax.jit(selected_bound.flat)(a, 1, **selected_bound.prepare_data(x=rectangular))
+np.testing.assert_allclose(flat, a * np.asarray([2, 4, 1, 5]))
+fixed_group = jax.jit(lambda scale, data: selected_bound.flat(scale, 1, **data))
+np.testing.assert_allclose(fixed_group(a, selected_bound.prepare_data(x=mixed)), a * np.asarray([2, 4, 5]))
+
+def check_inner_row(module, bound_data):
+    def row(groups, j, compiled=True):
+        f = jax.jit(module.flat) if compiled else module.flat
+        if bound_data:
+            return f(a, 1, j, **module.prepare_data(x=groups))
+        return f(a, *module.pad_ragged(groups), 1, j)
+
+    rows = [[[2, 4]], [[7, 8], [5, 6]]]
+    np.testing.assert_allclose(row(rows, 1), a * np.asarray([2, 4]))
+    try:
+        row(rows, 2).block_until_ready()
+    except Exception as error:
+        assert "BoundsError" in str(error), error
+    else:
+        raise AssertionError("the inactive row slot was selectable")
+
+    with_empty = [[[2, 4], []], [[7, 8], [5, 6]]]
+    np.testing.assert_array_equal(row(with_empty, 2, compiled=False), [])
+    try:
+        row(with_empty, 1).block_until_ready()
+    except Exception as error:
+        assert "data-dependent output size" in str(error), error
+    else:
+        raise AssertionError("the real empty row was ignored in the selectable lengths")
+
+
+check_inner_row(direct_row, False)
+check_inner_row(prepared_row, True)
 
 first = jax.jit(jax.value_and_grad(first_row.score))
 np.testing.assert_allclose(first(a, *first_row.pad_ragged([[[]]])), (0, 0))

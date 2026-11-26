@@ -171,7 +171,7 @@ function _rebound(kept::_RebindBorrowed, @nospecialize(kernel::PreparedKernel),
     target = _rebound(kept.target, kernel, constants, schedule)
     table = Tuple(_rebound_table(kept.constants, constants.values))
     BorrowedBatchedKernel(target, kept.native, table, kept.callables,
-                          _borrowed_batch_caches(kept.slots), kept.ast)
+                          _borrowed_batch_caches(kept.slots, length(outputs(kernel))), kept.ast)
 end
 
 function _rebound(kept::_RebindPrepared, @nospecialize(kernel::PreparedKernel),
@@ -189,7 +189,7 @@ function _rebound(kept::_RebindScheduled, @nospecialize(kernel::PreparedKernel),
                   constants::_RebindConstants, schedule::NativeScheduling)
     prefix = kept.prefix === nothing ? nothing :
              _rebound(kept.prefix, kernel, constants, schedule)
-    caches = _borrowed_batch_caches(length(outputs(kernel)))
+    caches = ntuple(_ -> _BatchOutputSlot(), length(outputs(kernel)))
     _kernel_new_instance(kept.type, (kernel, prefix, _scheduled_workers(kept.residual, schedule),
                                      caches, schedule))
 end

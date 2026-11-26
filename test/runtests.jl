@@ -20,6 +20,13 @@ end
 using ReactiveKernels
 using Test
 
+# `RK_JAX_PLATE_GROUPS=<n>` emits every `jax_source` module that has data with
+# plate layouts and runs it in `n` groups (`jax_python.jl`; negative: units one
+# after another), a differential run of the suite's parity checks. Tests of
+# the emitted text itself expect the default emission and fail in that run.
+haskey(ENV, "RK_JAX_PLATE_GROUPS") &&
+    task_local_storage(:reactivekernels_jax_plate_layout_default, :groups)
+
 const _MATRIX_CORE_TESTS = (
     "test_runtests_selector.jl",
     "test_changelog.jl",
@@ -174,6 +181,8 @@ const _MATRIX_CORE_TESTS = (
     "test_jax_nested_inputs.jl",
     "test_jax_translations.jl",
     "test_jax_guarded_expm.jl",
+    "test_jax_table_expm.jl",
+    "test_jax_layout.jl",
     "test_jax_elementwise.jl",
     "test_jax_captured_records.jl",
     "test_jax_tuple_writes.jl",
@@ -200,6 +209,9 @@ const _MATRIX_CORE_TESTS = (
     "test_jax_data_ranges.jl",
     "test_jax_scan_bounds.jl",
     "test_jax_scan_plate_reads.jl",
+    "test_jax_chain_rows.jl",
+    "test_jax_event_rounds.jl",
+    "test_jax_prepared_indices.jl",
     "test_jax_shared_record_reads.jl",
     "test_jax_scan_row_inputs.jl",
     "test_jax_checks.jl",
@@ -249,6 +261,7 @@ const _MATRIX_CORE_TESTS = (
     "test_position_record_reverse.jl",
     "test_native_matrix_record_reverse.jl",
     "test_position_batching_reuse.jl",
+    "test_batched_destinations.jl",
     "test_native_scheduling.jl",
     "test_scheduled_prefix.jl",
     "test_position_batching_allocation_slices.jl",

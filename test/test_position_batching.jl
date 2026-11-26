@@ -176,8 +176,12 @@ end
                           expression.args[2].args)
     before_loop = Expr(:block, expression.args[2].args[1:loop_index-1]...)
     loop = expression.args[2].args[loop_index]
-    @test occursin("_authored_plate_marker", string(before_loop))
-    @test !occursin("_authored_plate_marker", string(loop))
+    # The sum can fold directly into the plate loop, eliminating transformed.
+    has_plate_iteration(ex) = ex isa Expr &&
+        ((ex.head === :call && first(ex.args) == GlobalRef(ReactiveKernels, :_plate_cells)) ||
+         any(has_plate_iteration, ex.args))
+    @test has_plate_iteration(before_loop)
+    @test !has_plate_iteration(loop)
     @test batch([2.0], [1.0, 2.0, 3.0]) == [28.0]
     @test batch(fill(2.0, 23), [1.0, 2.0, 3.0]) == fill(28.0, 23)
     @test code_expr(batch) === expression

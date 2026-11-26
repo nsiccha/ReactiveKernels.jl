@@ -19,7 +19,12 @@ def arguments(module, groups):
     return (), module.prepare_data(batches=groups, base=base)
 
 
-for module in (direct, bound):
+modules = [direct, bound]
+if "--chains" in sys.argv[2:]:
+    import chains_records
+    modules.append(chains_records)
+
+for module in modules:
     score = jax.jit(jax.value_and_grad(module.score))
     traces = []
     for groups, value, derivative in cases:
