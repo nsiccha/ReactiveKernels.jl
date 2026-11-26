@@ -111,6 +111,9 @@ def _rk_length_groups(lengths, groups, sequential):
         g -= 1
     bounds.reverse()
     units = tuple(by_length[cuts[a]:cuts[b]] for a, b in zip(bounds[:-1], bounds[1:]))
+    if len(units) == 1 and not sequential:
+        # Units of one length: the plate as one batch.
+        return None
     # A group of empty rows keeps one stored entry, as an empty column does.
     widths = []
     for u in units:

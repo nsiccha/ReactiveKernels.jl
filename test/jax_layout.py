@@ -90,6 +90,12 @@ for module, data, expected in ((walk, walk_data(), float(sys.argv[2])),
     np.testing.assert_allclose(as_arguments(0.6, **chosen), values[0], rtol=1e-12)
     np.testing.assert_allclose(as_arguments(0.6, **data), values[0], rtol=1e-12)
 
+# Units of one length have one group, which is the plate as one batch.
+even = rows_data(1, [4, 4, 4])
+assert set(rows.prepare_plate_layout(even, 3)["_rk_plate_layout"].values()) == {None}
+assert all(isinstance(layout, rows.PlateLayout) and len(layout.units) == 1
+           for layout in rows.prepare_plate_layout(even, 3, True)["_rk_plate_layout"].values())
+
 # No units, and units that are all empty.
 for lengths in ([], [0, 0, 0]):
     for module, data in ((walk, walk_data(1, lengths)), (rows, rows_data(1, lengths)),
