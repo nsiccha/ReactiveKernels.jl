@@ -74,7 +74,8 @@ end
     end
     totals = plate(orders, Ref(entries)) do order, table
         path = scan(order, Ref(table); init = 0.0) do state, index, rows
-            next = if index > 0
+            # A carry-dependent guard keeps the row read inside the scan.
+            next = if index > 0 && isfinite(state)
                 jax_scan_score(rows[index], state)
             else
                 state - a
