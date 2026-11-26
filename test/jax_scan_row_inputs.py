@@ -44,6 +44,10 @@ mixed = (jnp.array([2**60 + 1], dtype=jnp.int64), jnp.array([0.5], dtype=jnp.flo
 row, valid = model._rk_scan_record_rows(mixed, jnp.array([1]), True, 1)
 assert valid and isinstance(row, tuple)
 assert int(row[0][0]) == 2**60 + 1 and row[1].dtype == jnp.float32
+weak = jnp.broadcast_to(jnp.asarray(1.0), (2,))
+strong = jnp.ones(2, dtype=weak.dtype)
+assert weak.weak_type and not strong.weak_type
+assert isinstance(model._rk_pack_record((weak, strong)), tuple)
 
 
 def residual_count(width):

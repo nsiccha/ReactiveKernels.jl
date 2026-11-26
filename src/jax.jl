@@ -1357,10 +1357,10 @@ def _rk_pack_record(columns):
     # Some callers supply columns at their own precision, or packed ragged
     # views. Their original column reads preserve each value's dtype/layout.
     first = columns[0]
-    if getattr(first, "ndim", None) == 1 and all(
-        getattr(c, "ndim", None) == 1 and c.dtype == first.dtype and c.shape == first.shape
-        for c in columns
-    ):
+    def compatible(c):
+        return (getattr(c, "ndim", None) == 1 and c.shape == first.shape and c.dtype == first.dtype
+                and getattr(c, "weak_type", False) == getattr(first, "weak_type", False))
+    if all(compatible(c) for c in columns):
         return jnp.stack(columns, axis=-1)
     return columns
 """
