@@ -208,6 +208,7 @@ const _MATRIX_CORE_TESTS = (
     "test_jax_scan_bounds.jl",
     "test_jax_scan_plate_reads.jl",
     "test_jax_chain_rows.jl",
+    "test_jax_event_rounds.jl",
     "test_jax_prepared_indices.jl",
     "test_jax_shared_record_reads.jl",
     "test_jax_scan_row_inputs.jl",

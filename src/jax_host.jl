@@ -1997,6 +1997,67 @@ def _rk_scan_schedule(*lengths):
     owners[starts[counts != 0]] *= -1
     return owners
 """),
+    :event_rounds => ("_rk_event_rounds", """
+def _rk_event_rounds(tags):
+    if tags is None or not tags.size:
+        return (), (), np.empty(0, dtype=np.int64)
+    owners = np.abs(tags) - 1
+    counts = np.bincount(owners)
+    height = int(counts.max())
+    subjects = np.argsort(-counts, kind="stable")
+    ordered = counts[subjects]
+    local = np.arange(len(tags)) - (np.cumsum(counts) - counts)[owners]
+
+    # First-fit, longest subject first. A tree of remaining capacities
+    # finds the first stream with room in log(subjects) probes.
+    base = 1 << (len(counts) - 1).bit_length()
+    space = np.full(2 * base, height, dtype=np.int64)
+    lane = np.zeros_like(counts)
+    starts = np.zeros_like(counts)
+    for subject in subjects:
+        length = counts[subject]
+        if not length:
+            break
+        node = 1
+        while node < base:
+            node *= 2
+            if space[node] < length:
+                node += 1
+        lane[subject] = node - base
+        starts[subject] = height - space[node]
+        space[node] -= length
+        while node > 1:
+            node //= 2
+            space[node] = max(space[2 * node], space[2 * node + 1])
+
+    loads = height - space[base:base + int(lane.max()) + 1]
+    ends = np.unique(loads)
+    # Each segment traces a scan body. Bound that count independently of
+    # the data and switch to the two-width schedule for irregular streams.
+    if len(ends) <= 8:
+        rank = np.argsort(np.argsort(-loads, kind="stable"))
+        order = np.lexsort((rank[lane[owners]], starts[owners] + local))
+        stream_phases = []
+        cursor = begin = 0
+        for end in ends:
+            width = int(np.count_nonzero(loads >= end))
+            stop = cursor + (end - begin) * width
+            stream_phases.append(order[cursor:stop].reshape(end - begin, width))
+            begin, cursor = end, stop
+        return (), tuple(stream_phases), np.argsort(order)
+
+    # Place each subject around a cycle, at most once per round. Preserve
+    # its causal order even when its slots wrap across the end of the cycle.
+    starts[subjects] = (np.cumsum(ordered) - ordered) % height
+    wrapped = np.maximum(starts + counts - height, 0)
+    rounds = np.where(local < wrapped[owners], local, local + (starts - wrapped)[owners])
+    order = np.argsort(rounds, kind="stable")
+    width, wide = divmod(len(tags), height)
+    split = wide * (width + 1)
+    phases = (order[:split].reshape(wide, width + 1),
+              order[split:].reshape(height - wide, width))
+    return tuple(phase for phase in phases if phase.size), (), np.argsort(order)
+"""),
     :sign_groups => ("_rk_sign_groups", """
 def _rk_sign_groups(values):
     x = np.asarray(values)

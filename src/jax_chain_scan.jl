@@ -1,3 +1,6 @@
+Base.include_dependency(joinpath(@__DIR__, "jax_round_scan.py"))
+const _JAX_ROUND_SCAN = read(joinpath(@__DIR__, "jax_round_scan.py"), String)
+
 _jax_chain_tuple(xs) = "(" * join(xs, ", ") * (isempty(xs) ? ")" : ",)")
 _jax_chain_bool(x) = x ? "True" : "False"
 
@@ -23,7 +26,7 @@ function _jax_chain_entry(ctx, table, index)
     end
     entry
 end
-_jax_prepared_aux_type(kind) = kind in (:row_layout, :map_rows, :sign_groups) ? Tuple : kind === :scan_rows ? Vector{Int} : Int
+_jax_prepared_aux_type(kind) = kind in (:row_layout, :map_rows, :sign_groups, :event_rounds) ? Tuple : kind === :scan_rows ? Vector{Int} : Int
 function _jax_chain_dtypes(T)
     T <: Number && return _jax_dtype(T)
     _jax_number_fields(T) ? _jax_chain_tuple(_jax_dtype.(fieldtypes(T))) : nothing
@@ -116,6 +119,56 @@ _jax_chain_algebra(x) = x isa Union{Number,Symbol} || x isa Expr &&
      x.head in (:(=), :kw) && length(x.args) == 2 && x.args[1] isa Symbol && _jax_chain_algebra(x.args[2]) ||
      x.head === :call && first(x.args) in (:+, :-, :*) && all(_jax_chain_algebra, x.args[2:end]))
 
+# A lookup cell can batch its existing scalar code when every arm selects a
+# field of the same indexed record. Both its subject boundary and its chosen
+# field are then identical to those seen by the individual scalar call.
+function _jax_chain_lookup_cell(p, types, each)
+    length(p.recipes) == 1 || return false
+    r = only(p.recipes)
+    r.op isa _KernelSourceOp && _has_source(r) || return false
+    ports = Dict(canon_id(p.graph, v.id) => i for (i, v) in enumerate(p.have))
+    names = _recipe_source_names(r)
+    length(names) == length(r.inputs) || return false
+    inputs = Dict(n => get(ports, canon_id(p.graph, v.id), 0) for (n, v) in zip(names, r.inputs))
+    event_int(n) = get(inputs, n, 0) in each && types[inputs[n]] <: Integer
+    mod = _jax_source_module(r.op)
+    captures = _jax_source_captures(r.op)
+    shadowed = isnothing(captures) ? names : union(names, keys(captures))
+    function lookup(ex)
+        ex = _kernel_branch_unwrap(ex)
+        ex isa Expr || return nothing
+        if ex.head in (:if, :elseif) && length(ex.args) == 3
+            pred, yes, no = ex.args
+            pred isa Expr && pred.head === :call && length(pred.args) == 3 || return nothing
+            op, selector, literal = pred.args
+            _jax_static_callee(mod, op, shadowed) === (==) && event_int(selector) &&
+                literal isa Integer || return nothing
+            a, b = lookup(yes), lookup(no)
+            return a == b ? a : nothing
+        end
+        ex.head === :ref && length(ex.args) == 2 || return nothing
+        base, index = ex.args
+        field = nothing
+        if base isa Expr && base.head === :ref && length(base.args) == 2
+            index isa Int || return nothing
+            field = index
+            base, index = base.args
+        end
+        port = get(inputs, base, 0)
+        port > 0 && !(port in each) && event_int(index) && !(types[inputs[index]] <: Bool) || return nothing
+        T = types[port]
+        T <: AbstractVector || return nothing
+        E = eltype(T)
+        if field === nothing
+            E <: Number || return nothing
+        else
+            _jax_number_fields(E) && 1 <= field <= fieldcount(E) || return nothing
+        end
+        (port, inputs[index])
+    end
+    lookup(r.source) !== nothing
+end
+
 # Build a numeric lookup table once over the real entries of all subjects.
 # Each field of a tuple-valued cell keeps the same packed row boundaries.
 function _jax_chain_table(ctx, recipe, args, mapped; sum_rows = false, domains = String[])
@@ -145,8 +198,12 @@ function _jax_chain_table(ctx, recipe, args, mapped; sum_rows = false, domains =
     end
     sum_rows && !(E <: Number) && return nothing
     dtypes = _jax_chain_dtypes(E)
+    vector_read = _jax_requested_layout() === :rounds && !recipe.effectful &&
+                  !any(r -> r.effectful, recipe.op.kernel.plan.recipes) &&
+                  _jax_chain_lookup_cell(recipe.op.kernel.plan, types, each)
+    options = vector_read ? ", vector_read=True" : ""
     call = "_rk_map_rows(" * join((cell, _jax_chain_tuple(columns), _jax_chain_tuple(axes), layout, dtypes,
-                                   _jax_chain_bool(sum_rows), _jax_chain_tuple(domains)), ", ") * ")"
+                                   _jax_chain_bool(sum_rows), _jax_chain_tuple(domains)), ", ") * options * ")"
     sum_rows && return _PyVal(call, Vector{_jax_return_type(sum, Any[Vector{E}])})
     # An invalid broadcast in an untaken arm can still be traced. Use the
     # same fallback boundaries as _rk_map_rows until its guarded check runs.
@@ -406,7 +463,13 @@ function _jax_chain_scan_body(ctx, p, recipe, body, inputs, mapped, pos)
             normalized, tags_out, _jax_chain_tuple(first.(extras)),
             _jax_chain_tuple(last.(extras)), _jax_chain_bool(seed_mapped), dtypes,
             repr(reduction), _jax_chain_bool(include_seed), decorate, _jax_chain_tuple(event_inputs.values))
-    call = "_rk_scan_events(" * join(args, ", ") * ")"
+    call = if _jax_requested_layout() === :rounds && event_inputs.pure && !checked
+        schedule = _jax_prepared_bound!(ctx, :event_rounds, tags)
+        helper = _jax_helper!(ctx, "_rk_round_scan", _JAX_ROUND_SCAN)
+        helper * "(" * schedule * ", " * join(args, ", ") * ")"
+    else
+        "_rk_scan_events(" * join(args, ", ") * ")"
+    end
     if epilogue
         result = _jax_bind!(ctx, only(scan.outputs).name, _PyVal(call, Vector{Vector{E}}, false, first(columns).extent))
         push!(cellports, only(scan.outputs))

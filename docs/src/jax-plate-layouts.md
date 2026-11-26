@@ -52,3 +52,13 @@ indices and the permutation that restores the output order are array inputs.
 Reordering units with the same group shapes reuses the compiled function.
 Each selected group contributes one plate body to the trace, up to the
 caller's group limit.
+
+
+`plate_layout = :rounds` packs independent subjects’ recurrent events into
+streams that advance in a few fixed-width segments. If the stream lengths
+would require more than eight segments, a two-segment schedule selects
+subjects by index. Each subject advances in its original order.
+Every true event is visited once and the longest subject sets the number of
+rounds. Empty subjects keep their original initial-state semantics. A scan
+with observable checks keeps its serial execution order. Compare the
+resulting module against the other layouts at the chain counts of interest.
