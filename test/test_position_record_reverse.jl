@@ -16,6 +16,39 @@ end
 
 record_loss(x, reader, args) = sum(reader(x, args...).total)
 
+@kernel function paired_plates(p::Vector{Float64}, t::Vector{Int})
+    left = plate(t) do x
+        exp(-p[1] * x) * (1 + p[2] * x)
+    end
+    right = plate(t) do x
+        sin(p[1] + x) * p[2]
+    end
+    return left, right
+end
+
+function paired_loss(p, reader, t)
+    left, right = reader(p, t)
+    sum(left) + sum(right)
+end
+
+@testset "ordinary Reverse of position plates with inferred output types" begin
+    reader = vectorize(prepare(paired_plates); batched=:p)
+    for t in ([2, 4, 7, 11], [1], Int[]), width in (1, 7)
+        p = reshape(collect(range(0.1, 0.9; length=2 * width)), 2, width)
+        dp = zero(p)
+        expected = zero(p)
+        for i in axes(p, 2), x in t
+            a, b = p[1, i], p[2, i]
+            decay = exp(-a * x)
+            expected[1, i] += -x * decay * (1 + b * x) + cos(a + x) * b
+            expected[2, i] += x * decay + sin(a + x)
+        end
+        Enzyme.autodiff(Enzyme.Reverse, paired_loss, Enzyme.Active,
+                        Enzyme.Duplicated(p, dp), Enzyme.Const(reader), Enzyme.Const(t))
+        @test dp ≈ expected
+    end
+end
+
 @testset "ordinary Reverse of composed position records" begin
     # The empty/nonempty tail reaches ownership checks and heterogeneous
     # record storage even though the loss reads only total. Enzyme dogfood

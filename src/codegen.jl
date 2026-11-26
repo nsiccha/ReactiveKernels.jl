@@ -7713,7 +7713,7 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
         observed_column = output_index in column_wants && any(parts.residual.recipes) do r
             any(input -> canon_id(g, input.id) == cid, r.inputs)
         end
-        separate_first |= observed_column && typeintersect(valtype(v), SubArray) !== Union{}
+        separate_first |= output_index in column_wants && typeintersect(valtype(v), SubArray) !== Union{}
         allocation = reuse ?
             Expr(:call, GlobalRef(@__MODULE__,
                  observed_column ? :_replicated_observed_output! : :_replicated_output!),
@@ -7727,8 +7727,8 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
                               output_vars[canon_id(g, v.id)], position,
                               values_at_position[output_index]))
     end
-    # Keep concrete specializations for consumers that can see a dense
-    # first result and a view at later positions.
+    # A plate or scan can write to a dense buffer first and a column view
+    # later. Keep their writes type-specialized for ordinary reverse mode.
     if separate_first
         push!(body.args, Expr(:(=), position, 1))
         first_step = _substitute_symbols(step, Dict(first_position => true))
