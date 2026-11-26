@@ -1881,7 +1881,7 @@ end
     device_part = split(text, "\ndef kernel")[2]
     # `prepare_data` computes them in a loop over the cells; the plate reads
     # each cell's values as ragged inputs of its own.
-    @test occursin(r"\[cell_data\w*\(element\w*\) for element\w* in X\]", host_part)
+    @test occursin(r"cell_data\w*\(element\w*, element\w*\) for element\w*, element\w* in _rk_plate_rows_np\(X, Y\)", host_part)
     @test all(n -> haskey(src.prepared, n), (:levels, :idx))
     @test occursin("\"levels_lengths\"", host_part) && occursin("\"idx_lengths\"", host_part)
     @test !occursin("_np(", device_part)
@@ -1889,7 +1889,11 @@ end
     both = jax_source(jax_cell_order; have = (:k, :X, :Y), data = (; X, Y),
                       functions = (total = :total, per = :per))
     @test count("def cell_data", string(both)) == 1
-    @test [f.name for f in both.functions] == ["prepare_data", "total", "per"]
+    names = ["prepare_data", "total", "per"]
+    if haskey(ENV, "RK_JAX_PLATE_GROUPS")
+        append!(names, ["prepare_plate_layout", "select_plate_layout"])
+    end
+    @test [f.name for f in both.functions] == names
     # Over the group index, the gathered rows: the gather stays in the cell
     # (the host also computes it, for the recipes it feeds).
     x = [0.5, 1.0, 2.0, 3.0, 0.25]
@@ -2516,7 +2520,7 @@ end
 @testset "jax_source: a throw that depends on data is a masked runtime check" begin
     ternary = string(jax_source(jax_throw_ternary; have = (:x, :s), want = :total))
     @test occursin("_rk_check(s >= 0, \"scale must be nonnegative\")", ternary)
-    @test !occursin("jax.lax.cond(", ternary)
+    @test !occursin("jax.lax.cond(", last(split(ternary, "\ndef kernel(")))
     cells = string(jax_source(jax_throw_cells; have = (:x, :r, :s), want = :total))
     # The cell's check holds for lanes that take either outer arm.
     @test occursin("_rk_check(jnp.logical_not(jnp.logical_and(", cells)
