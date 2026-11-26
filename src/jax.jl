@@ -2398,6 +2398,13 @@ end
 # A loop from `lo` to `hi` binding `var` (a name, or a collection's element
 # targets, `_JaxLoopElement`) at each index.
 function _jax_range_for(ctx::_JaxContext, var, body, lo::_PyVal, hi::_PyVal)
+    if var isa Symbol && lo.static && lo.code == "1" && hi.static
+        mapped = _jax_signed_map(ctx, var, body, lo, hi)
+        mapped === nothing || return mapped
+    end
+    _jax_sequential_range(ctx, var, body, lo, hi)
+end
+function _jax_sequential_range(ctx::_JaxContext, var, body, lo::_PyVal, hi::_PyVal)
     _jax_padded_stop(lo, hi) && return _jax_padded_for(ctx, var, body, lo, hi)
     lo, hi, _, steps = _jax_loop_range(ctx, lo, hi; dynamic = true)
     isempty(steps) || return _jax_stepped_for(ctx, var, body, lo, hi, steps)
@@ -7418,6 +7425,7 @@ function _jax_named_function!(ctx, f, names, inputs, source_module, emit, origin
     contextual = any(a -> _jax_contextual_value(a) || haskey(ctx.scope.scan_reads, a.code), inputs)
     key = (:authored_function, objectid(f), Tuple(names),
            Tuple((a.T, a.static, !isempty(a.extent), !isempty(a.limit), a.padded, a.origin,
+                  get(ctx.scope.prepared_keys, a.code, nothing),
                   Tuple(!isempty(e) for e in a.field_extents),
                   Tuple(_jax_flat_kind(ctx, e) for e in (a.extent, a.field_extents...)))
                  for a in inputs), !isempty(_JAX_GUARDS), ctx.traced_branches > 0,
@@ -7609,6 +7617,8 @@ function _jax_function_input!(ctx, scope, params, passed, hint, v::_PyVal, T)
     union!(scope.used, ctx.mod.used)
     name = _jax_identifier(scope.used, hint)
     push!(params, name); push!(passed, v.code)
+    key = get(ctx.scope.prepared_keys, v.code, nothing)
+    key === nothing || (scope.prepared_keys[name] = key)
     extent = isempty(v.extent) ? "" : _jax_identifier(scope.used, Symbol(hint, :_lengths))
     limit = isempty(v.limit) ? "" : _jax_identifier(scope.used, Symbol(hint, :_bound))
     function carry_flat(source, target, hint)
@@ -9826,14 +9836,14 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
     # A plate can return several fields, only some of which a caller flattens.
     # Prepare a broadcast size only when an emitted function actually reads it.
     used_inputs = Set(name for f in functions[prepare_function+1:end] for (name, _) in f.inputs)
-    bounds = filter(b -> b[2] !== :broadcast_total || b[1] in used_inputs, _jax_prepared_bounds(mod))
+    bounds = filter(b -> !(b[2] in (:broadcast_total, :sign_groups)) || b[1] in used_inputs, _jax_prepared_bounds(mod))
     if !isempty(bounds)
         bodies[prepare_body] = join(_jax_prepare_bounds_lines(mod, prepare_lines, bounds), "\n")
         f = functions[prepare_function]
         functions[prepare_function] = JAXFunction(f.name, f.inputs,
-            [f.outputs; [name => Int for (name, _, _) in bounds]])
+            [f.outputs; [name => _jax_prepared_aux_type(kind) for (name, kind, _) in bounds]])
         append!(prepared_names, (name for (name, _, _) in bounds))
-        prepared_types = Any[prepared_types; fill(Int, length(bounds))]
+        prepared_types = Any[prepared_types; [_jax_prepared_aux_type(kind) for (_, kind, _) in bounds]]
     end
     meta = (INPUTS = Tuple(first(io) for io in functions[2].inputs),
             PREPARED = [n => (dtype = _jax_dtype_name(T), ndim = _jax_meta_rank(T),
@@ -10109,7 +10119,7 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
         # bounds that `prepare_data` computes (`_jax_trip_bound`).
         prepared = keyword_from !== nothing && k > keyword_from &&
             T isa Type && T <: AbstractArray && _jax_integer_data(T)
-        prepared && T <: AbstractVector{<:Integer} && (scope.prepared_keys[param] = key)
+        keyed && T isa Type && T <: AbstractVector{<:Real} && (scope.prepared_keys[param] = key)
         # Its origin names the array by its key in the prepared data, which
         # `prepare_data` reads to compute the bound.
         fields = record_lengths ? foldl((m, (j, F)) -> F <: AbstractVector ? m | 1 << (j - 1) : m,
@@ -10165,9 +10175,9 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
             # The static bounds of prepared arrays the body reads (ranges over
             # their entries), which `prepare_data` returns with the data.
             body = join(scope.lines, "\n")
-            for (bn, _, _) in _jax_prepared_bounds(mod)
+            for (bn, kind, _) in _jax_prepared_bounds(mod)
                 occursin(Regex("\\b" * bn * "\\b"), body) || continue
-                push!(inputs, bn => Int); push!(input_locals, bn)
+                push!(inputs, bn => _jax_prepared_aux_type(kind)); push!(input_locals, bn)
             end
             for ((pn, _), local_name) in zip(inputs[keyword_from+1:end], input_locals[keyword_from+1:end])
                 push!(lines, "    " * local_name * " = prepared[\"" * pn * "\"]")

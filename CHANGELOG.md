@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.390
+
+- JAX data preparation can group independent indexed updates by a prepared
+  input's positive, negative and remaining entries. The generated function
+  maps the selected numerical arm over each group and restores the input order.
+
 ## 0.1.389
 
 - A JAX broadcast or plate over an empty padded row contributes zero to a
