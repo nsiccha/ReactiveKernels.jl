@@ -16,6 +16,13 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.405
+
+Staged graph assembly can splice a child kernel called with computed
+arguments or inside a plate cell. The stored instructions describe only the
+child's ports. Each replay splices the child's current graph and records the
+call in that build's recipe sources.
+
 ## 0.1.404
 
 - A guarded JAX plate cell that reads the row or entry of a shared table its

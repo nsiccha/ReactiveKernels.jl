@@ -308,6 +308,29 @@ end
     end, ((; g=[1, 2, 1], x=[1., 0., 2.], y=[0., 1., 0.5]),))
 end
 
+@testset "a data-bound LKJ shape keeps staged assembly" begin
+    # The normalizing constant then calls the library's log-gamma rule.
+    source = quote
+        b[1:2, 1:2] .~ Normal.(0, 1)
+        L ~ LKJCholesky(2, eta)
+        s[1:2] .~ LogNormal.(0, 1)
+        v = b * transpose(s .* L)
+        mu = v[g, 1] .+ x .* v[g, 2]
+        y .~ Normal.(mu, 1)
+    end
+    designs = ((; g=[1, 2, 1], x=[1., 0., 2.], y=[0., 1., 0.5], eta=2.0),
+               (; g=[2, 1], x=[0.5, 1.], y=[1., 0.], eta=3.5))
+    check_constructor(source, designs)
+    cache = KernelBuildCache()
+    entries = map(designs) do data
+        plan = bind_data(lower_rkppl(source, data; mod=@__MODULE__, conditioned=(:y,)), data)
+        build_kernel(plan; cache)
+        @test haskey(cache.entry, :definition)
+        cache.entry
+    end
+    @test allequal(entries)
+end
+
 @testset "monotonic effects retain nested numerical calls" begin
     check_constructor(quote
         w ~ Dirichlet(alpha)
@@ -338,6 +361,150 @@ end
         @test Base.invokelatest(query, [a]) ≈ -log(2pi) - (a^2 + (data.y - 2f(a))^2)/2
     end
     @test entries[1] === entries[2]
+end
+
+const PLATE_CHILD_MODEL = quote
+    p ~ Uniform(lo, hi)
+    vs = cumsum(vcat(p, p))
+    @plate for i in eachindex(g)
+        mu[i] = adjust(vs[g[i]])
+    end
+    y .~ Normal.(mu, 1)
+end
+
+# Each module defines its own child with the same boundary. `body` decides
+# what the child computes, so a replay must read the current definition.
+function plate_child_module(body)
+    mod = Module(gensym(:PlateChild))
+    Core.eval(mod, :(using ReactiveKernels))
+    Core.eval(mod, :(@kernel adjust(x::Float64) = $body))
+    mod
+end
+
+plate_child_plan(mod, data) =
+    bind_data(lower_rkppl(PLATE_CHILD_MODEL, data; mod, conditioned=(:y,)), data)
+
+# A staged template names an imported function by its defining module.
+# Expansion names e.g. a plate's argument ports with gensyms, also inside the
+# generated plate functions. Two expansions of one program then print alike.
+canonical_refs(x) = x isa GlobalRef && isdefined(x.mod, x.name) ?
+    GlobalRef(Base.binding_module(x.mod, x.name), x.name) :
+    x isa Expr ? Expr(x.head, Any[canonical_refs(a) for a in x.args]...) : x
+canonical_code(x) = replace(string(Base.remove_linenums!(canonical_refs(x))), r"#\d+" => "#")
+
+function check_plate_child(built, plan)
+    reference = build_kernel(plan)
+    @test built.program == reference.program
+    @test built.spec.graph !== reference.spec.graph
+    port_names(m) = sort(String.(filter(n -> !startswith(String(n), "##"), collect(keys(m.spec.ports)))))
+    @test port_names(built) == port_names(reference)
+    @test count(n -> startswith(String(n), "##"), keys(built.spec.ports)) ==
+        count(n -> startswith(String(n), "##"), keys(reference.spec.ports))
+    staged, ordinary = map(m -> prepare_query(m, plan, :sampler), (built, reference))
+    @test canonical_code(code_expr(staged)) == canonical_code(code_expr(ordinary))
+    for u in (-0.4, 0.3)
+        @test Base.invokelatest(staged, [u]) ≈ Base.invokelatest(ordinary, [u])
+    end
+    Base.invokelatest(staged, [0.3])
+end
+
+@noinline function released_plate_child(cache, mod)
+    y = [1.5, 2.5, 0.5, 3.0]
+    plan = plate_child_plan(mod, (; lo=0.5, hi=4.0, g=[2, 2, 1, 2], y))
+    built = build_kernel(plan; cache)
+    (; design=WeakRef(plan.columns[:y]), graph=WeakRef(built.spec.graph))
+end
+
+@testset "a nested child in a plate replays without expanding the program" begin
+    data = (; lo=0., hi=2., g=[1, 2], y=[.2, .8])
+    double = plate_child_module(quote
+        z::Float64 = 2 * x
+        return z
+    end)
+    cache = KernelBuildCache()
+    plan = plate_child_plan(double, data)
+    first_build = build_kernel(plan; cache)
+    entry = cache.entry
+    # The staged entry expands the program once with a boundary for the
+    # child. A current-operands entry (`form`) would expand it on every build.
+    @test entry !== nothing && haskey(entry, :definition)
+    second = build_kernel(plan; cache)
+    @test cache.entry === entry
+    @test second.spec.graph !== first_build.spec.graph
+    @test second.spec.ports !== first_build.spec.ports
+    doubled = check_plate_child(second, plan)
+
+    # Another child with the same boundary, including one with an internal
+    # value, still provides its own graph to the saved assembly.
+    triple = plate_child_module(quote
+        w::Float64 = x + x
+        z::Float64 = w + x
+        return z
+    end)
+    @test check_plate_child(build_kernel(plate_child_plan(triple, data); cache), plate_child_plan(triple, data)) != doubled
+    @test cache.entry === entry
+
+    # Late-bound data with another row count and bounds.
+    other = (; lo=-1., hi=3., g=[2, 1, 2], y=[.5, -.2, 1.1])
+    check_plate_child(build_kernel(plate_child_plan(double, other); cache), plate_child_plan(double, other))
+    @test cache.entry === entry
+
+    plans = [plate_child_plan(m, data) for m in (double, triple, double)]
+    builds = fetch.([Threads.@spawn build_kernel(p; cache) for p in plans])
+    @test cache.entry === entry
+    @test allunique([b.spec.graph for b in builds])
+    for (built, p) in zip(builds, plans)
+        check_plate_child(built, p)
+    end
+    value!(builds[1].spec.graph, :additional, Float64)
+    @test all(b -> all(v -> v.name !== :additional, values(b.spec.graph.values)), builds[2:end])
+
+    refs = released_plate_child(cache, double)
+    @test cache.entry === entry
+    GC.gc(true)
+    @test refs.design.value === nothing
+    @test refs.graph.value === nothing
+
+    # A child with a computed argument outside a plate is lifted into its
+    # own port, named for the call.
+    lifted = KernelBuildCache()
+    source = quote
+        a ~ Normal(0, 1)
+        mu = 2 * adjust(a + 1)
+        y ~ Normal(mu, 1)
+    end
+    for m in (double, triple)
+        p = bind_data(lower_rkppl(source, (; y=1.5); mod=m, conditioned=(:y,)), (; y=1.5))
+        check_plate_child(build_kernel(p; cache=lifted), p)
+        @test haskey(lifted.entry, :definition)
+    end
+end
+
+@testset "a child in a lazy branch expands only its current operands" begin
+    mod = plate_child_module(quote
+        z::Float64 = x + 1
+        return z
+    end)
+    data = (; y=1.5)
+    plan = bind_data(lower_rkppl(quote
+        a ~ Normal(0, 1)
+        mu = a > 0 ? adjust(a) : 2a
+        y ~ Normal(mu, 1)
+    end, data; mod, conditioned=(:y,)), data)
+    cache = KernelBuildCache()
+    build_kernel(plan; cache)
+    entry = cache.entry
+    # The staged expansion refuses this call once. Later builds of the same
+    # program go straight to the reusable current-operands assembly.
+    @test entry !== nothing && haskey(entry, :form) && entry.unstaged !== nothing
+    builds = [build_kernel(plan; cache) for _ in 1:2]
+    @test cache.entry === entry
+    reference = prepare_query(build_kernel(plan), plan, :sampler)
+    for built in builds, a in (-0.4, 0.4)
+        @test Base.invokelatest(prepare_query(built, plan, :sampler), [a]) ≈
+            Base.invokelatest(reference, [a]) ≈
+            -log(2pi) - (a^2 + (data.y - (a > 0 ? a + 1 : 2a))^2)/2
+    end
 end
 
 @testset "a fitted closure keeps its ordinary build behavior" begin

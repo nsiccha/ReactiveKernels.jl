@@ -48,6 +48,9 @@ end
 @testset "an image constructor reuses nested numerical calls with new bounds" begin
     entry = W.INTERVAL_BUILDS.entry
     @test entry !== nothing
+    # The image stores staged assembly with a boundary for the plate's child:
+    # a hit splices the current child without expanding the program.
+    @test haskey(entry, :definition)
     plan = W.interval_plan((; lo=-2., hi=3., group=[2, 1, 2], y=[1., 0., -1.]))
     built = build_kernel(plan; cache=W.INTERVAL_BUILDS)
     @test W.INTERVAL_BUILDS.entry === entry

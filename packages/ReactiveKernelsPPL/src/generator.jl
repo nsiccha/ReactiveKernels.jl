@@ -23,9 +23,12 @@ keep this handle in its workload image and use it again after loading. Each
 call assigns the current layout and returns an independently editable graph.
 Assembly can include the package's distribution and parameter-transform endpoints.
 Direct positional calls over distinct named ports splice the supplied child
-or bind the named Julia function on each build. For nested children and calls
-with computed arguments, each build expands the current program and supplies
-its operands to reusable assembly instructions. Quoted arrays and callables
+or bind the named Julia function on each build. A child kernel with computed
+arguments, including one inside a plate, is described by its ports alone, so
+each build splices the current child without expanding the program again.
+For a child in a lazy branch and other nested calls, each build expands the
+current program and supplies its operands to reusable assembly instructions.
+Quoted arrays and callables
 with mutable captures use ordinary construction. The handle holds the last eligible
 assembly program. A consumer can release or evict it by dropping the handle.
 """
@@ -136,27 +139,28 @@ _build_source!(globals, x::Expr) = all(a -> _build_source!(globals, a), x.args)
 
 # Slot complete direct calls over named ports before checking the template.
 # More involved calls need their current operands during expansion.
-function _build_call(rhs, index)
+function _build_call(rhs, index; nested=false)
     Meta.isexpr(rhs, :call) && length(rhs.args) >= 2 || return nothing
     ref = first(rhs.args)
     ref isa GlobalRef && !_build_module(ref.mod) && isdefined(ref.mod, ref.name) || return nothing
     args = rhs.args[2:end]
-    all(x -> x isa Symbol, args) && allunique(args) || return nothing
     f = getglobal(ref.mod, ref.name)
     if f isa KernelSpec
+        any(x -> x isa Expr && x.head in (:kw, :parameters, :...), args) && return nothing
         f.call_signature isa ReactiveKernels._KernelEndpointCallSignature && return nothing
         ReactiveKernels._kernel_inline_signature_supported(f.call_signature) || return nothing
         ins, outs = Tuple(ReactiveKernels.valtype(v) for v in inputs(f)), Tuple(ReactiveKernels.valtype(v) for v in outputs(f))
         length(ins) == length(args) && all(_build_type, ins) && all(_build_type, outs) ||
             return nothing
-    elseif f isa Function && isconst(ref.mod, ref.name) &&
+    elseif !nested && all(x -> x isa Symbol, args) && allunique(args) &&
+            f isa Function && isconst(ref.mod, ref.name) &&
             (Base.issingletontype(typeof(f)) ||
              ReactiveKernels._native_generated_function(f) isa ReactiveKernels.RuntimeGeneratedFunction)
         ins, outs = ntuple(_ -> Any, length(args)), (Any,)
     else
         return nothing
     end
-    (; slot=ReactiveKernels._KernelBuildCall(index, Tuple(args), ins, outs), f)
+    (; slot=ReactiveKernels._KernelBuildCall(index, ref.name, ins, outs), f)
 end
 
 # A parameterized package type can itself hold a private type or a value.
@@ -169,17 +173,25 @@ function _build_type(T)
     all(p -> p isa Symbol || p isa Int || _build_type(p), T.parameters)
 end
 
+function _build_call_template(x, calls; nested=true)
+    x isa Expr || return x
+    x.head in (:quote, :inert) && return x
+    call = _build_call(x, length(calls)+1; nested)
+    if call !== nothing
+        push!(calls, (x, call.f))
+        return Expr(:call, ReactiveKernels._build_call_expr(call.slot),
+                    Any[_build_call_template(a, calls) for a in x.args[2:end]]...)
+    end
+    Expr(x.head, Any[_build_call_template(a, calls) for a in x.args]...)
+end
+
 function _build_template(def)
     body = def.args[2]
     statements = Any[]
     calls = Tuple{Expr,Any}[]
     for stmt in body.args
-        call = Meta.isexpr(stmt, :(=), 2) ? _build_call(stmt.args[2], length(calls)+1) : nothing
-        if call !== nothing
-            rhs = stmt.args[2]
-            push!(calls, (rhs, call.f))
-            stmt = Expr(:(=), stmt.args[1],
-                        Expr(:call, ReactiveKernels._build_call_expr(call.slot), rhs.args[2:end]...))
+        if Meta.isexpr(stmt, :(=), 2)
+            stmt = Expr(:(=), stmt.args[1], _build_call_template(stmt.args[2], calls; nested=false))
         end
         push!(statements, stmt)
     end
@@ -194,7 +206,14 @@ end
 # may reach the stored constructor. Check the source before expanding it.
 _stage_literal(x) = _build_literal(x)
 _stage_literal(x::Number) = _build_literal(x) && _build_type(typeof(x))
-_stage_literal(T::Type) = _build_type(T)
+_stage_literal(T::Type) = _build_type(T) || _stage_named_type(T)
+
+function _stage_named_type(T)
+    T isa DataType || return false
+    wrapper = T.name.wrapper
+    _lowering_binding(wrapper) === nothing && return false
+    all(p -> p isa Symbol || p isa Int || (p isa Type && _stage_literal(p)), T.parameters)
+end
 
 _stage_module(m) = _build_module(m) || m === LogExpFunctions
 
@@ -203,8 +222,30 @@ _stage_module(m) = _build_module(m) || m === LogExpFunctions
 # that binding. Store the lookup, including an absent name, by module and name.
 function _stage_global!(globals, mod, name)
     key = (mod, name)
+    haskey(globals, key) && return true
+    binding = ReactiveKernels._global_value(mod, name)
+    if binding !== nothing && something(binding) isa ReactiveKernels.ScalarDerivativeRule
+        # A library defines its scalar rules as constants, e.g. the log-gamma
+        # in an LKJ normalizing constant. Retain only such a library binding.
+        _stage_module(mod) && ReactiveKernels._global_isconst(mod, name) &&
+            any(m -> ReactiveKernels._global_value(m, name) === binding,
+                (ReactiveKernels, DistributionKernelSources)) || return false
+        globals[key] = binding
+        return true
+    end
+    if !_stage_module(mod)
+        # A named singleton can also be imported from another package. Its
+        # defining code is stable. Generated namespaces and closures still
+        # supply their operations through the build's call slots.
+        _lowering_named_module(mod) || return false
+        binding === nothing && return false
+        value = something(binding)
+        value isa Function && _lowering_binding(value) !== nothing &&
+            ReactiveKernels._global_isconst(mod, name) || return false
+        globals[key] = binding
+        return true
+    end
     _build_binding(globals, key, mod, name, _stage_literal, _stage_module) || return false
-    binding = globals[key]
     binding === nothing && return true
     value = something(binding)
     # Callers can add bindings to the evaluation module. Match the object
@@ -220,11 +261,11 @@ end
 _stage_source!(globals, ref::GlobalRef) = _stage_global!(globals, ref.mod, ref.name)
 _stage_source!(globals, x::Symbol) = _stage_global!(globals, PPLGeneratedModels, x)
 _stage_source!(globals, x) = _stage_literal(x)
-_stage_source!(globals, x::Union{DataType,UnionAll}) = _build_type(x)
+_stage_source!(globals, x::Union{DataType,UnionAll}) = _stage_literal(x)
 _stage_source!(globals, x::QuoteNode) = _stage_source!(globals, x.value)
 _stage_source!(globals, x::Expr) = all(a -> _stage_source!(globals, a), x.args)
 _stage_source!(globals, x::ReactiveKernels._KernelBuildCall) =
-    all(a -> a isa Symbol, x.arguments) && all(_build_type, x.inputs) && all(_build_type, x.outputs)
+    all(_build_type, x.inputs) && all(_build_type, x.outputs)
 
 # These inputs can participate when supplied anew on every build. A type
 # annotation or nested child may belong to the caller's package. Neither its
@@ -256,7 +297,8 @@ function _build_with_current_operands(cache, def, template)
                 return entry.constructor
             end
             steps, local_count = ReactiveKernels._build_steps(mod, form)
-            cache.entry = (; form, constructor=(; steps, local_count))
+            unstaged = entry !== nothing && haskey(entry, :unstaged) ? entry.unstaged : nothing
+            cache.entry = (; form, constructor=(; steps, local_count), unstaged)
             cache.entry.constructor
         end
     catch err
@@ -275,12 +317,17 @@ function _cached_build_spec(cache, def)
                     entry.globals)
             return entry
         end
+        # Expansion refuses e.g. a child in a lazy branch, which the splicer
+        # cannot reach. It refuses the same template again: expand it once.
+        entry !== nothing && haskey(entry, :unstaged) && entry.unstaged !== nothing &&
+            _same_program(entry.unstaged, template) && return nothing
         globals = Dict{Tuple{Module,Symbol},Any}()
         _stage_source!(globals, template) || return nothing
         constructor = try
             ReactiveKernels._stage_build(PPLGeneratedModels, template, length(calls))
         catch err
             err isa ReactiveKernels._UnsupportedConstructor || rethrow()
+            cache.entry = (; unstaged=ReactiveKernels._deepcopy_code(template, IdDict()))
             return nothing
         end
         cache.entry = (; definition=ReactiveKernels._deepcopy_code(template, IdDict()), globals, constructor)
