@@ -16,6 +16,12 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.393
+
+- `jax_source` supports `eachindex(a, b, ...)` over one-based vectors in
+  numerical kernels and data preparation. It checks all logical lengths,
+  including the lengths of padded rows, before iterating.
+
 ## 0.1.392
 
 - Indexed JAX event reads can differentiate a subset of packed coordinates against a shared reference point.
