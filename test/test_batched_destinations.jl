@@ -40,7 +40,7 @@ Base.:*(::IdentityFactor, x::Vector{Float64}) = x
 @kernel scale_once(p, x) = begin
     result = p * x
 end
-struct BoxedResult <: Number
+struct BoxedResult <: Real
     data::Vector{Float64}
 end
 @kernel boxed_product(p, x) = begin
@@ -191,6 +191,9 @@ end
 end
 
 @testset "numeric results that hold a vector retain its contents" begin
+    ref = [3.]
+    record = NamedTuple{(:a,),Tuple{Real}}((BoxedResult(ref),))
+    @test ReactiveKernels._replicated_aliases(ref, ([record],))
     for schedule in (nothing, NativeScheduling(chunk_size=1, workers=2))
         for reuse in (false, true)
             k = vectorize(boxed_product; batched=:p, schedule, reuse)
