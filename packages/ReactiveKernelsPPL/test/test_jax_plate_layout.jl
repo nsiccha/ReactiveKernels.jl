@@ -3,6 +3,7 @@ module JAXPlateLayoutTests
 using ReactiveKernels, ReactiveKernelsPPL, Test
 include(joinpath(pkgdir(ReactiveKernels), "test", "jax_python.jl"))
 include("jax_ppl_data.jl")
+include(joinpath(pkgdir(ReactiveKernels), "test", "jax_guarded_scan_fixture.jl"))
 
 @testset "Sampler plate layouts on observed and computed ragged rows" begin
     model = @rkppl begin
@@ -36,6 +37,33 @@ include("jax_ppl_data.jl")
             end
             @test result.joint_value ≈ query(u) rtol = 1e-11
             @test only(result.grad) ≈ slope rtol = 1e-11
+        end
+    end
+end
+
+@testset "Sampler entry with selectable subject scans" begin
+    model = @rkppl begin
+        a ~ Normal(0, 1)
+        mu = jax_guarded_scan_rows(a, bases, types, orders)
+        y ~ Normal(mu, 1)
+    end
+    plan = model(; bases = [[-1.0, 0.5], [2.0], Float64[]],
+                   types = [[3, 2, 3], [3], Int[]],
+                   orders = [[1, -1, 1], [1], Int[]]) | (; y = 0.25)
+    built = build_kernel(plan)
+    src = jax_source(built, plan; plate_layout = :padded)
+    @test occursin("SUBJECT_SCAN_SCHEDULES =", src.text)
+    @test any(f -> f.name == "select_plate_layout", src.functions)
+    if rk_jax_available()
+        query = prepare_query(built, plan, :sampler)
+        u = [0.35]
+        inputs = (u, jax_raw_data(plan, src)...)
+        for walk in ("padded", "events")
+            result = withenv("RK_JAX_SUBJECT_WALK" => walk) do
+                rk_jax_evaluate(src, "log_density", inputs; grad = :joint, prepare = :arguments)
+            end
+            @test result.joint_value ≈ query(u) rtol = 1e-11
+            @test result.grad ≈ rk_fd_gradient(query, u) rtol = 1e-6
         end
     end
 end

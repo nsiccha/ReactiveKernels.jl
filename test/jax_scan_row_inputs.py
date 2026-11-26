@@ -107,7 +107,7 @@ def residual_count(width):
 
 assert residual_count(2) == residual_count(16)
 
-body_sizes = []
+body_sizes = {"events": [], "padded": []}
 for rounds in (150, 700):
     lengths = (rounds, rounds // 3)
     bases = [np.linspace(-0.5, 1.0, n) for n in lengths]
@@ -121,24 +121,64 @@ for rounds in (150, 700):
     points = jnp.array([0.25, 0.5, 0.75])
     gradient = jax.vmap(jax.grad(score), in_axes=(0, None))
     expected = jax.jit(gradient)(points, data)
-    tangent = jax.jit(jax.vmap(lambda a: jax.jvp(lambda t: score(t, data), (a,), (1.0,))[1]))
-    np.testing.assert_allclose(tangent(points), expected)
+    tangent = jax.jit(jax.vmap(lambda a, d: jax.jvp(lambda t: score(t, d), (a,), (1.0,))[1],
+                               in_axes=(0, None)))
 
-    trace = jax.make_jaxpr(gradient)(points, data)
-    scans = [eq for eq in equations(trace) if eq.primitive.name == "scan"]
-    # Two subjects share the first phase, only the longest remains in the second.
-    phase_lengths = (lengths[1], rounds - lengths[1])
-    assert sorted((e.params["length"], e.params["reverse"]) for e in scans) == sorted(
-        (n, reverse) for n in phase_lengths for reverse in (False, True))
-    sizes = []
-    for scan in scans:
-        body = list(equations(scan.params["jaxpr"]))
-        assert all(rounds not in getattr(v.aval, "shape", ())
-                   for eq in body for v in eq.outvars)
-        sizes.append(len(body))
-    body_sizes.append(sizes)
+    padded = model.prepare_plate_layout(data, subject_walk="padded")
+    events = model.prepare_plate_layout(padded, subject_walk="events")
+    # Two subjects share the first event phase, only the longest remains
+    # in the second. The padded control uses one full-width scan.
+    for walk, selected, phases in (("padded", padded, (rounds,)),
+                                   ("events", events, (lengths[1], rounds - lengths[1]))):
+        np.testing.assert_allclose(jax.jit(gradient)(points, selected), expected)
+        np.testing.assert_allclose(tangent(points, selected), expected)
+        np.testing.assert_allclose(score(points[0], selected), score(points[0], data))
+        trace = jax.make_jaxpr(gradient)(points, selected)
+        scans = [eq for eq in equations(trace) if eq.primitive.name == "scan"]
+        assert sorted((e.params["length"], e.params["reverse"]) for e in scans) == sorted(
+            (n, reverse) for n in phases for reverse in (False, True))
+        sizes = []
+        for scan in scans:
+            body = list(equations(scan.params["jaxpr"]))
+            assert all(rounds not in getattr(v.aval, "shape", ())
+                       for eq in body for v in eq.outvars)
+            sizes.append(len(body))
+        body_sizes[walk].append(sizes)
 
-assert body_sizes[0] == body_sizes[1], body_sizes
+for sizes in body_sizes.values():
+    assert sizes[0] == sizes[1], sizes
+
+def make_step(prepared, count):
+    batched = jax.jit(jax.vmap(jax.value_and_grad(lambda a: score(a, prepared))))
+    return lambda: batched(points[:count])
+
+chosen, report = model.select_plate_layout(padded, make_step, chains=[2], repeats=2)
+assert sorted(row["variant"] for row in report) == ["events", "padded"]
+for row in report:
+    assert row["chains"] == 2 and row["error"] is None
+    samples = row["samples_seconds"]
+    assert len(samples) == 2 and min(samples) == row["seconds"]
+    assert np.median(samples) == row["median_seconds"]
+    assert row["setup_seconds"] > 0 and row["calibration_seconds"] >= row["setup_seconds"] + sum(samples)
+name, = model.SUBJECT_SCAN_SCHEDULES
+assert (chosen[name] is None) == (report[0]["variant"] == "padded")
+assert data[name] is not None and padded[name] is None
+np.testing.assert_allclose(make_step(chosen, 2)()[1], expected[:2])
+
+empty = model.prepare_data(bases=[[]], types=[[]], orders=[[]])
+_, report = model.select_plate_layout(empty, make_step, chains=[1], repeats=1)
+assert [row["variant"] for row in report] == ["padded"]
+
+bad = model.prepare_data(bases=[[1.0]], types=[[3]], orders=[[2]])
+for walk in ("padded", "events"):
+    selected = model.prepare_plate_layout(bad, subject_walk=walk)
+    try:
+        jax.block_until_ready(make_step(selected, 1)())
+    except Exception as exc:
+        assert "BoundsError" in str(exc), exc
+    else:
+        raise AssertionError(f"{walk} accepted an out-of-bounds active read")
+
 
 
 def subject_step(carry, row, n, subject, decay):

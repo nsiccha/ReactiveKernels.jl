@@ -242,7 +242,8 @@ function _jax_compact_cell_rows(ctx, inner, rows, read, guards, extent, index, g
 end
 
 function _jax_scan_row_inputs!(ctx, inner, rows, unpack, seqs, width, extent, pure;
-                               sequence = v -> _jax_scan_sequence(v, width), gather_rows = nothing, direct_reads = nothing)
+                               sequence = v -> _jax_scan_sequence(v, width), gather_rows = nothing,
+                               subject_rows = nothing)
     isempty(rows.reads) && return false
     body = join(inner.lines, "\n")
     tokens = Set(m.match for m in eachmatch(_JAX_HISTORY_TOKENS, body))
@@ -283,12 +284,14 @@ function _jax_scan_row_inputs!(ctx, inner, rows, unpack, seqs, width, extent, pu
         else
             compact = packed ? _jax_compact_cell_rows(ctx, inner, rows, r, guards, extent,
                                                       index, guard, limit) : nothing
-            if direct_reads !== nothing && compact === nothing && packed
-                push!(direct_reads, (length(seqs), r.table.code))
+            args = "(" * join((r.table.code, index, guard, limit), ", ") * ")"
+            if subject_rows !== nothing && compact === nothing && packed
+                push!(subject_rows.reads, (length(seqs), r.table.code))
                 check = _jax_helper!(ctx, "_rk_scan_index", _JAX_SCAN_INDEX)
-                check * "(" * join((r.table.code, index, guard, limit), ", ") * ")"
+                schedule = _jax_subject_scan_schedule!(ctx, subject_rows.lengths)
+                check * args * " if " * schedule * " is not None else " * gather * args
             else
-                something(compact, gather * "(" * join((r.table.code, index, guard, limit), ", ") * ")")
+                something(compact, gather * args)
             end
         end
         _jax_emit!(ctx, values * ", " * valid * " = " * call)

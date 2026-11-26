@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.401
+
+- Padded JAX exports with eligible subject scans can time the padded and
+  real-event walks on the target device. `select_plate_layout` reports the
+  schedule and returns the prepared data for the winning gradient batch.
+  Timing rows retain every blocked warm call, median latency, elapsed setup
+  through the first synchronized result, and total calibration time per row.
+
 ## 0.1.400
 
 - A generated JAX plate can share a guarded scalar derivative rule and its

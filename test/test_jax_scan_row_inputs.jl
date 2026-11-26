@@ -2,22 +2,7 @@ using ReactiveKernels, Test
 
 isdefined(@__MODULE__, :rk_jax_available) || include(joinpath(@__DIR__, "jax_python.jl"))
 
-@kernel function jax_guarded_scan_rows(a::Float64, bases::Vector{Vector{Float64}},
-                                      types::Vector{Vector{Int}}, orders::Vector{Vector{Int}})
-    subjects = plate(bases, types, orders) do base, kinds, visits
-        offsets = plate(base) do x
-            (a * x, 2a * x)
-        end
-        path = scan(kinds, visits, Ref(offsets); init = 0.5) do carry, kind, j, table
-            moved = 0.75 * carry + a
-            next = kind == 3 ? moved + table[j][1] : moved
-            (next, next)
-        end
-        sum(path)
-    end
-    total = sum(subjects)
-    return total
-end
+include("jax_guarded_scan_fixture.jl")
 
 @traceable jax_apply_scan_rows(p, state, offset) = p[1] * state + offset[2]
 
@@ -140,6 +125,14 @@ end
     grouped = jax_source(jax_guarded_scan_rows; have, want = :total, data = (:bases, :types, :orders),
                          plate_layout = :groups)
     @test occursin(" = _rk_scan_record_rows(", string(grouped))
+    named = jax_source(jax_guarded_scan_rows; have, data = (:bases, :types, :orders),
+        functions = (prepare_plate_layout = :total, select_plate_layout = :total),
+        constants = (SUBJECT_SCAN_SCHEDULES = 17,), plate_layout = :padded)
+    @test named.functions[2].inputs == padded.functions[2].inputs
+    @test [f.name for f in named.functions] == ["prepare_data", "prepare_plate_layout", "select_plate_layout",
+                                                "prepare_plate_layout_2", "select_plate_layout_2"]
+    @test occursin("SUBJECT_SCAN_SCHEDULES = 17", named.text)
+    @test occursin("for name, inputs in SUBJECT_SCAN_SCHEDULES_2.items()", named.text)
     @test occursin(" = _rk_subject_scan(", string(padded))
     @test occursin("_rk_record_plate(offsets_cell,", string(padded))
     @test occursin(" = _rk_event_table_rows(_rk_scan_record_rows, ", string(packed))

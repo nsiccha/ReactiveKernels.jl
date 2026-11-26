@@ -163,6 +163,9 @@ def _rk_grouped_plate(cell, in_axes, args, padded, rows, layout):
 """
 
 const _JAX_PREPARE_PLATE_LAYOUT = raw"""
+_RK_LAYOUT_NAMES = ("groups",)
+
+
 def prepare_plate_layout(prepared: dict, groups: int = 1, sequential: bool = False) -> dict:
     \"\"\"The prepared data with a layout for the plates over ragged rows.
 
@@ -195,6 +198,55 @@ def prepare_plate_layout(prepared: dict, groups: int = 1, sequential: bool = Fal
         layout[plate] = (None if any(n is None for n in sizes) else
                          _rk_length_groups(sizes, groups, sequential))
     return {**prepared, "_rk_plate_layout": layout}
+
+
+def _rk_layout_candidates(prepared, candidates):
+    if candidates is None:
+        candidates = [(groups, sequential) for groups in (1, 2, 4, 8, 16)
+                      for sequential in (False, True)]
+    seen = set()
+    for groups, sequential in candidates:
+        chosen = prepare_plate_layout(prepared, groups, sequential)
+        # Group sizes fix the cuts into this dataset's stable subject order.
+        key = tuple(None if layout is None else
+                    (tuple(u.size for u in layout.units), layout.sequential)
+                    for layout in chosen["_rk_plate_layout"].values())
+        if key not in seen:
+            seen.add(key)
+            yield "groups", groups, sequential, chosen
+"""
+
+const _JAX_PREPARE_SUBJECT_LAYOUT = raw"""
+_RK_LAYOUT_NAMES = ("padded", "events")
+
+
+def prepare_plate_layout(prepared: dict, *, subject_walk: str = "events") -> dict:
+    \"\"\"Choose the padded or real-event schedule for eligible subject scans.\"\"\"
+    if subject_walk not in _RK_LAYOUT_NAMES:
+        raise ValueError("subject_walk must be 'padded' or 'events'")
+    result = dict(prepared)
+    for name, inputs in SUBJECT_SCAN_SCHEDULES.items():
+        if subject_walk == "padded":
+            result[name] = None
+        elif result[name] is None:
+            result[name] = _rk_subject_scan_schedule(*(prepared[key] for key in inputs))
+    return result
+
+
+def _rk_layout_candidates(prepared, candidates):
+    if candidates is None:
+        candidates = _RK_LAYOUT_NAMES
+    seen = set()
+    for walk in candidates:
+        chosen = prepare_plate_layout(prepared, subject_walk=walk)
+        has_events = any(chosen[name] is not None and chosen[name][0]
+                         for name in SUBJECT_SCAN_SCHEDULES)
+        effective = "events" if has_events else "padded"
+        if effective not in seen:
+            seen.add(effective)
+            if walk != effective:
+                chosen = prepare_plate_layout(prepared, subject_walk=effective)
+            yield effective, None, None, chosen
 """
 
 # The reference tuner: which layout is fastest is a property of the device,
@@ -204,17 +256,18 @@ def prepare_plate_layout(prepared: dict, groups: int = 1, sequential: bool = Fal
 const _JAX_SELECT_PLATE_LAYOUT = raw"""
 def select_plate_layout(prepared: dict, make_step: Any, chains: Any = None,
                         candidates: Any = None, repeats: int = 3, *,
-                        alternatives: Any = None, calls: Any = None) -> tuple:
+                        alternatives: Any = None, calls: Any = None, guarded_reads: Any = None) -> tuple:
     \"\"\"Time layouts on the device and return the chosen prepared data and timings.
 
     A builder `make_step(data, count)` returns a zero-argument callable for one
     gradient batch or sampler step at that chain count. Omit `chains` for a
-    single workload and a builder taking only the data. The grouped module
-    tries the `(groups, sequential)` pairs in `candidates`. An optional
+    single workload and a builder taking only the data. A grouped module
+    tries the `(groups, sequential)` pairs in `candidates`. An eligible
+    padded module tries subject walks named "padded" and "events". An optional
     `alternatives` mapping names other emitted layouts. Each value is a pair
-    `(prepared_data, builder)` for that module, optionally followed by its
-    `prepare_guarded_reads` function to compare its compact and dense reads.
-    The current module tries both whenever its eligible read bounds differ.
+    `(prepared_data, builder)`, optionally followed by its `prepare_guarded_reads`.
+    Eligible reads try compact and dense capacities. Set `guarded_reads` to
+    "compact" or "dense" to hold that choice fixed across layouts.
 
     The first call warms the executable. With `calls(count)`, rank by the
     median warm time multiplied by the number of calls the fit requires at
@@ -222,8 +275,12 @@ def select_plate_layout(prepared: dict, make_step: Any, chains: Any = None,
     allocation failure skips the larger chain counts for that layout.
 
     The first row in the report names the chosen variant and chain count.
-    Each row records seconds per call and any memory error. When `calls` is
-    supplied it also records the projected fit duration in seconds.
+    For each row, `setup_seconds` runs from entering the builder through the
+    first blocked call. `calibration_seconds` also includes the warm repeats.
+    A memory failure ends the interval at the failed attempt. Successful
+    blocked warm calls are recorded in `samples_seconds`, with their
+    `median_seconds` once all repeats finish. With `calls`, `fit_seconds`
+    gives the projected fit duration at the measured warm latency.
     \"\"\"
     import operator
     import time
@@ -236,28 +293,16 @@ def select_plate_layout(prepared: dict, make_step: Any, chains: Any = None,
         raise ValueError("calls(count) requires chain counts")
     if alternatives is None:
         alternatives = {}
-    prepare_groups = @prepare_groups@
-    local_name = "groups" if prepare_groups is not None else "module"
-    if local_name in alternatives:
-        raise ValueError(f"{local_name} names the current module")
-    if candidates is None:
-        candidates = [(groups, sequential) for groups in (1, 2, 4, 8, 16)
-                      for sequential in (False, True)]
+    for name in _RK_LAYOUT_NAMES:
+        if name in alternatives:
+            raise ValueError(f"{name} names a layout of this module")
+
+    if guarded_reads not in (None, "compact", "dense"):
+        raise ValueError("guarded_reads must be 'compact', 'dense' or None")
 
     def layouts():
-        if prepare_groups is None:
-            yield local_name, None, None, prepared, make_step, @prepare_reads@
-        else:
-            seen = set()
-            for groups, sequential in candidates:
-                chosen = prepare_groups(prepared, groups, sequential)
-                # Group sizes fix the cuts into this dataset's stable subject order.
-                key = tuple(None if layout is None else
-                            (tuple(u.size for u in layout.units), layout.sequential)
-                            for layout in chosen["_rk_plate_layout"].values())
-                if key not in seen:
-                    seen.add(key)
-                    yield local_name, groups, sequential, chosen, make_step, @prepare_reads@
+        for name, groups, sequential, chosen in _rk_layout_candidates(prepared, candidates):
+            yield name, groups, sequential, chosen, make_step, @prepare_reads@
         for name, option in alternatives.items():
             chosen, builder, selector = (*option, None) if len(option) == 2 else option
             yield name, None, None, chosen, builder, selector
@@ -266,6 +311,8 @@ def select_plate_layout(prepared: dict, make_step: Any, chains: Any = None,
         for name, groups, sequential, chosen, builder, selector in layouts():
             if selector is None:
                 yield name, groups, sequential, None, chosen, builder
+            elif guarded_reads is not None:
+                yield name, groups, sequential, guarded_reads, selector(chosen, guarded_reads), builder
             else:
                 compact = selector(chosen, "compact")
                 yield name, groups, sequential, "compact", compact, builder
@@ -273,49 +320,107 @@ def select_plate_layout(prepared: dict, make_step: Any, chains: Any = None,
                 if dense is not compact:
                     yield name, groups, sequential, "dense", dense, builder
 
+    def rank(row):
+        return row.get("fit_seconds", row["seconds"] / (row["chains"] or 1))
+
     report = []
+    best_score = None
+    best_data = None
     work = {} if calls is None else {n: float(calls(n)) for n in counts}
     if any(not np.isfinite(n) or n <= 0 for n in work.values()):
         raise ValueError("the projected number of calls must be finite and positive")
-
-    def cost(row):
-        return row.get("fit_seconds", row["seconds"] / (row["chains"] or 1))
-
-    best_data, best_cost = None, float("inf")
     for name, groups, sequential, mode, chosen, builder in variants():
         for count in counts:
             row = {"variant": name, "groups": groups, "sequential": sequential,
-                   "chains": count, "seconds": float("inf"), "error": None}
+                   "chains": count, "seconds": float("inf"), "error": None,
+                   "samples_seconds": [], "median_seconds": None}
             if mode is not None:
                 row["guarded_reads"] = mode
             if calls is not None:
                 row["fit_seconds"] = float("inf")
             report.append(row)
             step = None
+            started = time.perf_counter()
             try:
                 step = builder(chosen) if count is None else builder(chosen, count)
                 jax.block_until_ready(step())
-                samples = []
+                row["setup_seconds"] = time.perf_counter() - started
+                samples = row["samples_seconds"]
                 for _ in range(repeats):
                     start = time.perf_counter()
                     jax.block_until_ready(step())
                     samples.append(time.perf_counter() - start)
-                row["seconds"] = min(samples) if calls is None else float(np.median(samples))
+                row["median_seconds"] = float(np.median(samples))
+                row["seconds"] = min(samples) if calls is None else row["median_seconds"]
                 if calls is not None:
                     row["fit_seconds"] = row["seconds"] * work[count]
-                measured = cost(row)
-                if best_data is None or measured < best_cost:
-                    best_data, best_cost = chosen, measured
+                score = rank(row)
+                if best_score is None or score < best_score:
+                    best_score, best_data = score, chosen
             except Exception as error:
                 if "RESOURCE_EXHAUSTED" not in str(error) and not isinstance(error, MemoryError):
                     raise
                 row["error"] = str(error)
                 break
-    report.sort(key=cost)
+            finally:
+                elapsed = time.perf_counter() - started
+                row["calibration_seconds"] = elapsed
+                row.setdefault("setup_seconds", elapsed)
+    report.sort(key=rank)
     if not report or report[0]["error"] is not None:
         raise RuntimeError("select_plate_layout: no candidate ran on this device")
     return best_data, report
 """
+
+# Add the optional API after naming the requested functions and constants:
+# existing callers can already have an entry named `select_plate_layout`.
+function _jax_layout_functions!(mod, bodies, functions, constants)
+    prepared = Set(first(io) for io in first(functions).outputs)
+    bounds = filter(b -> first(b) in prepared, _jax_prepared_bounds(mod))
+    reads = [(name, keys[1], keys[2], parse(BigInt, keys[3]))
+             for (name, kind, keys) in bounds if kind === :match_count]
+    read_selector = "None"
+    if !isempty(reads)
+        read_selector = _jax_identifier(mod.used, :prepare_guarded_reads)
+        push!(bodies, rstrip(replace(_JAX_PREPARE_GUARDED_READS,
+            "prepare_guarded_reads" => read_selector, "@read_bounds@" => _jax_py_literal(Tuple(reads)))))
+        push!(functions, JAXFunction(read_selector,
+            Pair{String,Any}["prepared" => Dict, "mode" => String], Pair{String,Any}["prepared" => Dict]))
+    end
+    if mod.layout === :groups
+        plates = _jax_layout_plates(mod)
+        isempty(plates) || _jax_module_helper!(mod, "_rk_length_groups", _JAX_LENGTH_GROUPS)
+        metadata = "GROUPED_PLATES"
+        values = Pair{String,Tuple}[name => Tuple(keys) for (name, keys) in plates]
+        source = _JAX_PREPARE_PLATE_LAYOUT
+        args = Pair{String,Any}["prepared" => Dict, "groups" => Int, "sequential" => Bool]
+    else
+        metadata = "SUBJECT_SCAN_SCHEDULES"
+        values = [name => keys for (name, kind, keys) in bounds if kind === :subject_scan]
+        source = _JAX_PREPARE_SUBJECT_LAYOUT
+        args = Pair{String,Any}["prepared" => Dict, "subject_walk" => String]
+    end
+    if mod.layout === :groups || (!isempty(values) && haskey(mod.helper_names, (:helper, "_rk_subject_scan")))
+        name = _jax_identifier(mod.used, metadata)
+        push!(constants, name * " = " * _jax_py_literal(values))
+        prepare = _jax_identifier(mod.used, :prepare_plate_layout)
+        push!(bodies, rstrip(replace(source, metadata => name, "prepare_plate_layout" => prepare)))
+        push!(functions, JAXFunction(prepare, args, Pair{String,Any}["prepared" => Dict]))
+    elseif !isempty(reads)
+        push!(bodies, "_RK_LAYOUT_NAMES = ('module',)\ndef _rk_layout_candidates(prepared, candidates):\n    yield 'module', None, None, prepared")
+    else
+        return
+    end
+    select = _jax_identifier(mod.used, :select_plate_layout)
+    push!(bodies, rstrip(replace(_JAX_SELECT_PLATE_LAYOUT,
+        "select_plate_layout" => select, "@prepare_reads@" => read_selector)))
+    push!(functions, JAXFunction(select,
+        Pair{String,Any}["prepared" => Dict, "make_step" => Any, "chains" => Any,
+                         "candidates" => Any, "repeats" => Int, "alternatives" => Any, "calls" => Any,
+                         "guarded_reads" => Any],
+        Pair{String,Any}["prepared" => Dict, "report" => Vector{Any}]))
+    nothing
+end
 
 # The plate arguments whose rows a group cuts to its width: each mapped ragged
 # vector of numeric rows, as its argument position and the prepared lengths

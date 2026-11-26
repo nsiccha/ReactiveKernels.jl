@@ -57,6 +57,14 @@ for primary_wins in (True, False):
     assert {(r["variant"], r["guarded_reads"]) for r in report} == {
         (v, mode) for v in ("groups", "padded") for mode in ("compact", "dense")}
 
+# Hold the producer mode fixed while the tuner enumerates its other layouts.
+for mode in ("compact", "dense"):
+    fixed, trials = padded.select_plate_layout(
+        raw, lambda d: lambda: padded.kernel(0.75, **d), repeats=1, guarded_reads=mode)
+    assert {r["guarded_reads"] for r in trials} == {mode}
+    assert padded.prepare_guarded_reads(fixed, mode) is fixed
+    np.testing.assert_allclose(padded.kernel(0.75, **fixed), padded.kernel(0.75, **raw))
+
 # When every visit is requested, the two capacities coincide.
 full = padded.prepare_data(kinds=[[3, 3]], visits=[[1, 2]])
 _, report = padded.select_plate_layout(full, lambda d: lambda: padded.kernel(0.75, **d), repeats=1)
