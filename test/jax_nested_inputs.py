@@ -7,6 +7,8 @@ import numpy as np
 sys.path.insert(0, sys.argv[1])
 import bound
 import direct
+import direct_row
+import prepared_row
 import first_row
 import selected
 import selected_bound
@@ -93,6 +95,12 @@ flat = jax.jit(selected_bound.flat)(a, 1, **selected_bound.prepare_data(x=rectan
 np.testing.assert_allclose(flat, a * np.asarray([2, 4, 1, 5]))
 fixed_group = jax.jit(lambda scale, data: selected_bound.flat(scale, 1, **data))
 np.testing.assert_allclose(fixed_group(a, selected_bound.prepare_data(x=mixed)), a * np.asarray([2, 4, 5]))
+
+rows = [[[2, 4]], [[7, 8], [5, 6]]]
+for inputs, row_flat in ((direct_row.pad_ragged(rows), direct_row.flat), ((), prepared_row.flat)):
+    data = {} if inputs else prepared_row.prepare_data(x=rows)
+    got = jax.jit(row_flat)(a, *inputs, 1, 1, **data)
+    np.testing.assert_allclose(got, a * np.asarray([2, 4]))
 
 first = jax.jit(jax.value_and_grad(first_row.score))
 np.testing.assert_allclose(first(a, *first_row.pad_ragged([[[]]])), (0, 0))

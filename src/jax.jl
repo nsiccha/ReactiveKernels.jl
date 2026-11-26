@@ -456,10 +456,10 @@ mutable struct _JaxScope
     # its arguments and can identify which prepared input owns the tail.
     prefixed_extents::Dict{String,Tuple{Int,String}}
     # Device names of prepared integer vectors and row lengths, and the
-    # two operands of a single row selection made inside a plate cell.
+    # selected row lengths, selector and logical number of selectable rows.
     prepared_keys::Dict{String,String}
     chain_layouts::Dict{String,String}
-    selected_lengths::Dict{String,Tuple{String,String}}
+    selected_lengths::Dict{String,NTuple{3,String}}
     carried::Set{Symbol}
     plates::Dict{ValueId,_JaxPlateCell}
     # Branches and scalar helpers retain the current step's indexed reads.
@@ -483,7 +483,7 @@ _JaxScope(parent::Union{Nothing,_JaxScope} = nothing; same_step::Bool = false) =
               parent === nothing ? Dict{String,Tuple{Int,String}}() : copy(parent.prefixed_extents),
               parent === nothing ? Dict{String,String}() : parent.prepared_keys,
               parent === nothing ? Dict{String,String}() : copy(parent.chain_layouts),
-              Dict{String,Tuple{String,String}}(),
+              Dict{String,NTuple{3,String}}(),
               Set{Symbol}(), Dict{ValueId,_JaxPlateCell}(),
               same_step ? parent.scan_reads : Dict{String,_JaxPlateCell}(),
               "", Tuple{String,String}[],
@@ -1590,7 +1590,8 @@ function _jax_ragged_index(ctx, x, parts, T, values, kept; target)
         return _jax_group_value(code, T, only(values).extent, extent)
     end
     if length(values) == 1 && kept == 0 && !target && only(values) !== nothing
-        ctx.scope.selected_lengths[extent] = (rows, only(values).code)
+        count = _jax_group_rows(x) ? x.field_extents[1] : "None"
+        ctx.scope.selected_lengths[extent] = (rows, only(values).code, count)
         # The prepared layout records the width of a numeric row read by each group.
         if !_jax_group_rows(x) && ctx.host === nothing && !isempty(ctx.scope.row_width_param) &&
            T <: AbstractVector{<:Number}
@@ -10830,11 +10831,15 @@ function _jax_result_code(ctx, w, wants, plan; public_arrays)
             nested || !isempty(selection) || haskey(ctx.mod.helper_names, :bounded_concatenation) || return v
             check = _jax_helper!(ctx, "_rk_check", _JAX_CHECK)
             helper = _jax_helper!(ctx, "_rk_result_vector", """
-def _rk_result_vector(values, length, lengths=None, index=None):
+def _rk_result_vector(values, length, lengths=None, index=None, count=None):
     if isinstance(length, jax.core.Tracer):
-        # A runtime index must select vectors of one shape in this executable.
-        valid = (jnp.all(lengths == values.shape[0]) if isinstance(index, jax.core.Tracer)
-                 else length == values.shape[0])
+        valid = length == values.shape[0]
+        if isinstance(index, jax.core.Tracer):
+            # Ignore inactive row slots when checking all selectable lengths.
+            full = lengths == values.shape[0]
+            if count is not None:
+                full = full | (jnp.arange(lengths.shape[0]) >= count)
+            valid = jnp.all(full)
         $check(valid,
                "The requested vector has a data-dependent output size under JIT. "
                "Request a named result to return its storage and logical length.")

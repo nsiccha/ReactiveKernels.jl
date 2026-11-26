@@ -42,6 +42,10 @@ end
     flat = groups[i]
 end
 
+@kernel selected_row(a::Float64, x::Vector{Vector{Vector{Int}}}, i::Int, j::Int) = begin
+    flat = a .* x[i][j]
+end
+
 @kernel first_row(a::Float64, x::Vector{Vector{Vector{Int}}}) = begin
     score = a * sum(x[1][1])
 end
@@ -86,6 +90,9 @@ end
             selected = (; have = (:a, :x, :i), functions = (flat = :flat, named = (; flat = :flat)))
             write(joinpath(dir, "selected.py"), jax_source(selected_group; selected...))
             write(joinpath(dir, "selected_bound.py"), jax_source(selected_group; selected..., data = (; x = first(data))))
+            row_want = (; have = (:a, :x, :i, :j), want = :flat, name = :flat)
+            write(joinpath(dir, "direct_row.py"), jax_source(selected_row; row_want...))
+            write(joinpath(dir, "prepared_row.py"), jax_source(selected_row; row_want..., data = (; x = first(data))))
             write(joinpath(dir, "first_row.py"), jax_source(first_row; have, want = :score, name = :score))
             a = 0.7
             cases = map(data) do x
