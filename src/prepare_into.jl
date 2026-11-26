@@ -198,6 +198,7 @@ end
 """
     prepare_into(spec, exemplars...; kwargs...)
     prepare_into(kernel::PreparedKernel, exemplars...)
+    prepare_into(reader)
 
 Prepare a Julia writer for one array result. Call `write!(dst, args...)` to
 fill and return `dst`. Pass a writable array with the result's axes and storage
@@ -214,6 +215,13 @@ during a direct broadcast can leave a partially written destination.
 For a `KernelSpec`, `Graph` or `Plan`, selection and binding keywords are
 those of [`prepare`](@ref). Positional exemplars describe the remaining HAVE
 ports in order. A prepared kernel keeps its selected computation and passes.
+
+For a native position-batched reader, pass its destination tree on each
+call. Match the reader's scalar, tuple or named-tuple output layout with a
+writable array for each stacked leaf. Distinct leaves may be disjoint views
+of a single matrix. Matching dense leaves can be filled as positions finish.
+Element conversions and producers that observe the concrete output-column
+type can use private staging. A failed call may leave completed writes.
 """
 function prepare_into(source::Union{KernelSpec,Graph,Plan}, exemplars...;
                       bound = source isa KernelSpec ? NamedTuple() : (), kwargs...)
@@ -374,4 +382,133 @@ end
         end
     end
     _write_result!(dst, _native_broadcast_materialize(bc))
+end
+
+# The borrowed driver already routes every final stack through an output slot.
+# Substitute a caller's destination for just those slots, leaving the input
+# lanes and the per-position scratch private to the writer.
+struct _BatchDestination{D}
+    dst::D
+    fallback::_BatchOutputSlot
+end
+
+function _batch_direct(dst::AbstractArray, value::Union{Number,AbstractArray}, count, chunk)
+    dst isa StridedArray && dst isa _IntoDense &&
+        (value isa Number || (value isa _IntoDense && eltype(value) <: Number)) || return false
+    leading = value isa Number ? () : chunk ? Base.front(size(value)) : size(value)
+    expected = (map(Base.OneTo, leading)..., Base.OneTo(count))
+    axes(dst) == expected || throw(DimensionMismatch(
+        "batched destination axes $(axes(dst)) differ from result axes $expected"))
+    eltype(dst) === (value isa Number ? typeof(value) : eltype(value))
+end
+function _batch_direct(dst::Tuple, values::Tuple, count, chunk)
+    length(dst) == length(values) || throw(ArgumentError("batched destination tuple length differs"))
+    all(map((d, v) -> _batch_direct(d, v, count, chunk), dst, values))
+end
+function _batch_direct(dst::NamedTuple{K}, value::NamedTuple{K}, count, chunk) where {K}
+    _batch_direct(values(dst), values(value), count, chunk)
+end
+_batch_direct(dst, value, count, chunk) = throw(ArgumentError(
+    "batched destination must match the result structure, got $(typeof(dst)) for $(typeof(value))"))
+
+@inline function _replicated_output!(slot::_BatchDestination, value, count)
+    _batch_direct(slot.dst, value, count, false) && return slot.dst
+    _replicated_output!(slot.fallback, value, count)
+end
+@inline function _replicated_observed_output!(slot::_BatchDestination, value, count)
+    # The ordinary scalar program can inspect a later position's column and
+    # its parent. Preserve that program's dense parent even for a view sink.
+    _replicated_output!(slot.fallback, value, count)
+end
+
+_batch_publish!(dst, result) = throw(ArgumentError("batched destination must match the result structure"))
+_batch_publish!(dst::AbstractArray, result::AbstractArray) =
+    dst === result ? dst : _write_result!(dst, result)
+function _batch_publish!(dst::Tuple, result::Tuple)
+    length(dst) == length(result) || throw(ArgumentError("batched destination tuple length differs"))
+    foreach(_batch_publish!, dst, result)
+    dst
+end
+function _batch_publish!(dst::NamedTuple{K}, result::NamedTuple{K}) where {K}
+    _batch_publish!(values(dst), values(result))
+    dst
+end
+_replicated_passthrough_output!(slot::_BatchDestination, value, count) =
+    _batch_publish!(slot.dst, value)
+
+function _scheduled_outputs(k::_ScheduledBatchedKernel, chunks, count, args, slots::Tuple)
+    map(slots, chunks) do slot, chunk
+        _batch_direct(slot.dst, chunk, count, true) && return slot.dst
+        _scheduled_output!(slot.fallback, chunk, count, args, Val(true))
+    end
+end
+
+mutable struct _IntoBatchWriter{K}
+    const template::K
+    reader::K
+    @atomic busy::Bool
+end
+
+_into_batch_writer(k) = _IntoBatchWriter(k, copy(k), false)
+prepare_into(k::GraphReplicatedKernel) = _into_batch_writer(_borrowed_batch(k))
+prepare_into(k::Union{BorrowedBatchedKernel,_ScheduledBatchedKernel}) =
+    _into_batch_writer(copy(k))
+function prepare_into(k::_KernelSignatureCallable{<:Union{GraphReplicatedKernel,BorrowedBatchedKernel,_ScheduledBatchedKernel}})
+    _KernelSignatureCallable(prepare_into(k.target), k.signature)
+end
+
+@inline function (callable::_KernelSignatureCallable{<:_IntoBatchWriter})(dst, args...; kwargs...)
+    write = (resolved...) -> callable.target(dst, resolved...)
+    _kernel_signature_invoke(_KernelSignatureCallable(write, callable.signature), args, NamedTuple(kwargs))
+end
+
+_batch_leaves(dst::AbstractArray) = (dst,)
+_batch_leaves(::Tuple{}) = ()
+_batch_leaves(dst::Tuple) = (_batch_leaves(first(dst))..., _batch_leaves(Base.tail(dst))...)
+_batch_leaves(dst::NamedTuple) = _batch_leaves(values(dst))
+_batch_leaves(dst) = throw(ArgumentError("each batched destination leaf must be a writable array"))
+
+_check_batch_leaves(::Tuple{}, inputs) = nothing
+function _check_batch_leaves(leaves::Tuple, inputs)
+    dst, others = first(leaves), Base.tail(leaves)
+    _into_aliases(dst, inputs) && throw(ArgumentError("destination overlaps an input to the batched reader"))
+    any(other -> _into_storage_overlap(dst, other), others) &&
+        throw(ArgumentError("batched destinations overlap"))
+    _check_batch_leaves(others, inputs)
+end
+
+@generated function _batch_writer_caches(caches::C, slots::D) where {C<:Tuple,D<:Tuple}
+    Expr(:tuple, (:(slots[$i]) for i in 1:fieldcount(D))...,
+         (:(caches[$i]) for i in fieldcount(D)+1:fieldcount(C))...)
+end
+
+function _batch_write(k::BorrowedBatchedKernel, slots, args)
+    length(args) == length(inputs(k)) || throw(MethodError(k, args))
+    k.native(k.constants, k.callables, _batch_writer_caches(k.caches, slots), args...)
+end
+_batch_write(k::_ScheduledBatchedKernel, slots, args) = _scheduled_read(k, slots, args)
+
+function (w::_IntoBatchWriter)(dst, args...)
+    leaves = _batch_leaves(dst)
+    _check_batch_leaves(leaves, (args, scalar_kernel(w.template)))
+    n = length(outputs(w.template))
+    destinations = n == 1 ? (dst,) : dst
+    destinations isa Tuple && length(destinations) == n ||
+        throw(ArgumentError("provide one destination per wanted output in reader order"))
+    # A custom copyto! may retain its source. Give it fresh scratch, as for a
+    # recursive or concurrent invocation of the same writer.
+    exclusive = all(d -> d isa _IntoDense, leaves) && !EnzymeCore.within_autodiff() &&
+        (@atomicreplace :acquire w.busy false => true).success
+    k = exclusive ? w.reader : copy(w.template)
+    try
+        slots = ntuple(i -> _BatchDestination(destinations[i], k.caches[i]), Val(length(destinations)))
+        result = _batch_write(k, slots, args)
+        _batch_publish!(dst, result)
+    catch
+        # An exception can expose an intermediate array (e.g. BoundsError).
+        exclusive && (w.reader = copy(w.template))
+        rethrow()
+    finally
+        exclusive && (@atomic :release w.busy = false)
+    end
 end

@@ -65,6 +65,31 @@ Batching requires pure recipes. Hidden mutation or state carried from one positi
 
 The [bound-regression example](bound-regression.md) develops the same input and output selection without a batch axis.
 
+## Writing into a result matrix
+
+`prepare_into(batch)` accepts the same inputs as `batch`, with the destination
+as its first argument. Here each trajectory occupies a column and each total
+occupies the last row. The two views share a matrix and address disjoint rows.
+
+```@example batching
+n, width = size(result.trajectory)
+bank = zeros(n + 1, width)
+dst = (; trajectory=view(bank, 1:n, :), total=view(bank, n + 1, :))
+write_batch! = prepare_into(batch)
+@assert write_batch!(dst, positions, schedule, 0.5) === dst
+@assert dst == result
+bank
+```
+
+Give each output leaf a writable array with the stacked result's axes. Its
+storage must be disjoint from inputs and other leaves. The writer can fill
+matching dense leaves directly. Element conversions or recipes that inspect
+a column's container can require staging. A failed call can leave partial writes.
+
+For sequential reads with kernel-owned storage, use `vectorize(...; reuse=true)`.
+After warming both a full chunk and a short tail, the reader can reuse dense
+outputs at either width. Copy any result that must survive later reads.
+
 ## Scheduling and inspecting a reader
 
 A scheduled reader computes the shared part of the graph once, then evaluates

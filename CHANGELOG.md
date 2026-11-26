@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.393
+
+- Native borrowed position readers reuse dense outputs at the two most recent
+  nonempty batch widths and reuse lane storage for ordinary numeric
+  scalar–array products. Serial readers also reuse storage for eligible
+  shared design computations, including `stack` of dense numeric vectors
+  along dimension one or two. `prepare_into(reader)` accepts caller-owned stacked
+  outputs, including disjoint views of one matrix.
+
 ## 0.1.392
 
 - Indexed JAX event reads can differentiate a subset of packed coordinates against a shared reference point.
