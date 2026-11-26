@@ -16,6 +16,13 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.268
+
+A truncated prior keeps staged `KernelBuildCache` assembly: the expansion
+inlines the library normalizer kernel, which is now reused while its binding
+and graph revision are unchanged. An edit to that kernel re-stages the
+program.
+
 ## 0.1.267
 
 A `KernelBuildCache` hit for a model whose child kernel is called with a

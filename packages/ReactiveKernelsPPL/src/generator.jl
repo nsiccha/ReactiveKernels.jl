@@ -28,6 +28,8 @@ arguments, including one inside a plate, is described by its ports alone, so
 each build splices the current child without expanding the program again.
 For a child in a lazy branch and other nested calls, each build expands the
 current program and supplies its operands to reusable assembly instructions.
+A library kernel that the program inlines, such as the normalizer of a
+truncated prior, is reused while its binding and graph revision are unchanged.
 Quoted arrays and callables
 with mutable captures use ordinary construction. The handle holds the last eligible
 assembly program. A consumer can release or evict it by dropping the handle.
@@ -217,6 +219,17 @@ end
 
 _stage_module(m) = _build_module(m) || m === LogExpFunctions
 
+struct _StagedKernel
+    binding::Some
+    revision::Any
+end
+
+# A hit requires each retained binding unchanged, and each kernel unedited.
+_staged_binding_current(key, recorded) = ReactiveKernels._global_value(key...) === recorded
+_staged_binding_current(key, recorded::_StagedKernel) =
+    ReactiveKernels._global_value(key...) === recorded.binding &&
+    kernel_revision(something(recorded.binding)) == recorded.revision
+
 # A GlobalRef to a name with no binding can contain a Julia Core.Binding
 # allocated in a closed package during the workload. Julia cannot serialize
 # that binding. Store the lookup, including an absent name, by module and name.
@@ -231,6 +244,17 @@ function _stage_global!(globals, mod, name)
             any(m -> ReactiveKernels._global_value(m, name) === binding,
                 (ReactiveKernels, DistributionKernelSources)) || return false
         globals[key] = binding
+        return true
+    end
+    if binding !== nothing && something(binding) isa KernelSpec
+        # A library kernel the expansion inlines, e.g. the normalizer of a
+        # truncated law, is code. `@kernel` binds it non-const and its graph is
+        # editable, so each hit compares both the binding and the revision the
+        # staged instructions were expanded from.
+        _stage_module(mod) &&
+            any(m -> ReactiveKernels._global_value(m, name) === binding,
+                (ReactiveKernels, @__MODULE__, DistributionKernelSources)) || return false
+        globals[key] = _StagedKernel(binding, kernel_revision(something(binding)))
         return true
     end
     if !_stage_module(mod)
@@ -313,8 +337,7 @@ function _cached_build_spec(cache, def)
     entry = lock(cache.lock) do
         entry = cache.entry
         if entry !== nothing && haskey(entry, :definition) && _same_program(entry.definition, template) &&
-                all(p -> ReactiveKernels._global_value(p.first...) === p.second,
-                    entry.globals)
+                all(p -> _staged_binding_current(p.first, p.second), entry.globals)
             return entry
         end
         # Expansion refuses e.g. a child in a lazy branch, which the splicer

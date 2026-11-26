@@ -308,6 +308,54 @@ end
     end, ((; g=[1, 2, 1], x=[1., 0., 2.], y=[0., 1., 0.5]),))
 end
 
+@testset "a truncated prior stages its library normalizer kernel" begin
+    # The normalizer is a library `@kernel` the expansion inlines. A hit
+    # requires that same binding at the revision it was expanded from.
+    source = quote
+        a ~ truncated(Normal(0, 1), lower, upper)
+        y ~ Normal(a, 1)
+    end
+    plan(data) = bind_data(lower_rkppl(source, data; mod=@__MODULE__, conditioned=(:y,)), data)
+    designs = ((; y=0.3, lower=0.2, upper=2.0), (; y=-0.4, lower=-1.0, upper=0.5))
+    cache = KernelBuildCache()
+    entry = nothing
+    for data in designs
+        p = plan(data)
+        built = build_kernel(p; cache)
+        @test haskey(cache.entry, :definition)
+        entry === nothing || @test cache.entry === entry
+        entry = cache.entry
+        staged, fresh = map(m -> prepare_query(m, p, :sampler), (built, build_kernel(p)))
+        for u in (-0.5, 0.4)
+            @test Base.invokelatest(staged, [u]) ≈ Base.invokelatest(fresh, [u])
+        end
+    end
+    # The reported case: literal bounds.
+    literal = bind_data(lower_rkppl(quote
+        a ~ truncated(Normal(0, 1), 0.2, 2.0)
+        y ~ Normal(a, 1)
+    end, (; y=0.3); mod=@__MODULE__, conditioned=(:y,)), (; y=0.3))
+    literal_cache = KernelBuildCache()
+    build_kernel(literal; cache=literal_cache)
+    @test haskey(literal_cache.entry, :definition)
+    normalizer = PPL._ppl_log_tail_difference
+    old = normalizer.ports[:mass]
+    p = plan(first(designs))
+    before = Base.invokelatest(prepare_query(build_kernel(p; cache), p, :sampler), [0.4])
+    try
+        normalizer.ports[:mass] = normalizer.ports[:a]
+        edited = build_kernel(p; cache)
+        @test cache.entry !== entry
+        actual = Base.invokelatest(prepare_query(edited, p, :sampler), [0.4])
+        @test actual ≈ Base.invokelatest(prepare_query(build_kernel(p), p, :sampler), [0.4])
+        @test actual != before
+    finally
+        normalizer.ports[:mass] = old
+    end
+    restored = build_kernel(p; cache)
+    @test Base.invokelatest(prepare_query(restored, p, :sampler), [0.4]) ≈ before
+end
+
 @testset "a data-bound LKJ shape keeps staged assembly" begin
     # The normalizing constant then calls the library's log-gamma rule.
     source = quote
