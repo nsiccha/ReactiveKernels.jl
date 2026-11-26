@@ -261,6 +261,8 @@ function rk_jax_float32(src32::JAXSource, reference, name, args; prepare::Bool =
     write(driver, _RK_JAX_FLOAT32_DRIVER)
     errors = joinpath(dir, "stderr.txt")
     cmd = `$RK_JAX_PYTHON $driver $module_path $reference_path $args_path $(String(name)) $(prepare ? "prepare" : "plain")`
+    # Start in 32-bit mode so the test observes which imported module enables x64.
+    cmd = addenv(cmd, "JAX_ENABLE_X64" => "0")
     output = try
         read(pipeline(cmd; stderr = errors), String)
     catch e
