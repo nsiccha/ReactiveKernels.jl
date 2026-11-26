@@ -48,9 +48,20 @@ prevents execution. If `select_plate_layout` has already measured this
 workload on the same device at this width, pass its returned prepared data
 to the binder. Later batches reuse the executable with new positions.
 
+For a sampler that traces a scalar log density, use the module's
+`select_plate_layout` when available. The callable from `bind_gradient`
+runs a compiled batched gradient that JAX cannot trace inside the sampler. Call
+`chosen, rows = module.select_plate_layout(prepared, make_step, chains=[n])`
+at the fit's chain count `n`. The `make_step` in `tune_gradient` below
+shows how to time a batched gradient. Pass the sampler
+`lambda q: module.log_density(q, **chosen)` so it traces the scalar
+density with the winning layout. A module with a single fixed layout can
+use the same closure over `prepared` directly.
+
 Call `gradient.calibrate(positions)` to time eligible layouts and reuse
 the fastest median for subsequent batches of that signature. Calibration
-returns per-layout timings. Make a new binding when the data or budget
+returns per-layout timings, or an empty list when the module has no layout
+selector. Make a new binding when the data or budget
 changes. The byte budget covers XLA’s reported device buffer allocation
 for the executable. Allow separate headroom for other live arrays and
 allocator overhead. A backend must supply a buffer estimate to run with a
@@ -58,15 +69,21 @@ budget.
 
 `select_plate_layout(prepared, make_step, chains=None)` runs that timing. The
 caller supplies `make_step(prepared)`, or `make_step(prepared, count)` with
-`chains`, returning a function that runs its own work once: one batched
-gradient, or one sampler step over all chains, so the sampler's memory and
-cost are measured too. Each candidate is compiled, run and timed; with
-`chains` they are compared by time per chain. A candidate the device has no
-memory for is recorded and its larger chain counts are skipped. The result is
+`chains`. The builder returns a zero-argument function for one batched
+gradient or one sampler step over all chains. Timings and memory failures
+describe the work that function runs. For a jitted gradient, budget one compilation or
+cache load per distinct candidate and chain count tried, one call to warm
+it up, and `repeats` timed calls (three by default). Gradient calibration
+does this at the width of `positions`. With `chains`, the selector compares
+layouts by time per chain. If a candidate runs out of memory, the selector
+records the failure and skips its larger chain counts. The result is
 the prepared data with the fastest layout and a report of every run.
 
 When a prepared scan can gather a producer's full table or compute just its
-requested rows, the module also emits `prepare_guarded_reads`. For example,
+requested rows, the module also emits `prepare_guarded_reads`.
+`prepare_data` starts in compact mode, using the maximum number of matching
+positions in any row as the capacity for each eligible read. If that count
+equals the full width, the compact and dense bounds coincide. For example,
 `dense = module.prepare_guarded_reads(prepared, "dense")` selects the full
 table. Pass `**dense` to the numerical function. Use `"compact"` to request
 the tiled computation. Both choices apply to every eligible read in that
