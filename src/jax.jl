@@ -10238,7 +10238,8 @@ function _jax_module_text(plans, types, constants, docstring::String, prepare;
         padded = layout === :chains ? filter(_jax_nested_rows, ragged) : ragged
         isempty(padded) || pushfirst!(mod.helpers, rstrip(_jax_pad_ragged_source(padded)))
     else
-        _jax_layout_functions!(mod, bodies, functions, constant_lines)
+        layouts = _jax_layout_functions!(mod, bodies, functions, constant_lines)
+        _jax_gradient_binding!(mod, bodies, functions, layouts)
     end
     lines = String[_jax_docstring(docstring, "")]
     header = rstrip(_jax_needs_x64(mod) ? _JAX_HEADER : replace(_JAX_HEADER, _JAX_X64_LINE => ""))

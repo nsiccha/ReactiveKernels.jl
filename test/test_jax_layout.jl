@@ -99,7 +99,7 @@ end
     @test occursin("GROUPED_PLATES = {\"totals_cell\": (\"orders_lengths\", \"weights_lengths\")}",
                    string(walk))
     @test [f.name for f in walk.functions] ==
-        ["prepare_data", "kernel", "prepare_plate_layout", "select_plate_layout"]
+        ["prepare_data", "kernel", "prepare_plate_layout", "select_plate_layout", "bind_gradient"]
     rows = jax_source(jax_layout_rows; have = (:a, :xs), want = :total, data = (:xs,),
                       plate_layout = :groups)
     # The second plate maps computed rows beside the prepared ones: both
@@ -132,6 +132,8 @@ end
             write(joinpath(dir, "rows.py"), rows)
             write(joinpath(dir, "index.py"), index)
             write(joinpath(dir, "guarded.py"), guarded)
+            binding_test = joinpath(@__DIR__, "jax_gradient_binding.py")
+            @test success(pipeline(`$RK_JAX_PYTHON $binding_test $dir`; stderr))
             script = joinpath(@__DIR__, "jax_layout.py")
             expected = (native_walk(0.6, keys, layout_orders(1), layout_weights(1)),
                         native_rows(0.6, layout_rows(1)),

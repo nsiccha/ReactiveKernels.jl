@@ -58,6 +58,26 @@ end
         query = prepare_query(built, plan, :sampler)
         u = [0.35]
         inputs = (u, jax_raw_data(plan, src)...)
+        mktempdir() do dir
+            write(joinpath(dir, "model.py"), src)
+            starts = [u, [-0.75], [1.25]]
+            values = [query(p) for p in starts]
+            slopes = [rk_fd_gradient(query, p) for p in starts]
+            args = _rk_jax_args(Any[inputs...], src)
+            script = """
+                import numpy as np
+                import model
+                $args
+                prepared = model.prepare_data(**raw_data(ARGS[1:]))
+                points = np.asarray($(_rk_py(starts)))
+                values, gradients = model.bind_gradient(model.log_density, prepared)(points)
+                np.testing.assert_allclose(values, $(_rk_py(values)), rtol=1e-11)
+                np.testing.assert_allclose(gradients, $(_rk_py(slopes)), rtol=1e-6)
+                """
+            path = joinpath(dir, "bind.py")
+            write(path, script)
+            @test success(pipeline(`$RK_JAX_PYTHON $path`; stderr))
+        end
         for walk in ("padded", "events")
             result = withenv("RK_JAX_SUBJECT_WALK" => walk) do
                 rk_jax_evaluate(src, "log_density", inputs; grad = :joint, prepare = :arguments)

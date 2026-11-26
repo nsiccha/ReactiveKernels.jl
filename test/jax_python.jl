@@ -19,7 +19,7 @@ function rk_jax_prepared_names(entries...)
     if get(task_local_storage(), :reactivekernels_jax_plate_layout_default, :padded) === :groups
         append!(names, ["prepare_plate_layout", "select_plate_layout"])
     end
-    names
+    push!(names, "bind_gradient")
 end
 
 # A ragged input (one vector per group) crosses as its padded array and
