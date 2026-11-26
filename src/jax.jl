@@ -10435,6 +10435,14 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
     meta = (INPUTS = Tuple(first(io) for io in functions[2].inputs),
             PREPARED = [n => _jax_input_metadata(T)
                         for (n, T) in zip(prepared_names, prepared_types)])
+    reads = [(name, keys[1], keys[2], parse(BigInt, keys[3]))
+             for (name, kind, keys) in bounds if kind === :match_count]
+    if !isempty(reads)
+        push!(bodies, rstrip(replace(_JAX_PREPARE_GUARDED_READS,
+            "@read_bounds@" => _jax_py_literal(Tuple(reads)))))
+        push!(functions, JAXFunction("prepare_guarded_reads",
+            Pair{String,Any}["prepared" => Dict, "mode" => String], Pair{String,Any}["prepared" => Dict]))
+    end
     plates = _jax_layout_plates(mod)
     if mod.layout === :groups
         # The plates whose layout `prepare_plate_layout` chooses, each with the
@@ -10444,12 +10452,16 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
         push!(functions, JAXFunction("prepare_plate_layout",
             Pair{String,Any}["prepared" => Dict, "groups" => Int, "sequential" => Bool],
             Pair{String,Any}["prepared" => Dict]))
-        push!(bodies, rstrip(_JAX_SELECT_PLATE_LAYOUT))
+        meta = merge(meta, (GROUPED_PLATES = Pair{String,Tuple}[name => Tuple(keys) for (name, keys) in plates],))
+    end
+    if mod.layout === :groups || !isempty(reads)
+        push!(bodies, rstrip(replace(_JAX_SELECT_PLATE_LAYOUT,
+            "@prepare_groups@" => (mod.layout === :groups ? "prepare_plate_layout" : "None"),
+            "@prepare_reads@" => (isempty(reads) ? "None" : "prepare_guarded_reads"))))
         push!(functions, JAXFunction("select_plate_layout",
             Pair{String,Any}["prepared" => Dict, "make_step" => Any, "chains" => Any,
                              "candidates" => Any, "repeats" => Int, "alternatives" => Any, "calls" => Any],
             Pair{String,Any}["prepared" => Dict, "report" => Vector{Any}]))
-        meta = merge(meta, (GROUPED_PLATES = Pair{String,Tuple}[name => Tuple(keys) for (name, keys) in plates],))
     end
     defs === nothing && return meta
     # With definitions, `DATA` describes `prepare_data`'s own parameters, and

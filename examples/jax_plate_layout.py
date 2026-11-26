@@ -39,8 +39,13 @@ def tune_sampler(modules, raw, starts, chain_counts, warmup_gradients, draws,
         return make_step
 
     grouped = modules["groups"]
-    alternatives = {name: (module.prepare_data(**raw), builder(module))
-                    for name, module in modules.items() if name != "groups"}
+    alternatives = {}
+    for name, module in modules.items():
+        if name != "groups":
+            option = (module.prepare_data(**raw), builder(module))
+            if hasattr(module, "prepare_guarded_reads"):
+                option += (module.prepare_guarded_reads,)
+            alternatives[name] = option
     def calls(count):
         return warmup_gradients + draws * gradients_per_draw / count
 

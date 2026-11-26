@@ -57,6 +57,25 @@ end
         end
         @test_throws "BoundsError" rk_jax_evaluate(src, "kernel", (0.75, [[2, 3]], [[0, 3]]);
                                                    prepare=:arguments)
+        mktempdir() do dir
+            for layout in (:groups, :padded)
+                model = jax_source(jax_requested_scan_producer; have, want=:total,
+                                   data=(:kinds, :visits), plate_layout=layout)
+                write(joinpath(dir, string(layout) * ".py"), model)
+            end
+            # This fixture is linear in a. Supply the native slope for each
+            # schedule, including a repeated read, inactive bad indices and an empty row.
+            open(joinpath(dir, "cases.py"), "w") do io
+                println(io, "cases = [")
+                for (ks, js) in (([[2, 3, 2, 3], [3], Int[]], [[99, 1, -1, 1], [1], Int[]]),
+                                 ([Int[]], [Int[]]), (tiles, indices))
+                    println(io, "    (", _rk_py(ks), ", ", _rk_py(js), ", ", native(1.0, ks, js), "),")
+                end
+                println(io, "]")
+            end
+            driver = joinpath(@__DIR__, "jax_guarded_reads.py")
+            @test success(`$RK_JAX_PYTHON $driver $dir`)
+        end
     end
 end
 

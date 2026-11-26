@@ -31,6 +31,16 @@ cost are measured too. Each candidate is compiled, run and timed; with
 `chains` they are compared by time per chain. A candidate the device has no
 memory for is recorded and its larger chain counts are skipped. The result is
 the prepared data with the fastest layout and a report of every run.
+
+When a prepared scan can gather a producer's full table or compute just its
+requested rows, the module also emits `prepare_guarded_reads`. For example,
+`dense = module.prepare_guarded_reads(prepared, "dense")` selects the full
+table. Pass `**dense` to the numerical function. Use `"compact"` to request
+the tiled computation. Both choices apply to every eligible read in that
+module and can be made again after preparing different data. The tuner times
+both when their prepared bounds differ, including on a padded export. The
+winning row's `guarded_reads` field records the mode to replay.
+
 The example also compares separately exported sampler modules in a mapping
 keyed by layout name. Supply identical raw inputs and at least as many
 starting positions as the largest batch. `tune_sampler` returns the module,

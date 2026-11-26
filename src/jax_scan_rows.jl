@@ -199,6 +199,29 @@ def _rk_scan_cell_rows(cell, args, mapped, columns, index, requested, length, ca
     return jax.tree.map(restore, empty, tiles, edge), acceptable
 """
 
+# Host-side selection for the same guarded producer. Each bound is used only
+# by _rk_scan_cell_rows. Its guard sequence is at least as wide as the scan,
+# including when the plate has been split into groups.
+const _JAX_PREPARE_GUARDED_READS = raw"""
+def prepare_guarded_reads(prepared: dict, mode: str) -> dict:
+    \"\"\"Choose how eligible guarded scan reads obtain their producer rows.
+
+    "compact" computes requested rows in tiles. "dense" gathers from the
+    producer's full table. The choice applies to all eligible sites. Call
+    the numerical functions with the result, for example kernel(x, **data).
+    \"\"\"
+    if mode not in ("compact", "dense"):
+        raise ValueError("guarded read mode must be 'compact' or 'dense'")
+    changed = {}
+    for bound, tags, lengths, target in @read_bounds@:
+        values = prepared[tags]
+        capacity = (StaticInt(np.shape(values)[-1]) if mode == "dense" else
+                    _rk_match_count(values, prepared[lengths] if lengths else None, target))
+        if capacity != prepared[bound]:
+            changed[bound] = capacity
+    return {**prepared, **changed} if changed else prepared
+"""
+
 function _jax_compact_cell_rows(ctx, inner, rows, read, guards, extent, index, guard, limit)
     cell = get(inner.scan_reads, read.table.code, nothing)
     cell === nothing && return nothing

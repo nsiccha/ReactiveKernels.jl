@@ -212,7 +212,9 @@ def select_plate_layout(prepared: dict, make_step: Any, chains: Any = None,
     single workload and a builder taking only the data. The grouped module
     tries the `(groups, sequential)` pairs in `candidates`. An optional
     `alternatives` mapping names other emitted layouts. Each value is a pair
-    `(prepared_data, builder)` for that module.
+    `(prepared_data, builder)` for that module, optionally followed by its
+    `prepare_guarded_reads` function to compare its compact and dense reads.
+    The current module tries both whenever its eligible read bounds differ.
 
     The first call warms the executable. With `calls(count)`, rank by the
     median warm time multiplied by the number of calls the fit requires at
@@ -234,34 +236,58 @@ def select_plate_layout(prepared: dict, make_step: Any, chains: Any = None,
         raise ValueError("calls(count) requires chain counts")
     if alternatives is None:
         alternatives = {}
-    if "groups" in alternatives:
-        raise ValueError("groups names the grouped module")
+    prepare_groups = @prepare_groups@
+    local_name = "groups" if prepare_groups is not None else "module"
+    if local_name in alternatives:
+        raise ValueError(f"{local_name} names the current module")
     if candidates is None:
         candidates = [(groups, sequential) for groups in (1, 2, 4, 8, 16)
                       for sequential in (False, True)]
 
+    def layouts():
+        if prepare_groups is None:
+            yield local_name, None, None, prepared, make_step, @prepare_reads@
+        else:
+            seen = set()
+            for groups, sequential in candidates:
+                chosen = prepare_groups(prepared, groups, sequential)
+                # Group sizes fix the cuts into this dataset's stable subject order.
+                key = tuple(None if layout is None else
+                            (tuple(u.size for u in layout.units), layout.sequential)
+                            for layout in chosen["_rk_plate_layout"].values())
+                if key not in seen:
+                    seen.add(key)
+                    yield local_name, groups, sequential, chosen, make_step, @prepare_reads@
+        for name, option in alternatives.items():
+            chosen, builder, selector = (*option, None) if len(option) == 2 else option
+            yield name, None, None, chosen, builder, selector
+
     def variants():
-        seen = set()
-        for groups, sequential in candidates:
-            chosen = prepare_plate_layout(prepared, groups, sequential)
-            # Group sizes fix the cuts into this dataset's stable subject order.
-            key = tuple(None if layout is None else
-                        (tuple(u.size for u in layout.units), layout.sequential)
-                        for layout in chosen["_rk_plate_layout"].values())
-            if key not in seen:
-                seen.add(key)
-                yield "groups", groups, sequential, chosen, make_step
-        for name, (chosen, builder) in alternatives.items():
-            yield name, None, None, chosen, builder
+        for name, groups, sequential, chosen, builder, selector in layouts():
+            if selector is None:
+                yield name, groups, sequential, None, chosen, builder
+            else:
+                compact = selector(chosen, "compact")
+                yield name, groups, sequential, "compact", compact, builder
+                dense = selector(compact, "dense")
+                if dense is not compact:
+                    yield name, groups, sequential, "dense", dense, builder
 
     report = []
     work = {} if calls is None else {n: float(calls(n)) for n in counts}
     if any(not np.isfinite(n) or n <= 0 for n in work.values()):
         raise ValueError("the projected number of calls must be finite and positive")
-    for name, groups, sequential, chosen, builder in variants():
+
+    def cost(row):
+        return row.get("fit_seconds", row["seconds"] / (row["chains"] or 1))
+
+    best_data, best_cost = None, float("inf")
+    for name, groups, sequential, mode, chosen, builder in variants():
         for count in counts:
             row = {"variant": name, "groups": groups, "sequential": sequential,
                    "chains": count, "seconds": float("inf"), "error": None}
+            if mode is not None:
+                row["guarded_reads"] = mode
             if calls is not None:
                 row["fit_seconds"] = float("inf")
             report.append(row)
@@ -277,20 +303,18 @@ def select_plate_layout(prepared: dict, make_step: Any, chains: Any = None,
                 row["seconds"] = min(samples) if calls is None else float(np.median(samples))
                 if calls is not None:
                     row["fit_seconds"] = row["seconds"] * work[count]
+                measured = cost(row)
+                if best_data is None or measured < best_cost:
+                    best_data, best_cost = chosen, measured
             except Exception as error:
                 if "RESOURCE_EXHAUSTED" not in str(error) and not isinstance(error, MemoryError):
                     raise
                 row["error"] = str(error)
                 break
-    report.sort(key=lambda row: row.get("fit_seconds", row["seconds"] / (row["chains"] or 1)))
+    report.sort(key=cost)
     if not report or report[0]["error"] is not None:
         raise RuntimeError("select_plate_layout: no candidate ran on this device")
-    best = report[0]
-    if best["variant"] == "groups":
-        chosen = prepare_plate_layout(prepared, best["groups"], best["sequential"])
-    else:
-        chosen = alternatives[best["variant"]][0]
-    return chosen, report
+    return best_data, report
 """
 
 # The plate arguments whose rows a group cuts to its width: each mapped ragged
