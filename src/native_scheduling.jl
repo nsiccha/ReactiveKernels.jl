@@ -191,7 +191,7 @@ struct _ScheduledBatchedKernel{Reuse,S,B,BT,PS,N}
     scalar::PreparedKernel
     prefix::Any
     workers::Vector{Any}
-    caches::NTuple{N,Base.RefValue{Any}}
+    caches::NTuple{N,_BatchOutputSlot}
     schedule::NativeScheduling
 end
 
@@ -253,7 +253,7 @@ function _position_schedule(@nospecialize(kernel::PreparedKernel), @nospecialize
     _ScheduledBatchedKernel{Reuse,Tuple(sources),analysis.positions,analysis.input_types,
                            prefix_sources,nout}(kernel, prefix,
                            _scheduled_workers(residual, schedule),
-                           _borrowed_batch_caches(nout), schedule)
+                           ntuple(_ -> _BatchOutputSlot(), nout), schedule)
 end
 
 function Base.copy(k::_ScheduledBatchedKernel{R,S,B,BT,PS,N}) where {R,S,B,BT,PS,N}
@@ -263,7 +263,7 @@ function Base.copy(k::_ScheduledBatchedKernel{R,S,B,BT,PS,N}) where {R,S,B,BT,PS
     end
     _ScheduledBatchedKernel{R,S,B,BT,PS,N}(
         k.scalar, k.prefix, workers,
-        _borrowed_batch_caches(N), k.schedule)
+        ntuple(_ -> _BatchOutputSlot(), N), k.schedule)
 end
 
 inputs(k::_ScheduledBatchedKernel) = inputs(k.scalar)
@@ -313,7 +313,8 @@ end
 
 _scheduled_output!(slot, chunk, count, args, ::Val{false}) = _scheduled_destination(chunk, count)
 function _scheduled_output!(slot, chunk, count, args, ::Val{true})
-    cache = _replicated_aliases(slot[], args) ? nothing : slot[]
+    _detach_batch_inputs!(slot, args)
+    cache = _batch_buffer!(slot, count)
     result = _scheduled_reuse(cache, chunk, count)
     slot[] = result
     result
@@ -338,7 +339,9 @@ end
 _scheduled_first_range(job::UnitRange{Int}, chunk_size) =
     first(job):min(last(job), first(job) + chunk_size - 1)
 
-function (k::_ScheduledBatchedKernel{Reuse,S,B,BT,PS,N})(args...) where {Reuse,S,B,BT,PS,N}
+(k::_ScheduledBatchedKernel)(args...) = _scheduled_read(k, nothing, args)
+function _scheduled_read(k::_ScheduledBatchedKernel{Reuse,S,B,BT,PS,N},
+                         destinations, args) where {Reuse,S,B,BT,PS,N}
     length(args) == length(inputs(k)) || throw(MethodError(k, args))
     count = _replicated_validate_axes(args, Val(B), BT)
     if iszero(count)
@@ -354,17 +357,17 @@ function (k::_ScheduledBatchedKernel{Reuse,S,B,BT,PS,N})(args...) where {Reuse,S
         # call-local workers so an image-held reader keeps no virtual pool.
         jobs = max(jobs, min(count, 2))
         workers = _scheduled_workers(first(k.workers), jobs)
-        return _run_scheduled(k, args, count, workers, jobs, max(budget, 2))
+        return _run_scheduled(k, args, count, workers, jobs, max(budget, 2), destinations)
     end
     # A reader prepared in a package image can load with more Julia threads.
     while length(k.workers) < jobs
         push!(k.workers, copy(first(k.workers)))
     end
-    _run_scheduled(k, args, count, k.workers, jobs, jobs == 1 ? 1 : budget)
+    _run_scheduled(k, args, count, k.workers, jobs, jobs == 1 ? 1 : budget, destinations)
 end
 
 function _scheduled_outputs(k::_ScheduledBatchedKernel{Reuse,S,B,BT,PS,N}, first_chunk,
-                            count, args) where {Reuse,S,B,BT,PS,N}
+                            count, args, ::Nothing) where {Reuse,S,B,BT,PS,N}
     ntuple(i -> _scheduled_output!(k.caches[i], first_chunk[i], count, args, Val(Reuse)), N)
 end
 
@@ -381,14 +384,14 @@ function _scheduled_store_job!(k, workers, index, args, shared, job, first_chunk
 end
 
 function _run_scheduled(k::_ScheduledBatchedKernel{Reuse,S,B,BT,PS,N},
-                        args, count, workers, jobs, budget) where {Reuse,S,B,BT,PS,N}
+                        args, count, workers, jobs, budget, destinations) where {Reuse,S,B,BT,PS,N}
     shared = _scheduled_shared(k, args, budget)
     chunk_size = k.schedule.chunk_size
     if budget == 1
         job = 1:count
         first_chunk = _scheduled_chunk(k, workers, 1, args, shared,
                                        _scheduled_first_range(job, chunk_size))
-        result = _scheduled_outputs(k, first_chunk, count, args)
+        result = _scheduled_outputs(k, first_chunk, count, args, destinations)
         _scheduled_store_job!(k, workers, 1, args, shared, job, first_chunk, result)
         return N == 1 ? only(result) : result
     end
@@ -404,7 +407,7 @@ function _run_scheduled(k::_ScheduledBatchedKernel{Reuse,S,B,BT,PS,N},
         Threads.@spawn firsts[index] = _scheduled_chunk(k, workers, index, args, shared,
             _scheduled_first_range(ranges[index], chunk_size))
     end
-    result = _scheduled_outputs(k, firsts[1], count, args)
+    result = _scheduled_outputs(k, firsts[1], count, args, destinations)
     @sync for index in 1:jobs
         Threads.@spawn _scheduled_store_job!(k, workers, index, args, shared,
                                              ranges[index], firsts[index], result)

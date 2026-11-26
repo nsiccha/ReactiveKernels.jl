@@ -171,7 +171,7 @@ end
     numbers = typeof((; a = 1.0, b = 2, c = (1.0, 2.0), d = (; x = 1f0)))
     holding = typeof((; a = 1.0, conc = [1.0]))
     for (T, answer) in ((Float64, false), (numbers, false), (Union{}, false),
-                        (NamedTuple{(:a,),Tuple{Real}}, false), (holding, true),
+                        (NamedTuple{(:a,),Tuple{Real}}, true), (holding, true),
                         (Vector{Float64}, true), (Tuple{Int,Vector{Int}}, true),
                         (Tuple, true), (Tuple{Int,Any}, true), (Any, true))
         @test may(T) === answer
