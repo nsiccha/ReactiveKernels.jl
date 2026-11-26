@@ -1566,7 +1566,7 @@ end
     y = [1, 3, 2, 0, 3, 1]
     src = jax_source(jax_prep; have = (:theta, :g, :y), want = :total, data = (; g, y))
     text = string(src)
-    @test [f.name for f in src.functions] == ["prepare_data", "kernel"]
+    @test [f.name for f in src.functions] == rk_jax_prepared_names("kernel")
     @test first.(src.functions[1].inputs) == ["g", "y"]
     @test first(first.(src.functions[2].inputs)) == "theta"
     # The preparation is host code with real loops; the function is JAX code.
@@ -1889,11 +1889,7 @@ end
     both = jax_source(jax_cell_order; have = (:k, :X, :Y), data = (; X, Y),
                       functions = (total = :total, per = :per))
     @test count("def cell_data", string(both)) == 1
-    names = ["prepare_data", "total", "per"]
-    if get(task_local_storage(), :reactivekernels_jax_plate_layout_default, :padded) === :groups
-        append!(names, ["prepare_plate_layout", "select_plate_layout"])
-    end
-    @test [f.name for f in both.functions] == names
+    @test [f.name for f in both.functions] == rk_jax_prepared_names("total", "per")
     # Over the group index, the gathered rows: the gather stays in the cell
     # (the host also computes it, for the recipes it feeds).
     x = [0.5, 1.0, 2.0, 3.0, 0.25]
@@ -2645,7 +2641,7 @@ register_source_provider!(jax_test_provider)
         device = jax_source(jax_generated_prep;
             have = (:theta, :x), want = :total)
         prep = jax_source(jax_generated_prep; have = (:theta, :x), want = :total, data = (; x))
-        @test [f.name for f in prep.functions] == ["prepare_data", "kernel"]
+        @test [f.name for f in prep.functions] == rk_jax_prepared_names("kernel")
         # The method is a host helper that `prepare_data` calls.
         text = string(prep)
         helper = split(split(text, "def _jax_test_first_at_np(")[2], "\n\n\n")[1]
@@ -2760,7 +2756,7 @@ end
     have = (:a, :x)
     x = reshape(collect(1.0:6.0), 2, 3)
     prep = jax_source(jax_dimension_prep; have, want = :result, data = (; x))
-    @test [f.name for f in prep.functions] == ["prepare_data", "kernel"]
+    @test [f.name for f in prep.functions] == rk_jax_prepared_names("kernel")
     try
         JAX_PROVIDER_MODE[] = :on
         provider = jax_source(jax_dimension_provider; have = (:a, :x, :reference), want = :result)

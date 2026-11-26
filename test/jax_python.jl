@@ -13,6 +13,15 @@ const RK_JAX_PYTHON = let python = get(ENV, "RK_JAX_PYTHON", "")
 end
 rk_jax_available() = !isempty(RK_JAX_PYTHON) && isfile(RK_JAX_PYTHON)
 
+# Grouped data exports add two layout entry points after the requested functions.
+function rk_jax_prepared_names(entries...)
+    names = ["prepare_data", entries...]
+    if get(task_local_storage(), :reactivekernels_jax_plate_layout_default, :padded) === :groups
+        append!(names, ["prepare_plate_layout", "select_plate_layout"])
+    end
+    names
+end
+
 # A ragged input (one vector per group) crosses as its padded array and
 # lengths, as the module's `pad_ragged` builds them. An empty row is zeros of
 # the column's element type, so an integer index column stays integer.
