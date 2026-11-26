@@ -10153,6 +10153,9 @@ function _jax_module_text(plans, types, constants, docstring::String, prepare;
     bodies = String[]
     functions = JAXFunction[]
     if prepare === nothing
+        for (_, (plan, _)) in plans
+            _jax_nested_results!(mod, plan, _jax_have_types(plan, types))
+        end
         _jax_functions!(mod, bodies, functions, plans, types; function_docs, rejecting)
     else
         data, excluded, defs, untranslated, keep, reasons, promoted, cells, cell_reasons,
@@ -10259,6 +10262,13 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
     end
     split = _jax_prepare_split(plans, ports, excluded; have_types, keep, cells, host_constants,
                                layout = mod.layout, cell_reasons = mod.cell_reasons)
+    # A host prefix can replace a group of rows with their concatenation.
+    # Remember which public results read that nested port before splitting it.
+    if any(_jax_nested_rows, Base.values(have_types))
+        for (_, (plan, _)) in plans
+            _jax_nested_results!(mod, plan, (have_types[v.name] for v in plan.have))
+        end
+    end
     for v in split.remaining
         _concrete_value_type(have_types[v.name]) || throw(ArgumentError(
             "jax_source: the HAVE value `$(v.name)` has type `$(have_types[v.name])`; pass a " *
@@ -10475,6 +10485,17 @@ function _jax_entry_text(mod, e::_JaxEntry, rejecting)
     join([body; lines[1:2]; "    return " * via * "(" * join([target; e.args], ", ") * ")"], "\n")
 end
 
+function _jax_nested_results!(mod, plan, types)
+    g = plan.graph
+    inputs = Set{ValueId}(canon_id(g, v.id) for (v, T) in zip(plan.have, types) if _jax_nested_rows(T))
+    isempty(inputs) && return
+    deps = _plate_dependencies(plan, inputs).values
+    for v in plan.want
+        id = canon_id(g, v.id)
+        isempty(get(deps, id, ())) || (mod.helper_names[(:nested_result, g, id)] = true)
+    end
+end
+
 function _jax_functions!(mod, bodies, functions, plans, types;
                          names = nothing, keyword_from = nothing,
                          function_docs = NamedTuple(), rejecting = ())
@@ -10547,7 +10568,7 @@ function _jax_functions!(mod, bodies, functions, plans, types;
                 end
                 wants = [_jax_returned(ctx, _jax_lookup(ctx, g, v); arrays = true) for v in q.want]
                 outputs[fname] = wants
-                _jax_emit!(ctx, "return " * _jax_result_code(ctx, w, wants; public_arrays = true))
+                _jax_emit!(ctx, "return " * _jax_result_code(ctx, w, wants, q; public_arrays = true))
                 ctx.scope.indent -= 1
             end
             nothing, [_jax_lookup(ctx, g, v) for v in p.want]
@@ -10751,7 +10772,7 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
             _jax_plan!(ctx, p)
             values = [_jax_returned(ctx, _jax_lookup(ctx, p.graph, v); arrays = reserve && !host)
                       for v in p.want]
-            _jax_result_code(ctx, w, values; public_arrays = reserve && !host), values
+            _jax_result_code(ctx, w, values, p; public_arrays = reserve && !host), values
         else
             emit(ctx)
         end
@@ -10798,23 +10819,29 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
     lines, JAXFunction(name, inputs, [String(v.name) => x.T for (v, x) in zip(p.want, wants)])
 end
 
-function _jax_result_code(ctx, w, wants; public_arrays)
+function _jax_result_code(ctx, w, wants, plan; public_arrays)
     w isa NamedTuple && return _jax_nested_dict(w, Iterators.Stateful(wants))
     nested = any(v -> _jax_nested_rows(v.T) || _jax_group_rows(v), values(ctx.scope.values))
-    if public_arrays && (nested || haskey(ctx.mod.helper_names, :bounded_concatenation))
-        wants = map(wants) do v
+    if public_arrays
+        wants = map(wants, plan.want) do v, output
             v.T isa Type && v.T <: AbstractVector{<:Number} && !isempty(v.extent) || return v
+            key = (:nested_result, plan.graph, canon_id(plan.graph, output.id))
+            selection = haskey(ctx.mod.helper_names, key) ? get(ctx.scope.selected_lengths, v.extent, ()) : ()
+            nested || !isempty(selection) || haskey(ctx.mod.helper_names, :bounded_concatenation) || return v
             check = _jax_helper!(ctx, "_rk_check", _JAX_CHECK)
             helper = _jax_helper!(ctx, "_rk_result_vector", """
-def _rk_result_vector(values, length):
+def _rk_result_vector(values, length, lengths=None, index=None):
     if isinstance(length, jax.core.Tracer):
-        $check(length == values.shape[0],
+        # A runtime index must select vectors of one shape in this executable.
+        valid = (jnp.all(lengths == values.shape[0]) if isinstance(index, jax.core.Tracer)
+                 else length == values.shape[0])
+        $check(valid,
                "The requested vector has a data-dependent output size under JIT. "
                "Request a named result to return its storage and logical length.")
         return values
     return values[:int(length)]
 """)
-            _PyVal(helper * "(" * v.code * ", " * v.extent * ")", v.T)
+            _PyVal(helper * "(" * join((v.code, v.extent, selection...), ", ") * ")", v.T)
         end
     end
     w isa Symbol ? only(wants).code : _jax_tuple_code(wants)

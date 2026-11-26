@@ -85,9 +85,14 @@ mixed = [[[2, 4], [], [5]], [], [[3]]]
 check_selected(selected, selected.pad_ragged(mixed), {})
 check_selected(selected_bound, (), selected_bound.prepare_data(x=mixed))
 
-values, lengths = selected.pad_ragged([[[2, 4], [1, 5]], [[9, 3], [8, 1]]])
+rectangular = [[[2, 4], [1, 5]], [[9, 3], [8, 1]]]
+values, lengths = selected.pad_ragged(rectangular)
 flat = jax.jit(selected.flat)(a, values, lengths, 1)
 np.testing.assert_allclose(flat, a * np.asarray([2, 4, 1, 5]))
+flat = jax.jit(selected_bound.flat)(a, 1, **selected_bound.prepare_data(x=rectangular))
+np.testing.assert_allclose(flat, a * np.asarray([2, 4, 1, 5]))
+fixed_group = jax.jit(lambda scale, data: selected_bound.flat(scale, 1, **data))
+np.testing.assert_allclose(fixed_group(a, selected_bound.prepare_data(x=mixed)), a * np.asarray([2, 4, 5]))
 
 first = jax.jit(jax.value_and_grad(first_row.score))
 np.testing.assert_allclose(first(a, *first_row.pad_ragged([[[]]])), (0, 0))
