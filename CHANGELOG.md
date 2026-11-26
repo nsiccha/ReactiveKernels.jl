@@ -16,6 +16,15 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.404
+
+- A guarded JAX plate cell that reads the row or entry of a shared table its
+  own index selects now gathers it before the cell's activity guard. The
+  batched gradient then adds one row per cell to the table's derivative,
+  instead of building a whole-table derivative for every cell. An active
+  cell's index past the table's last row raises a `BoundsError` instead of
+  reading a clamped row, and a plate whose shared table has no rows traces.
+
 ## 0.1.403
 
 - Prepared JAX modules can group the entries of a ragged plate by a

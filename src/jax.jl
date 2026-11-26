@@ -440,6 +440,15 @@ struct _JaxPrefixChecks
     guards::Vector{String}
 end
 
+# Row reads whose table and selector are already inputs to a padded plate
+# cell. Only a read under the cell's own activity guard can move to its entry.
+struct _JaxGuardedCellRows
+    tables::Set{_PyVal}
+    selectors::Set{String}
+    active::String
+    bindings::Vector{Pair{String,String}}
+end
+
 # One Python function body under construction. `links` maps an input of a
 # nested plan (a branch arm's, a plate cell's unmapped argument) to the
 # `(plan, value)` of the enclosing plan it is the same value as, so the
@@ -477,6 +486,7 @@ mutable struct _JaxScope
     row_width_param::String
     row_widths::Vector{Tuple{String,String}}
     scan_rows::Union{Nothing,_JaxScanRowInputs}
+    guarded_rows::Union{Nothing,_JaxGuardedCellRows}
     prefix_checks::Union{Nothing,_JaxPrefixChecks}
     # A record gather at entry to this scope, before any statements. A
     # conditional can share it if both of its arms start with the same read.
@@ -497,7 +507,7 @@ _JaxScope(parent::Union{Nothing,_JaxScope} = nothing; same_step::Bool = false) =
               Set{Symbol}(), Dict{ValueId,_JaxPlateCell}(),
               same_step ? parent.scan_reads : Dict{String,_JaxPlateCell}(),
               "", Tuple{String,String}[],
-              same_step ? parent.scan_rows : nothing, nothing, nothing, nothing, false)
+              same_step ? parent.scan_rows : nothing, nothing, nothing, nothing, nothing, false)
 # The `flat_positions` entry of the lengths of cells that each fill their stored
 # rows: a plate's cells returning vectors whose length the cell's own expression
 # fixes (`vcat(a, b)` of scalars), or matrices of a fixed shape. Every stored
@@ -1572,13 +1582,42 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
             return _PyVal(_py_atom(x.code) * "[" * join(parts, ", ") * "]", T, false, x.extent,
                           "", axes)
         end
-        return _PyVal(_py_atom(x.code) * "[" * join(parts, ", ") * "]", T, false, gather.extent)
+        return _jax_gather_result(ctx, x, parts, T, values, kept; target)
     end
     v = _jax_gather_result(ctx, x, parts, T, values, kept; target)
     # An entry of a prepared integer array keeps where it comes from, so a
     # loop over a range it ends has a static number of steps.
     kept == 0 && !target ? _jax_with_origin(v, _jax_selected_origin(x, T, join(parts, ", "))) : v
 end
+# Gather the requested row (and its length, for ragged storage) before the
+# batched conditional. The gather fills inactive indices without reading a
+# table entry. Report an invalid active read at its original program point.
+function _jax_guarded_cell_row(ctx, x, indices; target)
+    rows = ctx.scope.guarded_rows
+    (rows === nothing || target || !(x in rows.tables) || length(indices) != 1) && return nothing
+    i = only(indices)
+    (i === nothing || !(i.code in rows.selectors)) && return nothing
+    (isempty(_JAX_GUARDS) || last(_JAX_GUARDS) != (ctx.scope, rows.active)) && return nothing
+    lengths = _jax_ragged(x.T) && !_jax_outer_rows(x) ? _jax_row_lengths(x) : ""
+    table = isempty(lengths) ? x.code : "(" * x.code * ", " * lengths * ")"
+    count = _jax_group_rows(x) ? x.field_extents[1] :
+            isempty(lengths) && !isempty(x.extent) ? x.extent : x.code * ".shape[0]"
+    gather = _jax_helper!(ctx, "_rk_scan_rows", _JAX_SCAN_ROWS)
+    call = gather * "(" * join((table, i.code, rows.active, count), ", ") * ")"
+    binding = findfirst(p -> last(p) == call, rows.bindings)
+    name = if binding === nothing
+        name = _jax_fresh(ctx, :selected_row)
+        push!(rows.bindings, name => call)
+        name
+    else
+        first(rows.bindings[binding])
+    end
+    message = _jax_group_rows(x) ? "BoundsError: row index exceeds the number of rows in the group" :
+                                   "BoundsError: index outside shared plate input"
+    _jax_masked_check(ctx, _PyVal(name * "[1]", Bool), repr(message))
+    isempty(lengths) ? (name * "[0]", "") : (name * "[0][0]", name * "[0][1]")
+end
+
 function _jax_ragged_index(ctx, x, parts, T, values, kept; target)
     index = join(parts, ", ")
     select(s) = _py_atom(s) * "[" * index * "]"
@@ -1593,7 +1632,10 @@ function _jax_ragged_index(ctx, x, parts, T, values, kept; target)
     end
     rows = _jax_row_lengths(x)
     extent = select(rows)
-    if _jax_group_rows(x) && length(values) == 1 && only(values) !== nothing
+    selected = _jax_guarded_cell_row(ctx, x, values; target)
+    if selected !== nothing
+        code, extent = selected
+    elseif _jax_group_rows(x) && length(values) == 1 && only(values) !== nothing
         i = only(values)
         valid = "((" * i.code * " >= 1) & (" * i.code * " <= " * x.field_extents[1] * "))"
         isempty(i.extent) || (valid = "jnp.logical_or(~" * _jax_mask(i) * ", " * valid * ")")
@@ -1623,17 +1665,23 @@ function _jax_gather_result(ctx::_JaxContext, x::_PyVal, parts, T, values, kept:
     source = _py_atom(x.code)
     code = source * "[" * join(parts, ", ") * "]"
     target && return _PyVal(code, T)
+    selected = _jax_guarded_cell_row(ctx, x, values; target)
+    selected === nothing || return _PyVal(first(selected), T)
     array_index(v) = v !== nothing && _jax_is_array(v.T)
     k = findfirst(v -> array_index(v) && !isempty(v.extent), values)
     k === nothing && return _PyVal(code, T)
     extent = values[k].extent
-    kept == 1 && return _PyVal(code, T, false, extent)
+    # An empty selected row can be indexed by a padded vector inside the
+    # cell. Even an untaken cond arm must have a traceable result shape.
+    vector_read = length(parts) == 1 && ctx.scope.guarded_rows !== nothing &&
+                  x.T <: AbstractVector{<:Number}
+    kept == 1 && !vector_read && return _PyVal(code, T, false, extent)
     k == 1 && count(array_index, values) == 1 ||
         _jax_error("a non-leading padded index or multiple array indices ",
                    "beside another kept dimension have no JAX translation", _jax_where(ctx))
     # Raw padded storage can have a positive capacity even if every group is
     # empty. In that case there is no source row to read for a padding slot.
-    empty_shape = source * "[:0, " * join(parts[2:end], ", ") * "].shape[1:]"
+    empty_shape = vector_read ? "()" : source * "[:0, " * join(parts[2:end], ", ") * "].shape[1:]"
     width = _py_atom(values[k].code) * ".shape[0]"
     empty_rows = function()
         _jax_call(ctx, _runtime_check, [_PyVal(extent * " == 0", Bool),
@@ -8731,7 +8779,8 @@ function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
                              origins = fill(nothing, length(p.have)),
                              fields = fill(0, length(p.have)),
                              group_rows = fill(false, length(p.have)),
-                             active_cells::Bool = false, row_widths::Bool = false, event_inputs = nothing,
+                             active_cells::Bool = false, guarded_axes = nothing,
+                             row_widths::Bool = false, event_inputs = nothing,
                              record_axes = nothing, prefix = nothing)
     name = _jax_fresh(ctx, hint)
     outer = ctx.scope
@@ -8761,6 +8810,21 @@ function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
     end
     active = active_cells ? _jax_identifier(inner.used, :active_cell) : ""
     active_cells && push!(names, active)
+    if guarded_axes !== nothing
+        tables = Set{_PyVal}()
+        selectors = Set{String}()
+        for (port, mapped) in zip(p.have, guarded_axes)
+            v = inner.values[canon_id(p.graph, port.id)]
+            v.T isa Type || continue
+            if mapped && v.T <: Integer && v.T !== Bool
+                push!(selectors, v.code)
+            elseif !mapped && !v.static && !_jax_slots(v) &&
+                   v.T <: Union{AbstractVector{<:AbstractFloat},AbstractVector{<:AbstractVector{<:AbstractFloat}}}
+                push!(tables, v)
+            end
+        end
+        inner.guarded_rows = _JaxGuardedCellRows(tables, selectors, active, Pair{String,String}[])
+    end
     tables = event_inputs === nothing ? nothing : _jax_chain_step_tables!(inner, p, event_inputs)
     effects = _JAX_EFFECTS[]
     recipe = ctx.recipe
@@ -8794,7 +8858,8 @@ function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
     # activity flag, and only a cell that reads a row takes them.
     isempty(inner.row_widths) ||
         insert!(names, length(names) + (active_cells ? 0 : 1), inner.row_width_param)
-    push!(outer.lines, "    "^outer.indent * "def " * name * "(" * join(names, ", ") * "):")
+    params = inner.guarded_rows === nothing ? names : vcat(names, first.(inner.guarded_rows.bindings))
+    push!(outer.lines, "    "^outer.indent * "def " * name * "(" * join(params, ", ") * "):")
     append!(outer.lines, inner.lines)
     push!(outer.lines, "    "^inner.indent * "return " * (length(returned) == 1 ?
         returned[1] : "(" * join(returned, ", ") * ")"))
@@ -8946,6 +9011,8 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
                        for (i, v) in enumerate(inputs)]
     masks = [_jax_padded_mask(v) for v in axis_inputs[padded]]
     masked = any(padded) && all(m -> m !== nothing, masks)
+    guard_each_cell = masked && (any(v -> v.origin isa _JaxDenseRows, inputs[padded]) ||
+                                 any(v -> _jax_group_rows(v) || _jax_nested_rows(v.T), inputs))
     effects_before = _JAX_EFFECTS[]
     cell, wants, with_length, cell_params, cell_scope = _jax_plan_function!(ctx, _jax_body_hint(ctx, recipe, :cell), body, cell_types;
                                                                 extents = cell_extents,
@@ -8957,15 +9024,15 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
                                                                               _jax_group_rows(v)
                                                                               for (i, v) in enumerate(inputs)],
                                                                 active_cells = masked,
+                                                                guarded_axes = guard_each_cell && ctx.mod.layout !== :chains ? mapped : nothing,
                                                                 prefix = prefix_guards === nothing ? nothing :
                                                                     (inputs, mapped, prefix_guards),
                                                                 record_axes = R == 1 && ctx.mod.layout === :padded ?
                                                                     _jax_record_axes(ctx, body, inputs, mapped) : nothing,
                                                                 row_widths = R == 1 && _jax_plate_layout() === :groups)
-    guard_each_cell = masked && (any(v -> v.origin isa _JaxDenseRows, inputs[padded]) ||
-                                 any(v -> _jax_group_rows(v) || _jax_nested_rows(v.T), inputs))
     if guard_each_cell
-        cell = _jax_slots_active_cell(ctx, cell, cell_params)
+        bindings = cell_scope.guarded_rows === nothing ? () : cell_scope.guarded_rows.bindings
+        cell = _jax_slots_active_cell(ctx, cell, cell_params, bindings)
     end
     # A check cannot be run on padding unless its valid cells are known.
     # Pure cells without checks retain their existing translation.

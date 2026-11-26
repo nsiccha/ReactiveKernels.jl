@@ -241,6 +241,7 @@ const _MATRIX_CORE_TESTS = (
     "test_jax_padded_broadcasts.jl",
     "test_jax_masks.jl",
     "test_jax_padded_ranges.jl",
+    "test_jax_guarded_rows.jl",
     "test_js_source.jl",
     "test_js_run.jl",
     "test_js_iterators.jl",
