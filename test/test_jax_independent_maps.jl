@@ -70,4 +70,50 @@ end
         end
     end
 end
+@traceable function copy_corner(x, a)
+    out = fill(a, size(x, 1), size(x, 2))
+    for i in 1:size(x, 1)
+        for j in 1:2
+            out[i, j] = x[i, j]
+        end
+    end
+    for i in 1:min(size(x, 1), size(x, 2))
+        out[i, i] = 2.0
+    end
+    out
+end
+
+@kernel function corner_model(a::Float64, x::Matrix{Float64})
+    out = copy_corner(x .* a, a)
+    total = sum(out)
+    return total
+end
+
+@kernel function guarded_corner(a::Float64, x::Matrix{Float64})
+    total = a > 0 ? sum(copy_corner(x .* a, a)) : a
+    return total
+end
+
+@testset "Aligned matrix stores preserve order, bounds, and gradients" begin
+    have = (:a, :x)
+    src = jax_source(corner_model; have, want = :total)
+    @test occursin("BoundsError: block exceeds array dimensions", string(src))
+    @test occursin(".at[:", string(src))
+    x = [1.0 4.0 7.0; 0.5 2.0 -0.5]
+    native = prepare(corner_model; have, want = :total)
+    @test_throws BoundsError native(0.7, zeros(2, 1))
+    if rk_jax_available()
+        probe = rk_jax_evaluate(src, :kernel, (0.7, x); grad = true)
+        @test probe.value ≈ native(0.7, x)
+        @test probe.grad ≈ native(1.0, x) - native(0.0, x)
+        @test_throws "BoundsError: block exceeds array dimensions" rk_jax_evaluate(
+            src, :kernel, (0.7, zeros(2, 1)))
+        skipped = jax_source(guarded_corner; have, want = :total)
+        inactive = rk_jax_evaluate(skipped, :kernel, (-0.7, zeros(2, 1)); grad = true)
+        @test inactive.value == -0.7
+        @test inactive.grad == 1.0
+    end
+    @test native(0.7, zeros(0, 1)) == 0.0
+end
+
 end
