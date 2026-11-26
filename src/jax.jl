@@ -8678,8 +8678,8 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     length(ranks) == 1 || _jax_error("a plate over arrays of different ranks (",
         join(string.(ranks), ", "), ") has no JAX translation yet", _jax_where(ctx))
     R = only(ranks)
-    if ctx.mod.layout === :chains && R == 1
-        result = _jax_chain_scan_plate(ctx, p, recipe, body, inputs, mapped)
+    if R == 1
+        result = _jax_compact_plate(ctx, p, recipe, body, inputs, mapped)
         result === nothing || return result
     end
     # Arguments whose cell value is padded: a ragged array's rows, and the
@@ -8904,6 +8904,13 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
         end
         prefix, tail = get(cell_scope.prefixed_extents, extent, (0, extent))
         parts = get(ctx.mod.helper_names, (:broadcast_length, tail), nothing)
+        if ctx.mod.layout === :padded && prefix == 0
+            keys = _jax_row_length_keys(ctx, something(parts, [tail]), cell_scope, cell_params, args, axes)
+            if keys !== nothing
+                key = parts === nothing ? something(outer(extent), lengths) : lengths
+                ctx.mod.helper_names[(:row_sources, ctx.scope, key)] = keys
+            end
+        end
         if parts !== nothing
             total = _jax_broadcast_total!(ctx, parts, cell_scope, cell_params, args, axes)
             total === nothing || (ctx.scope.flat_positions[lengths] = _JaxFlatRows(total, prefix))
@@ -8989,7 +8996,7 @@ end
 # lengths. An iterated row takes the lengths directly. A shared collection
 # indexed by an iterated prepared integer takes the selected rows, including
 # repeats. A length that depends on a numerical cell result cannot be prepared.
-function _jax_broadcast_total!(ctx, parts, cell_scope, params, args, axes; kind = :broadcast_total)
+function _jax_row_length_keys(ctx, parts, cell_scope, params, args, axes)
     keys = String[]
     for part in parts
         source, selector = get(cell_scope.selected_lengths, part, (part, ""))
@@ -9008,7 +9015,11 @@ function _jax_broadcast_total!(ctx, parts, cell_scope, params, args, axes; kind 
             push!(keys, lengths, indices)
         end
     end
-    _jax_prepared_bound!(ctx, kind, keys...)
+    keys
+end
+function _jax_broadcast_total!(ctx, parts, cell_scope, params, args, axes; kind = :broadcast_total)
+    keys = _jax_row_length_keys(ctx, parts, cell_scope, params, args, axes)
+    keys === nothing ? nothing : _jax_prepared_bound!(ctx, kind, keys...)
 end
 # The stored array whose leading axes are a mapped plate argument's: the
 # argument itself, or, for a vector of tuples (a Python tuple of stacked
@@ -10155,8 +10166,19 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
     # A plate can return several fields, only some of which a caller flattens.
     # Prepare a broadcast size only when an emitted function actually reads it.
     used_inputs = Set(name for f in functions[prepare_function+1:end] for (name, _) in f.inputs)
-    bounds = filter(b -> b[2] ∉ (:broadcast_total, :scan_rows, :row_layout, :sign_groups) || b[1] in used_inputs,
-                    _jax_prepared_bounds(mod))
+    all_bounds = _jax_prepared_bounds(mod)
+    # A compact map's schedule can use row layouts that only the host reads.
+    dependencies = Dict(name => keys for (name, _, keys) in all_bounds)
+    pending = collect(used_inputs)
+    while !isempty(pending)
+        for key in get(dependencies, pop!(pending), ())
+            key in used_inputs && continue
+            push!(used_inputs, key)
+            push!(pending, key)
+        end
+    end
+    bounds = filter(b -> b[2] ∉ (:broadcast_total, :scan_rows, :row_layout, :sign_groups, :padded_map_rows) ||
+                         b[1] in used_inputs, all_bounds)
     if !isempty(bounds)
         bodies[prepare_body] = join(_jax_prepare_bounds_lines(mod, prepare_lines, bounds), "\n")
         f = functions[prepare_function]
@@ -10451,6 +10473,9 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
                     (push!(scope.used, flat_key); flat_key)
                 push!(params, flat); push!(inputs, flat_key => Vector{Int}); push!(input_locals, flat)
                 scope.flat_positions[extent] = _JaxFlatRows(flat * ".shape[0]", 0)
+                if keyed && mod.layout === :padded && T <: AbstractVector{<:AbstractVector{<:Number}}
+                    mod.helper_names[(:ragged_port, scope, param)] = key
+                end
                 keyed && (scope.prepared_keys[extent] = extent_key)
             end
         end
@@ -10524,7 +10549,7 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
             for (bn, kind, _) in _jax_prepared_bounds(mod)
                 occursin(Regex("\\b" * bn * "\\b"), body) || continue
                 push!(inputs, bn => _jax_prepared_aux_type(kind)); push!(input_locals, bn)
-                kind in (:row_layout, :map_rows, :scan_rows) && push!(schedules, bn)
+                kind in (:row_layout, :map_rows, :padded_map_rows, :scan_rows) && push!(schedules, bn)
             end
             for ((pn, _), local_name) in zip(inputs[keyword_from+1:end], input_locals[keyword_from+1:end])
                 value = "prepared[\"" * pn * "\"]"
