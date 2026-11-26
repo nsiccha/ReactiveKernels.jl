@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 
 sys.path.insert(0, sys.argv[1])
+import guarded
 import index
 import rows
 import walk
@@ -23,6 +24,12 @@ def walk_data(scale=1, lengths=LENGTHS):
     weights = [np.array([0.1 * t - 0.05 * i for t in range(1, scale * ((n + i) % 4) + 1)])
                for i, n in units]
     return walk.prepare_data(keys=keys, orders=orders, weights=weights)
+
+
+def guarded_data(scale=1, lengths=LENGTHS):
+    orders = [np.array([1 + (i + t) % 2 for t in range(1, scale * n + 1)], dtype=np.int64)
+              for i, n in enumerate(lengths, start=1)]
+    return guarded.prepare_data(keys=keys, orders=orders)
 
 
 def rows_data(scale=1, lengths=LENGTHS):
@@ -50,7 +57,8 @@ assert walk.GROUPED_PLATES == {"totals_cell": ("orders_lengths", "weights_length
 assert index.GROUPED_PLATES == {"sums_cell": (("xs_lengths", "units"),)}
 for module, data, expected in ((walk, walk_data(), float(sys.argv[2])),
                                (rows, rows_data(), float(sys.argv[3])),
-                               (index, index_data(), float(sys.argv[4]))):
+                               (index, index_data(), float(sys.argv[4])),
+                               (guarded, guarded_data(), float(sys.argv[5]))):
     assert "_rk_plate_layout" not in data
     values, gradients = batched(module, data)(positions)
     # Native Julia's value at the first position.
@@ -85,7 +93,7 @@ for module, data, expected in ((walk, walk_data(), float(sys.argv[2])),
 # No units, and units that are all empty.
 for lengths in ([], [0, 0, 0]):
     for module, data in ((walk, walk_data(1, lengths)), (rows, rows_data(1, lengths)),
-                         (index, index_data(1, lengths))):
+                         (index, index_data(1, lengths)), (guarded, guarded_data(1, lengths))):
         values, gradients = batched(module, data)(positions)
         for groups, sequential in ((3, False), (3, True)):
             v, g = batched(module, module.prepare_plate_layout(data, groups, sequential))(positions)
@@ -111,7 +119,8 @@ def traced(module, data, groups):
     return loops(jax.make_jaxpr(lambda a: module.kernel(a, **chosen))(0.6))
 
 
-for module, make in ((walk, walk_data), (rows, rows_data), (index, index_data)):
+for module, make in ((walk, walk_data), (rows, rows_data), (index, index_data),
+                     (guarded, guarded_data)):
     short, long = make(1), make(5)
     assert traced(module, short, 1) == traced(module, long, 1) == 1
     assert traced(module, short, 3) == traced(module, long, 3) == 3

@@ -54,6 +54,24 @@ end
     total
 end
 
+# A step whose record read only one arm makes (passed to the scan as a
+# scanned input) in a plate that takes a layout: the scanned rows are cut to
+# each group's width with the events they belong to.
+@kernel jax_layout_guarded(a::Float64, keys::Vector{Float64}, orders::Vector{Vector{Int}}) = begin
+    entries = plate(keys) do key
+        (key, a * key)
+    end
+    totals = plate(orders, Ref(entries)) do order, table
+        path = scan(order, Ref(table); init = 0.0) do state, index, rows
+            next = index > 1 ? 0.5 * state + rows[index][2] : state + a
+            (next, next)
+        end
+        sum(path)
+    end
+    total = sum(totals)
+    total
+end
+
 # The data of `jax_layout.py`, by the same formulas.
 const LENGTHS = [3, 1, 0, 7, 40, 2, 2, 0, 11, 5]
 # Units that repeat rows, skip some, and are not in the rows' order.
@@ -97,16 +115,21 @@ layout_rows(scale) = [[0.3 * sin(i + t) for t in 1:scale*n] for (i, n) in enumer
         native_walk = prepare(jax_layout_walk; have, want = :total)
         native_rows = prepare(jax_layout_rows; have = (:a, :xs), want = :total)
         native_index = prepare(jax_layout_index; have = (:a, :units, :xs), want = :total)
+        native_guarded = prepare(jax_layout_guarded; have = (:a, :keys, :orders), want = :total)
+        guarded = jax_source(jax_layout_guarded; have = (:a, :keys, :orders), want = :total,
+                             data = (:keys, :orders), plate_layout = :groups)
         keys = [0.25, -0.5]
         mktempdir() do dir
             write(joinpath(dir, "walk.py"), walk)
             write(joinpath(dir, "rows.py"), rows)
             write(joinpath(dir, "index.py"), index)
+            write(joinpath(dir, "guarded.py"), guarded)
             script = joinpath(@__DIR__, "jax_layout.py")
             expected = (native_walk(0.6, keys, layout_orders(1), layout_weights(1)),
                         native_rows(0.6, layout_rows(1)),
-                        native_index(0.6, LAYOUT_UNITS, layout_rows(1)))
-            @test success(`$RK_JAX_PYTHON $script $dir $(expected[1]) $(expected[2]) $(expected[3])`)
+                        native_index(0.6, LAYOUT_UNITS, layout_rows(1)),
+                        native_guarded(0.6, keys, layout_orders(1)))
+            @test success(`$RK_JAX_PYTHON $script $dir $(expected[1]) $(expected[2]) $(expected[3]) $(expected[4])`)
         end
     else
         @test_skip false
