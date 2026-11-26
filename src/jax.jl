@@ -9027,7 +9027,7 @@ end
 
 # Empty mapped axes retain their dimensions without tracing a cell that may
 # index empty shared storage. Recursion is over the fixed record schema only.
-function _jax_empty_record(v::_PyVal, shape::String; lengths::Bool = false)
+function _jax_empty_record(v::_PyVal, shape::AbstractString; lengths::Bool = false)
     lengths && isempty(v.extent) && return "None"
     T = v.T
     if _jax_is_tuple(T)
