@@ -44,6 +44,8 @@ end
     source(rows, offsets) = jax_source(ragged_scales; want = :total, data = (; rows, offsets))
     prepared = source(first(cases)...)
     raw = jax_source(ragged_scales; want = :total)
+    grouped = jax_source(ragged_scales; want = :total, data = (:rows, :offsets), plate_layout = :groups)
+    packed = jax_source(ragged_scales; want = :total, data = (:rows, :offsets), plate_layout = :chains)
     a = 1.7
     for (rows, offsets) in cases
         @test source(rows, offsets).text == prepared.text
@@ -51,8 +53,12 @@ end
         # On a real entry a/scale is independent of a, and d(log(scale))/da = 1/a.
         grad = sum(length, rows) / a
         if rk_jax_available()
-            for (src, mode) in ((raw, false), (prepared, :arguments))
-                got = rk_jax_evaluate(src, :kernel, (a, rows, offsets); grad = :joint, prepare = mode)
+            for (src, mode) in ((raw, false), (prepared, :arguments),
+                                (grouped, :arguments), (packed, :arguments))
+                groups = src === grouped ? "2" : get(ENV, "RK_JAX_PLATE_GROUPS", nothing)
+                got = withenv("RK_JAX_PLATE_GROUPS" => groups) do
+                    rk_jax_evaluate(src, :kernel, (a, rows, offsets); grad = :joint, prepare = mode)
+                end
                 @test got.joint_value ≈ value
                 @test got.grad ≈ grad
             end
@@ -83,11 +89,12 @@ end
                 (Float64[], [Int[], Int[]]),
                 (Float64[], Vector{Int}[]))
     srcs = [jax_source(ragged_gather; want = :total, data = (; rows)) for (_, rows) in datasets]
+    chain = jax_source(ragged_gather; want = :total, data = (:rows,), plate_layout = :chains)
     @test all(s -> s.text == first(srcs).text, srcs)
     native = prepare(ragged_gather; want = :total)
     if rk_jax_available()
-        for (x, rows) in datasets
-            result = rk_jax_evaluate(first(srcs), :kernel, (x, rows);
+        for src in (first(srcs), chain), (x, rows) in datasets
+            result = rk_jax_evaluate(src, :kernel, (x, rows);
                                      grad = true, prepare = :arguments)
             @test result.value ≈ native(x, rows)
             @test result.grad ≈ Float64[sum(count(==(i), row) for row in rows; init = 0)
@@ -98,6 +105,11 @@ end
         @test_throws BoundsError native(Float64[], [[1]])
         @test_throws ErrorException rk_jax_evaluate(first(srcs), :kernel,
             (Float64[], [[1]]); prepare = :arguments)
+        for (values, indices) in ((Float64[], [[1]]), ([1.0, 2.0], [[2], [3,1]]),
+                                  ([1.0], [Int[], [0]]))
+            @test_throws BoundsError native(values, indices)
+            @test_throws "BoundsError" rk_jax_evaluate(chain, :kernel, (values, indices); prepare = :arguments)
+        end
     else
         @test_skip "RK_JAX_PYTHON not set"
     end

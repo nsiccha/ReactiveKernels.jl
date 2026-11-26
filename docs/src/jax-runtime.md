@@ -81,6 +81,8 @@ distinct entry it requests once, so many rows that read one shared factor
 compute it once, and an entry it does not request is never computed. The
 derivative of a selected read keeps only the selected rows' residuals.
 
+For ragged event schedules, [JAX plate layouts](jax-plate-layouts.md) describes how to group subjects and time batched gradients on the target device.
+
 ## Chains under `vmap`
 
 When a run-time branch calls the matrix exponential on a traced matrix, the

@@ -16,6 +16,12 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.265
+
+- Model export forwards the chosen ragged plate layout to the JAX emitter.
+  A grouped export provides prepared layouts and device timing for the caller's
+  own step at its candidate batch widths.
+
 ## 0.1.264
 
 - Partitioned JAX modules export `prepare_unit_coordinates` and
