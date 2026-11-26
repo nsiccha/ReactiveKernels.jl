@@ -9262,14 +9262,14 @@ Base.@nospecializeinfer function _bind_data_latest(input_plan::StructuralPlan,
         _materialize_module_data!(plan, columns; already = computed,
             frozen = frozen.values)
     maps = _eval_levelmaps(plan.levelmaps, columns)
-    # Snapshot the contents for interning without putting collection lengths in key types.
-    map_key = map(m -> (m.predictor, m.column, copy(m.values), m.source, m.subset), maps)
-    maps = _interned(plan, (:levelmaps, map_key), maps)
+    map_key = map(m -> (m.predictor, m.column, _sequence_id(plan, :level_values, m.values),
+        m.source, m.subset), maps)
+    maps = _interned(plan, :levelmaps, map_key, maps)
     responses2, vectors2 =
         _infer_leveled_sizes(plan.responses, plan.vector_parameters, columns,
             plan.predictors, _with(plan; columns = columns, n_obs = n))
-    responses2 = _interned(plan, (:responses, copy(responses2)), responses2)
-    vectors2 = _interned(plan, (:vector_parameters, copy(vectors2)), vectors2)
+    responses2 = _interned(plan, :responses, responses2)
+    vectors2 = _interned(plan, :vector_parameters, vectors2)
     bound = _with(plan; responses = responses2, columns = columns,
         n_obs = n, roles = merged, levelmaps = maps,
         vector_parameters = vectors2, frozen = frozen)
