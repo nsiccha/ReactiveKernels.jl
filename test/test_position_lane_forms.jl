@@ -157,6 +157,7 @@ _callee(ex::Expr) = ex.head === :call ?
     (f = ex.args[1]; f isa GlobalRef ? f.name : f) : nothing
 # The innermost `for` loop around each call of `name` (`nothing` outside any).
 function enclosing_loops(ex, name, loop = nothing, found = Any[])
+    ex isa ReactiveKernels._PlateProgram && return enclosing_loops(ex.ast, name, nothing, found)
     ex isa Expr || return found
     _callee(ex) === name && push!(found, loop)
     for (k, arg) in enumerate(ex.args)

@@ -5726,10 +5726,10 @@ end
 # `ast` with each marked plate block (`_PlateBlock`) a call of its own
 # `_PlateProgram`, or its statements inline where it rebinds a name the rest of
 # the body binds.
-function _extract_plate_programs(ast::Expr)
+function _extract_plate_programs(ast::Expr, captures = (); inline_single::Bool = false)
     ast.head in (:function, :->) && length(ast.args) == 2 &&
         ast.args[1] isa Expr && ast.args[1].head === :tuple || return ast
-    parameters = Set{Symbol}()
+    parameters = Set{Symbol}(captures)
     for arg in ast.args[1].args
         name = _program_parameter(arg)
         name === nothing || push!(parameters, name)
@@ -5808,7 +5808,9 @@ function _extract_plate_programs(ast::Expr)
         get(replacements, node) do
             Expr(node.head, Any[replace_blocks(arg) for arg in node.args]...)
         end : node
-    Expr(ast.head, ast.args[1], replace_blocks(ast.args[2]))
+    extracted = Expr(ast.head, ast.args[1], replace_blocks(ast.args[2]))
+    inline_single && single_plate ?
+        _inline_plate_programs(extracted; expand = _inline_native_plate_program) : extracted
 end
 
 # Mutually exclusive versions of one plate do not add a second plate to a
@@ -6641,9 +6643,9 @@ function _lower_with_ops_collecting(p::Plan;
                     input_type_hints = hints)
             else
                 # A plate program of its own (`_extract_plate_programs`) where
-                # the body is compiled whole and keeps no cell tables.
-                own_program = plate_programs && cells === nothing &&
-                    get(task_local_storage(), _CELL_TABLES, nothing) === nothing
+                # the body is compiled whole. A position residual passes any
+                # cell scratch the plate reads as arguments of that program.
+                own_program = plate_programs && cells === nothing
                 plate_body = own_program ? Expr(:block) : body
                 readonly_slices = Set{Int}()
                 if exemplar_types !== nothing && _readonly_slice_candidate(r)
@@ -7458,9 +7460,18 @@ end
 # (`log(s)` per position of a shared `s = exp(a)`) is computed as written.
 function _replicated_part_ast(part::Plan; recycle = Pair{ValueId,Symbol}[],
                               cell_slots = nothing, cell_tables = nothing)
+    residual = cell_tables !== nothing
     ast, constants, callables, recipes = _lower_with_ops(_lowering_plan(part);
-        declare = true, recycle, cell_slots, cell_tables)
+        declare = true, recycle, cell_slots, cell_tables, plate_programs = residual)
     _simplify() && (ast = _stable_rewrites(ast, recipes))
+    if residual
+        # The position driver binds these scratch slots outside the residual.
+        # Each extracted plate takes the ones it reads as ordinary arguments.
+        # Expand a lone plate here, while its results still have the residual's
+        # names. Embedding then renames its assignments and their uses together.
+        ast = _extract_plate_programs(ast, Iterators.flatten((cell_slots, cell_tables));
+                                      inline_single = true)
+    end
     ast, constants, callables, recipes
 end
 
