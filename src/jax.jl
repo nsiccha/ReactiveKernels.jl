@@ -406,9 +406,11 @@ struct _JaxScanRowInputs
     tables::Set{String}
     sequences::Dict{String,_PyVal}
     reads::Vector{_JaxScanRowRead}
+    padded::Bool
     direct_bounds::Union{Nothing,Vector{Tuple{String,String,String}}}
 end
-_JaxScanRowInputs(tables, sequences, reads) = _JaxScanRowInputs(tables, sequences, reads, nothing)
+_JaxScanRowInputs(tables, sequences, reads; padded = false, direct_bounds = nothing) =
+    _JaxScanRowInputs(tables, sequences, reads, padded, direct_bounds)
 
 # One Python function body under construction. `links` maps an input of a
 # nested plan (a branch arm's, a plate cell's unmapped argument) to the
@@ -1347,7 +1349,8 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
     _jax_slots(x) && return _jax_slots_index(ctx, x, indices)
     if !target && length(indices) == 1 && (haskey(ctx.scope.scan_reads, x.code) ||
        (ctx.scope.scan_rows !== nothing && x.code in ctx.scope.scan_rows.tables &&
-        only(indices) isa Union{Symbol,_PyVal} && !isempty(_JAX_GUARDS))) &&
+        only(indices) isa Union{Symbol,_PyVal} &&
+        (ctx.scope.scan_rows.padded || !isempty(_JAX_GUARDS)))) &&
        !_jax_written_slice(only(indices))
         i = _jax_bound_expr(ctx, x, 1, only(indices))
         read = _jax_scan_plate_read(ctx, x, i)
@@ -8961,7 +8964,8 @@ function _jax_scan_plate_read(ctx, x, i)
         # Keep its original evaluation site if the completed step has effects.
         entry = _jax_fresh(ctx, cell !== nothing ? :plate_entry : :table_entry)
         _jax_emit!(ctx, entry * " = " * token)
-        return _PyVal(entry, E)
+        value = _PyVal(entry, E)
+        return cell === nothing ? _jax_with_origin(value, _jax_selected_origin(x, E, at)) : value
     end
     _jax_bind!(ctx, :plate_entry, _PyVal(code, E))
 end
@@ -9009,7 +9013,10 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     have = body.have
     inner.values[canon_id(body.graph, have[1].id)] = _PyVal(carry, types[1])
     unpack = String[]
-    scan_rows = _JaxScanRowInputs(Set{String}(), Dict{String,_PyVal}(), _JaxScanRowRead[])
+    padded_inputs = [i for i in iterated if !isempty(inputs[i].extent)]
+    extent = isempty(padded_inputs) ? "" : inputs[first(padded_inputs)].extent
+    scan_rows = _JaxScanRowInputs(Set{String}(), Dict{String,_PyVal}(), _JaxScanRowRead[];
+                                  padded = !isempty(extent))
     inner.scan_rows = scan_rows
     entry_position = string("scan ", _JAX_CELL_POSITIONS[] += 1)
     for (k, i) in enumerate(iterated)
@@ -9032,8 +9039,6 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     # its static limit) is scanned to the limit: past the length the carry
     # stays as it was, and the outputs there are padding, which the result's
     # extent masks, as a padded group's loop does.
-    padded_inputs = [i for i in iterated if !isempty(inputs[i].extent)]
-    extent = isempty(padded_inputs) ? "" : inputs[first(padded_inputs)].extent
     position = isempty(extent) ? "" : _jax_identifier(inner.used, :position)
     isempty(position) || push!(unpack, position)
     recipe_saved = ctx.recipe
@@ -9046,24 +9051,13 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
         ctx.scope = outer
         ctx.recipe = recipe_saved
     end
-    next_carry = wants[1].code
-    if !isempty(position)
-        C = _jax_typeof(wants[1])
-        live = position * " < " * extent
-        # Any carry (a number, an array, the named numbers of several carried
-        # values) keeps its previous value past the length, leaf by leaf.
-        next_carry = C <: Number || _jax_is_array(C) ?
-            "jnp.where(" * live * ", " * wants[1].code * ", " * carry * ")" :
-            "jax.tree_util.tree_map(lambda new, old: jnp.where(" * live * ", new, old), " *
-            wants[1].code * ", " * carry * ")"
-    end
     pure = !recipe.effectful && !any(r -> r.effectful, body.recipes) && _JAX_EFFECTS[] == effects_before
     width = _jax_scan_width(ctx, inputs, iterated)
     seqs = String[_jax_scan_sequence(inputs[i], width) for i in iterated]
     isempty(position) || push!(seqs, "jnp.arange(" * _py_atom(first(seqs)) * ".shape[0])")
     local_rows = ctx.mod.layout === :chains && !isempty(extent)
     base_count = length(seqs)
-    if local_rows && !isempty(scan_rows.reads)
+    gathered = if local_rows && !isempty(scan_rows.reads)
         _jax_helper!(ctx, "_RKChainRows", _JAX_CHAIN_ROWS)
         sequence = v -> _jax_scan_sequence(_PyVal("_rk_row_values(" * v.code * ")", v.T), width)
         gather_rows = (g, table, index, mask, limit) -> g * "(jax.tree.map(_rk_row_values, " *
@@ -9079,8 +9073,33 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     push!(outer.lines, "    "^outer.indent * "def " * step * "(" * carry * ", " * xs * "):")
     isempty(unpack) || push!(outer.lines, "    "^inner.indent * join(unpack, ", ") *
                             (length(unpack) == 1 ? "," : "") * " = " * xs)
-    append!(outer.lines, inner.lines)
-    push!(outer.lines, "    "^inner.indent * "return " * next_carry * ", " * wants[2].code)
+    if gathered && !isempty(position)
+        # A padded round has no gathered row. The last real event tag can
+        # still request its arm there. Guard the step, including arithmetic
+        # downstream of that arm, before differentiating a missing event.
+        advance = _jax_identifier(inner.used, :advance)
+        indent = "    "^inner.indent
+        push!(outer.lines, indent * "def " * advance * "():")
+        append!(outer.lines, ("    " * line for line in inner.lines))
+        push!(outer.lines, indent * "    return " * wants[1].code * ", " * wants[2].code)
+        empty_output = _jax_empty_record(wants[2], "()")
+        push!(outer.lines, indent * "return jax.lax.cond(" * position * " < " * extent * ", " *
+                           advance * ", lambda: (" * carry * ", " * empty_output * "))")
+    else
+        next_carry = wants[1].code
+        if !isempty(position)
+            C = _jax_typeof(wants[1])
+            live = position * " < " * extent
+            # Any carry (a number, an array, the named numbers of several carried
+            # values) keeps its previous value past the length, leaf by leaf.
+            next_carry = C <: Number || _jax_is_array(C) ?
+                "jnp.where(" * live * ", " * wants[1].code * ", " * carry * ")" :
+                "jax.tree_util.tree_map(lambda new, old: jnp.where(" * live * ", new, old), " *
+                wants[1].code * ", " * carry * ")"
+        end
+        append!(outer.lines, inner.lines)
+        push!(outer.lines, "    "^inner.indent * "return " * next_carry * ", " * wants[2].code)
+    end
     sequences = "(" * join(seqs, ", ") * (length(seqs) == 1 ? ",)" : ")")
     result = _jax_fresh(ctx, :scan_result)
     E = _jax_typeof(wants[2])

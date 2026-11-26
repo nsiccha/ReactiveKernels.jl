@@ -227,8 +227,8 @@ end
 # Associate the authored step's scalar index and predicate with whole event
 # columns. The common scan lowering decides which guarded reads can move.
 function _jax_chain_step_tables!(scope, plan, inputs)
-    rows = _JaxScanRowInputs(Set{String}(), Dict{String,_PyVal}(), _JaxScanRowRead[],
-                             Tuple{String,String,String}[])
+    rows = _JaxScanRowInputs(Set{String}(), Dict{String,_PyVal}(), _JaxScanRowRead[];
+                             direct_bounds = Tuple{String,String,String}[])
     scope.scan_rows = rows
     param(i) = scope.values[canon_id(plan.graph, plan.have[i].id)]
     for (i, column) in enumerate(inputs.columns)
