@@ -74,10 +74,22 @@ prepared shapes, dtypes and static metadata on the same compilation target.
 For example, a change that moves observations between censoring groups can
 change their prepared shapes even when the raw observation count stays fixed.
 
-Call `gradient.calibrate(positions)` to time eligible layouts and reuse
-the fastest median for subsequent batches of that signature. Calibration
-returns per-layout timings, or an empty list when the module has no layout
-selector. Make a new binding when the data or budget
+Call `rows = gradient.calibrate(positions, repeats=3)`. The first row names the
+installed layout, or the list is empty for a fixed module.
+Calibration compares median warm latencies at this signature. Layouts whose
+interquartile ranges overlap the fastest layout's enter 12 synchronized rounds
+with it in rotating order. The lowest confirmation median wins. To replace
+a current finalist, a challenger must also win at least 10 paired rounds.
+The current layout is initially the supplied partition, including custom ones,
+then the layout installed for this signature.
+
+Each row marks the incumbent with `current` and records
+`samples_seconds` and `median_seconds`. Read extra calls in round order from
+`confirmation_samples_seconds` and their median from `confirmation_median_seconds`.
+The winning row gives its `selection_reason`. `calibration_seconds` includes
+confirmation attempts.
+
+Make a new binding when the data or budget
 changes. The byte budget covers XLA’s reported device buffer allocation
 for the executable. Allow separate headroom for other live arrays and
 allocator overhead. A backend must supply a buffer estimate to run with a
