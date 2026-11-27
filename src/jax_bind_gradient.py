@@ -1,3 +1,7 @@
+def _rk_batched_gradient(density, positions, data):
+    return jax.vmap(jax.value_and_grad(lambda p: density(p, **data)))(positions)
+
+
 def bind_gradient(density, prepared, *, device=None, memory_budget_bytes=None):
     """Bind a batched value-and-gradient to prepared data on one device.
 
@@ -53,10 +57,10 @@ def bind_gradient(density, prepared, *, device=None, memory_budget_bytes=None):
     def compile_program(chosen, key):
         target, shape, dtype, weak = key
         sharding = jax.sharding.SingleDeviceSharding(target)
-        batch = jax.jit(jax.vmap(jax.value_and_grad(lambda p: density(p, **chosen))),
-                        in_shardings=sharding)
+        function = jax.tree_util.Partial(density)
+        batch = jax.jit(_rk_batched_gradient, in_shardings=sharding)
         abstract_positions = jax.ShapeDtypeStruct(shape, dtype, sharding=sharding, weak_type=weak)
-        program = batch.lower(abstract_positions).compile()
+        program = batch.lower(function, abstract_positions, chosen).compile()
         if memory_budget_bytes is not None:
             try:
                 stats = program.memory_analysis()
@@ -67,7 +71,8 @@ def bind_gradient(density, prepared, *, device=None, memory_budget_bytes=None):
                 raise MemoryError("backend did not report planned device buffer bytes")
             if size > memory_budget_bytes:
                 raise MemoryError(f"gradient requires {size} planned bytes, budget is {memory_budget_bytes}")
-        return program
+        device_data = jax.device_put(chosen, target)
+        return lambda positions: program(function, positions, device_data)
 
     def candidates():
         yield data

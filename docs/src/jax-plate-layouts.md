@@ -18,7 +18,7 @@ events wherever the scan supports it. `prepare_data` uses the latter by default.
 To repeat a particular walk, call
 `module.prepare_plate_layout(prepared, subject_walk="padded")` or pass
 `subject_walk="events"`. Neither call times the model. The selected data can
-be passed as arguments to a jitted function or captured by a closure.
+be passed directly to a jitted function as one dictionary argument.
 
 `jax_source(...; data, plate_layout = :groups)` emits a module whose caller
 chooses how such plates run. After `prepared = module.prepare_data(**raw)`,
@@ -42,7 +42,8 @@ For batched gradients, create `gradient = module.bind_gradient(module.log_densit
 prepared, device=device, memory_budget_bytes=budget)` and call
 `values, grads = gradient(positions)`. A scalar kernel can supply
 `module.kernel` in place of the density. Device and budget are optional.
-The binding snapshots the prepared data. Its first call at a device, shape
+The binding snapshots the prepared data and supplies its arrays to the
+executable as device inputs. Its first call at a device, shape
 and dtype tries the supplied layout and only tries alternatives if memory
 prevents execution. If `select_plate_layout` has already measured this
 workload on the same device at this width, pass its returned prepared data
@@ -53,10 +54,25 @@ For a sampler that traces a scalar log density, use the module's
 runs a compiled batched gradient that JAX cannot trace inside the sampler. Call
 `chosen, rows = module.select_plate_layout(prepared, make_step, chains=[n])`
 at the fit's chain count `n`. The `make_step` in `tune_gradient` below
-shows how to time a batched gradient. Pass the sampler
-`lambda q: module.log_density(q, **chosen)` so it traces the scalar
-density with the winning layout. A module with a single fixed layout can
-use the same closure over `prepared` directly.
+shows how to time a batched gradient. To time a sampler transition, have
+`make_step` run the same transition with each candidate.
+
+Pass `chosen` as an argument to the outermost compiled sampler step.
+For example, a jitted `step(state, data)` can define its unary callback
+as `lambda q: module.log_density(q, **data)` inside the step. Call
+`step(state, chosen)`, or `step(state, prepared)` for a fixed layout.
+Here `data` already contains traced inputs when JAX traces the callback.
+If the sampler owns the compilation, its interface must carry the data
+through that boundary. A callback created outside the step that captures
+concrete arrays can embed their values in the program.
+
+JAX flattens the dictionary and its registered layout objects as a pytree.
+Observations, schedule indices and permutations are array inputs.
+The tree records structure such as an absent schedule, group widths and
+prepared `StaticInt` values. Reuse across datasets requires matching
+prepared shapes, dtypes and static metadata on the same compilation target.
+For example, a change that moves observations between censoring groups can
+change their prepared shapes even when the raw observation count stays fixed.
 
 Call `gradient.calibrate(positions)` to time eligible layouts and reuse
 the fastest median for subsequent batches of that signature. Calibration

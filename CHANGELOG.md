@@ -16,6 +16,13 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.406
+
+The JAX gradient binder passes its snapshot of prepared arrays as executable
+inputs. Bindings of the same density can reuse compilation when their prepared
+shapes, dtypes, static layout metadata and target match. The layout examples
+show how to keep those arrays as inputs when a sampler traces the density.
+
 ## 0.1.405
 
 Staged graph assembly can splice a child kernel called with computed
