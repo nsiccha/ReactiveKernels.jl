@@ -9,11 +9,11 @@
     <link rel="preload stylesheet" href="/ReactiveKernels.jl/dev/assets/style.D5aKkk-d.css" as="style">
     <link rel="preload stylesheet" href="/ReactiveKernels.jl/dev/vp-icons.css" as="style">
     
-    <script type="module" src="/ReactiveKernels.jl/dev/assets/app.DxMmH9F3.js"></script>
+    <script type="module" src="/ReactiveKernels.jl/dev/assets/app.kmWvSQIT.js"></script>
     <link rel="preload" href="/ReactiveKernels.jl/dev/assets/inter-roman-latin.Di8DUHzh.woff2" as="font" type="font/woff2" crossorigin="">
-    <link rel="modulepreload" href="/ReactiveKernels.jl/dev/assets/chunks/theme.Dh6Dupw1.js">
+    <link rel="modulepreload" href="/ReactiveKernels.jl/dev/assets/chunks/theme.CrvI9A-7.js">
     <link rel="modulepreload" href="/ReactiveKernels.jl/dev/assets/chunks/framework.BTpfZnOf.js">
-    <link rel="modulepreload" href="/ReactiveKernels.jl/dev/assets/jax-translations.md.CHkIKyEX.lean.js">
+    <link rel="modulepreload" href="/ReactiveKernels.jl/dev/assets/jax-translations.md.DnGZ6MD5.lean.js">
     <meta name="robots" content="noindex, nofollow">
     <script id="check-dark-mode">(()=>{const e=localStorage.getItem("vitepress-theme-appearance")||"auto",a=window.matchMedia("(prefers-color-scheme: dark)").matches;(!e||e==="auto"?a:e==="dark")&&document.documentElement.classList.add("dark")})();</script>
     <script id="check-mac-os">document.documentElement.classList.toggle("mac",/Mac|iPhone|iPod|iPad/i.test(navigator.platform));</script>
@@ -133,7 +133,8 @@ end # module
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    The first call at a shape and dtype runs one feasible layout. An explicit</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    gradient.calibrate(positions, repeats=3) measures eligible layouts and</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    installs its winner for subsequent calls on this binding. It returns the</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    timing rows (empty if the module has only one layout).</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    timing rows, winner first (empty without a layout selector). Overlapping</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    pilot timings trigger 12 interleaved rounds among the close contenders.</span></span>
 <span class="line"></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    memory_budget_bytes limits the executable&#39;s planned device buffer bytes.</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    The device allocator, other live arrays and backend overhead are separate.</span></span>
@@ -142,6 +143,7 @@ end # module
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    from functools import partial</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    from operator import index</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    from threading import RLock</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    import time</span></span>
 <span class="line"></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    if memory_budget_bytes is not None:</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        memory_budget_bytes = index(memory_budget_bytes)</span></span>
@@ -152,7 +154,7 @@ end # module
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    # caller later edits a host array. JAX arrays already have value semantics.</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    immutable = {id(x): x for x in jax.tree_util.tree_leaves(prepared) if isinstance(x, jax.Array)}</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    data = deepcopy(prepared, immutable)</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    time_layouts, layout_variants = None, None</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    measure, layout_variants = None, None</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    programs = {}</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    lock = RLock()</span></span>
 <span class="line"></span>
@@ -198,20 +200,26 @@ end # module
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        device_data = jax.device_put(chosen, target)</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        return lambda positions: program(function, positions, device_data)</span></span>
 <span class="line"></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def candidates():</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        yield data</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    supplied = (&quot;supplied&quot;, None, None, None)</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def alternatives():</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        if layout_variants is not None:</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            for _, _, _, _, chosen, _ in layout_variants(data, None):</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                if chosen is not data:</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    yield chosen</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            for name, groups, sequential, mode, chosen, _ in layout_variants(data, None):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                yield (name, groups, sequential, mode), chosen</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def candidates():</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        yield supplied, data</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        for layout, chosen in alternatives():</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            if chosen is not data:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                yield layout, chosen</span></span>
 <span class="line"></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def gradient(positions):</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        key, positions = signature(positions)</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        with lock:</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            program = programs.get(key)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            _, program = programs.get(key, (supplied, None))</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            if program is None:</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                failure = None</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                for chosen in candidates():</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                for layout, chosen in candidates():</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    try:</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                        program = compile_program(chosen, key)</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                        result = jax.block_until_ready(program(jax.device_put(positions, key[0])))</span></span>
@@ -221,29 +229,129 @@ end # module
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                        failure = str(error)</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                        program = None</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                        continue</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    programs[key] = program</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    programs[key] = layout, program</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    return result</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                raise MemoryError(f&quot;no gradient layout fit on {key[0]}: {failure}&quot;)</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        return program(jax.device_put(positions, key[0]))</span></span>
 <span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def same_as_supplied(chosen):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        # Selectors share the bound model data. Compare only changed layout</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        # metadata, including the members and widths of a caller&#39;s own groups.</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        for name, value in chosen.items():</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            original = data.get(name)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            if value is original:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                continue</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            if name == &quot;_rk_plate_layout&quot;:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                value = {k: v for k, v in value.items() if v is not None}</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                original = {k: v for k, v in (original or {}).items() if v is not None}</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            leaves, tree = jax.tree_util.tree_flatten(value)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            others, other_tree = jax.tree_util.tree_flatten(original)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            if tree != other_tree or any(a is not b and not np.array_equal(a, b)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                         for a, b in zip(leaves, others)):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                return False</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        return True</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def calibration_candidates(active):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        found = False</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        for layout, chosen in alternatives():</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            current = same_as_supplied(chosen) if active == supplied else layout == active</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            found = found or current</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            yield layout, chosen, current</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        if not found:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            # A caller can supply a partition outside the default search.</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            yield supplied, data, True</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def confirm(finalists, rows, steps):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        for i in range(12):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            start = i % len(finalists)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            for k in finalists[start:] + finalists[:start]:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                row = rows[k]</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                if row[&quot;error&quot;] is not None:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    continue</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                started = time.perf_counter()</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                try:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    jax.block_until_ready(steps[k]())</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                except Exception as error:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    if not isinstance(error, MemoryError) and &quot;RESOURCE_EXHAUSTED&quot; not in str(error):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                        raise</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    row[&quot;error&quot;] = str(error)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    row[&quot;seconds&quot;] = row[&quot;fit_seconds&quot;] = float(&quot;inf&quot;)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    del steps[k]</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                elapsed = time.perf_counter() - started</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                row[&quot;calibration_seconds&quot;] += elapsed</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                if row[&quot;error&quot;] is None:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    row[&quot;confirmation_samples_seconds&quot;].append(elapsed)</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        confirmed = [k for k in finalists if k in steps]</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        if not confirmed:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            return None</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        for k in confirmed:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            samples = rows[k][&quot;confirmation_samples_seconds&quot;]</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            rows[k][&quot;confirmation_median_seconds&quot;] = float(np.median(samples))</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        confirmed.sort(key=lambda k: rows[k][&quot;confirmation_median_seconds&quot;])</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        current = next((k for k in confirmed if rows[k][&quot;current&quot;]), None)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        if current is None:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            return confirmed[0], &quot;confirmation&quot;</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        baseline = rows[current][&quot;confirmation_samples_seconds&quot;]</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        median = rows[current][&quot;confirmation_median_seconds&quot;]</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        for k in confirmed:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            if rows[k][&quot;confirmation_median_seconds&quot;] &gt;= median:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                break</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            samples = rows[k][&quot;confirmation_samples_seconds&quot;]</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            if sum(a &lt; b for a, b in zip(samples, baseline)) &gt;= 10:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                return k, &quot;paired_win&quot;</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        return current, &quot;retain_current&quot;</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def select(rows, steps):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        order = sorted(steps, key=lambda k: rows[k][&quot;median_seconds&quot;])</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        quartiles = {k: np.percentile(rows[k][&quot;samples_seconds&quot;], (25, 75)) for k in order}</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        while order:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            low, high = quartiles[order[0]]</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            finalists = [k for k in order if quartiles[k][0] &lt;= high and low &lt;= quartiles[k][1]]</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            if len(finalists) == 1:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                return finalists[0], &quot;pilot&quot;</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            winner = confirm(finalists, rows, steps)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            if winner is not None:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                return winner</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            # Every finalist ran out of memory. Compare the remaining pilots.</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            order = [k for k in order if k in steps]</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        errors = &quot;, &quot;.join(dict.fromkeys(row[&quot;error&quot;] for row in rows.values()))</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        raise RuntimeError(f&quot;bind_gradient: no candidate ran on this device: {errors}&quot;)</span></span>
+<span class="line"></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def calibrate(positions, repeats=3):</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        if index(repeats) &lt; 1:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        repeats = index(repeats)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        if repeats &lt; 1:</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            raise ValueError(&quot;repeats must be positive&quot;)</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        if time_layouts is None:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        if measure is None:</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            gradient(positions)</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            return []</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        key, positions = signature(positions)</span></span>
 <span class="line"></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        def make_step(chosen, _count):</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            program = compile_program(chosen, key)</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            return partial(program, jax.device_put(positions, key[0]))</span></span>
-<span class="line"></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        with lock:</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            step, rows = time_layouts(data, make_step, chains=[len(positions)], candidates=None,</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                      repeats=repeats, alternatives=None, calls=lambda count: 1,</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                                      guarded_reads=None, keep_step=True)</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            programs[key] = step.func</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        return rows</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            active, program = programs.get(key, (supplied, None))</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            batch = jax.device_put(positions, key[0])</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            rows, steps = {}, {}</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            for layout, chosen, current in calibration_candidates(active):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                def build():</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    if current and program is not None:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                        return partial(program, batch)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    bound_data = data if current and active == supplied else chosen</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    executable = compile_program(bound_data, key)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    return partial(executable, batch)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                step, row = measure(layout, len(positions), build, repeats)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                row.update(current=current, confirmation_samples_seconds=[], confirmation_median_seconds=None)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                rows[layout] = row</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                if step is not None:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    steps[layout] = step</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    row[&quot;seconds&quot;] = row[&quot;median_seconds&quot;]</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                row[&quot;fit_seconds&quot;] = row[&quot;seconds&quot;]</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            winner, reason = select(rows, steps)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            programs[key] = winner, steps[winner].func</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            first = rows.pop(winner)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            first[&quot;selection_reason&quot;] = reason</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            return [first, *sorted(rows.values(), key=lambda r: (r[&quot;error&quot;] is not None, r[&quot;seconds&quot;]))]</span></span>
 <span class="line"></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    gradient.calibrate = calibrate</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    return gradient</span></span></code></pre></div><p>After <code>write(&quot;matrix_model.py&quot;, host_source)</code>, run <code>python examples/jax_translations.py matrix_model.py</code> with a Python that has JAX and SciPy. This consumer checks the result and gradient against SciPy and that preparation returns NumPy arrays:</p><div class="vp-raw-html"><div class="markdown"><pre><code class="language-python">&quot;&quot;&quot;Run with: python examples/jax_translations.py matrix_model.py&quot;&quot;&quot;
@@ -270,7 +378,7 @@ np.testing.assert_allclose&#40;gradient, expm&#40;A&#41;.sum&#40;&#41;, rtol&#61
 print&#40;&quot;Host preparation and device value/gradient agree with SciPy.&quot;&#41;
 </code></pre>
 </div></div><p>The repository&#39;s JAX tests execute these examples with <code>RK_JAX_PYTHON</code> enabled: direct and wrapped calls, matrix rank, changed sizes, host preparation, and ordinary gradients against native Julia. The documentation build executes the Julia examples; it displays the Python consumer&#39;s source.</p></div></div></main><footer class="VPDocFooter" data-v-83890dd9 data-v-4f9813fa><!--[--><!--]--><div class="edit-info" data-v-4f9813fa><div class="edit-link" data-v-4f9813fa><a class="VPLink link vp-external-link-icon no-icon edit-link-button" href="https://github.com/nsiccha/ReactiveKernels.jl/edit/main/docs/src/jax-translations.md" target="_blank" rel="noreferrer" data-v-4f9813fa><!--[--><span class="vpi-square-pen edit-link-icon" data-v-4f9813fa></span> Edit this page<!--]--></a></div><!----></div><nav class="prev-next" aria-labelledby="doc-footer-aria-label" data-v-4f9813fa><span class="visually-hidden" id="doc-footer-aria-label" data-v-4f9813fa>Pager</span><div class="pager" data-v-4f9813fa><a class="VPLink link pager-link prev" href="/ReactiveKernels.jl/dev/jax-host" data-v-4f9813fa><!--[--><span class="desc" data-v-4f9813fa>Previous page</span><span class="title" data-v-4f9813fa>JAX host preparation</span><!--]--></a></div><div class="pager" data-v-4f9813fa><a class="VPLink link pager-link next" href="/ReactiveKernels.jl/dev/jax-runtime" data-v-4f9813fa><!--[--><span class="desc" data-v-4f9813fa>Next page</span><span class="title" data-v-4f9813fa>JAX runtime and derivatives</span><!--]--></a></div></nav></footer><!--[--><!--]--></div></div></div><!--[--><!--]--></div></div><footer class="VPFooter has-sidebar" data-v-a9a9e638 data-v-c970a860><div class="container" data-v-c970a860><p class="message" data-v-c970a860>Made with <a href="https://luxdl.github.io/DocumenterVitepress.jl/dev/" target="_blank"><strong>DocumenterVitepress.jl</strong></a><br></p><p class="copyright" data-v-c970a860>© Copyright 2026.</p></div></footer><!--[--><!--]--></div></div>
-    <script>window.__VP_HASH_MAP__=JSON.parse("{\"api.md\":\"DmVrURys\",\"automatic-differentiation.md\":\"C8wqUTcK\",\"bound-data.md\":\"D0-7ltKN\",\"bound-regression.md\":\"DneqktpH\",\"coordinate-updates.md\":\"Dy0MnCQa\",\"discrete-latents.md\":\"BrbzxxaK\",\"distribution-api.md\":\"BRYAmVCD\",\"eight-schools.md\":\"D3bR7iXS\",\"generated-assets_aov_readme.md\":\"CGa4CqlY\",\"graphs.md\":\"LLrGLtns\",\"index.md\":\"Bid5RHjn\",\"integer-parameters.md\":\"lLVBoQkm\",\"jax-helpers.md\":\"DA5HBnXO\",\"jax-host.md\":\"CPb5G5d8\",\"jax-ode.md\":\"BXLYzKsd\",\"jax-plate-layouts.md\":\"lkdakjbb\",\"jax-runtime.md\":\"B65kV_hN\",\"jax-translations.md\":\"CHkIKyEX\",\"jax.md\":\"Cyqs2NZY\",\"manual-derivative-rules.md\":\"CjIkxwun\",\"nonallocating.md\":\"aJqj4oiP\",\"position-batching.md\":\"tuKiUCJq\",\"ppl-api.md\":\"U7xKTGmK\",\"public_aov_readme.md\":\"CaMS-hen\",\"rkppl.md\":\"D-RSAYxM\",\"scan.md\":\"JV214QYo\",\"visualization.md\":\"D8qIv9He\"}");window.__VP_SITE_DATA__=JSON.parse("{\"lang\":\"en-US\",\"dir\":\"ltr\",\"title\":\"ReactiveKernels.jl\",\"description\":\"Documentation for ReactiveKernels.jl\",\"base\":\"/ReactiveKernels.jl/dev/\",\"head\":[],\"router\":{\"prefetchLinks\":true},\"appearance\":true,\"themeConfig\":{\"outline\":\"deep\",\"search\":{\"provider\":\"local\",\"options\":{\"detailedView\":true}},\"nav\":[{\"text\":\"Start\",\"items\":[{\"text\":\"ReactiveKernels\",\"link\":\"/index\"}]},{\"text\":\"Guides\",\"items\":[{\"text\":\"Graphs and queries\",\"link\":\"/graphs\"},{\"text\":\"Bound data\",\"link\":\"/bound-data\"},{\"text\":\"Position batching\",\"link\":\"/position-batching\"},{\"text\":\"Sequential recurrences\",\"link\":\"/scan\"},{\"text\":\"Prepared differentiation\",\"link\":\"/automatic-differentiation\"},{\"text\":\"Probabilistic graphs\",\"link\":\"/rkppl\"},{\"text\":\"Finite integer parameters\",\"link\":\"/integer-parameters\"},{\"text\":\"Coordinate updates\",\"link\":\"/coordinate-updates\"},{\"text\":\"Reusable buffers\",\"link\":\"/nonallocating\"},{\"text\":\"Graph inspection\",\"link\":\"/visualization\"},{\"text\":\"JAX source\",\"link\":\"/jax\"},{\"text\":\"JAX helpers and submodels\",\"link\":\"/jax-helpers\"},{\"text\":\"JAX host preparation\",\"link\":\"/jax-host\"},{\"text\":\"JAX translations\",\"link\":\"/jax-translations\"},{\"text\":\"JAX runtime and derivatives\",\"link\":\"/jax-runtime\"},{\"text\":\"JAX plate layouts\",\"link\":\"/jax-plate-layouts\"},{\"text\":\"JAX ODE solves\",\"link\":\"/jax-ode\"},{\"text\":\"Derivative graphs\",\"link\":\"/manual-derivative-rules\"}]},{\"text\":\"Examples\",\"items\":[{\"text\":\"Bound regression\",\"link\":\"/bound-regression\"},{\"text\":\"Eight schools\",\"link\":\"/eight-schools\"},{\"text\":\"Conditional latent states\",\"link\":\"/discrete-latents\"}]},{\"text\":\"Reference\",\"items\":[{\"text\":\"Core API\",\"link\":\"/api\"},{\"text\":\"PPL API\",\"link\":\"/ppl-api\"},{\"text\":\"Distribution API\",\"link\":\"/distribution-api\"}]}],\"sidebar\":[{\"text\":\"Start\",\"collapsed\":false,\"items\":[{\"text\":\"ReactiveKernels\",\"link\":\"/index\"}]},{\"text\":\"Guides\",\"collapsed\":false,\"items\":[{\"text\":\"Graphs and queries\",\"link\":\"/graphs\"},{\"text\":\"Bound data\",\"link\":\"/bound-data\"},{\"text\":\"Position batching\",\"link\":\"/position-batching\"},{\"text\":\"Sequential recurrences\",\"link\":\"/scan\"},{\"text\":\"Prepared differentiation\",\"link\":\"/automatic-differentiation\"},{\"text\":\"Probabilistic graphs\",\"link\":\"/rkppl\"},{\"text\":\"Finite integer parameters\",\"link\":\"/integer-parameters\"},{\"text\":\"Coordinate updates\",\"link\":\"/coordinate-updates\"},{\"text\":\"Reusable buffers\",\"link\":\"/nonallocating\"},{\"text\":\"Graph inspection\",\"link\":\"/visualization\"},{\"text\":\"JAX source\",\"link\":\"/jax\"},{\"text\":\"JAX helpers and submodels\",\"link\":\"/jax-helpers\"},{\"text\":\"JAX host preparation\",\"link\":\"/jax-host\"},{\"text\":\"JAX translations\",\"link\":\"/jax-translations\"},{\"text\":\"JAX runtime and derivatives\",\"link\":\"/jax-runtime\"},{\"text\":\"JAX plate layouts\",\"link\":\"/jax-plate-layouts\"},{\"text\":\"JAX ODE solves\",\"link\":\"/jax-ode\"},{\"text\":\"Derivative graphs\",\"link\":\"/manual-derivative-rules\"}]},{\"text\":\"Examples\",\"collapsed\":false,\"items\":[{\"text\":\"Bound regression\",\"link\":\"/bound-regression\"},{\"text\":\"Eight schools\",\"link\":\"/eight-schools\"},{\"text\":\"Conditional latent states\",\"link\":\"/discrete-latents\"}]},{\"text\":\"Reference\",\"collapsed\":false,\"items\":[{\"text\":\"Core API\",\"link\":\"/api\"},{\"text\":\"PPL API\",\"link\":\"/ppl-api\"},{\"text\":\"Distribution API\",\"link\":\"/distribution-api\"}]}],\"editLink\":{\"pattern\":\"https://github.com/nsiccha/ReactiveKernels.jl/edit/main/docs/src/:path\"},\"socialLinks\":[{\"icon\":\"github\",\"link\":\"https://github.com/nsiccha/ReactiveKernels.jl\"}],\"footer\":{\"message\":\"Made with <a href=\\\"https://luxdl.github.io/DocumenterVitepress.jl/dev/\\\" target=\\\"_blank\\\"><strong>DocumenterVitepress.jl</strong></a><br>\",\"copyright\":\"© Copyright 2026.\"}},\"locales\":{},\"scrollOffset\":134,\"cleanUrls\":true}");</script>
+    <script>window.__VP_HASH_MAP__=JSON.parse("{\"api.md\":\"C8XwQxRp\",\"automatic-differentiation.md\":\"C8wqUTcK\",\"bound-data.md\":\"D0-7ltKN\",\"bound-regression.md\":\"DneqktpH\",\"coordinate-updates.md\":\"Dy0MnCQa\",\"discrete-latents.md\":\"BrbzxxaK\",\"distribution-api.md\":\"BQBuvXy4\",\"eight-schools.md\":\"B8eY7q6n\",\"generated-assets_aov_readme.md\":\"CGa4CqlY\",\"graphs.md\":\"LLrGLtns\",\"index.md\":\"Bid5RHjn\",\"integer-parameters.md\":\"lLVBoQkm\",\"jax-helpers.md\":\"0TbRw3h_\",\"jax-host.md\":\"CPb5G5d8\",\"jax-ode.md\":\"BXLYzKsd\",\"jax-plate-layouts.md\":\"BF-v4TNb\",\"jax-runtime.md\":\"CI8iPPKQ\",\"jax-translations.md\":\"DnGZ6MD5\",\"jax.md\":\"Cyqs2NZY\",\"manual-derivative-rules.md\":\"CjIkxwun\",\"nonallocating.md\":\"aJqj4oiP\",\"position-batching.md\":\"tuKiUCJq\",\"ppl-api.md\":\"SlYudX_h\",\"public_aov_readme.md\":\"CaMS-hen\",\"rkppl.md\":\"DxZKwwKF\",\"scan.md\":\"JV214QYo\",\"visualization.md\":\"D8qIv9He\"}");window.__VP_SITE_DATA__=JSON.parse("{\"lang\":\"en-US\",\"dir\":\"ltr\",\"title\":\"ReactiveKernels.jl\",\"description\":\"Documentation for ReactiveKernels.jl\",\"base\":\"/ReactiveKernels.jl/dev/\",\"head\":[],\"router\":{\"prefetchLinks\":true},\"appearance\":true,\"themeConfig\":{\"outline\":\"deep\",\"search\":{\"provider\":\"local\",\"options\":{\"detailedView\":true}},\"nav\":[{\"text\":\"Start\",\"items\":[{\"text\":\"ReactiveKernels\",\"link\":\"/index\"}]},{\"text\":\"Guides\",\"items\":[{\"text\":\"Graphs and queries\",\"link\":\"/graphs\"},{\"text\":\"Bound data\",\"link\":\"/bound-data\"},{\"text\":\"Position batching\",\"link\":\"/position-batching\"},{\"text\":\"Sequential recurrences\",\"link\":\"/scan\"},{\"text\":\"Prepared differentiation\",\"link\":\"/automatic-differentiation\"},{\"text\":\"Probabilistic graphs\",\"link\":\"/rkppl\"},{\"text\":\"Finite integer parameters\",\"link\":\"/integer-parameters\"},{\"text\":\"Coordinate updates\",\"link\":\"/coordinate-updates\"},{\"text\":\"Reusable buffers\",\"link\":\"/nonallocating\"},{\"text\":\"Graph inspection\",\"link\":\"/visualization\"},{\"text\":\"JAX source\",\"link\":\"/jax\"},{\"text\":\"JAX helpers and submodels\",\"link\":\"/jax-helpers\"},{\"text\":\"JAX host preparation\",\"link\":\"/jax-host\"},{\"text\":\"JAX translations\",\"link\":\"/jax-translations\"},{\"text\":\"JAX runtime and derivatives\",\"link\":\"/jax-runtime\"},{\"text\":\"JAX plate layouts\",\"link\":\"/jax-plate-layouts\"},{\"text\":\"JAX ODE solves\",\"link\":\"/jax-ode\"},{\"text\":\"Derivative graphs\",\"link\":\"/manual-derivative-rules\"}]},{\"text\":\"Examples\",\"items\":[{\"text\":\"Bound regression\",\"link\":\"/bound-regression\"},{\"text\":\"Eight schools\",\"link\":\"/eight-schools\"},{\"text\":\"Conditional latent states\",\"link\":\"/discrete-latents\"}]},{\"text\":\"Reference\",\"items\":[{\"text\":\"Core API\",\"link\":\"/api\"},{\"text\":\"PPL API\",\"link\":\"/ppl-api\"},{\"text\":\"Distribution API\",\"link\":\"/distribution-api\"}]}],\"sidebar\":[{\"text\":\"Start\",\"collapsed\":false,\"items\":[{\"text\":\"ReactiveKernels\",\"link\":\"/index\"}]},{\"text\":\"Guides\",\"collapsed\":false,\"items\":[{\"text\":\"Graphs and queries\",\"link\":\"/graphs\"},{\"text\":\"Bound data\",\"link\":\"/bound-data\"},{\"text\":\"Position batching\",\"link\":\"/position-batching\"},{\"text\":\"Sequential recurrences\",\"link\":\"/scan\"},{\"text\":\"Prepared differentiation\",\"link\":\"/automatic-differentiation\"},{\"text\":\"Probabilistic graphs\",\"link\":\"/rkppl\"},{\"text\":\"Finite integer parameters\",\"link\":\"/integer-parameters\"},{\"text\":\"Coordinate updates\",\"link\":\"/coordinate-updates\"},{\"text\":\"Reusable buffers\",\"link\":\"/nonallocating\"},{\"text\":\"Graph inspection\",\"link\":\"/visualization\"},{\"text\":\"JAX source\",\"link\":\"/jax\"},{\"text\":\"JAX helpers and submodels\",\"link\":\"/jax-helpers\"},{\"text\":\"JAX host preparation\",\"link\":\"/jax-host\"},{\"text\":\"JAX translations\",\"link\":\"/jax-translations\"},{\"text\":\"JAX runtime and derivatives\",\"link\":\"/jax-runtime\"},{\"text\":\"JAX plate layouts\",\"link\":\"/jax-plate-layouts\"},{\"text\":\"JAX ODE solves\",\"link\":\"/jax-ode\"},{\"text\":\"Derivative graphs\",\"link\":\"/manual-derivative-rules\"}]},{\"text\":\"Examples\",\"collapsed\":false,\"items\":[{\"text\":\"Bound regression\",\"link\":\"/bound-regression\"},{\"text\":\"Eight schools\",\"link\":\"/eight-schools\"},{\"text\":\"Conditional latent states\",\"link\":\"/discrete-latents\"}]},{\"text\":\"Reference\",\"collapsed\":false,\"items\":[{\"text\":\"Core API\",\"link\":\"/api\"},{\"text\":\"PPL API\",\"link\":\"/ppl-api\"},{\"text\":\"Distribution API\",\"link\":\"/distribution-api\"}]}],\"editLink\":{\"pattern\":\"https://github.com/nsiccha/ReactiveKernels.jl/edit/main/docs/src/:path\"},\"socialLinks\":[{\"icon\":\"github\",\"link\":\"https://github.com/nsiccha/ReactiveKernels.jl\"}],\"footer\":{\"message\":\"Made with <a href=\\\"https://luxdl.github.io/DocumenterVitepress.jl/dev/\\\" target=\\\"_blank\\\"><strong>DocumenterVitepress.jl</strong></a><br>\",\"copyright\":\"© Copyright 2026.\"}},\"locales\":{},\"scrollOffset\":134,\"cleanUrls\":true}");</script>
     
   </body>
 </html>
