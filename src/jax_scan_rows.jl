@@ -1,5 +1,7 @@
 Base.include_dependency(joinpath(@__DIR__, "jax_subject_scan.py"))
 const _JAX_SUBJECT_SCAN = read(joinpath(@__DIR__, "jax_subject_scan.py"), String)
+Base.include_dependency(joinpath(@__DIR__, "jax_requested_rows.py"))
+const _JAX_REQUESTED_CELL_ROWS = read(joinpath(@__DIR__, "jax_requested_rows.py"), String)
 
 function _jax_subject_scan_lengths(ctx, firstrow)
     o = firstrow.origin
@@ -23,7 +25,7 @@ function _jax_record_axes(ctx, body, inputs, mapped)
         rows && input.T isa Type && input.T <: AbstractVector{<:AbstractVector{<:Number}} || return nothing
         flat = get(ctx.scope.flat_positions, input.extent, nothing)
         (flat === nothing || flat == _JAX_FULL_ROWS || flat.prefix != 0) && return nothing
-        (flat.total, _py_atom(input.extent) * ".shape[0]")
+        (total = flat.total, subjects = _py_atom(input.extent) * ".shape[0]", key = _jax_ragged_port(ctx, input))
     end
 end
 
@@ -43,47 +45,56 @@ function _jax_record_plate_call(ctx, p, recipe, E, inputs, mapped, cell, args)
     output = canon_id(p.graph, only(recipe.outputs).id)
     any(r -> r.op isa _AuthoredScanOp && any(x -> canon_id(p.graph, x.id) == output, r.inputs),
         p.recipes) || return nothing
+    _jax_helper!(ctx, "_rk_if_nonempty", _JAX_IF_NONEMPTY)
     f = _jax_helper!(ctx, "_rk_record_plate", _JAX_RECORD_PLATE)
-    f * "(" * join([cell, string(i - 1), v.extent, plan..., args...], ", ") * ")"
+    schedule = plan.key === nothing ? "None" :
+        _jax_prepared_bound!(ctx, :record_rows, plan.key * "_lengths", plan.key * "_flat")
+    f * "(" * join([cell, string(i - 1), v.extent, plan.total, plan.subjects, args...], ", ") *
+        ", schedule=" * schedule * ")"
 end
 
 const _JAX_RECORD_PLATE = raw"""
-def _rk_record_plate(cell, axis, length, total, subjects, *args):
+def _rk_record_plate(cell, axis, length, total, subjects, *args, schedule=None):
     # The final argument is the activity flag of the original mapped cell.
     axes = tuple(0 if i == axis or i == len(args) - 1 else None for i in range(len(args)))
-    def ordinary(length, *columns):
-        return jax.vmap(cell, in_axes=axes)(*columns)
+    def ordinary(length, schedule, *columns):
+        return _rk_if_nonempty(length > 0, lambda: jax.vmap(cell, in_axes=axes)(*columns))
     run = jax.custom_batching.custom_vmap(ordinary)
     @run.def_vmap
-    def batch(n, mapped, lengths, *columns):
-        by_length, *by_row = mapped
+    def batch(n, mapped, lengths, schedule, *columns):
+        by_length, by_schedule, *by_row = mapped
         width = columns[axis].shape[-1]
-        if (n != subjects or not by_length or not by_row[axis] or
+        if (n != subjects or not by_length or any(jax.tree.leaves(by_schedule)) or not by_row[axis] or
                 not isinstance(total, (int, np.integer)) or total in (0, n * width)):
             in_axes = jax.tree.map(lambda b: 0 if b else None, tuple(mapped))
-            values = jax.vmap(ordinary, in_axes=in_axes)(lengths, *columns)
+            values = jax.vmap(ordinary, in_axes=in_axes)(lengths, schedule, *columns)
         else:
-            positions = jnp.nonzero((jnp.arange(width) < lengths[:, None]).ravel(), size=total)[0]
-            owners = positions // width
+            if schedule is None:
+                # A derived row may carry its total without a prepared schedule.
+                positions = jnp.nonzero((jnp.arange(width) < lengths[:, None]).ravel(), size=total)[0]
+                owners = positions // width
+                offsets = jnp.cumsum(lengths) - lengths
+                rows = offsets[:, None] + jnp.minimum(jnp.arange(width), jnp.maximum(lengths[:, None] - 1, 0))
+            else:
+                positions, owners, rows = schedule
             selected = []
             event_axes = []
             for x, row, col in zip(columns, by_row, axes):
                 if col == 0:
-                    selected.append(x.reshape(-1)[positions] if row else x[positions % width])
+                    selected.append(jnp.take(x.reshape(-1), positions, mode="clip", unique_indices=True,
+                                             indices_are_sorted=True) if row else x[positions % width])
                     event_axes.append(0)
                 else:
                     selected.append(x[owners] if row else x)
                     event_axes.append(0 if row else None)
             records = jax.vmap(cell, in_axes=tuple(event_axes))(*selected)
-            offsets = jnp.cumsum(lengths) - lengths
-            rows = offsets[:, None] + jnp.minimum(jnp.arange(width), jnp.maximum(lengths[:, None] - 1, 0))
             # A short row repeats its final entry in the padded representation.
             def restore(field):
                 return jnp.where(lengths[:, None] > 0, jnp.take(field, rows, mode="clip"),
                                  jnp.zeros_like(field, shape=()))
             values = jax.tree.map(restore, records)
         return values, jax.tree.map(lambda x: True, values)
-    return run(length, *args)
+    return run(length, schedule, *args)
 """
 
 # A guarded read of an already materialized numeric table. The schedule
@@ -206,7 +217,7 @@ const _JAX_PREPARE_GUARDED_READS = raw"""
 def prepare_guarded_reads(prepared: dict, mode: str) -> dict:
     \"\"\"Choose how eligible guarded scan reads obtain their producer rows.
 
-    "compact" computes requested rows in tiles. "dense" gathers from the
+    "compact" computes requested rows. "dense" gathers from the
     producer's full table. The choice applies to all eligible sites. Call
     the numerical functions with the result, for example kernel(x, **data).
     \"\"\"
@@ -222,6 +233,14 @@ def prepare_guarded_reads(prepared: dict, mode: str) -> dict:
     return {**prepared, **changed} if changed else prepared
 """
 
+function _jax_direct_record_key(ctx, v)
+    o = v.origin
+    o isa _JaxOrigin && o.position === nothing && !isempty(o.path) &&
+        o.scale == "1" && o.offset == "0" || return nothing
+    plan = get(ctx.mod.helper_names, (:record_axis, ctx.scope, v.code, v.extent), nothing)
+    plan !== nothing && plan.key == o.key ? o.key : nothing
+end
+
 function _jax_compact_cell_rows(ctx, inner, rows, read, guards, extent, index, guard, limit)
     cell = get(inner.scan_reads, read.table.code, nothing)
     cell === nothing && return nothing
@@ -234,11 +253,19 @@ function _jax_compact_cell_rows(ctx, inner, rows, read, guards, extent, index, g
     # Only exclude repeated tail padding if the scan masks that very sequence
     # at its logical row length. Otherwise count every physical match.
     lengths = !isempty(extent) && seq.extent == extent && !isempty(o.path) ? o.key * "_lengths" : ""
-    capacity = _jax_prepared_bound!(ctx, :match_count, o.key, lengths, String(m.captures[2]))
+    target = String(m.captures[2])
+    capacity = _jax_prepared_bound!(ctx, :match_count, o.key, lengths, target)
     helper = _jax_helper!(ctx, "_rk_scan_cell_rows", _JAX_SCAN_CELL_ROWS)
     mapped = _jax_chain_tuple(_jax_chain_bool.(cell.mapped))
-    helper * "(" * join((cell.name, _jax_chain_tuple(cell.args), mapped, read.table.code,
-                         index, guard, limit, capacity), ", ") * ")"
+    args = [cell.name, _jax_chain_tuple(cell.args), mapped, read.table.code, index, guard, limit, capacity]
+    if ctx.mod.layout === :padded && !isempty(lengths) && limit == extent && _jax_direct_record_key(ctx, seq) == o.key
+        index_key = _jax_direct_record_key(ctx, rows.sequences[read.index])
+        if index_key !== nothing
+            push!(args, _jax_prepared_bound!(ctx, :requested_rows, o.key, index_key, lengths, target))
+            helper = _jax_helper!(ctx, "_rk_requested_cell_rows", _JAX_REQUESTED_CELL_ROWS)
+        end
+    end
+    helper * "(" * join(args, ", ") * ")"
 end
 
 function _jax_scan_row_inputs!(ctx, inner, rows, unpack, seqs, width, extent, pure;

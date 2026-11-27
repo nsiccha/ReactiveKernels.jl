@@ -2021,6 +2021,16 @@ def _rk_prepare_row_layout(*operands):
 """),
     :map_rows => _JAX_MAP_SCHEDULE,
     :padded_map_rows => _JAX_MAP_SCHEDULE,
+    :record_rows => ("_rk_record_rows", """
+def _rk_record_rows(lengths, positions):
+    width = int(np.max(lengths, initial=0))
+    if positions.size == 0 or positions.size == len(lengths) * width:
+        return None
+    offsets = np.cumsum(lengths) - lengths
+    # Padding repeats the last entry of each nonempty row.
+    rows = offsets[:, None] + np.minimum(np.arange(width), np.maximum(lengths[:, None] - 1, 0))
+    return positions, positions // width, rows
+"""),
     :scan_rows => ("_rk_scan_schedule", """
 def _rk_scan_schedule(*lengths):
     # The sign marks a fresh carry; empty rows generate no events. Leave the
@@ -2080,6 +2090,20 @@ def _rk_event_rounds(tags):
     phases = (order[:split].reshape(wide, width + 1),
               order[split:].reshape(height - wide, width))
     return tuple((positions, transfer[positions]) for positions in phases if positions.size), np.argsort(order)
+"""),
+    :requested_rows => ("_rk_requested_rows", """
+def _rk_requested_rows(tags, indices, lengths, target):
+    if tags.ndim != 2 or tags.shape != indices.shape or lengths.shape != (len(tags),):
+        return None
+    width = tags.shape[1]
+    live = np.arange(width) < lengths[:, None]
+    valid = (indices >= 1) & (indices <= lengths[:, None]) & (indices <= width)
+    owners, visits = np.nonzero((tags == target) & live & valid)
+    rows = indices[owners, visits] - 1
+    # One output per visit, even when several visits select the same row.
+    restore = np.full(tags.shape, len(owners), dtype=np.int64)
+    restore[owners, visits] = np.arange(len(owners))
+    return owners, rows, restore
 """),
     :match_count => ("_rk_match_count", """
 def _rk_match_count(values, lengths, target):
@@ -2170,8 +2194,8 @@ function _jax_prepare_bounds_lines(mod::_JaxModule, lines::Vector{String}, bound
         at === nothing && error("circular prepared layout dependencies")
         name, kind, keys = popat!(pending, at)
         args = [isempty(k) ? "None" : result * "[\"" * k * "\"]" for k in keys]
-        # The final match-count operand is the comparison's integer literal.
-        kind === :match_count && (args[end] = last(keys))
+        # Guarded read schedules use the comparison's integer literal.
+        kind in (:match_count, :requested_rows) && (args[end] = last(keys))
         kind === :padded_map_rows && push!(args, "padded=True")
         if mod.layout === :chains && kind in (:min, :max, :span)
             _jax_module_helper!(mod, "_RKChainRows", _JAX_CHAIN_ROWS)
