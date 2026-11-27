@@ -53,11 +53,11 @@ def _rk_subject_scan(step, seed, sequences, shared, schedule, tables, reads, dec
         shared_axes = jax.tree.map(lambda b: 0 if b else None, by_shared)
         def one_round(carry, inputs):
             current, saved = carry
-            owners, positions, transfer, rows, shared_rows = inputs
+            owners, starts, receives, sends, rows, shared_rows = inputs
             def start_lane(old, reset, other):
                 return jax.vmap(lambda a, b, c, first, receive:
                                 jnp.where(first, b, jnp.where(receive, c, a)))(
-                                    old, reset, other, positions == 0, transfer > 0)
+                                    old, reset, other, starts, receives)
             current = jax.tree.map(start_lane, current, initial(owners), saved)
             def shared_arg(x, batched, column):
                 if column is not None:
@@ -65,9 +65,8 @@ def _rk_subject_scan(step, seed, sequences, shared, schedule, tables, reads, dec
                 return x[owners] if batched else x
             args = jax.tree.map(shared_arg, shared, by_shared, shared_rows)
             current, out = jax.vmap(advance, in_axes=(0, 0, *shared_axes))(current, rows, *args)
-            send = jnp.roll(transfer < 0, -1)
             saved = jax.tree.map(lambda old, new: jax.vmap(jnp.where)(
-                                 send, jnp.roll(new, -1, axis=0), old), saved, current)
+                                 sends, jnp.roll(new, -1, axis=0), old), saved, current)
             return (current, saved), out
 
         for owners, positions, transfer in phases:
@@ -80,7 +79,11 @@ def _rk_subject_scan(step, seed, sequences, shared, schedule, tables, reads, dec
             # owners outside the recurrence. Keep larger operands per subject.
             shared_rows = jax.tree.map(lambda x, batched: x[owners] if batched and x.ndim == 1 else None,
                                        shared, by_shared)
-            carry, out = jax.lax.scan(one_round, carry, (owners, positions, transfer, tuple(rows), shared_rows))
+            # Routing depends only on the schedule. Pass its masks to the scan
+            # so reverse mode can reuse them without saving them at every round.
+            sends = jnp.roll(transfer < 0, -1, axis=1)
+            carry, out = jax.lax.scan(one_round, carry, (owners, positions == 0, transfer > 0,
+                                                         sends, tuple(rows), shared_rows))
             chunks.append(jax.tree.map(lambda x: x.reshape((-1,) + x.shape[2:]), out))
         def restore_values(*parts):
             column = parts[0] if len(parts) == 1 else jnp.concatenate(parts)
