@@ -54,11 +54,15 @@
 # `groups 256` passes on the first and the third; it was not run on the
 # second.
 #
+# It is specific to Julia 1.10. Julia 1.12.7 and 1.13.1 with the same
+# registered Enzyme 0.13.221 return the gradient at 387, 257 and 256 steps.
+#
 # ReactiveKernels keeps its strip lowering: the program is valid, and
 # reshaping it so that Enzyme accepts it would hide the defect. The repair
 # belongs in Enzyme.
 #
-# Recorded on a Linux fleet host, Julia 1.10.12 (LLVM 15), 2026-11-27.
+# Recorded on a Linux fleet host, 2026-11-27, on Julia 1.10.12 (LLVM 15)
+# unless another version is named.
 #
 #   julia --startup-file=no --project=<env> benchmark/repro_enzyme_strip_refill_stored_recurrence.jl groups 387
 using Enzyme
