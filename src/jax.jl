@@ -414,6 +414,7 @@ struct _JaxPlateCell
     args::Vector{String}
     mapped::BitVector
     axis_inputs::Vector{ValueId}
+    record_reads::Vector{Tuple{Int,Int}}
 end
 
 struct _JaxScanRowRead
@@ -1494,6 +1495,7 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices; target::Bool = false)
             if i.T isa Type && i.T <: Integer && i.T !== Bool
                 read = _jax_helper!(ctx, "_rk_record_at", _JAX_RECORD_AT)
                 row = _PyVal(read * "(" * x.code * ", " * _jax_minus_one(i) * ")", E)
+                row = _jax_cell_record_read!(ctx, x, i, row)
                 return _jax_bind_record_entry(ctx, row)
             end
             indices = [i]
@@ -8786,7 +8788,7 @@ function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
                              group_rows = fill(false, length(p.have)),
                              active_cells::Bool = false, guarded_axes = nothing,
                              row_widths::Bool = false, event_inputs = nothing,
-                             record_axes = nothing, prefix = nothing)
+                             record_axes = nothing, prefix = nothing, indexed_axes = nothing)
     name = _jax_fresh(ctx, hint)
     outer = ctx.scope
     inner = _JaxScope(outer)
@@ -8815,6 +8817,7 @@ function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
     end
     active = active_cells ? _jax_identifier(inner.used, :active_cell) : ""
     active_cells && push!(names, active)
+    indexed_axes === nothing || _jax_cell_record_inputs!(ctx, inner, p, indexed_axes, names, active)
     if guarded_axes !== nothing
         tables = Set{_PyVal}()
         selectors = Set{String}()
@@ -8864,6 +8867,10 @@ function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
     isempty(inner.row_widths) ||
         insert!(names, length(names) + (active_cells ? 0 : 1), inner.row_width_param)
     params = inner.guarded_rows === nothing ? names : vcat(names, first.(inner.guarded_rows.bindings))
+    record_reads = get(ctx.mod.helper_names, (:cell_record_reads, inner), nothing)
+    if record_reads !== nothing
+        params = vcat(params, [name * "=None" for (name, _, _) in record_reads.reads])
+    end
     push!(outer.lines, "    "^outer.indent * "def " * name * "(" * join(params, ", ") * "):")
     append!(outer.lines, inner.lines)
     push!(outer.lines, "    "^inner.indent * "return " * (length(returned) == 1 ?
@@ -9034,6 +9041,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
                                                                     (inputs, mapped, prefix_guards),
                                                                 record_axes = R == 1 && ctx.mod.layout === :padded ?
                                                                     _jax_record_axes(ctx, body, inputs, mapped) : nothing,
+                                                                indexed_axes = R == 1 && !guard_each_cell && ctx.mod.layout === :padded ? mapped : nothing,
                                                                 row_widths = R == 1 && _jax_plate_layout() === :groups)
     if guard_each_cell
         bindings = cell_scope.guarded_rows === nothing ? () : cell_scope.guarded_rows.bindings
@@ -9111,8 +9119,11 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
        all(i -> !mapped[i] || eltype(inputs[i].T) <: Number, eachindex(inputs)) &&
        !recipe.effectful && !any(r -> r.effectful, body.recipes) && _JAX_EFFECTS[] == effects_before
         axis_ids = ValueId[canon_id(p.graph, v.id) for (v, maps) in zip(recipe.inputs, mapped) if maps]
+        record_reads = get(ctx.mod.helper_names, (:cell_record_reads, cell_scope), nothing)
+        reads = record_reads === nothing ? Tuple{Int,Int}[] :
+            [(table, selector) for (_, table, selector) in record_reads.reads]
         ctx.scope.plates[canon_id(p.graph, only(recipe.outputs).id)] =
-            _JaxPlateCell(cell, args, axes .== "0", axis_ids)
+            _JaxPlateCell(cell, args, axes .== "0", axis_ids, reads)
     end
     axes_text = "(" * join(axes, ", ") * (length(axes) == 1 ? ",)" : ")")
     # A plate over prepared ragged rows can run in the layout the prepared

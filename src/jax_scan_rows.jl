@@ -3,6 +3,44 @@ const _JAX_SUBJECT_SCAN = read(joinpath(@__DIR__, "jax_subject_scan.py"), String
 Base.include_dependency(joinpath(@__DIR__, "jax_requested_rows.py"))
 const _JAX_REQUESTED_CELL_ROWS = read(joinpath(@__DIR__, "jax_requested_rows.py"), String)
 
+# Direct record reads at cell scope can receive their entries from a caller
+# that already knows both the subject and event indices. Keep the ordinary
+# read as the default, so every other caller retains the same cell program.
+function _jax_cell_record_inputs!(ctx, scope, p, mapped, names, active)
+    tables, selectors = Dict{String,Int}(), Dict{String,Int}()
+    for (port, maps) in zip(p.have, mapped)
+        v = scope.values[canon_id(p.graph, port.id)]
+        at = findfirst(==(v.code), names)
+        if maps && v.T isa Type && v.T <: Integer && v.T !== Bool
+            selectors[v.code] = at - 1
+        elseif !maps && v.T isa Type && v.T <: AbstractVector && _jax_uniform_record(eltype(v.T))
+            tables[v.code] = at - 1
+        end
+    end
+    ctx.mod.helper_names[(:cell_record_reads, scope)] =
+        (; tables, selectors, active, reads = Tuple{String,Int,Int}[])
+end
+
+function _jax_cell_record_read!(ctx, table, index, row)
+    records = get(ctx.mod.helper_names, (:cell_record_reads, ctx.scope), nothing)
+    records === nothing && return row
+    haskey(records.tables, table.code) && haskey(records.selectors, index.code) || return row
+    # A nested branch can suppress the access. Only the cell's activity
+    # guard may surround a read that the requested-cell caller supplies.
+    guards = [g for (s, g) in _JAX_GUARDS if _jax_scope_within(s, ctx.scope)]
+    (isempty(guards) || guards == [records.active]) || return row
+    table_at, selector_at = records.tables[table.code], records.selectors[index.code]
+    found = findfirst(r -> r[2:3] == (table_at, selector_at), records.reads)
+    name = if found === nothing
+        name = _jax_fresh(ctx, :requested_record)
+        push!(records.reads, (name, table_at, selector_at))
+        name
+    else
+        records.reads[found][1]
+    end
+    _PyVal(row.code * " if " * name * " is None else " * name, row.T)
+end
+
 function _jax_subject_scan_lengths(ctx, firstrow)
     o = firstrow.origin
     ctx.mod.layout === :padded && o isa _JaxOrigin && o.position === nothing &&
@@ -262,6 +300,7 @@ function _jax_compact_cell_rows(ctx, inner, rows, read, guards, extent, index, g
         index_key = _jax_direct_record_key(ctx, rows.sequences[read.index])
         if index_key !== nothing
             push!(args, _jax_prepared_bound!(ctx, :requested_rows, o.key, index_key, lengths, target))
+            push!(args, _jax_chain_tuple(["(" * string(t) * ", " * string(i) * ")" for (t, i) in cell.record_reads]))
             helper = _jax_helper!(ctx, "_rk_requested_cell_rows", _JAX_REQUESTED_CELL_ROWS)
         end
     end
