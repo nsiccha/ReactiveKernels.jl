@@ -1477,6 +1477,10 @@ end
 @inline function _lane_broadcast(recycled,
         bc::Base.Broadcast.Broadcasted{<:Base.Broadcast.DefaultArrayStyle})
     bc.axes === nothing || return _native_broadcast_materialize(bc)
+    _lane_broadcast_apply(recycled, bc.style, bc.f, bc.args...)
+end
+
+@inline function _lane_broadcast_body(recycled, bc)
     ax = Base.@inline Base.Broadcast.combine_axes(bc.args...)
     ready = Base.Broadcast.instantiate(
         Base.Broadcast.Broadcasted(bc.style, bc.f, bc.args, ax))
@@ -1486,6 +1490,22 @@ end
     buffer === nothing && return _lane_keep!(recycled,
         _native_broadcast_copyto!(similar(ready, T), ready))
     copyto!(buffer, ready)
+end
+
+# Compile the array work independently of its containing program. Pass its
+# operands separately: passing a Broadcasted or a vararg tuple through the
+# boundary would materialize that temporary on Julia 1.10.
+@inline _lane_broadcast_apply(recycled, style, f, args...) =
+    _lane_broadcast_body(recycled, Base.Broadcast.Broadcasted(style, f, args))
+for arity in 1:4
+    args = [Symbol(:argument_, i) for i in 1:arity]
+    types = [Symbol(:Argument, i) for i in 1:arity]
+    typed = [:($arg::$T) for (arg, T) in zip(args, types)]
+    @eval @noinline function _lane_broadcast_apply(recycled, style, f::F,
+            $(typed...)) where {F,$(types...)}
+        _lane_broadcast_body(recycled,
+            Base.Broadcast.Broadcasted(style, f, ($(args...),)))
+    end
 end
 
 # Base's scalar multiplication on dense numeric arrays is an elementwise
@@ -1508,6 +1528,9 @@ const _LaneIndex = Union{Integer,AbstractRange{<:Integer},Colon,AbstractVector{<
 # `Array{T}` of the index shape, which a copy into a matching buffer equals.
 @inline function _lane_getindex(recycled,
         A::Union{Array{T},SubArray{T,<:Any,<:Array}}, I::Vararg{_LaneIndex}) where {T}
+    _lane_getindex_body(recycled, A, I)
+end
+@inline function _lane_getindex_body(recycled, A::AbstractArray{T}, I) where {T}
     all(index -> index isa Integer, I) && return A[I...]
     # One bounds check over the indices: the checked indices then read in
     # place, as `getindex` itself reads after its own check.
@@ -1516,6 +1539,21 @@ const _LaneIndex = Union{Integer,AbstractRange{<:Integer},Colon,AbstractVector{<
     buffer = _lane_reuse(recycled, T, Base.index_shape(J...))
     buffer === nothing && return _lane_keep!(recycled, @inbounds A[I...])
     copyto!(buffer, @inbounds view(A, J...))
+end
+
+# The common index arities use the same boundary without packing the indices
+# at the caller. Other arities retain the inline path above.
+for arity in 1:4
+    indices = [Symbol(:index_, i) for i in 1:arity]
+    typed = [:($index::_LaneIndex) for index in indices]
+    scalar = [:($index::Integer) for index in indices]
+    @eval @inline _lane_getindex(recycled,
+        A::Union{Array{T},SubArray{T,<:Any,<:Array}}, $(scalar...)) where {T} =
+        A[$(indices...)]
+    @eval @noinline function _lane_getindex(recycled,
+            A::Union{Array{T},SubArray{T,<:Any,<:Array}}, $(typed...)) where {T}
+        _lane_getindex_body(recycled, A, ($(indices...),))
+    end
 end
 
 # A slice that a dotted call reads as one of its operands, `f.(x[k])` or

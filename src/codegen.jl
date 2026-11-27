@@ -7465,18 +7465,15 @@ end
 # (`log(s)` per position of a shared `s = exp(a)`) is computed as written.
 function _replicated_part_ast(part::Plan; recycle = Pair{ValueId,Symbol}[],
                               cell_slots = nothing, cell_tables = nothing)
-    residual = cell_tables !== nothing
     ast, constants, callables, recipes = _lower_with_ops(_lowering_plan(part);
-        declare = true, recycle, cell_slots, cell_tables, plate_programs = residual)
+        declare = true, recycle, cell_slots, cell_tables, plate_programs = true)
     _simplify() && (ast = _stable_rewrites(ast, recipes))
-    if residual
-        # The position driver binds these scratch slots outside the residual.
-        # Each extracted plate takes the ones it reads as ordinary arguments.
-        # Expand a lone plate here, while its results still have the residual's
-        # names. Embedding then renames its assignments and their uses together.
-        ast = _extract_plate_programs(ast, Iterators.flatten((cell_slots, cell_tables));
-                                      inline_single = true)
-    end
+    # Both parts can contain unchanged plate loops shared by other readers.
+    # Their scratch slots are bound by the position driver, outside this part;
+    # each extracted plate takes the ones it reads as ordinary arguments.
+    # Expand a lone plate before embedding renames its assignments and uses.
+    captures = Iterators.flatten((something(cell_slots, ()), something(cell_tables, ())))
+    ast = _extract_plate_programs(ast, captures; inline_single = true)
     ast, constants, callables, recipes
 end
 
