@@ -16,6 +16,16 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.408
+
+The emitted JAX `select_plate_layout` confirms competing layouts in 12 rotating,
+synchronized rounds by default and ranks their median latency per chain (or
+projected calls). Reports retain pilot and confirmation samples and name the
+score used. `confirmation_rounds=0` and a single effective layout preserve
+pilot-only timing. Memory failures remain reported and skip larger widths;
+timing callbacks are released between widths. Bound-gradient calibration
+shares the timing loop and retains its existing selection policy.
+
 ## 0.1.407
 
 Bound JAX gradients confirm overlapping layout timings in interleaved rounds.

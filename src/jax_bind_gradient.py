@@ -19,7 +19,6 @@ def bind_gradient(density, prepared, *, device=None, memory_budget_bytes=None):
     from functools import partial
     from operator import index
     from threading import RLock
-    import time
 
     if memory_budget_bytes is not None:
         memory_budget_bytes = index(memory_budget_bytes)
@@ -31,6 +30,7 @@ def bind_gradient(density, prepared, *, device=None, memory_budget_bytes=None):
     immutable = {id(x): x for x in jax.tree_util.tree_leaves(prepared) if isinstance(x, jax.Array)}
     data = deepcopy(prepared, immutable)
     measure, layout_variants = _MEASURE_LAYOUT, _LAYOUT_VARIANTS
+    confirm_layouts = _CONFIRM_LAYOUTS
     programs = {}
     lock = RLock()
 
@@ -138,32 +138,9 @@ def bind_gradient(density, prepared, *, device=None, memory_budget_bytes=None):
             yield supplied, data, True
 
     def confirm(finalists, rows, steps):
-        for i in range(12):
-            start = i % len(finalists)
-            for k in finalists[start:] + finalists[:start]:
-                row = rows[k]
-                if row["error"] is not None:
-                    continue
-                started = time.perf_counter()
-                try:
-                    jax.block_until_ready(steps[k]())
-                except Exception as error:
-                    if not isinstance(error, MemoryError) and "RESOURCE_EXHAUSTED" not in str(error):
-                        raise
-                    row["error"] = str(error)
-                    row["seconds"] = row["fit_seconds"] = float("inf")
-                    del steps[k]
-                elapsed = time.perf_counter() - started
-                row["calibration_seconds"] += elapsed
-                if row["error"] is None:
-                    row["confirmation_samples_seconds"].append(elapsed)
-
-        confirmed = [k for k in finalists if k in steps]
+        confirmed = confirm_layouts(finalists, rows, steps, 12)
         if not confirmed:
             return None
-        for k in confirmed:
-            samples = rows[k]["confirmation_samples_seconds"]
-            rows[k]["confirmation_median_seconds"] = float(np.median(samples))
         confirmed.sort(key=lambda k: rows[k]["confirmation_median_seconds"])
         current = next((k for k in confirmed if rows[k]["current"]), None)
         if current is None:

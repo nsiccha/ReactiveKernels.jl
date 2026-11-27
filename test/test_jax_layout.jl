@@ -100,6 +100,8 @@ end
                    string(walk))
     @test [f.name for f in walk.functions] ==
         ["prepare_data", "kernel", "prepare_plate_layout", "select_plate_layout", "bind_gradient"]
+    selector = only(filter(f -> f.name == "select_plate_layout", walk.functions))
+    @test "confirmation_rounds" in first.(selector.inputs)
     rows = jax_source(jax_layout_rows; have = (:a, :xs), want = :total, data = (:xs,),
                       plate_layout = :groups)
     # The second plate maps computed rows beside the prepared ones: both

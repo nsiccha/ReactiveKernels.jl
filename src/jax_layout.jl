@@ -256,7 +256,8 @@ def _rk_layout_candidates(prepared, candidates):
 const _JAX_SELECT_PLATE_LAYOUT = raw"""
 def select_plate_layout(prepared: dict, make_step: Any, chains: Any = None,
                         candidates: Any = None, repeats: int = 3, *,
-                        alternatives: Any = None, calls: Any = None, guarded_reads: Any = None) -> tuple:
+                        alternatives: Any = None, calls: Any = None, guarded_reads: Any = None,
+                        confirmation_rounds: int = 12) -> tuple:
     \"\"\"Time layouts on the device and return the chosen prepared data and timings.
 
     A builder `make_step(data, count)` returns a zero-argument callable for one
@@ -269,27 +270,42 @@ def select_plate_layout(prepared: dict, make_step: Any, chains: Any = None,
     Eligible reads try compact and dense capacities. Set `guarded_reads` to
     "compact" or "dense" to hold that choice fixed across layouts.
 
-    The first call warms the executable. With `calls(count)`, rank by the
-    median warm time multiplied by the number of calls the fit requires at
-    that count. Otherwise rank by the shortest warm time per chain. An
-    allocation failure skips the larger chain counts for that layout.
+    Each builder is called once per layout and width. The first step warms
+    the executable, followed by `repeats` pilot calls. When comparing layouts,
+    all feasible candidates at each width then run `confirmation_rounds`
+    times in rotating order, synchronized after every call. Rank by the
+    confirmation median per chain, or by median * `calls(count)` when given.
+    The callable may be stateful: confirmation continues its pilot state.
+    Callbacks for one width are released before building the next width.
+    An allocation failure skips larger widths for that layout.
 
-    The first row in the report names the chosen variant and chain count.
-    For each row, `setup_seconds` runs from entering the builder through the
-    first blocked call. `calibration_seconds` also includes the warm repeats.
-    A memory failure ends the interval at the failed attempt. Successful
-    blocked warm calls are recorded in `samples_seconds`, with their
-    `median_seconds` once all repeats finish. With `calls`, `fit_seconds`
-    gives the projected fit duration at the measured warm latency.
+    With `confirmation_rounds=0`, or only one effective layout, use the pilot
+    minimum per chain (pilot median * calls when given), without extra calls.
+    This preserves the timing procedure for a fixed-layout chain-count curve.
+
+    The first row names the chosen variant and chain count. `setup_seconds`
+    runs from entering the builder through the first blocked call.
+    `calibration_seconds` also includes that candidate's pilot and confirmation
+    calls, excluding time spent on other candidates. A memory failure ends
+    its interval at the failed attempt. Pilot calls are in `samples_seconds`,
+    with `median_seconds` once all repeats finish. Confirmation has separate
+    `confirmation_samples_seconds` and `confirmation_median_seconds` fields.
+    `seconds` is the latency used for ranking; `score_method` names its source
+    and objective. With `calls`, `fit_seconds` gives the projected fit duration.
     \"\"\"
     import operator
+    repeats = operator.index(repeats)
+    confirmation_rounds = operator.index(confirmation_rounds)
     if repeats < 1:
         raise ValueError("repeats must be positive")
+    if confirmation_rounds < 0:
+        raise ValueError("confirmation_rounds must be nonnegative")
     counts = (None,) if chains is None else sorted({operator.index(n) for n in chains})
     if chains is not None and any(n <= 0 for n in counts):
         raise ValueError("chain counts must be positive")
     if calls is not None and chains is None:
         raise ValueError("calls(count) requires chain counts")
+
     def rank(row):
         return row.get("fit_seconds", row["seconds"] / (row["chains"] or 1))
 
@@ -299,27 +315,95 @@ def select_plate_layout(prepared: dict, make_step: Any, chains: Any = None,
     work = {} if calls is None else {n: float(calls(n)) for n in counts}
     if any(not np.isfinite(n) or n <= 0 for n in work.values()):
         raise ValueError("the projected number of calls must be finite and positive")
-    variants = @variants@(prepared, make_step, candidates, alternatives, guarded_reads)
-    for name, groups, sequential, mode, chosen, builder in variants:
+    variants = list(@variants@(prepared, make_step, candidates, alternatives, guarded_reads))
+
+    def measure(k, count):
+        name, groups, sequential, mode, chosen, builder = variants[k]
+        def build():
+            return builder(chosen) if count is None else builder(chosen, count)
+        step, row = @measure@((name, groups, sequential, mode), count, build, repeats)
+        row.update(confirmation_samples_seconds=[], confirmation_median_seconds=None)
+        report.append(row)
+        return step, row
+
+    def score(k, row, confirmed):
+        nonlocal best_score, best_data
+        phase = "confirmation" if confirmed else "pilot"
+        statistic = "median" if confirmed or calls is not None else "minimum"
+        objective = "projected_calls" if calls is not None else "per_chain"
+        row["score_method"] = f"{phase}_{statistic}_{objective}"
+        if row["error"] is not None:
+            row["seconds"] = float("inf")
+        elif confirmed:
+            row["seconds"] = row["confirmation_median_seconds"]
+        elif calls is not None:
+            row["seconds"] = row["median_seconds"]
+        if calls is not None:
+            row["fit_seconds"] = row["seconds"] * work[row["chains"]]
+        if row["error"] is None and (best_score is None or rank(row) < best_score):
+            best_score, best_data = rank(row), variants[k][4]
+
+    if confirmation_rounds and len(variants) > 1:
+        failed = set()
         for count in counts:
-            def build():
-                return builder(chosen) if count is None else builder(chosen, count)
-            step, row = @measure@((name, groups, sequential, mode), count, build, repeats)
-            del step
-            report.append(row)
-            if calls is not None:
-                row["seconds"] = row["median_seconds"] if row["error"] is None else float("inf")
-                row["fit_seconds"] = row["seconds"] * work[count]
-            if row["error"] is not None:
-                break
-            score = rank(row)
-            if best_score is None or score < best_score:
-                best_score = score
-                best_data = chosen
+            rows, steps = {}, {}
+            try:
+                for k in range(len(variants)):
+                    if k in failed:
+                        continue
+                    step, row = measure(k, count)
+                    rows[k] = row
+                    if step is not None:
+                        steps[k] = step
+                    del step
+                # Confirm even a lone survivor so all widths use the same score.
+                @confirm@(list(steps), rows, steps, confirmation_rounds)
+                for k, row in rows.items():
+                    score(k, row, True)
+                    if row["error"] is not None:
+                        failed.add(k)
+            finally:
+                steps.clear()
+    else:
+        for k in range(len(variants)):
+            for count in counts:
+                step, row = measure(k, count)
+                del step
+                score(k, row, False)
+                if row["error"] is not None:
+                    break
     report.sort(key=rank)
     if not report or report[0]["error"] is not None:
         raise RuntimeError("select_plate_layout: no candidate ran on this device")
     return best_data, report
+
+
+def @confirm@(finalists, rows, steps, rounds):
+    import time
+    for i in range(rounds if finalists else 0):
+        start = i % len(finalists)
+        for k in finalists[start:] + finalists[:start]:
+            row = rows[k]
+            if row["error"] is not None:
+                continue
+            started = time.perf_counter()
+            try:
+                jax.block_until_ready(steps[k]())
+            except Exception as error:
+                if not isinstance(error, MemoryError) and "RESOURCE_EXHAUSTED" not in str(error):
+                    raise
+                row["error"] = str(error)
+                row["seconds"] = row["fit_seconds"] = float("inf")
+                del steps[k]
+            elapsed = time.perf_counter() - started
+            row["calibration_seconds"] += elapsed
+            if row["error"] is None:
+                row["confirmation_samples_seconds"].append(elapsed)
+    confirmed = [k for k in finalists if k in steps]
+    for k in confirmed:
+        samples = rows[k]["confirmation_samples_seconds"]
+        rows[k]["confirmation_median_seconds"] = float(np.median(samples))
+    return confirmed
 
 
 def @variants@(prepared, make_step, candidates=None, alternatives=None, guarded_reads=None):
@@ -424,16 +508,17 @@ function _jax_layout_functions!(mod, bodies, functions, constants)
     end
     select = _jax_identifier(mod.used, :select_plate_layout)
     measure = _jax_param_name(mod.used, :_rk_measure_layout; stable=false)
+    confirm = _jax_param_name(mod.used, :_rk_confirm_layouts; stable=false)
     variants = _jax_param_name(mod.used, :_rk_layout_variants; stable=false)
     push!(bodies, rstrip(replace(_JAX_SELECT_PLATE_LAYOUT,
-        "@measure@" => measure, "@variants@" => variants,
+        "@measure@" => measure, "@confirm@" => confirm, "@variants@" => variants,
         "select_plate_layout" => select, "@prepare_reads@" => read_selector)))
     push!(functions, JAXFunction(select,
         Pair{String,Any}["prepared" => Dict, "make_step" => Any, "chains" => Any,
                          "candidates" => Any, "repeats" => Int, "alternatives" => Any, "calls" => Any,
-                         "guarded_reads" => Any],
+                         "guarded_reads" => Any, "confirmation_rounds" => Int],
         Pair{String,Any}["prepared" => Dict, "report" => Vector{Any}]))
-    (; measure, variants)
+    (; measure, confirm, variants)
 end
 
 Base.include_dependency(joinpath(@__DIR__, "jax_bind_gradient.py"))
@@ -445,6 +530,7 @@ function _jax_gradient_binding!(mod, bodies, functions, layout)
     push!(bodies, rstrip(replace(_JAX_BIND_GRADIENT, "def bind_gradient(" => "def " * name * "(",
         "_rk_batched_gradient" => batch,
         "_MEASURE_LAYOUT" => (isnothing(layout) ? "None" : layout.measure),
+        "_CONFIRM_LAYOUTS" => (isnothing(layout) ? "None" : layout.confirm),
         "_LAYOUT_VARIANTS" => (isnothing(layout) ? "None" : layout.variants))))
     push!(functions, JAXFunction(name,
         Pair{String,Any}["density" => Any, "prepared" => Dict, "device" => Any,
