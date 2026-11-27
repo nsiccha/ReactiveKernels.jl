@@ -82,8 +82,9 @@ def _rk_subject_scan(step, seed, sequences, shared, schedule, tables, reads, dec
             # Routing depends only on the schedule. Pass its masks to the scan
             # so reverse mode can reuse them without saving them at every round.
             sends = jnp.roll(transfer < 0, -1, axis=1)
+            # Two consecutive rounds share a backend loop iteration.
             carry, out = jax.lax.scan(one_round, carry, (owners, positions == 0, transfer > 0,
-                                                         sends, tuple(rows), shared_rows))
+                                                         sends, tuple(rows), shared_rows), unroll=2)
             chunks.append(jax.tree.map(lambda x: x.reshape((-1,) + x.shape[2:]), out))
         def restore_values(*parts):
             column = parts[0] if len(parts) == 1 else jnp.concatenate(parts)

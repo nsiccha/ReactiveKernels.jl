@@ -32,6 +32,16 @@ for model in (padded, groups):
         with np.testing.assert_raises_regex(Exception, "BoundsError"):
             jax.block_until_ready(jax.jit(model.kernel)(0.75, **model.prepare_guarded_reads(bad, mode)))
 
+# The first two Julia references use the same widths and request count, with
+# different visit positions. Pass both schedules to one compiled gradient.
+bindings = [padded.prepare_data(kinds=k, visits=v) for k, v, _ in cases[:2]]
+gradient = jax.jit(jax.value_and_grad(padded.kernel))
+compiled = gradient.lower(0.75, **bindings[0]).compile()
+for binding, (_, _, slope) in zip(bindings, cases[:2]):
+    np.testing.assert_allclose(compiled(0.75, **binding), [0.75*slope, slope])
+    old = {key: x for key, x in binding.items() if not key.startswith("_rk_requested_rows_")}
+    np.testing.assert_allclose(gradient(0.75, **old), [0.75*slope, slope])
+
 tags, visits, _ = cases[0]
 raw = padded.prepare_data(kinds=tags, visits=visits)
 with np.testing.assert_raises_regex(ValueError, "guarded read mode"):

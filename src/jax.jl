@@ -9141,8 +9141,10 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     call = R == 1 ? _jax_layout_call(ctx, cell, axes_text, call_args,
                                      _jax_layout_arguments(ctx, inputs, mapped, ragged),
                                      rows_at, rows) : nothing
+    record_plate = false
     if call === nothing && R == 1 && masked && !guard_each_cell && !only(with_length)
         call = _jax_record_plate_call(ctx, p, recipe, E, inputs, mapped, cell, call_args)
+        record_plate = call !== nothing
     end
     if call === nothing
         call = cell
@@ -9183,7 +9185,7 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
             empty!(row_layouts)
         end
     end
-    if masked && !guard_each_cell && isempty(chain_counts)
+    if masked && !guard_each_cell && !record_plate && isempty(chain_counts)
         condition = _jax_nonempty_condition(axis_inputs[padded])
         isempty(condition) || (call = _jax_if_nonempty(ctx, condition, "lambda: " * call))
     end
@@ -10557,7 +10559,7 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
             push!(pending, key)
         end
     end
-    bounds = filter(b -> b[2] ∉ (:broadcast_total, :scan_rows, :row_layout, :sign_groups, :match_count, :padded_map_rows, :subject_scan) ||
+    bounds = filter(b -> b[2] ∉ (:broadcast_total, :scan_rows, :row_layout, :sign_groups, :match_count, :padded_map_rows, :subject_scan, :record_rows, :requested_rows) ||
                          b[1] in used_inputs, all_bounds)
     if !isempty(bounds)
         bodies[prepare_body] = join(_jax_prepare_bounds_lines(mod, prepare_lines, bounds), "\n")
@@ -10935,13 +10937,16 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
             # their entries), which `prepare_data` returns with the data.
             body = join(scope.lines, "\n")
             schedules = Set{String}()
+            optional_schedules = Set{String}()
             for (bn, kind, _) in _jax_prepared_bounds(mod)
                 occursin(Regex("\\b" * bn * "\\b"), body) || continue
                 push!(inputs, bn => _jax_prepared_aux_type(kind)); push!(input_locals, bn)
-                kind in (:row_layout, :map_rows, :padded_map_rows, :scan_rows, :subject_scan) && push!(schedules, bn)
+                kind in (:row_layout, :map_rows, :padded_map_rows, :scan_rows, :subject_scan, :record_rows, :requested_rows) && push!(schedules, bn)
+                kind in (:record_rows, :requested_rows) && push!(optional_schedules, bn)
             end
             for ((pn, _), local_name) in zip(inputs[keyword_from+1:end], input_locals[keyword_from+1:end])
                 value = "prepared[\"" * pn * "\"]"
+                pn in optional_schedules && (value = "prepared.get(\"" * pn * "\")")
                 # Closed-over host arrays have to support traced indexing as
                 # well. StaticInt has no pytree leaves, so sizes stay static.
                 pn in schedules && (value = "jax.tree.map(jnp.asarray, " * value * ")")

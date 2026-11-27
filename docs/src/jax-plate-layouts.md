@@ -95,19 +95,18 @@ layouts by time per chain. If a candidate runs out of memory, the selector
 records the failure and skips its larger chain counts. The result is
 the prepared data with the fastest layout and a report of every run.
 
-When a prepared scan can gather a producer's full table or compute just its
-requested rows, the module also emits `prepare_guarded_reads`.
-`prepare_data` starts in compact mode, using the maximum number of matching
-positions in any row as the capacity for each eligible read. If that count
-equals the full width, the compact and dense bounds coincide. For example,
-`dense = module.prepare_guarded_reads(prepared, "dense")` selects the full
-table. Pass `**dense` to the numerical function. Use `"compact"` to request
-the tiled computation. Both choices apply to every eligible read in that
-module and can be made again after preparing different data. The tuner times
-both when their prepared bounds differ, including on a padded export. The
-winning row's `guarded_reads` field records the mode to replay. To compare
-subject walks at a fixed guarded-read mode, pass `guarded_reads="compact"`
-or `guarded_reads="dense"` to `select_plate_layout`.
+Modules with eligible guarded reads expose `prepare_guarded_reads`.
+`prepare_data` defaults to `"compact"`, using the largest match count in
+any row as each read's capacity. When guards and indices come directly from
+padded data and the scan and table extents agree, compact mode batches valid
+requests across subjects. Other eligible compact reads use tiles.
+
+Pass `**module.prepare_guarded_reads(prepared, "dense")` to the numerical
+function to gather full producer tables. Either mode applies to all eligible
+reads and can be chosen again with new data. If compact and dense capacities
+differ, the tuner tries both, including on padded exports. The winner's
+`guarded_reads` field names the mode to replay. Pass `guarded_reads="compact"`
+or `guarded_reads="dense"` to `select_plate_layout` to hold the mode fixed.
 
 The example also compares separately exported sampler modules in a mapping
 keyed by layout name. Supply identical raw inputs and at least as many

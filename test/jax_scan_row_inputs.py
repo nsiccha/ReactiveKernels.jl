@@ -47,6 +47,29 @@ for lengths in ([1, 3, 0], [2, 0, 9]):
     assert work == [(len(positions),)], work
 
 
+# Reuse one compiled gradient after changing real row positions, scan tags and
+# the location of an empty subject. The public fixture is affine in a.
+def loss(a, data):
+    return model.kernel(a, **data)
+
+
+for layout in ("events", "padded"):
+    compiled = None
+    for bases, types, orders, expected in (
+            ([[1., 2.], [], [3.]], [[3, 2], [], [3]], [[2, 99], [], [1]], (8.71875, 10.25)),
+            ([[], [-1.], [2., 3.]], [[], [3], [2, 3]], [[], [1], [99, 1]], (4.59375, 4.75))):
+        data = model.prepare_plate_layout(model.prepare_data(bases, types, orders), subject_walk=layout)
+        a = jnp.asarray(0.75)
+        if compiled is None:
+            compiled = jax.jit(jax.value_and_grad(loss)).lower(a, data).compile()
+        np.testing.assert_allclose(compiled(a, data), expected)
+    # An earlier prepared dict has the flat positions and lengths without
+    # the optional record schedule.
+    schedule, = (key for key in data if key.startswith("_rk_record_rows_"))
+    older = {key: value for key, value in data.items() if key != schedule}
+    np.testing.assert_allclose(jax.jit(jax.value_and_grad(loss))(a, older), expected)
+
+
 # Homogeneous boolean records retain their dtype on empty and short rows.
 def boolean_row(n, data):
     return model._rk_record_plate(lambda x, active: (x > 1,), 0, n, 4, 3,

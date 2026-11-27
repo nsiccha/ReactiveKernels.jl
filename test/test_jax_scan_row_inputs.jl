@@ -25,7 +25,7 @@ end
 @testset "A prepared scan guard batches the requested producer rows" begin
     have = (:a, :kinds, :visits)
     src = jax_source(jax_requested_scan_producer; have, want=:total, data=(:kinds, :visits))
-    @test occursin(" = _rk_scan_cell_rows(", string(src))
+    @test occursin(r" = _rk_(requested|scan)_cell_rows\(", string(src))
     @test occursin(" = _rk_match_count(", string(src))
     native = prepare(jax_requested_scan_producer; have, want=:total)
     if rk_jax_available()
@@ -46,6 +46,9 @@ end
             for layout in (:groups, :padded)
                 model = jax_source(jax_requested_scan_producer; have, want=:total,
                                    data=(:kinds, :visits), plate_layout=layout)
+                if layout === :padded
+                    @test occursin(" = _rk_requested_cell_rows(", model.text)
+                end
                 write(joinpath(dir, string(layout) * ".py"), model)
             end
             # This fixture is linear in a. Supply the native slope for each
@@ -53,6 +56,7 @@ end
             open(joinpath(dir, "cases.py"), "w") do io
                 println(io, "cases = [")
                 for (ks, js) in (([[2, 3, 2, 3], [3], Int[]], [[99, 1, -1, 1], [1], Int[]]),
+                                 ([[3, 2, 3, 2], [3], Int[]], [[2, 99, 2, -1], [1], Int[]]),
                                  ([Int[]], [Int[]]), (tiles, indices))
                     println(io, "    (", _rk_py(ks), ", ", _rk_py(js), ", ", native(1.0, ks, js), "),")
                 end
@@ -100,6 +104,44 @@ end
 @traceable function jax_scan_positive_order(x)
     x >= 0 || throw(ArgumentError("checked scan operation"))
     x
+end
+
+@traceable function jax_checked_record(x)
+    x > 0 || throw(ArgumentError("nonpositive record input"))
+    (x, 2x)
+end
+
+@kernel function jax_checked_record_scan(a::Float64, bases::Vector{Vector{Float64}},
+                                         visits::Vector{Vector{Int}})
+    totals = plate(bases, visits) do base, js
+        records = plate(base) do x
+            jax_checked_record(a * x)
+        end
+        path = scan(js, Ref(records); init = 0.0) do carry, j, table
+            next = carry + table[j][1]
+            (next, next)
+        end
+        sum(path)
+    end
+    total = sum(totals)
+    return total
+end
+
+@testset "Scheduled record checks visit real producer entries before the scan" begin
+    have = (:a, :bases, :visits)
+    src = jax_source(jax_checked_record_scan; have, want=:total, data=(:bases, :visits), plate_layout=:padded)
+    @test occursin("schedule=_rk_record_rows_", src.text)
+    native = prepare(jax_checked_record_scan; have, want=:total)
+    if rk_jax_available()
+        bases, visits = [[1., 2.], Float64[], [3.]], [[2, 1], Int[], [1]]
+        result = rk_jax_evaluate(src, "kernel", (0.75, bases, visits); prepare=:arguments, grad=true)
+        @test result.value ≈ native(0.75, bases, visits)
+        @test result.grad ≈ native(1.0, bases, visits)
+        # The second producer entry is invalid even if the scan never reads it.
+        bad, later = [[1., 0.], Float64[], [3.]], [[99, 1], Int[], [1]]
+        @test_throws "nonpositive record input" native(0.75, bad, later)
+        @test_throws "nonpositive record input" rk_jax_evaluate(src, "kernel", (0.75, bad, later); prepare=:arguments)
+    end
 end
 
 @kernel function jax_scan_row_order(a::Float64, kinds::Vector{Int}, visits::Vector{Int},

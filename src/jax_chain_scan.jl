@@ -26,7 +26,7 @@ function _jax_chain_entry(ctx, table, index)
     end
     entry
 end
-_jax_prepared_aux_type(kind) = kind in (:row_layout, :map_rows, :padded_map_rows, :sign_groups, :event_rounds, :subject_scan) ? Tuple : kind === :scan_rows ? Vector{Int} : Int
+_jax_prepared_aux_type(kind) = kind in (:row_layout, :map_rows, :padded_map_rows, :sign_groups, :event_rounds, :subject_scan, :record_rows, :requested_rows) ? Tuple : kind === :scan_rows ? Vector{Int} : Int
 function _jax_chain_dtypes(T)
     T <: Number && return _jax_dtype(T)
     _jax_number_fields(T) ? _jax_chain_tuple(_jax_dtype.(fieldtypes(T))) : nothing
@@ -197,6 +197,14 @@ function _jax_padded_row_key(ctx, v)
     nothing
 end
 
+function _jax_ragged_port(ctx, v)
+    for scope in _jax_scope_chain(ctx.scope)
+        key = get(ctx.mod.helper_names, (:ragged_port, scope, v.code), nothing)
+        key === nothing || return key
+    end
+    nothing
+end
+
 const _JAX_PADDED_ROW_SUMS = raw"""
 def _rk_padded_row_sums(cell, args, axes, schedule, dtype):
     # Positions are in the logical broadcast of the rows. A computed array
@@ -264,12 +272,7 @@ function _jax_chain_table(ctx, recipe, args, mapped; sum_rows = false, domains =
     layout = if padded
         operands = String[]
         for (i, lengths) in zip(each, keys)
-            data = ""
-            for scope in _jax_scope_chain(ctx.scope)
-                data = get(ctx.mod.helper_names, (:ragged_port, scope, args[i].code), "")
-                isempty(data) || break
-            end
-            push!(operands, lengths, data)
+            push!(operands, lengths, something(_jax_ragged_port(ctx, args[i]), ""))
         end
         key = _jax_prepared_bound!(ctx, :padded_map_rows, operands...)
         _jax_call(ctx, _runtime_check, [_PyVal(key * " is not None", Bool, true),
