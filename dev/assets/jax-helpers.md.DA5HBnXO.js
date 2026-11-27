@@ -314,6 +314,10 @@ import{_ as e,o as a,c as i,a6 as n}from"./chunks/framework.BTpfZnOf.js";const u
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    return model(&quot;constrain&quot;, unconstrained, **prepared)</span></span>
 <span class="line"></span>
 <span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">def _rk_batched_gradient(density, positions, data):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    return jax.vmap(jax.value_and_grad(lambda p: density(p, **data)))(positions)</span></span>
+<span class="line"></span>
+<span class="line"></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">def bind_gradient(density, prepared, *, device=None, memory_budget_bytes=None):</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    &quot;&quot;&quot;Bind a batched value-and-gradient to prepared data on one device.</span></span>
 <span class="line"></span>
@@ -369,10 +373,10 @@ import{_ as e,o as a,c as i,a6 as n}from"./chunks/framework.BTpfZnOf.js";const u
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def compile_program(chosen, key):</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        target, shape, dtype, weak = key</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        sharding = jax.sharding.SingleDeviceSharding(target)</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        batch = jax.jit(jax.vmap(jax.value_and_grad(lambda p: density(p, **chosen))),</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                        in_shardings=sharding)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        function = jax.tree_util.Partial(density)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        batch = jax.jit(_rk_batched_gradient, in_shardings=sharding)</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        abstract_positions = jax.ShapeDtypeStruct(shape, dtype, sharding=sharding, weak_type=weak)</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        program = batch.lower(abstract_positions).compile()</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        program = batch.lower(function, abstract_positions, chosen).compile()</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        if memory_budget_bytes is not None:</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            try:</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                stats = program.memory_analysis()</span></span>
@@ -383,7 +387,8 @@ import{_ as e,o as a,c as i,a6 as n}from"./chunks/framework.BTpfZnOf.js";const u
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                raise MemoryError(&quot;backend did not report planned device buffer bytes&quot;)</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            if size &gt; memory_budget_bytes:</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                raise MemoryError(f&quot;gradient requires {size} planned bytes, budget is {memory_budget_bytes}&quot;)</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        return program</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        device_data = jax.device_put(chosen, target)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        return lambda positions: program(function, positions, device_data)</span></span>
 <span class="line"></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def candidates():</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        yield data</span></span>
