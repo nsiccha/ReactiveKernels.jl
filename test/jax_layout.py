@@ -278,7 +278,9 @@ selected, prepared_fit, count, fits = tune_sampler(modules, raw, positions, iter
                                                   10, 80, 2, groups=(1,), repeats=2)
 assert {(r["variant"], r["chains"]) for r in fits} == {(v, n) for v in modules for n in (2, 4)}
 assert [r["fit_seconds"] for r in fits] == sorted(r["fit_seconds"] for r in fits)
-assert all(r["median_seconds"] == np.median(r["samples_seconds"]) == r["seconds"] for r in fits)
+assert all(r["median_seconds"] == np.median(r["samples_seconds"]) for r in fits)
+assert all(r["confirmation_median_seconds"] == np.median(r["confirmation_samples_seconds"])
+           == r["seconds"] for r in fits)
 assert all(r["fit_seconds"] == r["seconds"] * (10 + 160 / r["chains"]) for r in fits)
 assert selected is modules[fits[0]["variant"]] and count == fits[0]["chains"]
 np.testing.assert_allclose(selected.log_density(0.6, **prepared_fit), rows.kernel(0.6, **chosen))
@@ -294,3 +296,7 @@ def dense_step(data, n):
 best, report = dense.select_plate_layout(dense_data, dense_step, chains=(2, 4), repeats=1)
 assert sorted(row["chains"] for row in report) == [2, 4]
 np.testing.assert_allclose(jax.grad(lambda a: dense.kernel(a, **best))(0.6), 1.25)
+
+
+from jax_layout_selection import check_selection
+check_selection(walk, walk_data())

@@ -10,9 +10,7 @@ across subjects also supplies a choice of walks. After preparing the data, call
 `chosen, timings = module.select_plate_layout(prepared, make_step, chains=[64])`.
 Use `make_step(chosen, 64)()` to repeat the winning batch. The builder
 `make_step(data, count)` returns a zero-argument gradient or sampler step.
-The first timing row names the winning `variant`. Each successful row gives
-the chain count, the blocked warm calls in `samples_seconds`, and their
-median in `median_seconds`. The `"padded"` walk gathers records before scanning each
+The first timing row names the winning `variant`. The `"padded"` walk gathers records before scanning each
 subject up to the common row width. The `"events"` walk schedules reads at real
 events wherever the scan supports it. `prepare_data` uses the latter by default.
 To repeat a particular walk, call
@@ -95,17 +93,24 @@ for the executable. Allow separate headroom for other live arrays and
 allocator overhead. A backend must supply a buffer estimate to run with a
 budget.
 
-`select_plate_layout(prepared, make_step, chains=None)` runs that timing. The
-caller supplies `make_step(prepared)`, or `make_step(prepared, count)` with
-`chains`. The builder returns a zero-argument function for one batched
-gradient or one sampler step over all chains. Timings and memory failures
-describe the work that function runs. For a jitted gradient, budget one compilation or
-cache load per distinct candidate and chain count tried, one call to warm
-it up, and `repeats` timed calls (three by default). Gradient calibration
-does this at the width of `positions`. With `chains`, the selector compares
-layouts by time per chain. If a candidate runs out of memory, the selector
-records the failure and skips its larger chain counts. The result is
-the prepared data with the fastest layout and a report of every run.
+`select_plate_layout(prepared, make_step, chains=None)` calls
+`make_step(prepared)` without chains, or `make_step(prepared, count)` with
+chains. Each builder returns a zero-argument callable and runs once per
+candidate and width. Budget one compilation/cache load, one warmup call,
+and `repeats` pilot calls (default three).
+
+For multiple effective layouts, `confirmation_rounds=12` adds synchronized
+calls in rotating candidate order at each width, regardless of pilot overlap.
+Rank by confirmation median/chain, or median times `calls(count)`.
+Measurements describe this timing window, without guaranteeing a later winner.
+Stateful callbacks continue their pilot state. Callbacks coexist within one
+width and are released before the next, potentially using more memory than
+sequential timing. Memory failures at any stage are reported and skip that
+candidate's larger widths. Other errors propagate.
+
+`confirmation_rounds=0`, or one effective layout, retains pilot-only timing:
+minimum/chain, or median times `calls(count)`. A fixed-layout chain-count curve
+therefore adds no calls. Fix both the layout and `guarded_reads` when both vary.
 
 Modules with eligible guarded reads expose `prepare_guarded_reads`.
 `prepare_data` defaults to `"compact"`, using the largest match count in
@@ -120,23 +125,21 @@ differ, the tuner tries both, including on padded exports. The winner's
 `guarded_reads` field names the mode to replay. Pass `guarded_reads="compact"`
 or `guarded_reads="dense"` to `select_plate_layout` to hold the mode fixed.
 
-The example also compares separately exported sampler modules in a mapping
-keyed by layout name. Supply identical raw inputs and at least as many
-starting positions as the largest batch. `tune_sampler` returns the module,
-prepared data, chain count and timing table. It ranks each measured width by
-the median gradient-call time multiplied by the projected calls to finish
-warmup and sampling. Its inputs are warmup gradients per chain, the total
-draw count and mean gradients per draw. An application can pass its own
-`calls(count)` to `select_plate_layout` to reflect its adaptation schedule.
-A grouped export with no ragged plates still measures each candidate chain
-count once.
+The example compares separately exported sampler modules keyed by layout
+name, using identical inputs and enough starting positions for every batch.
+`tune_sampler` returns the module, prepared data, count and report. It projects
+fit time from warmup gradients/chain, total draws and mean gradients/draw.
+Applications can supply `calls(count)` for their own adaptation schedule.
+A grouped export without ragged plates measures one layout at each width.
 
-Each row also gives two elapsed wall times in seconds. `setup_seconds` starts
-just before the tuner calls the builder and ends when the first result is
-ready. It includes any eager compilation or cache loading the builder does.
-`calibration_seconds` covers that setup and all timed repetitions for the
-row. A memory failure ends its interval at the failed attempt. The tuner
-ranks successful rows by warm performance.
+`setup_seconds` covers the builder through its first blocked result, including
+compilation. `calibration_seconds` adds that candidate's pilot and confirmation
+calls, excluding other candidates' time and ending at a failed attempt.
+`samples_seconds`/`median_seconds` retain pilots;
+`confirmation_samples_seconds`/`confirmation_median_seconds` retain confirmation.
+Failed rows may contain partial samples but cannot win. `seconds` is the ranked
+latency; `score_method` names its phase, statistic and objective. With `calls`,
+`fit_seconds` is the projected total.
 
 ```@example jax_plate_runtime
 using ReactiveKernels, Markdown # hide
