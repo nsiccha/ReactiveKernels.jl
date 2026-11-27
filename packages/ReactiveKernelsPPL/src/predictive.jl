@@ -316,8 +316,10 @@ The shape each observation's draws take on the binding `plan` of the program
 `built` was built from, keyed like `:pointwise`: the bound response's shape,
 or, for a response `plan` leaves absent, the shape of the operands it
 broadcasts with. A response holding one array per `@plate` index takes each
-index's shape (from the law values themselves when the response is absent and
-no data the cell reads per index fix it). Pass it to
+index's shape. For absent array cells the target has `kind = :cells` and
+`dims = nothing`. The query reads each shape from the current law arguments.
+A `response_cell_ranks` declaration adds the expected `rank` to this target.
+Pass it to
 [`predictive_laws`](@ref) and [`predictive_draws`](@ref) with the value of
 [`predictive_node`](@ref) on a cut over the same design.
 """
@@ -332,7 +334,9 @@ function predictive_targets(built, plan::StructuralPlan)
             dims = column isa _Absent ? nothing :
                 Tuple{Vararg{Int}}[size(c) for c in column]
             T = column isa _Absent ? _valueless_response_eltype(r) : eltype(eltype(column))
-            return (kind = :cells, dims = dims, eltype = T)
+            target = (kind = :cells, dims = dims, eltype = T)
+            rank = get(_binding_cell_ranks(plan), r.response, nothing)
+            return column isa _Absent && rank !== nothing ? (; target..., rank) : target
         end
         return (kind = :array, dims = size(column), eltype = eltype(column))
     end
@@ -554,12 +558,21 @@ end
 
 function _response_laws(entry, target)
     if target.kind === :cells
-        hasproperty(entry, :sizes) || return [PredictiveLaws(entry, d)
-            for d in something(target.dims, Tuple{Vararg{Int}}[])]
+        if !hasproperty(entry, :sizes)
+            if hasproperty(target, :rank) && !isempty(entry.law) && prod(_law_shape(entry)) > 0
+                throw(DimensionMismatch("[query] the laws are scalar per index, " *
+                    "the binding declared cell rank $(target.rank)"))
+            end
+            return [PredictiveLaws(entry, d) for d in something(target.dims, Tuple{Vararg{Int}}[])]
+        end
         sizes = entry.sizes
         ndims(sizes) == 2 || throw(DimensionMismatch("[query] the observation " *
             "laws hold $(ndims(sizes) - 2) more axes than one design's: a " *
             "vectorized cut's value needs `position = k` to select draw k"))
+        if hasproperty(target, :rank) && !isempty(axes(sizes, 2)) && size(sizes, 1) != target.rank
+            throw(DimensionMismatch("[query] the law arguments have cell rank " *
+                "$(size(sizes, 1)), the binding declared $(target.rank)"))
+        end
         dims = target.dims === nothing ?
             [Tuple(view(sizes, :, i)) for i in axes(sizes, 2)] : target.dims
         length(dims) == size(sizes, 2) || throw(DimensionMismatch(

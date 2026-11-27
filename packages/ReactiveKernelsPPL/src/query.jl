@@ -436,6 +436,10 @@ function _absent_typed_as(plan::StructuralPlan, program::Expr)
     for k in absent
         v, T = columns[k], get(types, k, nothing)
         T isa Type || continue
+        rank = get(_binding_cell_ranks(plan), k, nothing)
+        if rank !== nothing && typeintersect(T, AbstractVector{<:AbstractArray{<:Any,rank}}) === Union{}
+            _fail(k, "the built program's input $T disagrees with the declared cell rank $rank")
+        end
         if v isa _AbsentArray && T <: AbstractVector{<:AbstractArray} && ndims(v) == 1
             # The graph observes one array per index: one cell per index,
             # each of one entry (shapes are not part of the program).

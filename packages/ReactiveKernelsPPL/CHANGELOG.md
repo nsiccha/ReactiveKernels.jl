@@ -16,6 +16,14 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.271
+
+A first `bind_data` with an omitted dotted plate response can infer array
+cells from a computed location such as `mu[i] = a .+ times[rows[i]]`.
+For an opaque location, `response_cell_ranks=(y=1,)` declares vector cells.
+Rebinding inherits the declaration. Predictive draws take each cell's
+dimensions from the current law arguments, including empty groups.
+
 ## 0.1.270
 
 A truncated prior keeps staged `KernelBuildCache` assembly: the expansion

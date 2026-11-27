@@ -125,3 +125,89 @@ end
             Base.invokelatest(fitted, u, Xoshiro(27))
     end
 end
+
+function _aps_gather_source(domain; reduce = false)
+    loc = reduce ? :(a + sum(times[rows[i]])) : :(a .+ times[rows[i]])
+    quote
+        a ~ Normal(0, 1)
+        @plate for i in eachindex(subject)
+            mu[i] = $loc
+        end
+        @plate for i in eachindex($domain)
+            y[i] .~ Normal.(mu[i], 0.1)
+        end
+    end
+end
+
+@testset "first predictive binding with a computed array location" begin
+    programs = Dict{Int,Tuple{Int,Int}}()
+    times = [0.2, 0.4, 0.6]
+    designs = ([[1, 2], [3]], [Int[], [2, 1], [3], [1, 3, 2]], Vector{Int}[])
+    for domain in (:y, :subject), rows in designs
+        data = (; subject = collect(eachindex(rows)), times, rows)
+        source = _aps_gather_source(domain)
+        base = lower_rkppl(source, data; conditioned = (:y,), mod = @__MODULE__)
+        plan = bind_data(base, data)
+        built = build_kernel(plan)
+        target = predictive_targets(built, plan).y
+        @test target.kind === :cells && target.dims === nothing
+        q = prepare_predictive(built, plan)
+        fitdata = (; data..., y = [times[row] for row in rows])
+        fit = bind_data(base, fitdata)
+        qfit = prepare_predictive(built, fit)
+        for a in (-0.3, 1.0)
+            rng = Xoshiro(17)
+            expected = [[rand(rng, Normal(a + times[j], 0.1)) for j in row] for row in rows]
+            @test q([a], Xoshiro(17)).y == expected == qfit([a], Xoshiro(17)).y
+        end
+        if domain === :y && !isempty(rows)
+            emitted = ReactiveKernels.code_expr(q.kernel)
+            programs[length(rows)] = (_aps_nodes(emitted), _aps_loops(emitted))
+            @test _aps_loops(emitted) > 0
+        end
+        if domain === :y && length(rows) == 2
+            @test_throws ContractValidationError prepare_query(built, plan, :likelihood)
+            sampler = prepare_sampler(built, fit, [0.3];
+                backend = AutoEnzyme(; mode = Enzyme.Reverse))
+            val, grad = sampler_value_and_gradient!(sampler, zeros(1), [0.3])
+            @test val ≈ logpdf(Normal(), 0.3) + sum(logpdf(Normal(0.3 + x, 0.1), x)
+                for xs in fitdata.y for x in xs)
+            @test only(grad) ≈ -0.3 - 0.3 * sum(length, rows) / 0.1^2
+        end
+    end
+    @test programs[2] == programs[4]
+
+    data = (; subject = [1, 2], times, rows = [[1, 2], [3]])
+    source = _aps_gather_source(:subject; reduce = true)
+    plan = bind_data(lower_rkppl(source, data; conditioned = (:y,), mod = @__MODULE__), data)
+    built = build_kernel(plan)
+    @test predictive_targets(built, plan).y.kind === :array
+    rng = Xoshiro(17)
+    @test prepare_predictive(built, plan)([1.0], Xoshiro(17)).y ==
+        [rand(rng, Normal(1 + sum(times[row]), 0.1)) for row in data.rows]
+end
+
+@testset "computed matrix locations broadcast with per-index vector scales" begin
+    source = quote
+        a ~ Normal(0, 1)
+        @plate for i in eachindex(subject)
+            mu[i] = a .+ times[rows[i]]
+        end
+        @plate for i in eachindex(y)
+            y[i] .~ Normal.(mu[i], sigma[i])
+        end
+    end
+    data = (; subject = [1, 2], times = [0.2, 0.4, 0.6],
+        rows = [[1 2; 2 3], reshape([3, 1], 1, 2)], sigma = [[0.1, 0.2], [0.3]])
+    base = lower_rkppl(source, data; conditioned = (:y,), mod = @__MODULE__)
+    plan = bind_data(base, data)
+    @test eltype(plan.columns[:y]) <: AbstractMatrix
+    built = build_kernel(plan)
+    fit = bind_data(base, (; data..., y = [data.times[r] for r in data.rows]))
+    rng = Xoshiro(17)
+    expected = [rand.(Ref(rng), Normal.(0.3 .+ data.times[r], sd))
+        for (r, sd) in zip(data.rows, data.sigma)]
+    for bound in (plan, fit)
+        @test prepare_predictive(built, bound)([0.3], Xoshiro(17)).y == expected
+    end
+end

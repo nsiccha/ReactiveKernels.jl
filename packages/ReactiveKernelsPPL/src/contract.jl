@@ -1089,8 +1089,10 @@ struct _BindingData
     lock::ReentrantLock
     values::Dict{Symbol,Any}
     graphs::IdDict{Any,Any}
+    response_cell_ranks::Dict{Symbol,Int}
 end
-_BindingData() = _BindingData(ReentrantLock(), Dict{Symbol,Any}(), IdDict{Any,Any}())
+_BindingData(ranks = Dict{Symbol,Int}()) =
+    _BindingData(ReentrantLock(), Dict{Symbol,Any}(), IdDict{Any,Any}(), ranks)
 
 # The expanded author program is used only by native random queries. Density
 # planning, row counts and the numerical build cache do not read this field.
@@ -2600,16 +2602,27 @@ function _size_absent_responses!(plan::StructuralPlan, columns::AbstractDict)
         if r.range isa Expr && _response_range_source(r) !== r.response &&
                 get(columns, _response_range_source(r), nothing) isa AbstractArray
             rows = _response_range_indices(columns, r)
-            dims = (max(first(dims), maximum(rows; init = 0)), Base.tail(dims)...)
+            # An empty selection supplies zero indices when no independent
+            # operand sets an outer extent. The singleton is only a fallback.
+            dims = (max(isempty(shape) ? 0 : first(dims), maximum(rows; init = 0)),
+                Base.tail(dims)...)
         end
         cells = _absent_cell_shapes(plan, columns, r.response)
-        # With no per-index data to size its cells, a response that held one
-        # array per index in the binding being rebound still does: one cell
-        # per index, each of one entry (shapes are not part of the program,
-        # as for a built graph's in `_absent_typed_as`).
-        if cells === nothing
-            N = _rebound_cell_ndims(plan, r.response)
-            N === nothing || (cells = fill(ntuple(_ -> 1, N), first(dims)))
+        # The program needs a cell rank. The predictive law supplies its
+        # actual axes at the current parameter draw.
+        declared = get(plan.data_values.response_cell_ranks, r.response, nothing)
+        rank = declared
+        rank === nothing && (rank = _rebound_cell_ndims(plan, r.response))
+        rank === nothing && (rank = _computed_location_cell_rank(axis_plan, r))
+        if rank !== nothing && cells === nothing
+            cells = fill(ntuple(_ -> 1, rank), first(dims))
+        elseif rank !== nothing
+            n = _absent_cell_rank(cells)
+            declared !== nothing && n > declared && _fail(r.response,
+                "rank-$n operands exceed the declared cell rank $declared")
+            if rank > n
+                cells = NTuple{rank,Int}[ntuple(j -> j <= n ? s[j] : 1, rank) for s in cells]
+            end
         end
         for nm in names
             old = columns[nm]
@@ -2641,6 +2654,35 @@ function _rebound_cell_ndims(plan::StructuralPlan, response::Symbol)
     old isa _AbsentCells && return ndims(eltype(old))
     _holds_arrays(old) || return nothing
     return eltype(old) <: AbstractArray ? ndims(eltype(old)) : ndims(first(old))
+end
+
+_binding_cell_ranks(plan::StructuralPlan) =
+    plan.data_values === nothing ? NamedTuple() : plan.data_values.response_cell_ranks
+
+function _response_cell_ranks(plan, declarations)
+    declarations isa Union{NamedTuple,AbstractDict} ||
+        _fail(:bind, "response_cell_ranks needs a named tuple or symbol-keyed dictionary")
+    ranks = Dict{Symbol,Int}()
+    for (name, rank) in pairs(declarations)
+        name isa Symbol && haskey(plan.cell_broadcasts, name) &&
+            any(r -> r.response === name, plan.responses) || _fail(:bind,
+                "response_cell_ranks key $name must name a dotted plate likelihood")
+        rank isa Integer && !(rank isa Bool) && 1 <= rank <= typemax(Int) ||
+            _fail(name, "an array-valued response cell needs a positive integer rank")
+        ranks[name] = rank
+    end
+    return ranks
+end
+
+function _check_response_cell_ranks(ranks, columns)
+    for (name, rank) in ranks
+        col = columns[name]
+        col isa _Absent && continue
+        col isa AbstractVector && (isempty(col) ?
+            _array_type_rank(eltype(col)) === rank :
+            all(c -> c isa AbstractArray && ndims(c) == rank, col)) ||
+            _fail(name, "the observed response must hold one rank-$rank array per index")
+    end
 end
 
 # A dotted `@plate` cell (`y[i] .~ D.(…)`) whose per-index data hold one
@@ -7672,6 +7714,15 @@ end
 _contains_plate_column(ex) = ex isa Expr &&
     (_is_plate_column_expr(ex) || any(_contains_plate_column, ex.args))
 
+# A retained column as its native kernel, used for both binding data-only
+# plates and inferring the result type of a sampled location.
+function _plate_column_kernel(ex, names)
+    result = _cell_scan_fresh!(Set(names), :_ppl_bound_cells)
+    signature = Expr(:call, :_ppl_bound_plate, names...)
+    body = Expr(:block, Expr(:(=), result, ex), Expr(:return, result))
+    return _eval_kernel_def(Expr(:(=), signature, body))
+end
+
 # A data-only plate column at binding: the cell, once per index, over the
 # zipped inputs (`plate(lanes...) do args...; cell; end`).
 function _eval_plate_column(ex, lookup, label)
@@ -7680,10 +7731,7 @@ function _eval_plate_column(ex, lookup, label)
     # below cannot infer the element type of an empty cell from its AST.
     if _contains_plate_column(ex.args[2])
         names = sort!(collect(_plate_column_reads(ex)))
-        result = _cell_scan_fresh!(Set(names), :_ppl_bound_cells)
-        signature = Expr(:call, :_ppl_bound_plate, names...)
-        body = Expr(:block, Expr(:(=), result, ex), Expr(:return, result))
-        spec = _eval_kernel_def(Expr(:(=), signature, body))
+        spec = _plate_column_kernel(ex, names)
         return Base.invokelatest(spec, map(lookup, names)...)
     end
     call, lam = ex.args
@@ -9098,7 +9146,7 @@ end
 
 """
     bind_data(plan, columns; roles=Dict(), dims=Dict(), conditioned=plan.conditioned,
-              frozen=plan.frozen) -> StructuralPlan
+              frozen=plan.frozen, response_cell_ranks=…) -> StructuralPlan
 
 `columns` accepts a symbol-keyed `AbstractDict` or a `NamedTuple` of data
 values, as does value-based `lower_rkppl`. Named tuples use the same binding
@@ -9135,6 +9183,13 @@ definition as data is refused, as for any definition. A rebinding keeps its
 plan's frozen values unless `frozen` replaces them; `frozen = nothing`
 evaluates every definition again.
 
+A dotted plate likelihood such as `y[i] .~ Normal.(mu[i], s)` can infer
+array cells from a collected location on the first binding. If its result
+type is opaque, pass `response_cell_ranks=(y=1,)` for vectors or `(y=2,)`
+for matrices. The law arguments supply each cell's dimensions at prediction.
+Rebinding inherits the declarations unless a new named tuple or dictionary
+replaces them. Observed cells must agree with their declared rank.
+
 Binding resolves module values and calls in a package-owned latest-world
 scope, including definitions just evaluated in a builder.
 """
@@ -9144,7 +9199,7 @@ bind_data(plan::StructuralPlan, columns::NamedTuple; kwargs...) =
 function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
         roles::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}(),
         dims::AbstractDict{Symbol,<:Integer} = Dict{Symbol,Int}(),
-        conditioned = plan.conditioned,
+        conditioned = plan.conditioned, response_cell_ranks = _binding_cell_ranks(plan),
         frozen::Union{FrozenValues,Nothing} = plan.frozen)
     # Resolve the callee binding in the same scope as its evaluation: on
     # Julia 1.12, a call-only invokelatest cannot see a just-created binding
@@ -9152,7 +9207,7 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     return _with_structural_cache() do
         _with_bind_memo() do
             Base.invokelatest(_bind_data_latest, plan, columns; roles, dims, conditioned,
-                frozen = something(frozen, FrozenValues()))
+                response_cell_ranks, frozen = something(frozen, FrozenValues()))
         end
     end
 end
@@ -9161,7 +9216,8 @@ Base.@nospecializeinfer function _bind_data_latest(input_plan::StructuralPlan,
         @nospecialize(columns::AbstractDict{Symbol});
         roles::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}(),
         dims::AbstractDict{Symbol,<:Integer} = Dict{Symbol,Int}(),
-        conditioned = input_plan.conditioned, frozen::FrozenValues = input_plan.frozen)
+        conditioned = input_plan.conditioned, response_cell_ranks = _binding_cell_ranks(input_plan),
+        frozen::FrozenValues = input_plan.frozen)
     # `plan` is reassigned below and captured by closures, so Julia boxes it;
     # declared, its uses stay typed (snag downstream-workl-75f8cba4).
     plan::StructuralPlan = input_plan
@@ -9188,7 +9244,8 @@ Base.@nospecializeinfer function _bind_data_latest(input_plan::StructuralPlan,
     frozen_inputs = _bind_frozen!(plan, columns, frozen)
     # Every step below sizes and evaluates with this binding's record, which
     # `frozen` may supply in place of the plan's own (`bind_data(fit, …; frozen)`).
-    plan = _with(plan; frozen, data_values = _BindingData())
+    ranks = _response_cell_ranks(plan, response_cell_ranks)
+    plan = _with(plan; frozen, data_values = _BindingData(ranks))
     merge!(plan.data_values.values, pairs(frozen.values))
     _absent_observations!(plan, columns)
     _route_conditioned_values!(plan, columns)
@@ -9207,6 +9264,7 @@ Base.@nospecializeinfer function _bind_data_latest(input_plan::StructuralPlan,
     inputs, _ = _model_level_inputs(plan, raw)
     union!(inputs, (_conditioned_input(n) for n in _conditioned_inputs(plan)))
     _materialize_derived_responses!(plan, columns)
+    _check_response_cell_ranks(ranks, columns)
     # A derived response that evaluates to a number is one observation,
     # exactly like the same number bound as data.
     _scalar_responses_as_observations!(plan, columns)
