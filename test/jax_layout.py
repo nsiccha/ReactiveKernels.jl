@@ -242,7 +242,8 @@ else:
 
 
 example = Path(__file__).resolve().parents[1] / "examples" / "jax_plate_layout.py"
-tune_gradient = runpy.run_path(str(example))["tune_gradient"]
+example_functions = runpy.run_path(str(example))
+tune_gradient = example_functions["tune_gradient"]
 raw = {"xs": [np.array([1.0, 2.0]), np.array([3.0])]}
 chosen, report = tune_gradient(rows, raw, positions, (2, 4))
 assert report[0]["chains"] in (2, 4)
@@ -250,11 +251,25 @@ np.testing.assert_allclose(rows.kernel(0.6, **chosen), rows.kernel(0.6, **rows.p
 with np.testing.assert_raises_regex(ValueError, "initial position"):
     tune_gradient(rows, raw, positions, iter((len(positions) + 1,)))
 
+# Two timing steps share the trace and each reads its own candidate's arrays.
+seen = []
+def density(a, **prepared):
+    seen.append(isinstance(prepared["x"], jax.core.Tracer))
+    return dense.kernel(a, **prepared)
+
+builder = example_functions["_gradient_builder"](density, positions)
+for x in ([1., 2.], [4., 8.]):
+    step = builder(dense.prepare_data(x=np.array(x)), 2)
+    value, grad = step()
+    np.testing.assert_allclose(value, positions[:2] * sum(x))
+    np.testing.assert_allclose(grad, sum(x))
+assert seen == [True]
+
 # Exercise the fit objective with separately bound modules, and a generator of
 # chain counts shared across the candidates. An initial position belongs to
 # exactly one chain in the batch that was timed.
 from types import SimpleNamespace
-tune_sampler = runpy.run_path(str(example))["tune_sampler"]
+tune_sampler = example_functions["tune_sampler"]
 grouped_sampler = SimpleNamespace(prepare_data=rows.prepare_data, log_density=rows.kernel,
                                   select_plate_layout=rows.select_plate_layout)
 other_sampler = SimpleNamespace(prepare_data=rows.prepare_data, log_density=rows.kernel)

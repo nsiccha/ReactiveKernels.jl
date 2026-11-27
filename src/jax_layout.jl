@@ -439,7 +439,9 @@ const _JAX_BIND_GRADIENT = read(joinpath(@__DIR__, "jax_bind_gradient.py"), Stri
 
 function _jax_gradient_binding!(mod, bodies, functions, layout)
     name = _jax_identifier(mod.used, :bind_gradient)
+    batch = _jax_param_name(mod.used, :_rk_batched_gradient; stable=false)
     push!(bodies, rstrip(replace(_JAX_BIND_GRADIENT, "def bind_gradient(" => "def " * name * "(",
+        "_rk_batched_gradient" => batch,
         "_TIME_LAYOUTS" => (isnothing(layout) ? "None" : layout.tuner),
         "_LAYOUT_VARIANTS" => (isnothing(layout) ? "None" : layout.variants))))
     push!(functions, JAXFunction(name,

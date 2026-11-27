@@ -20,6 +20,19 @@ with patch.object(dense, "_rk_layout_variants", side_effect=AssertionError("unso
     np.testing.assert_allclose(bound(points[:1]), [[2], [4]])
 np.testing.assert_allclose(dense.bind_gradient(dense.kernel, data)(points), [30 * points, [30, 30]])
 
+# A second binding uses the first trace with new data. Keep both bindings
+# alive to check that each invocation supplies its own snapshot.
+traces = []
+def observed(p, **prepared):
+    traces.append(isinstance(prepared["x"], jax.core.Tracer))
+    return dense.kernel(p, **prepared)
+
+first, second = (dense.bind_gradient(observed, dense.prepare_data(x=np.array(x)))
+                 for x in ([2., -1.], [3., 4.]))
+for binding, scale in ((first, 1), (second, 7), (first, 1)):
+    np.testing.assert_allclose(binding(points), [scale * points, [scale, scale]])
+assert traces == [True]
+
 # Observe the actual executable returned by the tuner. The first ordinary call
 # after calibration must run that same executable, even with new positions.
 data = rows.prepare_data(xs=[np.array([2.]), np.array([1., 3., 4.]), np.empty(0)])
@@ -52,8 +65,11 @@ data = dense.prepare_data(x=np.array([3.]))
 dev = jax.local_devices()[0]
 sharding = jax.sharding.SingleDeviceSharding(dev)
 sig = jax.ShapeDtypeStruct(points.shape, points.dtype, sharding=sharding)
-program = jax.jit(jax.vmap(jax.value_and_grad(lambda p: watched(p, **data))),
-                  in_shardings=sharding).lower(sig).compile()
+def batch(function, positions, inputs):
+    return jax.vmap(jax.value_and_grad(lambda p: function(p, **inputs)))(positions)
+
+program = jax.jit(batch, in_shardings=sharding).lower(
+    jax.tree_util.Partial(watched), sig, data).compile()
 limit = program.memory_analysis().total_allocation_bytes
 with np.testing.assert_raises_regex(MemoryError, "planned bytes"):
     dense.bind_gradient(watched, data, memory_budget_bytes=limit - 1)(points)
