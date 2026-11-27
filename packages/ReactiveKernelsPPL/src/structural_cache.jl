@@ -129,6 +129,19 @@ end
 _names_id(plan::StructuralPlan, names) =
     _structural_enabled() ? _names_id(_structural_cache(plan), names) : nothing
 
+# An ordered sequence compared element by element with the same identity
+# semantics as a tuple in the structural IdDict, independent of its length.
+function _sequence_id(plan::StructuralPlan, kind::Symbol, items::Vector)
+    _structural_enabled() || return nothing
+    h = UInt(0)
+    for item in items
+        h = hash(objectid(item), h)
+    end
+    same(stored) = all(i -> stored[i] === items[i], eachindex(items))
+    return _signature_id(same, () -> copy(items), _structural_cache(plan),
+        (kind, h, length(items)))
+end
+
 # A table's names with `signature(value)` per name, compared by identity:
 # a column table's value types (`:types`), the roles binding assigns
 # (`:roles`). Hashed by its names alone: hashing a type (`objectid` of a
@@ -287,6 +300,8 @@ function _interned(plan::StructuralPlan, id::Tuple, value)
     cache = _structural_cache(plan)
     return lock(() -> get!(cache.entries, (:interned, id), value), cache.lock)
 end
+_interned(plan::StructuralPlan, kind::Symbol, items::Vector, value = items) =
+    _interned(plan, (kind, _sequence_id(plan, kind, items)), value)
 
 # ── Values of one binding ───────────────────────────────────────────
 #

@@ -5926,11 +5926,11 @@ Base.@nospecializeinfer function _kernel_port_sig(@nospecialize(spec::KernelSpec
     ids
 end
 
-function plan(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
-              want = _KERNEL_DEFAULT_BOUNDARY)
-    plan(spec.graph;
-         have = _kernel_selection(spec, have, spec.have_names, :have),
-         want = _kernel_selection(spec, want, spec.want_names, :want))
+Base.@nospecializeinfer function plan(@nospecialize(spec::KernelSpec);
+        have = _KERNEL_DEFAULT_BOUNDARY, want = _KERNEL_DEFAULT_BOUNDARY)
+    plan(getfield(spec, :graph);
+         have = _kernel_selection(spec, have, getfield(spec, :have_names), :have),
+         want = _kernel_selection(spec, want, getfield(spec, :want_names), :want))
 end
 
 # Resolve the spec-level `bound` NamedTuple (authored port name => data) into

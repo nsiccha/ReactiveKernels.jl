@@ -67,6 +67,22 @@ _scache_kernel_entries(plan) =
     @test !haskey(b.columns, :y) || b.columns[:y] isa _SCACHE._Absent
 end
 
+@testset "rebinding reuses the map for the same ordered levels" begin
+    source = quote
+        c[levels(g)] .~ Normal.(0, 2)
+        s ~ Exponential(1)
+        mu = c[g]
+        y .~ Normal.(mu, s)
+    end
+    plan = lower_rkppl(source, (:g, :y); conditioned = (:y,))
+    bind_levels(g) = bind_data(plan, (; g, y = zeros(length(g)))).levelmaps
+    first_maps = bind_levels([1, 2, 3])
+    @test only(bind_levels([1, 2, 3, 4])).values == [1, 2, 3, 4]
+    @test only(bind_levels([2, 3, 4])).values == [2, 3, 4]
+    @test bind_levels([1, 1, 2, 3]) === first_maps
+    @test only(first_maps).values == [1, 2, 3]
+end
+
 @testset "structural cache: rebinding adds no analyses" begin
     unbound = _scache_lower(_scache_design(4))
     first_bound = bind_data(unbound, _scache_design(5))

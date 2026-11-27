@@ -1,8 +1,8 @@
 # Integer parameters have no unconstrained real coordinates. Their named
 # values remain runtime inputs, including when a query changes only one block.
 _integer_parameter(p) = get(SAMPLED_SUPPORT, p.family, nothing) === :integer
-_integer_parameters(plan) = [p for p in (plan.parameters..., plan.plate_parameters..., plan.array_parameters...)
-    if _integer_parameter(p) && p.name ∉ plan.conditioned]
+_integer_parameters(plan) = [p for group in (plan.parameters, plan.plate_parameters, plan.array_parameters)
+    for p in group if _integer_parameter(p) && p.name ∉ plan.conditioned]
 _has_integer_parameters(plan) = any(p -> p.name ∉ plan.marginalized_integers,
     _integer_parameters(plan))
 
