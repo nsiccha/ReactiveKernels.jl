@@ -157,6 +157,7 @@ const _PPL_TEST_FILES = (
     "test_corpus.jl",
     "test_submodels_full.jl",
     "test_nested_subject_plate.jl",
+    "test_repeated_observed_arguments.jl",
     "test_nested_broadcast_replanning.jl",
     "test_scoped_submodels.jl",
     "test_submodel_return_values.jl",

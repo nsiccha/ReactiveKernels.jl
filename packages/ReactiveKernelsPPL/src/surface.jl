@@ -8260,11 +8260,6 @@ function _expand_cell_submodel(colref::Expr, callexpr::Expr, ivar::Symbol,
     end
     latent_stream = col ∉ data && slot !== nothing && _is_dotted_obj(lines[slot])
     argset = Set{Symbol}(_submodel_args(sm))
-    for st in lines
-        nm = _declared_value_name(_stmt_lhs(st))
-        nm in argset && _sfail("submodel `$(sm.name)`: `$nm` is both an " *
-            "argument and a local statement — rename the local")
-    end
     # A scan's loop variable and step locals live inside that scan.
     scoped = Set{Symbol}()
     foreach(s -> _scan_scoped_names!(scoped, s), scans)
