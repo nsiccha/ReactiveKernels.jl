@@ -1,5 +1,12 @@
 # Standalone CPU reproducer: only Enzyme is required.
 #
+# Repaired on 2026-11-27 by Enzyme.jl dogfood a23e4ecc with libEnzyme
+# f2ed2bc6 (repair replayed_cache_limits). The crash observations below
+# describe the earlier builds named in this header. RK regression coverage
+# is in test/test_scan_strip_refill_ad.jl; its 257-, 387-, 3000-step and
+# ragged-group Reverse cases are skipped on unrepaired Julia 1.10 stacks
+# because they abort the process. The 256-step control still runs there.
+#
 # Native Enzyme reverse mode crashes the process (a segmentation fault, or
 # glibc's `malloc(): unaligned tcache chunk detected` / `free(): invalid size`,
 # varying from run to run) at the first gradient of this in-bounds function.
