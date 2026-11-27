@@ -282,8 +282,44 @@ def select_plate_layout(prepared: dict, make_step: Any, chains: Any = None,
     `median_seconds` once all repeats finish. With `calls`, `fit_seconds`
     gives the projected fit duration at the measured warm latency.
     \"\"\"
-    return @tuner@(prepared, make_step, chains, candidates, repeats, alternatives,
-                   calls, guarded_reads, keep_step=False)
+    import operator
+    if repeats < 1:
+        raise ValueError("repeats must be positive")
+    counts = (None,) if chains is None else sorted({operator.index(n) for n in chains})
+    if chains is not None and any(n <= 0 for n in counts):
+        raise ValueError("chain counts must be positive")
+    if calls is not None and chains is None:
+        raise ValueError("calls(count) requires chain counts")
+    def rank(row):
+        return row.get("fit_seconds", row["seconds"] / (row["chains"] or 1))
+
+    report = []
+    best_score = None
+    best_data = None
+    work = {} if calls is None else {n: float(calls(n)) for n in counts}
+    if any(not np.isfinite(n) or n <= 0 for n in work.values()):
+        raise ValueError("the projected number of calls must be finite and positive")
+    variants = @variants@(prepared, make_step, candidates, alternatives, guarded_reads)
+    for name, groups, sequential, mode, chosen, builder in variants:
+        for count in counts:
+            def build():
+                return builder(chosen) if count is None else builder(chosen, count)
+            step, row = @measure@((name, groups, sequential, mode), count, build, repeats)
+            del step
+            report.append(row)
+            if calls is not None:
+                row["seconds"] = row["median_seconds"] if row["error"] is None else float("inf")
+                row["fit_seconds"] = row["seconds"] * work[count]
+            if row["error"] is not None:
+                break
+            score = rank(row)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_data = chosen
+    report.sort(key=rank)
+    if not report or report[0]["error"] is not None:
+        raise RuntimeError("select_plate_layout: no candidate ran on this device")
+    return best_data, report
 
 
 def @variants@(prepared, make_step, candidates=None, alternatives=None, guarded_reads=None):
@@ -316,69 +352,35 @@ def @variants@(prepared, make_step, candidates=None, alternatives=None, guarded_
                 yield name, groups, sequential, "dense", dense, builder
 
 
-def @tuner@(prepared, make_step, chains, candidates, repeats, alternatives,
-            calls, guarded_reads, *, keep_step):
-    import operator
+def @measure@(layout, count, build, repeats):
     import time
-    if repeats < 1:
-        raise ValueError("repeats must be positive")
-    counts = (None,) if chains is None else sorted({operator.index(n) for n in chains})
-    if chains is not None and any(n <= 0 for n in counts):
-        raise ValueError("chain counts must be positive")
-    if calls is not None and chains is None:
-        raise ValueError("calls(count) requires chain counts")
-    def rank(row):
-        return row.get("fit_seconds", row["seconds"] / (row["chains"] or 1))
-
-    report = []
-    best_score = None
-    best_data = None
-    work = {} if calls is None else {n: float(calls(n)) for n in counts}
-    if any(not np.isfinite(n) or n <= 0 for n in work.values()):
-        raise ValueError("the projected number of calls must be finite and positive")
-    variants = @variants@(prepared, make_step, candidates, alternatives, guarded_reads)
-    for name, groups, sequential, mode, chosen, builder in variants:
-        for count in counts:
-            row = {"variant": name, "groups": groups, "sequential": sequential,
-                   "chains": count, "seconds": float("inf"), "error": None,
-                   "samples_seconds": [], "median_seconds": None}
-            if mode is not None:
-                row["guarded_reads"] = mode
-            if calls is not None:
-                row["fit_seconds"] = float("inf")
-            report.append(row)
-            step = None
-            started = time.perf_counter()
-            try:
-                step = builder(chosen) if count is None else builder(chosen, count)
-                jax.block_until_ready(step())
-                row["setup_seconds"] = time.perf_counter() - started
-                samples = row["samples_seconds"]
-                for _ in range(repeats):
-                    start = time.perf_counter()
-                    jax.block_until_ready(step())
-                    samples.append(time.perf_counter() - start)
-                row["median_seconds"] = float(np.median(samples))
-                row["seconds"] = min(samples) if calls is None else row["median_seconds"]
-                if calls is not None:
-                    row["fit_seconds"] = row["seconds"] * work[count]
-                score = rank(row)
-                if best_score is None or score < best_score:
-                    best_score = score
-                    best_data = step if keep_step else chosen
-            except Exception as error:
-                if "RESOURCE_EXHAUSTED" not in str(error) and not isinstance(error, MemoryError):
-                    raise
-                row["error"] = str(error)
-                break
-            finally:
-                elapsed = time.perf_counter() - started
-                row["calibration_seconds"] = elapsed
-                row.setdefault("setup_seconds", elapsed)
-    report.sort(key=rank)
-    if not report or report[0]["error"] is not None:
-        raise RuntimeError("select_plate_layout: no candidate ran on this device")
-    return best_data, report
+    name, groups, sequential, mode = layout
+    samples = []
+    row = {"variant": name, "groups": groups, "sequential": sequential,
+           "chains": count, "seconds": float("inf"), "error": None,
+           "samples_seconds": samples, "median_seconds": None}
+    if mode is not None:
+        row["guarded_reads"] = mode
+    started = time.perf_counter()
+    try:
+        step = build()
+        jax.block_until_ready(step())
+        row["setup_seconds"] = time.perf_counter() - started
+        for _ in range(repeats):
+            start = time.perf_counter()
+            jax.block_until_ready(step())
+            samples.append(time.perf_counter() - start)
+        row["seconds"] = min(samples)
+        row["median_seconds"] = float(np.median(samples))
+    except Exception as error:
+        if "RESOURCE_EXHAUSTED" not in str(error) and not isinstance(error, MemoryError):
+            raise
+        row["error"] = str(error)
+        step = None
+    elapsed = time.perf_counter() - started
+    row["calibration_seconds"] = elapsed
+    row.setdefault("setup_seconds", elapsed)
+    return step, row
 """
 
 # Add the optional API after naming the requested functions and constants:
@@ -421,17 +423,17 @@ function _jax_layout_functions!(mod, bodies, functions, constants)
         return
     end
     select = _jax_identifier(mod.used, :select_plate_layout)
-    tuner = _jax_param_name(mod.used, :_rk_time_layouts; stable=false)
+    measure = _jax_param_name(mod.used, :_rk_measure_layout; stable=false)
     variants = _jax_param_name(mod.used, :_rk_layout_variants; stable=false)
     push!(bodies, rstrip(replace(_JAX_SELECT_PLATE_LAYOUT,
-        "@tuner@" => tuner, "@variants@" => variants,
+        "@measure@" => measure, "@variants@" => variants,
         "select_plate_layout" => select, "@prepare_reads@" => read_selector)))
     push!(functions, JAXFunction(select,
         Pair{String,Any}["prepared" => Dict, "make_step" => Any, "chains" => Any,
                          "candidates" => Any, "repeats" => Int, "alternatives" => Any, "calls" => Any,
                          "guarded_reads" => Any],
         Pair{String,Any}["prepared" => Dict, "report" => Vector{Any}]))
-    (; tuner, variants)
+    (; measure, variants)
 end
 
 Base.include_dependency(joinpath(@__DIR__, "jax_bind_gradient.py"))
@@ -442,7 +444,7 @@ function _jax_gradient_binding!(mod, bodies, functions, layout)
     batch = _jax_param_name(mod.used, :_rk_batched_gradient; stable=false)
     push!(bodies, rstrip(replace(_JAX_BIND_GRADIENT, "def bind_gradient(" => "def " * name * "(",
         "_rk_batched_gradient" => batch,
-        "_TIME_LAYOUTS" => (isnothing(layout) ? "None" : layout.tuner),
+        "_MEASURE_LAYOUT" => (isnothing(layout) ? "None" : layout.measure),
         "_LAYOUT_VARIANTS" => (isnothing(layout) ? "None" : layout.variants))))
     push!(functions, JAXFunction(name,
         Pair{String,Any}["density" => Any, "prepared" => Dict, "device" => Any,

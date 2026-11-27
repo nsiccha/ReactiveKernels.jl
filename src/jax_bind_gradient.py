@@ -9,7 +9,8 @@ def bind_gradient(density, prepared, *, device=None, memory_budget_bytes=None):
     The first call at a shape and dtype runs one feasible layout. An explicit
     gradient.calibrate(positions, repeats=3) measures eligible layouts and
     installs its winner for subsequent calls on this binding. It returns the
-    timing rows (empty if the module has only one layout).
+    timing rows, winner first (empty without a layout selector). Overlapping
+    pilot timings trigger 12 interleaved rounds among the close contenders.
 
     memory_budget_bytes limits the executable's planned device buffer bytes.
     The device allocator, other live arrays and backend overhead are separate.
@@ -18,6 +19,7 @@ def bind_gradient(density, prepared, *, device=None, memory_budget_bytes=None):
     from functools import partial
     from operator import index
     from threading import RLock
+    import time
 
     if memory_budget_bytes is not None:
         memory_budget_bytes = index(memory_budget_bytes)
@@ -28,7 +30,7 @@ def bind_gradient(density, prepared, *, device=None, memory_budget_bytes=None):
     # caller later edits a host array. JAX arrays already have value semantics.
     immutable = {id(x): x for x in jax.tree_util.tree_leaves(prepared) if isinstance(x, jax.Array)}
     data = deepcopy(prepared, immutable)
-    time_layouts, layout_variants = _TIME_LAYOUTS, _LAYOUT_VARIANTS
+    measure, layout_variants = _MEASURE_LAYOUT, _LAYOUT_VARIANTS
     programs = {}
     lock = RLock()
 
@@ -74,20 +76,26 @@ def bind_gradient(density, prepared, *, device=None, memory_budget_bytes=None):
         device_data = jax.device_put(chosen, target)
         return lambda positions: program(function, positions, device_data)
 
-    def candidates():
-        yield data
+    supplied = ("supplied", None, None, None)
+
+    def alternatives():
         if layout_variants is not None:
-            for _, _, _, _, chosen, _ in layout_variants(data, None):
-                if chosen is not data:
-                    yield chosen
+            for name, groups, sequential, mode, chosen, _ in layout_variants(data, None):
+                yield (name, groups, sequential, mode), chosen
+
+    def candidates():
+        yield supplied, data
+        for layout, chosen in alternatives():
+            if chosen is not data:
+                yield layout, chosen
 
     def gradient(positions):
         key, positions = signature(positions)
         with lock:
-            program = programs.get(key)
+            _, program = programs.get(key, (supplied, None))
             if program is None:
                 failure = None
-                for chosen in candidates():
+                for layout, chosen in candidates():
                     try:
                         program = compile_program(chosen, key)
                         result = jax.block_until_ready(program(jax.device_put(positions, key[0])))
@@ -97,29 +105,129 @@ def bind_gradient(density, prepared, *, device=None, memory_budget_bytes=None):
                         failure = str(error)
                         program = None
                         continue
-                    programs[key] = program
+                    programs[key] = layout, program
                     return result
                 raise MemoryError(f"no gradient layout fit on {key[0]}: {failure}")
         return program(jax.device_put(positions, key[0]))
 
+    def same_as_supplied(chosen):
+        # Selectors share the bound model data. Compare only changed layout
+        # metadata, including the members and widths of a caller's own groups.
+        for name, value in chosen.items():
+            original = data.get(name)
+            if value is original:
+                continue
+            if name == "_rk_plate_layout":
+                value = {k: v for k, v in value.items() if v is not None}
+                original = {k: v for k, v in (original or {}).items() if v is not None}
+            leaves, tree = jax.tree_util.tree_flatten(value)
+            others, other_tree = jax.tree_util.tree_flatten(original)
+            if tree != other_tree or any(a is not b and not np.array_equal(a, b)
+                                         for a, b in zip(leaves, others)):
+                return False
+        return True
+
+    def calibration_candidates(active):
+        found = False
+        for layout, chosen in alternatives():
+            current = same_as_supplied(chosen) if active == supplied else layout == active
+            found = found or current
+            yield layout, chosen, current
+        if not found:
+            # A caller can supply a partition outside the default search.
+            yield supplied, data, True
+
+    def confirm(finalists, rows, steps):
+        for i in range(12):
+            start = i % len(finalists)
+            for k in finalists[start:] + finalists[:start]:
+                row = rows[k]
+                if row["error"] is not None:
+                    continue
+                started = time.perf_counter()
+                try:
+                    jax.block_until_ready(steps[k]())
+                except Exception as error:
+                    if not isinstance(error, MemoryError) and "RESOURCE_EXHAUSTED" not in str(error):
+                        raise
+                    row["error"] = str(error)
+                    row["seconds"] = row["fit_seconds"] = float("inf")
+                    del steps[k]
+                elapsed = time.perf_counter() - started
+                row["calibration_seconds"] += elapsed
+                if row["error"] is None:
+                    row["confirmation_samples_seconds"].append(elapsed)
+
+        confirmed = [k for k in finalists if k in steps]
+        if not confirmed:
+            return None
+        for k in confirmed:
+            samples = rows[k]["confirmation_samples_seconds"]
+            rows[k]["confirmation_median_seconds"] = float(np.median(samples))
+        confirmed.sort(key=lambda k: rows[k]["confirmation_median_seconds"])
+        current = next((k for k in confirmed if rows[k]["current"]), None)
+        if current is None:
+            return confirmed[0], "confirmation"
+
+        baseline = rows[current]["confirmation_samples_seconds"]
+        median = rows[current]["confirmation_median_seconds"]
+        for k in confirmed:
+            if rows[k]["confirmation_median_seconds"] >= median:
+                break
+            samples = rows[k]["confirmation_samples_seconds"]
+            if sum(a < b for a, b in zip(samples, baseline)) >= 10:
+                return k, "paired_win"
+        return current, "retain_current"
+
+    def select(rows, steps):
+        order = sorted(steps, key=lambda k: rows[k]["median_seconds"])
+        quartiles = {k: np.percentile(rows[k]["samples_seconds"], (25, 75)) for k in order}
+        while order:
+            low, high = quartiles[order[0]]
+            finalists = [k for k in order if quartiles[k][0] <= high and low <= quartiles[k][1]]
+            if len(finalists) == 1:
+                return finalists[0], "pilot"
+
+            winner = confirm(finalists, rows, steps)
+            if winner is not None:
+                return winner
+            # Every finalist ran out of memory. Compare the remaining pilots.
+            order = [k for k in order if k in steps]
+        errors = ", ".join(dict.fromkeys(row["error"] for row in rows.values()))
+        raise RuntimeError(f"bind_gradient: no candidate ran on this device: {errors}")
+
     def calibrate(positions, repeats=3):
-        if index(repeats) < 1:
+        repeats = index(repeats)
+        if repeats < 1:
             raise ValueError("repeats must be positive")
-        if time_layouts is None:
+        if measure is None:
             gradient(positions)
             return []
         key, positions = signature(positions)
 
-        def make_step(chosen, _count):
-            program = compile_program(chosen, key)
-            return partial(program, jax.device_put(positions, key[0]))
-
         with lock:
-            step, rows = time_layouts(data, make_step, chains=[len(positions)], candidates=None,
-                                      repeats=repeats, alternatives=None, calls=lambda count: 1,
-                                      guarded_reads=None, keep_step=True)
-            programs[key] = step.func
-        return rows
+            active, program = programs.get(key, (supplied, None))
+            batch = jax.device_put(positions, key[0])
+            rows, steps = {}, {}
+            for layout, chosen, current in calibration_candidates(active):
+                def build():
+                    if current and program is not None:
+                        return partial(program, batch)
+                    bound_data = data if current and active == supplied else chosen
+                    executable = compile_program(bound_data, key)
+                    return partial(executable, batch)
+                step, row = measure(layout, len(positions), build, repeats)
+                row.update(current=current, confirmation_samples_seconds=[], confirmation_median_seconds=None)
+                rows[layout] = row
+                if step is not None:
+                    steps[layout] = step
+                    row["seconds"] = row["median_seconds"]
+                row["fit_seconds"] = row["seconds"]
+            winner, reason = select(rows, steps)
+            programs[key] = winner, steps[winner].func
+            first = rows.pop(winner)
+            first["selection_reason"] = reason
+            return [first, *sorted(rows.values(), key=lambda r: (r["error"] is not None, r["seconds"]))]
 
     gradient.calibrate = calibrate
     return gradient
