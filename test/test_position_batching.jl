@@ -261,6 +261,62 @@ end
     end
 end
 
+@testset "different position programs share their data-only plate functions" begin
+    @kernel function shared_position_data(p::Vector{Float64}, t::Vector{Float64})
+        wave = plate(t) do x
+            sin(x)
+        end
+        energy = plate(t) do x
+            x * x
+        end
+        result = p[1] .* wave .+ p[2] .* energy
+        extra = p[1] + p[2]
+        return result, extra
+    end
+    @kernel function changed_position_data(p::Vector{Float64}, t::Vector{Float64})
+        wave = plate(t) do x
+            sin(x)
+        end
+        energy = plate(t) do x
+            x * x
+        end
+        result = p[1] .* wave .+ p[2] .* energy
+        extra = p[1] - p[2]
+        return result, extra
+    end
+    function prefix_functions(reader)
+        functions = Set{DataType}()
+        function visit(node)
+            if node isa ReactiveKernels._PlateProgram
+                node.always_inline || push!(functions, typeof(ReactiveKernels.compile(node.ast)))
+                visit(node.ast)
+            elseif node isa Expr && node.head !== :quote
+                foreach(visit, node.args)
+            end
+        end
+        visit(code_expr(reader))
+        functions
+    end
+    for reuse in (false, true)
+        original = vectorize(prepare(shared_position_data); batched=:p, reuse)
+        neighbor = vectorize(prepare(changed_position_data); batched=:p, reuse)
+        functions = prefix_functions(original)
+        @test length(functions) == 2
+        @test prefix_functions(neighbor) == functions
+        expression = code_expr(original)
+        for width in (1, 4), count in (0, 1, 7, 73)
+            p = reshape(collect(range(0.1, 0.9; length=2width)), 2, width)
+            t = [0.1 * i for i in 1:count]
+            expected = [p[1,j] * sin(x) + p[2,j] * x^2 for x in t, j in axes(p,2)]
+            @test first(original(p,t)) ≈ expected
+            @test last(original(p,t)) == vec(sum(p; dims=1))
+            @test first(neighbor(p,t)) ≈ expected
+            @test last(neighbor(p,t)) == vec(p[1,:] - p[2,:])
+            @test code_expr(original) === expression
+        end
+    end
+end
+
 @testset "rank checks and HAVE passthrough" begin
     @kernel typed_positions(position::Vector{Float64}) = begin
         result::Float64 = sum(position)
