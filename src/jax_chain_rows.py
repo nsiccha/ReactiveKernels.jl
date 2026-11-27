@@ -459,9 +459,13 @@ def _rk_chain_sum(row, count):
     return jnp.sum(jnp.where(jnp.arange(row.shape[0]) < count, row, 0))
 
 
-def _rk_chain_fori(start, stop, body, initial, capacity):
+def _rk_chain_fori(start, stop, body, initial, capacity, running_slot=None):
     from equinox.internal import while_loop
-    return while_loop(lambda state: state[0] < stop,
+    def keep(state):
+        within = state[0] < stop
+        return within if running_slot is None else within & state[1][running_slot]
+
+    return while_loop(keep,
                       lambda state: (state[0] + 1, body(*state)),
                       (jnp.asarray(start), initial), kind="checkpointed",
                       checkpoints=max(1, int(capacity).bit_length()))[1]
