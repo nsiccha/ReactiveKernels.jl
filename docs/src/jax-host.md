@@ -50,9 +50,11 @@ group entries across rows by conditions on the bound data. It records row and
 column positions for the actual entries. The compiled function evaluates the
 selected arms and sums the values in their original rows. Shared scalar
 parameters and unresolved comparisons stay in the compiled function.
-The compiled function can batch straight-line arithmetic across a group.
-When a live condition guards that arithmetic, all visits and mapped chains
-must select the same arm to take the parallel path. Mixed decisions use
-the scalar cell. The same emitted module serves different row lengths and
+Within a group, JAX can batch nested conditions over elementwise arithmetic
+even when visits take different arms. This includes unary numerical rules
+whose primal and first derivative both use supported arithmetic. A cell
+with other operations can still batch a straight-line arm when every visit
+and mapped chain selects it. Otherwise it uses the scalar map.
+The same emitted module serves different row lengths and
 branch decisions. Changing the number of entries in a group can trigger
 recompilation by JAX.
