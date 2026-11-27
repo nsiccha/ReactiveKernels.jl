@@ -16,6 +16,15 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.273
+
+`@rkppl` declarations expose their named helper and submodel calls to notebook
+dependency analysis. In Pluto, editing a helper now reruns the dependent model
+and its queries; previously a query could silently retain its old value.
+This includes qualified and broadcast calls and calls inside submodel bodies
+and keyword defaults. Capturing a model still leaves helper execution and
+data binding deferred.
+
 ## 0.1.272
 
 Repeated submodel calls in a `@plate` can observe a data argument directly

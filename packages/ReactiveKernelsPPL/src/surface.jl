@@ -223,6 +223,51 @@ function _check_body_shape(body)
                   "caller-scope data plus a block")
 end
 
+# The model body stays quoted until binding. Its module-visible callees are
+# nevertheless dependencies of the declaration: notebook tools must rerun it
+# when a helper or submodel changes. Expose those reads without evaluating a
+# helper, looking up a property, or requiring its binding to exist yet. Data
+# arguments remain deferred inputs, not dependencies of the declaration.
+_model_dependency_path(x) = x isa Union{Symbol,GlobalRef} ||
+    (Meta.isexpr(x, :., 2) && x.args[2] isa QuoteNode &&
+        _model_dependency_path(x.args[1]))
+
+function _model_call_dependencies!(out::Vector{Any}, seen::Set{Any}, ex,
+        locals::Set{Symbol} = Set{Symbol}())
+    ex isa Expr || return out
+    ex.head === :quote && return out
+    if ex.head === :-> && length(ex.args) == 2
+        return _model_call_dependencies!(out, seen, ex.args[2],
+            union(locals, _lambda_locals(ex)))
+    end
+    dotted = _is_dotted_call(ex)
+    if (ex.head === :call && !isempty(ex.args)) || dotted
+        head = ex.args[1]
+        builtin = head isa Symbol && (head in (:~, :.~) || head in locals ||
+            _builtin_call_head(head; dotted) !== nothing ||
+            _rhs_spelling_head(head, dotted))
+        if !builtin && (_model_dependency_path(head) ||
+                Meta.isexpr(head, :curly))
+            if !(head in seen)
+                push!(seen, head)
+                push!(out, head)
+            end
+        end
+    end
+    for arg in ex.args
+        _model_call_dependencies!(out, seen, arg, locals)
+    end
+    return out
+end
+
+function _model_dependency_expr(body, declaration; locals = Set{Symbol}())
+    dependencies = _model_call_dependencies!(Any[], Set{Any}(), body, locals)
+    isempty(dependencies) && return declaration
+    # Julia removes this branch. Static dependency analysis can still see
+    # named and qualified callees, including helpers defined after the model.
+    Expr(:block, Expr(:if, false, Expr(:tuple, dependencies...)), declaration)
+end
+
 """Build the `sm = RKPPLSubmodel(...)` binding from a submodel definition."""
 function _submodel_def_expr(def::Expr, mod::Module)
     call, body = def.args[1], def.args[2]
@@ -255,12 +300,15 @@ function _submodel_def_expr(def::Expr, mod::Module)
     kwvec = Expr(:vect, [:( $(QuoteNode(k)) => $(Meta.quot(v)) )
         for (k, v) in kwdefaults]...)
     previous = gensym(:previous_doc)
-    return esc(quote
+    declaration = quote
         local $previous = $(_binding_documentation)($mod, $(QuoteNode(name)))
         Base.@__doc__ $name = $(RKPPLSubmodel)($(QuoteNode(name)), $argvec,
             $(Meta.quot(body)), $mod, $kwvec)
         $name = $(_capture_definition_documentation)($name, $previous)
-    end)
+    end
+    dependency_body = Expr(:block, body, last.(kwdefaults)...)
+    return esc(_model_dependency_expr(dependency_body, declaration;
+        locals = Set{Symbol}(allnames)))
 end
 
 """Capture a model block, or define a reusable submodel
@@ -283,7 +331,8 @@ affine form otherwise."""
 macro rkppl(body)
     _is_submodel_def(body) && return _submodel_def_expr(body, __module__)
     _check_body_shape(body)
-    return Expr(:call, RKPPLModel, Meta.quot(body), __module__)
+    declaration = Expr(:call, RKPPLModel, Meta.quot(body), __module__)
+    return esc(_model_dependency_expr(body, declaration))
 end
 
 """Capture a model block and bind caller-scope inputs and pins
@@ -294,7 +343,8 @@ macro rkppl(data, body)
         "use site")
     _check_body_shape(body)
     q = Meta.quot(body)
-    return esc(:($(_bind_immediate)($(RKPPLModel)($q, $(__module__)), $data)))
+    declaration = :($(_bind_immediate)($(RKPPLModel)($q, $(__module__)), $data))
+    return esc(_model_dependency_expr(body, declaration))
 end
 
 function (m::RKPPLModel)(; kwargs...)
