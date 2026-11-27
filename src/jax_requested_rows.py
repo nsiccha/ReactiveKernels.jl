@@ -1,4 +1,4 @@
-def _rk_requested_cell_rows(cell, args, mapped, columns, index, requested, length, capacity, schedule):
+def _rk_requested_cell_rows(cell, args, mapped, columns, index, requested, length, capacity, schedule, record_reads=()):
     def ordinary(args, columns, index, requested, length, schedule):
         return _rk_scan_cell_rows(cell, args, mapped, columns, index, requested, length, capacity)
 
@@ -29,6 +29,15 @@ def _rk_requested_cell_rows(cell, args, mapped, columns, index, requested, lengt
                 else:
                     selected.append(jax.tree.map(lambda a, b: a[owners] if b else a, x, by_subject))
                 axes.append(jax.tree.map(lambda b: 0 if event or b else None, by_subject))
+            for table, selector in record_reads:
+                # Compose subject and record indices before mapping the cell.
+                # The ordinary transpose then accumulates repeated pairs into
+                # the original table, without a full table per requested cell.
+                at = selected[selector] - 1
+                selected.append(jax.tree.map(
+                    lambda a, b: jnp.asarray(a)[owners, at] if b else jnp.asarray(a)[at],
+                    args[table], by_arg[table]))
+                axes.append(0)
             fields = jax.vmap(cell, in_axes=tuple(axes))(*selected)
             values = jnp.take(jnp.stack(fields, axis=-1), restore, axis=0, mode="fill", fill_value=0)
         else:
