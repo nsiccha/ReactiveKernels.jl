@@ -101,22 +101,55 @@ def _rk_ragged_group(cell, operands):
     except ImportError:
         return serial()
 
-    # Only elementwise arithmetic can enter the parallel path. A jit call
-    # has the same proof obligation as its caller.
+    # Recognize arithmetic in the cell and in the programs it calls.
     elementwise = {
-        "abs", "add", "and", "broadcast_in_dim", "convert_element_type",
-        "div", "eq", "exp", "expm1", "ge", "gt", "integer_pow", "le",
-        "log", "log1p", "lt", "max", "min", "mul", "ne", "neg", "not",
-        "or", "pow", "select_n", "sqrt", "square", "sub", "tanh",
+        "abs", "add", "and", "bitcast_convert_type", "broadcast_in_dim",
+        "clamp", "convert_element_type", "div", "eq", "erfc", "exp", "expm1",
+        "ge", "gt", "integer_pow", "le", "log", "log1p", "lt",
+        "max", "min", "mul", "ne", "neg", "not",
+        "or", "polynomial", "pow", "select_n", "sqrt", "square", "sub", "tanh",
     }
-    def straight_line(equations):
+    def arithmetic_rule(eq, check_jvp):
+        # The custom rule supplies the whole first derivative. Calls inside
+        # that derivative execute their primals at this differentiation order.
+        params = eq.params
+        if not arithmetic(params["call_jaxpr"].eqns, branches=True, check_jvp=False):
+            return False
+        if not check_jvp:
+            return True
+        # A derivative can check an index or run a loop that its primal does
+        # not. A unary rule has just the active and inactive input cases.
+        thunk = params.get("jvp_jaxpr_fun")
+        if len(eq.invars) - params["num_consts"] != 1 or not hasattr(thunk, "call_wrapped"):
+            return False
+        for zero in ((False, True) if params["symbolic_zeros"] else (False,)):
+            try:
+                derivative, _, _ = thunk.call_wrapped(zero)
+            except Exception:
+                # A rule may only support its primal or one activity.
+                return False
+            if not arithmetic(derivative.eqns, branches=True, check_jvp=False):
+                return False
+        return True
+
+    def arithmetic(equations, *, branches=False, check_jvp=True):
         for eq in equations:
             if eq.effects:
                 return False
-            if eq.primitive.name == "jit":
-                if not straight_line(eq.params["jaxpr"].eqns):
+            name = eq.primitive.name
+            if name in elementwise:
+                continue
+            if name == "jit":
+                programs = (eq.params["jaxpr"],)
+            elif branches and name == "cond" and "branches_platforms" not in eq.params:
+                programs = eq.params["branches"]
+            elif branches and name == "custom_jvp_call":
+                if not arithmetic_rule(eq, check_jvp):
                     return False
-            elif eq.primitive.name not in elementwise:
+                continue
+            else:
+                return False
+            if not all(arithmetic(p.eqns, branches=branches, check_jvp=check_jvp) for p in programs):
                 return False
         return True
 
@@ -127,7 +160,9 @@ def _rk_ragged_group(cell, operands):
     equations = graph.eqns
     if closed.effects:
         return serial()
-    if straight_line(equations):
+    # vmap batches cond itself: its transpose cuts the untaken arm's
+    # input cotangents, including when its arithmetic is singular.
+    if arithmetic(equations, branches=True):
         return jax.vmap(cell)(*operands)
 
     # A common support check can surround most of the work in a group.
@@ -141,9 +176,9 @@ def _rk_ragged_group(cell, operands):
     arms = branch.params["branches"]
     before, after = equations[:k], equations[k + 1:]
     if (len(arms) != 2 or "branches_platforms" in branch.params
-            or not straight_line(before) or not straight_line(after)):
+            or not arithmetic(before) or not arithmetic(after)):
         return serial()
-    parallel = [i for i, arm in enumerate(arms) if straight_line(arm.eqns)]
+    parallel = [i for i, arm in enumerate(arms) if arithmetic(arm.eqns)]
     if not parallel:
         return serial()
 

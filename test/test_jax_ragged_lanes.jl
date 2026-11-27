@@ -50,12 +50,14 @@ import fixed, live, jax, numpy as np
 import jax.numpy as jnp
 from collections import Counter
 
-def inventory(jaxpr):
+def inventory(jaxpr, exp_widths=None):
     result = Counter()
     def count(item):
         if hasattr(item, "eqns"):
             for eq in item.eqns:
                 result[eq.primitive.name] += 1
+                if exp_widths is not None and eq.primitive.name == "exp":
+                    exp_widths.append(np.prod(eq.outvars[0].aval.shape, dtype=int))
                 count(eq.params)
         elif hasattr(item, "jaxpr"):
             count(item.jaxpr)
@@ -89,10 +91,69 @@ for xs in (positive, -positive, positive * [[1.], [-1.]],
         assert np.isfinite(a).all()
         np.testing.assert_allclose(a, b, rtol=2e-12, atol=2e-12)
 
+# Both sides of the live guards occur in one prepared group. The log and
+# square root have singular or undefined derivatives on the opposite side.
+@jax.custom_jvp
+def root(x):
+    return jnp.sqrt(x)
+
+@root.defjvp
+def root_jvp(primals, tangents):
+    y = root(primals[0])
+    return y, tangents[0] / (2 * y)
+
+def nested(x):
+    return jax.lax.cond(x > 0,
+        lambda: jax.lax.cond(x > 1, lambda: jnp.log(x - 1), lambda: root(1 - x)),
+        lambda: root(-x))
+
+def nested_sum(xs):
+    return live._rk_ragged_group(nested, (xs,)).sum()
+
+traces = []
+for repeats in (1, 7):
+    xs = np.tile([0.5, -4., 3.], repeats)
+    value, grad = jax.jit(jax.value_and_grad(nested_sum))(xs)
+    np.testing.assert_allclose(value, repeats * (np.sqrt(0.5) + 2 + np.log(2)))
+    np.testing.assert_allclose(grad, np.tile([-0.5 / np.sqrt(0.5), -0.25, 0.5], repeats))
+    traces.append(inventory(jax.make_jaxpr(jax.value_and_grad(nested_sum))(xs)))
+for trace in traces:
+    assert trace["scan"] == 0 and trace["sqrt"] > 0 and trace["log"] > 0, trace
+for op in ("sqrt", "log"):
+    assert traces[1][op] <= traces[0][op], (op, traces)
+
+# The primal alone cannot establish that the derivative is safe to batch.
+@jax.custom_jvp
+def checked_root(x):
+    return jnp.sqrt(x)
+
+from jax.experimental import checkify
+
+@checked_root.defjvp
+def checked_root_jvp(primals, tangents):
+    x, = primals
+    checkify.check(x > 0, "root derivative requires positive input")
+    y = checked_root(x)
+    return y, tangents[0] / (2 * y)
+
+def checked_sum(xs, cutoff):
+    def cell(x):
+        return jax.lax.cond(x > cutoff, checked_root, jnp.square, x)
+    return live._rk_ragged_group(cell, (xs,)).sum()
+
+checked = jax.jit(checkify.checkify(jax.value_and_grad(checked_sum)))
+xs = np.array([-1., 4.])
+err, (value, grad) = checked(xs, 0.)
+err.throw()
+np.testing.assert_allclose((value, *grad), (3., -2., 0.25))
+err, _ = checked(xs, -2.)
+assert "root derivative requires positive input" in err.get()
+
 for module in (fixed, live):
     vg = jax.value_and_grad(module.score)
     compiled = jax.jit(vg)
     traces = []
+    widths = []
     for rows, modes, value, gradient in cases:
         if module is live:
             padded, lengths, flat = live._rk_pad_rows(rows, np.float64)
@@ -102,10 +163,11 @@ for module in (fixed, live):
         got = compiled(0.4, **args)
         np.testing.assert_allclose(got, (value, gradient), rtol=2e-12, atol=2e-12)
         if len(traces) < 2:
-            traces.append(inventory(jax.make_jaxpr(vg)(0.4, **args)))
-    # The second binding repeats the rows seven times. Visit every reachable
-    # body in the reverse trace; the compiled loop changes trip count.
-    assert traces[0]["scan"] > 0 and traces[0]["exp"] > 0, traces
+            exp_widths = []
+            traces.append(inventory(jax.make_jaxpr(vg)(0.4, **args), exp_widths))
+            widths.append(max(exp_widths))
+    # Repeating the rows grows the arrays carrying the cell's arithmetic.
+    assert widths[1] == 7 * widths[0], widths
     for body in ("exp", "log", "cond", "scan"):
         assert traces[1][body] == traces[0][body], (body, traces)
     rows, modes = [[1., 2.]], [[1., 1., 1.]]
@@ -121,7 +183,7 @@ for module in (fixed, live):
     else:
         raise AssertionError("accepted incompatible row lengths")
 """)
-            @test success(`$RK_JAX_PYTHON $(joinpath(dir, "check.py"))`)
+            @test success(pipeline(`$RK_JAX_PYTHON $(joinpath(dir, "check.py"))`, stderr=stderr))
         end
     else
         @test_skip "RK_JAX_PYTHON not set"
