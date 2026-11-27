@@ -112,6 +112,12 @@ candidate's larger widths. Other errors propagate.
 minimum/chain, or median times `calls(count)`. A fixed-layout chain-count curve
 therefore adds no calls. Fix both the layout and `guarded_reads` when both vary.
 
+A fixed-layout row holds its `repeats` pilot calls alone. Three are few: their
+median scatters widely for a short step on a busy host. For a rule, pass more,
+for example `repeats=60`, and read `median_seconds`; `samples_seconds` keeps
+every call. Widths are timed in turn, each after its compilation, so host load
+can shift their levels.
+
 Modules with eligible guarded reads expose `prepare_guarded_reads`.
 `prepare_data` defaults to `"compact"`, using the largest match count in
 any row as each read's capacity. When guards and indices come directly from
