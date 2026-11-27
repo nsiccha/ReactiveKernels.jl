@@ -335,7 +335,6 @@ import{_ as e,o as a,c as i,a6 as n}from"./chunks/framework.BTpfZnOf.js";const u
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    from functools import partial</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    from operator import index</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    from threading import RLock</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    import time</span></span>
 <span class="line"></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    if memory_budget_bytes is not None:</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        memory_budget_bytes = index(memory_budget_bytes)</span></span>
@@ -347,6 +346,7 @@ import{_ as e,o as a,c as i,a6 as n}from"./chunks/framework.BTpfZnOf.js";const u
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    immutable = {id(x): x for x in jax.tree_util.tree_leaves(prepared) if isinstance(x, jax.Array)}</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    data = deepcopy(prepared, immutable)</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    measure, layout_variants = None, None</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    confirm_layouts = None</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    programs = {}</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    lock = RLock()</span></span>
 <span class="line"></span>
@@ -454,32 +454,9 @@ import{_ as e,o as a,c as i,a6 as n}from"./chunks/framework.BTpfZnOf.js";const u
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            yield supplied, data, True</span></span>
 <span class="line"></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def confirm(finalists, rows, steps):</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        for i in range(12):</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            start = i % len(finalists)</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            for k in finalists[start:] + finalists[:start]:</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                row = rows[k]</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                if row[&quot;error&quot;] is not None:</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    continue</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                started = time.perf_counter()</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                try:</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    jax.block_until_ready(steps[k]())</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                except Exception as error:</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    if not isinstance(error, MemoryError) and &quot;RESOURCE_EXHAUSTED&quot; not in str(error):</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                        raise</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    row[&quot;error&quot;] = str(error)</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    row[&quot;seconds&quot;] = row[&quot;fit_seconds&quot;] = float(&quot;inf&quot;)</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    del steps[k]</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                elapsed = time.perf_counter() - started</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                row[&quot;calibration_seconds&quot;] += elapsed</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                if row[&quot;error&quot;] is None:</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    row[&quot;confirmation_samples_seconds&quot;].append(elapsed)</span></span>
-<span class="line"></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        confirmed = [k for k in finalists if k in steps]</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        confirmed = confirm_layouts(finalists, rows, steps, 12)</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        if not confirmed:</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            return None</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        for k in confirmed:</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            samples = rows[k][&quot;confirmation_samples_seconds&quot;]</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            rows[k][&quot;confirmation_median_seconds&quot;] = float(np.median(samples))</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        confirmed.sort(key=lambda k: rows[k][&quot;confirmation_median_seconds&quot;])</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        current = next((k for k in confirmed if rows[k][&quot;current&quot;]), None)</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        if current is None:</span></span>
