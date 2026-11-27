@@ -29,7 +29,6 @@ inputs. Bindings of the same density can reuse compilation when their prepared
 shapes, dtypes, static layout metadata and target match. The layout examples
 show how to keep those arrays as inputs when a sampler traces the density.
 
-
 ## 0.1.405
 
 Staged graph assembly can splice a child kernel called with computed
