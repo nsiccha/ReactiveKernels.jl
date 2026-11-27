@@ -451,3 +451,46 @@ end
         @test_broken _pd_draws(model, data, yy, Xoshiro(1)) isa NamedTuple
     end
 end
+
+# The location's cell lengths depend on the current parameter draw.
+_pd_cell_matrices(subject, a) = [fill(a + g, g, a > 0 ? 2 : 1) for g in subject]
+
+@testset "first predictive binding with a declared cell rank" begin
+    source = quote
+        a ~ Normal(0, 1)
+        loc = _pd_cell_matrices(subject, a)
+        @plate for i in eachindex(subject)
+            y[i] .~ Normal.(loc[i], 0.1)
+        end
+    end
+    data = (; subject = [2, 0, 1])
+    plan = lower_rkppl(source, data; conditioned = (:y,), mod = @__MODULE__)
+    first = bind_data(plan, data; response_cell_ranks = (y = 2,))
+    built = build_kernel(first)
+    @test_throws ContractValidationError prepare_query(built, first, :likelihood)
+    for d in (data, (; subject = [1, 3]), (; subject = Int[]))
+        bound = bind_data(first, d)
+        target = predictive_targets(built, bound).y
+        @test target.kind === :cells && target.dims === nothing
+        @test target.rank == 2
+        q = prepare_predictive(built, bound)
+        for a in (-1.0, 1.0)
+            loc = _pd_cell_matrices(d.subject, a)
+            rng = Xoshiro(17)
+            expected = [map(m -> rand(rng, Normal(m, 0.1)), ms) for ms in loc]
+            draws = q([a], Xoshiro(17)).y
+            @test size.(draws) == size.(loc)
+            @test draws == expected
+        end
+    end
+    supplied = (; data..., y = _pd_cell_matrices(data.subject, 1.0))
+    fit = bind_data(first, supplied)
+    @test predictive_targets(built, fit).y.dims == size.(supplied.y)
+    @test_throws "rank-2 array" bind_data(fit, (; data..., y = vec.(supplied.y)))
+    @test_throws "positive integer" bind_data(plan, data; response_cell_ranks = (y = -1,))
+    @test_throws "dotted plate" bind_data(plan, data; response_cell_ranks = (z = 1,))
+    wrong = bind_data(plan, data; response_cell_ranks = Dict(:y => 1))
+    @test_throws "declared cell rank" predictive_targets(built, wrong)
+    @test_throws "binding declared 1" prepare_predictive(build_kernel(wrong), wrong)(
+        [0.2], Xoshiro(17))
+end

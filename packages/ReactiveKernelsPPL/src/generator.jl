@@ -1896,6 +1896,14 @@ function _composed_needs_rows(plan::StructuralPlan, pred::PredictorSpec,
             return false
         i !== nothing && _authored_plate_result(plan.assignments[i].expr) &&
             return false
+        # In an array-valued observation cell, an indexed location loc[i]
+        # already supplies the outer lane. Sizing it from the response
+        # would make even a predictive cut depend on the omitted values.
+        if !isempty(plan.cell_broadcasts)
+            located = _located_responses(plan, pred.name)
+            !isempty(located) && all(r -> _cell_broadcast_response(plan, r) &&
+                ex in plan.cell_broadcasts[r.response], located) && return false
+        end
     end
     # A value with the located responses' own axes (a declared array
     # `theta[axes(y, 1)]` read whole by `Normal.(theta, s)`) already holds

@@ -737,6 +737,31 @@ ReactiveKernels._metadata_function(::typeof(PPLGeneratedModels._ppl_logistic)) =
 _position_metadata(i) = i === :(:) ? _OS.known_info(Colon()) :
     i isa Int ? _OS.known_info(i) : _OS.scalar_info(Int)
 
+# Infer the type of a collected location from its native plate and the
+# types at its input ports. This also works when the iterator is empty.
+# Julia infers the cell body; a gather and a reduction of the same gather
+# can therefore yield different ranks without executing a sampled value.
+function _computed_location_cell_rank(plan::StructuralPlan, r::LikelihoodSpec)
+    reads = get(plan.cell_broadcasts, r.response, nothing)
+    reads === nothing && return nothing
+    _is_simplex_family(r.family) && return nothing  # probability vectors are whole law arguments
+    name = _identity_location_value(plan, r.predictor)
+    name in reads || return nothing
+    d = _find_definition(plan, name)
+    _is_plate_column_expr(d.expr) || return nothing
+    names = sort!(collect(_plate_column_reads(d.expr)))
+    types = Any[_OS.type_bound(_value_metadata(plan, n, Set([name]);
+        data_axes = false, symbolic_data = true)) for n in names]
+    p = ReactiveKernels.plan(_plate_column_kernel(d.expr, names))
+    inferred = ReactiveKernels._cell_value_types(p; argument_types = types)
+    T = inferred[ReactiveKernels.canon_id(p.graph, only(p.want).id)]
+    T !== Union{} && T <: AbstractVector || return nothing
+    return _array_type_rank(eltype(T))
+end
+
+_array_type_rank(T) = T !== Union{} && T <: AbstractArray ?
+    ReactiveKernels._cell_static_ndims(T) : nothing
+
 # Shape reads for a portable data preparation program: the binding supplies
 # rank and element type, while every axis length remains a read of its input.
 _symbolic_data_metadata(value, name) = _OS.ValueInfo(; type_bound = typeof(value), axes = ())
