@@ -17,8 +17,24 @@ import Enzyme
 using Test
 
 const TE_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
-const TE_SEED_WARNING = r"program threw there"
+const TE_SEED_WARNING = r"Non-allocating AD preparation evaluates the program once"
 const TE_WARM_WARNING = r"`warm = true` evaluates the gradient"
+# With Enzyme's dogfood repair `derivative_report`, a native-Enzyme preparation
+# at `type_stability_level = :all`, the default, checks the derivative Enzyme
+# compiles by evaluating the gradient once at the exemplar
+# (`test_derivative_stability.jl`). That evaluation compiles the gradient as
+# `warm = true` does, so `warm = true` runs no second one, and where the
+# program throws there the warning is the check's (snag
+# `exemplar-test-wa-16a5c7a6`). Where nothing is checked (another Enzyme, or
+# `type_stability_level = :rk`) `warm = true` runs the evaluation and warns.
+const TE_DERIVATIVE_CHECK = isdefined(Enzyme, :derivative_report) &&
+    isdefined(Enzyme, :has_dogfood_repair) && Enzyme.has_dogfood_repair(:derivative_report)
+const TE_CHECK_WARNING =
+    r"check of the derivative native Enzyme compiles evaluates the prepared operator once"
+# The gradient evaluation that warns at a throwing exemplar, by level.
+const TE_WARM_LEVELS = (
+    :all => (TE_DERIVATIVE_CHECK ? TE_CHECK_WARNING : TE_WARM_WARNING),
+    :rk => TE_WARM_WARNING)
 
 # Diverges at `s >= 1`, as an ODE solve fails past a blow-up.
 te_scale(s) = s < 1 ? 1 / (1 - s) :
@@ -67,12 +83,14 @@ const TE_POINTS = ([0.2, -0.4, 0.7], [-0.5, 0.3, 0.1], [0.6, 1.2, -0.8])
     @test g ≈ last(ad_value_and_gradient!(ordinary, zeros(3), TE_POINTS[2],
                                            TE_X, TE_Y)) rtol = 1e-10
 
-    @testset "warm = true" begin
-        warmed = @test_logs (:warn, TE_WARM_WARNING) match_mode = :any prepare_ad(
-            kernel, TE_BACKEND, TE_THROWING, TE_X, TE_Y; active = :u, warm = true)
-        warmed_na = @test_logs (:warn, TE_SEED_WARNING) (:warn, TE_WARM_WARNING) match_mode = :any prepare_ad(
+    @testset "warm = true at type_stability_level = :$level" for (level, warning) in TE_WARM_LEVELS
+        warmed = @test_logs (:warn, warning) match_mode = :any prepare_ad(
+            kernel, TE_BACKEND, TE_THROWING, TE_X, TE_Y; active = :u, warm = true,
+            type_stability_level = level)
+        warmed_na = @test_logs (:warn, TE_SEED_WARNING) (:warn, warning) match_mode = :any prepare_ad(
             prepare_nonallocating(kernel, TE_THROWING, TE_X, TE_Y), TE_BACKEND,
-            TE_THROWING, TE_X, TE_Y; active = :u, warm = true)
+            TE_THROWING, TE_X, TE_Y; active = :u, warm = true,
+            type_stability_level = level)
         for u in TE_POINTS
             g, gw, gwna = zeros(3), zeros(3), zeros(3)
             value, _ = ad_value_and_gradient!(ordinary, g, u, TE_X, TE_Y)
