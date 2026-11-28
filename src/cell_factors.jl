@@ -397,7 +397,10 @@ end
 
 # The first gather reached from the term supplies its row labels. Several
 # operands may gather different arrays: their positions correspond by the
-# authored broadcast, and the term query retains every operand.
+# authored broadcast, and the term query retains every operand. A row of
+# `vcat(a, b, ...)` is a row of exactly one operand, so its labels are each
+# operand's labels in operand order (an observed `@scan`'s seeds and steps,
+# say); they are computed by a recipe added to the graph.
 function _cell_factor_rows(spec::KernelSpec, argument::Value; bound = NamedTuple())
     g = spec.graph
     # Split recipes can introduce internal values that are not named ports.
@@ -406,8 +409,7 @@ function _cell_factor_rows(spec::KernelSpec, argument::Value; bound = NamedTuple
     argument_types = Any[haskey(bound, v.name) ? typeof(bound[v.name]) : valtype(v)
                          for v in p.have]
     types = _cell_value_types(p; argument_types, known)
-    seen = Set{ValueId}()
-    function walk(v)
+    function walk(v, seen)
         id = canon_id(g, v.id)
         id in seen && return nothing
         push!(seen, id)
@@ -425,15 +427,30 @@ function _cell_factor_rows(spec::KernelSpec, argument::Value; bound = NamedTuple
             I isa Type && I !== Any && !(I <: AbstractArray) && return nothing
             return r.inputs[index]
         end
+        if form.kind === :vcat
+            # A number operand has no labels: the sum stays in the outer.
+            labels = Value[]
+            for part in form.parts
+                part isa _CellInputLiteral || return nothing
+                rows = walk(r.inputs[part.input], Set{ValueId}(seen))
+                rows === nothing && return nothing
+                push!(labels, rows)
+            end
+            rows = value!(g, Symbol(:_rk_factor_rows_, id), Any)
+            add!(g, Tuple(labels) => rows, _cell_factor_vcat_rows)
+            return rows
+        end
         for (i, input) in enumerate(r.inputs)
             _cell_row_role(form.roles[i]) || continue
-            rows = walk(input)
+            rows = walk(input, seen)
             rows === nothing || return rows
         end
         nothing
     end
-    walk(argument)
+    walk(argument, Set{ValueId}())
 end
+
+_cell_factor_vcat_rows(labels...) = vcat(labels...)
 
 # Whether `value` or anything its producers read, transitively, is in `others`.
 function _cell_factor_reads(spec::KernelSpec, value::Value, others)

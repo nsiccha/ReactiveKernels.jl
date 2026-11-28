@@ -16,6 +16,42 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.274
+
+An observed `@scan` whose carried arrays are all observed data (no per-step
+innovation, no history read), at top level or in a `@plate` cell, computes its
+entries' conditional densities as RK plates instead of a sequential scan: one
+one-entry plate per seed and one plate over the steps, whose reads `x[t - k]`
+go through shifted index ranges, concatenated in entry order. Given the
+parameters these densities are independent, so:
+
+- `prepare_cell_factors` of a cell holding such a scan exposes one reduction
+  over the series' entries. `reduction_rows(f, j, cell)` are the entry
+  positions `1:n`, each term is one seed's or step's conditional density and
+  reads only that entry's positions of what the cell reads (an AR(1) step
+  reads the means of its own and the previous entry, through a cell-local
+  `m = mu[rows[g]]` or a submodel's `mu[rows[g]]` argument), and the outer is
+  their plain sum. Before, the series was one term in the outer factor,
+  reading every coordinate the series reads.
+- A top-level observed series' entry cells (`prepare_cell_query(built, plan,
+  :y)`) read only their own entries.
+
+Values, gradients, `likelihood` and `:pointwise` are unchanged, up to the
+order of summation. `recipe_inventory` shows plates where it showed a
+`:scan`, and `kernel_expr` and `jax_source` show the plates. A scan with a
+carried array that is not data, a per-step innovation or a history read keeps
+its sequential scan and one factor. A cell's bound that reads a
+parameter-dependent value (`for t in 2:length(m)` with `m = mu[rows[g]]`) gets
+the same plates but keeps the total in the outer factor, because the entries'
+row labels then read parameters: bound such a loop by data (`length(y[g])`,
+`length(time)`). A cell bound read from data that does not match the observed
+array's length raises its `DimensionMismatch` when the model is built rather
+than when it is evaluated. Needs ReactiveKernels 0.1.420.
+
+**Breaking:** `cell_reductions` of a cell holding a fully observed scan gains
+one entry, so a consumer that took that cell as one term (BRM's sparse
+Laplace) receives its entries as terms.
+
 ## 0.1.273
 
 `@rkppl` declarations expose their named helper and submodel calls to notebook

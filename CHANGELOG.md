@@ -16,6 +16,16 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.420
+
+The rows of a cell's sum over `vcat(a, b, ...)` are each operand's rows in
+operand order (`_cell_factor_rows`, read by ReactiveKernelsPPL's
+`prepare_cell_factors`), so the sum has one term per entry of every operand.
+Before, the labels were the first operand's alone: such a sum got too few
+terms, and the total its terms add up to missed the later operands' entries.
+ReactiveKernelsPPL 0.1.274 builds on this for an observed `@scan`, whose
+seeds and steps are concatenated.
+
 ## 0.1.419
 
 A plate cell that passes a gather of a computed value to a called submodel
