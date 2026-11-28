@@ -26,6 +26,8 @@ trajectory
 
 The step reads `decay` as a shared enclosing value. Bare sequence arguments are iterated together and must have matching axes. Several values can be carried in a named tuple when the recurrence needs more than one state component.
 
+Work in a step that reads only shared values, and not the carry, the step's elements or earlier outputs, has the same value at every step. A prepared scan computes it once, before its first step, and an empty sequence computes none of it. A step that reads `weights[order][t]` therefore gathers `weights[order]` once, and the scan's cost stays linear in its length. A lazy branch arm still runs only when its branch is taken.
+
 ## Ordinary-loop check
 
 The displayed agreement compares the generated recurrence with an ordinary Julia loop. The check uses the same inputs but a separate implementation of the update.
