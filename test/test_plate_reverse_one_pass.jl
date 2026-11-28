@@ -681,8 +681,39 @@ end
 warm_gradient_bytes(q, g, u) = (sampler_value_and_gradient!(q, g, u);
     @allocated sampler_value_and_gradient!(q, g, u))
 
-@testset "grouped one pass on a partitioned count likelihood and on crossed groups" begin
+# What every grouped case checks: value and gradient with the generated
+# reverse on against off at three points, no refused rule call, and no warm
+# allocation either way. Returns the tape slots of the preparation with the
+# generated reverse on.
+function grouped_one_pass_slots(plan)
     backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    built = build_kernel(plan)
+    u = [0.1 * sin(i) for i in 1:built.layout.total]
+    off = with_plate_reverse(false) do
+        prepare_sampler(built, plan, u; backend, nonallocating = true)
+    end
+    on = with_plate_reverse(true) do
+        prepare_sampler(built, plan, u; backend, nonallocating = true)
+    end
+    for point in (u, u .+ 0.3, u .- 0.2)
+        g0, g1 = similar(point), similar(point)
+        v0, _ = sampler_value_and_gradient!(off, g0, point)
+        v1, _ = sampler_value_and_gradient!(on, g1, point)
+        @test v1 ≈ v0 rtol = 1e-12
+        @test g1 ≈ g0 rtol = 1e-10 atol = 1e-12
+    end
+    g = similar(u)
+    sampler_value_and_gradient!(on, g, u)
+    slots = [c for caches in ReactiveKernels._ad_owned_storage(on.ad)
+             if caches isa Tuple for c in caches
+             if c isa ReactiveKernels._PlateTapeSlot]
+    @test !any(slot -> slot.declined, slots)
+    @test warm_gradient_bytes(on, g, u) == 0
+    @test warm_gradient_bytes(off, g, u) == 0
+    slots
+end
+
+@testset "grouped one pass on a partitioned count likelihood and on crossed groups" begin
     n, J, J2 = 600, 20, 7
     group = [mod1(7i, J) for i in 1:n]
     group2 = [mod1(5i + i ÷ 9, J2) for i in 1:n]
@@ -692,32 +723,28 @@ warm_gradient_bytes(q, g, u) = (sampler_value_and_gradient!(q, g, u);
     cases = ((ScheduleModels.counts(; group, J, x) | (; y = counts), 2),
              (ScheduleModels.crossed(; group, group2, J, J2, x) | (; y = responses), 1))
     for (plan, grouped) in cases
-        built = build_kernel(plan)
-        u = [0.1 * sin(i) for i in 1:built.layout.total]
-        off = with_plate_reverse(false) do
-            prepare_sampler(built, plan, u; backend, nonallocating = true)
-        end
-        on = with_plate_reverse(true) do
-            prepare_sampler(built, plan, u; backend, nonallocating = true)
-        end
-        for point in (u, u .+ 0.3, u .- 0.2)
-            g0, g1 = similar(point), similar(point)
-            v0, _ = sampler_value_and_gradient!(off, g0, point)
-            v1, _ = sampler_value_and_gradient!(on, g1, point)
-            @test v1 ≈ v0 rtol = 1e-12
-            @test g1 ≈ g0 rtol = 1e-10 atol = 1e-12
-        end
-        g = similar(u)
-        sampler_value_and_gradient!(on, g, u)
-        slots = [c for caches in ReactiveKernels._ad_owned_storage(on.ad)
-                 if caches isa Tuple for c in caches
-                 if c isa ReactiveKernels._PlateTapeSlot]
+        slots = grouped_one_pass_slots(plan)
         # A likelihood's tape holds its groups and a few shared scalars, never its rows.
         @test count(slot -> J <= length(slot.tape) < n ÷ 4, slots) == grouped
-        @test !any(slot -> slot.declined, slots)
-        @test warm_gradient_bytes(on, g, u) == 0
-        @test warm_gradient_bytes(off, g, u) == 0
     end
+end
+
+# A cell's exponential of a number is `_native_scalar_exp` in a native program
+# (0.1.371), and its slope is its own value: work the backend's two sweeps
+# would repeat. With such work a plate takes the grouped one pass at any size
+# with more cells than groups. Here both parts of the partitioned count
+# likelihood, 30 zero and 60 positive counts, are shorter than
+# `_PR_ONE_PASS_MIN_CELLS`, from which a gather without shared work takes it.
+@testset "a short count likelihood takes the grouped one pass for its exponential" begin
+    n, J = 90, 20
+    group = [mod1(7i, J) for i in 1:n]
+    x = [0.3 * cos(i) for i in 1:n]
+    counts = [i % 3 == 0 ? 0 : 1 + i % 4 for i in 1:n]
+    empty = count(iszero, counts)
+    @test empty == 30 && n - empty < ReactiveKernels._PR_ONE_PASS_MIN_CELLS
+    slots = grouped_one_pass_slots(ScheduleModels.counts(; group, J, x) | (; y = counts))
+    # One tape per part: its groups and a few shared scalars, fewer than its cells.
+    @test count(slot -> J <= length(slot.tape) < empty, slots) == 2
 end
 
 # The crossed likelihood divides by its shared scale, so its sweep certifies

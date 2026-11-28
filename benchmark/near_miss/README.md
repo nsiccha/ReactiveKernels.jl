@@ -430,3 +430,47 @@ requested one and one with a second reader keep the statements as written.
 Still missed: beside the vector softplus of 0.1.372, `0.5 * z^2` and
 `log1p(exp(v))` keep the loop scalar (48 to 51 µs against 10 µs for
 `0.5 * abs2(z)` with `log1pexp(v)`).
+
+## Which plates the generated reverse takes
+
+`plate_reverse_shapes.jl` prepares ten model shapes at 60 and 2,000 rows with
+the opt-in generated reverse of summed plates on and off
+(`with_plate_reverse`), both from one plan in one process, and times the two
+gradients in alternating rounds. It prints the lengths of the one-pass tapes
+the preparation owns (none: every plate runs inline, as with the generated
+reverse off) and the gradient time on divided by off.
+
+The generated reverse lets a plate take its one pass below 128 cells, with a
+buffer per row or with scalar cotangents only, when a cell holds work that
+its value and its slope share. The test for that work named `exp`; a native
+program has called the exponential of a number `_native_scalar_exp` since
+0.1.371, so no cell met it. 0.1.416 asks the predicate that knows every name
+of the exponential. Before: `main` `48106ad6a`, one process. After: the
+branch from a fresh build, two processes at once on a host at a load of 62 to
+85, both readings given.
+
+| Model | Rows | Tapes before | Tapes after | On / off before | On / off after |
+| --- | ---: | --- | --- | ---: | ---: |
+| `y .~ Poisson.(exp.(a .+ b .* x))` | 60 | 3 | 3, 3, 3 | 1.03 | 0.39, 0.55 |
+| the same | 2,000 | 3 | 3, 3, 3 | 0.99 | 0.35, 0.37 |
+| Poisson with a parameter per row, `exp.(a .+ sd .* z)` | 60 | none | 62, 62 | 1.01 | 0.51, 0.71 |
+| the same | 2,000 | none | 2002, 2002 | 1.00 | 0.38, 0.44 |
+| Poisson with a group effect, `sd .* z[group]`, 10 groups | 60 | 3 | 14, 14, 3 | 0.95 | 0.67, 0.79 |
+| the same, 20 groups | 2,000 | 24, 24, 3 | 24, 24, 3 | 0.34 | 0.35, 0.44 |
+
+The other seven shapes own the same tapes before and after, so their programs
+did not change: Bernoulli-logit plain (3, 3), with a parameter per row (none)
+and grouped (14 or 24, and 3); a Normal with scale `exp(ls)` plain (none) and
+grouped (3 at 60 rows; 24 and 3 at 2,000); a grouped negative binomial (62 or
+2002); a grouped Normal (none at 60 rows, 24 at 2,000). Where `main` gains
+with the generated reverse on, their readings stay near `main`'s (0.41 to 0.52
+against 0.43, 0.60 to 0.85 against 0.67 to 0.71, 0.46 against 0.41); where
+`main` reads 1.0 to 1.1 they scatter between 0.82 and 1.39, which is what two
+processes of one program give on that host. The tapes are what the probe
+shows for them. The largest absolute difference between the two gradients in
+any row is 5.5e-12; `test_plate_reverse_one_pass.jl` holds them to a relative
+1e-10.
+
+Seen on the way and not changed: the Bernoulli-logit plates take a tape and
+gain nothing (1.0 to 1.1), and a grouped Normal of 60 rows runs inline although
+its tape would be in owned storage (the 128-cell minimum).
