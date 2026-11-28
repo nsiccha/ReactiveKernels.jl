@@ -16,6 +16,23 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.413
+
+- A borrowed position reader (`vectorize(...; reuse = true)`) gives each plate
+  cell its own shared design again. Since 0.1.399 such a reader keeps the
+  storage of its shared design values from one cell to the next, and a call
+  that equal cells share (one evaluation per distinct argument tuple) compares
+  its arguments by identity first. Where that call read a value its own cell
+  had computed into kept storage (rows gathered as `column[rows]`, a dotted
+  call, a plate inside the cell), every cell after the first received the first
+  cell's result, whatever its own data: wrong values, with no error. A value
+  such a call reads, directly or through other values of the cell, now has its
+  own allocation in every cell, and a plate inside the cell whose cells the
+  call reads keeps no per-cell buffers. The cell's other values keep their
+  storage. Owning and scheduled readers and `bound=` were not affected. A
+  dependant whose borrowed reader computes a design in a plate of its own
+  states 0.1.413 as its floor.
+
 ## 0.1.412
 
 `prepare_data` decides a ragged plate's row-length checks and its grouped

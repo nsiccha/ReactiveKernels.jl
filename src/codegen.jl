@@ -4170,6 +4170,18 @@ function _plate_nested_native!(runtime_ops, runtime_recipes, kernel, input_types
     if cell_slots !== nothing
         excluded = Set(canon_id(scalar.graph, v.id) for v in
                        (result_slot ? scalar.have : vcat(scalar.want, scalar.have)))
+        # What a shared call reads stays in its table for the whole plate, so
+        # it keeps its own allocation (`_shared_keyed_values`). A plate inside
+        # the cell whose cells such a call reads keeps no per-cell table
+        # either: a table's buffers are refilled when the next outer cell runs
+        # that plate, while the stored cells are still a key. Without tables a
+        # stored cell takes the buffer it holds out of its slot
+        # (`_lane_release!`).
+        keyed = _shared_keyed_values(scalar)
+        union!(excluded, keyed)
+        any(r -> r.op isa _AuthoredPlateOp &&
+                 any(v -> canon_id(scalar.graph, v.id) in keyed, r.outputs),
+            scalar.recipes) && (cell_tables = nothing)
         for v in _lane_slot_values(scalar, excluded)
             push!(recycle, canon_id(scalar.graph, v.id) => gensym(Symbol(v.name, :_cell_slot)))
         end
@@ -4625,6 +4637,9 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
     if cell_slots !== nothing
         emitted = Set(i for (_, indices) in groups for i in indices)
         excluded = Set(canon_id(inner.graph, v.id) for v in inner.have)
+        # What a shared call reads stays in its table for the whole plate, so
+        # it keeps its own allocation (`_shared_keyed_values`).
+        union!(excluded, _shared_keyed_values(inner))
         result_ids = Set(canon_id(inner.graph, v.id) for v in inner.want)
         for i in _lane_slot_recipes(inner, excluded)
             i in emitted && !haskey(lane_arms, i) && !(i in sliced_scans) &&
