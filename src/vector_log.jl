@@ -70,21 +70,5 @@ function _exp_sum_with_sign_proof(ex)
     Expr(:call, _rw_helper(:_add_with_sign_proof), terms...)
 end
 
-# A source softplus may still be present if its earlier pass rejected the
-# cell. Only its already selected vector twin is safe beside a vector log.
-_vector_log_safe(f) = f === _log_exp_sum || f === _add_with_sign_proof ||
-    f === _exp_with_sign_proof || f === _scale_with_sign_proof || f === _scaled_with_sign_proof ||
-    (f !== rk_log1pexp && f !== LogExpFunctions.log1pexp && _vector_safe_function(f))
-
-function _vectorize_cell_logs(body)
-    candidate = _index_run_replace(body, _RW_OPAQUE) do ex
-        Meta.isexpr(ex, :call, 2) && _vector_log_callee(ex.args[1]) === log || return ex
-        sum = ex.args[2]
-        # A lone exponential is left to the rewrites that cancel it.
-        Meta.isexpr(sum, :call) && length(sum.args) >= 3 || return ex
-        proven = _exp_sum_with_sign_proof(sum)
-        proven === nothing ? ex : Expr(:call, _rw_helper(:_log_exp_sum), proven)
-    end
-    candidate === body && return body
-    _vector_safe_cell(candidate, Returns(nothing), _vector_log_safe) && _vector_doubles() >= 2 ? candidate : body
-end
+# Where a summed plate's cell takes this logarithm: `_vectorize_cell`
+# (vector_cells.jl), together with the cell's other vector forms.

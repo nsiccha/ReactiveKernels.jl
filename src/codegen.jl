@@ -4939,13 +4939,16 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         # table carried from one cell to the next, or one call that keeps the
         # loop scalar runs the cells one at a time, where the source's
         # softplus is the faster one. A cell that is one call names its
-        # function by table position (`__callables__[k]`).
+        # function by table position (`__callables__[k]`). The cell is tested
+        # with the vector softplus in place, as it would run, and only where
+        # it holds a softplus at all.
         vector_cells = isempty(slotted) && isempty(table_entries) && isempty(shares) &&
             !any(r -> r.op isa _AuthoredScanOp, inner.recipes)
         table_function(callee) = (k = _callable_slot(callee);
             k === nothing || !(k in eachindex(runtime_ops)) ? nothing : Some(runtime_ops[k]))
-        cell_statements = vector_cells && _vector_safe_cell(loopbody, table_function) ?
-            _vector_softplus_calls(loopbody, table_function) : loopbody
+        vector_body = vector_cells ? _vector_softplus_calls(loopbody, table_function) : loopbody
+        cell_statements = vector_body !== loopbody && _vector_safe_cell(vector_body, table_function) ?
+            vector_body : loopbody
         simd_body = Expr(:block,
             Expr(:(=), index, Expr(:call, GlobalRef(Base, :CartesianIndex), linear)),
             cell_statements.args...)
