@@ -505,8 +505,12 @@ end
 function _run_build_steps(steps, local_count, args)
     frame = Vector{Any}(undef, local_count)
     result = nothing
-    for step in steps
-        result = Base.invokelatest(step.run, frame, args, step.indices, step.slots)
+    # The instructions build this definition's graphs and nothing else holds
+    # them yet: nested kernel calls find their keyed recipes by key.
+    _with_assembly_tables() do
+        for step in steps
+            result = Base.invokelatest(step.run, frame, args, step.indices, step.slots)
+        end
     end
     result::KernelSpec
 end

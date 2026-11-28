@@ -2449,13 +2449,39 @@ end
 function _reindex_producers!(g::Graph)
     empty!(g.producers)
     for recipe in g.recipes
-        indexed = Set{ValueId}()
-        for output in recipe.outputs
-            canonical = canon_id(g, output.id)
-            canonical in indexed && continue
-            push!(get!(g.producers, canonical, Int[]), recipe.id)
-            push!(indexed, canonical)
-        end
+        _index_producers!(g, recipe)
+    end
+    g
+end
+
+# File `recipe` under the value class of each of its outputs, once per class:
+# two outputs of one recipe can share a class.
+function _index_producers!(g::Graph, recipe::Recipe)
+    outputs = recipe.outputs
+    for position in eachindex(outputs)
+        canonical = canon_id(g, outputs[position].id)
+        _output_class_before(g, outputs, canonical, position) && continue
+        push!(get!(g.producers, canonical, Int[]), recipe.id)
+    end
+    g
+end
+
+function _output_class_before(g::Graph, outputs::Tuple, canonical::ValueId, position::Int)
+    for earlier in 1:position-1
+        canon_id(g, outputs[earlier].id) == canonical && return true
+    end
+    false
+end
+
+# Each list is filed under the root of its value class. Aliasing a root that
+# has producers under another root leaves its list under an id that is no
+# longer a root, and nothing else makes the index stale: `_add_recipe!` files
+# every recipe it adds. A caller that only added aliases and recipes can
+# therefore skip rebuilding an index whose keys are all still roots.
+function _reindex_rerooted_producers!(g::Graph)
+    aliases = g.aliases
+    for id in keys(g.producers)
+        haskey(aliases, id) && return _reindex_producers!(g)
     end
     g
 end
@@ -2484,11 +2510,67 @@ function _canonical_ids_equal(g::Graph, values::Tuple{Vararg{Value}}, ids::Vecto
     true
 end
 
+# The keyed recipes of one graph by the hash of their key, for a caller that
+# adds many keyed recipes to a graph nothing else holds (`merge`). Finding the
+# earlier recipe with a recipe's key then reads the recipes sharing that hash
+# instead of every recipe of the graph. `covered` counts the leading recipes
+# filed so far, so recipes added without the table are filed on its next use.
+mutable struct _KeyedRecipes
+    const positions::Dict{UInt,Vector{Int}}
+    covered::Int
+end
+_KeyedRecipes() = _KeyedRecipes(Dict{UInt,Vector{Int}}(), 0)
+
+# One assembly of a graph from its construction instructions adds recipes to
+# graphs nothing else holds yet, among them the keyed recipes of every nested
+# kernel call it splices. Within `_with_assembly_tables` each such graph gets a
+# table, so a splice does not read every recipe of its caller for each recipe
+# it adds. The tables live for that assembly only.
+const _ASSEMBLY_KEYED = gensym(:assembly_keyed_recipes)
+_with_assembly_tables(f) =
+    task_local_storage(f, _ASSEMBLY_KEYED, IdDict{Graph,_KeyedRecipes}())
+function _assembly_table(g::Graph)
+    tables = get(task_local_storage(), _ASSEMBLY_KEYED, nothing)
+    tables === nothing ? nothing :
+        get!(_KeyedRecipes, tables::IdDict{Graph,_KeyedRecipes}, g)
+end
+
+Base.@nospecializeinfer function _keyed_positions(g::Graph, keyed::_KeyedRecipes,
+        @nospecialize(cse_key))
+    recipes = g.recipes
+    while keyed.covered < length(recipes)
+        position = keyed.covered += 1
+        r = recipes[position]
+        r.effectful || r.cse_key === nothing ||
+            push!(get!(keyed.positions, hash(r.cse_key), Int[]), position)
+    end
+    get(keyed.positions, hash(cse_key), nothing)
+end
+
+# The earlier recipe that computes what a recipe with `cse_key` over the
+# canonical inputs `canon_ins` and `arity` outputs would: the first in recipe
+# order, among `positions` when a table names them and among all otherwise.
+Base.@nospecializeinfer function _cse_recipe(g::Graph, @nospecialize(cse_key),
+        canon_ins::Vector{ValueId}, arity::Int, positions::Union{Nothing,Vector{Int}})
+    recipes = g.recipes
+    for index in (positions === nothing ? eachindex(recipes) : positions)
+        r = recipes[index]
+        r.effectful && continue
+        r.cse_key === nothing && continue
+        isequal(r.cse_key, cse_key) || continue
+        length(r.outputs) == arity || continue
+        _canonical_ids_equal(g, r.inputs, canon_ins) || continue
+        return r
+    end
+    nothing
+end
+
 # Registration stores callable and provenance values as graph metadata. Its body
 # does not need a new inferred executable for every numerical operation type.
 Base.@nospecializeinfer function _add_recipe!(g::Graph,
         inputs, outputs, @nospecialize(op),
-        cost::Real, @nospecialize(cse_key), effectful::Bool, @nospecialize(source))
+        cost::Real, @nospecialize(cse_key), effectful::Bool, @nospecialize(source),
+        keyed::Union{Nothing,_KeyedRecipes} = nothing)
     ins = _astuple(inputs)
     outs = _astuple(outputs)
     recipe_cost = Float64(cost)
@@ -2502,12 +2584,11 @@ Base.@nospecializeinfer function _add_recipe!(g::Graph,
     # producer's outputs instead of adding a duplicate recipe.
     if cse_key !== nothing && !effectful
         canon_ins = ValueId[canon_id(g, v.id) for v in ins]
-        for r in g.recipes
-            r.effectful && continue
-            r.cse_key === nothing && continue
-            isequal(r.cse_key, cse_key) || continue
-            length(r.outputs) == length(outs) || continue
-            _canonical_ids_equal(g, r.inputs, canon_ins) || continue
+        keyed === nothing && (keyed = _assembly_table(g))
+        positions = keyed === nothing ? nothing : _keyed_positions(g, keyed, cse_key)
+        r = keyed !== nothing && positions === nothing ? nothing :
+            _cse_recipe(g, cse_key, canon_ins, length(outs), positions)
+        if r !== nothing
             alias_plan = _cse_alias_plan(g, outs, r.outputs, cse_key)
             for v in ins; _register!(g, v); end
             for v in outs; _register!(g, v); end
@@ -2525,9 +2606,7 @@ Base.@nospecializeinfer function _add_recipe!(g::Graph,
     r = Recipe(length(g.recipes) + 1, ins, outs, op, recipe_cost, cse_key,
                effectful, source)
     push!(g.recipes, r)
-    for v in outs
-        push!(get!(g.producers, canon_id(g, v.id), Int[]), r.id)
-    end
+    _index_producers!(g, r)
     g.version += 1
     r
 end
