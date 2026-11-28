@@ -3291,9 +3291,21 @@ _pr_gather_value(::Type{<:SubArray{Float64,1,<:AbstractVector,<:Tuple{AbstractUn
 # is then empty, the next call allocates and its reverse pass refills the slot.
 # A second call at the site before the first one's reverse pass (the call in a
 # loop) finds the slot empty and allocates as well; a changed length does too.
+#
+# A slot keeps its tape between calls (`retain`) only where nothing
+# differentiates the rule itself. An outer derivative pass over the rule (the
+# forward pass of a Hessian-vector product) takes the length test below from
+# the primal slot and applies the zeroing and the sweep's writes to its shadow
+# of the vector, at the same indices. A backend preparation makes that shadow
+# once, while the slot is empty, and one operator holds several preparations.
+# A tape that a call through one of them left in the primal slot would be
+# reused by a call through another, whose shadow vector still has no elements:
+# the tangents would be written past its end. Without `retain` every call
+# allocates its tape, and the outer pass allocates the shadow beside it.
 mutable struct _PlateTapeSlot
     tape::Vector{Float64}
     empty::Vector{Float64}
+    retain::Bool
     # A backend adapter that could not take the one pass at this site says so
     # here. The schedule is chosen on operand types and sizes before the
     # backend sees the call; its own annotations can still refuse it.
@@ -3304,7 +3316,7 @@ mutable struct _PlateTapeSlot
 end
 function _PlateTapeSlot()
     empty = Float64[]
-    _PlateTapeSlot(empty, empty, false, UInt64[])
+    _PlateTapeSlot(empty, empty, true, false, UInt64[])
 end
 # A constants-table entry is bound data or a value derived from data alone. A
 # slot belongs to one preparation, whose table does not change, so each such
@@ -3462,13 +3474,21 @@ function _pr_verified_preparation(op, prepared, point, seeds, contexts, evaluate
 end
 @inline function _pr_take_tape!(slot::_PlateTapeSlot, n::Int)
     tape = slot.tape
-    length(tape) == n || return zeros(Float64, n)
+    slot.retain && length(tape) == n || return zeros(Float64, n)
     slot.tape = slot.empty
     fill!(tape, 0.0)
 end
 @inline _pr_take_tape!(::Union{Nothing,_PlateRuleMark}, n::Int) = zeros(Float64, n)
-@inline _pr_return_tape!(slot::_PlateTapeSlot, tape::Vector{Float64}) = (slot.tape = tape; nothing)
+@inline _pr_return_tape!(slot::_PlateTapeSlot, tape::Vector{Float64}) =
+    (slot.retain && (slot.tape = tape); nothing)
 @inline _pr_return_tape!(::Union{Nothing,_PlateRuleMark}, tape::Vector{Float64}) = nothing
+# Stop the slots of an operator's contexts from keeping their tapes
+# (`_prepare_ad_operator`, before the backend makes its shadows of them).
+_pr_release_tapes!(slot::_PlateTapeSlot) = (slot.retain = false; nothing)
+_pr_release_tapes!(table::Tuple) = foreach(_pr_release_tapes!, table)
+_pr_release_tapes!(context::DifferentiationInterface.Cache) =
+    _pr_release_tapes!(DifferentiationInterface.unwrap(context))
+_pr_release_tapes!(other) = nothing
 
 # The operand classes a one-pass tape holds a buffer for, on types alone:
 # `Float64` vectors, views of them, tuples of `Float64`, and the rows of a
