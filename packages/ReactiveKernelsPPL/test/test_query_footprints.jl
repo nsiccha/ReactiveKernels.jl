@@ -298,4 +298,117 @@ end
         end
     end
 end
+
+@rkppl _qf_ar1(m, sigma, phi) = begin
+    @scan begin
+        y[1] ~ Normal(m[1], sigma / sqrt(1 - phi^2))
+        for t in 2:length(m)
+            y[t] ~ Normal(m[t] + phi * (y[t - 1] - m[t - 1]), sigma)
+        end
+    end
+    return y
+end
+
+@testset "a value read through a product, vcat or sparse product stays at its cell's rows" begin
+    # A cell's gather `mu[rows[g]]`, here the argument of a called AR(1) scan
+    # as BRM emits for `AR1Normal`, stays at the cell's rows only once `mu`'s
+    # full axes are proven before anything runs. That proof knew no product,
+    # `vcat` or sparse product, so with one of them in `mu`'s cone every cell
+    # read `mu` whole, and every group's coordinates with it, silently under
+    # `locality = :error` (snag `cell-footprint-h-95e7b619`).
+    G, n = 3, 4
+    group = repeat(1:G, inner = n)
+    rows = [collect(((g - 1) * n + 1):(g * n)) for g in 1:G]
+    x = [0.3 * cos(1.7k) for k in 1:(G * n)]
+    y = [[0.2 * sin(k + g) for k in 1:n] for g in 1:G]
+    half = G * n ÷ 2
+    column = [g == 1 ? 1 : 2 for g in group]
+    data = (; group, rows, x, y, head = group[1:half], tail = group[(half + 1):end],
+        S = sparse(eachindex(group), column, x, G * n, 2))
+    z(g) = Symbol("z.$g")
+    plate = :(@plate for g in eachindex(y)
+        y[g] ~ _qf_ar1(mu[rows[g]], 0.7, 0.4)
+    end)
+    cases = (
+        (quote
+            z[1:$G] .~ Normal.(0, 1)
+            X = hcat(x)
+            beta[1:1] .~ Normal.(0, 1)
+            pop = X * beta
+            mu = z[group] .+ pop
+            $plate
+        end, g -> Set([z(g), Symbol("beta.1")]), (c, r) -> c(z(group[r])) + x[r] * c(Symbol("beta.1"))),
+        (quote
+            z[1:$G] .~ Normal.(0, 1)
+            X = hcat(x)
+            beta[1:1] .~ Normal.(0, 1)
+            mu = z[group] .+ X * beta
+            $plate
+        end, g -> Set([z(g), Symbol("beta.1")]), (c, r) -> c(z(group[r])) + x[r] * c(Symbol("beta.1"))),
+        # BRM's population effects: a submodel returning `X * beta`.
+        (quote
+            z[1:$G] .~ Normal.(0, 1)
+            X = hcat(x)
+            pop ~ _qf_population(X, 1, 0.0, 1.0)
+            mu = z[group] .+ pop
+            $plate
+        end, g -> Set([z(g), Symbol("pop.beta.1")]), (c, r) -> c(z(group[r])) + x[r] * c(Symbol("pop.beta.1"))),
+        (quote
+            z[1:$G] .~ Normal.(0, 1)
+            left = z[head]
+            right = z[tail]
+            mu = vcat(left, right)
+            $plate
+        end, g -> Set([z(g)]), (c, r) -> c(z(group[r]))),
+        # A bound sparse factor: each row reads the one coefficient it stores.
+        (quote
+            z[1:$G] .~ Normal.(0, 1)
+            beta[1:2] .~ Normal.(0, 1)
+            pop = S * beta
+            mu = z[group] .+ pop
+            $plate
+        end, g -> Set([z(g), Symbol("beta.$(g == 1 ? 1 : 2)")]),
+            (c, r) -> c(z(group[r])) + x[r] * c(Symbol("beta.$(column[r])"))),
+        # The snag's own model: drawn scale and autocorrelation.
+        (quote
+            phi ~ Uniform(-1, 1)
+            sigma ~ Exponential(1)
+            z[1:$G] .~ Normal.(0, 1)
+            X = hcat(x)
+            pop ~ _qf_population(X, 1, 0.0, 1.0)
+            mu = z[group] .+ pop
+            @plate for g in eachindex(y)
+                y[g] ~ _qf_ar1(mu[rows[g]], sigma, phi)
+            end
+        end, g -> Set([:phi, :sigma, z(g), Symbol("pop.beta.1")]), nothing))
+    lognormal(v, m, s) = -0.5 * ((v - m) / s)^2 - log(s) - 0.5 * log(2π)
+    ar1(v, m) = lognormal(v[1], m[1], 0.7 / sqrt(1 - 0.4^2)) +
+        sum(lognormal(v[t], m[t] + 0.4 * (v[t - 1] - m[t - 1]), 0.7) for t in 2:length(v))
+    for (ast, expected, mean) in cases
+        plan, built = build(ast, data)
+        names = coordinate_names(built.layout)
+        u = [0.1k - 0.35 for k in eachindex(names)]
+        coordinate(name) = u[only(findall(==(name), names))]
+        cell = prepare_cell_query(built, plan, :y; locality = :error)
+        locality = ReactiveKernels.partition_locality(cell)
+        @test !any(e -> e.status === :whole, locality)
+        @test any(e -> e.value === :mu && e.status === :rows, locality)
+        footprint = partition_footprint_kernel(cell.kernel)
+        for g in 1:G
+            @test Set(names[Base.invokelatest(footprint, u, g).unconstrained]) == expected(g)
+            mean === nothing && continue
+            @test cell(u, g) ≈ ar1(y[g], [mean(coordinate, r) for r in rows[g]])
+        end
+        # With the group effects partitioned and the rest fixed, as BRM's sparse
+        # Laplace reads each cell, a cell reads its own group's effect only.
+        shared = prepare_cell_query(built, plan, :y; locality = :error,
+            partitioned = (:z => collect(1:G),), u0 = u)
+        local_footprint = partition_footprint_kernel(shared; shared = false)
+        with_cell_batch(shared, u) do batch
+            for g in 1:G
+                @test names[Base.invokelatest(local_footprint, batch, g).unconstrained] == [z(g)]
+            end
+        end
+    end
+end
 end

@@ -16,6 +16,19 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.409
+
+A plate cell that passes a gather of a computed value to a called submodel
+(`y[g] ~ ar1(mu[rows[g]], sigma, phi)`, the cell BRM emits for `AR1Normal`)
+reads that value at the cell's rows also when it is computed through a matrix
+product (`X * beta`, inline as `lh .+ X * beta` or as a submodel's returned
+product, the shape of BRM's population effects), a `vcat` or a product over a
+bound sparse factor. The proof that the gather's bound indices are in range
+needs the value's full axes before anything runs, and it did not derive them
+through those forms. Each cell then computed the value whole, its footprint
+held every group's coordinates, and `locality = :error` raised nothing.
+Values are unchanged.
+
 ## 0.1.408
 
 The emitted JAX `select_plate_layout` confirms competing layouts in 12 rotating,

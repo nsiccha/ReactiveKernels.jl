@@ -458,6 +458,14 @@ end
 @inline _cell_product_shape(factor::Tuple, w::AbstractVector) = (first(factor),)
 @inline _cell_product_shape(factor::Tuple, w::AbstractMatrix) = (first(factor), axes(w, 2))
 @inline _cell_product_shape(factor::Tuple, w::Number) = factor
+# The same axes from the right operand's full axes rather than its value, for a
+# proof made before anything runs (`_cell_bound_capture_check`): a number's `()`
+# keeps the factor's axes, a vector's one axis gives the factor's row axis, a
+# matrix's second axis adds its columns. `nothing` for any other rank.
+_cell_product_axes(factor::Tuple, w::Tuple{}) = factor
+_cell_product_axes(factor::Tuple, w::Tuple{Any}) = (first(factor),)
+_cell_product_axes(factor::Tuple, w::Tuple{Any,Any}) = (first(factor), w[2])
+_cell_product_axes(factor::Tuple, w::Tuple) = nothing
 
 # The full axes of a column read `A[:, j...]`: `A`'s first axis.
 @inline _cell_column_shape(shape::Tuple) = (first(shape),)
@@ -2065,6 +2073,46 @@ function _cell_bound_capture_check(p::Plan, producers, static_type, known, outli
             end
             return shapes[cid] = _plate_broadcast_shape(Tuple(full))
         end
+        # The forms below take their axes from their operands' as the cell's
+        # own shape lowering does (`_cell_compute_shape!`): a product
+        # `A * w` from `A`'s and `w`'s (`_cell_product_shape`), or with no
+        # single right operand from its inferred vector result and `A`'s row
+        # axis; a `vcat` from its operands', a number literal being one row;
+        # a product over a bound sparse factor from that factor's stored rows
+        # and its operand's. A capture read through any of them (`lh .+ X *
+        # beta`, BRM's population effects) is then read at the cell's rows.
+        # `product(a, w)` is `A * w` from `A`'s axes `a`; a vector `w` of
+        # unproven axes still gives `A`'s row axis.
+        product(a, w) = let s = shape(w)
+            isempty(a) ? nothing : s !== nothing ? _cell_product_axes(a, s) :
+                static_type(w) <: AbstractVector ? (first(a),) : nothing
+        end
+        if f.kind === :product
+            a = shape(r.inputs[findfirst(==(:factor), f.roles)])
+            a === nothing && return nothing
+            if f.operand == 0
+                static_type(only(r.outputs)) <: AbstractVector && !isempty(a) ||
+                    return nothing
+                return shapes[cid] = _cell_column_shape(a)
+            end
+            return shapes[cid] = product(a, r.inputs[f.operand])
+        end
+        if f.kind === :vcat
+            parts = Any[]
+            for part in f.parts
+                s = part isa _CellInputLiteral ? shape(r.inputs[part.input]) : ()
+                s === nothing && return nothing
+                push!(parts, s)
+            end
+            return shapes[cid] = _cell_vcat_shape(Tuple(parts))
+        end
+        if f.kind === :sparse_product
+            rows = bound(r.inputs[1])
+            rows !== nothing && something(rows) isa _CellSparseRows || return nothing
+            w = shape(r.inputs[2])
+            (w === nothing || isempty(w)) && return nothing
+            return shapes[cid] = _cell_sparse_shape(something(rows), w)
+        end
         f.kind in (:identity, :checked, :pointwise, :columns, :hcat, :reduce, :transposed,
                    :array_arithmetic, :position_map) ||
             return nothing
@@ -2072,7 +2120,11 @@ function _cell_bound_capture_check(p::Plan, producers, static_type, known, outli
         for j in f.leaves
             s = shape(r.inputs[j])
             s === nothing && return nothing
-            f.roles[j] === :factor_leaf && return nothing
+            if f.roles[j] === :factor_leaf
+                # A dotted operand `A * w` (`_cell_part_shape!`).
+                s = product(s, r.inputs[f.gather_index[j]])
+                s === nothing && return nothing
+            end
             push!(parts, f.roles[j] === :column ? _cell_column_shape(s) : s)
         end
         for part in _cell_extra_parts(f)
