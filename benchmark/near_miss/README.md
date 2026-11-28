@@ -427,9 +427,50 @@ its own stays a statement and wraps each position's sum, which is the 1,280
 bytes of the last three rows. An intermediate with a declared type, a
 requested one and one with a second reader keep the statements as written.
 
-Still missed: beside the vector softplus of 0.1.372, `0.5 * z^2` and
-`log1p(exp(v))` keep the loop scalar (48 to 51 µs against 10 µs for
-`0.5 * abs2(z)` with `log1pexp(v)`).
+A softplus in a summed plate (0.1.419), 4,096 cells. `main` at `8a64b4f93`
+and the change, each from a fresh build, one after the other in one hold of a
+shared host at a load of 54 to 64; microseconds of CPU time per call, fastest
+batch. A first reading an hour earlier, against a build of `0ca8384ae` whose
+softplus sources are the same as `main`'s, is in parentheses.
+
+| Cell | Before | After |
+| --- | ---: | ---: |
+| `log1pexp(v) + 0.5 * abs2(z)` | 10.0 (10.0) | 8.7 (10.0) |
+| `log1pexp(v) + 0.5 * (z * z)` | 10.0 (9.6) | 10.0 (9.9) |
+| `log1pexp(v) + 0.5 * z^2` | 43.0 (40.7) | 9.9 (9.9) |
+| `log1pexp(v) + 0.5 * z^3` | 47.9 (40.2) | 10.5 (10.9) |
+| `log1pexp(v) + 0.5 * z^4` | 48.3 (43.4) | 62.6 (54.7) |
+| `log1pexp(v) + sqrt(abs2(z) + 1)` | 35.8 (37.1) | 11.4 (11.5) |
+| `log1pexp(v) + smooth(z)`, a function of the model's | 47.2 (36.2) | 10.5 (10.5) |
+| `log1pexp(v) + log(abs2(z) + 1)` | 58.8 (53.3) | 47.5 (53.2) |
+| `log1pexp(v) + log(exp(z) + exp(-z) + exp(2z))` | 84.8 (81.6) | 26.8 (27.1) |
+| `log1pexp(v) + log(exp(z) + exp(-z))` | 66.5 (79.3) | 79.5 (97.4) |
+| `log1p(exp(v)) + 0.5 * abs2(z)` | 39.2 (50.7) | 10.1 (9.9) |
+| `log(1 + exp(v)) + 0.5 * abs2(z)` | 38.4 (44.6) | 10.0 (10.0) |
+| `-log(logistic(-v)) + 0.5 * abs2(z)` | 50.1 (44.4) | 10.1 (9.6) |
+| `-log1p(-logistic(v)) + 0.5 * abs2(z)` | 37.1 (36.9) | 10.0 (10.0) |
+| `-log(1 - logistic(v)) + 0.5 * abs2(z)` | 37.1 (37.6) | 10.1 (10.0) |
+| `-loglogistic(-v) + 0.5 * abs2(z)` | 37.0 (44.4) | 10.0 (10.0) |
+| `-log1mlogistic(v) + 0.5 * abs2(z)` | 50.7 (38.0) | 9.6 (10.0) |
+| `-log(1 / (1 + exp(-v))) + 0.5 * abs2(z)` | 45.6 (40.9) | 9.4 (9.3) |
+
+Before the change the vector softplus needed every other call of the cell in
+a fixed list, and the softplus itself spelled `log1pexp` or `rk_log1pexp`.
+Now a call the list does not name is put to the compiler (a sum over it is
+compiled once per process and read), and every form the stable rewrites
+compute as a softplus has a twin that is the vector softplus for a `Float64`.
+All 18 rows return the same value on both trees.
+
+Three rows keep the scalar loop on purpose: `z^4` is a call of `pow`, Base's
+`log` is a call, and the two-term logarithm of exponentials is the stable
+log-add-exp, which runs one cell at a time. Their prepared programs are the
+same text on both trees, so the differences between their columns (and
+between the two readings) are the host's: tens of percent, in both directions.
+
+Still missed: that two-term `log(exp(a) + exp(b))`, which is a softplus of
+the difference and takes 52 µs alone where a three-term sum takes 16 µs; and
+`log(1 / (1 + exp(v)))` and `e = exp(v); log1p(e)`, which no stable rule
+takes.
 
 ## Which plates the generated reverse takes
 
