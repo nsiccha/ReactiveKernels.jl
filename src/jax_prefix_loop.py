@@ -121,9 +121,16 @@ def _rk_cuda_prefix(run, args, initial):
     return jax.tree.unflatten(jax.tree.structure(initial), call(*leaves))
 
 
-def _rk_prefix_fori(start, stop, body, initial, running_slot, last_step):
+# `live` is the condition the loop's code runs under (a branch arm, a plate
+# mask), or None. Where it is false the loop's value is unused, so that lane
+# takes no step. Under `jax.vmap` a branch runs every arm and selects: the
+# untaken arm's loop would otherwise iterate on operands it was never meant
+# for, to its own exit or the range's end. The bounded schedule is unchanged.
+def _rk_prefix_fori(start, stop, body, initial, running_slot, last_step, live=None):
     if _rk_loop_ad is None:
         return jax.lax.fori_loop(start, stop, body, initial)
+    if live is not None and jnp.ndim(live):
+        live = jnp.any(live)
 
     # Stage once and pass every closed-over array explicitly through AD.
     closed = jax.make_jaxpr(body)(jnp.asarray(start), initial)
@@ -136,12 +143,14 @@ def _rk_prefix_fori(start, stop, body, initial, running_slot, last_step):
         leaves = jax.core.eval_jaxpr(graph, consts, i, *jax.tree.leaves(carry))
         return jax.tree.unflatten(tree, leaves)
 
-    def run(lo, hi, last, carry, consts, *, device=False):
+    def run(lo, hi, last, live, carry, consts, *, device=False):
         def keep(state):
             i, values = state
             within = i < hi
             if last is not None:
                 within = within & (i <= last)
+            if live is not None:
+                within = within & live
             if running_slot is not None:
                 within = within & values[running_slot]
             return within
@@ -160,17 +169,17 @@ def _rk_prefix_fori(start, stop, body, initial, running_slot, last_step):
     static_lo = int(start) if isinstance(start, _rk_loop_integer) else None
     static_hi = int(stop) if isinstance(stop, _rk_loop_integer) else None
 
-    def bounded(lo, hi, last, carry, consts):
+    def bounded(lo, hi, last, live, carry, consts):
         begin = lo if static_lo is None else static_lo
         end = hi if static_hi is None else static_hi
         return jax.lax.fori_loop(begin, end, lambda i, c: step(i, c, consts), carry)
 
-    args = (start, stop, last_step, initial, tuple(closed.consts))
+    args = (start, stop, last_step, live, initial, tuple(closed.consts))
     execute = run
     if running_slot is not None and _rk_scalar_loop(graph):
         def execute(*xs):
             return jax.lax.platform_dependent(
-                cuda=lambda: _rk_cuda_prefix(run, xs, xs[3]), default=lambda: run(*xs))
+                cuda=lambda: _rk_cuda_prefix(run, xs, xs[4]), default=lambda: run(*xs))
 
     out = jax.tree.map(jax.typeof, initial)
     return _RKPrefixLoop(execute, bounded, args, out, graph.effects)(*args)
