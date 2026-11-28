@@ -360,3 +360,54 @@ D8 `TDist.(nu)` previously failed during lowering. It now agrees exactly in
 value and gradient with D8s `StudentT.(nu, 0, 1)` at the checked parameter
 point. In the same run their densities took 11.68 and 11.65 µs respectively,
 and their value-and-gradient calls took 18.06 and 17.94 µs.
+
+## Spellings of two native fast paths in the core package
+
+`core_spellings.jl` times sibling spellings of fast paths the core package
+admits, without the model package: whether the prepared program holds the
+fast path's helper, the time of one call and the bytes it allocates. The
+columns are `main` at `48106ad6a` (the source of both paths is the same at
+`3c165e804`, where the change starts) and the change that widened both
+admissions. Each tree ran in its own Julia 1.10.12 process, both at once on
+gordito at a load of 43 to 54 on 32 threads; times are microseconds of the
+measuring thread's CPU time, fastest batch of about 5 ms.
+
+The vector logarithm of a summed plate (0.1.373), 4,096 cells:
+
+| Argument of the logarithm | Before | After |
+| --- | ---: | ---: |
+| `(exp(v) + exp(-v)) + exp(2v)` | 17.8 | 17.9 |
+| `exp(v) + (exp(-v) + exp(2v))` | 17.6 | 16.2 |
+| `exp(v) + exp(-v) + exp(2v)` | 49.4 | 17.6 |
+| five terms in one `+` call | 59.9 | 25.5 |
+| `0.3 * exp(v) + 0.7 * exp(-v)` | 30.9 | 13.1 |
+| `exp(v) * 2 + 0.5 * (exp(-v) + exp(2v))` | 37.4 | 17.2 |
+| `1.5 * exp(v) + -0.25 * exp(-v)` | 41.8 | 43.4 |
+
+Julia reads `a + b + c` as one three-argument call, which the pass did not
+take as a sum. The last row keeps the written logarithm on purpose: with a
+negative factor the argument can be negative, where Base raises a
+`DomainError` and the vector logarithm does not.
+
+The fused gathered row sum of a position batch (`rows = W[index, :]` read once
+by `vec(sum(X .* rows; dims=2))`), 2,000 rows by 6 columns at 16 positions
+unless said otherwise; bytes per call in parentheses:
+
+| Index | Before | After |
+| --- | ---: | ---: |
+| `Vector{Int}` | 73.6 (64) | 74.3 (64) |
+| `Vector{Int32}` | 764.7 (3,334,208) | 82.1 (64) |
+| `Vector{UInt16}` | 600.6 (3,334,208) | 75.5 (64) |
+| view of a `Vector{Int}` | 669.0 (3,334,272) | 75.4 (128) |
+| range `1:1:50`, 50 rows | 34.3 (92,512) | 2.2 (96) |
+
+Before the change every index type but `Vector{Int}` left the fused reader
+for the literal operations at each position, which cost more than not fusing
+at all: the same statements with the product on a line of its own took 283 to
+354 µs and 260,672 bytes for each of these index types.
+
+Still missed, on both trees: the product on a line of its own, and `dropdims`
+in place of `vec`, are not fused (220 to 350 µs, 260,672 bytes, for every
+index type); and beside the vector softplus of 0.1.372, `0.5 * z^2` and
+`log1p(exp(v))` keep the loop scalar (48 to 51 µs against 10 µs for
+`0.5 * abs2(z)` with `log1pexp(v)`).
