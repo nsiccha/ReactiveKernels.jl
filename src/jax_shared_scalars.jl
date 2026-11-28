@@ -16,6 +16,16 @@ def _rk_scalar_demand_batch(size, batched, active, *parameters):
     return active, batched[0]
 """
 
+# A guarded scalar's tangent is shared by the cells while its coefficients are
+# selected per cell, so reverse mode sums the cells' products. Broadcasting
+# the tangent to the cells behind a barrier makes that sum read one stored
+# product; otherwise the GPU compiler can put the cells' other elementwise
+# derivatives inside the summing kernel, which runs them slower.
+const _JAX_CELL_TANGENT = raw"""
+def _rk_cell_tangent(selected, tangent):
+    return jax.lax.optimization_barrier(jnp.where(selected, tangent, jnp.zeros_like(tangent)))
+"""
+
 const _JAX_SELECTED_CUT = raw"""
 # A cut returns a tuple of scalar outputs. Select each coefficient before
 # its cell multiplies a tangent or a cotangent, including at a singularity.

@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.411
+## 0.1.412
 
 - The opt-in generated reverse of summed plates (`with_plate_reverse`, the
   `plate_reverse` preference) again counts a cell's exponential as work its
@@ -31,7 +31,7 @@ are recorded in the git history only.
   which plates take a one-pass tape and the gradient time with the generated
   reverse on against off.
 
-## 0.1.410
+## 0.1.411
 
 - The vector logarithm of a summed native plate (0.1.373) takes a sum of
   exponentials however it is written: one `+` call of any number of terms,
@@ -49,6 +49,21 @@ are recorded in the git history only.
   position, which was slower and allocated more than the same two statements
   written apart. A `Bool` mask and wider integer types keep the literal
   operations.
+
+## 0.1.410
+
+A native scan computes the parts of its step that read only shared values
+(closure captures and `Ref` operands, not the carry, a sequence element or the
+`history` vector) once, before its first step, instead of at every step. A
+step that reads `mu[rows][t]` now gathers `mu[rows]` once per scan, so one
+value and one gradient cost time and memory linear in the scan's length
+instead of quadratic. A subexpression of a larger step statement is split out
+as `bound=` partial evaluation splits around bound data, never from a branch
+arm, a short-circuit operand, a generator or a closure. An empty scan still
+evaluates none of its step, and values and derivatives are unchanged.
+`@rkppl` cell scans and submodel calls that read a model vector through a
+gather (`mu[rows[g]][t]`, `y[g] ~ ar1(mu[rows[g]], sigma, phi)`) are linear
+with no change to the model.
 
 ## 0.1.409
 

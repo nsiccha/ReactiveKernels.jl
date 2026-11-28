@@ -38,6 +38,7 @@ end
 @testset "guarded shared scalar rules" begin
     src = jax_source(mapped; have=(:a,:b,:xs), want=:total)
     @test occursin("_rk_scalar_demand(", string(src))
+    @test occursin("_rk_cell_tangent(selected, tangents[", string(src))
     @test !occursin("_rk_scalar_demand(", string(jax_source(unsafe; want=:total)))
     if rk_jax_available()
         native = prepare(ragged; have=(:a,:b,:rows), want=:total)

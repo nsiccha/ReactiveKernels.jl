@@ -755,8 +755,12 @@ _rewrite_parameter(item, names::Dict{Symbol,Any}, op_offset::Int) =
     item isa Symbol ? Expr(:kw, item, _rewrite_embedded(item, names, op_offset)) :
     _rewrite_labeled(item, names, op_offset)
 
+# With `moved`, a set of the body's own locals, each top-level statement
+# assigning one of them goes to `prefix` instead, renamed alike: the caller
+# runs those once, before the embedded statements (`_authored_scan_step`).
 function _embedded_statements(ast::Expr, callargs, lhs, op_offset::Int;
-                              source_ids = nothing, value_ids = nothing)
+                              source_ids = nothing, value_ids = nothing,
+                              moved = nothing, prefix = nothing)
     ast.head === :function || throw(ArgumentError(
         "nested preparation requires an RK-generated function expression"))
     signature, body = ast.args
@@ -811,7 +815,10 @@ function _embedded_statements(ast::Expr, callargs, lhs, op_offset::Int;
             "embedded RK kernel has an early return"))
     for statement in bodyargs[1:(return_index - 1)]
         statement isa LineNumberNode && continue
-        push!(statements, _rewrite_embedded(statement, names, op_offset))
+        target = moved !== nothing && statement isa Expr && statement.head === :(=) &&
+            statement.args[1] isa Symbol && statement.args[1] in moved ?
+            prefix : statements
+        push!(target, _rewrite_embedded(statement, names, op_offset))
     end
     returned = _rewrite_embedded(
         bodyargs[return_index].args[1], names, op_offset)
@@ -996,7 +1003,9 @@ end
 # body reading one element of each sequence at `index` and binding
 # `(carry, output)`, and the step's static output type. The step reads the
 # carry and the sequence elements by the names given; shared operands pass
-# whole.
+# whole. Its step-invariant statements (`_authored_scan_invariant_locals`)
+# are the separate `prefix`, which a lowering runs once before its first step
+# and only when a step runs.
 function _authored_scan_step(op::_AuthoredScanOp, callargs, offset, index, carry,
                              output; strips = nothing, type_offset = nothing)
     step = op.kernel
@@ -1026,16 +1035,17 @@ function _authored_scan_step(op::_AuthoredScanOp, callargs, offset, index, carry
         push!(elements, :($element = $(_inbounds_value(:($(callargs[i])[$position])))))
         push!(arguments, element)
     end
-    for i in shared_positions
-        push!(arguments, callargs[i])
-    end
     # A hoisted statement's value is already in its strip buffer: it is
     # found by its output local before the embedding renames the step's
     # locals.
     step_ast = strips !== nothing && !isempty(strips.hoisted) ?
         _scan_hoisted_rewrite(step.ast, strips, index) : step.ast
+    moved = _authored_scan_invariant_locals(op, step_ast)
+    prefix = Any[]
+    append!(arguments, _scan_shared_arguments!(prefix, moved,
+        Any[callargs[i] for i in shared_positions]))
     step_statements = _embedded_statements(
-        step_ast, arguments, Expr(:tuple, carry, output), offset)
+        step_ast, arguments, Expr(:tuple, carry, output), offset; moved, prefix)
     step_body = Expr(:block, elements..., step_statements...)
     # The step's static output type for an empty sequence: the step's argument
     # types are the carry seed, one element of each sequence and the shared
@@ -1052,7 +1062,95 @@ function _authored_scan_step(op::_AuthoredScanOp, callargs, offset, index, carry
                                                         offset; type_offset)
     inferred_output_type = something(output_type, Any)
     inferred_carry_type = something(carry_type, Any)
-    (; seqs, xs, step_body, inferred_output_type, inferred_carry_type)
+    (; seqs, xs, step_body, prefix, inferred_output_type, inferred_carry_type)
+end
+
+# The step-body locals of a plain scan step's step-invariant statements: each
+# reads neither the carry, a sequence element nor the `history` vector, only
+# shared operands (closure captures and `Ref` operands) and earlier such
+# statements, so every step computes the same value. Such subexpressions of a
+# mixed statement are recipes of their own (`_scan_split_shared`). A native
+# lowering runs them once, before the first step and only when a step runs,
+# instead of at every step: a gather `v[rows]` the step reads at its index
+# would otherwise cost the whole gather per step, which makes the scan
+# quadratic in its length. Their values and derivatives are the first step's,
+# and an empty scan still runs none of them. A lazy branch whose condition and
+# arms read only shared values moves whole, so its arm still runs only when
+# taken.
+#
+# A statement moves only when it is the one binding of its own local (no other
+# statement assigns or declares it), and every name it reads from the step is
+# a shared parameter or the local of an earlier moved statement.
+function _authored_scan_invariant_locals(op::_AuthoredScanOp, ast::Expr)
+    moved = Set{Symbol}()
+    step = op.kernel
+    _scan_step_is_plain(step) || return moved
+    sp = step.plan
+    cid(v) = canon_id(sp.graph, v.id)
+    shared = _scan_shared_parameters(op)
+    invariant = Set(cid(sp.have[i]) for i in shared)
+    step_names = _varnames(sp)
+    candidates = Set{Symbol}()
+    for r in sp.recipes
+        (r.effectful || isempty(r.inputs) || length(r.outputs) != 1) && continue
+        all(v -> cid(v) in invariant, r.inputs) || continue
+        push!(invariant, cid(only(r.outputs)))
+        push!(candidates, step_names[cid(only(r.outputs))])
+    end
+    isempty(candidates) && return moved
+    signature, body = ast.args
+    params = Symbol[_signature_name(p) for p in signature.args[3:end]]
+    statements = Any[s for s in body.args if !(s isa LineNumberNode)]
+    bindings = Dict{Symbol,Int}()
+    for s in statements, name in _scan_bound_names(s)
+        bindings[name] = get(bindings, name, 0) + 1
+    end
+    allowed = Set{Symbol}(params[i] for i in shared)
+    dynamic = union(Set(keys(bindings)), Set(params))
+    for s in statements
+        s isa Expr && s.head === :(=) && s.args[1] isa Symbol || continue
+        name = s.args[1]
+        name in candidates && get(bindings, name, 0) == 1 || continue
+        rhs = s.args[2]
+        reads = setdiff(_kernel_loop_symbols!(Set{Symbol}(), rhs),
+                        _local_symbols!(Set{Symbol}(), rhs))
+        any(r -> r in dynamic && !(r in allowed), reads) && continue
+        push!(moved, name)
+        push!(allowed, name)
+    end
+    moved
+end
+
+# The positions of a scan step's shared parameters among its HAVE ports
+# `(carry, element..., shared..., [history])`: the atomic operands after the
+# carry seed, without a `history =` scan's last one, the history vector.
+_scan_shared_parameters(op::_AuthoredScanOp) =
+    [i for i in 2:(length(op.kernel.plan.have) - _scan_has_history(op))
+     if i in typeof(op).parameters[2]]
+
+# Every local a step statement binds, once per binding, and every name it
+# declares `local`.
+function _scan_bound_names(statement)
+    names = collect(_local_symbols!(Set{Symbol}(), statement))
+    declare(ex) = ex isa Expr && (ex.head === :local ?
+        foreach(a -> append!(names, _lhs_symbols!(Set{Symbol}(),
+            a isa Expr && a.head === :(=) ? a.args[1] : a)), ex.args) :
+        foreach(declare, ex.args))
+    declare(statement)
+    names
+end
+
+# The shared operands a step receives. When statements move to the prefix, an
+# operand the caller computes (not a bare local) is bound once in the prefix,
+# so a moved statement reads it there instead of from a per-step binding.
+function _scan_shared_arguments!(prefix, moved, args)
+    isempty(moved) && return args
+    map(args) do arg
+        arg isa Expr || return arg
+        name = gensym(:scan_shared)
+        push!(prefix, :($name = $arg))
+        name
+    end
 end
 
 # Inline the scalar step into the ordered native loop. Calling the nested
@@ -1085,7 +1183,7 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
         body, op, callargs, lhs, offset; recycled)
     indices, index, carry, output, output_type, position = gensym.((:scan_indices,
         :scan_index, :scan_carry, :scan_output, :scan_output_type, :scan_position))
-    (; seqs, xs, step_body, inferred_output_type, inferred_carry_type) =
+    (; seqs, xs, step_body, prefix, inferred_output_type, inferred_carry_type) =
         _authored_scan_step(op, callargs, offset, index, carry, output; strips,
                             type_offset)
     typeof_ref = GlobalRef(Base, :typeof)
@@ -1295,8 +1393,10 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
     push!(flat.args, :($carry = $(callargs[1])))
     lhs !== nothing && _scan_includes_init(op) && push!(flat.args, :($position = 1))
     loops!(flat, indices, first_index)
+    # The step-invariant statements run once, when a step runs.
     push!(body.args, Expr(:if, :($(GlobalRef(Base, :isempty))($indices)),
-                          empty_output, Expr(:block, Expr(:if, unpeeled, flat, nonempty))))
+                          empty_output,
+                          Expr(:block, prefix..., Expr(:if, unpeeled, flat, nonempty))))
     append!(body.args, final_output.args)
     outer_body
 end
@@ -1344,7 +1444,7 @@ function _lower_authored_scan_slice_native!(body, op::_AuthoredScanOp, callargs,
     end
     indices, index, carry, output = gensym.((:scan_indices, :scan_index,
         :scan_carry, :scan_output))
-    (; seqs, xs, step_body, inferred_output_type, inferred_carry_type) =
+    (; seqs, xs, step_body, prefix, inferred_output_type, inferred_carry_type) =
         _authored_scan_step(op, callargs, offset, index, carry, output; type_offset)
     init = Int(_scan_includes_init(op))
     seed = callargs[1]
@@ -1398,7 +1498,8 @@ function _lower_authored_scan_slice_native!(body, op::_AuthoredScanOp, callargs,
                 $vector_ref{$element_type}(undef, $trajectory_length), ($lo,)))))
         last_step = gensym(:scan_element_step)
         push!(demanded.args, :($last_step = $lo - $init))
-        steps = Expr(:block, :($carry = $seed))
+        # The step-invariant statements run once, before the first step run.
+        steps = Expr(:block, :($carry = $seed), prefix...)
         if demand.carry_free
             append!(steps.args, step_at(last_step).args)
         else
@@ -1429,10 +1530,16 @@ function _lower_authored_scan_slice_native!(body, op::_AuthoredScanOp, callargs,
         init == 1 && push!(demanded.args, :($lo == 1 && $hi >= 1 && $(store(1, seed))))
         if demand.carry_free
             # Each output depends on its own step: run exactly the demanded ones.
-            first_position = :($(GlobalRef(Base, :max))($lo, $(1 + init)))
+            first_position = gensym(:scan_slice_first)
+            push!(demanded.args,
+                :($first_position = $(GlobalRef(Base, :max))($lo, $(1 + init))))
             push!(demanded.args, :($carry = $seed))
-            push!(demanded.args, Expr(:for, Expr(:(=), position, :($first_position:$hi)),
-                Expr(:block, step_at(:($position - $init)).args..., store(position, output))))
+            # The step-invariant statements run once, when a step runs.
+            push!(demanded.args, Expr(:if, :($first_position <= $hi), Expr(:block,
+                prefix...,
+                Expr(:for, Expr(:(=), position, :($first_position:$hi)),
+                    Expr(:block, step_at(:($position - $init)).args...,
+                         store(position, output))))))
         else
             # Steps 1 through the last demanded one, the first peeled so the
             # carry takes the step's type, as in the ordinary loop, unless the
@@ -1446,7 +1553,7 @@ function _lower_authored_scan_slice_native!(body, op::_AuthoredScanOp, callargs,
                 Expr(:for, :($slot = 2:$last_step), stored(slot)))
             flat = Expr(:block, :($carry = $seed),
                 Expr(:for, :($slot = 1:$last_step), stored(slot)))
-            steps = Expr(:if, unpeeled, flat, peeled)
+            steps = Expr(:block, prefix..., Expr(:if, unpeeled, flat, peeled))
             push!(demanded.args, :($last_step = $hi - $init))
             push!(demanded.args, Expr(:if, :($lo <= $hi && $last_step >= 1), steps))
         end
@@ -1501,12 +1608,14 @@ function _lower_authored_scan_history_native!(body, op::_AuthoredScanOp, callarg
     for i in iterated_positions
         push!(arguments, Expr(:ref, callargs[i], index))
     end
-    for i in shared_positions
-        push!(arguments, callargs[i])
-    end
+    # Step-invariant statements run once, when a step runs (`_authored_scan_step`).
+    moved = _authored_scan_invariant_locals(op, step.ast)
+    prefix = Any[]
+    append!(arguments, _scan_shared_arguments!(prefix, moved,
+        Any[callargs[i] for i in shared_positions]))
     push!(arguments, earlier)
     step_body = _embedded_statements(
-        step.ast, arguments, Expr(:tuple, carry, output), offset)
+        step.ast, arguments, Expr(:tuple, carry, output), offset; moved, prefix)
     module_ref(name) = GlobalRef(@__MODULE__, name)
     start = gensym(:scan_history_offset)
     record = Any[
@@ -1539,7 +1648,8 @@ function _lower_authored_scan_history_native!(body, op::_AuthoredScanOp, callarg
     flat = Expr(:block, :($carry = $(callargs[1])),
         Expr(:for, :($index = $indices), Expr(:block, step_body..., record...)))
     push!(body.args, Expr(:if, :(!$(GlobalRef(Base, :isempty))($indices)),
-        Expr(:block, Expr(:if, :($carry_type === $typeof_ref($(callargs[1]))), flat, nonempty))))
+        Expr(:block, prefix...,
+             Expr(:if, :($carry_type === $typeof_ref($(callargs[1]))), flat, nonempty))))
     body
 end
 

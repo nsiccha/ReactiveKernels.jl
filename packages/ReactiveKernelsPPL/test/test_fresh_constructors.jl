@@ -581,4 +581,120 @@ end
     end
 end
 
+# Calls whose arguments the assembly instructions evaluate in Julia's order.
+module AssemblyOrder
+using ReactiveKernels
+const LOG = Any[]
+note(x...) = (push!(LOG, x); x)
+pair(a, b) = (a, b)
+mutable struct Box
+    v::Any
+end
+keyword(a; k=1) = (push!(LOG, (:keyword, a, k)); a + k)
+mutable_value = 10
+reassign(v) = (global mutable_value = v; v)
+empty_spec() = KernelSpec(Graph(), Dict{Symbol,Value}(), Symbol[], Symbol[], Symbol[])
+end
+
+@testset "staged assembly instructions keep Julia's evaluation order" begin
+    A = RK._CONSTRUCTOR_ARGUMENT
+    op(i) = Expr(:call, GlobalRef(Base, :getindex), A, i)
+    G(n) = GlobalRef(AssemblyOrder, n)
+    note(x...) = Expr(:call, G(:note), x...)
+    pair(a, b) = Expr(:call, G(:pair), a, b)
+    done(value) = Expr(:block, note(QuoteNode(:result), value), Expr(:call, G(:empty_spec)))
+    programs = Any[
+        # A recipe group and a nested graph inside a call's argument.
+        Expr(:let, Expr(:block), Expr(:block,
+            :(g = $(G(:Box))($(op(1)))),
+            :(d = Base.Dict{Core.Symbol,Core.Any}()),
+            :(d[$(op(2))] = $(note(QuoteNode(:declare), :(g.v), :(($(op(3)), $(op(4))))))),
+            Expr(:block, note(QuoteNode(:group), :([$(op(5)), d[$(op(2))]])),
+                 :(h = $(Expr(:let, Expr(:block), Expr(:block,
+                     :(inner = $(pair(note(QuoteNode(:a)), note(QuoteNode(:b))))),
+                     pair(:inner, :(Core.Tuple{Core.Int,Core.Float64}))))))),
+            done(pair(:(g.v), pair(:h, :d))))),
+        # A read before a later argument reassigns it; an assignment's value.
+        Expr(:let, Expr(:block), Expr(:block,
+            :(x = $(op(1))),
+            :(y = $(pair(:x, Expr(:block, :(x = $(note(QuoteNode(:reassign)))))))),
+            :(z = $(pair(Expr(:block, :(x = 5)), Expr(:block, :(x = 6))))),
+            done(pair(:y, :((z, x)))))),
+        # `a[i] = v`, `end`, keywords, splatting and branches.
+        Expr(:let, Expr(:block), Expr(:block,
+            :(v = Base.vect($(op(1)), $(op(2)), $(op(3)))),
+            :(v[$(note(QuoteNode(:index), 2))[2]] = $(note(QuoteNode(:value)))),
+            :(w = v[end]),
+            Expr(:(=), :k, Expr(:call, G(:keyword),
+                Expr(:parameters, Expr(:kw, :k, :($(note(QuoteNode(:kw)))[1] === :kw ? 3 : 4))),
+                :($(note(QuoteNode(:positional)))[1] isa Symbol ? 1 : 2))),
+            Expr(:(=), :kk, Expr(:call, G(:keyword), Expr(:parameters, :k), 1)),
+            :(s = $(pair(:(Base.vect(v...)), :kk))),
+            Expr(:(=), :b, Expr(:if, op(4), note(QuoteNode(:then)), note(QuoteNode(:else)))),
+            Expr(:(=), :c, Expr(:&&, op(4), note(QuoteNode(:and)))),
+            done(pair(:((w, k, s)), :((b, c)))))),
+        # A global that a later argument changes.
+        Expr(:let, Expr(:block), Expr(:block,
+            :(a = $(pair(G(:mutable_value), Expr(:call, G(:reassign), 20)))),
+            done(pair(:a, G(:mutable_value))))),
+    ]
+    operands = Any[:sym, :key, 1.5, true, :five]
+    for form in programs
+        logs = map((:julia, :instructions)) do how
+            Core.eval(AssemblyOrder, :(mutable_value = 10))
+            empty!(AssemblyOrder.LOG)
+            spec = if how === :julia
+                Core.eval(AssemblyOrder, Expr(:let, Expr(:(=), A, operands), form))
+            else
+                steps, n = RK._build_steps(AssemblyOrder, form)
+                RK._run_build_steps(steps, n, operands)
+            end
+            @test spec isa KernelSpec
+            repr(AssemblyOrder.LOG)
+        end
+        @test logs[1] == logs[2]
+    end
+end
+
+# A recipe group, or a plate cell's graph, used to compile as one method per
+# model: up to 92k LLVM instructions for one step of Bruno's joint PK/QT build
+# (snag a-new-model-s-rk-0f45951b). Each instruction now holds one assembly
+# call over positional reads, so another model reuses its compiled method.
+@testset "staged assembly shares one-call instructions across models" begin
+    calls(x) = x isa Expr ? (x.head === :call) + sum(calls, x.args; init=0) : 0
+    function staged(source, data)
+        cache = KernelBuildCache()
+        plan = bind_data(lower_rkppl(source, data; mod=@__MODULE__, conditioned=(:y,)), data)
+        build_kernel(plan; cache)
+        @test cache.entry !== nothing && haskey(cache.entry, :constructor)
+        cache.entry.constructor.steps
+    end
+    data = (; K=3, g=[1, 2, 3, 1], x=[.1, .2, .3, .4], y=[1., 2., 3., 4.])
+    first_model = staged(quote
+        mu0 ~ Normal(0, 1)
+        tau ~ LogNormal(0, 1)
+        sigma ~ LogNormal(0, 1)
+        b ~ Normal(0, 1)
+        z[1:K] .~ Normal.(0, 1)
+        eta = mu0 .+ b .* x .+ tau .* z[g]
+        y .~ Normal.(eta, sigma)
+    end, data)
+    second_model = staged(quote
+        a0 ~ Normal(0, 2)
+        a1 ~ Normal(0, 2)
+        tau ~ LogNormal(0, 1)
+        sigma ~ LogNormal(0, 1)
+        z[1:K] .~ Normal.(0, 1)
+        w[1:K] .~ Normal.(0, 1)
+        eta = a0 .+ a1 .* x .+ tau .* z[g] .+ w[g] .* x
+        y .~ Normal.(eta, sigma)
+    end, data)
+    for step in [first_model; second_model]
+        @test calls(RK.RuntimeGeneratedFunctions.get_expression(step.run)) <= 1
+    end
+    compiled = Set(objectid(step.run) for step in first_model)
+    reused = count(step -> objectid(step.run) in compiled, second_model)
+    @test reused >= 0.9 * length(second_model)
+end
+
 end

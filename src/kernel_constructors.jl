@@ -203,9 +203,12 @@ function _bind_build_calls(x, seen)
     Expr(x.head, Any[_bind_build_calls(a, seen) for a in x.args]...)
 end
 
+# One assembly instruction. `run(frame, operands, indices, slots)` reads build
+# local `j` as `frame[slots[j]]` and operand `j` as `operands[indices[j]]`.
 struct _BuildStep
     run::Any
     indices::Vector{Int}
+    slots::Vector{Int}
 end
 
 struct _BuildConstructor
@@ -221,20 +224,187 @@ function _build_callable(mod, form)
     compile(qualified)
 end
 
-# Compile one assembly statement at a time. Different definitions then share
-# Julia methods for e.g. declaring a typed port or splicing a two-input child,
-# regardless of the port names, positions, or other recipes in either model.
+# Compile one assembly call at a time. Each instruction reads its locals and
+# operands by position, so its Julia method depends only on the call's shape.
+# Different definitions then share the methods for e.g. declaring a typed port,
+# building a recipe or splicing a two-input child, regardless of the port
+# names, positions, recipes or the number of statements in either model.
+# A recipe group, or the plate cell graph built inside a call's argument, is
+# unnested into such calls too. Calls keep Julia's left-to-right evaluation
+# order. Syntax with its own evaluation rules (a branch, keyword arguments,
+# splatting, `end` in an index) stays in one instruction.
 const _BUILD_FRAME = gensym(:build_frame)
+const _BUILD_INDICES = gensym(:build_indices)
+const _BUILD_SLOTS = gensym(:build_slots)
 
-function _build_step_form(x, locals, indices)
-    x isa Symbol && haskey(locals, x) && return Expr(:ref, _BUILD_FRAME, locals[x])
-    x isa Expr || return x
-    if Meta.isexpr(x, :call, 3) && x.args[1] === GlobalRef(Base, :getindex) &&
-            x.args[2] === _CONSTRUCTOR_ARGUMENT && x.args[3] isa Int
-        push!(indices, x.args[3])
-        return Expr(:ref, _CONSTRUCTOR_ARGUMENT, length(indices))
+_build_operand(@nospecialize(x)) = Meta.isexpr(x, :call, 3) &&
+    x.args[1] === GlobalRef(Base, :getindex) && x.args[2] === _CONSTRUCTOR_ARGUMENT &&
+    x.args[3] isa Int
+
+# Read in place by the instruction that uses it: a name, a literal, an operand
+# or a type expression of constant parameters, e.g. `Dict{Symbol,Value}`.
+function _build_inline(@nospecialize(x))
+    x isa Expr || return true
+    _build_operand(x) && return true
+    x.head === :curly && all(a -> !(a isa Symbol) && !_build_operand(a) && _build_inline(a), x.args)
+end
+
+_build_mentions_end(@nospecialize(x)) = x === :end || x === :begin ||
+    x isa Expr && any(_build_mentions_end, x.args)
+
+# A call, tuple, array, index or field read whose parts evaluate left to right.
+function _build_node(@nospecialize(x))
+    x isa Expr || return false
+    x.head === :. && return length(x.args) == 2 && x.args[2] isa QuoteNode
+    x.head in (:call, :tuple, :vect, :ref, :curly) || return false
+    args = x.head === :call ? x.args[2:end] : x.args
+    any(a -> Meta.isexpr(a, (:parameters, :kw, :..., :(=))), args) && return false
+    !(x.head === :ref && any(_build_mentions_end, x.args[2:end]))
+end
+_build_parts(x::Expr) = x.head === :. ? Any[x.args[1]] : x.args
+_build_rebuild(x::Expr, leaves) =
+    x.head === :. ? Expr(:., only(leaves), x.args[2]) : Expr(x.head, leaves...)
+
+_build_sequence(@nospecialize(x)) = Meta.isexpr(x, :block) ||
+    Meta.isexpr(x, :let, 2) && Meta.isexpr(x.args[1], :block, 0)
+_build_statements(x::Expr) =
+    filter(a -> !(a isa LineNumberNode), (x.head === :let ? x.args[2] : x).args)
+
+function _build_assigned!(names, @nospecialize(x))
+    x isa Expr || return names
+    Meta.isexpr(x, :(=), 2) && x.args[1] isa Symbol && push!(names, x.args[1])
+    for a in x.args
+        _build_assigned!(names, a)
     end
-    Expr(x.head, Any[_build_step_form(a, locals, indices) for a in x.args]...)
+    names
+end
+
+# The instructions of one assembly, in evaluation order: `name => value`
+# assigns a build local, `nothing => value` only evaluates. `locals` holds
+# every name the construction assigns; any other name is a global. A
+# temporary is a fresh local that only its own instruction assigns.
+struct _BuildFlat
+    out::Vector{Pair{Union{Nothing,Symbol},Any}}
+    locals::Set{Symbol}
+    temps::Set{Symbol}
+end
+
+# Can a read of `x` change before a later part of the same call executes?
+function _build_mutable_read(@nospecialize(x), assigned, flat)
+    x isa Symbol && return !(x in flat.temps) && (x in assigned || !(x in flat.locals))
+    x isa GlobalRef && return !_global_isconst(x.mod, x.name)
+    false
+end
+
+function _build_temp!(flat, @nospecialize(x))
+    t = gensym(:build_value)
+    push!(flat.temps, t)
+    push!(flat.out, t => x)
+    t
+end
+
+# Evaluate `parts` in order. A part that is a call gets its own instructions;
+# a read of a name that a later such part can assign takes its value first.
+function _build_parts!(flat, parts)
+    n = length(parts)
+    hoist = Bool[!_build_inline(p) for p in parts]
+    stop = something(findlast(hoist), 0)
+    after = [Set{Symbol}() for _ in 1:n]
+    for i in stop-1:-1:1
+        union!(after[i], after[i+1])
+        _build_assigned!(after[i], parts[i+1])
+    end
+    leaves = Vector{Any}(undef, n)
+    for i in 1:n
+        leaf = hoist[i] ? _build_value!(flat, parts[i]) : parts[i]
+        i < stop && _build_mutable_read(leaf, after[i], flat) && (leaf = _build_temp!(flat, leaf))
+        leaves[i] = leaf
+    end
+    leaves
+end
+_build_node!(flat, x::Expr) = _build_rebuild(x, _build_parts!(flat, _build_parts(x)))
+
+# `a[i...] = v` evaluates `v` before `a` and `i`.
+_build_index_assignment(@nospecialize(x)) = Meta.isexpr(x, :(=), 2) &&
+    Meta.isexpr(x.args[1], :ref) && length(x.args[1].args) >= 1 &&
+    !any(a -> Meta.isexpr(a, (:parameters, :kw, :..., :(=))), x.args[1].args) &&
+    !any(_build_mentions_end, x.args[1].args[2:end])
+
+function _build_index_assign!(flat, x)
+    leaves = _build_parts!(flat, Any[x.args[2]; x.args[1].args])
+    Expr(:(=), Expr(:ref, leaves[2:end]...), leaves[1]), leaves[1]
+end
+
+# The value of `a = v` or `a[i] = v` is `v`, even once something reassigns `a`.
+_build_kept!(flat, @nospecialize(value)) =
+    value isa GlobalRef || value isa Symbol && !(value in flat.temps) ?
+        _build_temp!(flat, value) : value
+
+# Emit `x`, whose value is unused, as instructions.
+function _build_statement!(flat, @nospecialize(x))
+    x isa LineNumberNode && return flat
+    if _build_sequence(x)
+        for s in _build_statements(x)
+            _build_statement!(flat, s)
+        end
+    elseif Meta.isexpr(x, :(=), 2) && x.args[1] isa Symbol
+        lhs, rhs = x.args
+        value = _build_node(rhs) ? _build_node!(flat, rhs) :
+            _build_inline(rhs) ? rhs : _build_value!(flat, rhs)
+        push!(flat.out, lhs => value)
+    elseif _build_index_assignment(x)
+        push!(flat.out, nothing => first(_build_index_assign!(flat, x)))
+    elseif _build_node(x)
+        push!(flat.out, nothing => _build_node!(flat, x))
+    else
+        push!(flat.out, nothing => x)
+    end
+    flat
+end
+
+# Emit `x` as instructions. Return what reads its value afterwards: a name,
+# a literal or an operand.
+function _build_value!(flat, @nospecialize(x))
+    _build_inline(x) && return x
+    if _build_sequence(x)
+        body = _build_statements(x)
+        isempty(body) && return nothing
+        for s in body[1:end-1]
+            _build_statement!(flat, s)
+        end
+        return _build_value!(flat, body[end])
+    elseif Meta.isexpr(x, :(=), 2) && x.args[1] isa Symbol
+        value = _build_kept!(flat, _build_value!(flat, x.args[2]))
+        push!(flat.out, x.args[1] => value)
+        return value
+    elseif _build_index_assignment(x)
+        assignment, value = _build_index_assign!(flat, x)
+        value = _build_kept!(flat, value)
+        push!(flat.out, nothing => assignment)
+        return value
+    end
+    _build_temp!(flat, _build_node(x) ? _build_node!(flat, x) : x)
+end
+
+function _build_step_form(x, slot, indices, slots)
+    if x isa Symbol && haskey(slot, x)
+        push!(slots, slot[x])
+        return Expr(:ref, _BUILD_FRAME, Expr(:ref, _BUILD_SLOTS, length(slots)))
+    end
+    x isa Expr || return x
+    if _build_operand(x)
+        push!(indices, x.args[3])
+        return Expr(:ref, _CONSTRUCTOR_ARGUMENT, Expr(:ref, _BUILD_INDICES, length(indices)))
+    end
+    # A keyword's name is not a read; `f(; a)` passes the value of `a` as `a`.
+    Meta.isexpr(x, :kw, 2) && x.args[1] isa Symbol &&
+        return Expr(:kw, x.args[1], _build_step_form(x.args[2], slot, indices, slots))
+    if x.head === :parameters
+        return Expr(:parameters, Any[a isa Symbol && haskey(slot, a) ?
+            Expr(:kw, a, _build_step_form(a, slot, indices, slots)) :
+            _build_step_form(a, slot, indices, slots) for a in x.args]...)
+    end
+    Expr(x.head, Any[_build_step_form(a, slot, indices, slots) for a in x.args]...)
 end
 
 function _build_steps(mod, form)
@@ -245,23 +415,33 @@ function _build_steps(mod, form)
     end
     Meta.isexpr(form, :let, 2) && Meta.isexpr(form.args[1], :block, 0) &&
         Meta.isexpr(form.args[2], :block) || throw(_UnsupportedConstructor())
+    flat = _BuildFlat(Pair{Union{Nothing,Symbol},Any}[], _build_assigned!(Set{Symbol}(), form), Set{Symbol}())
+    result = _build_value!(flat, form)
+    out = flat.out
+    (isempty(out) || first(out[end]) !== result) && push!(out, nothing => result)
+    slot = Dict{Symbol,Int}()
+    for (target, _) in out
+        target === nothing || get!(slot, target, length(slot)+1)
+    end
     steps = _BuildStep[]
-    locals = Dict{Symbol,Int}()
     functions = Dict{Expr,Any}()
-    for statement in form.args[2].args
-        statement isa LineNumberNode && continue
-        if Meta.isexpr(statement, :(=), 2) && statement.args[1] isa Symbol
-            get!(locals, first(statement.args), length(locals)+1)
+    for (target, value) in out
+        indices, slots = Int[], Int[]
+        body = if target === nothing
+            _build_step_form(value, slot, indices, slots)
+        else
+            push!(slots, slot[target])
+            lhs = Expr(:ref, _BUILD_FRAME, Expr(:ref, _BUILD_SLOTS, 1))
+            Expr(:(=), lhs, _build_step_form(value, slot, indices, slots))
         end
-        indices = Int[]
-        body = _build_step_form(statement, locals, indices)
-        source = Expr(:->, Expr(:tuple, _BUILD_FRAME, _CONSTRUCTOR_ARGUMENT), body)
+        source = Expr(:->, Expr(:tuple, _BUILD_FRAME, _CONSTRUCTOR_ARGUMENT,
+                                _BUILD_INDICES, _BUILD_SLOTS), body)
         run = get!(functions, source) do
             compile(macroexpand(mod, Expr(Symbol("hygienic-scope"), source, mod)))
         end
-        push!(steps, _BuildStep(run, indices))
+        push!(steps, _BuildStep(run, indices, slots))
     end
-    steps, length(locals)
+    steps, length(slot)
 end
 
 function _stage_build(mod, definition, count)
@@ -326,7 +506,7 @@ function _run_build_steps(steps, local_count, args)
     frame = Vector{Any}(undef, local_count)
     result = nothing
     for step in steps
-        result = Base.invokelatest(step.run, frame, view(args, step.indices))
+        result = Base.invokelatest(step.run, frame, args, step.indices, step.slots)
     end
     result::KernelSpec
 end

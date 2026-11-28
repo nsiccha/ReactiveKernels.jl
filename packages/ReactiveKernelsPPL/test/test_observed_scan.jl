@@ -669,6 +669,94 @@ end
         qb = prepare_query(b.built, b.bound, :sampler)
         @test Base.invokelatest(qa, u) ≈ Base.invokelatest(qb, u) rtol = 1e-12
     end
+
+# A step that reads its series through a gather of a model vector,
+# `mu[rows[g]][t]`, written in the step or substituted from a submodel
+# argument (`y[g] ~ ar1_mean(mu[rows[g]], …)`), runs that gather once per cell,
+# as the cell-local spelling `m = mu[rows[g]]` does, not at every step: one
+# value costs time and memory linear in the series length (snag
+# `scan-step-re-eva-8952ed66`; ReactiveKernels' `test_scan_step_invariants.jl`
+# checks gradients of the same shape).
+@rkppl ar1_mean(m, sigma, phi) = begin
+    @scan begin
+        y[1] ~ Normal(m[1], sigma / sqrt(1 - phi^2))
+        for t in 2:length(m)
+            y[t] ~ Normal(m[t] + phi * (y[t - 1] - m[t - 1]), sigma)
+        end
+    end
+    return y
+end
+
+gathered_local = quote
+    phi ~ Uniform(-1, 1)
+    sigma ~ Exponential(1)
+    a ~ Normal(0, 1)
+    mu = a .+ xflat
+    @plate for g in eachindex(y)
+        m = mu[rows[g]]
+        @scan begin
+            y[g][1] ~ Normal(m[1], sigma / sqrt(1 - phi^2))
+            for t in 2:length(y[g])
+                y[g][t] ~ Normal(m[t] + phi * (y[g][t - 1] - m[t - 1]), sigma)
+            end
+        end
+    end
+end
+gathered_step = quote
+    phi ~ Uniform(-1, 1)
+    sigma ~ Exponential(1)
+    a ~ Normal(0, 1)
+    mu = a .+ xflat
+    @plate for g in eachindex(y)
+        @scan begin
+            y[g][1] ~ Normal(mu[rows[g]][1], sigma / sqrt(1 - phi^2))
+            for t in 2:length(y[g])
+                y[g][t] ~ Normal(mu[rows[g]][t] + phi * (y[g][t - 1] - mu[rows[g]][t - 1]),
+                    sigma)
+            end
+        end
+    end
+end
+gathered_call = quote
+    phi ~ Uniform(-1, 1)
+    sigma ~ Exponential(1)
+    a ~ Normal(0, 1)
+    mu = a .+ xflat
+    @plate for g in eachindex(y)
+        y[g] ~ ar1_mean(mu[rows[g]], sigma, phi)
+    end
+end
+
+@testset "a step's gather of a model vector runs once per cell" begin
+    allocated = Dict{Int,Vector{Int}}()
+    for n in (200, 1600)
+        y = [series(n, g) for g in 1:2]
+        xflat = [0.1sin(t) for t in 1:2n]
+        rows = [collect(1:n), collect(2n:-1:(n + 1))]
+        data = (; y, xflat, rows)
+        fs = [build(p, data; mod = @__MODULE__)
+              for p in (gathered_local, gathered_step, gathered_call)]
+        qs = [prepare_query(f.built, f.bound, :sampler) for f in fs]
+        for u in ([0.2, -0.3, 0.1], [-0.7, 0.4, -0.5])
+            value = Base.invokelatest(qs[1], u)
+            @test Base.invokelatest(qs[2], u) ≈ value rtol = 1e-12
+            @test Base.invokelatest(qs[3], u) ≈ value rtol = 1e-12
+        end
+        u = [0.2, -0.3, 0.1]
+        allocated[n] = map(qs) do q
+            Base.invokelatest(q, u)
+            @allocated Base.invokelatest(q, u)
+        end
+    end
+    # Eight times the series: about eight times the bytes. A gather per step
+    # read would be 64 times (8 bytes x n^2 per read).
+    for k in 1:3
+        @test allocated[1600][k] <= 12 * allocated[200][k] + 4096
+    end
+    @test allocated[1600][2] <= 2 * allocated[1600][1] + 4096
+    @test allocated[1600][3] <= 2 * allocated[1600][1] + 4096
+end
+
 end
 
 module ObservedScanTypeStability
