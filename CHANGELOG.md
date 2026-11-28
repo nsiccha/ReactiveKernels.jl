@@ -16,6 +16,17 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.410
+
+- The vector logarithm of a summed native plate (0.1.373) takes a sum of
+  exponentials however it is written: one `+` call of any number of terms,
+  such as `log(exp(a) + exp(b) + exp(c))`, which Julia reads as a single
+  three-argument call and which stayed scalar, and terms or partial sums
+  multiplied by a nonnegative literal on either side, such as
+  `log(0.3 * exp(a) + 0.7 * exp(b))`. Each sum and product is still evaluated
+  where it is written, so values and dispatch are those of the source. A
+  negative factor keeps the written logarithm and its `DomainError`.
+
 ## 0.1.409
 
 Stable rewrites at preparation compute `1 - logistic(x)` as `logistic(-x)`,
