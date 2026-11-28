@@ -171,6 +171,64 @@ for rounds in (150, 700):
 for sizes in body_sizes.values():
     assert sizes[0] == sizes[1], sizes
 
+
+def table_step(carry, row, n):
+    position, first, second = row
+    next_value = carry * 0.5 + first[0] * second[1]
+    return jax.lax.cond(position < n, lambda: (next_value, next_value),
+                        lambda: (carry, jnp.zeros_like(carry)))
+
+
+def check_table_reads(lengths, size=4):
+    # Two index columns read one per-subject record table at every event,
+    # including repeated rows and the out-of-range fill sentinel `size`.
+    lengths = np.asarray(lengths, dtype=np.int64)
+    n = len(lengths)
+    width = int(lengths.max(initial=0))
+    tags = np.repeat(np.arange(1, n + 1), lengths)
+    schedule = model._rk_subject_scan_schedule(lengths, tags, model._rk_event_rounds(tags))
+    schedule = jax.tree.map(jnp.asarray, schedule)
+    steps = (np.arange(n)[:, None] + np.arange(width)) % (size + 1)
+    spans = (2 * np.arange(width) + 1)[None, :] % size + np.zeros((n, 1), dtype=np.int64)
+
+    def run(columns, scan_schedule):
+        def subject_loss(length, a, b, i, j):
+            rows = (jnp.arange(width), i, j)
+            path = model._rk_subject_scan(table_step, 0., rows, (length,), scan_schedule, ((a, b),),
+                                          ((1, 0), (2, 0)), lambda f: f)
+            return path.sum()
+        return jax.vmap(subject_loss)(jnp.asarray(lengths), *columns, steps, spans).sum()
+
+    def reference(columns):
+        a, b = columns
+        total = 0.
+        for s, length in enumerate(lengths):
+            state = 0.
+            for t in range(length):
+                first = a[s, steps[s, t]] if steps[s, t] < size else 0.
+                state = state * 0.5 + first * b[s, spans[s, t]]
+                total += state
+        return total
+
+    columns = (jnp.linspace(-1., 2., n * size).reshape(n, size),
+               jnp.linspace(0.5, -1.5, n * size).reshape(n, size))
+    value, gradient = jax.jit(jax.value_and_grad(lambda c: run(c, schedule)))(columns)
+    expected, expected_gradient = jax.value_and_grad(reference)(columns)
+    np.testing.assert_allclose(value, expected)
+    for got, want in zip(gradient, expected_gradient):
+        np.testing.assert_allclose(got, want)
+    # Every read of the table, in every event phase, goes through one gather,
+    # so ordinary reverse mode accumulates into one table with one scatter.
+    trace = jax.make_jaxpr(jax.grad(lambda c: run(c, schedule)))(columns)
+    scatters = [eq for eq in equations(trace) if eq.primitive.name == "scatter-add"
+                and eq.invars[0].aval.shape == (n, size, 2)]
+    assert len(scatters) == (1 if width else len(scatters)), scatters
+
+
+for subject_lengths in ([0, 0], [0, 1], [5, 4, 3, 3, 2, 1], [7, 1, 1, 1, 1]):
+    check_table_reads(subject_lengths)
+
+
 def make_step(prepared, count):
     batched = jax.jit(jax.vmap(jax.value_and_grad(lambda a: score(a, prepared))))
     return lambda: batched(points[:count])
@@ -250,3 +308,4 @@ def check_subject_scalars(lengths):
 
 for subject_lengths in ([], [0, 0], [0, 1], [5, 4, 3, 3, 2, 1]):
     check_subject_scalars(subject_lengths)
+

@@ -17,12 +17,31 @@ def _rk_subject_scan(step, seed, sequences, shared, schedule, tables, reads, dec
             return jnp.take(x, indices, axis=0, mode="fill", fill_value=0)
         return jax.tree.map(field, table, batched)
 
+    # Read every site of one table, each an (owners, indices) pair, through
+    # a single gather. Its transpose then accumulates all of their cotangents
+    # in one scatter, instead of one zero-filled table per site plus adds.
+    def gather_sites(table, batched, sites):
+        if len(sites) == 1:
+            return [gather(table, batched, *sites[0])]
+        owners = None if sites[0][0] is None else jnp.concatenate([o.ravel() for o, _ in sites])
+        values = gather(table, batched, owners, jnp.concatenate([i.ravel() for _, i in sites]))
+        leaves, tree = jax.tree.flatten(values)
+        parts = [jax.lax.split(v, [i.size for _, i in sites]) for v in leaves]
+        return [jax.tree.unflatten(tree, [p[k].reshape(i.shape + p[k].shape[1:]) for p in parts])
+                for k, (_, i) in enumerate(sites)]
+
+    table_reads = {}
+    for i, table_id in reads:
+        table_reads.setdefault(table_id, []).append(i)
+
     advance = decorate(step)
     def ordinary(seed, xs, shared, schedule, tables):
         columns = list(xs)
-        for i, table_id in reads:
+        for table_id, read in table_reads.items():
             table = tables[table_id]
-            columns[i] = gather(table, jax.tree.map(lambda _: False, table), None, xs[i])
+            values = gather_sites(table, jax.tree.map(lambda _: False, table), [(None, xs[i]) for i in read])
+            for i, value in zip(read, values):
+                columns[i] = value
         return jax.lax.scan(lambda c, row: advance(c, row, *shared), seed, tuple(columns))[1]
 
     # A nested helper may still close over a subject value that could not be
@@ -69,12 +88,17 @@ def _rk_subject_scan(step, seed, sequences, shared, schedule, tables, reads, dec
                                  sends, jnp.roll(new, -1, axis=0), old), saved, current)
             return (current, saved), out
 
-        for owners, positions, transfer in phases:
+        phase_rows = [list(jax.tree.map(lambda x, batched: x[owners, positions] if batched else x[positions],
+                                        xs, by_column)) for owners, positions, _ in phases]
+        # Gather each table once for the reads of every phase.
+        for table_id, read in table_reads.items():
+            sites = [(p, i) for p in range(len(phases)) for i in read]
+            values = gather_sites(tables[table_id], by_table[table_id],
+                                  [(phases[p][0], phase_rows[p][i]) for p, i in sites])
+            for (p, i), value in zip(sites, values):
+                phase_rows[p][i] = value
+        for (owners, positions, transfer), rows in zip(phases, phase_rows):
             carry = jax.tree.map(lambda x: x[:owners.shape[1]], carry)
-            rows = list(jax.tree.map(lambda x, batched: x[owners, positions] if batched else x[positions],
-                                     xs, by_column))
-            for i, table_id in reads:
-                rows[i] = gather(tables[table_id], by_table[table_id], owners, rows[i])
             # Gather one scalar per event so reverse mode can sum repeated
             # owners outside the recurrence. Keep larger operands per subject.
             shared_rows = jax.tree.map(lambda x, batched: x[owners] if batched and x.ndim == 1 else None,
