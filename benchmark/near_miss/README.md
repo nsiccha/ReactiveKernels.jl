@@ -406,8 +406,27 @@ for the literal operations at each position, which cost more than not fusing
 at all: the same statements with the product on a line of its own took 283 to
 354 µs and 260,672 bytes for each of these index types.
 
-Still missed, on both trees: the product on a line of its own, and `dropdims`
-in place of `vec`, are not fused (220 to 350 µs, 260,672 bytes, for every
-index type); and beside the vector softplus of 0.1.372, `0.5 * z^2` and
+The same computation written in other statements (0.1.413), with a
+`Vector{Int}` index unless said otherwise; each tree in a process of its own,
+microseconds of CPU time per call with bytes in parentheses, a shared host at
+a load of 47 to 51:
+
+| Statements | Before | After |
+| --- | ---: | ---: |
+| `value = vec(sum(X .* rows; dims=2))` | 74.9 (64) | 74.7 (64) |
+| `scaled = X .* rows`, then `value = vec(sum(scaled; dims=2))` | 201.5 (260,672) | 79.6 (64) |
+| `value = dropdims(sum(X .* rows; dims=2); dims=2)` | 259.8 (260,672) | 77.6 (64) |
+| the product, the sum and `dropdims` each on a line of its own | 240.1 (260,672) | 75.2 (1,344) |
+| the last one with a `Vector{Int32}` index | 238.5 (260,672) | 75.6 (1,344) |
+| the last one with the range `1:1:50`, 50 rows | 23.6 (10,592) | 2.7 (1,376) |
+
+The fusion had matched two adjacent statements. It now follows the values:
+gathered rows whose only use is an elementwise product with one other array,
+whose only use is a sum over the second dimension. A flattening on a line of
+its own stays a statement and wraps each position's sum, which is the 1,280
+bytes of the last three rows. An intermediate with a declared type, a
+requested one and one with a second reader keep the statements as written.
+
+Still missed: beside the vector softplus of 0.1.372, `0.5 * z^2` and
 `log1p(exp(v))` keep the loop scalar (48 to 51 µs against 10 µs for
 `0.5 * abs2(z)` with `log1pexp(v)`).

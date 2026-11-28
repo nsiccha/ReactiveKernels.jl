@@ -307,6 +307,43 @@ function _jax_compact_cell_rows(ctx, inner, rows, read, guards, extent, index, g
     helper * "(" * join(args, ", ") * ")"
 end
 
+# The input of the enclosing subject plate, mapped in order over a prepared
+# ragged array's rows, whose logical row length is `extent`: its local name
+# and prepared key.
+function _jax_extent_record_input(ctx, extent)
+    isempty(extent) && return nothing
+    for (k, plan) in ctx.mod.helper_names
+        k isa Tuple && length(k) == 4 && k[1] === :record_axis && k[2] === ctx.scope &&
+            k[4] == extent && plan.key !== nothing && return (k[3], plan.key)
+    end
+    nothing
+end
+
+# Whether a scan's guarded reads of table rows `r.table` at `r.index` can
+# skip their run-time bounds check, as static code: `prepare_data`'s verdict
+# that every requested index lies in its subject's table rows, and that the
+# table holds at least the stored width of the input giving those rows. The
+# index, the scan's live length, the table's rows and a `tag == n` guard
+# must all be rows of the subject plate's prepared data; nothing otherwise.
+# Another guard counts every live step as requested.
+function _jax_scan_index_proof(ctx, rows, r, guards, extent, limit)
+    index = _jax_direct_record_key(ctx, rows.sequences[r.index])
+    live = _jax_extent_record_input(ctx, extent)
+    table = _jax_extent_record_input(ctx, limit)
+    (index === nothing || live === nothing || table === nothing) && return nothing
+    tags, target = "", ""
+    m = length(guards) == 1 ? match(r"^([A-Za-z_][A-Za-z_0-9]*) == (\d+)$", only(guards)) : nothing
+    if m !== nothing && haskey(rows.sequences, m.captures[1])
+        key = _jax_direct_record_key(ctx, rows.sequences[m.captures[1]])
+        key === nothing || ((tags, target) = (key, String(m.captures[2])))
+    end
+    verdict = _jax_prepared_bound!(ctx, :scan_index_bound, index, index * "_lengths",
+                                   last(live) * "_lengths", last(table), last(table) * "_lengths",
+                                   tags, isempty(tags) ? "" : tags * "_lengths", target)
+    "(" * verdict * " and " * first(table) * ".shape[0] <= jax.tree.leaves(" * r.table.code *
+        ")[0].shape[0])"
+end
+
 function _jax_scan_row_inputs!(ctx, inner, rows, unpack, seqs, width, extent, pure;
                                sequence = v -> _jax_scan_sequence(v, width), gather_rows = nothing,
                                subject_rows = nothing)
@@ -316,6 +353,10 @@ function _jax_scan_row_inputs!(ctx, inner, rows, unpack, seqs, width, extent, pu
     reads = filter(r -> r.token in tokens, rows.reads)
     replacements = Dict(r.token => r.fallback for r in reads)
     checks = String[]
+    # On a GPU the check copies its predicate to the host mid-program. Drop
+    # it when prepare_data proves every gathered read (nothing once one lacks
+    # a proof).
+    proofs = ctx.host === nothing && ctx.mod.layout === :padded ? String[] : nothing
     guarded = any(r -> r.guard != "True", reads)
     for group in unique((r.table.code, r.index) for r in reads)
         sites = filter(r -> (r.table.code, r.index) == group, reads)
@@ -362,6 +403,10 @@ function _jax_scan_row_inputs!(ctx, inner, rows, unpack, seqs, width, extent, pu
         end
         _jax_emit!(ctx, values * ", " * valid * " = " * call)
         push!(checks, valid)
+        if proofs !== nothing
+            proof = _jax_scan_index_proof(ctx, rows, r, guards, extent, limit)
+            proofs = proof === nothing ? nothing : push!(proofs, proof)
+        end
         push!(seqs, values)
         input = r.token
         push!(unpack, input)
@@ -373,7 +418,9 @@ function _jax_scan_row_inputs!(ctx, inner, rows, unpack, seqs, width, extent, pu
     end
     if !isempty(checks)
         valid = foldl((a, b) -> "jnp.logical_and(" * a * ", " * b * ")", checks)
+        mark = length(ctx.scope.lines)
         _jax_masked_check(ctx, _PyVal(valid, Bool), repr("BoundsError: active scan table index"))
+        proofs === nothing || _jax_unless_proven!(ctx, mark, "(" * join(proofs, " and ") * ")", nothing)
     end
     inner.lines .= [replace(line, _JAX_HISTORY_TOKENS => word -> get(replacements, word, word))
                     for line in inner.lines]

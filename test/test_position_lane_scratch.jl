@@ -339,6 +339,165 @@ end
     @test first(both(X, W, index)) == W[index, :, :]
 end
 
+# The same computation with the product on a line of its own, with
+# `dropdims` for `vec`, and with every statement on its own line.
+@kernel weighted_rows_apart(X, W, index) = begin
+    rows = W[index, :]
+    scaled = X .* rows
+    value = vec(sum(scaled; dims=2))
+    return value
+end
+@kernel weighted_rows_apart_matrix(X, W, index) = begin
+    rows = W[index, :]
+    scaled = rows .* X
+    value = sum(scaled; dims=2)
+    return value
+end
+@kernel weighted_rows_dropdims(X, W, index) = begin
+    rows = W[index, :]
+    value = dropdims(sum(X .* rows; dims=2); dims=2)
+    return value
+end
+@kernel weighted_rows_lines(X, W, index) = begin
+    rows = W[index, :]
+    scaled = X .* rows
+    total = sum(scaled; dims=2)
+    value = dropdims(total; dims=2)
+    return value
+end
+# Intermediates that cannot go with their producers, and other reductions.
+@kernel weighted_rows_typed(X, W, index) = begin
+    rows = W[index, :]
+    scaled::Matrix{Float64} = X .* rows
+    value = vec(sum(scaled; dims=2))
+    return value
+end
+@kernel weighted_rows_product_twice(X, W, index) = begin
+    rows = W[index, :]
+    scaled = X .* rows
+    value = vec(sum(scaled; dims=2))
+    total = sum(scaled)
+    return value, total
+end
+@kernel weighted_rows_gather_twice(X, W, index) = begin
+    rows = W[index, :]
+    scaled = X .* rows
+    value = vec(sum(scaled; dims=2))
+    corner = rows[1, 1]
+    return value, corner
+end
+@kernel weighted_columns(X, W, index) = begin
+    rows = W[index, :]
+    scaled = X .* rows
+    value = vec(sum(scaled; dims=1))
+    return value
+end
+@kernel weighted_columns_dropdims(X, W, index) = begin
+    rows = W[index, :]
+    value = dropdims(sum(X .* rows; dims=1); dims=1)
+    return value
+end
+# Two gathered operands: the later gather is the one read row by row.
+@kernel weighted_rows_two_gathers(V, W, index) = begin
+    left = V[index, :]
+    rows = W[index, :]
+    scaled = left .* rows
+    value = vec(sum(scaled; dims=2))
+    return value
+end
+
+@testset "a gathered row product is fused however its statements are written" begin
+    first_value(result) = result isa Tuple ? first(result) : result
+    at(result, j) = selectdim(first_value(result), ndims(first_value(result)), j)
+    spellings = (
+        (weighted_rows_apart, (X, W, index) -> vec(sum(X .* W[index, :]; dims=2))),
+        (weighted_rows_apart_matrix, (X, W, index) -> sum(W[index, :] .* X; dims=2)),
+        (weighted_rows_dropdims, (X, W, index) -> dropdims(sum(X .* W[index, :]; dims=2); dims=2)),
+        (weighted_rows_lines, (X, W, index) -> dropdims(sum(X .* W[index, :]; dims=2); dims=2)))
+    for (spec, literal) in spellings, reuse in (false, true)
+        reader = vectorize(prepare(spec); batched=:W, reuse)
+        source = string(code_expr(reader))
+        @test occursin("_lane_gathered_sum", source)
+        @test !occursin("_lane_getindex", source)
+        # Several rows, no row, no column, one row (the literal operations)
+        # and repeated rows.
+        for (index, width) in (([3, 1, 3, 2], 3), (Int[], 5), ([1, 1], 0), ([2], 25),
+                               (repeat([1, 3, 2], 11), 7))
+            W = reshape(collect(1.0:6width), 3, width, 2)
+            X = reshape(collect(1.0:length(index)*width), length(index), width)
+            result = reader(X, W, index)
+            for j in axes(W, 3)
+                @test at(result, j) == literal(X, W[:, :, j], index)
+            end
+        end
+        W = reshape(collect(1.0:18), 3, 3, 2)
+        for index in (Int32[3, 1, 3, 2], 1:3, view([0, 3, 1, 2, 0], 2:4), [true, false, true])
+            rows = index isa AbstractVector{Bool} ? count(index) : length(index)
+            X = reshape(collect(1.0:3rows), rows, 3)
+            result = reader(X, W, index)
+            @test all(j -> at(result, j) == literal(X, W[:, :, j], index), axes(W, 3))
+        end
+        @test_throws BoundsError reader(zeros(2, 0), zeros(3, 0, 2), [1, 4])
+        @test_throws DimensionMismatch reader(ones(4, 2), ones(3, 3, 2), [3, 1, 2, 1])
+        offset = view(ones(4, 4), :, Base.IdentityUnitRange(2:4))
+        @test_throws DimensionMismatch reader(offset, ones(3, 3, 2), [3, 1, 2, 1])
+        # A singleton row broadcasts; each call reads the current indices
+        # and weights.
+        index = [2, 1]
+        W = reshape(ComplexF64.(1:12), 2, 3, 2)
+        X = fill(1.0im, 1, 3)
+        for j in 1:2
+            reverse!(index)
+            W .+= 2im
+            @test at(reader(X, W, index), j) == literal(X, W[:, :, j], index)
+        end
+    end
+    # None of the spellings allocates a gather, a product or a sum per
+    # position (about 115 KB here for the literal operations). A flattening
+    # on a line of its own wraps each position's sum.
+    wide_X, wide_W = ones(200, 6), ones(50, 6, 4)
+    ints = repeat(collect(1:50), 4)
+    allocated(reader) = (reader(wide_X, wide_W, ints); @allocated reader(wide_X, wide_W, ints))
+    reference = allocated(vectorize(prepare(weighted_rows); batched=:W, reuse=true))
+    for (spec, _) in spellings
+        @test allocated(vectorize(prepare(spec); batched=:W, reuse=true)) <= reference + 1024
+    end
+
+    # An intermediate with a declared type, a second reader of the product
+    # or of the gathered rows, and a sum over the first dimension keep the
+    # statements as written.
+    W = reshape(collect(1.0:18), 3, 3, 2)
+    index = [3, 1, 3, 2]
+    X = reshape(collect(1.0:12), 4, 3)
+    rows(j) = W[index, :, j]
+    written = (
+        (weighted_rows_typed, j -> vec(sum(X .* rows(j); dims=2))),
+        (weighted_rows_product_twice, j -> vec(sum(X .* rows(j); dims=2))),
+        (weighted_rows_gather_twice, j -> vec(sum(X .* rows(j); dims=2))),
+        (weighted_columns, j -> vec(sum(X .* rows(j); dims=1))),
+        (weighted_columns_dropdims, j -> dropdims(sum(X .* rows(j); dims=1); dims=1)))
+    for (spec, literal) in written
+        reader = vectorize(prepare(spec); batched=:W, reuse=true)
+        @test !occursin("_lane_gathered_sum", string(code_expr(reader)))
+        result = reader(X, W, index)
+        @test all(j -> at(result, j) == literal(j), axes(W, 3))
+    end
+    result = vectorize(prepare(weighted_rows_product_twice); batched=:W, reuse=true)(X, W, index)
+    @test last(result) == [sum(X .* rows(j)) for j in axes(W, 3)]
+    result = vectorize(prepare(weighted_rows_gather_twice); batched=:W, reuse=true)(X, W, index)
+    @test last(result) == [W[3, 1, j] for j in axes(W, 3)]
+    # A requested intermediate stays, the product as the gathered rows do.
+    both = prepare_batched(weighted_rows_apart; batched=:W, want=(:scaled, :value))
+    @test !occursin("_lane_gathered_sum", string(code_expr(both)))
+    @test first(both(X, W, index)) == X .* W[index, :, :]
+
+    reader = vectorize(prepare(weighted_rows_two_gathers); batched=:W, reuse=true)
+    @test occursin("_lane_gathered_sum", string(code_expr(reader)))
+    V = reshape(collect(0.5:0.5:4.5), 3, 3)
+    result = reader(V, W, index)
+    @test all(j -> at(result, j) == vec(sum(V[index, :] .* rows(j); dims=2)), axes(W, 3))
+end
+
 @testset "scheduled workers reuse their lane slots" begin
     args = lane_inputs(60, 24)
     expected = lane_reference(:rel_min, args...)

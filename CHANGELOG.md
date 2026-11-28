@@ -16,7 +16,7 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
-## 0.1.412
+## 0.1.414
 
 - The opt-in generated reverse of summed plates (`with_plate_reverse`, the
   `plate_reverse` preference) again counts a cell's exponential as work its
@@ -30,6 +30,34 @@ are recorded in the git history only.
   `benchmark/near_miss/plate_reverse_shapes.jl` reports, for ten model shapes,
   which plates take a one-pass tape and the gradient time with the generated
   reverse on against off.
+
+## 0.1.413
+
+- A single-use gathered row product in a native position batch (0.1.411) runs
+  its fused loop however its statements are written. `rows = W[index, :]`
+  whose only use is an elementwise product with one other array, whose only
+  use is a sum over the second dimension, is one read of `W` row by row: the
+  product may stand inside the sum or on a line of its own, and the n-by-1
+  sum may be taken as it is, under `vec` or under `dropdims(…; dims=2)`. Only
+  `vec(sum(X .* rows; dims=2))` and the bare sum in one statement after the
+  gather did; the same computation with `scaled = X .* rows` on its own line,
+  or with `dropdims`, gathered, multiplied and summed at every position. An
+  intermediate with a declared type, a requested one, and one with a second
+  reader keep the statements as written, as does a sum over another
+  dimension.
+
+## 0.1.412
+
+`prepare_data` decides a ragged plate's row-length checks and its grouped
+or expanded sum from the prepared lengths. Data that pass run the grouped
+sum with no runtime check or branch, which removes device-to-host round trips
+from every GPU evaluation. Other data keep the checks, so invalid rows still
+raise when the function runs, in program order.
+
+In a padded export, `prepare_data` likewise decides the bounds check of a
+subject scan's table reads at a padded index, optionally guarded by a padded
+tag: when every requested index lies within its subject's table rows, the
+compiled function drops that check and its mid-program round trip.
 
 ## 0.1.411
 

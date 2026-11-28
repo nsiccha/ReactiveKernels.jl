@@ -157,13 +157,21 @@ end
     value = dropdims(sum(X .* rows; dims=2); dims=2)
     return value
 end
+@kernel weighted_rows_lines(X, W, index) = begin
+    rows = W[index, :]
+    scaled = X .* rows
+    total = sum(scaled; dims=2)
+    value = dropdims(total; dims=2)
+    return value
+end
 rng = MersenneTwister(7)
 n, k, m, positions = 2000, 6, 50, 16
 X = randn(rng, n, k)
 W = randn(rng, m, k, positions)
 index = rand(rng, 1:m, n)
 for (name, spec) in (("fused spelling", weighted_rows), ("product on its own line", weighted_rows_apart),
-                     ("dropdims instead of vec", weighted_rows_dropdims))
+                     ("dropdims instead of vec", weighted_rows_dropdims),
+                     ("every statement on its own line", weighted_rows_lines))
     reader = vectorize(prepare(spec); batched = :W, reuse = true)
     for (kind, ix) in (("Vector{Int}", index), ("Vector{Int32}", Int32.(index)), ("Vector{UInt16}", UInt16.(index)),
                        ("view of a Vector{Int}", view(vcat(index, index), 1:n)), ("range 1:1:50", nothing))

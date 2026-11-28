@@ -649,16 +649,19 @@ end
 _lane_source_eligible(r::Recipe) = _lane_source_expr(
     r, Any[gensym(:argument) for _ in r.inputs], :recycled; nested = Symbol[]) !== nothing
 
-# A position residual's single-use rows = W[index, :] followed by
-# sum(X .* rows; dims=2), optionally under vec. Keep the operand order for
-# types with their own multiplication or broadcasting methods.
+# A position residual's single-use rows = W[index, :], multiplied elementwise
+# by one other array and summed over the second dimension. `Flatten` is what
+# the source applies to the n-by-1 sum: `identity`, `vec` or
+# `dropdims(…; dims=2)`. Keep the operand order for types with their own
+# multiplication or broadcasting methods.
 struct _GatheredRowSum{GatherFirst,Flatten} end
+
+_drop_second_dim(result) = dropdims(result; dims=2)
 
 function _literal_gathered_sum(::_GatheredRowSum{First,Flatten}, X, W, index) where {First,Flatten}
     rows = W[index, :]
     product = First ? _native_broadcasted(*, rows, X) : _native_broadcasted(*, X, rows)
-    result = sum(_native_broadcast_materialize(product); dims=2)
-    Flatten ? vec(result) : result
+    Flatten(sum(_native_broadcast_materialize(product); dims=2))
 end
 
 _lane_gathered_sum(recycled, op, X, W, index) = _literal_gathered_sum(op, X, W, index)
@@ -670,7 +673,8 @@ const _LaneRowMatrix{T} = Union{Matrix{T},SubArray{T,2,<:Array{T},<:Any,true}}
 # `W[index, :]` gathers for any vector of machine integers with one-based
 # axes: a `Vector` of any such element type, a range, a view. A `Bool` vector
 # is a mask and other integer types convert element by element; both keep the
-# literal operations.
+# literal operations. `vec` and `dropdims(…; dims=2)` of the n-by-1 sum are
+# the same vector, which the loop fills directly.
 function _lane_gathered_sum(recycled, op::_GatheredRowSum{First,Flatten},
         X::_LaneRowMatrix{T}, W::_LaneRowMatrix{S}, index::AbstractVector{<:Base.BitInteger}) where
         {First,Flatten,T<:Union{Float32,Float64},S<:Union{Float32,Float64}}
@@ -682,7 +686,7 @@ function _lane_gathered_sum(recycled, op::_GatheredRowSum{First,Flatten},
         return _literal_gathered_sum(op, X, W, index)
     checkbounds(W, index, :)
     R = promote_type(T, S)
-    out = Flatten ? _lane_zeros(recycled, R, n) : _lane_zeros(recycled, R, n, 1)
+    out = Flatten === identity ? _lane_zeros(recycled, R, n, 1) : _lane_zeros(recycled, R, n)
     for j in axes(X, 2)
         @inbounds for i in eachindex(index)
             a, b = X[i, j], W[index[i], j]
@@ -692,71 +696,138 @@ function _lane_gathered_sum(recycled, op::_GatheredRowSum{First,Flatten},
     out
 end
 
-# Match the reader's resolved callees and the two input positions, including
+# The two input positions of an elementwise product `a .* b`, or `nothing`.
+function _lane_product_operands(ctx::_LaneSourceContext, position, node)
+    _lane_materialize_call(node) || return nothing
+    product = node.args[2]
+    _lane_broadcasted_call(product) && length(product.args) == 4 &&
+        _lane_binding(ctx, product.args[2]) === (*) || return nothing
+    a = get(position, product.args[3], nothing)
+    b = get(position, product.args[4], nothing)
+    a !== nothing && b !== nothing && a != b || return nothing
+    (; a, b)
+end
+
+# A recipe that is the elementwise product of its two inputs.
+function _lane_product_reader(r::Recipe)
+    length(r.inputs) == 2 && length(r.outputs) == 1 || return nothing
+    native = _cell_native(r)
+    native === nothing && return nothing
+    ex, params, mod = native
+    position = _lane_source_arguments(params, eachindex(params))
+    _lane_product_operands(_LaneSourceContext(mod, position), position, ex)
+end
+
+# A recipe that sums an elementwise product over its second dimension:
+# `sum(P; dims=2)` as written, or under `vec` or `dropdims(…; dims=2)`. `P` is
+# the product itself (`a` and `b` are its input positions, `value` is 0) or one
+# input that holds it (`value`). Callees are matched as resolved, including
 # renamed ports of composed kernels. No method, size or level is sampled.
 function _lane_row_sum_reader(r::Recipe)
-    length(r.inputs) == 2 && length(r.outputs) == 1 || return nothing
+    length(r.inputs) in (1, 2) && length(r.outputs) == 1 || return nothing
     native = _cell_native(r)
     native === nothing && return nothing
     ex, params, mod = native
     position = _lane_source_arguments(params, eachindex(params))
     ctx = _LaneSourceContext(mod, position)
     Meta.isexpr(ex, :call) || return nothing
-    flatten = _lane_binding(ctx, ex.args[1]) === Base.vec
-    if flatten
+    flatten = identity
+    callee = _lane_binding(ctx, ex.args[1])
+    if callee === Base.vec
         length(ex.args) == 2 || return nothing
-        ex = ex.args[2]
+        flatten, ex = vec, ex.args[2]
+    elseif callee === Base.dropdims
+        parts = _cell_call_parts(ex)
+        parts === nothing && return nothing
+        args, kwargs = parts
+        length(args) == 1 && length(kwargs) == 1 && get(kwargs, :dims, nothing) === 2 || return nothing
+        flatten, ex = _drop_second_dim, only(args)
     end
     Meta.isexpr(ex, :call) && _lane_binding(ctx, ex.args[1]) === Base.sum || return nothing
     parts = _cell_call_parts(ex)
     parts === nothing && return nothing
     args, kwargs = parts
     length(args) == 1 && length(kwargs) == 1 && get(kwargs, :dims, nothing) === 2 || return nothing
-    _lane_materialize_call(only(args)) || return nothing
-    product = only(args).args[2]
-    _lane_broadcasted_call(product) && length(product.args) == 4 &&
-        _lane_binding(ctx, product.args[2]) === (*) || return nothing
-    a = get(position, product.args[3], nothing)
-    b = get(position, product.args[4], nothing)
-    a !== nothing && b !== nothing && a != b || return nothing
-    (; a, b, flatten)
+    summed = only(args)
+    value = summed isa Symbol ? get(position, summed, nothing) : nothing
+    value === nothing || return length(r.inputs) == 1 ? (; a = 0, b = 0, value, flatten) : nothing
+    sides = _lane_product_operands(ctx, position, summed)
+    sides === nothing && return nothing
+    (; sides.a, sides.b, value = 0, flatten)
 end
 
+# `rows = W[index, :]` whose only use is an elementwise product with one other
+# array, whose only use is a sum over the second dimension, becomes one recipe
+# that reads `W` row by row. The product may stand inside the sum or on a line
+# of its own: what is asked is that each intermediate has this one reader and
+# can go with its producer.
 function _lane_fuse_gathered_sums(p::Plan)
     recipes = p.recipes
-    replacements = Dict{Int,Recipe}()
-    readers = nothing
+    # Most plans gather no rows: they are returned before any recipe's source
+    # is read.
+    any(r -> Meta.isexpr(r.source, :ref, 3), recipes) || return p
     cid(v) = canon_id(p.graph, v.id)
-    for i in 1:length(recipes)-1
-        gather, reader = recipes[i], recipes[i + 1]
-        (gather.effectful || reader.effectful) && continue
-        Meta.isexpr(gather.source, :ref, 3) || continue
-        form = _readonly_slice_form(gather)
-        form === nothing && continue
-        rowindex, tail = form.parts
-        rowindex isa Int && tail isa Colon || continue
-        rows = only(gather.outputs)
-        # Removing the intermediate must not remove a declared conversion,
-        # a requested value, an input check or a use outside this reader.
-        valtype(rows) === Any || continue
-        id = cid(rows)
-        get(p.producer, id, nothing) === gather || continue
-        any(v -> cid(v) == id, p.want) && continue
-        any(c -> any(a -> a isa Value && cid(a) == id, c.args), p.checks) && continue
+    readers = nothing
+    # The index of the recipe that produces `v`, if `v` can go with it:
+    # removing it must not remove a declared conversion, a requested value,
+    # an input check or a use outside its one reader.
+    function removable(v)
+        valtype(v) === Any || return nothing
+        id = cid(v)
+        producer = get(p.producer, id, nothing)
+        producer === nothing && return nothing
+        any(w -> cid(w) == id, p.want) && return nothing
+        any(c -> any(a -> a isa Value && cid(a) == id, c.args), p.checks) && return nothing
+        readers === nothing && (readers = _recipe_readers(p.graph, recipes))
+        length(readers[id]) == 1 || return nothing
+        findfirst(r -> r === producer, recipes)
+    end
+    replacements = Dict{Int,Recipe}()
+    dropped = Set{Int}()
+    for (at, reader) in enumerate(recipes)
+        reader.effectful && continue
         read = _lane_row_sum_reader(reader)
         read === nothing && continue
-        a, b = reader.inputs[read.a], reader.inputs[read.b]
-        first = cid(a) == id
-        xor(first, cid(b) == id) || continue
-        readers === nothing && (readers = _recipe_readers(p.graph, recipes))
-        length(readers[id]) == 1 || continue
-        inputs = (first ? b : a, gather.inputs[form.array], gather.inputs[rowindex])
-        op = _GatheredRowSum{first,read.flatten}()
-        replacements[i + 1] = Recipe(reader.id, inputs, reader.outputs, op,
-            gather.cost + reader.cost, nothing, false)
+        between = Int[]
+        operands = if read.value == 0
+            (reader.inputs[read.a], reader.inputs[read.b])
+        else
+            j = removable(reader.inputs[read.value])
+            j === nothing && continue
+            sides = _lane_product_reader(recipes[j])
+            sides === nothing && continue
+            push!(between, j)
+            (recipes[j].inputs[sides.a], recipes[j].inputs[sides.b])
+        end
+        # Of two gathered operands the later one is read row by row.
+        found = nothing
+        for (rows, other, first) in ((operands[1], operands[2], true), (operands[2], operands[1], false))
+            g = removable(rows)
+            g === nothing && continue
+            gather = recipes[g]
+            Meta.isexpr(gather.source, :ref, 3) || continue
+            form = _readonly_slice_form(gather)
+            form === nothing && continue
+            rowindex, tail = form.parts
+            rowindex isa Int && tail isa Colon || continue
+            # The gather moves to the reader's place: nothing from there to
+            # here may have an effect (a stateless plan holds no such recipe).
+            g < at && !any(k -> recipes[k].effectful, g:at) || continue
+            (found === nothing || g > found.g) && (found = (; g, other, first, form, rowindex))
+        end
+        found === nothing && continue
+        gather = recipes[found.g]
+        inputs = (found.other, gather.inputs[found.form.array], gather.inputs[found.rowindex])
+        op = _GatheredRowSum{found.first,read.flatten}()
+        cost = gather.cost + reader.cost
+        for j in between
+            cost += recipes[j].cost
+        end
+        replacements[at] = Recipe(reader.id, inputs, reader.outputs, op, cost, nothing, false)
+        push!(dropped, found.g)
+        union!(dropped, between)
     end
     isempty(replacements) && return p
-    fused = Recipe[get(replacements, i, r) for (i, r) in enumerate(recipes)
-                   if !haskey(replacements, i + 1)]
+    fused = Recipe[get(replacements, i, r) for (i, r) in enumerate(recipes) if !(i in dropped)]
     _partial_subplan(p, p.have, p.want, fused)
 end

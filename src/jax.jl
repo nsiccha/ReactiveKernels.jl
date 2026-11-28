@@ -10568,7 +10568,7 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
             push!(pending, key)
         end
     end
-    bounds = filter(b -> b[2] ∉ (:broadcast_total, :scan_rows, :row_layout, :sign_groups, :match_count, :padded_map_rows, :subject_scan, :record_rows, :requested_rows) ||
+    bounds = filter(b -> b[2] ∉ (:broadcast_total, :ragged_counts, :scan_index_bound, :scan_rows, :row_layout, :sign_groups, :match_count, :padded_map_rows, :subject_scan, :record_rows, :requested_rows) ||
                          b[1] in used_inputs, all_bounds)
     if !isempty(bounds)
         bodies[prepare_body] = join(_jax_prepare_bounds_lines(mod, prepare_lines, bounds), "\n")
