@@ -16,6 +16,23 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.413
+
+The `1 - logistic(x)` stable rewrite of 0.1.409 reaches a logit mean under
+both samplers. A mean-precision Beta or beta-binomial whose mean is the
+logistic of a scalar, as in every intercept-only model, was rewritten by the
+ordinary sampler only; one whose mean is a vector, by the default
+non-allocating sampler only; and one whose predictor adds a group effect
+gathered per row, such as `logistic.(a .+ z[pos])`, by neither. Each now keeps
+its density and gradient accurate to `eta = ±700` under either sampler, where
+the written form is `-Inf` from `eta ≈ 37`. The rules read through a dotted
+call materialized with Base's `materialize`, through a declaration to an array
+type that leaves the element type free (RKPPL's `mu::AbstractVector`) and the
+name it declares, and through a summand gathered from readable names. The
+call they read through keeps its own call: only the dotted call inside it is
+rewritten, so a materialized value stays materialized and a declaration still
+converts. `simplify = false` keeps the written form.
+
 ## 0.1.412
 
 `prepare_data` decides a ragged plate's row-length checks and its grouped
