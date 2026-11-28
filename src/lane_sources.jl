@@ -666,13 +666,18 @@ _lane_gathered_sum(recycled, op, X, W, index) = _literal_gathered_sum(op, X, W, 
 
 const _LaneRowMatrix{T} = Union{Matrix{T},SubArray{T,2,<:Array{T},<:Any,true}}
 
+# The fused loop reads row `index[i]` of `W` for row `i` of `X`. That is what
+# `W[index, :]` gathers for any vector of machine integers with one-based
+# axes: a `Vector` of any such element type, a range, a view. A `Bool` vector
+# is a mask and other integer types convert element by element; both keep the
+# literal operations.
 function _lane_gathered_sum(recycled, op::_GatheredRowSum{First,Flatten},
-        X::_LaneRowMatrix{T}, W::_LaneRowMatrix{S}, index::Vector{Int}) where
+        X::_LaneRowMatrix{T}, W::_LaneRowMatrix{S}, index::AbstractVector{<:Base.BitInteger}) where
         {First,Flatten,T<:Union{Float32,Float64},S<:Union{Float32,Float64}}
     # Offset axes, singleton expansion, a one-row sum (Base can sum it
     # pairwise), and dimension errors retain the literal operations.
     n, k = size(X)
-    isconcretetype(T) && isconcretetype(S) && !Base.has_offset_axes(X, W) &&
+    isconcretetype(T) && isconcretetype(S) && !Base.has_offset_axes(X, W, index) &&
         n != 1 && n == length(index) && k == size(W, 2) ||
         return _literal_gathered_sum(op, X, W, index)
     checkbounds(W, index, :)
