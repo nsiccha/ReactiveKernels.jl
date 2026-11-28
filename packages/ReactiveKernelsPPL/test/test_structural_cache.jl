@@ -291,3 +291,33 @@ end
     GC.gc(true)
     @test ref.value === nothing
 end
+
+# The types Julia holds for the analysis `f` in the compiled and inferred
+# instances of the three helpers that take one, and of the keyword bodies it
+# generates for two of them (named `#helper#N`).
+function _scache_analysis_types()
+    types = Set{Any}()
+    for name in names(_SCACHE; all = true)
+        occursin(r"^#?_(structural|structural_set|analysis)(#\d+)?$", string(name)) || continue
+        for m in methods(getfield(_SCACHE, name))
+            position = findfirst(==(:f), Base.method_argnames(m))
+            position === nothing && continue
+            for instance in Base.specializations(m)
+                push!(types, Base.unwrap_unionall(instance.specTypes).parameters[position])
+            end
+        end
+    end
+    return types
+end
+
+# Analyses call one another through `_structural`. Inference that follows an
+# analysis into the helper nests the helper under itself, Julia's recursion
+# limit ends those frames as limited, and a limited frame is not cached: a
+# process that has to infer binding itself then repeats each analysis for
+# every path that reaches it, and on Julia 1.12.7 did not finish its first
+# lowering (snag `first-rkbrmi-low-59c952cd`; 43 analysis closure types in
+# these instances before the helpers stopped specializing on `f`).
+@testset "structural cache: no helper is specialized on an analysis" begin
+    bind_data(_scache_lower(_scache_design(4)), _scache_design(4))
+    @test _scache_analysis_types() == Set{Any}((Any,))
+end
