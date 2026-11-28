@@ -187,14 +187,24 @@ function _jax_is_nested_sum(p)
         length(p.want) == 1 && canon_id(p.graph, only(p.want).id) == canon_id(p.graph, only(total.outputs).id)
 end
 
-function _jax_padded_row_key(ctx, v)
-    key = _jax_chain_key(ctx, v)
-    key === nothing || return key
+# The prepared (lengths, selector) pairs whose broadcast gives the row lengths
+# `extent` of a plate's output, as that plate recorded them, or `nothing`.
+function _jax_row_sources(ctx, extent::AbstractString)
     for scope in _jax_scope_chain(ctx.scope)
-        sources = get(ctx.mod.helper_names, (:row_sources, scope, v.extent), nothing)
-        sources === nothing || return _jax_prepared_bound!(ctx, :row_layout, sources...)
+        sources = get(ctx.mod.helper_names, (:row_sources, scope, extent), nothing)
+        sources === nothing || return sources
     end
     nothing
+end
+
+# The prepared value holding the row lengths `extent`: a prepared lengths
+# vector, or the row layout `prepare_data` computes for a plate's output rows.
+_jax_padded_row_key(ctx, v::_PyVal) = _jax_padded_row_key(ctx, v.extent)
+function _jax_padded_row_key(ctx, extent::AbstractString)
+    key = get(ctx.scope.prepared_keys, extent, nothing)
+    key === nothing || return key
+    sources = _jax_row_sources(ctx, extent)
+    sources === nothing ? nothing : _jax_prepared_bound!(ctx, :row_layout, sources...)
 end
 
 function _jax_ragged_port(ctx, v)

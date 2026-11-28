@@ -2145,7 +2145,9 @@ def _rk_ragged_counts(bound, *operands):
     # Whether a ragged plate's prepared row lengths need no run-time checks:
     # `bound` holds the lengths of the data rows whose coordinates the
     # grouped sum covers, then come one vector of row lengths and an optional
-    # one-based row selector per other mapped input. 1 when every input's
+    # one-based row selector per other mapped input. Rows that a plate
+    # computed come as their prepared row layout, which is missing when the
+    # rows it broadcasts are incompatible. 1 when every input's
     # rows match the merged lengths (or have length one), no length is
     # negative, and the merged lengths are `bound`, so the grouped sum needs
     # neither its checks nor its layout branch. 0 keeps both: invalid data
@@ -2154,6 +2156,10 @@ def _rk_ragged_counts(bound, *operands):
         bound = np.asarray(bound)
         sizes = [bound]
         for lengths, indices in zip(operands[::2], operands[1::2]):
+            if lengths is None:
+                return StaticInt(0)
+            if isinstance(lengths, tuple):
+                lengths = lengths[0]
             lengths = np.asarray(lengths)
             if indices is not None:
                 indices = np.asarray(indices)

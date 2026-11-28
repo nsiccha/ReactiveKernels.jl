@@ -247,9 +247,11 @@ def _rk_ragged_lane_sum(cells, entries, groups, rows, cols, data_lengths, length
 
 # The prepared proof (`:ragged_counts`, a `StaticInt`) that a ragged plate's
 # row lengths `sizes` (codes; the data domain's prepared lengths first) need
-# no checks, or `nothing` when `prepare_data` cannot read one of them: each
-# must be a prepared lengths vector, or one selected by a prepared one-based
-# row index. Chain and round layouts hold their lengths differently.
+# no checks, or `nothing` when `prepare_data` cannot read one of them. Each
+# must be a prepared lengths vector, the rows of a plate's output whose
+# lengths are the broadcast of prepared rows, or either of those selected by
+# a prepared one-based row index. Chain and round layouts hold their lengths
+# differently.
 function _jax_ragged_counts_proof(ctx, sizes)
     ctx.host === nothing && _jax_plate_layout() in (:padded, :groups) || return nothing
     keys = String[]
@@ -260,21 +262,34 @@ function _jax_ragged_counts_proof(ctx, sizes)
             continue
         end
         i == 1 && return nothing
-        selected = get(ctx.scope.selected_lengths, size, nothing)
-        if selected === nothing
-            # A cell's selected row lengths, as the plate passes them out
-            # (`_jax_outer_extent`): `lengths[index - 1]` of two arrays.
-            m = match(r"^([A-Za-z_]\w*)\[([A-Za-z_]\w*) - 1\]$", size)
-            m === nothing && return nothing
-            selected = (String(m.captures[1]), String(m.captures[2]), "")
-        end
-        rows, index, _ = selected
-        lengths = get(ctx.scope.prepared_keys, rows, nothing)
-        indices = get(ctx.scope.prepared_keys, index, nothing)
-        (lengths === nothing || indices === nothing) && return nothing
-        push!(keys, lengths, indices)
+        operands = _jax_ragged_counts_operands(ctx, size)
+        operands === nothing && return nothing
+        append!(keys, operands)
     end
     _jax_prepared_bound!(ctx, :ragged_counts, keys...)
+end
+
+# `_rk_ragged_counts`'s operands for the row lengths `size` that are not a
+# prepared vector themselves: prepared `(lengths, selector)` pairs.
+function _jax_ragged_counts_operands(ctx, size)
+    selected = get(ctx.scope.selected_lengths, size, nothing)
+    if selected === nothing
+        # A cell's selected row lengths, as the plate passes them out
+        # (`_jax_outer_extent`): `lengths[index - 1]`. The lengths can be a
+        # field of a tuple-valued plate's (`plate_lengths[1]`).
+        m = match(r"^(.+)\[([A-Za-z_]\w*) - 1\]$", size)
+        m === nothing || (selected = (String(m.captures[1]), String(m.captures[2]), ""))
+    end
+    if selected !== nothing
+        rows, index, _ = selected
+        # Rows a plate computed are read as the row layout `prepare_data`
+        # builds from the prepared rows they broadcast.
+        lengths = _jax_padded_row_key(ctx, rows)
+        indices = get(ctx.scope.prepared_keys, index, nothing)
+        lengths === nothing || indices === nothing || return [lengths, indices]
+    end
+    # A plate's output rows, read whole: each prepared row they broadcast.
+    _jax_row_sources(ctx, size)
 end
 
 # Run the statements emitted since line `mark` of the current scope only when
