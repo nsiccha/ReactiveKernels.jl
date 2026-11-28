@@ -32,6 +32,11 @@
 # (`observed ? log(p) : log1p(-p)`, rewritten arm by arm). An argument that is a name
 # reads that name's definition when the name is assigned once and the
 # definition dominates the site (the same or an enclosing block, earlier).
+# The rewritten call then reads the definition's operands at the site: names
+# it can read, a name the program assigns more than once as long as no
+# statement between them assigns or mutates it (a plate output's buffer and
+# its narrowed array, `_rw_drop_stale!`), and sums, differences and products
+# of those (an inline linear predictor, computed again there).
 # A matched composition becomes a call of one of the `_rk_*_of` helpers below,
 # whose methods decide by dispatch: the stable form for `Real` operands, the
 # literal composition for every other type (a matrix exponential, a custom
@@ -113,6 +118,19 @@ Base.getindex(x::_RwFn) = x.f
     convert(_rw_float(c, LogExpFunctions.logistic(x)), LogExpFunctions.log1mlogistic(x))
 @_record_source @inline _rk_log_one_minus_of(c::Real, ::_RwExp, x::Real) =
     LogExpFunctions.log1mexp(convert(_rw_float(c, x), x))
+
+# `c - f(x)` with `c` a literal one: the complement of a probability (the second
+# shape of a mean-precision Beta, `(1 - logistic(eta)) * kappa`) and of an
+# exponential (the cloglog link's `1 - exp(-exp(eta))`). `1 - logistic(x)` is
+# `logistic(-x)`, spelled `exp(-log1pexp(x))`: LogExpFunctions' `logistic`
+# computes `exp(x)` before it branches, so under an Enzyme release without
+# its rule its ordinary reverse is `0 * Inf = NaN` above x = 709
+# (`reactivekernels-use` §7ac), where this form's derivative stays finite.
+@_record_source @inline _rk_one_minus_of(c, f::F, x) where {F} = c - f(x)
+@_record_source @inline _rk_one_minus_of(c::Real, ::typeof(LogExpFunctions.logistic), x::Real) =
+    exp(-LogExpFunctions.log1pexp(convert(_rw_float(c, x), x)))
+@_record_source @inline _rk_one_minus_of(c::Real, ::_RwExp, x::Real) =
+    -expm1(convert(_rw_float(c, x), x))
 
 # `log(c + y)` with `c` a literal one.
 @_record_source @inline _rk_log_one_plus(c, y) = log(c + y)
@@ -276,7 +294,7 @@ function _rk_log_abs_apply end
 # The helpers record their sources (`@_record_source`), so `jax_source`
 # translates the same stable forms native execution runs.
 const _RK_STABLE_HELPERS = (_rk_log_of, _rk_log1p_of, _rk_log1p_neg_of, _rk_log_one_minus_of,
-    _rk_log_one_plus, _rk_log_one_plus_of, _rk_log_add_of, _rk_log_sum_of, _rk_logit_of,
+    _rk_one_minus_of, _rk_log_one_plus, _rk_log_one_plus_of, _rk_log_add_of, _rk_log_sum_of, _rk_logit_of,
     _rk_log_odds_of, _rk_exp_log_of, _rk_minus_one_of, _rk_inv_of, _rk_div_by_of, _rk_div_by_scale, _rk_pow_of,
     _rk_sqrt_of, _rk_log_sigmoid, _rk_log1m_sigmoid, _rk_at_exp1, _rk_at_exp_std1, _rk_at_exp,
     _rk_at_exp_std)
@@ -340,7 +358,7 @@ function _rw_ref(f)
     f === exp && return GlobalRef(Base, :exp)
     f === _native_exp && return GlobalRef(@__MODULE__, :_native_exp)
     f === _native_scalar_exp && return GlobalRef(@__MODULE__, :_native_scalar_exp)
-    f === LogExpFunctions.logistic && return GlobalRef(LogExpFunctions, :logistic)
+    _rw_logistic(f) && return GlobalRef(LogExpFunctions, :logistic)
     f === abs && return GlobalRef(Base, :abs)
     f === abs2 && return GlobalRef(Base, :abs2)
     nothing
@@ -601,7 +619,10 @@ function _rw_view(ex, ctx::_RwContext, env)
                 inner !== nothing && inner.broadcast ? inner : nothing)
     f = _rw_resolve(callee, @__MODULE__)
     f === nothing && return nothing
-    if (f === _native_broadcast_materialize || f === _cell_array_broadcast) && length(args) == 1
+    # A materialized or lazy cell array of a broadcast holds its entries as
+    # they are (`_cell_array_materialize` of a `Broadcasted` keeps each one).
+    if (f === _native_broadcast_materialize || f === _cell_array_broadcast ||
+        f === _cell_array_materialize) && length(args) == 1
         inner = _rw_view(args[1], ctx, env)
         return inner !== nothing && inner.broadcast ? inner : nothing
     elseif f === _cell_array_as && length(args) == 2 && _rw_keeps_elements(args[1])
@@ -630,8 +651,64 @@ function _rw_operand(a, ctx::_RwContext, env)
     end
     (_rw_view(a, ctx, env), false)
 end
+# A definition's operand is readable at the site when the site can read it, or
+# when it is a name the program assigns more than once (a plate output's
+# buffer, then its narrowed array): a definition that reads such a name stays
+# in `env` only until a statement assigns or mutates the name again
+# (`_rw_drop_stale!`), so through a live definition it still holds the value
+# the definition read.
 _rw_movable(x, from_definition::Bool, ctx, env) =
-    !from_definition || _rw_available(x, ctx, env)
+    !from_definition || _rw_movable_operand(x, ctx, env)
+_rw_movable_operand(x, ctx, env) = _rw_available(x, ctx, env) ||
+    (x isa Symbol && get(ctx.counts, x, 0) >= 2) || _rw_movable_arithmetic(x, ctx, env)
+
+# An operand a definition computes inline from such names and literals with
+# sums, differences and products (a linear predictor `a .+ b .* x`, read as
+# `logistic.(a .+ b .* x)`): the site computes it again from the values the
+# definition read. Each of these is evaluated where the definition evaluated
+# it first, so it raises nothing new, and a dotted one fuses into the site's
+# broadcast.
+function _rw_movable_arithmetic(x, ctx, env)
+    x isa Expr && x.head === :call && length(x.args) >= 2 || return false
+    f = _rw_resolve(x.args[1], @__MODULE__)
+    args = x.args[2:end]
+    if _rw_is_broadcasted(f)
+        f = _rw_resolve(args[1], @__MODULE__)
+        args = args[2:end]
+        isempty(args) && return false
+    end
+    # A cell's read (`_rw_read_parts`) is no leaf: only a top-level operand is
+    # given a fresh local (`_rw_fresh`).
+    (f === (+) || f === (-) || f === (*)) &&
+        all(a -> a isa Number || (a isa Symbol && _rw_movable_operand(a, ctx, env)) ||
+                 _rw_movable_arithmetic(a, ctx, env), args)
+end
+
+# Whether `ex` reads any of `names`.
+function _rw_reads_any(ex, names)
+    ex isa Symbol && return ex in names
+    ex isa Expr || return false
+    ex.head in (:quote, :inert, :meta) && return false
+    any(a -> _rw_reads_any(a, names), ex.args)
+end
+
+# `env` without the definitions that read a name `ex` assigns or mutates and
+# the program assigns more than once: from `ex` on, such a name may hold
+# another value. Each defined name stays readable (`_RwOuter`): its own value
+# does not change. A name assigned once has no reader before its definition,
+# which is recorded after this. `also` names a binding that shadows a name.
+function _rw_drop_stale!(env::Dict{Symbol,Any}, ctx, ex; also = ())
+    changed = Symbol[n for n in keys(_rw_count!(Dict{Symbol,Int}(), ex))
+                     if get(ctx.counts, n, 0) >= 2]
+    append!(changed, also)
+    isempty(changed) && return env
+    for name in collect(keys(env))
+        rhs = env[name]
+        rhs isa _RwOuter && continue
+        _rw_reads_any(rhs, changed) && (env[name] = _RwOuter())
+    end
+    env
+end
 
 # A dotted outer call may read a scalar or dotted inner call; a scalar outer
 # call reads only a scalar one (`log` of a vector is not elementwise).
@@ -645,6 +722,9 @@ _rw_emit(ctx::_RwContext, outer::_RwView, helper::Symbol, args...) = outer.broad
 # A function operand (`_rw_ref`) of a dotted helper call as an immutable `_RwFn`.
 _rw_dotted_operand(a) = a isa GlobalRef && _rw_resolve(a, @__MODULE__) isa Function ?
     Expr(:call, GlobalRef(@__MODULE__, :_RwFn), a) : a
+# The function operand of an emitted helper call, as `_rw_ref` spelled it.
+_rw_unwrap_fn(a) = a isa Expr && a.head === :call && length(a.args) == 2 &&
+    _rw_resolve(a.args[1], @__MODULE__) === _RwFn ? a.args[2] : a
 
 # The inner call of one operand when it is `f(x)` with `f` among `fs` and `x`
 # readable at the site: `(view, x)`, else `nothing`.
@@ -682,7 +762,12 @@ end
 
 # --- the rules -----------------------------------------------------------------
 
-_rw_logistic(f) = f === LogExpFunctions.logistic
+# LogExpFunctions' `logistic`, or a package's own formulation of it, declared
+# with `_metadata_function` (RKPPL's inverse link `_ppl_logistic`, whose
+# reverse stays finite in both tails). The rewritten call names `logistic`
+# (`_rw_ref`), whose helper methods compute the stable form without calling it.
+_rw_logistic(f) = f === LogExpFunctions.logistic ||
+    _metadata_function(f) === LogExpFunctions.logistic
 _rw_exp_or_logistic(f) = _rw_is_exp(f) || _rw_logistic(f)
 
 # `log(…)`.
@@ -726,6 +811,13 @@ function _rw_rule_log(outer::_RwView, ctx, env)
         hy = _rw_unary(inner.args[2], ctx, env, outer, _rw_exp_or_logistic)
         hy !== nothing && _rw_movable(hy[2], def, ctx, env) || return nothing
         return _rw_emit(ctx, outer, :_rk_log_one_minus_of, inner.args[1], _rw_ref(hy[1].f), hy[2])
+    elseif inner.f === _rk_one_minus_of && length(inner.args) == 3
+        # The same, read through a statement this pass already rewrote
+        # (`q = 1 - logistic(x)` before `log(q)`).
+        c, g, x = inner.args
+        g = _rw_resolve(_rw_unwrap_fn(g), @__MODULE__)
+        _rw_exp_or_logistic(g) && _rw_movable(x, def, ctx, env) || return nothing
+        return _rw_emit(ctx, outer, :_rk_log_one_minus_of, c, _rw_ref(g), x)
     elseif inner.f === (/) && length(inner.args) == 2
         # log(1 / (1 + exp(-u)))
         s = _rw_sigmoid(a, ctx, env, outer)
@@ -775,17 +867,22 @@ function _rw_rule_exp(outer::_RwView, ctx, env)
     p = hit[2]
     producer, _ = _rw_operand(p, ctx, env)
     producer !== nothing && _rw_fits(outer, producer) && _rw_ref(producer.f) !== nothing &&
-        producer.f isa _RwNonNegative || return nothing
+        (producer.f isa _RwNonNegative || _rw_logistic(producer.f)) || return nothing
     _rw_emit(ctx, outer, :_rk_exp_log_of, _rw_ref(producer.f), p)
 end
 
-# `a - b`: `exp(x) - 1`, and the log-odds `log(p) - log1p(-p)` of `p = logistic(x)`.
+# `a - b`: `exp(x) - 1`, `1 - logistic(x)`, `1 - exp(x)`, and the log-odds
+# `log(p) - log1p(-p)` of `p = logistic(x)`.
 function _rw_rule_minus(outer::_RwView, ctx, env)
     length(outer.args) == 2 || return nothing
     a, b = outer.args
     if _rw_one(b)
         hit = _rw_unary(a, ctx, env, outer, _rw_is_exp)
         hit === nothing || return _rw_emit(ctx, outer, :_rk_minus_one_of, _rw_ref(hit[1].f), hit[2], b)
+    end
+    if _rw_one(a)
+        hit = _rw_unary(b, ctx, env, outer, _rw_exp_or_logistic)
+        hit === nothing || return _rw_emit(ctx, outer, :_rk_one_minus_of, a, _rw_ref(hit[1].f), hit[2])
     end
     la = _rw_view(a, ctx, env)
     lb = _rw_view(b, ctx, env)
@@ -920,8 +1017,10 @@ function _rw_plate_expr(ex, plate, ctx, env)
     push!(ctx.loops, loop)
     inner = ctx.hoisted ? Dict{Symbol,Any}(name => _RwOuter() for name in keys(env)) :
             copy(env)
-    # A name the loop assigns has no definition from before it.
+    # A name the loop assigns has no definition from before it, and no
+    # definition from before it reads such a name.
     foreach(name -> delete!(inner, name), assigned)
+    ctx.hoisted || _rw_drop_stale!(inner, ctx, ex)
     # The extracted cell body starts after SIMD's index assignment. Keep the
     # index readable by existing cell-read rewrites, but never loop-invariant.
     inner[plate.index] = nothing
@@ -1189,7 +1288,11 @@ function _rw_expr(ex, ctx::_RwContext, env::Dict{Symbol,Any})
         inner = copy(env)
         for b in (bindings isa Expr && bindings.head === :block ? bindings.args : Any[bindings])
             a = _rw_assignment(b)
-            a === nothing || (inner[a[1]] = a[2])
+            a === nothing && continue
+            # A definition reading an outer name the binding shadows no
+            # longer reads what that name means inside.
+            _rw_drop_stale!(inner, ctx, nothing; also = (a[1],))
+            inner[a[1]] = a[2]
         end
         return Expr(:let, bindings, _rw_expr(ex.args[2], ctx, inner))
     elseif head in (:if, :elseif, :&&, :||)
@@ -1209,9 +1312,12 @@ function _rw_expr(ex, ctx::_RwContext, env::Dict{Symbol,Any})
         loops = copy(ctx.loops)
         empty!(ctx.loops)
         (head !== :try || !isempty(loops)) && push!(ctx.loops, _rw_barrier())
+        # A later pass through the body, its condition or a handler sees what
+        # the body assigned, so no definition reading such a name reaches it.
         inner = head === :for && ctx.hoisted ?
-                Dict{Symbol,Any}(name => _RwOuter() for name in keys(env)) : env
-        condition = head === :for ? ex.args[1] : _rw_expr(ex.args[1], ctx, env)
+                Dict{Symbol,Any}(name => _RwOuter() for name in keys(env)) :
+                _rw_drop_stale!(copy(env), ctx, ex)
+        condition = head === :for ? ex.args[1] : _rw_expr(ex.args[1], ctx, inner)
         result = Expr(head, condition,
             Any[_rw_expr(a, ctx, copy(inner)) for a in ex.args[2:end]]...)
         empty!(ctx.loops)
@@ -1236,6 +1342,9 @@ end
 function _rw_block(ex::Expr, ctx::_RwContext, env::Dict{Symbol,Any})
     out = Expr(:block)
     for st in ex.args
+        # Before the statement: any part of it may run after its own
+        # assignment of such a name (a branch's condition, a loop's later pass).
+        _rw_drop_stale!(env, ctx, st)
         new = _rw_expr(st, ctx, env)
         push!(out.args, new)
         a = _rw_assignment(new)
@@ -1294,7 +1403,7 @@ function _rw_pure(rhs, ctx::_RwContext)
         # A table call of the raw function (`p = logistic(e)` in a cell).
         1 <= slot <= length(ctx.recipes) && ctx.recipes[slot] isa Recipe || return false
         op = ctx.recipes[slot].op
-        return (_rw_is_exp(op) || op === LogExpFunctions.logistic) &&
+        return _rw_exp_or_logistic(op) &&
                all(simple, rhs.args[2:end])
     end
     f = _rw_resolve(rhs.args[1], @__MODULE__)
@@ -1303,10 +1412,10 @@ function _rw_pure(rhs, ctx::_RwContext)
     elseif _rw_is_broadcasted(f)
         length(rhs.args) >= 2 || return false
         g = _rw_resolve(rhs.args[2], @__MODULE__)
-        return (_rw_is_exp(g) || g === LogExpFunctions.logistic) &&
+        return _rw_exp_or_logistic(g) &&
                all(simple, rhs.args[3:end])
     end
-    (_rw_is_exp(f) || f === LogExpFunctions.logistic) && all(simple, rhs.args[2:end])
+    _rw_exp_or_logistic(f) && all(simple, rhs.args[2:end])
 end
 
 # Removes, in the blocks the walk rebuilt, the statements of pure inner calls

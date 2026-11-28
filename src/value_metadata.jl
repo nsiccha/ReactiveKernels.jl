@@ -19,7 +19,9 @@ The function whose OutputSignatures rules describe the calls of `f`: `f`
 itself, unless `f` is a package's own formulation of a function those rules
 already describe. A package states that for its own scalar function with a
 method of this function, as it adds a JAX translation with
-`_jax_elementwise`; OutputSignatures still owns every rule.
+`_jax_elementwise`; OutputSignatures still owns every rule. The formulation
+must equal that function as a real function: the stable rewrites
+(`stable_rewrites.jl`, `_rw_logistic`) match its calls as that function's.
 """
 _metadata_function(f) = f
 

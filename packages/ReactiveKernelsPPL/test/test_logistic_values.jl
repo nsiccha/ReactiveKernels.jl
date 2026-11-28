@@ -383,3 +383,63 @@ end
         _lv_check(f, located(oracle), points)
     end
 end
+
+# A logit mean's complement, the second shape `(1 - mu) * kappa` of a
+# mean-precision Beta or BetaBinomial2, is read from the linear predictor by
+# ReactiveKernels' stable rewrites (snag `rk-stable-rewrit-f6a60366`): the
+# written `1 .- logistic.(eta)` cancels to zero from eta ≈ 37, where the log
+# density is -Inf. One coordinate `a` is the linear predictor (`x` is zero),
+# against a 512-bit oracle of the density up to a constant, through the
+# sampler and its Enzyme reverse gradient.
+import SpecialFunctions
+
+const _LV_BB_Y = [3, 30, 0, 57, 1]
+const _LV_BB_N = [10, 60, 12, 57, 400]
+const _LV_PROP = [0.2, 0.7, 0.4, 0.6, 0.3]
+
+_lv_rising(x, k) = sum(log(x + i) for i in 0:k-1; init = big(0.0))
+function _lv_bb_oracle(eta::BigFloat)
+    a = 20 / (1 + exp(-eta)); b = 20 / (1 + exp(eta))
+    -eta^2 / (2 * big(1000.0)^2) + sum(_lv_rising(a, y) + _lv_rising(b, n - y) -
+        _lv_rising(big(20.0), n) for (y, n) in zip(_LV_BB_Y, _LV_BB_N))
+end
+function _lv_beta_oracle(eta::BigFloat)
+    a = 5 / (1 + exp(-eta)); b = 5 / (1 + exp(eta))
+    -eta^2 / (2 * big(1000.0)^2) + sum((a - 1) * log(big(p)) + (b - 1) * log1p(-big(p)) -
+        SpecialFunctions.loggamma(a) - SpecialFunctions.loggamma(b) +
+        SpecialFunctions.loggamma(big(5.0)) for p in _LV_PROP)
+end
+_lv_slope(oracle, eta) = (h = big(1e-40); (oracle(eta + h) - oracle(eta - h)) / 2h)
+
+@testset "a logit mean's complement stays accurate in the tails" begin
+    setprecision(BigFloat, 512) do
+        models = (
+            (_lv_bb_oracle, :(begin
+                a ~ Normal(0, 1000)
+                mu = a .+ x
+                y .~ BetaBinomial2.(n, logistic.(mu), 20.0)
+            end), (; y = _LV_BB_Y, n = _LV_BB_N, x = zeros(5)), (:y, :n, :x)),
+            # A user-written mean-precision Beta over an inline predictor.
+            (_lv_beta_oracle, :(begin
+                a ~ Normal(0, 1000)
+                m = logistic.(a .+ x)
+                prop .~ Beta.(m .* 5.0, (1 .- m) .* 5.0)
+            end), (; prop = _LV_PROP, x = zeros(5)), (:prop, :x)),
+        )
+        for (oracle, ast, data, conditioned) in models
+            values = Dict{Symbol,Any}(pairs(data))
+            bound = bind_data(lower_rkppl(ast, values; conditioned), values)
+            built = build_kernel(bound)
+            sampler = prepare_sampler(built, bound, [0.0];
+                backend = AutoEnzyme(; mode = Enzyme.Reverse))
+            g = [0.0]
+            lp0, _ = sampler_value_and_gradient!(sampler, g, [0.0])
+            reference = oracle(big(0.0))
+            for eta in (-700.0, -100.0, -40.0, -2.0, 0.0, 2.0, 20.0, 37.0, 40.0, 100.0, 700.0)
+                lp, _ = sampler_value_and_gradient!(sampler, g, [eta])
+                @test lp - lp0 ≈ Float64(oracle(big(eta)) - reference) atol = 1e-11
+                @test g[1] ≈ Float64(_lv_slope(oracle, big(eta))) rtol = 1e-12
+            end
+        end
+    end
+end

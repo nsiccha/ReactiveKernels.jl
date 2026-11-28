@@ -1057,6 +1057,13 @@ end
     total = log(v) + 2 * log1p(-p)
     return total
 end
+# `1 - logistic(a)` as `exp(-softplus(a))`, as native: finite and accurate
+# where the written complement cancels to zero.
+@kernel jax_stable_complement(a::Float64) = begin
+    p = logistic(a)
+    total = 1 - p
+    return total
+end
 # A lazy arm's read of a value computed before the branch, as native rewrites
 # a leaf arm: the arm stays lazy, and reads `a` instead of `p`.
 @kernel jax_stable_arm(a::Float64) = begin
@@ -2079,6 +2086,18 @@ end
     end
     @test !occursin("jnp.log1p(-", string(across))
     @test occursin("jnp.log1p(-", string(literal_across))
+    complement = jax_source(jax_stable_complement; have = (:a,), want = :total)
+    literal_complement = ReactiveKernels._with_simplify(false) do
+        jax_source(jax_stable_complement; have = (:a,), want = :total)
+    end
+    @test !occursin("total = 1 - p", string(complement))
+    @test occursin("total = 1 - p", string(literal_complement))
+    if rk_jax_available()
+        r = rk_jax_evaluate(complement, "kernel", (40.0,); grad = true)
+        @test r.value ≈ prepare(jax_stable_complement; have = (:a,), want = :total)(40.0) rtol = 1e-12
+        @test r.value ≈ exp(-40.0) / (1 + exp(-40.0)) rtol = 1e-12
+        @test only(r.grad) ≈ -exp(-40.0) / (1 + exp(-40.0))^2 rtol = 1e-10
+    end
     if rk_jax_available()
         native_across = prepare(jax_stable_across; have = (:a,), want = :total)
         r = rk_jax_evaluate(across, "kernel", (800.0,); grad = true)
