@@ -66,7 +66,11 @@ device idle, longer on a loaded host. `prepare_data` therefore decides some
 checks on data alone and returns the verdict as static metadata:
 
 - the row lengths a ragged row sum reads, including a location's rows
-  selected by a prepared row index; passing data also skip its layout branch;
+  selected by a prepared row index; passing data also skip its layout branch.
+  Rows an earlier plate computed count too when their lengths are the
+  broadcast of prepared rows, such as a prediction on each subject's own time
+  grid (`w .* t[s] .+ base[s]`), read whole or selected by a prepared row
+  index; for selected rows `prepare_data` also returns their layout;
 - in a padded export, a subject scan's reads of table rows at a padded index
   (`table[j]`, possibly only where a padded tag equals a literal): each
   requested index must lie within its subject's table rows.

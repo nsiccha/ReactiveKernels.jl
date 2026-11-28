@@ -16,6 +16,21 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.418
+
+`prepare_data` also decides the row-length checks and layout branch of a
+ragged row sum (0.1.412) whose location rows an earlier plate computed. The
+lengths of such rows are data when they are the broadcast of prepared rows,
+as for a prediction on each subject's own time grid (`w .* t[s] .+ base[s]`),
+but no prepared array holds them, so the sum kept its two checks and its
+layout branch: four device-to-host copies per gradient call on a GPU. Read
+whole or selected by a prepared one-based row index, including through a
+plate that projects one row of a tuple-valued cell, their lengths are now
+proven like prepared ones, under `plate_layout = :groups` too.
+`prepare_data` returns the selected rows' layout (`_rk_row_layout_…`) next
+to the verdict that reads it. Data that fail keep the checks and the branch,
+so an invalid row still raises when the function runs, in program order.
+
 ## 0.1.417
 
 - A borrowed position reader (`vectorize(...; reuse = true)`) gives each plate

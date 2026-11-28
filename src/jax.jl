@@ -9239,7 +9239,10 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
         end
         prefix, tail = get(cell_scope.prefixed_extents, extent, (0, extent))
         parts = get(ctx.mod.helper_names, (:broadcast_length, tail), nothing)
-        if ctx.mod.layout === :padded && prefix == 0
+        # The prepared rows whose broadcast gives these rows' lengths. A
+        # padded row sum's coordinates (`_jax_padded_row_key`) and a ragged
+        # row sum's proof (`_jax_ragged_counts_proof`) read them.
+        if ctx.mod.layout in (:padded, :groups) && prefix == 0
             keys = _jax_row_length_keys(ctx, something(parts, [tail]), cell_scope, cell_params, args, axes)
             if keys !== nothing
                 key = parts === nothing ? something(outer(extent), lengths) : lengths
