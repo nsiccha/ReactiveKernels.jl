@@ -142,6 +142,14 @@ end
     @test slot.tape === longer
     @test RK._pr_take_tape!(nothing, 3) == zeros(3)
     @test RK._pr_return_tape!(nothing, zeros(3)) === nothing
+    # A released slot keeps nothing: every call allocates, a return is dropped.
+    released = RK._PlateTapeSlot()
+    RK._pr_release_tapes!((nothing, DifferentiationInterface.Cache((zeros(2), released))))
+    taken = RK._pr_take_tape!(released, 5)
+    @test taken == zeros(5)
+    RK._pr_return_tape!(released, taken)
+    @test isempty(released.tape) && released.tape === released.empty
+    @test RK._pr_take_tape!(released, 5) !== taken
 end
 
 @testset "one-pass gradients reuse the preparation's tape, $n cells" for (n, grouped_run) in
@@ -229,5 +237,89 @@ end
     prepared, idx, x = prepare_case(128, 32, false)
     @test isempty(tape_slots(prepared))
     check!(prepared, (fill(71., 3), Ref(81.)), q, 1.2, idx, x)
+end
+
+# Every tape slot reachable from a prepared operator: the one its cache table
+# owns and each shadow of it that a backend preparation keeps.
+function reachable_tape_slots!(found, @nospecialize(x), seen)
+    x isa Union{Module,Type,Method,Core.MethodInstance,Core.CodeInstance,Symbol,
+                AbstractString,Expr,Number,Nothing,Task,IO} && return found
+    isbitstype(typeof(x)) && return found
+    if ismutable(x)
+        x in seen && return found
+        push!(seen, x)
+    end
+    x isa RK._PlateTapeSlot && return push!(found, x)
+    if x isa Array
+        eltype(x) <: Union{Number,Symbol,AbstractString} && return found
+        for i in eachindex(x)
+            isassigned(x, i) && reachable_tape_slots!(found, x[i], seen)
+        end
+        return found
+    end
+    for i in 1:nfields(x)
+        isdefined(x, i) && reachable_tape_slots!(found, getfield(x, i), seen)
+    end
+    found
+end
+reachable_tape_slots(prepared) =
+    reachable_tape_slots!(RK._PlateTapeSlot[], prepared, Base.IdSet{Any}())
+
+function second_order_reference(q, s, idx, x, direction)
+    gradient, hvp = zeros(length(q)), zeros(length(q))
+    for i in eachindex(idx)
+        j = idx[i]
+        argument = s * q[j] + x[i]
+        gradient[j] += s * cos(argument)
+        hvp[j] -= s^2 * sin(argument) * direction[j]
+    end
+    gradient, hvp
+end
+
+# The outer pass of a Hessian-vector product differentiates the rule: it takes
+# the rule's decision to reuse a slot's vector from the slot, and zeroes and
+# fills its own shadow of that vector over the same length. The backend keeps
+# one shadow of the slot per preparation it holds (here one for the allocating
+# and one for the in-place product), each made at preparation. A shadow whose
+# vector is shorter than the slot's is written past its end by the next call
+# through its preparation, which no bounds check sees.
+@testset "a Hessian-vector operator's tape slot and its shadows hold vectors of one length, $n cells" for (n, run) in
+        ((128, 32), (257, 16))
+    q, direction = [.1, -.4, .3], [.2, -.7, 1.1]
+    idx = [mod1(div(i - 1, run) + 1, 3) for i in 1:n]
+    x = [sin(i / 3) / 2 for i in 1:n]
+    backend = SecondOrder(AutoEnzyme(; mode = Enzyme.Forward),
+                          AutoEnzyme(; mode = Enzyme.Reverse))
+    kernel = RK.with_bound_statistics(false) do
+        with_plate_reverse() do
+            prepare_nonallocating(prepare(gathered_then_log; bound = (; idx, x)), q, 1.2)
+        end
+    end
+    prepared = with_plate_reverse() do
+        prepare_ad_hvp(kernel, backend, (direction,), q, 1.2; active = :q)
+    end
+    owned = only(tape_slots(prepared))
+    lengths() = [length(slot.tape) for slot in reachable_tape_slots(prepared)]
+    @test any(slot -> slot === owned, reachable_tape_slots(prepared))
+    @info "tape slots of a Hessian-vector operator" n lengths = lengths()
+    @test allequal(lengths())
+    # With a shorter shadow the calls below would overwrite its neighbours.
+    if allequal(lengths())
+        for rep in 1:2, (point, scale, tangent) in (
+                (q, 1.2, direction), ([-.8, .6, 1.2], .7, [-.4, .1, .9]))
+            expected_g, expected_h = second_order_reference(point, scale, idx, x, tangent)
+            @test only(ad_hvp(prepared, (tangent,), point, scale)) ≈ expected_h rtol=3e-10 atol=3e-10
+            @test allequal(lengths())
+            g, (h,) = ad_gradient_and_hvp(prepared, (tangent,), point, scale)
+            @test g ≈ expected_g rtol=3e-10 atol=3e-10
+            @test h ≈ expected_h rtol=3e-10 atol=3e-10
+            @test allequal(lengths())
+            gradient, results = fill(71., 3), (fill(72., 3),)
+            ad_gradient_and_hvp!(prepared, gradient, results, (tangent,), point, scale)
+            @test gradient ≈ expected_g rtol=3e-10 atol=3e-10
+            @test only(results) ≈ expected_h rtol=3e-10 atol=3e-10
+            @test allequal(lengths())
+        end
+    end
 end
 end

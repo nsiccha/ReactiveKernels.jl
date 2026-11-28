@@ -16,6 +16,33 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.422
+
+A Hessian-vector product through a generated plate reverse no longer writes
+past the end of a vector. With the generated summed-plate reverse on
+(`with_plate_reverse`, preference `plate_reverse = "on"`), a non-allocating
+kernel keeps the one-pass tape of each plate rule in a slot of its
+preparation's cache table and reuses the vector at the next call when its
+length fits. `prepare_ad_hvp`, a third-order operator and every operator of a
+`SecondOrder` backend differentiate that rule with a second pass, which zeroes
+and fills its own shadow of the tape over the same length.
+DifferentiationInterface's Enzyme extension makes that shadow once per backend
+preparation, while the slot is empty, and a Hessian-vector operator holds two
+preparations: one for `ad_hvp` and `ad_gradient_and_hvp`, one for the in-place
+`ad_hvp!` and `ad_gradient_and_hvp!`. A tape that a call through one of them
+left in the slot was reused by a call through the other, whose shadow vector
+still had no elements, and that call wrote one number per tape entry past its
+end, into the next object on the heap. No bounds check sees such a write. The
+process then died at a later allocation or collection (`GC error (probable
+corruption)`, a segmentation fault in the collector, or a segmentation fault
+while a `TypeError` raised by `new` was printed), or went on with a damaged
+object.
+
+These operators now allocate the tape at every call, and the outer pass
+allocates its shadow beside it with the same length: two small vectors more
+per product for each plate rule. Gradients, pullbacks and pushforwards of a
+first-order backend keep their tape between calls as before.
+
 ## 0.1.421
 
 - In a native summed plate, a cell that holds a softplus runs as vector code

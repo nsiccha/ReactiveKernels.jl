@@ -2102,6 +2102,12 @@ _ad_operator_scalar_output(::Val{:hvp}) = true
 _ad_operator_scalar_output(::Val{:third}) = true
 _ad_operator_scalar_output(::Val{:pullback}) = false
 _ad_operator_scalar_output(::Val{:pushforward}) = false
+# Whether the generated plate rules of an operator's program keep their
+# one-pass tapes between calls (`_PlateTapeSlot`). A Hessian-vector or
+# third-order operator differentiates those rules with an outer pass; there
+# every call allocates its tape.
+_ad_operator_retains_tapes(::Val{O}, backend) where {O} =
+    !(O === :hvp || O === :third || backend isa DifferentiationInterface.SecondOrder)
 
 _ad_operator_preparation(::Val{:gradient}, call, backend, point, ::Tuple{}, contexts) =
     DifferentiationInterface.prepare_gradient(call, backend, point, contexts...)
@@ -2388,6 +2394,8 @@ function _prepare_ad_operator(op::Val{O}, kernel::_ADKernel, resolver,
                  retain, _ad_operator_seeding(op, seeds, backend)...)
     end
     call, point, contexts, active_selector, external_values = candidate
+    # Before the backend makes its shadows of the cache table.
+    _ad_operator_retains_tapes(op, backend) || _pr_release_tapes!(contexts)
     # The backend differentiates `call`: its code is what the level audits.
     _report_type_stability(
         values,
