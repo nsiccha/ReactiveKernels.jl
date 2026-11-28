@@ -3053,8 +3053,31 @@ end
 function _kernel_authored_scan(spec::KernelSpec, ::Val{A},
                                ::Val{I} = Val(false),
                                ::Val{H} = Val(false)) where {A,I,H}
-    kernel = prepare(spec)
+    kernel = _scan_split_shared(prepare(spec), A, H)
     _AuthoredScanOp{typeof(kernel),A,I,H}(kernel)
+end
+
+# The prepared scan step with each recipe that reads a step-varying value (the
+# carry, a sequence element, the `history` vector) split around its maximal
+# subexpressions that read only shared operands (closure captures and `Ref`
+# operands), as `bound=` partial evaluation splits around bound data
+# (`_partial_split_recipes`). Each such subexpression is then a recipe of its
+# own whose value is the same at every step, which the native lowerings run
+# once (`_authored_scan_invariant_locals`): `mu[rows]` in
+# `phi * carry + mu[rows][t]`. Branch arms, short-circuit operands,
+# generators and closures are not entered, and the parts apply the authored
+# operations to the same operands, so values are unchanged. `kernel` itself
+# when nothing splits.
+function _scan_split_shared(kernel, atomic, history::Bool)
+    p = kernel.plan
+    shared = Set{ValueId}(canon_id(p.graph, p.have[i].id)
+                          for i in 2:(length(p.have) - history) if i in atomic)
+    isempty(shared) && return kernel
+    readable = Dict{Int,Any}(q.id => source for (q, source) in
+                             zip(p.recipes, kernel.lowered_recipes))
+    split = _partial_split_recipes(p, shared, Set{Int}(), readable)
+    split === p && return kernel
+    _position_cell_kernel(split, readable)
 end
 
 # A dotted operator such as `.*` is broadcast *syntax*, not a bound function:
