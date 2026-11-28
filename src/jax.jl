@@ -2463,7 +2463,12 @@ function _jax_expr(ctx::_JaxContext, ::Val{:while}, ex)
     # every authored condition is evaluated exactly once.
     condition = _jax_bind!(ctx, :loop_test, _jax_expr(ctx, condition_ex))
     initial = [_jax_carry_value(ctx, ctx.locals[n]) for n in carried]
-    carry_code = "(" * join((v.code for v in initial), ", ") * ", " * condition.code * ")"
+    # An inactive lane enters with a false test and takes no step
+    # (`_jax_live_loop`). Its own test could otherwise hold forever there.
+    live = _jax_live_loop(ctx)
+    entry = live === nothing ? condition.code :
+        "jnp.logical_and(" * condition.code * ", jnp.any(" * live * "))"
+    carry_code = "(" * join((v.code for v in initial), ", ") * ", " * entry * ")"
     function loop_function(hint, build)
         fname = _jax_fresh(ctx, hint)
         carry = _jax_fresh(ctx, :carry)
@@ -2825,8 +2830,21 @@ function _jax_fori_call(ctx, args, carried, running; last_step = nothing)
     isnothing(running) && isnothing(last_step) && return "jax.lax.fori_loop(" * args * ")"
     _jax_helper!(ctx, "_rk_prefix_fori", _JAX_PREFIX_FORI)
     slot = isnothing(running) ? "None" : string(_jax_running_slot(carried, running))
-    "_rk_prefix_fori(" * args * ", " * slot * ", " * something(last_step, "None") * ")"
+    # The loop takes no step where its code is inactive (`_jax_live_loop`).
+    live = _jax_live_loop(ctx)
+    "_rk_prefix_fori(" * args * ", " * slot * ", " * something(last_step, "None") *
+        (live === nothing ? "" : ", " * live) * ")"
 end
+
+# The condition a loop's code runs under (a data-dependent branch arm, a
+# plate mask, a padded step), or nothing. Julia runs the loop only where it
+# holds, so elsewhere the loop's value is unused and it need not iterate.
+# Under `jax.vmap` JAX runs every arm of a branch whose condition differs
+# between lanes: without this an untaken arm's loop iterates on operands
+# it was never written for, to its own exit or its range's end (snag
+# transit-prefix-l-f232d82e: 3.3 million series steps per batched gradient
+# where the unbatched program took 165 thousand).
+_jax_live_loop(ctx::_JaxContext) = ctx.host === nothing ? _jax_active_condition(ctx) : nothing
 
 # A `for` over a range whose ends are data, `lo:hi`, taking a static number
 # of `steps` (`_jax_loop_range`): step `k` is a lazy branch, `jax.lax.cond`,

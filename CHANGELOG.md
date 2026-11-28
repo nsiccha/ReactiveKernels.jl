@@ -16,6 +16,28 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.412
+
+A JAX loop written inside a run-time branch takes no step for a `jax.vmap`
+lane that takes the other arm. `jax.vmap` evaluates both arms of a branch
+whose condition differs between chains or plate cells and selects. A loop with
+an exit or a padded length, or a `while` loop, in the arm a lane does not take
+used to iterate on that lane's operands anyway, to its own exit or to the end
+of its range. The emitted loop now receives the condition its code runs under:
+an enclosing branch, plate mask or padded step, or the one its helper was
+called under. A lane where that is false keeps the loop's initial values,
+which the branch discards. Selected values and derivatives are unchanged, as
+is the guarded scan that reverse AD differentiates.
+
+Measured on the emitted module of a 431-parameter transit-compartment model,
+with the condition added to its ten series and time-step loop calls (RTX 5060
+Ti, float64, card alone, host load 44 to 55, medians of 8 calls): the gradient
+under `jax.vmap` took 0.37 s for one chain and 0.47 s for 64, from 4.0 s and
+4.4 s, and the unbatched gradient 0.35 s, from 0.65 s, because the module's
+own plate cells select between arms as well. One batched gradient took 3.3
+million series steps before and 51 thousand after, with the same value and
+gradient.
+
 ## 0.1.411
 
 - The vector logarithm of a summed native plate (0.1.373) takes a sum of
