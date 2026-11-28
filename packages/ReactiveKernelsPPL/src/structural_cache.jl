@@ -67,10 +67,15 @@ function _structural_cache(plan::StructuralPlan)
     anchor = plan.assignments
     id = objectid(anchor)
     lock(_STRUCTURAL_CACHES_LOCK) do
-        bucket = get!(Vector{Tuple{WeakRef,_StructuralCache}}, _STRUCTURAL_CACHES, id)
-        for (ref, cache) in bucket
+        for (ref, cache) in get(_STRUCTURAL_CACHES, id, ())
             ref.value === anchor && return cache
         end
+        # A build of a plan no binding registered (a copy, a plan made directly)
+        # keeps its analyses for that build only (`_with_build_structural_cache`).
+        scratch = get(task_local_storage(), _BUILD_STRUCTURAL_CACHES, nothing)
+        scratch === nothing ||
+            return get!(_StructuralCache, scratch::IdDict{Any,_StructuralCache}, anchor)
+        bucket = get!(Vector{Tuple{WeakRef,_StructuralCache}}, _STRUCTURAL_CACHES, id)
         cache = _StructuralCache()
         push!(bucket, (WeakRef(anchor), cache))
         # Drop the caches of collected lowerings now and then.
@@ -173,12 +178,26 @@ function _structural_key(cache::_StructuralCache, plan::StructuralPlan;
     return (_structure_fields(plan), cols, n_obs ? plan.n_obs : nothing)
 end
 
-# The cache serves `bind_data`, whose input is a finished lowering. Lowering
-# itself fills its tables as it goes, so outside binding every analysis
-# computes afresh.
+# The cache serves `bind_data`, whose input is a finished lowering, and
+# `build_kernel`, whose input is a finished binding
+# (`_with_build_structural_cache`). Lowering itself fills its tables as it
+# goes, so everywhere else every analysis computes afresh.
 _structural_enabled() = get(task_local_storage(), :rkppl_structural_cache, false)::Bool
 _with_structural_cache(f) = _structural_enabled() ? f() :
     task_local_storage(f, :rkppl_structural_cache, true)
+
+# `build_kernel` takes a bound plan, a finished binding like `bind_data`'s
+# input, so it reads the analyses its plan's binding computed and computes
+# each further one once. The table of process-wide caches holds a cache until
+# its periodic sweep, and a cache's keys hold plan fields (a frozen record
+# among them). A build therefore registers no cache: it uses the one a binding
+# registered for its plan, or else one that lives for this build only, so a
+# build keeps nothing of a fit alive that its binding did not.
+const _BUILD_STRUCTURAL_CACHES = :rkppl_build_structural_caches
+_with_build_structural_cache(f) = _structural_enabled() ? f() :
+    task_local_storage(_BUILD_STRUCTURAL_CACHES, IdDict{Any,_StructuralCache}()) do
+        task_local_storage(f, :rkppl_structural_cache, true)
+    end
 
 const _UNCACHED = gensym(:uncached)
 

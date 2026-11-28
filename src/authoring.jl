@@ -562,7 +562,7 @@ Base.@nospecializeinfer function _kernel_add!(
         pack_source = Expr(:tuple, (value.name for value in hidden)...)
         _add_recipe!(graph, hidden, (packed,), _kernel_tuple_pack,
                      cost, nothing, false, pack_source)
-        return _reindex_producers!(graph)
+        return _reindex_rerooted_producers!(graph)
     end
     # A single-output child returns its one value, so `(a,) = child(x)` binds
     # that value's first element, as for any other right side.
@@ -570,7 +570,7 @@ Base.@nospecializeinfer function _kernel_add!(
         whole = value!(graph, gensym(:nested_output), valtype(only(child_outputs)))
         _kernel_add!(graph, call_inputs, (whole,), spec, cost, cse_key, effectful, source)
         _kernel_add_first!(graph, whole, only(outs))
-        return _reindex_producers!(graph)
+        return _reindex_rerooted_producers!(graph)
     end
     # Julia's `(a,) = t` binds the leading elements and ignores the rest. The
     # unnamed trailing outputs become hidden values, so the planner still
@@ -661,7 +661,9 @@ Base.@nospecializeinfer function _kernel_add!(
     # The child's input checks follow its values: one runs in a cut that takes
     # the caller's actual as an input.
     _kernel_clone_checks!(graph, cloned, child_graph)
-    _reindex_producers!(graph)
+    # The splice added aliases and recipes only, so the producer index is stale
+    # only where an alias moved a class that already had producers.
+    _reindex_rerooted_producers!(graph)
 end
 
 # A SINGLE-DEFINITION bare-identity recipe `b = a` (RHS a bare port, not a call) makes `b` a
@@ -6374,12 +6376,13 @@ function _kernel_clone_value_map!(graph::Graph, ports::Dict{Symbol,Value},
 end
 
 function _kernel_clone_recipes!(graph::Graph, mapped::Dict{ValueId,Value},
-                                spec::KernelSpec)
+                                spec::KernelSpec,
+                                keyed::Union{Nothing,_KeyedRecipes} = nothing)
     for recipe in spec.graph.recipes
         ins = Tuple(mapped[value.id] for value in recipe.inputs)
         outs = Tuple(mapped[value.id] for value in recipe.outputs)
         _add_recipe!(graph, ins, outs, recipe.op, recipe.cost,
-             _kernel_provenance_key(recipe), recipe.effectful, recipe.source)
+             _kernel_provenance_key(recipe), recipe.effectful, recipe.source, keyed)
     end
     graph
 end
@@ -6455,37 +6458,60 @@ with the fragment boundary.
 function Base.merge(base::KernelSpec, fragment::KernelSpec; boundary::Symbol = :base)
     boundary in (:base, :fragment) || throw(ArgumentError(
         "kernel merge boundary must be :base or :fragment, got $(repr(boundary))"))
+    _kernel_merge((base, fragment), boundary === :base ? base : fragment)
+end
 
-    shared = sort!(collect(intersect(keys(base.ports), keys(fragment.ports))))
-    for name in shared
-        left = valtype(base.ports[name])
-        right = valtype(fragment.ports[name])
-        left == right || throw(ArgumentError(
-            "cannot merge kernel port :$name: base type $left does not match fragment type $right"))
-    end
-
+# One fresh graph with the recipes of every spec, in order, and the boundary of
+# `chosen`. Each spec is cloned once: merging them pairwise instead clones the
+# first again for every later one. A spec's type names its call signature, so
+# this is not compiled again for every combination of specs.
+Base.@nospecializeinfer function _kernel_merge(
+        @nospecialize(specs::Tuple{Vararg{KernelSpec}}), @nospecialize(chosen::KernelSpec))
     graph = Graph()
     ports = Dict{Symbol,Value}()
     order = Symbol[]
-    for spec in (base, fragment), name in spec.port_order
-        haskey(ports, name) && continue
-        _kernel_declare!(graph, ports, order, name, valtype(spec.ports[name]))
+    for position in eachindex(specs)
+        spec = specs[position]::KernelSpec
+        spec_ports = getfield(spec, :ports)
+        # A later spec joins the ports declared so far. The second spec joins
+        # the first spec's own ports.
+        known = position == 2 ? getfield(specs[1]::KernelSpec, :ports) : ports
+        if position > 1
+            for name in sort!(collect(intersect(keys(known), keys(spec_ports))))
+                left = valtype(known[name])
+                right = valtype(spec_ports[name])
+                left == right || throw(ArgumentError(
+                    "cannot merge kernel port :$name: base type $left does not match fragment type $right"))
+            end
+        end
+        for name in getfield(spec, :port_order)
+            haskey(ports, name) && continue
+            _kernel_declare!(graph, ports, order, name, valtype(spec_ports[name]))
+        end
     end
-    base_values = _kernel_clone_value_map!(graph, ports, base)
-    fragment_values = _kernel_clone_value_map!(graph, ports, fragment)
+    values = Dict{ValueId,Value}[]
+    for spec in specs
+        push!(values, _kernel_clone_value_map!(graph, ports, spec))
+    end
     # Boundary/internal aliases must be established before recipe insertion so
     # provenance CSE sees the final canonical inputs.
-    _kernel_clone_aliases!(graph, base_values, base)
-    _kernel_clone_aliases!(graph, fragment_values, fragment)
-    _kernel_clone_recipes!(graph, base_values, base)
-    _kernel_clone_recipes!(graph, fragment_values, fragment)
-    _kernel_clone_checks!(graph, base_values, base.graph)
-    _kernel_clone_checks!(graph, fragment_values, fragment.graph)
+    for position in eachindex(specs)
+        _kernel_clone_aliases!(graph, values[position], specs[position])
+    end
+    # Every recipe of the new graph is cloned here, each under its provenance
+    # key: look an earlier recipe with that key up by the key.
+    keyed = _KeyedRecipes()
+    for position in eachindex(specs)
+        _kernel_clone_recipes!(graph, values[position], specs[position], keyed)
+    end
+    for position in eachindex(specs)
+        _kernel_clone_checks!(graph, values[position],
+            getfield(specs[position]::KernelSpec, :graph))
+    end
     _kernel_reindex_producers!(graph)
 
-    chosen = boundary === :base ? base : fragment
-    KernelSpec(graph, ports, order, copy(chosen.have_names), copy(chosen.want_names),
-               chosen.call_signature)
+    KernelSpec(graph, ports, order, copy(getfield(chosen, :have_names)),
+               copy(getfield(chosen, :want_names)), getfield(chosen, :call_signature))
 end
 
 """
@@ -6500,14 +6526,7 @@ function compose(first::KernelSpec, rest::KernelSpec...; boundary::Symbol = :bas
     boundary in (:base, :fragment) || throw(ArgumentError(
         "kernel composition boundary must be :base or :fragment, got $(repr(boundary))"))
     isempty(rest) && return Base.merge(first, @kernel(begin end); boundary = :base)
-    combined = first
-    for fragment in rest
-        combined = Base.merge(combined, fragment; boundary = :base)
-    end
-    boundary === :base && return combined
-    last = rest[end]
-    KernelSpec(combined.graph, combined.ports, combined.port_order,
-               copy(last.have_names), copy(last.want_names), last.call_signature)
+    _kernel_merge((first, rest...), boundary === :base ? first : rest[end])
 end
 
 """
@@ -6565,7 +6584,7 @@ Base.@nospecializeinfer function rename(@nospecialize(spec::KernelSpec),
     end
     values = _kernel_clone_value_map!(graph, new_ports, spec, port_name)
     _kernel_clone_aliases!(graph, values, spec)
-    _kernel_clone_recipes!(graph, values, spec)
+    _kernel_clone_recipes!(graph, values, spec, _KeyedRecipes())
     _kernel_clone_checks!(graph, values, spec.graph)
     _kernel_reindex_producers!(graph)
     KernelSpec(graph, new_ports, new_order,
