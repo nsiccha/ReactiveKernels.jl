@@ -10383,6 +10383,7 @@ function _jax_module_text(plans, types, constants, docstring::String, prepare;
                                       [mod.helpers; bodies])
     if host
         header = rstrip(_JAX_HOST_HEADER) * "\n" * header
+        haskey(mod.helper_names, (:helper, "PreparedData")) && (header = "import collections.abc\n" * header)
         any(b -> occursin("scipy.linalg.", b), [mod.helpers; bodies]) &&
             (header = "import scipy.linalg\n" * header)
     end
@@ -10600,6 +10601,7 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
         append!(prepared_names, (name for (name, _, _) in bounds))
         prepared_types = Any[prepared_types; types]
     end
+    bodies[prepare_body] = _jax_packed_return(mod, bodies[prepare_body])
     meta = (INPUTS = Tuple(first(io) for io in functions[2].inputs),
             PREPARED = [n => _jax_input_metadata(T)
                         for (n, T) in zip(prepared_names, prepared_types)])

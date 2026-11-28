@@ -10,7 +10,10 @@ sys.path.insert(0, sys.argv[1])
 import dense
 import rows
 
-data = dense.prepare_data(x=np.array([2., -1., 3.]))
+# A caller's own plain dict of writable arrays (the prepared data themselves
+# are read-only): the binding snapshots it, so a later edit changes nothing.
+data = {name: np.array(value) if isinstance(value, np.ndarray) else value
+        for name, value in dense.prepare_data(x=np.array([2., -1., 3.])).items()}
 points = np.array([.5, 1.5])
 with patch.object(dense, "_rk_layout_variants", side_effect=AssertionError("unsolicited tuning")):
     bound = dense.bind_gradient(dense.kernel, data, device=jax.local_devices()[0])

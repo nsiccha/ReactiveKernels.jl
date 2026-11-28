@@ -16,6 +16,20 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.421
+
+**Breaking:** a `jax_source` module's `prepare_data` returns a `PreparedData`
+instead of a dict, and so do its `prepare_plate_layout` and
+`prepare_guarded_reads`. It reads like the dict did (`prepared["x"]`, `.get`,
+`.items()`, `f(u, **prepared)`), and `dict(prepared)` gives that dict. As a JAX
+pytree it is one flat array per dtype, so a jitted function that takes the
+prepared data as one argument (`jax.jit(lambda u, d: f(u, **d))(u, prepared)`)
+passes a few arrays instead of one per prepared value, each of which costs time
+on every call. It cannot be changed in place: assigning an item raises
+`TypeError`, and a prepared array is read-only. Build a new one with
+`PreparedData({**prepared, name: value})`, or edit `dict(prepared)`.
+`bind_gradient` packs a plain dict it is given.
+
 ## 0.1.420
 
 The rows of a cell's sum over `vcat(a, b, ...)` are each operand's rows in

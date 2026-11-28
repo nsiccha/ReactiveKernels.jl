@@ -58,7 +58,7 @@ end
     # `prepare_data` takes the data by their own names; only `x` is a
     # parameter, the others are read from `**data` into respelled locals.
     @test Set(inputs(src, "prepare_data")) == Set(["class", "lambda", "id", "x"])
-    @test occursin("def prepare_data(x: ArrayLike, **data: ArrayLike) -> dict:", text)
+    @test occursin("def prepare_data(x: ArrayLike, **data: ArrayLike) -> PreparedData:", text)
     @test occursin("_rk_keyword_inputs(data, (", text)
     # The functions read `**prepared` by the same names.
     kernel_inputs = inputs(src, "kernel")

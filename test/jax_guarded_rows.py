@@ -52,7 +52,8 @@ def reference(tables, weights, groups):
 
 def functions(n, w, groups):
     lengths = np.full(n, w, dtype=np.int64)
-    prepared = bound.prepare_data(groups=groups)
+    # A plain dict copy: the prepared data are read-only (PreparedData).
+    prepared = dict(bound.prepare_data(groups=groups))
     # A padding cell may name a row that no table has. Only its activity
     # flag, from the lengths, keeps it from reading one.
     for key, spec in bound.PREPARED.items():

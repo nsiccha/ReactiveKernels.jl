@@ -29,6 +29,10 @@ def bind_gradient(density, prepared, *, device=None, memory_budget_bytes=None):
     # caller later edits a host array. JAX arrays already have value semantics.
     immutable = {id(x): x for x in jax.tree_util.tree_leaves(prepared) if isinstance(x, jax.Array)}
     data = deepcopy(prepared, immutable)
+    # The compiled program takes the data as a few flat arrays, also when the
+    # caller passes a plain dict.
+    if not isinstance(data, PreparedData):
+        data = PreparedData(data)
     measure, layout_variants = _MEASURE_LAYOUT, _LAYOUT_VARIANTS
     confirm_layouts = _CONFIRM_LAYOUTS
     programs = {}
