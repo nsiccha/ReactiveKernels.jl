@@ -1648,7 +1648,10 @@ function _pr_factored_sweep!(out, fc::_PRFactored, stmts, adj, mutable, toplevel
             # Ordinary AD already has the joint rule for an owned scalar.
             # A source cut, or an exponential reused by its slope, can save
             # work across the two sweeps even with a full-size row buffer.
-            st.shared_cell_work |= s.f === exp || s.f === expm1 ||
+            # The exponential is asked by `_rw_is_exp`, which knows every name
+            # a native program calls it by: a scalar one in a cell is
+            # `_native_scalar_exp`, not `exp`.
+            st.shared_cell_work |= _rw_is_exp(s.f) || s.f === expm1 ||
                 (haskey(cuts, s.lhs) && !(s.f isa ScalarDerivativeRule))
             for (k, (a, p)) in enumerate(zip(s.args, partials))
                 a isa Symbol && a in active || continue

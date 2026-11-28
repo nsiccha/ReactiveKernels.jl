@@ -16,6 +16,21 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.411
+
+- The opt-in generated reverse of summed plates (`with_plate_reverse`, the
+  `plate_reverse` preference) again counts a cell's exponential as work its
+  value and its slope share. Such work lets a plate take the one pass below
+  128 cells, with a buffer per row, or with scalar cotangents only. The test
+  for it named `exp`, and since 0.1.371 a native program calls the
+  exponential of a number `_native_scalar_exp`, so no cell met it: a Poisson
+  regression `y .~ Poisson.(exp.(a .+ b .* x))` was left to the backend at
+  every size, and one with a group effect below 128 rows. The test now asks
+  the predicate the stable rewrites use for every name of the exponential.
+  `benchmark/near_miss/plate_reverse_shapes.jl` reports, for ten model shapes,
+  which plates take a one-pass tape and the gradient time with the generated
+  reverse on against off.
+
 ## 0.1.410
 
 - The vector logarithm of a summed native plate (0.1.373) takes a sum of
