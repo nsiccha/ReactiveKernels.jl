@@ -10605,7 +10605,8 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
         append!(prepared_names, (name for (name, _, _) in bounds))
         prepared_types = Any[prepared_types; types]
     end
-    bodies[prepare_body] = _jax_packed_return(mod, bodies[prepare_body])
+    bodies[prepare_body] = _jax_packed_return(mod, bodies[prepare_body],
+                                              _jax_prepared_scalars(prepared_names, prepared_types))
     meta = (INPUTS = Tuple(first(io) for io in functions[2].inputs),
             PREPARED = [n => _jax_input_metadata(T)
                         for (n, T) in zip(prepared_names, prepared_types)])

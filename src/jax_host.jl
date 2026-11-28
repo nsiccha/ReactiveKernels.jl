@@ -1955,15 +1955,27 @@ Base.include_dependency(joinpath(@__DIR__, "jax_prepared_data.py"))
 const _JAX_PREPARED_DATA = read(joinpath(@__DIR__, "jax_prepared_data.py"), String)
 
 # `prepare_data`'s body `body` with its final `return <dict>` returning that
-# dict as `PreparedData`.
-function _jax_packed_return(mod::_JaxModule, body::AbstractString)
+# dict as `PreparedData`. `scalars` names the prepared scalars of a numeric
+# type with their dtypes, as `PREPARED` declares them: a Python number passed
+# through as one is packed at that dtype instead of staying a leaf of its own
+# (decision `1y10hhp`). Every `PreparedData` the module builds reads them from
+# `_RK_PREPARED_SCALARS`, the layout functions' copies and `bind_gradient`'s
+# included.
+function _jax_packed_return(mod::_JaxModule, body::AbstractString, scalars::AbstractVector{<:Pair})
     lines = split(body, "\n")
     m = match(r"^    return (.+)$", lines[end])
     m === nothing && error("prepare_data does not end in its return")
     _jax_module_helper!(mod, "PreparedData", _JAX_PREPARED_DATA)
+    _jax_module_helper!(mod, "_RK_PREPARED_SCALARS", "_RK_PREPARED_SCALARS = " * _jax_py_literal(scalars))
     lines[end] = "    return PreparedData(" * m.captures[1] * ")"
     join(lines, "\n")
 end
+
+# The prepared scalars a Python number can pack into: `PREPARED`'s entries of
+# rank 0 whose type is a Julia `Bool`, integer or float, with their dtypes.
+_jax_prepared_scalars(names, types) = Pair{String,String}[
+    n => _jax_dtype_name(T) for (n, T) in zip(names, types)
+    if T isa Type && T <: Union{Bool,Integer,AbstractFloat} && _jax_dtype_name(T) != "object"]
 
 # Static bounds of prepared integer arrays, for ranges whose ends are their
 # entries (`_jax_trip_bound`): `prepare_data` returns them with the data. An

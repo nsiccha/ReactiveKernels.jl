@@ -21,6 +21,11 @@ end
     @test occursin("\nimport collections.abc\n", src.text)
     @test occursin(r"\n    return PreparedData\(", src.text)
     @test occursin("-> PreparedData:", src.text)
+    # A Python number passed through as data is packed at the dtype PREPARED
+    # declares for it, the module's float type in a float32 module (decision `1y10hhp`).
+    @test occursin(r"\n_RK_PREPARED_SCALARS = \{[^\n]*\"s\": \"float64\"", src.text)
+    src32 = jax_source(prepared_rows; have, data, functions = (score = :score,), float_type = Float32)
+    @test occursin(r"\n_RK_PREPARED_SCALARS = \{[^\n]*\"s\": \"float32\"", src32.text)
     native = prepare(prepared_rows; have, want = :score)
     w = 0.3
     expected = native(w, data.x, data.k, data.s)
@@ -42,8 +47,12 @@ assert set(rows.PREPARED) <= set(names), (names, list(rows.PREPARED))
 leaves = jax.tree_util.tree_leaves(prepared)
 plain = dict(prepared)
 assert len(leaves) < len(jax.tree_util.tree_leaves(plain)), (len(leaves), len(jax.tree_util.tree_leaves(plain)))
-arrays = [l for l in leaves if np.ndim(l) > 0]
-assert len(set(l.dtype for l in arrays)) == len(arrays), [l.dtype for l in arrays]
+# One array per dtype, the Python-float data input `s` included.
+assert all(isinstance(l, np.ndarray) for l in leaves), leaves
+assert len(set(l.dtype for l in leaves)) == len(leaves), [l.dtype for l in leaves]
+assert type(prepared["s"]) is float and prepared["s"] == $(data.s)
+traced = jax.jit(lambda d: d["s"])(prepared)
+assert traced.dtype == np.float64 and not traced.weak_type, (traced.dtype, traced.weak_type)
 expected, slope = $(expected), $(slope)
 vg = jax.value_and_grad(lambda w, d: rows.score(w, **d))
 for data in (prepared, plain, jax.device_put(prepared), jax.tree_util.tree_map(np.asarray, prepared),
@@ -68,7 +77,8 @@ try:
 except ValueError:
     pass
 edited = rows.PreparedData({**prepared, "s": 2.0})
-assert edited["s"] == 2.0 and isinstance(edited, rows.PreparedData)
+assert edited["s"] == 2.0 and type(edited["s"]) is float and isinstance(edited, rows.PreparedData)
+assert len(jax.tree_util.tree_leaves(edited)) == len(leaves)
 print("PREPARED_DATA_CHECKED")
 """)
             out = read(Cmd(`$RK_JAX_PYTHON check.py`; dir), String)
