@@ -2112,6 +2112,7 @@ def _rk_match_count(values, lengths, target):
         matches &= np.arange(matches.shape[-1]) < np.asarray(lengths)[:, None]
     return StaticInt(int(np.count_nonzero(matches, axis=-1).max(initial=0)))
 """),
+    :row_groups => ("_rk_row_groups", _JAX_ROW_GROUPS),
     :sign_groups => ("_rk_sign_groups", """
 def _rk_sign_groups(values):
     x = np.asarray(values)

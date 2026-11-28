@@ -55,6 +55,25 @@ first NaN wins and positive zero sorts above negative zero. An evaluated
 
 With Statistics loaded (`ReactiveKernelsStatisticsExt`, RK 0.1.262), `mean(x)`, `mean(f, x)`, `var(x)` and `std(x)` translate, with the keywords `dims` (one integer known while JAX traces, or `:`), and for `var` and `std` also `corrected` (a literal `true` or `false`) and `mean`. Each is the core `sum`, `length` and `size` translation it composes, `sum(x) / length(x)` and `sum(abs2.(x .- m)) / (n - corrected)`, so a padded row or a `dims` reduction reads only its valid entries and `prepare_data` takes NumPy's spelling. Over `dims` the reduced axis keeps length one, as in Julia. An empty argument, or one entry with `corrected`, gives Julia's NaN. Before, Statistics' own methods, which branch, were refused as "the function `_mean` has loops or branches".
 
+## Rows read at a prepared index
+
+A row-wise product of a matrix with rows of a table read at a prepared
+integer index, `vec(sum(A .* table[k, :]; dims=2))` or
+`sum(table[k, :] .* A; dims=2)` (BRM's grouped HSGP term reads each row's
+group coefficients this way), has a grouped translation. When the index's
+groups average at least 16 rows, `prepare_data` groups its rows by the table
+row they read, in blocks of 16 rows. The compiled function reads each
+block's table row once, multiplies it with the block's rows of `A` and
+returns the sums in the original row order. Its reverse adds one row of
+cotangents per block instead of one per row, which under `jax.vmap` over
+many chains replaces most of an atomic scatter-add. Smaller groups keep the
+literal gather, and `prepare_data` passes no extra arrays for them, so
+their functions compile the same program as before. Values agree with the literal product up to the order
+of each sum's terms; an index outside the table reads what the literal gather reads.
+An `A` that broadcasts against the gathered rows, and an index the
+functions compute, keep the literal translation. Native preparation is
+unchanged.
+
 ## Package translations
 
 A package extension can map its own callable during source emission. Julia execution is unchanged; ordinary `jax.grad` differentiates the emitted primal without a registered derivative rule.
