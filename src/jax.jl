@@ -7153,8 +7153,11 @@ function _jax_scalar_jvp!(ctx, name, N, Cuts, calls; guarded = false)
         cutname, outputs = calls[mask]
         ret = Cuts[mask][3]
         indices = [i for i in 1:N if (mask >> (i - 1)) & 1 == 1]
+        tangent(i) = guarded ?
+            _jax_helper!(ctx, "_rk_cell_tangent", _JAX_CELL_TANGENT) * "(selected, tangents[" * string(i - 1) * "])" :
+            "tangents[" * string(i - 1) * "]"
         terms = ["values[" * string(findfirst(==(ret[k + 1]), outputs) - 1) *
-                 "] * tangents[" * string(i - 1) * "]" for (k, i) in enumerate(indices)]
+                 "] * " * tangent(i) for (k, i) in enumerate(indices)]
         call = guarded ? _jax_selected_cut!(ctx, cutname) * "(selected, demand, *args)" :
                          cutname * "(*primals)"
         append!(lines, ["    if mask == " * string(mask) * ":",
