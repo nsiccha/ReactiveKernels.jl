@@ -236,8 +236,9 @@ function _pr_flatten!(stmts::Vector{Any}, ex, ctx::_PRCtx)
 end
 
 # A stable-rewrite helper call (`_rk_log_of(_native_exp, u)`, emitted by
-# `src/stable_rewrites.jl`) expanded into the body of the method its operands
-# select, read from Julia's lowered code of that method: the helper is its own
+# `src/stable_rewrites.jl`), or the twin a vector loop calls in its place
+# (`_vector_log_of`, `src/vector_cells.jl`), expanded into the body of the
+# method its operands select, read from Julia's lowered code of that method: the helper is its own
 # single source, and the primitives of its stable form (`float`, `log1pexp`,
 # `expm1`, …) take their partials as any other call does. An operand the
 # generator cannot type is a cell value, which this generator takes to be a
@@ -245,7 +246,8 @@ end
 # `nothing` for any other call, and for a method body with control flow, which
 # then keeps the helper call (and fails only if its derivative is needed).
 function _pr_expand_stable_helper(f, argexprs, ctx::_PRCtx)
-    f isa Function && any(h -> h === f, _RK_STABLE_HELPERS) || return nothing
+    f isa Function && (any(h -> h === f, _RK_STABLE_HELPERS) || any(h -> h === f, _RK_VECTOR_HELPERS)) ||
+        return nothing
     types = Any[_pr_operand_type(a, ctx) for a in argexprs]
     match = Base._which(Tuple{typeof(f),types...})
     cis = Base.code_lowered(f, Tuple{types...})

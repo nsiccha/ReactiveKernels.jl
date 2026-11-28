@@ -188,14 +188,14 @@ mutable_exp = exp
     sum_expr = :($(ref(Base,:log))($(ref(Base,:+))($(ref(Base,:+))(
         $(ref(Base,:exp))(x), $(ref(Base,:exp))(y)), $(ref(Base,:exp))(z))))
     body = Expr(:block, sum_expr)
-    transformed = RK._vectorize_cell_logs(body)
+    transformed = RK._vectorize_cell(body)
     @test (transformed !== body) == (RK._vector_doubles() >= 2)
     kernel = RK.compile(Expr(:function, Expr(:tuple, :x, :y, :z), transformed))
     # A global variable can be rebound between preparation and evaluation.
     mutable_call = Expr(:call, ref(@__MODULE__, :mutable_exp), :x)
     mixed = Expr(:block, Expr(:call, ref(Base, :log),
         Expr(:call, ref(Base, :+), mutable_call, Expr(:call, ref(Base, :exp), :y))))
-    @test RK._vectorize_cell_logs(mixed) === mixed
+    @test RK._vectorize_cell(mixed) === mixed
 
     trace = Int[]
     @test kernel((LoggedOperand(i, trace) for i in 1:3)...) === -1.0
@@ -216,7 +216,7 @@ mutable_exp = exp
     # order are the written expression's.
     flat_body = Expr(:block, :($(ref(Base,:log))($(ref(Base,:+))(
         $(ref(Base,:exp))(x), $(ref(Base,:exp))(y), $(ref(Base,:exp))(z)))))
-    flat_transformed = RK._vectorize_cell_logs(flat_body)
+    flat_transformed = RK._vectorize_cell(flat_body)
     @test (flat_transformed !== flat_body) == (RK._vector_doubles() >= 2)
     written, rewritten = map((flat_body, flat_transformed)) do body
         RK.compile(Expr(:function, Expr(:tuple, :x, :y, :z), body))
@@ -241,11 +241,11 @@ mutable_exp = exp
     for left in (true, false)
         for c in (-0.25, -0.0, -1)
             body = product(c, left)
-            @test RK._vectorize_cell_logs(body) === body
+            @test RK._vectorize_cell(body) === body
         end
         for c in (0.25, 0.0, 2, 0x02, 0.5f0)
             body = product(c, left)
-            transformed = RK._vectorize_cell_logs(body)
+            transformed = RK._vectorize_cell(body)
             @test (transformed !== body) == (RK._vector_doubles() >= 2)
             written, rewritten = map((body, transformed)) do b
                 RK.compile(Expr(:function, Expr(:tuple, :x, :y), b))

@@ -136,9 +136,14 @@ isdefined(@__MODULE__, :InnerPlateSplit) ||
         bound = prepare(C.nested; have = (:q, :y, :n), want = :total, bound = (; y, n))
         @test C.calls[] == 2length(y)
         @test only(caches(bound.plan)).op.value == log.(n .+ 1.0) .- log.(y .+ 1.0)
-        @test bound(q) == expected
+        # With both data terms cached, the cell is a softplus beside
+        # arithmetic, which the compiler makes vector code of: its softplus
+        # is the vector one, a unit in the last place per cell from the
+        # scalar one that the program without bound data keeps beside
+        # `counted_term`.
+        @test bound(q) ≈ expected rtol = 4 * eps()
         @test C.calls[] == 2length(y)
-        @test gradient(bound, q) == gradient(plain, q, y, n)
+        @test gradient(bound, q) ≈ gradient(plain, q, y, n) rtol = 4 * eps()
         # With `y` alone bound, its own term is the maximal node.
         C.calls[] = 0
         partly = prepare(C.nested; have = (:q, :y, :n), want = :total, bound = (; y))

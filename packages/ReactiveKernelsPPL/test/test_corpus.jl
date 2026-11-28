@@ -146,6 +146,11 @@ function _canon(io::IO, x, depth::Int = 0, names = nothing)
         # metadata, pinned by `test_authored_names.jl`.
         x isa StructuralPlan &&
             (fs = filter(!=(:named_values), fs))
+        # The author's program that native draws run is what lowering was
+        # given, in the spelling it was written in, so two spellings of one
+        # plan differ in it. `test_generation.jl` pins it.
+        x isa StructuralPlan &&
+            (fs = filter(!=(:draw_source), fs))
 
         if isempty(fs)
             print(io, repr(x))
@@ -271,6 +276,11 @@ end
     @test occursin("array_parameters=[]", sprint(_canon, plain))
     held = ReactiveKernelsPPL._with(plain; frozen = FrozenValues((m = 1.5,), (;)))
     @test occursin("frozen=FrozenValues(values=(m=1.5) inputs=())", sprint(_canon, held))
+
+    # Every lowered plan holds the author's program for native draws. The
+    # canonical form leaves it out, so a plan written two ways compares equal.
+    @test plain.draw_source !== nothing
+    @test !occursin("draw_source=", sprint(_canon, plain))
 end
 
 @testset "corpus field tables" begin
