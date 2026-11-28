@@ -204,7 +204,9 @@ def whiles(f, *args):
 control = whiles(lambda x: jax.lax.scan(lambda c, v: (c * v, c), 1.0, x)[1], jnp.ones(3))
 assert control == 1, control
 prepared = m.prepare_data(**raw_data(ARGS))
-positions = np.tile(np.asarray(sys.argv[3].split(","), dtype=np.float64), (4, 1))
+# A one-dimensional factor has no partials: its position is empty.
+position = np.asarray([float(v) for v in sys.argv[3].split(",") if v], dtype=np.float64)
+positions = np.tile(position, (4, 1))
 step = jax.vmap(jax.value_and_grad(lambda p, d: m.log_density(p, **d)), in_axes=(0, None))
 print(whiles(step, positions, prepared))
 """)
