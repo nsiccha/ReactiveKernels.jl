@@ -252,7 +252,7 @@ def _rk_scan_cell_rows(cell, args, mapped, columns, index, requested, length, ca
 # by _rk_scan_cell_rows. Its guard sequence is at least as wide as the scan,
 # including when the plate has been split into groups.
 const _JAX_PREPARE_GUARDED_READS = raw"""
-def prepare_guarded_reads(prepared: dict, mode: str) -> dict:
+def prepare_guarded_reads(prepared: PreparedData, mode: str) -> PreparedData:
     \"\"\"Choose how eligible guarded scan reads obtain their producer rows.
 
     "compact" computes requested rows. "dense" gathers from the
@@ -268,7 +268,7 @@ def prepare_guarded_reads(prepared: dict, mode: str) -> dict:
                     _rk_match_count(values, prepared[lengths] if lengths else None, target))
         if capacity != prepared[bound]:
             changed[bound] = capacity
-    return {**prepared, **changed} if changed else prepared
+    return PreparedData({**prepared, **changed}) if changed else prepared
 """
 
 function _jax_direct_record_key(ctx, v)

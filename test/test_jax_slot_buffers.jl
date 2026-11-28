@@ -254,7 +254,7 @@ labelsets = [np.asarray(x, dtype=np.int64) for x in cases]
 ratesets = [-0.2 + 0.02*np.arange(len(x)) for x in cases]
 for module, data in ((ragged, dict(labelsets=labelsets)),
                      (derived, dict(rawsets=[x.astype(float) for x in labelsets]))):
-    prepared = module.prepare_data(**data)
+    prepared = dict(module.prepare_data(**data))
     rates, prepared['ratesets_lengths'], prepared['ratesets_flat'] = module._rk_pad_rows(ratesets, np.float64)
     np.testing.assert_allclose(jax.jit(module.score)(0.4, rates, **prepared), sum(expected), rtol=1e-10)
     np.testing.assert_allclose(jax.jit(jax.grad(module.score))(0.4, rates, **prepared), sum(gradients), rtol=1e-8)
@@ -262,14 +262,14 @@ for module, data in ((ragged, dict(labelsets=labelsets)),
     for row, expected_row in zip(actual, rate_gradients):
         np.testing.assert_allclose(row[:len(expected_row)], expected_row, rtol=1e-8, atol=1e-12)
         np.testing.assert_allclose(row[len(expected_row):], 0., atol=1e-12)
-prepared = ragged.prepare_data(labelsets=[np.array([], dtype=np.int64)] * 3)
+prepared = dict(ragged.prepare_data(labelsets=[np.array([], dtype=np.int64)] * 3))
 rates, prepared['ratesets_lengths'], prepared['ratesets_flat'] = ragged._rk_pad_rows([np.array([])] * 3, np.float64)
 np.testing.assert_allclose(jax.jit(ragged.score)(0.4, rates, **prepared), 0.)
 np.testing.assert_allclose(jax.jit(jax.grad(ragged.score))(0.4, rates, **prepared), 0.)
 # A zero-length buffer inside a nonempty outer plate must not differentiate
 # its unused storage through log(0), including the shared scalar argument.
 for module in (ragged_plate, record_plate):
-    prepared = module.prepare_data(labelsets=[np.array(x, dtype=np.int64) for x in ([], [1], [1,2,1])])
+    prepared = dict(module.prepare_data(labelsets=[np.array(x, dtype=np.int64) for x in ([], [1], [1,2,1])]))
     rates, prepared['ratesets_lengths'], prepared['ratesets_flat'] = module._rk_pad_rows(
         [np.array([]), np.array([-.2]), np.array([-.2,.1,.8])], np.float64)
     np.testing.assert_allclose(jax.jit(module.score)(.4, rates, **prepared), -.12, atol=1e-12)

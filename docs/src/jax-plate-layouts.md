@@ -16,7 +16,7 @@ events wherever the scan supports it. `prepare_data` uses the latter by default.
 To repeat a particular walk, call
 `module.prepare_plate_layout(prepared, subject_walk="padded")` or pass
 `subject_walk="events"`. Neither call times the model. The selected data can
-be passed directly to a jitted function as one dictionary argument.
+be passed directly to a jitted function as one `PreparedData` argument.
 
 `jax_source(...; data, plate_layout = :groups)` emits a module whose caller
 chooses how such plates run. After `prepared = module.prepare_data(**raw)`,
@@ -64,7 +64,7 @@ If the sampler owns the compilation, its interface must carry the data
 through that boundary. A callback created outside the step that captures
 concrete arrays can embed their values in the program.
 
-JAX flattens the dictionary and its registered layout objects as a pytree.
+JAX flattens the `PreparedData` and its registered layout objects as a pytree.
 Observations, schedule indices and permutations are array inputs.
 The tree records structure such as an absent schedule, group widths and
 prepared `StaticInt` values. Reuse across datasets requires matching

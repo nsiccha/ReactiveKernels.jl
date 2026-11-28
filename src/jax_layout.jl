@@ -166,7 +166,7 @@ const _JAX_PREPARE_PLATE_LAYOUT = raw"""
 _RK_LAYOUT_NAMES = ("groups",)
 
 
-def prepare_plate_layout(prepared: dict, groups: int = 1, sequential: bool = False) -> dict:
+def prepare_plate_layout(prepared: PreparedData, groups: int = 1, sequential: bool = False) -> PreparedData:
     \"\"\"The prepared data with a layout for the plates over ragged rows.
 
     `groups = 1` is each plate as one batch over all of its units, every row
@@ -197,7 +197,7 @@ def prepare_plate_layout(prepared: dict, groups: int = 1, sequential: bool = Fal
         sizes = [lengths(entry) for entry in entries]
         layout[plate] = (None if any(n is None for n in sizes) else
                          _rk_length_groups(sizes, groups, sequential))
-    return {**prepared, "_rk_plate_layout": layout}
+    return PreparedData({**prepared, "_rk_plate_layout": layout})
 
 
 def _rk_layout_candidates(prepared, candidates):
@@ -220,7 +220,7 @@ const _JAX_PREPARE_SUBJECT_LAYOUT = raw"""
 _RK_LAYOUT_NAMES = ("padded", "events")
 
 
-def prepare_plate_layout(prepared: dict, *, subject_walk: str = "events") -> dict:
+def prepare_plate_layout(prepared: PreparedData, *, subject_walk: str = "events") -> PreparedData:
     \"\"\"Choose the padded or real-event schedule for eligible subject scans.\"\"\"
     if subject_walk not in _RK_LAYOUT_NAMES:
         raise ValueError("subject_walk must be 'padded' or 'events'")
@@ -230,7 +230,7 @@ def prepare_plate_layout(prepared: dict, *, subject_walk: str = "events") -> dic
             result[name] = None
         elif result[name] is None:
             result[name] = _rk_subject_scan_schedule(*(prepared[key] for key in inputs))
-    return result
+    return PreparedData(result)
 
 
 def _rk_layout_candidates(prepared, candidates):
@@ -254,7 +254,7 @@ def _rk_layout_candidates(prepared, candidates):
 # caller supplies the work to time (its own batched step), so a sampler's
 # memory and cost are part of the measurement.
 const _JAX_SELECT_PLATE_LAYOUT = raw"""
-def select_plate_layout(prepared: dict, make_step: Any, chains: Any = None,
+def select_plate_layout(prepared: PreparedData, make_step: Any, chains: Any = None,
                         candidates: Any = None, repeats: int = 3, *,
                         alternatives: Any = None, calls: Any = None, guarded_reads: Any = None,
                         confirmation_rounds: int = 12) -> tuple:

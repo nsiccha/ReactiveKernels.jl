@@ -1946,6 +1946,25 @@ class StaticInt(int):
 jax.tree_util.register_pytree_node(StaticInt, lambda s: ((), int(s)), lambda v, _: StaticInt(v))
 """
 
+# What `prepare_data` and the layout functions return: a read-only mapping
+# whose JAX pytree is one flat array per dtype (`jax_prepared_data.py`). Passed
+# to a jitted function as an argument it costs a few leaves, not one per
+# prepared array, whose dispatch on every call is otherwise a measured part of
+# a one-chain GPU gradient call (snag `data-as-argument-73d58747`).
+Base.include_dependency(joinpath(@__DIR__, "jax_prepared_data.py"))
+const _JAX_PREPARED_DATA = read(joinpath(@__DIR__, "jax_prepared_data.py"), String)
+
+# `prepare_data`'s body `body` with its final `return <dict>` returning that
+# dict as `PreparedData`.
+function _jax_packed_return(mod::_JaxModule, body::AbstractString)
+    lines = split(body, "\n")
+    m = match(r"^    return (.+)$", lines[end])
+    m === nothing && error("prepare_data does not end in its return")
+    _jax_module_helper!(mod, "PreparedData", _JAX_PREPARED_DATA)
+    lines[end] = "    return PreparedData(" * m.captures[1] * ")"
+    join(lines, "\n")
+end
+
 # Static bounds of prepared integer arrays, for ranges whose ends are their
 # entries (`_jax_trip_bound`): `prepare_data` returns them with the data. An
 # array without entries gives 0 (no range over its entries runs) and a span
@@ -3180,7 +3199,7 @@ function _jax_prepare_function!(mod::_JaxModule, split, raw_types, names, types;
         kinds = unique(annotation(T) for T in raw_types[keyword])
         push!(signature, "**" * keyword_data * ": " * (length(kinds) == 1 ? only(kinds) : "Any"))
     end
-    lines = String["def prepare_data(" * join(signature, ", ") * ") -> dict:"]
+    lines = String["def prepare_data(" * join(signature, ", ") * ") -> PreparedData:"]
     keyword_doc = isempty(keyword) ? "" :
         "\n    `**" * keyword_data * "` takes " * join(("`" * n * "`" for n in param_names[keyword]), ", ") *
         " by name, which no parameter can have:\n    pass the data by name, `prepare_data(**raw)`.\n"
