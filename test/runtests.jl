@@ -218,6 +218,7 @@ const _MATRIX_CORE_TESTS = (
     "test_jax_shared_record_reads.jl",
     "test_jax_scan_row_inputs.jl",
     "test_jax_requested_records.jl",
+    "test_jax_grouped_rowdot.jl",
     "test_jax_checks.jl",
     "test_jax_history.jl",
     "test_jax_padded_fields.jl",

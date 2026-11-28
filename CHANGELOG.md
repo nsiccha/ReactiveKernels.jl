@@ -16,6 +16,39 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.423
+
+`jax_source` has a grouped translation for a row-wise product with table rows
+read at a prepared integer index, `vec(sum(A .* table[k, :]; dims=2))` or
+`sum(table[k, :] .* A; dims=2)`. BRM's grouped HSGP term is written the first
+way: every observation row reads its group's row of basis coefficients. The
+literal translation gathers one table row per data row, and under `jax.vmap`
+its reverse is an atomic scatter-add of every data row's products into the
+table's few rows. When the index's groups average at least 16 rows,
+`prepare_data` now groups the rows by the table row they read, in blocks of
+16, and the compiled function reads each block's table row once; its reverse
+adds one row of cotangents per block. Smaller groups and an empty index keep
+the literal gather: `prepare_data` returns no extra arrays for them, and
+their functions compile the same program as before. Values agree with the
+literal product up to the order of each sum's terms, and an index outside
+the table reads what the literal gather reads. An `A` that broadcasts
+against the gathered rows, an index the functions compute, host emission and
+native preparation keep their translation. There is no registered
+derivative: forward mode, reverse mode and `jax.vmap` are JAX's own.
+
+Measured on the emitted modules of three of Bruno's report fits against the
+0.1.412 tree without the translation (RTX 5060 Ti, float64, `jax.vmap` of
+`value_and_grad`, card alone, host load 36 to 77, both modules loaded from
+the compile cache, 1,000 paired rounds in each load order, the two orders
+averaged). The QTcF fit (2,497 rows in 52 groups, 64 basis functions) took
+0.38 ms less of 10.0 ms per call at 64 chains, 1.46 ms less of 21.9 ms at 256
+and 6.06 ms less of 67.5 ms at 1,024, which is 15,170 to 16,678 chain
+gradients per second, and the same within 0.05 ms at one chain. The ALT and
+NEUT fits (8 and 10 rows per group) compiled the same program as without it
+at every width. The threshold of 16 rows is a tuned constant: whether
+blocking groups of 8 to 15 rows pays has not been measured on emitted
+modules.
+
 ## 0.1.422
 
 A Hessian-vector product through a generated plate reverse no longer writes

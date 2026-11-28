@@ -8677,6 +8677,10 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe, op::_KernelSourc
     _has_source(recipe) || _jax_error("a source operation without its source", _jax_where(ctx))
     # A partitioned plate's decided branches take their arm before rewriting.
     recipe = _jax_lane_pruned(recipe)
+    # Row products with table rows gathered by a prepared index read each
+    # table row once per group of rows (`jax_grouped_rowdot.jl`).
+    grouped = _jax_grouped_rowdot(ctx, p, recipe, inputs)
+    grouped === nothing || return _jax_split_outputs(ctx, recipe, grouped)
     stable = _jax_stable_rewrite(ctx, p, recipe, inputs)
     # A recipe's whole source is bound to its one output's name.
     target = length(recipe.outputs) == 1 ? (out = only(recipe.outputs);
@@ -10589,7 +10593,7 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
             push!(pending, key)
         end
     end
-    bounds = filter(b -> b[2] ∉ (:broadcast_total, :ragged_counts, :scan_index_bound, :scan_rows, :row_layout, :sign_groups, :match_count, :padded_map_rows, :subject_scan, :record_rows, :requested_rows) ||
+    bounds = filter(b -> b[2] ∉ (:broadcast_total, :ragged_counts, :scan_index_bound, :scan_rows, :row_layout, :sign_groups, :row_groups, :match_count, :padded_map_rows, :subject_scan, :record_rows, :requested_rows) ||
                          b[1] in used_inputs, all_bounds)
     if !isempty(bounds)
         bodies[prepare_body] = join(_jax_prepare_bounds_lines(mod, prepare_lines, bounds), "\n")
