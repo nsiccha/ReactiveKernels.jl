@@ -16,6 +16,22 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.274
+
+A dotted sum or product of three or more operands, `.+(a, b, c)` or
+`.*(a, b, c)`, now fuses into its observation plate as the nested binary
+spelling `(a .+ b) .+ c` does. BRM emits a predictor with a group effect
+beside another row-length term as such a sum, `eta = .+(Intercept, ranef,
+smooth)`, read through a link (`p = logistic.(eta)`). Before, that sum stayed
+an ordinary broadcast, and its named column gather `ranef = b[g, 1]` was
+copied into a row-length vector of its own. Now the plate reads the gather in
+place, so the named spelling costs what the inline one does. The row-length term may be the result of a `@kernel` call, as BRM's
+HSGP value is: the call still runs once, and the plate reads its result.
+Densities are unchanged, because Julia's `+(a, b, c)` also folds from the
+left. On a 2,000-row BetaBinomial2 logit model with a smooth, one
+Enzyme-reverse gradient allocated 129 kB named and 97 kB inline before, and
+32 kB for either now.
+
 ## 0.1.273
 
 `@rkppl` declarations expose their named helper and submodel calls to notebook
