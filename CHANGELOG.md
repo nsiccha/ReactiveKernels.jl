@@ -52,7 +52,10 @@ are recorded in the git history only.
   such a cell: its location derivatives move by at most `2 * eps() / scale`,
   which is more than their last place where the law's own subtraction
   cancels. At `scale = 3e5` the new and the previous gradient are 1.4e-10 and
-  1.7e-10 from the exact one.
+  1.7e-10 from the exact one. A program prepared with bound data differs by
+  the same rounding from the program without it where the cached data leaves
+  a cell the compiler makes vector code of. That held for `log1pexp` since
+  0.1.372 and now holds for the written-out forms.
 - On 4,096 cells (AVX-512, Julia 1.10, CPU time per call), beside
   `log1pexp(v)`: `0.5 * z^2` from 43.0 to 9.9 µs, `sqrt(abs2(z) + 1)` from
   35.8 to 11.4 µs, a function of the model's from 47.2 to 10.5 µs, a
