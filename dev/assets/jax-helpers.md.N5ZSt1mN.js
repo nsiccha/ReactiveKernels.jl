@@ -32,6 +32,7 @@ import{_ as e,o as a,c as i,a6 as n}from"./chunks/framework.BTpfZnOf.js";const u
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">- \`b.spread\`: Spread of the members around the mean.</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">- \`b.z\`: Standardised member deviations.</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">&quot;&quot;&quot;</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">import collections.abc</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">import numpy as np</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">import scipy.special as ssp</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">from typing import Any</span></span>
@@ -121,7 +122,107 @@ import{_ as e,o as a,c as i,a6 as n}from"./chunks/framework.BTpfZnOf.js";const u
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    return results</span></span>
 <span class="line"></span>
 <span class="line"></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">def prepare_data(a_loc: ArrayLike, a_rate: ArrayLike, a_scale: ArrayLike, b_loc: ArrayLike, b_rate: ArrayLike, b_scale: ArrayLike, n: ArrayLike, noise: ArrayLike, y: ArrayLike) -&gt; dict:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">class PreparedData(collections.abc.Mapping):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    &quot;&quot;&quot;The prepared data by name: what \`prepare_data\` and the layout functions return.</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    It reads like a dict (\`prepared[&quot;x&quot;]\`, \`.get\`, \`.items()\`, \`f(u, **prepared)\`)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    and \`dict(prepared)\` gives a plain dict of the same values. It cannot be</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    changed in place: build a new one with \`PreparedData({**prepared, name: value})\`.</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    As a JAX pytree its leaves are one flat array per dtype, which hold every</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    NumPy array and scalar, followed by any other value as its own leaf (a</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    Python number keeps its weak type, a JAX array its device). Passing it to a</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    jitted function costs a few leaves however many arrays it holds, and the</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    function reads each value as a static slice of its array.</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    \`jax.device_put\` and \`jax.tree_util.tree_map\` keep it packed.</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    &quot;&quot;&quot;</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    __slots__ = (&quot;_buffers&quot;, &quot;_others&quot;, &quot;_layout&quot;, &quot;_values&quot;)</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def __init__(self, values=(), **named):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        values = dict(values, **named)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        names = tuple(values)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        leaves, tree = jax.tree_util.tree_flatten(values)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        groups, spec, others = {}, [], []</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        for leaf in leaves:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            if isinstance(leaf, (np.ndarray, np.generic)) and leaf.dtype.kind in &quot;biufc&quot;:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                array = np.asarray(leaf)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                group = groups.setdefault(array.dtype, [])</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                offset = sum(part.size for part in group)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                group.append(array.reshape(-1))</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                spec.append((array.dtype, offset, array.shape, isinstance(leaf, np.generic)))</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            else:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                spec.append(len(others))</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                others.append(leaf)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        dtypes = tuple(groups)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        buffers = []</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        for dtype in dtypes:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            buffer = np.concatenate(groups[dtype])</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            buffer.flags.writeable = False</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            buffers.append(buffer)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        self._buffers, self._others = tuple(buffers), tuple(others)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        self._layout = (names, tree, dtypes, tuple(spec))</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        self._values = None</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    @classmethod</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def _unflatten(cls, layout, children):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        self = object.__new__(cls)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        count = len(layout[2])</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        self._buffers, self._others = tuple(children[:count]), tuple(children[count:])</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        self._layout, self._values = layout, None</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        return self</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def _flatten(self):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        return (*self._buffers, *self._others), self._layout</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def __reduce__(self):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        return PreparedData._unflatten, (self._layout, (*self._buffers, *self._others))</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def __deepcopy__(self, memo):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        import copy</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        buffers = copy.deepcopy(self._buffers, memo)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        for buffer in buffers:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            if isinstance(buffer, np.ndarray):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                buffer.flags.writeable = False</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        return PreparedData._unflatten(self._layout, (*buffers, *copy.deepcopy(self._others, memo)))</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def _read(self, entry):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        if isinstance(entry, int):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            return self._others[entry]</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        dtype, offset, shape, scalar = entry</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        buffer = self._buffers[self._layout[2].index(dtype)]</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        size = int(np.prod(shape, dtype=np.int64))</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        if isinstance(buffer, np.ndarray):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            return buffer[offset] if scalar else buffer[offset:offset + size].reshape(shape)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        return jax.lax.slice_in_dim(buffer, offset, offset + size).reshape(shape)</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def _dict(self):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        if self._values is None:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            names, tree, _, spec = self._layout</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            values = jax.tree_util.tree_unflatten(tree, [self._read(entry) for entry in spec])</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            self._values = {name: values[name] for name in names}</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        return self._values</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def __getitem__(self, name):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        return self._dict()[name]</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def __iter__(self):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        return iter(self._layout[0])</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def __len__(self):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        return len(self._layout[0])</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def __contains__(self, name):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        return name in self._layout[0]</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def __repr__(self):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        return &quot;PreparedData(&quot; + &quot;, &quot;.join(self._layout[0]) + &quot;)&quot;</span></span>
+<span class="line"></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">jax.tree_util.register_pytree_node(PreparedData, PreparedData._flatten, PreparedData._unflatten)</span></span>
+<span class="line"></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">def prepare_data(a_loc: ArrayLike, a_rate: ArrayLike, a_scale: ArrayLike, b_loc: ArrayLike, b_rate: ArrayLike, b_scale: ArrayLike, n: ArrayLike, noise: ArrayLike, y: ArrayLike) -&gt; PreparedData:</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    &quot;&quot;&quot;The functions&#39; data inputs, computed from the raw data once per dataset.</span></span>
 <span class="line"></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    Pass the data by the names the model reads them; a list of arrays is a ragged</span></span>
@@ -151,7 +252,7 @@ import{_ as e,o as a,c as i,a6 as n}from"./chunks/framework.BTpfZnOf.js";const u
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    ppl_pw_y_resp_lanes_1 = lanes</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    ppl_pw_y_resp_lanes_2 = lanes_2</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    ppl_pw_y_resp_lane_order = np.argsort(np.concatenate((lanes, lanes_2,)), kind=&quot;stable&quot;)</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    return {&quot;ppl_last_a_z&quot;: StaticInt(ppl_last_a_z), &quot;ppl_first_b_z&quot;: StaticInt(ppl_first_b_z), &quot;ppl_last_b_z&quot;: StaticInt(ppl_last_b_z), &quot;y&quot;: np.asarray(y, dtype=np.float64), &quot;noise&quot;: noise, &quot;_ppl_pw_y_resp_lanes_1&quot;: np.asarray(ppl_pw_y_resp_lanes_1, dtype=np.int64), &quot;_ppl_pw_y_resp_lanes_2&quot;: np.asarray(ppl_pw_y_resp_lanes_2, dtype=np.int64), &quot;_ppl_pw_y_resp_lane_order&quot;: np.asarray(ppl_pw_y_resp_lane_order, dtype=np.int64), &quot;a_loc&quot;: a_loc, &quot;a_scale&quot;: a_scale, &quot;ppl_prior_a_mean_log_scale&quot;: ppl_prior_a_mean_log_scale, &quot;ppl_prior_a_spread_log_scale&quot;: ppl_prior_a_spread_log_scale, &quot;a_rate&quot;: a_rate, &quot;b_loc&quot;: b_loc, &quot;b_scale&quot;: b_scale, &quot;ppl_prior_b_mean_log_scale&quot;: ppl_prior_b_mean_log_scale, &quot;ppl_prior_b_spread_log_scale&quot;: ppl_prior_b_spread_log_scale, &quot;b_rate&quot;: b_rate, &quot;n&quot;: StaticInt(n)}</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    return PreparedData({&quot;ppl_last_a_z&quot;: StaticInt(ppl_last_a_z), &quot;ppl_first_b_z&quot;: StaticInt(ppl_first_b_z), &quot;ppl_last_b_z&quot;: StaticInt(ppl_last_b_z), &quot;y&quot;: np.asarray(y, dtype=np.float64), &quot;noise&quot;: noise, &quot;_ppl_pw_y_resp_lanes_1&quot;: np.asarray(ppl_pw_y_resp_lanes_1, dtype=np.int64), &quot;_ppl_pw_y_resp_lanes_2&quot;: np.asarray(ppl_pw_y_resp_lanes_2, dtype=np.int64), &quot;_ppl_pw_y_resp_lane_order&quot;: np.asarray(ppl_pw_y_resp_lane_order, dtype=np.int64), &quot;a_loc&quot;: a_loc, &quot;a_scale&quot;: a_scale, &quot;ppl_prior_a_mean_log_scale&quot;: ppl_prior_a_mean_log_scale, &quot;ppl_prior_a_spread_log_scale&quot;: ppl_prior_a_spread_log_scale, &quot;a_rate&quot;: a_rate, &quot;b_loc&quot;: b_loc, &quot;b_scale&quot;: b_scale, &quot;ppl_prior_b_mean_log_scale&quot;: ppl_prior_b_mean_log_scale, &quot;ppl_prior_b_spread_log_scale&quot;: ppl_prior_b_spread_log_scale, &quot;b_rate&quot;: b_rate, &quot;n&quot;: StaticInt(n)})</span></span>
 <span class="line"></span>
 <span class="line"></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">def model(_entry: str, unconstrained: ArrayLike, **prepared: ArrayLike) -&gt; Any:</span></span>
@@ -345,6 +446,10 @@ import{_ as e,o as a,c as i,a6 as n}from"./chunks/framework.BTpfZnOf.js";const u
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    # caller later edits a host array. JAX arrays already have value semantics.</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    immutable = {id(x): x for x in jax.tree_util.tree_leaves(prepared) if isinstance(x, jax.Array)}</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    data = deepcopy(prepared, immutable)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    # The compiled program takes the data as a few flat arrays, also when the</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    # caller passes a plain dict.</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    if not isinstance(data, PreparedData):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        data = PreparedData(data)</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    measure, layout_variants = None, None</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    confirm_layouts = None</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    programs = {}</span></span>
