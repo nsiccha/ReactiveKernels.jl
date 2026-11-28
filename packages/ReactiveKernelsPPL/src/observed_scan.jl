@@ -7,33 +7,48 @@
 # the array read the data. A carried array that is not data keeps its latent
 # trajectory.
 #
-# Lowering states this as an ordinary program. The scan computes each seed's
-# and step's conditional density in a carried array of its own, reading the
-# observed values, and one dotted `LogDensity` observation of the response
-# reads those densities entry by entry:
+# Lowering states this as an ordinary program. When every carried array is
+# observed (no per-step innovation, no history read), each seed's and step's
+# conditional density reads only data and values computed outside the scan,
+# so the densities are independent given the parameters: they are RK plates,
+# one per seed and one over the steps, whose lag reads `x[t - k]` go through
+# shifted index ranges (`_observed_scan_plates`). One dotted `LogDensity`
+# observation of the response reads those densities entry by entry:
 #
 #     @scan begin                          _rkppl_scan_observed_y = _observed_scan_values(:y, y, T)
-#         y[1] ~ D1(…)                     @scan begin
-#         for t in 2:T                         _rkppl_scan_logdensity_y[1] = <D1 density at y[1]>
-#             y[t] ~ D(…, y[t - 1])   ⟶        for t in 2:T
-#         end                                      _rkppl_scan_logdensity_y[t] = <D density at y[t]>
-#     end                                      end
+#         y[1] ~ D1(…)                     _rkppl_scan_seed_1_y = plate(1:1) do e
+#         for t in 2:T                         <D1 density at _rkppl_scan_observed_y[e]>
+#             y[t] ~ D(…, y[t - 1])   ⟶    end
+#         end                              _rkppl_scan_steps_y = plate(2:T, 1:(T - 1)) do t, t1
+#     end                                      <D density at _rkppl_scan_observed_y[t], reading [t1]>
 #                                          end
+#                                          _rkppl_scan_logdensity_y = vcat(_rkppl_scan_seed_1_y,
+#                                              _rkppl_scan_steps_y)
 #                                          y .~ LogDensity.(_observed_scan_logdensity,
 #                                              _rkppl_scan_logdensity_y)
 #
-# so the response keeps every observation contract (`likelihood`,
-# `:pointwise` with one density per entry, absent responses, arrays per
-# index in a dotted `@plate` cell). In a `@plate` cell the observed array is
-# the loop index's array, `y[g][t]`, read in place. The unbound spelling
-# `y[g][t] ~ …` in a cell is a latent trajectory per index, exactly as a
-# cell-local carried array returned as `y[g]`.
+# Otherwise the densities chain through a latent value, and a scan computes
+# them in a carried array of its own, reading the observed values
+# (`_observed_scan_rewrite`). Either way the response keeps every observation
+# contract (`likelihood`, `:pointwise` with one density per entry, absent
+# responses, arrays per index in a dotted `@plate` cell). In a `@plate` cell
+# the observed array is the loop index's array, `y[g][t]`, read in place. The
+# unbound spelling `y[g][t] ~ …` in a cell is a latent trajectory per index,
+# exactly as a cell-local carried array returned as `y[g]`.
 
-# An observation's density, computed by the scan that reads the observed
-# trajectory: the law is the density it is given.
+# An observation's density, computed from the observed trajectory: the law is
+# the density it is given.
 @kernel _observed_scan_logdensity(value, density) = density
 
 const _OBSERVED_SCAN_LAW = GlobalRef(@__MODULE__, :_observed_scan_logdensity)
+
+# The same law over a top-level observed array's checked values
+# (`_observed_scan_values`) as well. The plates read those values only in their
+# bodies, which binding leaves to preparation; the response holding them keeps
+# their check at binding, as the scan holding them did.
+@kernel _observed_scan_checked_logdensity(value, density, checked) = density
+
+const _OBSERVED_SCAN_CHECKED_LAW = GlobalRef(@__MODULE__, :_observed_scan_checked_logdensity)
 
 # Bind-time check of a top-level observed carried array: a vector of real
 # numbers with one entry per scan index (no `len` when the scan's length is
@@ -196,6 +211,127 @@ _observed_scan_reads(ex, sources) = ex isa Expr ?
 
 _observed_scan_statement(lhs, lp) = Expr(:call, :.~, lhs,
     Expr(:., GlobalRef(@__MODULE__, :LogDensity), Expr(:tuple, _OBSERVED_SCAN_LAW, lp)))
+_observed_scan_statement(lhs, lp, checked) = Expr(:call, :.~, lhs,
+    Expr(:., GlobalRef(@__MODULE__, :LogDensity),
+        Expr(:tuple, _OBSERVED_SCAN_CHECKED_LAW, lp, checked)))
+
+# The step an index names: `0` for the loop index `t`, `k` for a backward lag
+# `t - k` (a literal or a bound integer name), otherwise `nothing`.
+function _observed_scan_lag(idx, t::Symbol)
+    idx === t && return 0
+    Meta.isexpr(idx, :call, 3) && idx.args[1] === :- && idx.args[2] === t &&
+        (idx.args[3] isa Integer || idx.args[3] isa Symbol) || return nothing
+    return idx.args[3]
+end
+
+_observed_scan_mentions(ex, names) = ex isa Symbol ? ex in names :
+    ex isa Expr && any(a -> _observed_scan_mentions(a, names), ex.args)
+
+# Rewrite the reads of one seed or step body for its plate. A read `x[i]` whose
+# index `position(i)` names a plate element reads through that element:
+# an observed array reads its data (`source`), a name reads itself, and any
+# other array expression that reads no step value is computed once before
+# the plate (`hoist`). Other reads of an observed array read its data.
+function _observed_scan_plate_reads(ex, observed, source, position, steplocal, hoist)
+    walk(e) = begin
+        e isa Expr || return e
+        if e.head === :ref && length(e.args) == 2
+            base, idx = e.args
+            q = position(idx)
+            if q !== nothing
+                base in observed && return Expr(:ref, source(base), q)
+                base isa Symbol && !(base in steplocal) && return Expr(:ref, base, q)
+                base isa Expr && !_observed_scan_mentions(base, steplocal) &&
+                    !_observed_scan_mentions(base, observed) &&
+                    return Expr(:ref, hoist(base), q)
+            end
+            base in observed && return Expr(:ref, source(base), walk(idx))
+        end
+        return Expr(e.head, Any[walk(a) for a in e.args]...)
+    end
+    return walk(ex)
+end
+
+_observed_scan_plate(seqs, elements, body) = Expr(:do,
+    Expr(:call, GlobalRef(ReactiveKernels, :plate), seqs...),
+    Expr(:->, Expr(:tuple, elements...), Expr(:block, body...)))
+
+# Once every carried array of a scan is observed data, each seed's and step's
+# conditional density reads only data, parameters and values computed outside
+# the scan: given the parameters, the densities are independent. State them
+# as RK plates (rkppl-use §5), as the latent scan states its conditional
+# densities over the completed trajectory (`_scan_density_plate`): one
+# one-entry plate per seed and one plate over the steps, concatenated in entry
+# order. A read `x[t - k]` reads through its own index sequence
+# `(lo - k):(hi - k)`, and a seed's read `x[j]` through `j:j`, so each entry
+# reads exactly its own positions (`_cell_plate_form`) and RK can split the
+# observation's total into one term per entry (`prepare_cell_factors`).
+# Returns each observed array's entries expression, or `nothing` when the
+# densities chain and the scan stays sequential: a carried array that is not
+# data, a per-step innovation, or a history read (its window accumulates over
+# the earlier entries, which a scan computes incrementally).
+_observed_scan_plateable(spec::ScanSpec, observed) =
+    all(in(observed), spec.states) && !_scan_has_history(spec) &&
+    all(st -> st.kind === :sample ? st.indexed : !st.indexed, spec.step)
+
+function _observed_scan_plates(block, spec::ScanSpec, observed, source, hi, fresh, hoist,
+        define)
+    _observed_scan_plateable(spec, observed) || return nothing
+    items = Any[x for x in block.args if !(x isa LineNumberNode)]
+    seeds = items[1:end-1]
+    steps = Any[x for x in last(items).args[2].args if !(x isa LineNumberNode)]
+    length(steps) == length(spec.step) || return nothing
+    t, lo = spec.loopvar, spec.lo
+    steplocal = Set{Symbol}(st.target for st in spec.step if st.kind === :assign)
+    out = Dict{Symbol,Any}()
+    for a in spec.states
+        parts = Any[]
+        for s in seeds
+            lhs = _observed_scan_lhs(s)
+            Meta.isexpr(lhs, :ref, 2) && lhs.args[1] === a || continue
+            k = lhs.args[2]
+            entries = Dict{Any,Symbol}(k => fresh(Symbol(:_rkppl_scan_entry_, a)))
+            seedpos = idx -> idx isa Integer ?
+                get!(() -> fresh(Symbol(:_rkppl_scan_entry_, a)), entries, idx) : nothing
+            seedreads = ex -> _observed_scan_plate_reads(ex, observed, source, seedpos,
+                steplocal, hoist)
+            density = _observed_scan_density(s.args[3], Expr(:ref, source(a), entries[k]),
+                "observation `$(repr(lhs))`", seedreads)
+            # The seed's own entry first: its sequence labels the plate's row.
+            order = sort!(collect(keys(entries)); by = j -> (j != k, j))
+            push!(parts, define(Symbol(:_rkppl_scan_seed_, k, :_), a,
+                _observed_scan_plate(Any[:($j:$j) for j in order],
+                    Any[entries[j] for j in order], Any[density])))
+        end
+        lags = Dict{Any,Symbol}(0 => t)
+        steppos = idx -> let k = _observed_scan_lag(idx, t)
+            k === nothing ? nothing :
+                get!(() -> fresh(Symbol(:_rkppl_scan_, t, :_lag)), lags, k)
+        end
+        stepreads = ex -> _observed_scan_plate_reads(ex, observed, source, steppos,
+            steplocal, hoist)
+        body = Any[]
+        for (s, st) in zip(steps, spec.step)
+            if st.kind === :assign
+                push!(body, Expr(:(=), s.args[1], stepreads(s.args[2])))
+            elseif st.target === a
+                push!(body, _observed_scan_density(s.args[3], Expr(:ref, source(a), t),
+                    "observation `$(repr(s.args[2]))`", stepreads))
+                break
+            end
+        end
+        # The loop index first: its sequence `lo:hi` labels the steps' rows.
+        order = sort!(collect(keys(lags)); by = k -> (k !== 0, string(k)))
+        shifted(x, k) = x isa Integer && k isa Integer ? x - k : :($x - $k)
+        seqs = Any[k === 0 ? :($lo:$hi) : :($(shifted(lo, k)):$(shifted(hi, k)))
+                   for k in order]
+        push!(parts, define(:_rkppl_scan_steps_, a,
+            _observed_scan_plate(seqs, Any[lags[k] for k in order], body)))
+        out[a] = length(parts) == 1 ? only(parts) :
+            Expr(:call, GlobalRef(Base, :vcat), parts...)
+    end
+    return out
+end
 
 # A top-level `@scan` whose carried arrays include observed data: the checked
 # observed values, the scan stating their densities, and one observation per
@@ -225,11 +361,26 @@ function _observed_scan_statements(arg::Expr, data, defined, taken)
         k == 1 && len === nothing &&
             push!(out, Expr(:(=), hi, Expr(:call, GlobalRef(Base, :length), values[a])))
     end
-    translate(ex) = _observed_scan_reads(ex, values)
-    rewritten = _observed_scan_rewrite(block, Set(observed), lps,
-        (a, idx) -> Expr(:ref, values[a], idx), translate, hi === spec.hi ? nothing : hi)
-    push!(out, Expr(:macrocall, arg.args[1:end-1]..., rewritten))
-    append!(out, (_observed_scan_statement(a, lps[a]) for a in observed))
+    hoisted = Dict{Any,Symbol}()
+    hoist(ex) = get!(hoisted, ex) do
+        name = fresh(:_rkppl_scan_value)
+        push!(out, Expr(:(=), name, ex))
+        name
+    end
+    define(stem, a, ex) = (name = fresh(Symbol(stem, a));
+        push!(out, Expr(:(=), name, ex)); name)
+    plates = _observed_scan_plates(block, spec, Set(observed), a -> values[a], hi,
+        fresh, hoist, define)
+    if plates === nothing
+        translate(ex) = _observed_scan_reads(ex, values)
+        rewritten = _observed_scan_rewrite(block, Set(observed), lps,
+            (a, idx) -> Expr(:ref, values[a], idx), translate, hi === spec.hi ? nothing : hi)
+        push!(out, Expr(:macrocall, arg.args[1:end-1]..., rewritten))
+        append!(out, (_observed_scan_statement(a, lps[a]) for a in observed))
+    else
+        append!(out, (Expr(:(=), lps[a], plates[a]) for a in observed))
+        append!(out, (_observed_scan_statement(a, lps[a], values[a]) for a in observed))
+    end
     return out
 end
 
@@ -285,6 +436,32 @@ function _observed_cell_scan(c, ivar, data, taken)
             GlobalRef(@__MODULE__, :_observed_scan_cell_bound), QuoteNode(y), ivar,
             Expr(:ref, y, ivar), bound)))
         bound = checked
+    end
+    # A fully observed scan states its entries' densities as plates: each cell
+    # local it reads (the observed array `y[ivar]` included) is computed once
+    # per cell, and the plates read it at their entries.
+    if isempty(latent)
+        hoisted = Dict{Any,Symbol}()
+        hoist(ex) = get!(hoisted, ex) do
+            name = fresh(:_rkppl_scan_value)
+            push!(out, Expr(:(=), name, ex))
+            name
+        end
+        cellvalues = Dict(placeholders[y] => Expr(:ref, y, ivar) for y in observed)
+        shown = Dict(placeholders[y] => y for y in observed)
+        define(stem, p, ex) = (name = fresh(Symbol(stem, shown[p]));
+            push!(out, Expr(:(=), name, ex)); name)
+        plates = _observed_scan_plates(spelled, spec, obs, p -> hoist(cellvalues[p]),
+            bound, fresh, hoist, define)
+        if plates !== nothing
+            for y in observed
+                output = fresh(Symbol(:_rkppl_scan_density_, y))
+                push!(out, Expr(:(=), Expr(:ref, output, ivar), plates[placeholders[y]]))
+                push!(out, _observed_scan_statement(Expr(:ref, y, ivar),
+                    Expr(:ref, output, ivar)))
+            end
+            return out
+        end
     end
     lps = Dict(placeholders[y] => fresh(Symbol(:_rkppl_scan_logdensity_, y)) for y in observed)
     sources = Dict(placeholders[y] => Expr(:ref, y, ivar) for y in observed)

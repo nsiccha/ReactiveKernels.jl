@@ -101,7 +101,10 @@ end
         # Only the declared parameters: the observed trajectory has no coordinates.
         @test coordinate_names(f.built.layout) == [:phi, :sigma, :a, :b]
         check(f, ar_oracle(f, y, x))
-        @test (:scan, 0) in structure(f.built.spec)
+        # Given the parameters the entries' densities read only data, so they
+        # are plates over the entries: no sequential loop remains.
+        @test (:plate, 0) in structure(f.built.spec)
+        @test !any(e -> e[1] === :scan, structure(f.built.spec))
         # A supplied length is the scan's length too.
         g = build(ar_errors, (; y, x, T = n))
         check(g, ar_oracle(g, y, x); shifts = (0.05,))
@@ -165,9 +168,11 @@ end
             (; prior, likelihood = sum(sum, pw), jac, pointwise = pw)
         end
         check(f, oracle)
-        # One recurrence per group, retained inside the group plate.
+        # Each group's entries are plates inside the group plate: no
+        # sequential loop remains.
         @test (:plate, 0) in structure(f.built.spec)
-        @test any(e -> e[1] === :scan && e[2] >= 1, structure(f.built.spec))
+        @test any(e -> e[1] === :plate && e[2] >= 1, structure(f.built.spec))
+        @test !any(e -> e[1] === :scan, structure(f.built.spec))
     end
     # The retained structure does not grow with the groups.
     shape(lengths) = structure(build(cell_ar_errors, (;
@@ -274,7 +279,7 @@ end
         f = build(called, (; y, x); mod = @__MODULE__)
         @test coordinate_names(f.built.layout) == [:phi, :sigma, :a, :b]
         check(f, ar_oracle(f, y, x))
-        @test (:scan, 0) in structure(f.built.spec)
+        @test !any(e -> e[1] === :scan, structure(f.built.spec))
     end
 end
 
@@ -425,6 +430,8 @@ end
             (; prior, likelihood = sum(pw), jac, pointwise = pw)
         end
         check(f, oracle)
+        # A latent carried array keeps the recurrence one sequential scan.
+        @test any(e -> e[1] === :scan, structure(f.built.spec))
     end
     # The same recurrence per group, with ragged series.
     cell_sv = quote
@@ -827,9 +834,13 @@ end
             end
         end
     end
-    f = build(mismatched, (; y = [series(3), series(2)], n = [3, 1]))
-    q = prepare_query(f.built, f.bound, :likelihood)
-    @test_throws DimensionMismatch Base.invokelatest(q, [0.1, 0.2])
+    # A bound that reads only data is checked where the data's values are
+    # computed, when the model is built; one that reads parameters, when it
+    # is evaluated.
+    @test_throws DimensionMismatch begin
+        f = build(mismatched, (; y = [series(3), series(2)], n = [3, 1]))
+        Base.invokelatest(prepare_query(f.built, f.bound, :likelihood), [0.1, 0.2])
+    end
     # Not built yet: a missing entry would need its successors' densities
     # marginalized over it; binding names the gap.
     y = Union{Missing,Float64}[series(5)...]
