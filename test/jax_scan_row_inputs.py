@@ -131,7 +131,10 @@ def residual_count(width):
 assert residual_count(2) == residual_count(16)
 
 body_sizes = {"events": [], "padded": []}
-for rounds in (150, 700):
+# Both lengths leave the same remainder in each event phase (50 and 100, then
+# 250 and 500 rounds) under the scan's fixed unroll factor, so the lowered
+# programs must have the same size: no body is copied per round.
+for rounds in (150, 750):
     lengths = (rounds, rounds // 3)
     bases = [np.linspace(-0.5, 1.0, n) for n in lengths]
     types = [np.where(np.arange(n) % 3 == k, 3, 2) for k, n in enumerate(lengths)]
@@ -166,6 +169,8 @@ for rounds in (150, 700):
             assert all(rounds not in getattr(v.aval, "shape", ())
                        for eq in body for v in eq.outvars)
             sizes.append(len(body))
+        lowered = jax.jit(gradient).lower(points, selected).as_text()
+        sizes.append(lowered.count("\n"))
         body_sizes[walk].append(sizes)
 
 for sizes in body_sizes.values():
