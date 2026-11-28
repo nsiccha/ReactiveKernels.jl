@@ -16,6 +16,23 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.409
+
+Stable rewrites at preparation compute `1 - logistic(x)` as `logistic(-x)`,
+in the form `exp(-log1pexp(x))` whose reverse stays finite in both tails, and
+`1 - exp(x)` as `-expm1(x)`, elementwise for dotted calls. A mean-precision
+Beta or beta-binomial whose second shape is `(1 - logistic(eta)) * kappa`,
+the form RKPPL emits for a logit mean and the natural spelling of a
+user-written one, now keeps its density and gradient accurate to
+`eta = ±700`; the written form cancels to zero from `eta ≈ 37`, where its log
+density is `-Inf`. A rule now reads a definition's operand that the program
+assigns more than once, as long as no statement in between assigns or mutates
+it (a plate output), and an inline linear predictor (sums, differences and
+products of such operands), so every rule reaches through them. A package's
+own formulation of the logistic declared with `_metadata_function`, such as
+RKPPL's inverse link, is matched as the logistic. `simplify = false` keeps the
+written form.
+
 ## 0.1.408
 
 The emitted JAX `select_plate_layout` confirms competing layouts in 12 rotating,

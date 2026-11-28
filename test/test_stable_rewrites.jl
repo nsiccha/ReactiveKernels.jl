@@ -9,6 +9,7 @@
 module StableRewritesTest
 
 import Enzyme
+import SpecialFunctions
 using ReactiveKernels
 using ReactiveKernels: LogExpFunctions
 using ReactiveKernelsDistributionKernels: DistributionKernelSources
@@ -518,6 +519,210 @@ end
     A = [0.2 0.1; 0.1 0.3]
     @test RK._rk_log_of(exp, A) == log(exp(A))
     @test RK._rk_pow_of(exp, A, Val(2)) == exp(A)^2
+end
+
+# The complement of a logistic and of an exponential (snag
+# `rk-stable-rewrit-f6a60366`). A mean-precision Beta's second shape
+# `(1 - logistic(eta)) * kappa` cancels to zero from eta ≈ 37, so its log
+# density is -Inf where the exact one is finite; read from `eta`, it is
+# accurate to eta ≈ 740, where `logistic(-eta)` itself leaves the normal range.
+const beta_law = DistributionKernelSources.beta
+
+@kernel stable_one_minus_logistic(x::Float64) = begin
+    p = logistic(x)
+    out = 1 - p
+    return out
+end
+@kernel stable_one_minus_exp(x::Float64) = begin
+    out = 1 - exp(x)
+    return out
+end
+# `log` of a complement the pass rewrote one statement earlier.
+@kernel stable_log_complement(x::Float64) = begin
+    p = logistic(x)
+    q = 1 - p
+    out = log(q)
+    return out
+end
+@kernel stable_log_complement_dotted(x::Vector{Float64}) = begin
+    p = logistic.(x)
+    q = 1 .- p
+    out = sum(log.(q))
+    return out
+end
+# The emitted form of a mean-precision Beta likelihood.
+@kernel stable_beta_complement(eta::Vector{Float64}, y::Vector{Float64}, kappa::Float64) = begin
+    mu = logistic.(eta)
+    a = mu .* kappa
+    b = (1 .- mu) .* kappa
+    lp = plate(y, a, b) do yi, ai, bi
+        beta_law(ai, bi).logpdf(yi)
+    end
+    total = sum(lp)
+    return total
+end
+
+_complement(x) = 1 / (1 + exp(big(x)))
+_complement_slope(x) = (e = exp(big(x)); -e / (1 + e)^2)
+_beta_complement_oracle(eta, y, kappa) = sum(eachindex(y)) do i
+    k = big(kappa)
+    a = k / (1 + exp(-big(eta[i]))); b = k / (1 + exp(big(eta[i])))
+    (a - 1) * log(big(y[i])) + (b - 1) * log1p(-big(y[i])) -
+        (SpecialFunctions.loggamma(a) + SpecialFunctions.loggamma(b) - SpecialFunctions.loggamma(k))
+end
+# Its partial in eta[i], by a BigFloat central difference.
+function _beta_complement_slope(eta, y, kappa, i; h = big(1e-30))
+    up = big.(eta); up[i] += h
+    down = big.(eta); down[i] -= h
+    (_beta_complement_oracle(up, y, kappa) - _beta_complement_oracle(down, y, kappa)) / 2h
+end
+function _complement_gradient(k, eta, rest...)
+    d = zero(eta)
+    Enzyme.autodiff(Enzyme.Reverse, Enzyme.Const(k), Enzyme.Active,
+                    Enzyme.Duplicated(copy(eta), d), map(Enzyme.Const, rest)...)
+    d
+end
+# Calls of `f` in a prepared program, its callee resolved.
+_calls_to(f, x) = 0
+function _calls_to(f, ex::Expr)
+    ex.head in (:quote, :inert) && return 0
+    here = ex.head === :call && !isempty(ex.args) && RK._rw_resolve(ex.args[1], @__MODULE__) === f
+    here + sum(a -> _calls_to(f, a), ex.args; init = 0)
+end
+
+@testset "1 - logistic(x) and 1 - exp(x) read x" begin
+    k = prepare(stable_one_minus_logistic)
+    literal = prepare(stable_one_minus_logistic; simplify = false)
+    @test _calls_to(RK._rk_one_minus_of, code_expr(k)) == 1
+    # The probability nothing reads any more is gone.
+    @test _calls_to(logistic, code_expr(k)) == 0
+    @test _calls_to(logistic, code_expr(literal)) == 1
+    for x in (-800.0, -40.0, -1.0, 0.0, 2.0, 37.0, 40.0, 100.0, 700.0, 740.0, 800.0)
+        @test _close(k(x), _complement(x))
+        @test _close(_reverse(k, x)[1], _complement_slope(x))
+    end
+    # The reported hole, kept under `simplify = false`: the literal cancels to
+    # zero from x = 37.
+    @test literal(40.0) == 0
+    # Where the literal keeps its digits the two agree to within its rounding.
+    for x in (-30.0, -1.0, 0.0, 1.0, 3.0)
+        @test k(x) ≈ literal(x) rtol = 1e-14
+        @test _reverse(k, x)[1] ≈ _reverse(literal, x)[1] rtol = 1e-14
+    end
+    k = prepare(stable_one_minus_exp)
+    @test occursin("_rk_one_minus_of", _code(k))
+    @test _close(k(1e-20), -expm1(big(1e-20)))
+    @test _close(_reverse(k, 1e-20)[1], -exp(big(1e-20)))
+    @test k(800.0) == -Inf && k(-800.0) == 1
+    # A log of the rewritten complement keeps the log1mlogistic form.
+    for kernel in (stable_log_complement, stable_log_one_minus)
+        k = prepare(kernel)
+        @test occursin("_rk_log_one_minus_of", _code(k))
+        @test _close(k(800.0), -800) && _close(_reverse(k, 800.0)[1], -1)
+        @test _close(k(40.0), -log1p(exp(big(40.0))))
+    end
+    k = prepare(stable_log_complement_dotted)
+    @test occursin("_rk_log_one_minus_of", _code(k))
+    x = [800.0, 40.0, -800.0]
+    @test _close(k(x), -800 - log1p(exp(big(40.0))))
+    @test _vgradient(k, x) ≈ [-1.0, -Float64(1 / (1 + exp(-big(40.0)))), 0.0] atol = 1e-300
+    # The Beta's second shape: finite and accurate to eta = 700, as the exact
+    # density is; the literal is -Inf from eta = 40.
+    k = prepare(stable_beta_complement)
+    literal = prepare(stable_beta_complement; simplify = false)
+    y, kappa = [0.2, 0.7, 0.4], 5.0
+    for e in (-700.0, -40.0, 0.0, 2.0, 37.0, 40.0, 100.0, 700.0)
+        eta = [e, e + 0.5, e - 0.25]
+        @test _close(k(eta, y, kappa), _beta_complement_oracle(eta, y, kappa); rtol = 1e-12)
+        g = _complement_gradient(k, eta, y, kappa)
+        for i in eachindex(eta)
+            @test _close(g[i], _beta_complement_slope(eta, y, kappa, i); rtol = 1e-10)
+        end
+    end
+    @test literal(fill(40.0, 3), y, kappa) == -Inf
+    eta = [0.3, -1.2, 2.0]
+    @test k(eta, y, kappa) ≈ literal(eta, y, kappa) rtol = 1e-13
+    @test _complement_gradient(k, eta, y, kappa) ≈ _complement_gradient(literal, eta, y, kappa) rtol = 1e-12
+end
+
+# The probability's operand as a likelihood's location gives it: a plate
+# output, which the program assigns twice (its buffer, then its narrowed
+# array), and an inline linear predictor.
+@kernel stable_complement_plate_output(u::Float64, x::Vector{Float64}, y::Vector{Float64},
+                                       kappa::Float64) = begin
+    eta = plate(x) do xi
+        u + xi
+    end
+    mu = logistic.(eta)
+    a = mu .* kappa
+    b = (1 .- mu) .* kappa
+    lp = plate(y, a, b) do yi, ai, bi
+        beta_law(ai, bi).logpdf(yi)
+    end
+    total = sum(lp)
+    return total
+end
+@kernel stable_complement_inline(u::Float64, x::Vector{Float64}, y::Vector{Float64},
+                                 kappa::Float64) = begin
+    mu = logistic.(u .+ 2.0 .* x)
+    a = mu .* kappa
+    b = (1 .- mu) .* kappa
+    lp = plate(y, a, b) do yi, ai, bi
+        beta_law(ai, bi).logpdf(yi)
+    end
+    total = sum(lp)
+    return total
+end
+# A name the program assigns twice, with the definition reading it before or
+# after its second assignment (`order`).
+function _reassigned_complement(order::Symbol)
+    plus, times, minus = GlobalRef(Base, :+), GlobalRef(Base, :*), GlobalRef(Base, :-)
+    lg = GlobalRef(LogExpFunctions, :logistic)
+    define = :(p = $lg(v))
+    reassign = :(v = $times(v, 2.0))
+    first, second = order === :before ? (define, reassign) : (reassign, define)
+    Expr(:->, Expr(:tuple, :u), Expr(:block,
+        :(v = $plus(u, 1.0)), first, second, :(q = $minus(1, p)), :(return q)))
+end
+
+@testset "a complement reads its location: plate outputs and inline predictors" begin
+    # Read through a definition only while its operand still holds the value
+    # the definition read.
+    after = RK._stable_rewrites(_reassigned_complement(:after), ())
+    before = RK._stable_rewrites(_reassigned_complement(:before), ())
+    @test _calls_to(RK._rk_one_minus_of, after) == 1
+    @test _calls_to(RK._rk_one_minus_of, before) == 0
+    @test eval(after)(39.0) ≈ Float64(_complement(80.0)) rtol = 1e-13
+    @test eval(before)(3.0) == 1 - logistic(4.0)
+    y, kappa = [0.2, 0.7, 0.4], 5.0
+    for (kernel, eta_of) in ((stable_complement_plate_output, (u, x) -> u .+ x),
+                             (stable_complement_inline, (u, x) -> u .+ 2.0 .* x))
+        x = [0.0, 0.5, -0.25]
+        for prepared in (prepare(kernel), prepare_nonallocating(kernel))
+            @test occursin("_rk_one_minus_of", _code(prepared))
+            for u in (-700.0, 0.0, 40.0, 700.0)
+                eta = eta_of(u, x)
+                @test _close(prepared(u, x, y, kappa), _beta_complement_oracle(eta, y, kappa);
+                             rtol = 1e-12)
+                g = _scalar_reverse(prepared, u, x, y, kappa)
+                @test _close(g, sum(i -> _beta_complement_slope(eta, y, kappa, i), eachindex(eta));
+                             rtol = 1e-10)
+            end
+        end
+        @test !isfinite(prepare(kernel; simplify = false)(40.0, x, y, kappa))
+    end
+end
+
+@testset "complement helpers: the literal unless the operand is Real" begin
+    @test RK._rk_one_minus_of(1, logistic, 2.5f0) isa Float32
+    @test RK._rk_one_minus_of(1.0, logistic, 2.5f0) isa Float64
+    @test RK._rk_one_minus_of(1, logistic, 3) isa Float64
+    @test RK._rk_one_minus_of(1, exp, 1) isa Float64
+    @test RK._rk_one_minus_of(1, logistic, Inf) == 0 && RK._rk_one_minus_of(1, logistic, -Inf) == 1
+    @test isnan(RK._rk_one_minus_of(1, logistic, NaN))
+    A = [0.2 0.1; 0.1 0.3]
+    @test_throws MethodError RK._rk_one_minus_of(1, exp, A)
+    @test_throws MethodError 1 - exp(A)
 end
 
 # A kernel of a log-magnitude at an exponential (snag
