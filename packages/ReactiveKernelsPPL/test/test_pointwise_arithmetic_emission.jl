@@ -566,84 +566,90 @@ end
 # link (snag named-row-gather-8c0f5102). An n-ary `.+`/`.*` is a left fold, as
 # Julia's `+(a, b, c)` is, so the sum is a plate whose cells read the named
 # column gather in place: naming the gather costs what writing it inline costs.
+# The row-length term is a matrix product, or the result of a `@kernel` call
+# (BRM's HSGP value is one); the call runs once and the plate reads its result.
+module _PointwiseNaryKernels
+using ReactiveKernels
+@kernel _pointwise_row_product(X, beta) = begin
+    value = X * beta
+    return value
+end
+end
+using ._PointwiseNaryKernels: _pointwise_row_product
+
+function _pointwise_nary_program(pop, gather)
+    named = gather === :named
+    return Expr(:block,
+        :(beta[1:2] .~ Normal.(0, 1)),
+        :(sd ~ LogNormal(0, 0.5)),
+        :(Z[1:J, 1:1] .~ Normal.(0, 1)),
+        :(a ~ Normal(0, 1)),
+        :(c ~ Normal(0, 1)),
+        :(phi ~ LogNormal(3, 0.5)),
+        :(b = Z .* sd),
+        :(pop = $pop),
+        (named ? (:(ranef = b[gi, 1]),) : ())...,
+        :(eta = .+(a, $(named ? :ranef : :(b[gi, 1])), pop, .*(c, w, x))),
+        :(p = logistic.(eta)),
+        :(y .~ BetaBinomial2.(n, p, phi)))
+end
+
 @testset "an n-ary sum with a named column gather joins the likelihood plate" begin
-    named = @rkppl begin
-        beta[1:2] .~ Normal.(0, 1)
-        sd ~ LogNormal(0, 0.5)
-        Z[1:J, 1:1] .~ Normal.(0, 1)
-        a ~ Normal(0, 1)
-        c ~ Normal(0, 1)
-        phi ~ LogNormal(3, 0.5)
-        b = Z .* sd
-        pop = X * beta
-        ranef = b[gi, 1]
-        eta = .+(a, ranef, pop, .*(c, w, x))
-        p = logistic.(eta)
-        y .~ BetaBinomial2.(n, p, phi)
-    end
-    inline = @rkppl begin
-        beta[1:2] .~ Normal.(0, 1)
-        sd ~ LogNormal(0, 0.5)
-        Z[1:J, 1:1] .~ Normal.(0, 1)
-        a ~ Normal(0, 1)
-        c ~ Normal(0, 1)
-        phi ~ LogNormal(3, 0.5)
-        b = Z .* sd
-        pop = X * beta
-        eta = .+(a, b[gi, 1], pop, .*(c, w, x))
-        p = logistic.(eta)
-        y .~ BetaBinomial2.(n, p, phi)
-    end
-    bytes = Dict(:named => Tuple{Int,Int}[], :inline => Tuple{Int,Int}[])
-    for n_rows in (8, 80), (label, model) in ((:named, named), (:inline, inline))
-        gi = [mod1(3i, 4) for i in 1:n_rows]
-        X = hcat(ones(n_rows), [0.05 * i - 0.3 for i in 1:n_rows])
-        x = [0.1 * sin(i) for i in 1:n_rows]
-        w = [1.0 + 0.01 * i for i in 1:n_rows]
-        n = [5 + mod(i, 7) for i in 1:n_rows]
-        y = [mod(2i, n[i] + 1) for i in 1:n_rows]
-        saved = deepcopy((gi, X, x, w, n, y))
-        plan = model(; J = 4, gi, X, x, w, n) | (; y)
-        built = build_kernel(plan)
-        source = sprint(show, Base.remove_linenums!(deepcopy(kernel_expr(plan, built.layout))))
-        @test occursin("eta = plate(", source)
-        @test !occursin("b[gi, 1]", source)
-        label === :named &&
-            @test occursin("ranef = ReactiveKernels._readonly_gather(_ppl_column_b_1, gi)", source)
-        params = (; beta = [0.4, -0.7], sd = 1.2, Z = reshape([0.3, -0.2, 0.1, 0.5], 4, 1),
-            a = 0.2, c = -0.6, phi = 18.0)
-        u = collect(Float64, unconstrain(built.layout, params))
-        sampler = prepare_sampler(built, plan, u; backend = AutoEnzyme(; mode = Enzyme.Reverse))
-        oracle(v) = let k = constrain(built.layout, v)
-            eta = .+(k.a, (k.Z .* k.sd)[gi, 1], X * k.beta, .*(k.c, w, x))
-            mu = inv.(1 .+ exp.(.-eta))
-            sum(logpdf.(Normal(), k.beta)) + logpdf(LogNormal(0, 0.5), k.sd) +
-                sum(logpdf.(Normal(), k.Z)) + log(k.sd) +
-                logpdf(Normal(), k.a) + logpdf(Normal(), k.c) +
-                logpdf(LogNormal(3, 0.5), k.phi) + log(k.phi) +
-                sum(logpdf(BetaBinomial(n[i], mu[i] * k.phi, (1 - mu[i]) * k.phi), y[i])
-                    for i in 1:n_rows)
+    for pop in (:(X * beta), :(_pointwise_row_product(X, beta)))
+        bytes = Dict(:named => Tuple{Int,Int}[], :inline => Tuple{Int,Int}[])
+        for n_rows in (8, 80), gather in (:named, :inline)
+            gi = [mod1(3i, 4) for i in 1:n_rows]
+            X = hcat(ones(n_rows), [0.05 * i - 0.3 for i in 1:n_rows])
+            x = [0.1 * sin(i) for i in 1:n_rows]
+            w = [1.0 + 0.01 * i for i in 1:n_rows]
+            n = [5 + mod(i, 7) for i in 1:n_rows]
+            y = [mod(2i, n[i] + 1) for i in 1:n_rows]
+            saved = deepcopy((gi, X, x, w, n, y))
+            data = Dict{Symbol,Any}(:J => 4, :gi => gi, :X => X, :x => x, :w => w,
+                :n => n, :y => y)
+            plan = bind_data(lower_rkppl(_pointwise_nary_program(pop, gather), data;
+                conditioned = (:y,), mod = @__MODULE__), data)
+            built = build_kernel(plan)
+            source = sprint(show, Base.remove_linenums!(deepcopy(kernel_expr(plan, built.layout))))
+            @test occursin("eta = plate(", source)
+            @test !occursin("b[gi, 1]", source)
+            gather === :named &&
+                @test occursin("ranef = ReactiveKernels._readonly_gather(_ppl_column_b_1, gi)", source)
+            params = (; beta = [0.4, -0.7], sd = 1.2, Z = reshape([0.3, -0.2, 0.1, 0.5], 4, 1),
+                a = 0.2, c = -0.6, phi = 18.0)
+            u = collect(Float64, unconstrain(built.layout, params))
+            sampler = prepare_sampler(built, plan, u; backend = AutoEnzyme(; mode = Enzyme.Reverse))
+            oracle(v) = let k = constrain(built.layout, v)
+                eta = .+(k.a, (k.Z .* k.sd)[gi, 1], X * k.beta, .*(k.c, w, x))
+                mu = inv.(1 .+ exp.(.-eta))
+                sum(logpdf.(Normal(), k.beta)) + logpdf(LogNormal(0, 0.5), k.sd) +
+                    sum(logpdf.(Normal(), k.Z)) + log(k.sd) +
+                    logpdf(Normal(), k.a) + logpdf(Normal(), k.c) +
+                    logpdf(LogNormal(3, 0.5), k.phi) + log(k.phi) +
+                    sum(logpdf(BetaBinomial(n[i], mu[i] * k.phi, (1 - mu[i]) * k.phi), y[i])
+                        for i in 1:n_rows)
+            end
+            gradient = similar(u)
+            value, _ = sampler_value_and_gradient!(sampler, gradient, u)
+            @test value ≈ oracle(u) rtol = 1e-12
+            for k in eachindex(u)
+                up, down = copy(u), copy(u)
+                up[k] += 1e-6
+                down[k] -= 1e-6
+                @test gradient[k] ≈ (oracle(up) - oracle(down)) / 2e-6 rtol = 1e-6 atol = 2e-6
+            end
+            @test (gi, X, x, w, n, y) == saved
+            push!(bytes[gather], (_pointwise_primal_bytes(sampler.kernel, u),
+                _pointwise_reverse_bytes(sampler, gradient, u)))
         end
-        gradient = similar(u)
-        value, _ = sampler_value_and_gradient!(sampler, gradient, u)
-        @test value ≈ oracle(u) rtol = 1e-12
-        for k in eachindex(u)
-            up, down = copy(u), copy(u)
-            up[k] += 1e-6
-            down[k] -= 1e-6
-            @test gradient[k] ≈ (oracle(up) - oracle(down)) / 2e-6 rtol = 1e-6 atol = 2e-6
-        end
-        @test (gi, X, x, w, n, y) == saved
-        push!(bytes[label], (_pointwise_primal_bytes(sampler.kernel, u),
-            _pointwise_reverse_bytes(sampler, gradient, u)))
+        # Naming the gather allocates nothing the inline spelling does not.
+        @test bytes[:named] == bytes[:inline]
+        # Only the row-length term's vector (and, in reverse, its shadow) grows
+        # with the observations.
+        primal, reverse = bytes[:named][2] .- bytes[:named][1]
+        @test primal <= 8 * (80 - 8) + 64
+        @test reverse <= 2 * 8 * (80 - 8) + 128
     end
-    # Naming the gather allocates nothing the inline spelling does not.
-    @test bytes[:named] == bytes[:inline]
-    # Only the design product's vector (and, in reverse, its shadow) grows
-    # with the observations.
-    primal, reverse = bytes[:named][2] .- bytes[:named][1]
-    @test primal <= 8 * (80 - 8) + 64
-    @test reverse <= 2 * 8 * (80 - 8) + 128
 end
 
 # A factor term `c[g]` of an affine predictor reads its coefficients by level

@@ -625,7 +625,19 @@ function _pointwise_call_leaf(ex, values, bound_names)
             return _pointwise_unknown(ex, values)
         push!(states, part)
     end
-    return _pointwise_call(ex, states, bound_names)
+    return _pointwise_leaf_call(ex, states, bound_names)
+end
+
+# The plate reads such a leaf's result by position and never replaces the call,
+# so a sound partial fact about that result is enough, as it is for RKPPL's
+# value metadata (`_metadata_result`): a visible `@kernel` graph's output (BRM's
+# HSGP value `brm_hsgp_spectral_graph`) has known axes although no numerical
+# rule certifies the call itself (`ReactiveKernels._metadata_call`).
+function _pointwise_leaf_call(ex, states, bound_names)
+    r = ReactiveKernels._call_metadata(ex, _OS.ValueInfo[s.info for s in states],
+        @__MODULE__, bound_names)
+    info = r.status === :incompatible ? _OS.ValueInfo() : r.value
+    return _PointwiseValue(info, any(s.live for s in states))
 end
 
 # A column gather `A[idx, k]` of a known matrix by a known integer index
