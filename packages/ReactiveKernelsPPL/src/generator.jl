@@ -555,6 +555,10 @@ _same_program(x::Array, y::Array) = typeof(x) === typeof(y) &&
 # once. Other ranks, axes and callable leaves keep their authored expression.
 const _POINTWISE_ARITHMETIC = Dict(Symbol(".+") => :+, Symbol(".-") => :-,
     Symbol(".*") => :*, Symbol("./") => :/, Symbol(".^") => :^)
+# Julia's n-ary `+` and `*` fold from the left (`+(a, b, c)` is `(a + b) + c`),
+# so a dotted sum or product of any number of operands (BRM's
+# `.+(intercept, ranef, smooth)`) lowers to the same binary cell arithmetic.
+const _POINTWISE_NARY = (Symbol(".+"), Symbol(".*"))
 
 struct _PointwiseValue
     info::ReactiveKernels.OutputSignatures.ValueInfo
@@ -726,7 +730,7 @@ function _pointwise_tree!(inputs, formals, ex, values, indices, gathers, bound_n
     end
     if Meta.isexpr(ex, :call) && !isempty(ex.args) &&
             haskey(_POINTWISE_ARITHMETIC, ex.args[1]) &&
-            length(ex.args) in (2, 3)
+            (length(ex.args) in (2, 3) || ex.args[1] in _POINTWISE_NARY)
         terms = Any[]
         states = _PointwiseValue[]
         for a in ex.args[2:end]
@@ -738,8 +742,9 @@ function _pointwise_tree!(inputs, formals, ex, values, indices, gathers, bound_n
         end
         result = _pointwise_call(ex, states, bound_names)
         _pointwise_known(result) || return nothing, result
-        return Expr(:call, _POINTWISE_ARITHMETIC[ex.args[1]], terms...),
-            result
+        op = _POINTWISE_ARITHMETIC[ex.args[1]]
+        return foldl((acc, t) -> Expr(:call, op, acc, t), terms[3:end];
+            init = Expr(:call, op, terms[1:min(end, 2)]...)), result
     end
     column = _pointwise_column_gather(ex, values, indices, bound_names)
     leaf, state = if Meta.isexpr(ex, :ref, 2) && ex.args[1] isa Symbol &&
