@@ -69,42 +69,42 @@ end
     return total
 end
 
-# --- softplus beside another term in a summed plate (RK 0.1.372)
-@kernel soft_abs2(x::Vector{Float64}, w::Vector{Float64}) = begin
-    cells = plate(x, w) do v, z
-        log1pexp(v) + 0.5 * abs2(z)
-    end
-    total::Float64 = sum(cells)
-    return total
+# --- softplus in a summed plate (RK 0.1.372): beside another term, and written out
+const logistic = RK.LogExpFunctions.logistic
+const loglogistic = RK.LogExpFunctions.loglogistic
+const log1mlogistic = RK.LogExpFunctions.log1mlogistic
+smooth(z) = muladd(z, z, 1.0) / (1.0 + abs(z))
+const SOFTPLUS_CELLS = Pair{String,Any}[]
+macro softplus_cell(name, label, cell)
+    esc(quote
+        @kernel $name(x::Vector{Float64}, w::Vector{Float64}) = begin
+            cells = plate(x, w) do v, z
+                $cell
+            end
+            total::Float64 = sum(cells)
+            return total
+        end
+        push!(SOFTPLUS_CELLS, $label => $name)
+    end)
 end
-@kernel soft_square(x::Vector{Float64}, w::Vector{Float64}) = begin
-    cells = plate(x, w) do v, z
-        log1pexp(v) + 0.5 * z^2
-    end
-    total::Float64 = sum(cells)
-    return total
-end
-@kernel soft_product(x::Vector{Float64}, w::Vector{Float64}) = begin
-    cells = plate(x, w) do v, z
-        log1pexp(v) + 0.5 * (z * z)
-    end
-    total::Float64 = sum(cells)
-    return total
-end
-@kernel soft_spelled(x::Vector{Float64}, w::Vector{Float64}) = begin
-    cells = plate(x, w) do v, z
-        log1p(exp(v)) + 0.5 * abs2(z)
-    end
-    total::Float64 = sum(cells)
-    return total
-end
-@kernel soft_sqrt(x::Vector{Float64}, w::Vector{Float64}) = begin
-    cells = plate(x, w) do v, z
-        log1pexp(v) + sqrt(abs2(z) + 1.0)
-    end
-    total::Float64 = sum(cells)
-    return total
-end
+@softplus_cell soft_abs2 "log1pexp(v) + 0.5 * abs2(z)" (log1pexp(v) + 0.5 * abs2(z))
+@softplus_cell soft_product "log1pexp(v) + 0.5 * (z * z)" (log1pexp(v) + 0.5 * (z * z))
+@softplus_cell soft_square "log1pexp(v) + 0.5 * z^2" (log1pexp(v) + 0.5 * z^2)
+@softplus_cell soft_cube "log1pexp(v) + 0.5 * z^3" (log1pexp(v) + 0.5 * z^3)
+@softplus_cell soft_fourth "log1pexp(v) + 0.5 * z^4" (log1pexp(v) + 0.5 * z^4)
+@softplus_cell soft_sqrt "log1pexp(v) + sqrt(abs2(z) + 1)" (log1pexp(v) + sqrt(abs2(z) + 1.0))
+@softplus_cell soft_function "log1pexp(v) + smooth(z), a function of the model's" (log1pexp(v) + smooth(z))
+@softplus_cell soft_log "log1pexp(v) + log(abs2(z) + 1)" (log1pexp(v) + log(abs2(z) + 1.0))
+@softplus_cell soft_log_sum "log1pexp(v) + log(exp(z) + exp(-z) + exp(2z))" (log1pexp(v) + log(exp(z) + exp(-z) + exp(2.0 * z)))
+@softplus_cell soft_log_pair "log1pexp(v) + log(exp(z) + exp(-z))" (log1pexp(v) + log(exp(z) + exp(-z)))
+@softplus_cell soft_spelled "log1p(exp(v)) + 0.5 * abs2(z)" (log1p(exp(v)) + 0.5 * abs2(z))
+@softplus_cell soft_spelled_log "log(1 + exp(v)) + 0.5 * abs2(z)" (log(1 + exp(v)) + 0.5 * abs2(z))
+@softplus_cell soft_logistic "-log(logistic(-v)) + 0.5 * abs2(z)" (-log(logistic(-v)) + 0.5 * abs2(z))
+@softplus_cell soft_log1m "-log1p(-logistic(v)) + 0.5 * abs2(z)" (-log1p(-logistic(v)) + 0.5 * abs2(z))
+@softplus_cell soft_complement "-log(1 - logistic(v)) + 0.5 * abs2(z)" (-log(1 - logistic(v)) + 0.5 * abs2(z))
+@softplus_cell soft_loglogistic "-loglogistic(-v) + 0.5 * abs2(z)" (-loglogistic(-v) + 0.5 * abs2(z))
+@softplus_cell soft_log1mlogistic "-log1mlogistic(v) + 0.5 * abs2(z)" (-log1mlogistic(v) + 0.5 * abs2(z))
+@softplus_cell soft_sigmoid "-log(1 / (1 + exp(-v))) + 0.5 * abs2(z)" (-log(1 / (1 + exp(-v))) + 0.5 * abs2(z))
 
 function report(group, name, k, helper, args...)
     source = string(code_expr(k))
@@ -129,11 +129,9 @@ for (name, spec) in (("(exp(v) + exp(-v)) + exp(2v)", logs_nested), ("exp(v) + e
         println("CORE\tvector log\t$name\terror\t", first(sprint(showerror, err), 200))
     end
 end
-for (name, spec) in (("log1pexp(v) + 0.5 * abs2(z)", soft_abs2), ("log1pexp(v) + 0.5 * z^2", soft_square),
-                     ("log1pexp(v) + 0.5 * (z * z)", soft_product), ("log1p(exp(v)) + 0.5 * abs2(z)", soft_spelled),
-                     ("log1pexp(v) + sqrt(abs2(z) + 1)", soft_sqrt))
+for (name, spec) in SOFTPLUS_CELLS
     try
-        report("vector softplus, 4096 cells", name, prepare(spec), ("_vector_log1pexp", "_vector_rk_log1pexp"), 3.0 .* x, w)
+        report("vector softplus, 4096 cells", name, prepare(spec), ("_vector_",), 3.0 .* x, w)
     catch err
         println("CORE\tvector softplus\t$name\terror\t", first(sprint(showerror, err), 200))
     end

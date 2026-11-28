@@ -93,6 +93,14 @@ const _vector_softplus = scalar_derivative_rule(_vector_softplus_graph;
 @inline _vector_log1pexp(x::Float64) = _vector_softplus(x)
 @inline _vector_log1pexp(x) = LogExpFunctions.log1pexp(x)
 
+# The logarithms of a logistic are a softplus by definition
+# (`loglogistic(x) = -log1pexp(-x)`, `log1mlogistic(x) = -log1pexp(x)`), so a
+# vector loop computes them from the vector softplus too.
+@inline _vector_loglogistic(x::Float64) = -_vector_softplus(-x)
+@inline _vector_loglogistic(x) = LogExpFunctions.loglogistic(x)
+@inline _vector_log1mlogistic(x::Float64) = -_vector_softplus(x)
+@inline _vector_log1mlogistic(x) = LogExpFunctions.log1mlogistic(x)
+
 # The loop whose compiled form `_vector_doubles` reads: a sum over the vector
 # softplus, as a summed plate's cell loop runs it.
 function _vector_softplus_probe(x::Vector{Float64})
@@ -126,21 +134,34 @@ end
 # source's softplus.
 const _VECTOR_SOFTPLUS_DOUBLES = 4
 
-# The vector twin of a softplus where a vector holds `doubles` cells (this
+# The functions that compute a softplus, each with the name of its vector twin.
+_vector_softplus_twins() = ((rk_log1pexp, :_vector_rk_log1pexp),
+    (LogExpFunctions.log1pexp, :_vector_log1pexp),
+    (LogExpFunctions.loglogistic, :_vector_loglogistic),
+    (LogExpFunctions.log1mlogistic, :_vector_log1mlogistic))
+
+# The vector twin of such a function where a vector holds `doubles` cells (this
 # process's CPU unless given), or `nothing`.
-_vector_softplus_twin(f, doubles = _vector_doubles()) = doubles < _VECTOR_SOFTPLUS_DOUBLES ? nothing :
-    f === rk_log1pexp ? :_vector_rk_log1pexp :
-    f === LogExpFunctions.log1pexp ? :_vector_log1pexp : nothing
+function _vector_softplus_twin(f, doubles = _vector_doubles())
+    doubles < _VECTOR_SOFTPLUS_DOUBLES && return nothing
+    for (source, twin) in _vector_softplus_twins()
+        f === source && return twin
+    end
+    nothing
+end
 
-# The softplus a vector-loop call stands for: `LogExpFunctions.log1pexp` for
-# either twin, for the passes that read a cell by the function it computes.
+# The function a vector-loop call stands for, for the passes that read a cell
+# by the function it computes: `LogExpFunctions.log1pexp` for either softplus
+# twin, the logistic logarithm for its twin.
 _vector_softplus_source(f) =
-    f === _vector_rk_log1pexp || f === _vector_log1pexp ? LogExpFunctions.log1pexp : f
+    f === _vector_rk_log1pexp || f === _vector_log1pexp ? LogExpFunctions.log1pexp :
+    f === _vector_loglogistic ? LogExpFunctions.loglogistic :
+    f === _vector_log1mlogistic ? LogExpFunctions.log1mlogistic : f
 
-# Calls that leave a loop straight-line arithmetic: the compiler turns a loop
-# of these into vector code. Anything else may keep the loop scalar, where the
-# vector softplus is the slower one, so a function is added here only with a
-# measurement of a loop that calls it.
+# Calls known to leave a loop straight-line arithmetic: the compiler turns a
+# loop of these into vector code. They are the answers that need no asking;
+# for a call of any other function the compiler is asked (`_vector_compiles`,
+# vector_cells.jl).
 _vector_safe_function(f) = f === (+) || f === (-) || f === (*) || f === (/) ||
     f === _native_mul || f === _native_scalar_exp ||
     f === abs || f === abs2 || f === max || f === min || f === ifelse || f === muladd ||
@@ -150,11 +171,14 @@ _vector_safe_function(f) = f === (+) || f === (-) || f === (*) || f === (/) ||
     f === Base.CartesianIndex || f === Base.Broadcast._broadcast_getindex ||
     f === _plate_read || f === _plate_total_add ||
     f === rk_log1pexp || f === LogExpFunctions.log1pexp ||
-    f === _vector_rk_log1pexp || f === _vector_log1pexp
+    f === _vector_rk_log1pexp || f === _vector_log1pexp ||
+    f === _vector_loglogistic || f === _vector_log1mlogistic
 
 # Whether a summed plate's cell `ex` is straight-line arithmetic: assignments
-# and calls of `_vector_safe_function`s, with no lazy branch, loop or indexed
-# read of its own (a constant's table read aside). `callable(callee)` answers
+# and calls that leave a loop vector code, with no lazy branch, loop or indexed
+# read of its own (a constant's table read aside). A call is one of
+# `safe_function`'s, or one the compiler turns into vector code together with
+# the expressions it is given (`_vector_compiles`). `callable(callee)` answers
 # the function a callee that is not a global names, or `nothing`.
 function _vector_safe_cell(ex, callable = Returns(nothing), safe_function = _vector_safe_function)
     ex isa Expr || return true
@@ -165,7 +189,7 @@ function _vector_safe_cell(ex, callable = Returns(nothing), safe_function = _vec
         value = _vector_callee_value(ex.args[1])
         value === nothing && (value = callable(ex.args[1]))
         value === nothing && return false
-        safe_function(something(value)) || return false
+        safe_function(something(value)) || return _vector_compiles(ex, callable)
         return all(arg -> _vector_safe_cell(arg, callable, safe_function), @view ex.args[2:end])
     elseif head === :ref
         return length(ex.args) == 2 && ex.args[1] === _CONSTANTS_ARG
@@ -195,18 +219,20 @@ function _vector_callee_value(callee)
     nothing
 end
 
-# `ex` with each softplus call replaced by its vector twin. `ex` is code a
-# vector loop runs: a summed plate's cell. `callable(callee)` answers the
-# function a callee that is not a global names, or `nothing`.
+# `ex` with each softplus call replaced by its vector twin, or `ex` itself
+# where it holds none. `ex` is code a vector loop runs: a summed plate's cell.
+# `callable(callee)` answers the function a callee that is not a global names,
+# or `nothing`.
 function _vector_softplus_calls(ex, callable = Returns(nothing))
     ex isa Expr || return ex
     ex.head in (:quote, :inert, :meta, :macrocall) && return ex
     args = Any[_vector_softplus_calls(arg, callable) for arg in ex.args]
+    changed = any(i -> args[i] !== ex.args[i], eachindex(args))
     if ex.head === :call && !isempty(args)
         value = _vector_callee_value(ex.args[1])
         value === nothing && (value = callable(ex.args[1]))
         twin = value === nothing ? nothing : _vector_softplus_twin(something(value))
-        twin === nothing || (args[1] = GlobalRef(@__MODULE__, twin))
+        twin === nothing || (args[1] = GlobalRef(@__MODULE__, twin); changed = true)
     end
-    Expr(ex.head, args...)
+    changed ? Expr(ex.head, args...) : ex
 end

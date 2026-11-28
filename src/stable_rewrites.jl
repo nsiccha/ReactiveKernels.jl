@@ -1075,7 +1075,7 @@ function _rw_plate_expr(ex, plate, ctx, env)
                              copy(inner)) for body in plate.bodies]
     pop!(ctx.loops)
     if ctx.vectorize_cells && plate.simd
-        map!(_vectorize_cell_logs, rewritten, rewritten)
+        map!(_vectorize_cell, rewritten, rewritten)
     end
     result = plate.replace(rewritten)
     isempty(loop.prelude) && return result

@@ -105,7 +105,18 @@ function _gradient(k, y, mu, sigma)
         Enzyme.Duplicated(copy(mu), dmu), Enzyme.Active(sigma))[1][3]
     (dmu, dsigma)
 end
-_agrees(a, b; rtol) = isequal(a, b) || isapprox(a, b; rtol)
+_agrees(a, b; rtol, atol = 0.0) = isequal(a, b) || isapprox(a, b; rtol, atol)
+# The logistic law's cells take the vector softplus once the shared scale's
+# terms have left them (`_vectorize_cell`, `src/vector_cells.jl`). Its partial
+# is the owned rule's, which can differ in its last place from the one
+# ordinary reverse derives for `LogExpFunctions.log1pexp` in the literal
+# program. The law's location derivative is `(1 - 2p) / sigma` for that
+# partial `p <= 1/2`, so a last-place difference in `p` moves it by at most
+# `2 * eps() / sigma`. Where the law's own subtraction cancels (a large scale,
+# so a small `|z|`), that is more than `rtol` of the entry: at `sigma = 3e5`
+# both gradients are 1.4e-10 and 1.7e-10 from the exact `tanh(z / 2) / sigma`.
+_partial_rounding(kernel, sigma) =
+    kernel === shared_logistic && isfinite(sigma) && sigma > 0 ? 4 * eps() / sigma : 0.0
 
 const Y = [0.3, -0.2, 1.1, 2.5, -1.0, 0.7, 0.0]
 const MU = [0.1, 0.0, 0.9, 2.0, -0.5, 0.7, -0.3]
@@ -120,7 +131,7 @@ const MU = [0.1, 0.0, 0.9, 2.0, -0.5, 0.7, -0.3]
         for sigma in (0.7, 2.0, 1e-3, 3e5)
             @test k(Y, MU, sigma) ≈ literal(Y, MU, sigma) rtol = 1e-14
             g, gl = _gradient(k, Y, MU, sigma), _gradient(literal, Y, MU, sigma)
-            @test g[1] ≈ gl[1] rtol = 1e-13
+            @test g[1] ≈ gl[1] rtol = 1e-13 atol = _partial_rounding(kernel, sigma)
             @test g[2] ≈ gl[2] rtol = 1e-13
         end
         # Extreme scales and data: the plate's own loop decides each of these,
@@ -132,7 +143,7 @@ const MU = [0.1, 0.0, 0.9, 2.0, -0.5, 0.7, -0.3]
             @test _agrees(v, vl; rtol = 1e-14)
             if isfinite(vl)
                 g, gl = _gradient(k, y, mu, sigma), _gradient(literal, y, mu, sigma)
-                @test all(_agrees.(g[1], gl[1]; rtol = 1e-13))
+                @test all(_agrees.(g[1], gl[1]; rtol = 1e-13, atol = _partial_rounding(kernel, sigma)))
                 @test _agrees(g[2], gl[2]; rtol = 1e-13)
             end
         end

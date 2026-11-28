@@ -16,6 +16,54 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.421
+
+- In a native summed plate, a cell that holds a softplus runs as vector code
+  beside any call the compiler turns into vector code. Since 0.1.372 that
+  needed every call of the cell to be in a fixed list. For a call the list
+  does not name, preparation now asks the compiler: it compiles a sum over
+  the call as the cell writes it, with a `Float64` for each name the call
+  reads, once per process, and takes the call when that loop holds vectors as
+  wide as a softplus loop's and calls nothing. So `z^2` and `z^3` (Julia
+  compiles them as products), `sqrt(abs2(z) + 1)` (the compiler proves the
+  argument is not negative and drops the domain check) and a straight-line
+  function of the model's own are taken. `z^4` and `z^2.0` (calls of `pow`),
+  a bare `sqrt(z)` (its domain check can throw) and Base's `log` are not, and
+  their cells run as before. Only a cell with a softplus or a logarithm of a
+  sum of exponentials asks. A question took 50 to 100 ms on a host at a load
+  of 58 on 32 threads, 230 ms for an expression with two exponentials, and
+  is answered from a table for the rest of the process.
+- The softplus is the vector softplus however the cell writes it:
+  `log1p(exp(x))`, `log(1 + exp(x))`, `log(logistic(x))`,
+  `log1p(-logistic(x))`, `log(1 - logistic(x))`, `log(1 / (1 + exp(-x)))` and
+  its complement, and `LogExpFunctions.loglogistic` and `log1mlogistic` called
+  by name, where it had to be `log1pexp` or `rk_log1pexp`. The stable rewrites
+  already computed each of these as a softplus, one cell at a time. A
+  broadcast of `loglogistic` or `log1mlogistic` that a non-allocating program
+  materializes by itself takes the vector softplus as well. `simplify = false`
+  keeps a written-out softplus as written.
+- A cell with a softplus and a logarithm of three or more exponentials
+  (0.1.373) takes both vector forms. Each used to keep the other scalar.
+- Values agree with the previous ones to the rounding of the vector softplus
+  (one unit in the last place per cell). Its derivative is the owned rule's
+  partial, as since 0.1.372, so the gradient of a cell that newly takes the
+  vector softplus can differ from the previous one by the rounding of that
+  partial. The plate of a logistic location-scale law with a shared scale is
+  such a cell: its location derivatives move by at most `2 * eps() / scale`,
+  which is more than their last place where the law's own subtraction
+  cancels. At `scale = 3e5` the new and the previous gradient are 1.4e-10 and
+  1.7e-10 from the exact one. A program prepared with bound data differs by
+  the same rounding from the program without it where the cached data leaves
+  a cell the compiler makes vector code of. That held for `log1pexp` since
+  0.1.372 and now holds for the written-out forms.
+- On 4,096 cells (AVX-512, Julia 1.10, CPU time per call), beside
+  `log1pexp(v)`: `0.5 * z^2` from 43.0 to 9.9 µs, `sqrt(abs2(z) + 1)` from
+  35.8 to 11.4 µs, a function of the model's from 47.2 to 10.5 µs, a
+  three-term logarithm of exponentials from 84.8 to 26.8 µs. The eight
+  written-out softplus forms take 9.4 to 10.1 µs, from 37 to 51 µs;
+  `log1pexp(v) + 0.5 * abs2(z)` takes 10.0 µs.
+  `benchmark/near_miss/core_spellings.jl` times each spelling.
+
 ## 0.1.420
 
 The rows of a cell's sum over `vcat(a, b, ...)` are each operand's rows in
