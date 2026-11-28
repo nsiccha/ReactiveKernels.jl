@@ -55,6 +55,12 @@ for n in (0, 1, 7, 31):
         counts.append(Counter(eq.primitive.name for eq in walk(graph)))
         roots = [eq for eq in walk(graph) if eq.primitive.name == "sqrt"]
         assert roots and all(eq.outvars[0].aval.shape == () for eq in roots)
+        # Each shared tangent reaches the cells behind a barrier, so reverse
+        # mode sums one stored product per cell.
+        cells = [eq for eq in walk(graph) if eq.primitive.name == "optimization_barrier"
+                 and any(v.aval.shape == (n,) and jnp.issubdtype(v.aval.dtype, jnp.floating)
+                         for v in eq.outvars)]
+        assert cells
 
 assert counts[0] == counts[1]
 
