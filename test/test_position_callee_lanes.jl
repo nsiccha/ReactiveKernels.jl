@@ -4,6 +4,8 @@ using Test
 using ReactiveKernels
 using ReactiveKernels: plate, scan, code_expr, derivative_rule
 
+include("rule_execution_tables.jl")
+
 # A position-batched reader reuses the buffers of RK-owned callees whose
 # mathematics is a graph (snag rule-plate-splic-728756b1): a derivative rule's
 # primal cut, called as a recipe or in a lazy arm, and a child kernel with a
@@ -212,11 +214,13 @@ end
         # Outside a position residual the callee keeps its ordinary call.
         @test !occursin("_lane_call", string(code_expr(prepare(spec))))
     end
-    # A rule whose graph holds a plate stays an isbits value, and its primal
+    # A rule whose graph holds a plate keeps that cut's source plan for source
+    # backends, so it is not an isbits value as a whole (RK 0.1.293). The
+    # tables its native calls read are, its call is inferred, and its primal
     # cut is the prepared graph's.
-    @test isbits(decay_rule)
+    @test _rule_execution_isbits(decay_rule)
     ts = times(9); q = [1.2, 0.1]
-    @test decay_rule(ts, q) == prepare(decay; have = (:ts, :q), want = :y)(ts, q)
+    @test @inferred(decay_rule(ts, q)) == prepare(decay; have = (:ts, :q), want = :y)(ts, q)
 end
 
 # On RK 25ed45ff2 each unit vector was allocated at every treatment cell and
