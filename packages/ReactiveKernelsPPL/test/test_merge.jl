@@ -210,6 +210,119 @@ end
     @test_throws SurfaceLoweringError _lower_y(clash)
 end
 
+# A model text states a law (`c[levels(g)] .~ Normal.(0, sg)`), and an overlay
+# passed to `merge` re-spells it non-centred without editing that text: the
+# overlay's definition of `c` takes the declaration's place and its fresh
+# innovation array appends (decision `1uqqq2o`). The result is the
+# hand-written non-centred model. Its density is the centred model's at the
+# mapped point plus the log-Jacobian of the map, one `log(scale)` per element.
+# `scale` reads that scale off a constrained draw.
+function _merge_respelled_checks(centred, overlay, hand, name::Symbol, scale, g, y)
+    lower(m) = lower_rkppl(m.ast, (:y, :g); mod = @__MODULE__, conditioned = (:y,))
+    value(q, u) = Base.invokelatest(q, u)
+    before = deepcopy(centred.ast)
+    respelled = Base.merge(centred, overlay)
+    @test _plans_equal(lower(respelled), lower(hand))
+    @test centred.ast == before
+    pc, pn = centred(; g) | (; y), respelled(; g) | (; y)
+    bc, bn = build_kernel(pc), build_kernel(pn)
+    # The centred model samples the declared array. The re-spelled model
+    # samples the innovations `z`, and the array is a value read by name.
+    template = constrain(bc.layout, zeros(bc.layout.total))
+    @test haskey(template, name)
+    un = collect(range(-0.4, 0.5; length = bn.layout.total))
+    drawn = constrain(bn.layout, un)
+    @test haskey(drawn, :z) && !haskey(drawn, name)
+    mapped = value(prepare_query(bn, pn, (name,)), un)
+    @test length(mapped) == length(drawn.z) == length(template[name])
+    shared = (; (k => drawn[k] for k in keys(drawn) if k !== :z && haskey(template, k))...)
+    uc = unconstrain(bc.layout, merge(template, shared,
+        NamedTuple{(name,)}((collect(Float64, mapped),))))
+    @test value(prepare_query(bn, pn, :likelihood), un) ≈
+        value(prepare_query(bc, pc, :likelihood), uc)
+    @test value(prepare_query(bn, pn, :sampler), un) ≈
+        value(prepare_query(bc, pc, :sampler), uc) + length(mapped) * log(scale(drawn))
+end
+
+@testset "merge re-spells a centred declaration as non-centred" begin
+    g = ["a", "b", "b", "c", "a", "c", "b"]
+    y = [0.3, -0.8, 1.1, 0.2, -0.4, 0.9, 0.5]
+    @testset "a real-valued effect per level" begin
+        centred = @rkppl begin
+            a ~ Normal(0, 5)
+            sg ~ HalfNormal(1)
+            c[levels(g)] .~ Normal.(0, sg)
+            sigma ~ Exponential(1)
+            mu = a .+ c[g]
+            y .~ Normal.(mu, sigma)
+        end
+        overlay = quote
+            z[levels(g)] .~ Normal.(0, 1)
+            c = sg .* z
+        end
+        hand = @rkppl begin
+            a ~ Normal(0, 5)
+            sg ~ HalfNormal(1)
+            c = sg .* z
+            sigma ~ Exponential(1)
+            mu = a .+ c[g]
+            y .~ Normal.(mu, sigma)
+            z[levels(g)] .~ Normal.(0, 1)
+        end
+        _merge_respelled_checks(centred, overlay, hand, :c, d -> d.sg, g, y)
+    end
+    @testset "a location and a scale" begin
+        centred = @rkppl begin
+            mu_alpha ~ Normal(0, 10)
+            sigma_alpha ~ Exponential(1)
+            s ~ Exponential(1)
+            c[levels(g)] .~ Normal.(mu_alpha, sigma_alpha)
+            mu = c[g]
+            y .~ Normal.(mu, s)
+        end
+        overlay = quote
+            z[levels(g)] .~ Normal.(0, 1)
+            c = mu_alpha .+ sigma_alpha .* z
+        end
+        hand = @rkppl begin
+            mu_alpha ~ Normal(0, 10)
+            sigma_alpha ~ Exponential(1)
+            s ~ Exponential(1)
+            c = mu_alpha .+ sigma_alpha .* z
+            mu = c[g]
+            y .~ Normal.(mu, s)
+            z[levels(g)] .~ Normal.(0, 1)
+        end
+        _merge_respelled_checks(centred, overlay, hand, :c, d -> d.sigma_alpha, g, y)
+    end
+    # A positive effect, which adaptive centring does not take: its support
+    # transform is not the identity.
+    @testset "a positive effect per level" begin
+        centred = @rkppl begin
+            m ~ Normal(0, 1)
+            t ~ Exponential(1)
+            s ~ Exponential(1)
+            r[levels(g)] .~ LogNormal.(m, t)
+            mu = r[g]
+            y .~ Normal.(mu, s)
+        end
+        overlay = quote
+            z[levels(g)] .~ Normal.(0, 1)
+            r = exp.(m .+ t .* z)
+        end
+        hand = @rkppl begin
+            m ~ Normal(0, 1)
+            t ~ Exponential(1)
+            s ~ Exponential(1)
+            r = exp.(m .+ t .* z)
+            mu = r[g]
+            y .~ Normal.(mu, s)
+            z[levels(g)] .~ Normal.(0, 1)
+        end
+        _merge_respelled_checks(centred, overlay, hand, :r, d -> d.t, g, y)
+    end
+end
+
 @testset "merge NamedTuple fix transparency" begin
     n = 6
     fixed = Base.merge(merge_base, (; s = fill(2.0, n)))
