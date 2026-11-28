@@ -295,6 +295,32 @@ end
             end
         end
     end
+    # The fused loop reads any one-based vector of machine integers. A mask
+    # and wider integer types keep the literal operations. Every index type
+    # gives the values of the literal operations.
+    literal(X, W, index) = cat((sum(X .* W[index, :, j]; dims=2) for j in axes(W, 3))...; dims=3)
+    reader = vectorize(prepare(weighted_rows_matrix); batched=:W, reuse=true)
+    W = reshape(collect(1.0:18), 3, 3, 2)
+    base = [3, 1, 3, 2]
+    for index in (Int32.(base), UInt16.(base), Int8.(base), UInt.(base), view([0; base; 0], 2:5),
+                  1:3, Base.OneTo(3), 3:-1:1, Int32(1):Int32(2):Int32(3), big.(base), [true, false, true])
+        rows = index isa AbstractVector{Bool} ? count(index) : length(index)
+        X = reshape(collect(1.0:3rows), rows, 3)
+        @test reader(X, W, index) == literal(X, W, index)
+    end
+    @test_throws BoundsError reader(ones(2, 3), W, UInt16[1, 4])
+    @test_throws BoundsError reader(ones(2, 3), W, Int32[0, 1])
+    @test_throws BoundsError reader(ones(4, 3), W, 1:4)
+    # Whatever the index type, the fused loop allocates no gather, product or
+    # sum per position (about 115 KB here for the literal operations).
+    wide_X, wide_W = ones(200, 6), ones(50, 6, 4)
+    ints = repeat(collect(1:50), 4)
+    allocated(index) = (reader(wide_X, wide_W, index); @allocated reader(wide_X, wide_W, index))
+    reference = allocated(ints)
+    for index in (Int32.(ints), UInt16.(ints), view(ints, :))
+        @test reader(wide_X, wide_W, index) == literal(wide_X, wide_W, index)
+        @test allocated(index) <= reference + 512
+    end
     W = reshape(collect(1.0:18), 3, 3, 2)
     index = [3, 1, 3, 2]
     X = ones(4, 3)

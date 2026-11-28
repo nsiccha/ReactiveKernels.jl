@@ -60,6 +60,38 @@ end
     return total
 end
 
+@kernel flat_sum(x::Vector{Float64}) = begin
+    cells = plate(x) do v
+        log(exp(v) + exp(-v) + exp(2.0 * v))
+    end
+    total::Float64 = sum(cells)
+    return total
+end
+
+@kernel weighted_sum(x::Vector{Float64}) = begin
+    cells = plate(x) do v
+        log(0.3 * exp(v) + 0.7 * exp(-v))
+    end
+    total::Float64 = sum(cells)
+    return total
+end
+
+@kernel scaled_sum(x::Vector{Float64}) = begin
+    cells = plate(x) do v
+        log(exp(v) * 2 + 0.5 * (exp(-v) + exp(2.0 * v)))
+    end
+    total::Float64 = sum(cells)
+    return total
+end
+
+@kernel signed_weights(x::Vector{Float64}) = begin
+    cells = plate(x) do v
+        log(1.5 * exp(v) + -0.25 * exp(-v))
+    end
+    total::Float64 = sum(cells)
+    return total
+end
+
 score(x) = log((exp(x) + exp(-x)) + exp(2x))
 partial(x) = (exp(x) - exp(-x) + 2exp(2x)) / (exp(x) + exp(-x) + exp(2x))
 function reverse_gradient(k, x)
@@ -111,6 +143,35 @@ end
     @test only(reverse_gradient(nested, [1000.0])) ≈ 0.0 atol=eps()
 end
 
+@testset "a vector log of flat and scaled exponential sums" begin
+    wide = RK._vector_doubles() >= 2
+    backend = AutoEnzyme(mode=Enzyme.Reverse)
+    weighted(x) = log(0.3 * exp(x) + 0.7 * exp(-x))
+    weighted_partial(x) = (0.3 * exp(x) - 0.7 * exp(-x)) / (0.3 * exp(x) + 0.7 * exp(-x))
+    scaled(x) = log(exp(x) * 2 + 0.5 * (exp(-x) + exp(2x)))
+    scaled_partial(x) = (2exp(x) + 0.5 * (2exp(2x) - exp(-x))) / (exp(x) * 2 + 0.5 * (exp(-x) + exp(2x)))
+    for (spec, value, slope) in ((flat_sum, score, partial), (weighted_sum, weighted, weighted_partial),
+                                 (scaled_sum, scaled, scaled_partial))
+        k = prepare(spec)
+        source = string(code_expr(k))
+        @test occursin("_log_exp_sum", source) == wide
+        @test occursin("_plate_simd_cells", source)
+        for n in (0, 1, 7, 513)
+            x = sin.(collect(1:n))
+            @test k(x) ≈ sum(value, x; init=0.0)
+            op = prepare_ad(k, backend, x; active=:x)
+            total, gradient = ad_value_and_gradient!(op, similar(x), x)
+            @test total ≈ sum(value, x; init=0.0)
+            @test gradient ≈ slope.(x)
+        end
+    end
+    # A negative factor can make the sum negative: the written logarithm stays.
+    signed = prepare(signed_weights)
+    @test !occursin("_log_exp_sum", string(code_expr(signed)))
+    @test signed([0.0, 1.0]) ≈ log(1.25) + log(1.5 * exp(1.0) - 0.25 * exp(-1.0))
+    @test_throws DomainError signed([-2.0])
+end
+
 struct LoggedOperand
     id::Int
     trace::Vector{Int}
@@ -150,6 +211,54 @@ mutable_exp = exp
     end
     @test kernel(Inf, 0.0, 0.0) === Inf
     @test isnan(kernel(NaN, 0.0, 0.0))
+
+    # One `+` call of three terms stays one call: the operations and their
+    # order are the written expression's.
+    flat_body = Expr(:block, :($(ref(Base,:log))($(ref(Base,:+))(
+        $(ref(Base,:exp))(x), $(ref(Base,:exp))(y), $(ref(Base,:exp))(z)))))
+    flat_transformed = RK._vectorize_cell_logs(flat_body)
+    @test (flat_transformed !== flat_body) == (RK._vector_doubles() >= 2)
+    written, rewritten = map((flat_body, flat_transformed)) do body
+        RK.compile(Expr(:function, Expr(:tuple, :x, :y, :z), body))
+    end
+    traces = map((written, rewritten)) do f
+        seen = Int[]
+        @test f((LoggedOperand(i, seen) for i in 1:3)...) === -1.0
+        seen
+    end
+    @test first(traces) == last(traces) == [1, 2, 3, 12, 13, 0]
+    @test_throws DomainError rewritten(NegativeExp(), NegativeExp(), 0.0)
+    @test rewritten(0f0, 0f0, 0f0) === log(3f0)
+    @test rewritten(0.3, -0.2, 1.1) ≈ written(0.3, -0.2, 1.1)
+
+    # A literal factor multiplies on its written side. One that is negative,
+    # or a negative zero, keeps the written logarithm.
+    outcome(f, args...) = try f(args...) catch err; typeof(err) end
+    product(c, left) = Expr(:block, Expr(:call, ref(Base, :log), Expr(:call, ref(Base, :+),
+        left ? Expr(:call, ref(Base, :*), c, Expr(:call, ref(Base, :exp), :x)) :
+               Expr(:call, ref(Base, :*), Expr(:call, ref(Base, :exp), :x), c),
+        Expr(:call, ref(Base, :exp), :y))))
+    for left in (true, false)
+        for c in (-0.25, -0.0, -1)
+            body = product(c, left)
+            @test RK._vectorize_cell_logs(body) === body
+        end
+        for c in (0.25, 0.0, 2, 0x02, 0.5f0)
+            body = product(c, left)
+            transformed = RK._vectorize_cell_logs(body)
+            @test (transformed !== body) == (RK._vector_doubles() >= 2)
+            written, rewritten = map((body, transformed)) do b
+                RK.compile(Expr(:function, Expr(:tuple, :x, :y), b))
+            end
+            for point in ((0.3, -0.2), (-Inf, -Inf), (Inf, 0.0), (NaN, 0.0), (700.0, 700.0), (-745.0, -800.0))
+                a, b = written(point...), rewritten(point...)
+                @test isequal(a, b) || a ≈ b
+            end
+            @test rewritten(0f0, 0f0) === written(0f0, 0f0)
+            @test outcome(rewritten, NegativeExp(), -Inf) === outcome(written, NegativeExp(), -Inf)
+            @test outcome(rewritten, NegativeExp(), 0.0) === outcome(written, NegativeExp(), 0.0)
+        end
+    end
 end
 
 end # module

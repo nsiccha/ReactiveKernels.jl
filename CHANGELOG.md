@@ -16,6 +16,25 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.411
+
+- The vector logarithm of a summed native plate (0.1.373) takes a sum of
+  exponentials however it is written: one `+` call of any number of terms,
+  such as `log(exp(a) + exp(b) + exp(c))`, which Julia reads as a single
+  three-argument call and which stayed scalar, and terms or partial sums
+  multiplied by a nonnegative literal on either side, such as
+  `log(0.3 * exp(a) + 0.7 * exp(b))`. Each sum and product is still evaluated
+  where it is written, so values and dispatch are those of the source. A
+  negative factor keeps the written logarithm and its `DomainError`.
+- A single-use gathered row product in a native position batch,
+  `rows = W[index, :]` read once by `sum(X .* rows; dims=2)`, runs its fused
+  loop for every index that is a one-based vector of machine integers: a
+  `Vector` of any such element type, a range, a view. Only `Vector{Int}` did.
+  Any other index computed the gather, the product and the sum afresh at every
+  position, which was slower and allocated more than the same two statements
+  written apart. A `Bool` mask and wider integer types keep the literal
+  operations.
+
 ## 0.1.410
 
 A native scan computes the parts of its step that read only shared values
