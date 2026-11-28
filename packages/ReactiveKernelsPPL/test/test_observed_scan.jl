@@ -676,6 +676,7 @@ end
         qb = prepare_query(b.built, b.bound, :sampler)
         @test Base.invokelatest(qa, u) ≈ Base.invokelatest(qb, u) rtol = 1e-12
     end
+end
 
 # A step that reads its series through a gather of a model vector,
 # `mu[rows[g]][t]`, written in the step or substituted from a submodel
@@ -762,8 +763,6 @@ end
     end
     @test allocated[1600][2] <= 2 * allocated[1600][1] + 4096
     @test allocated[1600][3] <= 2 * allocated[1600][1] + 4096
-end
-
 end
 
 module ObservedScanTypeStability
