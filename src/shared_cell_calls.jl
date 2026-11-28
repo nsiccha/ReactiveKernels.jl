@@ -248,6 +248,38 @@ function _shared_table_param(shares::Vector{Pair{Int,Symbol}}, id::Int)
     index === nothing ? nothing : last(shares[index])
 end
 
+# The values of cell plan `p` that one of its shared calls reads, directly or
+# through other values the cell computes. A shared call's table keeps its
+# arguments, and its results, until the plate returns, and a later cell is
+# compared with them, by identity first. So none of these values may live in
+# storage a later cell rewrites: a lane slot's buffer is one object in every
+# cell, which made every cell after the first read the first cell's result,
+# whatever it had gathered (snag position-shared-4771ab38). The lowering gives
+# these values no lane slot (`_lower_authored_plate_loop_native!`,
+# `_plate_nested_native!`), so each cell allocates its own. A value reaches a
+# rewritten buffer only through the values it was computed from, hence the
+# closure over the cell's recipes; they need not be listed in dependency order.
+function _shared_keyed_values(p::Plan)
+    g = p.graph
+    keyed = Set{ValueId}()
+    any(r -> r.op isa _SharedCall, p.recipes) || return keyed
+    grew = true
+    while grew
+        grew = false
+        for r in p.recipes
+            r.op isa _SharedCall ||
+                any(v -> canon_id(g, v.id) in keyed, r.outputs) || continue
+            for v in r.inputs
+                cid = canon_id(g, v.id)
+                cid in keyed && continue
+                push!(keyed, cid)
+                grew = true
+            end
+        end
+    end
+    keyed
+end
+
 # Whether recipe `q` is the property read `x.name` of one value.
 function _shared_field_read(q::Recipe)
     q.op isa _KernelSourceOp && length(q.inputs) == 1 || return false

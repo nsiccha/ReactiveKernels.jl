@@ -461,6 +461,56 @@ end
     return cells
 end
 
+# What a shared call reads is never storage the next cell refills (snag
+# position-shared-4771ab38). A borrowed reader keeps the buffers of its shared
+# design values, and one buffer is the same object in every cell.
+# The call reads the gathered rows through a view of them.
+@kernel gathered_view(column, rows, eta, theta) = begin
+    designs = plate(rows) do r
+        t = column[r]
+        v = view(t, 2:4)
+        hashed_design(v)
+    end
+    cells = plate(designs, eta) do d, e
+        sum(d.c) * (theta + e)
+    end
+    return cells
+end
+# The call reads a dotted call of the gathered rows.
+@kernel gathered_scaled(column, rows, eta, theta) = begin
+    designs = plate(rows) do r
+        t = 2 .* column[r]
+        hashed_design(t)
+    end
+    cells = plate(designs, eta) do d, e
+        sum(d.c) * (theta + e)
+    end
+    return cells
+end
+# The call reads a plate inside the cell.
+@kernel inner_plate_cell(ts, eta, theta) = begin
+    cells = plate(ts, eta) do t, e
+        doubled = plate(t) do x
+            2x
+        end
+        d = hashed_design(doubled)
+        sum(d.c) * (theta + e)
+    end
+    return cells
+end
+# The call reads a plate inside the cell whose own cells are arrays.
+joined_design(parts) = (CALLS[] += 1; (; c = Hashed(cumsum(reduce(vcat, parts))), n = length(parts)))
+@kernel inner_arrays_cell(blocks, eta, theta) = begin
+    cells = plate(blocks, eta) do b, e
+        parts = plate(b) do x
+            2 .* x
+        end
+        d = joined_design(parts)
+        sum(d.c) * (theta + e)
+    end
+    return cells
+end
+
 function hashed_calls(reader, args...)
     reader(args...)
     CALLS[] = 0
@@ -552,6 +602,51 @@ end
         count, hashes, value = hashed_calls(reader, subjects, etas, thetas)
         @test count == 2
         @test hashes == 2
+    end
+end
+
+@testset "a shared call reads no buffer the next cell refills" begin
+    grid = collect(1.0:5.0)
+    rows = [collect(((s - 1) * 5 + 1):(s * 5)) for s in 1:NSUB]
+    # Odd subjects on one grid, even subjects on another, and no two alike.
+    alternating = reduce(vcat, [isodd(s) ? grid : 2 .* grid for s in 1:NSUB])
+    different = reduce(vcat, [s .* grid for s in 1:NSUB])
+    have = (:column, :rows, :eta, :theta)
+    for spec in (gathered_plate, gathered_view, gathered_scaled)
+        scalar = prepare(spec; have, want = :cells)
+        for (data, distinct) in ((repeat(grid, NSUB), 1), (alternating, 2), (different, NSUB))
+            expected = reduce(hcat, [scalar(data, rows, etas[:, k], thetas[k]) for k in 1:NPOS])
+            for (mode, reader) in pairs(readers(scalar))
+                count, hashes, value = hashed_calls(reader, data, rows, etas, thetas)
+                @test count == distinct
+                @test isequal(value, expected)
+            end
+        end
+    end
+    # A borrowed reader keeps nothing of one call that the next call's cells
+    # could match: the same reader, then other data in the same arrays.
+    scalar = prepare(gathered_plate; have, want = :cells)
+    reader = vectorize(scalar; batched = (:eta, :theta), reuse = true)
+    data = repeat(grid, NSUB)
+    before = copy(reader(data, rows, etas, thetas))
+    data .= different
+    value = reader(data, rows, etas, thetas)
+    @test isequal(value, reduce(hcat, [scalar(data, rows, etas[:, k], thetas[k]) for k in 1:NPOS]))
+    @test !isequal(value, before)
+    # The plates inside a cell: one of numbers, one whose cells are arrays.
+    vectors(scale) = [scale .* grid for _ in 1:NSUB]
+    halves(scale) = [[scale .* grid[1:3], scale .* grid[4:5]] for _ in 1:NSUB]
+    mixed(rows) = [isodd(s) ? rows(1)[s] : rows(2)[s] for s in 1:NSUB]
+    for (spec, name, rows) in ((inner_plate_cell, :ts, vectors), (inner_arrays_cell, :blocks, halves))
+        scalar = prepare(spec; have = (name, :eta, :theta), want = :cells)
+        for (data, distinct) in ((rows(1), 1), (mixed(rows), 2))
+            expected = reduce(hcat, [scalar(data, etas[:, k], thetas[k]) for k in 1:NPOS])
+            for (mode, reader) in pairs(readers(scalar))
+                count, hashes, value = hashed_calls(reader, data, etas, thetas)
+                @test count == distinct
+                @test isequal(value, expected)
+            end
+        end
     end
 end
 
