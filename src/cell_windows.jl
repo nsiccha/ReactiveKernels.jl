@@ -274,6 +274,26 @@ end
 # read-only in a cell, so these rows serve as the view.
 @inline Base.view(w::_CellWindow{<:Any,<:Any,<:Tuple{Any}},
                   indices::AbstractVector{<:Integer}) = w[indices]
+# The entries `w[I]` as a gather call in a plate body reads them
+# (`_cell_gather_call`): of a vector value, a read-only view of the window's
+# data at the positions of rows `I`, as that call borrows the whole value.
+# Those positions are `1:length(I)` when the window holds exactly rows `I` in
+# that order (one reader's request, compared in one pass), and are found row by
+# row otherwise (`_cell_local_rows`). The view is built over the window's data
+# as it is, bounds checked. Neither the copy `w[I]` nor Base's `view` serves:
+# the copy gathers at freshly found positions, and `view` of data that is
+# itself a view (a parameter's rows of the packed point) gathers that view's
+# own index vector at them; ordinary Enzyme Reverse 0.13.221 on Julia 1.10
+# does not differentiate either here ("Illegal cached pointer"). Any other
+# window or index keeps the window's indexing.
+@inline _cell_gather_view(w::_CellWindow, I) = w[I]
+@inline function _cell_gather_view(
+        w::_CellWindow{<:AbstractVector,<:Any,<:Tuple{Base.OneTo},Nothing},
+        I::AbstractVector{<:Integer})
+    positions = _cell_reads_rows(w, I) ? collect(1:length(I)) : _cell_local_rows(w, I, I)
+    checkbounds(w.data, positions)
+    Base.SubArray(w.data, (positions,))
+end
 
 Base.show(io::IO, w::_CellWindow{<:Any,Int}) =
     print(io, "cell window at row ", w.rows, " of ", summary(w.data))
@@ -1847,9 +1867,13 @@ function _cell_capture_positions(r::Recipe, static_type; branch_read = nothing)
     captures, untyped
 end
 
-# An array whose elements are linear positions, or integer vectors of them.
+# An array whose elements are linear positions, or integer vectors of them. A
+# Boolean vector is a logical mask, not positions (`_cell_index_type`): a read
+# through one is not a read at rows.
 _cell_positions_type(T) =
-    T <: AbstractArray{<:Integer} || T <: AbstractArray{<:AbstractVector{<:Integer}}
+    T <: AbstractArray{<:Integer} ||
+    T <: AbstractArray{<:AbstractVector{<:Integer}} &&
+        typeintersect(eltype(eltype(T)), Bool) === Union{}
 
 # An ordinary gather takes one integer per output row. A plate's element
 # can itself hold a vector of positions, including a bound per-cell cache.
@@ -1993,25 +2017,38 @@ end
 # Whether `ex` reads the names `captured` only as `v[q]` or `v[w[q]]`, with `q`
 # and `w` names, or as `v[q, j...]` / `v[w[q], j...]` with every later index the
 # whole axis `:` (a row of a matrix) or a literal position (an element of that
-# row); each such `q`, or `w[q]`, is recorded.
+# row); each such `q`, or `w[q]`, is recorded. A gather call `f(v, q)` or
+# `f(v, w[q])` (`_cell_gather_call`) is the read `v[q]` or `v[w[q]]`; its callee
+# is a `GlobalRef`, which no name of the body can shadow.
 function _cell_capture_reads!(reads, ex, captured, mod; tails = nothing)
     ex isa Symbol && return !(ex in captured)
     ex isa Expr || return true
     ex.head in _CELL_PLAIN_HEADS || return false
-    if ex.head === :ref && length(ex.args) >= 2 && ex.args[1] isa Symbol &&
-       ex.args[1] in captured
-        index = ex.args[2]
+    read = ex.head === :ref && length(ex.args) >= 2 ? ex.args :
+        ex.head === :call && length(ex.args) == 3 && ex.args[1] isa GlobalRef &&
+            _cell_gather_call(_cell_binding(ex.args[1], mod)) ? ex.args[2:3] : nothing
+    if read !== nothing && read[1] isa Symbol && read[1] in captured
+        index = read[2]
         name(x) = x isa Symbol && !(x in captured)
         name(index) || Meta.isexpr(index, :ref, 2) && all(name, index.args) ||
             return false
-        all(arg -> _cell_colon(arg, mod) || arg isa Int, ex.args[3:end]) || return false
+        all(arg -> _cell_colon(arg, mod) || arg isa Int, read[3:end]) || return false
         push!(reads, index)
         tails === nothing || push!(tails, Any[_cell_colon(arg, mod) ? Colon() : arg
-                                             for arg in ex.args[3:end]])
+                                             for arg in read[3:end]])
         return true
     end
     all(arg -> _cell_capture_reads!(reads, arg, captured, mod; tails), ex.args)
 end
+
+# Whether a call `f(v, I)` returns the entries `v[I]` and reads nothing else of
+# `v`. A plate body that reads a shared argument only through such calls reads
+# it at those positions, as it does through `v[I]` (`_cell_capture_reads!`), so
+# the argument is computed at the reading cell's rows and handed over as a
+# `_CellWindow`: `f` must accept one as `v` (`_cell_gather_view` reads it). A
+# package extends it for its own reader of that kind (ReactiveKernelsPPL's
+# in-place read of a dotted cell's gather).
+_cell_gather_call(@nospecialize(f)) = false
 
 # Retained branches may request both arms' capture rows only when those
 # requests cannot introduce an inactive invalid access. Prove their indices

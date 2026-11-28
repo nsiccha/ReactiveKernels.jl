@@ -297,6 +297,7 @@ const _PPL_TEST_FILES = (
     "test_array_cell_rows.jl",
     "test_cell_broadcast_arrays.jl",
     "test_cell_index_gathers.jl",
+    "test_dotted_cell_gather_footprints.jl",
     "test_cell_composed_gathers.jl",
     "test_plate_cell_arrays.jl",
     "test_vector_plate_outputs.jl",
