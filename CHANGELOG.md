@@ -16,6 +16,18 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.425
+
+A `PreparedData` also packs a Python number that `prepare_data` passes
+through, such as a scalar data input given as a Python float, at the dtype
+`PREPARED` declares for it (the module's float type for float data). Reading it
+still gives the Python number, rounded to that width; inside a function that
+takes the prepared data as an argument it is a scalar of that dtype instead of
+a weakly typed one, and it no longer adds an argument of its own to each call.
+A number the declared dtype cannot hold, such as an integer outside `int64`,
+stays its own leaf. `PreparedData(values, scalars)` takes the scalar dtypes as
+a second positional argument and defaults to the module's.
+
 ## 0.1.424
 
 **Breaking:** a `jax_source` module's `prepare_data` returns a `PreparedData`
