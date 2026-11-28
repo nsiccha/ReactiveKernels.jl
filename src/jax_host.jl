@@ -2172,6 +2172,34 @@ def _rk_ragged_counts(bound, *operands):
     exact = counts.shape == bound.shape and not np.any(counts != bound)
     return StaticInt(int(exact and not np.any(counts < 0)))
 """),
+    :scan_index_bound => ("_rk_scan_index_bound", """
+def _rk_scan_index_bound(index, index_lengths, live, table, table_lengths, tags, tags_lengths, target):
+    # Whether a subject scan's guarded table reads need no run-time check.
+    # Row s requests its first `live[s]` steps, only those with
+    # `tags == target` when tags are given; each requested one-based `index`
+    # must lie in 1:table_lengths[s]. Index and tag rows must have exactly
+    # the live lengths (a step past them would read padding) and the table's
+    # lengths must fit its stored rows. 1 drops the check; 0 keeps it, so
+    # invalid data raise in program order when the function runs, not here.
+    try:
+        index, live = np.asarray(index), np.asarray(live)
+        table_lengths = np.asarray(table_lengths)
+        if (index.ndim != 2 or live.shape != index.shape[:1] or table_lengths.shape != live.shape
+                or not np.array_equal(index_lengths, live) or np.any(live > index.shape[1])
+                or np.any(table_lengths > np.shape(table)[1])):
+            return StaticInt(0)
+        requested = np.arange(index.shape[1]) < live[:, None]
+        if tags is not None:
+            tags = np.asarray(tags)
+            if tags.ndim != 2 or not np.array_equal(tags_lengths, live):
+                return StaticInt(0)
+            width = min(index.shape[1], tags.shape[1])
+            requested[:, :width] &= tags[:, :width] == target
+        valid = (index >= 1) & (index <= table_lengths[:, None])
+    except (ValueError, TypeError, IndexError):
+        return StaticInt(0)
+    return StaticInt(int(not np.any(requested & ~valid)))
+"""),
     :min => ("_rk_bound_min", """
 def _rk_bound_min(a):
     \"\"\"The least entry of a prepared integer array, static (0 without entries).\"\"\"
@@ -2228,6 +2256,7 @@ function _jax_prepare_bounds_lines(mod::_JaxModule, lines::Vector{String}, bound
         args = [isempty(k) ? "None" : result * "[\"" * k * "\"]" for k in keys]
         # Guarded read schedules use the comparison's integer literal.
         kind in (:match_count, :requested_rows) && (args[end] = last(keys))
+        kind === :scan_index_bound && !isempty(last(keys)) && (args[end] = last(keys))
         kind === :padded_map_rows && push!(args, "padded=True")
         if mod.layout === :chains && kind in (:min, :max, :span)
             _jax_module_helper!(mod, "_RKChainRows", _JAX_CHAIN_ROWS)

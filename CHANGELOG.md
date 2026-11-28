@@ -24,6 +24,11 @@ sum with no runtime check or branch, which removes device-to-host round trips
 from every GPU evaluation. Other data keep the checks, so invalid rows still
 raise when the function runs, in program order.
 
+In a padded export, `prepare_data` likewise decides the bounds check of a
+subject scan's table reads at a padded index, optionally guarded by a padded
+tag: when every requested index lies within its subject's table rows, the
+compiled function drops that check and its mid-program round trip.
+
 ## 0.1.408
 
 The emitted JAX `select_plate_layout` confirms competing layouts in 12 rotating,

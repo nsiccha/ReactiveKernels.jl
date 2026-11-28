@@ -59,10 +59,17 @@ The same emitted module serves different row lengths and
 branch decisions. Changing the number of entries in a group can trigger
 recompilation by JAX.
 
-`prepare_data` also checks the row lengths such a sum reads, including a
-location's rows selected by a prepared row index, and returns the verdict as
-static metadata. When they pass, the compiled function runs the grouped sum
-with no runtime check or layout branch. On a GPU each of those would copy its
-predicate to the host and leave the device idle, longer on a loaded host.
-Data that fail keep both, so an invalid row still raises when the function
+## Checks decided in prepare_data
+
+On a GPU each runtime check copies its predicate to the host and leaves the
+device idle, longer on a loaded host. `prepare_data` therefore decides some
+checks on data alone and returns the verdict as static metadata:
+
+- the row lengths a ragged row sum reads, including a location's rows
+  selected by a prepared row index; passing data also skip its layout branch;
+- in a padded export, a subject scan's reads of table rows at a padded index
+  (`table[j]`, possibly only where a padded tag equals a literal): each
+  requested index must lie within its subject's table rows.
+
+Data that fail keep the check, so invalid data still raise when the function
 runs, in program order. Datasets with different verdicts trace separately.

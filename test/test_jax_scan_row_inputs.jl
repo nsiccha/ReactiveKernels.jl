@@ -236,3 +236,106 @@ end
         end
     end
 end
+
+@kernel function jax_subject_two_tables(a::Float64, xs::Vector{Vector{Float64}}, kinds::Vector{Vector{Int}},
+                                        steps::Vector{Vector{Int}}, spans::Vector{Vector{Int}},
+                                        visits::Vector{Vector{Int}})
+    totals = plate(xs, kinds, steps, spans, visits) do x, ks, st, sp, js
+        propagators = plate(x) do v
+            (a + v, a - v)
+        end
+        offsets = plate(ks) do k
+            (a * k, 2a * k)
+        end
+        path = scan(ks, st, sp, js, Ref(propagators), Ref(offsets); init = 0.0) do state, kind, step, span, j, P, O
+            moved = P[step][1] + state
+            next = kind == 3 ? P[span][2] * moved + O[j][2] : moved
+            (next, next)
+        end
+        sum(path)
+    end
+    total = sum(totals)
+    return total
+end
+
+@testset "prepare_data proves a subject scan's table reads" begin
+    have = (:a, :xs, :kinds, :steps, :spans, :visits)
+    data = (:xs, :kinds, :steps, :spans, :visits)
+    padded = jax_source(jax_subject_two_tables; have, want = :total, data, plate_layout = :padded)
+    # One verdict per gathered read: every step's propagator, a run's span and its offset.
+    @test count("= _rk_scan_index_bound(", padded.text) == 3
+    @test occursin(r"if not \(\(_rk_scan_index_bound_\w+ and x\.shape\[0\] <= jax\.tree\.leaves\(propagators\)", padded.text)
+    @test !occursin("_rk_scan_index_bound", jax_source(jax_subject_two_tables; have, want = :total, data,
+                                                        plate_layout = :chains).text)
+    native = prepare(jax_subject_two_tables; have, want = :total)
+    if rk_jax_available()
+        # Invalid spans and offsets only at steps that are not runs, and an empty subject.
+        good = ([[1., 2.], Float64[], [3.]], [[3, 2, 3], Int[], [2]], [[1, 2, 2], Int[], [1]],
+                [[2, 99, 1], Int[], [0]], [[1, 99, 3], Int[], [-5]])
+        mktempdir() do dir
+            write(joinpath(dir, "model.py"), padded)
+            write(joinpath(dir, "check.py"), """
+import sys
+import jax, jax.numpy as jnp, numpy as np
+jax.config.update("jax_enable_x64", True)
+sys.path.insert(0, sys.argv[1])
+import model
+
+def inventory(jaxpr, found=None):
+    found = {} if found is None else found
+    for eq in getattr(jaxpr, "jaxpr", jaxpr).eqns:
+        found[eq.primitive.name] = found.get(eq.primitive.name, 0) + 1
+        for p in eq.params.values():
+            for c in p if isinstance(p, (tuple, list)) else (p,):
+                if hasattr(c, "jaxpr") or hasattr(c, "eqns"):
+                    inventory(c, found)
+    return found.get("debug_callback", 0)
+
+good = $(_rk_py(collect(good)))
+expected = $(_rk_py([native(a, good...) for a in (0.4, -1.3)]))
+proofs = sorted(k for k in model.PREPARED if k.startswith("_rk_scan_index_bound"))
+assert len(proofs) == 3, list(model.PREPARED)
+vg = jax.value_and_grad(lambda a, d: model.kernel(a, **d))
+data = model.prepare_data(*good)
+assert [data[p] for p in proofs] == [1, 1, 1], [data[p] for p in proofs]
+# On a GPU the check would copy its predicate to the host mid-program.
+assert inventory(jax.make_jaxpr(vg)(0.4, data)) == 0
+for a, value in zip((0.4, -1.3), expected):
+    np.testing.assert_allclose(jax.jit(vg)(a, data)[0], value)
+# A verdict of 0 restores the check and changes no value or gradient.
+off = {**data, **{p: model.StaticInt(0) for p in proofs}}
+assert inventory(jax.make_jaxpr(vg)(0.4, off)) > 0
+np.testing.assert_allclose(jax.jit(vg)(0.4, off), jax.jit(vg)(0.4, data))
+# A run's span past its subject's rows, and a zero step read at every live
+# step: prepare_data does not raise, the check stays and the function does.
+for which, row in ((3, [2, 99, 3]), (2, [1, 0, 2])):
+    bad = list(good)
+    bad[which] = [row] + good[which][1:]
+    data = model.prepare_data(*bad)
+    assert [data[p] for p in proofs].count(0) == 1, [data[p] for p in proofs]
+    try:
+        jax.block_until_ready(jax.jit(vg)(0.4, data))
+        jax.effects_barrier()
+    except Exception as err:
+        assert "BoundsError" in str(err), str(err)
+    else:
+        raise AssertionError("accepted an out-of-range table index")
+
+# The verdict: requested steps only, live lengths, the table's own rows.
+b = model._rk_scan_index_bound
+idx, live = np.array([[1, 9, 2], [3, 0, 0]]), np.array([3, 1])
+tab, rows = np.zeros((2, 3)), np.array([2, 3])
+tags = np.array([[3, 2, 3], [3, 1, 1]])
+assert b(idx, live, live, tab, rows, tags, live, 3) == 1
+assert b(idx, live, live, tab, rows, None, None, None) == 0  # 9 is live without the guard
+assert b(idx, live, live, tab, np.array([1, 3]), tags, live, 3) == 0  # 2 past a row of 1
+assert b(idx, np.array([3, 2]), live, tab, rows, tags, live, 3) == 0  # index row longer than the scan
+assert b(idx, live, live, tab, rows, tags, np.array([3, 2]), 3) == 0  # tag row longer than the scan
+assert b(idx, live, live, tab, np.array([2, 4]), tags, live, 3) == 0  # table lengths exceed storage
+assert b(np.zeros((2, 0), int), np.array([0, 0]), np.array([0, 0]), np.zeros((2, 0)),
+         np.array([0, 0]), None, None, None) == 1
+""")
+            @test success(pipeline(`$RK_JAX_PYTHON $(joinpath(dir, "check.py")) $dir`, stderr=stderr))
+        end
+    end
+end
