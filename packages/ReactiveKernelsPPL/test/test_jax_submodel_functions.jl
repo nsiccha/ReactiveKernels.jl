@@ -181,7 +181,41 @@ for k in (1, 3, 8):
     end
 end
 
+# The `while` loops XLA runs in a module's batched sampler gradient, counted in
+# the optimized HLO. A scan of three trips is the positive control: it must
+# count as one loop, so a zero below is not a missed spelling.
+function lkj_gradient_whiles(src, data, u)
+    mktempdir() do dir
+        module_path, args_path = joinpath(dir, "rk_module.py"), joinpath(dir, "args.py")
+        write(module_path, src)
+        write(args_path, _rk_jax_args(Any[data...], src))
+        check = joinpath(dir, "check.py")
+        write(check, raw"""
+import importlib.util, re, sys
+import numpy as np
+import jax, jax.numpy as jnp
+jax.config.update("jax_enable_x64", True)
+spec = importlib.util.spec_from_file_location("rk_module", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+exec(open(sys.argv[2]).read())
+def whiles(f, *args):
+    return len(re.findall(r"\bwhile\(", jax.jit(f).lower(*args).compile().as_text()))
+control = whiles(lambda x: jax.lax.scan(lambda c, v: (c * v, c), 1.0, x)[1], jnp.ones(3))
+assert control == 1, control
+prepared = m.prepare_data(**raw_data(ARGS))
+positions = np.tile(np.asarray(sys.argv[3].split(","), dtype=np.float64), (4, 1))
+step = jax.vmap(jax.value_and_grad(lambda p, d: m.log_density(p, **d)), in_axes=(0, None))
+print(whiles(step, positions, prepared))
+""")
+        parse(Int, readchomp(`$RK_JAX_PYTHON $check $module_path $args_path $(join(u, ","))`))
+    end
+end
+
+lkj_rows_helper(text) = only(eachmatch(r"(?ms)^def _ppl_lkj_rows\(.*?(?=^\S|\z)", text)).match
+
 @testset "LKJ row products in a bound lower or upper sampler factor" begin
+    helpers = String[]
     for (K, uplo) in ((1, 'L'), (3, 'U'), (8, 'L'))
         model = lower_rkppl(quote
             L ~ LKJCholesky(K, eta, $uplo)
@@ -198,14 +232,22 @@ end
                  Base.invokelatest(native, u - h * direction)) / (2h)
         for layout in (:padded, :groups)
             src = jax_source(built, bound; plate_layout = layout)
-            @test occursin("jax.lax.scan(advance", src.text)
+            # The rows are one exclusive cumulative product per row, with no
+            # loop whose trips follow K.
+            helper = lkj_rows_helper(src.text)
+            push!(helpers, helper)
+            @test occursin("jnp.cumprod(", helper)
+            @test !any(p -> occursin(p, helper), ("lax.scan", "while_loop", "fori_loop"))
             if rk_jax_available()
                 names = first.(only(f for f in src.functions if f.name == "prepare_data").inputs)
                 data = Tuple(getproperty(raw, Symbol(n)) for n in names)
                 got = rk_jax_evaluate(src, :log_density, (u, data...); grad = true, prepare = :arguments)
                 @test got.value ≈ Base.invokelatest(native, u) atol = 2e-12
                 @test sum(got.grad .* direction; init = 0.0) ≈ deriv atol = 2e-8
+                @test lkj_gradient_whiles(src, data, u) == 0
             end
         end
     end
+    # One helper for every dimension: K is its argument, not its length.
+    @test allequal(helpers)
 end
