@@ -920,11 +920,9 @@ end # module
 const _DRR = DerivativeRuleRegionGraphs
 
 # Source plans are build-time metadata. The tables passed to compiled native
-# regions must still be plain values, and calls must not allocate for plans.
-_rule_execution_isbits(x) = isbits(x)
-_rule_execution_isbits(x::Tuple) = all(_rule_execution_isbits, x)
-_rule_execution_isbits(r::ReactiveKernels._RuleRegion) =
-    isbits((r.f, r.constants, r.callables))
+# regions must still be plain values (`_rule_execution_isbits`), and calls
+# must not allocate for plans.
+include("rule_execution_tables.jl")
 function _rule_call_allocations(f, ts, q)
     f(ts, q)
     @allocated f(ts, q)
@@ -953,8 +951,7 @@ end
     # A region retains its authored plan for source emission. Only the native
     # execution tables need to be isbits; source metadata is never an operand.
     for (rule, graph) in ((decay, _DRR.decay_rule), (recurrence, _DRR.recurrence_rule))
-        @test _rule_execution_isbits((rule.primal_ops, rule.forward_ops,
-            rule.reverse_ops, rule.staged_ops, rule.lane))
+        @test _rule_execution_isbits(rule)
         compiled = prepare(graph; have=(:ts, :q), want=:y)
         for n in (0, 7, 129)
             times = collect(range(0.0, 5.0; length=n))
