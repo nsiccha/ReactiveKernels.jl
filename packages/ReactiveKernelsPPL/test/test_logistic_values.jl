@@ -388,14 +388,17 @@ end
 # mean-precision Beta or BetaBinomial2, is read from the linear predictor by
 # ReactiveKernels' stable rewrites (snag `rk-stable-rewrit-f6a60366`): the
 # written `1 .- logistic.(eta)` cancels to zero from eta ≈ 37, where the log
-# density is -Inf. One coordinate `a` is the linear predictor (`x` is zero),
-# against a 512-bit oracle of the density up to a constant, through the
-# sampler and its Enzyme reverse gradient.
+# density is -Inf. The first coordinate is the linear predictor (`x` and any
+# group effect are zero), against a 512-bit oracle of the density up to a
+# constant, through both samplers and their Enzyme reverse gradients. A scalar
+# mean, a gathered group effect and the ordinary sampler's declarations were
+# reached in snag `rk-0-1-409-logis-00ccd623`.
 import SpecialFunctions
 
 const _LV_BB_Y = [3, 30, 0, 57, 1]
 const _LV_BB_N = [10, 60, 12, 57, 400]
 const _LV_PROP = [0.2, 0.7, 0.4, 0.6, 0.3]
+const _LV_BB_POS = [1, 2, 3, 1, 2]
 
 _lv_rising(x, k) = sum(log(x + i) for i in 0:k-1; init = big(0.0))
 function _lv_bb_oracle(eta::BigFloat)
@@ -425,20 +428,75 @@ _lv_slope(oracle, eta) = (h = big(1e-40); (oracle(eta + h) - oracle(eta - h)) / 
                 m = logistic.(a .+ x)
                 prop .~ Beta.(m .* 5.0, (1 .- m) .* 5.0)
             end), (; prop = _LV_PROP, x = zeros(5)), (:prop, :x)),
+            # A scalar mean beside vector data, as every intercept-only model
+            # has it (snag `rk-0-1-409-logis-00ccd623`): a scalar parameter,
+            # then BRM's emitted programs with the mean named and inline, and
+            # its mean-precision Beta.
+            (_lv_bb_oracle, :(begin
+                a ~ Normal(0, 1000)
+                y .~ BetaBinomial2.(n, logistic.(a), 20.0)
+            end), (; y = _LV_BB_Y, n = _LV_BB_N), (:y, :n)),
+            (_lv_bb_oracle, :(begin
+                eta_Intercept ~ Normal(0.0, 1000.0)
+                eta = eta_Intercept
+                p = logistic.(eta)
+                y .~ BetaBinomial2.(n, p, PHI_)
+            end), (; y = _LV_BB_Y, n = _LV_BB_N, PHI_ = 20.0), (:y, :n, :PHI_)),
+            (_lv_bb_oracle, :(begin
+                eta_Intercept ~ Normal(0.0, 1000.0)
+                eta = eta_Intercept
+                y .~ BetaBinomial2.(n, logistic.(eta), PHI_)
+            end), (; y = _LV_BB_Y, n = _LV_BB_N, PHI_ = 20.0), (:y, :n, :PHI_)),
+            (_lv_beta_oracle, :(begin
+                mu_Intercept ~ Normal(0.0, 1000.0)
+                logit_mu = mu_Intercept
+                mu = logistic.(logit_mu)
+                prop .~ Beta.(mu .* KAPPA_, (1 .- mu) .* KAPPA_)
+            end), (; prop = _LV_PROP, KAPPA_ = 5.0), (:prop, :KAPPA_)),
+            # A group effect gathered per row in the predictor, as BRM emits
+            # a varying intercept (`logistic.(when .+ place[pos])`): inline,
+            # and as a named gather beside a design product. The first
+            # coordinate is the linear predictor; the others stay at zero.
+            (_lv_bb_oracle, :(begin
+                a ~ Normal(0, 1000)
+                z[1:3] .~ Normal.(0, 1)
+                y .~ BetaBinomial2.(n, logistic.(a .+ z[pos]), 20.0)
+            end), (; y = _LV_BB_Y, n = _LV_BB_N, pos = _LV_BB_POS), (:y, :n, :pos)),
+            (_lv_beta_oracle, :(begin
+                a ~ Normal(0.0, 1000.0)
+                z[1:3] .~ Normal.(0, 1)
+                mu = logistic.(a .+ z[pos])
+                prop .~ Beta.(mu .* KAPPA_, (1 .- mu) .* KAPPA_)
+            end), (; prop = _LV_PROP, KAPPA_ = 5.0, pos = _LV_BB_POS), (:prop, :KAPPA_, :pos)),
+            (_lv_beta_oracle, :(begin
+                b[1:2] .~ Normal.(0.0, 1000.0)
+                when = X * b
+                z[1:3] .~ Normal.(0, 1)
+                place = z[pos]
+                mu = logistic.(when .+ place)
+                prop .~ Beta.(mu .* KAPPA_, (1 .- mu) .* KAPPA_)
+            end), (; prop = _LV_PROP, KAPPA_ = 5.0, pos = _LV_BB_POS,
+                    X = hcat(ones(5), zeros(5))), (:prop, :KAPPA_, :pos, :X)),
         )
-        for (oracle, ast, data, conditioned) in models
+        # The default sampler runs the non-allocating program and
+        # `nonallocating = false` the ordinary one; each spells the mean
+        # differently, and both are rewritten.
+        for (oracle, ast, data, conditioned) in models, nonallocating in (:auto, false)
             values = Dict{Symbol,Any}(pairs(data))
             bound = bind_data(lower_rkppl(ast, values; conditioned), values)
             built = build_kernel(bound)
-            sampler = prepare_sampler(built, bound, [0.0];
-                backend = AutoEnzyme(; mode = Enzyme.Reverse))
-            g = [0.0]
-            lp0, _ = sampler_value_and_gradient!(sampler, g, [0.0])
+            n = built.layout.total
+            at(eta) = (u = zeros(n); u[1] = eta; u)
+            sampler = prepare_sampler(built, bound, at(0.0);
+                backend = AutoEnzyme(; mode = Enzyme.Reverse), nonallocating)
+            g = zeros(n)
+            lp0, _ = sampler_value_and_gradient!(sampler, g, at(0.0))
             reference = oracle(big(0.0))
             for eta in (-700.0, -100.0, -40.0, -2.0, 0.0, 2.0, 20.0, 37.0, 40.0, 100.0, 700.0)
-                lp, _ = sampler_value_and_gradient!(sampler, g, [eta])
+                lp, _ = sampler_value_and_gradient!(sampler, g, at(eta))
                 @test lp - lp0 ≈ Float64(oracle(big(eta)) - reference) atol = 1e-11
                 @test g[1] ≈ Float64(_lv_slope(oracle, big(eta))) rtol = 1e-12
+                @test all(isfinite, g)
             end
         end
     end
