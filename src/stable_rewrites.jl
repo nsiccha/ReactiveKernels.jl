@@ -36,7 +36,8 @@
 # it can read, a name the program assigns more than once as long as no
 # statement between them assigns or mutates it (a plate output's buffer and
 # its narrowed array, `_rw_drop_stale!`), and sums, differences and products
-# of those (an inline linear predictor, computed again there).
+# of those and of gathers from them (an inline linear predictor such as
+# `a .+ g[pos]`, computed again there).
 # A matched composition becomes a call of one of the `_rk_*_of` helpers below,
 # whose methods decide by dispatch: the stable form for `Real` operands, the
 # literal composition for every other type (a matrix exponential, a custom
@@ -594,8 +595,26 @@ function _rw_lazy_broadcast(x, env)
 end
 
 # A declared array type (`_cell_array_as`) whose conversion keeps every
-# element as it is: one of `Float64` entries.
-_rw_keeps_elements(T) = T isa Type && T <: AbstractArray && eltype(T) === Float64
+# element as it is: one of `Float64` entries, or one that leaves the element
+# type free (RKPPL's `mu::AbstractVector`, `Vector`), whose conversion returns
+# an array it already is and copies any other with its own element type
+# (snag `rk-0-1-409-logis-00ccd623`).
+_rw_keeps_elements(T) = T isa Type && T <: AbstractArray &&
+    (eltype(T) === Float64 || (T isa UnionAll && eltype(T) === Any))
+
+# The definition a name holds in `env`, through names bound to names; any other
+# expression as it is. A name without a live definition gives `nothing`.
+function _rw_named_value(x, env)
+    for _ in 1:64
+        x isa Symbol || return x
+        x = get(env, x, nothing)
+    end
+    nothing
+end
+
+# The calls `_rw_view` reads through to the dotted call they hold.
+_rw_wrapper(f) = f === _native_broadcast_materialize || f === Base.Broadcast.materialize ||
+    f === _cell_array_broadcast || f === _cell_array_materialize || f === _cell_array_as
 
 # The call `ex` makes, or `nothing`.
 function _rw_view(ex, ctx::_RwContext, env)
@@ -621,12 +640,16 @@ function _rw_view(ex, ctx::_RwContext, env)
     f === nothing && return nothing
     # A materialized or lazy cell array of a broadcast holds its entries as
     # they are (`_cell_array_materialize` of a `Broadcasted` keeps each one).
-    if (f === _native_broadcast_materialize || f === _cell_array_broadcast ||
-        f === _cell_array_materialize) && length(args) == 1
+    # The non-allocating step program materializes a dotted call that needs no
+    # buffer, such as one over a scalar, with Base's own `materialize`.
+    if (f === _native_broadcast_materialize || f === Base.Broadcast.materialize ||
+        f === _cell_array_broadcast || f === _cell_array_materialize) && length(args) == 1
         inner = _rw_view(args[1], ctx, env)
         return inner !== nothing && inner.broadcast ? inner : nothing
     elseif f === _cell_array_as && length(args) == 2 && _rw_keeps_elements(args[1])
-        inner = _rw_view(args[2], ctx, env)
+        # A declaration of a named value (`mu::AbstractVector = m`) reads that
+        # name's live definition.
+        inner = _rw_view(_rw_named_value(args[2], env), ctx, env)
         return inner !== nothing && inner.broadcast ? inner : nothing
     elseif _rw_is_broadcasted(f) && !isempty(args)
         g = _rw_resolve(args[1], @__MODULE__)
@@ -649,7 +672,17 @@ function _rw_operand(a, ctx::_RwContext, env)
         a = value
         (hops += 1) > 64 && return (nothing, false)
     end
-    (_rw_view(a, ctx, env), false)
+    (_rw_view(a, ctx, env), _rw_reads_named(a))
+end
+# Whether the view of an inline expression reads a name's definition (a
+# declaration of a named value, possibly inside another wrapper): its operands
+# are then a definition's, which must be readable at the site.
+function _rw_reads_named(a)
+    a isa Expr && a.head === :call && !isempty(a.args) || return false
+    f = _rw_resolve(a.args[1], @__MODULE__)
+    _rw_wrapper(f) || return false
+    f === _cell_array_as && length(a.args) == 3 && a.args[3] isa Symbol && return true
+    _rw_reads_named(last(a.args))
 end
 # A definition's operand is readable at the site when the site can read it, or
 # when it is a name the program assigns more than once (a plate output's
@@ -681,7 +714,17 @@ function _rw_movable_arithmetic(x, ctx, env)
     # given a fresh local (`_rw_fresh`).
     (f === (+) || f === (-) || f === (*)) &&
         all(a -> a isa Number || (a isa Symbol && _rw_movable_operand(a, ctx, env)) ||
-                 _rw_movable_arithmetic(a, ctx, env), args)
+                 _rw_movable_gather(a, ctx, env) || _rw_movable_arithmetic(a, ctx, env), args)
+end
+
+# A summand gathered by index from such names (a group effect read per row,
+# `when .+ place[pos]`): RK's own gathers, which read their source and raise
+# the `BoundsError` its indexing raises (`_lane_gathered`, `_cell_array_gather`).
+function _rw_movable_gather(x, ctx, env)
+    x isa Expr && x.head === :call && length(x.args) >= 3 || return false
+    f = _rw_resolve(x.args[1], @__MODULE__)
+    (f === _lane_gathered || f === _cell_array_gather) || return false
+    all(a -> a isa Integer || (a isa Symbol && _rw_movable_operand(a, ctx, env)), x.args[2:end])
 end
 
 # Whether `ex` reads any of `names`.
@@ -1152,7 +1195,10 @@ function _rw_rules(ex::Expr, ctx::_RwContext, env)
     _callable_slot(callee) === nothing || return nothing
     f = _rw_resolve(callee, @__MODULE__)
     f === nothing && return nothing
-    f === _native_broadcast_materialize && return nothing
+    # A wrapper the view reads through keeps its call: the walk rewrites the
+    # dotted call inside it, so a materialized value stays materialized and a
+    # declaration still converts.
+    _rw_wrapper(f) && return nothing
     outer = _rw_view(ex, ctx, env)
     outer === nothing && return nothing
     g = outer.f
@@ -1407,7 +1453,7 @@ function _rw_pure(rhs, ctx::_RwContext)
                all(simple, rhs.args[2:end])
     end
     f = _rw_resolve(rhs.args[1], @__MODULE__)
-    if f === _native_broadcast_materialize
+    if f === _native_broadcast_materialize || f === Base.Broadcast.materialize
         return length(rhs.args) == 2 && _rw_pure(rhs.args[2], ctx)
     elseif _rw_is_broadcasted(f)
         length(rhs.args) >= 2 || return false

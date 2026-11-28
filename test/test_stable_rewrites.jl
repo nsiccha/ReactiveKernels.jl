@@ -713,6 +713,57 @@ end
     end
 end
 
+# The spellings of a location the samplers' programs give it (snag
+# `rk-0-1-409-logis-00ccd623`): the non-allocating program materializes a
+# dotted call over a scalar with Base's own `materialize`; the ordinary one
+# declares RKPPL's `mu::AbstractVector` as a conversion of a named value; and a
+# varying intercept adds a gathered group effect to the predictor.
+function _complement_program(params, statements...)
+    minus = GlobalRef(Base, :-)
+    materialize = GlobalRef(Base.Broadcast, :materialize)
+    broadcasted = GlobalRef(Base.Broadcast, :broadcasted)
+    Expr(:->, Expr(:tuple, params...), Expr(:block, statements...,
+        :(q = $materialize($broadcasted($minus, 1, p))), :(return q)))
+end
+# Mentions of `f` in a program, as a callee or as the function a dotted call
+# applies.
+_mentions(f, x) = Int(x isa GlobalRef && RK._rw_resolve(x, @__MODULE__) === f)
+_mentions(f, ex::Expr) = ex.head in (:quote, :inert) ? 0 : sum(a -> _mentions(f, a), ex.args; init = 0)
+const _rwlg = GlobalRef(LogExpFunctions, :logistic)
+const _rwbc = GlobalRef(RK, :_native_broadcasted)
+const _rwlazy = GlobalRef(RK, :_cell_array_broadcast)
+const _rwas = GlobalRef(RK, :_cell_array_as)
+
+@testset "a complement reads a scalar mean, a declared mean and a gathered predictor" begin
+    scalar = RK._stable_rewrites(_complement_program((:u,),
+        :(p = $(GlobalRef(Base.Broadcast, :materialize))(
+            $(GlobalRef(Base.Broadcast, :broadcasted))($_rwlg, u)))), ())
+    @test _mentions(RK._rk_one_minus_of, scalar) == 1
+    @test eval(scalar)(40.0) isa Float64
+    @test _close(eval(scalar)(40.0), _complement(40.0))
+    for T in (AbstractVector, AbstractArray, Vector, Vector{Float64})
+        declared = RK._stable_rewrites(_complement_program((:u,),
+            :(m = $_rwlazy($_rwbc($_rwlg, u))), :(p = $_rwas($T, m))), ())
+        @test _mentions(RK._rk_one_minus_of, declared) == 1
+        @test all(_close.(eval(declared)([40.0, -3.0]), _complement.([40.0, -3.0])))
+    end
+    # A declaration that converts the entries keeps the written complement.
+    float32 = RK._stable_rewrites(_complement_program((:u,),
+        :(m = $_rwlazy($_rwbc($_rwlg, u))), :(p = $_rwas(Vector{Float32}, m))), ())
+    @test _mentions(RK._rk_one_minus_of, float32) == 0
+    plus = GlobalRef(Base, :+)
+    for gather in (GlobalRef(RK, :_lane_gathered), GlobalRef(RK, :_cell_array_gather))
+        gathered = RK._stable_rewrites(_complement_program((:u, :z, :pos),
+            :(p = $(GlobalRef(RK, :_native_broadcast_materialize))(
+                $_rwbc($_rwlg, $_rwbc($plus, u, $gather(z, pos)))))), ())
+        @test _mentions(RK._rk_one_minus_of, gathered) == 1
+        z, pos = [0.0, 1.0, -2.0], [1, 2, 3, 1]
+        @test all(_close.(eval(gathered)(39.0, z, pos), _complement.(39.0 .+ z[pos])))
+        # The gather still raises the error its indexing raises.
+        @test_throws BoundsError eval(gathered)(39.0, z, [4])
+    end
+end
+
 @testset "complement helpers: the literal unless the operand is Real" begin
     @test RK._rk_one_minus_of(1, logistic, 2.5f0) isa Float32
     @test RK._rk_one_minus_of(1.0, logistic, 2.5f0) isa Float64
