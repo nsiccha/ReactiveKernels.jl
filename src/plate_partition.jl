@@ -92,7 +92,7 @@ function _locality_describe(entry)
         "not provably an integer vector, a factor not an array, a transposed value not a vector, " *
         "or a `vec` of a reduction that keeps another axis)" :
         entry.reason === :untyped_index ?
-        "the cell's body reads it as `v[q]`, but `q` (a batched argument) is not provably an integer position or a vector of them (declare its type)" :
+        "the cell's body reads it as `v[q]`, but `q` (a batched argument) is not provably an integer position or a vector of them (declare its type; a Boolean mask is not positions, it selects entries by value)" :
         entry.reason === :cascade ?
         "it is read whole by `$(entry.reader)`, which is itself computed whole" :
         "its producer `$(entry.source)`: $(entry.reason)"

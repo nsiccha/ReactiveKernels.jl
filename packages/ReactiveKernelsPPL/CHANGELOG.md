@@ -16,6 +16,24 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.276
+
+A dotted `@plate` observation whose argument gathers a model value at the
+cell's bound rows, `y[g] .~ Normal.(mu[rows[g]], sigma)`, also through a cell
+local (`m = mu[rows[g]]`), keeps that read local in `prepare_cell_query`,
+`prepare_cell_sampler` and their footprints: cell `g` computes `mu` at
+`rows[g]` and reads only the coordinates those rows read, through gathers,
+matrix products, `vcat` and a bound sparse product alike. Before, every cell
+computed `mu` whole and its footprint held every group's coordinates, under
+`locality = :error` too. A gathered value with no row form (one an ordinary
+function computes) is now listed as `:whole` by `partition_locality` and
+raises `PartitionLocalityError` under `locality = :error`; it was listed as
+shared. So is a value gathered through one Boolean mask per cell
+(`mu[mask[g]]`), which selects entries by value; written as plain indexing in
+a cell local, that read made the cell query throw `BoundsError`. Densities and
+gradients are unchanged, and so is the whole-model program, which still reads
+the gather in place. Requires ReactiveKernels 0.1.426.
+
 ## 0.1.275
 
 A dotted sum or product of three or more operands, `.+(a, b, c)` or

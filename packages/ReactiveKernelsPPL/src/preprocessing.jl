@@ -466,6 +466,11 @@ end
 @inline _ppl_cell_gather(x::AbstractVector, index::AbstractVector{<:Integer}) =
     ReactiveKernels._readonly_gather(x, index)
 @inline _ppl_cell_gather(x::AbstractVector, index::AbstractVector{Bool}) = x[index]
+# It reads `x` at `index` only, so a cell query computes `x` at the cell's rows
+# (`ReactiveKernels._cell_gather_call`) and reads that window in place too.
+@inline _ppl_cell_gather(x::ReactiveKernels._CellWindow, index) =
+    ReactiveKernels._cell_gather_view(x, index)
+ReactiveKernels._cell_gather_call(::typeof(_ppl_cell_gather)) = true
 
 # Stage lanes of a stopping-ratio response (SB `brm_ordinal` structure 2):
 # observation `i` with level `y[i]` passes stages `1..min(y[i], K-1)` —

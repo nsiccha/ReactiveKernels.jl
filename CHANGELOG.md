@@ -16,6 +16,25 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.426
+
+A plate body that reads a shared argument only through a gather call,
+`f(v, q)` or `f(v, w[q])`, reads it at those positions, as it does through
+`v[q]` and `v[w[q]]`. A cell query, a partition and their footprints then
+compute the argument at the reading cell's rows, and the call reads that
+window in place; before, the call counted as a read of the whole argument. A
+package declares such a function with `_cell_gather_call`. ReactiveKernelsPPL
+0.1.276 declares the in-place read of a dotted cell's gather: until then every
+cell of `y[g] .~ Normal.(mu[rows[g]], sigma)` computed `mu` whole, its
+footprint held every group's coordinates, and `partition_locality` listed `mu`
+as shared, so `locality = :error` raised nothing. Values and gradients are
+unchanged.
+
+A cell's read through one Boolean mask per cell (`mu[mask[g]]`) is no longer
+taken for a read at row positions: the cell query threw `BoundsError`. Such a
+value is computed whole and `partition_locality` names it (`:untyped_index`),
+so `locality = :error` raises `PartitionLocalityError`.
+
 ## 0.1.425
 
 A `PreparedData` also packs a Python number that `prepare_data` passes
