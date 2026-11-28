@@ -2140,6 +2140,38 @@ def _rk_broadcast_total(*operands):
             result = np.where(result == 1, lengths, result)
     return StaticInt(int(np.sum(result, dtype=np.int64)))
 """),
+    :ragged_counts => ("_rk_ragged_counts", """
+def _rk_ragged_counts(bound, *operands):
+    # Whether a ragged plate's prepared row lengths need no run-time checks:
+    # `bound` holds the lengths of the data rows whose coordinates the
+    # grouped sum covers, then come one vector of row lengths and an optional
+    # one-based row selector per other mapped input. 1 when every input's
+    # rows match the merged lengths (or have length one), no length is
+    # negative, and the merged lengths are `bound`, so the grouped sum needs
+    # neither its checks nor its layout branch. 0 keeps both: invalid data
+    # then raise in program order when the function runs, not here.
+    try:
+        bound = np.asarray(bound)
+        sizes = [bound]
+        for lengths, indices in zip(operands[::2], operands[1::2]):
+            lengths = np.asarray(lengths)
+            if indices is not None:
+                indices = np.asarray(indices)
+                if np.any(indices < 1) or np.any(indices > lengths.shape[0]):
+                    return StaticInt(0)
+                lengths = lengths[indices - 1]
+            sizes.append(lengths)
+        sizes = np.broadcast_arrays(*sizes)
+    except (ValueError, IndexError, TypeError):
+        return StaticInt(0)
+    counts = sizes[0]
+    for other in sizes[1:]:
+        if np.any((counts != other) & (counts != 1) & (other != 1)):
+            return StaticInt(0)
+        counts = np.where(counts == 1, other, counts)
+    exact = counts.shape == bound.shape and not np.any(counts != bound)
+    return StaticInt(int(exact and not np.any(counts < 0)))
+"""),
     :min => ("_rk_bound_min", """
 def _rk_bound_min(a):
     \"\"\"The least entry of a prepared integer array, static (0 without entries).\"\"\"

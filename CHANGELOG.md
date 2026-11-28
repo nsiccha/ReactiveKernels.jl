@@ -16,6 +16,14 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.409
+
+`prepare_data` decides a ragged plate's row-length checks and its grouped
+or expanded sum from the prepared lengths. Data that pass run the grouped
+sum with no runtime check or branch, which removes device-to-host round trips
+from every GPU evaluation. Other data keep the checks, so invalid rows still
+raise when the function runs, in program order.
+
 ## 0.1.408
 
 The emitted JAX `select_plate_layout` confirms competing layouts in 12 rotating,

@@ -58,3 +58,11 @@ and mapped chain selects it. Otherwise it uses the scalar map.
 The same emitted module serves different row lengths and
 branch decisions. Changing the number of entries in a group can trigger
 recompilation by JAX.
+
+`prepare_data` also checks the row lengths such a sum reads, including a
+location's rows selected by a prepared row index, and returns the verdict as
+static metadata. When they pass, the compiled function runs the grouped sum
+with no runtime check or layout branch. On a GPU each of those would copy its
+predicate to the host and leave the device idle, longer on a loaded host.
+Data that fail keep both, so an invalid row still raises when the function
+runs, in program order. Datasets with different verdicts trace separately.
