@@ -198,8 +198,22 @@ unless `columns = :names` (names), `:types` (names and value types) or
 only when `n_obs = true`. Callers receive a fresh copy, so they may mutate
 the result; `fresh = false` shares the cached value with callers that only
 read it. `same(recomputed, cached)` is the hit check's comparison.
+
+`f` is not specialized on, in inference either. Analyses call one another, so
+inference that follows `f` puts this method under itself once per analysis on
+the way, each time with another closure type. Julia's recursion limit ends
+such frames as limited, and a limited frame is not cached, so each later
+call of an analysis infers it again with every analysis it calls. A process
+that had to infer this code itself, because another package's methods had
+failed the edges of the image's copy, did not return from its first
+`lower_rkppl` on Julia 1.12.7: 421,669 of its first 425,547 inference frames
+repeated one of 160 method instances whose earlier frame had ended limited
+(snag `first-rkbrmi-low-59c952cd`). The value was untyped before, since a
+cache hit returns it from an `IdDict{Any,Any}`; an analysis is now inferred
+when it first runs, on its own. `test_structural_cache.jl` pins that no
+helper holds a specialization on `f`.
 """
-function _structural(f, plan::StructuralPlan, tag::Tuple;
+Base.@nospecializeinfer function _structural(@nospecialize(f), plan::StructuralPlan, tag::Tuple;
         columns::Symbol = :names, n_obs::Bool = false, fresh::Bool = true,
         same = isequal)
     _structural_enabled() || return f()
@@ -229,7 +243,8 @@ end
 # invalidates every caller, and a fresh process recompiles binding and
 # `build_kernel` (decision `1as3h7s`). Dispatching on the value asks no
 # `IteratorSize`; a value of another set type is copied element by element.
-_structural_set(f, plan::StructuralPlan, tag::Tuple; kwargs...) =
+Base.@nospecializeinfer _structural_set(@nospecialize(f), plan::StructuralPlan, tag::Tuple;
+        kwargs...) =
     _symbol_set(_structural(f, plan, tag; kwargs...))
 _symbol_set(x::Set{Symbol}) = x
 _symbol_set(x) = ReactiveKernels._push_each!(Set{Symbol}(), x)
@@ -248,9 +263,11 @@ const _NO_DATA_CHECKS = gensym(:no_data_checks)
 
 # A cached analysis returns a value: a data check it ran would be skipped on
 # every hit, unless the analysis is keyed by the column table itself (which
-# no step mutates), so it may run checks only then.
-_analysis(f, columns::Symbol) = task_local_storage(f, _DATA_CHECKS,
-    columns === :identity ? nothing : _NO_DATA_CHECKS)
+# no step mutates), so it may run checks only then. `f` stays unspecialized,
+# as in `_structural`.
+Base.@nospecializeinfer _analysis(@nospecialize(f), columns::Symbol) =
+    task_local_storage(f, _DATA_CHECKS,
+        columns === :identity ? nothing : _NO_DATA_CHECKS)
 
 """
     _data_check(check, plan)
