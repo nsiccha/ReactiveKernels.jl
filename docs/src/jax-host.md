@@ -58,3 +58,18 @@ and mapped chain selects it. Otherwise it uses the scalar map.
 The same emitted module serves different row lengths and
 branch decisions. Changing the number of entries in a group can trigger
 recompilation by JAX.
+
+## Checks decided in prepare_data
+
+On a GPU each runtime check copies its predicate to the host and leaves the
+device idle, longer on a loaded host. `prepare_data` therefore decides some
+checks on data alone and returns the verdict as static metadata:
+
+- the row lengths a ragged row sum reads, including a location's rows
+  selected by a prepared row index; passing data also skip its layout branch;
+- in a padded export, a subject scan's reads of table rows at a padded index
+  (`table[j]`, possibly only where a padded tag equals a literal): each
+  requested index must lie within its subject's table rows.
+
+Data that fail keep the check, so invalid data still raise when the function
+runs, in program order. Datasets with different verdicts trace separately.

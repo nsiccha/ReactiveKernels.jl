@@ -245,6 +245,51 @@ def _rk_ragged_lane_sum(cells, entries, groups, rows, cols, data_lengths, length
     return jax.lax.cond(jnp.all(lengths == data_lengths), grouped, expanded)
 """
 
+# The prepared proof (`:ragged_counts`, a `StaticInt`) that a ragged plate's
+# row lengths `sizes` (codes; the data domain's prepared lengths first) need
+# no checks, or `nothing` when `prepare_data` cannot read one of them: each
+# must be a prepared lengths vector, or one selected by a prepared one-based
+# row index. Chain and round layouts hold their lengths differently.
+function _jax_ragged_counts_proof(ctx, sizes)
+    ctx.host === nothing && _jax_plate_layout() in (:padded, :groups) || return nothing
+    keys = String[]
+    for (i, size) in enumerate(sizes)
+        key = get(ctx.scope.prepared_keys, size, nothing)
+        if key !== nothing
+            i == 1 ? push!(keys, key) : push!(keys, key, "")
+            continue
+        end
+        i == 1 && return nothing
+        selected = get(ctx.scope.selected_lengths, size, nothing)
+        if selected === nothing
+            # A cell's selected row lengths, as the plate passes them out
+            # (`_jax_outer_extent`): `lengths[index - 1]` of two arrays.
+            m = match(r"^([A-Za-z_]\w*)\[([A-Za-z_]\w*) - 1\]$", size)
+            m === nothing && return nothing
+            selected = (String(m.captures[1]), String(m.captures[2]), "")
+        end
+        rows, index, _ = selected
+        lengths = get(ctx.scope.prepared_keys, rows, nothing)
+        indices = get(ctx.scope.prepared_keys, index, nothing)
+        (lengths === nothing || indices === nothing) && return nothing
+        push!(keys, lengths, indices)
+    end
+    _jax_prepared_bound!(ctx, :ragged_counts, keys...)
+end
+
+# Run the statements emitted since line `mark` of the current scope only when
+# the prepared `StaticInt` `proof` is 0, decided while tracing. `default`
+# (`name => code`), when given, first binds a name those statements assign.
+function _jax_unless_proven!(ctx, mark, proof, default)
+    body = ctx.scope.lines[mark+1:end]
+    isempty(body) && return nothing
+    resize!(ctx.scope.lines, mark)
+    default === nothing || _jax_emit!(ctx, first(default) * " = " * last(default))
+    _jax_emit!(ctx, "if not " * proof * ":")
+    append!(ctx.scope.lines, [replace("    " * line, "\n" => "\n    ") for line in body])
+    nothing
+end
+
 function _jax_ragged_lane_sum(ctx, p, op, inputs)
     n = length(op.recipe.inputs)
     base = inputs[1:n]
@@ -309,6 +354,13 @@ function _jax_ragged_lane_sum(ctx, p, op, inputs)
     groups = join((v.code for v in inputs[n+1:end-3]), ", ")
     arrays = [_py_atom(v.code) for (v, m) in zip(base, mapped) if m]
     widths = "(" * join((a * ".shape[1]" for a in arrays), ", ") * ",)"
+    # Lengths that `prepare_data` can read prove the grouped sum valid before
+    # it runs (`_rk_ragged_counts`). Proven data then skip its checks and
+    # layout branch, whose device-to-host round trips stall the GPU on every
+    # call; other data keep both, so their errors still come in program order.
+    checked = length(sizes) > 1 || length(op.nested.bound) > 1
+    proof = checked ? _jax_ragged_counts_proof(ctx, sizes) : nothing
+    first_check = length(ctx.scope.lines)
     counts = bound
     if length(sizes) > 1
         ls = _jax_fresh(ctx, :row_lengths)
@@ -326,6 +378,9 @@ function _jax_ragged_lane_sum(ctx, p, op, inputs)
         valid = _PyVal("jnp.all($counts >= 0)", Bool)
         _jax_call(ctx, _runtime_check, [valid, _PyVal(repr("incompatible ragged plate axes"), DimensionMismatch)])
     end
+    # The proven path passes the prepared lengths themselves, which
+    # `_rk_ragged_lane_sum` recognizes (`lengths is data_lengths`).
+    proof === nothing || _jax_unless_proven!(ctx, first_check, proof, counts == bound ? nothing : counts => bound)
     _jax_helper!(ctx, "_rk_any_active", _JAX_ANY_ACTIVE)
     _jax_helper!(ctx, "_rk_ragged_group", _JAX_RAGGED_GROUP)
     run = _jax_helper!(ctx, "_rk_ragged_lane_sum", _JAX_RAGGED_LANE_SUM)

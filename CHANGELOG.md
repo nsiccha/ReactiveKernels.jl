@@ -16,6 +16,19 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.412
+
+`prepare_data` decides a ragged plate's row-length checks and its grouped
+or expanded sum from the prepared lengths. Data that pass run the grouped
+sum with no runtime check or branch, which removes device-to-host round trips
+from every GPU evaluation. Other data keep the checks, so invalid rows still
+raise when the function runs, in program order.
+
+In a padded export, `prepare_data` likewise decides the bounds check of a
+subject scan's table reads at a padded index, optionally guarded by a padded
+tag: when every requested index lies within its subject's table rows, the
+compiled function drops that check and its mid-program round trip.
+
 ## 0.1.411
 
 - The vector logarithm of a summed native plate (0.1.373) takes a sum of

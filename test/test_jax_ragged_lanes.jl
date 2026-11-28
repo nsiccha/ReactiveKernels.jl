@@ -26,8 +26,27 @@ end
     src = emit(mixed)
     @test src.text == emit(larger).text
     @test occursin(" = _rk_ragged_lane_sum(", src.text)
+    # Prepared lengths are proven once by `prepare_data`; the function runs
+    # the checks and the layout branch only for data that fail the proof.
+    @test occursin("= _rk_ragged_counts(", src.text)
+    @test occursin(r"\n\s+if not _rk_ragged_counts_\w+:\n", src.text)
     live = emit((:mode,))
     @test occursin(" = _rk_ragged_lane_sum(", live.text)
+    # Rows passed when the function runs cannot be proven beforehand.
+    @test !occursin("_rk_ragged_counts", live.text)
+    # A location's row lengths read through a prepared one-based row index,
+    # as a plate passes them out (`lengths[index - 1]`), are proven from
+    # both prepared arrays; anything else that is not prepared is not.
+    let RK = ReactiveKernels
+        ctx = RK._JaxContext(RK._JaxModule(), RK._JaxScope(), nothing, Main, Dict{Symbol,RK._PyVal}(), nothing)
+        merge!(ctx.scope.prepared_keys, Dict("bound" => "obs_row_lengths", "loc_lengths" => "loc_rows_lengths",
+                                             "which" => "obs_subject"))
+        proof = RK._jax_ragged_counts_proof(ctx, ["bound", "loc_lengths[which - 1]"])
+        @test (proof, :ragged_counts, ("obs_row_lengths", "loc_rows_lengths", "obs_subject")) in
+              RK._jax_prepared_bounds(ctx.mod)
+        @test RK._jax_ragged_counts_proof(ctx, ["bound", "loc_lengths[other - 1]"]) === nothing
+        @test RK._jax_ragged_counts_proof(ctx, ["bound", "jnp.full((m.shape[0],), m.shape[1])"]) === nothing
+    end
     native = prepare(weighted_rows; have, want = :score)
     if rk_jax_available()
         cases = [reference, larger, mixed, (; x=mixed.x, mode=[[2., -1.], Float64[], [1.]]),
@@ -182,6 +201,42 @@ for module in (fixed, live):
         assert "incompatible ragged plate axes" in str(err), str(err)
     else:
         raise AssertionError("accepted incompatible row lengths")
+
+# On a GPU every evaluated check and data-dependent layout branch copies its
+# predicate to the host. Proven prepared lengths need neither; lengths that
+# fail the proof keep both, so the error above still comes from the function.
+def checks_and_branches(f, args):
+    found = inventory(jax.make_jaxpr(f)(0.4, **args))
+    return found["debug_callback"], found["cond"]
+proofs = [k for k in fixed.PREPARED if k.startswith("_rk_ragged_counts")]
+assert len(proofs) == 1, list(fixed.PREPARED)
+vg = jax.value_and_grad(fixed.score)
+for rows, modes, _, _ in cases[:3]:
+    good = fixed.prepare_data(x=rows, mode=modes)
+    assert good[proofs[0]] == 1, (rows, modes, good[proofs[0]])
+    assert checks_and_branches(vg, good)[0] == 0, checks_and_branches(vg, good)
+bad = fixed.prepare_data(x=[[1., 2.]], mode=[[1., 1., 1.]])
+assert bad[proofs[0]] == 0, bad[proofs[0]]
+callbacks, branches = checks_and_branches(vg, bad)
+assert callbacks > 0, callbacks
+assert branches > checks_and_branches(vg, good)[1], (branches, checks_and_branches(vg, good))
+
+# The proof over a location's selected rows: a valid selection whose lengths
+# match the data's (or have length one) proves; an out-of-range selector,
+# incompatible rows, a negative length or a different row count do not.
+counts = fixed._rk_ragged_counts
+lengths, subject = np.array([2, 1, 0, 5]), np.array([1, 2, 3])
+assert counts(np.array([2, 1, 0]), lengths, subject) == 1
+assert counts(np.array([2, 1, 0]), lengths, None) == 0
+assert counts(np.array([2, 1, 0]), lengths, np.array([1, 2, 5])) == 0
+assert counts(np.array([2, 1, 0]), lengths, np.array([0, 2, 3])) == 0
+assert counts(np.array([3, 1, 0]), lengths, subject) == 0
+# A location row of length one broadcasts over its data row, either way round.
+assert counts(np.array([2, 2, 0]), lengths, subject) == 1
+assert counts(np.array([2, 1, 0]), np.array([1, 1, 1]), subject) == 1
+assert counts(np.array([1, 1, 0]), np.array([2, 1, 0]), subject) == 0
+assert counts(np.array([-1, 1, 0]), np.array([1, 1, 0]), subject) == 0
+assert counts(np.array([2, 1, 0])) == 1 and counts(np.array([2, -1, 0])) == 0
 """)
             @test success(pipeline(`$RK_JAX_PYTHON $(joinpath(dir, "check.py"))`, stderr=stderr))
         end
