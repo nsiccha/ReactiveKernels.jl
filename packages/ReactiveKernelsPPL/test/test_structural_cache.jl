@@ -321,3 +321,50 @@ end
     bind_data(_scache_lower(_scache_design(4)), _scache_design(4))
     @test _scache_analysis_types() == Set{Any}((Any,))
 end
+
+# `build_kernel` takes a bound plan, a finished binding, so it computes each
+# structural analysis once and reuses the ones `bind_data` computed for that
+# plan. Outside the cache every read of an analysis computes it again, and
+# validation reads some of them once per name a definition mentions (snag
+# fitted-open-on-a-3082f909).
+@testset "structural cache: build_kernel reuses a binding's analyses" begin
+    same(a, b) = _SCACHE._same_program(a, b)
+    unbound = _scache_lower(_scache_design(4))
+    bound = bind_data(unbound, _scache_design(6))
+    # The program without the cache, as `kernel_expr` computes it by itself.
+    reference = _SCACHE._program_identity(_scache_program(bound))
+    @test same(build_kernel(bound).program, reference)
+    builds = KernelBuildCache()
+    @test same(build_kernel(bound; cache = builds).program, reference)
+    @test same(build_kernel(bind_data(unbound, _scache_design(9)); cache = builds).program,
+        reference)
+    @test !_SCACHE._structural_enabled()
+    _SCACHE._STRUCTURAL_CACHE_CHECK[] = true
+    try
+        # Every analysis a build reads from the cache equals its recomputation.
+        @test same(build_kernel(bound).program, reference)
+        @test same(build_kernel(bound; cache = builds).program, reference)
+        # Positive control: the build reads the entries the binding stored.
+        cache = _scache_entries(unbound)
+        stale = [k for k in keys(cache) if k isa Tuple && first(k) isa Tuple &&
+            first(first(k)) === :module_data_names]
+        @test !isempty(stale)
+        foreach(k -> cache[k] = Set([:not_a_definition]), stale)
+        @test_throws ErrorException build_kernel(bound)
+        empty!(cache)
+        @test same(build_kernel(bound).program, reference)
+    finally
+        _SCACHE._STRUCTURAL_CACHE_CHECK[] = false
+    end
+    # A plan a build refuses is refused the same way.
+    @test_throws ReactiveKernelsPPL.ContractValidationError build_kernel(unbound)
+    # A build registers no cache: a plan no binding registered (here a copy)
+    # keeps its analyses for the build only, so nothing of it outlives the build.
+    registered() = lock(() -> sum(length, values(_SCACHE._STRUCTURAL_CACHES); init = 0),
+        _SCACHE._STRUCTURAL_CACHES_LOCK)
+    copied = deepcopy(bound)
+    before = registered()
+    @test same(build_kernel(copied).program, reference)
+    @test same(build_kernel(copied; cache = builds).program, reference)
+    @test registered() == before
+end

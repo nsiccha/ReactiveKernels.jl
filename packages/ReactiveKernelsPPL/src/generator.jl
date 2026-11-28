@@ -71,14 +71,20 @@ uses its own boundary: `prepare` it and call it through [`prepare_query`](@ref) 
 barrier) or wrap those calls in `Base.invokelatest` yourself.
 """
 build_kernel(plan::StructuralPlan; cache::Union{KernelBuildCache,Nothing}=nothing) =
-    Base.invokelatest(_build_kernel_latest, plan, cache)
+    _with_build_structural_cache() do
+        Base.invokelatest(_build_kernel_latest, plan, cache)
+    end
 
+# A bound plan is a finished binding, so its structural analyses are computed
+# once here too, and the ones `bind_data` computed for this plan are reused
+# (`_with_build_structural_cache`). The plan is validated once: `_kernel_expr`
+# emits the plan this function has just validated.
 function _build_kernel_latest(plan::StructuralPlan, cache=nothing)
     validate_plan(plan)
     isbound(plan) || throw(ContractValidationError(
         "[generator] build_kernel requires a bound plan (bind_data first)"))
     layout = assign_layout(plan)
-    def = kernel_expr(plan, layout)
+    def = _kernel_expr(plan, layout; validated = true)
     if cache !== nothing
         spec = _cached_build_spec(cache, def)
         _register_packed_check!(spec, layout)
@@ -414,9 +420,14 @@ Pure (no eval): the generator tests inspect and evaluate it. `plan` may also
 be a binding with nothing left to observe (`model(; x)`), read as
 `bind_data(binding)`, exactly as [`build_kernel`](@ref) reads it.
 """
-function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :ppl_model)
+kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :ppl_model) =
+    _kernel_expr(plan, layout; name)
+
+# `validated`: the caller has run `validate_plan(plan)` on this plan.
+function _kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :ppl_model,
+        validated::Bool = false)
     def = ReactiveKernels._within_kernel_names(name) do
-        Base.invokelatest(_kernel_expr_latest, plan, layout; name)
+        Base.invokelatest(_kernel_expr_latest, plan, layout; name, validated)
     end
     def = _finish_kernel_expr(plan, def)
     return isempty(plan.marginalized_integers) ? def : _integer_marginal_program(plan, def)
@@ -429,8 +440,8 @@ function _finish_kernel_expr(plan, def)
 end
 
 function _kernel_expr_latest(plan::StructuralPlan, layout::LayoutTable;
-        name::Symbol = :ppl_model, density_sites = nothing)
-    validate_plan(plan)
+        name::Symbol = :ppl_model, density_sites = nothing, validated::Bool = false)
+    validated || validate_plan(plan)
     isbound(plan) || throw(ContractValidationError(
         "[generator] kernel_expr requires a bound plan (bind_data first)"))
     stmts = Expr[]
