@@ -91,27 +91,38 @@ end # module
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    changed in place: build a new one with \`PreparedData({**prepared, name: value})\`.</span></span>
 <span class="line"></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    As a JAX pytree its leaves are one flat array per dtype, which hold every</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    NumPy array and scalar, followed by any other value as its own leaf (a</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    Python number keeps its weak type, a JAX array its device). Passing it to a</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    jitted function costs a few leaves however many arrays it holds, and the</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    function reads each value as a static slice of its array.</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    \`jax.device_put\` and \`jax.tree_util.tree_map\` keep it packed.</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    NumPy array and scalar, followed by any other value as its own leaf (a JAX</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    array keeps its device). A Python number that \`PREPARED\` declares a scalar</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    is held at that dtype too: reading it gives the Python number, rounded to</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    the declared width, and inside a traced function it is a scalar of that</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    dtype rather than a weakly typed one. A number the declared dtype cannot</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    hold stays its own leaf. Passing it to a jitted function costs a few leaves</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    however many arrays it holds, and the function reads each value as a static</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    slice of its array. \`jax.device_put\` and \`jax.tree_util.tree_map\` keep it</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    packed.</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    &quot;&quot;&quot;</span></span>
 <span class="line"></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    __slots__ = (&quot;_buffers&quot;, &quot;_others&quot;, &quot;_layout&quot;, &quot;_values&quot;)</span></span>
 <span class="line"></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def __init__(self, values=(), **named):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def __init__(self, values=(), scalars=None, /, **named):</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        values = dict(values, **named)</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        names = tuple(values)</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        leaves, tree = jax.tree_util.tree_flatten(values)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        if scalars is None:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            scalars = globals().get(&quot;_RK_PREPARED_SCALARS&quot;, {})</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        pairs, tree = jax.tree_util.tree_flatten_with_path(values)</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        groups, spec, others = {}, [], []</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        for leaf in leaves:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        for path, leaf in pairs:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            python = None</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            if type(leaf) in (bool, int, float, complex) and len(path) == 1:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                packed = _rk_pack_number(leaf, scalars.get(getattr(path[0], &quot;key&quot;, None)))</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                if packed is not None:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                    leaf, python = packed, type(leaf)</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            if isinstance(leaf, (np.ndarray, np.generic)) and leaf.dtype.kind in &quot;biufc&quot;:</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                array = np.asarray(leaf)</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                group = groups.setdefault(array.dtype, [])</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                offset = sum(part.size for part in group)</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                group.append(array.reshape(-1))</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                spec.append((array.dtype, offset, array.shape, isinstance(leaf, np.generic)))</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                spec.append((array.dtype, offset, array.shape, isinstance(leaf, np.generic), python))</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            else:</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                spec.append(len(others))</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                others.append(leaf)</span></span>
@@ -150,11 +161,13 @@ end # module
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def _read(self, entry):</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        if isinstance(entry, int):</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            return self._others[entry]</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        dtype, offset, shape, scalar = entry</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        dtype, offset, shape, scalar, python = entry</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        buffer = self._buffers[self._layout[2].index(dtype)]</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        size = int(np.prod(shape, dtype=np.int64))</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        if isinstance(buffer, np.ndarray):</span></span>
-<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            return buffer[offset] if scalar else buffer[offset:offset + size].reshape(shape)</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            if scalar:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">                return buffer[offset] if python is None else python(buffer[offset])</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            return buffer[offset:offset + size].reshape(shape)</span></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        return jax.lax.slice_in_dim(buffer, offset, offset + size).reshape(shape)</span></span>
 <span class="line"></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    def _dict(self):</span></span>
@@ -180,7 +193,29 @@ end # module
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        return &quot;PreparedData(&quot; + &quot;, &quot;.join(self._layout[0]) + &quot;)&quot;</span></span>
 <span class="line"></span>
 <span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">def _rk_pack_number(value, dtype):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    # The Python number \`value\` as a NumPy scalar of \`dtype\` (the dtype</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    # \`PREPARED\` declares for it), or None when no dtype is declared or the</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    # dtype cannot hold it: a float rounds to a narrower float, but an integer</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    # must survive exactly and a finite float may not overflow.</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    if dtype is None:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        return None</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    try:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        with np.errstate(all=&quot;ignore&quot;):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">            packed = np.asarray(value, dtype=dtype)[()]</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    except (TypeError, ValueError, OverflowError):</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        return None</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    if packed.dtype.kind not in &quot;biufc&quot;:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        return None</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    if isinstance(value, float) and packed.dtype.kind in &quot;fc&quot;:</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">        return packed if np.isfinite(packed) or not np.isfinite(value) else None</span></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">    return packed if packed.item() == value else None</span></span>
+<span class="line"></span>
+<span class="line"></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">jax.tree_util.register_pytree_node(PreparedData, PreparedData._flatten, PreparedData._unflatten)</span></span>
+<span class="line"></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">_RK_PREPARED_SCALARS = {}</span></span>
 <span class="line"></span>
 <span class="line"></span>
 <span class="line"><span style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;">def prepare_data(A: ArrayLike) -&gt; PreparedData:</span></span>
