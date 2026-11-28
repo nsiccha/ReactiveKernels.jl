@@ -806,19 +806,22 @@ def _rk_ordered_constrain(u, lo, hi):
     v = u[lo - 1:hi]
     return jnp.cumsum(jnp.concatenate([v[:1], jnp.exp(v[1:])]))
 """
-# A column advances every independent row's ordered product by one partial.
-# Prepare the triangular coordinates from the shape and pass the columns as
-# scan inputs, so the reverse sweep never scatters into z from inside a round.
+# Entry (i, j) of the factor is partial j of row i times the product of that
+# row's earlier scales sqrt(1 - z^2), and the diagonal entry is the product of
+# all of them: an exclusive cumulative product along each row of the partials'
+# grid, where an entry on or above the diagonal is 0 with scale 1. One
+# `jnp.cumprod` behind a column of ones computes every row at once, so the
+# value and its gradient compile without a loop. (A `lax.scan` over the columns
+# compiled to four host-driven `while` loops per batched gradient call.) The
+# triangular coordinates come from the shape, so the reverse sweep scatters
+# into z once, outside any round.
 const _JAX_LKJ_ROWS = """
 def _ppl_lkj_rows(z, K):
     row, col = np.tril_indices(K, -1)
     grid = jnp.zeros((K, K - 1), dtype=z.dtype).at[row, col].set(z)
-    def advance(product, column):
-        partial, scale = column
-        return product * scale, product * partial
-    diagonal, columns = jax.lax.scan(advance, jnp.ones(K, dtype=z.dtype),
-                                     (grid.T, jnp.sqrt(1 - grid.T ** 2)))
-    return diagonal, jnp.pad(columns.T, ((0, 0), (0, 1)))
+    products = jnp.cumprod(jnp.concatenate([jnp.ones((K, 1), dtype=z.dtype),
+                                            jnp.sqrt(1 - grid ** 2)], axis=1), axis=1)
+    return products[:, -1], jnp.pad(products[:, :-1] * grid, ((0, 0), (0, 1)))
 """
 
 function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
